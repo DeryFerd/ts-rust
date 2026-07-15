@@ -7,6 +7,7 @@ use ts_binder::{
 };
 use ts_diagnostics::{Diagnostic, message_by_code};
 use ts_jsnum::{Number, PseudoBigInt};
+use xxhash_rust::xxh3::Xxh3;
 
 use super::{
     CanonicalCheckerDiagnostics, CanonicalCheckerOptions, CanonicalTypeMapperStore,
@@ -19,7 +20,7 @@ use super::{
         malformed_alias_merge, preflight_class_or_interface_reference, preflight_node,
         preflight_type_parameter_symbol, type_list_key,
     },
-    type_records::{TypeData, TypeRecord},
+    type_records::{CacheHashKey, TypeData, TypeRecord},
 };
 
 const NODE_FLAG_JSDOC: u32 = 1 << 22;
@@ -67,6 +68,25 @@ pub enum TypeNodeUnavailable {
         node: NodeRef,
         symbol: SemanticSymbolId,
     },
+    GenericAliasConstraintUnsupported {
+        alias: SemanticSymbolId,
+        parameter: NodeRef,
+    },
+    GenericAliasInstantiationUnsupported {
+        alias: SemanticSymbolId,
+        declared_type: TypeId,
+    },
+    MissingGenericAliasMetadata(SemanticSymbolId),
+    InvalidGenericAliasInstantiationCache(SemanticSymbolId),
+    GenericAliasDefaultReferenceUnsupported {
+        alias: SemanticSymbolId,
+        default_type: NodeRef,
+        referenced_parameter: SemanticSymbolId,
+    },
+    CircularGenericAliasDefault {
+        alias: SemanticSymbolId,
+        default_type: NodeRef,
+    },
     InvalidTypeAliasSymbol(SemanticSymbolId),
     MissingTypeAliasDeclaration(SemanticSymbolId),
     InvalidTypeAliasDeclaration(NodeRef),
@@ -103,7 +123,28 @@ struct TypeAliasPlan {
     name: NodeRef,
     name_text: String,
     type_node: NodeRef,
-    type_parameter_symbols: Vec<SemanticSymbolId>,
+    type_parameters: Vec<PlannedTypeParameter>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PlannedTypeParameter {
+    symbol: SemanticSymbolId,
+    default_type: Option<NodeRef>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PlannedTypeReference {
+    symbol: SemanticSymbolId,
+    type_arguments: Vec<NodeRef>,
+    alias_owner: Option<SemanticSymbolId>,
+    arity: PlannedTypeReferenceArity,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PlannedTypeReferenceArity {
+    Valid,
+    NotGeneric,
+    InvalidGeneric { minimum: usize, maximum: usize },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -124,7 +165,7 @@ enum PlannedLiteralType {
 #[derive(Debug, Default)]
 struct TypeQueryPlan {
     aliases: BTreeMap<SemanticSymbolId, TypeAliasPlan>,
-    references: BTreeMap<NodeRef, SemanticSymbolId>,
+    references: BTreeMap<NodeRef, PlannedTypeReference>,
     literals: BTreeMap<NodeRef, PlannedLiteralType>,
     unions: BTreeMap<NodeRef, PlannedUnionType>,
 }
@@ -139,6 +180,34 @@ struct PlannedUnionType {
 struct CachedTypeAlias {
     declared_type: TypeId,
     type_parameter_count: usize,
+    missing_generic_metadata: bool,
+}
+
+fn type_alias_instantiation_cache_key(
+    type_arguments: &[TypeId],
+    alias: Option<(u64, &[TypeId])>,
+) -> CacheHashKey {
+    let mut hasher = Xxh3::new();
+    write_type_list(&mut hasher, type_arguments);
+    if let Some((symbol, arguments)) = alias {
+        hasher.update(&[1]);
+        hasher.update(&symbol.to_le_bytes());
+        write_type_list(&mut hasher, arguments);
+    } else {
+        hasher.update(&[0]);
+    }
+    CacheHashKey::new(hasher.digest128())
+}
+
+fn write_type_list(hasher: &mut Xxh3, types: &[TypeId]) {
+    hasher.update(
+        &u64::try_from(types.len())
+            .expect("type-list length must fit the pinned uint64 encoding")
+            .to_le_bytes(),
+    );
+    for type_ in types {
+        hasher.update(&type_.get().to_le_bytes());
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -290,12 +359,22 @@ fn valid_type_alias_identity_seed(
 
 fn cached_type_alias(
     store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
     symbol: SemanticSymbolId,
     strict_builtin_iterator_return: bool,
 ) -> Result<Option<CachedTypeAlias>, DeclaredTypeError> {
     let Some(links) = store.type_alias_links(symbol) else {
         return Ok(None);
     };
+    if store
+        .symbol(symbol)
+        .and_then(|symbol| symbol.declarations())
+        .is_none_or(|declarations| declarations.len() != 1)
+    {
+        return Err(type_node_unavailable(
+            TypeNodeUnavailable::InvalidCachedTypeAlias(symbol),
+        ));
+    }
     let Some(declared_type) = links.declared_type else {
         if links.type_parameters.is_some() || links.instantiations.is_some() {
             return Err(type_node_unavailable(
@@ -305,26 +384,56 @@ fn cached_type_alias(
         return Ok(None);
     };
 
+    let expected_parameter_symbols = cached_alias_parameter_symbols(store, host, symbol)?;
+    let mut missing_generic_metadata = false;
     let type_parameter_count = match links.type_parameters.as_deref() {
-        None if links.instantiations.is_none() => 0,
+        None if links.instantiations.is_none() => {
+            if expected_parameter_symbols
+                .as_ref()
+                .is_some_and(|parameters| !parameters.is_empty())
+            {
+                let is_error_type = store
+                    .intrinsic_bootstrap()
+                    .is_some_and(|bootstrap| declared_type == bootstrap.error_type);
+                if !is_error_type {
+                    return Err(type_node_unavailable(
+                        TypeNodeUnavailable::InvalidCachedTypeAlias(symbol),
+                    ));
+                }
+                missing_generic_metadata = true;
+            }
+            0
+        }
         Some(type_parameters) if !type_parameters.is_empty() => {
             let unique_parameters = type_parameters.iter().copied().collect::<HashSet<_>>();
-            let parameters_are_valid = unique_parameters.len() == type_parameters.len()
-                && type_parameters.iter().all(|parameter| {
-                    cached_ordinary_type_parameter_owner(store, *parameter).is_some()
-                });
+            let parameter_symbols = type_parameters
+                .iter()
+                .map(|parameter| cached_ordinary_type_parameter_owner(store, *parameter))
+                .collect::<Option<Vec<_>>>();
+            let parameters_are_valid =
+                unique_parameters.len() == type_parameters.len() && parameter_symbols.is_some();
+            if let Some(expected) = &expected_parameter_symbols
+                && parameter_symbols.as_deref() != Some(expected.as_slice())
+            {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidCachedTypeAlias(symbol),
+                ));
+            }
             let has_identity_seed = links.instantiations.as_ref().is_some_and(|instantiations| {
                 instantiations
-                    .get(&type_list_key(type_parameters))
-                    .is_some_and(|identity_seed| {
-                        valid_type_alias_identity_seed(
-                            store,
-                            symbol,
-                            declared_type,
-                            *identity_seed,
-                            strict_builtin_iterator_return,
-                        )
-                    })
+                    .values()
+                    .all(|instantiation| store.type_payload(*instantiation).is_some())
+                    && instantiations
+                        .get(&type_list_key(type_parameters))
+                        .is_some_and(|identity_seed| {
+                            valid_type_alias_identity_seed(
+                                store,
+                                symbol,
+                                declared_type,
+                                *identity_seed,
+                                strict_builtin_iterator_return,
+                            )
+                        })
             });
             if !parameters_are_valid || !has_identity_seed {
                 return Err(type_node_unavailable(
@@ -342,7 +451,47 @@ fn cached_type_alias(
     Ok(Some(CachedTypeAlias {
         declared_type,
         type_parameter_count,
+        missing_generic_metadata,
     }))
+}
+
+fn cached_alias_parameter_symbols(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    symbol: SemanticSymbolId,
+) -> Result<Option<Vec<SemanticSymbolId>>, DeclaredTypeError> {
+    let declaration = store
+        .symbol(symbol)
+        .and_then(|symbol| symbol.declarations())
+        .and_then(|declarations| declarations.first())
+        .copied()
+        .ok_or_else(|| {
+            type_node_unavailable(TypeNodeUnavailable::MissingTypeAliasDeclaration(symbol))
+        })?;
+    if host.source(declaration).is_none() {
+        return Ok(None);
+    }
+    let declaration_node = preflight_node(store, host, declaration)?;
+    let NodeData::TypeAliasDeclaration(alias) = &declaration_node.data else {
+        return Err(type_node_unavailable(
+            TypeNodeUnavailable::InvalidCachedTypeAlias(symbol),
+        ));
+    };
+    if declaration_node.kind != SyntaxKind::TypeAliasDeclaration
+        || !host.symbol_matches(store, declaration, symbol)
+    {
+        return Err(type_node_unavailable(
+            TypeNodeUnavailable::InvalidCachedTypeAlias(symbol),
+        ));
+    }
+    explicit_type_parameter_symbols(
+        store,
+        host,
+        declaration,
+        alias.type_parameters.as_ref(),
+        &mut HashSet::new(),
+    )
+    .map(Some)
 }
 
 struct TypeQueryPlanner<'store, 'host, 'arena> {
@@ -350,6 +499,7 @@ struct TypeQueryPlanner<'store, 'host, 'arena> {
     host: &'host DeclaredTypeHost<'arena>,
     strict_builtin_iterator_return: bool,
     plan: TypeQueryPlan,
+    planning_defaults: HashSet<(SemanticSymbolId, NodeRef)>,
 }
 
 impl<'store, 'host, 'arena> TypeQueryPlanner<'store, 'host, 'arena> {
@@ -363,6 +513,7 @@ impl<'store, 'host, 'arena> TypeQueryPlanner<'store, 'host, 'arena> {
             host,
             strict_builtin_iterator_return,
             plan: TypeQueryPlan::default(),
+            planning_defaults: HashSet::new(),
         }
     }
 
@@ -371,7 +522,67 @@ impl<'store, 'host, 'arena> TypeQueryPlanner<'store, 'host, 'arena> {
     }
 
     fn plan_type_node(&mut self, node: NodeRef) -> Result<(), DeclaredTypeError> {
-        self.plan_type_node_in_context(node, None, false)
+        if let Some(alias) = self.direct_type_alias_owner(node)? {
+            self.plan_type_alias(alias, false).map(|_| ())
+        } else {
+            self.plan_type_node_in_context(node, None, false)
+        }
+    }
+
+    fn direct_type_alias_owner(
+        &self,
+        node: NodeRef,
+    ) -> Result<Option<SemanticSymbolId>, DeclaredTypeError> {
+        let mut child = node;
+        loop {
+            let Some(parent) = preflight_node(self.store, self.host, child)?.parent else {
+                return Ok(None);
+            };
+            let parent = NodeRef::new(node.arena, node.file, parent);
+            let record = preflight_node(self.store, self.host, parent)?;
+            match &record.data {
+                NodeData::ParenthesizedTypeNode(parenthesized)
+                    if parenthesized.type_ == child.node =>
+                {
+                    child = parent;
+                }
+                NodeData::TypeAliasDeclaration(alias)
+                    if record.kind == SyntaxKind::TypeAliasDeclaration
+                        && alias.type_ == child.node =>
+                {
+                    let bound = self.host.bound_file(parent).ok_or({
+                        DeclaredTypeError::Unavailable(
+                            DeclaredTypeUnavailable::MissingOrForeignFacts(parent),
+                        )
+                    })?;
+                    let symbol = bound
+                        .symbol(parent)
+                        .and_then(|symbol| self.store.get_merged_symbol(symbol))
+                        .ok_or_else(|| {
+                            type_node_unavailable(TypeNodeUnavailable::InvalidTypeAliasDeclaration(
+                                parent,
+                            ))
+                        })?;
+                    let flags = self
+                        .store
+                        .symbol(symbol)
+                        .map(ts_binder::semantic::Symbol::flags)
+                        .ok_or(DeclaredTypeError::Unavailable(
+                            DeclaredTypeUnavailable::SymbolNotOwned(symbol),
+                        ))?;
+                    if !self.host.symbol_matches(self.store, parent, symbol)
+                        || !flags.contains(SymbolFlags::TYPE_ALIAS)
+                        || malformed_alias_merge(flags)
+                    {
+                        return Err(type_node_unavailable(
+                            TypeNodeUnavailable::InvalidTypeAliasDeclaration(parent),
+                        ));
+                    }
+                    return Ok(Some(symbol));
+                }
+                _ => return Ok(None),
+            }
+        }
     }
 
     fn plan_type_node_in_context(
@@ -436,7 +647,9 @@ impl<'store, 'host, 'arena> TypeQueryPlanner<'store, 'host, 'arena> {
                 self.plan_type_node_in_context(inner, alias_owner, union_constituent)
             }
             SyntaxKind::LiteralType => self.plan_literal_type(node),
-            SyntaxKind::TypeReference => self.plan_type_reference(node, union_constituent),
+            SyntaxKind::TypeReference => {
+                self.plan_type_reference(node, alias_owner, union_constituent)
+            }
             SyntaxKind::UnionType => self.plan_union_type(node, alias_owner),
             kind if union_constituent => Err(type_node_unavailable(
                 TypeNodeUnavailable::UnsupportedUnionConstituent(node),
@@ -652,6 +865,7 @@ impl<'store, 'host, 'arena> TypeQueryPlanner<'store, 'host, 'arena> {
         let declared_type = cached.declared_type;
         let declared_data = self.store.type_payload(declared_type).map(TypeRecord::data);
         let remains_union = matches!(declared_data, Some(TypeData::Union(_)));
+        let mut current_missing_generic_metadata = cached.missing_generic_metadata;
         if union_constituent
             || matches!(
                 declared_data,
@@ -664,9 +878,11 @@ impl<'store, 'host, 'arena> TypeQueryPlanner<'store, 'host, 'arena> {
         }
 
         let mut symbol = root_symbol;
-        let mut visited = HashSet::new();
+        let mut visited = HashMap::new();
+        let mut path = Vec::new();
+        let mut missing_generic_metadata = HashSet::new();
         loop {
-            if !visited.insert(symbol) {
+            if let Some(cycle_start) = visited.get(&symbol).copied() {
                 if remains_union {
                     return Err(type_construction_error(
                         LiteralTypeCacheError::InvalidCachedUnion(declared_type),
@@ -676,13 +892,22 @@ impl<'store, 'host, 'arena> TypeQueryPlanner<'store, 'host, 'arena> {
                     .store
                     .intrinsic_bootstrap()
                     .is_some_and(|bootstrap| declared_type == bootstrap.error_type);
-                return if is_canonical_cycle_error {
+                let cycle = &path[cycle_start..];
+                let missing_metadata_is_on_cycle = missing_generic_metadata
+                    .iter()
+                    .all(|missing| cycle.contains(missing));
+                return if is_canonical_cycle_error && missing_metadata_is_on_cycle {
                     Ok(())
                 } else {
                     Err(type_node_unavailable(
                         TypeNodeUnavailable::InvalidCachedTypeAlias(root_symbol),
                     ))
                 };
+            }
+            visited.insert(symbol, path.len());
+            path.push(symbol);
+            if current_missing_generic_metadata {
+                missing_generic_metadata.insert(symbol);
             }
             let has_host_declaration = self
                 .store
@@ -694,10 +919,21 @@ impl<'store, 'host, 'arena> TypeQueryPlanner<'store, 'host, 'arena> {
                 // Fully cached queries intentionally support an empty host.
                 // The canonical semantic identity was validated above; AST
                 // RHS provenance is enforced whenever its owner is available.
-                return Ok(());
+                return if missing_generic_metadata.is_empty() {
+                    Ok(())
+                } else {
+                    Err(type_node_unavailable(
+                        TypeNodeUnavailable::InvalidCachedTypeAlias(root_symbol),
+                    ))
+                };
             }
             match self.cached_type_alias_rhs(symbol)? {
                 CachedTypeAliasRhs::DirectUnion => {
+                    if !missing_generic_metadata.is_empty() {
+                        return Err(type_node_unavailable(
+                            TypeNodeUnavailable::InvalidCachedTypeAlias(root_symbol),
+                        ));
+                    }
                     if remains_union {
                         self.store
                             .validate_cached_union_result(declared_type, Some(symbol))
@@ -706,6 +942,11 @@ impl<'store, 'host, 'arena> TypeQueryPlanner<'store, 'host, 'arena> {
                     return Ok(());
                 }
                 CachedTypeAliasRhs::NonUnion => {
+                    if !missing_generic_metadata.is_empty() {
+                        return Err(type_node_unavailable(
+                            TypeNodeUnavailable::InvalidCachedTypeAlias(root_symbol),
+                        ));
+                    }
                     if remains_union {
                         return Err(type_construction_error(
                             LiteralTypeCacheError::InvalidCachedUnion(declared_type),
@@ -757,6 +998,11 @@ impl<'store, 'host, 'arena> TypeQueryPlanner<'store, 'host, 'arena> {
                             DeclaredTypeUnavailable::SymbolNotOwned(canonical),
                         ))?;
                     if !flags.contains(SymbolFlags::TYPE_ALIAS) || malformed_alias_merge(flags) {
+                        if !missing_generic_metadata.is_empty() {
+                            return Err(type_node_unavailable(
+                                TypeNodeUnavailable::InvalidCachedTypeAlias(root_symbol),
+                            ));
+                        }
                         if remains_union {
                             return Err(type_construction_error(
                                 LiteralTypeCacheError::InvalidCachedUnion(declared_type),
@@ -766,6 +1012,7 @@ impl<'store, 'host, 'arena> TypeQueryPlanner<'store, 'host, 'arena> {
                     }
                     let Some(target_cached) = cached_type_alias(
                         self.store,
+                        self.host,
                         canonical,
                         self.strict_builtin_iterator_return,
                     )?
@@ -774,6 +1021,57 @@ impl<'store, 'host, 'arena> TypeQueryPlanner<'store, 'host, 'arena> {
                             TypeNodeUnavailable::InvalidCachedTypeAlias(root_symbol),
                         ));
                     };
+                    let has_type_arguments = self.type_reference_argument_count(reference)? != 0;
+                    if target_cached.type_parameter_count != 0 || has_type_arguments {
+                        if !missing_generic_metadata.is_empty()
+                            || target_cached.missing_generic_metadata
+                        {
+                            current_missing_generic_metadata =
+                                target_cached.missing_generic_metadata;
+                            symbol = canonical;
+                            continue;
+                        }
+                        let is_error = self
+                            .store
+                            .intrinsic_bootstrap()
+                            .is_some_and(|bootstrap| declared_type == bootstrap.error_type);
+                        if self.cached_type_reference_has_arity_error(
+                            reference,
+                            canonical,
+                            target_cached.type_parameter_count,
+                        )? {
+                            return if is_error {
+                                Ok(())
+                            } else {
+                                Err(type_node_unavailable(
+                                    TypeNodeUnavailable::InvalidCachedTypeAlias(root_symbol),
+                                ))
+                            };
+                        }
+                        let is_cached_instantiation = if target_cached.type_parameter_count == 0 {
+                            false
+                        } else {
+                            let key = self.cached_type_reference_instantiation_key(
+                                root_symbol,
+                                reference,
+                                symbol,
+                                canonical,
+                                target_cached.type_parameter_count,
+                            )?;
+                            self.store
+                                .type_alias_links(canonical)
+                                .and_then(|links| links.instantiations.as_ref())
+                                .and_then(|instantiations| instantiations.get(&key))
+                                .is_some_and(|instantiation| *instantiation == declared_type)
+                        };
+                        if is_cached_instantiation {
+                            return Ok(());
+                        }
+                        return Err(type_node_unavailable(
+                            TypeNodeUnavailable::InvalidCachedTypeAlias(root_symbol),
+                        ));
+                    }
+                    current_missing_generic_metadata = target_cached.missing_generic_metadata;
                     if target_cached.declared_type != declared_type {
                         return Err(type_construction_error(
                             LiteralTypeCacheError::InvalidCachedUnion(declared_type),
@@ -783,6 +1081,253 @@ impl<'store, 'host, 'arena> TypeQueryPlanner<'store, 'host, 'arena> {
                 }
             }
         }
+    }
+
+    fn type_reference_argument_nodes(
+        &self,
+        reference: NodeRef,
+    ) -> Result<Vec<NodeRef>, DeclaredTypeError> {
+        let record = preflight_node(self.store, self.host, reference)?;
+        let NodeData::TypeReferenceNode(reference_data) = &record.data else {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidTypeReference(reference),
+            ));
+        };
+        let name = NodeRef::new(reference.arena, reference.file, reference_data.type_name);
+        let name_node = preflight_node(self.store, self.host, name)?;
+        if name_node.parent != Some(reference.node) {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidTypeReference(reference),
+            ));
+        }
+        let Some(arguments) = &reference_data.type_arguments else {
+            return Ok(Vec::new());
+        };
+        if arguments.nodes.is_empty()
+            || arguments.has_trailing_comma
+            || arguments.range.start < name_node.range.end
+            || arguments.range.end != record.range.end
+            || arguments.range.start >= arguments.range.end
+        {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidTypeReference(reference),
+            ));
+        }
+        let mut nodes = Vec::with_capacity(arguments.nodes.len());
+        let mut previous_end = name_node.range.end;
+        for argument in &arguments.nodes {
+            let argument = NodeRef::new(reference.arena, reference.file, *argument);
+            let argument_node = preflight_node(self.store, self.host, argument)?;
+            if argument_node.parent != Some(reference.node)
+                || argument_node.range.start < previous_end
+                || argument_node.range.start <= arguments.range.start
+                || argument_node.range.end >= arguments.range.end
+                || argument_node.range.start < record.range.start
+                || argument_node.range.end > record.range.end
+                || nodes.contains(&argument)
+            {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidTypeReference(reference),
+                ));
+            }
+            previous_end = argument_node.range.end;
+            nodes.push(argument);
+        }
+        Ok(nodes)
+    }
+
+    fn type_reference_argument_count(
+        &self,
+        reference: NodeRef,
+    ) -> Result<usize, DeclaredTypeError> {
+        self.type_reference_argument_nodes(reference)
+            .map(|nodes| nodes.len())
+    }
+
+    fn cached_type_node_identity(
+        &self,
+        root_symbol: SemanticSymbolId,
+        node: NodeRef,
+    ) -> Result<TypeId, DeclaredTypeError> {
+        let record = preflight_node(self.store, self.host, node)?;
+        let bootstrap = self
+            .store
+            .intrinsic_bootstrap()
+            .ok_or(DeclaredTypeError::Unavailable(
+                DeclaredTypeUnavailable::IntrinsicBootstrapNotInitialized,
+            ))?;
+        let intrinsic = match record.kind {
+            SyntaxKind::AnyKeyword => Some(bootstrap.any_type),
+            SyntaxKind::UnknownKeyword => Some(bootstrap.unknown_type),
+            SyntaxKind::StringKeyword => Some(bootstrap.string_type),
+            SyntaxKind::NumberKeyword => Some(bootstrap.number_type),
+            SyntaxKind::BigIntKeyword => Some(bootstrap.bigint_type),
+            SyntaxKind::BooleanKeyword => Some(bootstrap.boolean_type),
+            SyntaxKind::SymbolKeyword => Some(bootstrap.es_symbol_type),
+            SyntaxKind::VoidKeyword => Some(bootstrap.void_type),
+            SyntaxKind::UndefinedKeyword => Some(bootstrap.undefined_type),
+            SyntaxKind::NullKeyword => Some(bootstrap.null_type),
+            SyntaxKind::NeverKeyword => Some(bootstrap.never_type),
+            SyntaxKind::ObjectKeyword => Some(bootstrap.non_primitive_type),
+            SyntaxKind::IntrinsicKeyword => Some(bootstrap.intrinsic_marker_type),
+            _ => None,
+        };
+        if let Some(intrinsic) = intrinsic {
+            return Ok(intrinsic);
+        }
+        if let NodeData::ParenthesizedTypeNode(parenthesized) = &record.data {
+            let inner = NodeRef::new(node.arena, node.file, parenthesized.type_);
+            if record.kind != SyntaxKind::ParenthesizedType
+                || preflight_node(self.store, self.host, inner)?.parent != Some(node.node)
+            {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidCachedTypeAlias(root_symbol),
+                ));
+            }
+            return self.cached_type_node_identity(root_symbol, inner);
+        }
+        if let NodeData::LiteralTypeNode(literal) = &record.data {
+            let literal = NodeRef::new(node.arena, node.file, literal.literal);
+            let literal_record = preflight_node(self.store, self.host, literal)?;
+            if record.kind != SyntaxKind::LiteralType
+                || literal_record.parent != Some(node.node)
+                || literal_record.range != record.range
+            {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidCachedTypeAlias(root_symbol),
+                ));
+            }
+            if literal_record.kind == SyntaxKind::NullKeyword
+                && matches!(literal_record.data, NodeData::KeywordExpression(_))
+            {
+                return Ok(bootstrap.null_type);
+            }
+        }
+        let resolved = self
+            .store
+            .type_node_links(node)
+            .and_then(|links| links.resolved_type)
+            .ok_or_else(|| {
+                type_node_unavailable(TypeNodeUnavailable::InvalidCachedTypeAlias(root_symbol))
+            })?;
+        if self.store.type_payload(resolved).is_none() {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidCachedTypeAlias(root_symbol),
+            ));
+        }
+        Ok(resolved)
+    }
+
+    fn cached_type_reference_instantiation_key(
+        &self,
+        root_symbol: SemanticSymbolId,
+        reference: NodeRef,
+        owner: SemanticSymbolId,
+        target: SemanticSymbolId,
+        target_parameter_count: usize,
+    ) -> Result<CacheHashKey, DeclaredTypeError> {
+        let mut type_arguments = Vec::new();
+        for argument in self.type_reference_argument_nodes(reference)? {
+            type_arguments.push(self.cached_type_node_identity(root_symbol, argument)?);
+        }
+
+        let owner_is_local = self.is_local_type_alias(owner)?;
+        let target_has_host_declaration = self
+            .store
+            .symbol(target)
+            .and_then(|symbol| symbol.declarations())
+            .and_then(|declarations| declarations.first())
+            .is_some_and(|declaration| self.host.source(*declaration).is_some());
+        let target_is_local =
+            owner_is_local && target_has_host_declaration && self.is_local_type_alias(target)?;
+        if target_parameter_count != 0 && owner_is_local && !target_is_local {
+            return Ok(type_alias_instantiation_cache_key(&type_arguments, None));
+        }
+
+        let owner_cached = cached_type_alias(
+            self.store,
+            self.host,
+            owner,
+            self.strict_builtin_iterator_return,
+        )?
+        .ok_or_else(|| {
+            type_node_unavailable(TypeNodeUnavailable::InvalidCachedTypeAlias(root_symbol))
+        })?;
+        let owner_arguments = self
+            .store
+            .type_alias_links(owner)
+            .and_then(|links| links.type_parameters.as_ref())
+            .cloned()
+            .unwrap_or_default();
+        if owner_cached.missing_generic_metadata
+            || owner_arguments.len() != owner_cached.type_parameter_count
+        {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidCachedTypeAlias(root_symbol),
+            ));
+        }
+        let owner_global = self
+            .store
+            .symbol_store()
+            .assigned_global_symbol_id(owner)
+            .ok_or_else(|| {
+                type_node_unavailable(TypeNodeUnavailable::InvalidCachedTypeAlias(root_symbol))
+            })?;
+        Ok(type_alias_instantiation_cache_key(
+            &type_arguments,
+            Some((owner_global, &owner_arguments)),
+        ))
+    }
+
+    fn cached_type_reference_has_arity_error(
+        &self,
+        reference: NodeRef,
+        target: SemanticSymbolId,
+        parameter_count: usize,
+    ) -> Result<bool, DeclaredTypeError> {
+        let argument_count = self.type_reference_argument_count(reference)?;
+        if parameter_count == 0 {
+            return Ok(argument_count != 0);
+        }
+        let declaration = self
+            .store
+            .symbol(target)
+            .and_then(|symbol| symbol.declarations())
+            .and_then(|declarations| declarations.first())
+            .copied()
+            .ok_or_else(|| {
+                type_node_unavailable(TypeNodeUnavailable::MissingTypeAliasDeclaration(target))
+            })?;
+        let declaration_node = preflight_node(self.store, self.host, declaration)?;
+        let NodeData::TypeAliasDeclaration(alias) = &declaration_node.data else {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidTypeAliasDeclaration(declaration),
+            ));
+        };
+        let parameters = alias.type_parameters.as_ref().ok_or_else(|| {
+            type_node_unavailable(TypeNodeUnavailable::InvalidTypeAliasDeclaration(
+                declaration,
+            ))
+        })?;
+        if parameters.nodes.len() != parameter_count {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidCachedTypeAlias(target),
+            ));
+        }
+        let mut minimum = 0;
+        for (index, parameter) in parameters.nodes.iter().enumerate() {
+            let parameter = NodeRef::new(declaration.arena, declaration.file, *parameter);
+            let parameter_node = preflight_node(self.store, self.host, parameter)?;
+            let NodeData::TypeParameterDeclaration(parameter) = &parameter_node.data else {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidTypeAliasDeclaration(declaration),
+                ));
+            };
+            if parameter.default_type.is_none() {
+                minimum = index + 1;
+            }
+        }
+        Ok(argument_count < minimum || argument_count > parameter_count)
     }
 
     #[allow(clippy::too_many_lines)] // Keeps the pinned literal grammar and provenance checks linear.
@@ -968,6 +1513,7 @@ impl<'store, 'host, 'arena> TypeQueryPlanner<'store, 'host, 'arena> {
     fn plan_type_reference(
         &mut self,
         node: NodeRef,
+        alias_owner: Option<SemanticSymbolId>,
         union_constituent: bool,
     ) -> Result<(), DeclaredTypeError> {
         let record = preflight_node(self.store, self.host, node)?;
@@ -976,15 +1522,6 @@ impl<'store, 'host, 'arena> TypeQueryPlanner<'store, 'host, 'arena> {
                 TypeNodeUnavailable::InvalidTypeReference(node),
             ));
         };
-        if reference
-            .type_arguments
-            .as_ref()
-            .is_some_and(|arguments| !arguments.nodes.is_empty())
-        {
-            return Err(type_node_unavailable(
-                TypeNodeUnavailable::TypeArgumentsUnsupported(node),
-            ));
-        }
 
         let name = NodeRef::new(node.arena, node.file, reference.type_name);
         let name_node = preflight_node(self.store, self.host, name)?;
@@ -1001,6 +1538,38 @@ impl<'store, 'host, 'arena> TypeQueryPlanner<'store, 'host, 'arena> {
                 TypeNodeUnavailable::QualifiedTypeReference(node),
             ));
         };
+        let mut type_arguments = Vec::new();
+        let mut previous_end = name_node.range.end;
+        if let Some(arguments) = &reference.type_arguments {
+            if arguments.nodes.is_empty()
+                || arguments.has_trailing_comma
+                || arguments.range.start < name_node.range.end
+                || arguments.range.end != record.range.end
+                || arguments.range.start >= arguments.range.end
+            {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidTypeReference(node),
+                ));
+            }
+            for argument in &arguments.nodes {
+                let argument = NodeRef::new(node.arena, node.file, *argument);
+                let argument_node = preflight_node(self.store, self.host, argument)?;
+                if argument_node.parent != Some(node.node)
+                    || argument_node.range.start < previous_end
+                    || argument_node.range.start <= arguments.range.start
+                    || argument_node.range.end >= arguments.range.end
+                    || argument_node.range.start < record.range.start
+                    || argument_node.range.end > record.range.end
+                    || type_arguments.contains(&argument)
+                {
+                    return Err(type_node_unavailable(
+                        TypeNodeUnavailable::InvalidTypeReference(node),
+                    ));
+                }
+                previous_end = argument_node.range.end;
+                type_arguments.push(argument);
+            }
+        }
 
         if !union_constituent
             && self
@@ -1079,22 +1648,123 @@ impl<'store, 'host, 'arena> TypeQueryPlanner<'store, 'host, 'arena> {
             ));
         }
 
-        if flags.intersects(SymbolFlags::CLASS | SymbolFlags::INTERFACE) {
+        for argument in &type_arguments {
+            self.plan_type_node_in_context(*argument, None, false)?;
+        }
+
+        let mut effective_alias_owner = alias_owner;
+        let arity = if flags.intersects(SymbolFlags::CLASS | SymbolFlags::INTERFACE) {
             let local_count =
                 preflight_class_or_interface_reference(self.store, self.host, symbol, flags)?;
-            if local_count != 0 {
-                return Err(type_node_unavailable(
-                    TypeNodeUnavailable::GenericReferenceUnsupported { node, symbol },
-                ));
+            if local_count != 0 || !type_arguments.is_empty() {
+                return Err(type_node_unavailable(if type_arguments.is_empty() {
+                    TypeNodeUnavailable::GenericReferenceUnsupported { node, symbol }
+                } else {
+                    TypeNodeUnavailable::TypeArgumentsUnsupported(node)
+                }));
             }
+            PlannedTypeReferenceArity::Valid
         } else if flags.contains(SymbolFlags::TYPE_PARAMETER) {
             preflight_type_parameter_symbol(self.store, self.host, symbol, &mut HashSet::new())?;
+            if type_arguments.is_empty() {
+                PlannedTypeReferenceArity::Valid
+            } else {
+                PlannedTypeReferenceArity::NotGeneric
+            }
         } else if flags.contains(SymbolFlags::TYPE_ALIAS) {
             let type_parameter_count = self.plan_type_alias(symbol, union_constituent)?;
-            if type_parameter_count != 0 {
-                return Err(type_node_unavailable(
-                    TypeNodeUnavailable::GenericReferenceUnsupported { node, symbol },
-                ));
+            if type_parameter_count != 0
+                && let Some(owner) = alias_owner
+                && !self.is_local_type_alias(symbol)?
+                && self.is_local_type_alias(owner)?
+            {
+                effective_alias_owner = None;
+            }
+            if type_parameter_count == 0 {
+                if type_arguments.is_empty() {
+                    PlannedTypeReferenceArity::Valid
+                } else {
+                    PlannedTypeReferenceArity::NotGeneric
+                }
+            } else {
+                let parameters = self
+                    .plan
+                    .aliases
+                    .get(&symbol)
+                    .ok_or_else(|| {
+                        type_node_unavailable(TypeNodeUnavailable::MissingGenericAliasMetadata(
+                            symbol,
+                        ))
+                    })?
+                    .type_parameters
+                    .clone();
+                let minimum = parameters
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, parameter)| {
+                        parameter.default_type.is_none().then_some(index + 1)
+                    })
+                    .max()
+                    .unwrap_or(0);
+                if type_arguments.len() < minimum || type_arguments.len() > type_parameter_count {
+                    PlannedTypeReferenceArity::InvalidGeneric {
+                        minimum,
+                        maximum: type_parameter_count,
+                    }
+                } else {
+                    for (index, parameter) in
+                        parameters.iter().enumerate().skip(type_arguments.len())
+                    {
+                        let default_type = parameter.default_type.ok_or_else(|| {
+                            type_node_unavailable(TypeNodeUnavailable::MissingGenericAliasMetadata(
+                                symbol,
+                            ))
+                        })?;
+                        let default_key = (symbol, default_type);
+                        if !self.planning_defaults.insert(default_key) {
+                            return Err(type_node_unavailable(
+                                TypeNodeUnavailable::CircularGenericAliasDefault {
+                                    alias: symbol,
+                                    default_type,
+                                },
+                            ));
+                        }
+                        let result = (|| {
+                            self.plan_type_node_in_context(default_type, None, false)?;
+                            self.validate_generic_alias_default_references(
+                                symbol,
+                                default_type,
+                                &parameters[..index],
+                                &parameters,
+                            )?;
+                            self.validate_planned_direct_alias_node(
+                                symbol,
+                                default_type,
+                                None,
+                                &mut HashSet::new(),
+                            )
+                        })();
+                        assert!(self.planning_defaults.remove(&default_key));
+                        result?;
+                    }
+                    let alias_type = self
+                        .plan
+                        .aliases
+                        .get(&symbol)
+                        .ok_or_else(|| {
+                            type_node_unavailable(TypeNodeUnavailable::MissingGenericAliasMetadata(
+                                symbol,
+                            ))
+                        })?
+                        .type_node;
+                    self.validate_planned_direct_alias_node(
+                        symbol,
+                        alias_type,
+                        Some(symbol),
+                        &mut HashSet::from([symbol]),
+                    )?;
+                    PlannedTypeReferenceArity::Valid
+                }
             }
         } else if flags.contains(SymbolFlags::ALIAS) {
             return Err(type_node_unavailable(
@@ -1107,12 +1777,311 @@ impl<'store, 'host, 'arena> TypeQueryPlanner<'store, 'host, 'arena> {
             return Err(type_node_unavailable(
                 TypeNodeUnavailable::UnsupportedReferenceTarget { node, symbol },
             ));
-        }
+        };
 
-        if let Some(existing) = self.plan.references.insert(node, symbol) {
-            assert_eq!(existing, symbol, "one type-reference node has one symbol");
+        let planned = PlannedTypeReference {
+            symbol,
+            type_arguments,
+            alias_owner: effective_alias_owner,
+            arity,
+        };
+        if let Some(existing) = self.plan.references.insert(node, planned.clone()) {
+            assert_eq!(existing, planned, "one type-reference node has one plan");
         }
         Ok(())
+    }
+
+    fn validate_generic_alias_default_references(
+        &self,
+        alias: SemanticSymbolId,
+        default_type: NodeRef,
+        earlier_parameters: &[PlannedTypeParameter],
+        alias_parameters: &[PlannedTypeParameter],
+    ) -> Result<(), DeclaredTypeError> {
+        let (arena, _) = self.host.source(default_type).ok_or({
+            DeclaredTypeError::Unavailable(DeclaredTypeUnavailable::MissingOrForeignFacts(
+                default_type,
+            ))
+        })?;
+        for (node, record) in arena.iter() {
+            if record.kind != SyntaxKind::TypeReference {
+                continue;
+            }
+            let reference = NodeRef::new(arena.id(), default_type.file, node);
+            if !self.node_is_within(reference, default_type)? {
+                continue;
+            }
+            let symbol = if let Some(planned) = self.plan.references.get(&reference) {
+                planned.symbol
+            } else {
+                let cached = self
+                    .store
+                    .symbol_node_links(reference)
+                    .and_then(|links| links.resolved_symbol)
+                    .ok_or_else(|| {
+                        type_node_unavailable(TypeNodeUnavailable::MissingPlannedTypeReference(
+                            reference,
+                        ))
+                    })?;
+                self.store.get_merged_symbol(cached).ok_or_else(|| {
+                    type_node_unavailable(TypeNodeUnavailable::InvalidCachedSymbol {
+                        node: reference,
+                        symbol: cached,
+                    })
+                })?
+            };
+            let flags = self
+                .store
+                .symbol(symbol)
+                .map(ts_binder::semantic::Symbol::flags)
+                .ok_or(DeclaredTypeError::Unavailable(
+                    DeclaredTypeUnavailable::SymbolNotOwned(symbol),
+                ))?;
+            if flags.contains(SymbolFlags::TYPE_PARAMETER)
+                && alias_parameters
+                    .iter()
+                    .any(|parameter| parameter.symbol == symbol)
+                && !earlier_parameters
+                    .iter()
+                    .any(|parameter| parameter.symbol == symbol)
+            {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::GenericAliasDefaultReferenceUnsupported {
+                        alias,
+                        default_type,
+                        referenced_parameter: symbol,
+                    },
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_planned_direct_alias_node(
+        &self,
+        alias: SemanticSymbolId,
+        node: NodeRef,
+        alias_body: Option<SemanticSymbolId>,
+        visited_aliases: &mut HashSet<SemanticSymbolId>,
+    ) -> Result<(), DeclaredTypeError> {
+        let record = preflight_node(self.store, self.host, node)?;
+        match &record.data {
+            NodeData::ParenthesizedTypeNode(parenthesized) => self
+                .validate_planned_direct_alias_node(
+                    alias,
+                    NodeRef::new(node.arena, node.file, parenthesized.type_),
+                    alias_body,
+                    visited_aliases,
+                ),
+            NodeData::TypeReferenceNode(_) => {
+                let reference_symbol = if let Some(reference) = self.plan.references.get(&node) {
+                    reference.symbol
+                } else if let Some(cached) = self
+                    .store
+                    .symbol_node_links(node)
+                    .and_then(|links| links.resolved_symbol)
+                {
+                    self.store.get_merged_symbol(cached).ok_or_else(|| {
+                        type_node_unavailable(TypeNodeUnavailable::InvalidCachedSymbol {
+                            node,
+                            symbol: cached,
+                        })
+                    })?
+                } else {
+                    self.resolve_uncached_type_reference_symbol(node)?
+                };
+                let flags = self
+                    .store
+                    .symbol(reference_symbol)
+                    .map(ts_binder::semantic::Symbol::flags)
+                    .ok_or(DeclaredTypeError::Unavailable(
+                        DeclaredTypeUnavailable::SymbolNotOwned(reference_symbol),
+                    ))?;
+                if !flags.contains(SymbolFlags::TYPE_ALIAS)
+                    || !visited_aliases.insert(reference_symbol)
+                {
+                    return Ok(());
+                }
+                if let Some(target) = self.plan.aliases.get(&reference_symbol) {
+                    return self.validate_planned_direct_alias_node(
+                        alias,
+                        target.type_node,
+                        Some(reference_symbol),
+                        visited_aliases,
+                    );
+                }
+                let declared_type = self
+                    .store
+                    .type_alias_links(reference_symbol)
+                    .and_then(|links| links.declared_type)
+                    .ok_or_else(|| {
+                        type_node_unavailable(TypeNodeUnavailable::MissingGenericAliasMetadata(
+                            reference_symbol,
+                        ))
+                    })?;
+                if self
+                    .store
+                    .intrinsic_bootstrap()
+                    .is_some_and(|bootstrap| declared_type == bootstrap.intrinsic_marker_type)
+                    && !symbol_is_builtin_iterator_return(self.store, reference_symbol)
+                {
+                    return Err(type_node_unavailable(
+                        TypeNodeUnavailable::GenericAliasInstantiationUnsupported {
+                            alias,
+                            declared_type,
+                        },
+                    ));
+                }
+                Ok(())
+            }
+            NodeData::UnionTypeNode(_) => {
+                let union = self.plan.unions.get(&node).ok_or_else(|| {
+                    type_node_unavailable(TypeNodeUnavailable::MissingPlannedUnionType(node))
+                })?;
+                for constituent in &union.types {
+                    self.validate_planned_direct_alias_node(
+                        alias,
+                        *constituent,
+                        None,
+                        visited_aliases,
+                    )?;
+                }
+                Ok(())
+            }
+            _ if record.kind == SyntaxKind::IntrinsicKeyword
+                && alias_body
+                    .is_none_or(|owner| !symbol_is_builtin_iterator_return(self.store, owner)) =>
+            {
+                let declared_type = self
+                    .store
+                    .intrinsic_bootstrap()
+                    .map(|bootstrap| bootstrap.intrinsic_marker_type)
+                    .ok_or(DeclaredTypeError::Unavailable(
+                        DeclaredTypeUnavailable::IntrinsicBootstrapNotInitialized,
+                    ))?;
+                Err(type_node_unavailable(
+                    TypeNodeUnavailable::GenericAliasInstantiationUnsupported {
+                        alias,
+                        declared_type,
+                    },
+                ))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn resolve_uncached_type_reference_symbol(
+        &self,
+        node: NodeRef,
+    ) -> Result<SemanticSymbolId, DeclaredTypeError> {
+        let record = preflight_node(self.store, self.host, node)?;
+        let NodeData::TypeReferenceNode(reference) = &record.data else {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidTypeReference(node),
+            ));
+        };
+        let name = NodeRef::new(node.arena, node.file, reference.type_name);
+        let name_node = preflight_node(self.store, self.host, name)?;
+        let NodeData::Identifier(identifier) = &name_node.data else {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::QualifiedTypeReference(node),
+            ));
+        };
+        if name_node.parent != Some(node.node) || name_node.flags.0 & NODE_FLAG_JSDOC != 0 {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidTypeReference(node),
+            ));
+        }
+        let (arena, bound) = self.host.source(node).ok_or({
+            DeclaredTypeError::Unavailable(DeclaredTypeUnavailable::MissingOrForeignFacts(node))
+        })?;
+        let mut callback_host = self.host.name_resolver_host(self.store)?;
+        match CanonicalNameResolver::new(
+            arena,
+            bound,
+            self.store.symbol_store(),
+            &mut callback_host,
+        )?
+        .resolve(
+            Some(CanonicalResolutionLocation::Bound(name)),
+            &identifier.text,
+            SymbolFlags::TYPE,
+            None,
+            true,
+            false,
+        ) {
+            Ok(Some(symbol)) => self.store.symbol(symbol).map(|_| symbol).ok_or({
+                DeclaredTypeError::Unavailable(DeclaredTypeUnavailable::SymbolNotOwned(symbol))
+            }),
+            Ok(None) => Err(type_node_unavailable(
+                TypeNodeUnavailable::MissingTypeReference(node),
+            )),
+            Err(CanonicalNameResolutionError::AliasResolutionUnavailable(alias)) => {
+                Err(type_node_unavailable(
+                    TypeNodeUnavailable::ImportAliasTypeReference { node, alias },
+                ))
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn node_is_within(
+        &self,
+        mut node: NodeRef,
+        ancestor: NodeRef,
+    ) -> Result<bool, DeclaredTypeError> {
+        let mut visited = HashSet::new();
+        loop {
+            if node == ancestor {
+                return Ok(true);
+            }
+            if !visited.insert(node) {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidTypeReference(node),
+                ));
+            }
+            let Some(parent) = preflight_node(self.store, self.host, node)?.parent else {
+                return Ok(false);
+            };
+            node = NodeRef::new(node.arena, node.file, parent);
+        }
+    }
+
+    fn is_local_type_alias(&self, symbol: SemanticSymbolId) -> Result<bool, DeclaredTypeError> {
+        let mut current = self
+            .store
+            .symbol(symbol)
+            .and_then(|symbol| symbol.declarations())
+            .and_then(|declarations| declarations.first())
+            .copied()
+            .ok_or_else(|| {
+                type_node_unavailable(TypeNodeUnavailable::MissingTypeAliasDeclaration(symbol))
+            })?;
+        let mut visited = HashSet::new();
+        loop {
+            if !visited.insert(current) {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidTypeAliasDeclaration(current),
+                ));
+            }
+            let record = preflight_node(self.store, self.host, current)?;
+            if matches!(
+                record.kind,
+                SyntaxKind::FunctionDeclaration
+                    | SyntaxKind::FunctionExpression
+                    | SyntaxKind::ArrowFunction
+                    | SyntaxKind::MethodDeclaration
+                    | SyntaxKind::GetAccessor
+                    | SyntaxKind::SetAccessor
+                    | SyntaxKind::Constructor
+            ) {
+                return Ok(true);
+            }
+            let Some(parent) = record.parent else {
+                return Ok(false);
+            };
+            current = NodeRef::new(current.arena, current.file, parent);
+        }
     }
 
     fn plan_type_alias(
@@ -1120,14 +2089,19 @@ impl<'store, 'host, 'arena> TypeQueryPlanner<'store, 'host, 'arena> {
         symbol: SemanticSymbolId,
         union_constituent: bool,
     ) -> Result<usize, DeclaredTypeError> {
-        if let Some(cached) =
-            cached_type_alias(self.store, symbol, self.strict_builtin_iterator_return)?
-        {
+        let cached = cached_type_alias(
+            self.store,
+            self.host,
+            symbol,
+            self.strict_builtin_iterator_return,
+        )?;
+        if let Some(cached) = cached {
             self.validate_cached_type_alias_identity(symbol, cached, union_constituent)?;
-            return Ok(cached.type_parameter_count);
         }
         if let Some(plan) = self.plan.aliases.get(&symbol) {
-            return Ok(plan.type_parameter_symbols.len());
+            return Ok(cached.map_or(plan.type_parameters.len(), |cached| {
+                cached.type_parameter_count
+            }));
         }
 
         let record = self.store.symbol(symbol).ok_or({
@@ -1146,9 +2120,21 @@ impl<'store, 'host, 'arena> TypeQueryPlanner<'store, 'host, 'arena> {
                 type_node_unavailable(TypeNodeUnavailable::MissingTypeAliasDeclaration(symbol))
             })?
             .to_vec();
+        if declarations.len() != 1 {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidTypeAliasSymbol(symbol),
+            ));
+        }
+        if let Some(cached_alias) = cached
+            && declarations
+                .first()
+                .is_some_and(|declaration| self.host.source(*declaration).is_none())
+        {
+            return Ok(cached_alias.type_parameter_count);
+        }
 
         let mut first = None;
-        let mut type_parameter_symbols = Vec::new();
+        let mut type_parameters = Vec::new();
         let mut checked = HashSet::new();
         for declaration in declarations {
             let declaration_node = preflight_node(self.store, self.host, declaration)?;
@@ -1186,15 +2172,60 @@ impl<'store, 'host, 'arena> TypeQueryPlanner<'store, 'host, 'arena> {
                     TypeNodeUnavailable::InvalidTypeAliasDeclaration(declaration),
                 ));
             }
-            for parameter in explicit_type_parameter_symbols(
+            let parameter_symbols = explicit_type_parameter_symbols(
                 self.store,
                 self.host,
                 declaration,
                 alias.type_parameters.as_ref(),
                 &mut checked,
-            )? {
-                if !type_parameter_symbols.contains(&parameter) {
-                    type_parameter_symbols.push(parameter);
+            )?;
+            if let Some(parameters) = &alias.type_parameters {
+                if parameters.nodes.len() != parameter_symbols.len() {
+                    return Err(type_node_unavailable(
+                        TypeNodeUnavailable::InvalidTypeAliasDeclaration(declaration),
+                    ));
+                }
+                for (parameter, parameter_symbol) in parameters.nodes.iter().zip(parameter_symbols)
+                {
+                    let parameter = NodeRef::new(declaration.arena, declaration.file, *parameter);
+                    let parameter_node = preflight_node(self.store, self.host, parameter)?;
+                    let NodeData::TypeParameterDeclaration(parameter_data) = &parameter_node.data
+                    else {
+                        return Err(type_node_unavailable(
+                            TypeNodeUnavailable::InvalidTypeAliasDeclaration(declaration),
+                        ));
+                    };
+                    if parameter_node.parent != Some(declaration.node) {
+                        return Err(type_node_unavailable(
+                            TypeNodeUnavailable::InvalidTypeAliasDeclaration(declaration),
+                        ));
+                    }
+                    if parameter_data.constraint.is_some() {
+                        return Err(type_node_unavailable(
+                            TypeNodeUnavailable::GenericAliasConstraintUnsupported {
+                                alias: symbol,
+                                parameter,
+                            },
+                        ));
+                    }
+                    let default_type = parameter_data.default_type.map(|default_type| {
+                        NodeRef::new(declaration.arena, declaration.file, default_type)
+                    });
+                    if let Some(default_type) = default_type
+                        && preflight_node(self.store, self.host, default_type)?.parent
+                            != Some(parameter.node)
+                    {
+                        return Err(type_node_unavailable(
+                            TypeNodeUnavailable::InvalidTypeAliasDeclaration(declaration),
+                        ));
+                    }
+                    let planned = PlannedTypeParameter {
+                        symbol: parameter_symbol,
+                        default_type,
+                    };
+                    if !type_parameters.contains(&planned) {
+                        type_parameters.push(planned);
+                    }
                 }
             }
             if first.is_none() {
@@ -1207,17 +2238,20 @@ impl<'store, 'host, 'arena> TypeQueryPlanner<'store, 'host, 'arena> {
                 TypeNodeUnavailable::MissingTypeAliasDeclaration(symbol),
             ));
         };
-        let type_parameter_count = type_parameter_symbols.len();
+        let type_parameter_count =
+            cached.map_or(type_parameters.len(), |cached| cached.type_parameter_count);
         self.plan.aliases.insert(
             symbol,
             TypeAliasPlan {
                 name,
                 name_text,
                 type_node,
-                type_parameter_symbols,
+                type_parameters,
             },
         );
-        self.plan_type_node_in_context(type_node, Some(symbol), union_constituent)?;
+        if cached.is_none() {
+            self.plan_type_node_in_context(type_node, Some(symbol), union_constituent)?;
+        }
         Ok(type_parameter_count)
     }
 }
@@ -1454,6 +2488,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
     ) -> Result<TypeId, DeclaredTypeError> {
         if let Some(cached) = cached_type_alias(
             self.store,
+            self.host,
             symbol,
             self.options.strict_builtin_iterator_return,
         )? {
@@ -1497,11 +2532,11 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             .cloned()
             .unwrap_or_default();
         let declared_type = if cycle_free {
-            if !alias.type_parameter_symbols.is_empty() {
+            if !alias.type_parameters.is_empty() {
                 let type_parameters = alias
-                    .type_parameter_symbols
+                    .type_parameters
                     .iter()
-                    .map(|parameter| execute_type_parameter(self.store, *parameter))
+                    .map(|parameter| execute_type_parameter(self.store, parameter.symbol))
                     .collect::<Vec<_>>();
                 let mut instantiations = HashMap::new();
                 instantiations.insert(type_list_key(&type_parameters), resolved);
@@ -1729,9 +2764,10 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         {
             return Ok(resolved_type);
         }
-        let symbol = plan.references.get(&node).copied().ok_or_else(|| {
+        let reference = plan.references.get(&node).cloned().ok_or_else(|| {
             type_node_unavailable(TypeNodeUnavailable::MissingPlannedTypeReference(node))
         })?;
+        let symbol = reference.symbol;
 
         let mut symbol_links = self
             .store
@@ -1753,27 +2789,61 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                     },
                 ));
             }
-            if cached != canonical {
-                symbol_links.resolved_symbol = Some(canonical);
-                if !self.store.set_symbol_node_links(node, symbol_links.clone()) {
-                    return Err(type_node_unavailable(
-                        TypeNodeUnavailable::InvalidCachedSymbol {
-                            node,
-                            symbol: cached,
-                        },
-                    ));
-                }
-            }
-        } else {
-            symbol_links.resolved_symbol = Some(symbol);
-            if !self.store.set_symbol_node_links(node, symbol_links) {
-                return Err(type_node_unavailable(
-                    TypeNodeUnavailable::InvalidCachedSymbol { node, symbol },
-                ));
-            }
         }
 
-        let resolved_type = self.execute_declared_type(symbol, plan, prepared)?;
+        if reference.arity != PlannedTypeReferenceArity::Valid {
+            for argument in &reference.type_arguments {
+                self.execute_type_node(*argument, plan, prepared)?;
+            }
+        }
+        let declared_type = self.execute_declared_type(symbol, plan, prepared)?;
+        let resolved_type = match reference.arity {
+            PlannedTypeReferenceArity::Valid => {
+                let alias_parameter_count = self
+                    .store
+                    .type_alias_links(symbol)
+                    .and_then(|links| links.type_parameters.as_ref())
+                    .map(Vec::len);
+                let is_type_alias = self.symbol_flags(symbol)?.contains(SymbolFlags::TYPE_ALIAS);
+                if is_type_alias
+                    && !reference.type_arguments.is_empty()
+                    && alias_parameter_count.is_none()
+                {
+                    self.issue_type_reference_arity_diagnostic(
+                        node,
+                        symbol,
+                        PlannedTypeReferenceArity::NotGeneric,
+                    )?;
+                    self.error_type()?
+                } else if is_type_alias
+                    && (!reference.type_arguments.is_empty()
+                        || alias_parameter_count.is_some_and(|count| count != 0))
+                {
+                    self.execute_generic_alias_instantiation(
+                        &reference,
+                        declared_type,
+                        plan,
+                        prepared,
+                    )?
+                } else {
+                    declared_type
+                }
+            }
+            PlannedTypeReferenceArity::NotGeneric => {
+                self.issue_type_reference_arity_diagnostic(node, symbol, reference.arity)?;
+                self.error_type()?
+            }
+            PlannedTypeReferenceArity::InvalidGeneric { .. } => {
+                self.issue_type_reference_arity_diagnostic(node, symbol, reference.arity)?;
+                self.error_type()?
+            }
+        };
+        symbol_links.resolved_symbol = Some(symbol);
+        if !self.store.set_symbol_node_links(node, symbol_links) {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidCachedSymbol { node, symbol },
+            ));
+        }
         let mut type_links = self
             .store
             .type_node_links(node)
@@ -1786,6 +2856,248 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             ));
         }
         Ok(resolved_type)
+    }
+
+    fn execute_generic_alias_instantiation(
+        &mut self,
+        reference: &PlannedTypeReference,
+        declared_type: TypeId,
+        plan: &TypeQueryPlan,
+        prepared: &mut PreparedTypeQueryTypes,
+    ) -> Result<TypeId, DeclaredTypeError> {
+        let symbol = reference.symbol;
+        let metadata = plan.aliases.get(&symbol).cloned().ok_or_else(|| {
+            type_node_unavailable(TypeNodeUnavailable::MissingGenericAliasMetadata(symbol))
+        })?;
+        let links = self
+            .store
+            .type_alias_links(symbol)
+            .cloned()
+            .unwrap_or_default();
+        let Some(type_parameters) = links.type_parameters.clone() else {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidGenericAliasInstantiationCache(symbol),
+            ));
+        };
+        if type_parameters.len() != metadata.type_parameters.len() || links.instantiations.is_none()
+        {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidGenericAliasInstantiationCache(symbol),
+            ));
+        }
+
+        let alias_identity = if let Some(owner) = reference.alias_owner {
+            let owner_plan = plan.aliases.get(&owner).ok_or_else(|| {
+                type_node_unavailable(TypeNodeUnavailable::MissingGenericAliasMetadata(owner))
+            })?;
+            let arguments = owner_plan
+                .type_parameters
+                .iter()
+                .map(|parameter| execute_type_parameter(self.store, parameter.symbol))
+                .collect::<Vec<_>>();
+            Some((owner, arguments))
+        } else {
+            None
+        };
+        let mut provided_arguments = Vec::with_capacity(reference.type_arguments.len());
+        for argument in &reference.type_arguments {
+            provided_arguments.push(self.execute_type_node(*argument, plan, prepared)?);
+        }
+        let key =
+            self.type_alias_instantiation_key(&provided_arguments, alias_identity.as_ref())?;
+        let mut type_arguments = provided_arguments;
+        for parameter in metadata.type_parameters.iter().skip(type_arguments.len()) {
+            let default_type = parameter.default_type.ok_or_else(|| {
+                type_node_unavailable(TypeNodeUnavailable::MissingGenericAliasMetadata(symbol))
+            })?;
+            let default_type = self.execute_type_node(default_type, plan, prepared)?;
+            let default_type = self.instantiate_direct_alias_type(
+                symbol,
+                default_type,
+                &type_parameters,
+                &type_arguments,
+            )?;
+            type_arguments.push(default_type);
+        }
+        let instantiation = self.instantiate_direct_alias_type(
+            symbol,
+            declared_type,
+            &type_parameters,
+            &type_arguments,
+        )?;
+
+        if let Some(cached) = links
+            .instantiations
+            .as_ref()
+            .and_then(|instantiations| instantiations.get(&key))
+            .copied()
+        {
+            if cached != instantiation || self.store.type_payload(cached).is_none() {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidGenericAliasInstantiationCache(symbol),
+                ));
+            }
+            return Ok(cached);
+        }
+
+        let mut links = self
+            .store
+            .type_alias_links(symbol)
+            .cloned()
+            .ok_or_else(|| {
+                type_node_unavailable(TypeNodeUnavailable::InvalidGenericAliasInstantiationCache(
+                    symbol,
+                ))
+            })?;
+        let instantiations = links.instantiations.as_mut().ok_or_else(|| {
+            type_node_unavailable(TypeNodeUnavailable::InvalidGenericAliasInstantiationCache(
+                symbol,
+            ))
+        })?;
+        if let Some(previous) = instantiations.insert(key, instantiation)
+            && previous != instantiation
+        {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidGenericAliasInstantiationCache(symbol),
+            ));
+        }
+        if !self.store.set_type_alias_links(symbol, links) {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidGenericAliasInstantiationCache(symbol),
+            ));
+        }
+        Ok(instantiation)
+    }
+
+    fn instantiate_direct_alias_type(
+        &self,
+        symbol: SemanticSymbolId,
+        type_: TypeId,
+        mapped_parameters: &[TypeId],
+        type_arguments: &[TypeId],
+    ) -> Result<TypeId, DeclaredTypeError> {
+        self.validate_direct_alias_type(symbol, type_, mapped_parameters)?;
+        if matches!(
+            self.store.type_payload(type_).map(TypeRecord::data),
+            Some(TypeData::TypeParameter(_))
+        ) && let Some(index) = mapped_parameters
+            .iter()
+            .position(|parameter| *parameter == type_)
+        {
+            return type_arguments.get(index).copied().ok_or_else(|| {
+                type_node_unavailable(TypeNodeUnavailable::MissingGenericAliasMetadata(symbol))
+            });
+        }
+        Ok(type_)
+    }
+
+    fn validate_direct_alias_type(
+        &self,
+        symbol: SemanticSymbolId,
+        type_: TypeId,
+        mapped_parameters: &[TypeId],
+    ) -> Result<(), DeclaredTypeError> {
+        let record = self.store.type_payload(type_).ok_or_else(|| {
+            type_node_unavailable(TypeNodeUnavailable::InvalidGenericAliasInstantiationCache(
+                symbol,
+            ))
+        })?;
+        match record.data() {
+            TypeData::Intrinsic(_)
+                if self
+                    .store
+                    .intrinsic_bootstrap()
+                    .is_some_and(|bootstrap| type_ == bootstrap.intrinsic_marker_type) =>
+            {
+                Err(type_node_unavailable(
+                    TypeNodeUnavailable::GenericAliasInstantiationUnsupported {
+                        alias: symbol,
+                        declared_type: type_,
+                    },
+                ))
+            }
+            TypeData::TypeParameter(_)
+            | TypeData::Intrinsic(_)
+            | TypeData::Literal(_)
+            | TypeData::Interface(_) => Ok(()),
+            TypeData::Union(union)
+                if !union
+                    .union
+                    .types
+                    .iter()
+                    .any(|constituent| mapped_parameters.contains(constituent)) =>
+            {
+                Ok(())
+            }
+            _ => Err(type_node_unavailable(
+                TypeNodeUnavailable::GenericAliasInstantiationUnsupported {
+                    alias: symbol,
+                    declared_type: type_,
+                },
+            )),
+        }
+    }
+
+    fn type_alias_instantiation_key(
+        &mut self,
+        type_arguments: &[TypeId],
+        alias: Option<&(SemanticSymbolId, Vec<TypeId>)>,
+    ) -> Result<CacheHashKey, DeclaredTypeError> {
+        let alias = if let Some((symbol, arguments)) = alias {
+            let global_symbol = self.store.global_symbol_id(*symbol).ok_or({
+                DeclaredTypeError::Unavailable(DeclaredTypeUnavailable::SymbolNotOwned(*symbol))
+            })?;
+            Some((global_symbol, arguments.as_slice()))
+        } else {
+            None
+        };
+        Ok(type_alias_instantiation_cache_key(type_arguments, alias))
+    }
+
+    fn issue_type_reference_arity_diagnostic(
+        &mut self,
+        node: NodeRef,
+        symbol: SemanticSymbolId,
+        arity: PlannedTypeReferenceArity,
+    ) -> Result<(), DeclaredTypeError> {
+        let name = self
+            .store
+            .symbol(symbol)
+            .and_then(|symbol| symbol.name().as_utf8())
+            .filter(|name| !name.is_empty())
+            .ok_or(DeclaredTypeError::Unavailable(
+                DeclaredTypeUnavailable::SymbolNotOwned(symbol),
+            ))?
+            .to_owned();
+        let (code, arguments) = match arity {
+            PlannedTypeReferenceArity::NotGeneric => (2315, vec![name]),
+            PlannedTypeReferenceArity::InvalidGeneric { minimum, maximum }
+                if minimum == maximum =>
+            {
+                (2314, vec![name, minimum.to_string()])
+            }
+            PlannedTypeReferenceArity::InvalidGeneric { minimum, maximum } => {
+                (2707, vec![name, minimum.to_string(), maximum.to_string()])
+            }
+            PlannedTypeReferenceArity::Valid => return Ok(()),
+        };
+        self.diagnostics.add(
+            Some(node),
+            Diagnostic::with_arguments(
+                message_by_code(code).expect("generic arity diagnostics are in the catalog"),
+                arguments,
+            ),
+        );
+        Ok(())
+    }
+
+    fn error_type(&self) -> Result<TypeId, DeclaredTypeError> {
+        self.store
+            .intrinsic_bootstrap()
+            .map(|bootstrap| bootstrap.error_type)
+            .ok_or(DeclaredTypeError::Unavailable(
+                DeclaredTypeUnavailable::IntrinsicBootstrapNotInitialized,
+            ))
     }
 
     fn keyword_type(&self, kind: SyntaxKind) -> Result<TypeId, DeclaredTypeError> {
@@ -1823,6 +3135,7 @@ mod tests {
         BoundFile, CanonicalBinder, CanonicalModuleState, CanonicalNameResolverOptions,
         CanonicalSourceFileFacts, CanonicalSourceLanguage, CheckFlags, EscapedName,
     };
+    use ts_core::TextRange;
     use ts_parser::{ParseResult, parse_source_file};
 
     use super::*;
@@ -1851,6 +3164,57 @@ mod tests {
 
     fn fixture_with_mutation(source: &str, mutate: impl FnOnce(&mut ParseResult)) -> Fixture {
         fixture_with(source, CanonicalModuleState::Script, mutate)
+    }
+
+    fn mutate_first_type_argument_list(
+        parsed: &mut ParseResult,
+        empty: bool,
+        has_trailing_comma: bool,
+    ) {
+        let reference = parsed
+            .arena
+            .iter()
+            .find_map(|(id, node)| {
+                matches!(
+                    &node.data,
+                    NodeData::TypeReferenceNode(reference)
+                        if reference.type_arguments.is_some()
+                )
+                .then_some(id)
+            })
+            .expect("source has a type-argument list");
+        let NodeData::TypeReferenceNode(reference) =
+            &mut parsed.arena.get_mut(reference).unwrap().data
+        else {
+            unreachable!()
+        };
+        let arguments = reference.type_arguments.as_mut().unwrap();
+        if empty {
+            arguments.nodes.clear();
+        }
+        arguments.has_trailing_comma = has_trailing_comma;
+    }
+
+    fn invalidate_first_type_argument_range(parsed: &mut ParseResult) {
+        let reference = parsed
+            .arena
+            .iter()
+            .find_map(|(id, node)| {
+                matches!(
+                    &node.data,
+                    NodeData::TypeReferenceNode(reference)
+                        if reference.type_arguments.is_some()
+                )
+                .then_some(id)
+            })
+            .expect("source has a type-argument list");
+        let NodeData::TypeReferenceNode(reference) =
+            &mut parsed.arena.get_mut(reference).unwrap().data
+        else {
+            unreachable!()
+        };
+        let arguments = reference.type_arguments.as_mut().unwrap();
+        arguments.range = TextRange::new(arguments.range.start, arguments.range.start);
     }
 
     fn fixture_with_module_state(source: &str, module_state: CanonicalModuleState) -> Fixture {
@@ -1955,6 +3319,7 @@ mod tests {
             NodeData::InterfaceDeclaration(data) => data.name,
             NodeData::ClassDeclaration(data) => data.name?,
             NodeData::TypeParameterDeclaration(data) => data.name,
+            NodeData::VariableDeclaration(data) => data.name,
             NodeData::ImportSpecifier(data) => data.name,
             _ => return None,
         };
@@ -2001,6 +3366,74 @@ mod tests {
         )
     }
 
+    fn alias_type_parameter_default(fixture: &Fixture, name: &str, index: usize) -> NodeRef {
+        let declaration = named_node(fixture, SyntaxKind::TypeAliasDeclaration, name);
+        let NodeData::TypeAliasDeclaration(alias) =
+            &fixture.parsed.arena.get(declaration.node).unwrap().data
+        else {
+            unreachable!()
+        };
+        let parameter = alias.type_parameters.as_ref().unwrap().nodes[index];
+        let NodeData::TypeParameterDeclaration(parameter) =
+            &fixture.parsed.arena.get(parameter).unwrap().data
+        else {
+            unreachable!()
+        };
+        NodeRef::new(
+            declaration.arena,
+            declaration.file,
+            parameter
+                .default_type
+                .expect("type parameter has a default"),
+        )
+    }
+
+    fn variable_type_node(fixture: &Fixture, name: &str) -> NodeRef {
+        let declaration = named_node(fixture, SyntaxKind::VariableDeclaration, name);
+        let NodeData::VariableDeclaration(variable) =
+            &fixture.parsed.arena.get(declaration.node).unwrap().data
+        else {
+            unreachable!()
+        };
+        NodeRef::new(
+            declaration.arena,
+            declaration.file,
+            variable.type_.expect("variable has a type annotation"),
+        )
+    }
+
+    fn merge_duplicate_alias_declarations(fixture: &mut Fixture, name: &str) -> SemanticSymbolId {
+        let declarations = fixture
+            .parsed
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                (record.kind == SyntaxKind::TypeAliasDeclaration
+                    && declaration_name(&fixture.parsed.arena, record) == Some(name))
+                .then_some(NodeRef::new(fixture.parsed.arena.id(), fixture.file, node))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(declarations.len(), 2);
+        let symbols = declarations
+            .iter()
+            .map(|declaration| node_symbol(fixture, *declaration))
+            .collect::<Vec<_>>();
+        let canonical = symbols[0];
+        if symbols[1] != canonical {
+            fixture
+                .store
+                .record_merged_symbol(canonical, symbols[1])
+                .unwrap();
+        }
+        let value_declaration = fixture.store.symbol(canonical).unwrap().value_declaration();
+        assert!(fixture.store.set_symbol_declarations(
+            canonical,
+            Some(declarations),
+            value_declaration,
+        ));
+        canonical
+    }
+
     fn store_state(store: &CanonicalTypeMapperStore) -> StoreState {
         (
             store.type_len(),
@@ -2009,6 +3442,13 @@ mod tests {
             store.type_resolution_len(),
             store.type_resolution_start(),
         )
+    }
+
+    fn alias_instantiation_key(
+        type_arguments: &[TypeId],
+        alias: Option<(u64, &[TypeId])>,
+    ) -> CacheHashKey {
+        type_alias_instantiation_cache_key(type_arguments, alias)
     }
 
     fn literal_state(store: &CanonicalTypeMapperStore) -> LiteralState {
@@ -3948,6 +5388,1125 @@ mod tests {
     }
 
     #[test]
+    fn direct_generic_aliases_substitute_nested_primitive_and_union_arguments() {
+        let mut fixture = fixture(concat!(
+            "type Id<T> = T; ",
+            "type Wrap<T> = Id<T>; ",
+            "type Text = Wrap<string>; ",
+            "type TextAgain = Wrap<string>; ",
+            "type Word = Wrap<'ok'>; ",
+            "type Scalar = Wrap<string | number>; ",
+            "let standalone: Id<string>;",
+        ));
+        let id = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Id");
+        let wrap = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Wrap");
+        let text = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Text");
+        let text_again = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "TextAgain");
+        let word = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Word");
+        let scalar = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Scalar");
+        let (string_type, number_type) = {
+            let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+            (bootstrap.string_type, bootstrap.number_type)
+        };
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        assert_eq!(
+            query_declared(
+                &mut fixture,
+                text,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Ok(string_type)
+        );
+        assert_eq!(
+            query_declared(
+                &mut fixture,
+                text_again,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Ok(string_type)
+        );
+        let word_type = query_declared(
+            &mut fixture,
+            word,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        assert!(matches!(
+            fixture.store.type_payload(word_type).map(TypeRecord::data),
+            Some(TypeData::Literal(data))
+                if data.value == LiteralValue::String("ok".to_owned())
+        ));
+        let scalar_type = query_declared(
+            &mut fixture,
+            scalar,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        assert_eq!(
+            union_types(&fixture.store, scalar_type),
+            [string_type, number_type]
+        );
+
+        let standalone = fixture
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(id, node)| {
+                let NodeData::TypeReferenceNode(reference) = &node.data else {
+                    return None;
+                };
+                let parent = node
+                    .parent
+                    .and_then(|parent| fixture.parsed.arena.get(parent))?;
+                let NodeData::Identifier(name) =
+                    &fixture.parsed.arena.get(reference.type_name)?.data
+                else {
+                    return None;
+                };
+                (parent.kind == SyntaxKind::VariableDeclaration && name.text == "Id")
+                    .then_some(NodeRef::new(fixture.parsed.arena.id(), fixture.file, id))
+            })
+            .expect("standalone generic type reference is present");
+        assert_eq!(
+            query_node(&mut fixture, standalone, &mut diagnostics),
+            Ok(string_type)
+        );
+
+        let id_links = fixture.store.type_alias_links(id).unwrap();
+        assert_eq!(id_links.type_parameters.as_ref().unwrap().len(), 1);
+        assert_eq!(id_links.instantiations.as_ref().unwrap().len(), 3);
+        let standalone_key = alias_instantiation_key(&[string_type], None);
+        assert_eq!(
+            id_links
+                .instantiations
+                .as_ref()
+                .unwrap()
+                .get(&standalone_key),
+            Some(&string_type)
+        );
+        let text_global = fixture.store.global_symbol_id(text).unwrap();
+        let text_again_global = fixture.store.global_symbol_id(text_again).unwrap();
+        let text_key = alias_instantiation_key(&[string_type], Some((text_global, &[])));
+        let text_again_key =
+            alias_instantiation_key(&[string_type], Some((text_again_global, &[])));
+        assert_ne!(text_key, text_again_key);
+        let wrap_links = fixture.store.type_alias_links(wrap).unwrap();
+        assert_eq!(wrap_links.type_parameters.as_ref().unwrap().len(), 1);
+        // The two `string` uses retain distinct direct-alias cache keys, as in
+        // pinned `getTypeAliasInstantiationKey`.
+        assert_eq!(wrap_links.instantiations.as_ref().unwrap().len(), 5);
+        assert_eq!(
+            wrap_links.instantiations.as_ref().unwrap().get(&text_key),
+            Some(&string_type)
+        );
+        assert_eq!(
+            wrap_links
+                .instantiations
+                .as_ref()
+                .unwrap()
+                .get(&text_again_key),
+            Some(&string_type)
+        );
+
+        let after_first_queries = (
+            fixture.store.type_len(),
+            fixture.store.mapper_len(),
+            fixture.store.type_alias_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+        assert_eq!(
+            query_declared(
+                &mut fixture,
+                text,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Ok(string_type)
+        );
+        assert_eq!(
+            query_declared(
+                &mut fixture,
+                text_again,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Ok(string_type)
+        );
+        assert_eq!(
+            query_declared(
+                &mut fixture,
+                word,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Ok(word_type)
+        );
+        assert_eq!(
+            query_declared(
+                &mut fixture,
+                scalar,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Ok(scalar_type)
+        );
+        assert_eq!(
+            query_node(&mut fixture, standalone, &mut diagnostics),
+            Ok(string_type)
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.mapper_len(),
+                fixture.store.type_alias_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            after_first_queries
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn cold_alias_rhs_query_uses_the_same_owner_key_as_declared_query() {
+        let mut fixture = fixture("type Id<T> = T; type Text = Id<string>;");
+        let id = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Id");
+        let text = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Text");
+        let rhs = alias_parts(&fixture, "Text").2;
+        let string_type = fixture.store.intrinsic_bootstrap().unwrap().string_type;
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        assert_eq!(
+            query_node(&mut fixture, rhs, &mut diagnostics),
+            Ok(string_type)
+        );
+        let text_global = fixture.store.global_symbol_id(text).unwrap();
+        let owner_key = alias_instantiation_key(&[string_type], Some((text_global, &[])));
+        let no_owner_key = alias_instantiation_key(&[string_type], None);
+        let instantiations = fixture
+            .store
+            .type_alias_links(id)
+            .unwrap()
+            .instantiations
+            .as_ref()
+            .unwrap();
+        assert_eq!(instantiations.get(&owner_key), Some(&string_type));
+        assert!(!instantiations.contains_key(&no_owner_key));
+
+        assert_eq!(
+            query_declared(
+                &mut fixture,
+                text,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Ok(string_type)
+        );
+        let state = union_state(&fixture.store);
+        assert_eq!(
+            query_node(&mut fixture, rhs, &mut diagnostics),
+            Ok(string_type)
+        );
+        assert_eq!(
+            query_declared(
+                &mut fixture,
+                text,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Ok(string_type)
+        );
+        assert_eq!(union_state(&fixture.store), state);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn generic_alias_defaults_map_earlier_parameters_and_cache_provided_arity() {
+        let mut fixture = fixture(concat!(
+            "type Pick<T, U = T> = U; ",
+            "type Picked = Pick<string>; ",
+            "type Value<T = number> = T; ",
+            "type Defaulted = Value;",
+        ));
+        let pick = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Pick");
+        let picked = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Picked");
+        let value = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Value");
+        let defaulted = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Defaulted");
+        let (string_type, number_type) = {
+            let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+            (bootstrap.string_type, bootstrap.number_type)
+        };
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        assert_eq!(
+            query_declared(
+                &mut fixture,
+                picked,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Ok(string_type)
+        );
+        assert_eq!(
+            query_declared(
+                &mut fixture,
+                defaulted,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Ok(number_type)
+        );
+        assert_eq!(fixture.store.mapper_len(), 0);
+        assert_eq!(
+            fixture
+                .store
+                .type_alias_links(pick)
+                .unwrap()
+                .instantiations
+                .as_ref()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            fixture
+                .store
+                .type_alias_links(value)
+                .unwrap()
+                .instantiations
+                .as_ref()
+                .unwrap()
+                .len(),
+            2
+        );
+
+        let mapper_count = fixture.store.mapper_len();
+        assert_eq!(
+            query_declared(
+                &mut fixture,
+                picked,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Ok(string_type)
+        );
+        assert_eq!(
+            query_declared(
+                &mut fixture,
+                defaulted,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Ok(number_type)
+        );
+        assert_eq!(fixture.store.mapper_len(), mapper_count);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn generic_alias_cache_rejects_swapped_parameter_order_before_query_writes() {
+        let mut fixture = fixture("type Pair<T, U> = T; let value: Pair<string, number>;");
+        let pair = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Pair");
+        let reference = variable_type_node(&fixture, "value");
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let declared = query_declared(
+            &mut fixture,
+            pair,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        let mut links = fixture.store.type_alias_links(pair).unwrap().clone();
+        let parameters = links.type_parameters.as_mut().unwrap();
+        parameters.swap(0, 1);
+        links.instantiations = Some(HashMap::from([(type_list_key(parameters), declared)]));
+        assert!(fixture.store.set_type_alias_links(pair, links));
+        let before = union_state(&fixture.store);
+
+        for _ in 0..2 {
+            assert_eq!(
+                query_node(&mut fixture, reference, &mut diagnostics),
+                Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidCachedTypeAlias(pair)
+                ))
+            );
+            assert_eq!(union_state(&fixture.store), before);
+        }
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn generic_alias_cache_rejects_missing_metadata_outside_a_proven_cycle() {
+        let mut fixture = fixture("type Id<T> = T; let value: Id<string>;");
+        let id = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Id");
+        let reference = variable_type_node(&fixture, "value");
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        query_declared(
+            &mut fixture,
+            id,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        let mut links = fixture.store.type_alias_links(id).unwrap().clone();
+        links.type_parameters = None;
+        links.instantiations = None;
+        assert!(fixture.store.set_type_alias_links(id, links));
+        let before = union_state(&fixture.store);
+
+        for _ in 0..2 {
+            assert_eq!(
+                query_node(&mut fixture, reference, &mut diagnostics),
+                Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidCachedTypeAlias(id)
+                ))
+            );
+            assert_eq!(union_state(&fixture.store), before);
+        }
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn generic_alias_cache_does_not_borrow_a_downstream_cycle_proof() {
+        let mut fixture = fixture("type Cycle = Cycle; type Root<T> = Cycle;");
+        let root = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Root");
+        let (_, cycle_name, _) = alias_parts(&fixture, "Cycle");
+        let error_type = fixture.store.intrinsic_bootstrap().unwrap().error_type;
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        assert_eq!(
+            query_declared(
+                &mut fixture,
+                root,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Ok(error_type)
+        );
+        assert_eq!(
+            fixture
+                .store
+                .type_alias_links(root)
+                .unwrap()
+                .type_parameters
+                .as_ref()
+                .map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics.as_slice()[0].diagnostic.code(), 2456);
+        assert_eq!(diagnostics.as_slice()[0].node, Some(cycle_name));
+        assert_eq!(diagnostics.as_slice()[0].diagnostic.arguments, ["Cycle"]);
+
+        let mut links = fixture.store.type_alias_links(root).unwrap().clone();
+        links.type_parameters = None;
+        links.instantiations = None;
+        assert!(fixture.store.set_type_alias_links(root, links));
+        let before = union_state(&fixture.store);
+
+        for _ in 0..2 {
+            assert_eq!(
+                query_declared(
+                    &mut fixture,
+                    root,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut diagnostics,
+                ),
+                Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidCachedTypeAlias(root)
+                ))
+            );
+            assert_eq!(union_state(&fixture.store), before);
+            assert_eq!(diagnostics.len(), 1);
+            assert_eq!(diagnostics.as_slice()[0].diagnostic.code(), 2456);
+            assert_eq!(diagnostics.as_slice()[0].node, Some(cycle_name));
+        }
+    }
+
+    #[test]
+    fn generic_alias_cache_rejects_poisoned_instantiation_before_query_writes() {
+        let mut fixture = fixture("type Id<T> = T; let value: Id<string>;");
+        let id = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Id");
+        let reference = variable_type_node(&fixture, "value");
+        let (string_type, number_type) = {
+            let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+            (bootstrap.string_type, bootstrap.number_type)
+        };
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        query_declared(
+            &mut fixture,
+            id,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        let mut links = fixture.store.type_alias_links(id).unwrap().clone();
+        links
+            .instantiations
+            .as_mut()
+            .unwrap()
+            .insert(alias_instantiation_key(&[string_type], None), number_type);
+        assert!(fixture.store.set_type_alias_links(id, links));
+        let before = union_state(&fixture.store);
+
+        for _ in 0..2 {
+            assert_eq!(
+                query_node(&mut fixture, reference, &mut diagnostics),
+                Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidGenericAliasInstantiationCache(id)
+                ))
+            );
+            assert_eq!(union_state(&fixture.store), before);
+        }
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn cached_alias_chain_requires_the_exact_rhs_instantiation_key() {
+        let mut fixture = fixture("type Id<T> = T; type Root = Id<string>;");
+        let id = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Id");
+        let root = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Root");
+        let (string_type, number_type) = {
+            let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+            (bootstrap.string_type, bootstrap.number_type)
+        };
+        let root_global = fixture.store.global_symbol_id(root).unwrap();
+        let string_key = alias_instantiation_key(&[string_type], Some((root_global, &[])));
+        let number_key = alias_instantiation_key(&[number_type], Some((root_global, &[])));
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        assert_eq!(
+            query_declared(
+                &mut fixture,
+                root,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Ok(string_type)
+        );
+        let links = fixture.store.type_alias_links(id).unwrap();
+        let parameters = links.type_parameters.as_ref().unwrap();
+        let identity_key = type_list_key(parameters);
+        assert_eq!(
+            links.instantiations.as_ref().unwrap().get(&string_key),
+            Some(&string_type)
+        );
+        assert_eq!(
+            links.instantiations.as_ref().unwrap().get(&identity_key),
+            links.declared_type.as_ref()
+        );
+
+        let warm = union_state(&fixture.store);
+        assert_eq!(
+            query_declared(
+                &mut fixture,
+                root,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Ok(string_type)
+        );
+        assert_eq!(union_state(&fixture.store), warm);
+
+        let mut links = fixture.store.type_alias_links(id).unwrap().clone();
+        let declared_type = links.declared_type;
+        let instantiations = links.instantiations.as_mut().unwrap();
+        assert_eq!(instantiations.remove(&string_key), Some(string_type));
+        assert_eq!(instantiations.insert(number_key, string_type), None);
+        assert_eq!(instantiations.get(&identity_key), declared_type.as_ref());
+        assert!(fixture.store.set_type_alias_links(id, links));
+        let poisoned = union_state(&fixture.store);
+
+        for _ in 0..2 {
+            assert_eq!(
+                query_declared(
+                    &mut fixture,
+                    root,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut diagnostics,
+                ),
+                Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidCachedTypeAlias(root)
+                ))
+            );
+            assert_eq!(union_state(&fixture.store), poisoned);
+        }
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn multi_declaration_aliases_fail_typed_in_cold_and_warm_queries() {
+        let mut cold = fixture("type A<T> = T; type A<U> = U;");
+        let cold_alias = merge_duplicate_alias_declarations(&mut cold, "A");
+        let cold_before = union_state(&cold.store);
+        let mut cold_diagnostics = CanonicalCheckerDiagnostics::default();
+        for _ in 0..2 {
+            assert_eq!(
+                query_declared(
+                    &mut cold,
+                    cold_alias,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut cold_diagnostics,
+                ),
+                Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidTypeAliasSymbol(cold_alias)
+                ))
+            );
+            assert_eq!(union_state(&cold.store), cold_before);
+        }
+        assert!(cold_diagnostics.is_empty());
+
+        let mut warm = fixture("type A<T> = T; type B<U> = U;");
+        let warm_alias = named_symbol(&warm, SyntaxKind::TypeAliasDeclaration, "A");
+        let other = named_symbol(&warm, SyntaxKind::TypeAliasDeclaration, "B");
+        let mut warm_diagnostics = CanonicalCheckerDiagnostics::default();
+        query_declared(
+            &mut warm,
+            warm_alias,
+            CanonicalTypeQueryOptions::default(),
+            &mut warm_diagnostics,
+        )
+        .unwrap();
+        warm.store.record_merged_symbol(warm_alias, other).unwrap();
+        let declarations = [warm_alias, other]
+            .iter()
+            .map(|symbol| warm.store.symbol(*symbol).unwrap().declarations().unwrap()[0])
+            .collect::<Vec<_>>();
+        let value_declaration = warm.store.symbol(warm_alias).unwrap().value_declaration();
+        assert!(warm.store.set_symbol_declarations(
+            warm_alias,
+            Some(declarations),
+            value_declaration,
+        ));
+        let warm_before = union_state(&warm.store);
+        for _ in 0..2 {
+            assert_eq!(
+                query_declared(
+                    &mut warm,
+                    warm_alias,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut warm_diagnostics,
+                ),
+                Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidCachedTypeAlias(warm_alias)
+                ))
+            );
+            assert_eq!(union_state(&warm.store), warm_before);
+        }
+        assert!(warm_diagnostics.is_empty());
+    }
+
+    #[test]
+    fn unsupported_later_generic_default_fails_before_query_writes() {
+        let mut fixture = fixture("type Bad<T = string, U = intrinsic> = U; let value: Bad;");
+        let bad = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Bad");
+        let reference = variable_type_node(&fixture, "value");
+        let marker = fixture
+            .store
+            .intrinsic_bootstrap()
+            .unwrap()
+            .intrinsic_marker_type;
+        let before = union_state(&fixture.store);
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        for _ in 0..2 {
+            assert_eq!(
+                query_node(&mut fixture, reference, &mut diagnostics),
+                Err(type_node_unavailable(
+                    TypeNodeUnavailable::GenericAliasInstantiationUnsupported {
+                        alias: bad,
+                        declared_type: marker,
+                    }
+                ))
+            );
+            assert_eq!(union_state(&fixture.store), before);
+        }
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn generic_alias_defaults_accept_outer_lexical_type_parameters() {
+        let mut fixture = fixture("function f<X>() { type Id<T = X> = T; let value: Id; }");
+        let outer = named_symbol(&fixture, SyntaxKind::TypeParameter, "X");
+        let reference = variable_type_node(&fixture, "value");
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let expected = query_declared(
+            &mut fixture,
+            outer,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+
+        assert_eq!(
+            query_node(&mut fixture, reference, &mut diagnostics),
+            Ok(expected)
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn generic_alias_arity_errors_match_pinned_diagnostics_and_are_idempotent() {
+        let mut fixture = fixture(concat!(
+            "type Id<T> = T; ",
+            "type Optional<T = string, U = number> = U; ",
+            "type Plain = string; ",
+            "type Missing = Id; ",
+            "type Range = Optional<string, number, boolean>; ",
+            "type NotGeneric = Plain<string>;",
+        ));
+        let missing = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Missing");
+        let range = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Range");
+        let not_generic = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "NotGeneric");
+        let error_type = fixture.store.intrinsic_bootstrap().unwrap().error_type;
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        for symbol in [missing, range, not_generic] {
+            assert_eq!(
+                query_declared(
+                    &mut fixture,
+                    symbol,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut diagnostics,
+                ),
+                Ok(error_type)
+            );
+        }
+        assert_eq!(
+            diagnostics
+                .as_slice()
+                .iter()
+                .map(|diagnostic| (
+                    diagnostic.diagnostic.code(),
+                    diagnostic.diagnostic.arguments.clone(),
+                ))
+                .collect::<Vec<_>>(),
+            [
+                (2314, vec!["Id".to_owned(), "1".to_owned()]),
+                (
+                    2707,
+                    vec!["Optional".to_owned(), "0".to_owned(), "2".to_owned()],
+                ),
+                (2315, vec!["Plain".to_owned()]),
+            ]
+        );
+        assert_eq!(
+            diagnostics.as_slice()[0].node,
+            Some(alias_parts(&fixture, "Missing").2)
+        );
+        assert_eq!(
+            diagnostics.as_slice()[1].node,
+            Some(alias_parts(&fixture, "Range").2)
+        );
+        assert_eq!(
+            diagnostics.as_slice()[2].node,
+            Some(alias_parts(&fixture, "NotGeneric").2)
+        );
+
+        let diagnostic_count = diagnostics.len();
+        for symbol in [missing, range, not_generic] {
+            assert_eq!(
+                query_declared(
+                    &mut fixture,
+                    symbol,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut diagnostics,
+                ),
+                Ok(error_type)
+            );
+        }
+        assert_eq!(diagnostics.len(), diagnostic_count);
+    }
+
+    #[test]
+    fn invalid_outer_arity_still_checks_nested_type_arguments_first() {
+        let mut fixture = fixture(concat!(
+            "type Id<T> = T; ",
+            "type Plain = string; ",
+            "type Nested = Plain<Id>; ",
+            "type Excess = Id<string, Id>;",
+        ));
+        let nested = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Nested");
+        let excess = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Excess");
+        let nested_outer = alias_parts(&fixture, "Nested").2;
+        let excess_outer = alias_parts(&fixture, "Excess").2;
+        let nested_inner = match &fixture.parsed.arena.get(nested_outer.node).unwrap().data {
+            NodeData::TypeReferenceNode(reference) => NodeRef::new(
+                nested_outer.arena,
+                nested_outer.file,
+                reference.type_arguments.as_ref().unwrap().nodes[0],
+            ),
+            _ => unreachable!(),
+        };
+        let excess_inner = match &fixture.parsed.arena.get(excess_outer.node).unwrap().data {
+            NodeData::TypeReferenceNode(reference) => NodeRef::new(
+                excess_outer.arena,
+                excess_outer.file,
+                reference.type_arguments.as_ref().unwrap().nodes[1],
+            ),
+            _ => unreachable!(),
+        };
+        let error_type = fixture.store.intrinsic_bootstrap().unwrap().error_type;
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        assert_eq!(
+            query_declared(
+                &mut fixture,
+                nested,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Ok(error_type)
+        );
+        assert_eq!(
+            query_declared(
+                &mut fixture,
+                excess,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Ok(error_type)
+        );
+        assert_eq!(
+            diagnostics
+                .as_slice()
+                .iter()
+                .map(|diagnostic| (diagnostic.diagnostic.code(), diagnostic.node))
+                .collect::<Vec<_>>(),
+            [
+                (2314, Some(nested_inner)),
+                (2315, Some(nested_outer)),
+                (2314, Some(excess_inner)),
+                (2314, Some(excess_outer)),
+            ]
+        );
+
+        let diagnostic_count = diagnostics.len();
+        for symbol in [nested, excess] {
+            assert_eq!(
+                query_declared(
+                    &mut fixture,
+                    symbol,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut diagnostics,
+                ),
+                Ok(error_type)
+            );
+        }
+        assert_eq!(diagnostics.len(), diagnostic_count);
+    }
+
+    #[test]
+    fn cached_forward_generic_default_reference_preserves_cold_atomic_failure() {
+        let source = "type Bad<T = U, U = string> = T; let value: Bad;";
+
+        let mut cold = fixture(source);
+        let cold_bad = named_symbol(&cold, SyntaxKind::TypeAliasDeclaration, "Bad");
+        let cold_u = named_symbol(&cold, SyntaxKind::TypeParameter, "U");
+        let cold_default = alias_type_parameter_default(&cold, "Bad", 0);
+        let cold_reference = variable_type_node(&cold, "value");
+        let cold_before = union_state(&cold.store);
+        let mut cold_diagnostics = CanonicalCheckerDiagnostics::default();
+        for _ in 0..2 {
+            assert_eq!(
+                query_node(&mut cold, cold_reference, &mut cold_diagnostics),
+                Err(type_node_unavailable(
+                    TypeNodeUnavailable::GenericAliasDefaultReferenceUnsupported {
+                        alias: cold_bad,
+                        default_type: cold_default,
+                        referenced_parameter: cold_u,
+                    }
+                ))
+            );
+            assert_eq!(union_state(&cold.store), cold_before);
+            assert!(cold.store.type_alias_links(cold_bad).is_none());
+        }
+        assert!(cold_diagnostics.is_empty());
+
+        let mut warm = fixture(source);
+        let warm_bad = named_symbol(&warm, SyntaxKind::TypeAliasDeclaration, "Bad");
+        let warm_u = named_symbol(&warm, SyntaxKind::TypeParameter, "U");
+        let warm_default = alias_type_parameter_default(&warm, "Bad", 0);
+        let warm_reference = variable_type_node(&warm, "value");
+        let mut warm_diagnostics = CanonicalCheckerDiagnostics::default();
+        let warmed_type = query_node(&mut warm, warm_default, &mut warm_diagnostics).unwrap();
+        assert_eq!(
+            warm.store
+                .symbol_node_links(warm_default)
+                .and_then(|links| links.resolved_symbol),
+            Some(warm_u)
+        );
+        assert_eq!(
+            warm.store
+                .type_node_links(warm_default)
+                .and_then(|links| links.resolved_type),
+            Some(warmed_type)
+        );
+        assert!(warm.store.type_alias_links(warm_bad).is_none());
+        let warm_before = union_state(&warm.store);
+
+        for _ in 0..2 {
+            assert_eq!(
+                query_node(&mut warm, warm_reference, &mut warm_diagnostics),
+                Err(type_node_unavailable(
+                    TypeNodeUnavailable::GenericAliasDefaultReferenceUnsupported {
+                        alias: warm_bad,
+                        default_type: warm_default,
+                        referenced_parameter: warm_u,
+                    }
+                ))
+            );
+            assert_eq!(union_state(&warm.store), warm_before);
+            assert!(warm.store.type_alias_links(warm_bad).is_none());
+        }
+        assert!(warm_diagnostics.is_empty());
+    }
+
+    #[test]
+    fn circular_generic_alias_defaults_fail_typed_without_recursive_planning() {
+        for source in [
+            "type A<T = A> = T; let value: A;",
+            "type A<T = B> = T; type B<U = A> = U; let value: A;",
+        ] {
+            let mut fixture = fixture(source);
+            let alias = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "A");
+            let default_type = alias_type_parameter_default(&fixture, "A", 0);
+            let reference = variable_type_node(&fixture, "value");
+            let before = union_state(&fixture.store);
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+            for _ in 0..2 {
+                assert_eq!(
+                    query_node(&mut fixture, reference, &mut diagnostics),
+                    Err(type_node_unavailable(
+                        TypeNodeUnavailable::CircularGenericAliasDefault {
+                            alias,
+                            default_type,
+                        }
+                    ))
+                );
+                assert_eq!(union_state(&fixture.store), before);
+                assert!(fixture.store.type_alias_links(alias).is_none());
+            }
+            assert!(diagnostics.is_empty());
+        }
+    }
+
+    #[test]
+    fn unsupported_generic_alias_dependencies_fail_before_semantic_writes() {
+        let cases = [
+            ("type Id<T> = T; type Bad = Id<{ value: string }>;", 0),
+            ("type Maybe<T> = T | null;", 1),
+            ("type Constrained<T extends string> = T;", 2),
+            ("type Constant<T> = string | number;", 3),
+            (
+                "type Forward<T = U, U = string> = T; type Bad = Forward;",
+                4,
+            ),
+        ];
+        for (source, expected) in cases {
+            let mut fixture = fixture(source);
+            let alias_name = match expected {
+                0 => "Bad",
+                1 => "Maybe",
+                2 => "Constrained",
+                3 => "Constant",
+                _ => "Bad",
+            };
+            let alias = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, alias_name);
+            let before = union_state(&fixture.store);
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            let error = query_declared(
+                &mut fixture,
+                alias,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(
+                    (expected, error),
+                    (
+                        0,
+                        DeclaredTypeError::TypeNodeUnavailable(
+                            TypeNodeUnavailable::UnsupportedSyntax {
+                                kind: SyntaxKind::TypeLiteral,
+                                ..
+                            }
+                        )
+                    ) | (
+                        1,
+                        DeclaredTypeError::TypeNodeUnavailable(
+                            TypeNodeUnavailable::UnsupportedUnionConstituent(_)
+                        )
+                    ) | (
+                        2,
+                        DeclaredTypeError::TypeNodeUnavailable(
+                            TypeNodeUnavailable::GenericAliasConstraintUnsupported { .. }
+                        )
+                    ) | (
+                        3,
+                        DeclaredTypeError::TypeNodeUnavailable(
+                            TypeNodeUnavailable::GenericReferenceUnsupported { .. }
+                        )
+                    ) | (
+                        4,
+                        DeclaredTypeError::TypeNodeUnavailable(
+                            TypeNodeUnavailable::GenericAliasDefaultReferenceUnsupported { .. }
+                        )
+                    )
+                ),
+                "unexpected error: {error:?}"
+            );
+            assert_eq!(union_state(&fixture.store), before);
+            assert!(diagnostics.is_empty());
+        }
+    }
+
+    #[test]
+    fn malformed_type_argument_lists_fail_typed_before_query_writes() {
+        let cases = [
+            (
+                "type Value<T = string> = T; type Bad = Value<string>;",
+                Some((true, false)),
+            ),
+            (
+                "type Plain = string; type Bad = Plain<string>;",
+                Some((true, false)),
+            ),
+            ("type Id<T> = T; type Bad = Id<string,>;", None),
+        ];
+        for (source, mutation) in cases {
+            let mut fixture = if let Some((empty, has_trailing_comma)) = mutation {
+                fixture_with_mutation(source, |parsed| {
+                    mutate_first_type_argument_list(parsed, empty, has_trailing_comma);
+                })
+            } else {
+                fixture(source)
+            };
+            let bad = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Bad");
+            let reference = alias_parts(&fixture, "Bad").2;
+            let before = union_state(&fixture.store);
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+            for _ in 0..2 {
+                assert_eq!(
+                    query_declared(
+                        &mut fixture,
+                        bad,
+                        CanonicalTypeQueryOptions::default(),
+                        &mut diagnostics,
+                    ),
+                    Err(type_node_unavailable(
+                        TypeNodeUnavailable::InvalidTypeReference(reference)
+                    ))
+                );
+                assert_eq!(union_state(&fixture.store), before);
+            }
+            assert!(diagnostics.is_empty());
+        }
+
+        let mut fixture = fixture_with_mutation(
+            "type Id<T> = T; type Bad = Id<string>;",
+            invalidate_first_type_argument_range,
+        );
+        let bad = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Bad");
+        let reference = alias_parts(&fixture, "Bad").2;
+        let before = union_state(&fixture.store);
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        assert_eq!(
+            query_declared(
+                &mut fixture,
+                bad,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidTypeReference(reference)
+            ))
+        );
+        assert_eq!(union_state(&fixture.store), before);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn recursive_generic_aliases_match_pinned_arity_and_cycle_diagnostics() {
+        let mut fixture = fixture(concat!(
+            "type Loop<T> = Loop<T>; ",
+            "let explicit: Loop<string>; ",
+            "let bare: Loop;",
+        ));
+        let alias = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Loop");
+        let (_, alias_name, self_reference) = alias_parts(&fixture, "Loop");
+        let explicit = variable_type_node(&fixture, "explicit");
+        let bare = variable_type_node(&fixture, "bare");
+        let error_type = fixture.store.intrinsic_bootstrap().unwrap().error_type;
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        assert_eq!(
+            query_declared(
+                &mut fixture,
+                alias,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Ok(error_type)
+        );
+        assert_eq!(fixture.store.mapper_len(), 0);
+        assert_eq!(fixture.store.type_resolution_len(), 0);
+        assert_eq!(fixture.store.type_resolution_start(), 0);
+        assert_eq!(diagnostics.len(), 2);
+        assert_eq!(diagnostics.as_slice()[0].diagnostic.code(), 2315);
+        assert_eq!(diagnostics.as_slice()[0].node, Some(self_reference));
+        assert_eq!(diagnostics.as_slice()[1].diagnostic.code(), 2456);
+        assert_eq!(diagnostics.as_slice()[1].node, Some(alias_name));
+        assert!(
+            diagnostics
+                .as_slice()
+                .iter()
+                .all(|diagnostic| diagnostic.diagnostic.arguments == ["Loop"])
+        );
+
+        assert_eq!(
+            query_node(&mut fixture, explicit, &mut diagnostics),
+            Ok(error_type)
+        );
+        assert_eq!(diagnostics.len(), 3);
+        assert_eq!(diagnostics.as_slice()[2].diagnostic.code(), 2315);
+        assert_eq!(diagnostics.as_slice()[2].node, Some(explicit));
+        assert_eq!(
+            query_node(&mut fixture, bare, &mut diagnostics),
+            Ok(error_type)
+        );
+        assert_eq!(diagnostics.len(), 3);
+
+        let state = store_state(&fixture.store);
+        assert_eq!(
+            query_declared(
+                &mut fixture,
+                alias,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Ok(error_type)
+        );
+        assert_eq!(
+            query_node(&mut fixture, explicit, &mut diagnostics),
+            Ok(error_type)
+        );
+        assert_eq!(
+            query_node(&mut fixture, bare, &mut diagnostics),
+            Ok(error_type)
+        );
+        assert_eq!(store_state(&fixture.store), state);
+        assert_eq!(diagnostics.len(), 3);
+    }
+
+    #[test]
     fn generic_builtin_iterator_return_accepts_its_marker_seed_on_retry() {
         for strict in [false, true] {
             let mut fixture = fixture("type BuiltinIteratorReturn<T> = intrinsic;");
@@ -4384,7 +6943,6 @@ mod tests {
             ("namespace N { export interface X {} } type Bad = N.X;", 0),
             ("type Bad = Missing;", 1),
             ("interface Box<T> {} type Bad = Box<string>;", 2),
-            ("type Id<T> = T; type Bad = Id;", 3),
             ("class Box<T> {} type Bad = Box;", 3),
         ];
 

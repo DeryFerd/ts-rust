@@ -647,6 +647,19 @@ impl SymbolStore {
         self.ensure_global_symbol_id(symbol).map(NonZeroU64::get)
     }
 
+    /// Returns an already-assigned process-global identity without allocating one.
+    #[must_use]
+    pub fn assigned_global_symbol_id(&self, symbol: SemanticSymbolId) -> Option<u64> {
+        if !self.contains_symbol(symbol) {
+            return None;
+        }
+        self.global_symbol_ids
+            .get(symbol.index())
+            .copied()
+            .flatten()
+            .map(NonZeroU64::get)
+    }
+
     #[must_use]
     pub fn known_symbol_name(symbol_name: &str) -> EscapedName {
         EscapedName::known_symbol(symbol_name)
@@ -855,6 +868,12 @@ mod tests {
         let mut store = SymbolStore::new();
         let allocated_first = alloc_source_symbol(&mut store, "first");
         let allocated_second = alloc_source_symbol(&mut store, "second");
+        assert_eq!(store.assigned_global_symbol_id(allocated_first), None);
+        assert_eq!(store.assigned_global_symbol_id(allocated_second), None);
+
+        let mut foreign_store = SymbolStore::new();
+        let foreign = alloc_source_symbol(&mut foreign_store, "foreign");
+        assert_eq!(store.assigned_global_symbol_id(foreign), None);
 
         // Invalid construction must not consume the first symbol's lazy ID.
         assert_eq!(
@@ -868,6 +887,14 @@ mod tests {
         let second_id = unique_id(&second_name);
         let first_id = private_id(&first_name);
         assert!(second_id < first_id);
+        assert_eq!(
+            store.assigned_global_symbol_id(allocated_second),
+            Some(second_id)
+        );
+        assert_eq!(
+            store.assigned_global_symbol_id(allocated_first),
+            Some(first_id)
+        );
 
         // Both dynamic families use the same once-assigned global symbol ID.
         assert_eq!(
@@ -875,6 +902,10 @@ mod tests {
             first_id
         );
         assert_eq!(store.global_symbol_id(allocated_second), Some(second_id));
+        assert_eq!(
+            store.assigned_global_symbol_id(allocated_second),
+            Some(second_id)
+        );
     }
 
     #[test]

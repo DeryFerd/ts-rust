@@ -9193,6 +9193,7 @@ impl<'a> Parser<'a> {
         }
         let start = self.consume().range.start;
         let mut arguments = Vec::new();
+        let mut has_trailing_comma = false;
         while self.current.kind != SyntaxKind::GreaterThanToken
             && self.current.kind != SyntaxKind::EndOfFile
         {
@@ -9201,6 +9202,7 @@ impl<'a> Parser<'a> {
                 break;
             }
             self.bump();
+            has_trailing_comma = self.current.kind == SyntaxKind::GreaterThanToken;
         }
         let end = if self.current.kind == SyntaxKind::GreaterThanToken {
             self.consume().range.end
@@ -9213,7 +9215,7 @@ impl<'a> Parser<'a> {
         Some(NodeList {
             range: TextRange::new(start, end),
             nodes: arguments,
-            has_trailing_comma: false,
+            has_trailing_comma,
         })
     }
 
@@ -10001,6 +10003,42 @@ mod tests {
         assert_eq!(
             result.arena.get(shift.right).unwrap().kind,
             SyntaxKind::BinaryExpression
+        );
+    }
+
+    #[test]
+    fn type_argument_lists_retain_empty_and_trailing_comma_grammar_shape() {
+        let source = "type Trailing = Id<string,>; type Empty = Id<>;";
+        let result = parse_source_file(source);
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let mut lists = result
+            .arena
+            .iter()
+            .filter_map(|(_, node)| {
+                let NodeData::TypeReferenceNode(reference) = &node.data else {
+                    return None;
+                };
+                reference.type_arguments.as_ref()
+            })
+            .collect::<Vec<_>>();
+        lists.sort_by_key(|list| list.range.start);
+
+        assert_eq!(lists.len(), 2);
+        assert_eq!(lists[0].nodes.len(), 1);
+        assert!(lists[0].has_trailing_comma);
+        assert_eq!(
+            source.get(
+                lists[0].range.start.get() as usize..lists[0].range.end.get() as usize
+            ),
+            Some("<string,>")
+        );
+        assert!(lists[1].nodes.is_empty());
+        assert!(!lists[1].has_trailing_comma);
+        assert_eq!(
+            source.get(
+                lists[1].range.start.get() as usize..lists[1].range.end.get() as usize
+            ),
+            Some("<>")
         );
     }
 

@@ -1552,6 +1552,74 @@ mod tests {
     }
 
     #[test]
+    fn source_generic_aliases_substitute_nested_union_and_default_arguments() {
+        let source = parsed(concat!(
+            "type Id<T> = T; ",
+            "type Wrap<T> = Id<T>; ",
+            "type Value<T = number> = T; ",
+            r#"const text: Wrap<string> = "ok"; "#,
+            "const scalar: Wrap<string | number> = 1; ",
+            "const defaulted: Value = 1; ",
+            "const bad: Id<string> = 1;",
+        ));
+        let file = FileId::new(65);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let diagnostics = context.diagnostics().as_slice();
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(
+            diagnostics[0].node,
+            Some(variable_name(&source, file, "bad"))
+        );
+        assert_eq!(diagnostics[0].diagnostic.code(), 2322);
+        assert_eq!(
+            diagnostics[0].diagnostic.render().unwrap(),
+            "Type 'number' is not assignable to type 'string'."
+        );
+        assert!(is_type_checked(&context, file));
+
+        let state = observable_state(&context, file);
+        context.check_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), state);
+    }
+
+    #[test]
+    fn source_generic_alias_arity_errors_do_not_cascade_to_assignability() {
+        let source = parsed(concat!(
+            "type Id<T> = T; ",
+            "type Optional<T = string, U = number> = U; ",
+            "type Plain = string; ",
+            "const missing: Id = 1; ",
+            "const range: Optional<string, number, boolean> = true; ",
+            "const plain: Plain<string> = 1;",
+        ));
+        let file = FileId::new(66);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        assert_eq!(
+            context
+                .diagnostics()
+                .as_slice()
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.code())
+                .collect::<Vec<_>>(),
+            [2314, 2707, 2315]
+        );
+        assert!(
+            context
+                .diagnostics()
+                .as_slice()
+                .iter()
+                .all(|diagnostic| diagnostic.diagnostic.code() != 2322)
+        );
+        assert!(is_type_checked(&context, file));
+    }
+
+    #[test]
     fn expression_literals_use_fresh_booleans_and_null_widening_identity() {
         let source = parsed("");
         let file = FileId::new(43);
@@ -1710,8 +1778,9 @@ mod tests {
     #[test]
     fn cross_source_retry_diagnostic_publishes_when_its_owner_succeeds() {
         let first = parsed(concat!(
+            "type Blocked<T> = T; ",
             "const first: B = 1; ",
-            r#"const blocked: Array<string> = "";"#,
+            r#"const blocked: Blocked<{ value: string }> = "";"#,
         ));
         let second = parsed("type B = B;");
         let first_file = FileId::new(53);
@@ -1721,14 +1790,21 @@ mod tests {
             CanonicalCheckerOptions::default(),
         );
 
-        assert!(matches!(
-            context.check_source_file(first_file),
-            Err(SourceCheckError::DeclaredType(
-                DeclaredTypeError::TypeNodeUnavailable(
-                    TypeNodeUnavailable::TypeArgumentsUnsupported(_)
-                )
-            ))
-        ));
+        let result = context.check_source_file(first_file);
+        assert!(
+            matches!(
+                result,
+                Err(SourceCheckError::DeclaredType(
+                    DeclaredTypeError::TypeNodeUnavailable(
+                        TypeNodeUnavailable::UnsupportedSyntax {
+                            kind: SyntaxKind::TypeLiteral,
+                            ..
+                        }
+                    )
+                ))
+            ),
+            "unexpected first-file result: {result:?}"
+        );
         assert!(context.diagnostics().is_empty());
         assert!(!is_type_checked(&context, first_file));
         assert!(!is_type_checked(&context, second_file));
