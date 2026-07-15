@@ -93,6 +93,7 @@ pub enum TypeNodeUnavailable {
     UnsupportedUnionConstituentType(TypeId),
     InvalidCachedUnionType(TypeId),
     InvalidUnionAlias(SemanticSymbolId),
+    InvalidPreparedTypeQuery,
     LiteralTypeCapacity,
     ResolutionStackInvariant(SemanticSymbolId),
 }
@@ -170,6 +171,9 @@ fn type_construction_error(error: LiteralTypeCacheError) -> DeclaredTypeError {
         }
         LiteralTypeCacheError::InvalidUnionAlias(symbol) => {
             type_node_unavailable(TypeNodeUnavailable::InvalidUnionAlias(symbol))
+        }
+        LiteralTypeCacheError::InvalidPreparedQuery => {
+            type_node_unavailable(TypeNodeUnavailable::InvalidPreparedTypeQuery)
         }
         LiteralTypeCacheError::Capacity => {
             type_node_unavailable(TypeNodeUnavailable::LiteralTypeCapacity)
@@ -668,7 +672,17 @@ impl<'store, 'host, 'arena> TypeQueryPlanner<'store, 'host, 'arena> {
                         LiteralTypeCacheError::InvalidCachedUnion(declared_type),
                     ));
                 }
-                return Ok(());
+                let is_canonical_cycle_error = self
+                    .store
+                    .intrinsic_bootstrap()
+                    .is_some_and(|bootstrap| declared_type == bootstrap.error_type);
+                return if is_canonical_cycle_error {
+                    Ok(())
+                } else {
+                    Err(type_node_unavailable(
+                        TypeNodeUnavailable::InvalidCachedTypeAlias(root_symbol),
+                    ))
+                };
             }
             let has_host_declaration = self
                 .store
@@ -1265,8 +1279,8 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         );
         planner.plan_type_node(node)?;
         let plan = planner.finish();
-        let prepared = self.prepare_literal_types(&plan)?;
-        self.execute_type_node(node, &plan, prepared)
+        let mut prepared = self.prepare_literal_types(&plan)?;
+        self.execute_type_node(node, &plan, &mut prepared)
     }
 
     /// Resolves the declared type identity of one symbol.
@@ -1298,8 +1312,8 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             planner.plan_type_alias(symbol, false)?;
         }
         let plan = planner.finish();
-        let prepared = self.prepare_literal_types(&plan)?;
-        self.execute_declared_type(symbol, &plan, prepared)
+        let mut prepared = self.prepare_literal_types(&plan)?;
+        self.execute_declared_type(symbol, &plan, &mut prepared)
     }
 
     fn prepare_literal_types(
@@ -1387,7 +1401,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         &mut self,
         symbol: SemanticSymbolId,
         plan: &TypeQueryPlan,
-        prepared: PreparedTypeQueryTypes,
+        prepared: &mut PreparedTypeQueryTypes,
     ) -> Result<TypeId, DeclaredTypeError> {
         let flags = self.symbol_flags(symbol)?;
         let error_type = self
@@ -1436,7 +1450,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         &mut self,
         symbol: SemanticSymbolId,
         plan: &TypeQueryPlan,
-        prepared: PreparedTypeQueryTypes,
+        prepared: &mut PreparedTypeQueryTypes,
     ) -> Result<TypeId, DeclaredTypeError> {
         if let Some(cached) = cached_type_alias(
             self.store,
@@ -1541,7 +1555,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         &mut self,
         node: NodeRef,
         plan: &TypeQueryPlan,
-        prepared: PreparedTypeQueryTypes,
+        prepared: &mut PreparedTypeQueryTypes,
     ) -> Result<TypeId, DeclaredTypeError> {
         let record = preflight_node(self.store, self.host, node)?;
         match record.kind {
@@ -1583,7 +1597,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         &mut self,
         node: NodeRef,
         plan: &TypeQueryPlan,
-        prepared: PreparedTypeQueryTypes,
+        prepared: &mut PreparedTypeQueryTypes,
     ) -> Result<TypeId, DeclaredTypeError> {
         if let Some(resolved_type) = self
             .store
@@ -1706,7 +1720,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         &mut self,
         node: NodeRef,
         plan: &TypeQueryPlan,
-        prepared: PreparedTypeQueryTypes,
+        prepared: &mut PreparedTypeQueryTypes,
     ) -> Result<TypeId, DeclaredTypeError> {
         if let Some(resolved_type) = self
             .store
@@ -3002,6 +3016,34 @@ mod tests {
     }
 
     #[test]
+    fn literal_preflight_rejects_symbol_bearing_cached_regular_before_query_writes() {
+        let mut fixture = fixture("type Bad = 0 | 1;");
+        let bad = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Bad");
+        let zero = fixture.store.intrinsic_bootstrap().unwrap().zero_type;
+        assert!(fixture.store.set_type_symbol(zero, Some(bad)));
+        let before = union_state(&fixture.store);
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        assert_eq!(
+            query_declared(
+                &mut fixture,
+                bad,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Err(DeclaredTypeError::TypeNodeUnavailable(
+                TypeNodeUnavailable::InvalidCachedLiteralType(zero)
+            ))
+        );
+        assert_eq!(union_state(&fixture.store), before);
+        assert!(diagnostics.is_empty());
+        let TypeData::Literal(zero_data) = fixture.store.type_payload(zero).unwrap().data() else {
+            panic!("zeroType must remain a literal")
+        };
+        assert_eq!(zero_data.fresh_type, None);
+    }
+
+    #[test]
     fn cached_alias_union_requires_its_exact_alias_owner_before_writes_and_retries() {
         let mut fixture = fixture("type Seed = string | number; type Result = Seed | boolean;");
         let seed = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Seed");
@@ -3523,7 +3565,77 @@ mod tests {
     }
 
     #[test]
-    fn one_query_scans_the_global_union_cache_once_for_multiple_union_executions() {
+    fn cached_alias_cycle_accepts_only_the_canonical_error_result() {
+        let source = "type A = B; type B = A; type Result = A | number;";
+        let mut cold = fixture(source);
+        let cold_result = named_symbol(&cold, SyntaxKind::TypeAliasDeclaration, "Result");
+        let cold_error = cold.store.intrinsic_bootstrap().unwrap().error_type;
+        let mut cold_diagnostics = CanonicalCheckerDiagnostics::default();
+        assert_eq!(
+            query_declared(
+                &mut cold,
+                cold_result,
+                CanonicalTypeQueryOptions::default(),
+                &mut cold_diagnostics,
+            ),
+            Ok(cold_error)
+        );
+        assert_eq!(cold_diagnostics.len(), 2);
+        assert!(
+            cold_diagnostics
+                .as_slice()
+                .iter()
+                .all(|diagnostic| diagnostic.diagnostic.code() == 2456)
+        );
+
+        let mut warm = fixture(source);
+        let a = named_symbol(&warm, SyntaxKind::TypeAliasDeclaration, "A");
+        let b = named_symbol(&warm, SyntaxKind::TypeAliasDeclaration, "B");
+        let result = named_symbol(&warm, SyntaxKind::TypeAliasDeclaration, "Result");
+        let a_reference = alias_parts(&warm, "A").2;
+        let b_reference = alias_parts(&warm, "B").2;
+        let string_type = warm.store.intrinsic_bootstrap().unwrap().string_type;
+        for (alias, reference, target) in [(a, a_reference, b), (b, b_reference, a)] {
+            assert!(warm.store.set_type_alias_links(
+                alias,
+                TypeAliasLinks {
+                    declared_type: Some(string_type),
+                    ..TypeAliasLinks::default()
+                }
+            ));
+            assert!(warm.store.set_type_node_links(
+                reference,
+                TypeNodeLinks {
+                    resolved_type: Some(string_type),
+                    ..TypeNodeLinks::default()
+                }
+            ));
+            assert!(warm.store.set_symbol_node_links(
+                reference,
+                SymbolNodeLinks {
+                    resolved_symbol: Some(target),
+                }
+            ));
+        }
+        let before = union_state(&warm.store);
+        let mut warm_diagnostics = CanonicalCheckerDiagnostics::default();
+        assert_eq!(
+            query_declared(
+                &mut warm,
+                result,
+                CanonicalTypeQueryOptions::default(),
+                &mut warm_diagnostics,
+            ),
+            Err(DeclaredTypeError::TypeNodeUnavailable(
+                TypeNodeUnavailable::InvalidCachedTypeAlias(a)
+            ))
+        );
+        assert_eq!(union_state(&warm.store), before);
+        assert!(warm_diagnostics.is_empty());
+    }
+
+    #[test]
+    fn trusted_union_queries_skip_global_scans_and_dirty_state_scans_once() {
         let mut fixture = fixture("type Many = (1 | 2) | (3 | 4) | 5;");
         assert!(
             fixture
@@ -3546,6 +3658,20 @@ mod tests {
             )
             .is_ok()
         );
+        assert_eq!(fixture.store.union_cache_validation_scan_count(), before);
+        fixture.store.mark_union_cache_validation_dirty();
+        fixture
+            .store
+            .prepare_type_query_types(&[], &[], &[], 1, 0)
+            .unwrap();
+        assert_eq!(
+            fixture.store.union_cache_validation_scan_count(),
+            before + 1
+        );
+        fixture
+            .store
+            .prepare_type_query_types(&[], &[], &[], 1, 0)
+            .unwrap();
         assert_eq!(
             fixture.store.union_cache_validation_scan_count(),
             before + 1

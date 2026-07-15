@@ -129,6 +129,7 @@ pub struct SemanticStore<TypePayload, MapperPayload> {
     relations: RelationCaches,
     pub(super) intrinsic_bootstrap: Option<IntrinsicBootstrap>,
     claimed_strict_builtin_iterator_return: Option<bool>,
+    pub(super) union_cache_needs_validation: bool,
     #[cfg(test)]
     pub(super) union_cache_validation_scans: usize,
 }
@@ -178,6 +179,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             relations: RelationCaches::default(),
             intrinsic_bootstrap: None,
             claimed_strict_builtin_iterator_return: None,
+            union_cache_needs_validation: false,
             #[cfg(test)]
             union_cache_validation_scans: 0,
         }
@@ -473,6 +475,12 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         self.type_aliases.try_reserve(additional)
     }
 
+    pub(super) fn mark_union_cache_validation_dirty(&mut self) {
+        if self.intrinsic_bootstrap.is_some() {
+            self.union_cache_needs_validation = true;
+        }
+    }
+
     #[must_use]
     pub fn types(&self) -> impl ExactSizeIterator<Item = (TypeId, &TypePayload)> {
         self.types.iter()
@@ -545,7 +553,9 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             cursor = next;
         }
 
-        Ok(self.merged_symbols.insert(source, target))
+        let previous = self.merged_symbols.insert(source, target);
+        self.mark_union_cache_validation_dirty();
+        Ok(previous)
     }
 
     /// Returns a symbol's raw parent after exactly one merged redirect.
@@ -622,7 +632,11 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         flags: SymbolFlags,
         check_flags: CheckFlags,
     ) -> bool {
-        self.symbols.set_symbol_flags(symbol, flags, check_flags)
+        if !self.symbols.set_symbol_flags(symbol, flags, check_flags) {
+            return false;
+        }
+        self.mark_union_cache_validation_dirty();
+        true
     }
 
     pub fn set_symbol_declarations(

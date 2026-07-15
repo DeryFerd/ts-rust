@@ -665,6 +665,7 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
             return false;
         };
         record.type_arguments = type_arguments;
+        self.mark_union_cache_validation_dirty();
         true
     }
 
@@ -1159,6 +1160,7 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
             return false;
         };
         record.object_flags = object_flags;
+        self.mark_union_cache_validation_dirty();
         true
     }
 
@@ -1198,6 +1200,7 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
             return false;
         };
         record.flags = candidate;
+        self.mark_union_cache_validation_dirty();
         true
     }
 
@@ -1217,6 +1220,7 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
             return false;
         };
         target_record.flags = source_flags;
+        self.mark_union_cache_validation_dirty();
         true
     }
 
@@ -1231,6 +1235,7 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
             return false;
         };
         record.symbol = symbol;
+        self.mark_union_cache_validation_dirty();
         true
     }
 
@@ -1242,6 +1247,7 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
             return false;
         };
         record.alias = alias;
+        self.mark_union_cache_validation_dirty();
         true
     }
 
@@ -1757,6 +1763,7 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         data.origin = origin;
         data.key_property_name = key_property_name;
         data.constituent_map = constituent_map;
+        self.mark_union_cache_validation_dirty();
         true
     }
 
@@ -1845,6 +1852,7 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         };
         data.fresh_type = fresh_type;
         data.regular_type = regular_type;
+        self.mark_union_cache_validation_dirty();
         true
     }
 
