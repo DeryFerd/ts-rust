@@ -563,14 +563,20 @@ impl<'a> FlowBuilder<'a> {
         if let Some(expression) = expression {
             let saved_current = self.current;
             let Some(pre_switch_case_flow) = self.pre_switch_case_flow else {
-                self.bind_statement_list(&statements);
+                self.bind_case_statements(&statements);
                 return;
             };
             self.current = Some(pre_switch_case_flow);
             self.bind_node(expression);
             self.current = saved_current;
         }
-        self.bind_statement_list(&statements);
+        self.bind_case_statements(&statements);
+    }
+
+    fn bind_case_statements(&mut self, statements: &[NodeId]) {
+        for statement in statements {
+            self.bind_node(*statement);
+        }
     }
 
     fn case_block_has_default(&self, case_block: NodeId) -> bool {

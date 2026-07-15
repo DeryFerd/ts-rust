@@ -4211,6 +4211,68 @@ mod tests {
     }
 
     #[test]
+    fn case_statements_allocate_detached_function_flow_in_source_order() {
+        let parsed = parse_source_file(
+            r"
+                switch (subject) {
+                    default:
+                        before = 1;
+                        function detached() { inside = 1; }
+                        after = 1;
+                }
+            ",
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(53);
+        let result = bind_source_file_in_file(&parsed.arena, parsed.source_file, file);
+        let graph = result
+            .flow_graph(&parsed.arena, parsed.source_file)
+            .unwrap();
+        assert!(graph.is_complete(), "{:?}", graph.unsupported());
+
+        let switch_statement = source_statements(&parsed.arena, parsed.source_file)[0];
+        let statements = clause_statements(
+            &parsed.arena,
+            switch_clauses(&parsed.arena, switch_statement)[0],
+        );
+        let assignment_left = |statement| {
+            let NodeData::ExpressionStatement(expression) =
+                &parsed.arena.get(statement).unwrap().data
+            else {
+                panic!("expected expression statement");
+            };
+            let NodeData::BinaryExpression(assignment) =
+                &parsed.arena.get(expression.expression).unwrap().data
+            else {
+                panic!("expected assignment");
+            };
+            assignment.left
+        };
+        let before = assignment_left(statements[0]);
+        let detached = statements[1];
+        let after = assignment_left(statements[2]);
+
+        let source_end = graph
+            .container_end(node_ref(&parsed.arena, file, parsed.source_file))
+            .unwrap();
+        let after_flow = graph.nodes().get(source_end).unwrap();
+        assert_eq!(
+            after_flow.payload,
+            Some(FlowNodePayload::Ast(node_ref(&parsed.arena, file, after)))
+        );
+        let before_flow_ref = after_flow.antecedent.unwrap();
+        assert_eq!(
+            graph.nodes().get(before_flow_ref).unwrap().payload,
+            Some(FlowNodePayload::Ast(node_ref(&parsed.arena, file, before)))
+        );
+        let detached_start = graph
+            .container_start(node_ref(&parsed.arena, file, detached))
+            .unwrap();
+        assert!(before_flow_ref.flow.0 < detached_start.flow.0);
+        assert!(detached_start.flow.0 < source_end.flow.0);
+    }
+
+    #[test]
     fn unsupported_nested_effects_invalidate_an_enclosing_conditional() {
         let parsed = parse_source_file(
             "const result = flag ? (() => { try { value = 1; } finally {} }) : 0;",
