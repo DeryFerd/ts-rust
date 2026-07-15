@@ -469,6 +469,7 @@ fn type_node_error_is_unsupported(error: &TypeNodeUnavailable) -> bool {
         | TypeNodeUnavailable::InvalidUnionType(_)
         | TypeNodeUnavailable::MissingPlannedUnionType(_)
         | TypeNodeUnavailable::InvalidCachedUnionType(_)
+        | TypeNodeUnavailable::InvalidCachedArrayType(_)
         | TypeNodeUnavailable::InvalidUnionAlias(_)
         | TypeNodeUnavailable::InvalidPreparedTypeQuery
         | TypeNodeUnavailable::LiteralTypeCapacity
@@ -6687,6 +6688,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // Keeps the invariant classifier matrix exhaustive.
     fn canonical_program_error_classification_rejects_invariant_failures() {
         let parsed = parse_source_file("const value: number = 1;");
         let file = FileId::new(7);
@@ -6767,6 +6769,12 @@ mod tests {
             },
             CanonicalProgramCheckError::SourceCheck {
                 file_name: "/project/input.ts".to_owned(),
+                error: SourceCheckError::DeclaredType(DeclaredTypeError::TypeNodeUnavailable(
+                    TypeNodeUnavailable::InvalidCachedArrayType(type_id),
+                )),
+            },
+            CanonicalProgramCheckError::SourceCheck {
+                file_name: "/project/input.ts".to_owned(),
                 error: SourceCheckError::RelationUnavailable(RelationUnavailable::MalformedUnion(
                     type_id,
                 )),
@@ -6788,6 +6796,12 @@ mod tests {
             CanonicalProgramCheckError::SourceCheck {
                 file_name: "/project/input.ts".to_owned(),
                 error: SourceCheckError::ArrayType(ArrayTypeError::InvalidReference(type_id)),
+            },
+            CanonicalProgramCheckError::SourceCheck {
+                file_name: "/project/input.ts".to_owned(),
+                error: SourceCheckError::LiteralCache(SourceLiteralCacheError::ArrayType(
+                    ArrayTypeError::InvalidReference(type_id),
+                )),
             },
             CanonicalProgramCheckError::SourceCheck {
                 file_name: "/project/input.ts".to_owned(),
