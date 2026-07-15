@@ -8,16 +8,17 @@
 //! to a cache record.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     hash::Hash,
     marker::PhantomData,
-    num::NonZeroU64,
+    num::{NonZeroU32, NonZeroU64},
     ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign, Not},
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use ts_ast::NodeRef;
+use ts_ast::{FileId, NodeRef};
 use ts_binder::{EscapedName, SemanticStoreId, SemanticSymbolId, SymbolFlags};
+use ts_jsnum::{Number, PseudoBigInt};
 
 use super::{SignatureId, TypeId, TypeMapperId, type_records::CacheHashKey, types::VarianceFlags};
 
@@ -502,6 +503,316 @@ pub struct MarkedAssignmentSymbolLinks {
     pub has_definite_assignment: bool,
 }
 
+/// Exact value alternatives admitted by `evaluator.Result.Value`.
+///
+/// The upstream field is `any`, but its evaluator operations define these
+/// four concrete alternatives. Absence is represented by
+/// [`EvaluatorResult::value`] being `None`, rather than by a fabricated enum
+/// constant.
+#[derive(Clone, Debug, PartialEq)]
+pub enum EvaluatorValue {
+    String(String),
+    Number(Number),
+    Boolean(bool),
+    BigInt(PseudoBigInt),
+}
+
+/// Cached result of the pinned constant evaluator.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct EvaluatorResult {
+    pub value: Option<EvaluatorValue>,
+    pub is_syntactically_string: bool,
+    pub resolved_other_files: bool,
+    pub has_external_references: bool,
+}
+
+/// Constant-evaluation links attached to an enum-member declaration.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct EnumMemberLinks {
+    pub value: EvaluatorResult,
+}
+
+/// Validated identity of one Program source-file root.
+///
+/// Construction remains private to [`super::SemanticStore`], which verifies
+/// the exact arena node, root parent, file slot, and AST registration before
+/// issuing this token.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct SourceFileRef(NodeRef);
+
+impl SourceFileRef {
+    pub(super) const fn new(node: NodeRef) -> Self {
+        Self(node)
+    }
+
+    #[must_use]
+    pub const fn node_ref(self) -> NodeRef {
+        self.0
+    }
+
+    #[must_use]
+    pub const fn file(self) -> FileId {
+        self.0.file
+    }
+}
+
+/// Store-branded identity of a checker-owned isolated entity-name node.
+///
+/// The pinned checker parses JSX factory names into fresh synthetic ASTs, so
+/// these identities intentionally do not pretend to belong to a source-file
+/// [`NodeRef`] arena.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct EntityNameRef {
+    owner: SemanticStoreId,
+    index: NonZeroU32,
+}
+
+impl EntityNameRef {
+    pub(super) const fn new(owner: SemanticStoreId, index: NonZeroU32) -> Self {
+        Self { owner, index }
+    }
+
+    pub(super) const fn owner(self) -> SemanticStoreId {
+        self.owner
+    }
+
+    pub(super) const fn index(self) -> usize {
+        self.index.get() as usize - 1
+    }
+}
+
+/// Exact checker-owned `EntityName` tree payload.
+///
+/// Every qualified name points to an entity-name left child and an identifier
+/// right child in the same store. All nodes are intrinsically synthetic.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum EntityNameNode {
+    Identifier {
+        text: String,
+    },
+    QualifiedName {
+        left: EntityNameRef,
+        right: EntityNameRef,
+    },
+}
+
+/// Nil or allocated symbol slice.
+///
+/// A present cache entry can still contain a nil slice in Go. `Allocated([])`
+/// is therefore deliberately distinct from `Nil`.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum OptionalSymbolSequence {
+    #[default]
+    Nil,
+    Allocated(Vec<SemanticSymbolId>),
+}
+
+impl OptionalSymbolSequence {
+    #[must_use]
+    pub fn as_slice(&self) -> Option<&[SemanticSymbolId]> {
+        match self {
+            Self::Nil => None,
+            Self::Allocated(symbols) => Some(symbols),
+        }
+    }
+}
+
+/// Exact pointer-and-slice state of `ContainingSymbolLinks.extendedContainers`.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum ExtendedContainersState {
+    #[default]
+    Uncomputed,
+    Computed(OptionalSymbolSequence),
+}
+
+/// Cache key for one accessible symbol chain.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct AccessibleChainCacheKey {
+    pub use_only_external_aliasing: bool,
+    pub location: Option<NodeRef>,
+    pub meaning: SymbolFlags,
+}
+
+/// Accessibility and alternate-container links attached to one symbol.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ContainingSymbolLinks {
+    /// `None` is a nil map; `Some({})` is an allocated empty map. File keys
+    /// are validated source roots and each symbol sequence preserves order.
+    pub extended_containers_by_file: Option<HashMap<SourceFileRef, OptionalSymbolSequence>>,
+    pub extended_containers: ExtendedContainersState,
+    /// A present key with `Nil` is the pinned cached-miss state;
+    /// `Allocated([])` remains a distinct representable slice.
+    pub accessible_chain_cache: Option<HashMap<AccessibleChainCacheKey, OptionalSymbolSequence>>,
+}
+
+/// Emit-helper requests recorded per source file.
+///
+/// Bit positions and aliases match the pinned `ExternalEmitHelpers` exactly.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+#[repr(transparent)]
+pub struct ExternalEmitHelpers(u32);
+
+impl ExternalEmitHelpers {
+    pub const NONE: Self = Self(0);
+    pub const REST: Self = Self(1 << 0);
+    pub const DECORATE: Self = Self(1 << 1);
+    pub const METADATA: Self = Self(1 << 2);
+    pub const PARAM: Self = Self(1 << 3);
+    pub const AWAITER: Self = Self(1 << 4);
+    pub const AWAIT: Self = Self(1 << 5);
+    pub const ASYNC_GENERATOR: Self = Self(1 << 6);
+    pub const ASYNC_DELEGATOR: Self = Self(1 << 7);
+    pub const ASYNC_VALUES: Self = Self(1 << 8);
+    pub const EXPORT_STAR: Self = Self(1 << 9);
+    pub const IMPORT_STAR: Self = Self(1 << 10);
+    pub const IMPORT_DEFAULT: Self = Self(1 << 11);
+    pub const MAKE_TEMPLATE_OBJECT: Self = Self(1 << 12);
+    pub const CLASS_PRIVATE_FIELD_GET: Self = Self(1 << 13);
+    pub const CLASS_PRIVATE_FIELD_SET: Self = Self(1 << 14);
+    pub const CLASS_PRIVATE_FIELD_IN: Self = Self(1 << 15);
+    pub const SET_FUNCTION_NAME: Self = Self(1 << 16);
+    pub const PROP_KEY: Self = Self(1 << 17);
+    pub const ADD_DISPOSABLE_RESOURCE_AND_DISPOSE_RESOURCES: Self = Self(1 << 18);
+    pub const REWRITE_RELATIVE_IMPORT_EXTENSION: Self = Self(1 << 19);
+
+    pub const ES_DECORATE_AND_RUN_INITIALIZERS: Self = Self::DECORATE;
+    pub const FIRST_EMIT_HELPER: Self = Self::REST;
+    pub const LAST_EMIT_HELPER: Self = Self::REWRITE_RELATIVE_IMPORT_EXTENSION;
+    pub const FOR_AWAIT_OF_INCLUDES: Self = Self::ASYNC_VALUES;
+    pub const ASYNC_GENERATOR_INCLUDES: Self = Self(Self::AWAIT.0 | Self::ASYNC_GENERATOR.0);
+    pub const ASYNC_DELEGATOR_INCLUDES: Self =
+        Self(Self::AWAIT.0 | Self::ASYNC_DELEGATOR.0 | Self::ASYNC_VALUES.0);
+
+    #[must_use]
+    pub const fn bits(self) -> u32 {
+        self.0
+    }
+
+    #[must_use]
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    #[must_use]
+    pub const fn intersects(self, other: Self) -> bool {
+        self.0 & other.0 != 0
+    }
+}
+
+impl BitOr for ExternalEmitHelpers {
+    type Output = Self;
+
+    fn bitor(self, rhs: Self) -> Self::Output {
+        Self(self.0 | rhs.0)
+    }
+}
+
+impl BitOrAssign for ExternalEmitHelpers {
+    fn bitor_assign(&mut self, rhs: Self) {
+        self.0 |= rhs.0;
+    }
+}
+
+impl BitAnd for ExternalEmitHelpers {
+    type Output = Self;
+
+    fn bitand(self, rhs: Self) -> Self::Output {
+        Self(self.0 & rhs.0)
+    }
+}
+
+impl BitAndAssign for ExternalEmitHelpers {
+    fn bitand_assign(&mut self, rhs: Self) {
+        self.0 &= rhs.0;
+    }
+}
+
+impl Not for ExternalEmitHelpers {
+    type Output = Self;
+
+    fn not(self) -> Self::Output {
+        Self(!self.0)
+    }
+}
+
+/// Insertion-ordered node set preserving its unallocated zero state.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct OrderedNodeSet {
+    values: Vec<NodeRef>,
+    members: Option<HashSet<NodeRef>>,
+}
+
+impl OrderedNodeSet {
+    /// Constructs an allocated empty set.
+    #[must_use]
+    pub fn allocated() -> Self {
+        Self {
+            values: Vec::new(),
+            members: Some(HashSet::new()),
+        }
+    }
+
+    #[must_use]
+    pub const fn is_allocated(&self) -> bool {
+        self.members.is_some()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.values.len()
+    }
+
+    pub fn insert(&mut self, node: NodeRef) -> bool {
+        let members = self.members.get_or_insert_with(HashSet::new);
+        if !members.insert(node) {
+            return false;
+        }
+        self.values.push(node);
+        true
+    }
+
+    pub fn clear(&mut self) {
+        self.values.clear();
+        if let Some(members) = &mut self.members {
+            members.clear();
+        }
+    }
+
+    #[must_use]
+    pub fn contains(&self, node: &NodeRef) -> bool {
+        self.members
+            .as_ref()
+            .is_some_and(|members| members.contains(node))
+    }
+
+    #[must_use]
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = &NodeRef> {
+        self.values.iter()
+    }
+}
+
+/// Checker state owned by one source file.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SourceFileLinks {
+    pub type_checked: bool,
+    pub unused_checked: bool,
+    pub external_helpers_module: Option<SemanticSymbolId>,
+    pub requested_external_emit_helpers: ExternalEmitHelpers,
+    pub deferred_nodes: OrderedNodeSet,
+    /// `None` is a nil slice; `Some([])` is allocated empty.
+    pub identifier_check_nodes: Option<Vec<NodeRef>>,
+    pub local_jsx_namespace: String,
+    pub local_jsx_fragment_namespace: String,
+    pub local_jsx_factory: Option<EntityNameRef>,
+    pub local_jsx_fragment_factory: Option<EntityNameRef>,
+    pub jsx_fragment_type: Option<TypeId>,
+}
+
 #[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
 struct LinkStoreId(NonZeroU64);
 
@@ -923,6 +1234,7 @@ pub(super) struct CheckerLinkStores {
     pub(super) node: LinkStore<NodeRef, NodeLinks>,
     pub(super) symbol_node: LinkStore<NodeRef, SymbolNodeLinks>,
     pub(super) type_node: LinkStore<NodeRef, TypeNodeLinks>,
+    pub(super) enum_member: LinkStore<NodeRef, EnumMemberLinks>,
     pub(super) assertion: LinkStore<NodeRef, AssertionLinks>,
     pub(super) array_literal: LinkStore<NodeRef, ArrayLiteralLinks>,
     pub(super) switch_statement: LinkStore<NodeRef, SwitchStatementLinks>,
@@ -943,15 +1255,18 @@ pub(super) struct CheckerLinkStores {
     pub(super) variance: LinkStore<SemanticSymbolId, VarianceLinks>,
     pub(super) reverse_mapped_symbol: LinkStore<SemanticSymbolId, ReverseMappedSymbolLinks>,
     pub(super) marked_assignment_symbol: LinkStore<SemanticSymbolId, MarkedAssignmentSymbolLinks>,
+    pub(super) containing_symbol: LinkStore<SemanticSymbolId, ContainingSymbolLinks>,
+    pub(super) source_file: LinkStore<SourceFileRef, SourceFileLinks>,
 }
 
 impl CheckerLinkStores {
     #[must_use]
-    pub(super) fn allocated_lengths(&self) -> [usize; 23] {
+    pub(super) fn allocated_lengths(&self) -> [usize; 26] {
         [
             self.node.allocated_len(),
             self.symbol_node.allocated_len(),
             self.type_node.allocated_len(),
+            self.enum_member.allocated_len(),
             self.assertion.allocated_len(),
             self.array_literal.allocated_len(),
             self.switch_statement.allocated_len(),
@@ -972,6 +1287,8 @@ impl CheckerLinkStores {
             self.variance.allocated_len(),
             self.reverse_mapped_symbol.allocated_len(),
             self.marked_assignment_symbol.allocated_len(),
+            self.containing_symbol.allocated_len(),
+            self.source_file.allocated_len(),
         ]
     }
 }
@@ -980,15 +1297,19 @@ impl CheckerLinkStores {
 mod tests {
     use std::collections::HashMap;
 
+    use ts_ast::{FileId, NodeArena, NodeId, NodeRef};
     use ts_binder::SymbolFlags;
+    use ts_jsnum::{Number, PseudoBigInt};
 
     use super::{
-        AliasTargetState, ArrayLiteralLinks, CacheHashKey, DecoratorSignatureState,
-        DeferredSymbolLinks, EffectsSignatureState, ExhaustiveState, JsxFlags, LinkStore,
-        MembersAndExportsLinks, MembersOrExportsResolutionKind, ModuleSymbolLinks, NodeCheckFlags,
-        ResolvedSignatureState, SwitchStatementLinks, Tristate, TypeAliasLinks,
-        TypeResolutionStack, TypeResolutionTarget, TypeSystemPropertyName, VarianceFlags,
-        VarianceLinks,
+        AliasTargetState, ArrayLiteralLinks, CacheHashKey, ContainingSymbolLinks,
+        DecoratorSignatureState, DeferredSymbolLinks, EffectsSignatureState, EnumMemberLinks,
+        EvaluatorResult, EvaluatorValue, ExhaustiveState, ExtendedContainersState,
+        ExternalEmitHelpers, JsxFlags, LinkStore, MembersAndExportsLinks,
+        MembersOrExportsResolutionKind, ModuleSymbolLinks, NodeCheckFlags, OptionalSymbolSequence,
+        OrderedNodeSet, ResolvedSignatureState, SourceFileLinks, SwitchStatementLinks, Tristate,
+        TypeAliasLinks, TypeResolutionStack, TypeResolutionTarget, TypeSystemPropertyName,
+        VarianceFlags, VarianceLinks,
     };
 
     #[test]
@@ -1123,6 +1444,138 @@ mod tests {
         };
         assert_ne!(allocated_empty_module_map, ModuleSymbolLinks::default());
         assert_eq!(MembersAndExportsLinks::default().tables, [None, None]);
+
+        assert_eq!(EnumMemberLinks::default().value, EvaluatorResult::default());
+        assert_eq!(
+            ContainingSymbolLinks::default().extended_containers_by_file,
+            None
+        );
+        assert_eq!(
+            ContainingSymbolLinks::default().extended_containers,
+            ExtendedContainersState::Uncomputed
+        );
+        assert_eq!(
+            ContainingSymbolLinks::default().accessible_chain_cache,
+            None
+        );
+
+        let source = SourceFileLinks::default();
+        assert!(!source.type_checked);
+        assert!(!source.unused_checked);
+        assert_eq!(
+            source.requested_external_emit_helpers,
+            ExternalEmitHelpers::NONE
+        );
+        assert!(!source.deferred_nodes.is_allocated());
+        assert_eq!(source.identifier_check_nodes, None);
+        assert_eq!(source.local_jsx_namespace, "");
+        assert_eq!(source.local_jsx_fragment_namespace, "");
+
+        assert_ne!(
+            OptionalSymbolSequence::Nil,
+            OptionalSymbolSequence::Allocated(Vec::new())
+        );
+        assert_ne!(
+            ExtendedContainersState::Uncomputed,
+            ExtendedContainersState::Computed(OptionalSymbolSequence::Nil)
+        );
+        assert_ne!(
+            ExtendedContainersState::Computed(OptionalSymbolSequence::Nil),
+            ExtendedContainersState::Computed(OptionalSymbolSequence::Allocated(Vec::new()))
+        );
+    }
+
+    #[test]
+    fn evaluator_result_preserves_every_pinned_value_alternative_and_metadata() {
+        let values = [
+            EvaluatorValue::String("value".into()),
+            EvaluatorValue::Number(Number::new(-0.0)),
+            EvaluatorValue::Boolean(true),
+            EvaluatorValue::BigInt(PseudoBigInt::parse_valid("123n")),
+        ];
+        for value in values {
+            let result = EvaluatorResult {
+                value: Some(value.clone()),
+                is_syntactically_string: true,
+                resolved_other_files: true,
+                has_external_references: true,
+            };
+            assert_eq!(result.value, Some(value));
+            assert!(result.is_syntactically_string);
+            assert!(result.resolved_other_files);
+            assert!(result.has_external_references);
+        }
+    }
+
+    #[test]
+    fn external_emit_helper_flags_preserve_all_bits_and_composites() {
+        let flags = [
+            ExternalEmitHelpers::REST,
+            ExternalEmitHelpers::DECORATE,
+            ExternalEmitHelpers::METADATA,
+            ExternalEmitHelpers::PARAM,
+            ExternalEmitHelpers::AWAITER,
+            ExternalEmitHelpers::AWAIT,
+            ExternalEmitHelpers::ASYNC_GENERATOR,
+            ExternalEmitHelpers::ASYNC_DELEGATOR,
+            ExternalEmitHelpers::ASYNC_VALUES,
+            ExternalEmitHelpers::EXPORT_STAR,
+            ExternalEmitHelpers::IMPORT_STAR,
+            ExternalEmitHelpers::IMPORT_DEFAULT,
+            ExternalEmitHelpers::MAKE_TEMPLATE_OBJECT,
+            ExternalEmitHelpers::CLASS_PRIVATE_FIELD_GET,
+            ExternalEmitHelpers::CLASS_PRIVATE_FIELD_SET,
+            ExternalEmitHelpers::CLASS_PRIVATE_FIELD_IN,
+            ExternalEmitHelpers::SET_FUNCTION_NAME,
+            ExternalEmitHelpers::PROP_KEY,
+            ExternalEmitHelpers::ADD_DISPOSABLE_RESOURCE_AND_DISPOSE_RESOURCES,
+            ExternalEmitHelpers::REWRITE_RELATIVE_IMPORT_EXTENSION,
+        ];
+        for (index, flag) in flags.into_iter().enumerate() {
+            assert_eq!(flag.bits(), 1 << index);
+        }
+        assert_eq!(ExternalEmitHelpers::FIRST_EMIT_HELPER, flags[0]);
+        assert_eq!(ExternalEmitHelpers::LAST_EMIT_HELPER, flags[19]);
+        assert_eq!(
+            ExternalEmitHelpers::ES_DECORATE_AND_RUN_INITIALIZERS,
+            ExternalEmitHelpers::DECORATE
+        );
+        assert_eq!(
+            ExternalEmitHelpers::FOR_AWAIT_OF_INCLUDES,
+            ExternalEmitHelpers::ASYNC_VALUES
+        );
+        assert_eq!(
+            ExternalEmitHelpers::ASYNC_GENERATOR_INCLUDES.bits(),
+            (1 << 5) | (1 << 6)
+        );
+        assert_eq!(
+            ExternalEmitHelpers::ASYNC_DELEGATOR_INCLUDES.bits(),
+            (1 << 5) | (1 << 7) | (1 << 8)
+        );
+        let mut requested = ExternalEmitHelpers::REST | ExternalEmitHelpers::IMPORT_STAR;
+        requested &= !ExternalEmitHelpers::REST;
+        assert_eq!(requested, ExternalEmitHelpers::IMPORT_STAR);
+    }
+
+    #[test]
+    fn ordered_node_set_preserves_insertion_order_uniqueness_and_allocation_state() {
+        let arena = NodeArena::new();
+        let first = NodeRef::new(arena.id(), FileId::new(1), NodeId::new(2));
+        let second = NodeRef::new(arena.id(), FileId::new(1), NodeId::new(3));
+        let mut nodes = OrderedNodeSet::default();
+        assert!(!nodes.is_allocated());
+        assert!(nodes.insert(first));
+        assert!(!nodes.insert(first));
+        assert!(nodes.insert(second));
+        assert_eq!(
+            nodes.iter().copied().collect::<Vec<_>>(),
+            vec![first, second]
+        );
+        nodes.clear();
+        assert!(nodes.is_allocated());
+        assert!(nodes.is_empty());
+        assert_ne!(nodes, OrderedNodeSet::default());
+        assert_eq!(nodes, OrderedNodeSet::allocated());
     }
 
     #[test]

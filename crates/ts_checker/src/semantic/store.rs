@@ -1,6 +1,11 @@
 //! Aggregate ownership and provenance validation for canonical semantic data.
 
-use ts_ast::NodeRef;
+use std::{
+    collections::{BTreeMap, HashSet},
+    num::NonZeroU32,
+};
+
+use ts_ast::{FileId, NodeArena, NodeArenaId, NodeData, NodeFlags, NodeId, NodeRef, SyntaxKind};
 use ts_binder::{
     AstScope, CheckFlags, EscapedName, SemanticStoreId, SemanticSymbolId, SymbolData, SymbolFlags,
     SymbolStore, SymbolTableId,
@@ -14,10 +19,12 @@ use super::{
         TypePredicateId, TypedArena,
     },
     links::{
-        AliasSymbolLinks, ArrayLiteralLinks, AssertionLinks, CheckerLinkStores, DeclaredTypeLinks,
-        DeferredSymbolLinks, ExportTypeLinks, JsxElementLinks, LateBoundLinks, MappedSymbolLinks,
-        MarkedAssignmentSymbolLinks, MembersAndExportsLinks, ModuleSymbolLinks, NodeLinks,
-        ReverseMappedSymbolLinks, SignatureLinks, SpreadLinks, SwitchStatementLinks,
+        AliasSymbolLinks, ArrayLiteralLinks, AssertionLinks, CheckerLinkStores,
+        ContainingSymbolLinks, DeclaredTypeLinks, DeferredSymbolLinks, EntityNameNode,
+        EntityNameRef, EnumMemberLinks, ExportTypeLinks, ExtendedContainersState, JsxElementLinks,
+        LateBoundLinks, MappedSymbolLinks, MarkedAssignmentSymbolLinks, MembersAndExportsLinks,
+        ModuleSymbolLinks, NodeLinks, OptionalSymbolSequence, ReverseMappedSymbolLinks,
+        SignatureLinks, SourceFileLinks, SourceFileRef, SpreadLinks, SwitchStatementLinks,
         SymbolNodeLinks, SymbolReferenceLinks, TypeAliasLinks, TypeNodeLinks,
         TypeResolutionBoundary, TypeResolutionStack, TypeResolutionTarget,
         TypeResolutionTargetError, TypeSystemPropertyName, ValueSymbolLinks, VarianceLinks,
@@ -29,6 +36,21 @@ use super::{
     },
     type_records::{CacheHashKey, ConditionalRoot, TypeAlias, TypeData, TypeRecord},
 };
+
+#[derive(Debug)]
+enum PreparedEntityName {
+    Identifier(String),
+    QualifiedName { left: Box<Self>, right: String },
+}
+
+impl PreparedEntityName {
+    fn node_count(&self) -> usize {
+        match self {
+            Self::Identifier(_) => 1,
+            Self::QualifiedName { left, .. } => left.node_count() + 2,
+        }
+    }
+}
 
 /// Sole allocator and owner of one canonical program's semantic graph.
 ///
@@ -44,6 +66,9 @@ pub struct SemanticStore<TypePayload, MapperPayload> {
     index_infos: IndexInfoArena,
     type_aliases: TypedArena<TypeAliasId, TypeAlias>,
     conditional_roots: TypedArena<ConditionalRootId, ConditionalRoot>,
+    entity_names: Vec<EntityNameNode>,
+    source_files: BTreeMap<FileId, SourceFileRef>,
+    source_files_by_arena: BTreeMap<NodeArenaId, SourceFileRef>,
     links: CheckerLinkStores,
     type_resolutions: TypeResolutionStack,
     relations: RelationCaches,
@@ -84,6 +109,9 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             index_infos: IndexInfoArena::new(id),
             type_aliases: TypedArena::new(id),
             conditional_roots: TypedArena::new(id),
+            entity_names: Vec::new(),
+            source_files: BTreeMap::new(),
+            source_files_by_arena: BTreeMap::new(),
             links: CheckerLinkStores::default(),
             type_resolutions: TypeResolutionStack::new(id),
             relations: RelationCaches::default(),
@@ -105,9 +133,155 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         self.symbols.register_ast_scope(scope)
     }
 
+    /// Registers and returns the validated identity of one source-file root.
+    ///
+    /// The root must be the arena's exact `SourceFile` payload with no parent.
+    /// File and arena cross-wiring is rejected before either provenance map or
+    /// the embedded symbol owner's AST registry is mutated.
+    pub fn register_source_file(
+        &mut self,
+        arena: &NodeArena,
+        source_file: NodeId,
+        file: FileId,
+    ) -> Option<SourceFileRef> {
+        let root = arena.get(source_file)?;
+        if root.kind != SyntaxKind::SourceFile
+            || !matches!(root.data, NodeData::SourceFile(_))
+            || root.parent.is_some()
+        {
+            return None;
+        }
+
+        let source = SourceFileRef::new(NodeRef::new(arena.id(), file, source_file));
+        if self
+            .source_files
+            .get(&file)
+            .is_some_and(|registered| *registered != source)
+            || self
+                .source_files_by_arena
+                .get(&arena.id())
+                .is_some_and(|registered| *registered != source)
+        {
+            return None;
+        }
+
+        if !self.symbols.register_ast_scope(AstScope::new(file, arena)) {
+            return None;
+        }
+        self.source_files.insert(file, source);
+        self.source_files_by_arena.insert(arena.id(), source);
+        Some(source)
+    }
+
+    /// Copies one exact standalone `Identifier | QualifiedName` tree into the
+    /// checker-owned synthetic entity-name arena.
+    ///
+    /// The entire kind/data/parent/child closure is preflighted before any
+    /// semantic allocation, matching the fresh AST returned by pinned
+    /// `parser.ParseIsolatedEntityName` without fabricating a source-file
+    /// [`NodeRef`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if the checker-owned entity-name identity space is exhausted.
+    pub fn register_entity_name(
+        &mut self,
+        arena: &NodeArena,
+        root: NodeId,
+    ) -> Option<EntityNameRef> {
+        let mut visited = HashSet::new();
+        let prepared = Self::prepare_entity_name(arena, root, None, &mut visited)?;
+        self.entity_names
+            .len()
+            .checked_add(prepared.node_count())
+            .and_then(|len| u32::try_from(len).ok())
+            .expect("entity-name identity space exhausted before allocation");
+        Some(self.allocate_prepared_entity_name(prepared))
+    }
+
+    #[must_use]
+    pub fn entity_name(&self, entity_name: EntityNameRef) -> Option<&EntityNameNode> {
+        (entity_name.owner() == self.id())
+            .then(|| self.entity_names.get(entity_name.index()))
+            .flatten()
+    }
+
+    #[must_use]
+    pub fn entity_name_len(&self) -> usize {
+        self.entity_names.len()
+    }
+
+    #[must_use]
+    pub fn contains_source_file(&self, source_file: SourceFileRef) -> bool {
+        self.source_files
+            .get(&source_file.file())
+            .is_some_and(|registered| *registered == source_file)
+            && self.contains_node_ref(source_file.node_ref())
+    }
+
     #[must_use]
     pub fn contains_node_ref(&self, node: NodeRef) -> bool {
         self.symbols.contains_node_ref(node)
+    }
+
+    fn prepare_entity_name(
+        arena: &NodeArena,
+        node: NodeId,
+        expected_parent: Option<NodeId>,
+        visited: &mut HashSet<NodeId>,
+    ) -> Option<PreparedEntityName> {
+        if !visited.insert(node) {
+            return None;
+        }
+        let node_data = arena.get(node)?;
+        if node_data.parent != expected_parent || node_data.flags != NodeFlags::default() {
+            return None;
+        }
+        match (&node_data.kind, &node_data.data) {
+            (SyntaxKind::Identifier, NodeData::Identifier(identifier))
+                if identifier.flow_node.is_none() && !identifier.text.is_empty() =>
+            {
+                Some(PreparedEntityName::Identifier(identifier.text.clone()))
+            }
+            (SyntaxKind::QualifiedName, NodeData::QualifiedName(qualified))
+                if qualified.flow_node.is_none() && qualified.facts == 0 =>
+            {
+                let left = Self::prepare_entity_name(arena, qualified.left, Some(node), visited)?;
+                let right = Self::prepare_entity_name(arena, qualified.right, Some(node), visited)?;
+                let PreparedEntityName::Identifier(right) = right else {
+                    return None;
+                };
+                Some(PreparedEntityName::QualifiedName {
+                    left: Box::new(left),
+                    right,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    fn allocate_prepared_entity_name(&mut self, prepared: PreparedEntityName) -> EntityNameRef {
+        let node = match prepared {
+            PreparedEntityName::Identifier(text) => EntityNameNode::Identifier { text },
+            PreparedEntityName::QualifiedName { left, right } => {
+                let left = self.allocate_prepared_entity_name(*left);
+                let right =
+                    self.allocate_entity_name_node(EntityNameNode::Identifier { text: right });
+                EntityNameNode::QualifiedName { left, right }
+            }
+        };
+        self.allocate_entity_name_node(node)
+    }
+
+    fn allocate_entity_name_node(&mut self, node: EntityNameNode) -> EntityNameRef {
+        let one_based = u32::try_from(self.entity_names.len())
+            .ok()
+            .and_then(|index| index.checked_add(1))
+            .and_then(NonZeroU32::new)
+            .expect("preflighted entity-name identity exists");
+        let entity_name = EntityNameRef::new(self.id(), one_based);
+        self.entity_names.push(node);
+        entity_name
     }
 
     /// Allocates a canonical type payload.
@@ -367,6 +541,29 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             return false;
         }
         self.links.type_node.replace_key(node, links);
+        true
+    }
+
+    #[must_use]
+    pub fn enum_member_links(&self, node: NodeRef) -> Option<&EnumMemberLinks> {
+        self.contains_node_ref(node)
+            .then(|| self.links.enum_member.try_get(&node))
+            .flatten()
+    }
+
+    pub fn ensure_enum_member_links(&mut self, node: NodeRef) -> bool {
+        if !self.contains_node_ref(node) {
+            return false;
+        }
+        self.links.enum_member.get(node);
+        true
+    }
+
+    pub fn set_enum_member_links(&mut self, node: NodeRef, links: EnumMemberLinks) -> bool {
+        if !self.contains_node_ref(node) {
+            return false;
+        }
+        self.links.enum_member.replace_key(node, links);
         true
     }
 
@@ -974,6 +1171,112 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         true
     }
 
+    #[must_use]
+    pub fn containing_symbol_links(
+        &self,
+        symbol: SemanticSymbolId,
+    ) -> Option<&ContainingSymbolLinks> {
+        self.symbols
+            .contains_symbol(symbol)
+            .then(|| self.links.containing_symbol.try_get(&symbol))
+            .flatten()
+    }
+
+    pub fn ensure_containing_symbol_links(&mut self, symbol: SemanticSymbolId) -> bool {
+        if !self.symbols.contains_symbol(symbol) {
+            return false;
+        }
+        self.links.containing_symbol.get(symbol);
+        true
+    }
+
+    pub fn set_containing_symbol_links(
+        &mut self,
+        symbol: SemanticSymbolId,
+        links: ContainingSymbolLinks,
+    ) -> bool {
+        let valid_extended = match &links.extended_containers {
+            ExtendedContainersState::Uncomputed
+            | ExtendedContainersState::Computed(OptionalSymbolSequence::Nil) => true,
+            ExtendedContainersState::Computed(OptionalSymbolSequence::Allocated(symbols)) => {
+                self.valid_symbols(symbols)
+            }
+        };
+        let valid_by_file = links
+            .extended_containers_by_file
+            .as_ref()
+            .is_none_or(|by_file| {
+                by_file.iter().all(|(source_file, symbols)| {
+                    self.contains_source_file(*source_file)
+                        && self.valid_optional_symbol_sequence(symbols)
+                })
+            });
+        let valid_accessible = links.accessible_chain_cache.as_ref().is_none_or(|cache| {
+            cache.iter().all(|(key, symbols)| {
+                self.valid_optional_node(key.location)
+                    && self.valid_optional_symbol_sequence(symbols)
+            })
+        });
+        if !self.symbols.contains_symbol(symbol)
+            || !valid_extended
+            || !valid_by_file
+            || !valid_accessible
+        {
+            return false;
+        }
+        self.links.containing_symbol.replace_key(symbol, links);
+        true
+    }
+
+    #[must_use]
+    pub fn source_file_links(&self, source_file: SourceFileRef) -> Option<&SourceFileLinks> {
+        self.contains_source_file(source_file)
+            .then(|| self.links.source_file.try_get(&source_file))
+            .flatten()
+    }
+
+    pub fn ensure_source_file_links(&mut self, source_file: SourceFileRef) -> bool {
+        if !self.contains_source_file(source_file) {
+            return false;
+        }
+        self.links.source_file.get(source_file);
+        true
+    }
+
+    pub fn set_source_file_links(
+        &mut self,
+        source_file: SourceFileRef,
+        links: SourceFileLinks,
+    ) -> bool {
+        let valid_deferred_nodes = links
+            .deferred_nodes
+            .iter()
+            .all(|node| self.valid_source_node(source_file, *node));
+        let valid_identifier_nodes = links.identifier_check_nodes.as_deref().is_none_or(|nodes| {
+            nodes
+                .iter()
+                .all(|node| self.valid_source_node(source_file, *node))
+        });
+        let valid_jsx_factory = links
+            .local_jsx_factory
+            .is_none_or(|entity| self.entity_name(entity).is_some());
+        let valid_jsx_fragment_factory = links
+            .local_jsx_fragment_factory
+            .is_none_or(|entity| self.entity_name(entity).is_some());
+        if !self.contains_source_file(source_file)
+            || !self.valid_optional_symbol(links.external_helpers_module)
+            || !valid_deferred_nodes
+            || !valid_identifier_nodes
+            || !valid_jsx_factory
+            || !valid_jsx_fragment_factory
+            || !self.valid_optional_type(links.jsx_fragment_type)
+        {
+            return false;
+        }
+        self.links.source_file.replace_key(source_file, links);
+        true
+    }
+
     /// Reads one exact relation-cache result without allocating the lazy map.
     ///
     /// Relation-key construction is intentionally outside this substrate. The
@@ -1097,7 +1400,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         self.type_resolutions.resolution_start()
     }
 
-    pub(super) fn checker_link_allocated_lengths(&self) -> [usize; 23] {
+    pub(super) fn checker_link_allocated_lengths(&self) -> [usize; 26] {
         self.links.allocated_lengths()
     }
 
@@ -1426,6 +1729,13 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         node.is_none_or(|node| self.contains_node_ref(node))
     }
 
+    fn valid_source_node(&self, source_file: SourceFileRef, node: NodeRef) -> bool {
+        let source = source_file.node_ref();
+        self.contains_source_file(source_file)
+            && self.contains_node_ref(node)
+            && node.is_for(source.arena, source.file)
+    }
+
     fn valid_types(&self, ids: &[TypeId]) -> bool {
         ids.iter().all(|id| self.types.get(*id).is_some())
     }
@@ -1444,6 +1754,12 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
 
     fn valid_optional_symbol(&self, id: Option<SemanticSymbolId>) -> bool {
         id.is_none_or(|id| self.symbols.contains_symbol(id))
+    }
+
+    fn valid_optional_symbol_sequence(&self, sequence: &OptionalSymbolSequence) -> bool {
+        sequence
+            .as_slice()
+            .is_none_or(|ids| self.valid_symbols(ids))
     }
 
     fn valid_optional_symbol_table(&self, id: Option<SymbolTableId>) -> bool {
@@ -1663,24 +1979,31 @@ fn canonical_type_resolution_property(
 mod tests {
     use std::collections::HashMap;
 
-    use ts_ast::{FileId, NodeRef};
+    use ts_ast::{
+        FileId, IdentifierData, Node, NodeArena, NodeData, NodeFlags, NodeId, NodeRef,
+        QualifiedNameData, SyntaxKind,
+    };
     use ts_binder::{EscapedName, SymbolData, SymbolFlags, SymbolStore};
+    use ts_core::TextRange;
     use ts_parser::parse_source_file;
 
     use super::{AstScope, SemanticStore};
     use crate::semantic::{
-        AliasSymbolLinks, AliasTargetState, ArrayLiteralLinks, AssertionLinks, CacheHashKey,
-        DeclaredTypeLinks, DecoratorSignatureState, DeferredSymbolLinks, EffectsSignatureState,
-        ExhaustiveState, ExportTypeLinks, JsxElementLinks, JsxFlags, LateBoundLinks,
+        AccessibleChainCacheKey, AliasSymbolLinks, AliasTargetState, ArrayLiteralLinks,
+        AssertionLinks, CacheHashKey, ContainingSymbolLinks, DeclaredTypeLinks,
+        DecoratorSignatureState, DeferredSymbolLinks, EffectsSignatureState, EntityNameNode,
+        EnumMemberLinks, EvaluatorResult, EvaluatorValue, ExhaustiveState, ExportTypeLinks,
+        ExtendedContainersState, ExternalEmitHelpers, JsxElementLinks, JsxFlags, LateBoundLinks,
         MappedSymbolLinks, MarkedAssignmentSymbolLinks, MembersAndExportsLinks, ModuleSymbolLinks,
-        NodeLinks, RelationComparisonResult, RelationKind, ResolvedSignatureState,
-        ReverseMappedSymbolLinks, SignatureLinks, SpreadLinks, SwitchStatementLinks,
-        SymbolNodeLinks, SymbolReferenceLinks, TypeAliasLinks, TypeNodeLinks, TypeRecord,
-        TypeResolutionTarget, TypeSystemPropertyName, ValueSymbolLinks, VarianceFlags,
-        VarianceLinks,
+        NodeLinks, OptionalSymbolSequence, OrderedNodeSet, RelationComparisonResult, RelationKind,
+        ResolvedSignatureState, ReverseMappedSymbolLinks, SignatureLinks, SourceFileLinks,
+        SpreadLinks, SwitchStatementLinks, SymbolNodeLinks, SymbolReferenceLinks, TypeAliasLinks,
+        TypeNodeLinks, TypeRecord, TypeResolutionTarget, TypeSystemPropertyName, ValueSymbolLinks,
+        VarianceFlags, VarianceLinks,
         signatures::{ElementFlags, SignatureFlags, TypePredicateKind},
         types::{ObjectFlags, TypeFlags},
     };
+    use ts_jsnum::Number;
 
     type TestStore = SemanticStore<&'static str, &'static str>;
     type CanonicalTestStore = SemanticStore<TypeRecord, &'static str>;
@@ -1695,6 +2018,52 @@ mod tests {
                 EscapedName::source(name),
             ))
             .unwrap()
+    }
+
+    fn isolated_entity_name_arena(parts: &[&str]) -> (NodeArena, NodeId) {
+        assert!(!parts.is_empty());
+        let mut arena = NodeArena::new();
+        let first_parent = (parts.len() > 1).then(|| NodeId::new(2));
+        let mut entity = arena.alloc(Node {
+            kind: SyntaxKind::Identifier,
+            flags: NodeFlags::default(),
+            range: TextRange::default(),
+            parent: first_parent,
+            data: NodeData::Identifier(Box::new(IdentifierData {
+                flow_node: None,
+                text: parts[0].into(),
+            })),
+        });
+        for (index, part) in parts.iter().enumerate().skip(1) {
+            let index = u32::try_from(index).unwrap();
+            let qualified = NodeId::new(index * 2);
+            let right = arena.alloc(Node {
+                kind: SyntaxKind::Identifier,
+                flags: NodeFlags::default(),
+                range: TextRange::default(),
+                parent: Some(qualified),
+                data: NodeData::Identifier(Box::new(IdentifierData {
+                    flow_node: None,
+                    text: (*part).into(),
+                })),
+            });
+            assert_eq!(right, NodeId::new(index * 2 - 1));
+            let parent = (index as usize + 1 < parts.len()).then(|| NodeId::new((index + 1) * 2));
+            entity = arena.alloc(Node {
+                kind: SyntaxKind::QualifiedName,
+                flags: NodeFlags::default(),
+                range: TextRange::default(),
+                parent,
+                data: NodeData::QualifiedName(Box::new(QualifiedNameData {
+                    flow_node: None,
+                    left: entity,
+                    right,
+                    facts: 0,
+                })),
+            });
+            assert_eq!(entity, qualified);
+        }
+        (arena, entity)
     }
 
     fn empty_signature<TypePayload, MapperPayload>(
@@ -2218,6 +2587,365 @@ mod tests {
             ts_ast::NodeId::new(u32::MAX),
         );
         assert!(!store.contains_node_ref(out_of_bounds));
+    }
+
+    #[test]
+    fn source_file_tokens_validate_exact_roots_and_reject_cross_wiring_atomically() {
+        let first = parse_source_file("type Value = Namespace.Member;");
+        let second = parse_source_file("type Value = Namespace.Member;");
+        let first_file = FileId::new(31);
+        let second_file = FileId::new(32);
+        let mut store = TestStore::new();
+
+        let first_source = store
+            .register_source_file(&first.arena, first.source_file, first_file)
+            .unwrap();
+        assert_eq!(first_source.file(), first_file);
+        assert!(store.contains_source_file(first_source));
+        assert_eq!(
+            store.register_source_file(&first.arena, first.source_file, first_file),
+            Some(first_source),
+            "exact re-registration is idempotent"
+        );
+
+        let crossed_file_ref = NodeRef::new(first.arena.id(), second_file, first.source_file);
+        assert_eq!(
+            store.register_source_file(&first.arena, first.source_file, second_file),
+            None
+        );
+        assert!(!store.contains_node_ref(crossed_file_ref));
+
+        let crossed_arena_ref = NodeRef::new(second.arena.id(), first_file, second.source_file);
+        assert_eq!(
+            store.register_source_file(&second.arena, second.source_file, first_file),
+            None
+        );
+        assert!(!store.contains_node_ref(crossed_arena_ref));
+        assert!(store.contains_source_file(first_source));
+
+        let second_source = store
+            .register_source_file(&second.arena, second.source_file, second_file)
+            .unwrap();
+        assert!(store.contains_source_file(second_source));
+
+        let mut invalid_arena = NodeArena::new();
+        let mut invalid_root = first.arena.get(first.source_file).unwrap().clone();
+        invalid_root.parent = Some(NodeId::new(0));
+        let invalid_root = invalid_arena.alloc(invalid_root);
+        assert_eq!(
+            store.register_source_file(&invalid_arena, invalid_root, FileId::new(33)),
+            None
+        );
+        assert!(!store.contains_node_ref(NodeRef::new(
+            invalid_arena.id(),
+            FileId::new(33),
+            invalid_root
+        )));
+    }
+
+    #[test]
+    fn checker_owned_entity_names_validate_exact_closure_and_preserve_identity() {
+        let (arena, root) = isolated_entity_name_arena(&["Namespace", "Nested", "factory"]);
+        let mut store = TestStore::new();
+        let entity = store.register_entity_name(&arena, root).unwrap();
+        assert_eq!(store.entity_name_len(), 5);
+        let EntityNameNode::QualifiedName { left, right } = store.entity_name(entity).unwrap()
+        else {
+            panic!("three-part entity name must end in a qualified node")
+        };
+        assert_eq!(
+            store.entity_name(*right),
+            Some(&EntityNameNode::Identifier {
+                text: "factory".into(),
+            })
+        );
+        let EntityNameNode::QualifiedName {
+            left: first,
+            right: nested,
+        } = store.entity_name(*left).unwrap()
+        else {
+            panic!("nested left child must remain qualified")
+        };
+        assert_eq!(
+            store.entity_name(*first),
+            Some(&EntityNameNode::Identifier {
+                text: "Namespace".into(),
+            })
+        );
+        assert_eq!(
+            store.entity_name(*nested),
+            Some(&EntityNameNode::Identifier {
+                text: "Nested".into(),
+            })
+        );
+
+        let duplicate = store.register_entity_name(&arena, root).unwrap();
+        assert_ne!(duplicate, entity, "separate parses retain distinct roots");
+        assert_eq!(store.entity_name_len(), 10);
+
+        let parsed = parse_source_file("type Value = Namespace.Member;");
+        let qualified = parsed
+            .arena
+            .iter()
+            .find_map(|(id, node)| (node.kind == SyntaxKind::QualifiedName).then_some(id))
+            .unwrap();
+        let before = store.entity_name_len();
+        assert_eq!(store.register_entity_name(&parsed.arena, qualified), None);
+        assert_eq!(store.entity_name_len(), before);
+
+        let mut malformed = NodeArena::new();
+        let root = NodeId::new(2);
+        let left = malformed.alloc(Node {
+            kind: SyntaxKind::Identifier,
+            flags: NodeFlags::default(),
+            range: TextRange::default(),
+            parent: Some(root),
+            data: NodeData::Identifier(Box::new(IdentifierData {
+                flow_node: None,
+                text: "Namespace".into(),
+            })),
+        });
+        let mut invalid_right = parsed.arena.get(parsed.source_file).unwrap().clone();
+        invalid_right.parent = Some(root);
+        let right = malformed.alloc(invalid_right);
+        assert_eq!(right, NodeId::new(1));
+        let malformed_root = malformed.alloc(Node {
+            kind: SyntaxKind::QualifiedName,
+            flags: NodeFlags::default(),
+            range: TextRange::default(),
+            parent: None,
+            data: NodeData::QualifiedName(Box::new(QualifiedNameData {
+                flow_node: None,
+                left,
+                right,
+                facts: 0,
+            })),
+        });
+        assert_eq!(malformed_root, root);
+        assert_eq!(store.register_entity_name(&malformed, malformed_root), None);
+        assert_eq!(store.entity_name_len(), before);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Every ID-bearing slot gets an independent foreign probe.
+    fn final_sparse_link_stores_preserve_state_and_reject_every_foreign_id_atomically() {
+        let local_parse = parse_source_file("type Value = Namespace.Member;");
+        let other_parse = parse_source_file("type Other = OtherNamespace.Member;");
+        let foreign_parse = parse_source_file("type Value = Namespace.Member;");
+        let local_file = FileId::new(41);
+        let other_file = FileId::new(42);
+
+        let mut store = TestStore::new();
+        let local_source = store
+            .register_source_file(&local_parse.arena, local_parse.source_file, local_file)
+            .unwrap();
+        let other_source = store
+            .register_source_file(&other_parse.arena, other_parse.source_file, other_file)
+            .unwrap();
+        let local_identifier = local_parse
+            .arena
+            .iter()
+            .find_map(|(id, node)| (node.kind == SyntaxKind::Identifier).then_some(id))
+            .unwrap();
+        let local_node = NodeRef::new(local_parse.arena.id(), local_file, local_identifier);
+        let (local_factory_arena, local_factory_root) =
+            isolated_entity_name_arena(&["Namespace", "factory"]);
+        let local_factory = store
+            .register_entity_name(&local_factory_arena, local_factory_root)
+            .unwrap();
+        let (local_fragment_arena, local_fragment_root) =
+            isolated_entity_name_arena(&["Namespace", "Fragment"]);
+        let local_fragment_factory = store
+            .register_entity_name(&local_fragment_arena, local_fragment_root)
+            .unwrap();
+        assert_ne!(local_factory, local_fragment_factory);
+        let other_identifier = other_parse
+            .arena
+            .iter()
+            .find_map(|(id, node)| (node.kind == SyntaxKind::Identifier).then_some(id))
+            .unwrap();
+        let other_node = NodeRef::new(other_parse.arena.id(), other_file, other_identifier);
+        let local_symbol = alloc_test_symbol(&mut store, "local");
+        let local_container = alloc_test_symbol(&mut store, "container");
+        let local_type = store.alloc_type("local type");
+
+        let mut foreign = TestStore::new();
+        let foreign_source = foreign
+            .register_source_file(&foreign_parse.arena, foreign_parse.source_file, local_file)
+            .unwrap();
+        let foreign_identifier = foreign_parse
+            .arena
+            .iter()
+            .find_map(|(id, node)| (node.kind == SyntaxKind::Identifier).then_some(id))
+            .unwrap();
+        let foreign_node = NodeRef::new(foreign_parse.arena.id(), local_file, foreign_identifier);
+        let (foreign_factory_arena, foreign_factory_root) =
+            isolated_entity_name_arena(&["Namespace", "factory"]);
+        let foreign_factory = foreign
+            .register_entity_name(&foreign_factory_arena, foreign_factory_root)
+            .unwrap();
+        let (foreign_fragment_arena, foreign_fragment_root) =
+            isolated_entity_name_arena(&["Namespace", "Fragment"]);
+        let foreign_fragment_factory = foreign
+            .register_entity_name(&foreign_fragment_arena, foreign_fragment_root)
+            .unwrap();
+        let foreign_symbol = alloc_test_symbol(&mut foreign, "foreign");
+        let foreign_type = foreign.alloc_type("foreign type");
+
+        assert_eq!(local_symbol.get(), foreign_symbol.get());
+        assert_eq!(local_type.get(), foreign_type.get());
+        assert_eq!(local_node.file, foreign_node.file);
+        assert_eq!(local_node.node, foreign_node.node);
+        assert_ne!(local_node.arena, foreign_node.arena);
+        assert!(store.entity_name(local_factory).is_some());
+        assert!(foreign.entity_name(foreign_factory).is_some());
+        assert_eq!(store.entity_name(foreign_factory), None);
+
+        let enum_links = EnumMemberLinks {
+            value: EvaluatorResult {
+                value: Some(EvaluatorValue::Number(Number::new(7.0))),
+                is_syntactically_string: false,
+                resolved_other_files: true,
+                has_external_references: true,
+            },
+        };
+        assert!(store.set_enum_member_links(local_node, enum_links.clone()));
+        let counts_after_enum = store.checker_link_allocated_lengths();
+        assert!(!store.set_enum_member_links(foreign_node, EnumMemberLinks::default()));
+        assert_eq!(store.enum_member_links(local_node), Some(&enum_links));
+        assert_eq!(store.checker_link_allocated_lengths(), counts_after_enum);
+
+        let accessible_key = AccessibleChainCacheKey {
+            use_only_external_aliasing: true,
+            location: Some(local_node),
+            meaning: SymbolFlags::VALUE,
+        };
+        let containing_links = ContainingSymbolLinks {
+            extended_containers_by_file: Some(HashMap::from([(
+                local_source,
+                OptionalSymbolSequence::Allocated(vec![local_container, local_symbol]),
+            )])),
+            extended_containers: ExtendedContainersState::Computed(OptionalSymbolSequence::Nil),
+            accessible_chain_cache: Some(HashMap::from([(
+                accessible_key,
+                OptionalSymbolSequence::Nil,
+            )])),
+        };
+        assert!(store.set_containing_symbol_links(local_symbol, containing_links.clone()));
+        assert_eq!(
+            store
+                .containing_symbol_links(local_symbol)
+                .unwrap()
+                .accessible_chain_cache
+                .as_ref()
+                .unwrap()
+                .get(&accessible_key),
+            Some(&OptionalSymbolSequence::Nil),
+            "a present nil sequence is the cached accessible-chain miss"
+        );
+        let containing_counts = store.checker_link_allocated_lengths();
+        assert!(!store.set_containing_symbol_links(foreign_symbol, containing_links.clone()));
+
+        let mut invalid = containing_links.clone();
+        invalid.extended_containers_by_file = Some(HashMap::from([(
+            foreign_source,
+            OptionalSymbolSequence::Allocated(vec![local_symbol]),
+        )]));
+        assert!(!store.set_containing_symbol_links(local_symbol, invalid));
+
+        let mut invalid = containing_links.clone();
+        invalid.extended_containers_by_file = Some(HashMap::from([(
+            local_source,
+            OptionalSymbolSequence::Allocated(vec![foreign_symbol]),
+        )]));
+        assert!(!store.set_containing_symbol_links(local_symbol, invalid));
+
+        let mut invalid = containing_links.clone();
+        invalid.extended_containers =
+            ExtendedContainersState::Computed(OptionalSymbolSequence::Allocated(vec![
+                foreign_symbol,
+            ]));
+        assert!(!store.set_containing_symbol_links(local_symbol, invalid));
+
+        let mut invalid = containing_links.clone();
+        invalid.accessible_chain_cache = Some(HashMap::from([(
+            AccessibleChainCacheKey {
+                location: Some(foreign_node),
+                ..accessible_key
+            },
+            OptionalSymbolSequence::Nil,
+        )]));
+        assert!(!store.set_containing_symbol_links(local_symbol, invalid));
+
+        let mut invalid = containing_links.clone();
+        invalid.accessible_chain_cache = Some(HashMap::from([(
+            accessible_key,
+            OptionalSymbolSequence::Allocated(vec![foreign_symbol]),
+        )]));
+        assert!(!store.set_containing_symbol_links(local_symbol, invalid));
+        assert_eq!(
+            store.containing_symbol_links(local_symbol),
+            Some(&containing_links)
+        );
+        assert_eq!(store.checker_link_allocated_lengths(), containing_counts);
+
+        let mut deferred_nodes = OrderedNodeSet::allocated();
+        assert!(deferred_nodes.insert(local_source.node_ref()));
+        assert!(deferred_nodes.insert(local_node));
+        let source_links = SourceFileLinks {
+            type_checked: true,
+            unused_checked: true,
+            external_helpers_module: Some(local_symbol),
+            requested_external_emit_helpers: ExternalEmitHelpers::REST
+                | ExternalEmitHelpers::IMPORT_STAR,
+            deferred_nodes,
+            identifier_check_nodes: Some(vec![local_source.node_ref(), local_node]),
+            local_jsx_namespace: "Namespace".into(),
+            local_jsx_fragment_namespace: "Fragment".into(),
+            local_jsx_factory: Some(local_factory),
+            local_jsx_fragment_factory: Some(local_fragment_factory),
+            jsx_fragment_type: Some(local_type),
+        };
+        assert!(store.set_source_file_links(local_source, source_links.clone()));
+        assert_eq!(store.source_file_links(local_source), Some(&source_links));
+        let source_counts = store.checker_link_allocated_lengths();
+        assert!(!store.set_source_file_links(foreign_source, source_links.clone()));
+
+        let mut invalid = source_links.clone();
+        invalid.external_helpers_module = Some(foreign_symbol);
+        assert!(!store.set_source_file_links(local_source, invalid));
+
+        let mut invalid = source_links.clone();
+        invalid.deferred_nodes.insert(foreign_node);
+        assert!(!store.set_source_file_links(local_source, invalid));
+
+        let mut invalid = source_links.clone();
+        invalid.identifier_check_nodes = Some(vec![foreign_node]);
+        assert!(!store.set_source_file_links(local_source, invalid));
+
+        let mut invalid = source_links.clone();
+        invalid.local_jsx_factory = Some(foreign_factory);
+        assert!(!store.set_source_file_links(local_source, invalid));
+
+        let mut invalid = source_links.clone();
+        invalid.local_jsx_fragment_factory = Some(foreign_fragment_factory);
+        assert!(!store.set_source_file_links(local_source, invalid));
+
+        let mut invalid = source_links.clone();
+        invalid.jsx_fragment_type = Some(foreign_type);
+        assert!(!store.set_source_file_links(local_source, invalid));
+
+        let mut invalid = source_links.clone();
+        invalid.deferred_nodes.insert(other_node);
+        assert!(!store.set_source_file_links(local_source, invalid));
+
+        let mut invalid = source_links.clone();
+        invalid.identifier_check_nodes = Some(vec![other_node]);
+        assert!(!store.set_source_file_links(local_source, invalid));
+
+        assert_eq!(store.source_file_links(local_source), Some(&source_links));
+        assert_eq!(store.source_file_links(other_source), None);
+        assert_eq!(store.checker_link_allocated_lengths(), source_counts);
     }
 
     #[test]

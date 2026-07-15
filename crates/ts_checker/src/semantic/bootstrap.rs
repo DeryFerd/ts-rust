@@ -54,6 +54,7 @@ pub struct SemanticArenaCounts {
     pub index_infos: usize,
     pub type_aliases: usize,
     pub conditional_roots: usize,
+    pub entity_names: usize,
 }
 
 impl SemanticArenaCounts {
@@ -65,6 +66,7 @@ impl SemanticArenaCounts {
             && self.index_infos == 0
             && self.type_aliases == 0
             && self.conditional_roots == 0
+            && self.entity_names == 0
     }
 }
 
@@ -74,6 +76,7 @@ pub struct CheckerLinkCounts {
     pub node: usize,
     pub symbol_node: usize,
     pub type_node: usize,
+    pub enum_member: usize,
     pub assertion: usize,
     pub array_literal: usize,
     pub switch_statement: usize,
@@ -94,6 +97,8 @@ pub struct CheckerLinkCounts {
     pub variance: usize,
     pub reverse_mapped_symbol: usize,
     pub marked_assignment_symbol: usize,
+    pub containing_symbol: usize,
+    pub source_file: usize,
 }
 
 impl CheckerLinkCounts {
@@ -101,6 +106,7 @@ impl CheckerLinkCounts {
         self.node == 0
             && self.symbol_node == 0
             && self.type_node == 0
+            && self.enum_member == 0
             && self.assertion == 0
             && self.array_literal == 0
             && self.switch_statement == 0
@@ -121,6 +127,8 @@ impl CheckerLinkCounts {
             && self.variance == 0
             && self.reverse_mapped_symbol == 0
             && self.marked_assignment_symbol == 0
+            && self.containing_symbol == 0
+            && self.source_file == 0
     }
 }
 
@@ -342,6 +350,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             node,
             symbol_node,
             type_node,
+            enum_member,
             assertion,
             array_literal,
             switch_statement,
@@ -362,6 +371,8 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             variance,
             reverse_mapped_symbol,
             marked_assignment_symbol,
+            containing_symbol,
+            source_file,
         ] = self.checker_link_allocated_lengths();
         let (entries, resolution_start, boundaries, next_boundary_serial) =
             self.type_resolution_internal_state();
@@ -375,11 +386,13 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 index_infos: self.index_info_len(),
                 type_aliases: self.type_alias_len(),
                 conditional_roots: self.conditional_root_len(),
+                entity_names: self.entity_name_len(),
             },
             links: CheckerLinkCounts {
                 node,
                 symbol_node,
                 type_node,
+                enum_member,
                 assertion,
                 array_literal,
                 switch_statement,
@@ -400,6 +413,8 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 variance,
                 reverse_mapped_symbol,
                 marked_assignment_symbol,
+                containing_symbol,
+                source_file,
             },
             type_resolution: TypeResolutionStateSnapshot {
                 entries,
@@ -1050,10 +1065,11 @@ fn empty_signature(
 mod tests {
     use std::collections::HashSet;
 
-    use ts_ast::FileId;
+    use ts_ast::{FileId, IdentifierData, Node, NodeArena, NodeData, NodeFlags, SyntaxKind};
     use ts_binder::{
         AstScope, CheckFlags, EscapedName, InternalSymbolName, SymbolData, SymbolFlags, SymbolStore,
     };
+    use ts_core::TextRange;
     use ts_parser::parse_source_file;
 
     use super::*;
@@ -1124,6 +1140,7 @@ mod tests {
             index_infos: store.index_info_len(),
             type_aliases: store.type_alias_len(),
             conditional_roots: store.conditional_root_len(),
+            entity_names: store.entity_name_len(),
         }
     }
 
@@ -1132,6 +1149,7 @@ mod tests {
             node,
             symbol_node,
             type_node,
+            enum_member,
             assertion,
             array_literal,
             switch_statement,
@@ -1152,6 +1170,8 @@ mod tests {
             variance,
             reverse_mapped_symbol,
             marked_assignment_symbol,
+            containing_symbol,
+            source_file,
         ] = store.checker_link_allocated_lengths();
         let (entries, resolution_start, boundaries, next_boundary_serial) =
             store.type_resolution_internal_state();
@@ -1162,6 +1182,7 @@ mod tests {
                 node,
                 symbol_node,
                 type_node,
+                enum_member,
                 assertion,
                 array_literal,
                 switch_statement,
@@ -1182,6 +1203,8 @@ mod tests {
                 variance,
                 reverse_mapped_symbol,
                 marked_assignment_symbol,
+                containing_symbol,
+                source_file,
             },
             type_resolution: TypeResolutionStateSnapshot {
                 entries,
@@ -2047,7 +2070,8 @@ mod tests {
     fn sparse_links_and_resolution_state_reject_bootstrap_atomically() {
         let options = IntrinsicBootstrapOptions::default();
         let parsed = parse_source_file("const linked = 1;");
-        let scope = AstScope::new(FileId::new(0), &parsed.arena);
+        let file = FileId::new(0);
+        let scope = AstScope::new(file, &parsed.arena);
         let (node, _) = parsed.arena.iter().next().unwrap();
         let node = scope.node_ref(node).unwrap();
         let mut symbols = SymbolStore::new();
@@ -2058,10 +2082,29 @@ mod tests {
             ))
             .unwrap();
         let mut linked = TestStore::from_symbol_store(symbols);
-        assert!(linked.register_ast_scope(scope));
+        let source_file = linked
+            .register_source_file(&parsed.arena, parsed.source_file, file)
+            .unwrap();
+        let mut entity_arena = NodeArena::new();
+        let entity_root = entity_arena.alloc(Node {
+            kind: SyntaxKind::Identifier,
+            flags: NodeFlags::default(),
+            range: TextRange::default(),
+            parent: None,
+            data: NodeData::Identifier(Box::new(IdentifierData {
+                flow_node: None,
+                text: "factory".into(),
+            })),
+        });
+        assert!(
+            linked
+                .register_entity_name(&entity_arena, entity_root)
+                .is_some()
+        );
         assert!(linked.ensure_node_links(node));
         assert!(linked.ensure_symbol_node_links(node));
         assert!(linked.ensure_type_node_links(node));
+        assert!(linked.ensure_enum_member_links(node));
         assert!(linked.ensure_assertion_links(node));
         assert!(linked.ensure_array_literal_links(node));
         assert!(linked.ensure_switch_statement_links(node));
@@ -2082,13 +2125,17 @@ mod tests {
         assert!(linked.ensure_variance_links(linked_symbol));
         assert!(linked.ensure_reverse_mapped_symbol_links(linked_symbol));
         assert!(linked.ensure_marked_assignment_symbol_links(linked_symbol));
+        assert!(linked.ensure_containing_symbol_links(linked_symbol));
+        assert!(linked.ensure_source_file_links(source_file));
         let before = checker_state(&linked);
+        assert_eq!(before.semantic_arenas.entity_names, 1);
         assert_eq!(
             before.links,
             CheckerLinkCounts {
                 node: 1,
                 symbol_node: 1,
                 type_node: 1,
+                enum_member: 1,
                 assertion: 1,
                 array_literal: 1,
                 switch_statement: 1,
@@ -2109,6 +2156,8 @@ mod tests {
                 variance: 1,
                 reverse_mapped_symbol: 1,
                 marked_assignment_symbol: 1,
+                containing_symbol: 1,
+                source_file: 1,
             },
         );
         assert_eq!(

@@ -26,15 +26,17 @@ pub use ids::{
     ConditionalRootId, IndexInfoId, SignatureId, TypeAliasId, TypeId, TypeMapperId, TypePredicateId,
 };
 pub use links::{
-    AliasSymbolLinks, AliasTargetState, ArrayLiteralLinks, AssertionLinks, DeclaredTypeLinks,
-    DecoratorSignatureState, DeferredSymbolLinks, EffectsSignatureState, ExhaustiveState,
-    ExportTypeLinks, JsxElementLinks, JsxFlags, LateBoundLinks, LinkHandle, LinkStore,
-    MappedSymbolLinks, MarkedAssignmentSymbolLinks, MembersAndExportsLinks,
-    MembersOrExportsResolutionKind, ModuleSymbolLinks, NodeCheckFlags, NodeLinks,
-    ResolvedSignatureState, ReverseMappedSymbolLinks, SignatureLinks, SpreadLinks,
-    SwitchStatementLinks, SymbolNodeLinks, SymbolReferenceLinks, Tristate, TypeAliasLinks,
-    TypeNodeLinks, TypeResolutionBoundary, TypeResolutionTarget, TypeResolutionTargetError,
-    TypeSystemPropertyName, ValueSymbolLinks, VarianceLinks,
+    AccessibleChainCacheKey, AliasSymbolLinks, AliasTargetState, ArrayLiteralLinks, AssertionLinks,
+    ContainingSymbolLinks, DeclaredTypeLinks, DecoratorSignatureState, DeferredSymbolLinks,
+    EffectsSignatureState, EntityNameNode, EntityNameRef, EnumMemberLinks, EvaluatorResult,
+    EvaluatorValue, ExhaustiveState, ExportTypeLinks, ExtendedContainersState, ExternalEmitHelpers,
+    JsxElementLinks, JsxFlags, LateBoundLinks, LinkHandle, LinkStore, MappedSymbolLinks,
+    MarkedAssignmentSymbolLinks, MembersAndExportsLinks, MembersOrExportsResolutionKind,
+    ModuleSymbolLinks, NodeCheckFlags, NodeLinks, OptionalSymbolSequence, OrderedNodeSet,
+    ResolvedSignatureState, ReverseMappedSymbolLinks, SignatureLinks, SourceFileLinks,
+    SourceFileRef, SpreadLinks, SwitchStatementLinks, SymbolNodeLinks, SymbolReferenceLinks,
+    Tristate, TypeAliasLinks, TypeNodeLinks, TypeResolutionBoundary, TypeResolutionTarget,
+    TypeResolutionTargetError, TypeSystemPropertyName, ValueSymbolLinks, VarianceLinks,
 };
 pub use mapper::{CanonicalTypeMapperStore, TypeMapper, TypeMapperKind};
 pub use relation::{
