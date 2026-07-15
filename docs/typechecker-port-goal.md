@@ -473,7 +473,8 @@ remains the cluster-level source of truth.
   `[46,50)` respectively. Arrays/assertions, calls, functions, and broader
   assignment targets are the next dependency clusters.
 - The assertion and canonical-array substrate is integrated through `54101e4`,
-  `561382e`, `7df90aa`, `141e802`, `324d1b8`, and `331f156`. `T[]` now resolves
+  `561382e`, `7df90aa`, `141e802`, `324d1b8`, `331f156`, and `df0a890`.
+  `T[]` now resolves
   through the Program-owned canonical `Array<T>` target with target-local
   instantiation identity, fail-closed global capability checks, poisoned warm
   cache rejection, and atomic retry. Property-only fresh object literals now
@@ -485,13 +486,15 @@ remains the cluster-level source of truth.
   diagnostic for non-overlapping types. Raw literal links remain fresh while
   enclosing mutable locations consume their regular/widened result types, and
   assignment expressions publish the right-hand result identity needed by
-  `.types` baselines. `contextualTyping18` is exact; nested and const
-  assertions, structured derived unions, array literal expressions, array
-  display/relation, spreads, holes, tuples, and readonly-array syntax remain
-  explicit boundaries. The combined checker passes 671/671 library tests,
-  strict all-target checker Clippy, and doctest.
+  `.types` baselines. Canonical array assertion operands now recursively widen
+  to the stable ordinary Array identity, and non-overlapping array assertions
+  emit exact cold/warm TS2352 diagnostics. `contextualTyping18` is exact;
+  nested and const assertions, sibling-context union widening, spreads, holes,
+  tuples, and direct readonly-array type-reference syntax remain explicit
+  boundaries.
 - Contextual ordinary array literals are integrated through `a872db5`,
-  `cc7c4a0`, `a198e99`, `045cc36`, and `81b1482`. Expression unions now admit
+  `cc7c4a0`, `a198e99`, `045cc36`, `81b1482`, `83d12ba`, `a3fd511`, and
+  `88dcb9f`. Expression unions now admit
   primitives, literals, recursively canonical unions, and validated fresh
   property objects; subtype reduction preserves excess-property-distinct
   shapes. Checker-owned `Array<T>` references and array-literal clones have
@@ -502,15 +505,24 @@ remains the cluster-level source of truth.
   preserve the distinct strict empty-array `implicitNever` element. Positional
   no-spread elaboration uses retained element results, so `contextualTyping19`,
   `contextualTyping20`, and `contextualTyping21` match the pinned zero-error,
-  TS2353, and TS2322 artifacts including exact spans and arguments. The first
-  global-aware apparent-type slice maps string-, number-, and boolean-like
-  sources through authoritative library wrapper identities without leaking
-  answers into context-free relation caches. Spreads and holes remain atomic
-  typed boundaries; nested/reference union constituents, loose nullish
-  elements, array-literal assertion widening, tuples, readonly syntax, const
-  contexts, evolving arrays, and cross-target Array-to-ReadonlyArray relations
-  remain explicit follow-ups. The combined checker passes 690/690 library
-  tests, doctest, and strict all-target checker Clippy.
+  TS2353, and TS2322 artifacts including exact spans and arguments. Recursive
+  shorthand arrays are valid union constituents with authoritative global
+  capability, including contextual literal unions and cold/warm alias query
+  orders; loose nullish array elements retain their canonical widening
+  identities. Malformed canonical-array caches remain invariants rather than
+  being mislabeled as unsupported coverage. Recursive diagnostic elaboration
+  retains the checked expression tree through object properties, so nested
+  array failures point at the incompatible element without a spurious parent
+  property record. The first global-aware apparent-type slice maps string-,
+  number-, and boolean-like sources through authoritative library wrapper
+  identities without leaking answers into context-free relation caches.
+  Spreads and holes remain atomic typed boundaries; direct
+  `Array<T>`/`ReadonlyArray<T>` syntax, declared-interface array elements in
+  unions, mixed array/property-object subtype reduction, sibling-context union
+  widening, tuples, const contexts, evolving arrays, and cross-target
+  Array-to-ReadonlyArray relations remain explicit follow-ups. The combined
+  checker passes 705/705 library tests, doctest, strict all-target checker and
+  compiler Clippy, and rustdoc with warnings denied.
 
 No percentage in this section is a whole-corpus parity claim. A score is
 publishable only when its variant manifest and complete artifact comparison are
