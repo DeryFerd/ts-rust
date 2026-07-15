@@ -234,6 +234,88 @@ pub struct CanonicalBindDiagnostic {
     pub related_information: Vec<CanonicalRelatedInformation>,
 }
 
+/// Parser/Program-owned source-file facts consumed by canonical declaration
+/// binding.
+///
+/// These facts are deliberately supplied by the caller. The immutable Rust
+/// AST does not retain TypeScript-Go's `SourceFile` file-kind and module slots,
+/// and the binder must not reconstruct them from a file name or syntax.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CanonicalSourceLanguage {
+    TypeScript,
+    JavaScript,
+}
+
+/// Exact parser/Program module indicators for one source file.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CanonicalModuleState {
+    Script,
+    External,
+    CommonJs,
+    ExternalAndCommonJs,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CanonicalSourceFileFacts {
+    source_file_symbol_name: EscapedName,
+    language: CanonicalSourceLanguage,
+    is_declaration_file: bool,
+    module_state: CanonicalModuleState,
+}
+
+impl CanonicalSourceFileFacts {
+    #[must_use]
+    pub const fn new(
+        source_file_symbol_name: EscapedName,
+        language: CanonicalSourceLanguage,
+        is_declaration_file: bool,
+        module_state: CanonicalModuleState,
+    ) -> Self {
+        Self {
+            source_file_symbol_name,
+            language,
+            is_declaration_file,
+            module_state,
+        }
+    }
+
+    #[must_use]
+    pub const fn source_file_symbol_name(&self) -> crate::EscapedNameRef<'_> {
+        self.source_file_symbol_name.as_ref()
+    }
+
+    #[must_use]
+    pub const fn is_javascript_file(&self) -> bool {
+        matches!(self.language, CanonicalSourceLanguage::JavaScript)
+    }
+
+    #[must_use]
+    pub const fn is_declaration_file(&self) -> bool {
+        self.is_declaration_file
+    }
+
+    #[must_use]
+    pub const fn is_external_module(&self) -> bool {
+        matches!(
+            self.module_state,
+            CanonicalModuleState::External | CanonicalModuleState::ExternalAndCommonJs
+        )
+    }
+
+    #[must_use]
+    pub const fn is_common_js_module(&self) -> bool {
+        matches!(
+            self.module_state,
+            CanonicalModuleState::CommonJs | CanonicalModuleState::ExternalAndCommonJs
+        )
+    }
+
+    #[must_use]
+    pub const fn is_external_or_common_js_module(&self) -> bool {
+        !matches!(self.module_state, CanonicalModuleState::Script)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct NodeBinding {
     visited: bool,
@@ -255,6 +337,7 @@ pub struct BoundFile {
     file: FileId,
     arena: NodeArenaId,
     source_file: NodeId,
+    source_facts: Option<CanonicalSourceFileFacts>,
     node_count: usize,
     phase: BindingPhase,
     nodes: Vec<NodeBinding>,
@@ -291,6 +374,13 @@ impl BoundFile {
     #[must_use]
     pub const fn source_file(&self) -> NodeRef {
         NodeRef::new(self.arena, self.file, self.source_file)
+    }
+
+    /// Exact source facts supplied by the parser/Program host. Traversal-only
+    /// callers may omit them; declaration dispatch never infers replacements.
+    #[must_use]
+    pub const fn source_facts(&self) -> Option<&CanonicalSourceFileFacts> {
+        self.source_facts.as_ref()
     }
 
     /// Whether `node` was reached from this exact source-file root.
@@ -1178,6 +1268,36 @@ impl CanonicalBinder {
         source_file: NodeId,
         file: FileId,
     ) -> Result<&BoundFile, CanonicalBindError> {
+        self.bind_source_file_inner(arena, source_file, file, None)
+    }
+
+    /// Traverses one Program source file while retaining the exact
+    /// parser/Program source facts required by declaration binding.
+    ///
+    /// This B02b entry point still completes only the traversal phase until
+    /// the dependency-closed non-JavaScript declaration switch is installed.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same structural/provenance errors as
+    /// [`Self::bind_source_file`].
+    pub fn bind_source_file_with_facts(
+        &mut self,
+        arena: &NodeArena,
+        source_file: NodeId,
+        file: FileId,
+        facts: CanonicalSourceFileFacts,
+    ) -> Result<&BoundFile, CanonicalBindError> {
+        self.bind_source_file_inner(arena, source_file, file, Some(facts))
+    }
+
+    fn bind_source_file_inner(
+        &mut self,
+        arena: &NodeArena,
+        source_file: NodeId,
+        file: FileId,
+        source_facts: Option<CanonicalSourceFileFacts>,
+    ) -> Result<&BoundFile, CanonicalBindError> {
         let root = NodeRef::new(arena.id(), file, source_file);
         if self.files.contains_key(&file) {
             return Err(CanonicalBindError::DuplicateFile(file));
@@ -1201,7 +1321,7 @@ impl CanonicalBinder {
             });
         }
 
-        let mut traversal = FileTraversal::new(arena, source_file, file);
+        let mut traversal = FileTraversal::new(arena, source_file, file, source_facts);
         let flow = build_flow_graph_with_hooks(arena, &children, source_file, file, &mut traversal);
         let file_binding = traversal.finish(flow);
         self.files.insert(file, file_binding);
@@ -1810,6 +1930,7 @@ struct TraversalState {
 struct FileTraversal<'a> {
     arena: &'a NodeArena,
     source_file: NodeId,
+    source_facts: Option<CanonicalSourceFileFacts>,
     file: FileId,
     nodes: Vec<NodeBinding>,
     traversal_order: Vec<NodeId>,
@@ -1820,10 +1941,16 @@ struct FileTraversal<'a> {
 }
 
 impl<'a> FileTraversal<'a> {
-    fn new(arena: &'a NodeArena, source_file: NodeId, file: FileId) -> Self {
+    fn new(
+        arena: &'a NodeArena,
+        source_file: NodeId,
+        file: FileId,
+        source_facts: Option<CanonicalSourceFileFacts>,
+    ) -> Self {
         Self {
             arena,
             source_file,
+            source_facts,
             file,
             nodes: vec![NodeBinding::default(); arena.len()],
             traversal_order: Vec::with_capacity(arena.len()),
@@ -1843,6 +1970,7 @@ impl<'a> FileTraversal<'a> {
             file: self.file,
             arena: self.arena.id(),
             source_file: self.source_file,
+            source_facts: self.source_facts,
             node_count: self.arena.len(),
             phase: BindingPhase::Traversal,
             nodes: self.nodes,
@@ -2094,8 +2222,11 @@ mod tests {
     use ts_ast::{FileId, NodeData, NodeId, NodeRef, SyntaxKind};
     use ts_parser::parse_source_file;
 
-    use super::{BindingPhase, CanonicalBindError, CanonicalBinder, CanonicalDeclarationError};
-    use crate::{InternalSymbolName, SymbolFlags};
+    use super::{
+        BindingPhase, CanonicalBindError, CanonicalBinder, CanonicalDeclarationError,
+        CanonicalModuleState, CanonicalSourceFileFacts, CanonicalSourceLanguage,
+    };
+    use crate::{EscapedName, InternalSymbolName, SymbolFlags};
 
     fn position(order: &[NodeRef], node: NodeId) -> usize {
         order
@@ -3997,6 +4128,35 @@ mod tests {
         assert!(!first_bound.contains(wrong_arena));
 
         assert!(files.try_into_parts().is_err());
+    }
+
+    #[test]
+    fn source_file_facts_are_explicit_canonical_input() {
+        let parsed = parse_source_file("export interface Box<T> { value: T }");
+        let file = FileId::new(41);
+        let facts = CanonicalSourceFileFacts::new(
+            EscapedName::source("\"/project/main\""),
+            CanonicalSourceLanguage::TypeScript,
+            true,
+            CanonicalModuleState::External,
+        );
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(&parsed.arena, parsed.source_file, file, facts.clone())
+            .unwrap();
+        let bound = binder.file(file).unwrap();
+        assert_eq!(bound.source_facts(), Some(&facts));
+        assert_eq!(bound.phase(), BindingPhase::Traversal);
+        assert_eq!(bound.symbol_count(), 0);
+
+        let mut traversal_only = CanonicalBinder::new();
+        traversal_only
+            .bind_source_file(&parsed.arena, parsed.source_file, FileId::new(42))
+            .unwrap();
+        assert_eq!(
+            traversal_only.file(FileId::new(42)).unwrap().source_facts(),
+            None
+        );
     }
 
     #[test]
