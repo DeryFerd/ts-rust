@@ -4145,6 +4145,9 @@ impl<'a> Parser<'a> {
                 NodeData::EnumDeclaration(data) => data.modifiers.clone(),
                 NodeData::ImportDeclaration(data) => data.modifiers.clone(),
                 NodeData::ImportEqualsDeclaration(data) => data.modifiers.clone(),
+                NodeData::ExportDeclaration(data) => data.modifiers.clone(),
+                NodeData::ExportAssignment(data) => data.modifiers.clone(),
+                NodeData::NamespaceExportDeclaration(data) => data.modifiers.clone(),
                 NodeData::VariableStatement(data) => data.modifiers.clone(),
                 NodeData::ModuleDeclaration(data) => data.modifiers.clone(),
                 _ => None,
@@ -4171,6 +4174,11 @@ impl<'a> Parser<'a> {
                 NodeData::EnumDeclaration(data) => data.modifiers = Some(modifiers.clone()),
                 NodeData::ImportDeclaration(data) => data.modifiers = Some(modifiers.clone()),
                 NodeData::ImportEqualsDeclaration(data) => {
+                    data.modifiers = Some(modifiers.clone());
+                }
+                NodeData::ExportDeclaration(data) => data.modifiers = Some(modifiers.clone()),
+                NodeData::ExportAssignment(data) => data.modifiers = Some(modifiers.clone()),
+                NodeData::NamespaceExportDeclaration(data) => {
                     data.modifiers = Some(modifiers.clone());
                 }
                 NodeData::VariableStatement(data) => data.modifiers = Some(modifiers.clone()),
@@ -4559,12 +4567,6 @@ impl<'a> Parser<'a> {
     fn parse_export_declaration(&mut self) -> NodeId {
         let export_token = self.consume();
         let start = export_token.range.start;
-        let export_modifier = self.alloc_node(
-            SyntaxKind::ExportKeyword,
-            export_token.range,
-            NodeData::Token(Box::new(TokenData)),
-            &[],
-        );
         let next = self.next_token_kind();
         let invalid_contextual_declaration_name = match self.current.kind {
             SyntaxKind::InterfaceKeyword | SyntaxKind::NamespaceKeyword => {
@@ -4580,6 +4582,8 @@ impl<'a> Parser<'a> {
             _ => false,
         };
         if invalid_contextual_declaration_name {
+            let export_modifier =
+                self.alloc_token_node(SyntaxKind::ExportKeyword, export_token.range);
             return self.alloc_node_with_flags(
                 SyntaxKind::NotEmittedStatement,
                 NODE_FLAG_HAS_ERROR,
@@ -4616,6 +4620,8 @@ impl<'a> Parser<'a> {
             false
         };
         if class_modifier_before_import {
+            let export_modifier =
+                self.alloc_token_node(SyntaxKind::ExportKeyword, export_token.range);
             let mut import_modifiers = vec![export_modifier];
             while self.current.kind != SyntaxKind::ImportKeyword {
                 import_modifiers.push(self.consume_token_node());
@@ -4651,6 +4657,8 @@ impl<'a> Parser<'a> {
                 | SyntaxKind::AtToken
         ) {
             let declaration = self.parse_statement();
+            let export_modifier =
+                self.alloc_token_node(SyntaxKind::ExportKeyword, export_token.range);
             self.attach_modifiers(declaration, vec![export_modifier], start);
             return declaration;
         }
@@ -4673,16 +4681,9 @@ impl<'a> Parser<'a> {
                     symbol: None,
                     type_: None,
                     facts: 0,
-                    modifiers: Some(ModifierList {
-                        list: NodeList {
-                            range: TextRange::new(start, self.node_start(expression)),
-                            nodes: vec![export_modifier],
-                            has_trailing_comma: false,
-                        },
-                        flags: ts_ast::ModifierFlags::default(),
-                    }),
+                    modifiers: None,
                 })),
-                &[export_modifier, expression],
+                &[expression],
             );
         }
         if self.current.kind == SyntaxKind::AsKeyword {
@@ -4710,7 +4711,7 @@ impl<'a> Parser<'a> {
             );
         }
         if self.current.kind == SyntaxKind::DefaultKeyword {
-            let default_modifier = self.consume_token_node();
+            let default_token = self.consume();
             if matches!(
                 self.current.kind,
                 SyntaxKind::FunctionKeyword
@@ -4721,6 +4722,10 @@ impl<'a> Parser<'a> {
                 && self.next_token_kind() == SyntaxKind::FunctionKeyword)
             {
                 let declaration = self.parse_statement();
+                let export_modifier =
+                    self.alloc_token_node(SyntaxKind::ExportKeyword, export_token.range);
+                let default_modifier =
+                    self.alloc_token_node(SyntaxKind::DefaultKeyword, default_token.range);
                 self.attach_modifiers(declaration, vec![export_modifier, default_modifier], start);
                 return declaration;
             }
@@ -4736,16 +4741,9 @@ impl<'a> Parser<'a> {
                     symbol: None,
                     type_: None,
                     facts: 0,
-                    modifiers: Some(ModifierList {
-                        list: NodeList {
-                            range: TextRange::new(start, self.node_start(expression)),
-                            nodes: vec![export_modifier, default_modifier],
-                            has_trailing_comma: false,
-                        },
-                        flags: ts_ast::ModifierFlags::default(),
-                    }),
+                    modifiers: None,
                 })),
-                &[export_modifier, default_modifier, expression],
+                &[expression],
             );
         }
         let export_clause = if self.current.kind == SyntaxKind::OpenBraceToken {
@@ -4790,7 +4788,7 @@ impl<'a> Parser<'a> {
             .or(export_clause)
             .map_or(start, |id| self.node_end(id));
         let end = self.parse_semicolon(fallback);
-        let mut children = vec![export_modifier];
+        let mut children = Vec::new();
         children.extend(export_clause);
         children.extend(module_specifier);
         children.extend(attributes);
@@ -4805,14 +4803,7 @@ impl<'a> Parser<'a> {
                 module_specifier,
                 symbol: None,
                 facts: 0,
-                modifiers: Some(ModifierList {
-                    list: NodeList {
-                        range: TextRange::new(start, start),
-                        nodes: vec![export_modifier],
-                        has_trailing_comma: false,
-                    },
-                    flags: ts_ast::ModifierFlags::default(),
-                }),
+                modifiers: None,
             })),
             &children,
         )
@@ -9096,9 +9087,13 @@ impl<'a> Parser<'a> {
 
     fn consume_token_node(&mut self) -> NodeId {
         let token = self.consume();
+        self.alloc_token_node(token.kind, token.range)
+    }
+
+    fn alloc_token_node(&mut self, kind: SyntaxKind, range: TextRange) -> NodeId {
         self.alloc_node(
-            token.kind,
-            token.range,
+            kind,
+            range,
             NodeData::Token(Box::new(TokenData)),
             &[],
         )
@@ -12212,6 +12207,69 @@ mod tests {
             panic!("expected identifier expression");
         };
         assert_eq!(expression.text, "runtimeValue");
+    }
+
+    #[test]
+    fn export_grammar_tokens_are_not_modifiers_or_generated_children() {
+        let result = parse_source_file(concat!(
+            "export { value };\n",
+            "export default value;\n",
+            "export = value;\n",
+            "declare export { value };\n",
+            "@decorator export default value;\n",
+            "declare export as namespace Global;\n",
+        ));
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let statements = source_statements(&result);
+        assert_eq!(statements.len(), 6);
+        assert!(result.arena.iter().all(|(_, node)| {
+            !matches!(
+                node.kind,
+                SyntaxKind::ExportKeyword | SyntaxKind::DefaultKeyword
+            )
+        }));
+
+        for statement in &statements[..3] {
+            let modifiers = match &result.arena.get(*statement).unwrap().data {
+                NodeData::ExportDeclaration(export) => export.modifiers.as_ref(),
+                NodeData::ExportAssignment(export) => export.modifiers.as_ref(),
+                data => panic!("expected ordinary export node, got {data:?}"),
+            };
+            assert!(modifiers.is_none());
+
+            let mut children = Vec::new();
+            result
+                .arena
+                .get(*statement)
+                .unwrap()
+                .for_each_child(|child| children.push(child));
+            assert!(children.iter().all(|child| {
+                !matches!(
+                    result.arena.get(*child).unwrap().kind,
+                    SyntaxKind::ExportKeyword | SyntaxKind::DefaultKeyword
+                )
+            }));
+        }
+
+        let expected_modifiers = [
+            SyntaxKind::DeclareKeyword,
+            SyntaxKind::Decorator,
+            SyntaxKind::DeclareKeyword,
+        ];
+        for (statement, expected) in statements[3..].iter().zip(expected_modifiers) {
+            let modifiers = match &result.arena.get(*statement).unwrap().data {
+                NodeData::ExportDeclaration(export) => export.modifiers.as_ref(),
+                NodeData::ExportAssignment(export) => export.modifiers.as_ref(),
+                NodeData::NamespaceExportDeclaration(export) => export.modifiers.as_ref(),
+                data => panic!("expected modified export node, got {data:?}"),
+            }
+            .expect("preceding illegal modifier is retained");
+            assert_eq!(modifiers.list.nodes.len(), 1);
+            assert_eq!(
+                result.arena.get(modifiers.list.nodes[0]).unwrap().kind,
+                expected
+            );
+        }
     }
 
     #[test]
