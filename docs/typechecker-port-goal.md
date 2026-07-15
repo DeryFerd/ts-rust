@@ -130,6 +130,21 @@ remains the cluster-level source of truth.
   Clippy, and the all-target workspace check. Independent review found no
   P0-P2 issue. Full source facts, declaration-family dispatch, and table
   routing are the active B02b slice, so checker extraction remains closed.
+- T01b is integrated as `182e591`, expanding the canonical sparse checker
+  state from 9 to 23 of the pinned checker's 26 typed LinkStores. The 14 new
+  records cover assertion, array/switch/JSX, mapped/deferred/module/late/export,
+  members/exports, spread, variance, reverse-mapped, and assignment caches with
+  exact defaults, nil-versus-allocated-empty states, byte-backed name keys, and
+  atomic provenance validation for every ID-bearing slot. Bootstrap pristine
+  checks include every landed store, all 229 checker tests pass, and targeted
+  Clippy is clean with only the recorded baseline allowances. Enum-member,
+  containing-symbol, and source-file links remain explicit richer follow-ups.
+- B02b's source contract is integrated as `d58d523`: canonical binding now
+  retains a caller-derived byte-backed source symbol name plus explicit
+  JavaScript, declaration-file, external-module, and CommonJS facts. It never
+  infers those Program/parser facts from a filename or AST shape. Declaration
+  dispatch remains gated while the non-JavaScript families and the constructor
+  parser prerequisite are ported and audited.
 
 No percentage in this section is a whole-corpus parity claim. A score is
 publishable only when its variant manifest and complete artifact comparison are
