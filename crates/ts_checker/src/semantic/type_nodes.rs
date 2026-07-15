@@ -3768,7 +3768,12 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 }
                 PlannedTypeReferenceArity::NotGeneric
                 | PlannedTypeReferenceArity::InvalidGeneric { .. } => {
-                    self.issue_type_reference_arity_diagnostic(node, symbol, reference.arity)?;
+                    self.issue_type_reference_arity_diagnostic(
+                        node,
+                        symbol,
+                        reference.arity,
+                        Some(target),
+                    )?;
                     self.error_type()?
                 }
             }
@@ -3795,6 +3800,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                             node,
                             symbol,
                             PlannedTypeReferenceArity::NotGeneric,
+                            None,
                         )?;
                         self.error_type()?
                     } else if is_type_alias
@@ -3813,7 +3819,12 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 }
                 PlannedTypeReferenceArity::NotGeneric
                 | PlannedTypeReferenceArity::InvalidGeneric { .. } => {
-                    self.issue_type_reference_arity_diagnostic(node, symbol, reference.arity)?;
+                    self.issue_type_reference_arity_diagnostic(
+                        node,
+                        symbol,
+                        reference.arity,
+                        None,
+                    )?;
                     self.error_type()?
                 }
             }
@@ -4048,8 +4059,9 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         node: NodeRef,
         symbol: SemanticSymbolId,
         arity: PlannedTypeReferenceArity,
+        generic_global_target: Option<TypeId>,
     ) -> Result<(), DeclaredTypeError> {
-        let name = self
+        let symbol_name = self
             .store
             .symbol(symbol)
             .and_then(|symbol| symbol.name().as_utf8())
@@ -4058,6 +4070,11 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 DeclaredTypeUnavailable::SymbolNotOwned(symbol),
             ))?
             .to_owned();
+        let name = if let Some(target) = generic_global_target {
+            self.generic_global_type_display_name(node, symbol, target, &symbol_name)?
+        } else {
+            symbol_name
+        };
         let (code, arguments) = match arity {
             PlannedTypeReferenceArity::NotGeneric => (2315, vec![name]),
             PlannedTypeReferenceArity::InvalidGeneric { minimum, maximum }
@@ -4078,6 +4095,65 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             ),
         );
         Ok(())
+    }
+
+    fn generic_global_type_display_name(
+        &self,
+        node: NodeRef,
+        symbol: SemanticSymbolId,
+        target: TypeId,
+        symbol_name: &str,
+    ) -> Result<String, DeclaredTypeError> {
+        if preflight_generic_global_type_target(self.store, target)
+            .map_err(|_| type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node)))?
+            .is_some()
+        {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidTypeReference(node),
+            ));
+        }
+        let target_record = self.store.type_payload(target).ok_or_else(|| {
+            type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node))
+        })?;
+        let TypeData::Interface(interface) = target_record.data() else {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidTypeReference(node),
+            ));
+        };
+        if target_record
+            .symbol()
+            .and_then(|target_symbol| self.store.get_merged_symbol(target_symbol))
+            != Some(symbol)
+        {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidTypeReference(node),
+            ));
+        }
+        let [parameter] = interface
+            .reference
+            .resolved_type_arguments
+            .as_deref()
+            .ok_or_else(|| {
+                type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node))
+            })?
+        else {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidTypeReference(node),
+            ));
+        };
+        let parameter_symbol = cached_ordinary_type_parameter_owner(self.store, *parameter)
+            .ok_or_else(|| {
+                type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node))
+            })?;
+        let parameter_name = self
+            .store
+            .symbol(parameter_symbol)
+            .and_then(|parameter| parameter.name().as_utf8())
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| {
+                type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node))
+            })?;
+        Ok(format!("{symbol_name}<{parameter_name}>"))
     }
 
     fn error_type(&self) -> Result<TypeId, DeclaredTypeError> {
@@ -9837,7 +9913,9 @@ mod tests {
 
     #[test]
     fn direct_global_array_arity_errors_are_canonical_and_warm_idempotently() {
-        let mut fixture = global_array_fixture(concat!(
+        let mut fixture = fixture(concat!(
+            "interface Array<Element> {} ",
+            "interface ReadonlyArray<Item> {} ",
             "let missing: Array; ",
             "let extra: Array<number, string>; ",
             "let readonlyMissing: ReadonlyArray; ",
@@ -9859,12 +9937,33 @@ mod tests {
                 Ok(error_type)
             );
         }
-        assert_eq!(diagnostics.len(), 4);
-        assert!(
+        assert_eq!(
             diagnostics
                 .as_slice()
                 .iter()
-                .all(|diagnostic| diagnostic.diagnostic.code() == 2314)
+                .map(|diagnostic| (
+                    diagnostic.diagnostic.code(),
+                    diagnostic.diagnostic.arguments.clone(),
+                ))
+                .collect::<Vec<_>>(),
+            [
+                (
+                    2314,
+                    vec!["Array<Element>".to_owned(), "1".to_owned()],
+                ),
+                (
+                    2314,
+                    vec!["Array<Element>".to_owned(), "1".to_owned()],
+                ),
+                (
+                    2314,
+                    vec!["ReadonlyArray<Item>".to_owned(), "1".to_owned()],
+                ),
+                (
+                    2314,
+                    vec!["ReadonlyArray<Item>".to_owned(), "1".to_owned()],
+                ),
+            ]
         );
         let warm = store_state(&fixture.store);
         for node in nodes {
