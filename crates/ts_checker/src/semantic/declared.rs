@@ -176,9 +176,17 @@ impl<'a> DeclaredTypeHost<'a> {
         (source.arena.id() == reference.arena).then_some(source.bound)
     }
 
-    fn symbol_matches(&self, node: NodeRef, symbol: SemanticSymbolId) -> bool {
+    fn symbol_matches(
+        &self,
+        store: &SemanticStore<TypeRecord, TypeMapper>,
+        node: NodeRef,
+        symbol: SemanticSymbolId,
+    ) -> bool {
         self.bound_file(node).is_some_and(|bound| {
-            bound.symbol(node) == Some(symbol) || bound.local_symbol(node) == Some(symbol)
+            [bound.symbol(node), bound.local_symbol(node)]
+                .into_iter()
+                .flatten()
+                .any(|candidate| store.get_merged_symbol(candidate) == Some(symbol))
         })
     }
 }
@@ -568,7 +576,7 @@ fn preflight_type_parameter_symbol(
                 DeclaredTypeUnavailable::InvalidTypeParameterDeclaration(*declaration),
             ));
         }
-        if !host.symbol_matches(*declaration, symbol) {
+        if !host.symbol_matches(store, *declaration, symbol) {
             return Err(unavailable(
                 DeclaredTypeUnavailable::DeclarationSymbolMismatch(*declaration),
             ));
@@ -605,12 +613,15 @@ fn explicit_type_parameter_symbols(
                 DeclaredTypeUnavailable::InvalidTypeParameterDeclaration(parameter),
             ));
         }
-        let symbol = host
+        let raw_symbol = host
             .bound_file(parameter)
             .and_then(|bound| bound.symbol(parameter))
             .ok_or_else(|| {
                 unavailable(DeclaredTypeUnavailable::MissingOrForeignFacts(parameter))
             })?;
+        let symbol = store
+            .get_merged_symbol(raw_symbol)
+            .ok_or_else(|| unavailable(DeclaredTypeUnavailable::SymbolNotOwned(raw_symbol)))?;
         preflight_type_parameter_symbol(store, host, symbol, checked)?;
         push_unique(&mut result, symbol);
     }
@@ -749,7 +760,7 @@ fn preflight_class_plan(
     }
 
     let value_node = preflight_node(store, host, value_declaration)?;
-    if !host.symbol_matches(value_declaration, symbol) {
+    if !host.symbol_matches(store, value_declaration, symbol) {
         return Err(unavailable(
             DeclaredTypeUnavailable::DeclarationSymbolMismatch(value_declaration),
         ));
@@ -770,7 +781,7 @@ fn preflight_class_plan(
     let mut saw_class = false;
     for declaration in declarations {
         let node = preflight_node(store, host, declaration)?;
-        if !host.symbol_matches(declaration, symbol) {
+        if !host.symbol_matches(store, declaration, symbol) {
             return Err(unavailable(
                 DeclaredTypeUnavailable::DeclarationSymbolMismatch(declaration),
             ));
@@ -948,7 +959,7 @@ fn preflight_interface_plan(
     let mut interface_declarations = Vec::new();
     for declaration in declarations {
         let node = preflight_node(store, host, declaration)?;
-        if !host.symbol_matches(declaration, symbol) {
+        if !host.symbol_matches(store, declaration, symbol) {
             return Err(unavailable(
                 DeclaredTypeUnavailable::DeclarationSymbolMismatch(declaration),
             ));
@@ -1155,6 +1166,9 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         host: &DeclaredTypeHost<'_>,
         symbol: SemanticSymbolId,
     ) -> Result<TypeId, DeclaredTypeError> {
+        let symbol = self
+            .get_merged_symbol(symbol)
+            .ok_or_else(|| unavailable(DeclaredTypeUnavailable::SymbolNotOwned(symbol)))?;
         let flags = self
             .symbol(symbol)
             .ok_or_else(|| unavailable(DeclaredTypeUnavailable::SymbolNotOwned(symbol)))?

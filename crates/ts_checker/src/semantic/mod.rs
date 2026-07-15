@@ -11,6 +11,7 @@ pub mod declared;
 pub mod ids;
 pub mod links;
 pub mod mapper;
+pub mod name_resolution;
 mod merge;
 pub mod production;
 pub mod relation;
