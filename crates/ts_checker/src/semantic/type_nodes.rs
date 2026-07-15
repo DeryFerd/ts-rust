@@ -748,11 +748,11 @@ impl<'store, 'host, 'arena> TypeQueryPlanner<'store, 'host, 'arena> {
         }
         let fallback = preflight_generic_global_type_target(self.store, array_type)
             .map_err(|_| type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node)))?;
-        if let Some(cached) = self
+        let cached = self
             .store
             .type_node_links(node)
-            .and_then(|links| links.resolved_type)
-        {
+            .and_then(|links| links.resolved_type);
+        if let Some(cached) = cached {
             validate_generic_global_type_instantiation(self.store, array_type, cached).map_err(
                 |_| type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node)),
             )?;
@@ -769,6 +769,25 @@ impl<'store, 'host, 'arena> TypeQueryPlanner<'store, 'host, 'arena> {
                 ));
             }
             self.plan_type_node_in_context(element_type, None, false)?;
+            if let Some(cached) = cached {
+                let TypeData::TypeReference(reference) = self
+                    .store
+                    .type_payload(cached)
+                    .expect("the generic-global cache was preflighted")
+                    .data()
+                else {
+                    unreachable!("an initialized generic-global cache owns references")
+                };
+                let cached_element = reference
+                    .resolved_type_arguments
+                    .as_deref()
+                    .expect("the generic-global cache was preflighted")[0];
+                if self.cached_array_element_identity(element_type)? != Some(cached_element) {
+                    return Err(type_node_unavailable(
+                        TypeNodeUnavailable::InvalidTypeReference(node),
+                    ));
+                }
+            }
         }
         let planned = PlannedArrayType {
             element_type,
@@ -782,6 +801,47 @@ impl<'store, 'host, 'arena> TypeQueryPlanner<'store, 'host, 'arena> {
             ));
         }
         Ok(())
+    }
+
+    fn cached_array_element_identity(
+        &self,
+        node: NodeRef,
+    ) -> Result<Option<TypeId>, DeclaredTypeError> {
+        let record = preflight_node(self.store, self.host, node)?;
+        if let NodeData::ParenthesizedTypeNode(parenthesized) = &record.data {
+            return self.cached_array_element_identity(NodeRef::new(
+                node.arena,
+                node.file,
+                parenthesized.type_,
+            ));
+        }
+        let bootstrap = self
+            .store
+            .intrinsic_bootstrap()
+            .ok_or(DeclaredTypeError::Unavailable(
+                DeclaredTypeUnavailable::IntrinsicBootstrapNotInitialized,
+            ))?;
+        let keyword = match record.kind {
+            SyntaxKind::AnyKeyword => Some(bootstrap.any_type),
+            SyntaxKind::UnknownKeyword => Some(bootstrap.unknown_type),
+            SyntaxKind::StringKeyword => Some(bootstrap.string_type),
+            SyntaxKind::NumberKeyword => Some(bootstrap.number_type),
+            SyntaxKind::BigIntKeyword => Some(bootstrap.bigint_type),
+            SyntaxKind::BooleanKeyword => Some(bootstrap.boolean_type),
+            SyntaxKind::SymbolKeyword => Some(bootstrap.es_symbol_type),
+            SyntaxKind::VoidKeyword => Some(bootstrap.void_type),
+            SyntaxKind::UndefinedKeyword => Some(bootstrap.undefined_type),
+            SyntaxKind::NullKeyword => Some(bootstrap.null_type),
+            SyntaxKind::NeverKeyword => Some(bootstrap.never_type),
+            SyntaxKind::ObjectKeyword => Some(bootstrap.non_primitive_type),
+            SyntaxKind::IntrinsicKeyword => Some(bootstrap.intrinsic_marker_type),
+            _ => None,
+        };
+        Ok(keyword.or_else(|| {
+            self.store
+                .type_node_links(node)
+                .and_then(|links| links.resolved_type)
+        }))
     }
 
     fn plan_property_type_literal(
@@ -3058,6 +3118,9 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             .store
             .type_node_links(node)
             .and_then(|links| links.resolved_type);
+        if let Some(cached) = cached {
+            return Ok(cached);
+        }
         let resolved_type = if let Some(fallback) = array.fallback {
             fallback
         } else {
@@ -3076,15 +3139,6 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             )
             .map_err(|_| type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node)))?
         };
-        if let Some(cached) = cached {
-            return if cached == resolved_type {
-                Ok(cached)
-            } else {
-                Err(type_node_unavailable(
-                    TypeNodeUnavailable::InvalidTypeReference(node),
-                ))
-            };
-        }
         let mut links = self
             .store
             .type_node_links(node)
@@ -8866,6 +8920,36 @@ mod tests {
         let node = variable_type_node(&fixture, "values");
         let element_node = array_element_node(&fixture, node);
         let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let any_type = fixture.store.intrinsic_bootstrap().unwrap().any_type;
+        let poisoned_array = create_type_from_generic_global_type(
+            &mut fixture.store,
+            array_type,
+            any_type,
+            ObjectFlags::NONE,
+        )
+        .unwrap();
+        assert!(fixture.store.set_type_node_links(
+            node,
+            TypeNodeLinks {
+                resolved_type: Some(poisoned_array),
+                ..TypeNodeLinks::default()
+            },
+        ));
+        let poisoned = store_state(&fixture.store);
+        assert!(matches!(
+            query_array_node(&mut fixture, array_type, node, &mut diagnostics),
+            Err(DeclaredTypeError::TypeNodeUnavailable(
+                TypeNodeUnavailable::InvalidTypeReference(error_node)
+            )) if error_node == node
+        ));
+        assert_eq!(store_state(&fixture.store), poisoned);
+        assert!(fixture.store.type_node_links(element_node).is_none());
+        assert!(
+            fixture
+                .store
+                .set_type_node_links(node, TypeNodeLinks::default())
+        );
+
         let resolved = query_array_node(&mut fixture, array_type, node, &mut diagnostics).unwrap();
         let element_type = fixture
             .store
@@ -8890,6 +8974,12 @@ mod tests {
                 .object_flags()
                 .contains(ObjectFlags::FROM_TYPE_NODE)
         );
+        let warm = store_state(&fixture.store);
+        assert_eq!(
+            query_array_node(&mut fixture, array_type, node, &mut diagnostics),
+            Ok(resolved)
+        );
+        assert_eq!(store_state(&fixture.store), warm);
         assert!(diagnostics.is_empty());
     }
 
