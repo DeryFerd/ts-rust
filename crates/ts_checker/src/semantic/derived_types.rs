@@ -1,7 +1,7 @@
-//! Cached object-literal regularization and widening.
+//! Cached object-literal regularization and root-context widening.
 //!
-//! This is the dependency-closed property-only prefix of pinned
-//! `getRegularTypeOfObjectLiteral`, `getWidenedType`, and
+//! This is the dependency-closed property-object and canonical-array prefix
+//! of pinned `getRegularTypeOfObjectLiteral`, `getWidenedType`, and
 //! `getWidenedTypeOfObjectLiteral`. Derived anonymous types preserve the
 //! source object's symbol, clone only properties whose type changes, and keep
 //! the upstream cache identities stable across warm queries.
@@ -15,6 +15,7 @@ use ts_binder::{
 };
 
 use super::{
+    ArrayTypeError, CanonicalGlobalTypes,
     ids::TypeId,
     links::ValueSymbolLinks,
     mapper::TypeMapper,
@@ -67,10 +68,12 @@ impl DerivedTypeCaches {
 pub enum DerivedTypeError {
     BootstrapUninitialized,
     Type(TypeId),
+    ArrayType(ArrayTypeError),
     MalformedObjectLiteral(TypeId),
     InvalidRegularObjectLiteralCache { source: TypeId, cached: TypeId },
     InvalidWidenedTypeCache { source: TypeId, cached: TypeId },
     UnsupportedWideningType(TypeId),
+    RecursiveWideningType(TypeId),
     RecursiveObjectLiteral(TypeId),
     Capacity(TypeId),
 }
@@ -82,6 +85,7 @@ impl std::fmt::Display for DerivedTypeError {
                 formatter.write_str("derived types require intrinsic checker bootstrap")
             }
             Self::Type(type_) => write!(formatter, "type {type_:?} is not store-owned"),
+            Self::ArrayType(error) => write!(formatter, "array widening failed: {error}"),
             Self::MalformedObjectLiteral(type_) => {
                 write!(formatter, "object-literal type {type_:?} is malformed")
             }
@@ -99,6 +103,9 @@ impl std::fmt::Display for DerivedTypeError {
                     "type {type_:?} requires an unsupported widening family"
                 )
             }
+            Self::RecursiveWideningType(type_) => {
+                write!(formatter, "type {type_:?} has a recursive widening graph")
+            }
             Self::RecursiveObjectLiteral(type_) => write!(
                 formatter,
                 "object-literal type {type_:?} has a recursive property graph"
@@ -111,7 +118,28 @@ impl std::fmt::Display for DerivedTypeError {
     }
 }
 
-impl std::error::Error for DerivedTypeError {}
+impl std::error::Error for DerivedTypeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::ArrayType(error) => Some(error),
+            Self::BootstrapUninitialized
+            | Self::Type(_)
+            | Self::MalformedObjectLiteral(_)
+            | Self::InvalidRegularObjectLiteralCache { .. }
+            | Self::InvalidWidenedTypeCache { .. }
+            | Self::UnsupportedWideningType(_)
+            | Self::RecursiveWideningType(_)
+            | Self::RecursiveObjectLiteral(_)
+            | Self::Capacity(_) => None,
+        }
+    }
+}
+
+impl From<ArrayTypeError> for DerivedTypeError {
+    fn from(error: ArrayTypeError) -> Self {
+        Self::ArrayType(error)
+    }
+}
 
 #[derive(Clone, Debug)]
 struct PropertyShape {
@@ -172,6 +200,11 @@ enum WidenPlan {
         source: TypeId,
         shape: ObjectShape,
         properties: Vec<WidenPropertyPlan>,
+    },
+    Array {
+        source: TypeId,
+        element: WidenTransform,
+        readonly: bool,
     },
 }
 
@@ -239,7 +272,27 @@ impl SemanticStore<TypeRecord, TypeMapper> {
 
     /// Applies pinned root-context widening for the dependency-closed
     /// property-only object-literal prefix.
+    #[cfg(test)]
     pub(super) fn get_widened_type(&mut self, type_: TypeId) -> Result<TypeId, DerivedTypeError> {
+        self.get_widened_type_worker(type_, None)
+    }
+
+    /// Applies pinned root-context widening with authoritative global-array
+    /// identities available to the canonical `Array<T>` and
+    /// `ReadonlyArray<T>` prefix.
+    pub(super) fn get_widened_type_with_global_types(
+        &mut self,
+        type_: TypeId,
+        global_types: &CanonicalGlobalTypes,
+    ) -> Result<TypeId, DerivedTypeError> {
+        self.get_widened_type_worker(type_, Some(global_types))
+    }
+
+    fn get_widened_type_worker(
+        &mut self,
+        type_: TypeId,
+        global_types: Option<&CanonicalGlobalTypes>,
+    ) -> Result<TypeId, DerivedTypeError> {
         let record = self
             .type_payload(type_)
             .ok_or(DerivedTypeError::Type(type_))?;
@@ -256,7 +309,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         let mut plans = Vec::new();
         let mut visiting = HashSet::new();
         let mut planned = HashSet::new();
-        self.plan_widened_type(type_, &mut plans, &mut visiting, &mut planned)?;
+        self.plan_widened_type(type_, global_types, &mut plans, &mut visiting, &mut planned)?;
         if plans.is_empty() {
             return self.derived_types.widened_types.get(&type_).copied().ok_or(
                 DerivedTypeError::InvalidWidenedTypeCache {
@@ -270,8 +323,12 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             .iter()
             .filter(|plan| matches!(plan, WidenPlan::Object { .. }))
             .count();
+        let array_count = plans
+            .iter()
+            .filter(|plan| matches!(plan, WidenPlan::Array { .. }))
+            .count();
         let clone_count = plans.iter().try_fold(0usize, |count, plan| match plan {
-            WidenPlan::Existing { .. } => Some(count),
+            WidenPlan::Existing { .. } | WidenPlan::Array { .. } => Some(count),
             WidenPlan::Object { properties, .. } => count.checked_add(
                 properties
                     .iter()
@@ -282,15 +339,52 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         let Some(clone_count) = clone_count else {
             return Err(DerivedTypeError::Capacity(type_));
         };
+        let Some(type_count) = object_count.checked_add(array_count) else {
+            return Err(DerivedTypeError::Capacity(type_));
+        };
         if !self.derived_types.try_reserve_widened(plans.len())
-            || !self.try_reserve_types(object_count)
+            || !self.try_reserve_types(type_count)
             || !self.try_reserve_checker_symbol_allocations(clone_count, object_count)
         {
             return Err(DerivedTypeError::Capacity(type_));
         }
+        if array_count != 0
+            && let Some(global_types) = global_types
+        {
+            let mutable_count = plans
+                .iter()
+                .filter(|plan| {
+                    matches!(
+                        plan,
+                        WidenPlan::Array {
+                            readonly: false,
+                            ..
+                        }
+                    )
+                })
+                .count();
+            let readonly_count = array_count - mutable_count;
+            if global_types.array_type == global_types.readonly_array_type {
+                if !self.try_reserve_object_instantiations(global_types.array_type, array_count) {
+                    return Err(DerivedTypeError::Capacity(type_));
+                }
+            } else {
+                let mutable_reserved = mutable_count == 0
+                    || self
+                        .try_reserve_object_instantiations(global_types.array_type, mutable_count);
+                let readonly_reserved = readonly_count == 0
+                    || self.try_reserve_object_instantiations(
+                        global_types.readonly_array_type,
+                        readonly_count,
+                    );
+                if !mutable_reserved || !readonly_reserved {
+                    return Err(DerivedTypeError::Capacity(type_));
+                }
+            }
+        }
 
         for plan in plans {
-            self.publish_widened_type(plan);
+            self.publish_widened_type(plan, global_types);
         }
         Ok(*self
             .derived_types
@@ -310,6 +404,12 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         &self,
         type_: TypeId,
     ) -> DerivedObjectLiteralValidation {
+        if !matches!(
+            self.type_payload(type_).map(TypeRecord::data),
+            Some(TypeData::Object(_))
+        ) {
+            return DerivedObjectLiteralValidation::NotDerived;
+        }
         let mut regular_source = None;
         for (source, cached) in &self.derived_types.regular_object_literals {
             if *cached == type_ && regular_source.replace(*source).is_some() {
@@ -338,6 +438,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     type_,
                     &mut visiting,
                     &mut regular_visiting,
+                    None,
                 )
             }
         };
@@ -407,6 +508,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
     fn plan_widened_type(
         &self,
         source: TypeId,
+        global_types: Option<&CanonicalGlobalTypes>,
         plans: &mut Vec<WidenPlan>,
         visiting: &mut HashSet<TypeId>,
         planned: &mut HashSet<TypeId>,
@@ -428,6 +530,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 cached,
                 &mut widened_visiting,
                 &mut regular_visiting,
+                global_types,
             ) {
                 return Err(DerivedTypeError::InvalidWidenedTypeCache { source, cached });
             }
@@ -449,6 +552,29 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             plans.push(WidenPlan::Existing { source, target });
             return Ok(WidenTransform::Cached(source));
         }
+
+        if let Some(global_types) = global_types
+            && let Some(array) = self.canonical_array_reference(global_types, source)?
+        {
+            if !visiting.insert(source) {
+                return Err(DerivedTypeError::RecursiveWideningType(source));
+            }
+            let element = self.plan_widened_type(
+                array.element_type,
+                Some(global_types),
+                plans,
+                visiting,
+                planned,
+            )?;
+            debug_assert!(visiting.remove(&source));
+            planned.insert(source);
+            plans.push(WidenPlan::Array {
+                source,
+                element,
+                readonly: array.readonly,
+            });
+            return Ok(WidenTransform::Cached(source));
+        }
         if !record.object_flags().contains(ObjectFlags::OBJECT_LITERAL) {
             return Err(DerivedTypeError::UnsupportedWideningType(source));
         }
@@ -461,7 +587,8 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             .ok_or(DerivedTypeError::MalformedObjectLiteral(source))?;
         let mut properties = Vec::with_capacity(shape.properties.len());
         for property in &shape.properties {
-            let transform = self.plan_widened_type(property.type_, plans, visiting, planned)?;
+            let transform =
+                self.plan_widened_type(property.type_, global_types, plans, visiting, planned)?;
             properties.push(WidenPropertyPlan {
                 source: property.symbol,
                 name: property.name.clone(),
@@ -525,7 +652,11 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         );
     }
 
-    fn publish_widened_type(&mut self, plan: WidenPlan) {
+    fn publish_widened_type(
+        &mut self,
+        plan: WidenPlan,
+        global_types: Option<&CanonicalGlobalTypes>,
+    ) {
         match plan {
             WidenPlan::Existing { source, target } => {
                 assert_eq!(
@@ -577,6 +708,31 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     None,
                     None,
                 ));
+                assert_eq!(
+                    self.derived_types.widened_types.insert(source, widened),
+                    None
+                );
+            }
+            WidenPlan::Array {
+                source,
+                element,
+                readonly,
+            } => {
+                let element = match element {
+                    WidenTransform::Identity(type_) => type_,
+                    WidenTransform::Cached(source) => *self
+                        .derived_types
+                        .widened_types
+                        .get(&source)
+                        .expect("widened array elements are published before their parent"),
+                };
+                let widened = self
+                    .create_canonical_array_type(
+                        global_types.expect("array plans require authoritative global types"),
+                        element,
+                        readonly,
+                    )
+                    .expect("the widening plan preflighted its canonical array target");
                 assert_eq!(
                     self.derived_types.widened_types.insert(source, widened),
                     None
@@ -897,6 +1053,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         target: TypeId,
         visiting: &mut HashSet<TypeId>,
         regular_visiting: &mut HashSet<TypeId>,
+        global_types: Option<&CanonicalGlobalTypes>,
     ) -> bool {
         let Some(source_record) = self.type_payload(source) else {
             return false;
@@ -915,6 +1072,76 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 .intrinsic_bootstrap()
                 .is_some_and(|bootstrap| target == bootstrap.any_type);
         }
+        if let Some(global_types) = global_types {
+            let source_array = match self.canonical_array_reference(global_types, source) {
+                Ok(Some(source_array)) => source_array,
+                Ok(None) => {
+                    return self.widened_object_cache_entry_is_valid(
+                        source,
+                        target,
+                        visiting,
+                        regular_visiting,
+                        Some(global_types),
+                    );
+                }
+                Err(_) => return false,
+            };
+            if !visiting.insert(source) {
+                return false;
+            }
+            let valid = (|| {
+                let target_array = self
+                    .canonical_array_reference(global_types, target)
+                    .ok()??;
+                if target_array.array_literal
+                    || target_array.readonly != source_array.readonly
+                    || target != target_array.base_type
+                {
+                    return None;
+                }
+                let element_record = self.type_payload(source_array.element_type)?;
+                let expected_element = if element_record
+                    .object_flags()
+                    .intersects(ObjectFlags::REQUIRES_WIDENING)
+                {
+                    let cached = self
+                        .derived_types
+                        .widened_types
+                        .get(&source_array.element_type)
+                        .copied()?;
+                    if !self.widened_cache_entry_is_valid(
+                        source_array.element_type,
+                        cached,
+                        visiting,
+                        regular_visiting,
+                        Some(global_types),
+                    ) {
+                        return None;
+                    }
+                    cached
+                } else {
+                    source_array.element_type
+                };
+                (target_array.element_type == expected_element).then_some(())
+            })()
+            .is_some();
+            debug_assert!(visiting.remove(&source));
+            return valid;
+        }
+        self.widened_object_cache_entry_is_valid(source, target, visiting, regular_visiting, None)
+    }
+
+    fn widened_object_cache_entry_is_valid(
+        &self,
+        source: TypeId,
+        target: TypeId,
+        visiting: &mut HashSet<TypeId>,
+        regular_visiting: &mut HashSet<TypeId>,
+        global_types: Option<&CanonicalGlobalTypes>,
+    ) -> bool {
+        let Some(source_record) = self.type_payload(source) else {
+            return false;
+        };
         if !source_record
             .object_flags()
             .contains(ObjectFlags::OBJECT_LITERAL)
@@ -955,6 +1182,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                         cached,
                         visiting,
                         regular_visiting,
+                        global_types,
                     ) {
                         return None;
                     }
@@ -1143,12 +1371,13 @@ mod tests {
             .unwrap_or_else(|| panic!("missing property {name}"))
     }
 
-    fn observable_state(store: &CanonicalTypeMapperStore) -> (usize, usize, usize, usize) {
+    fn observable_state(store: &CanonicalTypeMapperStore) -> (usize, usize, usize, usize, usize) {
         (
             store.type_len(),
             store.symbol_len(),
             store.derived_types.regular_object_literals.len(),
             store.derived_types.widened_types.len(),
+            store.derived_types.array_literal_types.len(),
         )
     }
 
@@ -1391,5 +1620,219 @@ mod tests {
             widened_nested,
             "the successful retry must retain the already-published child identity"
         );
+    }
+
+    #[test]
+    fn canonical_array_widening_is_recursive_cached_and_fail_closed() {
+        let library = parsed("interface Array<T> {}");
+        let source = parsed(concat!(
+            "var values: any = [1]; ",
+            "var nested: any = [{ id: 1 }];",
+            "var union: any = [{ id: 1 }, { name: 2 }];",
+        ));
+        let library_file = FileId::new(4);
+        let file = FileId::new(5);
+        let mut context = checker_context(&[(library_file, &library), (file, &source)]);
+        context.check_source_file(file).unwrap();
+
+        let values =
+            resolved_expression_type(&context, variable_initializer(&source, file, "values"));
+        let nested =
+            resolved_expression_type(&context, variable_initializer(&source, file, "nested"));
+        let union =
+            resolved_expression_type(&context, variable_initializer(&source, file, "union"));
+        let global_types = context.global_types().clone();
+        let values_reference = context
+            .store()
+            .canonical_array_reference(&global_types, values)
+            .unwrap()
+            .unwrap();
+        let nested_reference = context
+            .store()
+            .canonical_array_reference(&global_types, nested)
+            .unwrap()
+            .unwrap();
+        assert!(values_reference.array_literal);
+        assert!(nested_reference.array_literal);
+
+        let widened_values = context
+            .store_mut_for_test()
+            .get_widened_type_with_global_types(values, &global_types)
+            .unwrap();
+        assert_eq!(widened_values, values_reference.base_type);
+        let warm_values = observable_state(context.store());
+        assert_eq!(
+            context
+                .store_mut_for_test()
+                .get_widened_type_with_global_types(values, &global_types)
+                .unwrap(),
+            widened_values,
+        );
+        assert_eq!(observable_state(context.store()), warm_values);
+
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        assert_eq!(
+            context
+                .store_mut_for_test()
+                .derived_types
+                .array_literal_types
+                .insert(nested_reference.base_type, number),
+            Some(nested),
+        );
+        let poisoned_literal_state = observable_state(context.store());
+        let expected_array_error = ArrayTypeError::InvalidArrayLiteralCache {
+            base: nested_reference.base_type,
+            cached: nested,
+        };
+        let array_error = context
+            .store_mut_for_test()
+            .get_widened_type_with_global_types(nested, &global_types)
+            .unwrap_err();
+        assert_eq!(
+            array_error,
+            DerivedTypeError::ArrayType(expected_array_error),
+        );
+        assert_eq!(
+            std::error::Error::source(&array_error)
+                .and_then(|source| source.downcast_ref::<ArrayTypeError>()),
+            Some(&expected_array_error),
+        );
+        assert_eq!(observable_state(context.store()), poisoned_literal_state);
+        assert_eq!(
+            context
+                .store()
+                .derived_types
+                .array_literal_types
+                .get(&nested_reference.base_type),
+            Some(&number),
+        );
+        assert_eq!(
+            context
+                .store_mut_for_test()
+                .derived_types
+                .array_literal_types
+                .insert(nested_reference.base_type, nested),
+            Some(number),
+        );
+
+        let widened_nested = context
+            .store_mut_for_test()
+            .get_widened_type_with_global_types(nested, &global_types)
+            .unwrap();
+        let widened_nested_reference = context
+            .store()
+            .canonical_array_reference(&global_types, widened_nested)
+            .unwrap()
+            .unwrap();
+        assert!(!widened_nested_reference.array_literal);
+        assert_ne!(
+            widened_nested_reference.element_type,
+            nested_reference.element_type,
+        );
+        let widened_element_shape = context
+            .store()
+            .resolved_object_shape(widened_nested_reference.element_type)
+            .unwrap();
+        assert_eq!(property(&widened_element_shape, "id").type_, number,);
+        assert_eq!(
+            context.store().derived_types.widened_types.get(&nested),
+            Some(&widened_nested),
+        );
+
+        assert_eq!(
+            context
+                .store_mut_for_test()
+                .derived_types
+                .widened_types
+                .insert(nested, number),
+            Some(widened_nested),
+        );
+        let poisoned_widened_state = observable_state(context.store());
+        assert_eq!(
+            context
+                .store_mut_for_test()
+                .get_widened_type_with_global_types(nested, &global_types),
+            Err(DerivedTypeError::InvalidWidenedTypeCache {
+                source: nested,
+                cached: number,
+            }),
+        );
+        assert_eq!(observable_state(context.store()), poisoned_widened_state);
+        assert_eq!(
+            context.store().derived_types.widened_types.get(&nested),
+            Some(&number),
+        );
+        assert_eq!(
+            context
+                .store_mut_for_test()
+                .derived_types
+                .widened_types
+                .insert(nested, widened_nested),
+            Some(number),
+        );
+        let warm_nested = observable_state(context.store());
+        assert_eq!(
+            context
+                .store_mut_for_test()
+                .get_widened_type_with_global_types(nested, &global_types)
+                .unwrap(),
+            widened_nested,
+        );
+        assert_eq!(observable_state(context.store()), warm_nested);
+
+        let union_element = context
+            .store()
+            .canonical_array_element_type(&global_types, union)
+            .unwrap()
+            .unwrap();
+        let union_record = context.store().type_payload(union_element).unwrap();
+        assert!(union_record.flags().intersects(TypeFlags::UNION));
+        assert!(
+            union_record
+                .object_flags()
+                .intersects(ObjectFlags::REQUIRES_WIDENING)
+        );
+        let union_boundary_state = observable_state(context.store());
+        assert_eq!(
+            context
+                .store_mut_for_test()
+                .get_widened_type_with_global_types(union, &global_types),
+            Err(DerivedTypeError::UnsupportedWideningType(union_element)),
+        );
+        assert_eq!(observable_state(context.store()), union_boundary_state);
+
+        let recursive = {
+            let store = context.store_mut_for_test();
+            let symbol = store
+                .type_payload(global_types.array_type)
+                .unwrap()
+                .symbol();
+            let recursive = store
+                .alloc_type_reference(ObjectFlags::CONTAINS_OBJECT_OR_ARRAY_LITERAL, symbol)
+                .unwrap();
+            assert!(store.set_object_target_and_mapper(
+                recursive,
+                Some(global_types.array_type),
+                None,
+            ));
+            assert!(store.set_type_reference_resolution(recursive, None, Some(vec![recursive]),));
+            assert_eq!(
+                store.insert_object_instantiation(
+                    global_types.array_type,
+                    crate::semantic::declared::type_list_key(&[recursive]),
+                    recursive,
+                ),
+                Some(recursive),
+            );
+            recursive
+        };
+        let recursive_boundary_state = observable_state(context.store());
+        assert_eq!(
+            context
+                .store_mut_for_test()
+                .get_widened_type_with_global_types(recursive, &global_types),
+            Err(DerivedTypeError::RecursiveWideningType(recursive)),
+        );
+        assert_eq!(observable_state(context.store()), recursive_boundary_state);
     }
 }

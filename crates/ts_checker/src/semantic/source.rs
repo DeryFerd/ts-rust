@@ -1941,6 +1941,7 @@ fn validate_deferred_assertions(
 
 fn assertion_operand_types(
     store: &mut CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
     operand: TypeId,
 ) -> Result<(TypeId, TypeId), SourceCheckError> {
     let flags = store
@@ -1962,7 +1963,7 @@ fn assertion_operand_types(
         operand
     };
     let regular = store.get_regular_type_of_object_literal(base)?;
-    let widened = store.get_widened_type(regular)?;
+    let widened = store.get_widened_type_with_global_types(regular, global_types)?;
     Ok((regular, widened))
 }
 
@@ -1979,7 +1980,8 @@ fn check_deferred_assertions(
         flags |= CanonicalTypeFormatFlags::NO_TRUNCATION;
     }
     for assertion in deferred {
-        let (operand, widened) = assertion_operand_types(store, assertion.operand_type)?;
+        let (operand, widened) =
+            assertion_operand_types(store, global_types, assertion.operand_type)?;
         if store.is_type_comparable_to_with_global_types(
             assertion.target_type,
             widened,
@@ -2836,6 +2838,120 @@ mod tests {
                 .collect::<Vec<_>>(),
             [assertion]
         );
+        assert!(is_type_checked(&context, file));
+
+        let warm = observable_state(&context, file);
+        context.check_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn array_assertion_operands_widen_to_the_canonical_array_identity() {
+        let library = parsed("interface Array<T> {}");
+        let source = parsed("var x: number[] = ([1] as number[]);");
+        let library_file = FileId::new(127);
+        let file = FileId::new(128);
+        let mut context = context(
+            &[(library_file, &library), (file, &source)],
+            CanonicalCheckerOptions::default(),
+        );
+        let assertion = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::AsExpression).then_some(NodeRef::new(
+                    source.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let array = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ArrayLiteralExpression).then_some(NodeRef::new(
+                    source.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+
+        context.check_source_file(file).unwrap();
+
+        assert!(context.diagnostics().is_empty());
+        assert!(is_type_checked(&context, file));
+        let operand = resolved_node_type(&context, array);
+        let target = resolved_node_type(&context, assertion);
+        let operand_array = context
+            .store()
+            .canonical_array_reference(context.global_types(), operand)
+            .unwrap()
+            .unwrap();
+        let target_array = context
+            .store()
+            .canonical_array_reference(context.global_types(), target)
+            .unwrap()
+            .unwrap();
+        assert!(operand_array.array_literal);
+        assert!(!target_array.array_literal);
+        assert_eq!(operand_array.base_type, target);
+        assert_eq!(operand_array.element_type, target_array.element_type);
+        assert_eq!(context.type_to_string(operand).unwrap(), "number[]");
+        assert_eq!(context.type_to_string(target).unwrap(), "number[]");
+        assert_eq!(
+            context.store().assertion_links(assertion),
+            Some(&AssertionLinks {
+                expr_type: Some(operand),
+            })
+        );
+
+        let warm = observable_state(&context, file);
+        context.check_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn nonoverlapping_array_assertions_issue_exact_ts2352_cold_and_warm() {
+        let library = parsed("interface Array<T> {}");
+        let source = parsed("var x: string[] = ([1] as string[]);");
+        let library_file = FileId::new(129);
+        let file = FileId::new(130);
+        let mut context = context(
+            &[(library_file, &library), (file, &source)],
+            CanonicalCheckerOptions::default(),
+        );
+        let assertion = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::AsExpression).then_some(NodeRef::new(
+                    source.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+
+        context.check_source_file(file).unwrap();
+
+        let [diagnostic] = context.diagnostics().as_slice() else {
+            panic!("expected one array assertion diagnostic")
+        };
+        assert_eq!(diagnostic.node, Some(assertion));
+        assert_eq!(diagnostic.diagnostic.code(), 2352);
+        assert_eq!(diagnostic.diagnostic.category(), Category::Error);
+        assert_eq!(diagnostic.diagnostic.arguments, ["number[]", "string[]"]);
+        assert_eq!(
+            diagnostic.diagnostic.render().unwrap(),
+            "Conversion of type 'number[]' to type 'string[]' may be a mistake because neither type sufficiently overlaps with the other. If this was intentional, convert the expression to 'unknown' first."
+        );
+        assert!(diagnostic.related_information.is_empty());
+        assert_eq!(node_text(&source, assertion), "[1] as string[]");
+        let range = source.arena.get(assertion.node).unwrap().range;
+        assert_eq!(range.start.get(), 19);
+        assert_eq!(range.end.get(), 34);
         assert!(is_type_checked(&context, file));
 
         let warm = observable_state(&context, file);
