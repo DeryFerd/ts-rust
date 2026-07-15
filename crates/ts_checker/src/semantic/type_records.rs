@@ -1585,6 +1585,31 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         true
     }
 
+    /// Atomically publishes the cold interface result produced when every
+    /// declaration has no heritage clause. This mirrors pinned `getBaseTypes`:
+    /// resolving bases invalidates the structured-member cache even when the
+    /// resolved base list is absent rather than allocated empty.
+    pub(super) fn publish_interface_no_base_resolution(&mut self, id: TypeId) -> bool {
+        let Some(record) = self.type_payload_mut(id) else {
+            return false;
+        };
+        if !record.object_flags.contains(ObjectFlags::INTERFACE) {
+            return false;
+        }
+        let TypeData::Interface(interface) = &mut record.data else {
+            return false;
+        };
+        if interface.base_types_resolved
+            || interface.resolved_base_constructor_type.is_some()
+            || interface.resolved_base_types.is_some()
+        {
+            return false;
+        }
+        interface.base_types_resolved = true;
+        record.object_flags &= !ObjectFlags::MEMBERS_RESOLVED;
+        true
+    }
+
     #[allow(clippy::too_many_arguments)] // Mirrors the declared-member caches exactly.
     pub fn set_interface_declared_members(
         &mut self,
@@ -2608,6 +2633,86 @@ mod tests {
                 .unwrap()
                 .object_flags()
                 .contains(ObjectFlags::MEMBERS_RESOLVED)
+        );
+    }
+
+    #[test]
+    fn no_base_interface_publication_is_atomic_and_invalidates_only_cold_members() {
+        let mut seeded = seeded_store("local");
+        let interface = seeded
+            .store
+            .alloc_interface_type(ObjectFlags::INTERFACE, Some(seeded.symbol))
+            .unwrap();
+        assert!(
+            seeded
+                .store
+                .set_structured_type_members(interface, None, None, None, None, None,)
+        );
+        assert!(
+            seeded
+                .store
+                .type_payload(interface)
+                .unwrap()
+                .object_flags()
+                .contains(ObjectFlags::MEMBERS_RESOLVED)
+        );
+
+        assert!(seeded.store.publish_interface_no_base_resolution(interface));
+        let (resolved, flags) = interface_snapshot(&seeded.store, interface);
+        assert!(resolved.base_types_resolved);
+        assert!(resolved.resolved_base_constructor_type.is_none());
+        assert!(resolved.resolved_base_types.is_none());
+        assert!(!flags.contains(ObjectFlags::MEMBERS_RESOLVED));
+
+        assert!(
+            seeded
+                .store
+                .set_structured_type_members(interface, None, None, None, None, None,)
+        );
+        assert!(!seeded.store.publish_interface_no_base_resolution(interface));
+        assert!(
+            seeded
+                .store
+                .type_payload(interface)
+                .unwrap()
+                .object_flags()
+                .contains(ObjectFlags::MEMBERS_RESOLVED)
+        );
+
+        let class = seeded
+            .store
+            .alloc_interface_type(ObjectFlags::CLASS, Some(seeded.symbol))
+            .unwrap();
+        let before = interface_snapshot(&seeded.store, class);
+        assert!(!seeded.store.publish_interface_no_base_resolution(class));
+        assert_eq!(interface_snapshot(&seeded.store, class), before);
+
+        let allocated_empty_bases = seeded
+            .store
+            .alloc_interface_type(ObjectFlags::INTERFACE, Some(seeded.symbol))
+            .unwrap();
+        assert!(seeded.store.set_interface_base_resolution(
+            allocated_empty_bases,
+            true,
+            None,
+            Some(Vec::new()),
+        ));
+        let before = interface_snapshot(&seeded.store, allocated_empty_bases);
+        assert!(
+            before
+                .0
+                .resolved_base_types
+                .as_ref()
+                .is_some_and(Vec::is_empty)
+        );
+        assert!(
+            !seeded
+                .store
+                .publish_interface_no_base_resolution(allocated_empty_bases)
+        );
+        assert_eq!(
+            interface_snapshot(&seeded.store, allocated_empty_bases),
+            before
         );
     }
 

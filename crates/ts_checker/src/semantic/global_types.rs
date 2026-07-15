@@ -9,7 +9,7 @@
 //! Unsupported semantic dependencies fail construction instead of silently
 //! changing a type identity.
 
-use ts_ast::{NodeRef, SyntaxKind};
+use ts_ast::{NodeData, NodeRef, SyntaxKind};
 use ts_binder::{
     CanonicalNameResolutionError, SemanticSymbolId, SymbolFlags, SymbolTableId, resolve_global_name,
 };
@@ -91,6 +91,8 @@ pub enum CanonicalGlobalTypeInitializationError {
     InvalidGenericTarget(TypeId),
     InvalidTypeReference(TypeId),
     InvalidInstantiationCache(TypeId),
+    InvalidGlobalObjectDeclaration(NodeRef),
+    InvalidGlobalObjectBaseResolution(TypeId),
 }
 
 impl std::fmt::Display for CanonicalGlobalTypeInitializationError {
@@ -137,6 +139,14 @@ impl std::fmt::Display for CanonicalGlobalTypeInitializationError {
             Self::InvalidInstantiationCache(type_id) => write!(
                 formatter,
                 "global library type {type_id:?} rejected its canonical instantiation"
+            ),
+            Self::InvalidGlobalObjectDeclaration(declaration) => write!(
+                formatter,
+                "global Object base resolution cannot validate declaration {declaration:?}"
+            ),
+            Self::InvalidGlobalObjectBaseResolution(type_id) => write!(
+                formatter,
+                "global Object type {type_id:?} has contradictory base-resolution state"
             ),
         }
     }
@@ -186,6 +196,20 @@ struct GlobalTypeResolver<'store, 'host, 'arena> {
     empty_object_type: TypeId,
     empty_generic_type: TypeId,
     diagnostics: Vec<CanonicalGlobalTypeDiagnostic>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GlobalObjectNoBasePlan {
+    NoPublish,
+    Publish(TypeId),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GlobalObjectBaseResolutionState {
+    Cold,
+    NoBases,
+    ResolvedBases,
+    Invalid,
 }
 
 impl GlobalTypeResolver<'_, '_, '_> {
@@ -343,6 +367,12 @@ pub(super) fn initialize_global_library_types(
 
     let array_type = resolver.resolve("Array", 1, true)?;
     let object_type = resolver.resolve("Object", 0, true)?;
+    let global_object_no_base_plan = preflight_global_object_no_base(
+        resolver.store,
+        resolver.host,
+        resolver.globals,
+        object_type,
+    )?;
     let function_type = resolver.resolve("Function", 0, true)?;
     let callable_function_type = if strict_bind_call_apply {
         resolver.resolve("CallableFunction", 0, true)?
@@ -405,6 +435,8 @@ pub(super) fn initialize_global_library_types(
     )?;
     let this_type = resolver.resolve("ThisType", 1, false)?;
 
+    commit_global_object_no_base(resolver.store, global_object_no_base_plan)?;
+
     Ok(CanonicalGlobalTypes {
         arguments_type,
         global_this_value_type,
@@ -424,6 +456,201 @@ pub(super) fn initialize_global_library_types(
         this_type,
         diagnostics: resolver.diagnostics,
     })
+}
+
+/// Proves the pinned no-heritage `Object` fast path without resolving any
+/// heritage expressions. The proof is deliberately restricted to a real,
+/// non-generic merged interface; value-side `var Object` declarations do not
+/// contribute bases and are ignored.
+fn preflight_global_object_no_base(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    globals: SymbolTableId,
+    object_type: TypeId,
+) -> Result<GlobalObjectNoBasePlan, CanonicalGlobalTypeInitializationError> {
+    let object_record = store.type_payload(object_type).ok_or(
+        CanonicalGlobalTypeInitializationError::InvalidType(object_type),
+    )?;
+    let TypeData::Interface(interface) = object_record.data() else {
+        // Missing, wrong-kind, and wrong-arity globals use the pinned empty
+        // object fallback and cannot establish a fact about global Object.
+        return Ok(GlobalObjectNoBasePlan::NoPublish);
+    };
+    let object_origin = object_record.object_flags() & ObjectFlags::CLASS_OR_INTERFACE;
+    let symbol = object_record.symbol().ok_or(
+        CanonicalGlobalTypeInitializationError::InvalidGlobalObjectBaseResolution(object_type),
+    )?;
+    let raw_global = store
+        .symbol_table(globals)
+        .ok_or(CanonicalGlobalTypeInitializationError::InvalidGlobals(
+            globals,
+        ))?
+        .get_source("Object")
+        .ok_or(
+            CanonicalGlobalTypeInitializationError::InvalidGlobalObjectBaseResolution(object_type),
+        )?;
+    let global_symbol = store.get_merged_symbol(raw_global).ok_or(
+        CanonicalGlobalTypeInitializationError::InvalidSymbol(raw_global),
+    )?;
+    if symbol != global_symbol {
+        return Err(
+            CanonicalGlobalTypeInitializationError::InvalidGlobalObjectBaseResolution(object_type),
+        );
+    }
+    let symbol_record =
+        store
+            .symbol(symbol)
+            .ok_or(CanonicalGlobalTypeInitializationError::InvalidSymbol(
+                symbol,
+            ))?;
+    let has_exact_interface_type_side =
+        (symbol_record.flags() & SymbolFlags::TYPE) == SymbolFlags::INTERFACE;
+    let declarations = symbol_record.declarations().ok_or(
+        CanonicalGlobalTypeInitializationError::InvalidGlobalObjectBaseResolution(object_type),
+    )?;
+    if declarations.is_empty() {
+        return Err(
+            CanonicalGlobalTypeInitializationError::InvalidGlobalObjectBaseResolution(object_type),
+        );
+    }
+
+    let mut saw_interface = false;
+    let mut saw_interface_heritage = false;
+    let mut declarations_prove_no_bases = true;
+    for declaration in declarations {
+        let node = host.node(*declaration).ok_or(
+            CanonicalGlobalTypeInitializationError::InvalidGlobalObjectDeclaration(*declaration),
+        )?;
+        if !host.symbol_matches(store, *declaration, symbol) {
+            return Err(
+                CanonicalGlobalTypeInitializationError::InvalidGlobalObjectDeclaration(
+                    *declaration,
+                ),
+            );
+        }
+        match (node.kind, &node.data) {
+            (SyntaxKind::InterfaceDeclaration, NodeData::InterfaceDeclaration(interface)) => {
+                saw_interface = true;
+                let has_heritage = interface.heritage_clauses.is_some();
+                if has_heritage {
+                    saw_interface_heritage = true;
+                }
+                if interface.type_parameters.is_some() || has_heritage {
+                    declarations_prove_no_bases = false;
+                }
+            }
+            (SyntaxKind::VariableDeclaration, NodeData::VariableDeclaration(_)) => {
+                // `declare var Object` is the value-side constructor and does
+                // not participate in interface base resolution.
+            }
+            (SyntaxKind::InterfaceDeclaration | SyntaxKind::VariableDeclaration, _) => {
+                return Err(
+                    CanonicalGlobalTypeInitializationError::InvalidGlobalObjectDeclaration(
+                        *declaration,
+                    ),
+                );
+            }
+            _ => declarations_prove_no_bases = false,
+        }
+    }
+    if has_exact_interface_type_side && !saw_interface {
+        return Err(
+            CanonicalGlobalTypeInitializationError::InvalidGlobalObjectBaseResolution(object_type),
+        );
+    }
+    if !has_exact_interface_type_side || !declarations_prove_no_bases {
+        // A class is both a type and a value, but it is not evidence for the
+        // interface-only no-heritage result. Other valid unsupported merged
+        // forms are equally conservative.
+        if object_origin == ObjectFlags::CLASS {
+            return Ok(GlobalObjectNoBasePlan::NoPublish);
+        }
+        if object_origin != ObjectFlags::INTERFACE {
+            return Err(
+                CanonicalGlobalTypeInitializationError::InvalidGlobalObjectBaseResolution(
+                    object_type,
+                ),
+            );
+        }
+        return match global_object_base_resolution_state(interface) {
+            GlobalObjectBaseResolutionState::Cold => Ok(GlobalObjectNoBasePlan::NoPublish),
+            GlobalObjectBaseResolutionState::ResolvedBases if saw_interface_heritage => {
+                Ok(GlobalObjectNoBasePlan::NoPublish)
+            }
+            GlobalObjectBaseResolutionState::NoBases
+            | GlobalObjectBaseResolutionState::ResolvedBases
+            | GlobalObjectBaseResolutionState::Invalid => Err(
+                CanonicalGlobalTypeInitializationError::InvalidGlobalObjectBaseResolution(
+                    object_type,
+                ),
+            ),
+        };
+    }
+    if object_origin != ObjectFlags::INTERFACE {
+        return Err(
+            CanonicalGlobalTypeInitializationError::InvalidGlobalObjectBaseResolution(object_type),
+        );
+    }
+
+    match global_object_base_resolution_state(interface) {
+        GlobalObjectBaseResolutionState::NoBases => Ok(GlobalObjectNoBasePlan::NoPublish),
+        GlobalObjectBaseResolutionState::Cold => Ok(GlobalObjectNoBasePlan::Publish(object_type)),
+        GlobalObjectBaseResolutionState::ResolvedBases
+        | GlobalObjectBaseResolutionState::Invalid => Err(
+            CanonicalGlobalTypeInitializationError::InvalidGlobalObjectBaseResolution(object_type),
+        ),
+    }
+}
+
+/// Publishes only after all other fallible global-library initialization has
+/// completed, so a later failure cannot leave behind this newly resolved fact.
+fn commit_global_object_no_base(
+    store: &mut CanonicalTypeMapperStore,
+    plan: GlobalObjectNoBasePlan,
+) -> Result<(), CanonicalGlobalTypeInitializationError> {
+    let GlobalObjectNoBasePlan::Publish(object_type) = plan else {
+        return Ok(());
+    };
+    let record = store.type_payload(object_type).ok_or(
+        CanonicalGlobalTypeInitializationError::InvalidType(object_type),
+    )?;
+    let TypeData::Interface(interface) = record.data() else {
+        return Err(
+            CanonicalGlobalTypeInitializationError::InvalidGlobalObjectBaseResolution(object_type),
+        );
+    };
+    match global_object_base_resolution_state(interface) {
+        // An already-warm cache is valid and must retain its member resolution
+        // state.
+        GlobalObjectBaseResolutionState::NoBases => Ok(()),
+        GlobalObjectBaseResolutionState::Cold
+            if store.publish_interface_no_base_resolution(object_type) =>
+        {
+            Ok(())
+        }
+        GlobalObjectBaseResolutionState::Cold
+        | GlobalObjectBaseResolutionState::ResolvedBases
+        | GlobalObjectBaseResolutionState::Invalid => Err(
+            CanonicalGlobalTypeInitializationError::InvalidGlobalObjectBaseResolution(object_type),
+        ),
+    }
+}
+
+fn global_object_base_resolution_state(
+    interface: &super::type_records::InterfaceTypeData,
+) -> GlobalObjectBaseResolutionState {
+    match (
+        interface.base_types_resolved,
+        interface.resolved_base_constructor_type,
+        interface.resolved_base_types.as_deref(),
+    ) {
+        (false, None, None) => GlobalObjectBaseResolutionState::Cold,
+        (true, None, None) => GlobalObjectBaseResolutionState::NoBases,
+        (true, None, Some(bases)) if !bases.is_empty() => {
+            GlobalObjectBaseResolutionState::ResolvedBases
+        }
+        _ => GlobalObjectBaseResolutionState::Invalid,
+    }
 }
 
 fn interface_arity(

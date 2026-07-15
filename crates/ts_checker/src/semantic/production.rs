@@ -1542,8 +1542,8 @@ mod tests {
     use super::*;
     use crate::semantic::{
         AliasTargetState, CanonicalModuleResolutionEntry, CanonicalModuleResolutionManifestInput,
-        CanonicalModuleResolutionMode, CanonicalResolvedModuleInput, TypeData,
-        TypeResolutionTarget, TypeResolutionTargetError, TypeSystemPropertyName,
+        CanonicalModuleResolutionMode, CanonicalResolvedModuleInput, DeclaredTypeUnavailable,
+        TypeData, TypeResolutionTarget, TypeResolutionTargetError, TypeSystemPropertyName,
         alias::{CanonicalAliasResolutionEvent, CanonicalAliasTargetUnavailable},
         type_records::TypeCacheState,
         types::ObjectFlags,
@@ -1759,6 +1759,65 @@ mod tests {
             .symbol_table(context.globals())
             .unwrap()
             .get_source(name)
+    }
+
+    fn interface_base_snapshot(
+        context: &CanonicalCheckerContext<'_>,
+        type_id: TypeId,
+    ) -> (bool, Option<TypeId>, Option<Vec<TypeId>>, ObjectFlags) {
+        let record = context.store().type_payload(type_id).unwrap();
+        let TypeData::Interface(interface) = record.data() else {
+            panic!("expected interface origin")
+        };
+        (
+            interface.base_types_resolved,
+            interface.resolved_base_constructor_type,
+            interface.resolved_base_types.clone(),
+            record.object_flags(),
+        )
+    }
+
+    fn reinitialize_global_library_types(
+        context: &mut CanonicalCheckerContext<'_>,
+    ) -> Result<CanonicalGlobalTypes, CanonicalGlobalTypeInitializationError> {
+        let globals = context.globals;
+        let options = context.options;
+        let CanonicalCheckerContext { files, store, .. } = context;
+        let host = DeclaredTypeHost::from_registry(
+            store,
+            files,
+            GlobalMergeCompletion::for_test(options.name_resolution),
+        )
+        .unwrap();
+        initialize_global_library_types(store, &host, globals, options.strict_bind_call_apply)
+    }
+
+    fn minimal_global_library() -> ParseResult {
+        parsed(
+            "interface IArguments {}\n\
+             interface Array<T> {}\n\
+             interface Object {}\n\
+             declare var Object: { prototype: Object };\n\
+             interface Function {}\n\
+             interface String {}\n\
+             interface Number {}\n\
+             interface Boolean {}\n\
+             interface RegExp {}",
+        )
+    }
+
+    fn heritage_global_library() -> ParseResult {
+        parsed(
+            "interface IArguments {}\n\
+             interface Array<T> {}\n\
+             interface ObjectBase {}\n\
+             interface Object extends ObjectBase {}\n\
+             interface Function {}\n\
+             interface String {}\n\
+             interface Number {}\n\
+             interface Boolean {}\n\
+             interface RegExp {}",
+        )
     }
 
     fn type_alias_body(source: &ParseResult, file: FileId, name: &str) -> NodeRef {
@@ -2979,6 +3038,13 @@ declare global { interface Augmented { second: number } }
         let global_this = store.type_payload(globals.global_this_value_type).unwrap();
         assert_eq!(global_this.symbol(), Some(bootstrap.global_this_symbol));
         assert_eq!(global_this.object_flags(), ObjectFlags::ANONYMOUS);
+        let TypeData::Interface(object) = store.type_payload(globals.object_type).unwrap().data()
+        else {
+            panic!("global Object must be an interface origin")
+        };
+        assert!(object.base_types_resolved);
+        assert!(object.resolved_base_constructor_type.is_none());
+        assert!(object.resolved_base_types.is_none());
 
         for (name, type_id) in [
             ("IArguments", globals.arguments_type),
@@ -3148,6 +3214,302 @@ declare global { interface Augmented { second: number } }
         assert_eq!(globals.readonly_array_type, globals.array_type);
         assert_eq!(globals.any_readonly_array_type, globals.any_array_type);
         assert_eq!(globals.this_type, bootstrap.empty_generic_type);
+    }
+
+    #[test]
+    fn merged_global_object_interfaces_without_heritage_publish_no_base_fact() {
+        let core = parsed(
+            "interface IArguments {}\n\
+             interface Array<T> {}\n\
+             interface Object { first: string }\n\
+             declare var Object: { prototype: Object };\n\
+             interface Function {}\n\
+             interface String {}\n\
+             interface Number {}\n\
+             interface Boolean {}\n\
+             interface RegExp {}",
+        );
+        let augmentation = parsed("interface Object { second: number }");
+        let core_file = FileId::new(124);
+        let augmentation_file = FileId::new(125);
+        let context = CanonicalCheckerContext::new(
+            completed_bindings(&[(core_file, &core), (augmentation_file, &augmentation)]),
+            vec![
+                (core_file, &core.arena),
+                (augmentation_file, &augmentation.arena),
+            ],
+            IntrinsicBootstrapOptions::default(),
+        )
+        .unwrap();
+
+        let object_symbol = global_symbol(&context, "Object").unwrap();
+        assert_eq!(
+            context
+                .store()
+                .symbol(object_symbol)
+                .unwrap()
+                .declarations()
+                .unwrap()
+                .len(),
+            3
+        );
+        let object_type = context.global_types().object_type;
+        let TypeData::Interface(object) = context.store().type_payload(object_type).unwrap().data()
+        else {
+            panic!("global Object must be an interface origin")
+        };
+        assert!(object.base_types_resolved);
+        assert!(object.resolved_base_constructor_type.is_none());
+        assert!(object.resolved_base_types.is_none());
+    }
+
+    #[test]
+    fn non_generic_global_object_with_this_type_still_publishes_no_base_fact() {
+        let source = parsed(
+            "interface IArguments {}\n\
+             interface Array<T> {}\n\
+             interface Object { identity(): this }\n\
+             interface Function {}\n\
+             interface String {}\n\
+             interface Number {}\n\
+             interface Boolean {}\n\
+             interface RegExp {}",
+        );
+        let file = FileId::new(133);
+        let context = CanonicalCheckerContext::new(
+            completed_bindings(&[(file, &source)]),
+            vec![(file, &source.arena)],
+            IntrinsicBootstrapOptions::default(),
+        )
+        .unwrap();
+
+        let object_type = context.global_types().object_type;
+        let snapshot = interface_base_snapshot(&context, object_type);
+        assert!(snapshot.0);
+        assert_eq!(snapshot.1, None);
+        assert_eq!(snapshot.2, None);
+        assert!(
+            snapshot
+                .3
+                .contains(ObjectFlags::INTERFACE | ObjectFlags::REFERENCE)
+        );
+    }
+
+    #[test]
+    fn global_object_interface_with_heritage_leaves_base_resolution_cold() {
+        let source = heritage_global_library();
+        let file = FileId::new(126);
+        let context = CanonicalCheckerContext::new(
+            completed_bindings(&[(file, &source)]),
+            vec![(file, &source.arena)],
+            IntrinsicBootstrapOptions::default(),
+        )
+        .unwrap();
+
+        let object_type = context.global_types().object_type;
+        let TypeData::Interface(object) = context.store().type_payload(object_type).unwrap().data()
+        else {
+            panic!("global Object must be an interface origin")
+        };
+        assert!(!object.base_types_resolved);
+        assert!(object.resolved_base_constructor_type.is_none());
+        assert!(object.resolved_base_types.is_none());
+    }
+
+    #[test]
+    fn heritage_object_warm_nil_base_cache_is_typed_and_mutation_free() {
+        let source = heritage_global_library();
+        let file = FileId::new(131);
+        let mut context = CanonicalCheckerContext::new(
+            completed_bindings(&[(file, &source)]),
+            vec![(file, &source.arena)],
+            IntrinsicBootstrapOptions::default(),
+        )
+        .unwrap();
+        let object_type = context.global_types().object_type;
+        {
+            let store = context.store_mut_for_test();
+            assert!(store.set_interface_base_resolution(object_type, true, None, None));
+            assert!(store.set_structured_type_members(object_type, None, None, None, None, None,));
+        }
+        let before = interface_base_snapshot(&context, object_type);
+        assert!(before.0);
+        assert_eq!(before.1, None);
+        assert_eq!(before.2, None);
+        assert!(before.3.contains(ObjectFlags::MEMBERS_RESOLVED));
+
+        assert_eq!(
+            reinitialize_global_library_types(&mut context),
+            Err(
+                CanonicalGlobalTypeInitializationError::InvalidGlobalObjectBaseResolution(
+                    object_type,
+                )
+            )
+        );
+        assert_eq!(interface_base_snapshot(&context, object_type), before);
+    }
+
+    #[test]
+    fn resolved_heritage_object_with_nonempty_bases_is_preserved() {
+        let source = heritage_global_library();
+        let file = FileId::new(132);
+        let mut context = CanonicalCheckerContext::new(
+            completed_bindings(&[(file, &source)]),
+            vec![(file, &source.arena)],
+            IntrinsicBootstrapOptions::default(),
+        )
+        .unwrap();
+        let object_type = context.global_types().object_type;
+        let base_symbol = global_symbol(&context, "ObjectBase").unwrap();
+        let base_type = context.get_declared_type_of_symbol(base_symbol).unwrap();
+        {
+            let store = context.store_mut_for_test();
+            assert!(store.set_interface_base_resolution(
+                object_type,
+                true,
+                None,
+                Some(vec![base_type]),
+            ));
+            assert!(store.set_structured_type_members(object_type, None, None, None, None, None,));
+        }
+        let before = interface_base_snapshot(&context, object_type);
+        assert!(before.0);
+        assert_eq!(before.1, None);
+        assert_eq!(before.2.as_deref(), Some([base_type].as_slice()));
+        assert!(before.3.contains(ObjectFlags::MEMBERS_RESOLVED));
+
+        let globals = reinitialize_global_library_types(&mut context).unwrap();
+        assert_eq!(globals.object_type, object_type);
+        assert_eq!(interface_base_snapshot(&context, object_type), before);
+    }
+
+    #[test]
+    fn global_object_class_is_not_used_as_no_base_interface_proof() {
+        let source = parsed(
+            "interface IArguments {}\n\
+             interface Array<T> {}\n\
+             class Object {}\n\
+             interface Function {}\n\
+             interface String {}\n\
+             interface Number {}\n\
+             interface Boolean {}\n\
+             interface RegExp {}",
+        );
+        let file = FileId::new(130);
+        let context = CanonicalCheckerContext::new(
+            completed_bindings(&[(file, &source)]),
+            vec![(file, &source.arena)],
+            IntrinsicBootstrapOptions::default(),
+        )
+        .unwrap();
+
+        let object_type = context.global_types().object_type;
+        let snapshot = interface_base_snapshot(&context, object_type);
+        assert!(!snapshot.0);
+        assert_eq!(snapshot.1, None);
+        assert_eq!(snapshot.2, None);
+        assert!(snapshot.3.contains(ObjectFlags::CLASS));
+    }
+
+    #[test]
+    fn warm_global_object_no_base_cache_retains_resolved_members() {
+        let source = minimal_global_library();
+        let file = FileId::new(127);
+        let mut context = CanonicalCheckerContext::new(
+            completed_bindings(&[(file, &source)]),
+            vec![(file, &source.arena)],
+            IntrinsicBootstrapOptions::default(),
+        )
+        .unwrap();
+        let object_type = context.global_types().object_type;
+        assert!(context.store_mut_for_test().set_structured_type_members(
+            object_type,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ));
+        let before = interface_base_snapshot(&context, object_type);
+        assert!(before.0);
+        assert_eq!(before.1, None);
+        assert_eq!(before.2, None);
+        assert!(before.3.contains(ObjectFlags::MEMBERS_RESOLVED));
+
+        let globals = reinitialize_global_library_types(&mut context).unwrap();
+        assert_eq!(globals.object_type, object_type);
+        assert_eq!(interface_base_snapshot(&context, object_type), before);
+    }
+
+    #[test]
+    fn later_global_type_failure_does_not_publish_preflighted_object_bases() {
+        let source = minimal_global_library();
+        let file = FileId::new(128);
+        let mut context = CanonicalCheckerContext::new(
+            completed_bindings(&[(file, &source)]),
+            vec![(file, &source.arena)],
+            IntrinsicBootstrapOptions::default(),
+        )
+        .unwrap();
+        let object_type = context.global_types().object_type;
+        let function_symbol = global_symbol(&context, "Function").unwrap();
+        let any_type = context.store().intrinsic_bootstrap().unwrap().any_type;
+        {
+            let store = context.store_mut_for_test();
+            assert!(store.set_interface_base_resolution(object_type, false, None, None));
+            assert!(store.set_structured_type_members(object_type, None, None, None, None, None,));
+            let mut links = store.declared_type_links(function_symbol).unwrap().clone();
+            links.declared_type = Some(any_type);
+            assert!(store.set_declared_type_links(function_symbol, links));
+        }
+        let before = interface_base_snapshot(&context, object_type);
+        assert!(!before.0);
+        assert_eq!(before.1, None);
+        assert_eq!(before.2, None);
+        assert!(before.3.contains(ObjectFlags::MEMBERS_RESOLVED));
+
+        let error = reinitialize_global_library_types(&mut context).unwrap_err();
+        assert_eq!(
+            error,
+            CanonicalGlobalTypeInitializationError::DeclaredType(DeclaredTypeError::Unavailable(
+                DeclaredTypeUnavailable::InvalidCachedDeclaredType {
+                    symbol: function_symbol,
+                    declared_type: any_type,
+                },
+            ))
+        );
+        assert_eq!(interface_base_snapshot(&context, object_type), before);
+    }
+
+    #[test]
+    fn allocated_empty_global_object_base_cache_is_typed_and_mutation_free() {
+        let source = minimal_global_library();
+        let file = FileId::new(129);
+        let mut context = CanonicalCheckerContext::new(
+            completed_bindings(&[(file, &source)]),
+            vec![(file, &source.arena)],
+            IntrinsicBootstrapOptions::default(),
+        )
+        .unwrap();
+        let object_type = context.global_types().object_type;
+        assert!(context.store_mut_for_test().set_interface_base_resolution(
+            object_type,
+            true,
+            None,
+            Some(Vec::new()),
+        ));
+        let before = interface_base_snapshot(&context, object_type);
+        assert_eq!(before.2, Some(Vec::new()));
+
+        assert_eq!(
+            reinitialize_global_library_types(&mut context),
+            Err(
+                CanonicalGlobalTypeInitializationError::InvalidGlobalObjectBaseResolution(
+                    object_type,
+                )
+            )
+        );
+        assert_eq!(interface_base_snapshot(&context, object_type), before);
     }
 
     #[test]
