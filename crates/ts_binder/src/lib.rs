@@ -19,7 +19,8 @@ pub use name_resolver::{
     CanonicalNameResolutionError, CanonicalNameResolver, CanonicalNameResolverHost,
     CanonicalNameResolverOptions, CanonicalResolutionLocation, CanonicalResolvedName,
     CanonicalScopeChangeState, CanonicalSyntheticScope, CanonicalSyntheticScopeId,
-    CanonicalSyntheticScopeStore, CanonicalSyntheticScopeStoreError, resolve_global_name,
+    CanonicalSyntheticScopeStore, CanonicalSyntheticScopeStoreError,
+    canonical_has_syntactic_modifier, resolve_global_name,
 };
 pub use semantic::{
     AstScope, CheckFlags, SemanticStoreId, SemanticSymbolId, SymbolData, SymbolStore, SymbolTableId,

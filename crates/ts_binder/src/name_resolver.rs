@@ -281,6 +281,7 @@ pub enum CanonicalNameResolutionError {
     JsDocDeferred(NodeRef),
     InvalidHostSymbol(SemanticSymbolId),
     InvalidHostTable(SymbolTableId),
+    AliasResolutionUnavailable(SemanticSymbolId),
     MissingDeclarationSymbol(NodeRef),
     MissingArgumentsSymbol,
     ForeignDeclarationAstUnavailable(NodeRef),
@@ -343,6 +344,9 @@ impl std::fmt::Display for CanonicalNameResolutionError {
             Self::InvalidHostTable(_) => {
                 formatter.write_str("name-resolution host returned a foreign symbol table")
             }
+            Self::AliasResolutionUnavailable(_) => {
+                formatter.write_str("name-resolution requires unavailable alias resolution")
+            }
             Self::MissingDeclarationSymbol(node) => write!(
                 formatter,
                 "name-resolution host omitted the symbol for declaration {:?}",
@@ -374,7 +378,10 @@ impl std::error::Error for CanonicalNameResolutionError {}
 /// Callback surface retained from the pinned Go resolver.
 ///
 /// The two required semantic callbacks must implement merged-symbol and alias
-/// behavior. The resolver validates every returned handle before observing it.
+/// behavior. Lookup is fallible because silently treating an unavailable
+/// checker capability (notably alias target flags) as a missing name changes
+/// TypeScript semantics. The resolver validates every returned handle before
+/// observing it.
 pub trait CanonicalNameResolverHost {
     fn compiler_options(&self) -> CanonicalNameResolverOptions;
 
@@ -389,7 +396,7 @@ pub trait CanonicalNameResolverHost {
         symbols: SymbolTableId,
         name: EscapedNameRef<'_>,
         meaning: SymbolFlags,
-    ) -> Option<SemanticSymbolId>;
+    ) -> Result<Option<SemanticSymbolId>, CanonicalNameResolutionError>;
 
     fn globals(&self) -> Option<SymbolTableId>;
 
@@ -1318,7 +1325,7 @@ impl<'a, H: CanonicalNameResolverHost> CanonicalNameResolver<'a, H> {
             | SyntaxKind::PropertyAssignment => declaration_name(self.arena, node)
                 .is_some_and(|name| self.requires_scope_change_worker(name)),
             SyntaxKind::PropertyDeclaration => {
-                if has_syntactic_modifier(self.arena, node, SyntaxKind::StaticKeyword) {
+                if canonical_has_syntactic_modifier(self.arena, node, SyntaxKind::StaticKeyword) {
                     !self.options.emit_standard_class_fields()
                 } else {
                     declaration_name(self.arena, node)
@@ -1375,7 +1382,7 @@ impl<'a, H: CanonicalNameResolverHost> CanonicalNameResolver<'a, H> {
             return false;
         }
         if function_asterisk_token(self.arena, location).is_some()
-            || has_syntactic_modifier(self.arena, location, SyntaxKind::AsyncKeyword)
+            || canonical_has_syntactic_modifier(self.arena, location, SyntaxKind::AsyncKeyword)
         {
             return true;
         }
@@ -1391,7 +1398,7 @@ impl<'a, H: CanonicalNameResolverHost> CanonicalNameResolver<'a, H> {
             return true;
         }
         loop {
-            if has_syntactic_modifier(self.arena, node, SyntaxKind::DeclareKeyword) {
+            if canonical_has_syntactic_modifier(self.arena, node, SyntaxKind::DeclareKeyword) {
                 return true;
             }
             let Some(parent) = self.node(node).parent else {
@@ -1514,7 +1521,7 @@ impl<'a, H: CanonicalNameResolverHost> CanonicalNameResolver<'a, H> {
             return Err(CanonicalNameResolutionError::UnboundLocation(declaration));
         }
         if declaration.is_for(self.arena.id(), self.bound.file_id()) {
-            return Ok(has_syntactic_modifier(
+            return Ok(canonical_has_syntactic_modifier(
                 self.arena,
                 declaration.node,
                 modifier,
@@ -1683,7 +1690,14 @@ fn lookup_with_host<H: CanonicalNameResolverHost>(
     if !symbols.contains_symbol_table(table) {
         return Err(CanonicalNameResolutionError::InvalidHostTable(table));
     }
-    let symbol = host.lookup(symbols, table, EscapedNameRef::source(name), meaning);
+    let symbol = match host.lookup(symbols, table, EscapedNameRef::source(name), meaning) {
+        Err(CanonicalNameResolutionError::AliasResolutionUnavailable(symbol))
+            if !symbols.contains_symbol(symbol) =>
+        {
+            return Err(CanonicalNameResolutionError::InvalidHostSymbol(symbol));
+        }
+        result => result?,
+    };
     if let Some(symbol) = symbol
         && !symbols.contains_symbol(symbol)
     {
@@ -1769,7 +1783,16 @@ fn modifier_list(data: &NodeData) -> Option<&ModifierList> {
     }
 }
 
-fn has_syntactic_modifier(arena: &NodeArena, node: NodeId, modifier: SyntaxKind) -> bool {
+/// Whether an immutable canonical AST node has one exact syntactic modifier.
+///
+/// Production resolver hosts use the same helper for declarations in another
+/// Program arena so foreign and local declaration queries cannot drift.
+#[must_use]
+pub fn canonical_has_syntactic_modifier(
+    arena: &NodeArena,
+    node: NodeId,
+    modifier: SyntaxKind,
+) -> bool {
     arena
         .get(node)
         .and_then(|node| modifier_list(&node.data))
@@ -1907,7 +1930,7 @@ fn is_static(arena: &NodeArena, node: NodeId) -> bool {
         || arena
             .get(node)
             .is_some_and(|node| is_class_element(node.kind))
-            && has_syntactic_modifier(arena, node, SyntaxKind::StaticKeyword)
+            && canonical_has_syntactic_modifier(arena, node, SyntaxKind::StaticKeyword)
 }
 
 fn is_binding_pattern(kind: SyntaxKind) -> bool {
@@ -2198,6 +2221,7 @@ mod tests {
         globals: Option<SymbolTableId>,
         arguments: Option<SemanticSymbolId>,
         lookup_override: Option<SemanticSymbolId>,
+        lookup_error: Option<CanonicalNameResolutionError>,
         synthetic_scopes: Option<CanonicalSyntheticScopeStore>,
         synthetic_scope_overrides: HashMap<CanonicalSyntheticScopeId, CanonicalSyntheticScope>,
         foreign_kinds: HashMap<NodeRef, SyntaxKind>,
@@ -2269,21 +2293,28 @@ mod tests {
             symbols: SymbolTableId,
             name: EscapedNameRef<'_>,
             meaning: SymbolFlags,
-        ) -> Option<SemanticSymbolId> {
+        ) -> Result<Option<SemanticSymbolId>, CanonicalNameResolutionError> {
             self.events.push("lookup");
             self.lookup_meanings.push(meaning);
+            if let Some(error) = self.lookup_error {
+                return Err(error);
+            }
             if let Some(symbol) = self.lookup_override {
-                return Some(symbol);
+                return Ok(Some(symbol));
             }
             if meaning == SymbolFlags::NONE {
-                return None;
+                return Ok(None);
             }
-            let symbol = store.symbol_table(symbols)?.get(name)?;
-            store
-                .symbol(symbol)?
-                .flags()
-                .intersects(meaning)
-                .then_some(symbol)
+            let Some(symbol) = store
+                .symbol_table(symbols)
+                .and_then(|symbols| symbols.get(name))
+            else {
+                return Ok(None);
+            };
+            Ok(store
+                .symbol(symbol)
+                .filter(|symbol| symbol.flags().intersects(meaning))
+                .map(|_| symbol))
         }
 
         fn globals(&self) -> Option<SymbolTableId> {
@@ -3027,6 +3058,30 @@ const immediate = (function () { return outer; })();
         assert_eq!(host.events, ["failed"]);
         assert_eq!(host.failed[0].0, None);
 
+        host.events.clear();
+        host.failed.clear();
+        host.lookup_error = Some(CanonicalNameResolutionError::AliasResolutionUnavailable(
+            value,
+        ));
+        assert_eq!(
+            resolve_global_name(
+                &symbols,
+                &mut host,
+                "value",
+                SymbolFlags::VALUE,
+                Some(not_found_message()),
+                false,
+                false,
+            ),
+            Err(CanonicalNameResolutionError::AliasResolutionUnavailable(
+                value
+            ))
+        );
+        assert_eq!(host.events, ["lookup"]);
+        assert!(host.failed.is_empty());
+        assert!(host.succeeded.is_empty());
+        host.lookup_error = None;
+
         let mut foreign = SymbolStore::new();
         let foreign_symbol = foreign
             .alloc_symbol(SymbolData::new(
@@ -3058,6 +3113,29 @@ const immediate = (function () { return outer; })();
 
         host.globals = Some(globals);
         host.lookup_override = Some(foreign_symbol);
+        assert_eq!(
+            resolve_global_name(
+                &symbols,
+                &mut host,
+                "value",
+                SymbolFlags::VALUE,
+                Some(not_found_message()),
+                false,
+                false,
+            ),
+            Err(CanonicalNameResolutionError::InvalidHostSymbol(
+                foreign_symbol
+            ))
+        );
+        assert_eq!(host.events, ["lookup"]);
+        assert!(host.failed.is_empty());
+        assert!(host.succeeded.is_empty());
+
+        host.events.clear();
+        host.lookup_override = None;
+        host.lookup_error = Some(CanonicalNameResolutionError::AliasResolutionUnavailable(
+            foreign_symbol,
+        ));
         assert_eq!(
             resolve_global_name(
                 &symbols,
