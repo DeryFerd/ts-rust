@@ -1,20 +1,29 @@
 //! Dependency-closed canonical semantic type display.
 //!
-//! This is the primitive, literal, and canonical-union prefix of pinned
+//! This is the primitive, literal, canonical-union, and property-only object
+//! prefix of pinned
 //! `internal/checker/printer.go::typeToString`,
 //! `internal/checker/nodebuilderimpl.go::typeToTypeNode`, and
 //! `internal/checker/relater.go::reportRelationError` at
 //! `dc37b5249ab60e2bbce936f71b883e6c8136167e`. It deliberately stops before
-//! general symbol naming and structural/advanced type serialization. Those
+//! qualified symbol naming and advanced structural type serialization. Those
 //! families return [`TypeDisplayUnavailable`] rather than placeholder text.
 
 use std::{collections::HashSet, fmt::Write as _, ops};
 
+use ts_ast::{NodeData, SyntaxKind};
+use ts_binder::{
+    CheckFlags, InternalSymbolName, SemanticSymbolId, SymbolFlags, canonical_has_syntactic_modifier,
+};
+
 use super::{
-    CanonicalTypeMapperStore, TypeAliasId, TypeId,
+    CanonicalTypeMapperStore, DeclaredTypeHost, TypeAliasId, TypeId,
     bootstrap::LiteralTypeCacheError,
-    type_records::{LiteralTypeData, LiteralValue, TypeData, TypeDataKind, TypeRecord},
-    types::TypeFlags,
+    links::ValueSymbolLinks,
+    type_records::{
+        LiteralTypeData, LiteralValue, TypeCacheState, TypeData, TypeDataKind, TypeRecord,
+    },
+    types::{ObjectFlags, TypeFlags},
 };
 
 const DEFAULT_MAXIMUM_TRUNCATION_LENGTH: usize = 160;
@@ -22,7 +31,7 @@ const NO_TRUNCATION_MAXIMUM_TRUNCATION_LENGTH: usize = 1_000_000;
 const ELLIPSIS: &str = "...";
 
 /// The pinned `TypeFormatFlags` subset observable for dependency-closed
-/// primitive, literal, and canonical-union display.
+/// primitive, literal, canonical-union, and property-only object display.
 ///
 /// Numeric values intentionally match typescript-go. Unsupported flag
 /// families are absent rather than silently ignored.
@@ -174,7 +183,7 @@ pub fn type_to_string(
 }
 
 /// Pinned context-free `TypeToStringEx` behavior for flags observable in the
-/// installed primitive/literal/canonical-union prefix.
+/// installed primitive/literal/canonical-union/property-object prefix.
 ///
 /// # Errors
 ///
@@ -185,9 +194,32 @@ pub fn type_to_string_with_flags(
     type_id: TypeId,
     flags: CanonicalTypeFormatFlags,
 ) -> Result<String, TypeDisplayUnavailable> {
+    type_to_string_with_optional_host_and_flags(store, None, type_id, flags)
+}
+
+/// Host-aware form used by source-backed checker paths once they already own
+/// a validated declared-type view. The host is required only for structural
+/// declared type literals whose `readonly` modifiers are not retained by
+/// binder-owned symbol records.
+#[allow(dead_code)] // Source/production wiring is owned by the next integration slice.
+pub(super) fn type_to_string_with_host_and_flags(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    type_id: TypeId,
+    flags: CanonicalTypeFormatFlags,
+) -> Result<String, TypeDisplayUnavailable> {
+    type_to_string_with_optional_host_and_flags(store, Some(host), type_id, flags)
+}
+
+fn type_to_string_with_optional_host_and_flags(
+    store: &CanonicalTypeMapperStore,
+    host: Option<&DeclaredTypeHost<'_>>,
+    type_id: TypeId,
+    flags: CanonicalTypeFormatFlags,
+) -> Result<String, TypeDisplayUnavailable> {
     let mut state = DisplayState::default();
     let mut visiting = HashSet::new();
-    let displayed = display_type_worker(store, type_id, flags, &mut state, &mut visiting)?;
+    let displayed = display_type_worker(store, host, type_id, flags, &mut state, &mut visiting)?;
     truncate_display(type_id, displayed, flags)
 }
 
@@ -226,6 +258,38 @@ pub fn get_type_names_for_assignability_error_with_flags(
     target: TypeId,
     flags: CanonicalTypeFormatFlags,
 ) -> Result<AssignabilityErrorDisplay, TypeDisplayUnavailable> {
+    get_type_names_for_assignability_error_with_optional_host_and_flags(
+        store, None, source, target, flags,
+    )
+}
+
+/// Host-aware TS2322 display pair for source-backed checker paths. Keeping the
+/// host on the pair query prevents source and target from being formatted with
+/// different provenance rules.
+#[allow(dead_code)] // Source/production wiring is owned by the next integration slice.
+pub(super) fn get_type_names_for_assignability_error_with_host_and_flags(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    source: TypeId,
+    target: TypeId,
+    flags: CanonicalTypeFormatFlags,
+) -> Result<AssignabilityErrorDisplay, TypeDisplayUnavailable> {
+    get_type_names_for_assignability_error_with_optional_host_and_flags(
+        store,
+        Some(host),
+        source,
+        target,
+        flags,
+    )
+}
+
+fn get_type_names_for_assignability_error_with_optional_host_and_flags(
+    store: &CanonicalTypeMapperStore,
+    host: Option<&DeclaredTypeHost<'_>>,
+    source: TypeId,
+    target: TypeId,
+    flags: CanonicalTypeFormatFlags,
+) -> Result<AssignabilityErrorDisplay, TypeDisplayUnavailable> {
     let flags = flags | CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT;
     let source_record = store
         .type_payload(source)
@@ -233,8 +297,8 @@ pub fn get_type_names_for_assignability_error_with_flags(
     let target_record = store
         .type_payload(target)
         .ok_or(TypeDisplayUnavailable::Type(target))?;
-    let mut source_name = type_to_string_with_flags(store, source, flags)?;
-    let target_name = type_to_string_with_flags(store, target, flags)?;
+    let mut source_name = type_to_string_with_optional_host_and_flags(store, host, source, flags)?;
+    let target_name = type_to_string_with_optional_host_and_flags(store, host, target, flags)?;
 
     // The pinned fallback asks for fully qualified names when the ordinary
     // strings collide. Primitive/literal names are invariant under that flag.
@@ -268,7 +332,7 @@ pub fn get_type_names_for_assignability_error_with_flags(
             // value-symbol accessibility and can be `typeof <name>`.
             return Err(TypeDisplayUnavailable::UniqueSymbolName(generalized));
         }
-        source_name = type_to_string_with_flags(store, generalized, flags)?;
+        source_name = type_to_string_with_optional_host_and_flags(store, host, generalized, flags)?;
     }
 
     Ok(AssignabilityErrorDisplay {
@@ -279,6 +343,7 @@ pub fn get_type_names_for_assignability_error_with_flags(
 
 fn display_type_worker(
     store: &CanonicalTypeMapperStore,
+    host: Option<&DeclaredTypeHost<'_>>,
     type_id: TypeId,
     flags: CanonicalTypeFormatFlags,
     state: &mut DisplayState,
@@ -421,7 +486,10 @@ fn display_type_worker(
         return Ok("object".to_owned());
     }
     if type_flags.intersects(TypeFlags::UNION) {
-        return display_union_type(store, type_id, flags, state, visiting);
+        return display_union_type(store, host, type_id, flags, state, visiting);
+    }
+    if type_flags.intersects(TypeFlags::OBJECT) {
+        return display_object_type(store, host, type_id, record, flags, state, visiting);
     }
     if let Some(alias) = record.alias() {
         return Err(TypeDisplayUnavailable::Alias { type_id, alias });
@@ -457,8 +525,932 @@ impl DisplayState {
     }
 }
 
+#[derive(Clone, Copy)]
+enum StructuralObjectProof {
+    Synthetic,
+    ObjectLiteral,
+    DeclaredTypeLiteral(SemanticSymbolId),
+}
+
+fn display_object_type(
+    store: &CanonicalTypeMapperStore,
+    host: Option<&DeclaredTypeHost<'_>>,
+    type_id: TypeId,
+    record: &TypeRecord,
+    flags: CanonicalTypeFormatFlags,
+    state: &mut DisplayState,
+    visiting: &mut HashSet<TypeId>,
+) -> Result<String, TypeDisplayUnavailable> {
+    if record.flags() != TypeFlags::OBJECT {
+        return Err(TypeDisplayUnavailable::MalformedType(type_id));
+    }
+    if let Some(alias) = record.alias() {
+        validate_property_object_alias(store, type_id, record, alias)?;
+        return display_alias_name(store, type_id, alias, state);
+    }
+
+    let kind = record.object_flags() & ObjectFlags::OBJECT_TYPE_KIND_MASK;
+    if kind == ObjectFlags::INTERFACE {
+        return display_interface_name(store, type_id, record, state);
+    }
+    if kind != ObjectFlags::ANONYMOUS || !matches!(record.data(), TypeData::Object(_)) {
+        return Err(TypeDisplayUnavailable::UnsupportedType {
+            type_id,
+            kind: record.data().kind(),
+        });
+    }
+
+    let proof = validate_structural_object_shell(store, host, type_id, record)?;
+    if !visiting.insert(type_id) {
+        return Err(TypeDisplayUnavailable::CyclicType(type_id));
+    }
+    let result =
+        display_structural_properties(store, host, type_id, record, proof, flags, state, visiting);
+    visiting.remove(&type_id);
+    result
+}
+
+fn display_interface_name(
+    store: &CanonicalTypeMapperStore,
+    type_id: TypeId,
+    record: &TypeRecord,
+    state: &mut DisplayState,
+) -> Result<String, TypeDisplayUnavailable> {
+    let TypeData::Interface(interface) = record.data() else {
+        return Err(TypeDisplayUnavailable::MalformedType(type_id));
+    };
+    let resolved =
+        record.object_flags() == (ObjectFlags::INTERFACE | ObjectFlags::MEMBERS_RESOLVED);
+    if record.object_flags() != ObjectFlags::INTERFACE && !resolved
+        || interface.all_type_parameters.is_some()
+        || interface.outer_type_parameter_count != 0
+        || interface.this_type.is_some()
+        || interface.reference.resolved_type_arguments.is_some()
+        || interface.reference.node.is_some()
+        || interface.reference.object.target.is_some()
+        || interface.reference.object.mapper.is_some()
+        || interface.reference.object.instantiations != TypeCacheState::Unallocated
+    {
+        return Err(TypeDisplayUnavailable::UnsupportedType {
+            type_id,
+            kind: record.data().kind(),
+        });
+    }
+    let symbol_id = record
+        .symbol()
+        .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+    let symbol = store
+        .symbol(symbol_id)
+        .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+    let declarations = symbol
+        .declarations()
+        .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+    if store.get_merged_symbol(symbol_id) != Some(symbol_id)
+        || symbol.flags() != SymbolFlags::INTERFACE
+        || symbol.check_flags() != CheckFlags::NONE
+        || symbol.value_declaration().is_some()
+        || symbol.parent().is_some()
+        || symbol.exports().is_some()
+        || symbol.export_symbol().is_some()
+        || store
+            .declared_type_links(symbol_id)
+            .is_none_or(|links| links.declared_type != Some(type_id))
+        || !matches!(declarations, [declaration] if store.source_node_kind(*declaration)
+            == Some(SyntaxKind::InterfaceDeclaration))
+    {
+        return Err(TypeDisplayUnavailable::MalformedType(type_id));
+    }
+    if resolved {
+        validate_resolved_named_interface(store, type_id, symbol_id, interface)?;
+    } else if interface != &super::type_records::InterfaceTypeData::default() {
+        return Err(TypeDisplayUnavailable::MalformedType(type_id));
+    }
+    display_symbol_name(store, type_id, symbol_id, state)
+        .ok_or(TypeDisplayUnavailable::MalformedType(type_id))
+}
+
+fn validate_resolved_named_interface(
+    store: &CanonicalTypeMapperStore,
+    type_id: TypeId,
+    owner: SemanticSymbolId,
+    interface: &super::type_records::InterfaceTypeData,
+) -> Result<(), TypeDisplayUnavailable> {
+    let structured = &interface.reference.object.structured;
+    if !interface.base_types_resolved
+        || interface.resolved_base_constructor_type.is_some()
+        || interface.resolved_base_types.is_some()
+        || !interface.declared_members_resolved
+        || interface.declared_members != structured.members
+        || interface.declared_call_signatures.is_some()
+        || interface.declared_construct_signatures.is_some()
+        || interface.declared_index_infos.is_some()
+        || structured.constrained.resolved_base_constraint.is_some()
+        || structured.signatures.is_some()
+        || structured.call_signature_count != 0
+        || structured.index_infos.is_some()
+        || structured
+            .object_type_without_abstract_construct_signatures
+            .is_some()
+        || store
+            .symbol(owner)
+            .is_none_or(|symbol| symbol.members() != structured.members)
+    {
+        return Err(TypeDisplayUnavailable::MalformedType(type_id));
+    }
+    let properties = structured.properties.as_deref().unwrap_or_default();
+    validate_structured_member_table(store, type_id, structured.members, properties)?;
+    for property in properties {
+        let record = store
+            .symbol(*property)
+            .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+        let allowed_flags = SymbolFlags::PROPERTY | SymbolFlags::OPTIONAL;
+        let [declaration] = record.declarations().unwrap_or_default() else {
+            return Err(TypeDisplayUnavailable::MalformedType(type_id));
+        };
+        let links = store
+            .value_symbol_links(*property)
+            .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+        let property_type = links
+            .resolved_type
+            .filter(|property_type| store.type_payload(*property_type).is_some())
+            .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+        if !record.flags().contains(SymbolFlags::PROPERTY)
+            || record.flags().without(allowed_flags) != SymbolFlags::NONE
+            || record.check_flags() != CheckFlags::NONE
+            || record.parent() != Some(owner)
+            || record.value_declaration() != Some(*declaration)
+            || record.members().is_some()
+            || record.exports().is_some()
+            || record.export_symbol().is_some()
+            || store.get_merged_symbol(*property) != Some(*property)
+            || !matches!(
+                store.source_node_kind(*declaration),
+                Some(SyntaxKind::PropertyDeclaration | SyntaxKind::PropertySignature)
+            )
+            || links
+                != &(ValueSymbolLinks {
+                    resolved_type: Some(property_type),
+                    ..ValueSymbolLinks::default()
+                })
+        {
+            return Err(TypeDisplayUnavailable::MalformedType(type_id));
+        }
+    }
+    Ok(())
+}
+
+fn validate_property_object_alias(
+    store: &CanonicalTypeMapperStore,
+    type_id: TypeId,
+    record: &TypeRecord,
+    alias: TypeAliasId,
+) -> Result<(), TypeDisplayUnavailable> {
+    let TypeData::Object(object) = record.data() else {
+        return Err(TypeDisplayUnavailable::Alias { type_id, alias });
+    };
+    let allowed_flags = ObjectFlags::ANONYMOUS
+        | ObjectFlags::MEMBERS_RESOLVED
+        | ObjectFlags::FROM_TYPE_NODE
+        | ObjectFlags::PROPAGATING_FLAGS
+        | ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES_COMPUTED
+        | ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES;
+    if record.object_flags() & ObjectFlags::OBJECT_TYPE_KIND_MASK != ObjectFlags::ANONYMOUS
+        || !(record.object_flags() & !allowed_flags).is_empty()
+        || object.target.is_some()
+        || object.mapper.is_some()
+        || object.instantiations != TypeCacheState::Unallocated
+    {
+        return Err(TypeDisplayUnavailable::Alias { type_id, alias });
+    }
+
+    let owner = record
+        .symbol()
+        .ok_or(TypeDisplayUnavailable::Alias { type_id, alias })?;
+    let owner_record = store
+        .symbol(owner)
+        .ok_or(TypeDisplayUnavailable::Alias { type_id, alias })?;
+    if store.get_merged_symbol(owner) != Some(owner)
+        || owner_record.flags() != SymbolFlags::TYPE_LITERAL
+        || owner_record.check_flags() != CheckFlags::NONE
+        || owner_record.name() != InternalSymbolName::Type.as_ref()
+        || owner_record.parent().is_some()
+        || owner_record.value_declaration().is_some()
+        || owner_record.exports().is_some()
+        || owner_record.export_symbol().is_some()
+        || owner_record.members() != object.structured.members
+        || !matches!(owner_record.declarations(), Some([declaration])
+            if store.source_node_kind(*declaration) == Some(SyntaxKind::TypeLiteral))
+    {
+        return Err(TypeDisplayUnavailable::Alias { type_id, alias });
+    }
+
+    let alias_record = store
+        .type_alias(alias)
+        .ok_or(TypeDisplayUnavailable::Alias { type_id, alias })?;
+    let alias_symbol = alias_record
+        .symbol()
+        .ok_or(TypeDisplayUnavailable::Alias { type_id, alias })?;
+    let alias_symbol_record = store
+        .symbol(alias_symbol)
+        .ok_or(TypeDisplayUnavailable::Alias { type_id, alias })?;
+    if alias_record.type_arguments().is_some()
+        || store.get_merged_symbol(alias_symbol) != Some(alias_symbol)
+        || alias_symbol_record.flags() != SymbolFlags::TYPE_ALIAS
+        || alias_symbol_record.check_flags() != CheckFlags::NONE
+        || alias_symbol_record.parent().is_some()
+        || alias_symbol_record.value_declaration().is_some()
+        || alias_symbol_record.exports().is_some()
+        || alias_symbol_record.export_symbol().is_some()
+        || !matches!(alias_symbol_record.declarations(), Some([declaration])
+            if store.source_node_kind(*declaration) == Some(SyntaxKind::TypeAliasDeclaration))
+        || store.type_alias_links(alias_symbol).is_none_or(|links| {
+            links.declared_type != Some(type_id)
+                || links.type_parameters.is_some()
+                || links.instantiations.is_some()
+                || links.is_constructor_declared_property
+        })
+    {
+        return Err(TypeDisplayUnavailable::Alias { type_id, alias });
+    }
+    Ok(())
+}
+
+fn validate_structural_object_shell(
+    store: &CanonicalTypeMapperStore,
+    host: Option<&DeclaredTypeHost<'_>>,
+    type_id: TypeId,
+    record: &TypeRecord,
+) -> Result<StructuralObjectProof, TypeDisplayUnavailable> {
+    let TypeData::Object(object) = record.data() else {
+        return Err(TypeDisplayUnavailable::MalformedType(type_id));
+    };
+    let allowed_flags = ObjectFlags::ANONYMOUS
+        | ObjectFlags::OBJECT_LITERAL
+        | ObjectFlags::FRESH_LITERAL
+        | ObjectFlags::MEMBERS_RESOLVED
+        | ObjectFlags::FROM_TYPE_NODE
+        | ObjectFlags::PROPAGATING_FLAGS
+        | ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES_COMPUTED
+        | ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES;
+    if !(record.object_flags() & !allowed_flags).is_empty()
+        || !record
+            .object_flags()
+            .intersects(ObjectFlags::MEMBERS_RESOLVED)
+        || record.object_flags().intersects(ObjectFlags::FRESH_LITERAL)
+            && !record
+                .object_flags()
+                .intersects(ObjectFlags::OBJECT_LITERAL)
+        || object.target.is_some()
+        || object.mapper.is_some()
+        || object.instantiations != TypeCacheState::Unallocated
+        || object
+            .structured
+            .constrained
+            .resolved_base_constraint
+            .is_some()
+        || object
+            .structured
+            .object_type_without_abstract_construct_signatures
+            .is_some()
+    {
+        return Err(TypeDisplayUnavailable::UnsupportedType {
+            type_id,
+            kind: record.data().kind(),
+        });
+    }
+    if object.structured.call_signature_count != 0
+        || object
+            .structured
+            .signatures
+            .as_ref()
+            .is_some_and(|signatures| !signatures.is_empty())
+        || object
+            .structured
+            .index_infos
+            .as_ref()
+            .is_some_and(|index_infos| !index_infos.is_empty())
+    {
+        return Err(TypeDisplayUnavailable::UnsupportedType {
+            type_id,
+            kind: record.data().kind(),
+        });
+    }
+
+    if record
+        .object_flags()
+        .intersects(ObjectFlags::OBJECT_LITERAL)
+    {
+        let owner = record
+            .symbol()
+            .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+        validate_object_literal_contract(store, host, type_id, record, owner)?;
+        return Ok(StructuralObjectProof::ObjectLiteral);
+    }
+    let Some(owner) = record.symbol() else {
+        if record
+            .object_flags()
+            .intersects(ObjectFlags::FROM_TYPE_NODE)
+        {
+            return Err(TypeDisplayUnavailable::MalformedType(type_id));
+        }
+        return Ok(StructuralObjectProof::Synthetic);
+    };
+    if host.is_none() {
+        return Err(TypeDisplayUnavailable::UnsupportedType {
+            type_id,
+            kind: record.data().kind(),
+        });
+    }
+    validate_structural_owner(
+        store,
+        host,
+        type_id,
+        owner,
+        SymbolFlags::TYPE_LITERAL,
+        InternalSymbolName::Type,
+        object.structured.members,
+    )?;
+    Ok(StructuralObjectProof::DeclaredTypeLiteral(owner))
+}
+
+fn validate_object_literal_contract(
+    store: &CanonicalTypeMapperStore,
+    host: Option<&DeclaredTypeHost<'_>>,
+    type_id: TypeId,
+    record: &TypeRecord,
+    owner: SemanticSymbolId,
+) -> Result<(), TypeDisplayUnavailable> {
+    let TypeData::Object(object) = record.data() else {
+        return Err(TypeDisplayUnavailable::MalformedType(type_id));
+    };
+    let owner_record = store
+        .symbol(owner)
+        .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+    let [owner_declaration] = owner_record.declarations().unwrap_or_default() else {
+        return Err(TypeDisplayUnavailable::MalformedType(type_id));
+    };
+    if store.get_merged_symbol(owner) != Some(owner)
+        || owner_record.flags() != SymbolFlags::OBJECT_LITERAL
+        || owner_record.check_flags() != CheckFlags::NONE
+        || owner_record.name() != InternalSymbolName::Object.as_ref()
+        || owner_record.value_declaration() != Some(*owner_declaration)
+        || owner_record.parent().is_some()
+        || owner_record.exports().is_some()
+        || owner_record.export_symbol().is_some()
+        || store.source_node_kind(*owner_declaration) != Some(SyntaxKind::ObjectLiteralExpression)
+        || host.is_some_and(|host| {
+            host.node(*owner_declaration).is_none()
+                || !host.symbol_matches(store, *owner_declaration, owner)
+        })
+    {
+        return Err(TypeDisplayUnavailable::MalformedType(type_id));
+    }
+
+    let result_members = object
+        .structured
+        .members
+        .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+    if owner_record.members() == Some(result_members) {
+        return Err(TypeDisplayUnavailable::MalformedType(type_id));
+    }
+    let result_table = store
+        .symbol_table(result_members)
+        .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+    let properties = object.structured.properties.as_deref().unwrap_or_default();
+    if object.structured.properties.is_some() != !properties.is_empty()
+        || result_table.len() != properties.len()
+        || owner_record.members().is_some() != !properties.is_empty()
+    {
+        return Err(TypeDisplayUnavailable::MalformedType(type_id));
+    }
+    let raw_table = match owner_record.members() {
+        Some(raw_members) => Some(
+            store
+                .symbol_table(raw_members)
+                .filter(|table| table.len() == properties.len())
+                .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?,
+        ),
+        None => None,
+    };
+
+    let mut expected_object_flags = ObjectFlags::ANONYMOUS
+        | ObjectFlags::OBJECT_LITERAL
+        | ObjectFlags::FRESH_LITERAL
+        | ObjectFlags::CONTAINS_OBJECT_OR_ARRAY_LITERAL
+        | ObjectFlags::MEMBERS_RESOLVED;
+    let mut raw_targets = HashSet::with_capacity(properties.len());
+    for clone in properties {
+        let clone_record = store
+            .symbol(*clone)
+            .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+        let clone_links = store
+            .value_symbol_links(*clone)
+            .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+        let property_type = clone_links
+            .resolved_type
+            .and_then(|property_type| {
+                store
+                    .type_payload(property_type)
+                    .map(|record| (property_type, record))
+            })
+            .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+        let raw = clone_links
+            .target
+            .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+        let raw_record = store
+            .symbol(raw)
+            .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+        let expected_links = ValueSymbolLinks {
+            resolved_type: Some(property_type.0),
+            target: Some(raw),
+            ..ValueSymbolLinks::default()
+        };
+        if clone_links != &expected_links
+            || clone_record.flags() != (SymbolFlags::PROPERTY | SymbolFlags::TRANSIENT)
+            || clone_record.check_flags() != CheckFlags::NONE
+            || clone_record.parent() != Some(owner)
+            || clone_record.members().is_some()
+            || clone_record.exports().is_some()
+            || clone_record.export_symbol().is_some()
+            || store.get_merged_symbol(*clone) != Some(*clone)
+            || raw_record.flags() != SymbolFlags::PROPERTY
+            || raw_record.check_flags() != CheckFlags::NONE
+            || raw_record.name() != clone_record.name()
+            || raw_record.declarations() != clone_record.declarations()
+            || raw_record.value_declaration() != clone_record.value_declaration()
+            || raw_record.parent() != Some(owner)
+            || raw_record.members().is_some()
+            || raw_record.exports().is_some()
+            || raw_record.export_symbol().is_some()
+            || store.get_merged_symbol(raw) != Some(raw)
+            || store
+                .value_symbol_links(raw)
+                .is_some_and(|links| links != &ValueSymbolLinks::default())
+            || !raw_targets.insert(raw)
+        {
+            return Err(TypeDisplayUnavailable::MalformedType(type_id));
+        }
+        let [declaration] = clone_record.declarations().unwrap_or_default() else {
+            return Err(TypeDisplayUnavailable::MalformedType(type_id));
+        };
+        if clone_record.value_declaration() != Some(*declaration)
+            || store.source_node_kind(*declaration) != Some(SyntaxKind::PropertyAssignment)
+            || result_table.get(clone_record.name()) != Some(*clone)
+            || raw_table.and_then(|table| table.get(raw_record.name())) != Some(raw)
+        {
+            return Err(TypeDisplayUnavailable::MalformedType(type_id));
+        }
+        expected_object_flags |= property_type.1.object_flags() & ObjectFlags::PROPAGATING_FLAGS;
+    }
+    if record.object_flags() != expected_object_flags
+        || raw_table.is_some_and(|table| table.iter().any(|(_, raw)| !raw_targets.contains(&raw)))
+    {
+        return Err(TypeDisplayUnavailable::MalformedType(type_id));
+    }
+    Ok(())
+}
+
+fn validate_structural_owner(
+    store: &CanonicalTypeMapperStore,
+    host: Option<&DeclaredTypeHost<'_>>,
+    type_id: TypeId,
+    owner: SemanticSymbolId,
+    expected_flags: SymbolFlags,
+    expected_name: InternalSymbolName,
+    members: Option<ts_binder::SymbolTableId>,
+) -> Result<(), TypeDisplayUnavailable> {
+    let record = store
+        .symbol(owner)
+        .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+    if store.get_merged_symbol(owner) != Some(owner)
+        || record.flags() != expected_flags
+        || record.check_flags() != CheckFlags::NONE
+        || record.name() != expected_name.as_ref()
+        || record.parent().is_some()
+        || record.members() != members
+        || record.exports().is_some()
+        || record.export_symbol().is_some()
+    {
+        return Err(TypeDisplayUnavailable::MalformedType(type_id));
+    }
+    let declarations = record
+        .declarations()
+        .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+    let [declaration] = declarations else {
+        return Err(TypeDisplayUnavailable::MalformedType(type_id));
+    };
+    let expected_kind = if expected_flags == SymbolFlags::OBJECT_LITERAL {
+        SyntaxKind::ObjectLiteralExpression
+    } else {
+        SyntaxKind::TypeLiteral
+    };
+    if store.source_node_kind(*declaration) != Some(expected_kind)
+        || expected_flags == SymbolFlags::OBJECT_LITERAL
+            && record.value_declaration() != Some(*declaration)
+        || expected_flags == SymbolFlags::TYPE_LITERAL && record.value_declaration().is_some()
+        || host.is_some_and(|host| {
+            host.node(*declaration).is_none() || !host.symbol_matches(store, *declaration, owner)
+        })
+    {
+        return Err(TypeDisplayUnavailable::MalformedType(type_id));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn display_structural_properties(
+    store: &CanonicalTypeMapperStore,
+    host: Option<&DeclaredTypeHost<'_>>,
+    type_id: TypeId,
+    record: &TypeRecord,
+    proof: StructuralObjectProof,
+    flags: CanonicalTypeFormatFlags,
+    state: &mut DisplayState,
+    visiting: &mut HashSet<TypeId>,
+) -> Result<String, TypeDisplayUnavailable> {
+    let structured = record
+        .data()
+        .structured()
+        .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+    let properties = structured.properties.as_deref().unwrap_or_default();
+    validate_structured_member_table(store, type_id, structured.members, properties)?;
+    validate_host_member_order(store, host, type_id, proof, properties)?;
+    let properties = properties
+        .iter()
+        .map(|property| validated_property(store, host, type_id, proof, *property))
+        .collect::<Result<Vec<_>, _>>()?;
+    if properties.is_empty() {
+        state.add(2);
+        return Ok("{}".to_owned());
+    }
+    if state.check_truncation(flags) {
+        state.add(2);
+        return if flags.contains(CanonicalTypeFormatFlags::NO_TRUNCATION) {
+            Ok("{ /*elided*/ }".to_owned())
+        } else {
+            Ok("{ ...; }".to_owned())
+        };
+    }
+
+    let mut result = String::from("{ ");
+    for (index, property) in properties.iter().copied().enumerate() {
+        let display_index = index + 1;
+        if state.check_truncation(flags) && display_index + 2 < properties.len() - 1 {
+            let elided = properties.len() - display_index;
+            if flags.contains(CanonicalTypeFormatFlags::NO_TRUNCATION) {
+                write!(result, "/*... {elided} more elided ...*/ ")
+                    .expect("writing to a String cannot fail");
+            } else {
+                write!(result, "... {elided} more ...; ").expect("writing to a String cannot fail");
+            }
+            append_structural_property(
+                store,
+                host,
+                *properties
+                    .last()
+                    .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?,
+                flags,
+                state,
+                visiting,
+                &mut result,
+            )?;
+            break;
+        }
+        append_structural_property(store, host, property, flags, state, visiting, &mut result)?;
+    }
+    result.push('}');
+    state.add(2);
+    Ok(result)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_structural_property(
+    store: &CanonicalTypeMapperStore,
+    host: Option<&DeclaredTypeHost<'_>>,
+    property: (&str, TypeId, bool, bool),
+    flags: CanonicalTypeFormatFlags,
+    state: &mut DisplayState,
+    visiting: &mut HashSet<TypeId>,
+    result: &mut String,
+) -> Result<(), TypeDisplayUnavailable> {
+    let (name, property_type, optional, readonly) = property;
+    if readonly {
+        result.push_str("readonly ");
+    }
+    result.push_str(name);
+    state.add(name.len().saturating_add(1));
+    if optional {
+        result.push('?');
+    }
+    result.push_str(": ");
+    result.push_str(&display_type_worker(
+        store,
+        host,
+        property_type,
+        flags,
+        state,
+        visiting,
+    )?);
+    if readonly {
+        state.add(9);
+    }
+    result.push_str("; ");
+    Ok(())
+}
+
+fn validate_structured_member_table(
+    store: &CanonicalTypeMapperStore,
+    type_id: TypeId,
+    members: Option<ts_binder::SymbolTableId>,
+    properties: &[SemanticSymbolId],
+) -> Result<(), TypeDisplayUnavailable> {
+    let property_set = properties.iter().copied().collect::<HashSet<_>>();
+    if property_set.len() != properties.len() {
+        return Err(TypeDisplayUnavailable::MalformedType(type_id));
+    }
+    let Some(members) = members else {
+        return if properties.is_empty() {
+            Ok(())
+        } else {
+            Err(TypeDisplayUnavailable::MalformedType(type_id))
+        };
+    };
+    let table = store
+        .symbol_table(members)
+        .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+    if table.len() != properties.len()
+        || table.iter().any(|(name, property)| {
+            !property_set.contains(&property)
+                || store
+                    .symbol(property)
+                    .is_none_or(|symbol| symbol.name() != name)
+        })
+        || properties.iter().any(|property| {
+            store
+                .symbol(*property)
+                .is_none_or(|symbol| table.get(symbol.name()) != Some(*property))
+        })
+    {
+        return Err(TypeDisplayUnavailable::MalformedType(type_id));
+    }
+    Ok(())
+}
+
+fn validate_host_member_order(
+    store: &CanonicalTypeMapperStore,
+    host: Option<&DeclaredTypeHost<'_>>,
+    type_id: TypeId,
+    proof: StructuralObjectProof,
+    properties: &[SemanticSymbolId],
+) -> Result<(), TypeDisplayUnavailable> {
+    let StructuralObjectProof::DeclaredTypeLiteral(owner) = proof else {
+        return Ok(());
+    };
+    let host = host.ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+    let owner_record = store
+        .symbol(owner)
+        .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+    let [owner_declaration] = owner_record.declarations().unwrap_or_default() else {
+        return Err(TypeDisplayUnavailable::MalformedType(type_id));
+    };
+    let owner_node = host
+        .node(*owner_declaration)
+        .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+    let NodeData::TypeLiteralNode(type_literal) = &owner_node.data else {
+        return Err(TypeDisplayUnavailable::MalformedType(type_id));
+    };
+    if type_literal.members.nodes.len() != properties.len()
+        || properties
+            .iter()
+            .zip(&type_literal.members.nodes)
+            .any(|(property, member)| {
+                store.symbol(*property).is_none_or(|record| {
+                    record.declarations().is_none_or(|declarations| {
+                        declarations.len() != 1 || declarations[0].node != *member
+                    })
+                })
+            })
+    {
+        return Err(TypeDisplayUnavailable::MalformedType(type_id));
+    }
+    Ok(())
+}
+
+fn validated_property<'a>(
+    store: &'a CanonicalTypeMapperStore,
+    host: Option<&DeclaredTypeHost<'_>>,
+    type_id: TypeId,
+    proof: StructuralObjectProof,
+    property: SemanticSymbolId,
+) -> Result<(&'a str, TypeId, bool, bool), TypeDisplayUnavailable> {
+    let record = store
+        .symbol(property)
+        .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+    let valid_flags_and_checks = match proof {
+        StructuralObjectProof::Synthetic => {
+            let allowed = SymbolFlags::PROPERTY | SymbolFlags::OPTIONAL | SymbolFlags::TRANSIENT;
+            record.flags().contains(SymbolFlags::PROPERTY)
+                && record.flags().without(allowed) == SymbolFlags::NONE
+                && record.check_flags().bits() & !CheckFlags::READONLY.bits() == 0
+        }
+        StructuralObjectProof::ObjectLiteral => {
+            record.flags() == (SymbolFlags::PROPERTY | SymbolFlags::TRANSIENT)
+                && record.check_flags() == CheckFlags::NONE
+        }
+        StructuralObjectProof::DeclaredTypeLiteral(_) => {
+            let allowed = SymbolFlags::PROPERTY | SymbolFlags::OPTIONAL;
+            record.flags().contains(SymbolFlags::PROPERTY)
+                && record.flags().without(allowed) == SymbolFlags::NONE
+                && record.check_flags().bits() & !CheckFlags::READONLY.bits() == 0
+        }
+    };
+    if !valid_flags_and_checks
+        || record.name().is_reserved_member_name()
+        || record.name().is_private_identifier()
+        || record.name().is_late_bound()
+        || record.members().is_some()
+        || record.exports().is_some()
+        || record.export_symbol().is_some()
+        || store.get_merged_symbol(property) != Some(property)
+    {
+        return Err(TypeDisplayUnavailable::MalformedType(type_id));
+    }
+    let name = record
+        .name()
+        .as_utf8()
+        .filter(|name| is_plain_identifier(name))
+        .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+    let optional = record.flags().intersects(SymbolFlags::OPTIONAL);
+    let links = store
+        .value_symbol_links(property)
+        .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+    let property_type = links
+        .resolved_type
+        .filter(|property_type| store.type_payload(*property_type).is_some())
+        .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+    let expected_links = match proof {
+        StructuralObjectProof::ObjectLiteral => ValueSymbolLinks {
+            resolved_type: Some(property_type),
+            target: links.target,
+            ..ValueSymbolLinks::default()
+        },
+        StructuralObjectProof::Synthetic | StructuralObjectProof::DeclaredTypeLiteral(_) => {
+            ValueSymbolLinks {
+                resolved_type: Some(property_type),
+                ..ValueSymbolLinks::default()
+            }
+        }
+    };
+    if links != &expected_links
+        || matches!(proof, StructuralObjectProof::ObjectLiteral) && links.target.is_none()
+    {
+        return Err(TypeDisplayUnavailable::MalformedType(type_id));
+    }
+
+    let readonly = match proof {
+        StructuralObjectProof::Synthetic => {
+            if record.parent().is_some()
+                || record
+                    .declarations()
+                    .is_some_and(|declarations| !declarations.is_empty())
+                || record.value_declaration().is_some()
+            {
+                return Err(TypeDisplayUnavailable::MalformedType(type_id));
+            }
+            record.check_flags().contains(CheckFlags::READONLY)
+        }
+        StructuralObjectProof::ObjectLiteral => false,
+        StructuralObjectProof::DeclaredTypeLiteral(owner) => {
+            let host = host.ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+            validate_declared_property(
+                store, host, type_id, owner, property, record, name, optional,
+            )?
+        }
+    };
+    Ok((name, property_type, optional, readonly))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_declared_property(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    type_id: TypeId,
+    owner: SemanticSymbolId,
+    property: SemanticSymbolId,
+    record: &ts_binder::semantic::Symbol,
+    name: &str,
+    optional: bool,
+) -> Result<bool, TypeDisplayUnavailable> {
+    let [declaration] = record.declarations().unwrap_or_default() else {
+        return Err(TypeDisplayUnavailable::MalformedType(type_id));
+    };
+    if record.parent() != Some(owner)
+        || record.value_declaration() != Some(*declaration)
+        || store.get_merged_symbol(property) != Some(property)
+        || !host.symbol_matches(store, *declaration, property)
+    {
+        return Err(TypeDisplayUnavailable::MalformedType(type_id));
+    }
+    let node = host
+        .node(*declaration)
+        .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+    let (name_node, postfix_token, modifiers) = match &node.data {
+        NodeData::PropertyDeclaration(property) => (
+            property.name,
+            property.postfix_token,
+            property.modifiers.as_ref(),
+        ),
+        NodeData::PropertySignatureDeclaration(property) => (
+            property.name,
+            property.postfix_token,
+            property.modifiers.as_ref(),
+        ),
+        _ => return Err(TypeDisplayUnavailable::MalformedType(type_id)),
+    };
+    let owner_record = store
+        .symbol(owner)
+        .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+    let [owner_declaration] = owner_record.declarations().unwrap_or_default() else {
+        return Err(TypeDisplayUnavailable::MalformedType(type_id));
+    };
+    if declaration.arena != owner_declaration.arena
+        || declaration.file != owner_declaration.file
+        || node.parent != Some(owner_declaration.node)
+    {
+        return Err(TypeDisplayUnavailable::MalformedType(type_id));
+    }
+    let (arena, _) = host
+        .source(*declaration)
+        .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+    let name_matches = arena.get(name_node).is_some_and(
+        |name_node| matches!(&name_node.data, NodeData::Identifier(data) if data.text == name),
+    );
+    let syntax_optional = match postfix_token {
+        None => false,
+        Some(token)
+            if arena
+                .get(token)
+                .is_some_and(|token| token.kind == SyntaxKind::QuestionToken) =>
+        {
+            true
+        }
+        Some(_) => return Err(TypeDisplayUnavailable::MalformedType(type_id)),
+    };
+    let valid_modifiers = modifiers.is_none_or(|modifiers| {
+        modifiers.flags.0 == 0
+            && !modifiers.list.has_trailing_comma
+            && modifiers.list.nodes.len() == 1
+            && arena
+                .get(modifiers.list.nodes[0])
+                .is_some_and(|modifier| modifier.kind == SyntaxKind::ReadonlyKeyword)
+    });
+    let readonly =
+        canonical_has_syntactic_modifier(arena, declaration.node, SyntaxKind::ReadonlyKeyword);
+    if !name_matches
+        || syntax_optional != optional
+        || !valid_modifiers
+        || record.check_flags().contains(CheckFlags::READONLY) && !readonly
+    {
+        return Err(TypeDisplayUnavailable::MalformedType(type_id));
+    }
+    Ok(readonly)
+}
+
+fn display_symbol_name(
+    store: &CanonicalTypeMapperStore,
+    _type_id: TypeId,
+    symbol: SemanticSymbolId,
+    state: &mut DisplayState,
+) -> Option<String> {
+    let symbol = store.symbol(symbol)?;
+    let escaped_name = symbol.name();
+    if escaped_name.is_reserved_member_name()
+        || escaped_name.is_internal()
+        || escaped_name.is_private_identifier()
+        || escaped_name.is_late_bound()
+    {
+        return None;
+    }
+    let name = escaped_name
+        .as_utf8()
+        .filter(|name| is_plain_identifier(name))?;
+    state.add(name.len().saturating_add(1).saturating_mul(2));
+    Some(name.to_owned())
+}
+
+fn is_plain_identifier(name: &str) -> bool {
+    let mut characters = name.chars();
+    let Some(first) = characters.next() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || matches!(first, '_' | '$'))
+        && characters
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '$'))
+}
+
 fn display_union_type(
     store: &CanonicalTypeMapperStore,
+    host: Option<&DeclaredTypeHost<'_>>,
     type_id: TypeId,
     flags: CanonicalTypeFormatFlags,
     state: &mut DisplayState,
@@ -474,7 +1466,7 @@ fn display_union_type(
             .type_payload(type_id)
             .ok_or(TypeDisplayUnavailable::Type(type_id))?;
         if let Some(alias) = record.alias() {
-            return display_union_alias(store, type_id, alias, state);
+            return display_alias_name(store, type_id, alias, state);
         }
         let TypeData::Union(data) = record.data() else {
             return Err(TypeDisplayUnavailable::InvalidUnion(type_id));
@@ -487,13 +1479,13 @@ fn display_union_type(
             return Err(TypeDisplayUnavailable::InvalidUnion(type_id));
         };
         let types = format_union_types(store, type_id, &display_data.union.types)?;
-        display_union_list(store, type_id, &types, flags, state, visiting)
+        display_union_list(store, host, type_id, &types, flags, state, visiting)
     })();
     visiting.remove(&type_id);
     result
 }
 
-fn display_union_alias(
+fn display_alias_name(
     store: &CanonicalTypeMapperStore,
     type_id: TypeId,
     alias: TypeAliasId,
@@ -504,20 +1496,9 @@ fn display_union_alias(
         .ok_or(TypeDisplayUnavailable::Alias { type_id, alias })?;
     let symbol = alias_record
         .symbol()
-        .and_then(|symbol| store.symbol(symbol))
         .ok_or(TypeDisplayUnavailable::Alias { type_id, alias })?;
-    let escaped_name = symbol.name();
-    if escaped_name.is_reserved_member_name() {
-        return Err(TypeDisplayUnavailable::Alias { type_id, alias });
-    }
-    let name = escaped_name
-        .as_utf8()
-        .filter(|name| !name.is_empty() && !escaped_name.is_internal())
-        .ok_or(TypeDisplayUnavailable::Alias { type_id, alias })?;
-    // Pinned single-symbol entity naming accounts for the initial identifier
-    // and the completed access segment separately.
-    state.add(name.len().saturating_add(1).saturating_mul(2));
-    Ok(name.to_owned())
+    display_symbol_name(store, type_id, symbol, state)
+        .ok_or(TypeDisplayUnavailable::Alias { type_id, alias })
 }
 
 fn format_union_types(
@@ -576,6 +1557,7 @@ fn format_union_types(
 
 fn display_union_list(
     store: &CanonicalTypeMapperStore,
+    host: Option<&DeclaredTypeHost<'_>>,
     union: TypeId,
     types: &[TypeId],
     flags: CanonicalTypeFormatFlags,
@@ -583,12 +1565,13 @@ fn display_union_list(
     visiting: &mut HashSet<TypeId>,
 ) -> Result<String, TypeDisplayUnavailable> {
     if types.len() == 1 {
-        return display_type_worker(store, types[0], flags, state, visiting);
+        return display_type_worker(store, host, types[0], flags, state, visiting);
     }
     if state.check_truncation(flags) && types.len() > 2 {
-        let first = display_type_worker(store, types[0], flags, state, visiting)?;
+        let first = display_type_worker(store, host, types[0], flags, state, visiting)?;
         let last = display_type_worker(
             store,
+            host,
             *types
                 .last()
                 .ok_or(TypeDisplayUnavailable::InvalidUnion(union))?,
@@ -609,6 +1592,7 @@ fn display_union_list(
             displayed.push(union_elision(types.len() - display_index, flags));
             displayed.push(display_type_worker(
                 store,
+                host,
                 *types
                     .last()
                     .ok_or(TypeDisplayUnavailable::InvalidUnion(union))?,
@@ -619,7 +1603,9 @@ fn display_union_list(
             break;
         }
         state.add(2);
-        displayed.push(display_type_worker(store, type_id, flags, state, visiting)?);
+        displayed.push(display_type_worker(
+            store, host, type_id, flags, state, visiting,
+        )?);
     }
     Ok(displayed.join(" | "))
 }
@@ -992,6 +1978,160 @@ mod tests {
         alias
     }
 
+    fn alloc_typed_property(
+        store: &mut CanonicalTypeMapperStore,
+        name: &str,
+        type_id: TypeId,
+        optional: bool,
+        readonly: bool,
+    ) -> SemanticSymbolId {
+        let flags = SymbolFlags::PROPERTY
+            | if optional {
+                SymbolFlags::OPTIONAL
+            } else {
+                SymbolFlags::NONE
+            };
+        let property = if readonly {
+            store.alloc_transient_symbol(flags, EscapedName::source(name), CheckFlags::READONLY)
+        } else {
+            store
+                .alloc_symbol(SymbolData::new(flags, EscapedName::source(name)))
+                .unwrap()
+        };
+        assert!(store.set_value_symbol_links(
+            property,
+            ValueSymbolLinks {
+                resolved_type: Some(type_id),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        property
+    }
+
+    fn set_object_properties(
+        store: &mut CanonicalTypeMapperStore,
+        object: TypeId,
+        properties: Vec<SemanticSymbolId>,
+    ) {
+        let members = if properties.is_empty() {
+            None
+        } else {
+            let members = store.alloc_symbol_table();
+            for property in &properties {
+                let name = store
+                    .symbol(*property)
+                    .unwrap()
+                    .name()
+                    .as_utf8()
+                    .unwrap()
+                    .to_owned();
+                assert_eq!(
+                    store.insert_symbol(members, EscapedName::source(&name), *property),
+                    Some(None),
+                );
+            }
+            Some(members)
+        };
+        let properties = (!properties.is_empty()).then_some(properties);
+        assert!(store.set_structured_type_members(object, members, properties, None, None, None,));
+    }
+
+    fn alloc_structural_object(
+        store: &mut CanonicalTypeMapperStore,
+        properties: Vec<SemanticSymbolId>,
+    ) -> TypeId {
+        let object = store
+            .alloc_plain_object_type(ObjectFlags::ANONYMOUS, None)
+            .unwrap();
+        set_object_properties(store, object, properties);
+        object
+    }
+
+    fn alloc_named_interface(store: &mut CanonicalTypeMapperStore, name: &str) -> TypeId {
+        let parsed = parse_source_file(&format!("interface {name} {{}}"));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(191);
+        assert!(
+            store
+                .register_source_file(&parsed.arena, parsed.source_file, file)
+                .is_some()
+        );
+        let declaration = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::InterfaceDeclaration)
+                    .then(|| NodeRef::new(parsed.arena.id(), file, node))
+            })
+            .unwrap();
+        let mut symbol_data = SymbolData::new(SymbolFlags::INTERFACE, EscapedName::source(name));
+        symbol_data.declarations = Some(vec![declaration]);
+        let symbol = store.alloc_symbol(symbol_data).unwrap();
+        let interface = store
+            .alloc_interface_type(ObjectFlags::INTERFACE, Some(symbol))
+            .unwrap();
+        assert!(store.set_declared_type_links(
+            symbol,
+            crate::semantic::DeclaredTypeLinks {
+                declared_type: Some(interface),
+                ..crate::semantic::DeclaredTypeLinks::default()
+            },
+        ));
+        interface
+    }
+
+    fn alloc_named_object_alias(
+        store: &mut CanonicalTypeMapperStore,
+        name: &str,
+    ) -> (TypeId, TypeAliasId) {
+        let parsed = parse_source_file(&format!("type {name} = {{}};"));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(194);
+        assert!(
+            store
+                .register_source_file(&parsed.arena, parsed.source_file, file)
+                .is_some()
+        );
+        let alias_declaration = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::TypeAliasDeclaration)
+                    .then(|| NodeRef::new(parsed.arena.id(), file, node))
+            })
+            .unwrap();
+        let type_literal = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::TypeLiteral)
+                    .then(|| NodeRef::new(parsed.arena.id(), file, node))
+            })
+            .unwrap();
+        let mut owner_data = SymbolData::new(
+            SymbolFlags::TYPE_LITERAL,
+            EscapedName::internal(InternalSymbolName::Type),
+        );
+        owner_data.declarations = Some(vec![type_literal]);
+        let owner = store.alloc_symbol(owner_data).unwrap();
+        let object = store
+            .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(owner))
+            .unwrap();
+        let mut alias_data = SymbolData::new(SymbolFlags::TYPE_ALIAS, EscapedName::source(name));
+        alias_data.declarations = Some(vec![alias_declaration]);
+        let alias_symbol = store.alloc_symbol(alias_data).unwrap();
+        let alias = store.alloc_type_alias(Some(alias_symbol)).unwrap();
+        assert!(store.set_type_alias(object, Some(alias)));
+        assert!(store.set_type_alias_links(
+            alias_symbol,
+            crate::semantic::TypeAliasLinks {
+                declared_type: Some(object),
+                ..crate::semantic::TypeAliasLinks::default()
+            },
+        ));
+        (object, alias)
+    }
+
     fn parsed_context(
         parsed: &ParseResult,
         file: FileId,
@@ -1031,6 +2171,678 @@ mod tests {
                 (name.text == expected).then(|| NodeRef::new(parsed.arena.id(), file, alias.type_))
             })
             .expect("the test source contains the requested type alias")
+    }
+
+    #[test]
+    fn formats_named_interfaces_object_aliases_and_property_only_structures() {
+        let mut store = bootstrapped_store();
+        let (string, number) = store
+            .intrinsic_bootstrap()
+            .map(|bootstrap| (bootstrap.string_type, bootstrap.number_type))
+            .unwrap();
+        let interface = alloc_named_interface(&mut store, "Shape");
+        let (alias, _) = alloc_named_object_alias(&mut store, "AliasShape");
+        let nested_value = alloc_typed_property(&mut store, "value", string, false, false);
+        let nested = alloc_structural_object(&mut store, vec![nested_value]);
+        let first = alloc_typed_property(&mut store, "a", string, false, false);
+        let second = alloc_typed_property(&mut store, "b", number, true, false);
+        let child = alloc_typed_property(&mut store, "child", nested, false, false);
+        let object = alloc_structural_object(&mut store, vec![first, second, child]);
+        let empty = alloc_structural_object(&mut store, Vec::new());
+
+        assert_eq!(type_to_string(&store, interface).unwrap(), "Shape");
+        assert_eq!(type_to_string(&store, alias).unwrap(), "AliasShape");
+        assert_eq!(type_to_string(&store, empty).unwrap(), "{}");
+        assert_eq!(
+            type_to_string(&store, object).unwrap(),
+            "{ a: string; b?: number; child: { value: string; }; }",
+        );
+    }
+
+    #[test]
+    fn prints_readonly_only_from_a_checker_owned_semantic_proof() {
+        let mut store = bootstrapped_store();
+        let string = store.intrinsic_bootstrap().unwrap().string_type;
+        let readonly = alloc_typed_property(&mut store, "value", string, false, true);
+        let object = alloc_structural_object(&mut store, vec![readonly]);
+
+        assert_eq!(
+            type_to_string(&store, object).unwrap(),
+            "{ readonly value: string; }",
+        );
+    }
+
+    #[test]
+    fn structural_cycles_and_poisoned_member_caches_fail_typed_without_writes() {
+        let mut cyclic_store = bootstrapped_store();
+        let cyclic = cyclic_store
+            .alloc_plain_object_type(ObjectFlags::ANONYMOUS, None)
+            .unwrap();
+        let self_property = alloc_typed_property(&mut cyclic_store, "self", cyclic, false, false);
+        set_object_properties(&mut cyclic_store, cyclic, vec![self_property]);
+        assert_eq!(
+            type_to_string(&cyclic_store, cyclic),
+            Err(TypeDisplayUnavailable::CyclicType(cyclic)),
+        );
+
+        let mut poisoned_store = bootstrapped_store();
+        let string = poisoned_store.intrinsic_bootstrap().unwrap().string_type;
+        let property = alloc_typed_property(&mut poisoned_store, "value", string, false, false);
+        let poisoned = poisoned_store
+            .alloc_plain_object_type(ObjectFlags::ANONYMOUS, None)
+            .unwrap();
+        let members = poisoned_store.alloc_symbol_table();
+        assert_eq!(
+            poisoned_store.insert_symbol(members, EscapedName::source("value"), property,),
+            Some(None),
+        );
+        assert!(poisoned_store.set_structured_type_members(
+            poisoned,
+            Some(members),
+            Some(vec![property, property]),
+            None,
+            None,
+            None,
+        ));
+        let before = (
+            poisoned_store.type_len(),
+            poisoned_store.symbol_len(),
+            poisoned_store.type_alias_len(),
+            poisoned_store.mapper_len(),
+            poisoned_store.relation_state_snapshot(),
+        );
+        assert_eq!(
+            type_to_string(&poisoned_store, poisoned),
+            Err(TypeDisplayUnavailable::MalformedType(poisoned)),
+        );
+        assert_eq!(
+            (
+                poisoned_store.type_len(),
+                poisoned_store.symbol_len(),
+                poisoned_store.type_alias_len(),
+                poisoned_store.mapper_len(),
+                poisoned_store.relation_state_snapshot(),
+            ),
+            before,
+        );
+    }
+
+    #[test]
+    fn named_object_cache_provenance_is_validated_before_display() {
+        let mut alias_store = bootstrapped_store();
+        let string = alias_store.intrinsic_bootstrap().unwrap().string_type;
+        let (object, alias) = alloc_named_object_alias(&mut alias_store, "Shape");
+        assert_eq!(type_to_string(&alias_store, object).unwrap(), "Shape");
+        assert!(alias_store.set_type_alias_arguments(alias, Some(vec![string])));
+        assert_eq!(
+            type_to_string(&alias_store, object),
+            Err(TypeDisplayUnavailable::Alias {
+                type_id: object,
+                alias,
+            }),
+        );
+
+        let mut interface_store = bootstrapped_store();
+        let symbol = interface_store
+            .alloc_symbol(SymbolData::new(
+                SymbolFlags::INTERFACE,
+                EscapedName::source("Unlinked"),
+            ))
+            .unwrap();
+        let interface = interface_store
+            .alloc_interface_type(ObjectFlags::INTERFACE, Some(symbol))
+            .unwrap();
+        assert_eq!(
+            type_to_string(&interface_store, interface),
+            Err(TypeDisplayUnavailable::MalformedType(interface)),
+        );
+    }
+
+    #[test]
+    fn unqualified_named_display_rejects_parent_and_flag_poisons() {
+        let mut interface_store = bootstrapped_store();
+        let interface = alloc_named_interface(&mut interface_store, "Good");
+        let interface_symbol = interface_store
+            .type_payload(interface)
+            .unwrap()
+            .symbol()
+            .unwrap();
+        let interface_declaration = interface_store
+            .symbol(interface_symbol)
+            .unwrap()
+            .declarations()
+            .unwrap()[0];
+        let parent = interface_store
+            .alloc_symbol(SymbolData::new(
+                SymbolFlags::NAMESPACE_MODULE,
+                EscapedName::source("Namespace"),
+            ))
+            .unwrap();
+        let mut nested_data =
+            SymbolData::new(SymbolFlags::INTERFACE, EscapedName::source("Nested"));
+        nested_data.declarations = Some(vec![interface_declaration]);
+        nested_data.parent = Some(parent);
+        let nested_symbol = interface_store.alloc_symbol(nested_data).unwrap();
+        let nested = interface_store
+            .alloc_interface_type(ObjectFlags::INTERFACE, Some(nested_symbol))
+            .unwrap();
+        assert!(interface_store.set_declared_type_links(
+            nested_symbol,
+            crate::semantic::DeclaredTypeLinks {
+                declared_type: Some(nested),
+                ..crate::semantic::DeclaredTypeLinks::default()
+            },
+        ));
+        assert_eq!(
+            type_to_string(&interface_store, nested),
+            Err(TypeDisplayUnavailable::MalformedType(nested)),
+        );
+
+        let mut alias_store = bootstrapped_store();
+        let (object, original_alias) = alloc_named_object_alias(&mut alias_store, "GoodAlias");
+        let original_alias_symbol = alias_store
+            .type_alias(original_alias)
+            .unwrap()
+            .symbol()
+            .unwrap();
+        let alias_declaration = alias_store
+            .symbol(original_alias_symbol)
+            .unwrap()
+            .declarations()
+            .unwrap()[0];
+        let mut merged_flags_data = SymbolData::new(
+            SymbolFlags::TYPE_ALIAS | SymbolFlags::VALUE_MODULE,
+            EscapedName::source("BadFlags"),
+        );
+        merged_flags_data.declarations = Some(vec![alias_declaration]);
+        let merged_flags_symbol = alias_store.alloc_symbol(merged_flags_data).unwrap();
+        let merged_flags_alias = alias_store
+            .alloc_type_alias(Some(merged_flags_symbol))
+            .unwrap();
+        assert!(alias_store.set_type_alias(object, Some(merged_flags_alias)));
+        assert!(alias_store.set_type_alias_links(
+            merged_flags_symbol,
+            crate::semantic::TypeAliasLinks {
+                declared_type: Some(object),
+                ..crate::semantic::TypeAliasLinks::default()
+            },
+        ));
+        assert_eq!(
+            type_to_string(&alias_store, object),
+            Err(TypeDisplayUnavailable::Alias {
+                type_id: object,
+                alias: merged_flags_alias,
+            }),
+        );
+
+        let alias_parent = alias_store
+            .alloc_symbol(SymbolData::new(
+                SymbolFlags::NAMESPACE_MODULE,
+                EscapedName::source("AliasNamespace"),
+            ))
+            .unwrap();
+        let mut nested_alias_data =
+            SymbolData::new(SymbolFlags::TYPE_ALIAS, EscapedName::source("NestedAlias"));
+        nested_alias_data.declarations = Some(vec![alias_declaration]);
+        nested_alias_data.parent = Some(alias_parent);
+        let nested_alias_symbol = alias_store.alloc_symbol(nested_alias_data).unwrap();
+        let nested_alias = alias_store
+            .alloc_type_alias(Some(nested_alias_symbol))
+            .unwrap();
+        assert!(alias_store.set_type_alias(object, Some(nested_alias)));
+        assert!(alias_store.set_type_alias_links(
+            nested_alias_symbol,
+            crate::semantic::TypeAliasLinks {
+                declared_type: Some(object),
+                ..crate::semantic::TypeAliasLinks::default()
+            },
+        ));
+        assert_eq!(
+            type_to_string(&alias_store, object),
+            Err(TypeDisplayUnavailable::Alias {
+                type_id: object,
+                alias: nested_alias,
+            }),
+        );
+    }
+
+    #[test]
+    fn host_backed_type_literals_derive_readonly_and_reject_order_drift() {
+        let parsed = parse_source_file("type Shape = { readonly first: string; second?: number };");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(192);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/host-formatter.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        let (symbols, files) = binder.finish().try_into_parts().unwrap();
+        let bound = files.get(&file).unwrap();
+        let type_literal = type_alias_body(&parsed, file, "Shape");
+        let NodeData::TypeLiteralNode(literal) = &parsed.arena.get(type_literal.node).unwrap().data
+        else {
+            panic!("expected a type literal")
+        };
+        let owner = bound.symbol(type_literal).unwrap();
+        let properties = literal
+            .members
+            .nodes
+            .iter()
+            .map(|member| {
+                bound
+                    .symbol(NodeRef::new(parsed.arena.id(), file, *member))
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        let mut store = CanonicalTypeMapperStore::from_symbol_store(symbols);
+        assert!(
+            store
+                .register_source_file(&parsed.arena, parsed.source_file, file)
+                .is_some()
+        );
+        store
+            .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions::default())
+            .unwrap();
+        let (string, number, never) = store
+            .intrinsic_bootstrap()
+            .map(|bootstrap| {
+                (
+                    bootstrap.string_type,
+                    bootstrap.number_type,
+                    bootstrap.never_type,
+                )
+            })
+            .unwrap();
+        for (property, property_type) in properties.iter().zip([string, number]) {
+            assert!(store.set_value_symbol_links(
+                *property,
+                ValueSymbolLinks {
+                    resolved_type: Some(property_type),
+                    ..ValueSymbolLinks::default()
+                },
+            ));
+        }
+        let members = store.symbol(owner).unwrap().members();
+        let object = store
+            .alloc_plain_object_type(
+                ObjectFlags::ANONYMOUS | ObjectFlags::FROM_TYPE_NODE,
+                Some(owner),
+            )
+            .unwrap();
+        assert!(store.set_structured_type_members(
+            object,
+            members,
+            Some(properties.clone()),
+            None,
+            None,
+            None,
+        ));
+        let host = DeclaredTypeHost::new([(&parsed.arena, bound)]).unwrap();
+
+        assert_eq!(
+            type_to_string(&store, object),
+            Err(TypeDisplayUnavailable::UnsupportedType {
+                type_id: object,
+                kind: TypeDataKind::Object,
+            }),
+        );
+        assert_eq!(
+            type_to_string_with_host_and_flags(
+                &store,
+                &host,
+                object,
+                CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT,
+            )
+            .unwrap(),
+            "{ readonly first: string; second?: number; }",
+        );
+        assert_eq!(
+            get_type_names_for_assignability_error_with_host_and_flags(
+                &store,
+                &host,
+                object,
+                never,
+                CanonicalTypeFormatFlags::NONE,
+            )
+            .unwrap(),
+            AssignabilityErrorDisplay {
+                source: "{ readonly first: string; second?: number; }".into(),
+                target: "never".into(),
+            },
+        );
+
+        let semantic_parent = store
+            .alloc_symbol(SymbolData::new(
+                SymbolFlags::TYPE_ALIAS,
+                EscapedName::source("SemanticParent"),
+            ))
+            .unwrap();
+        let owner_declaration = store.symbol(owner).unwrap().declarations().unwrap()[0];
+        let mut parented_owner_data = SymbolData::new(
+            SymbolFlags::TYPE_LITERAL,
+            EscapedName::internal(InternalSymbolName::Type),
+        );
+        parented_owner_data.declarations = Some(vec![owner_declaration]);
+        parented_owner_data.members = members;
+        parented_owner_data.parent = Some(semantic_parent);
+        let parented_owner = store.alloc_symbol(parented_owner_data).unwrap();
+        let parented = store
+            .alloc_plain_object_type(
+                ObjectFlags::ANONYMOUS | ObjectFlags::FROM_TYPE_NODE,
+                Some(parented_owner),
+            )
+            .unwrap();
+        assert!(store.set_structured_type_members(
+            parented,
+            members,
+            Some(properties.clone()),
+            None,
+            None,
+            None,
+        ));
+        assert_eq!(
+            type_to_string_with_host_and_flags(
+                &store,
+                &host,
+                parented,
+                CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT,
+            ),
+            Err(TypeDisplayUnavailable::MalformedType(parented)),
+        );
+
+        let drifted = store
+            .alloc_plain_object_type(
+                ObjectFlags::ANONYMOUS | ObjectFlags::FROM_TYPE_NODE,
+                Some(owner),
+            )
+            .unwrap();
+        assert!(store.set_structured_type_members(
+            drifted,
+            members,
+            Some(properties.iter().copied().rev().collect()),
+            None,
+            None,
+            None,
+        ));
+        assert_eq!(
+            type_to_string_with_host_and_flags(
+                &store,
+                &host,
+                drifted,
+                CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT,
+            ),
+            Err(TypeDisplayUnavailable::MalformedType(drifted)),
+        );
+    }
+
+    #[test]
+    fn object_literal_clone_tables_format_and_target_poison_fails_closed() {
+        let parsed = parse_source_file("const value = { a: 'x', b: 1 }; const empty = {};");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(193);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/object-formatter.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        let bindings = binder.finish();
+        let object_node = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                matches!(
+                    &record.data,
+                    NodeData::ObjectLiteralExpression(object) if !object.properties.nodes.is_empty()
+                )
+                .then(|| NodeRef::new(parsed.arena.id(), file, node))
+            })
+            .unwrap();
+        let empty_node = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                matches!(
+                    &record.data,
+                    NodeData::ObjectLiteralExpression(object) if object.properties.nodes.is_empty()
+                )
+                .then(|| NodeRef::new(parsed.arena.id(), file, node))
+            })
+            .unwrap();
+        let NodeData::ObjectLiteralExpression(object_literal) =
+            &parsed.arena.get(object_node.node).unwrap().data
+        else {
+            unreachable!()
+        };
+        let owner = bindings.file(file).unwrap().symbol(object_node).unwrap();
+        let empty_owner = bindings.file(file).unwrap().symbol(empty_node).unwrap();
+        let raw_properties = object_literal
+            .properties
+            .nodes
+            .iter()
+            .map(|property| {
+                bindings
+                    .file(file)
+                    .unwrap()
+                    .symbol(NodeRef::new(parsed.arena.id(), file, *property))
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let (symbols, _) = bindings.try_into_parts().unwrap();
+        let mut store = CanonicalTypeMapperStore::from_symbol_store(symbols);
+        assert!(
+            store
+                .register_source_file(&parsed.arena, parsed.source_file, file)
+                .is_some()
+        );
+        store
+            .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions::default())
+            .unwrap();
+        let property_types = store
+            .intrinsic_bootstrap()
+            .map(|bootstrap| [bootstrap.string_type, bootstrap.number_type])
+            .unwrap();
+
+        let result_members = store.alloc_symbol_table();
+        let mut clones = Vec::new();
+        for (raw, property_type) in raw_properties.iter().zip(property_types) {
+            let raw_record = store.symbol(*raw).unwrap();
+            let mut data = SymbolData::new(
+                SymbolFlags::PROPERTY | SymbolFlags::TRANSIENT,
+                raw_record.name().to_owned(),
+            );
+            data.declarations = raw_record.declarations().map(<[NodeRef]>::to_vec);
+            data.value_declaration = raw_record.value_declaration();
+            data.parent = raw_record.parent();
+            let name = raw_record.name().as_utf8().unwrap().to_owned();
+            let clone = store.alloc_symbol(data).unwrap();
+            assert!(store.set_value_symbol_links(
+                clone,
+                ValueSymbolLinks {
+                    resolved_type: Some(property_type),
+                    target: Some(*raw),
+                    ..ValueSymbolLinks::default()
+                },
+            ));
+            assert_eq!(
+                store.insert_symbol(result_members, EscapedName::source(&name), clone),
+                Some(None),
+            );
+            clones.push(clone);
+        }
+        let object = store
+            .alloc_plain_object_type(
+                ObjectFlags::ANONYMOUS
+                    | ObjectFlags::OBJECT_LITERAL
+                    | ObjectFlags::FRESH_LITERAL
+                    | ObjectFlags::CONTAINS_OBJECT_OR_ARRAY_LITERAL,
+                Some(owner),
+            )
+            .unwrap();
+        assert!(store.set_structured_type_members(
+            object,
+            Some(result_members),
+            Some(clones),
+            None,
+            None,
+            None,
+        ));
+        assert_eq!(
+            type_to_string(&store, object).unwrap(),
+            "{ a: string; b: number; }",
+        );
+
+        let empty_members = store.alloc_symbol_table();
+        let empty = store
+            .alloc_plain_object_type(
+                ObjectFlags::ANONYMOUS
+                    | ObjectFlags::OBJECT_LITERAL
+                    | ObjectFlags::FRESH_LITERAL
+                    | ObjectFlags::CONTAINS_OBJECT_OR_ARRAY_LITERAL,
+                Some(empty_owner),
+            )
+            .unwrap();
+        assert!(store.set_structured_type_members(
+            empty,
+            Some(empty_members),
+            None,
+            None,
+            None,
+            None,
+        ));
+        assert_eq!(type_to_string(&store, empty).unwrap(), "{}");
+
+        let unowned_members = store.alloc_symbol_table();
+        let unowned = store
+            .alloc_plain_object_type(
+                ObjectFlags::ANONYMOUS
+                    | ObjectFlags::OBJECT_LITERAL
+                    | ObjectFlags::FRESH_LITERAL
+                    | ObjectFlags::CONTAINS_OBJECT_OR_ARRAY_LITERAL,
+                None,
+            )
+            .unwrap();
+        assert!(store.set_structured_type_members(
+            unowned,
+            Some(unowned_members),
+            None,
+            None,
+            None,
+            None,
+        ));
+        assert_eq!(
+            type_to_string(&store, unowned),
+            Err(TypeDisplayUnavailable::MalformedType(unowned)),
+        );
+
+        let poison_members = store.alloc_symbol_table();
+        let raw = raw_properties[0];
+        let raw_record = store.symbol(raw).unwrap();
+        let mut poison_data = SymbolData::new(
+            SymbolFlags::PROPERTY | SymbolFlags::TRANSIENT,
+            raw_record.name().to_owned(),
+        );
+        poison_data.declarations = raw_record.declarations().map(<[NodeRef]>::to_vec);
+        poison_data.value_declaration = raw_record.value_declaration();
+        poison_data.parent = raw_record.parent();
+        let poison_name = raw_record.name().as_utf8().unwrap().to_owned();
+        let poison_clone = store.alloc_symbol(poison_data).unwrap();
+        assert!(store.set_value_symbol_links(
+            poison_clone,
+            ValueSymbolLinks {
+                resolved_type: Some(property_types[0]),
+                target: Some(raw_properties[1]),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        assert_eq!(
+            store.insert_symbol(
+                poison_members,
+                EscapedName::source(&poison_name),
+                poison_clone,
+            ),
+            Some(None),
+        );
+        let poisoned = store
+            .alloc_plain_object_type(
+                ObjectFlags::ANONYMOUS
+                    | ObjectFlags::OBJECT_LITERAL
+                    | ObjectFlags::FRESH_LITERAL
+                    | ObjectFlags::CONTAINS_OBJECT_OR_ARRAY_LITERAL,
+                Some(owner),
+            )
+            .unwrap();
+        assert!(store.set_structured_type_members(
+            poisoned,
+            Some(poison_members),
+            Some(vec![poison_clone]),
+            None,
+            None,
+            None,
+        ));
+        assert_eq!(
+            type_to_string(&store, poisoned),
+            Err(TypeDisplayUnavailable::MalformedType(poisoned)),
+        );
+    }
+
+    #[test]
+    fn long_object_properties_use_pinned_elision_and_no_truncation() {
+        let mut store = bootstrapped_store();
+        let string = store.intrinsic_bootstrap().unwrap().string_type;
+        let names = (0..40)
+            .map(|index| format!("p{index:03}"))
+            .collect::<Vec<_>>();
+        let properties = names
+            .iter()
+            .map(|name| alloc_typed_property(&mut store, name, string, false, false))
+            .collect();
+        let object = alloc_structural_object(&mut store, properties);
+        let full_parts = names
+            .iter()
+            .map(|name| format!("{name}: string;"))
+            .collect::<Vec<_>>();
+        let full = format!("{{ {} }}", full_parts.join(" "));
+        let mut truncated_parts = full_parts[..15].to_vec();
+        truncated_parts.push("... 24 more ...;".into());
+        truncated_parts.push(full_parts.last().unwrap().clone());
+        let truncated = format!("{{ {} }}", truncated_parts.join(" "));
+
+        assert_eq!(type_to_string(&store, object).unwrap(), truncated);
+        assert_eq!(
+            type_to_string_with_flags(
+                &store,
+                object,
+                CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT
+                    | CanonicalTypeFormatFlags::NO_TRUNCATION,
+            )
+            .unwrap(),
+            full,
+        );
     }
 
     #[test]
