@@ -10,7 +10,7 @@ use ts_binder::{SemanticSymbolId, SymbolFlags};
 
 use super::{
     AliasSymbolLinks, AliasTargetState, CanonicalSemanticStore, TypeResolutionTarget,
-    TypeResolutionTargetError, TypeSystemPropertyName,
+    TypeResolutionTargetError, TypeSystemPropertyName, links::TypeResolutionCheckpoint,
 };
 
 const CIRCULAR_DEFINITION_OF_IMPORT_ALIAS: u32 = 2_303;
@@ -40,14 +40,14 @@ pub enum CanonicalAliasTargetUnavailable {
 /// while resolving a target, matching `getTargetOfAliasDeclaration` upstream.
 /// Returning [`CanonicalAliasTargetUnavailable`] is fail-closed: the kernel
 /// restores its resolution stack and leaves the transitive target unresolved.
-pub trait CanonicalAliasTargetHost {
+pub trait CanonicalAliasTargetHost<MapperPayload> {
     /// Returns the immediate target selected by the alias declaration.
     ///
     /// # Errors
     ///
     /// Returns a typed unavailable boundary when the declaration family or a
     /// semantic provider needed by that family is not installed.
-    fn get_target_of_alias_declaration<MapperPayload>(
+    fn get_target_of_alias_declaration(
         &mut self,
         store: &mut CanonicalSemanticStore<MapperPayload>,
         alias: SemanticSymbolId,
@@ -157,7 +157,7 @@ pub struct CanonicalAliasResolver<'store, 'host, MapperPayload, Host> {
 
 impl<'store, 'host, MapperPayload, Host> CanonicalAliasResolver<'store, 'host, MapperPayload, Host>
 where
-    Host: CanonicalAliasTargetHost,
+    Host: CanonicalAliasTargetHost<MapperPayload>,
 {
     #[must_use]
     pub fn new(
@@ -253,31 +253,44 @@ where
             return Ok(cached);
         }
 
-        if !self.store.push_type_resolution(
+        let checkpoint = self.store.checkpoint_type_resolution();
+        let pushed = match self.store.push_type_resolution(
             TypeResolutionTarget::Symbol(alias),
             TypeSystemPropertyName::AliasTarget,
-        )? {
+        ) {
+            Ok(pushed) => pushed,
+            Err(error) => {
+                self.commit_checkpoint(alias, checkpoint)?;
+                return Err(error.into());
+            }
+        };
+        if !pushed {
+            self.commit_checkpoint(alias, checkpoint)?;
             return Ok(AliasTargetState::Unknown);
         }
 
         let target = match self.resolve_uncached_alias(alias, events) {
             Ok(target) => target,
-            Err(error) => return Err(self.unwind_error(alias, error)),
+            Err(error) => return Err(self.rollback_error(alias, checkpoint, error)),
         };
         let target = match self.publish_alias_target(alias, target) {
             Ok(target) => target,
-            Err(error) => return Err(self.unwind_error(alias, error)),
+            Err(error) => return Err(self.rollback_error(alias, checkpoint, error)),
         };
         let Some(cycle_free) = self.store.pop_type_resolution() else {
-            return Err(CanonicalAliasResolutionError::ResolutionStackInvariant(
-                alias,
-            ));
+            let error = CanonicalAliasResolutionError::ResolutionStackInvariant(alias);
+            return Err(self.rollback_error(alias, checkpoint, error));
         };
         if cycle_free {
+            self.commit_checkpoint(alias, checkpoint)?;
             return Ok(target);
         }
 
-        let target = self.publish_alias_target(alias, AliasTargetState::Unknown)?;
+        let target = match self.publish_alias_target(alias, AliasTargetState::Unknown) {
+            Ok(target) => target,
+            Err(error) => return Err(self.rollback_error(alias, checkpoint, error)),
+        };
+        self.commit_checkpoint(alias, checkpoint)?;
         events.push(CanonicalAliasResolutionEvent::CircularDefinitionOfImportAlias { alias });
         Ok(target)
     }
@@ -400,12 +413,33 @@ where
         Ok(())
     }
 
-    fn unwind_error(
+    fn commit_checkpoint(
         &mut self,
         alias: SemanticSymbolId,
+        checkpoint: TypeResolutionCheckpoint,
+    ) -> Result<(), CanonicalAliasResolutionError> {
+        match self.store.commit_type_resolution_checkpoint(checkpoint) {
+            Ok(()) => Ok(()),
+            Err(checkpoint) => {
+                let _ = self.store.rollback_type_resolution_checkpoint(checkpoint);
+                Err(CanonicalAliasResolutionError::ResolutionStackInvariant(
+                    alias,
+                ))
+            }
+        }
+    }
+
+    fn rollback_error(
+        &mut self,
+        alias: SemanticSymbolId,
+        checkpoint: TypeResolutionCheckpoint,
         error: CanonicalAliasResolutionError,
     ) -> CanonicalAliasResolutionError {
-        if self.store.pop_type_resolution().is_some() {
+        if self
+            .store
+            .rollback_type_resolution_checkpoint(checkpoint)
+            .is_ok()
+        {
             error
         } else {
             CanonicalAliasResolutionError::ResolutionStackInvariant(alias)
@@ -435,6 +469,10 @@ mod tests {
     enum SyntheticTarget {
         Available(CanonicalImmediateAliasTarget),
         Unavailable(CanonicalAliasTargetUnavailable),
+        ResolveThenUnavailable {
+            active_alias: SemanticSymbolId,
+            reason: CanonicalAliasTargetUnavailable,
+        },
     }
 
     #[derive(Default)]
@@ -458,15 +496,30 @@ mod tests {
                 .insert(alias, SyntheticTarget::Unavailable(reason));
         }
 
+        fn resolve_then_unavailable(
+            &mut self,
+            alias: SemanticSymbolId,
+            active_alias: SemanticSymbolId,
+            reason: CanonicalAliasTargetUnavailable,
+        ) {
+            self.targets.insert(
+                alias,
+                SyntheticTarget::ResolveThenUnavailable {
+                    active_alias,
+                    reason,
+                },
+            );
+        }
+
         fn calls(&self, alias: SemanticSymbolId) -> usize {
             self.calls.get(&alias).copied().unwrap_or(0)
         }
     }
 
-    impl CanonicalAliasTargetHost for SyntheticHost {
-        fn get_target_of_alias_declaration<MapperPayload>(
+    impl<MapperPayload> CanonicalAliasTargetHost<MapperPayload> for SyntheticHost {
+        fn get_target_of_alias_declaration(
             &mut self,
-            _store: &mut CanonicalSemanticStore<MapperPayload>,
+            store: &mut CanonicalSemanticStore<MapperPayload>,
             alias: SemanticSymbolId,
         ) -> Result<CanonicalImmediateAliasTarget, CanonicalAliasTargetUnavailable> {
             *self.calls.entry(alias).or_default() += 1;
@@ -479,6 +532,17 @@ mod tests {
                 )) {
                 SyntheticTarget::Available(target) => Ok(target),
                 SyntheticTarget::Unavailable(reason) => Err(reason),
+                SyntheticTarget::ResolveThenUnavailable {
+                    active_alias,
+                    reason,
+                } => {
+                    let mut nested_host = Self::default();
+                    let nested = CanonicalAliasResolver::new(store, &mut nested_host)
+                        .resolve_alias(active_alias)
+                        .expect("active synthetic alias query is dependency-closed");
+                    assert_eq!(nested.target, AliasTargetState::Unknown);
+                    Err(reason)
+                }
             }
         }
     }
@@ -538,6 +602,18 @@ mod tests {
         let missing_links = store.alias_symbol_links(missing_alias).unwrap();
         assert_eq!(missing_links.immediate_target, None);
         assert_eq!(missing_links.alias_target, AliasTargetState::Unresolved);
+
+        let transitive = CanonicalAliasResolver::new(&mut store, &mut host)
+            .resolve_alias(resolved_alias)
+            .unwrap();
+        assert_eq!(transitive.target, AliasTargetState::Resolved(target));
+        assert_eq!(host.calls(resolved_alias), 2);
+        assert_eq!(
+            CanonicalAliasResolver::new(&mut store, &mut host)
+                .get_immediate_aliased_symbol(resolved_alias),
+            Ok(Some(target))
+        );
+        assert_eq!(host.calls(resolved_alias), 2);
     }
 
     #[test]
@@ -626,6 +702,69 @@ mod tests {
     }
 
     #[test]
+    fn type_only_propagation_preserves_existing_marker_and_crosses_unknown() {
+        let parsed = parse_source_file("interface Marker {}");
+        let file = FileId::new(2);
+        let source_marker = NodeRef::new(parsed.arena.id(), file, parsed.source_file);
+        let target_marker_node = parsed
+            .arena
+            .iter()
+            .find_map(|(node, _)| (node != parsed.source_file).then_some(node))
+            .unwrap();
+        let target_marker = NodeRef::new(parsed.arena.id(), file, target_marker_node);
+        let mut store = TestStore::default();
+        store
+            .register_source_file(&parsed.arena, parsed.source_file, file)
+            .unwrap();
+        let protected = alias(&mut store, "protected");
+        let propagated = alias(&mut store, "propagated");
+        let target = alias(&mut store, "target");
+        assert!(store.set_alias_symbol_links(
+            protected,
+            AliasSymbolLinks {
+                type_only_declaration: Some(source_marker),
+                ..AliasSymbolLinks::default()
+            }
+        ));
+        assert!(store.set_alias_symbol_links(
+            target,
+            AliasSymbolLinks {
+                type_only_declaration: Some(target_marker),
+                ..AliasSymbolLinks::default()
+            }
+        ));
+        let mut host = SyntheticHost::default();
+        host.insert(protected, CanonicalImmediateAliasTarget::Resolved(target));
+        host.insert(propagated, CanonicalImmediateAliasTarget::Resolved(target));
+        host.insert(target, CanonicalImmediateAliasTarget::Missing);
+
+        let protected_result = CanonicalAliasResolver::new(&mut store, &mut host)
+            .resolve_alias(protected)
+            .unwrap();
+        assert_eq!(protected_result.target, AliasTargetState::Unknown);
+        assert_eq!(
+            store
+                .alias_symbol_links(protected)
+                .unwrap()
+                .type_only_declaration,
+            Some(source_marker)
+        );
+
+        let propagated_result = CanonicalAliasResolver::new(&mut store, &mut host)
+            .resolve_alias(propagated)
+            .unwrap();
+        assert_eq!(propagated_result.target, AliasTargetState::Unknown);
+        assert_eq!(
+            store
+                .alias_symbol_links(propagated)
+                .unwrap()
+                .type_only_declaration,
+            Some(target_marker)
+        );
+        assert_eq!(host.calls(target), 1);
+    }
+
+    #[test]
     fn circular_chain_caches_unknown_and_emits_ts2303_events_while_unwinding() {
         let mut store = TestStore::default();
         let first = alias(&mut store, "first");
@@ -662,6 +801,110 @@ mod tests {
         assert!(cached.events.is_empty());
         assert_eq!(host.calls(first), 1);
         assert_eq!(host.calls(second), 1);
+    }
+
+    #[test]
+    fn self_cycle_marks_only_its_suffix_and_preserves_active_outer_result() {
+        let mut store = TestStore::default();
+        let outer = alias(&mut store, "outer");
+        let recursive = alias(&mut store, "recursive");
+        assert_eq!(
+            store.push_type_resolution(
+                TypeResolutionTarget::Symbol(outer),
+                TypeSystemPropertyName::AliasTarget,
+            ),
+            Ok(true)
+        );
+        let mut host = SyntheticHost::default();
+        host.insert(
+            recursive,
+            CanonicalImmediateAliasTarget::Resolved(recursive),
+        );
+
+        let result = CanonicalAliasResolver::new(&mut store, &mut host)
+            .resolve_alias(recursive)
+            .unwrap();
+        assert_eq!(result.target, AliasTargetState::Unknown);
+        assert_eq!(
+            result.events,
+            [CanonicalAliasResolutionEvent::CircularDefinitionOfImportAlias { alias: recursive },]
+        );
+        assert_eq!(store.type_resolution_len(), 1);
+        assert_eq!(store.pop_type_resolution(), Some(true));
+    }
+
+    #[test]
+    fn callback_error_restores_outer_cycle_result_and_truncates_alias_suffix() {
+        let mut store = TestStore::default();
+        let outer = alias(&mut store, "outer");
+        let failing = alias(&mut store, "failing");
+        assert_eq!(
+            store.push_type_resolution(
+                TypeResolutionTarget::Symbol(outer),
+                TypeSystemPropertyName::AliasTarget,
+            ),
+            Ok(true)
+        );
+        let mut host = SyntheticHost::default();
+        host.resolve_then_unavailable(
+            failing,
+            outer,
+            CanonicalAliasTargetUnavailable::UnsupportedDeclarationFamily,
+        );
+
+        let error = CanonicalAliasResolver::new(&mut store, &mut host)
+            .resolve_alias(failing)
+            .unwrap_err();
+        assert_eq!(
+            error,
+            CanonicalAliasResolutionError::TargetUnavailable {
+                alias: failing,
+                reason: CanonicalAliasTargetUnavailable::UnsupportedDeclarationFamily,
+            }
+        );
+        assert_eq!(alias_target(&store, failing), AliasTargetState::Unresolved);
+        assert_eq!(store.type_resolution_len(), 1);
+        assert_eq!(store.pop_type_resolution(), Some(true));
+    }
+
+    struct RemovePreexistingBoundaryHost {
+        boundary: Option<crate::semantic::TypeResolutionBoundary>,
+    }
+
+    impl<MapperPayload> CanonicalAliasTargetHost<MapperPayload> for RemovePreexistingBoundaryHost {
+        fn get_target_of_alias_declaration(
+            &mut self,
+            store: &mut CanonicalSemanticStore<MapperPayload>,
+            _alias: SemanticSymbolId,
+        ) -> Result<CanonicalImmediateAliasTarget, CanonicalAliasTargetUnavailable> {
+            assert_eq!(store.pop_type_resolution(), Some(true));
+            let boundary = self
+                .boundary
+                .take()
+                .expect("synthetic callback owns one pre-existing boundary token");
+            assert!(store.restore_type_resolution_start(boundary).is_ok());
+            Err(CanonicalAliasTargetUnavailable::TargetProviderUnavailable)
+        }
+    }
+
+    #[test]
+    fn removed_preexisting_boundary_surfaces_resolution_stack_invariant() {
+        let mut store = TestStore::default();
+        let failing = alias(&mut store, "failing");
+        let boundary = store.reset_type_resolution_start();
+        let mut host = RemovePreexistingBoundaryHost {
+            boundary: Some(boundary),
+        };
+
+        let error = CanonicalAliasResolver::new(&mut store, &mut host)
+            .resolve_alias(failing)
+            .unwrap_err();
+        assert_eq!(
+            error,
+            CanonicalAliasResolutionError::ResolutionStackInvariant(failing)
+        );
+        assert_eq!(alias_target(&store, failing), AliasTargetState::Unresolved);
+        assert!(store.type_resolution_is_empty());
     }
 
     #[test]
@@ -728,15 +971,30 @@ mod tests {
             CanonicalImmediateAliasTarget::Resolved(foreign_target),
         );
 
-        let unavailable_error = CanonicalAliasResolver::new(&mut store, &mut host)
-            .resolve_alias(unavailable)
-            .unwrap_err();
+        let unavailable_error = CanonicalAliasResolutionError::TargetUnavailable {
+            alias: unavailable,
+            reason: CanonicalAliasTargetUnavailable::UnsupportedDeclarationFamily,
+        };
         assert_eq!(
-            unavailable_error,
-            CanonicalAliasResolutionError::TargetUnavailable {
-                alias: unavailable,
-                reason: CanonicalAliasTargetUnavailable::UnsupportedDeclarationFamily,
-            }
+            CanonicalAliasResolver::new(&mut store, &mut host)
+                .get_immediate_aliased_symbol(unavailable),
+            Err(unavailable_error)
+        );
+        assert_eq!(
+            alias_target(&store, unavailable),
+            AliasTargetState::Unresolved
+        );
+        assert_eq!(
+            store
+                .alias_symbol_links(unavailable)
+                .unwrap()
+                .immediate_target,
+            None
+        );
+        assert!(store.type_resolution_is_empty());
+        assert_eq!(
+            CanonicalAliasResolver::new(&mut store, &mut host).try_resolve_alias(unavailable),
+            Err(unavailable_error)
         );
         assert_eq!(
             alias_target(&store, unavailable),
@@ -744,15 +1002,49 @@ mod tests {
         );
         assert!(store.type_resolution_is_empty());
 
-        let foreign_error = CanonicalAliasResolver::new(&mut store, &mut host)
-            .resolve_alias(foreign_alias)
-            .unwrap_err();
         assert_eq!(
-            foreign_error,
-            CanonicalAliasResolutionError::InvalidTarget {
-                alias: foreign_alias,
-                target: foreign_target,
-            }
+            CanonicalAliasResolver::new(&mut store, &mut host).resolve_alias(unavailable),
+            Err(unavailable_error)
+        );
+        assert_eq!(
+            alias_target(&store, unavailable),
+            AliasTargetState::Unresolved
+        );
+        assert!(store.type_resolution_is_empty());
+
+        let foreign_error = CanonicalAliasResolutionError::InvalidTarget {
+            alias: foreign_alias,
+            target: foreign_target,
+        };
+        assert_eq!(
+            CanonicalAliasResolver::new(&mut store, &mut host)
+                .get_immediate_aliased_symbol(foreign_alias),
+            Err(foreign_error)
+        );
+        assert_eq!(
+            alias_target(&store, foreign_alias),
+            AliasTargetState::Unresolved
+        );
+        assert_eq!(
+            store
+                .alias_symbol_links(foreign_alias)
+                .unwrap()
+                .immediate_target,
+            None
+        );
+        assert!(store.type_resolution_is_empty());
+        assert_eq!(
+            CanonicalAliasResolver::new(&mut store, &mut host).try_resolve_alias(foreign_alias),
+            Err(foreign_error)
+        );
+        assert_eq!(
+            alias_target(&store, foreign_alias),
+            AliasTargetState::Unresolved
+        );
+        assert!(store.type_resolution_is_empty());
+        assert_eq!(
+            CanonicalAliasResolver::new(&mut store, &mut host).resolve_alias(foreign_alias),
+            Err(foreign_error)
         );
         assert_eq!(
             alias_target(&store, foreign_alias),

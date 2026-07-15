@@ -28,8 +28,8 @@ use super::{
         OptionalSymbolSequence, ResolvedSignatureState, ReverseMappedSymbolLinks, SignatureLinks,
         SourceFileLinks, SourceFileRef, SpreadLinks, SwitchStatementLinks, SymbolNodeLinks,
         SymbolReferenceLinks, TypeAliasLinks, TypeNodeLinks, TypeResolutionBoundary,
-        TypeResolutionStack, TypeResolutionTarget, TypeResolutionTargetError,
-        TypeSystemPropertyName, ValueSymbolLinks, VarianceLinks,
+        TypeResolutionCheckpoint, TypeResolutionStack, TypeResolutionTarget,
+        TypeResolutionTargetError, TypeSystemPropertyName, ValueSymbolLinks, VarianceLinks,
     },
     relation::{RelationCaches, RelationComparisonResult, RelationKind, RelationStateSnapshot},
     signatures::{
@@ -1632,6 +1632,28 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         token: TypeResolutionBoundary,
     ) -> Result<(), TypeResolutionBoundary> {
         self.type_resolutions.restore_resolution_start(token)
+    }
+
+    /// Starts one internal transaction around a fallible resolution callback.
+    pub(super) fn checkpoint_type_resolution(&mut self) -> TypeResolutionCheckpoint {
+        self.type_resolutions.checkpoint()
+    }
+
+    /// Commits a balanced callback suffix while preserving genuine cycle
+    /// result-bit changes.
+    pub(super) fn commit_type_resolution_checkpoint(
+        &mut self,
+        token: TypeResolutionCheckpoint,
+    ) -> Result<(), TypeResolutionCheckpoint> {
+        self.type_resolutions.commit_checkpoint(token)
+    }
+
+    /// Removes a fallible callback suffix and restores the pre-existing stack.
+    pub(super) fn rollback_type_resolution_checkpoint(
+        &mut self,
+        token: TypeResolutionCheckpoint,
+    ) -> Result<(), TypeResolutionCheckpoint> {
+        self.type_resolutions.rollback_checkpoint(token)
     }
 
     /// Allocates a canonical type-mapper payload.

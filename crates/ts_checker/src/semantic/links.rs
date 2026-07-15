@@ -1061,6 +1061,20 @@ struct TypeResolution {
     result: bool,
 }
 
+/// Opaque transaction token for one callback-owned type-resolution suffix.
+///
+/// Tokens are store-branded and single-use. The token owns the complete
+/// structural prefix needed to validate a commit or restore a rollback, so a
+/// checkpoint cannot become hidden long-lived stack state.
+#[derive(Debug)]
+#[must_use = "type-resolution checkpoints must be committed or rolled back"]
+pub(super) struct TypeResolutionCheckpoint {
+    owner: SemanticStoreId,
+    entries: Vec<TypeResolution>,
+    resolution_start: usize,
+    boundaries: Vec<TypeResolutionBoundaryFrame>,
+}
+
 /// Opaque restoration token for a temporary type-resolution boundary.
 ///
 /// Tokens are store-branded, single-use, and must be restored in LIFO order.
@@ -1072,7 +1086,7 @@ pub struct TypeResolutionBoundary {
     serial: u64,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct TypeResolutionBoundaryFrame {
     serial: u64,
     previous_start: usize,
@@ -1123,6 +1137,71 @@ impl TypeResolutionStack {
     #[must_use]
     pub(super) const fn next_boundary_serial(&self) -> u64 {
         self.next_boundary_serial
+    }
+
+    /// Snapshots the structural stack prefix before entering a fallible
+    /// callback-owned resolution suffix.
+    pub(super) fn checkpoint(&self) -> TypeResolutionCheckpoint {
+        TypeResolutionCheckpoint {
+            owner: self.owner,
+            entries: self.entries.clone(),
+            resolution_start: self.resolution_start,
+            boundaries: self.boundaries.clone(),
+        }
+    }
+
+    /// Commits a structurally balanced checkpoint while retaining any cycle
+    /// result-bit changes made to its prefix.
+    pub(super) fn commit_checkpoint(
+        &mut self,
+        token: TypeResolutionCheckpoint,
+    ) -> Result<(), TypeResolutionCheckpoint> {
+        if token.owner != self.owner
+            || self.entries.len() != token.entries.len()
+            || !self
+                .entries
+                .iter()
+                .zip(&token.entries)
+                .all(|(current, saved)| {
+                    current.target == saved.target && current.property == saved.property
+                })
+            || self.resolution_start != token.resolution_start
+            || self.boundaries != token.boundaries
+        {
+            return Err(token);
+        }
+        Ok(())
+    }
+
+    /// Rolls back a fallible callback suffix and restores every pre-existing
+    /// resolution result bit.
+    ///
+    /// Boundary identities present at checkpoint creation must remain an
+    /// unchanged prefix. Callback-created boundary frames are discarded, but
+    /// their consumed serials are deliberately not reused.
+    pub(super) fn rollback_checkpoint(
+        &mut self,
+        token: TypeResolutionCheckpoint,
+    ) -> Result<(), TypeResolutionCheckpoint> {
+        if token.owner != self.owner
+            || self.entries.len() < token.entries.len()
+            || !self
+                .entries
+                .iter()
+                .zip(&token.entries)
+                .all(|(current, saved)| {
+                    current.target == saved.target && current.property == saved.property
+                })
+            || self.boundaries.len() < token.boundaries.len()
+            || self.boundaries[..token.boundaries.len()] != token.boundaries
+        {
+            return Err(token);
+        }
+
+        self.entries = token.entries;
+        self.boundaries.truncate(token.boundaries.len());
+        self.resolution_start = token.resolution_start;
+        Ok(())
     }
 
     /// Temporarily starts cycle scanning at the current stack depth.
@@ -1752,6 +1831,82 @@ mod tests {
         assert!(stack.restore_resolution_start(boundary).is_ok());
         assert_eq!(stack.pop(), Some(true));
         assert_eq!(stack.pop(), Some(true));
+    }
+
+    #[test]
+    fn checkpoint_rollback_restores_prefix_and_discards_callback_suffix() {
+        let (owner, symbol, other) = test_symbol_targets();
+        let mut stack = TypeResolutionStack::new(owner);
+        assert!(
+            stack
+                .push(symbol, TypeSystemPropertyName::Type, |_, _| false)
+                .unwrap()
+        );
+        let checkpoint = stack.checkpoint();
+        assert!(
+            stack
+                .push(other, TypeSystemPropertyName::Type, |_, _| false)
+                .unwrap()
+        );
+        assert!(
+            !stack
+                .push(symbol, TypeSystemPropertyName::Type, |_, _| false)
+                .unwrap()
+        );
+        let callback_boundary = stack.reset_resolution_start();
+        assert_eq!(callback_boundary.serial, 1);
+
+        assert!(stack.rollback_checkpoint(checkpoint).is_ok());
+        assert_eq!(stack.len(), 1);
+        assert_eq!(stack.resolution_start(), 0);
+        assert_eq!(stack.boundary_len(), 0);
+        assert_eq!(stack.next_boundary_serial(), 1);
+        assert_eq!(stack.pop(), Some(true));
+
+        let _callback_boundary = stack
+            .restore_resolution_start(callback_boundary)
+            .expect_err("rolled-back callback boundary must be invalidated");
+        let next_boundary = stack.reset_resolution_start();
+        assert_eq!(next_boundary.serial, 2);
+        assert!(stack.restore_resolution_start(next_boundary).is_ok());
+    }
+
+    #[test]
+    fn checkpoints_are_store_branded_and_detect_replaced_preexisting_boundaries() {
+        let (owner, symbol, other) = test_symbol_targets();
+        let mut first = TypeResolutionStack::new(owner);
+        let foreign_symbols = ts_binder::SymbolStore::new();
+        let mut second = TypeResolutionStack::new(foreign_symbols.id());
+        let checkpoint = first.checkpoint();
+        let checkpoint = second
+            .rollback_checkpoint(checkpoint)
+            .expect_err("another store must reject the checkpoint token");
+        assert!(first.rollback_checkpoint(checkpoint).is_ok());
+
+        assert!(
+            first
+                .push(symbol, TypeSystemPropertyName::Type, |_, _| false)
+                .unwrap()
+        );
+        let boundary = first.reset_resolution_start();
+        let checkpoint = first.checkpoint();
+        assert!(
+            first
+                .push(other, TypeSystemPropertyName::Type, |_, _| false)
+                .unwrap()
+        );
+        assert_eq!(first.pop(), Some(true));
+        assert!(first.restore_resolution_start(boundary).is_ok());
+        let replacement = first.reset_resolution_start();
+
+        let checkpoint = first
+            .commit_checkpoint(checkpoint)
+            .expect_err("replaced pre-existing boundary must reject commit");
+        assert!(
+            first.rollback_checkpoint(checkpoint).is_err(),
+            "rollback must also detect the changed boundary identity"
+        );
+        assert!(first.restore_resolution_start(replacement).is_ok());
     }
 
     #[test]
