@@ -328,7 +328,6 @@ pub struct BindDiagnostic {
 /// downstream semantic work mistake them for complete TypeScript control flow.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UnsupportedFlowKind {
-    SwitchStatement,
     TryStatement,
     WithStatement,
     LogicalExpression,
@@ -361,6 +360,7 @@ pub struct BoundFlowGraph {
     container_starts: BTreeMap<NodeId, FlowRef>,
     container_ends: BTreeMap<NodeId, FlowRef>,
     container_returns: BTreeMap<NodeId, FlowRef>,
+    fallthrough_flows: BTreeMap<NodeId, FlowRef>,
     unreachable_nodes: BTreeSet<NodeId>,
     incomplete_containers: BTreeSet<NodeId>,
     unsupported: Vec<UnsupportedFlow>,
@@ -375,6 +375,7 @@ impl BoundFlowGraph {
             container_starts: BTreeMap::new(),
             container_ends: BTreeMap::new(),
             container_returns: BTreeMap::new(),
+            fallthrough_flows: BTreeMap::new(),
             unreachable_nodes: BTreeSet::new(),
             incomplete_containers: BTreeSet::new(),
             unsupported: Vec::new(),
@@ -438,6 +439,18 @@ impl BoundFlowGraph {
             return None;
         }
         self.container_returns.get(&container.node).copied()
+    }
+
+    /// Flow retained on a non-final switch clause that can fall through.
+    #[must_use]
+    pub fn fallthrough_flow_at(&self, clause: NodeRef) -> Option<FlowRef> {
+        if !clause.is_for(self.node_arena_id(), self.file_id()) {
+            return None;
+        }
+        let container = self.node_containers.get(&clause.node)?;
+        (!self.incomplete_containers.contains(container))
+            .then(|| self.fallthrough_flows.get(&clause.node).copied())
+            .flatten()
     }
 
     /// Returns `None` when `container` was never recognized as a flow
@@ -2014,6 +2027,52 @@ mod tests {
             panic!("expected block");
         };
         block.statements.nodes.clone()
+    }
+
+    fn switch_clauses(arena: &NodeArena, switch_statement: NodeId) -> Vec<NodeId> {
+        let NodeData::SwitchStatement(switch) = &arena.get(switch_statement).unwrap().data else {
+            panic!("expected switch statement");
+        };
+        let NodeData::CaseBlock(block) = &arena.get(switch.case_block).unwrap().data else {
+            panic!("expected case block");
+        };
+        block.clauses.nodes.clone()
+    }
+
+    fn clause_statements(arena: &NodeArena, clause: NodeId) -> Vec<NodeId> {
+        let NodeData::CaseOrDefaultClause(clause) = &arena.get(clause).unwrap().data else {
+            panic!("expected case or default clause");
+        };
+        clause.statements.nodes.clone()
+    }
+
+    fn switch_clause_ranges(graph: &BoundFlowGraph) -> Vec<(NodeRef, i32, i32)> {
+        graph
+            .nodes()
+            .iter()
+            .filter_map(|node| match &node.payload {
+                Some(FlowNodePayload::SwitchClause {
+                    switch_statement,
+                    clause_start,
+                    clause_end,
+                }) => Some((*switch_statement, *clause_start, *clause_end)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn nearest_ancestor_of_kind(arena: &NodeArena, node: NodeId, kind: SyntaxKind) -> NodeId {
+        let mut current = node;
+        loop {
+            let parent = arena
+                .get(current)
+                .and_then(|node| node.parent)
+                .expect("expected ancestor");
+            if arena.get(parent).unwrap().kind == kind {
+                return parent;
+            }
+            current = parent;
+        }
     }
 
     fn label_named(arena: &NodeArena, name: &str) -> NodeId {
@@ -3595,9 +3654,566 @@ mod tests {
     }
 
     #[test]
+    fn switch_groups_consecutive_empty_clauses_into_exact_ranges() {
+        let parsed =
+            parse_source_file("switch (true) { case 0: case 1: case 2: hit = 1; default: } after;");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(41);
+        let result = bind_source_file_in_file(&parsed.arena, parsed.source_file, file);
+        let graph = result
+            .flow_graph(&parsed.arena, parsed.source_file)
+            .unwrap();
+        assert!(graph.is_complete(), "{:?}", graph.unsupported());
+
+        let switch_statement = source_statements(&parsed.arena, parsed.source_file)[0];
+        let switch_ref = node_ref(&parsed.arena, file, switch_statement);
+        assert_eq!(
+            switch_clause_ranges(graph),
+            vec![(switch_ref, 0, 3), (switch_ref, 3, 4)]
+        );
+        let clauses = switch_clauses(&parsed.arena, switch_statement);
+        assert_eq!(clauses.len(), 4);
+        assert_eq!(
+            graph.fallthrough_flow_at(node_ref(&parsed.arena, file, clauses[0])),
+            None
+        );
+        assert_eq!(
+            graph.fallthrough_flow_at(node_ref(&parsed.arena, file, clauses[1])),
+            None
+        );
+        let fallthrough = graph
+            .fallthrough_flow_at(node_ref(&parsed.arena, file, clauses[2]))
+            .unwrap();
+        assert!(
+            graph
+                .nodes()
+                .get(fallthrough)
+                .unwrap()
+                .flags
+                .contains(FlowFlags::ASSIGNMENT)
+        );
+        assert_eq!(
+            graph.fallthrough_flow_at(node_ref(&parsed.arena, file, clauses[3])),
+            None
+        );
+    }
+
+    #[test]
+    fn switch_without_default_adds_the_empty_no_match_edge_last() {
+        let parsed = parse_source_file("switch (subject) { case 0: break; } after;");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(42);
+        let result = bind_source_file_in_file(&parsed.arena, parsed.source_file, file);
+        let graph = result
+            .flow_graph(&parsed.arena, parsed.source_file)
+            .unwrap();
+        assert!(graph.is_complete(), "{:?}", graph.unsupported());
+
+        let statements = source_statements(&parsed.arena, parsed.source_file);
+        let switch_statement = statements[0];
+        let break_statement = clause_statements(
+            &parsed.arena,
+            switch_clauses(&parsed.arena, switch_statement)[0],
+        )[0];
+        let break_flow = graph
+            .flow_at(node_ref(&parsed.arena, file, break_statement))
+            .unwrap();
+        let post_switch_flow = graph
+            .flow_at(node_ref(&parsed.arena, file, statements[1]))
+            .unwrap();
+        let post_switch = graph.nodes().get(post_switch_flow).unwrap();
+        assert_eq!(post_switch.flags, FlowFlags::BRANCH_LABEL);
+        assert_eq!(post_switch.antecedents[0], break_flow);
+        let no_match_flow = post_switch.antecedents[1];
+        let no_match = graph.nodes().get(no_match_flow).unwrap();
+        assert_eq!(
+            no_match.flags,
+            FlowFlags::SWITCH_CLAUSE | FlowFlags::REFERENCED
+        );
+        assert_eq!(
+            no_match.payload,
+            Some(FlowNodePayload::SwitchClause {
+                switch_statement: node_ref(&parsed.arena, file, switch_statement),
+                clause_start: 0,
+                clause_end: 0,
+            })
+        );
+        assert_eq!(
+            no_match.antecedent,
+            graph.flow_at(node_ref(&parsed.arena, file, switch_statement))
+        );
+    }
+
+    #[test]
+    fn switch_with_default_has_only_clause_break_edges() {
+        let parsed =
+            parse_source_file("switch (subject) { case 0: break; default: break; } after;");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(43);
+        let result = bind_source_file_in_file(&parsed.arena, parsed.source_file, file);
+        let graph = result
+            .flow_graph(&parsed.arena, parsed.source_file)
+            .unwrap();
+        assert!(graph.is_complete(), "{:?}", graph.unsupported());
+
+        let statements = source_statements(&parsed.arena, parsed.source_file);
+        let switch_statement = statements[0];
+        let switch_ref = node_ref(&parsed.arena, file, switch_statement);
+        assert_eq!(
+            switch_clause_ranges(graph),
+            vec![(switch_ref, 0, 1), (switch_ref, 1, 2)]
+        );
+        let break_flows = switch_clauses(&parsed.arena, switch_statement)
+            .into_iter()
+            .map(|clause| clause_statements(&parsed.arena, clause)[0])
+            .map(|statement| {
+                graph
+                    .flow_at(node_ref(&parsed.arena, file, statement))
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let post_switch_flow = graph
+            .flow_at(node_ref(&parsed.arena, file, statements[1]))
+            .unwrap();
+        let post_switch = graph.nodes().get(post_switch_flow).unwrap();
+        assert_eq!(post_switch.flags, FlowFlags::BRANCH_LABEL);
+        assert_eq!(post_switch.antecedents, break_flows);
+        assert!(!graph.nodes().iter().any(|node| {
+            node.payload
+                .as_ref()
+                .is_some_and(FlowNodePayload::is_empty_switch_clause)
+        }));
+    }
+
+    #[test]
+    fn non_narrowing_switch_with_default_emits_no_clause_flow_nodes() {
+        let parsed =
+            parse_source_file("switch (0) { case 0: first = 1; default: last = 1; } after;");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(44);
+        let result = bind_source_file_in_file(&parsed.arena, parsed.source_file, file);
+        let graph = result
+            .flow_graph(&parsed.arena, parsed.source_file)
+            .unwrap();
+        assert!(graph.is_complete(), "{:?}", graph.unsupported());
+
+        assert!(switch_clause_ranges(graph).is_empty());
+        assert!(
+            graph
+                .nodes()
+                .iter()
+                .all(|node| !node.flags.contains(FlowFlags::SWITCH_CLAUSE))
+        );
+        let switch_statement = source_statements(&parsed.arena, parsed.source_file)[0];
+        let clauses = switch_clauses(&parsed.arena, switch_statement);
+        let first_fallthrough = graph
+            .fallthrough_flow_at(node_ref(&parsed.arena, file, clauses[0]))
+            .unwrap();
+        assert!(
+            graph
+                .nodes()
+                .get(first_fallthrough)
+                .unwrap()
+                .flags
+                .contains(FlowFlags::ASSIGNMENT)
+        );
+        assert_eq!(
+            graph.fallthrough_flow_at(node_ref(&parsed.arena, file, clauses[1])),
+            None
+        );
+    }
+
+    #[test]
+    fn switch_fallthrough_and_break_edges_preserve_statement_order() {
+        let parsed = parse_source_file(
+            "switch (subject) { case 0: first = 1; case 1: break; default: last = 1; } after;",
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(45);
+        let result = bind_source_file_in_file(&parsed.arena, parsed.source_file, file);
+        let graph = result
+            .flow_graph(&parsed.arena, parsed.source_file)
+            .unwrap();
+        assert!(graph.is_complete(), "{:?}", graph.unsupported());
+
+        let statements = source_statements(&parsed.arena, parsed.source_file);
+        let switch_statement = statements[0];
+        let clauses = switch_clauses(&parsed.arena, switch_statement);
+        let first_fallthrough = graph
+            .fallthrough_flow_at(node_ref(&parsed.arena, file, clauses[0]))
+            .unwrap();
+        let break_statement = clause_statements(&parsed.arena, clauses[1])[0];
+        let break_flow = graph
+            .flow_at(node_ref(&parsed.arena, file, break_statement))
+            .unwrap();
+        let pre_second_case = graph.nodes().get(break_flow).unwrap();
+        assert_eq!(
+            pre_second_case.flags,
+            FlowFlags::BRANCH_LABEL | FlowFlags::REFERENCED
+        );
+        assert_eq!(pre_second_case.antecedents[1], first_fallthrough);
+        assert_eq!(
+            graph
+                .nodes()
+                .get(pre_second_case.antecedents[0])
+                .unwrap()
+                .payload,
+            Some(FlowNodePayload::SwitchClause {
+                switch_statement: node_ref(&parsed.arena, file, switch_statement),
+                clause_start: 1,
+                clause_end: 2,
+            })
+        );
+
+        let post_switch_flow = graph
+            .flow_at(node_ref(&parsed.arena, file, statements[1]))
+            .unwrap();
+        let post_switch = graph.nodes().get(post_switch_flow).unwrap();
+        assert_eq!(post_switch.flags, FlowFlags::BRANCH_LABEL);
+        assert_eq!(post_switch.antecedents[0], break_flow);
+        assert!(
+            graph
+                .nodes()
+                .get(post_switch.antecedents[1])
+                .unwrap()
+                .flags
+                .contains(FlowFlags::ASSIGNMENT)
+        );
+        assert_eq!(
+            graph.fallthrough_flow_at(node_ref(&parsed.arena, file, clauses[1])),
+            None
+        );
+        assert_eq!(
+            graph.fallthrough_flow_at(node_ref(&parsed.arena, file, clauses[2])),
+            None
+        );
+    }
+
+    #[test]
+    fn nested_switches_restore_break_and_case_expression_targets() {
+        let parsed = parse_source_file(
+            r"
+                switch (outer) {
+                    case 0:
+                        switch (inner) { default: break; }
+                        tail = 1;
+                        break;
+                    case (probe = 1):
+                        break;
+                }
+                after;
+            ",
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(46);
+        let result = bind_source_file_in_file(&parsed.arena, parsed.source_file, file);
+        let graph = result
+            .flow_graph(&parsed.arena, parsed.source_file)
+            .unwrap();
+        assert!(graph.is_complete(), "{:?}", graph.unsupported());
+
+        let outer_switch = source_statements(&parsed.arena, parsed.source_file)[0];
+        let inner_switch = nodes_of_kind(&parsed.arena, SyntaxKind::SwitchStatement)
+            .into_iter()
+            .find(|statement| *statement != outer_switch)
+            .unwrap();
+        let mut inner_break_flow = None;
+        let mut outer_break_flows = Vec::new();
+        for statement in nodes_of_kind(&parsed.arena, SyntaxKind::BreakStatement) {
+            let flow = graph
+                .flow_at(node_ref(&parsed.arena, file, statement))
+                .unwrap();
+            if nearest_ancestor_of_kind(&parsed.arena, statement, SyntaxKind::SwitchStatement)
+                == inner_switch
+            {
+                inner_break_flow = Some(flow);
+            } else {
+                outer_break_flows.push(flow);
+            }
+        }
+        let inner_target = branch_target_index(graph, inner_break_flow.unwrap());
+        assert_eq!(outer_break_flows.len(), 2);
+        let outer_target = branch_target_index(graph, outer_break_flows[0]);
+        assert_eq!(
+            branch_target_index(graph, outer_break_flows[1]),
+            outer_target
+        );
+        assert_ne!(inner_target, outer_target);
+
+        let probe = nodes_of_kind(&parsed.arena, SyntaxKind::Identifier)
+            .into_iter()
+            .find(|identifier| {
+                matches!(
+                    &parsed.arena.get(*identifier).unwrap().data,
+                    NodeData::Identifier(data) if data.text == "probe"
+                )
+            })
+            .unwrap();
+        let probe_assignment = graph
+            .nodes()
+            .iter()
+            .find(|node| {
+                node.payload == Some(FlowNodePayload::Ast(node_ref(&parsed.arena, file, probe)))
+            })
+            .unwrap();
+        let outer_entry = graph
+            .flow_at(node_ref(&parsed.arena, file, outer_switch))
+            .unwrap();
+        let inner_entry = graph
+            .flow_at(node_ref(&parsed.arena, file, inner_switch))
+            .unwrap();
+        assert_eq!(probe_assignment.antecedent, Some(outer_entry));
+        assert_ne!(probe_assignment.antecedent, Some(inner_entry));
+    }
+
+    #[test]
+    fn recovered_switch_at_eof_retains_clause_and_no_match_ranges() {
+        let parsed = parse_source_file("switch (true) { case 1:");
+        assert!(!parsed.diagnostics.is_empty());
+        let file = FileId::new(47);
+        let result = bind_source_file_in_file(&parsed.arena, parsed.source_file, file);
+        let graph = result
+            .flow_graph(&parsed.arena, parsed.source_file)
+            .unwrap();
+        assert!(graph.is_complete(), "{:?}", graph.unsupported());
+
+        let switch_statement = source_statements(&parsed.arena, parsed.source_file)[0];
+        let switch_ref = node_ref(&parsed.arena, file, switch_statement);
+        assert_eq!(
+            switch_clause_ranges(graph),
+            vec![(switch_ref, 0, 1), (switch_ref, 0, 0)]
+        );
+        let clauses = switch_clauses(&parsed.arena, switch_statement);
+        assert_eq!(clauses.len(), 1);
+        assert!(clause_statements(&parsed.arena, clauses[0]).is_empty());
+    }
+
+    #[test]
+    fn no_default_switch_restores_reachability_after_all_cases_return() {
+        let parsed = parse_source_file(
+            "function choose(subject: number) { switch (subject) { case 0: return 0; } after; }",
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(48);
+        let result = bind_source_file_in_file(&parsed.arena, parsed.source_file, file);
+        let graph = result
+            .flow_graph(&parsed.arena, parsed.source_file)
+            .unwrap();
+        assert!(graph.is_complete(), "{:?}", graph.unsupported());
+
+        let after = nodes_of_kind(&parsed.arena, SyntaxKind::ExpressionStatement)[0];
+        let after_flow = graph.flow_at(node_ref(&parsed.arena, file, after)).unwrap();
+        let no_match = graph.nodes().get(after_flow).unwrap();
+        assert_eq!(
+            no_match.flags,
+            FlowFlags::SWITCH_CLAUSE | FlowFlags::REFERENCED
+        );
+        assert!(
+            no_match
+                .payload
+                .as_ref()
+                .is_some_and(FlowNodePayload::is_empty_switch_clause)
+        );
+        assert_eq!(
+            graph.is_unreachable(node_ref(&parsed.arena, file, after)),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn default_switch_post_flow_can_come_only_from_a_conditional_break() {
+        let parsed = parse_source_file(
+            r"
+                function choose(subject: number, stop: boolean) {
+                    switch (subject) {
+                        default:
+                            if (stop) break;
+                            return 1;
+                    }
+                    after;
+                }
+            ",
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(49);
+        let result = bind_source_file_in_file(&parsed.arena, parsed.source_file, file);
+        let graph = result
+            .flow_graph(&parsed.arena, parsed.source_file)
+            .unwrap();
+        assert!(graph.is_complete(), "{:?}", graph.unsupported());
+
+        let break_statement = nodes_of_kind(&parsed.arena, SyntaxKind::BreakStatement)[0];
+        let break_flow = graph
+            .flow_at(node_ref(&parsed.arena, file, break_statement))
+            .unwrap();
+        let after = nodes_of_kind(&parsed.arena, SyntaxKind::ExpressionStatement)[0];
+        assert_eq!(
+            graph.flow_at(node_ref(&parsed.arena, file, after)),
+            Some(break_flow)
+        );
+        assert!(
+            graph
+                .nodes()
+                .get(break_flow)
+                .unwrap()
+                .flags
+                .contains(FlowFlags::TRUE_CONDITION)
+        );
+        assert!(!graph.nodes().iter().any(|node| {
+            node.payload
+                .as_ref()
+                .is_some_and(FlowNodePayload::is_empty_switch_clause)
+        }));
+    }
+
+    #[test]
+    fn terminating_case_does_not_prevent_later_case_binding() {
+        let parsed = parse_source_file(
+            r"
+                function choose(subject: number) {
+                    switch (subject) {
+                        case 0: return;
+                        case 1: selected = 1;
+                    }
+                    after;
+                }
+            ",
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(50);
+        let result = bind_source_file_in_file(&parsed.arena, parsed.source_file, file);
+        let graph = result
+            .flow_graph(&parsed.arena, parsed.source_file)
+            .unwrap();
+        assert!(graph.is_complete(), "{:?}", graph.unsupported());
+
+        let switch_statement = nodes_of_kind(&parsed.arena, SyntaxKind::SwitchStatement)[0];
+        let clauses = switch_clauses(&parsed.arena, switch_statement);
+        let selected = clause_statements(&parsed.arena, clauses[1])[0];
+        let selected_flow = graph
+            .flow_at(node_ref(&parsed.arena, file, selected))
+            .unwrap();
+        let selected_entry = graph.nodes().get(selected_flow).unwrap();
+        assert_eq!(
+            selected_entry.payload,
+            Some(FlowNodePayload::SwitchClause {
+                switch_statement: node_ref(&parsed.arena, file, switch_statement),
+                clause_start: 1,
+                clause_end: 2,
+            })
+        );
+        assert_eq!(
+            graph.is_unreachable(node_ref(&parsed.arena, file, selected)),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn terminating_detached_case_expression_restores_selected_clause_flow() {
+        let parsed = parse_source_file(
+            r"
+                switch (subject) {
+                    case (() => { return 1; }): selected = 1;
+                    default:
+                }
+                after;
+            ",
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(51);
+        let result = bind_source_file_in_file(&parsed.arena, parsed.source_file, file);
+        let graph = result
+            .flow_graph(&parsed.arena, parsed.source_file)
+            .unwrap();
+        assert!(graph.is_complete(), "{:?}", graph.unsupported());
+
+        let switch_statement = source_statements(&parsed.arena, parsed.source_file)[0];
+        let selected = clause_statements(
+            &parsed.arena,
+            switch_clauses(&parsed.arena, switch_statement)[0],
+        )[0];
+        let selected_flow = graph
+            .flow_at(node_ref(&parsed.arena, file, selected))
+            .unwrap();
+        assert_eq!(
+            graph.nodes().get(selected_flow).unwrap().payload,
+            Some(FlowNodePayload::SwitchClause {
+                switch_statement: node_ref(&parsed.arena, file, switch_statement),
+                clause_start: 0,
+                clause_end: 1,
+            })
+        );
+        let arrow = nodes_of_kind(&parsed.arena, SyntaxKind::ArrowFunction)[0];
+        assert_eq!(
+            graph.container_is_complete(node_ref(&parsed.arena, file, arrow)),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn unsupported_switch_clause_fails_closed_but_discovers_later_containers() {
+        let parsed = parse_source_file(
+            r"
+                function broken(value: number) {
+                    switch (value) {
+                        case 0: try { work; } finally {}
+                        default: function nested() { return; }
+                    }
+                }
+                const after = 1;
+            ",
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(52);
+        let result = bind_source_file_in_file(&parsed.arena, parsed.source_file, file);
+        let graph = result
+            .flow_graph(&parsed.arena, parsed.source_file)
+            .unwrap();
+        assert!(!graph.is_complete());
+
+        let functions = nodes_of_kind(&parsed.arena, SyntaxKind::FunctionDeclaration);
+        let outer = functions
+            .iter()
+            .copied()
+            .find(|function| {
+                parsed.arena.get(*function).unwrap().parent == Some(parsed.source_file)
+            })
+            .unwrap();
+        let nested = functions
+            .into_iter()
+            .find(|function| *function != outer)
+            .unwrap();
+        let source = node_ref(&parsed.arena, file, parsed.source_file);
+        assert_eq!(
+            graph.container_is_complete(node_ref(&parsed.arena, file, outer)),
+            Some(false)
+        );
+        assert_eq!(
+            graph.container_is_complete(node_ref(&parsed.arena, file, nested)),
+            Some(true)
+        );
+        assert_eq!(graph.container_is_complete(source), Some(true));
+        assert_eq!(graph.unsupported().len(), 1);
+        assert_eq!(
+            graph.unsupported()[0].kind,
+            UnsupportedFlowKind::TryStatement
+        );
+        assert_eq!(
+            graph.unsupported()[0].container,
+            node_ref(&parsed.arena, file, outer)
+        );
+        let after = source_statements(&parsed.arena, parsed.source_file)[1];
+        assert!(
+            graph
+                .flow_at(node_ref(&parsed.arena, file, after))
+                .is_some()
+        );
+    }
+
+    #[test]
     fn unsupported_nested_effects_invalidate_an_enclosing_conditional() {
         let parsed = parse_source_file(
-            "const result = flag ? (() => { switch (value) { default: value = 1; } }) : 0;",
+            "const result = flag ? (() => { try { value = 1; } finally {} }) : 0;",
         );
         assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
         let file = FileId::new(22);
@@ -3614,7 +4230,7 @@ mod tests {
         assert_eq!(graph.container_is_complete(arrow_ref), Some(false));
         assert!(graph.unsupported().iter().any(|unsupported| {
             unsupported.container == arrow_ref
-                && unsupported.kind == UnsupportedFlowKind::SwitchStatement
+                && unsupported.kind == UnsupportedFlowKind::TryStatement
         }));
         assert!(graph.unsupported().iter().any(|unsupported| {
             unsupported.container == source_ref
@@ -3710,7 +4326,7 @@ mod tests {
         let parsed = parse_source_file(
             r"
                 function iterate(value: number) {
-                    switch (value) { default: value = 0; }
+                    try { value = 0; } finally {}
                     value = 1;
                 }
                 const after = 1;
@@ -3740,11 +4356,11 @@ mod tests {
         assert_eq!(graph.unsupported().len(), 1);
         assert_eq!(
             graph.unsupported()[0].kind,
-            UnsupportedFlowKind::SwitchStatement
+            UnsupportedFlowKind::TryStatement
         );
         assert_eq!(graph.unsupported()[0].container, function_ref);
 
-        let top_level = parse_source_file("switch (flag) {} const after = 1;");
+        let top_level = parse_source_file("try { flag; } finally {} const after = 1;");
         let top_result =
             bind_source_file_in_file(&top_level.arena, top_level.source_file, FileId::new(15));
         let top_graph = top_result

@@ -23,6 +23,7 @@ struct SavedFlow {
     break_target: Option<FlowRef>,
     continue_target: Option<FlowRef>,
     active_labels: Vec<ActiveLabel>,
+    pre_switch_case_flow: Option<FlowRef>,
 }
 
 #[derive(Clone, Copy)]
@@ -55,6 +56,7 @@ struct FlowBuilder<'a> {
     break_target: Option<FlowRef>,
     continue_target: Option<FlowRef>,
     active_labels: Vec<ActiveLabel>,
+    pre_switch_case_flow: Option<FlowRef>,
     has_flow_effects: bool,
     effect_dependency_containers: Vec<NodeId>,
     built_containers: BTreeSet<NodeId>,
@@ -72,6 +74,7 @@ impl<'a> FlowBuilder<'a> {
             break_target: None,
             continue_target: None,
             active_labels: Vec::new(),
+            pre_switch_case_flow: None,
             has_flow_effects: false,
             effect_dependency_containers: Vec::new(),
             built_containers: BTreeSet::new(),
@@ -174,9 +177,10 @@ impl<'a> FlowBuilder<'a> {
             SyntaxKind::ForInStatement | SyntaxKind::ForOfStatement => {
                 self.bind_for_in_or_of_statement(node_id);
             }
-            SyntaxKind::SwitchStatement | SyntaxKind::CaseBlock => {
-                self.mark_unsupported(node_id, UnsupportedFlowKind::SwitchStatement);
-                self.discover_nested_containers(node_id);
+            SyntaxKind::SwitchStatement => self.bind_switch_statement(node_id),
+            SyntaxKind::CaseBlock => self.bind_case_block(node_id),
+            SyntaxKind::CaseClause | SyntaxKind::DefaultClause => {
+                self.bind_case_or_default_clause(node_id);
             }
             SyntaxKind::TryStatement | SyntaxKind::CatchClause => {
                 self.mark_unsupported(node_id, UnsupportedFlowKind::TryStatement);
@@ -440,6 +444,150 @@ impl<'a> FlowBuilder<'a> {
         }
         self.add_current_antecedent(pre_loop_label);
         self.current = self.finish_label(post_loop_label);
+    }
+
+    fn bind_switch_statement(&mut self, node_id: NodeId) {
+        let (expression, case_block) = match self.ast.get(node_id).map(|node| &node.data) {
+            Some(NodeData::SwitchStatement(data)) => (data.expression, data.case_block),
+            _ => return,
+        };
+        let post_switch_label = self.alloc_label();
+        self.bind_node(expression);
+        let Some(pre_switch_case_flow) = self.current else {
+            self.discover_nested_containers(case_block);
+            return;
+        };
+
+        let saved_break_target = self.break_target.replace(post_switch_label);
+        let saved_pre_switch_case_flow = self.pre_switch_case_flow.replace(pre_switch_case_flow);
+        self.bind_node(case_block);
+
+        if let Some(current) = self.current {
+            self.add_antecedent(post_switch_label, current);
+        }
+        if !self.case_block_has_default(case_block) {
+            let no_match = self.create_flow_switch_clause(pre_switch_case_flow, node_id, 0, 0);
+            self.add_antecedent(post_switch_label, no_match);
+        }
+        let post_switch_flow = self.finish_label(post_switch_label);
+        let switch_incomplete = self.graph.incomplete_containers.contains(&self.container);
+        self.break_target = saved_break_target;
+        self.pre_switch_case_flow = saved_pre_switch_case_flow;
+        self.current = (!switch_incomplete).then_some(post_switch_flow).flatten();
+    }
+
+    fn bind_case_block(&mut self, node_id: NodeId) {
+        let clauses = match self.ast.get(node_id).map(|node| &node.data) {
+            Some(NodeData::CaseBlock(data)) => data.clauses.nodes.clone(),
+            _ => return,
+        };
+        let Some(switch_statement) = self.ast.get(node_id).and_then(|node| node.parent) else {
+            self.bind_children(node_id);
+            return;
+        };
+        let Some(NodeData::SwitchStatement(switch_data)) =
+            self.ast.get(switch_statement).map(|node| &node.data)
+        else {
+            self.bind_children(node_id);
+            return;
+        };
+        let switch_expression = switch_data.expression;
+        let Some(pre_switch_case_flow) = self.pre_switch_case_flow else {
+            self.bind_children(node_id);
+            return;
+        };
+        let is_narrowing_switch = self.node_kind(switch_expression)
+            == Some(SyntaxKind::TrueKeyword)
+            || self.is_narrowing_expression(switch_expression);
+        let mut fallthrough_flow = self.graph.nodes.unreachable();
+        let mut index = 0;
+
+        while index < clauses.len() {
+            let clause_start = index;
+            while self.case_clause_statements_are_empty(clauses[index]) && index + 1 < clauses.len()
+            {
+                if self.is_unreachable(fallthrough_flow) {
+                    self.current = Some(pre_switch_case_flow);
+                }
+                self.bind_node(clauses[index]);
+                if self.current.is_none() {
+                    for clause in &clauses[index + 1..] {
+                        self.discover_nested_containers(*clause);
+                    }
+                    return;
+                }
+                index += 1;
+            }
+
+            let pre_case_label = self.alloc_label();
+            let pre_case_flow = if is_narrowing_switch {
+                self.create_flow_switch_clause(
+                    pre_switch_case_flow,
+                    switch_statement,
+                    clause_start,
+                    index + 1,
+                )
+            } else {
+                pre_switch_case_flow
+            };
+            self.add_antecedent(pre_case_label, pre_case_flow);
+            self.add_antecedent(pre_case_label, fallthrough_flow);
+            self.current = self.finish_label(pre_case_label);
+
+            let clause = clauses[index];
+            self.bind_node(clause);
+            let Some(current) = self.current else {
+                for remaining in &clauses[index + 1..] {
+                    self.discover_nested_containers(*remaining);
+                }
+                return;
+            };
+            fallthrough_flow = current;
+            if !self.is_unreachable(current) && index + 1 < clauses.len() {
+                self.graph.fallthrough_flows.insert(clause, current);
+                self.graph.node_containers.insert(clause, self.container);
+            }
+            index += 1;
+        }
+    }
+
+    fn bind_case_or_default_clause(&mut self, node_id: NodeId) {
+        let (expression, statements) = match self.ast.get(node_id).map(|node| &node.data) {
+            Some(NodeData::CaseOrDefaultClause(data)) => (
+                (self.node_kind(node_id) == Some(SyntaxKind::CaseClause))
+                    .then_some(data.expression),
+                data.statements.nodes.clone(),
+            ),
+            _ => return,
+        };
+        if let Some(expression) = expression {
+            let saved_current = self.current;
+            let Some(pre_switch_case_flow) = self.pre_switch_case_flow else {
+                self.bind_statement_list(&statements);
+                return;
+            };
+            self.current = Some(pre_switch_case_flow);
+            self.bind_node(expression);
+            self.current = saved_current;
+        }
+        self.bind_statement_list(&statements);
+    }
+
+    fn case_block_has_default(&self, case_block: NodeId) -> bool {
+        matches!(
+            self.ast.get(case_block).map(|node| &node.data),
+            Some(NodeData::CaseBlock(data))
+                if data.clauses.nodes.iter().any(|clause| {
+                    self.node_kind(*clause) == Some(SyntaxKind::DefaultClause)
+                })
+        )
+    }
+
+    fn case_clause_statements_are_empty(&self, clause: NodeId) -> bool {
+        matches!(
+            self.ast.get(clause).map(|node| &node.data),
+            Some(NodeData::CaseOrDefaultClause(data)) if data.statements.nodes.is_empty()
+        )
     }
 
     fn bind_break_or_continue_statement(&mut self, node_id: NodeId, jump: JumpKind) {
@@ -1124,6 +1272,7 @@ impl<'a> FlowBuilder<'a> {
             break_target: self.break_target.take(),
             continue_target: self.continue_target.take(),
             active_labels: std::mem::take(&mut self.active_labels),
+            pre_switch_case_flow: self.pre_switch_case_flow.take(),
         }
     }
 
@@ -1134,6 +1283,7 @@ impl<'a> FlowBuilder<'a> {
         self.break_target = saved.break_target;
         self.continue_target = saved.continue_target;
         self.active_labels = saved.active_labels;
+        self.pre_switch_case_flow = saved.pre_switch_case_flow;
     }
 
     fn maybe_bind_expression_flow_if_call(&mut self, expression: NodeId) {
@@ -1249,6 +1399,34 @@ impl<'a> FlowBuilder<'a> {
             .expect("binder mutation references belong to its flow arena");
         self.current = Some(flow);
         self.has_flow_effects = true;
+    }
+
+    fn create_flow_switch_clause(
+        &mut self,
+        antecedent: FlowRef,
+        switch_statement: NodeId,
+        clause_start: usize,
+        clause_end: usize,
+    ) -> FlowRef {
+        self.graph
+            .nodes
+            .mark_referenced(antecedent)
+            .expect("binder switch-clause antecedent belongs to its flow arena");
+        let payload = FlowNodePayload::SwitchClause {
+            switch_statement: self.node_ref(switch_statement),
+            clause_start: i32::try_from(clause_start)
+                .expect("switch clause start fits the upstream i32 payload"),
+            clause_end: i32::try_from(clause_end)
+                .expect("switch clause end fits the upstream i32 payload"),
+        };
+        self.graph
+            .nodes
+            .alloc(FlowNode::with_antecedent(
+                FlowFlags::SWITCH_CLAUSE,
+                payload,
+                antecedent,
+            ))
+            .expect("binder switch-clause payload belongs to its flow arena")
     }
 
     fn add_current_antecedent(&mut self, label: FlowRef) -> bool {
