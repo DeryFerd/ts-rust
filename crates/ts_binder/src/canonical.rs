@@ -3576,35 +3576,6 @@ mod tests {
                 holder[dynamic] = 1;
             "#,
         );
-        // Constructor declarations are not produced by the current parser
-        // slice yet. Re-shape its method payload so this primitive-level probe
-        // can exercise the pinned nameless constructor key.
-        let constructor = node_with_source(
-            &parsed.arena,
-            SyntaxKind::MethodDeclaration,
-            "constructor() {}",
-        );
-        let constructor_data = match &parsed.arena.get(constructor).unwrap().data {
-            NodeData::MethodDeclaration(data) => ts_ast::ConstructorDeclarationData {
-                asterisk_token: data.asterisk_token,
-                body: data.body,
-                end_flow_node: data.end_flow_node,
-                full_signature: data.full_signature,
-                locals: data.locals.clone(),
-                next_container: data.next_container,
-                parameters: data.parameters.clone(),
-                return_flow_node: None,
-                symbol: data.symbol,
-                type_: data.type_,
-                type_parameters: data.type_parameters.clone(),
-                facts: data.facts,
-                modifiers: data.modifiers.clone(),
-            },
-            _ => unreachable!(),
-        };
-        let constructor_node = parsed.arena.get_mut(constructor).unwrap();
-        constructor_node.kind = SyntaxKind::Constructor;
-        constructor_node.data = NodeData::ConstructorDeclaration(Box::new(constructor_data));
         // The current parser aliases ExportAssignment.expression into its
         // generated `type_` slot. Canonical traversal correctly rejects that
         // DAG, so give this focused binder probe distinct but equivalent leaf

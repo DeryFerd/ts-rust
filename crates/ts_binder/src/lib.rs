@@ -1429,13 +1429,10 @@ impl<'a> Binder<'a> {
     }
 
     fn is_constructor_like(&self, node: NodeId) -> bool {
-        match self.arena.get(node).map(|node| &node.data) {
-            Some(NodeData::ConstructorDeclaration(_)) => true,
-            Some(NodeData::MethodDeclaration(method)) => {
-                self.identifier_text(method.name) == Some("constructor")
-            }
-            _ => false,
-        }
+        matches!(
+            self.arena.get(node).map(|node| &node.data),
+            Some(NodeData::ConstructorDeclaration(_))
+        )
     }
 
     fn bind_type_parameters(
