@@ -415,6 +415,23 @@ remains the cluster-level source of truth.
   JavaScript (84), classes (79), functions (69), untyped variables (46),
   modules (32), interfaces (29), import-equals (28), enums and TSX (19 each),
   and imports (15). It is a root-algorithm queue, not a parity percentage.
+- The first property-object vertical slice is integrated through `5916c00`,
+  `8e3e52e`, `20fe648`, `9aad5c7`, `680b444`, and the source/compiler seams
+  `d33373c..7d74866`. Canonical queries now construct property-only type
+  literals, simple no-heritage interfaces, and nested object literals with
+  exact binder-owned raw members, checker-owned transient property clones,
+  resolved member tables, owner identity, propagated object flags, recursive
+  interface shells, and warm-cache validation. Assignability consumes that
+  representation without descriptors; the formatter prints named interfaces,
+  named object aliases, anonymous structures, optional/readonly members,
+  nested objects, and pinned property elision. Source checking can therefore
+  complete and issue deterministic TS2322 diagnostics for supported object
+  assignments instead of stopping at a display boundary. The merged slice
+  passes 609 checker library tests, 163 binder tests, strict scoped Clippy,
+  rustdoc, and doctests. Contextual property widening and pinned object-literal
+  elaboration (property-local incompatible, excess, and missing diagnostics)
+  are the next active dependency cluster; unions, indexes, spreads, computed
+  names, generic object bodies, and interface heritage remain typed boundaries.
 
 No percentage in this section is a whole-corpus parity claim. A score is
 publishable only when its variant manifest and complete artifact comparison are
