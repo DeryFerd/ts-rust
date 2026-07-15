@@ -2,7 +2,8 @@
 //!
 //! This module ports `isTypeRelatedTo`, `isSimpleTypeRelatedTo`, and their
 //! no-diagnostic entry points plus primitive/literal/nullable unions and the
-//! property-only object slice of `recursiveTypeRelatedTo`, including fresh
+//! property-only object slice of `recursiveTypeRelatedTo` for assignable,
+//! comparable, subtype, and strict-subtype relations, including fresh
 //! excess-property checks and strict/exact optional-property relations, from pinned
 //! `internal/checker/relater.go` at
 //! `dc37b5249ab60e2bbce936f71b883e6c8136167e`. Unsupported structural paths
@@ -397,6 +398,16 @@ impl<'store> RelaterSession<'store> {
         self.pending.set(key, result);
     }
 
+    fn allows_fresh_object_target(&self) -> bool {
+        // `removeSubtypes` compares fresh object-literal constituents in both
+        // positions. The narrower assignable/comparable entry points retain
+        // their existing fail-closed target boundary.
+        matches!(
+            self.relation,
+            RelationKind::Subtype | RelationKind::StrictSubtype
+        )
+    }
+
     fn union_types(&mut self, type_id: TypeId) -> Result<Vec<TypeId>, RelationUnavailable> {
         if let Some(types) = self.validated_unions.get(&type_id) {
             return Ok(types.clone());
@@ -566,10 +577,8 @@ impl<'store> RelaterSession<'store> {
         if source_flags.intersects(TypeFlags::STRUCTURED_OR_INSTANTIABLE)
             || target_flags.intersects(TypeFlags::STRUCTURED_OR_INSTANTIABLE)
         {
-            if matches!(
-                self.relation,
-                RelationKind::Assignable | RelationKind::Comparable
-            ) && source_flags.intersects(TypeFlags::OBJECT)
+            if supports_property_object_relation(self.relation)
+                && source_flags.intersects(TypeFlags::OBJECT)
                 && target_flags.intersects(TypeFlags::OBJECT)
             {
                 if self.is_fresh_object_literal(source)?
@@ -841,10 +850,8 @@ impl<'store> RelaterSession<'store> {
         if source_flags.intersects(TypeFlags::UNION) || target_flags.intersects(TypeFlags::UNION) {
             return self.union_or_intersection_related_to(source, target, intersection_state);
         }
-        if !matches!(
-            self.relation,
-            RelationKind::Assignable | RelationKind::Comparable
-        ) || !source_flags.intersects(TypeFlags::OBJECT)
+        if !supports_property_object_relation(self.relation)
+            || !source_flags.intersects(TypeFlags::OBJECT)
             || !target_flags.intersects(TypeFlags::OBJECT)
         {
             return Err(RelationUnavailable::StructuralRelation {
@@ -854,7 +861,17 @@ impl<'store> RelaterSession<'store> {
             });
         }
         let source_members = self.resolved_object_members(source, true)?;
-        let target_members = self.resolved_object_members(target, false)?;
+        let target_members =
+            self.resolved_object_members(target, self.allows_fresh_object_target())?;
+        if matches!(
+            self.relation,
+            RelationKind::Subtype | RelationKind::StrictSubtype
+        ) && self.is_fresh_object_literal(target)?
+            && target_members.properties.is_empty()
+            && !source_members.properties.is_empty()
+        {
+            return Ok(Ternary::False);
+        }
         self.properties_related_to(source, &source_members, &target_members)
     }
 
@@ -1119,7 +1136,8 @@ impl<'store> RelaterSession<'store> {
         source: TypeId,
         target: TypeId,
     ) -> Result<bool, RelationUnavailable> {
-        let target_members = self.resolved_object_members(target, false)?;
+        let target_members =
+            self.resolved_object_members(target, self.allows_fresh_object_target())?;
         if target_members.properties.is_empty() {
             return Ok(false);
         }
@@ -1169,16 +1187,26 @@ impl<'store> RelaterSession<'store> {
         source: TypeId,
         target: TypeId,
     ) -> Result<bool, RelationUnavailable> {
-        let target_members = self.resolved_object_members(target, false)?;
+        let target_members =
+            self.resolved_object_members(target, self.allows_fresh_object_target())?;
 
         // Pinned `hasExcessProperties` treats the empty object as an open
-        // target and exempts the global Object target from assignable-relation
-        // excess checks. Index signatures and union/intersection targets
-        // remain outside this property-only slice.
-        if target_members.properties.is_empty() || self.is_direct_global_object_type(target)? {
+        // target and exempts the global Object target only for assignable and
+        // comparable relations. Subtype relations retain fresh-literal excess
+        // checking against those targets. Index signatures and
+        // union/intersection targets remain outside this property-only slice.
+        if matches!(
+            self.relation,
+            RelationKind::Assignable | RelationKind::Comparable
+        ) && (target_members.properties.is_empty()
+            || self.is_direct_global_object_type(target)?)
+        {
             return Ok(false);
         }
         let source_members = self.resolved_object_members(source, true)?;
+        if target_members.properties.is_empty() {
+            return Ok(!source_members.properties.is_empty());
+        }
         let target_table = target_members
             .members
             .and_then(|members| self.store.symbol_table(members))
@@ -1735,14 +1763,12 @@ impl<'store> RelaterSession<'store> {
         if source_is_union || target_is_union {
             return Ok(());
         }
-        if matches!(
-            self.relation,
-            RelationKind::Assignable | RelationKind::Comparable
-        ) && source_flags.intersects(TypeFlags::OBJECT)
+        if supports_property_object_relation(self.relation)
+            && source_flags.intersects(TypeFlags::OBJECT)
             && target_flags.intersects(TypeFlags::OBJECT)
         {
             self.ensure_supported_object_kind(source, true)?;
-            self.ensure_supported_object_kind(target, false)?;
+            self.ensure_supported_object_kind(target, self.allows_fresh_object_target())?;
             return Ok(());
         }
         Err(RelationUnavailable::StructuralRelation {
@@ -1755,7 +1781,7 @@ impl<'store> RelaterSession<'store> {
     fn ensure_supported_object_kind(
         &self,
         type_id: TypeId,
-        allow_fresh_source: bool,
+        allow_fresh_literal: bool,
     ) -> Result<(), RelationUnavailable> {
         let record = self
             .store
@@ -1799,7 +1825,7 @@ impl<'store> RelaterSession<'store> {
             | ObjectFlags::UNRESOLVED_MEMBERS;
         if record.object_flags().intersects(unsupported_flags)
             || record.object_flags().intersects(fresh_object_literal)
-                && (!allow_fresh_source || !record.object_flags().contains(fresh_object_literal))
+                && (!allow_fresh_literal || !record.object_flags().contains(fresh_object_literal))
         {
             return Err(RelationUnavailable::UnsupportedStructuredType(type_id));
         }
@@ -1879,9 +1905,9 @@ impl<'store> RelaterSession<'store> {
     fn resolved_object_members(
         &self,
         type_id: TypeId,
-        allow_fresh_source: bool,
+        allow_fresh_literal: bool,
     ) -> Result<ResolvedObjectMembers, RelationUnavailable> {
-        self.ensure_supported_object_kind(type_id, allow_fresh_source)?;
+        self.ensure_supported_object_kind(type_id, allow_fresh_literal)?;
         let record = self
             .store
             .type_payload(type_id)
@@ -2455,10 +2481,8 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         {
             let union_relation = source_flags.intersects(TypeFlags::UNION)
                 || target_flags.intersects(TypeFlags::UNION);
-            let supported_object_relation = matches!(
-                relation,
-                RelationKind::Assignable | RelationKind::Comparable
-            ) && source_flags.intersects(TypeFlags::OBJECT)
+            let supported_object_relation = supports_property_object_relation(relation)
+                && source_flags.intersects(TypeFlags::OBJECT)
                 && target_flags.intersects(TypeFlags::OBJECT);
             if union_relation || supported_object_relation {
                 let mut session = RelaterSession::new(self, relation, bootstrap);
@@ -2889,6 +2913,16 @@ impl SemanticStore<TypeRecord, TypeMapper> {
 
 const fn bool_to_ternary(value: bool) -> Ternary {
     if value { Ternary::True } else { Ternary::False }
+}
+
+const fn supports_property_object_relation(relation: RelationKind) -> bool {
+    matches!(
+        relation,
+        RelationKind::Assignable
+            | RelationKind::Subtype
+            | RelationKind::StrictSubtype
+            | RelationKind::Comparable
+    )
 }
 
 pub(super) const fn union_validation_unavailable(
@@ -4269,6 +4303,158 @@ mod tests {
             "Comparable still performs fresh excess-property checks"
         );
         assert!(store.relation_cache_size(RelationKind::Comparable) >= 4);
+    }
+
+    #[test]
+    fn subtype_property_objects_preserve_fresh_excess_and_shape_rules() {
+        let mut store = initialized(true);
+        let (string, number) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (bootstrap.string_type, bootstrap.number_type)
+        };
+
+        let wide_id = alloc_typed_property(&mut store, "id", string, false);
+        let wide_name = alloc_typed_property(&mut store, "name", number, false);
+        let fresh_wide = alloc_fresh_property_object(&mut store, vec![wide_id, wide_name]);
+        let narrow_id = alloc_typed_property(&mut store, "id", string, false);
+        let fresh_narrow = alloc_fresh_property_object(&mut store, vec![narrow_id]);
+
+        let before_excess = store.relation_state_snapshot();
+        assert_eq!(
+            store.is_type_subtype_of(fresh_wide, fresh_narrow),
+            Ok(false)
+        );
+        assert_eq!(store.relation_state_snapshot(), before_excess);
+        assert_eq!(
+            store.is_type_strict_subtype_of(fresh_wide, fresh_narrow),
+            Ok(false)
+        );
+        assert_eq!(
+            store.relation_state_snapshot(),
+            before_excess,
+            "fresh excess rejection precedes recursive cache publication"
+        );
+
+        let matching_source_id = alloc_typed_property(&mut store, "id", string, false);
+        let matching_source = alloc_fresh_property_object(&mut store, vec![matching_source_id]);
+        let matching_target_id = alloc_typed_property(&mut store, "id", string, false);
+        let matching_target = alloc_fresh_property_object(&mut store, vec![matching_target_id]);
+        assert_eq!(
+            store.is_type_subtype_of(matching_source, matching_target),
+            Ok(true)
+        );
+        assert_eq!(
+            store.is_type_strict_subtype_of(matching_source, matching_target),
+            Ok(true)
+        );
+        assert_eq!(store.relation_cache_size(RelationKind::Subtype), 1);
+        assert_eq!(store.relation_cache_size(RelationKind::StrictSubtype), 1);
+    }
+
+    #[test]
+    fn subtype_property_objects_preserve_optional_weak_and_empty_rules() {
+        let mut store = initialized(true);
+        let string = store.intrinsic_bootstrap().unwrap().string_type;
+
+        let optional_value = alloc_typed_property(&mut store, "value", string, true);
+        let optional_source = alloc_property_object(&mut store, vec![optional_value]);
+        let required_value = alloc_typed_property(&mut store, "value", string, false);
+        let required_target = alloc_property_object(&mut store, vec![required_value]);
+        assert_eq!(
+            store.is_type_subtype_of(optional_source, required_target),
+            Ok(false)
+        );
+        assert_eq!(
+            store.is_type_strict_subtype_of(optional_source, required_target),
+            Ok(false)
+        );
+
+        let required_value = alloc_typed_property(&mut store, "value", string, false);
+        let required_source = alloc_property_object(&mut store, vec![required_value]);
+        let optional_value = alloc_typed_property(&mut store, "value", string, true);
+        let optional_target = alloc_property_object(&mut store, vec![optional_value]);
+        assert_eq!(
+            store.is_type_subtype_of(required_source, optional_target),
+            Ok(true)
+        );
+        assert_eq!(
+            store.is_type_strict_subtype_of(required_source, optional_target),
+            Ok(true)
+        );
+
+        let unrelated = alloc_typed_property(&mut store, "unrelated", string, false);
+        let unrelated_source = alloc_property_object(&mut store, vec![unrelated]);
+        let weak = alloc_typed_property(&mut store, "weak", string, true);
+        let weak_target = alloc_property_object(&mut store, vec![weak]);
+        let before_weak = store.relation_state_snapshot();
+        assert_eq!(
+            store.is_type_subtype_of(unrelated_source, weak_target),
+            Ok(false)
+        );
+        assert_eq!(store.relation_state_snapshot(), before_weak);
+        assert_eq!(
+            store.is_type_strict_subtype_of(unrelated_source, weak_target),
+            Ok(false)
+        );
+        assert_eq!(store.relation_state_snapshot(), before_weak);
+
+        let fresh_value = alloc_typed_property(&mut store, "value", string, false);
+        let fresh_source = alloc_fresh_property_object(&mut store, vec![fresh_value]);
+        let empty = alloc_property_object(&mut store, Vec::new());
+        assert_eq!(store.is_type_assignable_to(fresh_source, empty), Ok(true));
+        assert_eq!(store.is_type_comparable_to(fresh_source, empty), Ok(true));
+        let before_subtype_excess = store.relation_state_snapshot();
+        assert_eq!(store.is_type_subtype_of(fresh_source, empty), Ok(false));
+        assert_eq!(store.relation_state_snapshot(), before_subtype_excess);
+        assert_eq!(
+            store.is_type_strict_subtype_of(fresh_source, empty),
+            Ok(false)
+        );
+        assert_eq!(store.relation_state_snapshot(), before_subtype_excess);
+
+        let ordinary_value = alloc_typed_property(&mut store, "value", string, false);
+        let ordinary_source = alloc_property_object(&mut store, vec![ordinary_value]);
+        assert_eq!(store.is_type_subtype_of(ordinary_source, empty), Ok(true));
+        assert_eq!(
+            store.is_type_strict_subtype_of(ordinary_source, empty),
+            Ok(true)
+        );
+
+        let fresh_empty = alloc_fresh_property_object(&mut store, Vec::new());
+        assert_eq!(
+            store.is_type_subtype_of(ordinary_source, fresh_empty),
+            Ok(false)
+        );
+        assert_eq!(
+            store.is_type_strict_subtype_of(ordinary_source, fresh_empty),
+            Ok(false)
+        );
+    }
+
+    #[test]
+    fn unavailable_subtype_property_relations_are_cache_atomic() {
+        let mut store = initialized(true);
+        let string = store.intrinsic_bootstrap().unwrap().string_type;
+        let source_property = alloc_typed_property(&mut store, "value", string, false);
+        let source = alloc_property_object(&mut store, vec![source_property]);
+        let unresolved_property = alloc_symbol(&mut store, SymbolFlags::PROPERTY, "value");
+        let target = alloc_property_object(&mut store, vec![unresolved_property]);
+
+        let before = store.relation_state_snapshot();
+        assert_eq!(
+            store.is_type_subtype_of(source, target),
+            Err(RelationUnavailable::UnresolvedPropertyType(
+                unresolved_property
+            ))
+        );
+        assert_eq!(store.relation_state_snapshot(), before);
+        assert_eq!(
+            store.is_type_strict_subtype_of(source, target),
+            Err(RelationUnavailable::UnresolvedPropertyType(
+                unresolved_property
+            ))
+        );
+        assert_eq!(store.relation_state_snapshot(), before);
     }
 
     #[test]
@@ -5655,16 +5841,13 @@ mod tests {
         assert_eq!(store.is_type_assignable_to(target, source), Ok(false));
         assert_eq!(store.relation_cache_size(RelationKind::Assignable), 2);
         assert_eq!(store.relation_cache_size(RelationKind::Subtype), 0);
-        let before_subtype = store.relation_state_snapshot();
-        assert_eq!(
-            store.is_type_subtype_of(source, target),
-            Err(RelationUnavailable::StructuralRelation {
-                source,
-                target,
-                relation: RelationKind::Subtype,
-            })
-        );
-        assert_eq!(store.relation_state_snapshot(), before_subtype);
+        assert_eq!(store.is_type_subtype_of(source, target), Ok(true));
+        assert_eq!(store.relation_cache_size(RelationKind::Subtype), 1);
+        let after_subtype = store.relation_state_snapshot();
+        assert_eq!(store.is_type_subtype_of(source, target), Ok(true));
+        assert_eq!(store.relation_state_snapshot(), after_subtype);
+        assert_eq!(store.is_type_strict_subtype_of(source, target), Ok(true));
+        assert_eq!(store.relation_cache_size(RelationKind::StrictSubtype), 1);
     }
 
     #[test]
