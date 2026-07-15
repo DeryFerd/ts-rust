@@ -163,6 +163,7 @@ pub struct CompilationRelatedInformation {
     pub source_text: Option<SourceText>,
     pub range: Option<TextRange>,
     pub code: Option<u32>,
+    pub category: Option<CompilationDiagnosticCategory>,
     pub message: String,
 }
 
@@ -318,6 +319,9 @@ pub struct DiagnosticScorecardDiagnostic {
     pub code: Option<u32>,
     pub category: Option<CompilationDiagnosticCategory>,
     pub message: String,
+    /// Related records remain nested beneath their primary and never count as
+    /// top-level diagnostics.
+    pub related_information: Vec<DiagnosticScorecardDiagnostic>,
 }
 
 impl From<&CompilationDiagnostic> for DiagnosticScorecardDiagnostic {
@@ -331,6 +335,29 @@ impl From<&CompilationDiagnostic> for DiagnosticScorecardDiagnostic {
             code: diagnostic.code,
             category: diagnostic.category,
             message: diagnostic.message.clone(),
+            related_information: diagnostic
+                .related_information
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .map(DiagnosticScorecardDiagnostic::from)
+                .collect(),
+        }
+    }
+}
+
+impl From<&CompilationRelatedInformation> for DiagnosticScorecardDiagnostic {
+    fn from(diagnostic: &CompilationRelatedInformation) -> Self {
+        Self {
+            file_name: diagnostic.file_name.clone(),
+            range: diagnostic.range.map(|range| DiagnosticScorecardRange {
+                start: range.start.get(),
+                length: range.len(),
+            }),
+            code: diagnostic.code,
+            category: diagnostic.category,
+            message: diagnostic.message.clone(),
+            related_information: Vec::new(),
         }
     }
 }
@@ -587,7 +614,7 @@ pub fn run_upstream_diagnostic_baselines(
         FixtureChecker::Legacy
     };
     let mut scorecard = DiagnosticScorecard {
-        schema_version: 3,
+        schema_version: 4,
         checker_mode: match checker {
             FixtureChecker::Legacy => DiagnosticCheckerMode::Legacy,
             FixtureChecker::Canonical => DiagnosticCheckerMode::Canonical,
@@ -809,9 +836,15 @@ fn render_error_baseline(
     ordered.sort_by(|left, right| compare_compilation_diagnostics(left, right));
     let mut artifact = RenderedDiagnosticArtifact::default();
     for (index, pair) in ordered.windows(2).enumerate() {
-        if diagnostic_primary_order_key(pair[0]) == diagnostic_primary_order_key(pair[1]) {
+        if diagnostic_primary_order_key(pair[0]) == diagnostic_primary_order_key(pair[1])
+            && (pair[0].message != pair[1].message
+                || compare_compilation_related_information(
+                    pair[0].related_information.as_deref(),
+                    pair[1].related_information.as_deref(),
+                ) == Ordering::Equal)
+        {
             artifact.unsupported_details.push(format!(
-                "diagnostics {index} and {} have the same path/range/code ordering key; the checker does not expose message arguments, message chains, or related-information sort keys",
+                "diagnostics {index} and {} have the same path/range/code ordering key; the checker does not expose message arguments or message chains required by the pinned sort key",
                 index + 1
             ));
         }
@@ -1254,6 +1287,44 @@ fn compare_compilation_diagnostics(
         })
         .then_with(|| left.code.cmp(&right.code))
         .then_with(|| left.message.cmp(&right.message))
+        .then_with(|| {
+            compare_compilation_related_information(
+                left.related_information.as_deref(),
+                right.related_information.as_deref(),
+            )
+        })
+}
+
+fn compare_compilation_related_information(
+    left: Option<&[CompilationRelatedInformation]>,
+    right: Option<&[CompilationRelatedInformation]>,
+) -> Ordering {
+    let left = left.unwrap_or_default();
+    let right = right.unwrap_or_default();
+    right.len().cmp(&left.len()).then_with(|| {
+        left.iter()
+            .zip(right)
+            .map(|(left, right)| {
+                left.file_name
+                    .as_deref()
+                    .unwrap_or_default()
+                    .cmp(right.file_name.as_deref().unwrap_or_default())
+                    .then_with(|| {
+                        left.range
+                            .map(|range| range.start)
+                            .cmp(&right.range.map(|range| range.start))
+                    })
+                    .then_with(|| {
+                        left.range
+                            .map(|range| range.end)
+                            .cmp(&right.range.map(|range| range.end))
+                    })
+                    .then_with(|| left.code.cmp(&right.code))
+                    .then_with(|| left.message.cmp(&right.message))
+            })
+            .find(|ordering| *ordering != Ordering::Equal)
+            .unwrap_or(Ordering::Equal)
+    })
 }
 
 fn diagnostic_primary_order_key(
@@ -2519,10 +2590,46 @@ fn compile_case_variant(
                 ts_diagnostics::Category::Suggestion => CompilationDiagnosticCategory::Suggestion,
                 ts_diagnostics::Category::Message => CompilationDiagnosticCategory::Message,
             }),
-            // ProgramDiagnostic does not yet expose related information. The
-            // comparison rejects expected related records explicitly below.
             message: diagnostic.message.clone(),
-            related_information: None,
+            related_information: match checker {
+                // Legacy Program diagnostics still do not expose whether
+                // related records exist. Do not manufacture canonical detail
+                // or use the legacy checker as a fallback for canonical mode.
+                FixtureChecker::Legacy => None,
+                FixtureChecker::Canonical => Some(
+                    diagnostic
+                        .related_information
+                        .iter()
+                        .map(|related| CompilationRelatedInformation {
+                            file_name: related.file_name.clone(),
+                            source_text: related
+                                .file_name
+                                .as_deref()
+                                .and_then(|file_name| program.source_file(file_name))
+                                .map(|source_file| {
+                                    SourceText::from(source_file.source_text.clone())
+                                }),
+                            range: related.range,
+                            code: related.code,
+                            category: Some(match related.category {
+                                ts_diagnostics::Category::Error => {
+                                    CompilationDiagnosticCategory::Error
+                                }
+                                ts_diagnostics::Category::Warning => {
+                                    CompilationDiagnosticCategory::Warning
+                                }
+                                ts_diagnostics::Category::Suggestion => {
+                                    CompilationDiagnosticCategory::Suggestion
+                                }
+                                ts_diagnostics::Category::Message => {
+                                    CompilationDiagnosticCategory::Message
+                                }
+                            }),
+                            message: related.message.clone(),
+                        })
+                        .collect(),
+                ),
+            },
         })
         .collect::<Vec<_>>();
     diagnostics.sort_by(compare_compilation_diagnostics);
@@ -3410,14 +3517,14 @@ mod tests {
 
     use super::{
         Case, CompilationDiagnostic, CompilationDiagnosticCategory, CompilationRelatedInformation,
-        DiagnosticArtifactMismatchKind, DiagnosticVariantStatus, FixtureChecker, OptionVariant,
-        OutputDifferenceKind, ParseError, RunnerOptions, compare_case_emitted_output_sections,
-        compare_diagnostic_artifacts, compare_emitted_output_sections, compile_case,
-        compile_case_matrix, compile_case_matrix_with_checker, error_baseline_unit_order,
-        expand_option_matrix, first_different_line, fixture_compiler_options, matrix_axes,
-        parse_baseline_sections, parse_error_baseline_header, render_error_baseline,
-        run_case_against_baseline, run_upstream_baselines, select_variant_baselines,
-        virtual_unit_path,
+        DiagnosticArtifactMismatchKind, DiagnosticScorecardDiagnostic, DiagnosticVariantStatus,
+        FixtureChecker, OptionVariant, OutputDifferenceKind, ParseError, RunnerOptions,
+        compare_case_emitted_output_sections, compare_diagnostic_artifacts,
+        compare_emitted_output_sections, compile_case, compile_case_matrix,
+        compile_case_matrix_with_checker, error_baseline_unit_order, expand_option_matrix,
+        first_different_line, fixture_compiler_options, matrix_axes, parse_baseline_sections,
+        parse_error_baseline_header, render_error_baseline, run_case_against_baseline,
+        run_upstream_baselines, select_variant_baselines, virtual_unit_path,
     };
 
     #[test]
@@ -4036,6 +4143,7 @@ mod tests {
                     TextPos::new(related_start + 1),
                 )),
                 code: Some(2728),
+                category: Some(CompilationDiagnosticCategory::Message),
                 message: "The declaration is here.".to_owned(),
             }]),
         };
@@ -4054,6 +4162,89 @@ mod tests {
                 "    const café = 1;\r\n",
                 "    ",
             )
+        );
+    }
+
+    #[test]
+    fn renders_same_and_cross_file_related_records_in_owned_order() {
+        let case = Case::parse(
+            "related.ts",
+            concat!(
+                "// @filename: /src/a.ts\n",
+                "const primary = 1; const same = 2;\n",
+                "// @filename: /src/b.ts\n",
+                "const cross = 3;",
+            ),
+        )
+        .unwrap();
+        let first_source = case.units[0].source_text.clone();
+        let second_source = case.units[1].source_text.clone();
+        let primary_start =
+            u32::try_from(first_source.as_scannable_str().find("primary").unwrap()).unwrap();
+        let same_start =
+            u32::try_from(first_source.as_scannable_str().find("same").unwrap()).unwrap();
+        let cross_start =
+            u32::try_from(second_source.as_scannable_str().find("cross").unwrap()).unwrap();
+        let diagnostic = CompilationDiagnostic {
+            file_name: Some("/src/a.ts".to_owned()),
+            source_text: Some(first_source.clone()),
+            range: Some(TextRange::new(
+                TextPos::new(primary_start),
+                TextPos::new(primary_start + 7),
+            )),
+            code: Some(2451),
+            category: Some(CompilationDiagnosticCategory::Error),
+            message: "Cannot redeclare block-scoped variable 'primary'.".to_owned(),
+            related_information: Some(vec![
+                CompilationRelatedInformation {
+                    file_name: Some("/src/a.ts".to_owned()),
+                    source_text: Some(first_source),
+                    range: Some(TextRange::new(
+                        TextPos::new(same_start),
+                        TextPos::new(same_start + 4),
+                    )),
+                    code: Some(6203),
+                    category: Some(CompilationDiagnosticCategory::Message),
+                    message: "'primary' was also declared here.".to_owned(),
+                },
+                CompilationRelatedInformation {
+                    file_name: Some("/src/b.ts".to_owned()),
+                    source_text: Some(second_source),
+                    range: Some(TextRange::new(
+                        TextPos::new(cross_start),
+                        TextPos::new(cross_start + 5),
+                    )),
+                    code: Some(6204),
+                    category: Some(CompilationDiagnosticCategory::Message),
+                    message: "and here.".to_owned(),
+                },
+            ]),
+        };
+
+        let artifact = render_error_baseline(&case, std::slice::from_ref(&diagnostic));
+        assert!(artifact.unsupported_details.is_empty());
+        let same = artifact
+            .text
+            .find("!!! related TS6203 /src/a.ts:1:26: 'primary' was also declared here.")
+            .unwrap();
+        let cross = artifact
+            .text
+            .find("!!! related TS6204 /src/b.ts:1:7: and here.")
+            .unwrap();
+        assert!(same < cross, "{}", artifact.text);
+
+        let scorecard = DiagnosticScorecardDiagnostic::from(&diagnostic);
+        assert_eq!(scorecard.related_information.len(), 2);
+        assert_eq!(
+            scorecard
+                .related_information
+                .iter()
+                .map(|related| (related.file_name.as_deref(), related.code))
+                .collect::<Vec<_>>(),
+            [
+                (Some("/src/a.ts"), Some(6203)),
+                (Some("/src/b.ts"), Some(6204)),
+            ]
         );
     }
 

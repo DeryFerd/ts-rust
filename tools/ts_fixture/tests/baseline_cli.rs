@@ -147,8 +147,93 @@ fn canonical_checker_matches_pinned_simple_multi_file_diagnostic_baseline() {
     assert!(stdout.contains("diagnostic_comparison=full-artifact exact_matches=1"));
     let scorecard: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(scorecard_path).unwrap()).unwrap();
-    assert_eq!(scorecard["schemaVersion"], 3);
+    assert_eq!(scorecard["schemaVersion"], 4);
     assert_eq!(scorecard["checkerMode"], "canonical");
+    assert_eq!(
+        scorecard["variants"][0]["diagnostics"][0]["relatedInformation"],
+        serde_json::json!([])
+    );
+}
+
+#[test]
+fn canonical_checker_matches_related_information_artifact_and_scorecard_exactly() {
+    let repository = TestRepository::new();
+    repository.write_case(
+        "relatedInformation",
+        concat!(
+            "// @skipLibCheck: true\r\n",
+            "// @filename: /src/input.d.ts\r\n",
+            "export default class first {}\r\n",
+            "export default 0;",
+        ),
+        None,
+    );
+    repository.write_baseline(
+        "relatedInformation.errors.txt",
+        concat!(
+            "/src/input.d.ts(1,22): error TS2528: A module cannot have multiple default exports.\r\n",
+            "/src/input.d.ts(2,1): error TS2528: A module cannot have multiple default exports.\r\n",
+            "\r\n",
+            "\r\n",
+            "==== /src/input.d.ts (2 errors) ====\r\n",
+            "    export default class first {}\r\n",
+            "                         ~~~~~\r\n",
+            "!!! error TS2528: A module cannot have multiple default exports.\r\n",
+            "!!! related TS2753 /src/input.d.ts:2:1: Another export default is here.\r\n",
+            "    export default 0;\r\n",
+            "    ~~~~~~~~~~~~~~~~~\r\n",
+            "!!! error TS2528: A module cannot have multiple default exports.\r\n",
+            "!!! related TS2752 /src/input.d.ts:1:22: The first export default is here.",
+        ),
+    );
+
+    let scorecard_path = repository.0.join("related-scorecard.json");
+    let output = run(
+        &repository.0,
+        &[
+            "--diagnostics",
+            "--canonical-checker",
+            "--scorecard-json",
+            scorecard_path.to_str().unwrap(),
+            "--filter",
+            "relatedInformation",
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let scorecard: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(scorecard_path).unwrap()).unwrap();
+    assert_eq!(scorecard["schemaVersion"], 4);
+    assert_eq!(scorecard["checkerMode"], "canonical");
+    assert_eq!(scorecard["summary"]["exactMatches"], 1);
+    assert_eq!(scorecard["summary"]["actualDiagnostics"], 2);
+    assert_eq!(scorecard["variants"][0]["status"], "exact_match");
+
+    let diagnostics = scorecard["variants"][0]["diagnostics"].as_array().unwrap();
+    assert_eq!(diagnostics.len(), 2);
+    assert_eq!(diagnostics[0]["fileName"], "/src/input.d.ts");
+    assert_eq!(
+        diagnostics[0]["relatedInformation"][0]["fileName"],
+        "/src/input.d.ts"
+    );
+    assert_eq!(diagnostics[0]["relatedInformation"][0]["code"], 2753);
+    assert_eq!(
+        diagnostics[0]["relatedInformation"][0]["category"],
+        "error"
+    );
+    assert_eq!(
+        diagnostics[0]["relatedInformation"][0]["relatedInformation"],
+        serde_json::json!([])
+    );
+    assert_eq!(diagnostics[1]["fileName"], "/src/input.d.ts");
+    assert_eq!(
+        diagnostics[1]["relatedInformation"][0]["code"],
+        2752
+    );
 }
 
 #[test]
@@ -361,7 +446,7 @@ fn writes_deterministic_structured_full_artifact_scorecard() {
     assert_eq!(first_json, fs::read_to_string(second_path).unwrap());
 
     let scorecard: serde_json::Value = serde_json::from_str(&first_json).unwrap();
-    assert_eq!(scorecard["schemaVersion"], 3);
+    assert_eq!(scorecard["schemaVersion"], 4);
     assert_eq!(scorecard["checkerMode"], "legacy");
     assert_eq!(scorecard["comparisonScope"], "full_artifact");
     assert_eq!(scorecard["fullArtifactComparison"], true);
@@ -396,6 +481,7 @@ fn writes_deterministic_structured_full_artifact_scorecard() {
         diagnostic["message"],
         "Type 'number' is not assignable to type 'string'."
     );
+    assert_eq!(diagnostic["relatedInformation"], serde_json::json!([]));
 }
 
 #[test]

@@ -146,6 +146,12 @@ pub struct ProgramDiagnostic {
     pub code: Option<u32>,
     pub category: Category,
     pub message: String,
+    /// Related records owned by this diagnostic in their canonical order.
+    ///
+    /// These records are deliberately nested instead of entering Program's
+    /// top-level diagnostic stream. Canonical conversion validates every
+    /// located record against this Program before publishing the primary.
+    pub related_information: Vec<ProgramDiagnostic>,
 }
 
 /// A typed failure from the experimental canonical diagnostics pipeline.
@@ -191,8 +197,10 @@ pub enum CanonicalProgramCheckError {
         file: FileId,
     },
     InvalidDiagnosticNode(NodeRef),
-    RelatedInformationUnsupported {
-        code: u32,
+    InvalidRelatedDiagnosticNode {
+        primary_code: u32,
+        index: usize,
+        node: NodeRef,
     },
     DiagnosticFormat(FormatError),
 }
@@ -211,8 +219,7 @@ impl CanonicalProgramCheckError {
             | Self::FixedModuleFormatUnsupported { .. }
             | Self::ImportMetaModuleIndicatorUnsupported { .. }
             | Self::NodeModuleFactsUnsupported { .. }
-            | Self::DeclarationFileCheckingUnsupported { .. }
-            | Self::RelatedInformationUnsupported { .. } => true,
+            | Self::DeclarationFileCheckingUnsupported { .. } => true,
             Self::DeclarationBind { error, .. } => {
                 canonical_declaration_error_is_unsupported(error)
             }
@@ -221,6 +228,7 @@ impl CanonicalProgramCheckError {
             Self::Bind { .. }
             | Self::MissingBoundFile { .. }
             | Self::InvalidDiagnosticNode(_)
+            | Self::InvalidRelatedDiagnosticNode { .. }
             | Self::DiagnosticFormat(_) => false,
         }
     }
@@ -562,9 +570,13 @@ impl std::fmt::Display for CanonicalProgramCheckError {
                 formatter,
                 "canonical diagnostic references invalid Program node {node:?}"
             ),
-            Self::RelatedInformationUnsupported { code } => write!(
+            Self::InvalidRelatedDiagnosticNode {
+                primary_code,
+                index,
+                node,
+            } => write!(
                 formatter,
-                "canonical diagnostic TS{code} has related information not retained by ProgramDiagnostic"
+                "canonical diagnostic TS{primary_code} related record {index} references invalid Program node {node:?}"
             ),
             Self::DiagnosticFormat(error) => std::fmt::Display::fmt(error, formatter),
         }
@@ -586,7 +598,7 @@ impl std::error::Error for CanonicalProgramCheckError {
             | Self::DeclarationFileCheckingUnsupported { .. }
             | Self::MissingBoundFile { .. }
             | Self::InvalidDiagnosticNode(_)
-            | Self::RelatedInformationUnsupported { .. } => None,
+            | Self::InvalidRelatedDiagnosticNode { .. } => None,
         }
     }
 }
@@ -1037,9 +1049,9 @@ impl Program {
     /// the duration of checking, and only owned diagnostics are committed after
     /// every eligible source succeeds. The legacy checker is never invoked and
     /// there is no fallback on an unsupported canonical boundary.
-    /// Diagnostics retain canonical issuance order in this first slice;
-    /// Program-level sorting, deduplication, and related-information ownership
-    /// remain explicit follow-up work.
+    /// Diagnostics and their validated, owned related records retain canonical
+    /// issuance order in this first slice; Program-level sorting and
+    /// deduplication remain explicit follow-up work.
     /// Bundled default declarations participate in binding and global-type
     /// initialization but are not source-checked: they are immutable pinned
     /// compiler inputs, while declaration-file source checking is not installed.
@@ -1156,6 +1168,7 @@ impl Program {
                 message: diagnostic
                     .render()
                     .unwrap_or_else(|error| error.to_string()),
+                related_information: Vec::new(),
             }
         }));
         if let Some(value) = overrides.no_check {
@@ -1192,6 +1205,7 @@ impl Program {
                 code: None,
                 category: Category::Error,
                 message: error.to_string(),
+                related_information: Vec::new(),
             });
             discovery.files.clone()
         });
@@ -2623,15 +2637,14 @@ impl Program {
                 }
             })?;
             for diagnostic in bound.diagnostics() {
-                if !diagnostic.related_information.is_empty() {
-                    return Err(CanonicalProgramCheckError::RelatedInformationUnsupported {
-                        code: diagnostic.diagnostic.code(),
-                    });
-                }
                 diagnostics.push(
                     self.canonical_program_diagnostic(
                         Some(diagnostic.node),
                         &diagnostic.diagnostic,
+                        diagnostic
+                            .related_information
+                            .iter()
+                            .map(|related| (Some(related.node), &related.diagnostic)),
                     )?,
                 );
             }
@@ -2682,23 +2695,57 @@ impl Program {
         }
 
         for diagnostic in context.global_types().diagnostics() {
-            diagnostics
-                .push(self.canonical_program_diagnostic(diagnostic.node, &diagnostic.diagnostic)?);
+            diagnostics.push(self.canonical_program_diagnostic(
+                diagnostic.node,
+                &diagnostic.diagnostic,
+                std::iter::empty(),
+            )?);
         }
         for diagnostic in context.diagnostics().as_slice() {
-            if !diagnostic.related_information.is_empty() {
-                return Err(CanonicalProgramCheckError::RelatedInformationUnsupported {
-                    code: diagnostic.diagnostic.code(),
-                });
-            }
-            diagnostics
-                .push(self.canonical_program_diagnostic(diagnostic.node, &diagnostic.diagnostic)?);
+            diagnostics.push(
+                self.canonical_program_diagnostic(
+                    diagnostic.node,
+                    &diagnostic.diagnostic,
+                    diagnostic
+                        .related_information
+                        .iter()
+                        .map(|related| (related.node, &related.diagnostic)),
+                )?,
+            );
         }
 
         Ok(diagnostics)
     }
 
-    fn canonical_program_diagnostic(
+    fn canonical_program_diagnostic<'diagnostic>(
+        &self,
+        node: Option<NodeRef>,
+        diagnostic: &Diagnostic,
+        related_information: impl IntoIterator<Item = (Option<NodeRef>, &'diagnostic Diagnostic)>,
+    ) -> Result<ProgramDiagnostic, CanonicalProgramCheckError> {
+        let mut result = self.canonical_program_diagnostic_record(node, diagnostic)?;
+        let primary_code = diagnostic.code();
+        result.related_information = related_information
+            .into_iter()
+            .enumerate()
+            .map(|(index, (node, diagnostic))| {
+                self.canonical_program_diagnostic_record(node, diagnostic)
+                    .map_err(|error| match error {
+                        CanonicalProgramCheckError::InvalidDiagnosticNode(node) => {
+                            CanonicalProgramCheckError::InvalidRelatedDiagnosticNode {
+                                primary_code,
+                                index,
+                                node,
+                            }
+                        }
+                        error => error,
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(result)
+    }
+
+    fn canonical_program_diagnostic_record(
         &self,
         node: Option<NodeRef>,
         diagnostic: &Diagnostic,
@@ -2723,9 +2770,11 @@ impl Program {
             message: diagnostic
                 .render()
                 .map_err(CanonicalProgramCheckError::DiagnosticFormat)?,
+            related_information: Vec::new(),
         })
     }
 
+    #[allow(clippy::too_many_lines)]
     fn check_program_legacy(&mut self) {
         let module_maps = self
             .source_files
@@ -2823,6 +2872,7 @@ impl Program {
                         .diagnostic
                         .render()
                         .unwrap_or_else(|error| error.to_string()),
+                    related_information: Vec::new(),
                 });
             }
             source_file.checking = checking;
@@ -3108,6 +3158,7 @@ impl Program {
         self.source_files.push(source_file);
     }
 
+    #[allow(clippy::too_many_lines)]
     fn load_file(&mut self, file_system: &dyn FileSystem, file_name: &str, report_missing: bool) {
         let canonical = canonicalize(file_name, &self.current_directory, self.case_sensitivity);
         if self.file_index.contains_key(&canonical) {
@@ -3146,6 +3197,7 @@ impl Program {
                     ts_core::DiagnosticCategory::Message => Category::Message,
                 },
                 message: diagnostic.message.clone(),
+                related_information: Vec::new(),
             });
         }
         let index = self.source_files.len();
@@ -3168,6 +3220,7 @@ impl Program {
                         .diagnostic
                         .render()
                         .unwrap_or_else(|error| error.to_string()),
+                    related_information: Vec::new(),
                 });
             }
         }
@@ -3195,6 +3248,7 @@ impl Program {
                         message: message
                             .format(&[])
                             .unwrap_or_else(|error| error.to_string()),
+                        related_information: Vec::new(),
                     });
                 }
             }
@@ -4234,6 +4288,7 @@ fn emit_diagnostic(source_file: &SourceFile, error: &ts_printer::EmitError) -> P
         code: None,
         category: Category::Error,
         message: error.to_string(),
+        related_information: Vec::new(),
     }
 }
 
@@ -6230,6 +6285,7 @@ fn missing_file_diagnostic(file_name: &str) -> ProgramDiagnostic {
         message: message
             .format(&[file_name.to_owned()])
             .expect("TS6053 has one formatting argument"),
+        related_information: Vec::new(),
     }
 }
 
@@ -6242,6 +6298,7 @@ fn canonical_emit_unavailable_diagnostic() -> ProgramDiagnostic {
         message:
             "Emit is unavailable for Programs constructed with the experimental canonical checker."
                 .to_owned(),
+        related_information: Vec::new(),
     }
 }
 
@@ -6255,6 +6312,7 @@ fn output_overwrites_input_diagnostic(file_name: &str) -> ProgramDiagnostic {
         message: message
             .format(&[file_name.to_owned()])
             .expect("TS5055 has one formatting argument"),
+        related_information: Vec::new(),
     }
 }
 
@@ -6268,6 +6326,7 @@ fn output_collision_diagnostic(file_name: &str) -> ProgramDiagnostic {
         message: message
             .format(&[file_name.to_owned()])
             .expect("TS5056 has one formatting argument"),
+        related_information: Vec::new(),
     }
 }
 
@@ -6316,6 +6375,7 @@ fn emit_declaration_only_diagnostic() -> ProgramDiagnostic {
                 "composite".to_owned(),
             ])
             .expect("TS5069 has three formatting arguments"),
+        related_information: Vec::new(),
     }
 }
 
@@ -6333,6 +6393,7 @@ fn module_not_found_diagnostic(
         message: message
             .format(&[specifier.to_owned()])
             .expect("TS2307 has one formatting argument"),
+        related_information: Vec::new(),
     }
 }
 
@@ -6350,6 +6411,7 @@ fn side_effect_import_not_found_diagnostic(
         message: message
             .format(&[specifier.to_owned()])
             .expect("TS2882 has one formatting argument"),
+        related_information: Vec::new(),
     }
 }
 
@@ -6363,6 +6425,7 @@ fn type_definition_not_found(name: &str) -> ProgramDiagnostic {
         message: message
             .format(&[name.to_owned()])
             .expect("TS2688 has one formatting argument"),
+        related_information: Vec::new(),
     }
 }
 
@@ -6373,6 +6436,7 @@ fn config_diagnostic(diagnostic: &ConfigDiagnostic) -> ProgramDiagnostic {
         code: Some(diagnostic.code()),
         category: diagnostic.diagnostic.category(),
         message: diagnostic.render(),
+        related_information: Vec::new(),
     }
 }
 
@@ -6388,7 +6452,7 @@ mod tests {
         SourceCheckError, SourceCheckProvenanceError, SourceLiteralCacheError, SymbolMergeError,
         TypeDataKind, TypeDisplayUnavailable, TypeNodeUnavailable, UnsupportedSourceSyntax,
     };
-    use ts_diagnostics::Category;
+    use ts_diagnostics::{Category, Diagnostic, message_by_code};
     use ts_options::{
         CompilerOptions, ModuleDetectionKind, ModuleKind, ModuleResolutionKind, ScriptTarget,
     };
@@ -6572,6 +6636,12 @@ mod tests {
                 file_name: "/project/input.ts".to_owned(),
                 error: CanonicalBindError::InvalidSourceFile(node),
             },
+            CanonicalProgramCheckError::InvalidDiagnosticNode(node),
+            CanonicalProgramCheckError::InvalidRelatedDiagnosticNode {
+                primary_code: 2451,
+                index: 1,
+                node,
+            },
             CanonicalProgramCheckError::Context(
                 CanonicalCheckerContextError::DuplicateFileInOrder(file),
             ),
@@ -6707,6 +6777,185 @@ mod tests {
         assert_eq!(emit.diagnostics[0].code, None);
         assert_eq!(emit.diagnostics[0].category, Category::Error);
         assert!(emit.diagnostics[0].message.contains("Emit is unavailable"));
+    }
+
+    #[test]
+    fn canonical_program_diagnostic_owns_same_and_cross_file_related_records_in_order() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/project/first.ts",
+            "const primary: number = 1; const same: number = 2;",
+        )
+        .unwrap();
+        fs.write_file("/project/second.ts", "const cross: number = 3;")
+            .unwrap();
+        let program = Program::new_with_options(
+            &fs,
+            "/project",
+            &["first.ts".to_owned(), "second.ts".to_owned()],
+            CompilerOptions {
+                no_check: true,
+                no_lib: true,
+                ..CompilerOptions::default()
+            },
+        );
+        let node_named = |file_name: &str, expected: &str| {
+            let source = program.source_file(file_name).unwrap();
+            source
+                .parse
+                .arena
+                .iter()
+                .find_map(|(node, data)| match &data.data {
+                    NodeData::Identifier(identifier) if identifier.text == expected => {
+                        source.node_ref(node)
+                    }
+                    _ => None,
+                })
+                .unwrap()
+        };
+        let primary_node = node_named("/project/first.ts", "primary");
+        let same_file_node = node_named("/project/first.ts", "same");
+        let cross_file_node = node_named("/project/second.ts", "cross");
+        let primary = Diagnostic::with_arguments(message_by_code(2451).unwrap(), ["primary"]);
+        let leading = Diagnostic::with_arguments(message_by_code(6203).unwrap(), ["primary"]);
+        let follow_on = Diagnostic::new(message_by_code(6204).unwrap());
+
+        let owned = program
+            .canonical_program_diagnostic(
+                Some(primary_node),
+                &primary,
+                [
+                    (Some(same_file_node), &leading),
+                    (Some(cross_file_node), &follow_on),
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(owned.file_name.as_deref(), Some("/project/first.ts"));
+        assert_eq!(owned.code, Some(2451));
+        assert_eq!(owned.related_information.len(), 2);
+        assert_eq!(
+            owned
+                .related_information
+                .iter()
+                .map(|related| (
+                    related.file_name.as_deref(),
+                    related.code,
+                    related.message.as_str(),
+                    related.related_information.len(),
+                ))
+                .collect::<Vec<_>>(),
+            [
+                (
+                    Some("/project/first.ts"),
+                    Some(6203),
+                    "'primary' was also declared here.",
+                    0,
+                ),
+                (Some("/project/second.ts"), Some(6204), "and here.", 0,),
+            ]
+        );
+        assert!(program.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn canonical_program_keeps_binder_related_records_nested_in_their_primary() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/project/input.d.ts",
+            concat!(
+                "export default class first {}\n",
+                "export default 0;",
+            ),
+        )
+        .unwrap();
+        let program = Program::try_new_with_canonical_checker(
+            &fs,
+            "/project",
+            &["input.d.ts".to_owned()],
+            CompilerOptions {
+                lib: Some(vec!["es5".to_owned()]),
+                skip_lib_check: true,
+                ..CompilerOptions::default()
+            },
+        )
+        .unwrap();
+
+        let duplicate_diagnostics = program
+            .diagnostics()
+            .iter()
+            .filter(|diagnostic| diagnostic.code == Some(2528))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            duplicate_diagnostics.len(),
+            2,
+            "{:?}",
+            program.diagnostics()
+        );
+        for (diagnostic, related_code) in duplicate_diagnostics.into_iter().zip([2753, 2752]) {
+            assert_eq!(diagnostic.related_information.len(), 1);
+            let related = &diagnostic.related_information[0];
+            assert_eq!(related.code, Some(related_code));
+            assert_eq!(related.file_name, diagnostic.file_name);
+            assert!(related.related_information.is_empty());
+        }
+    }
+
+    #[test]
+    fn canonical_program_diagnostic_rejects_a_later_foreign_related_node_atomically() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/project/input.ts",
+            "const primary: number = 1; const related: number = 2;",
+        )
+        .unwrap();
+        let program = Program::new_with_options(
+            &fs,
+            "/project",
+            &["input.ts".to_owned()],
+            CompilerOptions {
+                no_check: true,
+                no_lib: true,
+                ..CompilerOptions::default()
+            },
+        );
+        let source = program.source_file("/project/input.ts").unwrap();
+        let identifiers = source
+            .parse
+            .arena
+            .iter()
+            .filter(|(_, data)| matches!(&data.data, NodeData::Identifier(_)))
+            .map(|(node, _)| source.node_ref(node).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(identifiers.len(), 2);
+        let foreign = parse_source_file("const foreign: number = 3;");
+        let foreign_node =
+            ts_ast::NodeRef::new(foreign.arena.id(), identifiers[0].file, foreign.source_file);
+        let primary = Diagnostic::with_arguments(message_by_code(2451).unwrap(), ["primary"]);
+        let leading = Diagnostic::with_arguments(message_by_code(6203).unwrap(), ["primary"]);
+        let follow_on = Diagnostic::new(message_by_code(6204).unwrap());
+
+        let error = program
+            .canonical_program_diagnostic(
+                Some(identifiers[0]),
+                &primary,
+                [
+                    (Some(identifiers[1]), &leading),
+                    (Some(foreign_node), &follow_on),
+                ],
+            )
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            CanonicalProgramCheckError::InvalidRelatedDiagnosticNode {
+                primary_code: 2451,
+                index: 1,
+                node: foreign_node,
+            }
+        );
+        assert!(!error.is_unsupported_boundary());
+        assert!(program.diagnostics().is_empty());
     }
 
     #[test]
