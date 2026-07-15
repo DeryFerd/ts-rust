@@ -1372,7 +1372,7 @@ impl CanonicalBinder {
                     arena,
                     file,
                     node,
-                    SymbolFlags::GET_ACCESSOR | optional_symbol_flag(arena, node),
+                    SymbolFlags::GET_ACCESSOR,
                     SymbolFlags::GET_ACCESSOR_EXCLUDES,
                     facts,
                 )?;
@@ -1382,7 +1382,7 @@ impl CanonicalBinder {
                     arena,
                     file,
                     node,
-                    SymbolFlags::SET_ACCESSOR | optional_symbol_flag(arena, node),
+                    SymbolFlags::SET_ACCESSOR,
                     SymbolFlags::SET_ACCESSOR_EXCLUDES,
                     facts,
                 )?;
