@@ -167,6 +167,31 @@ remains the cluster-level source of truth.
   Its independent audit found no P0-P2 issue. Relation-key generation,
   recursion identities, simple relations, and structural relation algorithms
   remain intentionally absent rather than approximated.
+- The later declaration/name-resolution wave supersedes the active-slice
+  descriptions above. B02 is now verified through `d1d6182`: non-JavaScript
+  TypeScript declaration dispatch includes modules and namespaces, import and
+  export aliases, modern import phases and recovery, TypeScript expando
+  assignments, and exact ambient export context. Independent reviews plus the
+  integration gate pass 143 binder tests, 25 focused import tests, strict
+  parser Clippy, and the all-target workspace check. B03's ordinary lexical
+  and module resolver landed as `b7e6e1b`; its independent review found that
+  nil/global lookup and checker-created synthetic scopes were not yet
+  representable, so B03 remains in `fixing` until its location contract and
+  constructor/ambient/recovery repairs pass a second review.
+- All 26 sparse checker LinkStores are represented through `ae84673`, with the
+  exact enum evaluator value domain repaired in `ba9eaf1`. A final inventory
+  audit verified the fields, lazy state, evaluator values, SourceFileRef
+  provenance, and pristine accounting, while finding four safe-API boundaries
+  now being repaired: isolated entity-name parsing, sentinel canonicalization,
+  syntax-kind branding for specialized stores, and defined-bit masking. T01
+  therefore remains in `fixing`, not `verified`, until those repairs land.
+- R00b is integrated as `4be3a12` and has completed an independent clean
+  audit. Exact simple/generic relation-key bytes, XXH3-128 encoding,
+  depth-four parameter recursion, constraint fail-closed behavior, recursion
+  identity precedence, and compatibility with the five lazy relation caches
+  all match the pinned Go implementation. General simple and structural
+  relation algorithms remain the next R00/R01 work rather than being implied
+  by the completed key substrate.
 
 No percentage in this section is a whole-corpus parity claim. A score is
 publishable only when its variant manifest and complete artifact comparison are
