@@ -8,6 +8,9 @@
 
 use std::collections::BTreeMap;
 
+#[cfg(test)]
+use std::cell::Cell;
+
 use ts_ast::{
     FileId, Node, NodeArena, NodeArenaId, NodeArenaRevision, NodeData, NodeId, NodeRef, SyntaxKind,
 };
@@ -42,6 +45,28 @@ struct ProductionAliasRegistrySource<'arena> {
 pub(super) struct ProductionAliasSourceRegistry<'arena> {
     store: SemanticStoreId,
     sources: BTreeMap<FileId, ProductionAliasRegistrySource<'arena>>,
+    #[cfg(test)]
+    instrumentation: ProductionAliasSourceRegistryInstrumentation,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct ProductionAliasSourceRegistryInstrumentation {
+    validation_passes: usize,
+    validated_sources: usize,
+    snapshot_iterations: Cell<usize>,
+    declared_type_views: Cell<usize>,
+    name_resolver_views: Cell<usize>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct ProductionAliasSourceRegistryInstrumentationSnapshot {
+    pub(super) validation_passes: usize,
+    pub(super) validated_sources: usize,
+    pub(super) snapshot_iterations: usize,
+    pub(super) declared_type_views: usize,
+    pub(super) name_resolver_views: usize,
 }
 
 #[derive(Debug)]
@@ -189,8 +214,22 @@ impl<'arena> ProductionAliasSourceRegistry<'arena> {
         }
         Ok(Self {
             store: store.id(),
+            #[cfg(test)]
+            instrumentation: ProductionAliasSourceRegistryInstrumentation {
+                validation_passes: 1,
+                validated_sources: retained.len(),
+                snapshot_iterations: Cell::new(0),
+                declared_type_views: Cell::new(0),
+                name_resolver_views: Cell::new(0),
+            },
             sources: retained,
         })
+    }
+
+    /// Returns the semantic-store brand validated when the registry adopted
+    /// its Program sources.
+    pub(super) const fn store_id(&self) -> SemanticStoreId {
+        self.store
     }
 
     /// Looks up one retained AST/binder snapshot without exposing the registry
@@ -208,10 +247,43 @@ impl<'arena> ProductionAliasSourceRegistry<'arena> {
 
     /// Iterates retained AST/binder snapshots without allocating or cloning
     /// binder side data.
+    #[cfg(test)]
     pub(super) fn snapshots(&self) -> impl Iterator<Item = (&'arena NodeArena, &BoundFile)> + '_ {
+        self.instrumentation
+            .snapshot_iterations
+            .set(self.instrumentation.snapshot_iterations.get() + 1);
         self.sources
             .values()
             .map(|source| (source.arena, &source.bound))
+    }
+
+    /// Records an allocation-free declared-type query view in test builds.
+    #[cfg(test)]
+    #[inline]
+    pub(super) fn note_declared_type_view(&self) {
+        self.instrumentation
+            .declared_type_views
+            .set(self.instrumentation.declared_type_views.get() + 1);
+    }
+
+    /// Records an allocation-free name-resolver query view in test builds.
+    #[cfg(test)]
+    #[inline]
+    pub(super) fn note_name_resolver_view(&self) {
+        self.instrumentation
+            .name_resolver_views
+            .set(self.instrumentation.name_resolver_views.get() + 1);
+    }
+
+    #[cfg(test)]
+    pub(super) fn instrumentation(&self) -> ProductionAliasSourceRegistryInstrumentationSnapshot {
+        ProductionAliasSourceRegistryInstrumentationSnapshot {
+            validation_passes: self.instrumentation.validation_passes,
+            validated_sources: self.instrumentation.validated_sources,
+            snapshot_iterations: self.instrumentation.snapshot_iterations.get(),
+            declared_type_views: self.instrumentation.declared_type_views.get(),
+            name_resolver_views: self.instrumentation.name_resolver_views.get(),
+        }
     }
 
     fn target_source(&self, file: FileId) -> Option<ProductionAliasTargetSource<'_>> {

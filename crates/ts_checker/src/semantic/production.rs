@@ -508,8 +508,9 @@ impl<'arena> CanonicalCheckerContext<'arena> {
             diagnostics,
             ..
         } = self;
-        let host = DeclaredTypeHost::new_after_global_merge(
-            files.snapshots(),
+        let host = DeclaredTypeHost::from_registry(
+            store,
+            files,
             GlobalMergeCompletion::new(options.name_resolution),
         )?;
         CanonicalTypeQuery::new(store, &host, *options, diagnostics)?
@@ -530,8 +531,9 @@ impl<'arena> CanonicalCheckerContext<'arena> {
             diagnostics,
             ..
         } = self;
-        let host = DeclaredTypeHost::new_after_global_merge(
-            files.snapshots(),
+        let host = DeclaredTypeHost::from_registry(
+            store,
+            files,
             GlobalMergeCompletion::new(options.name_resolution),
         )?;
         CanonicalTypeQuery::new(store, &host, *options, diagnostics)?.get_type_from_type_node(node)
@@ -565,7 +567,7 @@ impl<'arena> CanonicalCheckerContext<'arena> {
         &self,
         options: CanonicalNameResolverOptions,
     ) -> Result<ProductionNameResolverHost<'_, '_>, ProductionNameResolverHostError> {
-        ProductionNameResolverHost::new(&self.store, self.files.snapshots(), options)
+        ProductionNameResolverHost::from_registry(&self.store, &self.files, options)
     }
 
     /// The brand shared by adopted binder symbols and checker-owned records.
@@ -731,8 +733,7 @@ fn initialize_globals(
     add_undefined_to_globals(store, files, globals, undefined_symbol)?;
     let global_merge_completion = GlobalMergeCompletion::new(name_resolution_options);
 
-    let declared_host =
-        DeclaredTypeHost::new_after_global_merge(files.snapshots(), global_merge_completion)?;
+    let declared_host = DeclaredTypeHost::from_registry(store, files, global_merge_completion)?;
     let global_types =
         initialize_global_library_types(store, &declared_host, globals, strict_bind_call_apply)?;
 
@@ -1803,6 +1804,136 @@ mod tests {
             Some(true)
         );
         assert_eq!(context.diagnostics().len(), 2);
+    }
+
+    #[test]
+    fn context_type_reference_queries_borrow_the_once_validated_source_registry() {
+        let first = parsed("type BaseOne = string; type UseOne = BaseOne;");
+        let second = parsed("type BaseTwo = string; type UseTwo = BaseTwo;");
+        let third = parsed("type BaseThree = string; type UseThree = BaseThree;");
+        let first_file = FileId::new(801);
+        let second_file = FileId::new(802);
+        let third_file = FileId::new(803);
+        let files = [
+            (first_file, &first),
+            (second_file, &second),
+            (third_file, &third),
+        ];
+        let bodies = [
+            type_alias_body(&first, first_file, "UseOne"),
+            type_alias_body(&second, second_file, "UseTwo"),
+            type_alias_body(&third, third_file, "UseThree"),
+        ];
+        let mut context = CanonicalCheckerContext::new(
+            completed_bindings(&files),
+            files
+                .iter()
+                .map(|&(file, parsed)| (file, &parsed.arena))
+                .collect(),
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap();
+        let string_type = context.store().intrinsic_bootstrap().unwrap().string_type;
+        let baseline = context.files.instrumentation();
+
+        assert_eq!(baseline.validation_passes, 1);
+        assert_eq!(baseline.validated_sources, files.len());
+        assert_eq!(baseline.snapshot_iterations, 0);
+
+        for body in bodies {
+            assert_eq!(context.get_type_from_type_node(body), Ok(string_type));
+        }
+        let after_uncached = context.files.instrumentation();
+        assert_eq!(
+            after_uncached.declared_type_views,
+            baseline.declared_type_views + bodies.len()
+        );
+        assert_eq!(after_uncached.snapshot_iterations, 0);
+        assert!(after_uncached.name_resolver_views >= baseline.name_resolver_views + bodies.len());
+
+        for body in bodies {
+            assert_eq!(context.get_type_from_type_node(body), Ok(string_type));
+        }
+        let after_cached = context.files.instrumentation();
+        assert_eq!(
+            after_cached.declared_type_views,
+            after_uncached.declared_type_views + bodies.len()
+        );
+        assert_eq!(
+            after_cached.name_resolver_views,
+            after_uncached.name_resolver_views
+        );
+        assert_eq!(after_cached.snapshot_iterations, 0);
+
+        for name in ["UseOne", "UseTwo", "UseThree"] {
+            let symbol = global_symbol(&context, name).unwrap();
+            assert_eq!(context.get_declared_type_of_symbol(symbol), Ok(string_type));
+        }
+        let after_declared = context.files.instrumentation();
+        assert_eq!(
+            after_declared.declared_type_views,
+            after_cached.declared_type_views + bodies.len()
+        );
+        assert_eq!(after_declared.snapshot_iterations, 0);
+
+        drop(
+            context
+                .name_resolver_host(CanonicalNameResolverOptions::default())
+                .unwrap(),
+        );
+        drop(
+            context
+                .name_resolver_host(CanonicalNameResolverOptions::default())
+                .unwrap(),
+        );
+        let after_resolver_hosts = context.files.instrumentation();
+        assert_eq!(
+            after_resolver_hosts.name_resolver_views,
+            after_declared.name_resolver_views + 2
+        );
+        assert_eq!(after_resolver_hosts.validation_passes, 1);
+        assert_eq!(after_resolver_hosts.snapshot_iterations, 0);
+    }
+
+    #[test]
+    fn borrowed_registry_views_preserve_the_registry_store_brand() {
+        let source = parsed("type Value = string;");
+        let file = FileId::new(804);
+        let context = CanonicalCheckerContext::new(
+            completed_bindings(&[(file, &source)]),
+            vec![(file, &source.arena)],
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap();
+        let mut foreign = CanonicalTypeMapperStore::new();
+        foreign
+            .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions::default())
+            .unwrap();
+        let expected = context.id();
+        let actual = foreign.id();
+        let baseline = context.files.instrumentation();
+
+        let declared_error = DeclaredTypeHost::from_registry(
+            &foreign,
+            &context.files,
+            GlobalMergeCompletion::new(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap_err();
+        assert_eq!(
+            declared_error,
+            DeclaredTypeHostError::RegistryStoreMismatch { expected, actual }
+        );
+        let resolver_error = ProductionNameResolverHost::from_registry(
+            &foreign,
+            &context.files,
+            CanonicalNameResolverOptions::default(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            resolver_error,
+            ProductionNameResolverHostError::RegistryStoreMismatch { expected, actual }
+        );
+        assert_eq!(context.files.instrumentation(), baseline);
     }
 
     #[test]

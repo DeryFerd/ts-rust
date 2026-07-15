@@ -14,16 +14,33 @@ use ts_ast::{
 };
 use ts_binder::{
     BoundFile, CanonicalNameResolutionError, CanonicalNameResolverHost,
-    CanonicalNameResolverOptions, EscapedNameRef, SemanticSymbolId, SymbolFlags, SymbolStore,
-    SymbolTableId, canonical_has_syntactic_modifier,
+    CanonicalNameResolverOptions, EscapedNameRef, SemanticStoreId, SemanticSymbolId, SymbolFlags,
+    SymbolStore, SymbolTableId, canonical_has_syntactic_modifier,
 };
 
-use super::CanonicalTypeMapperStore;
+use super::{CanonicalTypeMapperStore, alias_provider::ProductionAliasSourceRegistry};
 
 #[derive(Clone, Copy, Debug)]
 struct ProductionNameResolverSource<'arena> {
     arena: &'arena NodeArena,
     bound: &'arena BoundFile,
+}
+
+#[derive(Debug)]
+enum ProductionNameResolverSources<'arena> {
+    Retained(BTreeMap<FileId, ProductionNameResolverSource<'arena>>),
+    Registry(&'arena ProductionAliasSourceRegistry<'arena>),
+}
+
+impl<'arena> ProductionNameResolverSources<'arena> {
+    fn get(&self, file: FileId) -> Option<ProductionNameResolverSource<'arena>> {
+        match self {
+            Self::Retained(sources) => sources.get(&file).copied(),
+            Self::Registry(sources) => (*sources)
+                .snapshot(file)
+                .map(|(arena, bound)| ProductionNameResolverSource { arena, bound }),
+        }
+    }
 }
 
 /// A validated production implementation of the checker callbacks required
@@ -59,7 +76,7 @@ struct ProductionNameResolverSource<'arena> {
 #[derive(Debug)]
 pub struct ProductionNameResolverHost<'store, 'arena> {
     store: &'store CanonicalTypeMapperStore,
-    sources: BTreeMap<FileId, ProductionNameResolverSource<'arena>>,
+    sources: ProductionNameResolverSources<'arena>,
     options: CanonicalNameResolverOptions,
 }
 
@@ -82,6 +99,10 @@ pub enum ProductionNameResolverHostError {
     InvalidSourceFile(NodeRef),
     InvalidSymbolStore(FileId),
     DuplicateFile(FileId),
+    RegistryStoreMismatch {
+        expected: SemanticStoreId,
+        actual: SemanticStoreId,
+    },
 }
 
 impl std::fmt::Display for ProductionNameResolverHostError {
@@ -125,6 +146,8 @@ impl std::fmt::Display for ProductionNameResolverHostError {
                 "name-resolution source {} was supplied more than once",
                 file.index()
             ),
+            Self::RegistryStoreMismatch { .. } => formatter
+                .write_str("name-resolution source registry belongs to another symbol store"),
         }
     }
 }
@@ -217,7 +240,32 @@ impl<'store, 'arena> ProductionNameResolverHost<'store, 'arena> {
 
         Ok(Self {
             store,
-            sources: retained,
+            sources: ProductionNameResolverSources::Retained(retained),
+            options,
+        })
+    }
+
+    /// Creates an allocation-free query view over a context-owned,
+    /// once-validated Program source registry.
+    pub(super) fn from_registry(
+        store: &'store CanonicalTypeMapperStore,
+        sources: &'arena ProductionAliasSourceRegistry<'arena>,
+        options: CanonicalNameResolverOptions,
+    ) -> Result<Self, ProductionNameResolverHostError> {
+        if store.intrinsic_bootstrap().is_none() {
+            return Err(ProductionNameResolverHostError::IntrinsicBootstrapNotInitialized);
+        }
+        if sources.store_id() != store.id() {
+            return Err(ProductionNameResolverHostError::RegistryStoreMismatch {
+                expected: sources.store_id(),
+                actual: store.id(),
+            });
+        }
+        #[cfg(test)]
+        sources.note_name_resolver_view();
+        Ok(Self {
+            store,
+            sources: ProductionNameResolverSources::Registry(sources),
             options,
         })
     }
@@ -278,7 +326,7 @@ impl<'store, 'arena> ProductionNameResolverHost<'store, 'arena> {
     }
 
     fn source(&self, reference: NodeRef) -> Option<ProductionNameResolverSource<'arena>> {
-        let source = self.sources.get(&reference.file).copied()?;
+        let source = self.sources.get(reference.file)?;
         (reference.is_for(source.arena.id(), source.bound.file_id())
             && source.bound.contains(reference))
         .then_some(source)

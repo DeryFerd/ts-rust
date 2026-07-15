@@ -23,12 +23,13 @@ use ts_ast::{
 };
 use ts_binder::{
     BoundFile, CanonicalNameResolutionError, CanonicalNameResolver, CanonicalNameResolverOptions,
-    CanonicalResolutionLocation, SemanticSymbolId, SymbolFlags,
+    CanonicalResolutionLocation, SemanticStoreId, SemanticSymbolId, SymbolFlags,
 };
 use xxhash_rust::xxh3::Xxh3;
 
 use super::{
     TypeResolutionTargetError,
+    alias_provider::ProductionAliasSourceRegistry,
     ids::TypeId,
     mapper::TypeMapper,
     name_resolution::{ProductionNameResolverHost, ProductionNameResolverHostError},
@@ -43,6 +44,29 @@ use super::{
 struct DeclaredTypeSource<'a> {
     arena: &'a NodeArena,
     bound: &'a BoundFile,
+}
+
+#[derive(Debug)]
+enum DeclaredTypeSources<'a> {
+    Retained(BTreeMap<FileId, DeclaredTypeSource<'a>>),
+    Registry(&'a ProductionAliasSourceRegistry<'a>),
+}
+
+impl Default for DeclaredTypeSources<'_> {
+    fn default() -> Self {
+        Self::Retained(BTreeMap::new())
+    }
+}
+
+impl<'a> DeclaredTypeSources<'a> {
+    fn get(&self, file: FileId) -> Option<DeclaredTypeSource<'a>> {
+        match self {
+            Self::Retained(sources) => sources.get(&file).copied(),
+            Self::Registry(sources) => (*sources)
+                .snapshot(file)
+                .map(|(arena, bound)| DeclaredTypeSource { arena, bound }),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -60,7 +84,7 @@ enum DeclaredNameResolution {
 /// mint the post-global name resolver used by interface heritage.
 #[derive(Debug, Default)]
 pub struct DeclaredTypeHost<'a> {
-    sources: BTreeMap<FileId, DeclaredTypeSource<'a>>,
+    sources: DeclaredTypeSources<'a>,
     name_resolution: DeclaredNameResolution,
 }
 
@@ -80,6 +104,10 @@ pub enum DeclaredTypeHostError {
     DeclarationsIncomplete(FileId),
     InvalidSourceFile(NodeRef),
     DuplicateFile(FileId),
+    RegistryStoreMismatch {
+        expected: SemanticStoreId,
+        actual: SemanticStoreId,
+    },
 }
 
 impl std::fmt::Display for DeclaredTypeHostError {
@@ -110,6 +138,9 @@ impl std::fmt::Display for DeclaredTypeHostError {
                 "declared-type source {} was supplied more than once",
                 file.index()
             ),
+            Self::RegistryStoreMismatch { .. } => {
+                formatter.write_str("declared-type source registry belongs to another symbol store")
+            }
         }
     }
 }
@@ -133,6 +164,7 @@ impl<'a> DeclaredTypeHost<'a> {
         Self::new_internal(sources, DeclaredNameResolution::Unavailable)
     }
 
+    #[cfg(test)]
     pub(super) fn new_after_global_merge(
         sources: impl IntoIterator<Item = (&'a NodeArena, &'a BoundFile)>,
         completion: GlobalMergeCompletion,
@@ -143,14 +175,32 @@ impl<'a> DeclaredTypeHost<'a> {
         )
     }
 
+    /// Creates an allocation-free declared-type view over a context-owned,
+    /// once-validated Program source registry.
+    pub(super) fn from_registry(
+        store: &SemanticStore<TypeRecord, TypeMapper>,
+        sources: &'a ProductionAliasSourceRegistry<'a>,
+        completion: GlobalMergeCompletion,
+    ) -> Result<Self, DeclaredTypeHostError> {
+        if sources.store_id() != store.id() {
+            return Err(DeclaredTypeHostError::RegistryStoreMismatch {
+                expected: sources.store_id(),
+                actual: store.id(),
+            });
+        }
+        #[cfg(test)]
+        sources.note_declared_type_view();
+        Ok(Self {
+            sources: DeclaredTypeSources::Registry(sources),
+            name_resolution: DeclaredNameResolution::GlobalsMerged(completion.name_resolution()),
+        })
+    }
+
     fn new_internal(
         sources: impl IntoIterator<Item = (&'a NodeArena, &'a BoundFile)>,
         name_resolution: DeclaredNameResolution,
     ) -> Result<Self, DeclaredTypeHostError> {
-        let mut host = Self {
-            sources: BTreeMap::new(),
-            name_resolution,
-        };
+        let mut retained = BTreeMap::new();
         for (arena, bound) in sources {
             let file = bound.file_id();
             if arena.id() != bound.node_arena_id() {
@@ -185,19 +235,21 @@ impl<'a> DeclaredTypeHost<'a> {
                     actual: arena.revision(),
                 });
             }
-            if host
-                .sources
+            if retained
                 .insert(file, DeclaredTypeSource { arena, bound })
                 .is_some()
             {
                 return Err(DeclaredTypeHostError::DuplicateFile(file));
             }
         }
-        Ok(host)
+        Ok(Self {
+            sources: DeclaredTypeSources::Retained(retained),
+            name_resolution,
+        })
     }
 
     pub(super) fn node(&self, reference: NodeRef) -> Option<&Node> {
-        let source = self.sources.get(&reference.file)?;
+        let source = self.sources.get(reference.file)?;
         if source.arena.id() != reference.arena || !source.bound.contains(reference) {
             return None;
         }
@@ -208,7 +260,7 @@ impl<'a> DeclaredTypeHost<'a> {
     }
 
     pub(super) fn source(&self, reference: NodeRef) -> Option<(&NodeArena, &BoundFile)> {
-        let source = self.sources.get(&reference.file)?;
+        let source = self.sources.get(reference.file)?;
         (source.arena.id() == reference.arena && source.bound.contains(reference))
             .then_some((source.arena, source.bound))
     }
@@ -222,17 +274,20 @@ impl<'a> DeclaredTypeHost<'a> {
                 DeclaredTypeUnavailable::PostGlobalNameResolutionUnavailable,
             ));
         };
-        Ok(ProductionNameResolverHost::new(
-            store,
-            self.sources
-                .values()
-                .map(|source| (source.arena, source.bound)),
-            options,
-        )?)
+        match &self.sources {
+            DeclaredTypeSources::Retained(sources) => Ok(ProductionNameResolverHost::new(
+                store,
+                sources.values().map(|source| (source.arena, source.bound)),
+                options,
+            )?),
+            DeclaredTypeSources::Registry(sources) => Ok(
+                ProductionNameResolverHost::from_registry(store, sources, options)?,
+            ),
+        }
     }
 
     pub(super) fn bound_file(&self, reference: NodeRef) -> Option<&BoundFile> {
-        let source = self.sources.get(&reference.file)?;
+        let source = self.sources.get(reference.file)?;
         (source.arena.id() == reference.arena).then_some(source.bound)
     }
 
@@ -1300,14 +1355,9 @@ impl RecursiveInterfacePlanner<'_, '_, '_> {
                 DeclaredTypeUnavailable::UnsupportedInterfaceHeritageResolution(expression),
             ));
         };
-        let source = self
-            .host
-            .sources
-            .get(&expression.file)
-            .copied()
-            .ok_or_else(|| {
-                unavailable(DeclaredTypeUnavailable::MissingOrForeignFacts(expression))
-            })?;
+        let source = self.host.sources.get(expression.file).ok_or_else(|| {
+            unavailable(DeclaredTypeUnavailable::MissingOrForeignFacts(expression))
+        })?;
         let mut callback_host = self.host.name_resolver_host(self.store)?;
         let base_symbol = CanonicalNameResolver::new(
             source.arena,
