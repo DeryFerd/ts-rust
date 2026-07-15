@@ -6814,7 +6814,6 @@ impl<'a> Parser<'a> {
             SyntaxKind::NullKeyword
             | SyntaxKind::TrueKeyword
             | SyntaxKind::FalseKeyword
-            | SyntaxKind::UndefinedKeyword
             | SyntaxKind::ThisKeyword
             | SyntaxKind::SuperKeyword => self.parse_keyword_expression(),
             kind if is_keyword_type(kind) => self.parse_identifier_name("Expected an expression."),
@@ -15213,6 +15212,55 @@ export as namespace GlobalName;
             };
             assert_eq!(identifier.text, expected);
         }
+    }
+
+    #[test]
+    fn parses_undefined_as_an_identifier_expression_and_a_keyword_type() {
+        let source = concat!(
+            "declare function f(o: { y?: string }): void;\n",
+            "f({ y: undefined });\n",
+            "type U = undefined;",
+        );
+        let result = parse_source_file(source);
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        assert!(
+            result
+                .arena
+                .iter()
+                .all(|(_, node)| node.data.matches_syntax_kind(node.kind))
+        );
+
+        let value = result
+            .arena
+            .iter()
+            .find_map(|(_, node)| match &node.data {
+                NodeData::PropertyAssignment(property) => Some(property.initializer),
+                _ => None,
+            })
+            .expect("object property initializer");
+        let value_node = result.arena.get(value).unwrap();
+        let NodeData::Identifier(value_identifier) = &value_node.data else {
+            panic!("expected undefined value identifier");
+        };
+        assert_eq!(value_node.kind, SyntaxKind::Identifier);
+        assert_eq!(value_identifier.text, "undefined");
+        assert_eq!(
+            (value_node.range.start.get(), value_node.range.end.get()),
+            (52, 61)
+        );
+
+        let statements = source_statements(&result);
+        let NodeData::TypeAliasDeclaration(alias) = &result.arena.get(statements[2]).unwrap().data
+        else {
+            panic!("expected type alias");
+        };
+        let type_node = result.arena.get(alias.type_).unwrap();
+        assert_eq!(type_node.kind, SyntaxKind::UndefinedKeyword);
+        assert!(matches!(type_node.data, NodeData::KeywordTypeNode(_)));
+        assert_eq!(
+            (type_node.range.start.get(), type_node.range.end.get()),
+            (75, 84)
+        );
     }
 
     #[test]
