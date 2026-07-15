@@ -158,6 +158,7 @@ impl TypeResolutionStateSnapshot {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CheckerStateSnapshot {
     pub checker_symbols: usize,
+    pub merged_symbols: usize,
     pub semantic_arenas: SemanticArenaCounts,
     pub links: CheckerLinkCounts,
     pub type_resolution: TypeResolutionStateSnapshot,
@@ -167,6 +168,7 @@ pub struct CheckerStateSnapshot {
 impl CheckerStateSnapshot {
     const fn is_pristine(self) -> bool {
         self.checker_symbols == 0
+            && self.merged_symbols == 0
             && self.semantic_arenas.is_empty()
             && self.links.is_empty()
             && self.type_resolution.is_pristine()
@@ -378,6 +380,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             self.type_resolution_internal_state();
         let state = CheckerStateSnapshot {
             checker_symbols: self.symbol_store().checker_created_symbol_len(),
+            merged_symbols: self.merged_symbol_len(),
             semantic_arenas: SemanticArenaCounts {
                 types: self.type_len(),
                 mappers: self.mapper_len(),
@@ -1242,6 +1245,7 @@ mod tests {
             store.type_resolution_internal_state();
         CheckerStateSnapshot {
             checker_symbols: store.symbol_store().checker_created_symbol_len(),
+            merged_symbols: store.merged_symbol_len(),
             semantic_arenas: semantic_counts(store),
             links: CheckerLinkCounts {
                 node,

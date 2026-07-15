@@ -20,6 +20,7 @@ use crate::{
     AstScope, BoundFlowGraph, EscapedName, InternalSymbolName, SemanticSymbolId, SymbolData,
     SymbolFlags, SymbolStore, SymbolTableId,
     flow_builder::{FlowTraversalHooks, build_flow_graph_with_hooks},
+    should_replace_value_declaration,
 };
 
 /// The last completed phase of the canonical binder.
@@ -711,8 +712,6 @@ struct DeclarationFacts {
     kind: SyntaxKind,
     diagnostic_node: NodeRef,
     display_name: String,
-    is_assignment: bool,
-    is_effective_module: bool,
 }
 
 struct PreparedDeclaration {
@@ -2020,11 +2019,6 @@ impl CanonicalBinder {
             } else {
                 name.escaped_display().to_string()
             },
-            is_assignment: is_assignment_declaration(declaration.kind),
-            is_effective_module: matches!(
-                declaration.kind,
-                SyntaxKind::ModuleDeclaration | SyntaxKind::Identifier
-            ),
         }
     }
 
@@ -2683,11 +2677,6 @@ impl CanonicalBinder {
                 kind: declaration.kind,
                 diagnostic_node,
                 display_name,
-                is_assignment: is_assignment_declaration(declaration.kind),
-                is_effective_module: matches!(
-                    declaration.kind,
-                    SyntaxKind::ModuleDeclaration | SyntaxKind::Identifier
-                ),
             },
             is_default_export,
             is_export_assignment_default: matches!(
@@ -2841,8 +2830,7 @@ impl CanonicalBinder {
                 .declaration_facts
                 .get(&node)
                 .expect("forced value declaration was already declared");
-            current_facts.is_assignment && !incoming_facts.is_assignment
-                || current_facts.kind != incoming_facts.kind && current_facts.is_effective_module
+            should_replace_value_declaration(current_facts.kind, incoming_facts.kind)
         });
         if replace {
             assert!(
@@ -2890,8 +2878,7 @@ impl CanonicalBinder {
                         .get(&current)
                         .expect("value declarations were added by this binder")
                 };
-                current_facts.is_assignment && !facts.is_assignment
-                    || current_facts.kind != facts.kind && current_facts.is_effective_module
+                should_replace_value_declaration(current_facts.kind, facts.kind)
             });
             if replace {
                 value_declaration = Some(node);
@@ -3623,17 +3610,6 @@ where
 {
     let message = message_by_code(code).expect("pinned binder diagnostic is in the catalog");
     Diagnostic::with_arguments(message, arguments)
-}
-
-fn is_assignment_declaration(kind: SyntaxKind) -> bool {
-    matches!(
-        kind,
-        SyntaxKind::BinaryExpression
-            | SyntaxKind::PropertyAccessExpression
-            | SyntaxKind::ElementAccessExpression
-            | SyntaxKind::Identifier
-            | SyntaxKind::CallExpression
-    )
 }
 
 fn is_property_name_literal(kind: SyntaxKind) -> bool {

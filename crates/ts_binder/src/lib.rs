@@ -23,7 +23,8 @@ pub use name_resolver::{
     canonical_has_syntactic_modifier, resolve_global_name,
 };
 pub use semantic::{
-    AstScope, CheckFlags, SemanticStoreId, SemanticSymbolId, SymbolData, SymbolStore, SymbolTableId,
+    AstScope, CheckFlags, SemanticStoreId, SemanticSymbolId, SymbolData, SymbolStore,
+    SymbolTableId, should_replace_value_declaration,
 };
 
 use std::{

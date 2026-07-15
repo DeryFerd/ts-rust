@@ -11,6 +11,7 @@ pub mod declared;
 pub mod ids;
 pub mod links;
 pub mod mapper;
+mod merge;
 pub mod production;
 pub mod relation;
 pub mod signatures;
@@ -45,6 +46,7 @@ pub use links::{
     TypeResolutionTargetError, TypeSystemPropertyName, ValueSymbolLinks, VarianceLinks,
 };
 pub use mapper::{CanonicalTypeMapperStore, TypeMapper, TypeMapperKind};
+pub use merge::{SymbolMergeDiagnosticKind, SymbolMergeError, get_excluded_symbol_flags};
 pub use production::{CanonicalCheckerContext, CanonicalCheckerContextError};
 pub use relation::{
     ExpandingFlags, IntersectionState, MinArgumentCountFlags, RecursionFlags,

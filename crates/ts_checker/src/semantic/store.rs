@@ -1,7 +1,7 @@
 //! Aggregate ownership and provenance validation for canonical semantic data.
 
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     num::NonZeroU32,
 };
 
@@ -60,6 +60,50 @@ struct SourceNodeFacts {
     signature_links_eligible: bool,
 }
 
+/// A merged-symbol redirect rejected before the redirect map changes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)] // Mutated only by the sibling merge substrate.
+pub(super) enum MergedSymbolRecordError {
+    InvalidTarget(SemanticSymbolId),
+    InvalidSource(SemanticSymbolId),
+    SelfRedirect(SemanticSymbolId),
+    RedirectCycle {
+        source: SemanticSymbolId,
+        target: SemanticSymbolId,
+    },
+}
+
+impl std::fmt::Display for MergedSymbolRecordError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidTarget(target) => {
+                write!(
+                    formatter,
+                    "merged-symbol target {target:?} is not store-owned"
+                )
+            }
+            Self::InvalidSource(source) => {
+                write!(
+                    formatter,
+                    "merged-symbol source {source:?} is not store-owned"
+                )
+            }
+            Self::SelfRedirect(symbol) => {
+                write!(
+                    formatter,
+                    "merged symbol {symbol:?} cannot redirect to itself"
+                )
+            }
+            Self::RedirectCycle { source, target } => write!(
+                formatter,
+                "merged-symbol redirect from {source:?} to {target:?} would create a cycle"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for MergedSymbolRecordError {}
+
 /// Sole allocator and owner of one canonical program's semantic graph.
 ///
 /// Every semantic handle is branded with this store's identity. Record writes
@@ -78,6 +122,7 @@ pub struct SemanticStore<TypePayload, MapperPayload> {
     source_files: BTreeMap<FileId, SourceFileRef>,
     source_files_by_arena: BTreeMap<NodeArenaId, SourceFileRef>,
     source_node_facts: BTreeMap<NodeArenaId, Vec<Option<SourceNodeFacts>>>,
+    merged_symbols: HashMap<SemanticSymbolId, SemanticSymbolId>,
     links: CheckerLinkStores,
     declared_types_in_progress: HashSet<SemanticSymbolId>,
     type_resolutions: TypeResolutionStack,
@@ -123,6 +168,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             source_files: BTreeMap::new(),
             source_files_by_arena: BTreeMap::new(),
             source_node_facts: BTreeMap::new(),
+            merged_symbols: HashMap::new(),
             links: CheckerLinkStores::default(),
             declared_types_in_progress: HashSet::new(),
             type_resolutions: TypeResolutionStack::new(id),
@@ -407,6 +453,68 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
     #[must_use]
     pub fn symbol_len(&self) -> usize {
         self.symbols.symbol_len()
+    }
+
+    /// Returns a symbol after exactly one merged-symbol redirect lookup.
+    ///
+    /// `None` means the input is not owned by this store. Redirect targets are
+    /// validated when recorded, so a valid input always returns a valid symbol.
+    #[must_use]
+    pub fn get_merged_symbol(&self, symbol: SemanticSymbolId) -> Option<SemanticSymbolId> {
+        self.symbols
+            .contains_symbol(symbol)
+            .then(|| self.merged_symbols.get(&symbol).copied().unwrap_or(symbol))
+    }
+
+    /// Number of exact source-to-merged redirects recorded by the checker.
+    #[must_use]
+    pub fn merged_symbol_len(&self) -> usize {
+        self.merged_symbols.len()
+    }
+
+    /// Records one exact source-to-target merged-symbol redirect.
+    ///
+    /// Existing source redirects follow upstream map-overwrite semantics.
+    /// Cycles and invalid provenance are rejected before the map changes.
+    #[allow(dead_code)] // Called by the production merge substrate.
+    pub(super) fn record_merged_symbol(
+        &mut self,
+        target: SemanticSymbolId,
+        source: SemanticSymbolId,
+    ) -> Result<Option<SemanticSymbolId>, MergedSymbolRecordError> {
+        if !self.symbols.contains_symbol(target) {
+            return Err(MergedSymbolRecordError::InvalidTarget(target));
+        }
+        if !self.symbols.contains_symbol(source) {
+            return Err(MergedSymbolRecordError::InvalidSource(source));
+        }
+        if target == source {
+            return Err(MergedSymbolRecordError::SelfRedirect(source));
+        }
+
+        let mut cursor = target;
+        let mut visited = HashSet::new();
+        loop {
+            if cursor == source {
+                return Err(MergedSymbolRecordError::RedirectCycle { source, target });
+            }
+            if !visited.insert(cursor) {
+                return Err(MergedSymbolRecordError::RedirectCycle { source, target });
+            }
+            let Some(next) = self.merged_symbols.get(&cursor).copied() else {
+                break;
+            };
+            cursor = next;
+        }
+
+        Ok(self.merged_symbols.insert(source, target))
+    }
+
+    /// Returns a symbol's raw parent after exactly one merged redirect.
+    #[must_use]
+    pub fn get_parent_of_symbol(&self, symbol: SemanticSymbolId) -> Option<SemanticSymbolId> {
+        let parent = self.symbols.symbol(symbol)?.parent()?;
+        self.get_merged_symbol(parent)
     }
 
     /// Returns the embedded canonical symbol owner for read-only queries.
@@ -1836,7 +1944,9 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             .is_some_and(|facts| facts.signature_links_eligible)
     }
 
-    fn source_node_kind(&self, node: NodeRef) -> Option<SyntaxKind> {
+    /// Returns the registered syntax kind for a source-reachable node.
+    #[must_use]
+    pub(super) fn source_node_kind(&self, node: NodeRef) -> Option<SyntaxKind> {
         self.source_node_fact(node).map(|facts| facts.kind)
     }
 

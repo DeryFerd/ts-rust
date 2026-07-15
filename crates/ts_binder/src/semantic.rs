@@ -16,9 +16,35 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use ts_ast::{FileId, NodeArena, NodeArenaId, NodeId, NodeRef};
+use ts_ast::{FileId, NodeArena, NodeArenaId, NodeId, NodeRef, SyntaxKind};
 
 use crate::{EscapedName, EscapedNameRef, InternalSymbolName, SymbolFlags};
+
+/// Exact declaration-kind precedence used by pinned `SetValueDeclaration`.
+///
+/// Non-assignment declarations replace assignment declarations, and a
+/// non-namespace declaration replaces an effective namespace declaration of a
+/// different kind. Callers handle the empty current slot separately.
+#[must_use]
+pub fn should_replace_value_declaration(current: SyntaxKind, incoming: SyntaxKind) -> bool {
+    is_assignment_declaration_kind(current) && !is_assignment_declaration_kind(incoming)
+        || current != incoming && is_effective_module_declaration_kind(current)
+}
+
+const fn is_assignment_declaration_kind(kind: SyntaxKind) -> bool {
+    matches!(
+        kind,
+        SyntaxKind::BinaryExpression
+            | SyntaxKind::PropertyAccessExpression
+            | SyntaxKind::ElementAccessExpression
+            | SyntaxKind::Identifier
+            | SyntaxKind::CallExpression
+    )
+}
+
+const fn is_effective_module_declaration_kind(kind: SyntaxKind) -> bool {
+    matches!(kind, SyntaxKind::ModuleDeclaration | SyntaxKind::Identifier)
+}
 
 /// Opaque process-local identity of one canonical semantic store.
 #[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -676,10 +702,10 @@ impl SymbolStore {
 
 #[cfg(test)]
 mod tests {
-    use ts_ast::{FileId, NodeRef};
+    use ts_ast::{FileId, NodeRef, SyntaxKind};
     use ts_parser::parse_source_file;
 
-    use super::{AstScope, CheckFlags, SymbolData, SymbolStore};
+    use super::{AstScope, CheckFlags, SymbolData, SymbolStore, should_replace_value_declaration};
     use crate::{EscapedName, InternalSymbolName, SymbolFlags};
 
     fn source_scope(store: &mut SymbolStore, file: u32, text: &str) -> (AstScope, NodeRef) {
@@ -687,6 +713,34 @@ mod tests {
         let scope = AstScope::new(FileId::new(file), &parsed.arena);
         assert!(store.register_ast_scope(scope));
         (scope, scope.node_ref(parsed.source_file).unwrap())
+    }
+
+    #[test]
+    fn value_declaration_precedence_matches_the_complete_pinned_branch_matrix() {
+        assert!(should_replace_value_declaration(
+            SyntaxKind::BinaryExpression,
+            SyntaxKind::FunctionDeclaration,
+        ));
+        assert!(!should_replace_value_declaration(
+            SyntaxKind::FunctionDeclaration,
+            SyntaxKind::BinaryExpression,
+        ));
+        assert!(should_replace_value_declaration(
+            SyntaxKind::ModuleDeclaration,
+            SyntaxKind::FunctionDeclaration,
+        ));
+        assert!(!should_replace_value_declaration(
+            SyntaxKind::ModuleDeclaration,
+            SyntaxKind::ModuleDeclaration,
+        ));
+        assert!(should_replace_value_declaration(
+            SyntaxKind::Identifier,
+            SyntaxKind::CallExpression,
+        ));
+        assert!(!should_replace_value_declaration(
+            SyntaxKind::CallExpression,
+            SyntaxKind::Identifier,
+        ));
     }
 
     fn alloc_source_symbol(store: &mut SymbolStore, name: &str) -> super::SemanticSymbolId {
