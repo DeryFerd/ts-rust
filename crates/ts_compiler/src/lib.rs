@@ -6,26 +6,34 @@ use std::{
 };
 
 use ts_ast::{FileId, Node, NodeData, NodeId, NodeRef, SyntaxKind};
-use ts_binder::{BindResult, SymbolFlags, bind_source_file_in_file};
+use ts_binder::{
+    BindResult, CanonicalBindError, CanonicalBinder, CanonicalDeclarationError,
+    CanonicalModuleState, CanonicalSourceFileFacts, CanonicalSourceLanguage, EscapedName,
+    SymbolFlags, bind_source_file_in_file,
+};
+use ts_checker::semantic::{
+    CanonicalCheckerContext, CanonicalCheckerContextError, CanonicalCheckerOptions,
+    IntrinsicBootstrapOptions, SourceCheckError,
+};
 use ts_checker::{
     CheckDiagnostic, CheckResult, CheckerOptions, EnumConstantValue as CheckerConstantValue,
     ProgramSource, TypeId, TypeKind, check_program_with_paths, empty_check_result,
 };
 use ts_config::{ConfigDiagnostic, resolve_config_file};
 use ts_core::{TextPos, TextRange};
-use ts_diagnostics::{Category, Diagnostic, message_by_code};
+use ts_diagnostics::{Category, Diagnostic, FormatError, message_by_code};
 use ts_glob::{DiscoveryOptions, discover_files};
 use ts_module::{ResolutionOptions, Resolver, automatic_type_directive_names, parse_package_json};
 use ts_options::{
-    CompilerOptions, ModuleDetectionKind, ModuleKind, PrinterSettings, ScriptTarget,
-    parse_project_options,
+    CompilerOptions, ModuleDetectionKind, ModuleKind, ModuleResolutionKind, PrinterSettings,
+    ScriptTarget, parse_project_options,
 };
 use ts_parser::{
     ParseResult, parse_javascript_source_file, parse_jsx_source_file, parse_source_file,
 };
 use ts_path::{
     CaseSensitivity, canonicalize, change_extension, declaration_emit_extension, directory_path,
-    is_absolute, resolve_path,
+    is_absolute, remove_file_extension, resolve_path,
 };
 use ts_printer::{
     AmdDependency as PrinterAmdDependency, BUNDLE_EXTENDS_HELPER, EmitConstantValue, EmitContext,
@@ -136,6 +144,149 @@ pub struct ProgramDiagnostic {
     pub code: Option<u32>,
     pub category: Category,
     pub message: String,
+}
+
+/// A typed failure from the experimental canonical diagnostics pipeline.
+///
+/// These failures are construction boundaries, not TypeScript diagnostics. A
+/// failed attempt never returns a partially checked [`Program`] and never
+/// falls back to the legacy checker.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CanonicalProgramCheckError {
+    UnsupportedSourceKind {
+        file_name: String,
+        script_kind: ts_path::ScriptKind,
+    },
+    FixedModuleFormatUnsupported {
+        file_name: String,
+    },
+    ImportMetaModuleIndicatorUnsupported {
+        file_name: String,
+    },
+    NodeModuleFactsUnsupported {
+        file_name: String,
+        module: ModuleKind,
+        module_resolution: ModuleResolutionKind,
+    },
+    DeclarationFileCheckingUnsupported {
+        file_name: String,
+    },
+    Bind {
+        file_name: String,
+        error: CanonicalBindError,
+    },
+    DeclarationBind {
+        file_name: String,
+        error: CanonicalDeclarationError,
+    },
+    Context(CanonicalCheckerContextError),
+    SourceCheck {
+        file_name: String,
+        error: SourceCheckError,
+    },
+    MissingBoundFile {
+        file_name: String,
+        file: FileId,
+    },
+    InvalidDiagnosticNode(NodeRef),
+    RelatedInformationUnsupported {
+        code: u32,
+    },
+    DiagnosticFormat(FormatError),
+}
+
+impl std::fmt::Display for CanonicalProgramCheckError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnsupportedSourceKind {
+                file_name,
+                script_kind,
+            } => write!(
+                formatter,
+                "canonical checking does not support {script_kind:?} source '{file_name}'"
+            ),
+            Self::FixedModuleFormatUnsupported { file_name } => write!(
+                formatter,
+                "canonical checking cannot yet retain fixed module-format facts for '{file_name}'"
+            ),
+            Self::ImportMetaModuleIndicatorUnsupported { file_name } => write!(
+                formatter,
+                "canonical checking cannot yet retain the import.meta module indicator for '{file_name}'"
+            ),
+            Self::NodeModuleFactsUnsupported {
+                file_name,
+                module,
+                module_resolution,
+            } => write!(
+                formatter,
+                "canonical checking cannot yet derive Node module facts for '{file_name}' with module={module:?} and moduleResolution={module_resolution:?}"
+            ),
+            Self::DeclarationFileCheckingUnsupported { file_name } => write!(
+                formatter,
+                "canonical checking of declaration file '{file_name}' requires skipLibCheck"
+            ),
+            Self::Bind { file_name, error } => {
+                write!(
+                    formatter,
+                    "canonical binding failed for '{file_name}': {error}"
+                )
+            }
+            Self::DeclarationBind { file_name, error } => write!(
+                formatter,
+                "canonical declaration binding failed for '{file_name}': {error}"
+            ),
+            Self::Context(error) => {
+                write!(formatter, "canonical checker construction failed: {error}")
+            }
+            Self::SourceCheck { file_name, error } => {
+                write!(
+                    formatter,
+                    "canonical checking failed for '{file_name}': {error}"
+                )
+            }
+            Self::MissingBoundFile { file_name, file } => write!(
+                formatter,
+                "canonical binding omitted Program file {} ('{file_name}')",
+                file.index()
+            ),
+            Self::InvalidDiagnosticNode(node) => write!(
+                formatter,
+                "canonical diagnostic references invalid Program node {node:?}"
+            ),
+            Self::RelatedInformationUnsupported { code } => write!(
+                formatter,
+                "canonical diagnostic TS{code} has related information not retained by ProgramDiagnostic"
+            ),
+            Self::DiagnosticFormat(error) => std::fmt::Display::fmt(error, formatter),
+        }
+    }
+}
+
+impl std::error::Error for CanonicalProgramCheckError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Bind { error, .. } => Some(error),
+            Self::DeclarationBind { error, .. } => Some(error),
+            Self::Context(error) => Some(error),
+            Self::SourceCheck { error, .. } => Some(error),
+            Self::DiagnosticFormat(error) => Some(error),
+            Self::UnsupportedSourceKind { .. }
+            | Self::FixedModuleFormatUnsupported { .. }
+            | Self::ImportMetaModuleIndicatorUnsupported { .. }
+            | Self::NodeModuleFactsUnsupported { .. }
+            | Self::DeclarationFileCheckingUnsupported { .. }
+            | Self::MissingBoundFile { .. }
+            | Self::InvalidDiagnosticNode(_)
+            | Self::RelatedInformationUnsupported { .. } => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum ProgramChecker {
+    #[default]
+    Legacy,
+    Canonical,
 }
 
 /// Command-line overrides applied after loading a project configuration.
@@ -326,6 +477,7 @@ pub struct Program {
     current_directory: String,
     case_sensitivity: CaseSensitivity,
     options: CompilerOptions,
+    checker: ProgramChecker,
 }
 
 impl Program {
@@ -337,7 +489,7 @@ impl Program {
         root_names: &[String],
     ) -> Self {
         let mut program = Self::new_unchecked(file_system, current_directory, root_names);
-        program.check_program();
+        program.check_program_legacy();
         program
     }
 
@@ -360,6 +512,22 @@ impl Program {
         root_names: &[String],
         options: CompilerOptions,
     ) -> Self {
+        Self::new_unchecked_with_options_and_checker(
+            file_system,
+            current_directory,
+            root_names,
+            options,
+            ProgramChecker::Legacy,
+        )
+    }
+
+    fn new_unchecked_with_options_and_checker(
+        file_system: &dyn FileSystem,
+        current_directory: &str,
+        root_names: &[String],
+        options: CompilerOptions,
+        checker: ProgramChecker,
+    ) -> Self {
         let case_sensitivity = if file_system.use_case_sensitive_file_names() {
             CaseSensitivity::Sensitive
         } else {
@@ -370,6 +538,7 @@ impl Program {
             current_directory: current_directory.clone(),
             case_sensitivity,
             options,
+            checker,
             ..Self::default()
         };
         for root_name in root_names {
@@ -399,7 +568,7 @@ impl Program {
     ) -> Self {
         let mut program = Self::new_unchecked(file_system, current_directory, root_names);
         program.load_module_graph(file_system, resolution_options);
-        program.check_program();
+        program.check_program_legacy();
         program
     }
 
@@ -546,27 +715,74 @@ impl Program {
     ) -> Self {
         let mut program =
             Self::new_unchecked_with_options(file_system, current_directory, root_names, options);
-        if program.options.emit_declaration_only
-            && !program.options.declaration
-            && !program.options.composite
-        {
-            program.diagnostics.push(emit_declaration_only_diagnostic());
+        program.load_remaining_program_graph(file_system);
+        program.check_program_legacy();
+        program
+    }
+
+    /// Creates a Program and checks it through the experimental canonical
+    /// diagnostics-only semantic core.
+    ///
+    /// The complete file graph is canonically traversed before declaration
+    /// replay starts. One checker context then borrows the Program's arenas for
+    /// the duration of checking, and only owned diagnostics are committed after
+    /// every eligible source succeeds. The legacy checker is never invoked and
+    /// there is no fallback on an unsupported canonical boundary.
+    /// Diagnostics retain canonical issuance order in this first slice;
+    /// Program-level sorting, deduplication, and related-information ownership
+    /// remain explicit follow-up work.
+    /// Bundled default declarations participate in binding and global-type
+    /// initialization but are not source-checked: they are immutable pinned
+    /// compiler inputs, while declaration-file source checking is not installed.
+    ///
+    /// Emit is intentionally unavailable on the returned Program until the
+    /// canonical emit-resolver surface is ported.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CanonicalProgramCheckError`] when canonical binding, checker
+    /// construction, source checking, or owned diagnostic conversion fails.
+    pub fn try_new_with_canonical_checker(
+        file_system: &dyn FileSystem,
+        current_directory: &str,
+        root_names: &[String],
+        options: CompilerOptions,
+    ) -> Result<Self, CanonicalProgramCheckError> {
+        let mut program = Self::new_unchecked_with_options_and_checker(
+            file_system,
+            current_directory,
+            root_names,
+            options,
+            ProgramChecker::Canonical,
+        );
+        program.load_remaining_program_graph(file_system);
+        if !program.options.no_check {
+            let diagnostics = program.check_program_canonical()?;
+            program.diagnostics.extend(diagnostics);
         }
-        if program
+        Ok(program)
+    }
+
+    fn load_remaining_program_graph(&mut self, file_system: &dyn FileSystem) {
+        if self.options.emit_declaration_only
+            && !self.options.declaration
+            && !self.options.composite
+        {
+            self.diagnostics.push(emit_declaration_only_diagnostic());
+        }
+        if self
             .source_files
             .iter()
             .any(|source| has_no_default_lib_directive(&source.source_text))
         {
-            program.options.no_lib = true;
+            self.options.no_lib = true;
         }
-        let resolution_options = program.options.module_resolution_options();
-        if !program.options.no_check {
-            program.load_default_libraries();
-            program.load_automatic_type_directives(file_system, &resolution_options);
+        let resolution_options = self.options.module_resolution_options();
+        if !self.options.no_check {
+            self.load_default_libraries();
+            self.load_automatic_type_directives(file_system, &resolution_options);
         }
-        program.load_module_graph(file_system, resolution_options);
-        program.check_program();
-        program
+        self.load_module_graph(file_system, resolution_options);
     }
 
     /// Creates a Program from the explicit `files` list in a tsconfig.
@@ -727,6 +943,12 @@ impl Program {
     #[allow(clippy::too_many_lines)]
     pub fn emit(&self) -> EmitOutput {
         let mut output = EmitOutput::default();
+        if self.checker == ProgramChecker::Canonical {
+            output
+                .diagnostics
+                .push(canonical_emit_unavailable_diagnostic());
+            return output;
+        }
         if self.options.no_emit_on_error && !self.diagnostics.is_empty() {
             return output;
         }
@@ -2049,7 +2271,153 @@ impl Program {
             })
     }
 
-    fn check_program(&mut self) {
+    #[allow(clippy::too_many_lines)]
+    fn check_program_canonical(
+        &self,
+    ) -> Result<Vec<ProgramDiagnostic>, CanonicalProgramCheckError> {
+        let mut binder = CanonicalBinder::new();
+        let source_facts = self
+            .source_files
+            .iter()
+            .map(|source| canonical_source_file_facts(source, &self.options))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        for (source, facts) in self.source_files.iter().zip(source_facts) {
+            binder
+                .bind_source_file_with_facts(
+                    &source.parse.arena,
+                    source.parse.source_file,
+                    source.id,
+                    facts,
+                )
+                .map_err(|error| CanonicalProgramCheckError::Bind {
+                    file_name: source.file_name.clone(),
+                    error,
+                })?;
+        }
+
+        for source in &self.source_files {
+            binder
+                .bind_typescript_declaration_slice(&source.parse.arena, source.id)
+                .map_err(|error| CanonicalProgramCheckError::DeclarationBind {
+                    file_name: source.file_name.clone(),
+                    error,
+                })?;
+        }
+
+        let mut diagnostics = Vec::new();
+        for source in &self.source_files {
+            let bound = binder.file(source.id).ok_or_else(|| {
+                CanonicalProgramCheckError::MissingBoundFile {
+                    file_name: source.file_name.clone(),
+                    file: source.id,
+                }
+            })?;
+            for diagnostic in bound.diagnostics() {
+                if !diagnostic.related_information.is_empty() {
+                    return Err(CanonicalProgramCheckError::RelatedInformationUnsupported {
+                        code: diagnostic.diagnostic.code(),
+                    });
+                }
+                diagnostics.push(
+                    self.canonical_program_diagnostic(
+                        Some(diagnostic.node),
+                        &diagnostic.diagnostic,
+                    )?,
+                );
+            }
+        }
+
+        let ordered_arenas = self
+            .source_files
+            .iter()
+            .map(|source| (source.id, &source.parse.arena))
+            .collect();
+        let check_files = self
+            .source_files
+            .iter()
+            .filter(|source| !source.is_default_library)
+            .map(|source| {
+                (
+                    source.id,
+                    source.file_name.clone(),
+                    ts_path::is_declaration_file(&source.file_name),
+                )
+            })
+            .collect::<Vec<_>>();
+        let options = CanonicalCheckerOptions {
+            intrinsic: IntrinsicBootstrapOptions {
+                strict_null_checks: self.options.strict_null_checks,
+                exact_optional_property_types: self.options.exact_optional_property_types,
+            },
+            strict_bind_call_apply: self.options.strict_bind_call_apply,
+            strict_builtin_iterator_return: self.options.strict_builtin_iterator_return,
+            no_error_truncation: false,
+            name_resolution: (&self.options).into(),
+        };
+        let mut context = CanonicalCheckerContext::new(binder.finish(), ordered_arenas, options)
+            .map_err(CanonicalProgramCheckError::Context)?;
+
+        for (file, file_name, is_declaration_file) in check_files {
+            if is_declaration_file {
+                if self.options.skip_lib_check {
+                    continue;
+                }
+                return Err(
+                    CanonicalProgramCheckError::DeclarationFileCheckingUnsupported { file_name },
+                );
+            }
+            context
+                .check_source_file(file)
+                .map_err(|error| CanonicalProgramCheckError::SourceCheck { file_name, error })?;
+        }
+
+        for diagnostic in context.global_types().diagnostics() {
+            diagnostics
+                .push(self.canonical_program_diagnostic(diagnostic.node, &diagnostic.diagnostic)?);
+        }
+        for diagnostic in context.diagnostics().as_slice() {
+            if !diagnostic.related_information.is_empty() {
+                return Err(CanonicalProgramCheckError::RelatedInformationUnsupported {
+                    code: diagnostic.diagnostic.code(),
+                });
+            }
+            diagnostics
+                .push(self.canonical_program_diagnostic(diagnostic.node, &diagnostic.diagnostic)?);
+        }
+
+        Ok(diagnostics)
+    }
+
+    fn canonical_program_diagnostic(
+        &self,
+        node: Option<NodeRef>,
+        diagnostic: &Diagnostic,
+    ) -> Result<ProgramDiagnostic, CanonicalProgramCheckError> {
+        let (file_name, range) = if let Some(node) = node {
+            let range = self
+                .node(node)
+                .map(|node| node.range)
+                .ok_or(CanonicalProgramCheckError::InvalidDiagnosticNode(node))?;
+            let source = self
+                .source_file_by_id(node.file)
+                .ok_or(CanonicalProgramCheckError::InvalidDiagnosticNode(node))?;
+            (Some(source.file_name.clone()), Some(range))
+        } else {
+            (None, None)
+        };
+        Ok(ProgramDiagnostic {
+            file_name,
+            range,
+            code: Some(diagnostic.code()),
+            category: diagnostic.category(),
+            message: diagnostic
+                .render()
+                .map_err(CanonicalProgramCheckError::DiagnosticFormat)?,
+        })
+    }
+
+    fn check_program_legacy(&mut self) {
         let module_maps = self
             .source_files
             .iter()
@@ -2475,19 +2843,24 @@ impl Program {
         let file_id = FileId::new(
             u32::try_from(index).expect("Program exceeds u32::MAX source files"),
         );
+        // SourceFile retains this compatibility binding for existing Program
+        // consumers. Canonical mode never publishes its diagnostics or passes
+        // it to the canonical checker.
         let binding = bind_source_file_in_file(&parse.arena, parse.source_file, file_id);
-        for diagnostic in &binding.diagnostics {
-            let range = parse.arena.get(diagnostic.node).map(|node| node.range);
-            self.diagnostics.push(ProgramDiagnostic {
-                file_name: Some(file_name.to_owned()),
-                range,
-                code: Some(diagnostic.diagnostic.code()),
-                category: diagnostic.diagnostic.category(),
-                message: diagnostic
-                    .diagnostic
-                    .render()
-                    .unwrap_or_else(|error| error.to_string()),
-            });
+        if self.checker == ProgramChecker::Legacy {
+            for diagnostic in &binding.diagnostics {
+                let range = parse.arena.get(diagnostic.node).map(|node| node.range);
+                self.diagnostics.push(ProgramDiagnostic {
+                    file_name: Some(file_name.to_owned()),
+                    range,
+                    code: Some(diagnostic.diagnostic.code()),
+                    category: diagnostic.diagnostic.category(),
+                    message: diagnostic
+                        .diagnostic
+                        .render()
+                        .unwrap_or_else(|error| error.to_string()),
+                });
+            }
         }
         if self.options.target < ScriptTarget::Es2015
             && let Some(message) = message_by_code(18045)
@@ -2652,6 +3025,73 @@ impl Program {
             implied_node_format: ModuleKind::CommonJs,
         });
     }
+}
+
+fn canonical_source_file_facts(
+    source: &SourceFile,
+    options: &CompilerOptions,
+) -> Result<CanonicalSourceFileFacts, CanonicalProgramCheckError> {
+    let script_kind = ts_path::script_kind_from_path(&source.file_name);
+    if script_kind != ts_path::ScriptKind::Ts {
+        return Err(CanonicalProgramCheckError::UnsupportedSourceKind {
+            file_name: source.file_name.clone(),
+            script_kind,
+        });
+    }
+
+    let is_declaration_file = ts_path::is_declaration_file(&source.file_name);
+    let extension = Path::new(&source.file_name)
+        .extension()
+        .and_then(|extension| extension.to_str());
+    if !source.is_default_library
+        && extension.is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("mts") || extension.eq_ignore_ascii_case("cts")
+        })
+    {
+        return Err(CanonicalProgramCheckError::FixedModuleFormatUnsupported {
+            file_name: source.file_name.clone(),
+        });
+    }
+    if source_contains_import_meta(&source.parse) {
+        return Err(
+            CanonicalProgramCheckError::ImportMetaModuleIndicatorUnsupported {
+                file_name: source.file_name.clone(),
+            },
+        );
+    }
+
+    let node_module = matches!(
+        options.module,
+        ModuleKind::Node16 | ModuleKind::Node18 | ModuleKind::Node20 | ModuleKind::NodeNext
+    );
+    let node_resolution = matches!(
+        options.module_resolution,
+        ModuleResolutionKind::Node16 | ModuleResolutionKind::NodeNext
+    );
+    if !source.is_default_library && (node_module || node_resolution) {
+        return Err(CanonicalProgramCheckError::NodeModuleFactsUnsupported {
+            file_name: source.file_name.clone(),
+            module: options.module,
+            module_resolution: options.module_resolution,
+        });
+    }
+
+    // The pinned binder only records CommonJS indicators for JavaScript-family
+    // sources. Those source kinds are rejected above, so this admitted slice
+    // has no CommonJS state; in particular, a `.cts` suffix is not evidence.
+    let is_external_module = source_file_is_external_module(&source.parse)
+        || (!is_declaration_file && options.module_detection == ModuleDetectionKind::Force);
+    let module_state = if is_external_module {
+        CanonicalModuleState::External
+    } else {
+        CanonicalModuleState::Script
+    };
+    Ok(CanonicalSourceFileFacts::new(
+        EscapedName::source(format!("\"{}\"", remove_file_extension(&source.file_name))),
+        CanonicalSourceLanguage::TypeScript,
+        is_declaration_file,
+        module_state,
+    ))
 }
 
 fn resolve_reference_path(
@@ -5344,19 +5784,34 @@ fn source_file_is_external_module(parse: &ParseResult) -> bool {
         let Some(node) = parse.arena.get(*statement) else {
             return false;
         };
-        matches!(
-            node.data,
+        match &node.data {
             NodeData::ImportDeclaration(_)
-                | NodeData::ImportEqualsDeclaration(_)
-                | NodeData::ExportDeclaration(_)
-                | NodeData::ExportAssignment(_)
-        ) || declaration_modifiers(node).is_some_and(|modifiers| {
-            node_has_modifier(
-                &parse.arena,
-                Some(modifiers),
-                ts_ast::SyntaxKind::ExportKeyword,
-            )
-        })
+            | NodeData::ExportDeclaration(_)
+            | NodeData::ExportAssignment(_) => true,
+            NodeData::ImportEqualsDeclaration(import) => matches!(
+                parse
+                    .arena
+                    .get(import.module_reference)
+                    .map(|node| &node.data),
+                Some(NodeData::ExternalModuleReference(_))
+            ),
+            _ => declaration_modifiers(node).is_some_and(|modifiers| {
+                node_has_modifier(
+                    &parse.arena,
+                    Some(modifiers),
+                    ts_ast::SyntaxKind::ExportKeyword,
+                )
+            }),
+        }
+    }) || source_contains_import_meta(parse)
+}
+
+fn source_contains_import_meta(parse: &ParseResult) -> bool {
+    parse.arena.iter().any(|(_, node)| {
+        matches!(
+            &node.data,
+            NodeData::MetaProperty(meta) if meta.keyword_token == SyntaxKind::ImportKeyword
+        )
     })
 }
 
@@ -5466,6 +5921,18 @@ fn missing_file_diagnostic(file_name: &str) -> ProgramDiagnostic {
         message: message
             .format(&[file_name.to_owned()])
             .expect("TS6053 has one formatting argument"),
+    }
+}
+
+fn canonical_emit_unavailable_diagnostic() -> ProgramDiagnostic {
+    ProgramDiagnostic {
+        file_name: None,
+        range: None,
+        code: None,
+        category: Category::Error,
+        message:
+            "Emit is unavailable for Programs constructed with the experimental canonical checker."
+                .to_owned(),
     }
 }
 
@@ -5605,14 +6072,18 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::time::{Duration, Instant};
 
+    use ts_checker::semantic::SourceCheckError;
     use ts_diagnostics::Category;
-    use ts_options::{CompilerOptions, ModuleKind, ScriptTarget};
+    use ts_options::{
+        CompilerOptions, ModuleDetectionKind, ModuleKind, ModuleResolutionKind, ScriptTarget,
+    };
     use ts_vfs::{FileSystem, MemoryFileSystem};
 
     use super::{
-        FileId, Program, SourceFile, SyntaxKind, bind_source_file_in_file,
-        defer_export_only_bundle_imports, empty_check_result, parse_source_file,
-        percent_encode_source_map_url,
+        CanonicalProgramCheckError, FileId, NodeData, Program, SourceFile, SyntaxKind,
+        bind_source_file_in_file, canonical_source_file_facts, defer_export_only_bundle_imports,
+        empty_check_result, parse_source_file, percent_encode_source_map_url,
+        source_file_is_external_module,
     };
 
     #[test]
@@ -5628,6 +6099,297 @@ mod tests {
         );
         assert_eq!(program.source_files().len(), 1);
         assert!(program.source_file("/project/main.ts").is_some());
+    }
+
+    #[test]
+    fn canonical_program_checks_multi_file_primitive_assignments_atomically() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file("/project/first.ts", r#"const first: number = "wrong";"#)
+            .unwrap();
+        fs.write_file("/project/second.ts", "const second: string = 1;")
+            .unwrap();
+        let program = Program::try_new_with_canonical_checker(
+            &fs,
+            "/project",
+            &["first.ts".to_owned(), "second.ts".to_owned()],
+            CompilerOptions {
+                lib: Some(vec!["es5".to_owned()]),
+                ..CompilerOptions::default()
+            },
+        )
+        .unwrap();
+
+        let es5 = program
+            .source_file("/__typescript/lib/lib.es5.d.ts")
+            .unwrap();
+        assert!(!program.options().skip_lib_check);
+        assert!(es5.is_default_library);
+        assert!(es5.checking.diagnostics.is_empty());
+
+        let diagnostics = program.diagnostics();
+        assert_eq!(diagnostics.len(), 2, "{diagnostics:?}");
+        assert_eq!(
+            diagnostics[0].file_name.as_deref(),
+            Some("/project/first.ts")
+        );
+        assert_eq!(diagnostics[0].code, Some(2322));
+        assert_eq!(
+            diagnostics[0].message,
+            "Type 'string' is not assignable to type 'number'."
+        );
+        assert_eq!(
+            diagnostics[1].file_name.as_deref(),
+            Some("/project/second.ts")
+        );
+        assert_eq!(diagnostics[1].code, Some(2322));
+        assert_eq!(
+            diagnostics[1].message,
+            "Type 'number' is not assignable to type 'string'."
+        );
+
+        for (file_name, variable_name, diagnostic) in [
+            ("/project/first.ts", "first", &diagnostics[0]),
+            ("/project/second.ts", "second", &diagnostics[1]),
+        ] {
+            let source = program.source_file(file_name).unwrap();
+            let variable_range = source
+                .parse
+                .arena
+                .iter()
+                .find_map(|(_, node)| match &node.data {
+                    NodeData::Identifier(identifier) if identifier.text == variable_name => {
+                        Some(node.range)
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(diagnostic.range, Some(variable_range));
+            assert!(source.checking.diagnostics.is_empty());
+        }
+
+        let emit = program.emit();
+        assert!(emit.files.is_empty());
+        assert_eq!(emit.diagnostics.len(), 1);
+        assert_eq!(emit.diagnostics[0].code, None);
+        assert_eq!(emit.diagnostics[0].category, Category::Error);
+        assert!(emit.diagnostics[0].message.contains("Emit is unavailable"));
+    }
+
+    #[test]
+    fn canonical_program_rejects_a_later_unsupported_file_without_fallback() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file("/project/first.ts", r#"const first: number = "wrong";"#)
+            .unwrap();
+        fs.write_file("/project/later.ts", "function later() {}")
+            .unwrap();
+
+        let error = Program::try_new_with_canonical_checker(
+            &fs,
+            "/project",
+            &["first.ts".to_owned(), "later.ts".to_owned()],
+            CompilerOptions {
+                lib: Some(vec!["es5".to_owned()]),
+                ..CompilerOptions::default()
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            CanonicalProgramCheckError::SourceCheck {
+                file_name,
+                error: SourceCheckError::Unsupported(_),
+            } if file_name == "/project/later.ts"
+        ));
+    }
+
+    #[test]
+    fn canonical_program_honors_forced_module_detection_for_plain_ts_files() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file("/project/first.ts", r#"const value: number = "wrong";"#)
+            .unwrap();
+        fs.write_file("/project/second.ts", "const value: string = 1;")
+            .unwrap();
+
+        let program = Program::try_new_with_canonical_checker(
+            &fs,
+            "/project",
+            &["first.ts".to_owned(), "second.ts".to_owned()],
+            CompilerOptions {
+                lib: Some(vec!["es5".to_owned()]),
+                module_detection: ModuleDetectionKind::Force,
+                ..CompilerOptions::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            program
+                .diagnostics()
+                .iter()
+                .filter(|diagnostic| diagnostic.code == Some(2322))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn canonical_program_rejects_tsx_until_source_kind_facts_are_retained() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file("/project/component.tsx", "const value: number = 1;")
+            .unwrap();
+
+        let error = Program::try_new_with_canonical_checker(
+            &fs,
+            "/project",
+            &["component.tsx".to_owned()],
+            CompilerOptions {
+                lib: Some(vec!["es5".to_owned()]),
+                ..CompilerOptions::default()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            CanonicalProgramCheckError::UnsupportedSourceKind {
+                file_name,
+                script_kind: ts_path::ScriptKind::Tsx,
+            } if file_name == "/project/component.tsx"
+        ));
+    }
+
+    #[test]
+    fn canonical_program_rejects_fixed_module_formats_without_guessing() {
+        for file_name in ["module.mts", "module.cts", "module.d.mts", "module.d.cts"] {
+            let fs = MemoryFileSystem::new(true);
+            fs.write_file(&format!("/project/{file_name}"), "const value: number = 1;")
+                .unwrap();
+
+            let error = Program::try_new_with_canonical_checker(
+                &fs,
+                "/project",
+                &[file_name.to_owned()],
+                CompilerOptions {
+                    lib: Some(vec!["es5".to_owned()]),
+                    skip_lib_check: true,
+                    ..CompilerOptions::default()
+                },
+            )
+            .unwrap_err();
+            assert!(matches!(
+                error,
+                CanonicalProgramCheckError::FixedModuleFormatUnsupported { file_name: actual }
+                    if actual == format!("/project/{file_name}")
+            ));
+        }
+    }
+
+    #[test]
+    fn canonical_program_rejects_import_meta_before_binding() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file("/project/main.ts", "const url = import.meta.url;")
+            .unwrap();
+
+        let error = Program::try_new_with_canonical_checker(
+            &fs,
+            "/project",
+            &["main.ts".to_owned()],
+            CompilerOptions {
+                lib: Some(vec!["es5".to_owned()]),
+                ..CompilerOptions::default()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            CanonicalProgramCheckError::ImportMetaModuleIndicatorUnsupported { file_name }
+                if file_name == "/project/main.ts"
+        ));
+    }
+
+    #[test]
+    fn canonical_program_requires_skip_lib_check_for_ordinary_declarations() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file("/project/globals.d.ts", "declare const value: number;")
+            .unwrap();
+
+        let error = Program::try_new_with_canonical_checker(
+            &fs,
+            "/project",
+            &["globals.d.ts".to_owned()],
+            CompilerOptions {
+                lib: Some(vec!["es5".to_owned()]),
+                ..CompilerOptions::default()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            CanonicalProgramCheckError::DeclarationFileCheckingUnsupported { file_name }
+                if file_name == "/project/globals.d.ts"
+        ));
+
+        let program = Program::try_new_with_canonical_checker(
+            &fs,
+            "/project",
+            &["globals.d.ts".to_owned()],
+            CompilerOptions {
+                lib: Some(vec!["es5".to_owned()]),
+                module_detection: ModuleDetectionKind::Force,
+                skip_lib_check: true,
+                ..CompilerOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(program.diagnostics().is_empty());
+        let declaration = program.source_file("/project/globals.d.ts").unwrap();
+        let facts = canonical_source_file_facts(declaration, program.options()).unwrap();
+        assert!(facts.is_declaration_file());
+        assert!(!facts.is_external_or_common_js_module());
+    }
+
+    #[test]
+    fn external_module_detection_distinguishes_import_equals_references() {
+        let external = parse_source_file(r#"import value = require("./value");"#);
+        assert!(source_file_is_external_module(&external));
+
+        let internal = parse_source_file(
+            "declare namespace values { const value: number; } import alias = values.value;",
+        );
+        assert!(!source_file_is_external_module(&internal));
+
+        let import_meta = parse_source_file("const url = import.meta.url;");
+        assert!(source_file_is_external_module(&import_meta));
+    }
+
+    #[test]
+    fn canonical_program_rejects_unported_node_implied_module_facts() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file("/project/main.ts", "const value: number = 1;")
+            .unwrap();
+
+        let error = Program::try_new_with_canonical_checker(
+            &fs,
+            "/project",
+            &["main.ts".to_owned()],
+            CompilerOptions {
+                lib: Some(vec!["es5".to_owned()]),
+                module: ModuleKind::NodeNext,
+                module_resolution: ModuleResolutionKind::NodeNext,
+                module_specified: true,
+                ..CompilerOptions::default()
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            CanonicalProgramCheckError::NodeModuleFactsUnsupported {
+                file_name,
+                module: ModuleKind::NodeNext,
+                module_resolution: ModuleResolutionKind::NodeNext,
+            } if file_name == "/project/main.ts"
+        ));
     }
 
     #[test]
