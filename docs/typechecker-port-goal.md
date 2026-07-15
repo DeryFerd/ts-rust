@@ -361,6 +361,18 @@ Additional architectural decisions:
   matching upstream child order. The current separate flow builder remains a
   tested legacy transition path only until its graph helpers are consumed by
   that traversal; it is not a second canonical binder.
+- Checker links follow upstream's 26 sparse, typed `LinkStore`s rather than a
+  monolithic per-node or per-symbol record. `Get` allocates one stable
+  zero-valued logical slot, while `Has` and `TryGet` never allocate; absent,
+  allocated-empty, negative-cache, and recursion-sentinel states remain
+  distinct. The first dependency-closed link slice covers common node links,
+  resolved symbols/types/signatures, value and alias symbols, declared types,
+  type aliases, and the shared type-resolution stack after T00 and B02 land.
+- Link operations never retain a mutable record borrow across recursive
+  checking. They read state, install any exact sentinel, release the borrow,
+  recurse, then re-fetch and commit through provenance-validating aggregate
+  methods. Specialized module, flow, mapped-type, JSX, accessibility,
+  node-builder, and emit-resolver stores can then be ported independently.
 - Start with one serial binder, one checker, and one semantic store per
   `Program`. Parsing may remain parallel because it produces immutable
   file-local arenas; binding and checking should be serial until stable
