@@ -6,6 +6,7 @@
 //! branded by their aggregate [`SemanticStore`]; they have no conversion to
 //! same-named legacy checker IDs.
 
+pub mod alias;
 pub mod bootstrap;
 pub mod declared;
 pub mod diagnostics;
