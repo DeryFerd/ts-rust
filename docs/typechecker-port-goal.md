@@ -212,18 +212,23 @@ remains the cluster-level source of truth.
   slices. Program-wide merged-symbol identity is closed by the later T04B1
   consumer work described below.
 - T05B's dependency-closed interface declared types are verified through
-  `e83f0df`, with merged-symbol consumer canonicalization in `aafbdbe`. Generic
-  and direct-`this` interfaces publish the exact recursive reference shell and
+  `e83f0df`, with merged-symbol consumer canonicalization in `aafbdbe` and the
+  cached direct-identifier heritage extension in `af20ef6`. Generic and
+  direct-`this` interfaces publish the exact recursive reference shell and
   synthetic `this`; definitely `this`-less interfaces use the plain interface
   identity; merged outer and local parameters preserve pinned ordering and
-  symbol identity; invalid non-entity heritage is ignored; unresolved
-  entity-name heritage fails explicitly before cache mutation; and every raw
-  merged class/interface symbol shares the canonical transient's exact declared
-  `TypeId` and cache entry. Thirty-one interface-focused tests and the expanded
-  333-test checker suite pass. An independent pinned-source audit found no P0-P2
-  issue. Heritage resolution and the
-  remaining alias, enum, reverse-mapped, and JSDoc families stay explicit
-  follow-up work rather than being approximated.
+  symbol identity; invalid non-entity heritage is ignored; and every raw merged
+  class/interface symbol shares the canonical transient's exact declared
+  `TypeId` and cache entry. A private post-global capability now permits the
+  narrow `isThislessInterface` path to resolve a direct identifier whose base
+  identity is already cached, preserving thisless bases, propagating synthetic
+  `this`, and treating missing or non-interface bases like the pin. Public or
+  pre-global hosts fail atomically, as do uncached recursive, qualified, and
+  alias-dependent heritage paths. Thirty-six declared-type tests and the
+  expanded 339-test checker suite pass. Independent pinned-source audits found
+  no remaining P0-P2 issue. Recursive heritage and the remaining alias, enum,
+  reverse-mapped, and JSDoc families stay explicit follow-up work rather than
+  being approximated.
 - T04B0's production construction boundary is verified through `21e69fb`,
   `0005257`, and `a426cd9`. It consumes declaration-complete binder ownership,
   validates exact file/arena/root/source-fact correspondence and exact bound
@@ -243,11 +248,23 @@ remains the cluster-level source of truth.
   through those redirects, and only a completed checker context can construct
   the resolver host. Three local bundled-library fixtures are byte-identical to
   the pin and exercise the same production path. The merge substrate's
-  independent audit found no P0-P2 issue; 162 binder tests, 333 checker tests,
-  the checker compile-fail doctest, strict targeted Clippy, and the all-target
+  independent audit found no P0-P2 issue. The eager global-library follow-up is
+  integrated in `af20ef6`: intrinsic value links, IArguments, Array, Object,
+  Function, strict CallableFunction/NewableFunction selection, String, Number,
+  Boolean, RegExp, Array<any>, the unique auto-array marker, ReadonlyArray,
+  ReadonlyArray<any>, and ThisType now initialize in pinned order. One-argument
+  generic references reuse the target cache and propagate flags; no-lib and
+  malformed-library inputs retain pinned fallbacks, resolved-member state,
+  diagnostic order, declaration locations, and eager-name library arguments.
+  A private global-merge completion brand prevents heritage name resolution
+  from escaping before its phase. The independent eager-global audit found and
+  closed that phase hole plus the auto-array resolved-members mismatch, then
+  reported no remaining P0-P2 issue. 162 binder tests, 339 checker tests, the
+  checker compile-fail doctest, strict targeted Clippy, and the all-target
   workspace check pass. T04 remains in progress: alias targets, late ambient
-  module merging, non-global augmentations, diagnostic callback ownership, and
-  standard-library global type initialization are explicit later slices.
+  module merging, non-global augmentations, full diagnostic callback/spelling
+  elaboration, callback mappers, lazy global families, and compiler-option
+  normalization are explicit later slices.
 
 No percentage in this section is a whole-corpus parity claim. A score is
 publishable only when its variant manifest and complete artifact comparison are
