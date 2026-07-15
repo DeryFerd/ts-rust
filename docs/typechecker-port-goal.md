@@ -196,6 +196,29 @@ remains the cluster-level source of truth.
   all match the pinned Go implementation. General simple and structural
   relation algorithms remain the next R00/R01 work rather than being implied
   by the completed key substrate.
+- Binder-owned `NodeFlagsContainsThis` side facts are integrated as `2f14c19`.
+  The exact bit-7 capture/propagation state machine is retained outside the
+  immutable AST and all 157 binder tests pass. This closes the direct-`this`
+  input needed by interface declared types without guessing from syntax during
+  checker construction.
+- T05A's declared type-parameter and class identity slice is verified through
+  `53c869e` and the independent cache-integrity repair `bc65b06`. It preserves
+  outermost-to-innermost plus local type-parameter order, class/interface merge
+  precedence, early recursive shell publication, the owning-class synthetic
+  `this` parameter, exact self-instantiation identity, exported-symbol routing,
+  and fail-closed cache validation. Twenty focused tests and all 279 checker
+  tests pass, and the final independent audit found no P0-P2 issue. Interface,
+  alias, enum, reverse-mapped, and JSDoc declared types remain explicit later
+  T05 slices; cross-file canonical identity still depends on T04's Program-wide
+  merged-symbol redirects.
+- T04B0's production construction boundary is integrated as `21e69fb`. It
+  consumes declaration-complete binder ownership, validates exact file/arena/
+  root/source-fact correspondence, preserves explicit Program order, registers
+  source roots, and bootstraps intrinsics without exposing partial state. Its
+  independent audit found one bounded stale-AST closure-integrity issue; the
+  repair and a targeted mutation audit are active before this slice is marked
+  verified. The ordered global merge, merged-symbol redirects, augmentations,
+  ambient modules, and library global initialization remain T04B1+ work.
 
 No percentage in this section is a whole-corpus parity claim. A score is
 publishable only when its variant manifest and complete artifact comparison are
