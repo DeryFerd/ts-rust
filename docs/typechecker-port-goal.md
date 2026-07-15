@@ -1,7 +1,7 @@
 # Goal: typescript-go core typechecking parity in Rust
 
 - Status: active
-- Audit date: 2026-07-14
+- Audit date: 2026-07-15
 - Local branch: `july-ultra`
 - Audited upstream pin: `dc37b5249ab60e2bbce936f71b883e6c8136167e`
 
@@ -327,6 +327,30 @@ remains the cluster-level source of truth.
   checker library tests, the checker compile-fail doctest, and scoped
   all-target Clippy pass. Union/intersection, object/function, qualified and
   import-alias type nodes remain explicit follow-up work.
+- T04's production query boundary now has one retained alias/source registry
+  through `7b0712a`, `17b12f2`, and `85e5005`. It owns the validated Program
+  snapshots, module-resolution manifest, alias target facade, and store-branded
+  source-file tokens. `2c93541` makes declared-type and name-resolver hosts
+  borrow that registry in O(1), including nested type references, recursive
+  heritage, and global-library initialization; repeated queries no longer
+  rebuild Program-wide maps or rescan sources.
+- T07's first semantic formatter slice is integrated through `9d61038`,
+  `763361f`, and `96fb33a`. Primitive, nullish, unique-symbol boundary, and
+  complete string/number/bigint literal display now live inside `ts_checker`,
+  including signed zero, NaN/infinity, quote selection, exact ordinary versus
+  `noErrorTruncation` budgets, and TS2322 literal-source generalization. General
+  union and symbol-aware object display remain the active formatter follow-up.
+- T06 and R01 now share a canonical primitive-union kernel. `af6096e`,
+  `745fad1`, and `841dfd2` port parsed union type nodes, flattening,
+  deduplication, literal reduction, nullable precedence, named origins, exact
+  cache identities, recursive alias cycles, transactional preparation, and a
+  dirty-only validation barrier whose lazy relation/member memo flags stay
+  O(1). Independently reviewed `ca22d61` ports the pinned SOME/EACH branch
+  order for identity, subtype, strict subtype, assignability, and comparability,
+  plus nullable correspondence, literal-to-primitive shortcuts, named-union
+  identity, cache thresholds, and transactional publication. The merged stack
+  passes all 517 checker library tests, rustdoc with warnings denied, the
+  compile-fail doctest, and scoped all-target Clippy.
 
 No percentage in this section is a whole-corpus parity claim. A score is
 publishable only when its variant manifest and complete artifact comparison are
