@@ -299,6 +299,39 @@ pub struct CanonicalSourceFileFacts {
     module_state: CanonicalModuleState,
 }
 
+/// One wildcard ambient-module entry recorded by declaration binding.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CanonicalPatternAmbientModule {
+    pattern: String,
+    star_index: usize,
+    symbol: SemanticSymbolId,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ModuleInstanceState {
+    Unknown,
+    NonInstantiated,
+    Instantiated,
+    ConstEnumOnly,
+}
+
+impl CanonicalPatternAmbientModule {
+    #[must_use]
+    pub fn pattern(&self) -> &str {
+        &self.pattern
+    }
+
+    #[must_use]
+    pub const fn star_index(&self) -> usize {
+        self.star_index
+    }
+
+    #[must_use]
+    pub const fn symbol(&self) -> SemanticSymbolId {
+        self.symbol
+    }
+}
+
 impl CanonicalSourceFileFacts {
     #[must_use]
     pub const fn new(
@@ -381,6 +414,8 @@ pub struct BoundFile {
     traversal_order: Vec<NodeId>,
     container_chain: Vec<NodeId>,
     diagnostics: Vec<CanonicalBindDiagnostic>,
+    pattern_ambient_modules: Vec<CanonicalPatternAmbientModule>,
+    global_exports: Option<SymbolTableId>,
     classifiable_names: BTreeSet<EscapedName>,
     not_const_enum_only_modules: BTreeSet<SemanticSymbolId>,
     symbol_count: u32,
@@ -453,6 +488,19 @@ impl BoundFile {
     #[must_use]
     pub fn diagnostics(&self) -> &[CanonicalBindDiagnostic] {
         &self.diagnostics
+    }
+
+    /// Wildcard ambient modules in declaration order.
+    #[must_use]
+    pub fn pattern_ambient_modules(&self) -> &[CanonicalPatternAmbientModule] {
+        &self.pattern_ambient_modules
+    }
+
+    /// `export as namespace` aliases. Absence remains distinct from an
+    /// allocated empty table.
+    #[must_use]
+    pub const fn global_exports(&self) -> Option<SymbolTableId> {
+        self.global_exports
     }
 
     /// Names observed with a classifiable declaration meaning.
@@ -961,8 +1009,18 @@ impl CanonicalBinder {
                 NodeRef::new(arena.id(), file, node),
             ));
         }
+        let module_states = order
+            .iter()
+            .copied()
+            .filter(|node| {
+                arena
+                    .get(*node)
+                    .is_some_and(|node| node.kind == SyntaxKind::ModuleDeclaration)
+            })
+            .map(|node| (node, get_module_instance_state(arena, node)))
+            .collect::<HashMap<_, _>>();
         for node in order {
-            self.bind_declaration_node(arena, file, node, &facts)?;
+            self.bind_declaration_node(arena, file, node, &facts, &module_states)?;
         }
         self.files
             .get_mut(&file)
@@ -1259,6 +1317,7 @@ impl CanonicalBinder {
         file: FileId,
         node: NodeId,
         facts: &CanonicalSourceFileFacts,
+        module_states: &HashMap<NodeId, ModuleInstanceState>,
     ) -> Result<(), CanonicalDeclarationError> {
         let kind = arena
             .get(node)
@@ -1467,6 +1526,12 @@ impl CanonicalBinder {
                     facts,
                 )?;
             }
+            SyntaxKind::ModuleDeclaration => {
+                let state = *module_states
+                    .get(&node)
+                    .expect("module state was preflighted for every module declaration");
+                self.bind_module_declaration(arena, file, node, facts, state)?;
+            }
             SyntaxKind::JsxAttributes => {
                 self.bind_anonymous_declaration(
                     arena,
@@ -1489,6 +1554,152 @@ impl CanonicalBinder {
             _ => {}
         }
         Ok(())
+    }
+
+    fn bind_module_declaration(
+        &mut self,
+        arena: &NodeArena,
+        file: FileId,
+        node: NodeId,
+        facts: &CanonicalSourceFileFacts,
+        state: ModuleInstanceState,
+    ) -> Result<(), CanonicalDeclarationError> {
+        if is_ambient_module(arena, node) {
+            if has_syntactic_modifier(arena, node, SyntaxKind::ExportKeyword) {
+                self.push_bind_diagnostic(arena, file, node, 2668, std::iter::empty::<String>());
+            }
+            if is_module_augmentation_external(arena, node, facts) {
+                self.declare_module_symbol(arena, file, node, facts, state)?;
+            } else {
+                let symbol = self.declare_symbol_and_add_to_symbol_table(
+                    arena,
+                    file,
+                    node,
+                    SymbolFlags::VALUE_MODULE,
+                    SymbolFlags::VALUE_MODULE_EXCLUDES,
+                    facts,
+                )?;
+                let Some(NodeData::ModuleDeclaration(module)) =
+                    arena.get(node).map(|node| &node.data)
+                else {
+                    unreachable!("module declaration dispatch is kind checked");
+                };
+                if arena
+                    .get(module.name)
+                    .is_some_and(|name| name.kind == SyntaxKind::StringLiteral)
+                {
+                    let pattern = node_text(arena, module.name).unwrap_or_default();
+                    let mut stars = pattern.match_indices('*').map(|(index, _)| index);
+                    if let Some(star_index) = stars.next() {
+                        if stars.next().is_some() {
+                            self.push_bind_diagnostic(arena, file, module.name, 5061, [pattern]);
+                        } else {
+                            self.files
+                                .get_mut(&file)
+                                .expect("ambient-module file is registered")
+                                .pattern_ambient_modules
+                                .push(CanonicalPatternAmbientModule {
+                                    pattern,
+                                    star_index,
+                                    symbol,
+                                });
+                        }
+                    }
+                }
+            }
+            return Ok(());
+        }
+
+        self.declare_module_symbol(arena, file, node, facts, state)?;
+        if state == ModuleInstanceState::NonInstantiated {
+            return Ok(());
+        }
+        let symbol = self
+            .bound_node_symbol(file, node)
+            .expect("module declaration writes its node symbol");
+        let record = self
+            .symbols
+            .symbol(symbol)
+            .expect("declared module symbol is store-owned");
+        let (flags, check_flags) = (record.flags(), record.check_flags());
+        let was_permanently_cleared = self
+            .files
+            .get(&file)
+            .expect("module file is registered")
+            .not_const_enum_only_modules
+            .contains(&symbol);
+        let const_enum_only = !flags
+            .intersects(SymbolFlags::FUNCTION | SymbolFlags::CLASS | SymbolFlags::REGULAR_ENUM)
+            && state == ModuleInstanceState::ConstEnumOnly
+            && !was_permanently_cleared;
+        if const_enum_only {
+            assert!(self.symbols.set_symbol_flags(
+                symbol,
+                flags | SymbolFlags::CONST_ENUM_ONLY_MODULE,
+                check_flags,
+            ));
+        } else {
+            assert!(self.symbols.set_symbol_flags(
+                symbol,
+                flags.without(SymbolFlags::CONST_ENUM_ONLY_MODULE),
+                check_flags,
+            ));
+            self.files
+                .get_mut(&file)
+                .expect("module file is registered")
+                .not_const_enum_only_modules
+                .insert(symbol);
+        }
+        Ok(())
+    }
+
+    fn declare_module_symbol(
+        &mut self,
+        arena: &NodeArena,
+        file: FileId,
+        node: NodeId,
+        facts: &CanonicalSourceFileFacts,
+        state: ModuleInstanceState,
+    ) -> Result<SemanticSymbolId, CanonicalDeclarationError> {
+        let instantiated = state != ModuleInstanceState::NonInstantiated;
+        self.declare_symbol_and_add_to_symbol_table(
+            arena,
+            file,
+            node,
+            if instantiated {
+                SymbolFlags::VALUE_MODULE
+            } else {
+                SymbolFlags::NAMESPACE_MODULE
+            },
+            if instantiated {
+                SymbolFlags::VALUE_MODULE_EXCLUDES
+            } else {
+                SymbolFlags::NAMESPACE_MODULE_EXCLUDES
+            },
+            facts,
+        )
+    }
+
+    fn push_bind_diagnostic<I, S>(
+        &mut self,
+        arena: &NodeArena,
+        file: FileId,
+        node: NodeId,
+        code: u32,
+        arguments: I,
+    ) where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.files
+            .get_mut(&file)
+            .expect("diagnostic file is registered")
+            .diagnostics
+            .push(CanonicalBindDiagnostic {
+                node: NodeRef::new(arena.id(), file, node),
+                diagnostic: make_diagnostic(code, arguments),
+                related_information: Vec::new(),
+            });
     }
 
     fn declaration_facts_for(
@@ -2335,8 +2546,7 @@ fn declaration_family_supported(arena: &NodeArena, node: NodeId) -> bool {
     !arena.get(node).is_some_and(|node| {
         matches!(
             node.kind,
-            SyntaxKind::ModuleDeclaration
-                | SyntaxKind::ImportEqualsDeclaration
+            SyntaxKind::ImportEqualsDeclaration
                 | SyntaxKind::NamespaceImport
                 | SyntaxKind::ImportSpecifier
                 | SyntaxKind::ExportSpecifier
@@ -2348,6 +2558,224 @@ fn declaration_family_supported(arena: &NodeArena, node: NodeId) -> bool {
                 | SyntaxKind::JsTypeAliasDeclaration
         )
     })
+}
+
+fn get_module_instance_state(arena: &NodeArena, node: NodeId) -> ModuleInstanceState {
+    let mut visited = HashMap::new();
+    get_module_instance_state_worker_for_declaration(arena, node, &mut visited)
+}
+
+fn get_module_instance_state_worker_for_declaration(
+    arena: &NodeArena,
+    node: NodeId,
+    visited: &mut HashMap<NodeId, ModuleInstanceState>,
+) -> ModuleInstanceState {
+    let Some(NodeData::ModuleDeclaration(module)) = arena.get(node).map(|node| &node.data) else {
+        unreachable!("module-instance state starts at a module declaration");
+    };
+    module
+        .body
+        .map_or(ModuleInstanceState::Instantiated, |body| {
+            get_module_instance_state_cached(arena, body, visited)
+        })
+}
+
+fn get_module_instance_state_cached(
+    arena: &NodeArena,
+    node: NodeId,
+    visited: &mut HashMap<NodeId, ModuleInstanceState>,
+) -> ModuleInstanceState {
+    if let Some(cached) = visited.get(&node).copied() {
+        return if cached == ModuleInstanceState::Unknown {
+            ModuleInstanceState::NonInstantiated
+        } else {
+            cached
+        };
+    }
+    visited.insert(node, ModuleInstanceState::Unknown);
+    let result = get_module_instance_state_worker(arena, node, visited);
+    visited.insert(node, result);
+    result
+}
+
+fn get_module_instance_state_worker(
+    arena: &NodeArena,
+    node: NodeId,
+    visited: &mut HashMap<NodeId, ModuleInstanceState>,
+) -> ModuleInstanceState {
+    let declaration = arena
+        .get(node)
+        .expect("module-instance state only follows reachable nodes");
+    match &declaration.data {
+        NodeData::InterfaceDeclaration(_) | NodeData::TypeAliasDeclaration(_)
+            if matches!(
+                declaration.kind,
+                SyntaxKind::InterfaceDeclaration
+                    | SyntaxKind::TypeAliasDeclaration
+                    | SyntaxKind::JsTypeAliasDeclaration
+            ) =>
+        {
+            ModuleInstanceState::NonInstantiated
+        }
+        NodeData::EnumDeclaration(_)
+            if has_combined_modifier(arena, node, SyntaxKind::ConstKeyword) =>
+        {
+            ModuleInstanceState::ConstEnumOnly
+        }
+        NodeData::ImportDeclaration(_) | NodeData::ImportEqualsDeclaration(_)
+            if matches!(
+                declaration.kind,
+                SyntaxKind::ImportDeclaration
+                    | SyntaxKind::JsImportDeclaration
+                    | SyntaxKind::ImportEqualsDeclaration
+            ) && !has_syntactic_modifier(arena, node, SyntaxKind::ExportKeyword) =>
+        {
+            ModuleInstanceState::NonInstantiated
+        }
+        NodeData::ExportDeclaration(export)
+            if export.module_specifier.is_none()
+                && export.export_clause.is_some_and(|clause| {
+                    arena
+                        .get(clause)
+                        .is_some_and(|clause| clause.kind == SyntaxKind::NamedExports)
+                }) =>
+        {
+            let clause = export.export_clause.expect("guarded above");
+            let Some(NodeData::NamedExports(exports)) = arena.get(clause).map(|node| &node.data)
+            else {
+                unreachable!("named export clause was kind checked");
+            };
+            let mut state = ModuleInstanceState::NonInstantiated;
+            for specifier in &exports.elements.nodes {
+                let specifier_state =
+                    get_module_instance_state_for_alias_target(arena, *specifier, visited);
+                if module_instance_state_rank(specifier_state) > module_instance_state_rank(state) {
+                    state = specifier_state;
+                }
+                if state == ModuleInstanceState::Instantiated {
+                    return state;
+                }
+            }
+            state
+        }
+        NodeData::ModuleBlock(block) => {
+            let mut state = ModuleInstanceState::NonInstantiated;
+            for statement in &block.statements.nodes {
+                match get_module_instance_state_cached(arena, *statement, visited) {
+                    ModuleInstanceState::NonInstantiated => {}
+                    ModuleInstanceState::ConstEnumOnly => {
+                        state = ModuleInstanceState::ConstEnumOnly;
+                    }
+                    ModuleInstanceState::Instantiated => {
+                        return ModuleInstanceState::Instantiated;
+                    }
+                    ModuleInstanceState::Unknown => {
+                        unreachable!("cached module state never exposes its cycle sentinel");
+                    }
+                }
+            }
+            state
+        }
+        NodeData::ModuleDeclaration(_) => {
+            get_module_instance_state_worker_for_declaration(arena, node, visited)
+        }
+        _ => ModuleInstanceState::Instantiated,
+    }
+}
+
+const fn module_instance_state_rank(state: ModuleInstanceState) -> u8 {
+    match state {
+        ModuleInstanceState::Unknown => 0,
+        ModuleInstanceState::NonInstantiated => 1,
+        ModuleInstanceState::Instantiated => 2,
+        ModuleInstanceState::ConstEnumOnly => 3,
+    }
+}
+
+fn get_module_instance_state_for_alias_target(
+    arena: &NodeArena,
+    node: NodeId,
+    visited: &mut HashMap<NodeId, ModuleInstanceState>,
+) -> ModuleInstanceState {
+    let Some(NodeData::ExportSpecifier(specifier)) = arena.get(node).map(|node| &node.data) else {
+        return ModuleInstanceState::Instantiated;
+    };
+    let name = specifier.property_name.unwrap_or(specifier.name);
+    if !arena
+        .get(name)
+        .is_some_and(|name| name.kind == SyntaxKind::Identifier)
+    {
+        return ModuleInstanceState::Instantiated;
+    }
+    let Some(name_text) = node_text(arena, name) else {
+        return ModuleInstanceState::Instantiated;
+    };
+
+    let mut parent = arena.get(node).and_then(|node| node.parent);
+    while let Some(scope) = parent {
+        if matches!(
+            arena.get(scope).map(|scope| scope.kind),
+            Some(SyntaxKind::Block | SyntaxKind::ModuleBlock | SyntaxKind::SourceFile)
+        ) {
+            let mut found = ModuleInstanceState::Unknown;
+            if let Some(statements) = statement_list(arena, scope) {
+                for statement in statements {
+                    if node_has_name(arena, *statement, &name_text) {
+                        let state = get_module_instance_state_cached(arena, *statement, visited);
+                        if found == ModuleInstanceState::Unknown
+                            || module_instance_state_rank(state) > module_instance_state_rank(found)
+                        {
+                            found = state;
+                        }
+                        if found == ModuleInstanceState::Instantiated {
+                            return found;
+                        }
+                        if arena.get(*statement).is_some_and(|statement| {
+                            statement.kind == SyntaxKind::ImportEqualsDeclaration
+                        }) {
+                            found = ModuleInstanceState::Instantiated;
+                        }
+                    }
+                }
+            }
+            if found != ModuleInstanceState::Unknown {
+                return found;
+            }
+        }
+        parent = arena.get(scope).and_then(|scope| scope.parent);
+    }
+    ModuleInstanceState::Instantiated
+}
+
+fn statement_list(arena: &NodeArena, node: NodeId) -> Option<&[NodeId]> {
+    match &arena.get(node)?.data {
+        NodeData::Block(block) => Some(&block.statements.nodes),
+        NodeData::ModuleBlock(block) => Some(&block.statements.nodes),
+        NodeData::SourceFile(source) => Some(&source.statements.nodes),
+        _ => None,
+    }
+}
+
+fn node_has_name(arena: &NodeArena, node: NodeId, expected: &str) -> bool {
+    if let Some(name) = get_name_of_declaration(arena, node) {
+        return arena
+            .get(name)
+            .is_some_and(|name| name.kind == SyntaxKind::Identifier)
+            && node_text(arena, name).as_deref() == Some(expected);
+    }
+    let Some(NodeData::VariableStatement(statement)) = arena.get(node).map(|node| &node.data)
+    else {
+        return false;
+    };
+    let Some(NodeData::VariableDeclarationList(list)) =
+        arena.get(statement.declaration_list).map(|node| &node.data)
+    else {
+        return false;
+    };
+    list.declarations
+        .nodes
+        .iter()
+        .any(|declaration| node_has_name(arena, *declaration, expected))
 }
 
 fn declaration_name_shape_unsupported(arena: &NodeArena, node: NodeId) -> bool {
@@ -2553,6 +2981,35 @@ fn is_ambient_module(arena: &NodeArena, node: NodeId) -> bool {
         || arena
             .get(module.name)
             .is_some_and(|name| name.kind == SyntaxKind::StringLiteral)
+}
+
+fn is_module_augmentation_external(
+    arena: &NodeArena,
+    node: NodeId,
+    facts: &CanonicalSourceFileFacts,
+) -> bool {
+    let Some(parent) = arena.get(node).and_then(|node| node.parent) else {
+        return false;
+    };
+    match arena.get(parent).map(|parent| parent.kind) {
+        Some(SyntaxKind::SourceFile) => facts.is_external_module(),
+        Some(SyntaxKind::ModuleBlock) => {
+            let Some(module) = arena.get(parent).and_then(|parent| parent.parent) else {
+                return false;
+            };
+            is_ambient_module(arena, module)
+                && arena
+                    .get(module)
+                    .and_then(|module| module.parent)
+                    .is_some_and(|source| {
+                        arena
+                            .get(source)
+                            .is_some_and(|source| source.kind == SyntaxKind::SourceFile)
+                    })
+                && !facts.is_external_module()
+        }
+        _ => false,
+    }
 }
 
 fn is_ambient_node(arena: &NodeArena, mut node: NodeId, facts: &CanonicalSourceFileFacts) -> bool {
@@ -3235,6 +3692,8 @@ impl<'a> FileTraversal<'a> {
             traversal_order: self.traversal_order,
             container_chain: self.container_chain,
             diagnostics: Vec::new(),
+            pattern_ambient_modules: Vec::new(),
+            global_exports: None,
             classifiable_names: BTreeSet::new(),
             not_const_enum_only_modules: BTreeSet::new(),
             symbol_count: 0,
@@ -5390,7 +5849,7 @@ mod tests {
 
     #[test]
     fn declaration_slice_preflight_rejects_atomically_and_retry_is_stable() {
-        let parsed = parse_source_file("namespace Deferred { export const value = 1; }");
+        let mut parsed = parse_source_file("type Deferred = string;");
         let file = FileId::new(43);
         let facts = CanonicalSourceFileFacts::new(
             EscapedName::source("\"/project/deferred\""),
@@ -5398,9 +5857,10 @@ mod tests {
             false,
             CanonicalModuleState::Script,
         );
-        let module = nodes_of_kind(&parsed.arena, SyntaxKind::ModuleDeclaration)[0];
+        let alias = nodes_of_kind(&parsed.arena, SyntaxKind::TypeAliasDeclaration)[0];
+        parsed.arena.get_mut(alias).unwrap().kind = SyntaxKind::JsTypeAliasDeclaration;
         let expected = Err(CanonicalDeclarationError::UnsupportedDeclarationFamily(
-            node_ref(&parsed.arena, file, module),
+            node_ref(&parsed.arena, file, alias),
         ));
         let mut binder = CanonicalBinder::new();
         binder
@@ -5424,6 +5884,113 @@ mod tests {
         assert!(bound.diagnostics().is_empty());
         assert_eq!(binder.symbol_store().symbol_len(), 0);
         assert_eq!(binder.symbol_store().symbol_table_len(), 0);
+    }
+
+    #[test]
+    fn module_dispatch_uses_exact_instance_state_and_const_enum_marker_rules() {
+        let parsed = parse_source_file(
+            r"
+namespace Types { export interface Shape {} }
+namespace Runtime { export const value = 1; }
+namespace Constants { export const enum E { A } }
+function Merged() {}
+namespace Merged { export const enum E { A } }
+",
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(46);
+        let facts = CanonicalSourceFileFacts::new(
+            EscapedName::source("\"/project/modules\""),
+            CanonicalSourceLanguage::TypeScript,
+            false,
+            CanonicalModuleState::Script,
+        );
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(&parsed.arena, parsed.source_file, file, facts)
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+
+        let bound = binder.file(file).unwrap();
+        let locals = binder
+            .symbol_store()
+            .symbol_table(bound.locals(bound.source_file()).unwrap())
+            .unwrap();
+        let types = locals.get_source("Types").unwrap();
+        let runtime = locals.get_source("Runtime").unwrap();
+        let constants = locals.get_source("Constants").unwrap();
+        let merged = locals.get_source("Merged").unwrap();
+        assert_eq!(
+            binder.symbol_store().symbol(types).unwrap().flags(),
+            SymbolFlags::NAMESPACE_MODULE
+        );
+        assert_eq!(
+            binder.symbol_store().symbol(runtime).unwrap().flags(),
+            SymbolFlags::VALUE_MODULE
+        );
+        assert_eq!(
+            binder.symbol_store().symbol(constants).unwrap().flags(),
+            SymbolFlags::VALUE_MODULE | SymbolFlags::CONST_ENUM_ONLY_MODULE
+        );
+        assert_eq!(
+            binder.symbol_store().symbol(merged).unwrap().flags(),
+            SymbolFlags::FUNCTION | SymbolFlags::VALUE_MODULE
+        );
+        assert!(bound.is_not_const_enum_only_module(merged));
+        assert!(!bound.is_not_const_enum_only_module(constants));
+        assert!(bound.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn ambient_modules_record_patterns_and_diagnostics_in_declaration_order() {
+        let parsed = parse_source_file(
+            r#"
+declare module "*.css" { export const classes: object; }
+declare module "bad**pattern" {}
+export declare module "visible" {}
+declare global { interface Window {} }
+"#,
+        );
+        let file = FileId::new(47);
+        let facts = CanonicalSourceFileFacts::new(
+            EscapedName::source("\"/project/ambient\""),
+            CanonicalSourceLanguage::TypeScript,
+            true,
+            CanonicalModuleState::Script,
+        );
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(&parsed.arena, parsed.source_file, file, facts)
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+
+        let bound = binder.file(file).unwrap();
+        assert_eq!(bound.pattern_ambient_modules().len(), 1);
+        let pattern = &bound.pattern_ambient_modules()[0];
+        assert_eq!(pattern.pattern(), "*.css");
+        assert_eq!(pattern.star_index(), 0);
+        let locals = binder
+            .symbol_store()
+            .symbol_table(bound.locals(bound.source_file()).unwrap())
+            .unwrap();
+        assert_eq!(locals.get_source("\"*.css\""), Some(pattern.symbol()));
+        assert!(locals.get(InternalSymbolName::Global.as_ref()).is_some());
+        assert_eq!(
+            bound
+                .diagnostics()
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.code())
+                .collect::<Vec<_>>(),
+            [5061, 2668]
+        );
+        assert_eq!(
+            bound.diagnostics()[0].diagnostic.arguments,
+            ["bad**pattern"]
+        );
     }
 
     #[test]
