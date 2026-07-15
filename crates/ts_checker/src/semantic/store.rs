@@ -79,6 +79,7 @@ pub struct SemanticStore<TypePayload, MapperPayload> {
     source_files_by_arena: BTreeMap<NodeArenaId, SourceFileRef>,
     source_node_facts: BTreeMap<NodeArenaId, Vec<Option<SourceNodeFacts>>>,
     links: CheckerLinkStores,
+    declared_types_in_progress: HashSet<SemanticSymbolId>,
     type_resolutions: TypeResolutionStack,
     relations: RelationCaches,
     pub(super) intrinsic_bootstrap: Option<IntrinsicBootstrap>,
@@ -123,6 +124,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             source_files_by_arena: BTreeMap::new(),
             source_node_facts: BTreeMap::new(),
             links: CheckerLinkStores::default(),
+            declared_types_in_progress: HashSet::new(),
             type_resolutions: TypeResolutionStack::new(id),
             relations: RelationCaches::default(),
             intrinsic_bootstrap: None,
@@ -804,6 +806,29 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         }
         self.links.declared_type.replace_key(symbol, links);
         true
+    }
+
+    /// Marks the narrow interval in which a recursive class shell is visible
+    /// through its declared-type link but is not initialized yet.
+    ///
+    /// The marker is checker-private and cannot exist before intrinsic
+    /// bootstrap, so it does not add a hidden pre-bootstrap pristine state.
+    pub(super) fn begin_declared_type_initialization(&mut self, symbol: SemanticSymbolId) -> bool {
+        self.intrinsic_bootstrap.is_some()
+            && self.symbols.contains_symbol(symbol)
+            && self.declared_types_in_progress.insert(symbol)
+    }
+
+    #[must_use]
+    pub(super) fn declared_type_initialization_in_progress(
+        &self,
+        symbol: SemanticSymbolId,
+    ) -> bool {
+        self.symbols.contains_symbol(symbol) && self.declared_types_in_progress.contains(&symbol)
+    }
+
+    pub(super) fn finish_declared_type_initialization(&mut self, symbol: SemanticSymbolId) -> bool {
+        self.symbols.contains_symbol(symbol) && self.declared_types_in_progress.remove(&symbol)
     }
 
     #[must_use]

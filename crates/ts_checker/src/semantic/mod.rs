@@ -7,6 +7,7 @@
 //! same-named legacy checker IDs.
 
 pub mod bootstrap;
+pub mod declared;
 pub mod ids;
 pub mod links;
 pub mod mapper;
@@ -21,6 +22,10 @@ pub use ts_binder::{AstScope, SemanticStoreId, SemanticSymbolId, SymbolTableId};
 pub use bootstrap::{
     CheckerLinkCounts, CheckerStateSnapshot, IntrinsicBootstrap, IntrinsicBootstrapError,
     IntrinsicBootstrapOptions, SemanticArenaCounts, TypeResolutionStateSnapshot,
+};
+pub use declared::{
+    DeclaredTypeError, DeclaredTypeHost, DeclaredTypeHostError, DeclaredTypeUnavailable,
+    UnsupportedDeclaredTypeKind, UnsupportedOuterTypeParameterContext,
 };
 pub use ids::{
     ConditionalRootId, IndexInfoId, SignatureId, TypeAliasId, TypeId, TypeMapperId, TypePredicateId,
