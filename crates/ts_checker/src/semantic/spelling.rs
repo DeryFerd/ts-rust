@@ -7,10 +7,10 @@
 //! the upstream empty-name sentinel used for symbols with the wrong meaning.
 //!
 //! Rust's standard library does not expose Go's simple case-mapping tables.
-//! This port reconstructs them from Rust's scalar mappings, with explicit
-//! handling for dotted capital I and the theta-symbol fold orbit. Its only
-//! known fidelity risk is a Unicode-data-version difference between the Rust
-//! toolchain and the pinned Go toolchain.
+//! This port reconstructs the pinned Go Unicode 15 mappings from Rust's scalar
+//! mappings, with explicit handling for dotted capital I and the theta-symbol
+//! fold orbit. Mappings added by the Rust toolchain's newer Unicode tables are
+//! suppressed below so the suggestion policy remains pinned to Unicode 15.
 
 use std::cmp::Ordering;
 
@@ -166,13 +166,55 @@ fn simple_lowercase(character: char) -> char {
     // `unicode.ToLower` returns the one-rune simple mapping.
     if character == '\u{0130}' {
         'i'
+    } else if has_post_unicode_15_lowercase_mapping(character) {
+        character
     } else {
         single_character_mapping(character, character.to_lowercase())
     }
 }
 
 fn simple_uppercase(character: char) -> char {
-    single_character_mapping(character, character.to_uppercase())
+    if has_post_unicode_15_uppercase_mapping(character) {
+        character
+    } else {
+        single_character_mapping(character, character.to_uppercase())
+    }
+}
+
+/// Uppercase sides of case pairs known to Rust but absent from Go's pinned
+/// Unicode 15 tables. Their newer lowercase mappings must remain invisible.
+fn has_post_unicode_15_lowercase_mapping(character: char) -> bool {
+    matches!(
+        character,
+        '\u{1C89}'
+            | '\u{A7CB}'
+            | '\u{A7CC}'
+            | '\u{A7CE}'
+            | '\u{A7D2}'
+            | '\u{A7D4}'
+            | '\u{A7DA}'
+            | '\u{A7DC}'
+            | '\u{10D50}'..='\u{10D65}'
+            | '\u{16EA0}'..='\u{16EB8}'
+    )
+}
+
+/// Lowercase sides of case pairs known to Rust but absent from Go's pinned
+/// Unicode 15 tables. Their newer uppercase mappings must remain invisible.
+fn has_post_unicode_15_uppercase_mapping(character: char) -> bool {
+    matches!(
+        character,
+        '\u{019B}'
+            | '\u{0264}'
+            | '\u{1C8A}'
+            | '\u{A7CD}'
+            | '\u{A7CF}'
+            | '\u{A7D3}'
+            | '\u{A7D5}'
+            | '\u{A7DB}'
+            | '\u{10D70}'..='\u{10D85}'
+            | '\u{16EBB}'..='\u{16ED3}'
+    )
 }
 
 fn single_character_mapping(original: char, mut mapped: impl Iterator<Item = char>) -> char {
@@ -218,7 +260,7 @@ fn simple_fold_equal(left: char, right: char) -> bool {
 mod tests {
     use super::{
         LevenshteinBuffers, get_spelling_suggestion, get_spelling_suggestion_for_strings,
-        levenshtein_with_max, unicode_equal_fold,
+        levenshtein_with_max, simple_lowercase, simple_uppercase, unicode_equal_fold,
     };
     use std::cmp::Ordering;
 
@@ -324,6 +366,63 @@ mod tests {
         // Default Unicode folding deliberately excludes Turkic-I mappings.
         assert!(!unicode_equal_fold("I", "ı"));
         assert!(!unicode_equal_fold("İ", "i"));
+    }
+
+    #[test]
+    fn newer_rust_case_pairs_remain_unmapped_under_pinned_unicode_15() {
+        fn assert_unmapped_pair(uppercase: char, lowercase: char) {
+            assert_eq!(simple_lowercase(uppercase), uppercase);
+            assert_eq!(simple_uppercase(lowercase), lowercase);
+            assert!(!unicode_equal_fold(
+                &uppercase.to_string(),
+                &lowercase.to_string()
+            ));
+        }
+
+        let singleton_pairs = [
+            ('\u{A7DC}', '\u{019B}'),
+            ('\u{A7CB}', '\u{0264}'),
+            ('\u{1C89}', '\u{1C8A}'),
+            ('\u{A7CC}', '\u{A7CD}'),
+            ('\u{A7CE}', '\u{A7CF}'),
+            ('\u{A7D2}', '\u{A7D3}'),
+            ('\u{A7D4}', '\u{A7D5}'),
+            ('\u{A7DA}', '\u{A7DB}'),
+        ];
+        for (uppercase, lowercase) in singleton_pairs {
+            assert_unmapped_pair(uppercase, lowercase);
+        }
+
+        let grouped_ranges = [
+            (0x10D50_u32, 0x10D65_u32, 0x10D70_u32),
+            (0x16EA0_u32, 0x16EB8_u32, 0x16EBB_u32),
+        ];
+        let mut range_pair_count = 0;
+        for (uppercase_start, uppercase_end, lowercase_start) in grouped_ranges {
+            for uppercase in uppercase_start..=uppercase_end {
+                let lowercase = lowercase_start + uppercase - uppercase_start;
+                assert_unmapped_pair(
+                    char::from_u32(uppercase).expect("valid uppercase scalar"),
+                    char::from_u32(lowercase).expect("valid lowercase scalar"),
+                );
+                range_pair_count += 1;
+            }
+        }
+        assert_eq!(singleton_pairs.len() + range_pair_count, 55);
+
+        assert!(!unicode_equal_fold("Ƛ", "ƛ"));
+        assert_eq!(get_spelling_suggestion_for_strings("ƛ", ["Ƛ"]), None);
+        assert_eq!(get_spelling_suggestion_for_strings("abcƛ", ["abcꟜ"]), None);
+        assert_eq!(distance("abcƛ", "abcꟜ", 2.0), Some(2.0));
+    }
+
+    #[test]
+    fn rust_unicode_version_matches_the_audited_case_mapping_surface() {
+        assert_eq!(
+            char::UNICODE_VERSION,
+            (17, 0, 0),
+            "re-audit post-Unicode-15 case-mapping exclusions for the new Rust Unicode tables"
+        );
     }
 
     #[test]
