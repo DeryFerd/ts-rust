@@ -76,6 +76,11 @@ remains the cluster-level source of truth.
   proved that equal local IDs from another store cannot enter any public
   record slot. Complete type payloads, lazy links, and program-owned symbols
   are now the next dependency-closed semantic lanes.
+- The program-symbol ownership boundary is frozen: `ts_binder` owns the exact
+  symbol/table substrate and `ts_checker::SemanticStore` embeds it under the
+  same semantic brand. This preserves the existing crate dependency direction
+  and makes one binder/declaration/flow traversal possible; the mechanical
+  ownership migration follows the complete type-payload slice.
 
 No percentage in this section is a whole-corpus parity claim. A score is
 publishable only when its variant manifest and complete artifact comparison are
@@ -312,7 +317,7 @@ The precise crate boundary can evolve, but the ownership invariants cannot.
 | Upstream concept | Rust representation | Invariant |
 |---|---|---|
 | AST node pointer | `NodeRef { arena: NodeArenaId, file: FileId, node: NodeId }` | A node is unambiguous across files and Program rebuilds. |
-| Symbol pointer and merges | Program-owned `SymbolId`, tables, declarations, and flags | Imports and merged declarations refer to the same semantic symbol, not a copied type description. |
+| Symbol pointer and merges | Program-owned `SemanticSymbolId`, `SymbolTableId`, declarations, and flags | Imports and merged declarations refer to the same semantic symbol, not a copied type description. |
 | `FlowNode` graph | Program/binder-owned `FlowRef { arena, file, flow }` arena | Checker flow queries follow antecedents created by binding without accepting a rebuilt Program's equal local ID. |
 | `Type` interfaces | Canonical `TypeId` arena plus a complete tagged payload | Identity, recursion, aliases, freshness, targets, and deferred forms survive across files. |
 | `Signature`, `IndexInfo`, predicates | Dedicated ID arenas/records | Complete call/construct rules and lazy links are retained. |
@@ -323,6 +328,32 @@ The precise crate boundary can evolve, but the ownership invariants cannot.
 
 Additional architectural decisions:
 
+- The canonical symbol substrate lives in `ts_binder`, following the existing
+  `ts_checker -> ts_binder` dependency. `ts_binder::SymbolStore` owns exact
+  `Symbol` and `SymbolTable` records plus their store-branded IDs;
+  `ts_checker::SemanticStore` embeds that store and remains the sole aggregate
+  owner of the program semantic graph. Both layers use one `SemanticStoreId`.
+  There is no separately branded binder graph and no legacy-symbol conversion
+  map.
+- Symbol member/export/local tables use store-owned `SymbolTableId`
+  indirection. This preserves nil versus allocated-empty state, lets types and
+  symbols share the same table identity, and avoids holding a mutable symbol
+  borrow across recursive allocation or merge. Cross-crate checker operations
+  mutate symbols through provenance-validating store methods; unchecked
+  `&mut Symbol` is not a public API.
+- Binder-created and checker-created transient symbols occupy the same symbol
+  arena. Exact `CheckFlags`, declaration order, value-declaration precedence,
+  parent/export-symbol links, shallow table cloning, and merge redirects are
+  part of this substrate rather than later adapters.
+- The ownership migration lands as one mechanical shared-contract change:
+  move and re-export the semantic brand/symbol/table IDs, embed the concrete
+  symbol store, and replace the provisional by-value type-member tables with
+  `SymbolTableId`. After that contract freezes, canonical binder/CFG work,
+  checker link records, and semantic artifact work may proceed independently.
+- The canonical binder owns declaration and flow state in one traversal,
+  matching upstream child order. The current separate flow builder remains a
+  tested legacy transition path only until its graph helpers are consumed by
+  that traversal; it is not a second canonical binder.
 - Start with one serial binder, one checker, and one semantic store per
   `Program`. Parsing may remain parallel because it produces immutable
   file-local arenas; binding and checking should be serial until stable
