@@ -341,6 +341,12 @@ Additional architectural decisions:
   borrow across recursive allocation or merge. Cross-crate checker operations
   mutate symbols through provenance-validating store methods; unchecked
   `&mut Symbol` is not a public API.
+- Symbol-table keys use a byte-backed `EscapedName` newtype. Upstream reserves
+  raw byte `0xFE`—which is deliberately invalid UTF-8—for internal names, so a
+  Rust `String` or Unicode sentinel would either be unable to represent the
+  key exactly or could collide with a legal source identifier. Source names
+  retain their UTF-8 bytes; internal call/new/private/computed names retain the
+  raw reserved prefix.
 - Binder-created and checker-created transient symbols occupy the same symbol
   arena. Exact `CheckFlags`, declaration order, value-declaration precedence,
   parent/export-symbol links, shallow table cloning, and merge redirects are
