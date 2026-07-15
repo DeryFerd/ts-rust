@@ -17,7 +17,10 @@
 
 use std::collections::{BTreeMap, HashSet};
 
-use ts_ast::{FileId, Node, NodeArena, NodeArenaId, NodeData, NodeList, NodeRef, SyntaxKind};
+use ts_ast::{
+    FileId, Node, NodeArena, NodeArenaId, NodeArenaRevision, NodeData, NodeList, NodeRef,
+    SyntaxKind,
+};
 use ts_binder::{BoundFile, SemanticSymbolId, SymbolFlags};
 use xxhash_rust::xxh3::Xxh3;
 
@@ -53,6 +56,11 @@ pub enum DeclaredTypeHostError {
         expected: NodeArenaId,
         actual: NodeArenaId,
     },
+    ArenaRevisionMismatch {
+        file: FileId,
+        expected: NodeArenaRevision,
+        actual: NodeArenaRevision,
+    },
     DeclarationsIncomplete(FileId),
     InvalidSourceFile(NodeRef),
     DuplicateFile(FileId),
@@ -64,6 +72,11 @@ impl std::fmt::Display for DeclaredTypeHostError {
             Self::ArenaMismatch { file, .. } => write!(
                 formatter,
                 "declared-type source {} uses a different AST arena",
+                file.index()
+            ),
+            Self::ArenaRevisionMismatch { file, .. } => write!(
+                formatter,
+                "declared-type source {} changed after canonical binding",
                 file.index()
             ),
             Self::DeclarationsIncomplete(file) => write!(
@@ -96,7 +109,8 @@ impl<'a> DeclaredTypeHost<'a> {
     /// # Errors
     ///
     /// Returns a typed provenance error if a source has incomplete bindings,
-    /// mismatched arena identity, an invalid root, or a duplicate file slot.
+    /// mismatched arena identity or revision, an invalid root, or a duplicate
+    /// file slot.
     pub fn new(
         sources: impl IntoIterator<Item = (&'a NodeArena, &'a BoundFile)>,
     ) -> Result<Self, DeclaredTypeHostError> {
@@ -127,6 +141,13 @@ impl<'a> DeclaredTypeHost<'a> {
                 )
             {
                 return Err(DeclaredTypeHostError::InvalidSourceFile(source));
+            }
+            if bound.node_arena_revision() != arena.revision() {
+                return Err(DeclaredTypeHostError::ArenaRevisionMismatch {
+                    file,
+                    expected: bound.node_arena_revision(),
+                    actual: arena.revision(),
+                });
             }
             if host
                 .sources
@@ -1382,6 +1403,71 @@ mod tests {
         assert_eq!(store.type_alias_len(), type_alias_count);
         assert_eq!(store.checker_link_allocated_lengths(), link_counts);
         assert_eq!(store.declared_type_links(symbol), declared_links.as_ref());
+    }
+
+    fn assert_declared_host_rejects_stale_arena(
+        mut fixture: Fixture,
+        mutate: impl FnOnce(&mut NodeArena),
+    ) {
+        let expected = fixture
+            .files
+            .get(&fixture.file)
+            .unwrap()
+            .node_arena_revision();
+        mutate(&mut fixture.parsed.arena);
+        let actual = fixture.parsed.arena.revision();
+        assert_eq!(
+            DeclaredTypeHost::new([(
+                &fixture.parsed.arena,
+                fixture.files.get(&fixture.file).unwrap(),
+            )])
+            .unwrap_err(),
+            DeclaredTypeHostError::ArenaRevisionMismatch {
+                file: fixture.file,
+                expected,
+                actual,
+            }
+        );
+    }
+
+    #[test]
+    fn declared_type_host_rejects_post_bind_identifier_mutation() {
+        assert_declared_host_rejects_stale_arena(fixture("class Before<T> {}"), |arena| {
+            let identifier = arena
+                .iter()
+                .find_map(|(node, data)| {
+                    matches!(
+                        &data.data,
+                        NodeData::Identifier(identifier) if identifier.text == "Before"
+                    )
+                    .then_some(node)
+                })
+                .unwrap();
+            let NodeData::Identifier(identifier) = &mut arena.get_mut(identifier).unwrap().data
+            else {
+                panic!("the selected node is an identifier")
+            };
+            identifier.text = "After".to_owned();
+        });
+    }
+
+    #[test]
+    fn declared_type_host_rejects_post_bind_source_text_mutation() {
+        assert_declared_host_rejects_stale_arena(fixture("interface Before {}"), |arena| {
+            arena.set_source_text("interface After {}");
+        });
+    }
+
+    #[test]
+    fn declared_type_host_rejects_post_bind_unreachable_allocation() {
+        assert_declared_host_rejects_stale_arena(fixture("interface Stable {}"), |arena| {
+            let orphan = arena
+                .iter()
+                .find(|(_, node)| node.kind == SyntaxKind::EndOfFile)
+                .map(|(_, node)| node.clone())
+                .unwrap();
+            arena.alloc(orphan);
+        });
     }
 
     #[test]

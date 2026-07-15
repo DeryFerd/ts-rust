@@ -13,7 +13,9 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use ts_ast::{FileId, ModifierList, NodeArena, NodeData, NodeId, NodeRef, SyntaxKind};
+use ts_ast::{
+    FileId, ModifierList, NodeArena, NodeArenaRevision, NodeData, NodeId, NodeRef, SyntaxKind,
+};
 use ts_diagnostics::{Diagnostic, Message, message_by_code};
 use ts_options::{CompilerOptions, ScriptTarget};
 
@@ -265,6 +267,11 @@ pub struct CanonicalResolvedName {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CanonicalNameResolutionError {
     WrongArena { file: FileId },
+    ArenaRevisionMismatch {
+        file: FileId,
+        expected: NodeArenaRevision,
+        actual: NodeArenaRevision,
+    },
     DeclarationsIncomplete(FileId),
     MissingSourceFileFacts(FileId),
     JavaScriptDeferred(FileId),
@@ -288,6 +295,11 @@ impl std::fmt::Display for CanonicalNameResolutionError {
             Self::WrongArena { file } => write!(
                 formatter,
                 "name-resolution arena does not match Program file slot {}",
+                file.index()
+            ),
+            Self::ArenaRevisionMismatch { file, .. } => write!(
+                formatter,
+                "name-resolution arena changed after binding Program file slot {}",
                 file.index()
             ),
             Self::DeclarationsIncomplete(file) => write!(
@@ -545,6 +557,13 @@ impl<'a, H: CanonicalNameResolverHost> CanonicalNameResolver<'a, H> {
         }
         if !symbols.contains_node_ref(bound.source_file()) {
             return Err(CanonicalNameResolutionError::InvalidSymbolStore(file));
+        }
+        if bound.node_arena_revision() != arena.revision() {
+            return Err(CanonicalNameResolutionError::ArenaRevisionMismatch {
+                file,
+                expected: bound.node_arena_revision(),
+                actual: arena.revision(),
+            });
         }
         let options = host.compiler_options();
         Ok(Self {
@@ -3688,6 +3707,42 @@ export { remote } from "pkg";
                 foreign_location
             ))
         );
+    }
+
+    #[test]
+    fn constructor_rejects_a_same_arena_post_bind_mutation() {
+        let mut source = bind(
+            "const before = 1; function read() { return before; }",
+            CanonicalModuleState::Script,
+        );
+        let expected = bound(&source).node_arena_revision();
+        let identifier = identifier_in(&source, "return before", "before");
+        let NodeData::Identifier(identifier_data) =
+            &mut source.parsed.arena.get_mut(identifier).unwrap().data
+        else {
+            panic!("the selected node is an identifier")
+        };
+        identifier_data.text = "after".to_owned();
+        let actual = source.parsed.arena.revision();
+        let mut host = TestHost::for_source(&source);
+
+        assert!(matches!(
+            CanonicalNameResolver::new(
+                &source.parsed.arena,
+                bound(&source),
+                source.bindings.symbol_store(),
+                &mut host,
+            ),
+            Err(CanonicalNameResolutionError::ArenaRevisionMismatch {
+                file: FILE,
+                expected: found_expected,
+                actual: found_actual,
+            }) if found_expected == expected && found_actual == actual
+        ));
+        assert!(host.events.is_empty());
+        assert!(host.referenced.is_empty());
+        assert!(host.failed.is_empty());
+        assert!(host.succeeded.is_empty());
     }
 
     #[test]
