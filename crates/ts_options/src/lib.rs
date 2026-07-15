@@ -124,6 +124,10 @@ pub struct CompilerOptions {
     pub strict: bool,
     /// Whether `strict` was explicitly supplied.
     pub strict_specified: bool,
+    pub strict_bind_call_apply: bool,
+    /// Whether `strictBindCallApply` was explicitly supplied rather than
+    /// inherited from `strict`.
+    pub strict_bind_call_apply_specified: bool,
     pub strict_null_checks: bool,
     /// Whether `strictNullChecks` was explicitly supplied rather than inherited
     /// from `strict`.
@@ -211,6 +215,8 @@ impl Default for CompilerOptions {
             strip_internal: false,
             strict: true,
             strict_specified: false,
+            strict_bind_call_apply: true,
+            strict_bind_call_apply_specified: false,
             strict_null_checks: true,
             strict_null_checks_specified: false,
             strict_property_initialization: true,
@@ -394,12 +400,15 @@ impl CompilerOptions {
                 "strict" => {
                     self.strict = overrides.strict;
                     self.strict_specified = true;
+                    if !names.contains("strictbindcallapply")
+                        && !self.strict_bind_call_apply_specified
+                    {
+                        self.strict_bind_call_apply = overrides.strict_bind_call_apply;
+                    }
                     if !names.contains("noimplicitany") && !self.no_implicit_any_specified {
                         self.no_implicit_any = overrides.no_implicit_any;
                     }
-                    if !names.contains("strictnullchecks")
-                        && !self.strict_null_checks_specified
-                    {
+                    if !names.contains("strictnullchecks") && !self.strict_null_checks_specified {
                         self.strict_null_checks = overrides.strict_null_checks;
                     }
                     if !names.contains("strictpropertyinitialization")
@@ -414,6 +423,10 @@ impl CompilerOptions {
                         self.use_unknown_in_catch_variables =
                             overrides.use_unknown_in_catch_variables;
                     }
+                }
+                "strictbindcallapply" => {
+                    self.strict_bind_call_apply = overrides.strict_bind_call_apply;
+                    self.strict_bind_call_apply_specified = true;
                 }
                 "strictnullchecks" => {
                     self.strict_null_checks = overrides.strict_null_checks;
@@ -656,6 +669,9 @@ pub fn parse_compiler_options_map(options: &BTreeMap<String, JsonValue>) -> Pars
                 parsed.strip_internal = boolean(original_name, value, &mut diagnostics);
             }
             "strict" => parsed.strict = boolean(original_name, value, &mut diagnostics),
+            "strictbindcallapply" => {
+                parsed.strict_bind_call_apply = boolean(original_name, value, &mut diagnostics);
+            }
             "strictnullchecks" => {
                 parsed.strict_null_checks = boolean(original_name, value, &mut diagnostics);
             }
@@ -771,6 +787,7 @@ struct PartialOptions {
     skip_lib_check: Option<bool>,
     strip_internal: Option<bool>,
     strict: Option<bool>,
+    strict_bind_call_apply: Option<bool>,
     strict_null_checks: Option<bool>,
     strict_property_initialization: Option<bool>,
     use_define_for_class_fields: Option<bool>,
@@ -810,6 +827,7 @@ impl PartialOptions {
         let check_js = self.check_js.unwrap_or(false);
         let no_implicit_any_specified = self.no_implicit_any.is_some();
         let strict_specified = self.strict.is_some();
+        let strict_bind_call_apply_specified = self.strict_bind_call_apply.is_some();
         let strict_null_checks_specified = self.strict_null_checks.is_some();
         let strict_property_initialization_specified =
             self.strict_property_initialization.is_some();
@@ -882,11 +900,11 @@ impl PartialOptions {
             strip_internal: self.strip_internal.unwrap_or(false),
             strict,
             strict_specified,
+            strict_bind_call_apply: self.strict_bind_call_apply.unwrap_or(strict),
+            strict_bind_call_apply_specified,
             strict_null_checks: self.strict_null_checks.unwrap_or(strict),
             strict_null_checks_specified,
-            strict_property_initialization: self
-                .strict_property_initialization
-                .unwrap_or(strict),
+            strict_property_initialization: self.strict_property_initialization.unwrap_or(strict),
             strict_property_initialization_specified,
             use_define_for_class_fields: self.use_define_for_class_fields,
             use_unknown_in_catch_variables: self.use_unknown_in_catch_variables.unwrap_or(strict),
@@ -1443,39 +1461,54 @@ mod tests {
         let defaults = parse_compiler_options(&object([])).options;
         assert!(defaults.strict);
         assert!(defaults.no_implicit_any);
+        assert!(defaults.strict_bind_call_apply);
         assert!(defaults.strict_null_checks);
         assert!(defaults.strict_property_initialization);
         assert!(defaults.use_unknown_in_catch_variables);
         assert!(!defaults.strict_specified);
         assert!(!defaults.no_implicit_any_specified);
+        assert!(!defaults.strict_bind_call_apply_specified);
         assert!(!defaults.strict_null_checks_specified);
         assert!(!defaults.strict_property_initialization_specified);
         assert!(!defaults.use_unknown_in_catch_variables_specified);
 
-        let disabled = parse_compiler_options(&object([("strict", JsonValue::Bool(false))]))
-            .options;
+        let disabled =
+            parse_compiler_options(&object([("strict", JsonValue::Bool(false))])).options;
         assert!(!disabled.strict);
         assert!(!disabled.no_implicit_any);
+        assert!(!disabled.strict_bind_call_apply);
         assert!(!disabled.strict_null_checks);
         assert!(!disabled.strict_property_initialization);
         assert!(!disabled.use_unknown_in_catch_variables);
 
         let mut inherited = parse_compiler_options(&object([
+            ("strictBindCallApply", JsonValue::Bool(true)),
             ("strictNullChecks", JsonValue::Bool(true)),
             ("strictPropertyInitialization", JsonValue::Bool(true)),
         ]))
         .options;
         inherited.apply_overrides(&disabled, &BTreeSet::from(["strict".to_owned()]));
         assert!(!inherited.strict);
+        assert!(inherited.strict_bind_call_apply);
+        assert!(inherited.strict_bind_call_apply_specified);
         assert!(inherited.strict_null_checks);
         assert!(inherited.strict_property_initialization);
 
         let mut implied = defaults;
         implied.apply_overrides(&disabled, &BTreeSet::from(["strict".to_owned()]));
         assert!(!implied.no_implicit_any);
+        assert!(!implied.strict_bind_call_apply);
         assert!(!implied.strict_null_checks);
         assert!(!implied.strict_property_initialization);
         assert!(!implied.use_unknown_in_catch_variables);
+
+        let explicit_false = parse_compiler_options(&object([
+            ("strict", JsonValue::Bool(true)),
+            ("strictBindCallApply", JsonValue::Bool(false)),
+        ]));
+        assert!(explicit_false.is_ok(), "{:?}", explicit_false.diagnostics);
+        assert!(!explicit_false.options.strict_bind_call_apply);
+        assert!(explicit_false.options.strict_bind_call_apply_specified);
     }
 
     #[test]
