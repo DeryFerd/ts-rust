@@ -26,7 +26,9 @@ use super::{
     },
     object_members::PropertyObjectPlan,
     relater::{ResolvedDeclaredProperty, ResolvedDeclaredPropertyObject},
-    source::{PlannedExpression, SourceCheckError, SourceCheckProvenanceError},
+    source::{
+        PlannedExpression, PlannedExpressionKind, SourceCheckError, SourceCheckProvenanceError,
+    },
     spelling::get_spelling_suggestion,
     type_records::TypeData,
 };
@@ -78,7 +80,8 @@ fn elaborate_known_properties(
     target_type: TypeId,
     flags: CanonicalTypeFormatFlags,
 ) -> Result<Vec<CanonicalCheckerDiagnostic>, SourceCheckError> {
-    let PlannedExpression::Object { plan, properties } = expression else {
+    let expression = expression.unparenthesized();
+    let PlannedExpressionKind::Object { plan, properties } = &expression.kind else {
         return Ok(Vec::new());
     };
     let Some(target) = store.resolved_declared_property_object(host, target_type)? else {
@@ -100,7 +103,10 @@ fn elaborate_known_properties(
             continue;
         }
 
-        if matches!(source_expression, PlannedExpression::Object { .. }) {
+        if matches!(
+            &source_expression.unparenthesized().kind,
+            PlannedExpressionKind::Object { .. }
+        ) {
             let nested = elaborate_known_properties(
                 store,
                 host,
@@ -165,7 +171,8 @@ fn shape_or_generic_diagnostic(
     fallback_node: NodeRef,
     flags: CanonicalTypeFormatFlags,
 ) -> Result<CanonicalCheckerDiagnostic, SourceCheckError> {
-    let PlannedExpression::Object { plan, .. } = expression else {
+    let expression = expression.unparenthesized();
+    let PlannedExpressionKind::Object { plan, .. } = &expression.kind else {
         return generic_assignability_diagnostic(
             store,
             host,

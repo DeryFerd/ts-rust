@@ -10,7 +10,7 @@ use std::collections::HashSet;
 
 use super::{
     CanonicalTypeMapperStore, DeclaredTypeHost, RelationUnavailable, TypeId,
-    source::{PlannedExpression, SourceCheckError},
+    source::{PlannedExpression, PlannedExpressionKind, SourceCheckError},
     type_records::{TypeData, TypeRecord},
     types::TypeFlags,
 };
@@ -34,6 +34,7 @@ pub(super) enum LiteralTreatment {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum PreparedExpression {
     Literal(LiteralTreatment),
+    Parenthesized(Box<PreparedExpression>),
     Object(Vec<PreparedExpression>),
 }
 
@@ -54,7 +55,7 @@ pub(super) fn prepare_expression_context(
     expression: &PlannedExpression,
     contextual_type: TypeId,
 ) -> Result<PreparedExpression, SourceCheckError> {
-    if matches!(expression, PlannedExpression::Object { .. }) {
+    if matches!(&expression.kind, PlannedExpressionKind::Object { .. }) {
         preflight_contextual_type_graph(
             store,
             host,
@@ -127,35 +128,38 @@ fn prepare_expression(
     contextual_type: Option<TypeId>,
     location: ExpressionLocation,
 ) -> Result<PreparedExpression, SourceCheckError> {
-    let prepared = match expression {
-        PlannedExpression::Null | PlannedExpression::GlobalUndefined => {
+    let prepared = match &expression.kind {
+        PlannedExpressionKind::Null | PlannedExpressionKind::GlobalUndefined => {
             PreparedExpression::Literal(LiteralTreatment::Identity)
         }
-        PlannedExpression::String(_) => PreparedExpression::Literal(literal_treatment(
+        PlannedExpressionKind::String(_) => PreparedExpression::Literal(literal_treatment(
             store,
             LiteralKind::String,
             contextual_type,
             location,
         )?),
-        PlannedExpression::Number { .. } => PreparedExpression::Literal(literal_treatment(
+        PlannedExpressionKind::Number { .. } => PreparedExpression::Literal(literal_treatment(
             store,
             LiteralKind::Number,
             contextual_type,
             location,
         )?),
-        PlannedExpression::BigInt { .. } => PreparedExpression::Literal(literal_treatment(
+        PlannedExpressionKind::BigInt { .. } => PreparedExpression::Literal(literal_treatment(
             store,
             LiteralKind::BigInt,
             contextual_type,
             location,
         )?),
-        PlannedExpression::Boolean(_) => PreparedExpression::Literal(literal_treatment(
+        PlannedExpressionKind::Boolean(_) => PreparedExpression::Literal(literal_treatment(
             store,
             LiteralKind::Boolean,
             contextual_type,
             location,
         )?),
-        PlannedExpression::Object { plan, properties } => {
+        PlannedExpressionKind::Parenthesized(inner) => PreparedExpression::Parenthesized(Box::new(
+            prepare_expression(store, host, inner, contextual_type, location)?,
+        )),
+        PlannedExpressionKind::Object { plan, properties } => {
             debug_assert_eq!(plan.properties.len(), properties.len());
             let contextual = contextual_object(store, host, contextual_type)?;
             let mut prepared = Vec::with_capacity(properties.len());
@@ -287,6 +291,8 @@ fn validate_contextual_union(
 
 #[cfg(test)]
 mod tests {
+    use ts_ast::{FileId, NodeArena, NodeId, NodeRef};
+
     use super::*;
     use crate::semantic::{IntrinsicBootstrapOptions, types::ObjectFlags};
 
@@ -456,14 +462,14 @@ mod tests {
             store.relation_state_snapshot(),
             store.checker_link_allocated_lengths(),
         );
+        let arena = NodeArena::new();
+        let expression = PlannedExpression::new(
+            NodeRef::new(arena.id(), FileId::new(0), NodeId::new(0)),
+            PlannedExpressionKind::Boolean(true),
+        );
 
         assert_eq!(
-            prepare_expression_context(
-                &mut store,
-                &host,
-                &PlannedExpression::Boolean(true),
-                object_union,
-            ),
+            prepare_expression_context(&mut store, &host, &expression, object_union),
             Ok(PreparedExpression::Literal(LiteralTreatment::Fresh))
         );
         assert_eq!(

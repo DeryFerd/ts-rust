@@ -228,7 +228,27 @@ impl From<LiteralTypeCacheError> for SourceCheckError {
 }
 
 #[derive(Clone, Debug)]
-pub(super) enum PlannedExpression {
+pub(super) struct PlannedExpression {
+    pub(super) node: NodeRef,
+    pub(super) kind: PlannedExpressionKind,
+}
+
+impl PlannedExpression {
+    pub(super) fn new(node: NodeRef, kind: PlannedExpressionKind) -> Self {
+        Self { node, kind }
+    }
+
+    pub(super) fn unparenthesized(&self) -> &Self {
+        let mut expression = self;
+        while let PlannedExpressionKind::Parenthesized(inner) = &expression.kind {
+            expression = inner;
+        }
+        expression
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(super) enum PlannedExpressionKind {
     Null,
     String(String),
     Number {
@@ -241,6 +261,7 @@ pub(super) enum PlannedExpression {
     },
     Boolean(bool),
     GlobalUndefined,
+    Parenthesized(Box<PlannedExpression>),
     Object {
         plan: super::object_members::PropertyObjectPlan,
         properties: Vec<PlannedExpression>,
@@ -823,17 +844,26 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             SyntaxKind::NullKeyword
                 if matches!(self.node(expression)?.data, NodeData::KeywordExpression(_)) =>
             {
-                Ok(PlannedExpression::Null)
+                Ok(PlannedExpression::new(
+                    expression,
+                    PlannedExpressionKind::Null,
+                ))
             }
             SyntaxKind::TrueKeyword
                 if matches!(self.node(expression)?.data, NodeData::KeywordExpression(_)) =>
             {
-                Ok(PlannedExpression::Boolean(true))
+                Ok(PlannedExpression::new(
+                    expression,
+                    PlannedExpressionKind::Boolean(true),
+                ))
             }
             SyntaxKind::FalseKeyword
                 if matches!(self.node(expression)?.data, NodeData::KeywordExpression(_)) =>
             {
-                Ok(PlannedExpression::Boolean(false))
+                Ok(PlannedExpression::new(
+                    expression,
+                    PlannedExpressionKind::Boolean(false),
+                ))
             }
             SyntaxKind::Identifier => {
                 let node = self.node(expression)?;
@@ -851,7 +881,10 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         SourceSyntaxRole::VariableInitializer,
                     ));
                 }
-                Ok(PlannedExpression::GlobalUndefined)
+                Ok(PlannedExpression::new(
+                    expression,
+                    PlannedExpressionKind::GlobalUndefined,
+                ))
             }
             SyntaxKind::StringLiteral => {
                 let value = {
@@ -871,7 +904,10 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     literal.text.clone()
                 };
                 self.strings.push(value.clone());
-                Ok(PlannedExpression::String(value))
+                Ok(PlannedExpression::new(
+                    expression,
+                    PlannedExpressionKind::String(value),
+                ))
             }
             SyntaxKind::NoSubstitutionTemplateLiteral => {
                 let value = {
@@ -891,23 +927,32 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     literal.text.clone()
                 };
                 self.strings.push(value.clone());
-                Ok(PlannedExpression::String(value))
+                Ok(PlannedExpression::new(
+                    expression,
+                    PlannedExpressionKind::String(value),
+                ))
             }
             SyntaxKind::NumericLiteral => {
                 let value = self.plan_numeric_literal(expression)?;
                 self.numbers.push(value);
-                Ok(PlannedExpression::Number {
-                    value,
-                    unary_operand: None,
-                })
+                Ok(PlannedExpression::new(
+                    expression,
+                    PlannedExpressionKind::Number {
+                        value,
+                        unary_operand: None,
+                    },
+                ))
             }
             SyntaxKind::BigIntLiteral => {
                 let value = self.plan_bigint_literal(expression)?;
                 self.bigints.push(value.clone());
-                Ok(PlannedExpression::BigInt {
-                    value,
-                    unary_operand: None,
-                })
+                Ok(PlannedExpression::new(
+                    expression,
+                    PlannedExpressionKind::BigInt {
+                        value,
+                        unary_operand: None,
+                    },
+                ))
             }
             SyntaxKind::ParenthesizedExpression => {
                 let inner_id = {
@@ -930,7 +975,10 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         SourceSyntaxRole::VariableInitializer,
                     ));
                 }
-                self.plan_expression(inner)
+                Ok(PlannedExpression::new(
+                    expression,
+                    PlannedExpressionKind::Parenthesized(Box::new(self.plan_expression(inner)?)),
+                ))
             }
             SyntaxKind::PrefixUnaryExpression => self.plan_prefix_unary(expression),
             SyntaxKind::ObjectLiteralExpression => self.plan_object_literal(expression),
@@ -978,7 +1026,10 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         for initializer in plan.property_type_nodes() {
             properties.push(self.plan_expression(initializer)?);
         }
-        Ok(PlannedExpression::Object { plan, properties })
+        Ok(PlannedExpression::new(
+            expression,
+            PlannedExpressionKind::Object { plan, properties },
+        ))
     }
 
     fn object_plan_error(
@@ -1082,20 +1133,26 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 let value = -positive;
                 self.numbers.push(positive);
                 self.numbers.push(value);
-                Ok(PlannedExpression::Number {
-                    value,
-                    unary_operand: Some(positive),
-                })
+                Ok(PlannedExpression::new(
+                    expression,
+                    PlannedExpressionKind::Number {
+                        value,
+                        unary_operand: Some(positive),
+                    },
+                ))
             }
             SyntaxKind::BigIntLiteral => {
                 let positive = self.plan_bigint_literal(operand)?;
                 let value = PseudoBigInt::new(&positive.base10_value, true);
                 self.bigints.push(positive.clone());
                 self.bigints.push(value.clone());
-                Ok(PlannedExpression::BigInt {
-                    value,
-                    unary_operand: Some(positive),
-                })
+                Ok(PlannedExpression::new(
+                    expression,
+                    PlannedExpressionKind::BigInt {
+                        value,
+                        unary_operand: Some(positive),
+                    },
+                ))
             }
             _ => Err(self.unsupported(operand, operand_kind, SourceSyntaxRole::PrefixUnaryOperand)),
         }
@@ -1237,14 +1294,16 @@ fn expression_type(
     expression: &PlannedExpression,
     prepared: &PreparedExpression,
 ) -> Result<TypeId, SourceCheckError> {
-    match (expression, prepared) {
-        (PlannedExpression::Null, PreparedExpression::Literal(LiteralTreatment::Identity)) => store
-            .intrinsic_bootstrap()
-            .map(|bootstrap| bootstrap.null_widening_type)
-            .ok_or(SourceCheckError::LiteralCache(
-                SourceLiteralCacheError::BootstrapUninitialized,
-            )),
-        (PlannedExpression::Boolean(value), PreparedExpression::Literal(treatment)) => {
+    match (&expression.kind, prepared) {
+        (PlannedExpressionKind::Null, PreparedExpression::Literal(LiteralTreatment::Identity)) => {
+            store
+                .intrinsic_bootstrap()
+                .map(|bootstrap| bootstrap.null_widening_type)
+                .ok_or(SourceCheckError::LiteralCache(
+                    SourceLiteralCacheError::BootstrapUninitialized,
+                ))
+        }
+        (PlannedExpressionKind::Boolean(value), PreparedExpression::Literal(treatment)) => {
             let (regular, widened) = store
                 .intrinsic_bootstrap()
                 .map(|bootstrap| {
@@ -1263,7 +1322,7 @@ fn expression_type(
             prepared_literal_type(store, regular, widened, *treatment)
         }
         (
-            PlannedExpression::GlobalUndefined,
+            PlannedExpressionKind::GlobalUndefined,
             PreparedExpression::Literal(LiteralTreatment::Identity),
         ) => store
             .intrinsic_bootstrap()
@@ -1271,7 +1330,7 @@ fn expression_type(
             .ok_or(SourceCheckError::LiteralCache(
                 SourceLiteralCacheError::BootstrapUninitialized,
             )),
-        (PlannedExpression::String(value), PreparedExpression::Literal(treatment)) => {
+        (PlannedExpressionKind::String(value), PreparedExpression::Literal(treatment)) => {
             let regular = store.regular_string_literal_type(value.clone())?;
             let widened = store
                 .intrinsic_bootstrap()
@@ -1282,7 +1341,7 @@ fn expression_type(
             prepared_literal_type(store, regular, widened, *treatment)
         }
         (
-            PlannedExpression::Number {
+            PlannedExpressionKind::Number {
                 value,
                 unary_operand,
             },
@@ -1301,7 +1360,7 @@ fn expression_type(
             prepared_literal_type(store, regular, widened, *treatment)
         }
         (
-            PlannedExpression::BigInt {
+            PlannedExpressionKind::BigInt {
                 value,
                 unary_operand,
             },
@@ -1320,9 +1379,14 @@ fn expression_type(
             prepared_literal_type(store, regular, widened, *treatment)
         }
         (
-            PlannedExpression::Object { plan, properties },
+            PlannedExpressionKind::Parenthesized(inner),
+            PreparedExpression::Parenthesized(prepared),
+        ) => expression_type(store, inner, prepared),
+        (
+            PlannedExpressionKind::Object { plan, properties },
             PreparedExpression::Object(prepared_properties),
         ) => {
+            debug_assert_eq!(expression.node, plan.node);
             debug_assert_eq!(properties.len(), prepared_properties.len());
             super::object_members::object_literal_state(store, plan)
                 .map_err(source_object_execution_error)?;
@@ -2831,7 +2895,7 @@ mod tests {
             "interface Child { id: number; value: string } ",
             "type Config = { count: number }; ",
             r#"const child: Child = { id: 1, value: "ok", extra: true }; "#,
-            "const config: Config = { count: 1, surplus: false };",
+            "const config: Config = ({ count: 1, surplus: false });",
         ));
         let file = FileId::new(96);
         let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
@@ -3787,10 +3851,11 @@ mod tests {
         };
 
         let store = context.store_mut_for_test();
+        let node = NodeRef::new(source.arena.id(), file, source.source_file);
         assert_eq!(
             expression_type(
                 store,
-                &PlannedExpression::Boolean(true),
+                &PlannedExpression::new(node, PlannedExpressionKind::Boolean(true)),
                 &PreparedExpression::Literal(LiteralTreatment::Fresh),
             ),
             Ok(true_type)
@@ -3798,7 +3863,7 @@ mod tests {
         assert_eq!(
             expression_type(
                 store,
-                &PlannedExpression::Boolean(false),
+                &PlannedExpression::new(node, PlannedExpressionKind::Boolean(false)),
                 &PreparedExpression::Literal(LiteralTreatment::Fresh),
             ),
             Ok(false_type)
@@ -3806,7 +3871,7 @@ mod tests {
         assert_eq!(
             expression_type(
                 store,
-                &PlannedExpression::Null,
+                &PlannedExpression::new(node, PlannedExpressionKind::Null),
                 &PreparedExpression::Literal(LiteralTreatment::Identity),
             ),
             Ok(null_widening)
