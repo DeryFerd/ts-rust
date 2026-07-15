@@ -158,6 +158,12 @@ pub enum CanonicalDeclarationError {
     InvalidLocalSymbol(SemanticSymbolId),
     /// An exported-symbol link references a symbol outside this store.
     InvalidExportSymbol(SemanticSymbolId),
+    /// The supplied export is not the declaration's canonical symbol slot.
+    ExportSymbolMismatch {
+        node: NodeRef,
+        actual: Option<SemanticSymbolId>,
+        export: SemanticSymbolId,
+    },
     /// A dynamic computed name must take the explicit computed-name path.
     DynamicNameRequiresComputed(NodeRef),
     /// Declaration naming depends on the not-yet-canonicalized JS file-kind
@@ -187,6 +193,11 @@ impl std::fmt::Display for CanonicalDeclarationError {
             Self::InvalidParent(_) => formatter.write_str("invalid canonical parent symbol"),
             Self::InvalidLocalSymbol(_) => formatter.write_str("invalid canonical local symbol"),
             Self::InvalidExportSymbol(_) => formatter.write_str("invalid canonical export symbol"),
+            Self::ExportSymbolMismatch { node, .. } => write!(
+                formatter,
+                "AST node {:?} does not contain the supplied export symbol",
+                node.node
+            ),
             Self::DynamicNameRequiresComputed(node) => write!(
                 formatter,
                 "dynamic name on AST node {:?} requires the computed-name declaration path",
@@ -730,6 +741,13 @@ impl CanonicalBinder {
         else {
             return Err(CanonicalDeclarationError::UnboundNode(node));
         };
+        if binding.symbol != Some(export) {
+            return Err(CanonicalDeclarationError::ExportSymbolMismatch {
+                node,
+                actual: binding.symbol,
+                export,
+            });
+        }
         let local_record = self
             .symbols
             .symbol(local)
@@ -792,7 +810,7 @@ impl CanonicalBinder {
         parent: Option<SemanticSymbolId>,
         is_computed_name: bool,
     ) -> Result<PreparedDeclaration, CanonicalDeclarationError> {
-        if assignment_name_requires_javascript_file_kind(arena, node.node) {
+        if !is_computed_name && assignment_name_requires_javascript_file_kind(arena, node.node) {
             return Err(CanonicalDeclarationError::JavaScriptFileKindRequired(node));
         }
         if !is_computed_name && has_dynamic_name(arena, node.node) {
@@ -1458,15 +1476,33 @@ fn is_exports_identifier(arena: &NodeArena, node: NodeId) -> bool {
 }
 
 fn is_module_exports_access(arena: &NodeArena, node: NodeId) -> bool {
-    matches!(
-        arena.get(node).map(|node| &node.data),
+    let (base, name) = match arena.get(node).map(|node| &node.data) {
         Some(NodeData::PropertyAccessExpression(access))
             if arena
-                .get(access.expression)
-                .is_some_and(|base| base.kind == SyntaxKind::Identifier)
-                && node_text(arena, access.expression).as_deref() == Some("module")
-                && node_text(arena, access.name).as_deref() == Some("exports")
-    )
+                .get(access.name)
+                .is_some_and(|name| name.kind == SyntaxKind::Identifier) =>
+        {
+            (access.expression, access.name)
+        }
+        Some(NodeData::ElementAccessExpression(access)) => {
+            let Some(name) = skip_parentheses(arena, access.argument_expression) else {
+                return false;
+            };
+            if !arena
+                .get(name)
+                .is_some_and(|name| is_string_or_numeric_literal_like(name.kind))
+            {
+                return false;
+            }
+            (access.expression, name)
+        }
+        _ => return false,
+    };
+    arena
+        .get(base)
+        .is_some_and(|base| base.kind == SyntaxKind::Identifier)
+        && node_text(arena, base).as_deref() == Some("module")
+        && node_text(arena, name).as_deref() == Some("exports")
 }
 
 fn is_bindable_object_define_property_call(arena: &NodeArena, node: NodeId) -> bool {
@@ -1507,7 +1543,13 @@ fn is_bindable_static_access_expression(
     exclude_this_keyword: bool,
 ) -> bool {
     let Some(base) = (match arena.get(node).map(|node| &node.data) {
-        Some(NodeData::PropertyAccessExpression(access)) => Some(access.expression),
+        Some(NodeData::PropertyAccessExpression(access))
+            if arena
+                .get(access.name)
+                .is_some_and(|name| name.kind == SyntaxKind::Identifier) =>
+        {
+            Some(access.expression)
+        }
         Some(NodeData::ElementAccessExpression(access))
             if arena
                 .get(access.argument_expression)
@@ -2781,6 +2823,29 @@ mod tests {
                 SymbolFlags::NONE,
             )
             .unwrap();
+        assert_eq!(
+            binder.link_exported_declaration(
+                node_ref(&parsed.arena, file, functions[0]),
+                local,
+                parent,
+            ),
+            Err(CanonicalDeclarationError::ExportSymbolMismatch {
+                node: node_ref(&parsed.arena, file, functions[0]),
+                actual: Some(first),
+                export: parent,
+            })
+        );
+        assert_eq!(
+            binder.symbol_store().symbol(local).unwrap().export_symbol(),
+            None
+        );
+        assert_eq!(
+            binder
+                .file(file)
+                .unwrap()
+                .local_symbol(node_ref(&parsed.arena, file, functions[0])),
+            None
+        );
         binder
             .link_exported_declaration(node_ref(&parsed.arena, file, functions[0]), local, first)
             .unwrap();
@@ -3040,7 +3105,7 @@ mod tests {
     #[test]
     fn javascript_only_assignment_names_wait_for_a_canonical_file_kind() {
         let parsed = parse_source_file(
-            "this.field = 1; module.exports = value; Object.defineProperty(exports, \"name\", {});",
+            "this.field = 1; module.exports = value; module[\"exports\"] = value; Object.defineProperty(exports, \"name\", {});",
         );
         let this_assignment = node_with_source(
             &parsed.arena,
@@ -3051,6 +3116,11 @@ mod tests {
             &parsed.arena,
             SyntaxKind::BinaryExpression,
             "module.exports = value",
+        );
+        let module_element_assignment = node_with_source(
+            &parsed.arena,
+            SyntaxKind::BinaryExpression,
+            "module[\"exports\"] = value",
         );
         let define_property = node_with_source(
             &parsed.arena,
@@ -3063,7 +3133,12 @@ mod tests {
             .bind_source_file(&parsed.arena, parsed.source_file, file)
             .unwrap();
         let table = binder.create_symbol_table();
-        for declaration in [this_assignment, module_assignment, define_property] {
+        for declaration in [
+            this_assignment,
+            module_assignment,
+            module_element_assignment,
+            define_property,
+        ] {
             assert_eq!(
                 binder.declare_symbol(
                     &parsed.arena,
@@ -3079,16 +3154,39 @@ mod tests {
                 ))
             );
         }
-        let bound = binder.file(file).unwrap();
-        assert_eq!(bound.symbol_count(), 0);
-        assert_eq!(bound.classifiable_names().count(), 0);
-        assert!(bound.diagnostics().is_empty());
+        assert_eq!(binder.file(file).unwrap().symbol_count(), 0);
         assert!(
             binder
                 .symbol_store()
                 .symbol_table(table)
                 .unwrap()
                 .is_empty()
+        );
+
+        let computed = binder
+            .declare_symbol_ex(
+                &parsed.arena,
+                file,
+                table,
+                None,
+                module_assignment,
+                SymbolFlags::ASSIGNMENT,
+                SymbolFlags::NONE,
+                false,
+                true,
+            )
+            .unwrap();
+        let bound = binder.file(file).unwrap();
+        assert_eq!(bound.symbol_count(), 1);
+        assert_eq!(bound.classifiable_names().count(), 0);
+        assert!(bound.diagnostics().is_empty());
+        assert_eq!(
+            binder
+                .symbol_store()
+                .symbol_table(table)
+                .unwrap()
+                .get(InternalSymbolName::Computed.as_ref()),
+            Some(computed)
         );
     }
 
