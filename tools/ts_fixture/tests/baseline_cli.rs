@@ -92,6 +92,87 @@ fn filters_limits_and_reports_matches() {
 }
 
 #[test]
+fn canonical_checker_matches_pinned_simple_multi_file_diagnostic_baseline() {
+    let repository = TestRepository::new();
+    repository.write_case(
+        "simpleTestMultiFile",
+        concat!(
+            "// @filename: /src/foo.ts\r\n",
+            "const x: number = \"\";\r\n",
+            "\r\n",
+            "// @filename: /src/bar.ts\r\n",
+            "const y: string = 1;",
+        ),
+        None,
+    );
+    repository.write_baseline(
+        "simpleTestMultiFile.errors.txt",
+        concat!(
+            "/src/bar.ts(1,7): error TS2322: Type 'number' is not assignable to type 'string'.\r\n",
+            "/src/foo.ts(1,7): error TS2322: Type 'string' is not assignable to type 'number'.\r\n",
+            "\r\n",
+            "\r\n",
+            "==== /src/foo.ts (1 errors) ====\r\n",
+            "    const x: number = \"\";\r\n",
+            "          ~\r\n",
+            "!!! error TS2322: Type 'string' is not assignable to type 'number'.\r\n",
+            "    \r\n",
+            "==== /src/bar.ts (1 errors) ====\r\n",
+            "    const y: string = 1;\r\n",
+            "          ~\r\n",
+            "!!! error TS2322: Type 'number' is not assignable to type 'string'.",
+        ),
+    );
+
+    let scorecard_path = repository.0.join("canonical-scorecard.json");
+    let output = run(
+        &repository.0,
+        &[
+            "--diagnostics",
+            "--canonical-checker",
+            "--scorecard-json",
+            scorecard_path.to_str().unwrap(),
+            "--filter",
+            "simpleTestMultiFile",
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("selected_cases=1 executed_variants=1 matched=1 mismatched=0"));
+    assert!(stdout.contains("diagnostic_comparison=full-artifact exact_matches=1"));
+    let scorecard: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(scorecard_path).unwrap()).unwrap();
+    assert_eq!(scorecard["schemaVersion"], 3);
+    assert_eq!(scorecard["checkerMode"], "canonical");
+}
+
+#[test]
+fn canonical_checker_cli_rejects_non_diagnostic_modes() {
+    let repository = TestRepository::new();
+    let artifact = run(&repository.0, &["--canonical-checker"]);
+    assert_eq!(artifact.status.code(), Some(2));
+    assert_eq!(
+        String::from_utf8(artifact.stderr).unwrap(),
+        "error: --canonical-checker requires --diagnostics\n"
+    );
+
+    let manifest = run(
+        &repository.0,
+        &["--diagnostics", "--canonical-checker", "--manifest"],
+    );
+    assert_eq!(manifest.status.code(), Some(2));
+    assert_eq!(
+        String::from_utf8(manifest.stderr).unwrap(),
+        "error: --canonical-checker cannot be used with --manifest\n"
+    );
+}
+
+#[test]
 fn manifest_is_deterministic_and_excludes_unrelated_suites() {
     let repository = TestRepository::new();
     repository.write_case("zeta", "// @noLib: true\nconst zeta = 1;\n", None);
@@ -280,7 +361,8 @@ fn writes_deterministic_structured_full_artifact_scorecard() {
     assert_eq!(first_json, fs::read_to_string(second_path).unwrap());
 
     let scorecard: serde_json::Value = serde_json::from_str(&first_json).unwrap();
-    assert_eq!(scorecard["schemaVersion"], 2);
+    assert_eq!(scorecard["schemaVersion"], 3);
+    assert_eq!(scorecard["checkerMode"], "legacy");
     assert_eq!(scorecard["comparisonScope"], "full_artifact");
     assert_eq!(scorecard["fullArtifactComparison"], true);
     assert_eq!(scorecard["summary"]["executedVariants"], 2);

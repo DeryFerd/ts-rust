@@ -225,6 +225,12 @@ pub struct RunnerOptions {
     pub limit: Option<usize>,
     /// Compare compiler diagnostics with upstream `.errors.txt` baselines instead of emit.
     pub diagnostics: bool,
+    /// Check through the experimental canonical diagnostics-only pipeline.
+    ///
+    /// This mode is intentionally unavailable to emitted-output and manifest
+    /// runs. Unsupported canonical boundaries are retained on each option
+    /// variant so a corpus run can continue without falling back to legacy.
+    pub canonical_checker: bool,
     /// Print the discovered corpus/oracle manifest without compiling cases.
     pub manifest: bool,
     /// Write a deterministic machine-readable diagnostic scorecard to this path.
@@ -237,6 +243,14 @@ pub struct RunnerOptions {
 pub enum DiagnosticComparisonScope {
     /// The complete, non-pretty `.errors.txt` artifact was compared byte for byte.
     FullArtifact,
+}
+
+/// Whole-checker pipeline used to produce a diagnostic scorecard.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiagnosticCheckerMode {
+    Legacy,
+    Canonical,
 }
 
 /// Deterministic outcome category for one diagnostic fixture variant.
@@ -351,6 +365,7 @@ pub struct DiagnosticArtifactDifference {
 #[serde(rename_all = "camelCase")]
 pub struct DiagnosticScorecard {
     pub schema_version: u32,
+    pub checker_mode: DiagnosticCheckerMode,
     pub comparison_scope: DiagnosticComparisonScope,
     pub full_artifact_comparison: bool,
     pub summary: DiagnosticScorecardSummary,
@@ -417,6 +432,12 @@ pub fn run_upstream_baselines(
     options: &RunnerOptions,
     writer: &mut impl Write,
 ) -> io::Result<RunnerSummary> {
+    if options.canonical_checker {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the canonical checker is diagnostics-only and cannot run emitted-output baselines",
+        ));
+    }
     let manifest = discover_upstream_manifest(repository)?;
     let manifest_summary = manifest.summary();
     let mut cases = Vec::new();
@@ -560,8 +581,17 @@ pub fn run_upstream_diagnostic_baselines(
         selected_cases: cases.len(),
         ..RunnerSummary::default()
     };
+    let checker = if options.canonical_checker {
+        FixtureChecker::Canonical
+    } else {
+        FixtureChecker::Legacy
+    };
     let mut scorecard = DiagnosticScorecard {
-        schema_version: 2,
+        schema_version: 3,
+        checker_mode: match checker {
+            FixtureChecker::Legacy => DiagnosticCheckerMode::Legacy,
+            FixtureChecker::Canonical => DiagnosticCheckerMode::Canonical,
+        },
         comparison_scope: DiagnosticComparisonScope::FullArtifact,
         full_artifact_comparison: true,
         summary: DiagnosticScorecardSummary {
@@ -585,7 +615,7 @@ pub fn run_upstream_diagnostic_baselines(
         let candidates = baseline_files
             .get(case_name)
             .map_or_else(Vec::new, |paths| paths.iter().collect::<Vec<_>>());
-        for (variant, compilation) in compile_case_matrix(&case)? {
+        for (variant, compilation) in compile_case_matrix_with_checker(&case, checker)? {
             summary.executed_variants += 1;
             let selected = select_variant_baselines_with(
                 &candidates,
@@ -2277,11 +2307,11 @@ fn compare_section_multisets(
 /// Returns an I/O error only if the in-memory fixture filesystem rejects a
 /// virtual source path.
 pub fn compile_case(case: &Case) -> std::io::Result<Compilation> {
-    let variant = expand_option_matrix(case)
+    let mut variant = expand_option_matrix(case)
         .into_iter()
         .next()
         .unwrap_or_default();
-    compile_case_variant(case, &variant)
+    compile_case_variant(case, &mut variant, FixtureChecker::Legacy)
 }
 
 /// Compiles every scalar compiler-option variant in deterministic order.
@@ -2290,10 +2320,24 @@ pub fn compile_case(case: &Case) -> std::io::Result<Compilation> {
 ///
 /// Returns an I/O error if the fixture filesystem rejects a virtual source.
 pub fn compile_case_matrix(case: &Case) -> std::io::Result<Vec<(OptionVariant, Compilation)>> {
+    compile_case_matrix_with_checker(case, FixtureChecker::Legacy)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FixtureChecker {
+    Legacy,
+    Canonical,
+}
+
+fn compile_case_matrix_with_checker(
+    case: &Case,
+    checker: FixtureChecker,
+) -> std::io::Result<Vec<(OptionVariant, Compilation)>> {
     expand_option_matrix(case)
         .into_iter()
-        .map(|variant| {
-            compile_case_variant(case, &variant).map(|compilation| (variant, compilation))
+        .map(|mut variant| {
+            compile_case_variant(case, &mut variant, checker)
+                .map(|compilation| (variant, compilation))
         })
         .collect()
 }
@@ -2323,7 +2367,11 @@ pub fn run_case_against_baseline(case: &Case, baseline: &str) -> std::io::Result
 }
 
 #[allow(clippy::too_many_lines)]
-fn compile_case_variant(case: &Case, variant: &OptionVariant) -> std::io::Result<Compilation> {
+fn compile_case_variant(
+    case: &Case,
+    variant: &mut OptionVariant,
+    checker: FixtureChecker,
+) -> std::io::Result<Compilation> {
     let file_system = MemoryFileSystem::new(true);
     let project_directory = project_config_unit(case).and_then(|(path, _)| {
         path.rsplit_once('/')
@@ -2423,13 +2471,33 @@ fn compile_case_variant(case: &Case, variant: &OptionVariant) -> std::io::Result
         .as_deref()
         .or_else(|| case.directive_values("currentDirectory").next())
         .unwrap_or_else(|| virtual_unit_root(case));
-    let program = ts_compiler::Program::new_with_options(
-        &file_system,
-        current_directory,
-        &roots,
-        compiler_options,
-    );
-    let emit = program.emit();
+    let program = match checker {
+        FixtureChecker::Legacy => ts_compiler::Program::new_with_options(
+            &file_system,
+            current_directory,
+            &roots,
+            compiler_options,
+        ),
+        FixtureChecker::Canonical => {
+            match ts_compiler::Program::try_new_with_canonical_checker(
+                &file_system,
+                current_directory,
+                &roots,
+                compiler_options,
+            ) {
+                Ok(program) => program,
+                Err(error) if error.is_unsupported_boundary() => {
+                    variant
+                        .unsupported_details
+                        .push(format!("experimental canonical checker: {error}"));
+                    variant.unsupported_details.sort();
+                    variant.unsupported_details.dedup();
+                    return Ok(Compilation::default());
+                }
+                Err(error) => return Err(io::Error::new(io::ErrorKind::InvalidData, error)),
+            }
+        }
+    };
     // The Go harness baselines pre-emit program/syntactic/semantic/global and
     // declaration diagnostics. Emit-result diagnostics are not part of that
     // stream, so use Program's aggregate as the closest available Rust API.
@@ -2461,11 +2529,15 @@ fn compile_case_variant(case: &Case, variant: &OptionVariant) -> std::io::Result
     let ordered = diagnostics.iter().collect::<Vec<_>>();
     let mut unsupported_details = Vec::new();
     let diagnostic_text = render_diagnostic_header(case, &ordered, &mut unsupported_details);
-    let outputs = emit
-        .files
-        .into_iter()
-        .map(|output| (output.file_name, output.text))
-        .collect();
+    let outputs = match checker {
+        FixtureChecker::Legacy => program
+            .emit()
+            .files
+            .into_iter()
+            .map(|output| (output.file_name, output.text))
+            .collect(),
+        FixtureChecker::Canonical => BTreeMap::new(),
+    };
     Ok(Compilation {
         diagnostics,
         diagnostic_text,
@@ -3338,13 +3410,14 @@ mod tests {
 
     use super::{
         Case, CompilationDiagnostic, CompilationDiagnosticCategory, CompilationRelatedInformation,
-        DiagnosticArtifactMismatchKind, OptionVariant, OutputDifferenceKind, ParseError,
-        compare_case_emitted_output_sections, compare_diagnostic_artifacts,
-        compare_emitted_output_sections, compile_case, compile_case_matrix,
-        error_baseline_unit_order, expand_option_matrix, first_different_line,
-        fixture_compiler_options, matrix_axes, parse_baseline_sections,
-        parse_error_baseline_header, render_error_baseline, run_case_against_baseline,
-        select_variant_baselines, virtual_unit_path,
+        DiagnosticArtifactMismatchKind, DiagnosticVariantStatus, FixtureChecker, OptionVariant,
+        OutputDifferenceKind, ParseError, RunnerOptions, compare_case_emitted_output_sections,
+        compare_diagnostic_artifacts, compare_emitted_output_sections, compile_case,
+        compile_case_matrix, compile_case_matrix_with_checker, error_baseline_unit_order,
+        expand_option_matrix, first_different_line, fixture_compiler_options, matrix_axes,
+        parse_baseline_sections, parse_error_baseline_header, render_error_baseline,
+        run_case_against_baseline, run_upstream_baselines, select_variant_baselines,
+        virtual_unit_path,
     };
 
     #[test]
@@ -3389,6 +3462,139 @@ mod tests {
                 .keys()
                 .any(|path| path.ends_with("node_modules/pkg/index.js"))
         );
+    }
+
+    #[test]
+    fn canonical_checker_matches_pinned_simple_multi_file_diagnostics_exactly() {
+        // This is the pinned source verbatim: there is deliberately no `noLib`
+        // or `lib` directive, so the fixture's default library closure (and its
+        // foundational lib.es5 declarations) participates in canonical setup.
+        let case = Case::parse(
+            "testdata/tests/cases/compiler/simpleTestMultiFile.ts",
+            concat!(
+                "// @filename: /src/foo.ts\r\n",
+                "const x: number = \"\";\r\n",
+                "\r\n",
+                "// @filename: /src/bar.ts\r\n",
+                "const y: string = 1;",
+            ),
+        )
+        .unwrap();
+        let mut runs = compile_case_matrix_with_checker(&case, FixtureChecker::Canonical).unwrap();
+        assert_eq!(runs.len(), 1);
+        let (variant, compilation) = runs.remove(0);
+
+        assert!(
+            variant.unsupported_details.is_empty(),
+            "{:?}",
+            variant.unsupported_details
+        );
+        assert!(compilation.outputs.is_empty());
+        assert_eq!(compilation.diagnostics.len(), 2);
+        assert_eq!(
+            compilation
+                .diagnostics
+                .iter()
+                .map(|diagnostic| (
+                    diagnostic.file_name.as_deref(),
+                    diagnostic.range,
+                    diagnostic.code,
+                    diagnostic.message.as_str(),
+                ))
+                .collect::<Vec<_>>(),
+            [
+                (
+                    Some("/src/bar.ts"),
+                    Some(TextRange::new(TextPos::new(6), TextPos::new(7))),
+                    Some(2322),
+                    "Type 'number' is not assignable to type 'string'.",
+                ),
+                (
+                    Some("/src/foo.ts"),
+                    Some(TextRange::new(TextPos::new(6), TextPos::new(7))),
+                    Some(2322),
+                    "Type 'string' is not assignable to type 'number'.",
+                ),
+            ]
+        );
+
+        let artifact = render_error_baseline(&case, &compilation.diagnostics);
+        assert!(
+            artifact.unsupported_details.is_empty(),
+            "{:?}",
+            artifact.unsupported_details
+        );
+        assert_eq!(
+            artifact.text,
+            concat!(
+                "/src/bar.ts(1,7): error TS2322: Type 'number' is not assignable to type 'string'.\r\n",
+                "/src/foo.ts(1,7): error TS2322: Type 'string' is not assignable to type 'number'.\r\n",
+                "\r\n",
+                "\r\n",
+                "==== /src/foo.ts (1 errors) ====\r\n",
+                "    const x: number = \"\";\r\n",
+                "          ~\r\n",
+                "!!! error TS2322: Type 'string' is not assignable to type 'number'.\r\n",
+                "    \r\n",
+                "==== /src/bar.ts (1 errors) ====\r\n",
+                "    const y: string = 1;\r\n",
+                "          ~\r\n",
+                "!!! error TS2322: Type 'number' is not assignable to type 'string'.",
+            )
+        );
+    }
+
+    #[test]
+    fn canonical_checker_retains_typed_failures_as_variant_unsupported_details() {
+        let case = Case::parse(
+            "unsupported.tsx",
+            "// @noLib: true\nconst value: number = 1;\n",
+        )
+        .unwrap();
+        let legacy = compile_case(&case).unwrap();
+        assert!(legacy.diagnostics.is_empty(), "{:?}", legacy.diagnostics);
+        assert!(!legacy.outputs.is_empty());
+
+        let mut runs = compile_case_matrix_with_checker(&case, FixtureChecker::Canonical).unwrap();
+        assert_eq!(runs.len(), 1);
+        let (variant, compilation) = runs.remove(0);
+
+        assert!(compilation.diagnostics.is_empty());
+        assert!(compilation.outputs.is_empty());
+        assert_eq!(variant.unsupported_details.len(), 1);
+        assert!(
+            variant.unsupported_details[0]
+                .contains("canonical checking does not support Tsx source '/.src/unsupported.tsx'"),
+            "{:?}",
+            variant.unsupported_details
+        );
+
+        let mut artifact = render_error_baseline(&case, &compilation.diagnostics);
+        artifact
+            .unsupported_details
+            .extend(variant.unsupported_details);
+        let comparison = compare_diagnostic_artifacts("", &artifact, &compilation.diagnostics);
+        assert_eq!(
+            comparison.status(),
+            DiagnosticVariantStatus::UnsupportedDetail
+        );
+    }
+
+    #[test]
+    fn canonical_checker_rejects_emitted_output_runner_api() {
+        let mut output = Vec::new();
+        let error = run_upstream_baselines(
+            Path::new("does-not-need-to-exist"),
+            &RunnerOptions {
+                canonical_checker: true,
+                ..RunnerOptions::default()
+            },
+            &mut output,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("diagnostics-only"));
+        assert!(output.is_empty());
     }
 
     #[test]

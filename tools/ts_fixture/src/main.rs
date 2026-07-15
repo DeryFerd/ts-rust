@@ -55,6 +55,7 @@ fn parse_arguments(arguments: &[String]) -> Result<Option<RunnerOptions>, String
         match arguments[index].as_str() {
             "--help" | "-h" => return Ok(None),
             "--diagnostics" => options.diagnostics = true,
+            "--canonical-checker" => options.canonical_checker = true,
             "--manifest" => options.manifest = true,
             "--scorecard-json" => {
                 index += 1;
@@ -94,6 +95,12 @@ fn parse_arguments(arguments: &[String]) -> Result<Option<RunnerOptions>, String
     if options.scorecard_json.is_some() && options.manifest {
         return Err("--scorecard-json cannot be used with --manifest".to_owned());
     }
+    if options.canonical_checker && !options.diagnostics {
+        return Err("--canonical-checker requires --diagnostics".to_owned());
+    }
+    if options.canonical_checker && options.manifest {
+        return Err("--canonical-checker cannot be used with --manifest".to_owned());
+    }
     Ok(Some(options))
 }
 
@@ -107,13 +114,16 @@ fn required_value(arguments: &[String], index: usize, option: &str) -> Result<St
 
 fn print_help() {
     println!(
-        "Usage: ts_fixture_baseline [--diagnostics] [--scorecard-json FILE] [--manifest] [--filter TEXT] [--skip COUNT] [--limit COUNT]"
+        "Usage: ts_fixture_baseline [--diagnostics] [--canonical-checker] [--scorecard-json FILE] [--manifest] [--filter TEXT] [--skip COUNT] [--limit COUNT]"
     );
     println!(
         "Reads the pinned typescript-go compiler/conformance corpus and actual baselines below TS_GO_REPO."
     );
     println!(
         "--diagnostics compares complete non-pretty .errors.txt artifacts byte for byte; a missing baseline expects no diagnostics."
+    );
+    println!(
+        "--canonical-checker opts diagnostic runs into the experimental canonical checker without emit or legacy fallback."
     );
 }
 
@@ -131,6 +141,7 @@ mod tests {
             "--limit".into(),
             "25".into(),
             "--diagnostics".into(),
+            "--canonical-checker".into(),
             "--scorecard-json".into(),
             "scorecard.json".into(),
         ])
@@ -140,6 +151,7 @@ mod tests {
         assert_eq!(options.skip, 10);
         assert_eq!(options.limit, Some(25));
         assert!(options.diagnostics);
+        assert!(options.canonical_checker);
         assert_eq!(
             options.scorecard_json.as_deref(),
             Some(std::path::Path::new("scorecard.json"))
@@ -159,6 +171,18 @@ mod tests {
         assert!(parse_arguments(&["--skip".into(), "many".into()]).is_err());
         assert!(parse_arguments(&["--unknown".into()]).is_err());
         assert!(parse_arguments(&["--scorecard-json".into(), "scorecard.json".into()]).is_err());
+        assert_eq!(
+            parse_arguments(&["--canonical-checker".into()]),
+            Err("--canonical-checker requires --diagnostics".to_owned())
+        );
+        assert_eq!(
+            parse_arguments(&[
+                "--diagnostics".into(),
+                "--canonical-checker".into(),
+                "--manifest".into(),
+            ]),
+            Err("--canonical-checker cannot be used with --manifest".to_owned())
+        );
         assert!(
             parse_arguments(&[
                 "--diagnostics".into(),

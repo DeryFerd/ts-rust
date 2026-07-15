@@ -8,12 +8,14 @@ use std::{
 use ts_ast::{FileId, Node, NodeData, NodeId, NodeRef, SyntaxKind};
 use ts_binder::{
     BindResult, CanonicalBindError, CanonicalBinder, CanonicalDeclarationError,
-    CanonicalModuleState, CanonicalSourceFileFacts, CanonicalSourceLanguage, EscapedName,
-    SymbolFlags, bind_source_file_in_file,
+    CanonicalModuleState, CanonicalNameResolutionError, CanonicalSourceFileFacts,
+    CanonicalSourceLanguage, EscapedName, SymbolFlags, bind_source_file_in_file,
 };
 use ts_checker::semantic::{
     CanonicalCheckerContext, CanonicalCheckerContextError, CanonicalCheckerOptions,
-    IntrinsicBootstrapOptions, SourceCheckError,
+    CanonicalGlobalInitializationError, CanonicalGlobalTypeInitializationError, DeclaredTypeError,
+    DeclaredTypeUnavailable, IntrinsicBootstrapOptions, RelationUnavailable, SourceCheckError,
+    SymbolMergeError, TypeDisplayUnavailable, TypeNodeUnavailable,
 };
 use ts_checker::{
     CheckDiagnostic, CheckResult, CheckerOptions, EnumConstantValue as CheckerConstantValue,
@@ -193,6 +195,307 @@ pub enum CanonicalProgramCheckError {
         code: u32,
     },
     DiagnosticFormat(FormatError),
+}
+
+impl CanonicalProgramCheckError {
+    /// Returns whether this failure is an explicit, not-yet-ported semantic
+    /// boundary rather than a violated compiler invariant.
+    ///
+    /// Corpus drivers may retain these failures as unsupported coverage. A
+    /// caller must not use the classification to suppress structural,
+    /// provenance, cache, catalog, or diagnostic-conversion failures.
+    #[must_use]
+    pub fn is_unsupported_boundary(&self) -> bool {
+        match self {
+            Self::UnsupportedSourceKind { .. }
+            | Self::FixedModuleFormatUnsupported { .. }
+            | Self::ImportMetaModuleIndicatorUnsupported { .. }
+            | Self::NodeModuleFactsUnsupported { .. }
+            | Self::DeclarationFileCheckingUnsupported { .. }
+            | Self::RelatedInformationUnsupported { .. } => true,
+            Self::DeclarationBind { error, .. } => {
+                canonical_declaration_error_is_unsupported(error)
+            }
+            Self::Context(error) => context_error_is_unsupported(error),
+            Self::SourceCheck { error, .. } => source_check_error_is_unsupported(error),
+            Self::Bind { .. }
+            | Self::MissingBoundFile { .. }
+            | Self::InvalidDiagnosticNode(_)
+            | Self::DiagnosticFormat(_) => false,
+        }
+    }
+}
+
+fn context_error_is_unsupported(error: &CanonicalCheckerContextError) -> bool {
+    match error {
+        CanonicalCheckerContextError::GlobalInitialization(error) => {
+            global_initialization_error_is_unsupported(error)
+        }
+        CanonicalCheckerContextError::Extraction(_)
+        | CanonicalCheckerContextError::DuplicateFileInOrder(_)
+        | CanonicalCheckerContextError::DuplicateArenaInOrder { .. }
+        | CanonicalCheckerContextError::ExtraOrderedFile(_)
+        | CanonicalCheckerContextError::MissingOrderedFile(_)
+        | CanonicalCheckerContextError::ArenaMismatch { .. }
+        | CanonicalCheckerContextError::MissingSourceFileFacts(_)
+        | CanonicalCheckerContextError::SourceFileProvenance { .. }
+        | CanonicalCheckerContextError::MissingSourceFileRoot(_)
+        | CanonicalCheckerContextError::InvalidSourceFileRoot { .. }
+        | CanonicalCheckerContextError::SourceFileHasParent { .. }
+        | CanonicalCheckerContextError::UnboundSourceFile(_)
+        | CanonicalCheckerContextError::BoundNodeNowUnreachable(_)
+        | CanonicalCheckerContextError::NewlyReachableUnboundNode(_)
+        | CanonicalCheckerContextError::ArenaRevisionMismatch { .. }
+        | CanonicalCheckerContextError::UnownedBoundNode(_)
+        | CanonicalCheckerContextError::SourceRegistrationFailed(_)
+        | CanonicalCheckerContextError::Bootstrap(_)
+        | CanonicalCheckerContextError::ModuleResolutions(_)
+        | CanonicalCheckerContextError::AliasTargetHost(_)
+        | CanonicalCheckerContextError::StrictBuiltinIteratorReturnClaim { .. } => false,
+    }
+}
+
+fn global_initialization_error_is_unsupported(error: &CanonicalGlobalInitializationError) -> bool {
+    match error {
+        CanonicalGlobalInitializationError::ScriptGlobalThisDeclaration { .. }
+        | CanonicalGlobalInitializationError::UndefinedValueDeclaration(_) => true,
+        CanonicalGlobalInitializationError::GlobalTypes(error) => {
+            global_type_initialization_error_is_unsupported(error)
+        }
+        CanonicalGlobalInitializationError::Merge(error) => merge_error_is_unsupported(error),
+        CanonicalGlobalInitializationError::MissingBootstrap
+        | CanonicalGlobalInitializationError::MissingFile(_)
+        | CanonicalGlobalInitializationError::MissingSourceFileFacts(_)
+        | CanonicalGlobalInitializationError::InvalidTable { .. }
+        | CanonicalGlobalInitializationError::InvalidGlobals(_)
+        | CanonicalGlobalInitializationError::InvalidSymbol(_)
+        | CanonicalGlobalInitializationError::MissingSourceFileSymbol(_)
+        | CanonicalGlobalInitializationError::InvalidUmdInsertion { .. }
+        | CanonicalGlobalInitializationError::UnexpectedUmdCollision { .. }
+        | CanonicalGlobalInitializationError::InvalidAugmentationName(_)
+        | CanonicalGlobalInitializationError::MissingAugmentationSymbol(_)
+        | CanonicalGlobalInitializationError::MissingAugmentationDeclaration(_)
+        | CanonicalGlobalInitializationError::InvalidDeclarationProvenance(_)
+        | CanonicalGlobalInitializationError::UnexpectedUndefinedCollision
+        | CanonicalGlobalInitializationError::InvalidUndefinedInsertion { .. }
+        | CanonicalGlobalInitializationError::DeclaredTypeHost(_) => false,
+    }
+}
+
+fn global_type_initialization_error_is_unsupported(
+    error: &CanonicalGlobalTypeInitializationError,
+) -> bool {
+    match error {
+        CanonicalGlobalTypeInitializationError::NameResolution(error) => {
+            name_resolution_error_is_unsupported(error)
+        }
+        CanonicalGlobalTypeInitializationError::DeclaredType(error) => {
+            declared_type_error_is_unsupported(error)
+        }
+        CanonicalGlobalTypeInitializationError::MissingBootstrap
+        | CanonicalGlobalTypeInitializationError::InvalidGlobals(_)
+        | CanonicalGlobalTypeInitializationError::InvalidSymbol(_)
+        | CanonicalGlobalTypeInitializationError::InvalidType(_)
+        | CanonicalGlobalTypeInitializationError::InvalidValueSymbolLinks(_)
+        | CanonicalGlobalTypeInitializationError::InvalidAnonymousType
+        | CanonicalGlobalTypeInitializationError::InvalidAnonymousTypeMembers(_)
+        | CanonicalGlobalTypeInitializationError::InvalidGenericTarget(_)
+        | CanonicalGlobalTypeInitializationError::InvalidTypeReference(_)
+        | CanonicalGlobalTypeInitializationError::InvalidInstantiationCache(_) => false,
+    }
+}
+
+fn merge_error_is_unsupported(error: &SymbolMergeError) -> bool {
+    match error {
+        SymbolMergeError::AliasResolutionRequired(_)
+        | SymbolMergeError::DiagnosticRequired { .. }
+        | SymbolMergeError::RecursiveMerge { .. } => true,
+        SymbolMergeError::InvalidSymbol(_)
+        | SymbolMergeError::InvalidTable(_)
+        | SymbolMergeError::InvalidMergedParent(_)
+        | SymbolMergeError::MissingValueDeclarationKind(_)
+        | SymbolMergeError::RedirectInvariant { .. }
+        | SymbolMergeError::StoreInvariant(_) => false,
+    }
+}
+
+fn canonical_declaration_error_is_unsupported(error: &CanonicalDeclarationError) -> bool {
+    match error {
+        CanonicalDeclarationError::JavaScriptDeclarationsDeferred(_)
+        | CanonicalDeclarationError::CommonJsDeclarationsDeferred(_)
+        | CanonicalDeclarationError::UnsupportedDeclarationFamily(_) => true,
+        CanonicalDeclarationError::UnboundFile(_)
+        | CanonicalDeclarationError::WrongArena { .. }
+        | CanonicalDeclarationError::ArenaRevisionMismatch { .. }
+        | CanonicalDeclarationError::UnboundNode(_)
+        | CanonicalDeclarationError::InvalidSymbolTable(_)
+        | CanonicalDeclarationError::InvalidParent(_)
+        | CanonicalDeclarationError::InvalidLocalSymbol(_)
+        | CanonicalDeclarationError::InvalidExportSymbol(_)
+        | CanonicalDeclarationError::ExportSymbolMismatch { .. }
+        | CanonicalDeclarationError::DynamicNameRequiresComputed(_)
+        | CanonicalDeclarationError::JavaScriptFileKindRequired(_)
+        | CanonicalDeclarationError::MissingContainingClassSymbol(_)
+        | CanonicalDeclarationError::MissingSourceFileFacts(_)
+        | CanonicalDeclarationError::DuplicateDeclarationDispatch(_) => false,
+    }
+}
+
+fn source_check_error_is_unsupported(error: &SourceCheckError) -> bool {
+    match error {
+        SourceCheckError::Unsupported(_) => true,
+        SourceCheckError::DeclaredType(error) => declared_type_error_is_unsupported(error),
+        SourceCheckError::RelationUnavailable(error) => relation_error_is_unsupported(error),
+        SourceCheckError::TypeDisplayUnavailable(error) => display_error_is_unsupported(error),
+        SourceCheckError::Provenance(_)
+        | SourceCheckError::LiteralCache(_)
+        | SourceCheckError::MissingDiagnostic(_) => false,
+    }
+}
+
+fn declared_type_error_is_unsupported(error: &DeclaredTypeError) -> bool {
+    match error {
+        DeclaredTypeError::Unavailable(error) => declared_type_unavailable_is_unsupported(error),
+        DeclaredTypeError::TypeNodeUnavailable(error) => type_node_error_is_unsupported(error),
+        DeclaredTypeError::NameResolution(error) => name_resolution_error_is_unsupported(error),
+        DeclaredTypeError::Host(_)
+        | DeclaredTypeError::NameResolverHost(_)
+        | DeclaredTypeError::TypeResolutionTarget(_) => false,
+    }
+}
+
+fn declared_type_unavailable_is_unsupported(error: &DeclaredTypeUnavailable) -> bool {
+    match error {
+        DeclaredTypeUnavailable::UnsupportedDeclaredType(_)
+        | DeclaredTypeUnavailable::UnsupportedInterfaceHeritageResolution(_)
+        | DeclaredTypeUnavailable::UnsupportedOuterTypeParameterContext { .. } => true,
+        DeclaredTypeUnavailable::IntrinsicBootstrapNotInitialized
+        | DeclaredTypeUnavailable::SymbolNotOwned(_)
+        | DeclaredTypeUnavailable::AliasMergedWithDeclaredSymbol(_)
+        | DeclaredTypeUnavailable::MissingDeclarations(_)
+        | DeclaredTypeUnavailable::MissingValueDeclaration(_)
+        | DeclaredTypeUnavailable::MissingOrForeignFacts(_)
+        | DeclaredTypeUnavailable::DeclarationSymbolMismatch(_)
+        | DeclaredTypeUnavailable::InvalidClassDeclaration(_)
+        | DeclaredTypeUnavailable::InvalidInterfaceDeclaration(_)
+        | DeclaredTypeUnavailable::PostGlobalNameResolutionUnavailable
+        | DeclaredTypeUnavailable::InvalidTypeParameterSymbol(_)
+        | DeclaredTypeUnavailable::InvalidTypeParameterDeclaration(_)
+        | DeclaredTypeUnavailable::InvalidCachedDeclaredType { .. } => false,
+    }
+}
+
+fn type_node_error_is_unsupported(error: &TypeNodeUnavailable) -> bool {
+    match error {
+        TypeNodeUnavailable::UnsupportedSyntax { .. }
+        | TypeNodeUnavailable::JsDoc(_)
+        | TypeNodeUnavailable::QualifiedTypeReference(_)
+        | TypeNodeUnavailable::TypeArgumentsUnsupported(_)
+        | TypeNodeUnavailable::MissingTypeReference(_)
+        | TypeNodeUnavailable::ImportAliasTypeReference { .. }
+        | TypeNodeUnavailable::UnsupportedReferenceTarget { .. }
+        | TypeNodeUnavailable::GenericReferenceUnsupported { .. }
+        | TypeNodeUnavailable::JsDocTypeAlias(_)
+        | TypeNodeUnavailable::UnsupportedUnionConstituent(_)
+        | TypeNodeUnavailable::UnsupportedUnionConstituentType(_) => true,
+        TypeNodeUnavailable::InvalidParenthesizedType(_)
+        | TypeNodeUnavailable::InvalidTypeReference(_)
+        | TypeNodeUnavailable::InvalidTypeAliasSymbol(_)
+        | TypeNodeUnavailable::MissingTypeAliasDeclaration(_)
+        | TypeNodeUnavailable::InvalidTypeAliasDeclaration(_)
+        | TypeNodeUnavailable::InvalidCachedTypeAlias(_)
+        | TypeNodeUnavailable::InvalidCachedSymbol { .. }
+        | TypeNodeUnavailable::CheckerOptionMismatch { .. }
+        | TypeNodeUnavailable::DiagnosticOwnerRequired(_)
+        | TypeNodeUnavailable::MissingPlannedTypeAlias(_)
+        | TypeNodeUnavailable::MissingPlannedTypeReference(_)
+        | TypeNodeUnavailable::InvalidLiteralType(_)
+        | TypeNodeUnavailable::MissingPlannedLiteralType(_)
+        | TypeNodeUnavailable::InvalidLiteralCacheValue
+        | TypeNodeUnavailable::InvalidCachedLiteralType(_)
+        | TypeNodeUnavailable::InvalidUnionType(_)
+        | TypeNodeUnavailable::MissingPlannedUnionType(_)
+        | TypeNodeUnavailable::InvalidCachedUnionType(_)
+        | TypeNodeUnavailable::InvalidUnionAlias(_)
+        | TypeNodeUnavailable::InvalidPreparedTypeQuery
+        | TypeNodeUnavailable::LiteralTypeCapacity
+        | TypeNodeUnavailable::ResolutionStackInvariant(_) => false,
+    }
+}
+
+fn name_resolution_error_is_unsupported(error: &CanonicalNameResolutionError) -> bool {
+    match error {
+        CanonicalNameResolutionError::JavaScriptDeferred(_)
+        | CanonicalNameResolutionError::CommonJsDeferred(_)
+        | CanonicalNameResolutionError::JsDocDeferred(_)
+        | CanonicalNameResolutionError::AliasResolutionUnavailable(_) => true,
+        CanonicalNameResolutionError::WrongArena { .. }
+        | CanonicalNameResolutionError::ArenaRevisionMismatch { .. }
+        | CanonicalNameResolutionError::DeclarationsIncomplete(_)
+        | CanonicalNameResolutionError::MissingSourceFileFacts(_)
+        | CanonicalNameResolutionError::InvalidSymbolStore(_)
+        | CanonicalNameResolutionError::UnboundLocation(_)
+        | CanonicalNameResolutionError::InvalidHostSymbol(_)
+        | CanonicalNameResolutionError::InvalidHostTable(_)
+        | CanonicalNameResolutionError::MissingDeclarationSymbol(_)
+        | CanonicalNameResolutionError::MissingArgumentsSymbol
+        | CanonicalNameResolutionError::ForeignDeclarationAstUnavailable(_)
+        | CanonicalNameResolutionError::InvalidSyntheticScope(_)
+        | CanonicalNameResolutionError::MissingSyntheticScope(_)
+        | CanonicalNameResolutionError::SyntheticScopeCycle(_) => false,
+    }
+}
+
+fn relation_error_is_unsupported(error: &RelationUnavailable) -> bool {
+    match error {
+        RelationUnavailable::UnsupportedUnionConstituent(_)
+        | RelationUnavailable::EnumRelation { .. }
+        | RelationUnavailable::LateBoundMembers(_)
+        | RelationUnavailable::RelationKeyTypeReferenceArguments(_)
+        | RelationUnavailable::RelationKeyTypeReferenceTarget(_)
+        | RelationUnavailable::RelationKeyTypeParameterConstraint(_)
+        | RelationUnavailable::RelationKeyCyclicGenericArguments(_)
+        | RelationUnavailable::UnresolvedStructuredMembers(_)
+        | RelationUnavailable::UnsupportedStructuredType(_)
+        | RelationUnavailable::StructuredSignatures(_)
+        | RelationUnavailable::StructuredIndexInfos(_)
+        | RelationUnavailable::UnsupportedProperty(_)
+        | RelationUnavailable::UnresolvedPropertyType(_)
+        | RelationUnavailable::StrictOptionalProperty(_)
+        | RelationUnavailable::UnresolvedGlobalObject(_)
+        | RelationUnavailable::StructuralRelation { .. } => true,
+        RelationUnavailable::MissingBootstrap
+        | RelationUnavailable::Type(_)
+        | RelationUnavailable::Symbol(_)
+        | RelationUnavailable::MalformedLiteral(_)
+        | RelationUnavailable::MalformedUnion(_)
+        | RelationUnavailable::InvalidUnionAlias(_)
+        | RelationUnavailable::InvalidUnionPreparation(_)
+        | RelationUnavailable::UnionValidationCapacity(_)
+        | RelationUnavailable::MalformedStructuredType(_)
+        | RelationUnavailable::MalformedEnumType(_)
+        | RelationUnavailable::InvalidSymbolMembers(_)
+        | RelationUnavailable::RelationKeyType(_)
+        | RelationUnavailable::InvalidUnknownLikeUnionState(_)
+        | RelationUnavailable::InvalidStructuredMembers(_) => false,
+    }
+}
+
+fn display_error_is_unsupported(error: &TypeDisplayUnavailable) -> bool {
+    match error {
+        TypeDisplayUnavailable::Alias { .. }
+        | TypeDisplayUnavailable::UnsupportedType { .. }
+        | TypeDisplayUnavailable::UnsupportedUnionConstituent { .. }
+        | TypeDisplayUnavailable::CyclicType(_)
+        | TypeDisplayUnavailable::UniqueSymbolName(_)
+        | TypeDisplayUnavailable::FullyQualifiedName { .. }
+        | TypeDisplayUnavailable::Utf8TruncationBoundary { .. } => true,
+        TypeDisplayUnavailable::Type(_)
+        | TypeDisplayUnavailable::MalformedType(_)
+        | TypeDisplayUnavailable::InvalidUnion(_)
+        | TypeDisplayUnavailable::InvalidLiteralLinks(_)
+        | TypeDisplayUnavailable::MissingBootstrap => false,
+    }
 }
 
 impl std::fmt::Display for CanonicalProgramCheckError {
@@ -6072,7 +6375,13 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::time::{Duration, Instant};
 
-    use ts_checker::semantic::SourceCheckError;
+    use ts_checker::semantic::{
+        CanonicalCheckerContextError, CanonicalGlobalInitializationError,
+        CanonicalGlobalTypeInitializationError, CanonicalTypeMapperStore, DeclaredTypeError,
+        DeclaredTypeUnavailable, IntrinsicBootstrapOptions, RelationKind, RelationUnavailable,
+        SourceCheckError, SourceCheckProvenanceError, SourceLiteralCacheError, SymbolMergeError,
+        TypeDataKind, TypeDisplayUnavailable, TypeNodeUnavailable, UnsupportedSourceSyntax,
+    };
     use ts_diagnostics::Category;
     use ts_options::{
         CompilerOptions, ModuleDetectionKind, ModuleKind, ModuleResolutionKind, ScriptTarget,
@@ -6080,10 +6389,10 @@ mod tests {
     use ts_vfs::{FileSystem, MemoryFileSystem};
 
     use super::{
-        CanonicalProgramCheckError, FileId, NodeData, Program, SourceFile, SyntaxKind,
-        bind_source_file_in_file, canonical_source_file_facts, defer_export_only_bundle_imports,
-        empty_check_result, parse_source_file, percent_encode_source_map_url,
-        source_file_is_external_module,
+        CanonicalBindError, CanonicalDeclarationError, CanonicalProgramCheckError, FileId,
+        NodeData, Program, SourceFile, SyntaxKind, bind_source_file_in_file,
+        canonical_source_file_facts, defer_export_only_bundle_imports, empty_check_result,
+        parse_source_file, percent_encode_source_map_url, source_file_is_external_module,
     };
 
     #[test]
@@ -6099,6 +6408,171 @@ mod tests {
         );
         assert_eq!(program.source_files().len(), 1);
         assert!(program.source_file("/project/main.ts").is_some());
+    }
+
+    #[test]
+    fn canonical_program_error_classification_accepts_capability_boundaries() {
+        let parsed = parse_source_file("const value: number = 1;");
+        let file = FileId::new(7);
+        let node = ts_ast::NodeRef::new(parsed.arena.id(), file, parsed.source_file);
+        let mut store = CanonicalTypeMapperStore::new();
+        let bootstrap = store
+            .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions::default())
+            .unwrap();
+        let type_id = bootstrap.any_type;
+        let symbol = bootstrap.undefined_symbol;
+
+        let unsupported = [
+            CanonicalProgramCheckError::UnsupportedSourceKind {
+                file_name: "/project/input.tsx".to_owned(),
+                script_kind: ts_path::ScriptKind::Tsx,
+            },
+            CanonicalProgramCheckError::DeclarationBind {
+                file_name: "/project/input.ts".to_owned(),
+                error: CanonicalDeclarationError::UnsupportedDeclarationFamily(node),
+            },
+            CanonicalProgramCheckError::Context(
+                CanonicalCheckerContextError::GlobalInitialization(
+                    CanonicalGlobalInitializationError::ScriptGlobalThisDeclaration {
+                        file,
+                        declaration: node,
+                    },
+                ),
+            ),
+            CanonicalProgramCheckError::Context(
+                CanonicalCheckerContextError::GlobalInitialization(
+                    CanonicalGlobalInitializationError::GlobalTypes(
+                        CanonicalGlobalTypeInitializationError::DeclaredType(
+                            DeclaredTypeError::TypeNodeUnavailable(
+                                TypeNodeUnavailable::TypeArgumentsUnsupported(node),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+            CanonicalProgramCheckError::Context(
+                CanonicalCheckerContextError::GlobalInitialization(
+                    CanonicalGlobalInitializationError::Merge(
+                        SymbolMergeError::AliasResolutionRequired(symbol),
+                    ),
+                ),
+            ),
+            CanonicalProgramCheckError::SourceCheck {
+                file_name: "/project/input.ts".to_owned(),
+                error: SourceCheckError::Unsupported(UnsupportedSourceSyntax::MissingVariableType(
+                    node,
+                )),
+            },
+            CanonicalProgramCheckError::SourceCheck {
+                file_name: "/project/input.ts".to_owned(),
+                error: SourceCheckError::DeclaredType(DeclaredTypeError::TypeNodeUnavailable(
+                    TypeNodeUnavailable::TypeArgumentsUnsupported(node),
+                )),
+            },
+            CanonicalProgramCheckError::SourceCheck {
+                file_name: "/project/input.ts".to_owned(),
+                error: SourceCheckError::RelationUnavailable(
+                    RelationUnavailable::StructuralRelation {
+                        source: type_id,
+                        target: type_id,
+                        relation: RelationKind::Assignable,
+                    },
+                ),
+            },
+            CanonicalProgramCheckError::SourceCheck {
+                file_name: "/project/input.ts".to_owned(),
+                error: SourceCheckError::TypeDisplayUnavailable(
+                    TypeDisplayUnavailable::UnsupportedType {
+                        type_id,
+                        kind: TypeDataKind::Conditional,
+                    },
+                ),
+            },
+        ];
+        assert!(
+            unsupported
+                .iter()
+                .all(CanonicalProgramCheckError::is_unsupported_boundary)
+        );
+    }
+
+    #[test]
+    fn canonical_program_error_classification_rejects_invariant_failures() {
+        let parsed = parse_source_file("const value: number = 1;");
+        let file = FileId::new(7);
+        let node = ts_ast::NodeRef::new(parsed.arena.id(), file, parsed.source_file);
+        let mut store = CanonicalTypeMapperStore::new();
+        let bootstrap = store
+            .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions::default())
+            .unwrap();
+        let type_id = bootstrap.any_type;
+        let symbol = bootstrap.undefined_symbol;
+        let invariant = [
+            CanonicalProgramCheckError::Bind {
+                file_name: "/project/input.ts".to_owned(),
+                error: CanonicalBindError::InvalidSourceFile(node),
+            },
+            CanonicalProgramCheckError::Context(
+                CanonicalCheckerContextError::DuplicateFileInOrder(file),
+            ),
+            CanonicalProgramCheckError::Context(
+                CanonicalCheckerContextError::GlobalInitialization(
+                    CanonicalGlobalInitializationError::GlobalTypes(
+                        CanonicalGlobalTypeInitializationError::InvalidType(type_id),
+                    ),
+                ),
+            ),
+            CanonicalProgramCheckError::Context(
+                CanonicalCheckerContextError::GlobalInitialization(
+                    CanonicalGlobalInitializationError::Merge(SymbolMergeError::InvalidSymbol(
+                        symbol,
+                    )),
+                ),
+            ),
+            CanonicalProgramCheckError::SourceCheck {
+                file_name: "/project/input.ts".to_owned(),
+                error: SourceCheckError::Provenance(SourceCheckProvenanceError::MissingFile(file)),
+            },
+            CanonicalProgramCheckError::SourceCheck {
+                file_name: "/project/input.ts".to_owned(),
+                error: SourceCheckError::LiteralCache(
+                    SourceLiteralCacheError::BootstrapUninitialized,
+                ),
+            },
+            CanonicalProgramCheckError::SourceCheck {
+                file_name: "/project/input.ts".to_owned(),
+                error: SourceCheckError::DeclaredType(DeclaredTypeError::Unavailable(
+                    DeclaredTypeUnavailable::AliasMergedWithDeclaredSymbol(symbol),
+                )),
+            },
+            CanonicalProgramCheckError::SourceCheck {
+                file_name: "/project/input.ts".to_owned(),
+                error: SourceCheckError::DeclaredType(DeclaredTypeError::Unavailable(
+                    DeclaredTypeUnavailable::PostGlobalNameResolutionUnavailable,
+                )),
+            },
+            CanonicalProgramCheckError::SourceCheck {
+                file_name: "/project/input.ts".to_owned(),
+                error: SourceCheckError::RelationUnavailable(RelationUnavailable::MalformedUnion(
+                    type_id,
+                )),
+            },
+            CanonicalProgramCheckError::SourceCheck {
+                file_name: "/project/input.ts".to_owned(),
+                error: SourceCheckError::TypeDisplayUnavailable(
+                    TypeDisplayUnavailable::InvalidUnion(type_id),
+                ),
+            },
+            CanonicalProgramCheckError::SourceCheck {
+                file_name: "/project/input.ts".to_owned(),
+                error: SourceCheckError::MissingDiagnostic(2322),
+            },
+        ];
+        assert!(
+            invariant
+                .iter()
+                .all(|error| !error.is_unsupported_boundary())
+        );
     }
 
     #[test]
