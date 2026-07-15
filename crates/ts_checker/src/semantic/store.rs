@@ -1,13 +1,16 @@
 //! Aggregate ownership and provenance validation for canonical semantic data.
 
-use std::collections::BTreeMap;
-
-use ts_ast::{FileId, NodeArena, NodeArenaId, NodeId, NodeRef};
+use ts_ast::NodeRef;
+use ts_binder::{
+    AstScope, CheckFlags, EscapedName, SemanticStoreId, SemanticSymbolId, SymbolData, SymbolFlags,
+    SymbolStore, SymbolTableId,
+    semantic::{Symbol, SymbolTable},
+};
 
 use super::{
     ids::{
-        ConditionalRootId, IndexInfoId, SemanticStoreId, SemanticSymbolId, SignatureId,
-        TypeAliasId, TypeId, TypeMapperId, TypePredicateId, TypedArena, allocate_semantic_store_id,
+        ConditionalRootId, IndexInfoId, SignatureId, TypeAliasId, TypeId, TypeMapperId,
+        TypePredicateId, TypedArena,
     },
     signatures::{
         CompositeSignature, IndexInfo, IndexInfoArena, Signature, SignatureArena, SignatureFlags,
@@ -16,85 +19,29 @@ use super::{
     type_records::{ConditionalRoot, TypeAlias},
 };
 
-/// Snapshot of one Program file's AST identity and allocated node range.
-///
-/// The constructor captures the arena identity and current node count from an
-/// actual [`NodeArena`]. It cannot promise persistence across Program rebuilds
-/// or arena replacement, and nodes allocated after this snapshot require a
-/// refreshed registration.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct AstScope {
-    arena: NodeArenaId,
-    file: FileId,
-    node_count: usize,
-}
-
-impl AstScope {
-    #[must_use]
-    pub fn new(file: FileId, arena: &NodeArena) -> Self {
-        Self {
-            arena: arena.id(),
-            file,
-            node_count: arena.len(),
-        }
-    }
-
-    #[must_use]
-    pub const fn file(&self) -> FileId {
-        self.file
-    }
-
-    #[must_use]
-    pub const fn arena(&self) -> NodeArenaId {
-        self.arena
-    }
-
-    #[must_use]
-    pub const fn node_count(&self) -> usize {
-        self.node_count
-    }
-
-    /// Creates a branded reference only for a node present in this snapshot.
-    #[must_use]
-    pub fn node_ref(&self, node: NodeId) -> Option<NodeRef> {
-        (node.index() < self.node_count).then(|| NodeRef::new(self.arena, self.file, node))
-    }
-
-    fn contains(&self, node: NodeRef) -> bool {
-        node.is_for(self.arena, self.file) && node.node.index() < self.node_count
-    }
-}
-
 /// Sole allocator and owner of one canonical program's semantic graph.
 ///
 /// Every semantic handle is branded with this store's identity. Record writes
 /// validate all incoming handles and AST references before mutating storage.
 #[derive(Debug)]
-pub struct SemanticStore<TypePayload, SymbolPayload, MapperPayload> {
-    id: SemanticStoreId,
+pub struct SemanticStore<TypePayload, MapperPayload> {
+    symbols: SymbolStore,
     types: TypedArena<TypeId, TypePayload>,
-    symbols: TypedArena<SemanticSymbolId, SymbolPayload>,
     mappers: TypedArena<TypeMapperId, MapperPayload>,
     signatures: SignatureArena,
     predicates: TypePredicateArena,
     index_infos: IndexInfoArena,
     type_aliases: TypedArena<TypeAliasId, TypeAlias>,
     conditional_roots: TypedArena<ConditionalRootId, ConditionalRoot>,
-    ast_scopes: BTreeMap<FileId, AstScope>,
-    ast_files: BTreeMap<NodeArenaId, FileId>,
 }
 
-impl<TypePayload, SymbolPayload, MapperPayload> Default
-    for SemanticStore<TypePayload, SymbolPayload, MapperPayload>
-{
+impl<TypePayload, MapperPayload> Default for SemanticStore<TypePayload, MapperPayload> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<TypePayload, SymbolPayload, MapperPayload>
-    SemanticStore<TypePayload, SymbolPayload, MapperPayload>
-{
+impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
     /// Creates an empty store with a fresh process-local identity.
     ///
     /// # Panics
@@ -102,25 +49,23 @@ impl<TypePayload, SymbolPayload, MapperPayload>
     /// Panics if the process has exhausted semantic-store identities.
     #[must_use]
     pub fn new() -> Self {
-        let id = allocate_semantic_store_id();
+        let symbols = SymbolStore::new();
+        let id = symbols.id();
         Self {
-            id,
+            symbols,
             types: TypedArena::new(id),
-            symbols: TypedArena::new(id),
             mappers: TypedArena::new(id),
             signatures: SignatureArena::new(id),
             predicates: TypePredicateArena::new(id),
             index_infos: IndexInfoArena::new(id),
             type_aliases: TypedArena::new(id),
             conditional_roots: TypedArena::new(id),
-            ast_scopes: BTreeMap::new(),
-            ast_files: BTreeMap::new(),
         }
     }
 
     #[must_use]
-    pub const fn id(&self) -> SemanticStoreId {
-        self.id
+    pub fn id(&self) -> SemanticStoreId {
+        self.symbols.id()
     }
 
     /// Registers a safe AST snapshot for semantic references.
@@ -129,25 +74,12 @@ impl<TypePayload, SymbolPayload, MapperPayload>
     /// Shrinking that bound, or reusing either identity with a different
     /// counterpart, is rejected before either registration map is modified.
     pub fn register_ast_scope(&mut self, scope: AstScope) -> bool {
-        if self.ast_scopes.get(&scope.file).is_some_and(|registered| {
-            registered.arena != scope.arena || registered.node_count > scope.node_count
-        }) || self
-            .ast_files
-            .get(&scope.arena)
-            .is_some_and(|registered| *registered != scope.file)
-        {
-            return false;
-        }
-        self.ast_scopes.insert(scope.file, scope);
-        self.ast_files.insert(scope.arena, scope.file);
-        true
+        self.symbols.register_ast_scope(scope)
     }
 
     #[must_use]
     pub fn contains_node_ref(&self, node: NodeRef) -> bool {
-        self.ast_scopes
-            .get(&node.file)
-            .is_some_and(|scope| scope.contains(node))
+        self.symbols.contains_node_ref(node)
     }
 
     /// Allocates a canonical type payload.
@@ -230,24 +162,82 @@ impl<TypePayload, SymbolPayload, MapperPayload>
         self.types.iter()
     }
 
-    /// Allocates a canonical semantic symbol payload.
-    ///
-    /// # Panics
-    ///
-    /// Panics before mutation if the local `u32` identity space is exhausted.
-    #[allow(dead_code)] // Hook for sibling concrete symbol allocators as they land.
-    pub(super) fn alloc_symbol(&mut self, payload: SymbolPayload) -> SemanticSymbolId {
-        self.symbols.alloc_with(|_| payload)
+    /// Allocates a fully validated canonical semantic symbol.
+    pub fn alloc_symbol(&mut self, data: SymbolData) -> Option<SemanticSymbolId> {
+        self.symbols.alloc_symbol(data)
     }
 
     #[must_use]
-    pub fn symbol_payload(&self, id: SemanticSymbolId) -> Option<&SymbolPayload> {
-        self.symbols.get(id)
+    pub fn symbol(&self, id: SemanticSymbolId) -> Option<&Symbol> {
+        self.symbols.symbol(id)
     }
 
     #[must_use]
     pub fn symbol_len(&self) -> usize {
-        self.symbols.len()
+        self.symbols.symbol_len()
+    }
+
+    /// Returns the embedded canonical symbol owner.
+    #[must_use]
+    pub const fn symbol_store(&self) -> &SymbolStore {
+        &self.symbols
+    }
+
+    /// Returns the embedded canonical symbol owner for validated mutations.
+    pub const fn symbol_store_mut(&mut self) -> &mut SymbolStore {
+        &mut self.symbols
+    }
+
+    /// Lazily assigns the pinned process-global symbol identity.
+    pub fn global_symbol_id(&mut self, symbol: SemanticSymbolId) -> Option<u64> {
+        self.symbols.global_symbol_id(symbol)
+    }
+
+    pub fn private_identifier_name(
+        &mut self,
+        containing_class: SemanticSymbolId,
+        description: &str,
+    ) -> Option<EscapedName> {
+        self.symbols
+            .private_identifier_name(containing_class, description)
+    }
+
+    pub fn unique_symbol_name(&mut self, symbol: SemanticSymbolId) -> Option<EscapedName> {
+        self.symbols.unique_symbol_name(symbol)
+    }
+
+    #[must_use]
+    pub fn alloc_transient_symbol(
+        &mut self,
+        flags: SymbolFlags,
+        name: EscapedName,
+        check_flags: CheckFlags,
+    ) -> SemanticSymbolId {
+        self.symbols
+            .alloc_transient_symbol(flags, name, check_flags)
+    }
+
+    #[must_use]
+    pub fn alloc_symbol_table(&mut self) -> SymbolTableId {
+        self.symbols.alloc_symbol_table()
+    }
+
+    #[must_use]
+    pub fn symbol_table(&self, id: SymbolTableId) -> Option<&SymbolTable> {
+        self.symbols.symbol_table(id)
+    }
+
+    pub fn insert_symbol(
+        &mut self,
+        table: SymbolTableId,
+        name: EscapedName,
+        symbol: SemanticSymbolId,
+    ) -> Option<Option<SemanticSymbolId>> {
+        self.symbols.insert_symbol(table, name, symbol)
+    }
+
+    pub fn clone_symbol_table(&mut self, source: SymbolTableId) -> Option<SymbolTableId> {
+        self.symbols.clone_symbol_table(source)
     }
 
     /// Allocates a canonical type-mapper payload.
@@ -556,11 +546,11 @@ impl<TypePayload, SymbolPayload, MapperPayload>
     }
 
     fn valid_symbols(&self, ids: &[SemanticSymbolId]) -> bool {
-        ids.iter().all(|id| self.symbols.get(*id).is_some())
+        ids.iter().all(|id| self.symbols.contains_symbol(*id))
     }
 
     fn valid_optional_symbol(&self, id: Option<SemanticSymbolId>) -> bool {
-        id.is_none_or(|id| self.symbols.get(id).is_some())
+        id.is_none_or(|id| self.symbols.contains_symbol(id))
     }
 
     fn valid_optional_mapper(&self, id: Option<TypeMapperId>) -> bool {
@@ -579,12 +569,22 @@ impl<TypePayload, SymbolPayload, MapperPayload>
 #[cfg(test)]
 mod tests {
     use ts_ast::{FileId, NodeRef};
+    use ts_binder::{EscapedName, SymbolData, SymbolFlags};
     use ts_parser::parse_source_file;
 
     use super::{AstScope, SemanticStore};
     use crate::semantic::signatures::{ElementFlags, SignatureFlags, TypePredicateKind};
 
-    type TestStore = SemanticStore<&'static str, &'static str, &'static str>;
+    type TestStore = SemanticStore<&'static str, &'static str>;
+
+    fn alloc_test_symbol(store: &mut TestStore, name: &str) -> crate::semantic::SemanticSymbolId {
+        store
+            .alloc_symbol(SymbolData::new(
+                SymbolFlags::PROPERTY,
+                EscapedName::source(name),
+            ))
+            .unwrap()
+    }
 
     fn empty_signature(store: &mut TestStore) -> crate::semantic::SignatureId {
         store
@@ -634,7 +634,7 @@ mod tests {
     fn seeded_store(payload: &'static str) -> SeededStore {
         let mut store = TestStore::new();
         let type_id = store.alloc_type(payload);
-        let symbol = store.alloc_symbol(payload);
+        let symbol = alloc_test_symbol(&mut store, payload);
         let mapper = store.alloc_mapper(payload);
         let predicate = store
             .alloc_type_predicate(TypePredicateKind::Identifier, 0, payload, Some(type_id))
@@ -677,6 +677,21 @@ mod tests {
         let moved = store;
         assert_eq!(moved.id(), identity);
         assert_ne!(TestStore::default().id(), identity);
+    }
+
+    #[test]
+    fn embedded_symbol_store_is_the_single_brand_and_global_id_owner() {
+        let mut store = TestStore::new();
+        assert_eq!(store.symbol_store().id(), store.id());
+        let symbol = alloc_test_symbol(&mut store, "value");
+        let global = store.global_symbol_id(symbol).unwrap();
+        assert_eq!(store.global_symbol_id(symbol), Some(global));
+
+        let mut foreign = TestStore::new();
+        let foreign_symbol = alloc_test_symbol(&mut foreign, "value");
+        assert_eq!(symbol.get(), foreign_symbol.get());
+        assert_ne!(symbol, foreign_symbol);
+        assert_eq!(store.global_symbol_id(foreign_symbol), None);
     }
 
     #[test]
@@ -838,7 +853,7 @@ mod tests {
         assert_signature_unmodified(store, target);
 
         assert_eq!(store.type_payload(first.type_id), None);
-        assert_eq!(store.symbol_payload(first.symbol), None);
+        assert_eq!(store.symbol(first.symbol), None);
         assert_eq!(store.mapper_payload(first.mapper), None);
         assert_eq!(store.type_predicate(first.predicate), None);
         assert_eq!(store.index_info(first.index_info), None);
@@ -1000,9 +1015,9 @@ mod tests {
         let return_type = store.alloc_type("string");
         let isolated_type = store.alloc_type("isolated");
         let replacement_type_parameter = store.alloc_type("U");
-        let this_parameter = store.alloc_symbol("this");
-        let parameter = store.alloc_symbol("value");
-        let replacement_this = store.alloc_symbol("replacement this");
+        let this_parameter = alloc_test_symbol(&mut store, "this");
+        let parameter = alloc_test_symbol(&mut store, "value");
+        let replacement_this = alloc_test_symbol(&mut store, "replacement this");
         let mapper = store.alloc_mapper("instantiate T");
         let predicate = store
             .alloc_type_predicate(TypePredicateKind::Identifier, 0, "value", Some(return_type))

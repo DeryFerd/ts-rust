@@ -149,6 +149,11 @@ impl EscapedName {
         &self.0
     }
 
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
     /// Returns the key as UTF-8 only when it has no internal marker.
     #[must_use]
     pub fn as_utf8(&self) -> Option<&str> {

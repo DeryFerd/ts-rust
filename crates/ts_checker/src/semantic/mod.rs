@@ -12,9 +12,10 @@ mod store;
 pub mod type_records;
 pub mod types;
 
+pub use ts_binder::{AstScope, SemanticStoreId, SemanticSymbolId, SymbolTableId};
+
 pub use ids::{
-    ConditionalRootId, IndexInfoId, SemanticStoreId, SemanticSymbolId, SignatureId, TypeAliasId,
-    TypeId, TypeMapperId, TypePredicateId,
+    ConditionalRootId, IndexInfoId, SignatureId, TypeAliasId, TypeId, TypeMapperId, TypePredicateId,
 };
-pub use store::{AstScope, SemanticStore};
+pub use store::SemanticStore;
 pub use type_records::{CanonicalSemanticStore, TypeData, TypeDataKind, TypeRecord};

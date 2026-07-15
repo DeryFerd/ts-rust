@@ -9,39 +9,9 @@
 //! This module deliberately has no conversion to the legacy checker IDs in
 //! [`crate`]. Crossing that boundary would conflate unrelated semantic graphs.
 
-use std::{marker::PhantomData, num::NonZeroU32, num::NonZeroU64};
+use std::{marker::PhantomData, num::NonZeroU32};
 
-/// Opaque process-local identity for one canonical semantic store.
-///
-/// Moving a store preserves its identity. A newly constructed store always
-/// receives a different identity.
-#[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct SemanticStoreId(NonZeroU64);
-
-impl std::fmt::Debug for SemanticStoreId {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("SemanticStoreId")
-    }
-}
-
-static LAST_SEMANTIC_STORE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-fn allocate_semantic_store_id_from(counter: &std::sync::atomic::AtomicU64) -> SemanticStoreId {
-    let previous = counter
-        .fetch_update(
-            std::sync::atomic::Ordering::Relaxed,
-            std::sync::atomic::Ordering::Relaxed,
-            |current| current.checked_add(1),
-        )
-        .unwrap_or_else(|_| panic!("semantic store identity space exhausted"));
-    SemanticStoreId(
-        NonZeroU64::new(previous + 1).expect("allocated semantic store identities are nonzero"),
-    )
-}
-
-pub(super) fn allocate_semantic_store_id() -> SemanticStoreId {
-    allocate_semantic_store_id_from(&LAST_SEMANTIC_STORE_ID)
-}
+pub use ts_binder::{SemanticStoreId, SemanticSymbolId};
 
 macro_rules! define_semantic_id {
     ($name:ident, $description:literal) => {
@@ -107,10 +77,6 @@ define_semantic_id!(
 define_semantic_id!(
     TypePredicateId,
     "Identity of one canonical type-predicate record."
-);
-define_semantic_id!(
-    SemanticSymbolId,
-    "Identity of one program-owned canonical semantic symbol."
 );
 define_semantic_id!(TypeMapperId, "Identity of one canonical type mapper.");
 define_semantic_id!(TypeAliasId, "Identity of one canonical type-alias record.");
@@ -182,30 +148,24 @@ impl<I: ArenaId, T> TypedArena<I, T> {
 
 #[cfg(test)]
 mod tests {
-    use std::{panic::catch_unwind, sync::atomic::AtomicU64};
+    use std::panic::catch_unwind;
+
+    use ts_binder::SymbolStore;
 
     use super::{
-        ConditionalRootId, IndexInfoId, SemanticSymbolId, SignatureId, TypeAliasId, TypeId,
-        TypeMapperId, TypePredicateId, TypedArena, allocate_semantic_store_id,
-        allocate_semantic_store_id_from, id_for_len,
+        ConditionalRootId, IndexInfoId, SignatureId, TypeAliasId, TypeId, TypeMapperId,
+        TypePredicateId, TypedArena, id_for_len,
     };
 
     #[test]
-    fn store_and_local_identity_allocation_fail_before_wraparound() {
-        let store_counter = AtomicU64::new(u64::MAX - 1);
-        let last_store = allocate_semantic_store_id_from(&store_counter);
-        assert_eq!(format!("{last_store:?}"), "SemanticStoreId");
-        assert!(catch_unwind(|| allocate_semantic_store_id_from(&store_counter)).is_err());
-        assert!(catch_unwind(|| allocate_semantic_store_id_from(&store_counter)).is_err());
-
-        let store = allocate_semantic_store_id();
+    fn local_identity_allocation_fails_before_wraparound() {
+        let store = SymbolStore::new().id();
         let last = id_for_len::<TypeId>(store, (u32::MAX - 1) as usize);
         assert_eq!(last.get(), u32::MAX);
         assert!(catch_unwind(|| id_for_len::<TypeId>(store, u32::MAX as usize)).is_err());
         assert!(catch_unwind(|| id_for_len::<SignatureId>(store, u32::MAX as usize)).is_err());
         assert!(catch_unwind(|| id_for_len::<IndexInfoId>(store, u32::MAX as usize)).is_err());
         assert!(catch_unwind(|| id_for_len::<TypePredicateId>(store, u32::MAX as usize)).is_err());
-        assert!(catch_unwind(|| id_for_len::<SemanticSymbolId>(store, u32::MAX as usize)).is_err());
         assert!(catch_unwind(|| id_for_len::<TypeMapperId>(store, u32::MAX as usize)).is_err());
         assert!(catch_unwind(|| id_for_len::<TypeAliasId>(store, u32::MAX as usize)).is_err());
         assert!(
@@ -215,8 +175,8 @@ mod tests {
 
     #[test]
     fn typed_arenas_reject_equal_local_ids_from_another_store() {
-        let first_store = allocate_semantic_store_id();
-        let second_store = allocate_semantic_store_id();
+        let first_store = SymbolStore::new().id();
+        let second_store = SymbolStore::new().id();
         let mut first = TypedArena::<TypeId, _>::new(first_store);
         let mut second = TypedArena::<TypeId, _>::new(second_store);
         let first_id = first.alloc_with(|_| "first");

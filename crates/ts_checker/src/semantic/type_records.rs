@@ -7,16 +7,14 @@
 //! allocated-empty slices, while explicit `HashMap` states preserve nil versus
 //! allocated-empty maps without turning checker hot paths into linear scans.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 
 use ts_ast::NodeRef;
+use ts_binder::{EscapedName, SemanticSymbolId, SymbolTableId};
 use ts_jsnum::{Number, PseudoBigInt};
 
 use super::{
-    ids::{
-        ConditionalRootId, IndexInfoId, SemanticStoreId, SemanticSymbolId, SignatureId,
-        TypeAliasId, TypeId, TypeMapperId,
-    },
+    ids::{ConditionalRootId, IndexInfoId, SignatureId, TypeAliasId, TypeId, TypeMapperId},
     signatures::{IndexFlags, TupleMetadata},
     store::SemanticStore,
     types::{AccessFlags, ObjectFlags, TypeFlags},
@@ -88,19 +86,6 @@ pub enum RegularLiteralLink {
     Type(TypeId),
 }
 
-/// Provisional, quarantined B02 symbol-table contract.
-///
-/// B02 has not yet supplied the canonical symbol-table owner. Until it does,
-/// this private-shape record brands the complete table by semantic store. Its
-/// `String` representation and by-value storage are deliberately not exposed;
-/// B02 must replace it with byte `EscapedName` keys and `SymbolTableId` before
-/// checker algorithms consume this layer.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SemanticSymbolTable {
-    store: SemanticStoreId,
-    entries: Vec<(String, SemanticSymbolId)>,
-}
-
 /// Arena-owned equivalent of upstream `TypeAlias`.
 #[derive(Debug, Eq, PartialEq)]
 pub struct TypeAlias {
@@ -136,7 +121,7 @@ pub struct ConstrainedTypeData {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct StructuredTypeData {
     pub constrained: ConstrainedTypeData,
-    pub members: Option<SemanticSymbolTable>,
+    pub members: Option<SymbolTableId>,
     pub properties: Option<Vec<SemanticSymbolId>>,
     /// Call signatures followed by construct signatures, exactly as upstream.
     pub signatures: Option<Vec<SignatureId>>,
@@ -173,7 +158,7 @@ pub struct InterfaceTypeData {
     pub declared_members_resolved: bool,
     pub resolved_base_constructor_type: Option<TypeId>,
     pub resolved_base_types: Option<Vec<TypeId>>,
-    pub declared_members: Option<SemanticSymbolTable>,
+    pub declared_members: Option<SymbolTableId>,
     pub declared_call_signatures: Option<Vec<SignatureId>>,
     pub declared_construct_signatures: Option<Vec<SignatureId>>,
     pub declared_index_infos: Option<Vec<IndexInfoId>>,
@@ -193,9 +178,7 @@ pub struct LiteralTypeData {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UniqueEsSymbolTypeData {
-    /// Quarantined B02 placeholder for upstream's escaped property name.
-    /// No checker API may rely on UTF-8 round-tripping this value.
-    pub name: String,
+    pub name: EscapedName,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -242,8 +225,8 @@ pub struct EvolvingArrayTypeData {
 pub struct UnionOrIntersectionTypeData {
     pub structured: StructuredTypeData,
     pub types: Vec<TypeId>,
-    pub property_cache: Option<SemanticSymbolTable>,
-    pub property_cache_without_function_property_augment: Option<SemanticSymbolTable>,
+    pub property_cache: Option<SymbolTableId>,
+    pub property_cache_without_function_property_augment: Option<SymbolTableId>,
     pub resolved_properties: Option<Vec<SemanticSymbolId>>,
 }
 
@@ -253,9 +236,7 @@ pub struct UnionTypeData {
     pub resolved_reduced_type: Option<TypeId>,
     pub regular_type: Option<TypeId>,
     pub origin: Option<TypeId>,
-    /// Quarantined B02 placeholder for upstream's escaped property name.
-    /// No checker API may rely on UTF-8 round-tripping this value.
-    pub key_property_name: String,
+    pub key_property_name: EscapedName,
     pub constituent_map: ConstituentMapState,
 }
 
@@ -582,10 +563,9 @@ impl TypeRecord {
 }
 
 /// Canonical store specialization used by subsequent type-checker modules.
-pub type CanonicalSemanticStore<SymbolPayload, MapperPayload> =
-    SemanticStore<TypeRecord, SymbolPayload, MapperPayload>;
+pub type CanonicalSemanticStore<MapperPayload> = SemanticStore<TypeRecord, MapperPayload>;
 
-impl<SymbolPayload, MapperPayload> SemanticStore<TypeRecord, SymbolPayload, MapperPayload> {
+impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
     fn alloc_record(
         &mut self,
         flags: TypeFlags,
@@ -644,27 +624,6 @@ impl<SymbolPayload, MapperPayload> SemanticStore<TypeRecord, SymbolPayload, Mapp
         };
         record.type_arguments = type_arguments;
         true
-    }
-
-    /// Temporary B02-only construction seam. This is intentionally not part of
-    /// the public checker API because both its key and ownership shapes change
-    /// when `EscapedName` and `SymbolTableId` land.
-    #[allow(dead_code)]
-    #[must_use]
-    pub(super) fn create_semantic_symbol_table(
-        &self,
-        entries: Vec<(String, SemanticSymbolId)>,
-    ) -> Option<SemanticSymbolTable> {
-        let mut names = BTreeSet::new();
-        if entries.iter().any(|(name, symbol)| {
-            !names.insert(name.as_str()) || self.symbol_payload(*symbol).is_none()
-        }) {
-            return None;
-        }
-        Some(SemanticSymbolTable {
-            store: self.id(),
-            entries,
-        })
     }
 
     #[must_use]
@@ -799,13 +758,11 @@ impl<SymbolPayload, MapperPayload> SemanticStore<TypeRecord, SymbolPayload, Mapp
         })
     }
 
-    #[allow(dead_code)] // Public construction waits for B02 EscapedName.
-    pub(super) fn alloc_unique_es_symbol_type(
+    pub fn alloc_unique_es_symbol_type(
         &mut self,
         symbol: Option<SemanticSymbolId>,
-        name: impl Into<String>,
+        name: EscapedName,
     ) -> Option<TypeId> {
-        let name = name.into();
         self.alloc_record(
             TypeFlags::UNIQUE_ES_SYMBOL,
             ObjectFlags::NONE,
@@ -1258,13 +1215,13 @@ impl<SymbolPayload, MapperPayload> SemanticStore<TypeRecord, SymbolPayload, Mapp
     pub fn set_structured_type_members(
         &mut self,
         id: TypeId,
-        members: Option<SemanticSymbolTable>,
+        members: Option<SymbolTableId>,
         properties: Option<Vec<SemanticSymbolId>>,
         call_signatures: Option<Vec<SignatureId>>,
         construct_signatures: Option<Vec<SignatureId>>,
         index_infos: Option<Vec<IndexInfoId>>,
     ) -> bool {
-        if !self.valid_symbol_table(members.as_ref())
+        if !self.valid_symbol_table(members)
             || !self.valid_optional_record_symbols(properties.as_deref())
             || !self.valid_optional_record_signatures(call_signatures.as_deref())
             || !self.valid_optional_record_signatures(construct_signatures.as_deref())
@@ -1464,12 +1421,12 @@ impl<SymbolPayload, MapperPayload> SemanticStore<TypeRecord, SymbolPayload, Mapp
         &mut self,
         id: TypeId,
         resolved: bool,
-        members: Option<SemanticSymbolTable>,
+        members: Option<SymbolTableId>,
         call_signatures: Option<Vec<SignatureId>>,
         construct_signatures: Option<Vec<SignatureId>>,
         index_infos: Option<Vec<IndexInfoId>>,
     ) -> bool {
-        if !self.valid_symbol_table(members.as_ref())
+        if !self.valid_symbol_table(members)
             || !self.valid_optional_record_signatures(call_signatures.as_deref())
             || !self.valid_optional_record_signatures(construct_signatures.as_deref())
             || !self.valid_optional_record_index_infos(index_infos.as_deref())
@@ -1593,12 +1550,12 @@ impl<SymbolPayload, MapperPayload> SemanticStore<TypeRecord, SymbolPayload, Mapp
     pub fn set_union_or_intersection_caches(
         &mut self,
         id: TypeId,
-        property_cache: Option<SemanticSymbolTable>,
-        property_cache_without_function_property_augment: Option<SemanticSymbolTable>,
+        property_cache: Option<SymbolTableId>,
+        property_cache_without_function_property_augment: Option<SymbolTableId>,
         resolved_properties: Option<Vec<SemanticSymbolId>>,
     ) -> bool {
-        if !self.valid_symbol_table(property_cache.as_ref())
-            || !self.valid_symbol_table(property_cache_without_function_property_augment.as_ref())
+        if !self.valid_symbol_table(property_cache)
+            || !self.valid_symbol_table(property_cache_without_function_property_augment)
             || !self.valid_optional_record_symbols(resolved_properties.as_deref())
         {
             return false;
@@ -1619,14 +1576,13 @@ impl<SymbolPayload, MapperPayload> SemanticStore<TypeRecord, SymbolPayload, Mapp
     }
 
     #[allow(clippy::too_many_arguments)] // Mirrors the union-only lazy caches.
-    #[allow(dead_code)] // Public mutation waits for B02 EscapedName.
-    pub(super) fn set_union_caches(
+    pub fn set_union_caches(
         &mut self,
         id: TypeId,
         resolved_reduced_type: Option<TypeId>,
         regular_type: Option<TypeId>,
         origin: Option<TypeId>,
-        key_property_name: impl Into<String>,
+        key_property_name: EscapedName,
         constituent_map: ConstituentMapState,
     ) -> bool {
         if ![resolved_reduced_type, regular_type, origin]
@@ -1636,7 +1592,6 @@ impl<SymbolPayload, MapperPayload> SemanticStore<TypeRecord, SymbolPayload, Mapp
         {
             return false;
         }
-        let key_property_name = key_property_name.into();
         let Some(TypeData::Union(data)) = self.type_payload_mut(id).map(|record| &mut record.data)
         else {
             return false;
@@ -2005,11 +1960,11 @@ impl<SymbolPayload, MapperPayload> SemanticStore<TypeRecord, SymbolPayload, Mapp
     }
 
     fn valid_record_symbol(&self, id: Option<SemanticSymbolId>) -> bool {
-        id.is_none_or(|id| self.symbol_payload(id).is_some())
+        id.is_none_or(|id| self.symbol(id).is_some())
     }
 
     fn valid_optional_record_symbols(&self, ids: Option<&[SemanticSymbolId]>) -> bool {
-        ids.is_none_or(|ids| ids.iter().all(|id| self.symbol_payload(*id).is_some()))
+        ids.is_none_or(|ids| ids.iter().all(|id| self.symbol(*id).is_some()))
     }
 
     fn valid_record_mapper(&self, id: Option<TypeMapperId>) -> bool {
@@ -2032,14 +1987,8 @@ impl<SymbolPayload, MapperPayload> SemanticStore<TypeRecord, SymbolPayload, Mapp
         ids.is_none_or(|ids| ids.iter().all(|id| self.index_info(*id).is_some()))
     }
 
-    fn valid_symbol_table(&self, table: Option<&SemanticSymbolTable>) -> bool {
-        table.is_none_or(|table| {
-            table.store == self.id()
-                && table
-                    .entries
-                    .iter()
-                    .all(|(_, symbol)| self.symbol_payload(*symbol).is_some())
-        })
+    fn valid_symbol_table(&self, table: Option<SymbolTableId>) -> bool {
+        table.is_none_or(|table| self.symbol_table(table).is_some())
     }
 
     fn valid_type_cache(&self, cache: &TypeCacheState) -> bool {
@@ -2064,16 +2013,40 @@ mod tests {
     use std::collections::HashMap;
 
     use ts_ast::{FileId, SyntaxKind};
+    use ts_binder::{EscapedName, SymbolData, SymbolFlags};
     use ts_jsnum::{Number, PseudoBigInt};
     use ts_parser::parse_source_file;
 
     use super::*;
     use crate::semantic::{
-        signatures::{ElementFlags, SignatureFlags},
         AstScope,
+        signatures::{ElementFlags, SignatureFlags},
     };
 
-    type TestStore = CanonicalSemanticStore<&'static str, &'static str>;
+    type TestStore = CanonicalSemanticStore<&'static str>;
+
+    fn alloc_test_symbol(store: &mut TestStore, name: &str) -> SemanticSymbolId {
+        store
+            .alloc_symbol(SymbolData::new(
+                SymbolFlags::PROPERTY,
+                EscapedName::source(name),
+            ))
+            .unwrap()
+    }
+
+    fn alloc_test_table(
+        store: &mut TestStore,
+        entries: &[(&str, SemanticSymbolId)],
+    ) -> SymbolTableId {
+        let table = store.alloc_symbol_table();
+        for (name, symbol) in entries {
+            assert_eq!(
+                store.insert_symbol(table, EscapedName::source(name), *symbol),
+                Some(None)
+            );
+        }
+        table
+    }
 
     struct SeededStore {
         store: TestStore,
@@ -2120,7 +2093,7 @@ mod tests {
         let base = store
             .alloc_intrinsic_type(TypeFlags::STRING, "string")
             .unwrap();
-        let symbol = store.alloc_symbol(payload);
+        let symbol = alloc_test_symbol(&mut store, payload);
         let mapper = store.alloc_mapper(payload);
         let alias = store.alloc_type_alias(Some(symbol)).unwrap();
         let root = store
@@ -2183,7 +2156,7 @@ mod tests {
                 )
                 .unwrap(),
             store
-                .alloc_unique_es_symbol_type(Some(seeded.symbol), "unique")
+                .alloc_unique_es_symbol_type(Some(seeded.symbol), EscapedName::source("unique"))
                 .unwrap(),
             store
                 .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(seeded.symbol))
@@ -2344,10 +2317,7 @@ mod tests {
             .store
             .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(seeded.symbol))
             .unwrap();
-        let table = seeded
-            .store
-            .create_semantic_symbol_table(vec![("p".into(), seeded.symbol)])
-            .unwrap();
+        let table = alloc_test_table(&mut seeded.store, &[("p", seeded.symbol)]);
         assert!(seeded.store.set_structured_type_members(
             object,
             Some(table),
@@ -2365,12 +2335,54 @@ mod tests {
             Some(vec![seeded.signature, seeded.signature])
         );
         assert_eq!(object_data.structured.call_signature_count, 1);
-        assert!(seeded
+        assert!(
+            seeded
+                .store
+                .type_payload(object)
+                .unwrap()
+                .object_flags()
+                .contains(ObjectFlags::MEMBERS_RESOLVED)
+        );
+    }
+
+    #[test]
+    fn escaped_names_survive_type_records_without_utf8_coercion() {
+        let mut seeded = seeded_store("local");
+        let unique_name = EscapedName::internal(ts_binder::InternalSymbolName::Computed);
+        let unique = seeded
             .store
-            .type_payload(object)
-            .unwrap()
-            .object_flags()
-            .contains(ObjectFlags::MEMBERS_RESOLVED));
+            .alloc_unique_es_symbol_type(Some(seeded.symbol), unique_name.clone())
+            .unwrap();
+        let TypeData::UniqueEsSymbol(unique_data) =
+            seeded.store.type_payload(unique).unwrap().data()
+        else {
+            panic!("expected unique symbol type")
+        };
+        assert_eq!(unique_data.name, unique_name);
+        assert_eq!(unique_data.name.as_bytes(), b"\xFEcomputed");
+
+        let object = seeded
+            .store
+            .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(seeded.symbol))
+            .unwrap();
+        let union = seeded
+            .store
+            .alloc_union_type(ObjectFlags::NONE, vec![seeded.base, object])
+            .unwrap();
+        let key = EscapedName::internal(ts_binder::InternalSymbolName::Call);
+        assert!(seeded.store.set_union_caches(
+            union,
+            None,
+            None,
+            None,
+            key.clone(),
+            ConstituentMapState::Unallocated,
+        ));
+        let TypeData::Union(union_data) = seeded.store.type_payload(union).unwrap().data() else {
+            panic!("expected union")
+        };
+        assert_eq!(union_data.key_property_name, key);
+        assert_eq!(union_data.key_property_name.as_bytes(), b"\xFEcall");
     }
 
     #[test]
@@ -2450,9 +2462,11 @@ mod tests {
                 RegularLiteralLink::Type(regular),
             )
             .unwrap();
-        assert!(seeded
-            .store
-            .set_literal_links(regular, Some(fresh), regular));
+        assert!(
+            seeded
+                .store
+                .set_literal_links(regular, Some(fresh), regular)
+        );
 
         let interface = seeded
             .store
@@ -2485,18 +2499,22 @@ mod tests {
             1,
             Some(this_type),
         ));
-        assert!(seeded
-            .store
-            .type_payload(interface)
-            .unwrap()
-            .object_flags()
-            .contains(ObjectFlags::REFERENCE));
+        assert!(
+            seeded
+                .store
+                .type_payload(interface)
+                .unwrap()
+                .object_flags()
+                .contains(ObjectFlags::REFERENCE)
+        );
 
         let alias = seeded.store.alloc_type_alias(Some(seeded.symbol)).unwrap();
         assert!(seeded.store.set_type_alias(interface, Some(alias)));
-        assert!(seeded
-            .store
-            .set_type_alias_arguments(alias, Some(vec![interface])));
+        assert!(
+            seeded
+                .store
+                .set_type_alias_arguments(alias, Some(vec![interface]))
+        );
 
         let conditional = seeded
             .store
@@ -2596,7 +2614,7 @@ mod tests {
         assert_eq!(
             second
                 .store
-                .alloc_unique_es_symbol_type(Some(first.symbol), "foreign"),
+                .alloc_unique_es_symbol_type(Some(first.symbol), EscapedName::source("foreign"),),
             None
         );
         assert_eq!(
@@ -2665,9 +2683,11 @@ mod tests {
             .unwrap();
         assert!(!second.store.set_type_symbol(object, Some(first.symbol)));
         assert!(!second.store.set_type_alias(object, Some(first.alias)));
-        assert!(!second
-            .store
-            .set_resolved_base_constraint(object, Some(first.base)));
+        assert!(
+            !second
+                .store
+                .set_resolved_base_constraint(object, Some(first.base))
+        );
         assert!(!second.store.set_object_target_and_mapper(
             object,
             Some(first.base),
@@ -2682,10 +2702,7 @@ mod tests {
             object,
             TypeCacheState::Allocated(HashMap::from([(CacheHashKey::new(1), first.base)])),
         ));
-        let foreign_table = first
-            .store
-            .create_semantic_symbol_table(vec![("x".into(), first.symbol)])
-            .unwrap();
+        let foreign_table = alloc_test_table(&mut first.store, &[("x", first.symbol)]);
         assert!(!second.store.set_structured_type_members(
             object,
             Some(foreign_table),
@@ -2741,13 +2758,19 @@ mod tests {
     fn nested_tables_and_hash_maps_reject_foreign_keys_and_values_without_mutation() {
         let first = seeded_store("first");
         let mut seeded = seeded_store("second");
-        assert!(seeded
-            .store
-            .create_semantic_symbol_table(vec![
-                ("same".into(), seeded.symbol),
-                ("same".into(), seeded.symbol),
-            ])
-            .is_none());
+        let duplicate_table = seeded.store.alloc_symbol_table();
+        assert_eq!(
+            seeded
+                .store
+                .insert_symbol(duplicate_table, EscapedName::source("same"), seeded.symbol,),
+            Some(None)
+        );
+        assert_eq!(
+            seeded
+                .store
+                .insert_symbol(duplicate_table, EscapedName::source("same"), seeded.symbol,),
+            Some(Some(seeded.symbol))
+        );
         let object = seeded
             .store
             .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(seeded.symbol))
@@ -2765,7 +2788,7 @@ mod tests {
             None,
             None,
             None,
-            "key",
+            EscapedName::source("key"),
             ConstituentMapState::Allocated(HashMap::from([(first.base, object)])),
         ));
         assert!(!seeded.store.set_union_caches(
@@ -2773,7 +2796,7 @@ mod tests {
             None,
             None,
             None,
-            "key",
+            EscapedName::source("key"),
             ConstituentMapState::Allocated(HashMap::from([(seeded.base, first.base)])),
         ));
         let TypeData::Object(object_data) = seeded.store.type_payload(object).unwrap().data()
@@ -2792,30 +2815,23 @@ mod tests {
     fn allocated_empty_states_and_hash_map_lookup_remain_observable() {
         assert_eq!(std::mem::size_of::<CacheHashKey>(), 16);
         let mut seeded = seeded_store("local");
-        let second_symbol = seeded.store.alloc_symbol("second");
-        let table = seeded
-            .store
-            .create_semantic_symbol_table(vec![
-                ("z".into(), seeded.symbol),
-                ("a".into(), second_symbol),
-            ])
-            .unwrap();
-        assert_eq!(
-            table.entries,
-            [
-                ("z".to_owned(), seeded.symbol),
-                ("a".to_owned(), second_symbol),
-            ]
+        let second_symbol = alloc_test_symbol(&mut seeded.store, "second");
+        let table = alloc_test_table(
+            &mut seeded.store,
+            &[("z", seeded.symbol), ("a", second_symbol)],
         );
-        let empty_table = seeded
-            .store
-            .create_semantic_symbol_table(Vec::new())
-            .unwrap();
-        assert!(empty_table.entries.is_empty());
+        let table_record = seeded.store.symbol_table(table).unwrap();
+        assert_eq!(table_record.len(), 2);
+        assert_eq!(table_record.get_source("z"), Some(seeded.symbol));
+        assert_eq!(table_record.get_source("a"), Some(second_symbol));
+        let empty_table = seeded.store.alloc_symbol_table();
+        assert!(seeded.store.symbol_table(empty_table).unwrap().is_empty());
 
-        assert!(seeded
-            .store
-            .set_type_alias_arguments(seeded.alias, Some(Vec::new())));
+        assert!(
+            seeded
+                .store
+                .set_type_alias_arguments(seeded.alias, Some(Vec::new()))
+        );
         assert_eq!(
             seeded
                 .store
@@ -2829,9 +2845,11 @@ mod tests {
             .store
             .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(seeded.symbol))
             .unwrap();
-        assert!(seeded
-            .store
-            .set_object_instantiations(object, TypeCacheState::Allocated(HashMap::new()),));
+        assert!(
+            seeded
+                .store
+                .set_object_instantiations(object, TypeCacheState::Allocated(HashMap::new()),)
+        );
         let TypeData::Object(object_data) = seeded.store.type_payload(object).unwrap().data()
         else {
             panic!("expected object")
@@ -2860,7 +2878,7 @@ mod tests {
             None,
             None,
             None,
-            "kind",
+            EscapedName::source("kind"),
             ConstituentMapState::Allocated(HashMap::from(
                 [(object, union), (seeded.base, object),]
             )),
@@ -2888,15 +2906,20 @@ mod tests {
     fn auxiliary_records_and_node_slots_reject_foreign_provenance() {
         let first = seeded_store("first");
         let mut second = seeded_store("second");
-        assert!(second
-            .store
-            .create_semantic_symbol_table(vec![("x".into(), first.symbol)])
-            .is_none());
+        let local_table = second.store.alloc_symbol_table();
+        assert_eq!(
+            second
+                .store
+                .insert_symbol(local_table, EscapedName::source("x"), first.symbol,),
+            None
+        );
         assert_eq!(second.store.alloc_type_alias(Some(first.symbol)), None);
         assert!(!second.store.set_type_alias_arguments(first.alias, None));
-        assert!(!second
-            .store
-            .set_type_alias_arguments(second.alias, Some(vec![first.base])));
+        assert!(
+            !second
+                .store
+                .set_type_alias_arguments(second.alias, Some(vec![first.base]))
+        );
         assert_eq!(
             second
                 .store
@@ -2980,12 +3003,16 @@ mod tests {
             None
         );
         assert_eq!(second.store.conditional_root_len(), root_count);
-        assert!(!second
-            .store
-            .set_conditional_root_instantiations(first.root, TypeCacheState::Unallocated));
-        assert!(!second
-            .store
-            .set_conditional_root_alias(second.root, Some(first.alias)));
+        assert!(
+            !second
+                .store
+                .set_conditional_root_instantiations(first.root, TypeCacheState::Unallocated)
+        );
+        assert!(
+            !second
+                .store
+                .set_conditional_root_alias(second.root, Some(first.alias))
+        );
         assert_eq!(
             second.store.conditional_root(second.root).unwrap().alias(),
             Some(second.alias)
@@ -3017,9 +3044,11 @@ mod tests {
             .store
             .alloc_instantiation_expression_type(ObjectFlags::NONE, Some(second.symbol), None)
             .unwrap();
-        assert!(!second
-            .store
-            .set_instantiation_expression_node(expression, Some(first.instantiation_node)));
+        assert!(
+            !second
+                .store
+                .set_instantiation_expression_node(expression, Some(first.instantiation_node))
+        );
         let TypeData::InstantiationExpression(expression_data) =
             second.store.type_payload(expression).unwrap().data()
         else {
@@ -3062,9 +3091,11 @@ mod tests {
                 | ObjectFlags::FRESH_LITERAL
                 | ObjectFlags::CONTAINS_OBJECT_OR_ARRAY_LITERAL,
         ));
-        assert!(seeded
-            .store
-            .copy_type_object_flags(regular, source, ObjectFlags::FRESH_LITERAL,));
+        assert!(
+            seeded
+                .store
+                .copy_type_object_flags(regular, source, ObjectFlags::FRESH_LITERAL,)
+        );
         let regular_flags = seeded.store.type_payload(regular).unwrap().object_flags();
         assert!(regular_flags.contains(ObjectFlags::ANONYMOUS | ObjectFlags::OBJECT_LITERAL));
         assert!(!regular_flags.contains(ObjectFlags::FRESH_LITERAL));
@@ -3075,12 +3106,16 @@ mod tests {
         );
 
         let before = seeded.store.type_payload(regular).unwrap().object_flags();
-        assert!(!seeded
-            .store
-            .set_type_object_flags(regular, ObjectFlags::ANONYMOUS | ObjectFlags::MAPPED,));
-        assert!(!seeded
-            .store
-            .set_type_object_flags(regular, ObjectFlags::MAPPED));
+        assert!(
+            !seeded
+                .store
+                .set_type_object_flags(regular, ObjectFlags::ANONYMOUS | ObjectFlags::MAPPED,)
+        );
+        assert!(
+            !seeded
+                .store
+                .set_type_object_flags(regular, ObjectFlags::MAPPED)
+        );
         assert_eq!(
             seeded.store.type_payload(regular).unwrap().object_flags(),
             before
@@ -3106,9 +3141,11 @@ mod tests {
             .store
             .alloc_union_type(ObjectFlags::NONE, vec![false_type, true_type])
             .unwrap();
-        assert!(seeded
-            .store
-            .add_type_flags(boolean_union, TypeFlags::BOOLEAN));
+        assert!(
+            seeded
+                .store
+                .add_type_flags(boolean_union, TypeFlags::BOOLEAN)
+        );
         assert_eq!(
             seeded.store.type_payload(boolean_union).unwrap().flags(),
             TypeFlags::UNION | TypeFlags::BOOLEAN
@@ -3134,17 +3171,21 @@ mod tests {
             .store
             .alloc_union_type(ObjectFlags::NONE, vec![enum_a, enum_b])
             .unwrap();
-        assert!(seeded
-            .store
-            .add_type_flags(enum_union, TypeFlags::ENUM_LITERAL));
+        assert!(
+            seeded
+                .store
+                .add_type_flags(enum_union, TypeFlags::ENUM_LITERAL)
+        );
         assert_eq!(
             seeded.store.type_payload(enum_union).unwrap().flags(),
             TypeFlags::UNION | TypeFlags::ENUM_LITERAL
         );
 
-        assert!(!seeded
-            .store
-            .add_type_flags(boolean_union, TypeFlags::STRING_LITERAL));
+        assert!(
+            !seeded
+                .store
+                .add_type_flags(boolean_union, TypeFlags::STRING_LITERAL)
+        );
         assert!(!seeded.store.add_type_flags(enum_union, TypeFlags::BOOLEAN));
         assert!(!seeded.store.copy_type_flags(regular, boolean_union));
         assert_eq!(
@@ -3286,9 +3327,11 @@ mod tests {
             None,
         ));
 
-        assert!(!seeded
-            .store
-            .set_interface_type_parameters(interface, Some(Vec::new()), 0, None,));
+        assert!(
+            !seeded
+                .store
+                .set_interface_type_parameters(interface, Some(Vec::new()), 0, None,)
+        );
         assert!(!seeded.store.set_interface_type_parameters(
             interface,
             Some(vec![ordinary]),
@@ -3313,9 +3356,11 @@ mod tests {
             1,
             Some(wrong_constraint_this),
         ));
-        assert!(!seeded
-            .store
-            .set_type_object_flags(interface, ObjectFlags::CLASS | ObjectFlags::REFERENCE,));
+        assert!(
+            !seeded
+                .store
+                .set_type_object_flags(interface, ObjectFlags::CLASS | ObjectFlags::REFERENCE,)
+        );
         let TypeData::Interface(data) = seeded.store.type_payload(interface).unwrap().data() else {
             panic!("expected interface")
         };
@@ -3352,30 +3397,36 @@ mod tests {
                 | ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES_COMPUTED
                 | ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES,
         ));
-        assert!(!seeded
-            .store
-            .set_type_object_flags(interface, ObjectFlags::CLASS));
-        assert!(!seeded
-            .store
-            .set_type_object_flags(interface, ObjectFlags::INTERFACE | ObjectFlags::REFERENCE));
+        assert!(
+            !seeded
+                .store
+                .set_type_object_flags(interface, ObjectFlags::CLASS)
+        );
+        assert!(
+            !seeded
+                .store
+                .set_type_object_flags(interface, ObjectFlags::INTERFACE | ObjectFlags::REFERENCE)
+        );
         let TypeData::Interface(data) = seeded.store.type_payload(interface).unwrap().data() else {
             panic!("expected interface")
         };
         assert_eq!(data.all_type_parameters, Some(vec![ordinary, this_type]));
         assert_eq!(data.outer_type_parameter_count, 1);
         assert_eq!(data.this_type, Some(this_type));
-        assert!(seeded
-            .store
-            .type_payload(interface)
-            .unwrap()
-            .object_flags()
-            .contains(
-                ObjectFlags::CLASS
-                    | ObjectFlags::REFERENCE
-                    | ObjectFlags::CONTAINS_WIDENING_TYPE
-                    | ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES_COMPUTED
-                    | ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES,
-            ));
+        assert!(
+            seeded
+                .store
+                .type_payload(interface)
+                .unwrap()
+                .object_flags()
+                .contains(
+                    ObjectFlags::CLASS
+                        | ObjectFlags::REFERENCE
+                        | ObjectFlags::CONTAINS_WIDENING_TYPE
+                        | ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES_COMPUTED
+                        | ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES,
+                )
+        );
     }
 
     #[test]
