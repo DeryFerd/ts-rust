@@ -174,17 +174,21 @@ remains the cluster-level source of truth.
   assignments, and exact ambient export context. Independent reviews plus the
   integration gate pass 143 binder tests, 25 focused import tests, strict
   parser Clippy, and the all-target workspace check. B03's ordinary lexical
-  and module resolver landed as `b7e6e1b`; its independent review found that
-  nil/global lookup and checker-created synthetic scopes were not yet
-  representable, so B03 remains in `fixing` until its location contract and
-  constructor/ambient/recovery repairs pass a second review.
+  and module resolver landed as `b7e6e1b`, with the complete optional-location,
+  file-independent global, and checker-created synthetic-scope repair in
+  `676d9a0`. Independent review found and verified the bounded `a6bc09d`
+  follow-up for recovered constructor bodies and synthetic-parent provenance.
+  B03 is now verified with 152 binder tests and strict binder Clippy green.
 - All 26 sparse checker LinkStores are represented through `ae84673`, with the
-  exact enum evaluator value domain repaired in `ba9eaf1`. A final inventory
-  audit verified the fields, lazy state, evaluator values, SourceFileRef
-  provenance, and pristine accounting, while finding four safe-API boundaries
-  now being repaired: isolated entity-name parsing, sentinel canonicalization,
-  syntax-kind branding for specialized stores, and defined-bit masking. T01
-  therefore remains in `fixing`, not `verified`, until those repairs land.
+  exact enum evaluator value domain repaired in `ba9eaf1`. The final boundary
+  repair landed as `7c95a62` and `4cc18ba`: isolated entity names now use the
+  exact sealed JS parser path, sentinel IDs have one canonical state, source
+  facts enforce every specialized call domain including `instanceof`, and
+  flag negation/setters admit only defined bits. Two independent audit rounds
+  are clean across fields, lazy state, evaluator values, SourceFileRef and AST
+  provenance, and pristine accounting. T01 is verified with 253 checker tests,
+  two focused isolated-parser tests, and no change to the known 175/179 parser
+  recovery baseline.
 - R00b is integrated as `4be3a12` and has completed an independent clean
   audit. Exact simple/generic relation-key bytes, XXH3-128 encoding,
   depth-four parameter recursion, constraint fail-closed behavior, recursion
