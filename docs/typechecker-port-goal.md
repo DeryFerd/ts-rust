@@ -65,11 +65,12 @@ remains the cluster-level source of truth.
 - Program-wide node and flow references are branded by both `NodeArenaId` and
   `FileId`, so equal dense IDs from rebuilt Programs fail closed. Complete
   symbol masks, the typed flow substrate, and the first exact binder-created
-  CFG slice are integrated as well. Sequential flow, branches, returns,
-  mutations, calls, unreachable traversal, and detached function containers
-  are active; loops, switch, try/finally, jumps, optional/logical chains,
-  destructuring, IIFEs, and static blocks remain explicit incomplete
-  boundaries rather than guessed graphs.
+  CFG slices are integrated as well. Sequential flow, branches, returns,
+  mutations, calls, unreachable traversal, detached function containers,
+  while/do/classic-for/for-in/for-of loops, and labeled or unlabeled jumps are
+  active. Switch, try/finally, optional/logical chains, destructuring, IIFEs,
+  and static blocks remain explicit incomplete boundaries rather than guessed
+  graphs.
 - Canonical semantic IDs plus signature, predicate, index, and tuple records
   are integrated behind a store-branded aggregate. AST scope growth is
   monotonic, raw payload allocation is crate-private, and independent review
