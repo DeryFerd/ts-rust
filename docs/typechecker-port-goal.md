@@ -144,9 +144,29 @@ remains the cluster-level source of truth.
 - B02b's source contract is integrated as `d58d523`: canonical binding now
   retains a caller-derived byte-backed source symbol name plus explicit
   JavaScript, declaration-file, external-module, and CommonJS facts. It never
-  infers those Program/parser facts from a filename or AST shape. Declaration
-  dispatch remains gated while the non-JavaScript families and the constructor
-  parser prerequisite are ported and audited.
+  infers those Program/parser facts from a filename or AST shape.
+- Canonical class-constructor parsing is integrated as `85dab99`, with binder
+  cleanup in `1be603c`. Real constructors now use the generated
+  `ConstructorDeclaration` payload while generators, computed/private names,
+  and optional/generic quoted `constructor` methods remain ordinary methods.
+- B02b ordinary non-JavaScript declaration dispatch is integrated as
+  `dddd6db..ca759ef`. It linearly replays B01's captured order for global and
+  external TS/TSX/d.ts files, preserving lazy locals/members/exports, exact
+  declaration flags and exclusions, class prototypes and parameter
+  properties, destructuring, anonymous/signature symbols, and exported
+  local/export pairs. Unsupported module, namespace, import/export alias, and
+  assignment families reject the whole file before writes and remain stable
+  on retry. Independent pinned-source review is clean after its constructor
+  repair and accessor-recovery correction; 117 binder and 236 checker tests
+  pass. The file remains honestly in `Traversal`, and checker extraction stays
+  gated while B02c ports those module/alias families.
+- R00a's relation-state substrate is integrated as `9bd331d`: exact flag/result
+  widths, five distinct lazy relation caches, nil-versus-allocated map state,
+  directional enum keys over canonical global symbol IDs, the signed
+  `(16_000_000 - size) / 8` budget, and bootstrap pristine-state accounting.
+  Its independent audit found no P0-P2 issue. Relation-key generation,
+  recursion identities, simple relations, and structural relation algorithms
+  remain intentionally absent rather than approximated.
 
 No percentage in this section is a whole-corpus parity claim. A score is
 publishable only when its variant manifest and complete artifact comparison are
