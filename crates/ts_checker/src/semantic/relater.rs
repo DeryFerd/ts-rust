@@ -2,17 +2,19 @@
 //!
 //! This module ports `isTypeRelatedTo`, `isSimpleTypeRelatedTo`, and their
 //! no-diagnostic entry points plus primitive/literal/nullable unions and the
-//! required-property object slice of `recursiveTypeRelatedTo` from pinned
+//! property-only object slice of `recursiveTypeRelatedTo`, including fresh
+//! excess-property checks and strict/exact optional-property relations, from pinned
 //! `internal/checker/relater.go` at
 //! `dc37b5249ab60e2bbce936f71b883e6c8136167e`. Unsupported structural paths
 //! return [`RelationUnavailable`] instead of being misreported as unrelated.
 
 use std::collections::{HashMap, HashSet};
 
-use ts_binder::{CheckFlags, SemanticSymbolId, SymbolFlags, SymbolTableId};
+use ts_binder::{CheckFlags, InternalSymbolName, SemanticSymbolId, SymbolFlags, SymbolTableId};
 
 use super::{
     bootstrap::LiteralTypeCacheError,
+    declared::malformed_alias_merge,
     ids::TypeId,
     links::MembersOrExportsResolutionKind,
     mapper::TypeMapper,
@@ -198,8 +200,12 @@ impl std::error::Error for RelationUnavailable {}
 #[derive(Clone, Copy)]
 struct RelationBootstrapFacts {
     strict_null_checks: bool,
+    exact_optional_property_types: bool,
     wildcard_type: TypeId,
     any_function_type: TypeId,
+    never_type: TypeId,
+    undefined_type: TypeId,
+    missing_type: TypeId,
     string_type: TypeId,
     number_type: TypeId,
     bigint_type: TypeId,
@@ -507,6 +513,11 @@ impl<'store> RelaterSession<'store> {
                 && source_flags.intersects(TypeFlags::OBJECT)
                 && target_flags.intersects(TypeFlags::OBJECT)
             {
+                if self.is_fresh_object_literal(source)?
+                    && self.has_excess_properties(source, target)?
+                {
+                    return Ok(Ternary::False);
+                }
                 if self.weak_target_lacks_common_properties(source, target)? {
                     return Ok(Ternary::False);
                 }
@@ -779,8 +790,8 @@ impl<'store> RelaterSession<'store> {
                 relation: self.relation,
             });
         }
-        let source_members = self.resolved_object_members(source)?;
-        let target_members = self.resolved_object_members(target)?;
+        let source_members = self.resolved_object_members(source, true)?;
+        let target_members = self.resolved_object_members(target, false)?;
         self.properties_related_to(source, target, &source_members, &target_members)
     }
 
@@ -1045,21 +1056,21 @@ impl<'store> RelaterSession<'store> {
         source: TypeId,
         target: TypeId,
     ) -> Result<bool, RelationUnavailable> {
-        let target_members = self.resolved_object_members(target)?;
+        let target_members = self.resolved_object_members(target, false)?;
         if target_members.properties.is_empty() {
             return Ok(false);
         }
         for property in &target_members.properties {
             if !self
-                .property_symbol(*property)?
+                .property_symbol(*property, false)?
                 .flags()
                 .intersects(SymbolFlags::OPTIONAL)
             {
                 return Ok(false);
             }
         }
-        let source_members = self.resolved_object_members(source)?;
-        if source_members.properties.is_empty() || self.global_object_type()? == Some(source) {
+        let source_members = self.resolved_object_members(source, true)?;
+        if source_members.properties.is_empty() || self.is_direct_global_object_type(source)? {
             return Ok(false);
         }
         let target_table = target_members
@@ -1068,13 +1079,74 @@ impl<'store> RelaterSession<'store> {
             .ok_or(RelationUnavailable::InvalidStructuredMembers(target))?;
         for property in source_members.properties {
             if target_table
-                .get(self.property_symbol(property)?.name())
+                .get(self.property_symbol(property, true)?.name())
                 .is_some()
             {
                 return Ok(false);
             }
         }
         Ok(true)
+    }
+
+    fn is_fresh_object_literal(&self, type_id: TypeId) -> Result<bool, RelationUnavailable> {
+        let record = self
+            .store
+            .type_payload(type_id)
+            .ok_or(RelationUnavailable::Type(type_id))?;
+        Ok(record
+            .object_flags()
+            .contains(ObjectFlags::OBJECT_LITERAL | ObjectFlags::FRESH_LITERAL))
+    }
+
+    fn has_excess_properties(
+        &self,
+        source: TypeId,
+        target: TypeId,
+    ) -> Result<bool, RelationUnavailable> {
+        let target_members = self.resolved_object_members(target, false)?;
+
+        // Pinned `hasExcessProperties` treats the empty object as an open
+        // target and exempts the global Object target from assignable-relation
+        // excess checks. Index signatures and union/intersection targets
+        // remain outside this property-only slice.
+        if target_members.properties.is_empty() || self.is_direct_global_object_type(target)? {
+            return Ok(false);
+        }
+        let source_members = self.resolved_object_members(source, true)?;
+        let target_table = target_members
+            .members
+            .and_then(|members| self.store.symbol_table(members))
+            .ok_or(RelationUnavailable::InvalidStructuredMembers(target))?;
+        for property in source_members.properties {
+            let name = self.property_symbol(property, true)?.name();
+            if target_table.get(name).is_none() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn is_direct_global_object_type(&self, type_id: TypeId) -> Result<bool, RelationUnavailable> {
+        let Some(global_object) = self.global_object_symbol()? else {
+            return Ok(false);
+        };
+        if self
+            .store
+            .declared_type_links(global_object)
+            .and_then(|links| links.declared_type)
+            == Some(type_id)
+        {
+            return Ok(true);
+        }
+        let Some(type_symbol) = self
+            .store
+            .type_payload(type_id)
+            .ok_or(RelationUnavailable::Type(type_id))?
+            .symbol()
+        else {
+            return Ok(false);
+        };
+        Ok(self.store.get_merged_symbol(type_symbol) == Some(global_object))
     }
 
     fn properties_related_to(
@@ -1087,7 +1159,7 @@ impl<'store> RelaterSession<'store> {
         // Preserve upstream's unmatched-property pass before comparing any
         // property types. This ordering is observable through relation caches.
         for target_property in &target_members.properties {
-            let target_symbol = self.property_symbol(*target_property)?;
+            let target_symbol = self.property_symbol(*target_property, false)?;
             if !target_symbol.flags().intersects(SymbolFlags::OPTIONAL)
                 && self
                     .lookup_source_property(source, source_members, *target_property)?
@@ -1124,33 +1196,96 @@ impl<'store> RelaterSession<'store> {
         source_property: SemanticSymbolId,
         target_property: SemanticSymbolId,
     ) -> Result<Ternary, RelationUnavailable> {
-        let source_flags = self.property_symbol(source_property)?.flags();
-        let target_flags = self.property_symbol(target_property)?.flags();
-        let target_type = self.property_type(target_property)?;
-        if self.bootstrap.strict_null_checks && target_flags.intersects(SymbolFlags::OPTIONAL) {
-            return Err(RelationUnavailable::StrictOptionalProperty(target_property));
-        }
-        let target_type_flags = self.store.type_flags(target_type)?;
-        if target_type_flags.intersects(TypeFlags::ANY_OR_UNKNOWN) {
-            return self.optional_property_result(
-                source,
-                target,
-                source_property,
-                target_property,
-                Ternary::True,
-            );
-        }
-        if self.bootstrap.strict_null_checks && source_flags.intersects(SymbolFlags::OPTIONAL) {
-            return Err(RelationUnavailable::StrictOptionalProperty(source_property));
-        }
+        let source_flags = self.property_symbol(source_property, true)?.flags();
+        let target_flags = self.property_symbol(target_property, false)?.flags();
         let source_type = self.property_type(source_property)?;
-        let related = self.is_related_to_ex(
+        let target_type = self.property_type(target_property)?;
+        let source_types = self.effective_property_types(
             source_type,
-            target_type,
-            RecursionFlags::BOTH,
-            IntersectionState::NONE,
+            source_flags.intersects(SymbolFlags::OPTIONAL),
         )?;
+        let target_types = self.effective_property_types(
+            target_type,
+            target_flags.intersects(SymbolFlags::OPTIONAL),
+        )?;
+        let related = self.property_types_related(&source_types, &target_types)?;
         self.optional_property_result(source, target, source_property, target_property, related)
+    }
+
+    fn effective_property_types(
+        &mut self,
+        type_id: TypeId,
+        optional: bool,
+    ) -> Result<Vec<TypeId>, RelationUnavailable> {
+        let flags = self.store.type_flags(type_id)?;
+        if !self.bootstrap.strict_null_checks || !optional {
+            return Ok(vec![type_id]);
+        }
+        if self.bootstrap.exact_optional_property_types {
+            if type_id == self.bootstrap.missing_type {
+                return Ok(vec![self.bootstrap.never_type]);
+            }
+            if flags.intersects(TypeFlags::UNION) {
+                let types = self.union_types(type_id)?;
+                if types.contains(&self.bootstrap.missing_type) {
+                    let mut types = types
+                        .into_iter()
+                        .filter(|candidate| *candidate != self.bootstrap.missing_type)
+                        .collect::<Vec<_>>();
+                    if types.is_empty() {
+                        types.push(self.bootstrap.never_type);
+                    }
+                    return Ok(types);
+                }
+            }
+            return Ok(vec![type_id]);
+        }
+        let contains_undefined = type_id == self.bootstrap.undefined_type
+            || flags.intersects(TypeFlags::UNION)
+                && self
+                    .union_types(type_id)?
+                    .contains(&self.bootstrap.undefined_type);
+        if contains_undefined {
+            return Ok(vec![type_id]);
+        }
+        // Source construction retains the declared/base annotation and the
+        // OPTIONAL symbol bit. Model pinned `T | undefined` here without
+        // allocating a relation-owned union or mutating semantic state.
+        Ok(vec![self.bootstrap.undefined_type, type_id])
+    }
+
+    fn property_types_related(
+        &mut self,
+        source_types: &[TypeId],
+        target_types: &[TypeId],
+    ) -> Result<Ternary, RelationUnavailable> {
+        if source_types.is_empty() {
+            return Ok(Ternary::True);
+        }
+        if target_types.is_empty() {
+            return Ok(Ternary::False);
+        }
+        let mut result = Ternary::True;
+        for source_type in source_types {
+            let mut related = Ternary::False;
+            for target_type in target_types {
+                let candidate = self.is_related_to_ex(
+                    *source_type,
+                    *target_type,
+                    RecursionFlags::BOTH,
+                    IntersectionState::NONE,
+                )?;
+                if candidate != Ternary::False {
+                    related = candidate;
+                    break;
+                }
+            }
+            if related == Ternary::False {
+                return Ok(Ternary::False);
+            }
+            result &= related;
+        }
+        Ok(result)
     }
 
     fn optional_property_result(
@@ -1164,8 +1299,8 @@ impl<'store> RelaterSession<'store> {
         if related == Ternary::False {
             return Ok(Ternary::False);
         }
-        let source_flags = self.property_symbol(source_property)?.flags();
-        let target_flags = self.property_symbol(target_property)?.flags();
+        let source_flags = self.property_symbol(source_property, true)?.flags();
+        let target_flags = self.property_symbol(target_property, false)?.flags();
         if source_flags.intersects(SymbolFlags::OPTIONAL)
             && !target_flags.intersects(SymbolFlags::OPTIONAL)
         {
@@ -1187,7 +1322,7 @@ impl<'store> RelaterSession<'store> {
         source_members: &ResolvedObjectMembers,
         target_property: SemanticSymbolId,
     ) -> Result<Option<SemanticSymbolId>, RelationUnavailable> {
-        let target_symbol = self.property_symbol(target_property)?;
+        let target_symbol = self.property_symbol(target_property, false)?;
         let name = target_symbol.name();
         if let Some(members) = source_members.members {
             let table = self
@@ -1195,7 +1330,7 @@ impl<'store> RelaterSession<'store> {
                 .symbol_table(members)
                 .ok_or(RelationUnavailable::InvalidStructuredMembers(source))?;
             if let Some(property) = table.get(name) {
-                self.property_symbol(property)?;
+                self.property_symbol(property, true)?;
                 return Ok(Some(property));
             }
         }
@@ -1206,14 +1341,33 @@ impl<'store> RelaterSession<'store> {
         &self,
         name: ts_binder::EscapedNameRef<'_>,
     ) -> Result<Option<SemanticSymbolId>, RelationUnavailable> {
-        let Some(global_object_type) = self.global_object_type()? else {
+        let Some(global_object) = self.global_object_symbol()? else {
             return Ok(None);
         };
-        self.ensure_supported_object_kind(global_object_type)?;
+        let Some(global_object_type) = self
+            .store
+            .declared_type_links(global_object)
+            .and_then(|links| links.declared_type)
+        else {
+            return Err(RelationUnavailable::UnresolvedGlobalObject(global_object));
+        };
+        self.ensure_supported_object_kind(global_object_type, false)?;
         let record = self
             .store
             .type_payload(global_object_type)
             .ok_or(RelationUnavailable::Type(global_object_type))?;
+        let no_inherited_members = match record.data() {
+            TypeData::Object(_) => true,
+            TypeData::Interface(interface) => {
+                interface.base_types_resolved
+                    && interface.resolved_base_constructor_type.is_none()
+                    && interface.resolved_base_types.is_none()
+            }
+            _ => false,
+        };
+        if no_inherited_members && self.raw_symbol_members_prove_absent(global_object, name)? {
+            return Ok(None);
+        }
         if !record
             .object_flags()
             .intersects(ObjectFlags::MEMBERS_RESOLVED)
@@ -1277,11 +1431,42 @@ impl<'store> RelaterSession<'store> {
         let Some(property) = table.get(name) else {
             return Ok(None);
         };
-        self.property_symbol(property)?;
+        self.property_symbol(property, false)?;
         Ok(Some(property))
     }
 
-    fn global_object_type(&self) -> Result<Option<TypeId>, RelationUnavailable> {
+    fn raw_symbol_members_prove_absent(
+        &self,
+        symbol: SemanticSymbolId,
+        name: ts_binder::EscapedNameRef<'_>,
+    ) -> Result<bool, RelationUnavailable> {
+        let record = self
+            .store
+            .symbol(symbol)
+            .ok_or(RelationUnavailable::Symbol(symbol))?;
+        let Some(members) = record.members() else {
+            return Ok(true);
+        };
+        let table = self
+            .store
+            .symbol_table(members)
+            .ok_or(RelationUnavailable::InvalidSymbolMembers(symbol))?;
+        for (member_name, member) in table.iter() {
+            let member = self
+                .store
+                .symbol(member)
+                .ok_or(RelationUnavailable::InvalidSymbolMembers(symbol))?;
+            if member.name() != member_name {
+                return Err(RelationUnavailable::InvalidSymbolMembers(symbol));
+            }
+        }
+        if table.get(InternalSymbolName::Computed.as_ref()).is_some() {
+            return Ok(false);
+        }
+        Ok(table.get(name).is_none())
+    }
+
+    fn global_object_symbol(&self) -> Result<Option<SemanticSymbolId>, RelationUnavailable> {
         let globals = self
             .store
             .intrinsic_bootstrap
@@ -1295,23 +1480,16 @@ impl<'store> RelaterSession<'store> {
         let Some(global_object) = globals.get_source("Object") else {
             return Ok(None);
         };
-        let global_object = self
-            .store
+        self.store
             .get_merged_symbol(global_object)
-            .ok_or(RelationUnavailable::Symbol(global_object))?;
-        let Some(global_object_type) = self
-            .store
-            .declared_type_links(global_object)
-            .and_then(|links| links.declared_type)
-        else {
-            return Err(RelationUnavailable::UnresolvedGlobalObject(global_object));
-        };
-        Ok(Some(global_object_type))
+            .map(Some)
+            .ok_or(RelationUnavailable::Symbol(global_object))
     }
 
     fn property_symbol(
         &self,
         symbol: SemanticSymbolId,
+        allow_object_literal_source: bool,
     ) -> Result<&ts_binder::semantic::Symbol, RelationUnavailable> {
         let record = self
             .store
@@ -1333,10 +1511,14 @@ impl<'store> RelaterSession<'store> {
                 .store
                 .symbol(parent)
                 .ok_or(RelationUnavailable::Symbol(parent))?;
-            if !parent
-                .flags()
-                .intersects(SymbolFlags::INTERFACE | SymbolFlags::TYPE_LITERAL)
-            {
+            let allowed_parent_flags = SymbolFlags::INTERFACE
+                | SymbolFlags::TYPE_LITERAL
+                | if allow_object_literal_source {
+                    SymbolFlags::OBJECT_LITERAL
+                } else {
+                    SymbolFlags::NONE
+                };
+            if !parent.flags().intersects(allowed_parent_flags) {
                 return Err(RelationUnavailable::UnsupportedProperty(symbol));
             }
         } else if record
@@ -1370,8 +1552,8 @@ impl<'store> RelaterSession<'store> {
             && source_flags.intersects(TypeFlags::OBJECT)
             && target_flags.intersects(TypeFlags::OBJECT)
         {
-            self.ensure_supported_object_kind(source)?;
-            self.ensure_supported_object_kind(target)?;
+            self.ensure_supported_object_kind(source, true)?;
+            self.ensure_supported_object_kind(target, false)?;
             return Ok(());
         }
         Err(RelationUnavailable::StructuralRelation {
@@ -1381,12 +1563,16 @@ impl<'store> RelaterSession<'store> {
         })
     }
 
-    fn ensure_supported_object_kind(&self, type_id: TypeId) -> Result<(), RelationUnavailable> {
+    fn ensure_supported_object_kind(
+        &self,
+        type_id: TypeId,
+        allow_fresh_source: bool,
+    ) -> Result<(), RelationUnavailable> {
         let record = self
             .store
             .type_payload(type_id)
             .ok_or(RelationUnavailable::Type(type_id))?;
-        if record.flags() != TypeFlags::OBJECT || record.alias().is_some() {
+        if record.flags() != TypeFlags::OBJECT || !self.supports_property_object_alias(type_id) {
             return Err(RelationUnavailable::UnsupportedStructuredType(type_id));
         }
         let kind = record.object_flags() & ObjectFlags::OBJECT_TYPE_KIND_MASK;
@@ -1396,6 +1582,7 @@ impl<'store> RelaterSession<'store> {
         {
             return Err(RelationUnavailable::UnsupportedStructuredType(type_id));
         }
+        let fresh_object_literal = ObjectFlags::OBJECT_LITERAL | ObjectFlags::FRESH_LITERAL;
         let unsupported_flags = ObjectFlags::CLASS
             | ObjectFlags::REFERENCE
             | ObjectFlags::TUPLE
@@ -1403,12 +1590,18 @@ impl<'store> RelaterSession<'store> {
             | ObjectFlags::REVERSE_MAPPED
             | ObjectFlags::EVOLVING_ARRAY
             | ObjectFlags::INSTANTIATED
-            | ObjectFlags::OBJECT_LITERAL
-            | ObjectFlags::FRESH_LITERAL
             | ObjectFlags::ARRAY_LITERAL
             | ObjectFlags::JSX_ATTRIBUTES
+            | ObjectFlags::JS_LITERAL
+            | ObjectFlags::CONTAINS_SPREAD
+            | ObjectFlags::OBJECT_REST_TYPE
+            | ObjectFlags::IS_CLASS_INSTANCE_CLONE
+            | ObjectFlags::OBJECT_LITERAL_PATTERN_WITH_COMPUTED_PROPERTIES
             | ObjectFlags::UNRESOLVED_MEMBERS;
-        if record.object_flags().intersects(unsupported_flags) {
+        if record.object_flags().intersects(unsupported_flags)
+            || record.object_flags().intersects(fresh_object_literal)
+                && (!allow_fresh_source || !record.object_flags().contains(fresh_object_literal))
+        {
             return Err(RelationUnavailable::UnsupportedStructuredType(type_id));
         }
         match (kind, record.data()) {
@@ -1423,11 +1616,68 @@ impl<'store> RelaterSession<'store> {
         Ok(())
     }
 
+    fn supports_property_object_alias(&self, type_id: TypeId) -> bool {
+        let Some(record) = self.store.type_payload(type_id) else {
+            return false;
+        };
+        let Some(alias_id) = record.alias() else {
+            return true;
+        };
+        if !matches!(record.data(), TypeData::Object(_))
+            || record.object_flags() & ObjectFlags::OBJECT_TYPE_KIND_MASK != ObjectFlags::ANONYMOUS
+            || record
+                .object_flags()
+                .intersects(ObjectFlags::OBJECT_LITERAL | ObjectFlags::FRESH_LITERAL)
+        {
+            return false;
+        }
+        let Some(owner) = record.symbol() else {
+            return false;
+        };
+        let Some(owner_record) = self.store.symbol(owner) else {
+            return false;
+        };
+        if self.store.get_merged_symbol(owner) != Some(owner)
+            || owner_record.flags() != SymbolFlags::TYPE_LITERAL
+            || owner_record.check_flags() != CheckFlags::NONE
+            || owner_record.name() != InternalSymbolName::Type.as_ref()
+        {
+            return false;
+        }
+        let Some(alias) = self.store.type_alias(alias_id) else {
+            return false;
+        };
+        let Some(alias_symbol) = alias.symbol() else {
+            return false;
+        };
+        let Some(alias_record) = self.store.symbol(alias_symbol) else {
+            return false;
+        };
+        let alias_flags = alias_record.flags();
+        if alias.type_arguments().is_some()
+            || self.store.get_merged_symbol(alias_symbol) != Some(alias_symbol)
+            || !alias_flags.contains(SymbolFlags::TYPE_ALIAS)
+            || malformed_alias_merge(alias_flags)
+            || alias_record.check_flags() != CheckFlags::NONE
+        {
+            return false;
+        }
+        self.store
+            .type_alias_links(alias_symbol)
+            .is_some_and(|links| {
+                links.declared_type == Some(type_id)
+                    && links.type_parameters.is_none()
+                    && links.instantiations.is_none()
+                    && !links.is_constructor_declared_property
+            })
+    }
+
     fn resolved_object_members(
         &self,
         type_id: TypeId,
+        allow_fresh_source: bool,
     ) -> Result<ResolvedObjectMembers, RelationUnavailable> {
-        self.ensure_supported_object_kind(type_id)?;
+        self.ensure_supported_object_kind(type_id, allow_fresh_source)?;
         let record = self
             .store
             .type_payload(type_id)
@@ -1463,7 +1713,7 @@ impl<'store> RelaterSession<'store> {
             if !property_set.insert(*property) {
                 return Err(RelationUnavailable::InvalidStructuredMembers(type_id));
             }
-            self.property_symbol(*property)?;
+            self.property_symbol(*property, allow_fresh_source)?;
         }
         match structured.members {
             None if properties.is_empty() => {}
@@ -1477,13 +1727,13 @@ impl<'store> RelaterSession<'store> {
                     return Err(RelationUnavailable::InvalidStructuredMembers(type_id));
                 }
                 for (name, property) in table.iter() {
-                    let symbol = self.property_symbol(property)?;
+                    let symbol = self.property_symbol(property, allow_fresh_source)?;
                     if symbol.name() != name || !property_set.contains(&property) {
                         return Err(RelationUnavailable::InvalidStructuredMembers(type_id));
                     }
                 }
                 for property in &properties {
-                    let symbol = self.property_symbol(*property)?;
+                    let symbol = self.property_symbol(*property, allow_fresh_source)?;
                     if table.get(symbol.name()) != Some(*property) {
                         return Err(RelationUnavailable::InvalidStructuredMembers(type_id));
                     }
@@ -1894,8 +2144,12 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             .ok_or(RelationUnavailable::MissingBootstrap)?;
         Ok(RelationBootstrapFacts {
             strict_null_checks: bootstrap.options.strict_null_checks,
+            exact_optional_property_types: bootstrap.options.exact_optional_property_types,
             wildcard_type: bootstrap.wildcard_type,
             any_function_type: bootstrap.any_function_type,
+            never_type: bootstrap.never_type,
+            undefined_type: bootstrap.undefined_type,
+            missing_type: bootstrap.missing_type,
             string_type: bootstrap.string_type,
             number_type: bootstrap.number_type,
             bigint_type: bootstrap.bigint_type,
@@ -2201,14 +2455,19 @@ const fn recursion_identity_unavailable(
 
 #[cfg(test)]
 mod tests {
-    use ts_binder::{EscapedName, SemanticSymbolId, SymbolData, SymbolFlags};
+    use ts_ast::{FileId, SyntaxKind};
+    use ts_binder::{
+        AstScope, CheckFlags, EscapedName, InternalSymbolName, SemanticSymbolId, SymbolData,
+        SymbolFlags,
+    };
     use ts_jsnum::{Number, PseudoBigInt};
+    use ts_parser::parse_source_file;
 
     use super::RelationUnavailable;
     use crate::semantic::{
         CanonicalTypeMapperStore, DeclaredTypeLinks, IntrinsicBootstrapOptions,
         MembersAndExportsLinks, MembersOrExportsResolutionKind, RelationComparisonResult,
-        RelationKind, TypeId, ValueSymbolLinks,
+        RelationKind, TypeAliasLinks, TypeId, ValueSymbolLinks,
         signatures::{SignatureFlags, Ternary},
         type_records::{LiteralValue, RegularLiteralLink, TypeData},
         types::{ObjectFlags, TypeFlags},
@@ -2217,11 +2476,18 @@ mod tests {
     type TestStore = CanonicalTypeMapperStore;
 
     fn initialized(strict_null_checks: bool) -> TestStore {
+        initialized_with_options(strict_null_checks, false)
+    }
+
+    fn initialized_with_options(
+        strict_null_checks: bool,
+        exact_optional_property_types: bool,
+    ) -> TestStore {
         let mut store = TestStore::new();
         store
             .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions {
                 strict_null_checks,
-                exact_optional_property_types: false,
+                exact_optional_property_types,
             })
             .unwrap();
         store
@@ -2321,9 +2587,89 @@ mod tests {
         object
     }
 
+    fn alloc_fresh_property_object(
+        store: &mut TestStore,
+        properties: Vec<SemanticSymbolId>,
+    ) -> TypeId {
+        let object = store
+            .alloc_plain_object_type(
+                ObjectFlags::ANONYMOUS | ObjectFlags::OBJECT_LITERAL | ObjectFlags::FRESH_LITERAL,
+                None,
+            )
+            .unwrap();
+        set_object_properties(store, object, properties);
+        object
+    }
+
+    fn alloc_synthetic_type_literal_object(store: &mut TestStore, type_id: TypeId) -> TypeId {
+        let owner = store
+            .alloc_symbol(SymbolData::new(
+                SymbolFlags::TYPE_LITERAL,
+                EscapedName::internal(InternalSymbolName::Type),
+            ))
+            .unwrap();
+        let property = alloc_typed_property(store, "x", type_id, false);
+        assert!(store.set_symbol_relationships(property, None, None, Some(owner), None,));
+        let object = store
+            .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(owner))
+            .unwrap();
+        set_object_properties(store, object, vec![property]);
+        object
+    }
+
+    fn attach_direct_type_alias(
+        store: &mut TestStore,
+        object: TypeId,
+        symbol: Option<SemanticSymbolId>,
+        type_arguments: Option<Vec<TypeId>>,
+        declared_type: Option<TypeId>,
+    ) {
+        let alias = store.alloc_type_alias(symbol).unwrap();
+        if type_arguments.is_some() {
+            assert!(store.set_type_alias_arguments(alias, type_arguments));
+        }
+        assert!(store.set_type_alias(object, Some(alias)));
+        if let Some(symbol) = symbol
+            && let Some(declared_type) = declared_type
+        {
+            assert!(store.set_type_alias_links(
+                symbol,
+                TypeAliasLinks {
+                    declared_type: Some(declared_type),
+                    ..TypeAliasLinks::default()
+                },
+            ));
+        }
+    }
+
     fn install_global_object(store: &mut TestStore, object_type: TypeId) -> SemanticSymbolId {
         let globals = store.intrinsic_bootstrap().unwrap().globals;
+        let raw_properties = store
+            .type_payload(object_type)
+            .and_then(|record| record.data().structured())
+            .and_then(|structured| structured.properties.clone())
+            .unwrap_or_default();
+        let raw_members = if raw_properties.is_empty() {
+            None
+        } else {
+            let members = store.alloc_symbol_table();
+            for property in raw_properties {
+                let name = store
+                    .symbol(property)
+                    .unwrap()
+                    .name()
+                    .as_utf8()
+                    .unwrap()
+                    .to_owned();
+                assert_eq!(
+                    store.insert_symbol(members, EscapedName::source(&name), property),
+                    Some(None)
+                );
+            }
+            Some(members)
+        };
         let object_symbol = alloc_symbol(store, SymbolFlags::INTERFACE, "Object");
+        assert!(store.set_symbol_relationships(object_symbol, raw_members, None, None, None,));
         assert_eq!(
             store.insert_symbol(globals, EscapedName::source("Object"), object_symbol),
             Some(None)
@@ -3276,6 +3622,399 @@ mod tests {
     }
 
     #[test]
+    fn fresh_object_literals_check_excess_properties_before_structural_width() {
+        let mut store = initialized(true);
+        let (string, number) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (bootstrap.string_type, bootstrap.number_type)
+        };
+        let stale_x = alloc_typed_property(&mut store, "x", string, false);
+        let stale_y = alloc_typed_property(&mut store, "y", number, false);
+        let stale = alloc_property_object(&mut store, vec![stale_x, stale_y]);
+        let target_x = alloc_typed_property(&mut store, "x", string, false);
+        let target = alloc_property_object(&mut store, vec![target_x]);
+        assert_eq!(store.is_type_assignable_to(stale, target), Ok(true));
+
+        let fresh_x = alloc_typed_property(&mut store, "x", string, false);
+        let fresh_y = alloc_typed_property(&mut store, "y", number, false);
+        let fresh = alloc_fresh_property_object(&mut store, vec![fresh_x, fresh_y]);
+        let before_excess = store.relation_state_snapshot();
+        assert_eq!(store.is_type_assignable_to(fresh, target), Ok(false));
+        assert_eq!(
+            store.relation_state_snapshot(),
+            before_excess,
+            "an excess-property failure precedes recursive cache publication"
+        );
+
+        let matching_x = alloc_typed_property(&mut store, "x", string, false);
+        let matching = alloc_fresh_property_object(&mut store, vec![matching_x]);
+        assert_eq!(store.is_type_assignable_to(matching, target), Ok(true));
+
+        let empty = alloc_property_object(&mut store, Vec::new());
+        assert_eq!(
+            store.is_type_assignable_to(fresh, empty),
+            Ok(true),
+            "the pinned empty-object target remains open to fresh literals"
+        );
+
+        let mut global_target = initialized(true);
+        let string = global_target.intrinsic_bootstrap().unwrap().string_type;
+        let global_property = alloc_typed_property(&mut global_target, "toString", string, false);
+        let global_object = alloc_property_object(&mut global_target, vec![global_property]);
+        install_global_object(&mut global_target, global_object);
+        let fresh_property = alloc_typed_property(&mut global_target, "x", string, false);
+        let fresh = alloc_fresh_property_object(&mut global_target, vec![fresh_property]);
+        assert_eq!(
+            global_target.is_type_assignable_to(fresh, global_object),
+            Ok(true),
+            "the exact global Object target is exempt from excess-property checks"
+        );
+    }
+
+    #[test]
+    fn object_literal_parented_properties_are_admitted_only_for_sources() {
+        let parsed = parse_source_file("const value = { x: 1 };");
+        let scope = AstScope::new(FileId::new(0), &parsed.arena);
+        let node_of_kind = |kind| {
+            let (node, _) = parsed
+                .arena
+                .iter()
+                .find(|(_, node)| node.kind == kind)
+                .unwrap_or_else(|| panic!("fixture is missing {kind:?}"));
+            scope.node_ref(node).unwrap()
+        };
+        let object_literal = node_of_kind(SyntaxKind::ObjectLiteralExpression);
+        let property_assignment = node_of_kind(SyntaxKind::PropertyAssignment);
+
+        let mut store = initialized(true);
+        assert!(store.register_ast_scope(scope));
+        let string = store.intrinsic_bootstrap().unwrap().string_type;
+
+        let mut owner_data = SymbolData::new(
+            SymbolFlags::OBJECT_LITERAL,
+            EscapedName::internal(InternalSymbolName::Object),
+        );
+        owner_data.declarations = Some(vec![object_literal]);
+        owner_data.value_declaration = Some(object_literal);
+        let owner = store.alloc_symbol(owner_data).unwrap();
+
+        let mut property_data = SymbolData::new(SymbolFlags::PROPERTY, EscapedName::source("x"));
+        property_data.declarations = Some(vec![property_assignment]);
+        property_data.value_declaration = Some(property_assignment);
+        property_data.parent = Some(owner);
+        let property = store.alloc_symbol(property_data).unwrap();
+        assert!(store.set_value_symbol_links(
+            property,
+            ValueSymbolLinks {
+                resolved_type: Some(string),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+
+        let source_members = store.alloc_symbol_table();
+        assert_eq!(
+            store.insert_symbol(source_members, EscapedName::source("x"), property),
+            Some(None)
+        );
+        assert!(store.set_symbol_relationships(owner, Some(source_members), None, None, None,));
+        let source = store
+            .alloc_plain_object_type(
+                ObjectFlags::ANONYMOUS | ObjectFlags::OBJECT_LITERAL | ObjectFlags::FRESH_LITERAL,
+                Some(owner),
+            )
+            .unwrap();
+        assert!(store.set_structured_type_members(
+            source,
+            Some(source_members),
+            Some(vec![property]),
+            None,
+            None,
+            None,
+        ));
+
+        let record = store.symbol(property).unwrap();
+        assert_eq!(record.flags(), SymbolFlags::PROPERTY);
+        assert_eq!(record.check_flags(), CheckFlags::NONE);
+        assert_eq!(record.parent(), Some(owner));
+        assert_eq!(
+            record.declarations(),
+            Some([property_assignment].as_slice())
+        );
+        assert_eq!(record.value_declaration(), Some(property_assignment));
+
+        let target_property = alloc_typed_property(&mut store, "x", string, false);
+        let target = alloc_property_object(&mut store, vec![target_property]);
+        assert_eq!(store.is_type_assignable_to(source, target), Ok(true));
+
+        let ordinary_source_property = alloc_typed_property(&mut store, "x", string, false);
+        let ordinary_source = alloc_property_object(&mut store, vec![ordinary_source_property]);
+        let object_literal_shaped_target = store
+            .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(owner))
+            .unwrap();
+        assert!(store.set_structured_type_members(
+            object_literal_shaped_target,
+            Some(source_members),
+            Some(vec![property]),
+            None,
+            None,
+            None,
+        ));
+        let before = store.relation_state_snapshot();
+        assert_eq!(
+            store.is_type_assignable_to(ordinary_source, object_literal_shaped_target),
+            Err(RelationUnavailable::UnsupportedProperty(property))
+        );
+        assert_eq!(store.relation_state_snapshot(), before);
+    }
+
+    #[test]
+    fn canonical_direct_type_literal_aliases_are_transparent_and_poison_forms_fail_closed() {
+        let parsed = parse_source_file("type Shape = { x: string };");
+        let scope = AstScope::new(FileId::new(0), &parsed.arena);
+        let node_of_kind = |kind| {
+            let (node, _) = parsed
+                .arena
+                .iter()
+                .find(|(_, node)| node.kind == kind)
+                .unwrap_or_else(|| panic!("fixture is missing {kind:?}"));
+            scope.node_ref(node).unwrap()
+        };
+        let alias_declaration = node_of_kind(SyntaxKind::TypeAliasDeclaration);
+        let type_literal = node_of_kind(SyntaxKind::TypeLiteral);
+        let property_declaration = node_of_kind(SyntaxKind::PropertyDeclaration);
+
+        let mut store = initialized(true);
+        assert!(store.register_ast_scope(scope));
+        let string = store.intrinsic_bootstrap().unwrap().string_type;
+
+        let mut owner_data = SymbolData::new(
+            SymbolFlags::TYPE_LITERAL,
+            EscapedName::internal(InternalSymbolName::Type),
+        );
+        owner_data.declarations = Some(vec![type_literal]);
+        let owner = store.alloc_symbol(owner_data).unwrap();
+        let mut property_data = SymbolData::new(SymbolFlags::PROPERTY, EscapedName::source("x"));
+        property_data.declarations = Some(vec![property_declaration]);
+        property_data.value_declaration = Some(property_declaration);
+        property_data.parent = Some(owner);
+        let property = store.alloc_symbol(property_data).unwrap();
+        assert!(store.set_value_symbol_links(
+            property,
+            ValueSymbolLinks {
+                resolved_type: Some(string),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        let members = store.alloc_symbol_table();
+        assert_eq!(
+            store.insert_symbol(members, EscapedName::source("x"), property),
+            Some(None)
+        );
+        assert!(store.set_symbol_relationships(owner, Some(members), None, None, None,));
+        let shape = store
+            .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(owner))
+            .unwrap();
+        assert!(store.set_structured_type_members(
+            shape,
+            Some(members),
+            Some(vec![property]),
+            None,
+            None,
+            None,
+        ));
+
+        let mut alias_data = SymbolData::new(SymbolFlags::TYPE_ALIAS, EscapedName::source("Shape"));
+        alias_data.declarations = Some(vec![alias_declaration]);
+        let alias_symbol = store.alloc_symbol(alias_data).unwrap();
+        attach_direct_type_alias(&mut store, shape, Some(alias_symbol), None, Some(shape));
+
+        let fresh_property = alloc_typed_property(&mut store, "x", string, false);
+        let fresh = alloc_fresh_property_object(&mut store, vec![fresh_property]);
+        assert_eq!(
+            store.is_type_assignable_to(fresh, shape),
+            Ok(true),
+            "direct alias metadata is display provenance, not a structural boundary"
+        );
+        let plain_property = alloc_typed_property(&mut store, "x", string, false);
+        let plain = alloc_property_object(&mut store, vec![plain_property]);
+        assert_eq!(store.is_type_assignable_to(shape, plain), Ok(true));
+
+        let transient_shape = alloc_synthetic_type_literal_object(&mut store, string);
+        let transient_alias_symbol = store.alloc_transient_symbol(
+            SymbolFlags::TYPE_ALIAS,
+            EscapedName::source("TransientShape"),
+            CheckFlags::NONE,
+        );
+        assert_eq!(
+            store.symbol(transient_alias_symbol).unwrap().flags(),
+            SymbolFlags::TYPE_ALIAS | SymbolFlags::TRANSIENT
+        );
+        attach_direct_type_alias(
+            &mut store,
+            transient_shape,
+            Some(transient_alias_symbol),
+            None,
+            Some(transient_shape),
+        );
+        assert_eq!(
+            store.is_type_assignable_to(fresh, transient_shape),
+            Ok(true),
+            "canonical script-global transient aliases remain structural"
+        );
+        assert_eq!(
+            store.is_type_assignable_to(transient_shape, plain),
+            Ok(true)
+        );
+
+        let allocated_empty_arguments = alloc_synthetic_type_literal_object(&mut store, string);
+        let generic_symbol = alloc_symbol(&mut store, SymbolFlags::TYPE_ALIAS, "Generic");
+        attach_direct_type_alias(
+            &mut store,
+            allocated_empty_arguments,
+            Some(generic_symbol),
+            Some(Vec::new()),
+            Some(allocated_empty_arguments),
+        );
+
+        let missing_symbol = alloc_synthetic_type_literal_object(&mut store, string);
+        attach_direct_type_alias(&mut store, missing_symbol, None, None, None);
+
+        let wrong_alias_flags = alloc_synthetic_type_literal_object(&mut store, string);
+        let interface_symbol = alloc_symbol(&mut store, SymbolFlags::INTERFACE, "NotAlias");
+        attach_direct_type_alias(
+            &mut store,
+            wrong_alias_flags,
+            Some(interface_symbol),
+            None,
+            Some(wrong_alias_flags),
+        );
+
+        let malformed_alias_merge = alloc_synthetic_type_literal_object(&mut store, string);
+        let mixed_alias_symbol = alloc_symbol(
+            &mut store,
+            SymbolFlags::TYPE_ALIAS | SymbolFlags::ALIAS,
+            "MixedAlias",
+        );
+        attach_direct_type_alias(
+            &mut store,
+            malformed_alias_merge,
+            Some(mixed_alias_symbol),
+            None,
+            Some(malformed_alias_merge),
+        );
+
+        let mismatched_declared_type = alloc_synthetic_type_literal_object(&mut store, string);
+        let mismatch_symbol = alloc_symbol(&mut store, SymbolFlags::TYPE_ALIAS, "Mismatch");
+        attach_direct_type_alias(
+            &mut store,
+            mismatched_declared_type,
+            Some(mismatch_symbol),
+            None,
+            Some(plain),
+        );
+
+        let wrong_owner_property = alloc_typed_property(&mut store, "x", string, false);
+        let wrong_owner = alloc_property_object(&mut store, vec![wrong_owner_property]);
+        let wrong_owner_symbol = alloc_symbol(&mut store, SymbolFlags::TYPE_ALIAS, "WrongOwner");
+        attach_direct_type_alias(
+            &mut store,
+            wrong_owner,
+            Some(wrong_owner_symbol),
+            None,
+            Some(wrong_owner),
+        );
+
+        let aliased_interface_symbol =
+            alloc_symbol(&mut store, SymbolFlags::INTERFACE, "AliasedInterface");
+        let aliased_interface = store
+            .alloc_interface_type(ObjectFlags::INTERFACE, Some(aliased_interface_symbol))
+            .unwrap();
+        let interface_property = alloc_typed_property(&mut store, "x", string, false);
+        set_object_properties(&mut store, aliased_interface, vec![interface_property]);
+        let interface_alias_symbol =
+            alloc_symbol(&mut store, SymbolFlags::TYPE_ALIAS, "InterfaceAlias");
+        attach_direct_type_alias(
+            &mut store,
+            aliased_interface,
+            Some(interface_alias_symbol),
+            None,
+            Some(aliased_interface),
+        );
+
+        for poisoned in [
+            allocated_empty_arguments,
+            missing_symbol,
+            wrong_alias_flags,
+            malformed_alias_merge,
+            mismatched_declared_type,
+            wrong_owner,
+            aliased_interface,
+        ] {
+            let before = store.relation_state_snapshot();
+            assert_eq!(
+                store.is_type_assignable_to(plain, poisoned),
+                Err(RelationUnavailable::UnsupportedStructuredType(poisoned))
+            );
+            assert_eq!(store.relation_state_snapshot(), before);
+        }
+    }
+
+    #[test]
+    fn fresh_excess_precedes_weak_checks_and_target_freshness_stays_typed() {
+        let mut ordered = initialized(true);
+        let string = ordered.intrinsic_bootstrap().unwrap().string_type;
+        let globals = ordered.intrinsic_bootstrap().unwrap().globals;
+        let object_symbol = alloc_symbol(&mut ordered, SymbolFlags::INTERFACE, "Object");
+        assert_eq!(
+            ordered.insert_symbol(globals, EscapedName::source("Object"), object_symbol),
+            Some(None)
+        );
+        let extra = alloc_typed_property(&mut ordered, "extra", string, false);
+        let source = alloc_fresh_property_object(&mut ordered, vec![extra]);
+        let weak = alloc_typed_property(&mut ordered, "expected", string, true);
+        let target = alloc_property_object(&mut ordered, vec![weak]);
+        let before = ordered.relation_state_snapshot();
+        assert_eq!(ordered.is_type_assignable_to(source, target), Ok(false));
+        assert_eq!(ordered.relation_state_snapshot(), before);
+
+        let mut unsupported_target = initialized(true);
+        let string = unsupported_target
+            .intrinsic_bootstrap()
+            .unwrap()
+            .string_type;
+        let source_property = alloc_typed_property(&mut unsupported_target, "value", string, false);
+        let source = alloc_property_object(&mut unsupported_target, vec![source_property]);
+        let target_property = alloc_typed_property(&mut unsupported_target, "value", string, false);
+        let target = alloc_fresh_property_object(&mut unsupported_target, vec![target_property]);
+        let before = unsupported_target.relation_state_snapshot();
+        assert_eq!(
+            unsupported_target.is_type_assignable_to(source, target),
+            Err(RelationUnavailable::UnsupportedStructuredType(target))
+        );
+        assert_eq!(unsupported_target.relation_state_snapshot(), before);
+    }
+
+    #[test]
+    fn nested_target_freshness_rolls_back_the_outer_pending_relation() {
+        let mut store = initialized(true);
+        let string = store.intrinsic_bootstrap().unwrap().string_type;
+        let source_inner_property = alloc_typed_property(&mut store, "value", string, false);
+        let source_inner = alloc_property_object(&mut store, vec![source_inner_property]);
+        let target_inner_property = alloc_typed_property(&mut store, "value", string, false);
+        let target_inner = alloc_fresh_property_object(&mut store, vec![target_inner_property]);
+        let source_property = alloc_typed_property(&mut store, "nested", source_inner, false);
+        let source = alloc_property_object(&mut store, vec![source_property]);
+        let target_property = alloc_typed_property(&mut store, "nested", target_inner, false);
+        let target = alloc_property_object(&mut store, vec![target_property]);
+        let before = store.relation_state_snapshot();
+        assert_eq!(
+            store.is_type_assignable_to(source, target),
+            Err(RelationUnavailable::UnsupportedStructuredType(target_inner))
+        );
+        assert_eq!(store.relation_state_snapshot(), before);
+    }
+
+    #[test]
     fn resolved_interface_properties_use_the_same_structural_path() {
         let mut store = initialized(true);
         let string = store.intrinsic_bootstrap().unwrap().string_type;
@@ -3309,7 +4048,7 @@ mod tests {
     }
 
     #[test]
-    fn optional_properties_are_exact_only_inside_the_supported_nullability_boundary() {
+    fn optional_properties_follow_loose_strict_and_exact_optional_matrices() {
         let mut loose = initialized(false);
         let string = loose.intrinsic_bootstrap().unwrap().string_type;
         let empty = alloc_property_object(&mut loose, Vec::new());
@@ -3337,7 +4076,10 @@ mod tests {
         );
 
         let mut strict = initialized(true);
-        let string = strict.intrinsic_bootstrap().unwrap().string_type;
+        let (string, undefined) = {
+            let bootstrap = strict.intrinsic_bootstrap().unwrap();
+            (bootstrap.string_type, bootstrap.undefined_type)
+        };
         let empty = alloc_property_object(&mut strict, Vec::new());
         let optional_target_property = alloc_typed_property(&mut strict, "value", string, true);
         let optional_target = alloc_property_object(&mut strict, vec![optional_target_property]);
@@ -3349,27 +4091,93 @@ mod tests {
 
         let required_source_property = alloc_typed_property(&mut strict, "value", string, false);
         let required_source = alloc_property_object(&mut strict, vec![required_source_property]);
-        let before = strict.relation_state_snapshot();
         assert_eq!(
             strict.is_type_assignable_to(required_source, optional_target),
-            Err(RelationUnavailable::StrictOptionalProperty(
-                optional_target_property
-            ))
+            Ok(true)
         );
-        assert_eq!(strict.relation_state_snapshot(), before);
+
+        let undefined_source_property =
+            alloc_typed_property(&mut strict, "value", undefined, false);
+        let undefined_source = alloc_property_object(&mut strict, vec![undefined_source_property]);
+        assert_eq!(
+            strict.is_type_assignable_to(undefined_source, optional_target),
+            Ok(true),
+            "non-exact optional properties virtually include undefined"
+        );
 
         let optional_source_property = alloc_typed_property(&mut strict, "value", string, true);
         let optional_source = alloc_property_object(&mut strict, vec![optional_source_property]);
         let required_target_property = alloc_typed_property(&mut strict, "value", string, false);
         let required_target = alloc_property_object(&mut strict, vec![required_target_property]);
-        let before = strict.relation_state_snapshot();
         assert_eq!(
             strict.is_type_assignable_to(optional_source, required_target),
-            Err(RelationUnavailable::StrictOptionalProperty(
-                optional_source_property
-            ))
+            Ok(false)
         );
-        assert_eq!(strict.relation_state_snapshot(), before);
+
+        let mut exact = initialized_with_options(true, true);
+        let (string, undefined, missing, never) = {
+            let bootstrap = exact.intrinsic_bootstrap().unwrap();
+            (
+                bootstrap.string_type,
+                bootstrap.undefined_type,
+                bootstrap.missing_type,
+                bootstrap.never_type,
+            )
+        };
+        let optional_string_property = alloc_typed_property(&mut exact, "value", string, true);
+        let optional_string = alloc_property_object(&mut exact, vec![optional_string_property]);
+        let required_string_property = alloc_typed_property(&mut exact, "value", string, false);
+        let required_string = alloc_property_object(&mut exact, vec![required_string_property]);
+        assert_eq!(
+            exact.is_type_assignable_to(required_string, optional_string),
+            Ok(true)
+        );
+
+        let required_undefined_property =
+            alloc_typed_property(&mut exact, "value", undefined, false);
+        let required_undefined =
+            alloc_property_object(&mut exact, vec![required_undefined_property]);
+        assert_eq!(
+            exact.is_type_assignable_to(required_undefined, optional_string),
+            Ok(false),
+            "exact optional properties do not add implicit undefined"
+        );
+
+        let explicit_undefined = canonical_union(&mut exact, &[undefined, string]);
+        let explicit_optional_property =
+            alloc_typed_property(&mut exact, "value", explicit_undefined, true);
+        let explicit_optional = alloc_property_object(&mut exact, vec![explicit_optional_property]);
+        assert_eq!(
+            exact.is_type_assignable_to(required_undefined, explicit_optional),
+            Ok(true),
+            "an explicitly declared undefined remains in the base annotation"
+        );
+
+        let stored_optional_property = alloc_typed_property(&mut exact, "value", missing, true);
+        let stored_optional = alloc_property_object(&mut exact, vec![stored_optional_property]);
+        assert_eq!(
+            exact.is_type_assignable_to(required_undefined, stored_optional),
+            Ok(false),
+            "a directly stored missing sentinel is removed from exact optional comparisons"
+        );
+        let required_never_property = alloc_typed_property(&mut exact, "value", never, false);
+        let required_never = alloc_property_object(&mut exact, vec![required_never_property]);
+        assert_eq!(
+            exact.is_type_assignable_to(required_never, stored_optional),
+            Ok(true),
+            "removing a stored missing sentinel leaves the exact never type"
+        );
+
+        let optional_source_property = alloc_typed_property(&mut exact, "value", string, true);
+        let optional_source = alloc_property_object(&mut exact, vec![optional_source_property]);
+        assert_eq!(
+            exact.is_type_assignable_to(optional_source, required_string),
+            Ok(false)
+        );
+        assert_eq!(
+            exact.is_type_assignable_to(optional_source, optional_string),
+            Ok(true)
+        );
     }
 
     #[test]
@@ -3400,6 +4208,24 @@ mod tests {
         let target_property = alloc_typed_property(&mut loose, "a", string, true);
         let target = alloc_property_object(&mut loose, vec![target_property]);
         assert_eq!(loose.is_type_assignable_to(source, target), Ok(true));
+
+        let mut unresolved_global = initialized(true);
+        let string = unresolved_global.intrinsic_bootstrap().unwrap().string_type;
+        let globals = unresolved_global.intrinsic_bootstrap().unwrap().globals;
+        let object_symbol = alloc_symbol(&mut unresolved_global, SymbolFlags::INTERFACE, "Object");
+        assert_eq!(
+            unresolved_global.insert_symbol(globals, EscapedName::source("Object"), object_symbol,),
+            Some(None)
+        );
+        let source_property = alloc_typed_property(&mut unresolved_global, "a", string, false);
+        let source = alloc_property_object(&mut unresolved_global, vec![source_property]);
+        let target_property = alloc_typed_property(&mut unresolved_global, "a", string, true);
+        let target = alloc_property_object(&mut unresolved_global, vec![target_property]);
+        assert_eq!(
+            unresolved_global.is_type_assignable_to(source, target),
+            Ok(true),
+            "an unresolved global Object does not poison a common own property"
+        );
 
         for strict_null_checks in [false, true] {
             let mut store = initialized(strict_null_checks);
@@ -3657,6 +4483,36 @@ mod tests {
     }
 
     #[test]
+    fn transformed_object_shapes_are_unsupported_and_atomic_in_both_roles() {
+        let mut store = initialized(true);
+        let ordinary = alloc_property_object(&mut store, Vec::new());
+        for flag in [
+            ObjectFlags::CONTAINS_SPREAD,
+            ObjectFlags::OBJECT_REST_TYPE,
+            ObjectFlags::IS_CLASS_INSTANCE_CLONE,
+        ] {
+            let transformed = store
+                .alloc_plain_object_type(ObjectFlags::ANONYMOUS | flag, None)
+                .unwrap();
+            assert!(store.set_structured_type_members(transformed, None, None, None, None, None,));
+
+            let before = store.relation_state_snapshot();
+            assert_eq!(
+                store.is_type_assignable_to(transformed, ordinary),
+                Err(RelationUnavailable::UnsupportedStructuredType(transformed))
+            );
+            assert_eq!(store.relation_state_snapshot(), before);
+
+            let before = store.relation_state_snapshot();
+            assert_eq!(
+                store.is_type_assignable_to(ordinary, transformed),
+                Err(RelationUnavailable::UnsupportedStructuredType(transformed))
+            );
+            assert_eq!(store.relation_state_snapshot(), before);
+        }
+    }
+
+    #[test]
     fn global_object_fallback_distinguishes_absent_resolved_and_unresolved_states() {
         let mut absent = initialized(true);
         let string = absent.intrinsic_bootstrap().unwrap().string_type;
@@ -3664,6 +4520,140 @@ mod tests {
         let target_property = alloc_typed_property(&mut absent, "custom", string, false);
         let target = alloc_property_object(&mut absent, vec![target_property]);
         assert_eq!(absent.is_type_assignable_to(source, target), Ok(false));
+
+        let mut shell_absent = initialized(true);
+        let string = shell_absent.intrinsic_bootstrap().unwrap().string_type;
+        let globals = shell_absent.intrinsic_bootstrap().unwrap().globals;
+        let object_symbol = alloc_symbol(&mut shell_absent, SymbolFlags::INTERFACE, "Object");
+        let unrelated = alloc_typed_property(&mut shell_absent, "unrelated", string, false);
+        let raw_members = shell_absent.alloc_symbol_table();
+        assert_eq!(
+            shell_absent.insert_symbol(raw_members, EscapedName::source("unrelated"), unrelated,),
+            Some(None)
+        );
+        assert!(shell_absent.set_symbol_relationships(
+            object_symbol,
+            Some(raw_members),
+            None,
+            None,
+            None,
+        ));
+        assert_eq!(
+            shell_absent.insert_symbol(globals, EscapedName::source("Object"), object_symbol,),
+            Some(None)
+        );
+        let object_type = shell_absent
+            .alloc_interface_type(ObjectFlags::INTERFACE, Some(object_symbol))
+            .unwrap();
+        assert!(shell_absent.set_declared_type_links(
+            object_symbol,
+            DeclaredTypeLinks {
+                declared_type: Some(object_type),
+                ..DeclaredTypeLinks::default()
+            },
+        ));
+        let source = alloc_property_object(&mut shell_absent, Vec::new());
+        let target_property = alloc_typed_property(&mut shell_absent, "custom", string, false);
+        let target = alloc_property_object(&mut shell_absent, vec![target_property]);
+        let before = shell_absent.relation_state_snapshot();
+        assert_eq!(
+            shell_absent.is_type_assignable_to(source, target),
+            Err(RelationUnavailable::UnresolvedStructuredMembers(
+                object_type
+            )),
+            "an interface with unresolved bases cannot prove inherited properties absent"
+        );
+        assert_eq!(shell_absent.relation_state_snapshot(), before);
+        assert!(shell_absent.set_interface_base_resolution(
+            object_type,
+            true,
+            None,
+            Some(Vec::new()),
+        ));
+        let before = shell_absent.relation_state_snapshot();
+        assert_eq!(
+            shell_absent.is_type_assignable_to(source, target),
+            Err(RelationUnavailable::UnresolvedStructuredMembers(
+                object_type
+            )),
+            "an allocated-empty base list is noncanonical and cannot prove absence"
+        );
+        assert_eq!(shell_absent.relation_state_snapshot(), before);
+        assert!(shell_absent.set_interface_base_resolution(object_type, true, None, None,));
+        assert_eq!(
+            shell_absent.is_type_assignable_to(source, target),
+            Ok(false),
+            "a canonical resolved base-less interface may prove the raw name absent"
+        );
+
+        let mut inherited = initialized(true);
+        let (string, globals) = {
+            let bootstrap = inherited.intrinsic_bootstrap().unwrap();
+            (bootstrap.string_type, bootstrap.globals)
+        };
+        let object_symbol = alloc_symbol(&mut inherited, SymbolFlags::INTERFACE, "Object");
+        let unrelated = alloc_typed_property(&mut inherited, "unrelated", string, false);
+        let raw_members = inherited.alloc_symbol_table();
+        assert_eq!(
+            inherited.insert_symbol(raw_members, EscapedName::source("unrelated"), unrelated,),
+            Some(None)
+        );
+        assert!(inherited.set_symbol_relationships(
+            object_symbol,
+            Some(raw_members),
+            None,
+            None,
+            None,
+        ));
+        assert_eq!(
+            inherited.insert_symbol(globals, EscapedName::source("Object"), object_symbol,),
+            Some(None)
+        );
+        let object_type = inherited
+            .alloc_interface_type(ObjectFlags::INTERFACE, Some(object_symbol))
+            .unwrap();
+        let constructor_property =
+            alloc_typed_property(&mut inherited, "fromConstructor", string, false);
+        let base_property = alloc_typed_property(&mut inherited, "fromBase", string, false);
+        set_object_properties(
+            &mut inherited,
+            object_type,
+            vec![constructor_property, base_property],
+        );
+        assert!(inherited.set_declared_type_links(
+            object_symbol,
+            DeclaredTypeLinks {
+                declared_type: Some(object_type),
+                ..DeclaredTypeLinks::default()
+            },
+        ));
+        let base = alloc_property_object(&mut inherited, Vec::new());
+        assert!(inherited.set_interface_base_resolution(
+            object_type,
+            true,
+            Some(base),
+            Some(Vec::new()),
+        ));
+        let source = alloc_property_object(&mut inherited, Vec::new());
+        let target_property =
+            alloc_typed_property(&mut inherited, "fromConstructor", string, false);
+        let target = alloc_property_object(&mut inherited, vec![target_property]);
+        assert_eq!(
+            inherited.is_type_assignable_to(source, target),
+            Ok(true),
+            "a resolved base constructor forces lookup through typed Object members"
+        );
+
+        assert!(
+            inherited.set_interface_base_resolution(object_type, true, None, Some(vec![base]),)
+        );
+        let target_property = alloc_typed_property(&mut inherited, "fromBase", string, false);
+        let target = alloc_property_object(&mut inherited, vec![target_property]);
+        assert_eq!(
+            inherited.is_type_assignable_to(source, target),
+            Ok(true),
+            "resolved base types force lookup through inherited typed Object members"
+        );
 
         let mut unresolved = initialized(true);
         let string = unresolved.intrinsic_bootstrap().unwrap().string_type;
@@ -3679,7 +4669,55 @@ mod tests {
         let before = unresolved.relation_state_snapshot();
         assert_eq!(
             unresolved.is_type_assignable_to(source, target),
-            Err(RelationUnavailable::UnresolvedGlobalObject(object_symbol))
+            Err(RelationUnavailable::UnresolvedGlobalObject(object_symbol)),
+            "raw absence requires a declared global Object type"
+        );
+        assert_eq!(unresolved.relation_state_snapshot(), before);
+
+        let raw_members = unresolved.alloc_symbol_table();
+        let unrelated_raw_property =
+            alloc_typed_property(&mut unresolved, "unrelated", string, false);
+        assert_eq!(
+            unresolved.insert_symbol(
+                raw_members,
+                EscapedName::source("unrelated"),
+                unrelated_raw_property,
+            ),
+            Some(None)
+        );
+        assert!(unresolved.set_symbol_relationships(
+            object_symbol,
+            Some(raw_members),
+            None,
+            None,
+            None,
+        ));
+        let unrelated_source = alloc_property_object(&mut unresolved, Vec::new());
+        let unrelated_target_property =
+            alloc_typed_property(&mut unresolved, "custom", string, false);
+        let unrelated_target =
+            alloc_property_object(&mut unresolved, vec![unrelated_target_property]);
+        let before = unresolved.relation_state_snapshot();
+        assert_eq!(
+            unresolved.is_type_assignable_to(unrelated_source, unrelated_target),
+            Err(RelationUnavailable::UnresolvedGlobalObject(object_symbol)),
+            "a raw table cannot prove absence without declared-type base facts"
+        );
+        assert_eq!(unresolved.relation_state_snapshot(), before);
+
+        let raw_property = alloc_typed_property(&mut unresolved, "custom", string, false);
+        assert_eq!(
+            unresolved.insert_symbol(raw_members, EscapedName::source("custom"), raw_property,),
+            Some(None)
+        );
+        let source = alloc_property_object(&mut unresolved, Vec::new());
+        let target_property = alloc_typed_property(&mut unresolved, "custom", string, false);
+        let target = alloc_property_object(&mut unresolved, vec![target_property]);
+        let before = unresolved.relation_state_snapshot();
+        assert_eq!(
+            unresolved.is_type_assignable_to(source, target),
+            Err(RelationUnavailable::UnresolvedGlobalObject(object_symbol)),
+            "a raw present name cannot fabricate a resolved property type"
         );
         assert_eq!(unresolved.relation_state_snapshot(), before);
 
@@ -3721,6 +4759,18 @@ mod tests {
             .unwrap();
         let global_property = alloc_typed_property(&mut resolved, "custom", string, false);
         set_object_properties(&mut resolved, object_type, vec![global_property]);
+        let raw_members = resolved.alloc_symbol_table();
+        assert_eq!(
+            resolved.insert_symbol(raw_members, EscapedName::source("custom"), global_property,),
+            Some(None)
+        );
+        assert!(resolved.set_symbol_relationships(
+            object_symbol,
+            Some(raw_members),
+            None,
+            None,
+            None,
+        ));
         assert!(resolved.set_declared_type_links(
             object_symbol,
             DeclaredTypeLinks {
@@ -3751,6 +4801,91 @@ mod tests {
 
     #[test]
     fn global_object_fallback_validates_the_complete_resolved_shape() {
+        let mut invalid_raw = initialized(true);
+        let string = invalid_raw.intrinsic_bootstrap().unwrap().string_type;
+        let globals = invalid_raw.intrinsic_bootstrap().unwrap().globals;
+        let object_symbol = alloc_symbol(&mut invalid_raw, SymbolFlags::INTERFACE, "Object");
+        let actual = alloc_typed_property(&mut invalid_raw, "actual", string, false);
+        let raw_members = invalid_raw.alloc_symbol_table();
+        assert_eq!(
+            invalid_raw.insert_symbol(raw_members, EscapedName::source("wrong"), actual),
+            Some(None)
+        );
+        assert!(invalid_raw.set_symbol_relationships(
+            object_symbol,
+            Some(raw_members),
+            None,
+            None,
+            None,
+        ));
+        assert_eq!(
+            invalid_raw.insert_symbol(globals, EscapedName::source("Object"), object_symbol),
+            Some(None)
+        );
+        let object_type = alloc_property_object(&mut invalid_raw, Vec::new());
+        assert!(invalid_raw.set_declared_type_links(
+            object_symbol,
+            DeclaredTypeLinks {
+                declared_type: Some(object_type),
+                ..DeclaredTypeLinks::default()
+            },
+        ));
+        let (source, target) = alloc_global_property_query(&mut invalid_raw);
+        let before = invalid_raw.relation_state_snapshot();
+        assert_eq!(
+            invalid_raw.is_type_assignable_to(source, target),
+            Err(RelationUnavailable::InvalidSymbolMembers(object_symbol))
+        );
+        assert_eq!(invalid_raw.relation_state_snapshot(), before);
+
+        let mut computed_raw = initialized(true);
+        let globals = computed_raw.intrinsic_bootstrap().unwrap().globals;
+        let object_symbol = alloc_symbol(&mut computed_raw, SymbolFlags::INTERFACE, "Object");
+        let computed = computed_raw
+            .alloc_symbol(SymbolData::new(
+                SymbolFlags::PROPERTY,
+                EscapedName::internal(InternalSymbolName::Computed),
+            ))
+            .unwrap();
+        let raw_members = computed_raw.alloc_symbol_table();
+        assert_eq!(
+            computed_raw.insert_symbol(
+                raw_members,
+                EscapedName::internal(InternalSymbolName::Computed),
+                computed,
+            ),
+            Some(None)
+        );
+        assert!(computed_raw.set_symbol_relationships(
+            object_symbol,
+            Some(raw_members),
+            None,
+            None,
+            None,
+        ));
+        assert_eq!(
+            computed_raw.insert_symbol(globals, EscapedName::source("Object"), object_symbol,),
+            Some(None)
+        );
+        let object_type = alloc_object_shell(&mut computed_raw);
+        assert!(computed_raw.set_declared_type_links(
+            object_symbol,
+            DeclaredTypeLinks {
+                declared_type: Some(object_type),
+                ..DeclaredTypeLinks::default()
+            },
+        ));
+        let (source, target) = alloc_global_property_query(&mut computed_raw);
+        let before = computed_raw.relation_state_snapshot();
+        assert_eq!(
+            computed_raw.is_type_assignable_to(source, target),
+            Err(RelationUnavailable::UnresolvedStructuredMembers(
+                object_type
+            )),
+            "a computed placeholder prevents a raw absence proof"
+        );
+        assert_eq!(computed_raw.relation_state_snapshot(), before);
+
         let mut unsupported = initialized(true);
         let global_object = unsupported
             .alloc_type_reference(ObjectFlags::NONE, None)
@@ -3763,7 +4898,21 @@ mod tests {
             None,
             None,
         ));
-        install_global_object(&mut unsupported, global_object);
+        let object_symbol = install_global_object(&mut unsupported, global_object);
+        let string = unsupported.intrinsic_bootstrap().unwrap().string_type;
+        let raw_property = alloc_typed_property(&mut unsupported, "custom", string, false);
+        let raw_members = unsupported.alloc_symbol_table();
+        assert_eq!(
+            unsupported.insert_symbol(raw_members, EscapedName::source("custom"), raw_property,),
+            Some(None)
+        );
+        assert!(unsupported.set_symbol_relationships(
+            object_symbol,
+            Some(raw_members),
+            None,
+            None,
+            None,
+        ));
         let (source, target) = alloc_global_property_query(&mut unsupported);
         let before = unsupported.relation_state_snapshot();
         assert_eq!(
