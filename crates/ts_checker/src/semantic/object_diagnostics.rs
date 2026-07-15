@@ -7,16 +7,13 @@
 //! module runs only after a failed assignability query and builds complete
 //! primary-plus-related records before the caller publishes any of them.
 //!
-//! The canonical checker does not yet carry the Program's default-library
-//! classification into this path. Until that exact fact is threaded through,
-//! TS6500 uses a temporary conservative current-source rule: it is emitted
-//! only when the target declaration is in the source currently being checked.
-//! This intentionally suppresses cross-file TS6500, but it is not an exact
-//! default-library test.
+//! TS6500 is suppressed only for declarations retained from a Program-owned
+//! default-library source, matching the pinned elaboration path without
+//! filename or declaration-shape heuristics.
 
 use std::collections::HashSet;
 
-use ts_ast::{FileId, NodeData, NodeRef, SyntaxKind};
+use ts_ast::{NodeData, NodeRef, SyntaxKind};
 use ts_diagnostics::{Diagnostic, message_by_code};
 
 use super::{
@@ -29,7 +26,7 @@ use super::{
     },
     object_members::PropertyObjectPlan,
     relater::{ResolvedDeclaredProperty, ResolvedDeclaredPropertyObject},
-    source::{PlannedExpression, SourceCheckError},
+    source::{PlannedExpression, SourceCheckError, SourceCheckProvenanceError},
     spelling::get_spelling_suggestion,
     type_records::TypeData,
 };
@@ -45,15 +42,8 @@ pub(super) fn diagnostics_for_failed_assignment(
     options: CanonicalCheckerOptions,
 ) -> Result<Vec<CanonicalCheckerDiagnostic>, SourceCheckError> {
     let flags = display_flags(options);
-    let mut elaborated = elaborate_known_properties(
-        store,
-        host,
-        expression,
-        source_type,
-        target_type,
-        fallback_node.file,
-        flags,
-    )?;
+    let mut elaborated =
+        elaborate_known_properties(store, host, expression, source_type, target_type, flags)?;
     if !elaborated.is_empty() {
         return Ok(elaborated);
     }
@@ -86,7 +76,6 @@ fn elaborate_known_properties(
     expression: &PlannedExpression,
     source_type: TypeId,
     target_type: TypeId,
-    checked_file: FileId,
     flags: CanonicalTypeFormatFlags,
 ) -> Result<Vec<CanonicalCheckerDiagnostic>, SourceCheckError> {
     let PlannedExpression::Object { plan, properties } = expression else {
@@ -118,7 +107,6 @@ fn elaborate_known_properties(
                 source_expression,
                 source_property_type,
                 target_property.type_,
-                checked_file,
                 flags,
             )?;
             if !nested.is_empty() {
@@ -139,7 +127,6 @@ fn elaborate_known_properties(
                 &mut diagnostic,
                 store,
                 host,
-                checked_file,
                 target_type,
                 target_property,
                 flags,
@@ -160,7 +147,6 @@ fn elaborate_known_properties(
             &mut diagnostic,
             store,
             host,
-            checked_file,
             target_type,
             target_property,
             flags,
@@ -338,12 +324,17 @@ fn append_expected_property_related(
     diagnostic: &mut CanonicalCheckerDiagnostic,
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
-    checked_file: FileId,
     target_type: TypeId,
     property: &ResolvedDeclaredProperty,
     flags: CanonicalTypeFormatFlags,
 ) -> Result<(), SourceCheckError> {
-    if property.declaration.file != checked_file {
+    let (_, bound) = host
+        .source(property.declaration)
+        .ok_or_else(|| invalid_structure(target_type))?;
+    let facts = bound.source_facts().ok_or(SourceCheckError::Provenance(
+        SourceCheckProvenanceError::MissingSourceFacts(property.declaration.file),
+    ))?;
+    if facts.is_default_library() {
         return Ok(());
     }
     let property_name = property_name(property)?.to_owned();

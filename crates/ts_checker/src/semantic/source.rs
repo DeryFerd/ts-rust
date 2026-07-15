@@ -1552,6 +1552,45 @@ mod tests {
         .unwrap()
     }
 
+    fn context_with_default_library_files<'arena>(
+        files: &[(FileId, &'arena ParseResult)],
+        default_library_files: &[FileId],
+        options: CanonicalCheckerOptions,
+    ) -> CanonicalCheckerContext<'arena> {
+        let mut binder = CanonicalBinder::new();
+        for &(file, parsed) in files {
+            let is_default_library = default_library_files.contains(&file);
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new_with_default_library(
+                        EscapedName::source(format!("\"/project/{}.ts\"", file.index())),
+                        CanonicalSourceLanguage::TypeScript,
+                        is_default_library,
+                        is_default_library,
+                        CanonicalModuleState::Script,
+                    ),
+                )
+                .unwrap();
+        }
+        for &(file, parsed) in files {
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+        }
+        CanonicalCheckerContext::new(
+            binder.finish(),
+            files
+                .iter()
+                .map(|(file, parsed)| (*file, &parsed.arena))
+                .collect(),
+            options,
+        )
+        .unwrap()
+    }
+
     fn variable_name(parsed: &ParseResult, file: FileId, expected: &str) -> NodeRef {
         let name = parsed
             .arena
@@ -2968,43 +3007,69 @@ mod tests {
     }
 
     #[test]
-    fn cross_file_target_info_is_conservative_only_for_ts6500() {
+    fn ts6500_uses_exact_default_library_source_provenance() {
         let usage = parsed(concat!(
             "const mismatch: Target = { value: 1 }; ",
+            "const libraryMismatch: LibraryTarget = { value: 1 }; ",
             "const missing: Missing = {};",
         ));
         let declarations = parsed(concat!(
             "interface Target { value: string } ",
             "interface Missing { required: number }",
         ));
+        let library = parsed("interface LibraryTarget { value: string }");
         let usage_file = FileId::new(102);
         let declarations_file = FileId::new(103);
-        let mut context = context(
-            &[(usage_file, &usage), (declarations_file, &declarations)],
+        let library_file = FileId::new(108);
+        let mut context = context_with_default_library_files(
+            &[
+                (usage_file, &usage),
+                (declarations_file, &declarations),
+                (library_file, &library),
+            ],
+            &[library_file],
             CanonicalCheckerOptions::default(),
         );
 
         context.check_source_file(usage_file).unwrap();
 
         let diagnostics = context.diagnostics().as_slice();
-        assert_eq!(diagnostics.len(), 2);
+        assert_eq!(diagnostics.len(), 3);
         assert_eq!(diagnostics[0].diagnostic.code(), 2322);
-        assert!(diagnostics[0].related_information.is_empty());
-        assert_eq!(diagnostics[1].diagnostic.code(), 2741);
-        assert_eq!(diagnostics[1].related_information.len(), 1);
+        assert_eq!(diagnostics[0].related_information.len(), 1);
         assert_eq!(
-            diagnostics[1].related_information[0].diagnostic.code(),
-            2728
+            diagnostics[0].related_information[0].diagnostic.code(),
+            6500
         );
         assert_eq!(
-            diagnostics[1].related_information[0]
+            diagnostics[0].related_information[0]
                 .node
                 .map(|node| node.file),
             Some(declarations_file)
         );
         assert_property_name_span(
             &declarations,
-            diagnostics[1].related_information[0].node.unwrap(),
+            diagnostics[0].related_information[0].node.unwrap(),
+            "value",
+            false,
+        );
+        assert_eq!(diagnostics[1].diagnostic.code(), 2322);
+        assert!(diagnostics[1].related_information.is_empty());
+        assert_eq!(diagnostics[2].diagnostic.code(), 2741);
+        assert_eq!(diagnostics[2].related_information.len(), 1);
+        assert_eq!(
+            diagnostics[2].related_information[0].diagnostic.code(),
+            2728
+        );
+        assert_eq!(
+            diagnostics[2].related_information[0]
+                .node
+                .map(|node| node.file),
+            Some(declarations_file)
+        );
+        assert_property_name_span(
+            &declarations,
+            diagnostics[2].related_information[0].node.unwrap(),
             "required",
             false,
         );
