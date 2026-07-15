@@ -297,7 +297,8 @@ impl<'a> AstGenerator<'a> {
                     ResolvedField {
                         schema_name: member.name.clone(),
                         ty,
-                        optional: member.optional.unwrap_or(false),
+                        optional: member.optional.unwrap_or(false)
+                            || rust_nullable_schema_field(name, &member.name),
                         list: member.list,
                         go_only: member.go_only,
                         no_go: member.no_go,
@@ -833,6 +834,14 @@ fn resolved_base_field(name: &str, field: &FieldDef) -> ResolvedField {
     }
 }
 
+/// Upstream's pointer-backed Go model permits a small number of parser-owned
+/// nil slots that are not marked optional in `ast.json`. Preserve the exact
+/// runtime contract when choosing a Rust storage type without modifying the
+/// vendored schema snapshot.
+fn rust_nullable_schema_field(node: &str, field: &str) -> bool {
+    matches!((node, field), ("ExportAssignment", "Type"))
+}
+
 fn is_header_field(name: &str) -> bool {
     matches!(name, "Kind" | "kind" | "Flags")
 }
@@ -1113,6 +1122,14 @@ mod tests {
         assert!(output.contains("pub statements: NodeList"));
         assert!(output.contains("pub modifiers: Option<ModifierList>"));
         assert!(output.contains("pub flow_node: Option<FlowNodeId>"));
+        let export_assignment = output
+            .split("pub struct ExportAssignmentData")
+            .nth(1)
+            .unwrap()
+            .split('}')
+            .next()
+            .unwrap();
+        assert!(export_assignment.contains("pub type_: Option<NodeId>"));
         assert!(output.contains("pub type Expression = NodeId;"));
         assert!(output.contains("pub type StatementList = NodeList;"));
     }
@@ -1154,6 +1171,9 @@ mod tests {
         ));
         assert!(output.contains(
             "Self::ImportDeclaration(node) => {\n                visit_optional_modifier_list(visitor, node.modifiers.as_ref())?;\n                visit_optional_child(visitor, node.import_clause)?;\n                visitor(node.module_specifier)?;\n                visit_optional_child(visitor, node.attributes)"
+        ));
+        assert!(output.contains(
+            "Self::ExportAssignment(node) => {\n                visit_optional_modifier_list(visitor, node.modifiers.as_ref())?;\n                visit_optional_child(visitor, node.type_)?;\n                visitor(node.expression)"
         ));
         assert!(output.contains(
             "Self::SourceFile(node) => {\n                visit_node_list(visitor, &node.statements)?;\n                visitor(node.end_of_file_token)"

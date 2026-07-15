@@ -4671,7 +4671,7 @@ impl<'a> Parser<'a> {
                     flow_node: None,
                     is_export_equals: true,
                     symbol: None,
-                    type_: expression,
+                    type_: None,
                     facts: 0,
                     modifiers: Some(ModifierList {
                         list: NodeList {
@@ -4734,7 +4734,7 @@ impl<'a> Parser<'a> {
                     flow_node: None,
                     is_export_equals: false,
                     symbol: None,
-                    type_: expression,
+                    type_: None,
                     facts: 0,
                     modifiers: Some(ModifierList {
                         list: NodeList {
@@ -12205,12 +12205,68 @@ mod tests {
             panic!("expected export assignment");
         };
         assert!(assignment.is_export_equals);
+        assert!(assignment.type_.is_none());
         let NodeData::Identifier(expression) =
             &result.arena.get(assignment.expression).unwrap().data
         else {
             panic!("expected identifier expression");
         };
         assert_eq!(expression.text, "runtimeValue");
+    }
+
+    #[test]
+    fn import_export_payloads_form_one_generated_child_tree() {
+        let result = parse_source_file(
+            r#"
+import defaultValue, { source as local, same } from "pkg" with { type: "json" };
+import * as namespaceValue from "namespace-pkg";
+import equalsValue = require("equals-pkg");
+export { local as renamed, same };
+export * from "star-pkg";
+export * as namespaceExport from "namespace-export-pkg";
+export default local;
+export = equalsValue;
+export as namespace GlobalName;
+"#,
+        );
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+
+        let mut stack = vec![result.source_file];
+        let mut reached = std::collections::HashSet::new();
+        while let Some(node) = stack.pop() {
+            assert!(reached.insert(node), "AST child is reused: {node:?}");
+            result
+                .arena
+                .get(node)
+                .unwrap()
+                .for_each_child(|child| stack.push(child));
+        }
+
+        for kind in [
+            SyntaxKind::ImportDeclaration,
+            SyntaxKind::ImportClause,
+            SyntaxKind::NamespaceImport,
+            SyntaxKind::ImportEqualsDeclaration,
+            SyntaxKind::ImportSpecifier,
+            SyntaxKind::ExportDeclaration,
+            SyntaxKind::ExportSpecifier,
+            SyntaxKind::NamespaceExport,
+            SyntaxKind::NamespaceExportDeclaration,
+            SyntaxKind::ExportAssignment,
+        ] {
+            assert!(
+                reached
+                    .iter()
+                    .any(|node| result.arena.get(*node).unwrap().kind == kind),
+                "missing {kind:?}"
+            );
+        }
+        assert!(reached.iter().all(|node| {
+            !matches!(
+                &result.arena.get(*node).unwrap().data,
+                NodeData::ExportAssignment(assignment) if assignment.type_.is_some()
+            )
+        }));
     }
 
     #[test]

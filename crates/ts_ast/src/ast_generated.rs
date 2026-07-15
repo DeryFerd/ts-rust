@@ -512,7 +512,7 @@ pub struct ExportAssignmentData {
     pub flow_node: Option<FlowNodeId>,
     pub is_export_equals: bool,
     pub symbol: Option<SymbolId>,
-    pub type_: NodeId,
+    pub type_: Option<NodeId>,
     pub facts: u32,
     pub modifiers: Option<ModifierList>,
 }
@@ -2242,7 +2242,7 @@ impl NodeData {
             }
             Self::ExportAssignment(node) => {
                 visit_optional_modifier_list(visitor, node.modifiers.as_ref())?;
-                visitor(node.type_)?;
+                visit_optional_child(visitor, node.type_)?;
                 visitor(node.expression)
             }
             Self::ExportDeclaration(node) => {
