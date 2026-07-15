@@ -133,7 +133,7 @@ impl CheckerStateSnapshot {
 }
 
 /// A bootstrap request rejected before any semantic allocation is performed.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum IntrinsicBootstrapError {
     /// The store already owns the singleton set under different compiler options.
     OptionsMismatch {
@@ -141,7 +141,7 @@ pub enum IntrinsicBootstrapError {
         requested: IntrinsicBootstrapOptions,
     },
     /// `NewChecker` bootstrap must precede every checker-owned write.
-    NonPristineCheckerState(CheckerStateSnapshot),
+    NonPristineCheckerState(Box<CheckerStateSnapshot>),
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -270,6 +270,18 @@ impl SemanticStore<TypeRecord, TypeMapper> {
     /// options or any prior checker-owned arena, sparse-link, or resolution
     /// write are rejected before this method changes semantic state. Prebound
     /// symbols/tables and registered AST scopes remain valid inputs.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IntrinsicBootstrapError::OptionsMismatch`] when a completed
+    /// bootstrap used different options, or
+    /// [`IntrinsicBootstrapError::NonPristineCheckerState`] when checker-owned
+    /// state predates the first request.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a canonical identity arena is exhausted or an internal pinned
+    /// bootstrap shape is rejected by its canonical allocator.
     pub fn initialize_intrinsic_bootstrap(
         &mut self,
         options: IntrinsicBootstrapOptions,
@@ -335,7 +347,9 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             },
         };
         if !state.is_pristine() {
-            return Err(IntrinsicBootstrapError::NonPristineCheckerState(state));
+            return Err(IntrinsicBootstrapError::NonPristineCheckerState(Box::new(
+                state,
+            )));
         }
 
         let bootstrap = IntrinsicBootstrap::build(self, options);
@@ -1092,6 +1106,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // One table pins the full upstream allocation sequence.
     fn strict_bootstrap_preserves_pinned_symbols_intrinsics_and_allocation_order() {
         let options = IntrinsicBootstrapOptions {
             strict_null_checks: true,
@@ -1363,6 +1378,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // Keeps interdependent identity assertions together.
     fn bootstrap_preserves_literal_union_object_and_sentinel_records() {
         let store = initialized(IntrinsicBootstrapOptions {
             strict_null_checks: true,
@@ -1579,6 +1595,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // Pins every default in the sentinel record cluster.
     fn bootstrap_preserves_predicate_signature_index_and_literal_tail_defaults() {
         let store = initialized(IntrinsicBootstrapOptions {
             strict_null_checks: true,
@@ -1817,7 +1834,9 @@ mod tests {
         let before = checker_state(&occupied);
         assert_eq!(
             occupied.initialize_intrinsic_bootstrap(options),
-            Err(IntrinsicBootstrapError::NonPristineCheckerState(before)),
+            Err(IntrinsicBootstrapError::NonPristineCheckerState(Box::new(
+                before,
+            ))),
         );
         assert_eq!(checker_state(&occupied), before);
         assert_eq!(occupied.symbol_len(), 0);
@@ -1873,7 +1892,9 @@ mod tests {
             assert!(!before.is_pristine());
             assert_eq!(
                 occupied.initialize_intrinsic_bootstrap(options),
-                Err(IntrinsicBootstrapError::NonPristineCheckerState(before)),
+                Err(IntrinsicBootstrapError::NonPristineCheckerState(Box::new(
+                    before,
+                ))),
             );
             assert_eq!(checker_state(&occupied), before);
             assert_eq!(occupied.symbol_len(), symbol_count);
@@ -1930,6 +1951,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // Exercises every disjoint checker-owned side store.
     fn sparse_links_and_resolution_state_reject_bootstrap_atomically() {
         let options = IntrinsicBootstrapOptions::default();
         let parsed = parse_source_file("const linked = 1;");
@@ -1971,7 +1993,9 @@ mod tests {
         );
         assert_eq!(
             linked.initialize_intrinsic_bootstrap(options),
-            Err(IntrinsicBootstrapError::NonPristineCheckerState(before)),
+            Err(IntrinsicBootstrapError::NonPristineCheckerState(Box::new(
+                before,
+            ))),
         );
         assert_eq!(checker_state(&linked), before);
         assert!(linked.node_links(node).is_some());
@@ -1997,7 +2021,9 @@ mod tests {
         assert_eq!(before.type_resolution.entries, 1);
         assert_eq!(
             resolving.initialize_intrinsic_bootstrap(options),
-            Err(IntrinsicBootstrapError::NonPristineCheckerState(before)),
+            Err(IntrinsicBootstrapError::NonPristineCheckerState(Box::new(
+                before,
+            ))),
         );
         assert_eq!(checker_state(&resolving), before);
         assert_eq!(resolving.pop_type_resolution(), Some(true));
@@ -2009,7 +2035,9 @@ mod tests {
         assert_eq!(before.type_resolution.next_boundary_serial, 1);
         assert_eq!(
             bounded.initialize_intrinsic_bootstrap(options),
-            Err(IntrinsicBootstrapError::NonPristineCheckerState(before)),
+            Err(IntrinsicBootstrapError::NonPristineCheckerState(Box::new(
+                before,
+            ))),
         );
         assert_eq!(checker_state(&bounded), before);
         assert!(bounded.restore_type_resolution_start(boundary).is_ok());
@@ -2026,7 +2054,9 @@ mod tests {
         assert_eq!(before.type_resolution.next_boundary_serial, 1);
         assert_eq!(
             boundary_history.initialize_intrinsic_bootstrap(options),
-            Err(IntrinsicBootstrapError::NonPristineCheckerState(before)),
+            Err(IntrinsicBootstrapError::NonPristineCheckerState(Box::new(
+                before,
+            ))),
         );
         assert_eq!(checker_state(&boundary_history), before);
 
@@ -2041,7 +2071,9 @@ mod tests {
         assert_eq!(before.checker_symbols, 1);
         assert_eq!(
             transient.initialize_intrinsic_bootstrap(options),
-            Err(IntrinsicBootstrapError::NonPristineCheckerState(before)),
+            Err(IntrinsicBootstrapError::NonPristineCheckerState(Box::new(
+                before,
+            ))),
         );
         assert_eq!(checker_state(&transient), before);
     }
