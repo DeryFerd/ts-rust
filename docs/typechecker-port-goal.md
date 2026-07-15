@@ -352,18 +352,21 @@ remains the cluster-level source of truth.
   order for identity, subtype, strict subtype, assignability, and comparability,
   plus nullable correspondence, literal-to-primitive shortcuts, named-union
   identity, cache thresholds, and transactional publication.
-- E00's first production source-checking slice is integrated through `625c143`
-  and `101fb48`. One context checks retained source files after a complete-tree
-  provenance preflight, supporting type aliases and explicitly typed ordinary
-  variables whose initializers are primitive literals. Target types include
-  named, anonymous, nullable, and literal unions. Successful checks publish an
-  idempotent source marker and exact TS2322 nodes, order, alias display, and
-  strict-null behavior; failed plans publish neither marker nor diagnostics,
-  and retry diagnostics stay privately partitioned by their owning source.
+- E00's first production source-checking slice is integrated through `625c143`,
+  `101fb48`, and `0afc838`. One context checks retained source files after a
+  complete-tree provenance preflight, supporting unmodified type aliases,
+  exact empty `export {}` module markers, and explicitly typed ordinary
+  variables (optionally exported) whose initializers are primitive literals.
+  Target types include named, anonymous, nullable, and literal unions.
+  Successful checks publish an idempotent source marker and exact TS2322 nodes,
+  order, alias display, and strict-null behavior; failed plans publish neither
+  marker nor diagnostics, and retry diagnostics stay privately partitioned by
+  their owning source. Export syntax requires a retained external-module fact,
+  preventing a caller from silently checking it in global Script scope.
   Unsupported statements and expressions remain typed boundaries with no
-  legacy fallback. The combined stack passes all 536 checker library tests;
-  its formatter review found no P0-P2 issue, and rustdoc, the compile-fail
-  doctest, and scoped all-target Clippy are green.
+  legacy fallback. The combined stack passes all 539 checker library tests;
+  its formatter and export-source reviews found no remaining P0-P2 issue, and
+  rustdoc, the compile-fail doctest, and scoped all-target Clippy are green.
 
 No percentage in this section is a whole-corpus parity claim. A score is
 publishable only when its variant manifest and complete artifact comparison are
