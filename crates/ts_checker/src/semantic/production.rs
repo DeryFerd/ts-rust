@@ -4,9 +4,10 @@
 //! checker-owned semantic store. Construction includes the dependency-closed
 //! prefix of typescript-go's `initializeChecker`: ordered global merging,
 //! deferred ambient-module collection, UMD globals, global-scope
-//! augmentations, and the built-in `undefined` conflict rule. Alias-dependent
-//! merging, checker diagnostics, global library types, and non-global module
-//! augmentations remain explicit typed boundaries.
+//! augmentations, the built-in `undefined` conflict rule, intrinsic value
+//! links, and eager standard-library type identities. Alias-dependent merging,
+//! general checker diagnostics, deferred ambient-module merging, and non-global
+//! module augmentations remain explicit typed boundaries.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -20,10 +21,54 @@ use ts_binder::{
 };
 
 use super::{
-    CanonicalTypeMapperStore, IntrinsicBootstrapError, IntrinsicBootstrapOptions, SourceFileRef,
-    SymbolMergeError,
+    CanonicalGlobalTypeInitializationError, CanonicalGlobalTypes, CanonicalTypeMapperStore,
+    DeclaredTypeHost, DeclaredTypeHostError, IntrinsicBootstrapError, IntrinsicBootstrapOptions,
+    SourceFileRef, SymbolMergeError,
+    global_types::initialize_global_library_types,
     name_resolution::{ProductionNameResolverHost, ProductionNameResolverHostError},
 };
+
+/// Compiler options consumed by the installed production-construction slice.
+///
+/// The intrinsic pair controls bootstrap identity. `strict_bind_call_apply`
+/// selects the pinned `CallableFunction`/`NewableFunction` globals instead of
+/// aliasing both fields to `Function`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CanonicalCheckerOptions {
+    pub intrinsic: IntrinsicBootstrapOptions,
+    pub strict_bind_call_apply: bool,
+    pub name_resolution: CanonicalNameResolverOptions,
+}
+
+impl From<IntrinsicBootstrapOptions> for CanonicalCheckerOptions {
+    fn from(intrinsic: IntrinsicBootstrapOptions) -> Self {
+        Self {
+            intrinsic,
+            strict_bind_call_apply: false,
+            name_resolution: CanonicalNameResolverOptions::default(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct GlobalMergeCompletion {
+    name_resolution: CanonicalNameResolverOptions,
+}
+
+impl GlobalMergeCompletion {
+    const fn new(name_resolution: CanonicalNameResolverOptions) -> Self {
+        Self { name_resolution }
+    }
+
+    pub(super) const fn name_resolution(self) -> CanonicalNameResolverOptions {
+        self.name_resolution
+    }
+
+    #[cfg(test)]
+    pub(super) const fn for_test(name_resolution: CanonicalNameResolverOptions) -> Self {
+        Self::new(name_resolution)
+    }
+}
 
 #[derive(Debug)]
 struct CanonicalCheckerFile<'arena> {
@@ -45,6 +90,7 @@ pub struct CanonicalCheckerContext<'arena> {
     files: BTreeMap<FileId, CanonicalCheckerFile<'arena>>,
     store: CanonicalTypeMapperStore,
     globals: SymbolTableId,
+    global_types: CanonicalGlobalTypes,
     pending_ambient_modules: Vec<SemanticSymbolId>,
     pattern_ambient_modules: Vec<CanonicalPatternAmbientModule>,
 }
@@ -68,8 +114,9 @@ impl<'arena> CanonicalCheckerContext<'arena> {
     pub fn new(
         bindings: CanonicalProgramBindings,
         ordered_arenas: Vec<(FileId, &'arena NodeArena)>,
-        bootstrap_options: IntrinsicBootstrapOptions,
+        options: impl Into<CanonicalCheckerOptions>,
     ) -> Result<Self, CanonicalCheckerContextError> {
+        let options = options.into();
         let (symbols, mut bound_files) = bindings
             .try_into_parts()
             .map_err(CanonicalCheckerContextError::Extraction)?;
@@ -94,7 +141,7 @@ impl<'arena> CanonicalCheckerContext<'arena> {
         }
 
         store
-            .initialize_intrinsic_bootstrap(bootstrap_options)
+            .initialize_intrinsic_bootstrap(options.intrinsic)
             .map_err(CanonicalCheckerContextError::Bootstrap)?;
 
         let mut files = BTreeMap::new();
@@ -115,14 +162,21 @@ impl<'arena> CanonicalCheckerContext<'arena> {
             return Err(CanonicalCheckerContextError::SourceRegistrationFailed(file));
         }
 
-        let initialized = initialize_globals(&mut store, &file_order, &files)
-            .map_err(CanonicalCheckerContextError::GlobalInitialization)?;
+        let initialized = initialize_globals(
+            &mut store,
+            &file_order,
+            &files,
+            options.strict_bind_call_apply,
+            options.name_resolution,
+        )
+        .map_err(CanonicalCheckerContextError::GlobalInitialization)?;
 
         Ok(Self {
             file_order,
             files,
             store,
             globals: initialized.globals,
+            global_types: initialized.global_types,
             pending_ambient_modules: initialized.pending_ambient_modules,
             pattern_ambient_modules: initialized.pattern_ambient_modules,
         })
@@ -159,6 +213,12 @@ impl<'arena> CanonicalCheckerContext<'arena> {
     #[must_use]
     pub const fn globals(&self) -> SymbolTableId {
         self.globals
+    }
+
+    /// Eager standard-library identities and global-type fallback diagnostics.
+    #[must_use]
+    pub const fn global_types(&self) -> &CanonicalGlobalTypes {
+        &self.global_types
     }
 
     /// Quoted ambient-module symbols deferred until global library types exist.
@@ -206,6 +266,7 @@ impl<'arena> CanonicalCheckerContext<'arena> {
 #[derive(Debug)]
 struct GlobalInitialization {
     globals: SymbolTableId,
+    global_types: CanonicalGlobalTypes,
     pending_ambient_modules: Vec<SemanticSymbolId>,
     pattern_ambient_modules: Vec<CanonicalPatternAmbientModule>,
 }
@@ -215,6 +276,8 @@ fn initialize_globals(
     store: &mut CanonicalTypeMapperStore,
     file_order: &[FileId],
     files: &BTreeMap<FileId, CanonicalCheckerFile<'_>>,
+    strict_bind_call_apply: bool,
+    name_resolution_options: CanonicalNameResolverOptions,
 ) -> Result<GlobalInitialization, CanonicalGlobalInitializationError> {
     let (globals, undefined_symbol) = store
         .intrinsic_bootstrap()
@@ -354,9 +417,18 @@ fn initialize_globals(
     }
 
     add_undefined_to_globals(store, files, globals, undefined_symbol)?;
+    let global_merge_completion = GlobalMergeCompletion::new(name_resolution_options);
+
+    let declared_host = DeclaredTypeHost::new_after_global_merge(
+        files.values().map(|file| (file.arena, &file.bound)),
+        global_merge_completion,
+    )?;
+    let global_types =
+        initialize_global_library_types(store, &declared_host, globals, strict_bind_call_apply)?;
 
     Ok(GlobalInitialization {
         globals,
+        global_types,
         pending_ambient_modules,
         pattern_ambient_modules,
     })
@@ -693,6 +765,12 @@ pub enum CanonicalGlobalInitializationError {
         globals: SymbolTableId,
         undefined_symbol: SemanticSymbolId,
     },
+    /// The retained Program sources cannot construct an exact declared-type
+    /// callback host at the post-global phase boundary.
+    DeclaredTypeHost(DeclaredTypeHostError),
+    /// Standard-library identity initialization rejected an invariant or an
+    /// unsupported declared-type dependency.
+    GlobalTypes(CanonicalGlobalTypeInitializationError),
     /// The exact symbol merge requires an unsupported dependency or rejected
     /// malformed provenance.
     Merge(SymbolMergeError),
@@ -772,6 +850,10 @@ impl std::fmt::Display for CanonicalGlobalInitializationError {
             Self::InvalidUndefinedInsertion { .. } => {
                 formatter.write_str("cannot install the intrinsic undefined global")
             }
+            Self::DeclaredTypeHost(error) => write!(formatter, "{error}"),
+            Self::GlobalTypes(error) => {
+                write!(formatter, "global type initialization failed: {error}")
+            }
             Self::Merge(error) => write!(formatter, "global symbol merge failed: {error}"),
         }
     }
@@ -780,6 +862,8 @@ impl std::fmt::Display for CanonicalGlobalInitializationError {
 impl std::error::Error for CanonicalGlobalInitializationError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::DeclaredTypeHost(error) => Some(error),
+            Self::GlobalTypes(error) => Some(error),
             Self::Merge(error) => Some(error),
             _ => None,
         }
@@ -789,6 +873,18 @@ impl std::error::Error for CanonicalGlobalInitializationError {
 impl From<SymbolMergeError> for CanonicalGlobalInitializationError {
     fn from(error: SymbolMergeError) -> Self {
         Self::Merge(error)
+    }
+}
+
+impl From<DeclaredTypeHostError> for CanonicalGlobalInitializationError {
+    fn from(error: DeclaredTypeHostError) -> Self {
+        Self::DeclaredTypeHost(error)
+    }
+}
+
+impl From<CanonicalGlobalTypeInitializationError> for CanonicalGlobalInitializationError {
+    fn from(error: CanonicalGlobalTypeInitializationError) -> Self {
+        Self::GlobalTypes(error)
     }
 }
 
@@ -982,6 +1078,7 @@ mod tests {
     use ts_parser::{ParseResult, parse_source_file};
 
     use super::*;
+    use crate::semantic::{TypeData, type_records::TypeCacheState, types::ObjectFlags};
 
     fn parsed(source: &str) -> ParseResult {
         let parsed = parse_source_file(source);
@@ -1625,6 +1722,302 @@ declare global { interface Augmented { second: number } }
                 .module_augmentations()
                 .len(),
             1
+        );
+
+        let store = context.store();
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        let globals = context.global_types();
+        assert!(globals.diagnostics().is_empty());
+        assert_eq!(
+            store
+                .value_symbol_links(bootstrap.arguments_symbol)
+                .unwrap()
+                .resolved_type,
+            Some(globals.arguments_type)
+        );
+        assert_eq!(
+            store
+                .value_symbol_links(bootstrap.undefined_symbol)
+                .unwrap()
+                .resolved_type,
+            Some(bootstrap.undefined_widening_type)
+        );
+        assert_eq!(
+            store
+                .value_symbol_links(bootstrap.unknown_symbol)
+                .unwrap()
+                .resolved_type,
+            Some(bootstrap.error_type)
+        );
+        assert_eq!(
+            store
+                .value_symbol_links(bootstrap.global_this_symbol)
+                .unwrap()
+                .resolved_type,
+            Some(globals.global_this_value_type)
+        );
+        let global_this = store.type_payload(globals.global_this_value_type).unwrap();
+        assert_eq!(global_this.symbol(), Some(bootstrap.global_this_symbol));
+        assert_eq!(global_this.object_flags(), ObjectFlags::ANONYMOUS);
+
+        for (name, type_id) in [
+            ("IArguments", globals.arguments_type),
+            ("Array", globals.array_type),
+            ("Object", globals.object_type),
+            ("Function", globals.function_type),
+            ("String", globals.string_type),
+            ("Number", globals.number_type),
+            ("Boolean", globals.boolean_type),
+            ("RegExp", globals.regexp_type),
+            ("ReadonlyArray", globals.readonly_array_type),
+            ("ThisType", globals.this_type),
+        ] {
+            let symbol = global_symbol(&context, name).unwrap();
+            assert_eq!(
+                store.declared_type_links(symbol).unwrap().declared_type,
+                Some(type_id),
+                "wrong declared identity for {name}"
+            );
+        }
+        assert_eq!(globals.callable_function_type, globals.function_type);
+        assert_eq!(globals.newable_function_type, globals.function_type);
+        assert!(
+            store
+                .declared_type_links(global_symbol(&context, "CallableFunction").unwrap())
+                .is_none()
+        );
+        assert!(
+            store
+                .declared_type_links(global_symbol(&context, "NewableFunction").unwrap())
+                .is_none()
+        );
+
+        let TypeData::TypeReference(any_array) =
+            store.type_payload(globals.any_array_type).unwrap().data()
+        else {
+            panic!("Array<any> must be a canonical reference")
+        };
+        assert_eq!(any_array.object.target, Some(globals.array_type));
+        assert_eq!(
+            any_array.resolved_type_arguments.as_deref(),
+            Some(&[bootstrap.any_type][..])
+        );
+        let TypeData::TypeReference(auto_array) =
+            store.type_payload(globals.auto_array_type).unwrap().data()
+        else {
+            panic!("Array<auto> must be a canonical reference")
+        };
+        assert_eq!(auto_array.object.target, Some(globals.array_type));
+        assert_eq!(
+            auto_array.resolved_type_arguments.as_deref(),
+            Some(&[bootstrap.auto_type][..])
+        );
+        assert!(
+            store
+                .type_payload(globals.auto_array_type)
+                .unwrap()
+                .object_flags()
+                .contains(ObjectFlags::NON_INFERRABLE_TYPE)
+        );
+        let TypeData::Interface(array) = store.type_payload(globals.array_type).unwrap().data()
+        else {
+            panic!("global Array must be an interface origin")
+        };
+        let TypeCacheState::Allocated(array_instantiations) =
+            &array.reference.object.instantiations
+        else {
+            panic!("global Array must own its instantiation cache")
+        };
+        assert!(
+            array_instantiations
+                .values()
+                .any(|id| *id == globals.any_array_type)
+        );
+        assert!(
+            array_instantiations
+                .values()
+                .any(|id| *id == globals.auto_array_type)
+        );
+
+        let TypeData::TypeReference(any_readonly_array) = store
+            .type_payload(globals.any_readonly_array_type)
+            .unwrap()
+            .data()
+        else {
+            panic!("ReadonlyArray<any> must be a canonical reference")
+        };
+        assert_eq!(
+            any_readonly_array.object.target,
+            Some(globals.readonly_array_type)
+        );
+        assert_eq!(
+            any_readonly_array.resolved_type_arguments.as_deref(),
+            Some(&[bootstrap.any_type][..])
+        );
+    }
+
+    #[test]
+    fn strict_bind_call_apply_selects_distinct_es5_function_interfaces() {
+        let es5 = parsed(include_str!("../../../ts_bundled/libs/lib.es5.d.ts"));
+        let file = FileId::new(120);
+        let context = CanonicalCheckerContext::new(
+            completed_bindings_with_facts(&[(file, &es5, true, CanonicalModuleState::Script)]),
+            vec![(file, &es5.arena)],
+            CanonicalCheckerOptions {
+                strict_bind_call_apply: true,
+                ..CanonicalCheckerOptions::default()
+            },
+        )
+        .unwrap();
+        let globals = context.global_types();
+        assert!(globals.diagnostics().is_empty());
+        assert_ne!(globals.callable_function_type, globals.function_type);
+        assert_ne!(globals.newable_function_type, globals.function_type);
+        assert_ne!(
+            globals.callable_function_type,
+            globals.newable_function_type
+        );
+        for (name, type_id) in [
+            ("Function", globals.function_type),
+            ("CallableFunction", globals.callable_function_type),
+            ("NewableFunction", globals.newable_function_type),
+        ] {
+            let symbol = global_symbol(&context, name).unwrap();
+            assert_eq!(
+                context
+                    .store()
+                    .declared_type_links(symbol)
+                    .unwrap()
+                    .declared_type,
+                Some(type_id)
+            );
+            let TypeData::Interface(interface) =
+                context.store().type_payload(type_id).unwrap().data()
+            else {
+                panic!("{name} must be an interface identity")
+            };
+            assert!(interface.all_type_parameters.is_none());
+            assert!(interface.this_type.is_none());
+            assert!(!interface.base_types_resolved);
+            assert!(interface.resolved_base_types.is_none());
+        }
+    }
+
+    #[test]
+    fn missing_optional_readonly_array_reuses_array_and_its_any_instantiation() {
+        let source = parsed(
+            "interface IArguments {}\n\
+             interface Array<T> {}\n\
+             interface Object {}\n\
+             interface Function {}\n\
+             interface String {}\n\
+             interface Number {}\n\
+             interface Boolean {}\n\
+             interface RegExp {}",
+        );
+        let file = FileId::new(123);
+        let context = CanonicalCheckerContext::new(
+            completed_bindings(&[(file, &source)]),
+            vec![(file, &source.arena)],
+            IntrinsicBootstrapOptions::default(),
+        )
+        .unwrap();
+        let globals = context.global_types();
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        assert!(globals.diagnostics().is_empty());
+        assert_eq!(globals.readonly_array_type, globals.array_type);
+        assert_eq!(globals.any_readonly_array_type, globals.any_array_type);
+        assert_eq!(globals.this_type, bootstrap.empty_generic_type);
+    }
+
+    #[test]
+    fn missing_global_types_keep_exact_fallbacks_and_diagnostic_order() {
+        let source = parsed("");
+        let file = FileId::new(121);
+        let context = CanonicalCheckerContext::new(
+            completed_bindings(&[(file, &source)]),
+            vec![(file, &source.arena)],
+            IntrinsicBootstrapOptions::default(),
+        )
+        .unwrap();
+        let store = context.store();
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        let globals = context.global_types();
+        let missing = [
+            "IArguments",
+            "Array",
+            "Object",
+            "Function",
+            "String",
+            "Number",
+            "Boolean",
+            "RegExp",
+        ];
+        assert_eq!(globals.diagnostics().len(), missing.len());
+        for (diagnostic, name) in globals.diagnostics().iter().zip(missing) {
+            assert_eq!(diagnostic.node, None);
+            assert_eq!(diagnostic.diagnostic.code(), 2318);
+            if matches!(name, "Array" | "RegExp" | "String") {
+                assert_eq!(diagnostic.diagnostic.arguments, [name, "es2015"]);
+            } else {
+                assert_eq!(diagnostic.diagnostic.arguments, [name]);
+            }
+        }
+        assert_eq!(globals.arguments_type, bootstrap.empty_object_type);
+        assert_eq!(globals.array_type, bootstrap.empty_generic_type);
+        assert_eq!(globals.object_type, bootstrap.empty_object_type);
+        assert_eq!(globals.function_type, bootstrap.empty_object_type);
+        assert_eq!(globals.callable_function_type, globals.function_type);
+        assert_eq!(globals.newable_function_type, globals.function_type);
+        assert_eq!(globals.any_array_type, bootstrap.empty_object_type);
+        assert_ne!(globals.auto_array_type, bootstrap.empty_object_type);
+        assert_eq!(
+            store
+                .type_payload(globals.auto_array_type)
+                .unwrap()
+                .object_flags(),
+            ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED
+        );
+        assert_eq!(globals.readonly_array_type, globals.array_type);
+        assert_eq!(globals.any_readonly_array_type, bootstrap.empty_object_type);
+        assert_eq!(globals.this_type, bootstrap.empty_generic_type);
+    }
+
+    #[test]
+    fn malformed_required_globals_report_wrong_kind_and_arity_at_declarations() {
+        let source = parsed(
+            "type IArguments = {};\n\
+             interface Array {}\n\
+             interface Object<T> {}\n\
+             interface Function {}\n\
+             interface String {}\n\
+             interface Number {}\n\
+             interface Boolean {}\n\
+             interface RegExp {}",
+        );
+        let file = FileId::new(122);
+        let context = CanonicalCheckerContext::new(
+            completed_bindings(&[(file, &source)]),
+            vec![(file, &source.arena)],
+            IntrinsicBootstrapOptions::default(),
+        )
+        .unwrap();
+        let diagnostics = context.global_types().diagnostics();
+        assert_eq!(diagnostics.len(), 3);
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.code())
+                .collect::<Vec<_>>(),
+            [2316, 2317, 2317]
+        );
+        assert_eq!(diagnostics[0].diagnostic.arguments, ["IArguments"]);
+        assert_eq!(diagnostics[1].diagnostic.arguments, ["Array", "1"]);
+        assert_eq!(diagnostics[2].diagnostic.arguments, ["Object", "0"]);
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.node.is_some())
         );
     }
 

@@ -32,9 +32,10 @@ struct ProductionNameResolverSource<'arena> {
 /// AST sources are retained by exact borrowed identity. The semantic store
 /// must already own their binder graph and have completed intrinsic bootstrap,
 /// which supplies the canonical globals and `arguments` identities.
-/// Direct construction is checker-internal. A completed
-/// [`super::CanonicalCheckerContext`] mints this host only after ordered global
-/// initialization completes.
+/// Direct construction is checker-internal. Production construction mints it
+/// through a private declared-type capability after ordered globals are
+/// merged; a completed [`super::CanonicalCheckerContext`] can mint additional
+/// hosts after all eager global initialization completes.
 ///
 /// The constructor deliberately does not escape through the crate's public
 /// API before that phase boundary exists:
@@ -136,8 +137,9 @@ impl<'store, 'arena> ProductionNameResolverHost<'store, 'arena> {
     /// An empty source set remains useful for the pinned nil-location global
     /// resolver. Bound declaration lookup additionally requires the exact
     /// source that owns the requested node.
-    // CanonicalCheckerContext is the sole non-test caller, preserving the
-    // post-global-initialization phase boundary.
+    // Only production construction and completed CanonicalCheckerContext
+    // entry points reach this constructor. The declared-type path is guarded
+    // by its private post-global-merge capability.
     pub(super) fn new(
         store: &'store CanonicalTypeMapperStore,
         sources: impl IntoIterator<Item = (&'arena NodeArena, &'arena BoundFile)>,

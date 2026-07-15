@@ -8,6 +8,7 @@
 
 pub mod bootstrap;
 pub mod declared;
+mod global_types;
 pub mod ids;
 pub mod links;
 pub mod mapper;
@@ -30,6 +31,9 @@ pub use declared::{
     DeclaredTypeError, DeclaredTypeHost, DeclaredTypeHostError, DeclaredTypeUnavailable,
     UnsupportedDeclaredTypeKind, UnsupportedOuterTypeParameterContext,
 };
+pub use global_types::{
+    CanonicalGlobalTypeDiagnostic, CanonicalGlobalTypeInitializationError, CanonicalGlobalTypes,
+};
 pub use ids::{
     ConditionalRootId, IndexInfoId, SignatureId, TypeAliasId, TypeId, TypeMapperId, TypePredicateId,
 };
@@ -50,7 +54,8 @@ pub use mapper::{CanonicalTypeMapperStore, TypeMapper, TypeMapperKind};
 pub use merge::{SymbolMergeDiagnosticKind, SymbolMergeError, get_excluded_symbol_flags};
 pub use name_resolution::{ProductionNameResolverHost, ProductionNameResolverHostError};
 pub use production::{
-    CanonicalCheckerContext, CanonicalCheckerContextError, CanonicalGlobalInitializationError,
+    CanonicalCheckerContext, CanonicalCheckerContextError, CanonicalCheckerOptions,
+    CanonicalGlobalInitializationError,
 };
 pub use relation::{
     ExpandingFlags, IntersectionState, MinArgumentCountFlags, RecursionFlags,

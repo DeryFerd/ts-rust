@@ -21,12 +21,17 @@ use ts_ast::{
     FileId, Node, NodeArena, NodeArenaId, NodeArenaRevision, NodeData, NodeList, NodeRef,
     SyntaxKind,
 };
-use ts_binder::{BoundFile, SemanticSymbolId, SymbolFlags};
+use ts_binder::{
+    BoundFile, CanonicalNameResolutionError, CanonicalNameResolver, CanonicalNameResolverOptions,
+    CanonicalResolutionLocation, SemanticSymbolId, SymbolFlags,
+};
 use xxhash_rust::xxh3::Xxh3;
 
 use super::{
     ids::TypeId,
     mapper::TypeMapper,
+    name_resolution::{ProductionNameResolverHost, ProductionNameResolverHostError},
+    production::GlobalMergeCompletion,
     store::SemanticStore,
     type_records::{CacheHashKey, InterfaceTypeData, TypeCacheState, TypeData, TypeRecord},
     types::{ObjectFlags, TypeFlags},
@@ -38,14 +43,23 @@ struct DeclaredTypeSource<'a> {
     bound: &'a BoundFile,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+enum DeclaredNameResolution {
+    #[default]
+    Unavailable,
+    GlobalsMerged(CanonicalNameResolverOptions),
+}
+
 /// Exact Program syntax and binder side data available to declared-type work.
 ///
 /// Sources are borrowed rather than copied so node identity remains the
 /// parser's identity. Every source must have completed canonical declaration
-/// binding before it can enter the host.
+/// binding before it can enter the host. Publicly constructed hosts cannot
+/// mint the post-global name resolver used by interface heritage.
 #[derive(Debug, Default)]
 pub struct DeclaredTypeHost<'a> {
     sources: BTreeMap<FileId, DeclaredTypeSource<'a>>,
+    name_resolution: DeclaredNameResolution,
 }
 
 /// A source rejected while constructing a [`DeclaredTypeHost`].
@@ -114,7 +128,27 @@ impl<'a> DeclaredTypeHost<'a> {
     pub fn new(
         sources: impl IntoIterator<Item = (&'a NodeArena, &'a BoundFile)>,
     ) -> Result<Self, DeclaredTypeHostError> {
-        let mut host = Self::default();
+        Self::new_internal(sources, DeclaredNameResolution::Unavailable)
+    }
+
+    pub(super) fn new_after_global_merge(
+        sources: impl IntoIterator<Item = (&'a NodeArena, &'a BoundFile)>,
+        completion: GlobalMergeCompletion,
+    ) -> Result<Self, DeclaredTypeHostError> {
+        Self::new_internal(
+            sources,
+            DeclaredNameResolution::GlobalsMerged(completion.name_resolution()),
+        )
+    }
+
+    fn new_internal(
+        sources: impl IntoIterator<Item = (&'a NodeArena, &'a BoundFile)>,
+        name_resolution: DeclaredNameResolution,
+    ) -> Result<Self, DeclaredTypeHostError> {
+        let mut host = Self {
+            sources: BTreeMap::new(),
+            name_resolution,
+        };
         for (arena, bound) in sources {
             let file = bound.file_id();
             if arena.id() != bound.node_arena_id() {
@@ -160,7 +194,7 @@ impl<'a> DeclaredTypeHost<'a> {
         Ok(host)
     }
 
-    fn node(&self, reference: NodeRef) -> Option<&Node> {
+    pub(super) fn node(&self, reference: NodeRef) -> Option<&Node> {
         let source = self.sources.get(&reference.file)?;
         if source.arena.id() != reference.arena || !source.bound.contains(reference) {
             return None;
@@ -169,6 +203,24 @@ impl<'a> DeclaredTypeHost<'a> {
             .arena
             .get(reference.node)
             .filter(|node| node.data.matches_syntax_kind(node.kind))
+    }
+
+    pub(super) fn name_resolver_host<'store>(
+        &self,
+        store: &'store SemanticStore<TypeRecord, TypeMapper>,
+    ) -> Result<ProductionNameResolverHost<'store, 'a>, DeclaredTypeError> {
+        let DeclaredNameResolution::GlobalsMerged(options) = self.name_resolution else {
+            return Err(unavailable(
+                DeclaredTypeUnavailable::PostGlobalNameResolutionUnavailable,
+            ));
+        };
+        Ok(ProductionNameResolverHost::new(
+            store,
+            self.sources
+                .values()
+                .map(|source| (source.arena, source.bound)),
+            options,
+        )?)
     }
 
     fn bound_file(&self, reference: NodeRef) -> Option<&BoundFile> {
@@ -225,6 +277,7 @@ pub enum DeclaredTypeUnavailable {
     DeclarationSymbolMismatch(NodeRef),
     InvalidClassDeclaration(NodeRef),
     InvalidInterfaceDeclaration(NodeRef),
+    PostGlobalNameResolutionUnavailable,
     UnsupportedInterfaceHeritageResolution(NodeRef),
     InvalidTypeParameterSymbol(SemanticSymbolId),
     InvalidTypeParameterDeclaration(NodeRef),
@@ -242,6 +295,8 @@ pub enum DeclaredTypeUnavailable {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DeclaredTypeError {
     Unavailable(DeclaredTypeUnavailable),
+    NameResolverHost(ProductionNameResolverHostError),
+    NameResolution(CanonicalNameResolutionError),
 }
 
 impl From<DeclaredTypeUnavailable> for DeclaredTypeError {
@@ -256,11 +311,33 @@ impl std::fmt::Display for DeclaredTypeError {
             Self::Unavailable(reason) => {
                 write!(formatter, "declared type is unavailable: {reason:?}")
             }
+            Self::NameResolverHost(error) => write!(formatter, "{error}"),
+            Self::NameResolution(error) => write!(formatter, "{error}"),
         }
     }
 }
 
-impl std::error::Error for DeclaredTypeError {}
+impl std::error::Error for DeclaredTypeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Unavailable(_) => None,
+            Self::NameResolverHost(error) => Some(error),
+            Self::NameResolution(error) => Some(error),
+        }
+    }
+}
+
+impl From<ProductionNameResolverHostError> for DeclaredTypeError {
+    fn from(error: ProductionNameResolverHostError) -> Self {
+        Self::NameResolverHost(error)
+    }
+}
+
+impl From<CanonicalNameResolutionError> for DeclaredTypeError {
+    fn from(error: CanonicalNameResolutionError) -> Self {
+        Self::NameResolution(error)
+    }
+}
 
 #[derive(Debug)]
 struct ClassPlan {
@@ -928,10 +1005,9 @@ fn interface_requires_this_type(
                     *declaration,
                     expression,
                     &mut HashSet::new(),
-                )? {
-                    return Err(unavailable(
-                        DeclaredTypeUnavailable::UnsupportedInterfaceHeritageResolution(expression),
-                    ));
+                )? && cached_heritage_requires_this_type(store, host, expression)?
+                {
+                    return Ok(true);
                 }
             }
             // `GetHeritageClause` returns the first matching clause. Invalid
@@ -940,6 +1016,72 @@ fn interface_requires_this_type(
         }
     }
     Ok(false)
+}
+
+fn cached_heritage_requires_this_type(
+    store: &SemanticStore<TypeRecord, TypeMapper>,
+    host: &DeclaredTypeHost<'_>,
+    expression: NodeRef,
+) -> Result<bool, DeclaredTypeError> {
+    let expression_node = preflight_node(store, host, expression)?;
+    let NodeData::Identifier(identifier) = &expression_node.data else {
+        return Err(unavailable(
+            DeclaredTypeUnavailable::UnsupportedInterfaceHeritageResolution(expression),
+        ));
+    };
+    let source =
+        host.sources.get(&expression.file).copied().ok_or_else(|| {
+            unavailable(DeclaredTypeUnavailable::MissingOrForeignFacts(expression))
+        })?;
+    let mut callback_host = host.name_resolver_host(store)?;
+    let base_symbol = CanonicalNameResolver::new(
+        source.arena,
+        source.bound,
+        store.symbol_store(),
+        &mut callback_host,
+    )?
+    .resolve(
+        Some(CanonicalResolutionLocation::Bound(expression)),
+        &identifier.text,
+        SymbolFlags::TYPE,
+        None,
+        false,
+        false,
+    )?;
+    let Some(base_symbol) = base_symbol else {
+        return Ok(true);
+    };
+    let flags = store
+        .symbol(base_symbol)
+        .ok_or_else(|| unavailable(DeclaredTypeUnavailable::SymbolNotOwned(base_symbol)))?
+        .flags();
+    if !flags.contains(SymbolFlags::INTERFACE) {
+        return Ok(true);
+    }
+
+    // Eager global initialization reaches Function only after its declared
+    // identity is cached. Recursive shell planning remains a later heritage
+    // slice and fails explicitly instead of changing allocation order here.
+    let cached = if flags.contains(SymbolFlags::CLASS) {
+        cached_class_type(store, base_symbol)?
+    } else {
+        cached_interface_type(store, base_symbol)?
+    };
+    let Some(base_type) = cached else {
+        return Err(unavailable(
+            DeclaredTypeUnavailable::UnsupportedInterfaceHeritageResolution(expression),
+        ));
+    };
+    let Some(TypeData::Interface(interface)) = store.type_payload(base_type).map(TypeRecord::data)
+    else {
+        return Err(unavailable(
+            DeclaredTypeUnavailable::InvalidCachedDeclaredType {
+                symbol: base_symbol,
+                declared_type: base_type,
+            },
+        ));
+    };
+    Ok(interface.this_type.is_some())
 }
 
 fn preflight_interface_plan(
@@ -1045,7 +1187,7 @@ fn execute_type_parameter(
     declared_type
 }
 
-fn type_list_key(types: &[TypeId]) -> CacheHashKey {
+pub(super) fn type_list_key(types: &[TypeId]) -> CacheHashKey {
     let mut hasher = Xxh3::new();
     hasher.update(
         &u64::try_from(types.len())
@@ -1309,6 +1451,14 @@ mod tests {
         DeclaredTypeHost::new([(arena, bound)]).unwrap()
     }
 
+    fn post_global_host<'a>(arena: &'a NodeArena, bound: &'a BoundFile) -> DeclaredTypeHost<'a> {
+        DeclaredTypeHost::new_after_global_merge(
+            [(arena, bound)],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap()
+    }
+
     fn identifier_text(arena: &NodeArena, identifier: NodeId) -> Option<&str> {
         let NodeData::Identifier(identifier) = &arena.get(identifier)?.data else {
             return None;
@@ -1357,6 +1507,23 @@ mod tests {
 
     fn named_symbol(fixture: &Fixture, kind: SyntaxKind, name: &str) -> SemanticSymbolId {
         node_symbol(fixture, named_node(fixture, kind, name))
+    }
+
+    fn merge_fixture_globals(fixture: &mut Fixture) {
+        let bound = fixture.files.get(&fixture.file).unwrap();
+        let locals = bound.locals(bound.source_file()).unwrap();
+        let mut symbols = fixture
+            .store
+            .symbol_table(locals)
+            .unwrap()
+            .iter()
+            .map(|(name, symbol)| (name.as_bytes().to_vec(), symbol))
+            .collect::<Vec<_>>();
+        symbols.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        let globals = fixture.store.intrinsic_bootstrap().unwrap().globals;
+        for (_, symbol) in symbols {
+            fixture.store.merge_global_symbol(globals, symbol).unwrap();
+        }
     }
 
     fn interface_data(store: &TestStore, declared_type: TypeId) -> &InterfaceTypeData {
@@ -1945,6 +2112,7 @@ mod tests {
     #[test]
     fn entity_name_heritage_is_unavailable_before_checker_writes() {
         let mut fixture = fixture("interface Base {} interface Derived extends Base {}");
+        merge_fixture_globals(&mut fixture);
         let derived = named_symbol(&fixture, SyntaxKind::InterfaceDeclaration, "Derived");
         let type_count = fixture.store.type_len();
         let mapper_count = fixture.store.mapper_len();
@@ -1955,7 +2123,7 @@ mod tests {
         assert!(matches!(
             fixture.store.get_declared_type_of_symbol(&host, derived),
             Err(DeclaredTypeError::Unavailable(
-                DeclaredTypeUnavailable::UnsupportedInterfaceHeritageResolution(_)
+                DeclaredTypeUnavailable::PostGlobalNameResolutionUnavailable
             ))
         ));
         assert_eq!(fixture.store.type_len(), type_count);
@@ -1965,13 +2133,84 @@ mod tests {
     }
 
     #[test]
+    fn cached_direct_interface_heritage_preserves_thisless_identity() {
+        let mut fixture = fixture("interface Base {} interface Derived extends Base {}");
+        merge_fixture_globals(&mut fixture);
+        let base = named_symbol(&fixture, SyntaxKind::InterfaceDeclaration, "Base");
+        let derived = named_symbol(&fixture, SyntaxKind::InterfaceDeclaration, "Derived");
+        let bound = fixture.files.get(&fixture.file).unwrap();
+        let host = post_global_host(&fixture.parsed.arena, bound);
+
+        let base_type = fixture
+            .store
+            .get_declared_type_of_symbol(&host, base)
+            .unwrap();
+        assert!(
+            interface_data(&fixture.store, base_type)
+                .this_type
+                .is_none()
+        );
+        let derived_type = fixture
+            .store
+            .get_declared_type_of_symbol(&host, derived)
+            .unwrap();
+        assert!(
+            interface_data(&fixture.store, derived_type)
+                .this_type
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn cached_direct_interface_heritage_propagates_this_and_missing_base_forces_it() {
+        let mut fixture = fixture(
+            "interface Base { value: this } interface Derived extends Base {} interface MissingDerived extends Missing {}",
+        );
+        merge_fixture_globals(&mut fixture);
+        let base = named_symbol(&fixture, SyntaxKind::InterfaceDeclaration, "Base");
+        let derived = named_symbol(&fixture, SyntaxKind::InterfaceDeclaration, "Derived");
+        let missing = named_symbol(&fixture, SyntaxKind::InterfaceDeclaration, "MissingDerived");
+        let bound = fixture.files.get(&fixture.file).unwrap();
+        let host = post_global_host(&fixture.parsed.arena, bound);
+
+        let base_type = fixture
+            .store
+            .get_declared_type_of_symbol(&host, base)
+            .unwrap();
+        assert!(
+            interface_data(&fixture.store, base_type)
+                .this_type
+                .is_some()
+        );
+        let derived_type = fixture
+            .store
+            .get_declared_type_of_symbol(&host, derived)
+            .unwrap();
+        assert!(
+            interface_data(&fixture.store, derived_type)
+                .this_type
+                .is_some()
+        );
+        let missing_type = fixture
+            .store
+            .get_declared_type_of_symbol(&host, missing)
+            .unwrap();
+        assert!(
+            interface_data(&fixture.store, missing_type)
+                .this_type
+                .is_some()
+        );
+    }
+
+    #[test]
     fn thisless_scan_preserves_declaration_order_around_heritage() {
         let mut blocked = fixture(
             "interface Base {} interface Ordered extends Base {} interface Ordered { value: this }",
         );
+        merge_fixture_globals(&mut blocked);
         let ordered = named_symbol(&blocked, SyntaxKind::InterfaceDeclaration, "Ordered");
         let bound = blocked.files.get(&blocked.file).unwrap();
-        let blocked_host = host(&blocked.parsed.arena, bound);
+        let blocked_host = post_global_host(&blocked.parsed.arena, bound);
         assert!(matches!(
             blocked
                 .store
@@ -1984,6 +2223,7 @@ mod tests {
         let mut short_circuited = fixture(
             "interface Base {} interface Ordered { value: this } interface Ordered extends Base {}",
         );
+        merge_fixture_globals(&mut short_circuited);
         let ordered = named_symbol(
             &short_circuited,
             SyntaxKind::InterfaceDeclaration,
