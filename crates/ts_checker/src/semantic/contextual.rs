@@ -82,6 +82,7 @@ fn prepare_expression_context_worker(
         preflight_contextual_type_graph(
             store,
             host,
+            global_types,
             contextual_type,
             &mut HashSet::new(),
             &mut HashSet::new(),
@@ -130,6 +131,7 @@ fn prepare_expression_without_context_worker(
 fn preflight_contextual_type_graph(
     store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
+    global_types: Option<&CanonicalGlobalTypes>,
     contextual_type: TypeId,
     validated: &mut HashSet<TypeId>,
     visiting: &mut HashSet<TypeId>,
@@ -146,23 +148,43 @@ fn preflight_contextual_type_graph(
             .map(TypeRecord::flags)
             .ok_or(RelationUnavailable::Type(contextual_type))?;
         if flags.intersects(TypeFlags::UNION) {
-            return validate_contextual_union(store, contextual_type);
+            return validate_contextual_union(store, global_types, contextual_type);
         }
         if flags.intersects(TypeFlags::OBJECT) {
+            if let Some(global_types) = global_types
+                && let Some(element_type) =
+                    store.canonical_array_element_type(global_types, contextual_type)?
+            {
+                return preflight_contextual_type_graph(
+                    store,
+                    host,
+                    Some(global_types),
+                    element_type,
+                    validated,
+                    visiting,
+                );
+            }
             let contextual = store
                 .resolved_declared_property_object(host, contextual_type)?
                 .ok_or(RelationUnavailable::UnsupportedStructuredType(
                     contextual_type,
                 ))?;
             for property in contextual.properties() {
-                preflight_contextual_type_graph(store, host, property.type_, validated, visiting)?;
+                preflight_contextual_type_graph(
+                    store,
+                    host,
+                    global_types,
+                    property.type_,
+                    validated,
+                    visiting,
+                )?;
             }
             return Ok(());
         }
         if flags.intersects(TypeFlags::STRUCTURED_OR_INSTANTIABLE) {
             return Err(RelationUnavailable::UnsupportedStructuredType(contextual_type).into());
         }
-        validate_contextual_union(store, contextual_type)
+        validate_contextual_union(store, global_types, contextual_type)
     })();
     assert!(visiting.remove(&contextual_type));
     if result.is_ok() {
@@ -185,24 +207,28 @@ fn prepare_expression(
         }
         PlannedExpressionKind::String(_) => PreparedExpression::Literal(literal_treatment(
             store,
+            global_types,
             LiteralKind::String,
             contextual_type,
             location,
         )?),
         PlannedExpressionKind::Number { .. } => PreparedExpression::Literal(literal_treatment(
             store,
+            global_types,
             LiteralKind::Number,
             contextual_type,
             location,
         )?),
         PlannedExpressionKind::BigInt { .. } => PreparedExpression::Literal(literal_treatment(
             store,
+            global_types,
             LiteralKind::BigInt,
             contextual_type,
             location,
         )?),
         PlannedExpressionKind::Boolean(_) => PreparedExpression::Literal(literal_treatment(
             store,
+            global_types,
             LiteralKind::Boolean,
             contextual_type,
             location,
@@ -276,7 +302,7 @@ fn contextual_object(
         // union domain. An object constituent (or an OBJECT-claiming malformed
         // union) is therefore a typed failure here, before source publication.
         // A valid primitive union has no members to propagate to an object.
-        validate_contextual_union(store, contextual_type)?;
+        validate_contextual_union(store, None, contextual_type)?;
         return Ok(None);
     }
     if flags.intersects(TypeFlags::OBJECT) {
@@ -292,6 +318,7 @@ fn contextual_object(
 
 fn literal_treatment(
     store: &mut CanonicalTypeMapperStore,
+    global_types: Option<&CanonicalGlobalTypes>,
     kind: LiteralKind,
     contextual_type: Option<TypeId>,
     location: ExpressionLocation,
@@ -299,7 +326,13 @@ fn literal_treatment(
     if location == ExpressionLocation::Cached {
         return Ok(LiteralTreatment::Fresh);
     }
-    if is_literal_of_contextual_type(store, kind, contextual_type, &mut HashSet::new())? {
+    if is_literal_of_contextual_type(
+        store,
+        global_types,
+        kind,
+        contextual_type,
+        &mut HashSet::new(),
+    )? {
         Ok(LiteralTreatment::Regular)
     } else {
         Ok(LiteralTreatment::WidenedPrimitive)
@@ -308,6 +341,7 @@ fn literal_treatment(
 
 fn is_literal_of_contextual_type(
     store: &mut CanonicalTypeMapperStore,
+    global_types: Option<&CanonicalGlobalTypes>,
     kind: LiteralKind,
     contextual_type: Option<TypeId>,
     visited: &mut HashSet<TypeId>,
@@ -324,13 +358,19 @@ fn is_literal_of_contextual_type(
             .ok_or(RelationUnavailable::Type(contextual_type))?;
         let flags = record.flags();
         if flags.intersects(TypeFlags::UNION) {
-            validate_contextual_union(store, contextual_type)?;
+            validate_contextual_union(store, global_types, contextual_type)?;
             let TypeData::Union(union) = record.data() else {
                 return Err(RelationUnavailable::MalformedUnion(contextual_type).into());
             };
             let types = union.union.types.clone();
             for constituent in types {
-                if is_literal_of_contextual_type(store, kind, Some(constituent), visited)? {
+                if is_literal_of_contextual_type(
+                    store,
+                    global_types,
+                    kind,
+                    Some(constituent),
+                    visited,
+                )? {
                     return Ok(true);
                 }
             }
@@ -358,10 +398,16 @@ fn is_literal_of_contextual_type(
 
 fn validate_contextual_union(
     store: &CanonicalTypeMapperStore,
+    global_types: Option<&CanonicalGlobalTypes>,
     union: TypeId,
 ) -> Result<(), SourceCheckError> {
-    store
-        .validate_union_constituent(union)
+    let result = match global_types {
+        Some(global_types) => {
+            store.validate_union_constituent_with_global_types(global_types, union)
+        }
+        None => store.validate_union_constituent(union),
+    };
+    result
         .map_err(|error| super::relater::union_validation_unavailable(union, error))
         .map_err(Into::into)
 }
@@ -404,6 +450,7 @@ mod tests {
         assert_eq!(
             literal_treatment(
                 &mut store,
+                None,
                 LiteralKind::String,
                 Some(expected),
                 ExpressionLocation::Mutable,
@@ -413,6 +460,7 @@ mod tests {
         assert_eq!(
             literal_treatment(
                 &mut store,
+                None,
                 LiteralKind::String,
                 Some(literal_or_number),
                 ExpressionLocation::Mutable,
@@ -423,6 +471,7 @@ mod tests {
         assert_eq!(
             literal_treatment(
                 &mut store,
+                None,
                 LiteralKind::String,
                 Some(primitive_or_number),
                 ExpressionLocation::Mutable,
@@ -432,6 +481,7 @@ mod tests {
         assert_eq!(
             literal_treatment(
                 &mut store,
+                None,
                 LiteralKind::Boolean,
                 Some(boolean),
                 ExpressionLocation::Mutable,
@@ -442,6 +492,7 @@ mod tests {
         assert_eq!(
             literal_treatment(
                 &mut store,
+                None,
                 LiteralKind::String,
                 None,
                 ExpressionLocation::Mutable,
@@ -451,6 +502,7 @@ mod tests {
         assert_eq!(
             literal_treatment(
                 &mut store,
+                None,
                 LiteralKind::String,
                 Some(expected),
                 ExpressionLocation::Cached,
@@ -492,13 +544,13 @@ mod tests {
         );
 
         assert_eq!(
-            validate_contextual_union(&store, containing_object),
+            validate_contextual_union(&store, None, containing_object),
             Err(SourceCheckError::RelationUnavailable(
                 RelationUnavailable::UnsupportedUnionConstituent(object)
             ))
         );
         assert_eq!(
-            validate_contextual_union(&store, claiming_object),
+            validate_contextual_union(&store, None, claiming_object),
             Err(SourceCheckError::RelationUnavailable(
                 RelationUnavailable::MalformedUnion(claiming_object)
             ))

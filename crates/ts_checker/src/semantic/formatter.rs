@@ -537,7 +537,7 @@ fn display_type_worker(
     }
     if type_flags.intersects(TypeFlags::BOOLEAN) && record.alias().is_none() {
         require_data_kind(type_id, record, TypeDataKind::Union)?;
-        validate_display_union(store, type_id)?;
+        validate_display_union(store, global_types, type_id)?;
         state.add(7);
         return Ok("boolean".to_owned());
     }
@@ -1697,7 +1697,7 @@ fn display_union_type(
     visiting: &mut HashSet<TypeId>,
 ) -> Result<String, TypeDisplayUnavailable> {
     ensure_acyclic_union_graph(store, type_id)?;
-    validate_display_union(store, type_id)?;
+    validate_display_union(store, global_types, type_id)?;
     if !visiting.insert(type_id) {
         return Err(TypeDisplayUnavailable::CyclicType(type_id));
     }
@@ -1944,11 +1944,16 @@ fn ensure_acyclic_union_graph(
 
 fn validate_display_union(
     store: &CanonicalTypeMapperStore,
+    global_types: Option<&CanonicalGlobalTypes>,
     union: TypeId,
 ) -> Result<(), TypeDisplayUnavailable> {
-    store
-        .validate_union_constituent(union)
-        .map_err(|error| union_display_unavailable(union, error))
+    let result = match global_types {
+        Some(global_types) => {
+            store.validate_union_constituent_with_global_types(global_types, union)
+        }
+        None => store.validate_union_constituent(union),
+    };
+    result.map_err(|error| union_display_unavailable(union, error))
 }
 
 const fn union_display_unavailable(
@@ -2174,6 +2179,7 @@ mod tests {
     use super::*;
     use crate::semantic::{
         CanonicalCheckerContext, CanonicalCheckerOptions, IntrinsicBootstrapOptions,
+        bootstrap::UnionReduction,
         type_records::{ConstituentMapState, LiteralValue, RegularLiteralLink},
         types::ObjectFlags,
     };
@@ -2495,6 +2501,19 @@ mod tests {
         let readonly_array = store
             .create_canonical_array_type(&global_types, named_t, true)
             .unwrap();
+        let nested_array = store
+            .create_canonical_array_type(&global_types, number_literal_array, false)
+            .unwrap();
+        let nested_literal_array = store
+            .create_array_literal_type(&global_types, nested_array)
+            .unwrap();
+        let nested_union = store
+            .expression_union_type_with_global_types(
+                &global_types,
+                &[nested_literal_array, string],
+                UnionReduction::None,
+            )
+            .unwrap();
 
         assert!(matches!(
             type_to_string(store, number_array),
@@ -2526,6 +2545,21 @@ mod tests {
         assert_eq!(
             type_to_string_with_global_types(store, &global_types, readonly_array).unwrap(),
             "readonly T[]"
+        );
+        assert_eq!(
+            type_to_string_with_global_types(store, &global_types, nested_literal_array).unwrap(),
+            "number[][]"
+        );
+        assert!(matches!(
+            type_to_string(store, nested_union),
+            Err(TypeDisplayUnavailable::UnsupportedUnionConstituent {
+                union,
+                constituent,
+            }) if union == nested_union && constituent == nested_literal_array
+        ));
+        assert_eq!(
+            type_to_string_with_global_types(store, &global_types, nested_union).unwrap(),
+            "string | number[][]"
         );
         assert_eq!(
             get_type_names_for_assignability_error_with_global_types(

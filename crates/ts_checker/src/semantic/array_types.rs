@@ -21,6 +21,39 @@ pub(super) struct CanonicalArrayReference {
     pub(super) array_literal: bool,
 }
 
+/// The authoritative global targets required to validate canonical array
+/// references without retaining the full initialized-global record.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct CanonicalArrayTargets {
+    array_type: TypeId,
+    readonly_array_type: TypeId,
+}
+
+impl CanonicalArrayTargets {
+    pub(super) const fn from_global_types(global_types: &CanonicalGlobalTypes) -> Self {
+        Self {
+            array_type: global_types.array_type,
+            readonly_array_type: global_types.readonly_array_type,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) const fn for_test(array_type: TypeId, readonly_array_type: TypeId) -> Self {
+        Self {
+            array_type,
+            readonly_array_type,
+        }
+    }
+
+    pub(super) const fn array_type(self) -> TypeId {
+        self.array_type
+    }
+
+    pub(super) const fn readonly_array_type(self) -> TypeId {
+        self.readonly_array_type
+    }
+}
+
 /// A malformed global-array target, reference, or derived cache entry.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ArrayTypeError {
@@ -78,19 +111,32 @@ impl CanonicalTypeMapperStore {
         global_types: &CanonicalGlobalTypes,
         type_id: TypeId,
     ) -> Result<Option<CanonicalArrayReference>, ArrayTypeError> {
+        self.canonical_array_reference_with_targets(
+            CanonicalArrayTargets::from_global_types(global_types),
+            type_id,
+        )
+    }
+
+    /// Target-only form used by semantic operations that retain an explicit
+    /// capability derived from [`CanonicalGlobalTypes`].
+    pub(super) fn canonical_array_reference_with_targets(
+        &self,
+        targets: CanonicalArrayTargets,
+        type_id: TypeId,
+    ) -> Result<Option<CanonicalArrayReference>, ArrayTypeError> {
         let Some(record) = self.type_payload(type_id) else {
             return Err(ArrayTypeError::InvalidReference(type_id));
         };
         let Some(reference) = direct_reference(record.data()) else {
             return Ok(None);
         };
-        self.validate_array_targets(global_types)?;
+        self.validate_array_targets(targets)?;
         let Some(target) = reference.object.target else {
             return Ok(None);
         };
-        let readonly = if target == global_types.array_type {
+        let readonly = if target == targets.array_type {
             false
-        } else if target == global_types.readonly_array_type {
+        } else if target == targets.readonly_array_type {
             true
         } else {
             return Ok(None);
@@ -223,13 +269,10 @@ impl CanonicalTypeMapperStore {
         Ok(clone)
     }
 
-    fn validate_array_targets(
-        &self,
-        global_types: &CanonicalGlobalTypes,
-    ) -> Result<(), ArrayTypeError> {
-        preflight_generic_global_type_target(self, global_types.array_type)?;
-        if global_types.readonly_array_type != global_types.array_type {
-            preflight_generic_global_type_target(self, global_types.readonly_array_type)?;
+    fn validate_array_targets(&self, targets: CanonicalArrayTargets) -> Result<(), ArrayTypeError> {
+        preflight_generic_global_type_target(self, targets.array_type)?;
+        if targets.readonly_array_type != targets.array_type {
+            preflight_generic_global_type_target(self, targets.readonly_array_type)?;
         }
         Ok(())
     }
@@ -318,7 +361,10 @@ mod tests {
     use ts_parser::{ParseResult, parse_source_file};
 
     use super::*;
-    use crate::semantic::{CanonicalCheckerContext, CanonicalCheckerOptions};
+    use crate::semantic::{
+        CanonicalCheckerContext, CanonicalCheckerOptions, RelationUnavailable,
+        bootstrap::{LiteralTypeCacheError, UnionReduction},
+    };
 
     fn context(parsed: &ParseResult, file: FileId) -> CanonicalCheckerContext<'_> {
         let mut binder = CanonicalBinder::new();
@@ -439,6 +485,133 @@ mod tests {
                 .create_array_literal_type(&global_types, base)
                 .unwrap(),
             literal
+        );
+    }
+
+    #[test]
+    fn global_aware_expression_unions_validate_nested_array_cache_ownership() {
+        let mut context = array_context(FileId::new(915));
+        let global_types = context.global_types().clone();
+        let (number, string) = {
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            (bootstrap.number_type, bootstrap.string_type)
+        };
+        let store = context.store_mut_for_test();
+        let inner_base = store
+            .create_canonical_array_type(&global_types, number, false)
+            .unwrap();
+        let inner_literal = store
+            .create_array_literal_type(&global_types, inner_base)
+            .unwrap();
+        let outer_base = store
+            .create_canonical_array_type(&global_types, inner_literal, false)
+            .unwrap();
+        let outer_literal = store
+            .create_array_literal_type(&global_types, outer_base)
+            .unwrap();
+
+        assert_eq!(
+            store.expression_union_type(&[outer_literal], UnionReduction::None),
+            Err(LiteralTypeCacheError::UnsupportedUnionConstituent(
+                outer_literal
+            )),
+            "the legacy union boundary remains fail-closed without global identities",
+        );
+        let union = store
+            .expression_union_type_with_global_types(
+                &global_types,
+                &[outer_literal, string],
+                UnionReduction::None,
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .expression_union_type_with_global_types(
+                    &global_types,
+                    &[string, outer_literal],
+                    UnionReduction::None,
+                )
+                .unwrap(),
+            union,
+            "the recursively validated global-aware cache is stable when warm",
+        );
+        let element_union = store
+            .expression_union_type_with_global_types(
+                &global_types,
+                &[inner_literal, string],
+                UnionReduction::None,
+            )
+            .unwrap();
+        let target_outer = store
+            .create_canonical_array_type(&global_types, element_union, false)
+            .unwrap();
+        assert_eq!(
+            store.is_type_assignable_to_with_global_types(
+                outer_literal,
+                target_outer,
+                &global_types,
+            ),
+            Ok(true),
+            "array covariance recurses through a union containing a canonical array",
+        );
+        assert!(matches!(
+            store.is_type_assignable_to_with_global_types(
+                target_outer,
+                outer_literal,
+                &global_types,
+            ),
+            Err(RelationUnavailable::UnsupportedStructuredType(_)),
+        ));
+
+        let outer_record = store.type_payload(outer_literal).unwrap();
+        let outer_symbol = outer_record.symbol();
+        let TypeData::TypeReference(outer_reference) = outer_record.data() else {
+            panic!("array literal must be a reference clone")
+        };
+        let outer_target = outer_reference.object.target;
+        let outer_arguments = outer_reference.resolved_type_arguments.clone();
+        let forged = store
+            .alloc_type_reference(outer_record.object_flags(), outer_symbol)
+            .unwrap();
+        assert!(store.set_object_target_and_mapper(forged, outer_target, None));
+        assert!(store.set_type_reference_resolution(forged, None, outer_arguments));
+        assert_eq!(
+            store.expression_union_type_with_global_types(
+                &global_types,
+                &[forged, string],
+                UnionReduction::None,
+            ),
+            Err(LiteralTypeCacheError::UnsupportedUnionConstituent(forged)),
+            "an exact-shape clone without derived-cache ownership is rejected",
+        );
+
+        store
+            .derived_types
+            .array_literal_types
+            .insert(inner_base, string);
+        let before = (
+            store.type_len(),
+            store.intrinsic_bootstrap().unwrap().union_cache_len(),
+            store.derived_types.array_literal_types.clone(),
+        );
+        assert_eq!(
+            store.expression_union_type_with_global_types(
+                &global_types,
+                &[outer_literal, string],
+                UnionReduction::None,
+            ),
+            Err(LiteralTypeCacheError::UnsupportedUnionConstituent(
+                inner_literal
+            )),
+        );
+        assert_eq!(
+            (
+                store.type_len(),
+                store.intrinsic_bootstrap().unwrap().union_cache_len(),
+                store.derived_types.array_literal_types.clone(),
+            ),
+            before,
+            "recursive cache poison is detected before any query write",
         );
     }
 

@@ -1635,7 +1635,11 @@ fn execute_expression_types(
                     bootstrap.undefined_widening_type
                 }
             } else {
-                store.expression_union_type(&element_types, UnionReduction::Subtype)?
+                store.expression_union_type_with_global_types(
+                    global_types,
+                    &element_types,
+                    UnionReduction::Subtype,
+                )?
             };
             let base = store.create_canonical_array_type(global_types, element_type, false)?;
             let array = store.create_array_literal_type(global_types, base)?;
@@ -2416,6 +2420,23 @@ mod tests {
         NodeRef::new(parsed.arena.id(), file, type_node)
     }
 
+    fn type_alias_body(parsed: &ParseResult, file: FileId, expected: &str) -> NodeRef {
+        let type_node = parsed
+            .arena
+            .iter()
+            .find_map(|(_, node)| {
+                let NodeData::TypeAliasDeclaration(alias) = &node.data else {
+                    return None;
+                };
+                let NodeData::Identifier(identifier) = &parsed.arena.get(alias.name)?.data else {
+                    return None;
+                };
+                (identifier.text == expected).then_some(alias.type_)
+            })
+            .unwrap_or_else(|| panic!("missing type alias {expected}"));
+        NodeRef::new(parsed.arena.id(), file, type_node)
+    }
+
     fn assignment_parts(parsed: &ParseResult, file: FileId, index: usize) -> (NodeRef, NodeRef) {
         let statement = parsed
             .arena
@@ -3070,6 +3091,245 @@ mod tests {
         assert_eq!(context.type_to_string(source_type).unwrap(), "never[]");
         assert!(context.diagnostics().is_empty());
         assert!(is_type_checked(&context, file));
+    }
+
+    #[test]
+    fn nested_array_literals_check_in_direct_and_object_property_positions() {
+        let library = parsed("interface Array<T> {}");
+        let source = parsed(
+            "var direct: number[][] = [[1]];\
+             var wrapped: { values: number[][] } = { values: [[2]] };\
+             var inferred: any = [{ values: [[3]] }];",
+        );
+        let library_file = FileId::new(127);
+        let file = FileId::new(128);
+        let mut context = context(
+            &[(library_file, &library), (file, &source)],
+            CanonicalCheckerOptions::default(),
+        );
+
+        context.check_source_file(file).unwrap();
+
+        let direct = variable_initializer(&source, file, "direct");
+        let direct_inner = array_elements(&source, file, direct)[0];
+        assert_eq!(
+            context
+                .type_to_string(resolved_node_type(&context, direct))
+                .unwrap(),
+            "number[][]",
+        );
+        assert_eq!(
+            context
+                .type_to_string(resolved_node_type(&context, direct_inner))
+                .unwrap(),
+            "number[]",
+        );
+
+        let wrapped = variable_initializer(&source, file, "wrapped");
+        let wrapped_values = object_property_initializer(&source, file, wrapped, "values");
+        assert_eq!(
+            context
+                .type_to_string(resolved_node_type(&context, wrapped_values))
+                .unwrap(),
+            "number[][]",
+        );
+        assert_eq!(
+            context
+                .type_to_string(object_property_type(&context, wrapped, "values"))
+                .unwrap(),
+            "number[][]",
+        );
+
+        let inferred = variable_initializer(&source, file, "inferred");
+        let inferred_object = array_elements(&source, file, inferred)[0];
+        let inferred_values = object_property_initializer(&source, file, inferred_object, "values");
+        assert_eq!(
+            context
+                .type_to_string(resolved_node_type(&context, inferred))
+                .unwrap(),
+            "{ values: number[][]; }[]",
+        );
+        assert_eq!(
+            context
+                .type_to_string(resolved_node_type(&context, inferred_values))
+                .unwrap(),
+            "number[][]",
+        );
+        assert!(context.diagnostics().is_empty());
+        assert!(is_type_checked(&context, file));
+
+        let warm = observable_state(&context, file);
+        context.check_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn strict_and_loose_nullish_array_literals_keep_canonical_identities() {
+        let library = parsed("interface Array<T> {}");
+        let source = parsed("var nulls: any = [null]; var undefineds: any = [undefined];");
+        let library_file = FileId::new(129);
+        for (index, strict_null_checks) in [false, true].into_iter().enumerate() {
+            let file = FileId::new(130 + u32::try_from(index).unwrap());
+            let mut context = context(
+                &[(library_file, &library), (file, &source)],
+                CanonicalCheckerOptions {
+                    intrinsic: IntrinsicBootstrapOptions {
+                        strict_null_checks,
+                        exact_optional_property_types: false,
+                    },
+                    ..CanonicalCheckerOptions::default()
+                },
+            );
+
+            context.check_source_file(file).unwrap();
+
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            let null_widening = bootstrap.null_widening_type;
+            let undefined_widening = bootstrap.undefined_widening_type;
+            let nulls = resolved_node_type(&context, variable_initializer(&source, file, "nulls"));
+            let undefineds =
+                resolved_node_type(&context, variable_initializer(&source, file, "undefineds"));
+            assert_eq!(
+                context
+                    .store()
+                    .canonical_array_element_type(context.global_types(), nulls),
+                Ok(Some(null_widening)),
+            );
+            assert_eq!(
+                context
+                    .store()
+                    .canonical_array_element_type(context.global_types(), undefineds),
+                Ok(Some(undefined_widening)),
+            );
+            assert_eq!(context.type_to_string(nulls).unwrap(), "null[]");
+            assert_eq!(context.type_to_string(undefineds).unwrap(), "undefined[]");
+            assert!(context.diagnostics().is_empty());
+            assert!(is_type_checked(&context, file));
+
+            let warm = observable_state(&context, file);
+            context.check_source_file(file).unwrap();
+            assert_eq!(observable_state(&context, file), warm);
+        }
+    }
+
+    #[test]
+    fn mixed_array_and_property_object_subtype_reduction_stays_typed_unavailable() {
+        let library = parsed("interface Array<T> {}");
+        let source = parsed("var mixed: any = [[1], { id: 1 }];");
+        let library_file = FileId::new(132);
+        let file = FileId::new(133);
+        let mut context = context(
+            &[(library_file, &library), (file, &source)],
+            CanonicalCheckerOptions::default(),
+        );
+
+        assert!(matches!(
+            context.check_source_file(file),
+            Err(SourceCheckError::LiteralCache(
+                SourceLiteralCacheError::UnsupportedUnionConstituent(_)
+            )),
+        ));
+        assert!(context.diagnostics().is_empty());
+        assert!(!is_type_checked(&context, file));
+    }
+
+    #[test]
+    fn global_type_queries_rescan_shared_array_union_cache_with_capability() {
+        let library = parsed("interface Array<T> {}");
+        let expression = parsed("var nested: any = [[1], \"text\"];");
+        let query = parsed("var target: string | number = 1;");
+        let library_file = FileId::new(134);
+        let expression_file = FileId::new(135);
+        let query_file = FileId::new(136);
+        let mut context = context(
+            &[
+                (library_file, &library),
+                (expression_file, &expression),
+                (query_file, &query),
+            ],
+            CanonicalCheckerOptions::default(),
+        );
+
+        context.check_source_file(expression_file).unwrap();
+        let nested = resolved_node_type(
+            &context,
+            variable_initializer(&expression, expression_file, "nested"),
+        );
+        assert!(context.type_to_string(nested).unwrap().contains("number[]"));
+
+        let scans = context.store().union_cache_validation_scan_count();
+        context
+            .store_mut_for_test()
+            .mark_union_cache_validation_dirty();
+        let target = context
+            .get_type_from_type_node(variable_type_node(&query, query_file, "target"))
+            .unwrap();
+
+        assert_eq!(context.type_to_string(target).unwrap(), "string | number");
+        assert_eq!(
+            context.store().union_cache_validation_scan_count(),
+            scans + 1,
+            "the global-aware production query validates the shared cache once",
+        );
+        assert!(!context.store().union_cache_needs_validation);
+    }
+
+    #[test]
+    fn global_type_queries_construct_array_union_aliases_cold_and_warm() {
+        let library = parsed("interface Array<T> {}");
+        let source = parsed("type U = number[] | string;");
+        let library_file = FileId::new(137);
+        let file = FileId::new(138);
+        let mut context = context(
+            &[(library_file, &library), (file, &source)],
+            CanonicalCheckerOptions::default(),
+        );
+        let body = type_alias_body(&source, file, "U");
+
+        let union = context.get_type_from_type_node(body).unwrap();
+
+        assert_eq!(context.type_to_string(union).unwrap(), "U");
+        let TypeData::Union(data) = context.store().type_payload(union).unwrap().data() else {
+            panic!("array union alias must resolve to a canonical union")
+        };
+        assert_eq!(data.union.types.len(), 2);
+        assert!(data.union.types.iter().any(|constituent| {
+            context
+                .store()
+                .canonical_array_reference(context.global_types(), *constituent)
+                .is_ok_and(|reference| reference.is_some())
+        }));
+
+        let warm = observable_state(&context, file);
+        assert_eq!(context.get_type_from_type_node(body), Ok(union));
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn contextual_literal_unions_validate_sibling_arrays_with_global_capability() {
+        let library = parsed("interface Array<T> {}");
+        let source = parsed("var values: (1 | number[])[] = [1];");
+        let library_file = FileId::new(139);
+        let file = FileId::new(140);
+        let mut context = context(
+            &[(library_file, &library), (file, &source)],
+            CanonicalCheckerOptions::default(),
+        );
+        let initializer = variable_initializer(&source, file, "values");
+
+        context.check_source_file(file).unwrap();
+
+        assert_eq!(
+            context
+                .type_to_string(resolved_node_type(&context, initializer))
+                .unwrap(),
+            "1[]",
+        );
+        assert!(context.diagnostics().is_empty());
+        assert!(is_type_checked(&context, file));
+        let warm = observable_state(&context, file);
+        context.check_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
     }
 
     #[test]

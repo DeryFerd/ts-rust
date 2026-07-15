@@ -13,6 +13,7 @@ use super::{
     CanonicalCheckerDiagnostics, CanonicalCheckerOptions, CanonicalGlobalTypes,
     CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHost, DeclaredTypeUnavailable, TypeId,
     TypeResolutionTarget, TypeSystemPropertyName, UnsupportedDeclaredTypeKind,
+    array_types::CanonicalArrayTargets,
     bootstrap::{LiteralTypeCacheError, PreparedTypeQueryTypes},
     declared::{
         cached_ordinary_type_parameter_owner, execute_type_parameter,
@@ -544,6 +545,7 @@ struct TypeQueryPlanner<'store, 'host, 'arena> {
     store: &'store CanonicalTypeMapperStore,
     host: &'host DeclaredTypeHost<'arena>,
     array_type: Option<TypeId>,
+    array_targets: Option<CanonicalArrayTargets>,
     strict_builtin_iterator_return: bool,
     plan: TypeQueryPlan,
     planning_defaults: HashSet<(SemanticSymbolId, NodeRef)>,
@@ -556,12 +558,14 @@ impl<'store, 'host, 'arena> TypeQueryPlanner<'store, 'host, 'arena> {
         store: &'store CanonicalTypeMapperStore,
         host: &'host DeclaredTypeHost<'arena>,
         array_type: Option<TypeId>,
+        array_targets: Option<CanonicalArrayTargets>,
         strict_builtin_iterator_return: bool,
     ) -> Self {
         Self {
             store,
             host,
             array_type,
+            array_targets,
             strict_builtin_iterator_return,
             plan: TypeQueryPlan::default(),
             planning_defaults: HashSet::new(),
@@ -660,14 +664,12 @@ impl<'store, 'host, 'arena> TypeQueryPlanner<'store, 'host, 'arena> {
                         TypeNodeUnavailable::InvalidUnionType(node),
                     ));
                 }
-                self.store
-                    .validate_cached_union_result(cached, alias_owner.or(derived_alias))
+                self.validate_cached_union_result(cached, alias_owner.or(derived_alias))
                     .map_err(type_construction_error)?;
                 return Ok(());
             }
             if union_constituent {
-                self.store
-                    .validate_cached_union_result(cached, None)
+                self.validate_cached_union_result(cached, None)
                     .map_err(type_construction_error)?;
             }
         }
@@ -700,9 +702,15 @@ impl<'store, 'host, 'arena> TypeQueryPlanner<'store, 'host, 'arena> {
                 self.plan_type_node_in_context(inner, alias_owner, union_constituent)
             }
             SyntaxKind::LiteralType => self.plan_literal_type(node),
-            SyntaxKind::ArrayType | SyntaxKind::TypeLiteral if union_constituent => Err(
+            // Global-aware shorthand `T[]` is the installed array-reference
+            // syntax. Direct `Array<T>`/`ReadonlyArray<T>` references still
+            // wait on generic interface type-argument instantiation.
+            SyntaxKind::ArrayType if union_constituent && self.array_targets.is_none() => Err(
                 type_node_unavailable(TypeNodeUnavailable::UnsupportedUnionConstituent(node)),
             ),
+            SyntaxKind::TypeLiteral if union_constituent => Err(type_node_unavailable(
+                TypeNodeUnavailable::UnsupportedUnionConstituent(node),
+            )),
             SyntaxKind::ArrayType => self.plan_array_type(node, alias_owner),
             SyntaxKind::TypeLiteral => self.plan_property_type_literal(node, alias_owner),
             SyntaxKind::TypeReference => {
@@ -715,6 +723,23 @@ impl<'store, 'host, 'arena> TypeQueryPlanner<'store, 'host, 'arena> {
             kind => Err(type_node_unavailable(
                 TypeNodeUnavailable::UnsupportedSyntax { node, kind },
             )),
+        }
+    }
+
+    fn validate_cached_union_result(
+        &self,
+        cached: TypeId,
+        expected_alias: Option<SemanticSymbolId>,
+    ) -> Result<(), LiteralTypeCacheError> {
+        match self.array_targets {
+            Some(targets) => self.store.validate_cached_union_result_with_array_targets(
+                targets,
+                cached,
+                expected_alias,
+            ),
+            None => self
+                .store
+                .validate_cached_union_result(cached, expected_alias),
         }
     }
 
@@ -2609,6 +2634,7 @@ pub(super) struct CanonicalTypeQuery<'store, 'host, 'arena, 'diagnostics> {
     store: &'store mut CanonicalTypeMapperStore,
     host: &'host DeclaredTypeHost<'arena>,
     array_type: Option<TypeId>,
+    global_types: Option<CanonicalGlobalTypes>,
     options: CanonicalTypeQueryOptions,
     diagnostics: &'diagnostics mut CanonicalCheckerDiagnostics,
     resolving_property_interfaces: HashSet<SemanticSymbolId>,
@@ -2643,6 +2669,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             store,
             host,
             array_type: None,
+            global_types: None,
             options,
             diagnostics,
             resolving_property_interfaces: HashSet::new(),
@@ -2662,6 +2689,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         let array_type = global_types.array_type;
         let mut query = Self::new(store, host, options, diagnostics)?;
         query.array_type = Some(array_type);
+        query.global_types = Some(global_types.clone());
         Ok(query)
     }
 
@@ -2692,6 +2720,9 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             self.store,
             self.host,
             self.array_type,
+            self.global_types
+                .as_ref()
+                .map(CanonicalArrayTargets::from_global_types),
             self.options.strict_builtin_iterator_return,
         );
         planner.plan_type_node(node)?;
@@ -2721,6 +2752,9 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             self.store,
             self.host,
             self.array_type,
+            self.global_types
+                .as_ref()
+                .map(CanonicalArrayTargets::from_global_types),
             self.options.strict_builtin_iterator_return,
         );
         if !flags
@@ -2826,9 +2860,24 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 ));
             }
         }
-        self.store
-            .prepare_type_query_types(&strings, &numbers, &bigints, unions.len(), named_unions)
-            .map_err(Self::literal_cache_error)
+        match self.global_types.as_ref() {
+            Some(global_types) => self.store.prepare_type_query_types_with_global_types(
+                &strings,
+                &numbers,
+                &bigints,
+                unions.len(),
+                named_unions,
+                global_types,
+            ),
+            None => self.store.prepare_type_query_types(
+                &strings,
+                &numbers,
+                &bigints,
+                unions.len(),
+                named_unions,
+            ),
+        }
+        .map_err(Self::literal_cache_error)
     }
 
     fn literal_cache_error(error: LiteralTypeCacheError) -> DeclaredTypeError {
@@ -3223,10 +3272,18 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         for constituent in union.types {
             types.push(self.execute_type_node(constituent, plan, prepared)?);
         }
-        let resolved_type = self
-            .store
-            .literal_union_type_prepared(&types, union.alias_symbol, prepared)
-            .map_err(Self::literal_cache_error)?;
+        let resolved_type = match self.global_types.as_ref() {
+            Some(global_types) => self.store.literal_union_type_prepared_with_global_types(
+                global_types,
+                &types,
+                union.alias_symbol,
+                prepared,
+            ),
+            None => self
+                .store
+                .literal_union_type_prepared(&types, union.alias_symbol, prepared),
+        }
+        .map_err(Self::literal_cache_error)?;
         let mut links = self
             .store
             .type_node_links(node)
@@ -8915,6 +8972,24 @@ mod tests {
             query_array_node(&mut fixture, array_type, first_node, &mut diagnostics,),
             Ok(first)
         );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn target_only_array_queries_keep_array_union_constituents_fail_closed() {
+        let mut fixture = fixture("interface Array<T> {} type U = number[] | string;");
+        let array_type = canonical_array_target(&mut fixture);
+        let body = alias_parts(&fixture, "U").2;
+        let before = store_state(&fixture.store);
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        assert!(matches!(
+            query_array_node(&mut fixture, array_type, body, &mut diagnostics),
+            Err(DeclaredTypeError::TypeNodeUnavailable(
+                TypeNodeUnavailable::UnsupportedUnionConstituent(_)
+            )),
+        ));
+        assert_eq!(store_state(&fixture.store), before);
         assert!(diagnostics.is_empty());
     }
 

@@ -18,6 +18,7 @@ use ts_binder::{
 
 use super::{
     CanonicalGlobalTypeInitializationError, CanonicalGlobalTypes, DeclaredTypeHost,
+    array_types::CanonicalArrayTargets,
     bootstrap::LiteralTypeCacheError,
     declared::type_list_key,
     derived_types::DerivedObjectLiteralValidation,
@@ -237,8 +238,7 @@ struct RelationBootstrapFacts {
 
 #[derive(Clone, Copy)]
 struct RelationGlobalTypes {
-    array: TypeId,
-    readonly_array: TypeId,
+    array_targets: CanonicalArrayTargets,
     string_wrapper: TypeId,
     number_wrapper: TypeId,
     boolean_wrapper: TypeId,
@@ -247,8 +247,7 @@ struct RelationGlobalTypes {
 impl RelationGlobalTypes {
     const fn from_global_types(global_types: &CanonicalGlobalTypes) -> Self {
         Self {
-            array: global_types.array_type,
-            readonly_array: global_types.readonly_array_type,
+            array_targets: CanonicalArrayTargets::from_global_types(global_types),
             string_wrapper: global_types.string_type,
             number_wrapper: global_types.number_type,
             boolean_wrapper: global_types.boolean_type,
@@ -256,7 +255,8 @@ impl RelationGlobalTypes {
     }
 
     fn contains_array_target(self, target: TypeId) -> bool {
-        target == self.array || target == self.readonly_array
+        target == self.array_targets.array_type()
+            || target == self.array_targets.readonly_array_type()
     }
 
     fn apparent_primitive_type(self, flags: TypeFlags) -> Option<TypeId> {
@@ -624,9 +624,13 @@ impl<'store> RelaterSession<'store> {
         if let Some(types) = self.validated_unions.get(&type_id) {
             return Ok(types.clone());
         }
-        self.store
-            .validate_union_constituent(type_id)
-            .map_err(|error| union_validation_unavailable(type_id, error))?;
+        let validation = match self.global_types {
+            Some(global_types) => self
+                .store
+                .validate_union_constituent_with_array_targets(global_types.array_targets, type_id),
+            None => self.store.validate_union_constituent(type_id),
+        };
+        validation.map_err(|error| union_validation_unavailable(type_id, error))?;
         let record = self
             .store
             .type_payload(type_id)
@@ -3454,6 +3458,7 @@ mod tests {
         CanonicalGlobalTypeInitializationError, CanonicalTypeMapperStore, DeclaredTypeLinks,
         IntrinsicBootstrapOptions, MembersAndExportsLinks, MembersOrExportsResolutionKind,
         RelationComparisonResult, RelationKind, TypeAliasLinks, TypeId, ValueSymbolLinks,
+        array_types::CanonicalArrayTargets,
         declared::type_list_key,
         global_types::create_type_from_generic_global_type,
         signatures::{SignatureFlags, Ternary},
@@ -4502,8 +4507,7 @@ mod tests {
         let missing_id = alloc_typed_property(&mut store, "id", number, false);
         let mismatching_target = alloc_property_object(&mut store, vec![missing_id]);
         let global_types = RelationGlobalTypes {
-            array: empty_generic,
-            readonly_array: empty_generic,
+            array_targets: CanonicalArrayTargets::for_test(empty_generic, empty_generic),
             string_wrapper: empty_object,
             number_wrapper,
             boolean_wrapper: empty_object,
@@ -5078,8 +5082,7 @@ mod tests {
         let array = alloc_canonical_array_target(&mut store, "Array");
         let readonly_array = alloc_canonical_array_target(&mut store, "ReadonlyArray");
         let global_types = RelationGlobalTypes {
-            array: array.target,
-            readonly_array: readonly_array.target,
+            array_targets: CanonicalArrayTargets::for_test(array.target, readonly_array.target),
             string_wrapper: empty_object,
             number_wrapper: empty_object,
             boolean_wrapper: empty_object,
@@ -5169,8 +5172,7 @@ mod tests {
         };
         let array = alloc_canonical_array_target(&mut store, "Array");
         let global_types = RelationGlobalTypes {
-            array: array.target,
-            readonly_array: array.target,
+            array_targets: CanonicalArrayTargets::for_test(array.target, array.target),
             string_wrapper: empty_object,
             number_wrapper: empty_object,
             boolean_wrapper: empty_object,
@@ -5262,8 +5264,7 @@ mod tests {
         let number_or_string = canonical_union(&mut store, &[number, string]);
         let array = alloc_canonical_array_target(&mut store, "Array");
         let global_types = RelationGlobalTypes {
-            array: array.target,
-            readonly_array: array.target,
+            array_targets: CanonicalArrayTargets::for_test(array.target, array.target),
             string_wrapper: empty_object,
             number_wrapper: empty_object,
             boolean_wrapper: empty_object,
@@ -5288,8 +5289,7 @@ mod tests {
         let fallback_source = alloc_reference(&mut store, empty_generic, vec![number]);
         let fallback_target = alloc_reference(&mut store, empty_generic, vec![string]);
         let fallback_globals = RelationGlobalTypes {
-            array: empty_generic,
-            readonly_array: empty_generic,
+            array_targets: CanonicalArrayTargets::for_test(empty_generic, empty_generic),
             string_wrapper: empty_object,
             number_wrapper: empty_object,
             boolean_wrapper: empty_object,

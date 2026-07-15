@@ -34,6 +34,7 @@ use ts_binder::{
 use ts_jsnum::{Number, PseudoBigInt};
 
 use super::{
+    CanonicalGlobalTypes,
     ids::{IndexInfoId, SignatureId, TypeAliasId, TypeId, TypePredicateId},
     links::ValueSymbolLinks,
     mapper::TypeMapper,
@@ -276,6 +277,22 @@ enum UnionPlan {
     },
 }
 
+#[derive(Clone, Copy)]
+enum UnionArrayValidation<'globals> {
+    None,
+    GlobalTypes(&'globals CanonicalGlobalTypes),
+    Targets(super::array_types::CanonicalArrayTargets),
+}
+
+impl<'globals> UnionArrayValidation<'globals> {
+    const fn from_global_types(global_types: Option<&'globals CanonicalGlobalTypes>) -> Self {
+        match global_types {
+            Some(global_types) => Self::GlobalTypes(global_types),
+            None => Self::None,
+        }
+    }
+}
+
 /// Store-branded, single-owner proof and budget for one dependency-closed
 /// type-node execution's completed cache validation and reservation.
 #[derive(Debug, Eq, PartialEq)]
@@ -446,6 +463,44 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         union_operations: usize,
         named_union_operations: usize,
     ) -> Result<PreparedTypeQueryTypes, LiteralTypeCacheError> {
+        self.prepare_type_query_types_worker(
+            strings,
+            numbers,
+            bigints,
+            union_operations,
+            named_union_operations,
+            None,
+        )
+    }
+
+    pub(super) fn prepare_type_query_types_with_global_types(
+        &mut self,
+        strings: &[String],
+        numbers: &[Number],
+        bigints: &[PseudoBigInt],
+        union_operations: usize,
+        named_union_operations: usize,
+        global_types: &CanonicalGlobalTypes,
+    ) -> Result<PreparedTypeQueryTypes, LiteralTypeCacheError> {
+        self.prepare_type_query_types_worker(
+            strings,
+            numbers,
+            bigints,
+            union_operations,
+            named_union_operations,
+            Some(global_types),
+        )
+    }
+
+    fn prepare_type_query_types_worker(
+        &mut self,
+        strings: &[String],
+        numbers: &[Number],
+        bigints: &[PseudoBigInt],
+        union_operations: usize,
+        named_union_operations: usize,
+        global_types: Option<&CanonicalGlobalTypes>,
+    ) -> Result<PreparedTypeQueryTypes, LiteralTypeCacheError> {
         if numbers.iter().any(|value| value.is_nan())
             || bigints.iter().any(|value| {
                 value.base10_value.is_empty() && value.negative
@@ -460,7 +515,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             return Err(LiteralTypeCacheError::InvalidValue);
         }
         if union_operations != 0 && self.union_cache_needs_validation {
-            self.validate_union_cache()?;
+            self.validate_union_cache(global_types)?;
             self.union_cache_needs_validation = false;
         }
         let bootstrap = self
@@ -765,7 +820,10 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         Ok(regular)
     }
 
-    fn validate_union_cache(&mut self) -> Result<(), LiteralTypeCacheError> {
+    fn validate_union_cache(
+        &mut self,
+        global_types: Option<&CanonicalGlobalTypes>,
+    ) -> Result<(), LiteralTypeCacheError> {
         #[cfg(test)]
         {
             self.union_cache_validation_scans = self
@@ -792,10 +850,14 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             )
         };
         for (key, union) in unions {
-            self.validate_union_cache_entry(&key, union)?;
+            self.validate_union_cache_entry(
+                &key,
+                union,
+                UnionArrayValidation::from_global_types(global_types),
+            )?;
         }
         for (key, result) in unions_of_unions {
-            self.validate_union_of_union_cache_entry(key, result)?;
+            self.validate_union_of_union_cache_entry(key, result, global_types)?;
         }
         Ok(())
     }
@@ -804,6 +866,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         &self,
         key: &UnionTypeCacheKey,
         union: TypeId,
+        array_validation: UnionArrayValidation<'_>,
     ) -> Result<(), LiteralTypeCacheError> {
         self.validate_union_structure(union)?;
         let record = self
@@ -821,7 +884,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         }
         let mut visiting = HashSet::new();
         for constituent in &data.union.types {
-            self.validate_union_constituent_worker(*constituent, &mut visiting)?;
+            self.validate_union_constituent_worker(*constituent, array_validation, &mut visiting)?;
         }
         Ok(())
     }
@@ -830,38 +893,51 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         &mut self,
         key: UnionOfUnionCacheKey,
         result: TypeId,
+        global_types: Option<&CanonicalGlobalTypes>,
     ) -> Result<(), LiteralTypeCacheError> {
         if !self.valid_union_alias_key(key.alias) {
             return Err(LiteralTypeCacheError::InvalidCachedUnion(result));
         }
         for candidate in [key.first, key.second, result] {
-            self.validate_union_constituent(candidate)?;
+            self.validate_union_constituent_worker(
+                candidate,
+                UnionArrayValidation::from_global_types(global_types),
+                &mut HashSet::new(),
+            )?;
         }
         let alias_symbol = key.alias.map(|alias| alias.symbol);
-        let expected =
-            match self.plan_union_type(&[key.first, key.second], key.reduction, alias_symbol)? {
-                UnionPlan::Existing(expected) => expected,
-                UnionPlan::Union {
+        let expected = match self.plan_union_type(
+            &[key.first, key.second],
+            key.reduction,
+            alias_symbol,
+            global_types,
+        )? {
+            UnionPlan::Existing(expected) => expected,
+            UnionPlan::Union {
+                types,
+                object_flags: _,
+                alias_symbol,
+                origin_types,
+            } => {
+                let expected_key = UnionTypeCacheKey {
                     types,
-                    object_flags: _,
-                    alias_symbol,
                     origin_types,
-                } => {
-                    let expected_key = UnionTypeCacheKey {
-                        types,
-                        origin_types,
-                        alias: alias_symbol.map(|symbol| UnionAliasCacheKey { symbol }),
-                    };
-                    let expected = self
-                        .intrinsic_bootstrap
-                        .as_ref()
-                        .and_then(|bootstrap| bootstrap.union_types.get(&expected_key))
-                        .copied()
-                        .ok_or(LiteralTypeCacheError::InvalidCachedUnion(result))?;
-                    self.validate_union_cache_entry(&expected_key, expected)?;
-                    expected
-                }
-            };
+                    alias: alias_symbol.map(|symbol| UnionAliasCacheKey { symbol }),
+                };
+                let expected = self
+                    .intrinsic_bootstrap
+                    .as_ref()
+                    .and_then(|bootstrap| bootstrap.union_types.get(&expected_key))
+                    .copied()
+                    .ok_or(LiteralTypeCacheError::InvalidCachedUnion(result))?;
+                self.validate_union_cache_entry(
+                    &expected_key,
+                    expected,
+                    UnionArrayValidation::from_global_types(global_types),
+                )?;
+                expected
+            }
+        };
         if result != expected {
             return Err(LiteralTypeCacheError::InvalidCachedUnion(result));
         }
@@ -1060,7 +1136,35 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         &self,
         type_: TypeId,
     ) -> Result<(), LiteralTypeCacheError> {
-        self.validate_union_constituent_worker(type_, &mut HashSet::new())
+        self.validate_union_constituent_worker(
+            type_,
+            UnionArrayValidation::None,
+            &mut HashSet::new(),
+        )
+    }
+
+    pub(super) fn validate_union_constituent_with_global_types(
+        &self,
+        global_types: &CanonicalGlobalTypes,
+        type_: TypeId,
+    ) -> Result<(), LiteralTypeCacheError> {
+        self.validate_union_constituent_worker(
+            type_,
+            UnionArrayValidation::GlobalTypes(global_types),
+            &mut HashSet::new(),
+        )
+    }
+
+    pub(super) fn validate_union_constituent_with_array_targets(
+        &self,
+        targets: super::array_types::CanonicalArrayTargets,
+        type_: TypeId,
+    ) -> Result<(), LiteralTypeCacheError> {
+        self.validate_union_constituent_worker(
+            type_,
+            UnionArrayValidation::Targets(targets),
+            &mut HashSet::new(),
+        )
     }
 
     pub(super) fn validate_cached_union_result(
@@ -1068,7 +1172,29 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         type_: TypeId,
         expected_alias: Option<SemanticSymbolId>,
     ) -> Result<(), LiteralTypeCacheError> {
-        self.validate_union_constituent(type_)?;
+        self.validate_cached_union_result_worker(type_, expected_alias, UnionArrayValidation::None)
+    }
+
+    pub(super) fn validate_cached_union_result_with_array_targets(
+        &self,
+        targets: super::array_types::CanonicalArrayTargets,
+        type_: TypeId,
+        expected_alias: Option<SemanticSymbolId>,
+    ) -> Result<(), LiteralTypeCacheError> {
+        self.validate_cached_union_result_worker(
+            type_,
+            expected_alias,
+            UnionArrayValidation::Targets(targets),
+        )
+    }
+
+    fn validate_cached_union_result_worker(
+        &self,
+        type_: TypeId,
+        expected_alias: Option<SemanticSymbolId>,
+        array_validation: UnionArrayValidation<'_>,
+    ) -> Result<(), LiteralTypeCacheError> {
+        self.validate_union_constituent_worker(type_, array_validation, &mut HashSet::new())?;
         if let Some(expected_alias) = expected_alias
             && let Some(record) = self.type_payload(type_)
             && matches!(record.data(), TypeData::Union(_))
@@ -1090,29 +1216,111 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             .as_ref()
             .ok_or(LiteralTypeCacheError::BootstrapUninitialized)?;
         let expected = [
-            (bootstrap.any_type, TypeFlags::ANY, "any"),
-            (bootstrap.wildcard_type, TypeFlags::ANY, "any"),
-            (bootstrap.error_type, TypeFlags::ANY, "error"),
-            (bootstrap.intrinsic_marker_type, TypeFlags::ANY, "intrinsic"),
-            (bootstrap.unknown_type, TypeFlags::UNKNOWN, "unknown"),
-            (bootstrap.undefined_type, TypeFlags::UNDEFINED, "undefined"),
-            (bootstrap.null_type, TypeFlags::NULL, "null"),
-            (bootstrap.string_type, TypeFlags::STRING, "string"),
-            (bootstrap.number_type, TypeFlags::NUMBER, "number"),
-            (bootstrap.bigint_type, TypeFlags::BIG_INT, "bigint"),
-            (bootstrap.es_symbol_type, TypeFlags::ES_SYMBOL, "symbol"),
-            (bootstrap.void_type, TypeFlags::VOID, "void"),
-            (bootstrap.never_type, TypeFlags::NEVER, "never"),
+            (bootstrap.any_type, TypeFlags::ANY, "any", ObjectFlags::NONE),
+            (
+                bootstrap.wildcard_type,
+                TypeFlags::ANY,
+                "any",
+                ObjectFlags::NONE,
+            ),
+            (
+                bootstrap.error_type,
+                TypeFlags::ANY,
+                "error",
+                ObjectFlags::NONE,
+            ),
+            (
+                bootstrap.intrinsic_marker_type,
+                TypeFlags::ANY,
+                "intrinsic",
+                ObjectFlags::NONE,
+            ),
+            (
+                bootstrap.unknown_type,
+                TypeFlags::UNKNOWN,
+                "unknown",
+                ObjectFlags::NONE,
+            ),
+            (
+                bootstrap.undefined_type,
+                TypeFlags::UNDEFINED,
+                "undefined",
+                ObjectFlags::NONE,
+            ),
+            (
+                bootstrap.undefined_widening_type,
+                TypeFlags::UNDEFINED,
+                "undefined",
+                if bootstrap.undefined_widening_type == bootstrap.undefined_type {
+                    ObjectFlags::NONE
+                } else {
+                    ObjectFlags::CONTAINS_WIDENING_TYPE
+                },
+            ),
+            (
+                bootstrap.null_type,
+                TypeFlags::NULL,
+                "null",
+                ObjectFlags::NONE,
+            ),
+            (
+                bootstrap.null_widening_type,
+                TypeFlags::NULL,
+                "null",
+                if bootstrap.null_widening_type == bootstrap.null_type {
+                    ObjectFlags::NONE
+                } else {
+                    ObjectFlags::CONTAINS_WIDENING_TYPE
+                },
+            ),
+            (
+                bootstrap.string_type,
+                TypeFlags::STRING,
+                "string",
+                ObjectFlags::NONE,
+            ),
+            (
+                bootstrap.number_type,
+                TypeFlags::NUMBER,
+                "number",
+                ObjectFlags::NONE,
+            ),
+            (
+                bootstrap.bigint_type,
+                TypeFlags::BIG_INT,
+                "bigint",
+                ObjectFlags::NONE,
+            ),
+            (
+                bootstrap.es_symbol_type,
+                TypeFlags::ES_SYMBOL,
+                "symbol",
+                ObjectFlags::NONE,
+            ),
+            (
+                bootstrap.void_type,
+                TypeFlags::VOID,
+                "void",
+                ObjectFlags::NONE,
+            ),
+            (
+                bootstrap.never_type,
+                TypeFlags::NEVER,
+                "never",
+                ObjectFlags::NONE,
+            ),
             (
                 bootstrap.non_primitive_type,
                 TypeFlags::NON_PRIMITIVE,
                 "object",
+                ObjectFlags::NONE,
             ),
         ]
         .into_iter()
-        .find_map(|(candidate, flags, name)| (candidate == type_).then_some((flags, name)));
-        if expected != Some((record.flags(), intrinsic_name))
-            || record.object_flags() != ObjectFlags::NONE
+        .find_map(|(candidate, flags, name, object_flags)| {
+            (candidate == type_).then_some((flags, name, object_flags))
+        });
+        if expected != Some((record.flags(), intrinsic_name, record.object_flags()))
             || record.symbol().is_some()
             || record.alias().is_some()
         {
@@ -1159,6 +1367,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         union: TypeId,
         record: &TypeRecord,
         data: &super::type_records::UnionTypeData,
+        array_validation: UnionArrayValidation<'_>,
     ) -> Result<(), LiteralTypeCacheError> {
         let alias = self
             .checked_union_alias_symbol(union, record.alias())?
@@ -1187,7 +1396,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         if cached != Some(union) {
             return Err(LiteralTypeCacheError::InvalidCachedUnion(union));
         }
-        self.validate_union_cache_entry(&key, union)
+        self.validate_union_cache_entry(&key, union, array_validation)
     }
 
     fn validate_supported_fresh_property_object(
@@ -1195,6 +1404,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         type_: TypeId,
         record: &TypeRecord,
         object: &ObjectTypeData,
+        array_validation: UnionArrayValidation<'_>,
         visiting: &mut HashSet<TypeId>,
     ) -> Result<(), LiteralTypeCacheError> {
         if !visiting.insert(type_) {
@@ -1327,7 +1537,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 {
                     return Err(LiteralTypeCacheError::UnsupportedUnionConstituent(type_));
                 }
-                self.validate_union_constituent_worker(property_type, visiting)?;
+                self.validate_union_constituent_worker(property_type, array_validation, visiting)?;
                 expected_flags |=
                     property_type_record.object_flags() & ObjectFlags::PROPAGATING_FLAGS;
             }
@@ -1364,9 +1574,41 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         }
     }
 
+    fn validate_supported_canonical_array(
+        &self,
+        type_: TypeId,
+        array_validation: UnionArrayValidation<'_>,
+        visiting: &mut HashSet<TypeId>,
+    ) -> Result<(), LiteralTypeCacheError> {
+        let reference = match array_validation {
+            UnionArrayValidation::None => None,
+            UnionArrayValidation::GlobalTypes(global_types) => self
+                .canonical_array_reference(global_types, type_)
+                .map_err(|_| LiteralTypeCacheError::UnsupportedUnionConstituent(type_))?,
+            UnionArrayValidation::Targets(targets) => self
+                .canonical_array_reference_with_targets(targets, type_)
+                .map_err(|_| LiteralTypeCacheError::UnsupportedUnionConstituent(type_))?,
+        }
+        .ok_or(LiteralTypeCacheError::UnsupportedUnionConstituent(type_))?;
+        if !visiting.insert(type_) {
+            return Err(LiteralTypeCacheError::UnsupportedUnionConstituent(type_));
+        }
+        // The element remains inside the installed union domain. In
+        // particular, declared interface elements such as `Foo[] | null`
+        // still wait on declared-object constituent validation.
+        let result = self.validate_union_constituent_worker(
+            reference.element_type,
+            array_validation,
+            visiting,
+        );
+        visiting.remove(&type_);
+        result
+    }
+
     fn validate_union_constituent_worker(
         &self,
         type_: TypeId,
+        array_validation: UnionArrayValidation<'_>,
         visiting: &mut HashSet<TypeId>,
     ) -> Result<(), LiteralTypeCacheError> {
         let Some(record) = self.type_payload(type_) else {
@@ -1446,8 +1688,15 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 self.validate_supported_literal_identity(type_, regular, fresh, &data.value)?;
                 Ok(())
             }
-            TypeData::Object(object) => {
-                self.validate_supported_fresh_property_object(type_, record, object, visiting)
+            TypeData::Object(object) => self.validate_supported_fresh_property_object(
+                type_,
+                record,
+                object,
+                array_validation,
+                visiting,
+            ),
+            TypeData::TypeReference(_) => {
+                self.validate_supported_canonical_array(type_, array_validation, visiting)
             }
             TypeData::Union(data) => {
                 if !visiting.insert(type_) {
@@ -1455,7 +1704,11 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 }
                 self.validate_union_structure(type_)?;
                 for constituent in &data.union.types {
-                    self.validate_union_constituent_worker(*constituent, visiting)?;
+                    self.validate_union_constituent_worker(
+                        *constituent,
+                        array_validation,
+                        visiting,
+                    )?;
                 }
                 let expected_flags = TypeFlags::UNION
                     | if data.union.types.len() == 2
@@ -1477,10 +1730,16 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                         type_,
                         origin,
                         &data.union.types,
+                        array_validation,
                         visiting,
                     )?;
                 }
-                self.validate_supported_union_cache_identity(type_, record, data)?;
+                self.validate_supported_union_cache_identity(
+                    type_,
+                    record,
+                    data,
+                    array_validation,
+                )?;
                 visiting.remove(&type_);
                 Ok(())
             }
@@ -1493,6 +1752,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         union: TypeId,
         origin: TypeId,
         normalized: &[TypeId],
+        array_validation: UnionArrayValidation<'_>,
         visiting: &mut HashSet<TypeId>,
     ) -> Result<(), LiteralTypeCacheError> {
         self.validate_union_origin_structure(union, origin)?;
@@ -1500,7 +1760,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             return Err(LiteralTypeCacheError::InvalidCachedUnion(union));
         };
         for constituent in &data.union.types {
-            self.validate_union_constituent_worker(*constituent, visiting)?;
+            self.validate_union_constituent_worker(*constituent, array_validation, visiting)?;
         }
 
         let mut flattened = Vec::new();
@@ -1815,12 +2075,16 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         &mut self,
         types: &mut Vec<TypeId>,
         has_object_types: bool,
+        global_types: Option<&CanonicalGlobalTypes>,
     ) -> Result<(), LiteralTypeCacheError> {
         // This is the dependency-closed `removeSubtypes` prefix for expression
         // unions. The validator admits primitives, literals, recursively
         // canonical unions, and fresh property objects, so the upstream type
         // parameter, discriminant fast path, and class-derivation branches are
-        // unreachable here.
+        // unreachable here. Global-aware calls additionally admit canonical
+        // arrays. Mixed array/property-object comparisons remain a typed
+        // unavailable boundary until apparent Array members are installed;
+        // relation failure must not be treated as a negative subtype answer.
         if types.len() < 2 {
             return Ok(());
         }
@@ -1859,9 +2123,15 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 comparison_count = comparison_count
                     .checked_add(1)
                     .ok_or(LiteralTypeCacheError::Capacity)?;
-                let related = self
-                    .is_type_strict_subtype_of(source, target)
-                    .map_err(|_| LiteralTypeCacheError::UnsupportedUnionConstituent(source))?;
+                let related = match global_types {
+                    Some(global_types) => self.is_type_strict_subtype_of_with_global_types(
+                        source,
+                        target,
+                        global_types,
+                    ),
+                    None => self.is_type_strict_subtype_of(source, target),
+                }
+                .map_err(|_| LiteralTypeCacheError::UnsupportedUnionConstituent(source))?;
                 if related {
                     types.remove(index);
                     break;
@@ -1929,13 +2199,27 @@ impl SemanticStore<TypeRecord, TypeMapper> {
 
     /// Constructs an anonymous expression union using the requested pinned
     /// reduction mode. Empty inputs reduce to the canonical `never` identity.
+    #[cfg(test)]
     pub(super) fn expression_union_type(
         &mut self,
         types: &[TypeId],
         reduction: UnionReduction,
     ) -> Result<TypeId, LiteralTypeCacheError> {
         let mut prepared = self.prepare_type_query_types(&[], &[], &[], 1, 0)?;
-        self.union_type_prepared(types, reduction, None, &mut prepared)
+        self.union_type_prepared(types, reduction, None, &mut prepared, None)
+    }
+
+    /// Constructs an expression union with authoritative global-array
+    /// identities available to constituent validation and subtype reduction.
+    pub(super) fn expression_union_type_with_global_types(
+        &mut self,
+        global_types: &CanonicalGlobalTypes,
+        types: &[TypeId],
+        reduction: UnionReduction,
+    ) -> Result<TypeId, LiteralTypeCacheError> {
+        let mut prepared =
+            self.prepare_type_query_types_worker(&[], &[], &[], 1, 0, Some(global_types))?;
+        self.union_type_prepared(types, reduction, None, &mut prepared, Some(global_types))
     }
 
     #[cfg(test)]
@@ -1955,7 +2239,23 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         alias_symbol: Option<SemanticSymbolId>,
         prepared: &mut PreparedTypeQueryTypes,
     ) -> Result<TypeId, LiteralTypeCacheError> {
-        self.union_type_prepared(types, UnionReduction::Literal, alias_symbol, prepared)
+        self.union_type_prepared(types, UnionReduction::Literal, alias_symbol, prepared, None)
+    }
+
+    pub(super) fn literal_union_type_prepared_with_global_types(
+        &mut self,
+        global_types: &CanonicalGlobalTypes,
+        types: &[TypeId],
+        alias_symbol: Option<SemanticSymbolId>,
+        prepared: &mut PreparedTypeQueryTypes,
+    ) -> Result<TypeId, LiteralTypeCacheError> {
+        self.union_type_prepared(
+            types,
+            UnionReduction::Literal,
+            alias_symbol,
+            prepared,
+            Some(global_types),
+        )
     }
 
     fn union_type_prepared(
@@ -1964,10 +2264,15 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         reduction: UnionReduction,
         alias_symbol: Option<SemanticSymbolId>,
         prepared: &mut PreparedTypeQueryTypes,
+        global_types: Option<&CanonicalGlobalTypes>,
     ) -> Result<TypeId, LiteralTypeCacheError> {
         prepared.consume_union(self.id(), alias_symbol.is_some())?;
         for type_ in types {
-            self.validate_union_constituent(*type_)?;
+            self.validate_union_constituent_worker(
+                *type_,
+                UnionArrayValidation::from_global_types(global_types),
+                &mut HashSet::new(),
+            )?;
         }
         if !self.valid_union_alias_key(alias_symbol.map(|symbol| UnionAliasCacheKey { symbol })) {
             return Err(alias_symbol.map_or(
@@ -2014,11 +2319,11 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 .and_then(|bootstrap| bootstrap.union_of_union_types.get(&key))
                 .copied()
         {
-            self.validate_union_of_union_cache_entry(key, cached)?;
+            self.validate_union_of_union_cache_entry(key, cached, global_types)?;
             return Ok(cached);
         }
 
-        let result = self.union_type_worker(types, reduction, alias_symbol)?;
+        let result = self.union_type_worker(types, reduction, alias_symbol, global_types)?;
         if let Some(key) = union_of_union_key {
             let bootstrap = self
                 .intrinsic_bootstrap
@@ -2034,15 +2339,22 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         types: &[TypeId],
         reduction: UnionReduction,
         alias_symbol: Option<SemanticSymbolId>,
+        global_types: Option<&CanonicalGlobalTypes>,
     ) -> Result<TypeId, LiteralTypeCacheError> {
-        match self.plan_union_type(types, reduction, alias_symbol)? {
+        match self.plan_union_type(types, reduction, alias_symbol, global_types)? {
             UnionPlan::Existing(existing) => Ok(existing),
             UnionPlan::Union {
                 types,
                 object_flags,
                 alias_symbol,
                 origin_types,
-            } => self.union_type_from_sorted_list(types, object_flags, alias_symbol, origin_types),
+            } => self.union_type_from_sorted_list(
+                types,
+                object_flags,
+                alias_symbol,
+                origin_types,
+                global_types,
+            ),
         }
     }
 
@@ -2051,6 +2363,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         types: &[TypeId],
         reduction: UnionReduction,
         alias_symbol: Option<SemanticSymbolId>,
+        global_types: Option<&CanonicalGlobalTypes>,
     ) -> Result<UnionPlan, LiteralTypeCacheError> {
         let mut type_set = Vec::with_capacity(types.len());
         let mut includes = TypeFlags::NONE;
@@ -2122,7 +2435,11 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 )?;
             }
             if reduction == UnionReduction::Subtype {
-                self.remove_union_subtypes(&mut type_set, includes.intersects(TypeFlags::OBJECT))?;
+                self.remove_union_subtypes(
+                    &mut type_set,
+                    includes.intersects(TypeFlags::OBJECT),
+                    global_types,
+                )?;
             }
             if type_set.is_empty() {
                 return Ok(UnionPlan::Existing(
@@ -2208,6 +2525,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         object_flags: ObjectFlags,
         alias_symbol: Option<SemanticSymbolId>,
         origin_types: Option<Vec<TypeId>>,
+        global_types: Option<&CanonicalGlobalTypes>,
     ) -> Result<TypeId, LiteralTypeCacheError> {
         let bootstrap = self
             .intrinsic_bootstrap
@@ -2230,7 +2548,11 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             .and_then(|bootstrap| bootstrap.union_types.get(&key))
             .copied()
         {
-            self.validate_union_cache_entry(&key, cached)?;
+            self.validate_union_cache_entry(
+                &key,
+                cached,
+                UnionArrayValidation::from_global_types(global_types),
+            )?;
             return Ok(cached);
         }
 
@@ -4026,6 +4348,27 @@ mod tests {
             ]),
             None,
         );
+    }
+
+    #[test]
+    fn union_validation_admits_only_the_canonical_loose_nullish_widening_pair() {
+        let store = initialized(IntrinsicBootstrapOptions::default());
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+
+        assert_eq!(
+            store.validate_union_constituent(bootstrap.null_widening_type),
+            Ok(()),
+        );
+        assert_eq!(
+            store.validate_union_constituent(bootstrap.undefined_widening_type),
+            Ok(()),
+        );
+        for sentinel in [bootstrap.missing_type, bootstrap.optional_type] {
+            assert_eq!(
+                store.validate_union_constituent(sentinel),
+                Err(LiteralTypeCacheError::UnsupportedUnionConstituent(sentinel)),
+            );
+        }
     }
 
     #[test]
