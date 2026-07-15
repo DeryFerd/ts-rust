@@ -327,7 +327,7 @@ impl std::fmt::Display for DeclaredTypeError {
             Self::Host(error) => write!(formatter, "{error}"),
             Self::NameResolverHost(error) => write!(formatter, "{error}"),
             Self::NameResolution(error) => write!(formatter, "{error}"),
-            Self::TypeResolutionTarget(error) => write!(formatter, "{error:?}"),
+            Self::TypeResolutionTarget(error) => write!(formatter, "{error}"),
         }
     }
 }
@@ -335,12 +335,11 @@ impl std::fmt::Display for DeclaredTypeError {
 impl std::error::Error for DeclaredTypeError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Unavailable(_) | Self::TypeNodeUnavailable(_) | Self::TypeResolutionTarget(_) => {
-                None
-            }
+            Self::Unavailable(_) | Self::TypeNodeUnavailable(_) => None,
             Self::Host(error) => Some(error),
             Self::NameResolverHost(error) => Some(error),
             Self::NameResolution(error) => Some(error),
+            Self::TypeResolutionTarget(error) => Some(error),
         }
     }
 }
@@ -2857,7 +2856,7 @@ mod tests {
             matches!(
                 qualified_error,
                 DeclaredTypeError::Unavailable(
-                DeclaredTypeUnavailable::UnsupportedInterfaceHeritageResolution(_)
+                    DeclaredTypeUnavailable::UnsupportedInterfaceHeritageResolution(_)
                 )
             ),
             "{qualified_error:?}"

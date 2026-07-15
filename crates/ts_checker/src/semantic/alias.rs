@@ -206,11 +206,7 @@ impl std::fmt::Display for CanonicalAliasResolutionError {
             Self::InvalidAliasLinks(symbol) => {
                 write!(formatter, "alias links rejected state for {symbol:?}")
             }
-            Self::TypeResolutionTarget(error) => write!(
-                formatter,
-                "invalid alias type-resolution target {:?} for {:?}",
-                error.target, error.property
-            ),
+            Self::TypeResolutionTarget(error) => write!(formatter, "{error}"),
             Self::ResolutionStackInvariant(symbol) => write!(
                 formatter,
                 "alias resolution stack could not unwind {symbol:?}"
@@ -219,7 +215,14 @@ impl std::fmt::Display for CanonicalAliasResolutionError {
     }
 }
 
-impl std::error::Error for CanonicalAliasResolutionError {}
+impl std::error::Error for CanonicalAliasResolutionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::TypeResolutionTarget(error) => Some(error),
+            _ => None,
+        }
+    }
+}
 
 impl From<TypeResolutionTargetError> for CanonicalAliasResolutionError {
     fn from(error: TypeResolutionTargetError) -> Self {

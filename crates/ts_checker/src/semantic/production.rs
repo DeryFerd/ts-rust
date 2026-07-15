@@ -30,7 +30,9 @@ use super::{
     alias_flags::{
         CanonicalSymbolFlagsError, CanonicalSymbolFlagsResolution, CanonicalSymbolFlagsResolver,
     },
-    alias_provider::{ProductionAliasTargetHost, ProductionAliasTargetHostError},
+    alias_provider::{
+        ProductionAliasSourceRegistry, ProductionAliasTargetHost, ProductionAliasTargetHostError,
+    },
     global_types::initialize_global_library_types,
     module_resolution::validate_module_resolution_manifest,
     name_resolution::{ProductionNameResolverHost, ProductionNameResolverHostError},
@@ -82,13 +84,6 @@ impl GlobalMergeCompletion {
     }
 }
 
-#[derive(Debug)]
-struct CanonicalCheckerFile<'arena> {
-    arena: &'arena NodeArena,
-    bound: BoundFile,
-    source_file: SourceFileRef,
-}
-
 /// A dependency-closed, production-ready canonical checker foundation.
 ///
 /// The context is the sole owner of the binder's canonical symbol graph after
@@ -100,7 +95,7 @@ struct CanonicalCheckerFile<'arena> {
 pub struct CanonicalCheckerContext<'arena> {
     options: CanonicalCheckerOptions,
     file_order: Vec<FileId>,
-    files: BTreeMap<FileId, CanonicalCheckerFile<'arena>>,
+    files: ProductionAliasSourceRegistry<'arena>,
     store: CanonicalTypeMapperStore,
     globals: SymbolTableId,
     global_types: CanonicalGlobalTypes,
@@ -273,23 +268,18 @@ impl<'arena> CanonicalCheckerContext<'arena> {
             );
         }
 
-        let mut files = BTreeMap::new();
+        let mut retained_files = Vec::with_capacity(registered.len());
         for (file, arena, source_file) in registered {
             let Some(bound) = bound_files.remove(&file) else {
                 return Err(CanonicalCheckerContextError::SourceRegistrationFailed(file));
             };
-            files.insert(
-                file,
-                CanonicalCheckerFile {
-                    arena,
-                    bound,
-                    source_file,
-                },
-            );
+            retained_files.push((arena, bound, source_file));
         }
         if let Some(file) = bound_files.keys().next().copied() {
             return Err(CanonicalCheckerContextError::SourceRegistrationFailed(file));
         }
+        let files = ProductionAliasSourceRegistry::new(&store, retained_files)
+            .map_err(CanonicalCheckerContextError::AliasTargetHost)?;
 
         let initialized = initialize_globals(
             &mut store,
@@ -329,15 +319,13 @@ impl<'arena> CanonicalCheckerContext<'arena> {
     /// Returns the exact AST arena and completed binder side data for `file`.
     #[must_use]
     pub fn file(&self, file: FileId) -> Option<(&'arena NodeArena, &BoundFile)> {
-        self.files
-            .get(&file)
-            .map(|entry| (entry.arena, &entry.bound))
+        self.files.snapshot(file)
     }
 
     /// Returns the checker-validated source-root identity for `file`.
     #[must_use]
     pub fn source_file(&self, file: FileId) -> Option<SourceFileRef> {
-        self.files.get(&file).map(|entry| entry.source_file)
+        self.files.source_file(file)
     }
 
     /// The canonical checker store, preserving the binder symbol-store brand.
@@ -400,11 +388,7 @@ impl<'arena> CanonicalCheckerContext<'arena> {
             module_resolutions,
             ..
         } = self;
-        let mut host = ProductionAliasTargetHost::new(
-            store,
-            files.values().map(|file| (file.arena, &file.bound)),
-            module_resolutions,
-        )?;
+        let mut host = ProductionAliasTargetHost::from_registry(store, files, module_resolutions)?;
         CanonicalAliasResolver::new(store, &mut host)
             .resolve_alias(alias)
             .map_err(Into::into)
@@ -432,11 +416,7 @@ impl<'arena> CanonicalCheckerContext<'arena> {
             module_resolutions,
             ..
         } = self;
-        let mut host = ProductionAliasTargetHost::new(
-            store,
-            files.values().map(|file| (file.arena, &file.bound)),
-            module_resolutions,
-        )?;
+        let mut host = ProductionAliasTargetHost::from_registry(store, files, module_resolutions)?;
         CanonicalSymbolFlagsResolver::new(store, &mut host)
             .get_symbol_flags(symbol)
             .map_err(Into::into)
@@ -460,7 +440,7 @@ impl<'arena> CanonicalCheckerContext<'arena> {
             ..
         } = self;
         let host = DeclaredTypeHost::new_after_global_merge(
-            files.values().map(|file| (file.arena, &file.bound)),
+            files.snapshots(),
             GlobalMergeCompletion::new(options.name_resolution),
         )?;
         CanonicalTypeQuery::new(store, &host, *options, diagnostics)?
@@ -482,7 +462,7 @@ impl<'arena> CanonicalCheckerContext<'arena> {
             ..
         } = self;
         let host = DeclaredTypeHost::new_after_global_merge(
-            files.values().map(|file| (file.arena, &file.bound)),
+            files.snapshots(),
             GlobalMergeCompletion::new(options.name_resolution),
         )?;
         CanonicalTypeQuery::new(store, &host, *options, diagnostics)?.get_type_from_type_node(node)
@@ -516,11 +496,7 @@ impl<'arena> CanonicalCheckerContext<'arena> {
         &self,
         options: CanonicalNameResolverOptions,
     ) -> Result<ProductionNameResolverHost<'_, '_>, ProductionNameResolverHostError> {
-        ProductionNameResolverHost::new(
-            &self.store,
-            self.files.values().map(|file| (file.arena, &file.bound)),
-            options,
-        )
+        ProductionNameResolverHost::new(&self.store, self.files.snapshots(), options)
     }
 
     /// The brand shared by adopted binder symbols and checker-owned records.
@@ -542,7 +518,7 @@ struct GlobalInitialization {
 fn initialize_globals(
     store: &mut CanonicalTypeMapperStore,
     file_order: &[FileId],
-    files: &BTreeMap<FileId, CanonicalCheckerFile<'_>>,
+    files: &ProductionAliasSourceRegistry<'_>,
     strict_bind_call_apply: bool,
     name_resolution_options: CanonicalNameResolverOptions,
 ) -> Result<GlobalInitialization, CanonicalGlobalInitializationError> {
@@ -557,15 +533,15 @@ fn initialize_globals(
     // sorts by escaped bytes because the canonical table intentionally uses a
     // hash map and must never become an implicit source of nondeterminism.
     for &file in file_order {
-        let entry = files
-            .get(&file)
+        let (_, bound) = files
+            .snapshot(file)
             .ok_or(CanonicalGlobalInitializationError::MissingFile(file))?;
-        let facts = entry.bound.source_facts().ok_or(
+        let facts = bound.source_facts().ok_or(
             CanonicalGlobalInitializationError::MissingSourceFileFacts(file),
         )?;
 
         if !facts.is_external_or_common_js_module()
-            && let Some(locals) = entry.bound.locals(entry.bound.source_file())
+            && let Some(locals) = bound.locals(bound.source_file())
         {
             if let Some(global_this) = table_symbol(store, file, locals, "globalThis")? {
                 let record = store.symbol(global_this).ok_or(
@@ -600,10 +576,10 @@ fn initialize_globals(
             }
         }
 
-        pattern_ambient_modules.extend_from_slice(entry.bound.pattern_ambient_modules());
+        pattern_ambient_modules.extend_from_slice(bound.pattern_ambient_modules());
 
-        if let Some(global_exports) = entry.bound.global_exports() {
-            if entry.bound.symbol(entry.bound.source_file()).is_none() {
+        if let Some(global_exports) = bound.global_exports() {
+            if bound.symbol(bound.source_file()).is_none() {
                 return Err(CanonicalGlobalInitializationError::MissingSourceFileSymbol(
                     file,
                 ));
@@ -643,14 +619,14 @@ fn initialize_globals(
     // Global-scope augmentations run only after every ordinary global and UMD
     // export is indexed, and before the built-in `undefined` rule.
     for &file in file_order {
-        let entry = files
-            .get(&file)
+        let (arena, bound) = files
+            .snapshot(file)
             .ok_or(CanonicalGlobalInitializationError::MissingFile(file))?;
-        for augmentation in entry.bound.module_augmentations() {
+        for augmentation in bound.module_augmentations() {
             let augmentation_name = augmentation.name();
-            let module = validate_augmentation_name(entry, file, augmentation_name)?;
+            let module = validate_augmentation_name(arena, bound, file, augmentation_name)?;
             let Some(NodeData::ModuleDeclaration(module_data)) =
-                entry.arena.get(module.node).map(|node| &node.data)
+                arena.get(module.node).map(|node| &node.data)
             else {
                 return Err(CanonicalGlobalInitializationError::InvalidAugmentationName(
                     augmentation_name,
@@ -659,8 +635,7 @@ fn initialize_globals(
             if module_data.keyword != SyntaxKind::GlobalKeyword {
                 continue;
             }
-            let symbol = entry
-                .bound
+            let symbol = bound
                 .symbol(module)
                 .ok_or(CanonicalGlobalInitializationError::MissingAugmentationSymbol(module))?;
             let record = store
@@ -687,10 +662,8 @@ fn initialize_globals(
     add_undefined_to_globals(store, files, globals, undefined_symbol)?;
     let global_merge_completion = GlobalMergeCompletion::new(name_resolution_options);
 
-    let declared_host = DeclaredTypeHost::new_after_global_merge(
-        files.values().map(|file| (file.arena, &file.bound)),
-        global_merge_completion,
-    )?;
+    let declared_host =
+        DeclaredTypeHost::new_after_global_merge(files.snapshots(), global_merge_completion)?;
     let global_types =
         initialize_global_library_types(store, &declared_host, globals, strict_bind_call_apply)?;
 
@@ -734,16 +707,17 @@ fn is_ambient_module_symbol_name(name: &[u8]) -> bool {
 }
 
 fn validate_augmentation_name(
-    entry: &CanonicalCheckerFile<'_>,
+    arena: &NodeArena,
+    bound: &BoundFile,
     file: FileId,
     name: NodeRef,
 ) -> Result<NodeRef, CanonicalGlobalInitializationError> {
-    if !name.is_for(entry.arena.id(), file) || !entry.bound.contains(name) {
+    if !name.is_for(arena.id(), file) || !bound.contains(name) {
         return Err(CanonicalGlobalInitializationError::InvalidAugmentationName(
             name,
         ));
     }
-    let Some(name_node) = entry.arena.get(name.node) else {
+    let Some(name_node) = arena.get(name.node) else {
         return Err(CanonicalGlobalInitializationError::InvalidAugmentationName(
             name,
         ));
@@ -753,15 +727,15 @@ fn validate_augmentation_name(
             name,
         ));
     };
-    let module = NodeRef::new(entry.arena.id(), file, module_id);
+    let module = NodeRef::new(arena.id(), file, module_id);
     let Some(NodeData::ModuleDeclaration(module_data)) =
-        entry.arena.get(module_id).map(|node| &node.data)
+        arena.get(module_id).map(|node| &node.data)
     else {
         return Err(CanonicalGlobalInitializationError::InvalidAugmentationName(
             name,
         ));
     };
-    if module_data.name != name.node || !entry.bound.contains(module) {
+    if module_data.name != name.node || !bound.contains(module) {
         return Err(CanonicalGlobalInitializationError::InvalidAugmentationName(
             name,
         ));
@@ -771,7 +745,7 @@ fn validate_augmentation_name(
 
 fn add_undefined_to_globals(
     store: &mut CanonicalTypeMapperStore,
-    files: &BTreeMap<FileId, CanonicalCheckerFile<'_>>,
+    files: &ProductionAliasSourceRegistry<'_>,
     globals: SymbolTableId,
     undefined_symbol: SemanticSymbolId,
 ) -> Result<(), CanonicalGlobalInitializationError> {
@@ -808,18 +782,16 @@ fn add_undefined_to_globals(
 }
 
 fn is_type_declaration(
-    files: &BTreeMap<FileId, CanonicalCheckerFile<'_>>,
+    files: &ProductionAliasSourceRegistry<'_>,
     declaration: NodeRef,
 ) -> Result<bool, CanonicalGlobalInitializationError> {
-    let entry = files
-        .get(&declaration.file)
+    let (arena, bound) = files
+        .snapshot(declaration.file)
         .ok_or(CanonicalGlobalInitializationError::InvalidDeclarationProvenance(declaration))?;
-    if !declaration.is_for(entry.arena.id(), declaration.file) || !entry.bound.contains(declaration)
-    {
+    if !declaration.is_for(arena.id(), declaration.file) || !bound.contains(declaration) {
         return Err(CanonicalGlobalInitializationError::InvalidDeclarationProvenance(declaration));
     }
-    let node = entry
-        .arena
+    let node = arena
         .get(declaration.node)
         .ok_or(CanonicalGlobalInitializationError::InvalidDeclarationProvenance(declaration))?;
     match node.kind {
@@ -838,12 +810,12 @@ fn is_type_declaration(
             Ok(clause.phase_modifier == Some(SyntaxKind::TypeKeyword))
         }
         SyntaxKind::ImportSpecifier | SyntaxKind::ExportSpecifier => {
-            let Some(parent) = node.parent.and_then(|parent| entry.arena.get(parent)) else {
+            let Some(parent) = node.parent.and_then(|parent| arena.get(parent)) else {
                 return Err(
                     CanonicalGlobalInitializationError::InvalidDeclarationProvenance(declaration),
                 );
             };
-            let Some(container) = parent.parent.and_then(|parent| entry.arena.get(parent)) else {
+            let Some(container) = parent.parent.and_then(|parent| arena.get(parent)) else {
                 return Err(
                     CanonicalGlobalInitializationError::InvalidDeclarationProvenance(declaration),
                 );
@@ -1212,6 +1184,8 @@ pub enum CanonicalCheckerContextError {
     Bootstrap(IntrinsicBootstrapError),
     /// The explicit checker-owned module-resolution manifest was invalid.
     ModuleResolutions(CanonicalModuleResolutionManifestError),
+    /// The retained Program could not form its once-validated alias source registry.
+    AliasTargetHost(ProductionAliasTargetHostError),
     /// The checker store already retained a conflicting query-session option.
     StrictBuiltinIteratorReturnClaim {
         established_strict_builtin_iterator_return: bool,
@@ -1312,6 +1286,12 @@ impl std::fmt::Display for CanonicalCheckerContextError {
             Self::ModuleResolutions(error) => {
                 write!(formatter, "checker module resolutions are invalid: {error}")
             }
+            Self::AliasTargetHost(error) => {
+                write!(
+                    formatter,
+                    "checker alias source registry is invalid: {error}"
+                )
+            }
             Self::StrictBuiltinIteratorReturnClaim {
                 established_strict_builtin_iterator_return,
                 requested_strict_builtin_iterator_return,
@@ -1331,6 +1311,7 @@ impl std::error::Error for CanonicalCheckerContextError {
         match self {
             Self::Extraction(error) => Some(error),
             Self::ModuleResolutions(error) => Some(error),
+            Self::AliasTargetHost(error) => Some(error),
             Self::GlobalInitialization(error) => Some(error),
             _ => None,
         }
@@ -1355,6 +1336,12 @@ impl From<CanonicalModuleResolutionManifestError> for CanonicalCheckerContextErr
     }
 }
 
+impl From<ProductionAliasTargetHostError> for CanonicalCheckerContextError {
+    fn from(error: ProductionAliasTargetHostError) -> Self {
+        Self::AliasTargetHost(error)
+    }
+}
+
 impl From<CanonicalGlobalInitializationError> for CanonicalCheckerContextError {
     fn from(error: CanonicalGlobalInitializationError) -> Self {
         Self::GlobalInitialization(error)
@@ -1373,6 +1360,7 @@ mod tests {
     use crate::semantic::{
         AliasTargetState, CanonicalModuleResolutionEntry, CanonicalModuleResolutionManifestInput,
         CanonicalModuleResolutionMode, CanonicalResolvedModuleInput, TypeData,
+        TypeResolutionTarget, TypeResolutionTargetError, TypeSystemPropertyName,
         alias::{CanonicalAliasResolutionEvent, CanonicalAliasTargetUnavailable},
         type_records::TypeCacheState,
         types::ObjectFlags,
@@ -2077,69 +2065,45 @@ mod tests {
     }
 
     #[test]
-    fn alias_query_host_construction_errors_leave_store_and_diagnostics_unchanged() {
+    fn alias_and_declared_errors_expose_nested_type_resolution_sources() {
         let importer = parsed("import { value as local } from './target';");
-        let target = parsed("export const value = 1;");
-        let wrong_arena = parsed("export const unrelated = 2;");
         let importer_file = FileId::new(212);
-        let target_file = FileId::new(213);
-        let specifier = node_ref(
-            &importer,
-            importer_file,
-            module_specifiers(&importer).into_iter().next().unwrap(),
-        );
-        let mut context = external_context(
-            &[(importer_file, &importer), (target_file, &target)],
-            CanonicalModuleResolutionManifestInput::new([
-                CanonicalModuleResolutionEntry::resolved(specifier, esm(target_file)),
-            ]),
-        );
+        let context = external_context_without_module_resolutions(&[(importer_file, &importer)]);
         let declaration = alias_declaration_named(&importer, importer_file, "local");
         let alias = alias_symbol(&context, declaration);
-        let expected_arena = context.file(importer_file).unwrap().1.node_arena_id();
-        let actual_arena = wrong_arena.arena.id();
-        context.files.get_mut(&importer_file).unwrap().arena = &wrong_arena.arena;
+        let leaf = TypeResolutionTargetError {
+            target: TypeResolutionTarget::Symbol(alias),
+            property: TypeSystemPropertyName::AliasTarget,
+        };
+        let alias_error = CanonicalAliasResolutionError::TypeResolutionTarget(leaf);
+        let flags_error = CanonicalSymbolFlagsError::AliasResolution(alias_error);
+        let query_error = CanonicalAliasQueryError::SymbolFlags(flags_error);
 
-        let links_before = context.store().checker_link_allocated_lengths();
-        let resolution_before = context.store().type_resolution_internal_state();
-        let alias_links_before = context.store().alias_symbol_links(alias).cloned();
-        let diagnostics_before = context.diagnostics().clone();
-        let expected_error =
-            CanonicalAliasQueryError::TargetHost(ProductionAliasTargetHostError::ArenaMismatch {
-                file: importer_file,
-                expected: expected_arena,
-                actual: actual_arena,
-            });
+        let flags_source = std::error::Error::source(&query_error).unwrap();
+        assert_eq!(
+            flags_source.downcast_ref::<CanonicalSymbolFlagsError>(),
+            Some(&flags_error)
+        );
+        let alias_source = flags_source.source().unwrap();
+        assert_eq!(
+            alias_source.downcast_ref::<CanonicalAliasResolutionError>(),
+            Some(&alias_error)
+        );
+        let leaf_source = alias_source.source().unwrap();
+        assert_eq!(
+            leaf_source.downcast_ref::<TypeResolutionTargetError>(),
+            Some(&leaf)
+        );
+        assert!(leaf_source.source().is_none());
 
-        assert_eq!(context.resolve_alias(alias), Err(expected_error));
+        let declared_error = DeclaredTypeError::TypeResolutionTarget(leaf);
+        assert_eq!(declared_error.to_string(), leaf.to_string());
         assert_eq!(
-            context.store().checker_link_allocated_lengths(),
-            links_before
+            std::error::Error::source(&declared_error)
+                .unwrap()
+                .downcast_ref::<TypeResolutionTargetError>(),
+            Some(&leaf)
         );
-        assert_eq!(
-            context.store().type_resolution_internal_state(),
-            resolution_before
-        );
-        assert_eq!(
-            context.store().alias_symbol_links(alias).cloned(),
-            alias_links_before
-        );
-        assert_eq!(context.diagnostics(), &diagnostics_before);
-
-        assert_eq!(context.get_symbol_flags(alias), Err(expected_error));
-        assert_eq!(
-            context.store().checker_link_allocated_lengths(),
-            links_before
-        );
-        assert_eq!(
-            context.store().type_resolution_internal_state(),
-            resolution_before
-        );
-        assert_eq!(
-            context.store().alias_symbol_links(alias).cloned(),
-            alias_links_before
-        );
-        assert_eq!(context.diagnostics(), &diagnostics_before);
     }
 
     #[test]

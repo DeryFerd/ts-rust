@@ -15,7 +15,7 @@ use ts_binder::{BoundFile, InternalSymbolName, SemanticStoreId, SemanticSymbolId
 
 use super::{
     CanonicalModuleResolutionLookup, CanonicalModuleResolutionManifest,
-    CanonicalModuleResolutionMode, CanonicalResolvedModule, CanonicalSemanticStore,
+    CanonicalModuleResolutionMode, CanonicalResolvedModule, CanonicalSemanticStore, SourceFileRef,
     alias::{
         CanonicalAliasTargetHost, CanonicalAliasTargetUnavailable, CanonicalImmediateAliasTarget,
     },
@@ -27,12 +27,35 @@ struct ProductionAliasTargetSource<'arena> {
     bound: &'arena BoundFile,
 }
 
+#[derive(Debug)]
+struct ProductionAliasRegistrySource<'arena> {
+    arena: &'arena NodeArena,
+    bound: BoundFile,
+    source_file: SourceFileRef,
+}
+
+/// Context-owned, once-validated Program sources for production alias queries.
+///
+/// The registry is the sole owner of retained binder side data. Query hosts
+/// borrow this registry instead of rebuilding and revalidating a source map.
+#[derive(Debug)]
+pub(super) struct ProductionAliasSourceRegistry<'arena> {
+    store: SemanticStoreId,
+    sources: BTreeMap<FileId, ProductionAliasRegistrySource<'arena>>,
+}
+
+#[derive(Debug)]
+enum ProductionAliasTargetSources<'source, 'arena> {
+    Retained(BTreeMap<FileId, ProductionAliasTargetSource<'arena>>),
+    Registry(&'source ProductionAliasSourceRegistry<'arena>),
+}
+
 /// Store-free production alias-target provider over exact retained Program
 /// AST/binder snapshots and the immutable compiler module-resolution manifest.
 #[derive(Debug)]
-pub struct ProductionAliasTargetHost<'arena, 'manifest> {
+pub struct ProductionAliasTargetHost<'source, 'arena, 'manifest> {
     store: SemanticStoreId,
-    sources: BTreeMap<FileId, ProductionAliasTargetSource<'arena>>,
+    sources: ProductionAliasTargetSources<'source, 'arena>,
     module_resolutions: &'manifest CanonicalModuleResolutionManifest,
 }
 
@@ -52,8 +75,17 @@ pub enum ProductionAliasTargetHostError {
     DeclarationsIncomplete(FileId),
     MissingSourceFileFacts(FileId),
     InvalidSourceFile(NodeRef),
+    InvalidRegisteredSourceFile {
+        file: FileId,
+        expected: NodeRef,
+        actual: SourceFileRef,
+    },
     InvalidSymbolStore(FileId),
     DuplicateFile(FileId),
+    RegistryStoreMismatch {
+        expected: SemanticStoreId,
+        actual: SemanticStoreId,
+    },
 }
 
 impl std::fmt::Display for ProductionAliasTargetHostError {
@@ -84,6 +116,11 @@ impl std::fmt::Display for ProductionAliasTargetHostError {
                 "alias-target source {} has an invalid source-file root",
                 source.file.index()
             ),
+            Self::InvalidRegisteredSourceFile { file, .. } => write!(
+                formatter,
+                "alias-target source {} has an invalid checker source registration",
+                file.index()
+            ),
             Self::InvalidSymbolStore(file) => write!(
                 formatter,
                 "alias-target source {} belongs to another symbol store",
@@ -94,6 +131,9 @@ impl std::fmt::Display for ProductionAliasTargetHostError {
                 "alias-target source {} was supplied more than once",
                 file.index()
             ),
+            Self::RegistryStoreMismatch { .. } => {
+                formatter.write_str("alias-target source registry belongs to another symbol store")
+            }
         }
     }
 }
@@ -113,7 +153,87 @@ enum SupportedAliasDeclaration {
     },
 }
 
-impl<'arena, 'manifest> ProductionAliasTargetHost<'arena, 'manifest> {
+impl<'arena> ProductionAliasSourceRegistry<'arena> {
+    /// Adopts and validates the complete retained Program source set once.
+    pub(super) fn new<MapperPayload>(
+        store: &CanonicalSemanticStore<MapperPayload>,
+        sources: impl IntoIterator<Item = (&'arena NodeArena, BoundFile, SourceFileRef)>,
+    ) -> Result<Self, ProductionAliasTargetHostError> {
+        let mut retained = BTreeMap::new();
+        for (arena, bound, source_file) in sources {
+            let file = validate_source(store, arena, &bound)?;
+            if source_file.node_ref() != bound.source_file()
+                || !store.contains_source_file(source_file)
+            {
+                return Err(
+                    ProductionAliasTargetHostError::InvalidRegisteredSourceFile {
+                        file,
+                        expected: bound.source_file(),
+                        actual: source_file,
+                    },
+                );
+            }
+            if retained
+                .insert(
+                    file,
+                    ProductionAliasRegistrySource {
+                        arena,
+                        bound,
+                        source_file,
+                    },
+                )
+                .is_some()
+            {
+                return Err(ProductionAliasTargetHostError::DuplicateFile(file));
+            }
+        }
+        Ok(Self {
+            store: store.id(),
+            sources: retained,
+        })
+    }
+
+    /// Looks up one retained AST/binder snapshot without exposing the registry
+    /// representation.
+    pub(super) fn snapshot(&self, file: FileId) -> Option<(&'arena NodeArena, &BoundFile)> {
+        self.sources
+            .get(&file)
+            .map(|source| (source.arena, &source.bound))
+    }
+
+    /// Returns the checker source-root identity registered for one file.
+    pub(super) fn source_file(&self, file: FileId) -> Option<SourceFileRef> {
+        self.sources.get(&file).map(|source| source.source_file)
+    }
+
+    /// Iterates retained AST/binder snapshots without allocating or cloning
+    /// binder side data.
+    pub(super) fn snapshots(&self) -> impl Iterator<Item = (&'arena NodeArena, &BoundFile)> + '_ {
+        self.sources
+            .values()
+            .map(|source| (source.arena, &source.bound))
+    }
+
+    fn target_source(&self, file: FileId) -> Option<ProductionAliasTargetSource<'_>> {
+        self.sources
+            .get(&file)
+            .map(|source| ProductionAliasTargetSource {
+                arena: source.arena,
+                bound: &source.bound,
+            })
+    }
+}
+
+impl ProductionAliasTargetSources<'_, '_> {
+    fn get(&self, file: FileId) -> Option<ProductionAliasTargetSource<'_>> {
+        match self {
+            Self::Retained(sources) => sources.get(&file).copied(),
+            Self::Registry(sources) => sources.target_source(file),
+        }
+    }
+}
+
+impl<'arena, 'manifest> ProductionAliasTargetHost<'arena, 'arena, 'manifest> {
     /// Validates and retains the exact declaration-complete Program sources.
     ///
     /// The checker store is used only to validate provenance and capture its
@@ -131,58 +251,7 @@ impl<'arena, 'manifest> ProductionAliasTargetHost<'arena, 'manifest> {
     ) -> Result<Self, ProductionAliasTargetHostError> {
         let mut retained = BTreeMap::new();
         for (arena, bound) in sources {
-            let file = bound.file_id();
-            if arena.id() != bound.node_arena_id() {
-                return Err(ProductionAliasTargetHostError::ArenaMismatch {
-                    file,
-                    expected: bound.node_arena_id(),
-                    actual: arena.id(),
-                });
-            }
-            if !bound.declarations_complete() {
-                return Err(ProductionAliasTargetHostError::DeclarationsIncomplete(file));
-            }
-            if bound.source_facts().is_none() {
-                return Err(ProductionAliasTargetHostError::MissingSourceFileFacts(file));
-            }
-
-            let source = bound.source_file();
-            if !source.is_for(arena.id(), file)
-                || !bound.contains(source)
-                || !matches!(
-                    arena.get(source.node),
-                    Some(Node {
-                        kind: SyntaxKind::SourceFile,
-                        parent: None,
-                        data: NodeData::SourceFile(_),
-                        ..
-                    })
-                )
-            {
-                return Err(ProductionAliasTargetHostError::InvalidSourceFile(source));
-            }
-            if bound.node_arena_revision() != arena.revision() {
-                return Err(ProductionAliasTargetHostError::ArenaRevisionMismatch {
-                    file,
-                    expected: bound.node_arena_revision(),
-                    actual: arena.revision(),
-                });
-            }
-            if !store.contains_node_ref(source)
-                || bound.traversal_order().any(|node| {
-                    !store.contains_node_ref(node)
-                        || bound
-                            .symbol(node)
-                            .into_iter()
-                            .chain(bound.local_symbol(node))
-                            .any(|symbol| store.get_merged_symbol(symbol).is_none())
-                        || bound
-                            .locals(node)
-                            .is_some_and(|table| store.symbol_table(table).is_none())
-                })
-            {
-                return Err(ProductionAliasTargetHostError::InvalidSymbolStore(file));
-            }
+            let file = validate_source(store, arena, bound)?;
             if retained
                 .insert(file, ProductionAliasTargetSource { arena, bound })
                 .is_some()
@@ -193,17 +262,39 @@ impl<'arena, 'manifest> ProductionAliasTargetHost<'arena, 'manifest> {
 
         Ok(Self {
             store: store.id(),
-            sources: retained,
+            sources: ProductionAliasTargetSources::Retained(retained),
+            module_resolutions,
+        })
+    }
+}
+
+impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'manifest> {
+    /// Creates an allocation-free query view over a context-owned, validated
+    /// source registry.
+    pub(super) fn from_registry<MapperPayload>(
+        store: &CanonicalSemanticStore<MapperPayload>,
+        sources: &'source ProductionAliasSourceRegistry<'arena>,
+        module_resolutions: &'manifest CanonicalModuleResolutionManifest,
+    ) -> Result<Self, ProductionAliasTargetHostError> {
+        if sources.store != store.id() {
+            return Err(ProductionAliasTargetHostError::RegistryStoreMismatch {
+                expected: sources.store,
+                actual: store.id(),
+            });
+        }
+        Ok(Self {
+            store: sources.store,
+            sources: ProductionAliasTargetSources::Registry(sources),
             module_resolutions,
         })
     }
 
-    fn checked_source<MapperPayload>(
-        &self,
+    fn checked_source<'host, MapperPayload>(
+        &'host self,
         store: &CanonicalSemanticStore<MapperPayload>,
         reference: NodeRef,
-    ) -> Result<ProductionAliasTargetSource<'arena>, CanonicalAliasTargetUnavailable> {
-        let source = self.sources.get(&reference.file).copied().ok_or(
+    ) -> Result<ProductionAliasTargetSource<'host>, CanonicalAliasTargetUnavailable> {
+        let source = self.sources.get(reference.file).ok_or(
             CanonicalAliasTargetUnavailable::ForeignDeclaration(reference),
         )?;
         if source.bound.node_arena_revision() != source.arena.revision() {
@@ -222,11 +313,11 @@ impl<'arena, 'manifest> ProductionAliasTargetHost<'arena, 'manifest> {
         Ok(source)
     }
 
-    fn checked_node<MapperPayload>(
-        &self,
+    fn checked_node<'host, MapperPayload>(
+        &'host self,
         store: &CanonicalSemanticStore<MapperPayload>,
         reference: NodeRef,
-    ) -> Result<(&'arena Node, ProductionAliasTargetSource<'arena>), CanonicalAliasTargetUnavailable>
+    ) -> Result<(&'host Node, ProductionAliasTargetSource<'host>), CanonicalAliasTargetUnavailable>
     {
         let source = self.checked_source(store, reference)?;
         let node = source
@@ -409,7 +500,7 @@ impl<'arena, 'manifest> ProductionAliasTargetHost<'arena, 'manifest> {
         declaration: NodeRef,
         resolved: CanonicalResolvedModule,
     ) -> Result<SemanticSymbolId, CanonicalAliasTargetUnavailable> {
-        let target = self.sources.get(&resolved.target_file()).copied().ok_or(
+        let target = self.sources.get(resolved.target_file()).ok_or(
             CanonicalAliasTargetUnavailable::ForeignModuleTarget {
                 declaration,
                 file: resolved.target_file(),
@@ -602,7 +693,69 @@ impl<'arena, 'manifest> ProductionAliasTargetHost<'arena, 'manifest> {
     }
 }
 
-impl<MapperPayload> CanonicalAliasTargetHost<MapperPayload> for ProductionAliasTargetHost<'_, '_> {
+fn validate_source<MapperPayload>(
+    store: &CanonicalSemanticStore<MapperPayload>,
+    arena: &NodeArena,
+    bound: &BoundFile,
+) -> Result<FileId, ProductionAliasTargetHostError> {
+    let file = bound.file_id();
+    if arena.id() != bound.node_arena_id() {
+        return Err(ProductionAliasTargetHostError::ArenaMismatch {
+            file,
+            expected: bound.node_arena_id(),
+            actual: arena.id(),
+        });
+    }
+    if !bound.declarations_complete() {
+        return Err(ProductionAliasTargetHostError::DeclarationsIncomplete(file));
+    }
+    if bound.source_facts().is_none() {
+        return Err(ProductionAliasTargetHostError::MissingSourceFileFacts(file));
+    }
+
+    let source = bound.source_file();
+    if !source.is_for(arena.id(), file)
+        || !bound.contains(source)
+        || !matches!(
+            arena.get(source.node),
+            Some(Node {
+                kind: SyntaxKind::SourceFile,
+                parent: None,
+                data: NodeData::SourceFile(_),
+                ..
+            })
+        )
+    {
+        return Err(ProductionAliasTargetHostError::InvalidSourceFile(source));
+    }
+    if bound.node_arena_revision() != arena.revision() {
+        return Err(ProductionAliasTargetHostError::ArenaRevisionMismatch {
+            file,
+            expected: bound.node_arena_revision(),
+            actual: arena.revision(),
+        });
+    }
+    if !store.contains_node_ref(source)
+        || bound.traversal_order().any(|node| {
+            !store.contains_node_ref(node)
+                || bound
+                    .symbol(node)
+                    .into_iter()
+                    .chain(bound.local_symbol(node))
+                    .any(|symbol| store.get_merged_symbol(symbol).is_none())
+                || bound
+                    .locals(node)
+                    .is_some_and(|table| store.symbol_table(table).is_none())
+        })
+    {
+        return Err(ProductionAliasTargetHostError::InvalidSymbolStore(file));
+    }
+    Ok(file)
+}
+
+impl<MapperPayload> CanonicalAliasTargetHost<MapperPayload>
+    for ProductionAliasTargetHost<'_, '_, '_>
+{
     fn get_target_of_alias_declaration(
         &mut self,
         store: &mut CanonicalSemanticStore<MapperPayload>,
@@ -1693,7 +1846,89 @@ mod tests {
     }
 
     #[test]
-    fn constructor_rejects_stale_sources_before_retaining_a_host() {
+    fn registry_rejects_a_source_registration_from_another_retained_file() {
+        let first = parsed("export const first = 1;");
+        let second = parsed("export const second = 2;");
+        let first_file = FileId::new(56);
+        let second_file = FileId::new(57);
+        let files = [
+            (first_file, &first, CanonicalModuleState::External),
+            (second_file, &second, CanonicalModuleState::External),
+        ];
+        let (symbols, mut bound_files) = bindings(&files);
+        let mut store = TestStore::from_symbol_store(symbols);
+        let first_source = store
+            .register_source_file(&first.arena, first.source_file, first_file)
+            .unwrap();
+        let second_source = store
+            .register_source_file(&second.arena, second.source_file, second_file)
+            .unwrap();
+        let expected = bound_files.get(&first_file).unwrap().source_file();
+
+        let error = ProductionAliasSourceRegistry::new(
+            &store,
+            [
+                (
+                    &first.arena,
+                    bound_files.remove(&first_file).unwrap(),
+                    second_source,
+                ),
+                (
+                    &second.arena,
+                    bound_files.remove(&second_file).unwrap(),
+                    first_source,
+                ),
+            ],
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            ProductionAliasTargetHostError::InvalidRegisteredSourceFile {
+                file: first_file,
+                expected,
+                actual: second_source,
+            }
+        );
+    }
+
+    #[test]
+    fn registry_validates_once_and_query_hosts_borrow_its_owned_sources() {
+        let importer = parsed("import { value } from './target';");
+        let target = parsed("export const value = 1;");
+        let importer_file = FileId::new(58);
+        let target_file = FileId::new(59);
+        let files = [
+            (importer_file, &importer, CanonicalModuleState::External),
+            (target_file, &target, CanonicalModuleState::External),
+        ];
+        let (symbols, mut bound_files) = bindings(&files);
+        let mut store = TestStore::from_symbol_store(symbols);
+        let mut retained = Vec::new();
+        for &(file, parsed, _) in &files {
+            let source_file = store
+                .register_source_file(&parsed.arena, parsed.source_file, file)
+                .unwrap();
+            retained.push((
+                &parsed.arena,
+                bound_files.remove(&file).unwrap(),
+                source_file,
+            ));
+        }
+        let registry = ProductionAliasSourceRegistry::new(&store, retained).unwrap();
+        assert!(bound_files.is_empty());
+        assert_eq!(registry.snapshots().count(), files.len());
+
+        let unavailable = CanonicalModuleResolutionManifest::unavailable();
+        let host =
+            ProductionAliasTargetHost::from_registry(&store, &registry, &unavailable).unwrap();
+        assert!(matches!(
+            host.sources,
+            ProductionAliasTargetSources::Registry(_)
+        ));
+    }
+
+    #[test]
+    fn registry_rejects_stale_sources_before_retaining_program_state() {
         let mut importer = parsed("import { value } from './target';");
         let target = parsed("export const value = 1;");
         let importer_file = FileId::new(60);
@@ -1702,27 +1937,29 @@ mod tests {
             (importer_file, &importer, CanonicalModuleState::External),
             (target_file, &target, CanonicalModuleState::External),
         ];
-        let (symbols, bound_files) = bindings(&files_before_mutation);
+        let (symbols, mut bound_files) = bindings(&files_before_mutation);
         importer.arena.set_source_text("stale");
         let mut store = TestStore::from_symbol_store(symbols);
-        assert!(
-            store
-                .register_source_file(&importer.arena, importer.source_file, importer_file)
-                .is_some()
-        );
-        assert!(
-            store
-                .register_source_file(&target.arena, target.source_file, target_file)
-                .is_some()
-        );
-        let unavailable = CanonicalModuleResolutionManifest::unavailable();
-        let error = ProductionAliasTargetHost::new(
+        let importer_source = store
+            .register_source_file(&importer.arena, importer.source_file, importer_file)
+            .unwrap();
+        let target_source = store
+            .register_source_file(&target.arena, target.source_file, target_file)
+            .unwrap();
+        let error = ProductionAliasSourceRegistry::new(
             &store,
             [
-                (&importer.arena, bound_files.get(&importer_file).unwrap()),
-                (&target.arena, bound_files.get(&target_file).unwrap()),
+                (
+                    &importer.arena,
+                    bound_files.remove(&importer_file).unwrap(),
+                    importer_source,
+                ),
+                (
+                    &target.arena,
+                    bound_files.remove(&target_file).unwrap(),
+                    target_source,
+                ),
             ],
-            &unavailable,
         )
         .unwrap_err();
         assert!(matches!(

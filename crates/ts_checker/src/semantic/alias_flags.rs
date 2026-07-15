@@ -67,7 +67,14 @@ impl std::fmt::Display for CanonicalSymbolFlagsError {
     }
 }
 
-impl std::error::Error for CanonicalSymbolFlagsError {}
+impl std::error::Error for CanonicalSymbolFlagsError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::AliasResolution(error) => Some(error),
+            _ => None,
+        }
+    }
+}
 
 impl From<CanonicalAliasResolutionError> for CanonicalSymbolFlagsError {
     fn from(error: CanonicalAliasResolutionError) -> Self {

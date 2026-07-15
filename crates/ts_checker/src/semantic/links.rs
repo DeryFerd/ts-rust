@@ -1054,6 +1054,18 @@ pub struct TypeResolutionTargetError {
     pub property: TypeSystemPropertyName,
 }
 
+impl std::fmt::Display for TypeResolutionTargetError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "invalid type-resolution target {:?} for {:?}",
+            self.target, self.property
+        )
+    }
+}
+
+impl std::error::Error for TypeResolutionTargetError {}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct TypeResolution {
     target: TypeResolutionTarget,
