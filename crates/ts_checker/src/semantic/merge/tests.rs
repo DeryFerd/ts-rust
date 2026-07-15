@@ -4,9 +4,13 @@ use ts_binder::{
 };
 use ts_parser::parse_source_file;
 
-use super::{SymbolMergeDiagnosticKind, SymbolMergeError, get_excluded_symbol_flags};
+use super::{
+    CheckerDiagnosticMergeHost, SymbolMergeDiagnostic, SymbolMergeDiagnosticKind, SymbolMergeError,
+    SymbolMergeHost, get_excluded_symbol_flags,
+};
 use crate::semantic::{
-    CanonicalTypeMapperStore, IntrinsicBootstrapError, IntrinsicBootstrapOptions,
+    CanonicalCheckerDiagnostics, CanonicalTypeMapperStore, IntrinsicBootstrapError,
+    IntrinsicBootstrapOptions, SemanticStore,
 };
 
 type Store = CanonicalTypeMapperStore;
@@ -468,6 +472,214 @@ fn unsupported_alias_and_diagnostic_branches_fail_typed() {
 }
 
 #[test]
+fn hosted_duplicate_diagnostics_continue_and_deduplicate_in_declaration_order() {
+    let mut store = Store::new();
+    let nodes = registered_nodes(&mut store, 1, "let item = 1; let item = 2;");
+    let declarations = nodes
+        .iter()
+        .filter_map(|(kind, node)| (*kind == SyntaxKind::VariableDeclaration).then_some(*node))
+        .collect::<Vec<_>>();
+    assert_eq!(declarations.len(), 2);
+    let mut target_data = SymbolData::new(
+        SymbolFlags::BLOCK_SCOPED_VARIABLE,
+        EscapedName::source("item"),
+    );
+    target_data.declarations = Some(vec![declarations[0]]);
+    let target = store.alloc_symbol(target_data).unwrap();
+    let mut source_data = SymbolData::new(
+        SymbolFlags::BLOCK_SCOPED_VARIABLE,
+        EscapedName::source("item"),
+    );
+    source_data.declarations = Some(vec![declarations[1]]);
+    let source = store.alloc_symbol(source_data).unwrap();
+    let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+    {
+        let mut host = CheckerDiagnosticMergeHost::new(&mut diagnostics);
+        assert_eq!(
+            store.merge_symbol_with_host(&mut host, target, source, false),
+            Ok(target)
+        );
+        assert_eq!(
+            store.merge_symbol_with_host(&mut host, target, source, false),
+            Ok(target)
+        );
+    }
+
+    assert_eq!(diagnostics.len(), 2);
+    assert_eq!(diagnostics.as_slice()[0].node, Some(declarations[1]));
+    assert_eq!(diagnostics.as_slice()[1].node, Some(declarations[0]));
+    for (index, related_node) in [declarations[0], declarations[1]].into_iter().enumerate() {
+        let diagnostic = &diagnostics.as_slice()[index];
+        assert_eq!(diagnostic.diagnostic.code(), 2451);
+        assert_eq!(diagnostic.diagnostic.arguments, ["item"]);
+        assert_eq!(diagnostic.related_information.len(), 1);
+        assert_eq!(diagnostic.related_information[0].node, Some(related_node));
+        assert_eq!(diagnostic.related_information[0].diagnostic.code(), 6203);
+    }
+    assert_eq!(store.get_merged_symbol(target), Some(target));
+    assert_eq!(store.get_merged_symbol(source), Some(source));
+}
+
+#[test]
+fn hosted_nested_collision_keeps_outer_side_effects_and_continues_once() {
+    let mut store = Store::new();
+    let nodes = registered_nodes(
+        &mut store,
+        1,
+        "interface First {} interface Second {} let child = 1; function child() {}",
+    );
+    let interfaces = nodes
+        .iter()
+        .filter_map(|(kind, node)| (*kind == SyntaxKind::InterfaceDeclaration).then_some(*node))
+        .collect::<Vec<_>>();
+    let variable = first(&nodes, SyntaxKind::VariableDeclaration);
+    let function = first(&nodes, SyntaxKind::FunctionDeclaration);
+    let mut target_child_data = SymbolData::new(
+        SymbolFlags::BLOCK_SCOPED_VARIABLE,
+        EscapedName::source("child"),
+    );
+    target_child_data.declarations = Some(vec![variable]);
+    let target_child = store.alloc_symbol(target_child_data).unwrap();
+    let mut source_child_data =
+        SymbolData::new(SymbolFlags::FUNCTION, EscapedName::source("child"));
+    source_child_data.declarations = Some(vec![function]);
+    let source_child = store.alloc_symbol(source_child_data).unwrap();
+    let target_members = table_with(&mut store, [("child", target_child)]);
+    let source_members = table_with(&mut store, [("child", source_child)]);
+    let target = transient(&mut store, SymbolFlags::INTERFACE, "Outer");
+    assert!(store.set_symbol_declarations(target, Some(vec![interfaces[0]]), None));
+    assert!(store.set_symbol_relationships(target, Some(target_members), None, None, None));
+    let mut source_data = SymbolData::new(SymbolFlags::INTERFACE, EscapedName::source("Outer"));
+    source_data.declarations = Some(vec![interfaces[1]]);
+    source_data.members = Some(source_members);
+    let source = store.alloc_symbol(source_data).unwrap();
+    let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+    {
+        let mut host = CheckerDiagnosticMergeHost::new(&mut diagnostics);
+        assert_eq!(
+            store.merge_symbol_with_host(&mut host, target, source, false),
+            Ok(target)
+        );
+    }
+
+    assert_eq!(
+        store.symbol(target).unwrap().declarations(),
+        Some(interfaces.as_slice())
+    );
+    assert_eq!(
+        store
+            .symbol_table(target_members)
+            .unwrap()
+            .get_source("child"),
+        Some(target_child)
+    );
+    assert_eq!(store.get_merged_symbol(source), Some(target));
+    assert_eq!(store.get_merged_symbol(source_child), Some(source_child));
+    assert_eq!(diagnostics.len(), 2);
+    assert_eq!(diagnostics.as_slice()[0].node, Some(function));
+    assert_eq!(diagnostics.as_slice()[1].node, Some(variable));
+}
+
+#[derive(Debug)]
+struct ResolvingMergeHost {
+    resolved: SemanticSymbolId,
+    alias_requests: Vec<SemanticSymbolId>,
+    diagnostics: Vec<SymbolMergeDiagnostic>,
+}
+
+impl<TypePayload, MapperPayload> SymbolMergeHost<TypePayload, MapperPayload>
+    for ResolvingMergeHost
+{
+    fn resolve_alias_for_merge(
+        &mut self,
+        _store: &mut SemanticStore<TypePayload, MapperPayload>,
+        symbol: SemanticSymbolId,
+    ) -> Result<SemanticSymbolId, SymbolMergeError> {
+        self.alias_requests.push(symbol);
+        Ok(self.resolved)
+    }
+
+    fn report_merge_diagnostic(
+        &mut self,
+        _store: &SemanticStore<TypePayload, MapperPayload>,
+        diagnostic: SymbolMergeDiagnostic,
+    ) -> Result<(), SymbolMergeError> {
+        self.diagnostics.push(diagnostic);
+        Ok(())
+    }
+}
+
+#[test]
+fn hosted_alias_resolution_reports_then_takes_the_source_continuation() {
+    let mut store = Store::new();
+    let globals = store.alloc_symbol_table();
+    let alias = alloc(&mut store, SymbolFlags::ALIAS, "item");
+    let resolved = alloc(&mut store, SymbolFlags::BLOCK_SCOPED_VARIABLE, "item");
+    let source = alloc(&mut store, SymbolFlags::FUNCTION, "item");
+    assert_eq!(
+        store.insert_symbol(globals, EscapedName::source("item"), alias),
+        Some(None)
+    );
+    let mut host = ResolvingMergeHost {
+        resolved,
+        alias_requests: Vec::new(),
+        diagnostics: Vec::new(),
+    };
+
+    assert_eq!(
+        store.merge_global_symbol_with_host(&mut host, globals, source),
+        Ok(source)
+    );
+    assert_eq!(host.alias_requests, [alias]);
+    assert_eq!(
+        host.diagnostics,
+        [SymbolMergeDiagnostic {
+            kind: SymbolMergeDiagnosticKind::IncompatibleDeclarations,
+            target: alias,
+            source,
+        }]
+    );
+    assert_eq!(
+        store.symbol_table(globals).unwrap().get_source("item"),
+        Some(source)
+    );
+    assert_eq!(store.get_merged_symbol(alias), Some(alias));
+    assert_eq!(store.get_merged_symbol(source), Some(source));
+}
+
+#[test]
+fn hosted_namespace_collision_reports_and_keeps_the_target() {
+    let mut store = Store::new();
+    let nodes = registered_nodes(&mut store, 1, "function module() {}");
+    let declaration = first(&nodes, SyntaxKind::FunctionDeclaration);
+    let target = alloc(
+        &mut store,
+        SymbolFlags::NAMESPACE_MODULE | SymbolFlags::BLOCK_SCOPED_VARIABLE,
+        "module",
+    );
+    let mut source_data = SymbolData::new(SymbolFlags::FUNCTION, EscapedName::source("module"));
+    source_data.declarations = Some(vec![declaration]);
+    let source = store.alloc_symbol(source_data).unwrap();
+    let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+    {
+        let mut host = CheckerDiagnosticMergeHost::new(&mut diagnostics);
+        assert_eq!(
+            store.merge_symbol_with_host(&mut host, target, source, false),
+            Ok(target)
+        );
+    }
+
+    assert_eq!(diagnostics.len(), 1);
+    assert_eq!(diagnostics.as_slice()[0].node, Some(declaration));
+    assert_eq!(diagnostics.as_slice()[0].diagnostic.code(), 2649);
+    assert_eq!(diagnostics.as_slice()[0].diagnostic.arguments, ["module"]);
+    assert_eq!(store.get_merged_symbol(source), Some(source));
+}
+
+#[test]
 fn const_enum_only_is_cleared_only_by_a_non_const_value_module() {
     let mut store = Store::new();
     let target = transient(
@@ -516,12 +728,17 @@ fn intrinsic_global_this_conflict_is_the_exact_diagnostic_noop_exception() {
     let global_this = store.intrinsic_bootstrap().unwrap().global_this_symbol;
     let before = store.symbol(global_this).unwrap().clone();
     let property = alloc(&mut store, SymbolFlags::PROPERTY, "globalThis");
-    assert_eq!(
-        store.merge_symbol(global_this, property, false),
-        Ok(global_this)
-    );
+    let mut diagnostics = CanonicalCheckerDiagnostics::default();
+    {
+        let mut host = CheckerDiagnosticMergeHost::new(&mut diagnostics);
+        assert_eq!(
+            store.merge_symbol_with_host(&mut host, global_this, property, false),
+            Ok(global_this)
+        );
+    }
     assert_eq!(store.symbol(global_this), Some(&before));
     assert_eq!(store.get_merged_symbol(property), Some(property));
+    assert!(diagnostics.is_empty());
 }
 
 #[test]

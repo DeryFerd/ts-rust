@@ -1,8 +1,9 @@
 //! Exact symbol-merge substrate used by pinned checker initialization.
 //!
 //! This ports the graph operations from `checker.go` without owning Program
-//! orchestration, alias resolution, or diagnostic emission. Unsupported
-//! branches fail with typed errors instead of guessing a merge result.
+//! orchestration. Host callbacks place alias resolution and nonfatal reporting
+//! inside the exact merge branches; callers that install no capabilities fail
+//! with typed errors instead of guessing a merge result.
 
 use std::collections::HashSet;
 
@@ -10,15 +11,236 @@ use ts_ast::{NodeRef, SyntaxKind};
 use ts_binder::{
     CheckFlags, SemanticSymbolId, SymbolFlags, SymbolTableId, should_replace_value_declaration,
 };
+use ts_diagnostics::{Diagnostic, message_by_code};
 
-use super::store::{MergedSymbolRecordError, SemanticStore};
+use super::{
+    diagnostics::{CanonicalCheckerDiagnostics, CanonicalCheckerRelatedInformation},
+    store::{MergedSymbolRecordError, SemanticStore},
+};
 
-/// Checker behavior required by an incompatible merge but not yet owned by
-/// the canonical construction prefix.
+/// The checker report selected by one incompatible merge branch.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SymbolMergeDiagnosticKind {
     IncompatibleDeclarations,
     CannotAugmentNonModule,
+}
+
+/// One nonfatal diagnostic requested from inside the exact merge control flow.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SymbolMergeDiagnostic {
+    pub kind: SymbolMergeDiagnosticKind,
+    pub target: SemanticSymbolId,
+    pub source: SemanticSymbolId,
+}
+
+/// Checker capabilities consulted by one recursive symbol-merge session.
+///
+/// Alias resolution receives the mutable store because the eventual exact
+/// resolver owns cache and cycle-state writes. Diagnostic reporting receives
+/// an immutable store snapshot and must report synchronously; returning `Ok`
+/// tells the merge kernel to take the pinned nonfatal continuation in place.
+/// The default methods preserve the previous fail-closed boundary.
+pub trait SymbolMergeHost<TypePayload, MapperPayload> {
+    /// Resolves a non-local alias reached by a compatible bound target.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed capability or semantic failure when the alias cannot be
+    /// resolved exactly. The merge session stops at the callback location.
+    fn resolve_alias_for_merge(
+        &mut self,
+        _store: &mut SemanticStore<TypePayload, MapperPayload>,
+        symbol: SemanticSymbolId,
+    ) -> Result<SemanticSymbolId, SymbolMergeError> {
+        Err(SymbolMergeError::AliasResolutionRequired(symbol))
+    }
+
+    /// Reports one collision before the merge takes its pinned continuation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed capability or reporting failure. `Ok(())` means the
+    /// diagnostic is nonfatal and permits the in-place continuation.
+    fn report_merge_diagnostic(
+        &mut self,
+        _store: &SemanticStore<TypePayload, MapperPayload>,
+        diagnostic: SymbolMergeDiagnostic,
+    ) -> Result<(), SymbolMergeError> {
+        Err(SymbolMergeError::DiagnosticRequired {
+            kind: diagnostic.kind,
+            target: diagnostic.target,
+            source: diagnostic.source,
+        })
+    }
+}
+
+/// Host used by the compatibility entry points until their caller owns
+/// diagnostics and alias resolution.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FailClosedSymbolMergeHost;
+
+impl<TypePayload, MapperPayload> SymbolMergeHost<TypePayload, MapperPayload>
+    for FailClosedSymbolMergeHost
+{
+}
+
+/// Dependency-closed merge host that owns TypeScript diagnostic continuations
+/// while leaving alias resolution fail-closed.
+///
+/// It uses retained declaration identities as locations. Plain-JavaScript
+/// suppression and declaration-name adjustment require the later Program/AST
+/// diagnostic host and can implement [`SymbolMergeHost`] directly.
+pub struct CheckerDiagnosticMergeHost<'diagnostics> {
+    diagnostics: &'diagnostics mut CanonicalCheckerDiagnostics,
+}
+
+impl<'diagnostics> CheckerDiagnosticMergeHost<'diagnostics> {
+    #[must_use]
+    pub const fn new(diagnostics: &'diagnostics mut CanonicalCheckerDiagnostics) -> Self {
+        Self { diagnostics }
+    }
+
+    fn report_incompatible<TypePayload, MapperPayload>(
+        &mut self,
+        store: &SemanticStore<TypePayload, MapperPayload>,
+        target: SemanticSymbolId,
+        source: SemanticSymbolId,
+    ) -> Result<(), SymbolMergeError> {
+        let target_record = store
+            .symbol(target)
+            .ok_or(SymbolMergeError::InvalidSymbol(target))?;
+        let source_record = store
+            .symbol(source)
+            .ok_or(SymbolMergeError::InvalidSymbol(source))?;
+        let target_declarations = target_record.declarations().unwrap_or_default().to_vec();
+        let source_declarations = source_record.declarations().unwrap_or_default().to_vec();
+        let symbol_name = display_symbol_name(source_record);
+        let code = if (target_record.flags() | source_record.flags()).intersects(SymbolFlags::ENUM)
+        {
+            2567
+        } else if (target_record.flags() | source_record.flags())
+            .intersects(SymbolFlags::BLOCK_SCOPED_VARIABLE)
+        {
+            2451
+        } else {
+            2300
+        };
+
+        self.report_duplicate_side(
+            &source_declarations,
+            &target_declarations,
+            code,
+            &symbol_name,
+        );
+        self.report_duplicate_side(
+            &target_declarations,
+            &source_declarations,
+            code,
+            &symbol_name,
+        );
+        Ok(())
+    }
+
+    fn report_duplicate_side(
+        &mut self,
+        declarations: &[NodeRef],
+        related_declarations: &[NodeRef],
+        code: u32,
+        symbol_name: &str,
+    ) {
+        for &node in declarations {
+            let message = message_by_code(code).expect("pinned merge diagnostic is in the catalog");
+            let diagnostic = if code == 2567 {
+                Diagnostic::new(message)
+            } else {
+                Diagnostic::with_arguments(message, [symbol_name])
+            };
+            let id = self.diagnostics.issue(Some(node), diagnostic);
+            for &related_node in related_declarations {
+                let Some(current) = self.diagnostics.get(id) else {
+                    continue;
+                };
+                if related_node == node
+                    || current.related_information.len() >= 5
+                    || current.related_information.iter().any(|related| {
+                        related.node == Some(related_node)
+                            && matches!(related.diagnostic.code(), 6203 | 6204)
+                    })
+                {
+                    continue;
+                }
+                let first = current.related_information.is_empty();
+                let related = CanonicalCheckerRelatedInformation {
+                    node: Some(related_node),
+                    diagnostic: if first {
+                        Diagnostic::with_arguments(
+                            message_by_code(6203)
+                                .expect("pinned leading related diagnostic is in the catalog"),
+                            [symbol_name],
+                        )
+                    } else {
+                        Diagnostic::new(
+                            message_by_code(6204)
+                                .expect("pinned follow-on related diagnostic is in the catalog"),
+                        )
+                    },
+                };
+                self.diagnostics.add_related_information(id, related);
+            }
+        }
+    }
+
+    fn report_cannot_augment<TypePayload, MapperPayload>(
+        &mut self,
+        store: &SemanticStore<TypePayload, MapperPayload>,
+        target: SemanticSymbolId,
+        source: SemanticSymbolId,
+    ) -> Result<(), SymbolMergeError> {
+        let target_record = store
+            .symbol(target)
+            .ok_or(SymbolMergeError::InvalidSymbol(target))?;
+        let source_record = store
+            .symbol(source)
+            .ok_or(SymbolMergeError::InvalidSymbol(source))?;
+        let node = source_record
+            .declarations()
+            .and_then(|declarations| declarations.first())
+            .copied();
+        self.diagnostics.issue(
+            node,
+            Diagnostic::with_arguments(
+                message_by_code(2649).expect("pinned augmentation diagnostic is in the catalog"),
+                [display_symbol_name(target_record)],
+            ),
+        );
+        Ok(())
+    }
+}
+
+impl<TypePayload, MapperPayload> SymbolMergeHost<TypePayload, MapperPayload>
+    for CheckerDiagnosticMergeHost<'_>
+{
+    fn report_merge_diagnostic(
+        &mut self,
+        store: &SemanticStore<TypePayload, MapperPayload>,
+        diagnostic: SymbolMergeDiagnostic,
+    ) -> Result<(), SymbolMergeError> {
+        match diagnostic.kind {
+            SymbolMergeDiagnosticKind::IncompatibleDeclarations => {
+                self.report_incompatible(store, diagnostic.target, diagnostic.source)
+            }
+            SymbolMergeDiagnosticKind::CannotAugmentNonModule => {
+                self.report_cannot_augment(store, diagnostic.target, diagnostic.source)
+            }
+        }
+    }
+}
+
+fn display_symbol_name(symbol: &ts_binder::semantic::Symbol) -> String {
+    symbol.name().as_utf8().map_or_else(
+        || symbol.name().escaped_display().to_string(),
+        str::to_owned,
+    )
 }
 
 /// A symbol graph that cannot be merged exactly by the installed substrate.
@@ -156,7 +378,8 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         &mut self,
         symbol: SemanticSymbolId,
     ) -> Result<SemanticSymbolId, SymbolMergeError> {
-        MergeSession::new(self).clone_symbol(symbol)
+        let mut host = FailClosedSymbolMergeHost;
+        MergeSession::new(self, &mut host).clone_symbol(symbol)
     }
 
     /// Merges one source symbol into one target symbol.
@@ -166,7 +389,22 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         source: SemanticSymbolId,
         unidirectional: bool,
     ) -> Result<SemanticSymbolId, SymbolMergeError> {
-        MergeSession::new(self).merge_symbol(target, source, unidirectional)
+        let mut host = FailClosedSymbolMergeHost;
+        self.merge_symbol_with_host(&mut host, target, source, unidirectional)
+    }
+
+    /// Merges one source symbol through one host-owned recursive session.
+    pub(super) fn merge_symbol_with_host<Host>(
+        &mut self,
+        host: &mut Host,
+        target: SemanticSymbolId,
+        source: SemanticSymbolId,
+        unidirectional: bool,
+    ) -> Result<SemanticSymbolId, SymbolMergeError>
+    where
+        Host: SymbolMergeHost<TypePayload, MapperPayload>,
+    {
+        MergeSession::new(self, host).merge_symbol(target, source, unidirectional)
     }
 
     /// Merges a complete source table into a target table in escaped-byte
@@ -178,7 +416,28 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         unidirectional: bool,
         merged_parent: Option<SemanticSymbolId>,
     ) -> Result<(), SymbolMergeError> {
-        MergeSession::new(self).merge_symbol_table(target, source, unidirectional, merged_parent)
+        let mut host = FailClosedSymbolMergeHost;
+        self.merge_symbol_table_with_host(&mut host, target, source, unidirectional, merged_parent)
+    }
+
+    /// Merges a source table through one host-owned recursive session.
+    pub(super) fn merge_symbol_table_with_host<Host>(
+        &mut self,
+        host: &mut Host,
+        target: SymbolTableId,
+        source: SymbolTableId,
+        unidirectional: bool,
+        merged_parent: Option<SemanticSymbolId>,
+    ) -> Result<(), SymbolMergeError>
+    where
+        Host: SymbolMergeHost<TypePayload, MapperPayload>,
+    {
+        MergeSession::new(self, host).merge_symbol_table(
+            target,
+            source,
+            unidirectional,
+            merged_parent,
+        )
     }
 
     /// Merges one symbol into the checker globals table by its exact escaped
@@ -188,21 +447,44 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         globals: SymbolTableId,
         symbol: SemanticSymbolId,
     ) -> Result<SemanticSymbolId, SymbolMergeError> {
-        MergeSession::new(self).merge_global_symbol(globals, symbol)
+        let mut host = FailClosedSymbolMergeHost;
+        self.merge_global_symbol_with_host(&mut host, globals, symbol)
+    }
+
+    /// Merges one global through one host-owned recursive session.
+    pub(super) fn merge_global_symbol_with_host<Host>(
+        &mut self,
+        host: &mut Host,
+        globals: SymbolTableId,
+        symbol: SemanticSymbolId,
+    ) -> Result<SemanticSymbolId, SymbolMergeError>
+    where
+        Host: SymbolMergeHost<TypePayload, MapperPayload>,
+    {
+        MergeSession::new(self, host).merge_global_symbol(globals, symbol)
     }
 }
 
 #[allow(dead_code)] // Constructed through the sibling-visible entry points above.
-struct MergeSession<'store, TypePayload, MapperPayload> {
+struct MergeSession<'store, 'host, TypePayload, MapperPayload, Host> {
     store: &'store mut SemanticStore<TypePayload, MapperPayload>,
+    host: &'host mut Host,
     active: HashSet<(SemanticSymbolId, SemanticSymbolId)>,
 }
 
 #[allow(dead_code)] // Constructed through the sibling-visible entry points above.
-impl<'store, TypePayload, MapperPayload> MergeSession<'store, TypePayload, MapperPayload> {
-    fn new(store: &'store mut SemanticStore<TypePayload, MapperPayload>) -> Self {
+impl<'store, 'host, TypePayload, MapperPayload, Host>
+    MergeSession<'store, 'host, TypePayload, MapperPayload, Host>
+where
+    Host: SymbolMergeHost<TypePayload, MapperPayload>,
+{
+    fn new(
+        store: &'store mut SemanticStore<TypePayload, MapperPayload>,
+        host: &'host mut Host,
+    ) -> Self {
         Self {
             store,
+            host,
             active: HashSet::new(),
         }
     }
@@ -314,11 +596,12 @@ impl<'store, TypePayload, MapperPayload> MergeSession<'store, TypePayload, Mappe
                 if compatible(resolved_flags, source_flags) {
                     target = self.clone_symbol(resolved_target)?;
                 } else {
-                    return Err(SymbolMergeError::DiagnosticRequired {
+                    self.report_diagnostic(SymbolMergeDiagnostic {
                         kind: SymbolMergeDiagnosticKind::IncompatibleDeclarations,
                         target,
                         source,
-                    });
+                    })?;
+                    return Ok(source);
                 }
             }
 
@@ -382,18 +665,18 @@ impl<'store, TypePayload, MapperPayload> MergeSession<'store, TypePayload, Mappe
                 .as_ref()
                 .is_some_and(|bootstrap| bootstrap.global_this_symbol == target);
             if !is_global_this {
-                return Err(SymbolMergeError::DiagnosticRequired {
+                self.report_diagnostic(SymbolMergeDiagnostic {
                     kind: SymbolMergeDiagnosticKind::CannotAugmentNonModule,
                     target,
                     source,
-                });
+                })?;
             }
         } else {
-            return Err(SymbolMergeError::DiagnosticRequired {
+            self.report_diagnostic(SymbolMergeDiagnostic {
                 kind: SymbolMergeDiagnosticKind::IncompatibleDeclarations,
                 target,
                 source,
-            });
+            })?;
         }
         Ok(target)
     }
@@ -444,7 +727,7 @@ impl<'store, TypePayload, MapperPayload> MergeSession<'store, TypePayload, Mappe
     }
 
     fn resolve_symbol_for_merge(
-        &self,
+        &mut self,
         symbol: SemanticSymbolId,
     ) -> Result<SemanticSymbolId, SymbolMergeError> {
         let flags = self.symbol(symbol)?.flags();
@@ -452,10 +735,19 @@ impl<'store, TypePayload, MapperPayload> MergeSession<'store, TypePayload, Mappe
         let non_local_alias = flags & (SymbolFlags::ALIAS | alias_excludes) == SymbolFlags::ALIAS
             || flags.intersects(SymbolFlags::ALIAS) && flags.intersects(SymbolFlags::ASSIGNMENT);
         if non_local_alias {
-            Err(SymbolMergeError::AliasResolutionRequired(symbol))
+            let resolved = self.host.resolve_alias_for_merge(self.store, symbol)?;
+            self.symbol(resolved)?;
+            Ok(resolved)
         } else {
             Ok(symbol)
         }
+    }
+
+    fn report_diagnostic(
+        &mut self,
+        diagnostic: SymbolMergeDiagnostic,
+    ) -> Result<(), SymbolMergeError> {
+        self.host.report_merge_diagnostic(self.store, diagnostic)
     }
 
     fn merged_value_declaration(

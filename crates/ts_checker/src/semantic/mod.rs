@@ -8,6 +8,7 @@
 
 pub mod bootstrap;
 pub mod declared;
+pub mod diagnostics;
 mod global_types;
 pub mod ids;
 pub mod links;
@@ -31,6 +32,10 @@ pub use declared::{
     DeclaredTypeError, DeclaredTypeHost, DeclaredTypeHostError, DeclaredTypeUnavailable,
     UnsupportedDeclaredTypeKind, UnsupportedOuterTypeParameterContext,
 };
+pub use diagnostics::{
+    CanonicalCheckerDiagnostic, CanonicalCheckerDiagnosticId, CanonicalCheckerDiagnostics,
+    CanonicalCheckerRelatedInformation,
+};
 pub use global_types::{
     CanonicalGlobalTypeDiagnostic, CanonicalGlobalTypeInitializationError, CanonicalGlobalTypes,
 };
@@ -51,7 +56,10 @@ pub use links::{
     TypeResolutionTargetError, TypeSystemPropertyName, ValueSymbolLinks, VarianceLinks,
 };
 pub use mapper::{CanonicalTypeMapperStore, TypeMapper, TypeMapperKind};
-pub use merge::{SymbolMergeDiagnosticKind, SymbolMergeError, get_excluded_symbol_flags};
+pub use merge::{
+    CheckerDiagnosticMergeHost, FailClosedSymbolMergeHost, SymbolMergeDiagnostic,
+    SymbolMergeDiagnosticKind, SymbolMergeError, SymbolMergeHost, get_excluded_symbol_flags,
+};
 pub use name_resolution::{ProductionNameResolverHost, ProductionNameResolverHostError};
 pub use production::{
     CanonicalCheckerContext, CanonicalCheckerContextError, CanonicalCheckerOptions,
