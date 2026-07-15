@@ -91,6 +91,14 @@ impl NodeFlags {
     /// The parser synthesized this node while representing source grammar.
     pub const REPARSED: Self = Self(1 << 3);
 
+    /// A binder-owned container contains a `this` keyword or `this` type.
+    ///
+    /// The immutable Rust AST never stores this derived fact in `Node::flags`;
+    /// canonical binding retains it in `BoundFile`. Upstream reuses this bit on
+    /// identifiers for `IdentifierHasExtendedUnicodeEscape`, so consumers must
+    /// not infer the binder fact from a parser-owned identifier flag.
+    pub const CONTAINS_THIS: Self = Self(1 << 7);
+
     /// The node was parsed in JavaScript source context.
     pub const JAVASCRIPT_FILE: Self = Self(1 << 16);
 }
@@ -223,6 +231,7 @@ mod tests {
     #[test]
     fn reparsed_node_flag_matches_upstream_bit() {
         assert_eq!(NodeFlags::REPARSED, NodeFlags(1 << 3));
+        assert_eq!(NodeFlags::CONTAINS_THIS, NodeFlags(1 << 7));
         assert_eq!(ModifierFlags::EXPORT, ModifierFlags(1 << 5));
     }
 

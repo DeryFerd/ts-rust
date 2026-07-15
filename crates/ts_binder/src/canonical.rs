@@ -393,6 +393,7 @@ impl CanonicalSourceFileFacts {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct NodeBinding {
     visited: bool,
+    contains_this: bool,
     symbol: Option<SemanticSymbolId>,
     local_symbol: Option<SemanticSymbolId>,
     locals: Option<SymbolTableId>,
@@ -473,6 +474,17 @@ impl BoundFile {
     pub fn contains(&self, node: NodeRef) -> bool {
         self.node_binding(node)
             .is_some_and(|binding| binding.visited)
+    }
+
+    /// Pinned binder-owned `NodeFlagsContainsThis` for this node.
+    ///
+    /// The parsed AST remains immutable, so this side fact is authoritative.
+    /// `Some(false)` is a bound negative; `None` means the node provenance is
+    /// invalid or the node was not reached by canonical traversal.
+    #[must_use]
+    pub fn contains_this(&self, node: NodeRef) -> Option<bool> {
+        let binding = self.node_binding(node)?;
+        binding.visited.then_some(binding.contains_this)
     }
 
     /// Canonical declaration symbol written by declaration binding. A focused
@@ -4203,6 +4215,20 @@ struct TraversalState {
     this_container: Option<NodeId>,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum SeenThisBoundary {
+    PassThrough,
+    ControlFlow { saved: bool, propagates: bool },
+    Interface { saved: bool },
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TraversalFrame {
+    node: NodeId,
+    state: TraversalState,
+    seen_this_boundary: SeenThisBoundary,
+}
+
 struct FileTraversal<'a> {
     arena: &'a NodeArena,
     source_file: NodeId,
@@ -4213,7 +4239,8 @@ struct FileTraversal<'a> {
     container_chain: Vec<NodeId>,
     last_container: Option<NodeId>,
     state: TraversalState,
-    state_stack: Vec<(NodeId, TraversalState)>,
+    seen_this_keyword: bool,
+    state_stack: Vec<TraversalFrame>,
 }
 
 impl<'a> FileTraversal<'a> {
@@ -4233,6 +4260,7 @@ impl<'a> FileTraversal<'a> {
             container_chain: Vec::new(),
             last_container: None,
             state: TraversalState::default(),
+            seen_this_keyword: false,
             state_stack: Vec::new(),
         }
     }
@@ -4241,6 +4269,10 @@ impl<'a> FileTraversal<'a> {
         assert!(
             self.state_stack.is_empty(),
             "canonical traversal exits every entered node"
+        );
+        assert!(
+            !self.seen_this_keyword,
+            "source-file ContainsThis capture restores the outer accumulator"
         );
         BoundFile {
             file: self.file,
@@ -4278,8 +4310,17 @@ impl<'a> FileTraversal<'a> {
         };
         self.traversal_order.push(node_id);
 
+        let kind = self
+            .arena
+            .get(node_id)
+            .expect("reachable tree was preflighted")
+            .kind;
+        if matches!(kind, SyntaxKind::ThisKeyword | SyntaxKind::ThisType) {
+            self.seen_this_keyword = true;
+        }
+
         let flags = container_flags(self.arena, node_id);
-        self.state_stack.push((node_id, self.state));
+        let saved_state = self.state;
         if flags.contains(ContainerFlags::IS_CONTAINER) {
             self.state.container = Some(node_id);
             self.state.block_scope_container = Some(node_id);
@@ -4295,15 +4336,50 @@ impl<'a> FileTraversal<'a> {
         if flags.contains(ContainerFlags::IS_THIS_CONTAINER) {
             self.state.this_container = Some(node_id);
         }
+
+        let seen_this_boundary = if flags.contains(ContainerFlags::IS_CONTROL_FLOW_CONTAINER) {
+            let saved = self.seen_this_keyword;
+            self.seen_this_keyword = false;
+            SeenThisBoundary::ControlFlow {
+                saved,
+                propagates: flags.contains(ContainerFlags::PROPAGATES_THIS_KEYWORD),
+            }
+        } else if flags.contains(ContainerFlags::IS_INTERFACE) {
+            let saved = self.seen_this_keyword;
+            self.seen_this_keyword = false;
+            SeenThisBoundary::Interface { saved }
+        } else {
+            SeenThisBoundary::PassThrough
+        };
+        self.state_stack.push(TraversalFrame {
+            node: node_id,
+            state: saved_state,
+            seen_this_boundary,
+        });
     }
 
     fn exit(&mut self, node_id: NodeId) {
-        let (entered, saved) = self
+        let frame = self
             .state_stack
             .pop()
             .expect("every canonical exit has a matching enter");
-        assert_eq!(entered, node_id, "canonical traversal exits in stack order");
-        self.state = saved;
+        assert_eq!(
+            frame.node, node_id,
+            "canonical traversal exits in stack order"
+        );
+        match frame.seen_this_boundary {
+            SeenThisBoundary::PassThrough => {}
+            SeenThisBoundary::ControlFlow { saved, propagates } => {
+                let captured = self.seen_this_keyword;
+                self.nodes[node_id.index()].contains_this = captured;
+                self.seen_this_keyword = if propagates { saved || captured } else { saved };
+            }
+            SeenThisBoundary::Interface { saved } => {
+                self.nodes[node_id.index()].contains_this = self.seen_this_keyword;
+                self.seen_this_keyword = saved;
+            }
+        }
+        self.state = frame.state;
     }
 
     fn add_to_container_chain(&mut self, node: NodeId) {
@@ -4498,7 +4574,7 @@ fn is_function_like_kind(kind: SyntaxKind) -> bool {
 mod tests {
     use std::{collections::BTreeSet, panic::AssertUnwindSafe};
 
-    use ts_ast::{FileId, NodeData, NodeId, NodeRef, SyntaxKind};
+    use ts_ast::{FileId, NodeData, NodeFlags, NodeId, NodeRef, SyntaxKind};
     use ts_parser::{parse_jsx_source_file, parse_source_file};
 
     use super::{
@@ -4548,6 +4624,22 @@ mod tests {
             .unwrap_or_else(|| panic!("missing {kind:?} with source {source:?}"))
     }
 
+    fn node_with_source_fragment(
+        arena: &ts_ast::NodeArena,
+        kind: SyntaxKind,
+        fragment: &str,
+    ) -> NodeId {
+        arena
+            .iter()
+            .find_map(|(id, node)| {
+                (node.kind == kind
+                    && super::source_text_of_node(arena, node)
+                        .is_some_and(|source| source.contains(fragment)))
+                .then_some(id)
+            })
+            .unwrap_or_else(|| panic!("missing {kind:?} containing {fragment:?}"))
+    }
+
     fn variable_initializers_named(arena: &ts_ast::NodeArena, expected: &str) -> Vec<NodeId> {
         arena
             .iter()
@@ -4560,6 +4652,325 @@ mod tests {
                     .flatten()
             })
             .collect()
+    }
+
+    fn assert_contains_this(
+        bound: &super::BoundFile,
+        arena: &ts_ast::NodeArena,
+        file: FileId,
+        node: NodeId,
+        expected: bool,
+    ) {
+        assert_eq!(
+            bound.contains_this(node_ref(arena, file, node)),
+            Some(expected)
+        );
+    }
+
+    fn assert_contains_this_type_capture_matrix(
+        bound: &super::BoundFile,
+        arena: &ts_ast::NodeArena,
+        file: FileId,
+    ) {
+        for (fragment, expected) in [
+            ("interface Empty", false),
+            ("interface Direct", true),
+            ("interface Signatures", true),
+            ("interface Nested", true),
+        ] {
+            let node = node_with_source_fragment(arena, SyntaxKind::InterfaceDeclaration, fragment);
+            assert_contains_this(bound, arena, file, node, expected);
+        }
+
+        for kind in [
+            SyntaxKind::CallSignature,
+            SyntaxKind::ConstructSignature,
+            SyntaxKind::MethodSignature,
+            SyntaxKind::FunctionType,
+            SyntaxKind::ConstructorType,
+        ] {
+            let nodes = nodes_of_kind(arena, kind);
+            assert_eq!(nodes.len(), 1, "fixture has one {kind:?}");
+            assert_contains_this(bound, arena, file, nodes[0], true);
+        }
+
+        let index_signature = nodes_of_kind(arena, SyntaxKind::IndexSignature);
+        assert_eq!(index_signature.len(), 1);
+        assert_contains_this(bound, arena, file, index_signature[0], false);
+        assert!(
+            nodes_of_kind(arena, SyntaxKind::ThisType)
+                .into_iter()
+                .all(|node| bound.contains_this(node_ref(arena, file, node)) == Some(false)),
+            "this type nodes update the accumulator but are not capture boundaries"
+        );
+    }
+
+    fn assert_contains_this_value_capture_matrix(
+        bound: &super::BoundFile,
+        arena: &ts_ast::NodeArena,
+        source_file: NodeId,
+        file: FileId,
+    ) {
+        let arrow = nodes_of_kind(arena, SyntaxKind::ArrowFunction);
+        assert_eq!(arrow.len(), 1);
+        assert_contains_this(bound, arena, file, arrow[0], true);
+        let arrow_outer = node_with_source_fragment(
+            arena,
+            SyntaxKind::FunctionDeclaration,
+            "function arrowOuter",
+        );
+        assert_contains_this(bound, arena, file, arrow_outer, true);
+
+        let function_expression = nodes_of_kind(arena, SyntaxKind::FunctionExpression);
+        assert_eq!(function_expression.len(), 1);
+        assert_contains_this(bound, arena, file, function_expression[0], true);
+        for fragment in ["function ordinaryOuter", "function interfaceOuter"] {
+            let node = node_with_source_fragment(arena, SyntaxKind::FunctionDeclaration, fragment);
+            assert_contains_this(bound, arena, file, node, false);
+        }
+
+        let base_method = node_with_source(arena, SyntaxKind::MethodDeclaration, "method() {}");
+        assert_contains_this(bound, arena, file, base_method, false);
+        for (fragment, expected) in [("onlySuper()", false), ("hasThis()", true)] {
+            let node = node_with_source_fragment(arena, SyntaxKind::MethodDeclaration, fragment);
+            assert_contains_this(bound, arena, file, node, expected);
+        }
+        assert_contains_this(bound, arena, file, source_file, false);
+
+        assert!(
+            nodes_of_kind(arena, SyntaxKind::ThisKeyword)
+                .into_iter()
+                .all(|node| bound.contains_this(node_ref(arena, file, node)) == Some(false)),
+            "this keyword nodes update the accumulator but are not capture boundaries"
+        );
+        let super_keyword = nodes_of_kind(arena, SyntaxKind::SuperKeyword);
+        assert_eq!(super_keyword.len(), 1);
+        assert_contains_this(bound, arena, file, super_keyword[0], false);
+    }
+
+    #[test]
+    fn contains_this_matches_pinned_capture_and_propagation_matrix() {
+        let parsed = parse_source_file(
+            r"
+                interface Empty {}
+                interface Direct { value: this }
+                interface Signatures {
+                    (): this;
+                    new (): this;
+                    method(): this;
+                    fn: () => this;
+                    ctor: new () => this;
+                    [key: string]: this;
+                }
+
+                function arrowOuter() {
+                    const arrow = () => this;
+                }
+                function ordinaryOuter() {
+                    const ordinary = function () { return this; };
+                }
+                function interfaceOuter() {
+                    interface Nested { value: this }
+                }
+
+                class Base { method() {} }
+                class Derived extends Base {
+                    onlySuper() { return super.method(); }
+                    hasThis() { return this; }
+                }
+            ",
+        );
+        let file = FileId::new(80);
+        let mut binder = CanonicalBinder::new();
+        let bound = binder
+            .bind_source_file(&parsed.arena, parsed.source_file, file)
+            .unwrap();
+        assert_contains_this_type_capture_matrix(bound, &parsed.arena, file);
+        assert_contains_this_value_capture_matrix(bound, &parsed.arena, parsed.source_file, file);
+    }
+
+    #[test]
+    fn contains_this_captures_remaining_non_propagating_control_flow_boundaries() {
+        let parsed = parse_source_file(
+            r"
+                namespace Nested { this; }
+                class Container {
+                    field = this;
+                    constructor() { this; }
+                    get value() { return this; }
+                    set value(next: unknown) { this; }
+                    static { this; }
+                }
+            ",
+        );
+        let file = FileId::new(86);
+        let mut binder = CanonicalBinder::new();
+        let bound = binder
+            .bind_source_file(&parsed.arena, parsed.source_file, file)
+            .unwrap();
+
+        for kind in [
+            SyntaxKind::ModuleBlock,
+            SyntaxKind::PropertyDeclaration,
+            SyntaxKind::Constructor,
+            SyntaxKind::GetAccessor,
+            SyntaxKind::SetAccessor,
+            SyntaxKind::ClassStaticBlockDeclaration,
+        ] {
+            let nodes = nodes_of_kind(&parsed.arena, kind);
+            assert_eq!(nodes.len(), 1, "fixture has one {kind:?}");
+            assert_contains_this(bound, &parsed.arena, file, nodes[0], true);
+        }
+        assert_contains_this(bound, &parsed.arena, file, parsed.source_file, false);
+
+        let top_level = parse_source_file("this;");
+        let top_level_file = FileId::new(87);
+        let mut top_level_binder = CanonicalBinder::new();
+        let top_level_bound = top_level_binder
+            .bind_source_file(&top_level.arena, top_level.source_file, top_level_file)
+            .unwrap();
+        assert_contains_this(
+            top_level_bound,
+            &top_level.arena,
+            top_level_file,
+            top_level.source_file,
+            true,
+        );
+    }
+
+    #[test]
+    fn contains_this_side_data_ignores_stale_ast_bits() {
+        let mut parsed = parse_source_file("interface Empty {}");
+        let interface = nodes_of_kind(&parsed.arena, SyntaxKind::InterfaceDeclaration)[0];
+        parsed.arena.get_mut(interface).unwrap().flags.0 |= NodeFlags::CONTAINS_THIS.0;
+        let file = FileId::new(81);
+        let mut binder = CanonicalBinder::new();
+        let bound = binder
+            .bind_source_file(&parsed.arena, parsed.source_file, file)
+            .unwrap();
+
+        assert_ne!(
+            parsed.arena.get(interface).unwrap().flags.0 & NodeFlags::CONTAINS_THIS.0,
+            0
+        );
+        assert_eq!(
+            bound.contains_this(node_ref(&parsed.arena, file, interface)),
+            Some(false),
+            "canonical binding owns the fact instead of trusting parser flags"
+        );
+    }
+
+    #[test]
+    fn contains_this_queries_are_provenance_safe_and_stable_through_extraction() {
+        let parsed = parse_source_file("interface Box { value: this }");
+        let other = parse_source_file("");
+        let file = FileId::new(82);
+        let interface = nodes_of_kind(&parsed.arena, SyntaxKind::InterfaceDeclaration)[0];
+        let name = node_with_source(&parsed.arena, SyntaxKind::Identifier, "Box");
+        let interface_ref = node_ref(&parsed.arena, file, interface);
+        let facts = CanonicalSourceFileFacts::new(
+            EscapedName::source("\"/project/box.ts\""),
+            CanonicalSourceLanguage::TypeScript,
+            false,
+            CanonicalModuleState::Script,
+        );
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(&parsed.arena, parsed.source_file, file, facts)
+            .unwrap();
+
+        let bound = binder.file(file).unwrap();
+        assert_eq!(bound.phase(), BindingPhase::Traversal);
+        assert_eq!(bound.contains_this(interface_ref), Some(true));
+        assert_eq!(
+            bound.contains_this(node_ref(&parsed.arena, file, name)),
+            Some(false)
+        );
+        assert_eq!(
+            bound.contains_this(NodeRef::new(parsed.arena.id(), FileId::new(83), interface)),
+            None
+        );
+        assert_eq!(
+            bound.contains_this(NodeRef::new(other.arena.id(), file, interface)),
+            None
+        );
+        assert_eq!(
+            bound.contains_this(NodeRef::new(
+                parsed.arena.id(),
+                file,
+                NodeId::new(u32::try_from(parsed.arena.len()).unwrap()),
+            )),
+            None
+        );
+
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        let bound = binder.file(file).unwrap();
+        assert_eq!(bound.phase(), BindingPhase::Declarations);
+        assert_eq!(bound.contains_this(interface_ref), Some(true));
+
+        let program = binder.finish();
+        assert_eq!(
+            program.file(file).unwrap().contains_this(interface_ref),
+            Some(true)
+        );
+        let (_, files) = program.try_into_parts().unwrap();
+        assert_eq!(
+            files.get(&file).unwrap().contains_this(interface_ref),
+            Some(true)
+        );
+
+        let mut detached = parse_source_file("interface Detached { value: this }");
+        let detached_interface =
+            nodes_of_kind(&detached.arena, SyntaxKind::InterfaceDeclaration)[0];
+        match &mut detached.arena.get_mut(detached.source_file).unwrap().data {
+            NodeData::SourceFile(source) => source.statements.nodes.clear(),
+            _ => unreachable!(),
+        }
+        let detached_file = FileId::new(84);
+        let mut detached_binder = CanonicalBinder::new();
+        let detached_bound = detached_binder
+            .bind_source_file(&detached.arena, detached.source_file, detached_file)
+            .unwrap();
+        assert_eq!(
+            detached_bound.contains_this(node_ref(
+                &detached.arena,
+                detached_file,
+                detached_interface,
+            )),
+            None,
+            "valid same-arena slots remain None when traversal never reached them"
+        );
+    }
+
+    #[test]
+    fn contains_this_preflight_failure_is_atomic_and_retryable() {
+        let mut parsed = parse_source_file("interface Box { value: this }");
+        let source = parsed.source_file;
+        let interface = nodes_of_kind(&parsed.arena, SyntaxKind::InterfaceDeclaration)[0];
+        parsed.arena.get_mut(interface).unwrap().parent = None;
+        let file = FileId::new(85);
+        let interface_ref = node_ref(&parsed.arena, file, interface);
+        let mut binder = CanonicalBinder::new();
+
+        assert_eq!(
+            binder.bind_source_file(&parsed.arena, source, file),
+            Err(CanonicalBindError::InvalidParent {
+                node: interface_ref,
+                expected: Some(source),
+                actual: None,
+            })
+        );
+        assert!(binder.file(file).is_none());
+        assert_eq!(binder.symbol_store().symbol_len(), 0);
+        assert_eq!(binder.symbol_store().symbol_table_len(), 0);
+
+        parsed.arena.get_mut(interface).unwrap().parent = Some(source);
+        let bound = binder
+            .bind_source_file(&parsed.arena, source, file)
+            .unwrap();
+        assert_eq!(bound.contains_this(interface_ref), Some(true));
     }
 
     #[test]
