@@ -384,6 +384,7 @@ impl<'store> RelaterSession<'store> {
         )
     }
 
+    #[cfg(test)]
     fn new_with_limits(
         store: &'store mut SemanticStore<TypeRecord, TypeMapper>,
         relation: RelationKind,
