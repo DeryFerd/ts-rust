@@ -33,8 +33,7 @@ pub use declared::{
     UnsupportedDeclaredTypeKind, UnsupportedOuterTypeParameterContext,
 };
 pub use diagnostics::{
-    CanonicalCheckerDiagnostic, CanonicalCheckerDiagnosticId, CanonicalCheckerDiagnostics,
-    CanonicalCheckerRelatedInformation,
+    CanonicalCheckerDiagnostic, CanonicalCheckerDiagnostics, CanonicalCheckerRelatedInformation,
 };
 pub use global_types::{
     CanonicalGlobalTypeDiagnostic, CanonicalGlobalTypeInitializationError, CanonicalGlobalTypes,

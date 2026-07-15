@@ -2,10 +2,9 @@
 //!
 //! TypeScript-Go diagnostics may have no source location (for example, a
 //! missing global type) and may accumulate related information after their
-//! primary occurrence has already been issued. This collection preserves
-//! exact insertion order while coalescing equal primary occurrences, so
-//! nonfatal semantic algorithms can report and continue without later sorting
-//! or replaying work.
+//! primary occurrence has already been issued. This collection preserves raw
+//! issuance order for checker algorithms. Final compiler aggregation owns the
+//! pinned `CompareDiagnostics` sorting policy.
 
 use ts_ast::NodeRef;
 use ts_diagnostics::Diagnostic;
@@ -25,70 +24,78 @@ pub struct CanonicalCheckerDiagnostic {
     pub related_information: Vec<CanonicalCheckerRelatedInformation>,
 }
 
-/// A collection-local handle returned when a primary diagnostic is issued.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct CanonicalCheckerDiagnosticId(usize);
+impl CanonicalCheckerDiagnostic {
+    /// Appends related information without applying duplicate or length policy.
+    ///
+    /// Callers such as duplicate-declaration reporting own those rules at the
+    /// exact checker branch where the related diagnostic is constructed.
+    pub fn append_related(&mut self, related: CanonicalCheckerRelatedInformation) {
+        self.related_information.push(related);
+    }
+}
 
 /// Deterministic owner for nonfatal checker diagnostics.
 ///
-/// Primary diagnostics retain first-insertion order. Issuing the same node,
-/// message, arguments, and details again returns the existing handle rather
-/// than appending another occurrence. Related information is likewise
-/// appended only once and retains the caller's order.
+/// [`Self::add`] is unconditional, matching the checker's ordinary diagnostic
+/// path. [`Self::lookup_or_issue`] matches the complete current diagnostic,
+/// including related information, and is reserved for checker paths that
+/// explicitly request lookup semantics. The collection retains raw issuance
+/// order; it is not the compiler's final sorted diagnostic view.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct CanonicalCheckerDiagnostics {
     diagnostics: Vec<CanonicalCheckerDiagnostic>,
 }
 
 impl CanonicalCheckerDiagnostics {
-    /// Issues a primary diagnostic or returns its existing collection handle.
-    pub fn issue(
+    /// Unconditionally appends one primary diagnostic.
+    pub fn add(
         &mut self,
         node: Option<NodeRef>,
         diagnostic: Diagnostic,
-    ) -> CanonicalCheckerDiagnosticId {
-        if let Some(index) = self
-            .diagnostics
-            .iter()
-            .position(|current| current.node == node && current.diagnostic == diagnostic)
-        {
-            return CanonicalCheckerDiagnosticId(index);
-        }
-        let id = CanonicalCheckerDiagnosticId(self.diagnostics.len());
-        self.diagnostics.push(CanonicalCheckerDiagnostic {
+    ) -> &mut CanonicalCheckerDiagnostic {
+        self.append_entry(CanonicalCheckerDiagnostic {
             node,
             diagnostic,
             related_information: Vec::new(),
-        });
-        id
+        })
     }
 
-    /// Appends unique related information to an issued diagnostic.
+    /// Returns an equal current diagnostic or unconditionally issues one.
     ///
-    /// Returns false for an out-of-range handle or an equal existing related
-    /// occurrence. Either case leaves the collection unchanged.
-    pub fn add_related_information(
+    /// Equality includes the complete related-information vector. In
+    /// particular, a pristine candidate does not match an earlier occurrence
+    /// after related information has been attached to that occurrence.
+    pub fn lookup_or_issue(
         &mut self,
-        id: CanonicalCheckerDiagnosticId,
-        related: CanonicalCheckerRelatedInformation,
-    ) -> bool {
-        let Some(diagnostic) = self.diagnostics.get_mut(id.0) else {
-            return false;
+        node: Option<NodeRef>,
+        diagnostic: Diagnostic,
+    ) -> &mut CanonicalCheckerDiagnostic {
+        let candidate = CanonicalCheckerDiagnostic {
+            node,
+            diagnostic,
+            related_information: Vec::new(),
         };
-        if diagnostic.related_information.contains(&related) {
-            return false;
+        if let Some(index) = self
+            .diagnostics
+            .iter()
+            .position(|current| current == &candidate)
+        {
+            return &mut self.diagnostics[index];
         }
-        diagnostic.related_information.push(related);
-        true
+        self.append_entry(candidate)
     }
 
-    /// Returns an issued diagnostic by its collection-local handle.
-    #[must_use]
-    pub fn get(&self, id: CanonicalCheckerDiagnosticId) -> Option<&CanonicalCheckerDiagnostic> {
-        self.diagnostics.get(id.0)
+    fn append_entry(
+        &mut self,
+        diagnostic: CanonicalCheckerDiagnostic,
+    ) -> &mut CanonicalCheckerDiagnostic {
+        self.diagnostics.push(diagnostic);
+        self.diagnostics
+            .last_mut()
+            .expect("a diagnostic was just appended")
     }
 
-    /// Primary diagnostics in exact first-insertion order.
+    /// Diagnostics in raw issuance order before compiler aggregation sorting.
     #[must_use]
     pub fn as_slice(&self) -> &[CanonicalCheckerDiagnostic] {
         &self.diagnostics
@@ -119,18 +126,19 @@ mod tests {
     use super::{CanonicalCheckerDiagnostics, CanonicalCheckerRelatedInformation};
 
     #[test]
-    fn optional_locations_deduplicate_without_reordering() {
+    fn unconditional_add_preserves_raw_issuance_order() {
         let mut diagnostics = CanonicalCheckerDiagnostics::default();
         let missing = Diagnostic::with_arguments(message_by_code(2318).unwrap(), ["Array"]);
         let duplicate = Diagnostic::with_arguments(message_by_code(2300).unwrap(), ["Item"]);
 
-        let first = diagnostics.issue(None, missing.clone());
-        assert_eq!(diagnostics.issue(None, missing), first);
-        diagnostics.issue(None, duplicate);
+        diagnostics.add(None, missing.clone());
+        diagnostics.add(None, missing);
+        diagnostics.add(None, duplicate);
 
-        assert_eq!(diagnostics.len(), 2);
+        assert_eq!(diagnostics.len(), 3);
         assert_eq!(diagnostics.as_slice()[0].diagnostic.code(), 2318);
-        assert_eq!(diagnostics.as_slice()[1].diagnostic.code(), 2300);
+        assert_eq!(diagnostics.as_slice()[1].diagnostic.code(), 2318);
+        assert_eq!(diagnostics.as_slice()[2].diagnostic.code(), 2300);
         assert!(
             diagnostics
                 .as_slice()
@@ -140,7 +148,7 @@ mod tests {
     }
 
     #[test]
-    fn related_information_is_unique_and_stably_appended() {
+    fn lookup_equality_includes_current_related_information() {
         let parsed = parse_source_file("let first = 1; let second = 2;");
         let file = FileId::new(1);
         let mut identifiers = parsed.arena.iter().filter_map(|(node, record)| {
@@ -153,10 +161,7 @@ mod tests {
         let first_node = identifiers.next().unwrap();
         let second_node = identifiers.next().unwrap();
         let mut diagnostics = CanonicalCheckerDiagnostics::default();
-        let id = diagnostics.issue(
-            Some(first_node),
-            Diagnostic::with_arguments(message_by_code(2451).unwrap(), ["value"]),
-        );
+        let primary = Diagnostic::with_arguments(message_by_code(2451).unwrap(), ["value"]);
         let first_related = CanonicalCheckerRelatedInformation {
             node: Some(second_node),
             diagnostic: Diagnostic::with_arguments(message_by_code(6203).unwrap(), ["value"]),
@@ -166,13 +171,42 @@ mod tests {
             diagnostic: Diagnostic::new(message_by_code(6204).unwrap()),
         };
 
-        assert!(diagnostics.add_related_information(id, first_related.clone()));
-        assert!(!diagnostics.add_related_information(id, first_related.clone()));
-        assert!(diagnostics.add_related_information(id, second_related.clone()));
+        diagnostics
+            .lookup_or_issue(Some(first_node), primary.clone())
+            .append_related(first_related.clone());
+        diagnostics
+            .lookup_or_issue(Some(first_node), primary.clone())
+            .append_related(second_related.clone());
+        diagnostics.lookup_or_issue(Some(first_node), primary.clone());
+        diagnostics.lookup_or_issue(Some(first_node), primary);
 
+        assert_eq!(diagnostics.len(), 3);
         assert_eq!(
-            diagnostics.get(id).unwrap().related_information,
-            [first_related, second_related]
+            diagnostics.as_slice()[0].related_information,
+            [first_related]
         );
+        assert_eq!(
+            diagnostics.as_slice()[1].related_information,
+            [second_related]
+        );
+        assert!(diagnostics.as_slice()[2].related_information.is_empty());
+    }
+
+    #[test]
+    fn related_append_is_unconditional() {
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let related = CanonicalCheckerRelatedInformation {
+            node: None,
+            diagnostic: Diagnostic::new(message_by_code(6204).unwrap()),
+        };
+        let diagnostic = diagnostics.add(
+            None,
+            Diagnostic::with_arguments(message_by_code(2300).unwrap(), ["item"]),
+        );
+
+        diagnostic.append_related(related.clone());
+        diagnostic.append_related(related.clone());
+
+        assert_eq!(diagnostic.related_information, [related.clone(), related]);
     }
 }

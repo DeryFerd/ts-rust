@@ -76,6 +76,11 @@ pub trait SymbolMergeHost<TypePayload, MapperPayload> {
 
 /// Host used by the compatibility entry points until their caller owns
 /// diagnostics and alias resolution.
+///
+/// A fail-closed error is terminal for that merge attempt. Recursive merging
+/// can mutate an outer target before reaching a missing nested capability, and
+/// the merge kernel does not roll those writes back. Callers must not catch the
+/// error and retry the same operation after installing another host.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct FailClosedSymbolMergeHost;
 
@@ -87,9 +92,10 @@ impl<TypePayload, MapperPayload> SymbolMergeHost<TypePayload, MapperPayload>
 /// Dependency-closed merge host that owns TypeScript diagnostic continuations
 /// while leaving alias resolution fail-closed.
 ///
-/// It uses retained declaration identities as locations. Plain-JavaScript
-/// suppression and declaration-name adjustment require the later Program/AST
-/// diagnostic host and can implement [`SymbolMergeHost`] directly.
+/// It uses retained raw declaration identities as locations and binder escaped
+/// names as spelling. Plain-JavaScript suppression, declaration-name location
+/// adjustment, and checker `symbolToString` spelling require the later
+/// Program/AST diagnostic host and can implement [`SymbolMergeHost`] directly.
 pub struct CheckerDiagnosticMergeHost<'diagnostics> {
     diagnostics: &'diagnostics mut CanonicalCheckerDiagnostics,
 }
@@ -155,37 +161,36 @@ impl<'diagnostics> CheckerDiagnosticMergeHost<'diagnostics> {
             } else {
                 Diagnostic::with_arguments(message, [symbol_name])
             };
-            let id = self.diagnostics.issue(Some(node), diagnostic);
+            let diagnostic = self.diagnostics.lookup_or_issue(Some(node), diagnostic);
             for &related_node in related_declarations {
-                let Some(current) = self.diagnostics.get(id) else {
-                    continue;
+                let leading = CanonicalCheckerRelatedInformation {
+                    node: Some(related_node),
+                    diagnostic: Diagnostic::with_arguments(
+                        message_by_code(6203)
+                            .expect("pinned leading related diagnostic is in the catalog"),
+                        [symbol_name],
+                    ),
+                };
+                let follow_on = CanonicalCheckerRelatedInformation {
+                    node: Some(related_node),
+                    diagnostic: Diagnostic::new(
+                        message_by_code(6204)
+                            .expect("pinned follow-on related diagnostic is in the catalog"),
+                    ),
                 };
                 if related_node == node
-                    || current.related_information.len() >= 5
-                    || current.related_information.iter().any(|related| {
-                        related.node == Some(related_node)
-                            && matches!(related.diagnostic.code(), 6203 | 6204)
-                    })
+                    || diagnostic.related_information.len() >= 5
+                    || diagnostic.related_information.contains(&leading)
+                    || diagnostic.related_information.contains(&follow_on)
                 {
                     continue;
                 }
-                let first = current.related_information.is_empty();
-                let related = CanonicalCheckerRelatedInformation {
-                    node: Some(related_node),
-                    diagnostic: if first {
-                        Diagnostic::with_arguments(
-                            message_by_code(6203)
-                                .expect("pinned leading related diagnostic is in the catalog"),
-                            [symbol_name],
-                        )
-                    } else {
-                        Diagnostic::new(
-                            message_by_code(6204)
-                                .expect("pinned follow-on related diagnostic is in the catalog"),
-                        )
-                    },
+                let related = if diagnostic.related_information.is_empty() {
+                    leading
+                } else {
+                    follow_on
                 };
-                self.diagnostics.add_related_information(id, related);
+                diagnostic.append_related(related);
             }
         }
     }
@@ -206,7 +211,7 @@ impl<'diagnostics> CheckerDiagnosticMergeHost<'diagnostics> {
             .declarations()
             .and_then(|declarations| declarations.first())
             .copied();
-        self.diagnostics.issue(
+        self.diagnostics.add(
             node,
             Diagnostic::with_arguments(
                 message_by_code(2649).expect("pinned augmentation diagnostic is in the catalog"),
@@ -244,6 +249,10 @@ fn display_symbol_name(symbol: &ts_binder::semantic::Symbol) -> String {
 }
 
 /// A symbol graph that cannot be merged exactly by the installed substrate.
+///
+/// Errors terminate the current recursive session but do not imply rollback.
+/// A nested error may be observed after earlier target mutations, so retrying
+/// the same merge is not a supported recovery strategy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SymbolMergeError {
     InvalidSymbol(SemanticSymbolId),

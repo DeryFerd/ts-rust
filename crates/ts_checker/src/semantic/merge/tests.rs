@@ -472,7 +472,7 @@ fn unsupported_alias_and_diagnostic_branches_fail_typed() {
 }
 
 #[test]
-fn hosted_duplicate_diagnostics_continue_and_deduplicate_in_declaration_order() {
+fn hosted_duplicate_diagnostics_reissue_after_related_information_changes_equality() {
     let mut store = Store::new();
     let nodes = registered_nodes(&mut store, 1, "let item = 1; let item = 2;");
     let declarations = nodes
@@ -506,19 +506,103 @@ fn hosted_duplicate_diagnostics_continue_and_deduplicate_in_declaration_order() 
         );
     }
 
-    assert_eq!(diagnostics.len(), 2);
-    assert_eq!(diagnostics.as_slice()[0].node, Some(declarations[1]));
-    assert_eq!(diagnostics.as_slice()[1].node, Some(declarations[0]));
-    for (index, related_node) in [declarations[0], declarations[1]].into_iter().enumerate() {
-        let diagnostic = &diagnostics.as_slice()[index];
-        assert_eq!(diagnostic.diagnostic.code(), 2451);
-        assert_eq!(diagnostic.diagnostic.arguments, ["item"]);
-        assert_eq!(diagnostic.related_information.len(), 1);
-        assert_eq!(diagnostic.related_information[0].node, Some(related_node));
-        assert_eq!(diagnostic.related_information[0].diagnostic.code(), 6203);
+    assert_eq!(diagnostics.len(), 4);
+    for round in 0..2 {
+        for (offset, (node, related_node)) in [
+            (declarations[1], declarations[0]),
+            (declarations[0], declarations[1]),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let diagnostic = &diagnostics.as_slice()[round * 2 + offset];
+            assert_eq!(diagnostic.node, Some(node));
+            assert_eq!(diagnostic.diagnostic.code(), 2451);
+            assert_eq!(diagnostic.diagnostic.arguments, ["item"]);
+            assert_eq!(diagnostic.related_information.len(), 1);
+            assert_eq!(diagnostic.related_information[0].node, Some(related_node));
+            assert_eq!(diagnostic.related_information[0].diagnostic.code(), 6203);
+        }
     }
+    assert_eq!(diagnostics.as_slice()[0], diagnostics.as_slice()[2]);
+    assert_eq!(diagnostics.as_slice()[1], diagnostics.as_slice()[3]);
     assert_eq!(store.get_merged_symbol(target), Some(target));
     assert_eq!(store.get_merged_symbol(source), Some(source));
+}
+
+#[test]
+fn three_way_duplicate_uses_distinct_leading_and_follow_on_related_diagnostics() {
+    let mut store = Store::new();
+    let nodes = registered_nodes(&mut store, 1, "let item = 1; let item = 2; let item = 3;");
+    let declarations = nodes
+        .iter()
+        .filter_map(|(kind, node)| (*kind == SyntaxKind::VariableDeclaration).then_some(*node))
+        .collect::<Vec<_>>();
+    assert_eq!(declarations.len(), 3);
+    let mut target_data = SymbolData::new(
+        SymbolFlags::BLOCK_SCOPED_VARIABLE,
+        EscapedName::source("item"),
+    );
+    target_data.declarations = Some(vec![declarations[0]]);
+    let target = store.alloc_symbol(target_data).unwrap();
+    let mut source_data = SymbolData::new(
+        SymbolFlags::BLOCK_SCOPED_VARIABLE,
+        EscapedName::source("item"),
+    );
+    source_data.declarations = Some(vec![declarations[1], declarations[2]]);
+    let source = store.alloc_symbol(source_data).unwrap();
+    let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+    {
+        let mut host = CheckerDiagnosticMergeHost::new(&mut diagnostics);
+        assert_eq!(
+            store.merge_symbol_with_host(&mut host, target, source, false),
+            Ok(target)
+        );
+    }
+
+    assert_eq!(diagnostics.len(), 3);
+    for (index, node) in [declarations[1], declarations[2]].into_iter().enumerate() {
+        let diagnostic = &diagnostics.as_slice()[index];
+        assert_eq!(diagnostic.node, Some(node));
+        assert_eq!(diagnostic.related_information.len(), 1);
+        assert_eq!(
+            diagnostic.related_information[0].node,
+            Some(declarations[0])
+        );
+        assert_eq!(diagnostic.related_information[0].diagnostic.code(), 6203);
+    }
+    let target_diagnostic = &diagnostics.as_slice()[2];
+    assert_eq!(target_diagnostic.node, Some(declarations[0]));
+    assert_eq!(target_diagnostic.related_information.len(), 2);
+    assert_eq!(
+        target_diagnostic.related_information[0].node,
+        Some(declarations[1])
+    );
+    assert_eq!(
+        target_diagnostic.related_information[0].diagnostic.code(),
+        6203
+    );
+    assert_eq!(
+        target_diagnostic.related_information[0]
+            .diagnostic
+            .arguments,
+        ["item"]
+    );
+    assert_eq!(
+        target_diagnostic.related_information[1].node,
+        Some(declarations[2])
+    );
+    assert_eq!(
+        target_diagnostic.related_information[1].diagnostic.code(),
+        6204
+    );
+    assert!(
+        target_diagnostic.related_information[1]
+            .diagnostic
+            .arguments
+            .is_empty()
+    );
 }
 
 #[test]
@@ -650,7 +734,94 @@ fn hosted_alias_resolution_reports_then_takes_the_source_continuation() {
 }
 
 #[test]
-fn hosted_namespace_collision_reports_and_keeps_the_target() {
+fn hosted_alias_resolution_takes_the_unknown_sentinel_source_continuation() {
+    let mut store = Store::new();
+    store
+        .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions::default())
+        .unwrap();
+    let unknown = store.intrinsic_bootstrap().unwrap().unknown_symbol;
+    let alias = alloc(&mut store, SymbolFlags::ALIAS, "item");
+    let source = alloc(&mut store, SymbolFlags::FUNCTION, "item");
+    let mut host = ResolvingMergeHost {
+        resolved: unknown,
+        alias_requests: Vec::new(),
+        diagnostics: Vec::new(),
+    };
+
+    assert_eq!(
+        store.merge_symbol_with_host(&mut host, alias, source, false),
+        Ok(source)
+    );
+    assert_eq!(host.alias_requests, [alias]);
+    assert!(host.diagnostics.is_empty());
+    assert_eq!(store.get_merged_symbol(alias), Some(alias));
+    assert_eq!(store.get_merged_symbol(source), Some(source));
+}
+
+#[test]
+fn hosted_compatible_resolved_alias_clones_and_merges_the_resolved_target() {
+    let mut store = Store::new();
+    let alias = alloc(&mut store, SymbolFlags::ALIAS, "item");
+    let resolved = alloc(&mut store, SymbolFlags::INTERFACE, "item");
+    let source = alloc(&mut store, SymbolFlags::INTERFACE, "item");
+    let mut host = ResolvingMergeHost {
+        resolved,
+        alias_requests: Vec::new(),
+        diagnostics: Vec::new(),
+    };
+
+    let merged = store
+        .merge_symbol_with_host(&mut host, alias, source, false)
+        .unwrap();
+
+    assert_ne!(merged, alias);
+    assert_ne!(merged, resolved);
+    assert_ne!(merged, source);
+    assert!(
+        store
+            .symbol(merged)
+            .unwrap()
+            .flags()
+            .contains(SymbolFlags::TRANSIENT | SymbolFlags::INTERFACE)
+    );
+    assert_eq!(host.alias_requests, [alias]);
+    assert!(host.diagnostics.is_empty());
+    assert_eq!(store.get_merged_symbol(alias), Some(alias));
+    assert_eq!(store.get_merged_symbol(resolved), Some(merged));
+    assert_eq!(store.get_merged_symbol(source), Some(merged));
+}
+
+#[test]
+fn alias_assignment_with_value_meanings_still_uses_host_resolution() {
+    let mut store = Store::new();
+    // VALUE_MODULE defeats the pure-alias predicate, so this reaches the
+    // separate ALIAS | ASSIGNMENT resolver branch from pinned checker.go.
+    let alias = alloc(
+        &mut store,
+        SymbolFlags::ALIAS | SymbolFlags::ASSIGNMENT | SymbolFlags::VALUE_MODULE,
+        "item",
+    );
+    let resolved = alloc(&mut store, SymbolFlags::FUNCTION, "item");
+    let source = alloc(&mut store, SymbolFlags::FUNCTION, "item");
+    let mut host = ResolvingMergeHost {
+        resolved,
+        alias_requests: Vec::new(),
+        diagnostics: Vec::new(),
+    };
+
+    let merged = store
+        .merge_symbol_with_host(&mut host, alias, source, false)
+        .unwrap();
+
+    assert_eq!(host.alias_requests, [alias]);
+    assert!(host.diagnostics.is_empty());
+    assert_eq!(store.get_merged_symbol(alias), Some(alias));
+    assert_eq!(store.get_merged_symbol(resolved), Some(merged));
+    assert_eq!(store.get_merged_symbol(source), Some(merged));
+}
+
+#[test]
+fn hosted_namespace_collision_unconditionally_reports_and_keeps_the_target() {
     let mut store = Store::new();
     let nodes = registered_nodes(&mut store, 1, "function module() {}");
     let declaration = first(&nodes, SyntaxKind::FunctionDeclaration);
@@ -670,12 +841,19 @@ fn hosted_namespace_collision_reports_and_keeps_the_target() {
             store.merge_symbol_with_host(&mut host, target, source, false),
             Ok(target)
         );
+        assert_eq!(
+            store.merge_symbol_with_host(&mut host, target, source, false),
+            Ok(target)
+        );
     }
 
-    assert_eq!(diagnostics.len(), 1);
-    assert_eq!(diagnostics.as_slice()[0].node, Some(declaration));
-    assert_eq!(diagnostics.as_slice()[0].diagnostic.code(), 2649);
-    assert_eq!(diagnostics.as_slice()[0].diagnostic.arguments, ["module"]);
+    assert_eq!(diagnostics.len(), 2);
+    for diagnostic in diagnostics.as_slice() {
+        assert_eq!(diagnostic.node, Some(declaration));
+        assert_eq!(diagnostic.diagnostic.code(), 2649);
+        assert_eq!(diagnostic.diagnostic.arguments, ["module"]);
+    }
+    assert_eq!(diagnostics.as_slice()[0], diagnostics.as_slice()[1]);
     assert_eq!(store.get_merged_symbol(source), Some(source));
 }
 
@@ -739,6 +917,43 @@ fn intrinsic_global_this_conflict_is_the_exact_diagnostic_noop_exception() {
     assert_eq!(store.symbol(global_this), Some(&before));
     assert_eq!(store.get_merged_symbol(property), Some(property));
     assert!(diagnostics.is_empty());
+}
+
+#[test]
+fn non_intrinsic_symbol_named_global_this_still_reports_namespace_collision() {
+    let mut store = Store::new();
+    store
+        .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions::default())
+        .unwrap();
+    let intrinsic = store.intrinsic_bootstrap().unwrap().global_this_symbol;
+    let nodes = registered_nodes(&mut store, 1, "function globalThis() {}");
+    let declaration = first(&nodes, SyntaxKind::FunctionDeclaration);
+    let target = alloc(
+        &mut store,
+        SymbolFlags::NAMESPACE_MODULE | SymbolFlags::BLOCK_SCOPED_VARIABLE,
+        "globalThis",
+    );
+    assert_ne!(target, intrinsic);
+    let mut source_data = SymbolData::new(SymbolFlags::FUNCTION, EscapedName::source("globalThis"));
+    source_data.declarations = Some(vec![declaration]);
+    let source = store.alloc_symbol(source_data).unwrap();
+    let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+    {
+        let mut host = CheckerDiagnosticMergeHost::new(&mut diagnostics);
+        assert_eq!(
+            store.merge_symbol_with_host(&mut host, target, source, false),
+            Ok(target)
+        );
+    }
+
+    assert_eq!(diagnostics.len(), 1);
+    assert_eq!(diagnostics.as_slice()[0].node, Some(declaration));
+    assert_eq!(diagnostics.as_slice()[0].diagnostic.code(), 2649);
+    assert_eq!(
+        diagnostics.as_slice()[0].diagnostic.arguments,
+        ["globalThis"]
+    );
 }
 
 #[test]
