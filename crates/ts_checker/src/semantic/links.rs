@@ -17,9 +17,9 @@ use std::{
 };
 
 use ts_ast::NodeRef;
-use ts_binder::{SemanticStoreId, SemanticSymbolId, SymbolFlags};
+use ts_binder::{EscapedName, SemanticStoreId, SemanticSymbolId, SymbolFlags};
 
-use super::{SignatureId, TypeId, TypeMapperId, type_records::CacheHashKey};
+use super::{SignatureId, TypeId, TypeMapperId, type_records::CacheHashKey, types::VarianceFlags};
 
 /// Three-valued state used by lazy checker decisions.
 ///
@@ -259,6 +259,97 @@ pub struct TypeNodeLinks {
     pub outer_type_parameters: Option<Vec<TypeId>>,
 }
 
+/// Cached operand type for an assertion expression.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct AssertionLinks {
+    pub expr_type: Option<TypeId>,
+}
+
+/// Lazily computed spread bounds for an array literal.
+///
+/// The zero defaults are intentional. Upstream only assigns `-1` while
+/// computing the indices; the default Go record is `(false, 0, 0)`.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ArrayLiteralLinks {
+    pub indices_computed: bool,
+    pub first_spread_index: isize,
+    pub last_spread_index: isize,
+}
+
+/// Exact lazy state domain of switch exhaustiveness.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+#[repr(u8)]
+pub enum ExhaustiveState {
+    #[default]
+    Unknown = 0,
+    Computing = 1,
+    False = 2,
+    True = 3,
+}
+
+/// Flow-analysis links attached to a switch statement.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SwitchStatementLinks {
+    pub exhaustive_state: ExhaustiveState,
+    pub switch_types_computed: bool,
+    pub witnesses_computed: bool,
+    /// `None` is nil; `Some([])` is an allocated empty slice.
+    pub switch_types: Option<Vec<TypeId>>,
+    /// `None` is nil; `Some([])` is an allocated empty slice.
+    pub witnesses: Option<Vec<String>>,
+}
+
+/// JSX element classification flags from the pinned checker.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+#[repr(transparent)]
+pub struct JsxFlags(u32);
+
+impl JsxFlags {
+    pub const NONE: Self = Self(0);
+    pub const INTRINSIC_NAMED_ELEMENT: Self = Self(1 << 0);
+    pub const INTRINSIC_INDEXED_ELEMENT: Self = Self(1 << 1);
+    pub const INTRINSIC_ELEMENT: Self =
+        Self(Self::INTRINSIC_NAMED_ELEMENT.0 | Self::INTRINSIC_INDEXED_ELEMENT.0);
+
+    #[must_use]
+    pub const fn bits(self) -> u32 {
+        self.0
+    }
+
+    #[must_use]
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    #[must_use]
+    pub const fn intersects(self, other: Self) -> bool {
+        self.0 & other.0 != 0
+    }
+}
+
+impl BitOr for JsxFlags {
+    type Output = Self;
+
+    fn bitor(self, rhs: Self) -> Self::Output {
+        Self(self.0 | rhs.0)
+    }
+}
+
+impl BitOrAssign for JsxFlags {
+    fn bitor_assign(&mut self, rhs: Self) {
+        self.0 |= rhs.0;
+    }
+}
+
+/// Checker caches attached to JSX elements and source-file JSX resolution.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct JsxElementLinks {
+    pub jsx_flags: JsxFlags,
+    pub resolved_jsx_element_attributes_type: Option<TypeId>,
+    pub jsx_namespace: Option<SemanticSymbolId>,
+    pub jsx_implicit_import_container: Option<SemanticSymbolId>,
+}
+
 /// Signature-specific syntax-node links.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct SignatureLinks {
@@ -285,6 +376,23 @@ pub struct ValueSymbolLinks {
     pub function_or_constructor_checked: bool,
 }
 
+/// Additional links for mapped symbols.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct MappedSymbolLinks {
+    pub key_type: Option<TypeId>,
+    pub synthetic_origin: Option<SemanticSymbolId>,
+}
+
+/// Additional links for deferred union/intersection symbols.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct DeferredSymbolLinks {
+    pub parent: Option<TypeId>,
+    /// `None` is not computed; `Some([])` is a computed empty slice.
+    pub constituents: Option<Vec<TypeId>>,
+    /// `None` is not computed; `Some([])` is a computed empty slice.
+    pub write_constituents: Option<Vec<TypeId>>,
+}
+
 /// Alias-target and use-state links.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct AliasSymbolLinks {
@@ -292,6 +400,30 @@ pub struct AliasSymbolLinks {
     pub alias_target: AliasTargetState,
     pub referenced: bool,
     pub type_only_declaration: Option<NodeRef>,
+}
+
+/// Module export-resolution links.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ModuleSymbolLinks {
+    /// `None` is a nil symbol table; an allocated empty table remains a
+    /// concrete `SymbolTableId`.
+    pub resolved_exports: Option<super::SymbolTableId>,
+    /// `None` is a nil map; `Some({})` is an allocated empty map.
+    pub type_only_export_star_map: Option<HashMap<EscapedName, Option<NodeRef>>>,
+    pub exports_checked: bool,
+}
+
+/// Links for a symbol produced by late binding.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct LateBoundLinks {
+    pub late_symbol: Option<SemanticSymbolId>,
+}
+
+/// Target and diagnostic origin for a synthetic export-type symbol.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ExportTypeLinks {
+    pub target: Option<SemanticSymbolId>,
+    pub originating_import: Option<NodeRef>,
 }
 
 /// Links specific to type-alias symbols.
@@ -315,6 +447,59 @@ pub struct DeclaredTypeLinks {
     pub index_signatures_checked: bool,
     pub type_parameters_checked: bool,
     pub enum_checked: bool,
+}
+
+/// Selector used to index [`MembersAndExportsLinks`].
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[repr(usize)]
+pub enum MembersOrExportsResolutionKind {
+    ResolvedExports = 0,
+    ResolvedMembers = 1,
+}
+
+/// Separate cached tables for resolved exports and resolved members.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct MembersAndExportsLinks {
+    pub tables: [Option<super::SymbolTableId>; 2],
+}
+
+impl MembersAndExportsLinks {
+    #[must_use]
+    pub const fn table(
+        &self,
+        kind: MembersOrExportsResolutionKind,
+    ) -> Option<super::SymbolTableId> {
+        self.tables[kind as usize]
+    }
+}
+
+/// Source symbols for a synthetic spread property.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SpreadLinks {
+    pub left_spread: Option<SemanticSymbolId>,
+    pub right_spread: Option<SemanticSymbolId>,
+}
+
+/// Cached variances for a type alias or interface symbol.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct VarianceLinks {
+    /// `None` is not computed; `Some([])` is a computed empty slice.
+    pub variances: Option<Vec<VarianceFlags>>,
+}
+
+/// Reverse-mapped property type inputs.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ReverseMappedSymbolLinks {
+    pub property_type: Option<TypeId>,
+    pub mapped_type: Option<TypeId>,
+    pub constraint_type: Option<TypeId>,
+}
+
+/// Assignment-marking state for a symbol.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct MarkedAssignmentSymbolLinks {
+    pub last_assignment_pos: i32,
+    pub has_definite_assignment: bool,
 }
 
 #[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -738,27 +923,55 @@ pub(super) struct CheckerLinkStores {
     pub(super) node: LinkStore<NodeRef, NodeLinks>,
     pub(super) symbol_node: LinkStore<NodeRef, SymbolNodeLinks>,
     pub(super) type_node: LinkStore<NodeRef, TypeNodeLinks>,
+    pub(super) assertion: LinkStore<NodeRef, AssertionLinks>,
+    pub(super) array_literal: LinkStore<NodeRef, ArrayLiteralLinks>,
+    pub(super) switch_statement: LinkStore<NodeRef, SwitchStatementLinks>,
+    pub(super) jsx_element: LinkStore<NodeRef, JsxElementLinks>,
     pub(super) signature: LinkStore<NodeRef, SignatureLinks>,
     pub(super) symbol_reference: LinkStore<SemanticSymbolId, SymbolReferenceLinks>,
     pub(super) value_symbol: LinkStore<SemanticSymbolId, ValueSymbolLinks>,
+    pub(super) mapped_symbol: LinkStore<SemanticSymbolId, MappedSymbolLinks>,
+    pub(super) deferred_symbol: LinkStore<SemanticSymbolId, DeferredSymbolLinks>,
     pub(super) alias_symbol: LinkStore<SemanticSymbolId, AliasSymbolLinks>,
+    pub(super) module_symbol: LinkStore<SemanticSymbolId, ModuleSymbolLinks>,
+    pub(super) late_bound: LinkStore<SemanticSymbolId, LateBoundLinks>,
+    pub(super) export_type: LinkStore<SemanticSymbolId, ExportTypeLinks>,
+    pub(super) members_and_exports: LinkStore<SemanticSymbolId, MembersAndExportsLinks>,
     pub(super) type_alias: LinkStore<SemanticSymbolId, TypeAliasLinks>,
     pub(super) declared_type: LinkStore<SemanticSymbolId, DeclaredTypeLinks>,
+    pub(super) spread: LinkStore<SemanticSymbolId, SpreadLinks>,
+    pub(super) variance: LinkStore<SemanticSymbolId, VarianceLinks>,
+    pub(super) reverse_mapped_symbol: LinkStore<SemanticSymbolId, ReverseMappedSymbolLinks>,
+    pub(super) marked_assignment_symbol: LinkStore<SemanticSymbolId, MarkedAssignmentSymbolLinks>,
 }
 
 impl CheckerLinkStores {
     #[must_use]
-    pub(super) fn allocated_lengths(&self) -> [usize; 9] {
+    pub(super) fn allocated_lengths(&self) -> [usize; 23] {
         [
             self.node.allocated_len(),
             self.symbol_node.allocated_len(),
             self.type_node.allocated_len(),
+            self.assertion.allocated_len(),
+            self.array_literal.allocated_len(),
+            self.switch_statement.allocated_len(),
+            self.jsx_element.allocated_len(),
             self.signature.allocated_len(),
             self.symbol_reference.allocated_len(),
             self.value_symbol.allocated_len(),
+            self.mapped_symbol.allocated_len(),
+            self.deferred_symbol.allocated_len(),
             self.alias_symbol.allocated_len(),
+            self.module_symbol.allocated_len(),
+            self.late_bound.allocated_len(),
+            self.export_type.allocated_len(),
+            self.members_and_exports.allocated_len(),
             self.type_alias.allocated_len(),
             self.declared_type.allocated_len(),
+            self.spread.allocated_len(),
+            self.variance.allocated_len(),
+            self.reverse_mapped_symbol.allocated_len(),
+            self.marked_assignment_symbol.allocated_len(),
         ]
     }
 }
@@ -770,9 +983,12 @@ mod tests {
     use ts_binder::SymbolFlags;
 
     use super::{
-        AliasTargetState, CacheHashKey, DecoratorSignatureState, EffectsSignatureState, LinkStore,
-        NodeCheckFlags, ResolvedSignatureState, Tristate, TypeAliasLinks, TypeResolutionStack,
-        TypeResolutionTarget, TypeSystemPropertyName,
+        AliasTargetState, ArrayLiteralLinks, CacheHashKey, DecoratorSignatureState,
+        DeferredSymbolLinks, EffectsSignatureState, ExhaustiveState, JsxFlags, LinkStore,
+        MembersAndExportsLinks, MembersOrExportsResolutionKind, ModuleSymbolLinks, NodeCheckFlags,
+        ResolvedSignatureState, SwitchStatementLinks, Tristate, TypeAliasLinks,
+        TypeResolutionStack, TypeResolutionTarget, TypeSystemPropertyName, VarianceFlags,
+        VarianceLinks,
     };
 
     #[test]
@@ -840,6 +1056,73 @@ mod tests {
         assert!(combined.contains(NodeCheckFlags::TYPE_CHECKED));
         assert!(combined.intersects(NodeCheckFlags::CONTEXT_CHECKED));
         assert_eq!((combined & !NodeCheckFlags::TYPE_CHECKED).bits(), 1 << 6);
+    }
+
+    #[test]
+    fn sparse_link_enums_and_flags_preserve_exact_numeric_values() {
+        assert_eq!(ExhaustiveState::Unknown as u8, 0);
+        assert_eq!(ExhaustiveState::Computing as u8, 1);
+        assert_eq!(ExhaustiveState::False as u8, 2);
+        assert_eq!(ExhaustiveState::True as u8, 3);
+
+        assert_eq!(JsxFlags::NONE.bits(), 0);
+        assert_eq!(JsxFlags::INTRINSIC_NAMED_ELEMENT.bits(), 1);
+        assert_eq!(JsxFlags::INTRINSIC_INDEXED_ELEMENT.bits(), 2);
+        assert_eq!(JsxFlags::INTRINSIC_ELEMENT.bits(), 3);
+
+        assert_eq!(VarianceFlags::INVARIANT.bits(), 0);
+        assert_eq!(VarianceFlags::COVARIANT.bits(), 1);
+        assert_eq!(VarianceFlags::CONTRAVARIANT.bits(), 2);
+        assert_eq!(VarianceFlags::BIVARIANT.bits(), 3);
+        assert_eq!(VarianceFlags::INDEPENDENT.bits(), 4);
+        assert_eq!(VarianceFlags::VARIANCE_MASK.bits(), 7);
+        assert_eq!(VarianceFlags::UNMEASURABLE.bits(), 8);
+        assert_eq!(VarianceFlags::UNRELIABLE.bits(), 16);
+        assert_eq!(VarianceFlags::ALLOWS_STRUCTURAL_FALLBACK.bits(), 24);
+
+        assert_eq!(MembersOrExportsResolutionKind::ResolvedExports as usize, 0);
+        assert_eq!(MembersOrExportsResolutionKind::ResolvedMembers as usize, 1);
+    }
+
+    #[test]
+    fn new_sparse_links_preserve_pinned_defaults_and_allocated_empty_states() {
+        assert_eq!(
+            ArrayLiteralLinks::default(),
+            ArrayLiteralLinks {
+                indices_computed: false,
+                first_spread_index: 0,
+                last_spread_index: 0,
+            }
+        );
+        assert_eq!(
+            SwitchStatementLinks::default().exhaustive_state,
+            ExhaustiveState::Unknown
+        );
+
+        let computed_empty_switch = SwitchStatementLinks {
+            switch_types: Some(Vec::new()),
+            witnesses: Some(Vec::new()),
+            ..SwitchStatementLinks::default()
+        };
+        assert_ne!(computed_empty_switch, SwitchStatementLinks::default());
+
+        let computed_empty_deferred = DeferredSymbolLinks {
+            constituents: Some(Vec::new()),
+            write_constituents: Some(Vec::new()),
+            ..DeferredSymbolLinks::default()
+        };
+        assert_ne!(computed_empty_deferred, DeferredSymbolLinks::default());
+
+        let computed_empty_variance = VarianceLinks {
+            variances: Some(Vec::new()),
+        };
+        assert_ne!(computed_empty_variance, VarianceLinks::default());
+        let allocated_empty_module_map = ModuleSymbolLinks {
+            type_only_export_star_map: Some(HashMap::new()),
+            ..ModuleSymbolLinks::default()
+        };
+        assert_ne!(allocated_empty_module_map, ModuleSymbolLinks::default());
+        assert_eq!(MembersAndExportsLinks::default().tables, [None, None]);
     }
 
     #[test]

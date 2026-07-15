@@ -64,18 +64,32 @@ impl SemanticArenaCounts {
     }
 }
 
-/// Allocated record counts for the nine canonical sparse checker link stores.
+/// Allocated record counts for the canonical sparse checker link stores.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CheckerLinkCounts {
     pub node: usize,
     pub symbol_node: usize,
     pub type_node: usize,
+    pub assertion: usize,
+    pub array_literal: usize,
+    pub switch_statement: usize,
+    pub jsx_element: usize,
     pub signature: usize,
     pub symbol_reference: usize,
     pub value_symbol: usize,
+    pub mapped_symbol: usize,
+    pub deferred_symbol: usize,
     pub alias_symbol: usize,
+    pub module_symbol: usize,
+    pub late_bound: usize,
+    pub export_type: usize,
+    pub members_and_exports: usize,
     pub type_alias: usize,
     pub declared_type: usize,
+    pub spread: usize,
+    pub variance: usize,
+    pub reverse_mapped_symbol: usize,
+    pub marked_assignment_symbol: usize,
 }
 
 impl CheckerLinkCounts {
@@ -83,12 +97,26 @@ impl CheckerLinkCounts {
         self.node == 0
             && self.symbol_node == 0
             && self.type_node == 0
+            && self.assertion == 0
+            && self.array_literal == 0
+            && self.switch_statement == 0
+            && self.jsx_element == 0
             && self.signature == 0
             && self.symbol_reference == 0
             && self.value_symbol == 0
+            && self.mapped_symbol == 0
+            && self.deferred_symbol == 0
             && self.alias_symbol == 0
+            && self.module_symbol == 0
+            && self.late_bound == 0
+            && self.export_type == 0
+            && self.members_and_exports == 0
             && self.type_alias == 0
             && self.declared_type == 0
+            && self.spread == 0
+            && self.variance == 0
+            && self.reverse_mapped_symbol == 0
+            && self.marked_assignment_symbol == 0
     }
 }
 
@@ -308,12 +336,26 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             node,
             symbol_node,
             type_node,
+            assertion,
+            array_literal,
+            switch_statement,
+            jsx_element,
             signature,
             symbol_reference,
             value_symbol,
+            mapped_symbol,
+            deferred_symbol,
             alias_symbol,
+            module_symbol,
+            late_bound,
+            export_type,
+            members_and_exports,
             type_alias,
             declared_type,
+            spread,
+            variance,
+            reverse_mapped_symbol,
+            marked_assignment_symbol,
         ] = self.checker_link_allocated_lengths();
         let (entries, resolution_start, boundaries, next_boundary_serial) =
             self.type_resolution_internal_state();
@@ -332,12 +374,26 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 node,
                 symbol_node,
                 type_node,
+                assertion,
+                array_literal,
+                switch_statement,
+                jsx_element,
                 signature,
                 symbol_reference,
                 value_symbol,
+                mapped_symbol,
+                deferred_symbol,
                 alias_symbol,
+                module_symbol,
+                late_bound,
+                export_type,
+                members_and_exports,
                 type_alias,
                 declared_type,
+                spread,
+                variance,
+                reverse_mapped_symbol,
+                marked_assignment_symbol,
             },
             type_resolution: TypeResolutionStateSnapshot {
                 entries,
@@ -1069,12 +1125,26 @@ mod tests {
             node,
             symbol_node,
             type_node,
+            assertion,
+            array_literal,
+            switch_statement,
+            jsx_element,
             signature,
             symbol_reference,
             value_symbol,
+            mapped_symbol,
+            deferred_symbol,
             alias_symbol,
+            module_symbol,
+            late_bound,
+            export_type,
+            members_and_exports,
             type_alias,
             declared_type,
+            spread,
+            variance,
+            reverse_mapped_symbol,
+            marked_assignment_symbol,
         ] = store.checker_link_allocated_lengths();
         let (entries, resolution_start, boundaries, next_boundary_serial) =
             store.type_resolution_internal_state();
@@ -1085,12 +1155,26 @@ mod tests {
                 node,
                 symbol_node,
                 type_node,
+                assertion,
+                array_literal,
+                switch_statement,
+                jsx_element,
                 signature,
                 symbol_reference,
                 value_symbol,
+                mapped_symbol,
+                deferred_symbol,
                 alias_symbol,
+                module_symbol,
+                late_bound,
+                export_type,
+                members_and_exports,
                 type_alias,
                 declared_type,
+                spread,
+                variance,
+                reverse_mapped_symbol,
+                marked_assignment_symbol,
             },
             type_resolution: TypeResolutionStateSnapshot {
                 entries,
@@ -1970,12 +2054,26 @@ mod tests {
         assert!(linked.ensure_node_links(node));
         assert!(linked.ensure_symbol_node_links(node));
         assert!(linked.ensure_type_node_links(node));
+        assert!(linked.ensure_assertion_links(node));
+        assert!(linked.ensure_array_literal_links(node));
+        assert!(linked.ensure_switch_statement_links(node));
+        assert!(linked.ensure_jsx_element_links(node));
         assert!(linked.ensure_signature_links(node));
         assert!(linked.ensure_symbol_reference_links(linked_symbol));
         assert!(linked.ensure_value_symbol_links(linked_symbol));
+        assert!(linked.ensure_mapped_symbol_links(linked_symbol));
+        assert!(linked.ensure_deferred_symbol_links(linked_symbol));
         assert!(linked.ensure_alias_symbol_links(linked_symbol));
+        assert!(linked.ensure_module_symbol_links(linked_symbol));
+        assert!(linked.ensure_late_bound_links(linked_symbol));
+        assert!(linked.ensure_export_type_links(linked_symbol));
+        assert!(linked.ensure_members_and_exports_links(linked_symbol));
         assert!(linked.ensure_type_alias_links(linked_symbol));
         assert!(linked.ensure_declared_type_links(linked_symbol));
+        assert!(linked.ensure_spread_links(linked_symbol));
+        assert!(linked.ensure_variance_links(linked_symbol));
+        assert!(linked.ensure_reverse_mapped_symbol_links(linked_symbol));
+        assert!(linked.ensure_marked_assignment_symbol_links(linked_symbol));
         let before = checker_state(&linked);
         assert_eq!(
             before.links,
@@ -1983,12 +2081,26 @@ mod tests {
                 node: 1,
                 symbol_node: 1,
                 type_node: 1,
+                assertion: 1,
+                array_literal: 1,
+                switch_statement: 1,
+                jsx_element: 1,
                 signature: 1,
                 symbol_reference: 1,
                 value_symbol: 1,
+                mapped_symbol: 1,
+                deferred_symbol: 1,
                 alias_symbol: 1,
+                module_symbol: 1,
+                late_bound: 1,
+                export_type: 1,
+                members_and_exports: 1,
                 type_alias: 1,
                 declared_type: 1,
+                spread: 1,
+                variance: 1,
+                reverse_mapped_symbol: 1,
+                marked_assignment_symbol: 1,
             },
         );
         assert_eq!(

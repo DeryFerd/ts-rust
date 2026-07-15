@@ -14,10 +14,13 @@ use super::{
         TypePredicateId, TypedArena,
     },
     links::{
-        AliasSymbolLinks, CheckerLinkStores, DeclaredTypeLinks, NodeLinks, SignatureLinks,
+        AliasSymbolLinks, ArrayLiteralLinks, AssertionLinks, CheckerLinkStores, DeclaredTypeLinks,
+        DeferredSymbolLinks, ExportTypeLinks, JsxElementLinks, LateBoundLinks, MappedSymbolLinks,
+        MarkedAssignmentSymbolLinks, MembersAndExportsLinks, ModuleSymbolLinks, NodeLinks,
+        ReverseMappedSymbolLinks, SignatureLinks, SpreadLinks, SwitchStatementLinks,
         SymbolNodeLinks, SymbolReferenceLinks, TypeAliasLinks, TypeNodeLinks,
         TypeResolutionBoundary, TypeResolutionStack, TypeResolutionTarget,
-        TypeResolutionTargetError, TypeSystemPropertyName, ValueSymbolLinks,
+        TypeResolutionTargetError, TypeSystemPropertyName, ValueSymbolLinks, VarianceLinks,
     },
     signatures::{
         CompositeSignature, IndexInfo, IndexInfoArena, Signature, SignatureArena, SignatureFlags,
@@ -553,6 +556,421 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         true
     }
 
+    #[must_use]
+    pub fn assertion_links(&self, node: NodeRef) -> Option<&AssertionLinks> {
+        self.contains_node_ref(node)
+            .then(|| self.links.assertion.try_get(&node))
+            .flatten()
+    }
+
+    pub fn ensure_assertion_links(&mut self, node: NodeRef) -> bool {
+        if !self.contains_node_ref(node) {
+            return false;
+        }
+        self.links.assertion.get(node);
+        true
+    }
+
+    pub fn set_assertion_links(&mut self, node: NodeRef, links: AssertionLinks) -> bool {
+        if !self.contains_node_ref(node) || !self.valid_optional_type(links.expr_type) {
+            return false;
+        }
+        self.links.assertion.replace_key(node, links);
+        true
+    }
+
+    #[must_use]
+    pub fn array_literal_links(&self, node: NodeRef) -> Option<&ArrayLiteralLinks> {
+        self.contains_node_ref(node)
+            .then(|| self.links.array_literal.try_get(&node))
+            .flatten()
+    }
+
+    pub fn ensure_array_literal_links(&mut self, node: NodeRef) -> bool {
+        if !self.contains_node_ref(node) {
+            return false;
+        }
+        self.links.array_literal.get(node);
+        true
+    }
+
+    pub fn set_array_literal_links(&mut self, node: NodeRef, links: ArrayLiteralLinks) -> bool {
+        if !self.contains_node_ref(node) {
+            return false;
+        }
+        self.links.array_literal.replace_key(node, links);
+        true
+    }
+
+    #[must_use]
+    pub fn switch_statement_links(&self, node: NodeRef) -> Option<&SwitchStatementLinks> {
+        self.contains_node_ref(node)
+            .then(|| self.links.switch_statement.try_get(&node))
+            .flatten()
+    }
+
+    pub fn ensure_switch_statement_links(&mut self, node: NodeRef) -> bool {
+        if !self.contains_node_ref(node) {
+            return false;
+        }
+        self.links.switch_statement.get(node);
+        true
+    }
+
+    pub fn set_switch_statement_links(
+        &mut self,
+        node: NodeRef,
+        links: SwitchStatementLinks,
+    ) -> bool {
+        if !self.contains_node_ref(node)
+            || !self.valid_optional_types(links.switch_types.as_deref())
+        {
+            return false;
+        }
+        self.links.switch_statement.replace_key(node, links);
+        true
+    }
+
+    #[must_use]
+    pub fn jsx_element_links(&self, node: NodeRef) -> Option<&JsxElementLinks> {
+        self.contains_node_ref(node)
+            .then(|| self.links.jsx_element.try_get(&node))
+            .flatten()
+    }
+
+    pub fn ensure_jsx_element_links(&mut self, node: NodeRef) -> bool {
+        if !self.contains_node_ref(node) {
+            return false;
+        }
+        self.links.jsx_element.get(node);
+        true
+    }
+
+    pub fn set_jsx_element_links(&mut self, node: NodeRef, links: JsxElementLinks) -> bool {
+        if !self.contains_node_ref(node)
+            || !self.valid_optional_type(links.resolved_jsx_element_attributes_type)
+            || !self.valid_optional_symbol(links.jsx_namespace)
+            || !self.valid_optional_symbol(links.jsx_implicit_import_container)
+        {
+            return false;
+        }
+        self.links.jsx_element.replace_key(node, links);
+        true
+    }
+
+    #[must_use]
+    pub fn mapped_symbol_links(&self, symbol: SemanticSymbolId) -> Option<&MappedSymbolLinks> {
+        self.symbols
+            .contains_symbol(symbol)
+            .then(|| self.links.mapped_symbol.try_get(&symbol))
+            .flatten()
+    }
+
+    pub fn ensure_mapped_symbol_links(&mut self, symbol: SemanticSymbolId) -> bool {
+        if !self.symbols.contains_symbol(symbol) {
+            return false;
+        }
+        self.links.mapped_symbol.get(symbol);
+        true
+    }
+
+    pub fn set_mapped_symbol_links(
+        &mut self,
+        symbol: SemanticSymbolId,
+        links: MappedSymbolLinks,
+    ) -> bool {
+        if !self.symbols.contains_symbol(symbol)
+            || !self.valid_optional_type(links.key_type)
+            || !self.valid_optional_symbol(links.synthetic_origin)
+        {
+            return false;
+        }
+        self.links.mapped_symbol.replace_key(symbol, links);
+        true
+    }
+
+    #[must_use]
+    pub fn deferred_symbol_links(&self, symbol: SemanticSymbolId) -> Option<&DeferredSymbolLinks> {
+        self.symbols
+            .contains_symbol(symbol)
+            .then(|| self.links.deferred_symbol.try_get(&symbol))
+            .flatten()
+    }
+
+    pub fn ensure_deferred_symbol_links(&mut self, symbol: SemanticSymbolId) -> bool {
+        if !self.symbols.contains_symbol(symbol) {
+            return false;
+        }
+        self.links.deferred_symbol.get(symbol);
+        true
+    }
+
+    pub fn set_deferred_symbol_links(
+        &mut self,
+        symbol: SemanticSymbolId,
+        links: DeferredSymbolLinks,
+    ) -> bool {
+        if !self.symbols.contains_symbol(symbol)
+            || !self.valid_optional_type(links.parent)
+            || !self.valid_optional_types(links.constituents.as_deref())
+            || !self.valid_optional_types(links.write_constituents.as_deref())
+        {
+            return false;
+        }
+        self.links.deferred_symbol.replace_key(symbol, links);
+        true
+    }
+
+    #[must_use]
+    pub fn module_symbol_links(&self, symbol: SemanticSymbolId) -> Option<&ModuleSymbolLinks> {
+        self.symbols
+            .contains_symbol(symbol)
+            .then(|| self.links.module_symbol.try_get(&symbol))
+            .flatten()
+    }
+
+    pub fn ensure_module_symbol_links(&mut self, symbol: SemanticSymbolId) -> bool {
+        if !self.symbols.contains_symbol(symbol) {
+            return false;
+        }
+        self.links.module_symbol.get(symbol);
+        true
+    }
+
+    pub fn set_module_symbol_links(
+        &mut self,
+        symbol: SemanticSymbolId,
+        links: ModuleSymbolLinks,
+    ) -> bool {
+        if !self.symbols.contains_symbol(symbol)
+            || !self.valid_optional_symbol_table(links.resolved_exports)
+            || links.type_only_export_star_map.as_ref().is_some_and(|map| {
+                map.values()
+                    .flatten()
+                    .any(|node| !self.contains_node_ref(*node))
+            })
+        {
+            return false;
+        }
+        self.links.module_symbol.replace_key(symbol, links);
+        true
+    }
+
+    #[must_use]
+    pub fn late_bound_links(&self, symbol: SemanticSymbolId) -> Option<&LateBoundLinks> {
+        self.symbols
+            .contains_symbol(symbol)
+            .then(|| self.links.late_bound.try_get(&symbol))
+            .flatten()
+    }
+
+    pub fn ensure_late_bound_links(&mut self, symbol: SemanticSymbolId) -> bool {
+        if !self.symbols.contains_symbol(symbol) {
+            return false;
+        }
+        self.links.late_bound.get(symbol);
+        true
+    }
+
+    pub fn set_late_bound_links(
+        &mut self,
+        symbol: SemanticSymbolId,
+        links: LateBoundLinks,
+    ) -> bool {
+        if !self.symbols.contains_symbol(symbol) || !self.valid_optional_symbol(links.late_symbol) {
+            return false;
+        }
+        self.links.late_bound.replace_key(symbol, links);
+        true
+    }
+
+    #[must_use]
+    pub fn export_type_links(&self, symbol: SemanticSymbolId) -> Option<&ExportTypeLinks> {
+        self.symbols
+            .contains_symbol(symbol)
+            .then(|| self.links.export_type.try_get(&symbol))
+            .flatten()
+    }
+
+    pub fn ensure_export_type_links(&mut self, symbol: SemanticSymbolId) -> bool {
+        if !self.symbols.contains_symbol(symbol) {
+            return false;
+        }
+        self.links.export_type.get(symbol);
+        true
+    }
+
+    pub fn set_export_type_links(
+        &mut self,
+        symbol: SemanticSymbolId,
+        links: ExportTypeLinks,
+    ) -> bool {
+        if !self.symbols.contains_symbol(symbol)
+            || !self.valid_optional_symbol(links.target)
+            || !self.valid_optional_node(links.originating_import)
+        {
+            return false;
+        }
+        self.links.export_type.replace_key(symbol, links);
+        true
+    }
+
+    #[must_use]
+    pub fn members_and_exports_links(
+        &self,
+        symbol: SemanticSymbolId,
+    ) -> Option<&MembersAndExportsLinks> {
+        self.symbols
+            .contains_symbol(symbol)
+            .then(|| self.links.members_and_exports.try_get(&symbol))
+            .flatten()
+    }
+
+    pub fn ensure_members_and_exports_links(&mut self, symbol: SemanticSymbolId) -> bool {
+        if !self.symbols.contains_symbol(symbol) {
+            return false;
+        }
+        self.links.members_and_exports.get(symbol);
+        true
+    }
+
+    pub fn set_members_and_exports_links(
+        &mut self,
+        symbol: SemanticSymbolId,
+        links: MembersAndExportsLinks,
+    ) -> bool {
+        if !self.symbols.contains_symbol(symbol)
+            || links
+                .tables
+                .iter()
+                .flatten()
+                .any(|table| !self.symbols.contains_symbol_table(*table))
+        {
+            return false;
+        }
+        self.links.members_and_exports.replace_key(symbol, links);
+        true
+    }
+
+    #[must_use]
+    pub fn spread_links(&self, symbol: SemanticSymbolId) -> Option<&SpreadLinks> {
+        self.symbols
+            .contains_symbol(symbol)
+            .then(|| self.links.spread.try_get(&symbol))
+            .flatten()
+    }
+
+    pub fn ensure_spread_links(&mut self, symbol: SemanticSymbolId) -> bool {
+        if !self.symbols.contains_symbol(symbol) {
+            return false;
+        }
+        self.links.spread.get(symbol);
+        true
+    }
+
+    pub fn set_spread_links(&mut self, symbol: SemanticSymbolId, links: SpreadLinks) -> bool {
+        if !self.symbols.contains_symbol(symbol)
+            || !self.valid_optional_symbol(links.left_spread)
+            || !self.valid_optional_symbol(links.right_spread)
+        {
+            return false;
+        }
+        self.links.spread.replace_key(symbol, links);
+        true
+    }
+
+    #[must_use]
+    pub fn variance_links(&self, symbol: SemanticSymbolId) -> Option<&VarianceLinks> {
+        self.symbols
+            .contains_symbol(symbol)
+            .then(|| self.links.variance.try_get(&symbol))
+            .flatten()
+    }
+
+    pub fn ensure_variance_links(&mut self, symbol: SemanticSymbolId) -> bool {
+        if !self.symbols.contains_symbol(symbol) {
+            return false;
+        }
+        self.links.variance.get(symbol);
+        true
+    }
+
+    pub fn set_variance_links(&mut self, symbol: SemanticSymbolId, links: VarianceLinks) -> bool {
+        if !self.symbols.contains_symbol(symbol) {
+            return false;
+        }
+        self.links.variance.replace_key(symbol, links);
+        true
+    }
+
+    #[must_use]
+    pub fn reverse_mapped_symbol_links(
+        &self,
+        symbol: SemanticSymbolId,
+    ) -> Option<&ReverseMappedSymbolLinks> {
+        self.symbols
+            .contains_symbol(symbol)
+            .then(|| self.links.reverse_mapped_symbol.try_get(&symbol))
+            .flatten()
+    }
+
+    pub fn ensure_reverse_mapped_symbol_links(&mut self, symbol: SemanticSymbolId) -> bool {
+        if !self.symbols.contains_symbol(symbol) {
+            return false;
+        }
+        self.links.reverse_mapped_symbol.get(symbol);
+        true
+    }
+
+    pub fn set_reverse_mapped_symbol_links(
+        &mut self,
+        symbol: SemanticSymbolId,
+        links: ReverseMappedSymbolLinks,
+    ) -> bool {
+        if !self.symbols.contains_symbol(symbol)
+            || !self.valid_optional_type(links.property_type)
+            || !self.valid_optional_type(links.mapped_type)
+            || !self.valid_optional_type(links.constraint_type)
+        {
+            return false;
+        }
+        self.links.reverse_mapped_symbol.replace_key(symbol, links);
+        true
+    }
+
+    #[must_use]
+    pub fn marked_assignment_symbol_links(
+        &self,
+        symbol: SemanticSymbolId,
+    ) -> Option<&MarkedAssignmentSymbolLinks> {
+        self.symbols
+            .contains_symbol(symbol)
+            .then(|| self.links.marked_assignment_symbol.try_get(&symbol))
+            .flatten()
+    }
+
+    pub fn ensure_marked_assignment_symbol_links(&mut self, symbol: SemanticSymbolId) -> bool {
+        if !self.symbols.contains_symbol(symbol) {
+            return false;
+        }
+        self.links.marked_assignment_symbol.get(symbol);
+        true
+    }
+
+    pub fn set_marked_assignment_symbol_links(
+        &mut self,
+        symbol: SemanticSymbolId,
+        links: MarkedAssignmentSymbolLinks,
+    ) -> bool {
+        if !self.symbols.contains_symbol(symbol) {
+            return false;
+        }
+        self.links
+            .marked_assignment_symbol
+            .replace_key(symbol, links);
+        true
+    }
+
     /// Pops one query and returns whether its dependency chain remained
     /// cycle-free.
     pub fn pop_type_resolution(&mut self) -> Option<bool> {
@@ -574,7 +992,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         self.type_resolutions.resolution_start()
     }
 
-    pub(super) fn checker_link_allocated_lengths(&self) -> [usize; 9] {
+    pub(super) fn checker_link_allocated_lengths(&self) -> [usize; 23] {
         self.links.allocated_lengths()
     }
 
@@ -923,6 +1341,10 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         id.is_none_or(|id| self.symbols.contains_symbol(id))
     }
 
+    fn valid_optional_symbol_table(&self, id: Option<SymbolTableId>) -> bool {
+        id.is_none_or(|id| self.symbols.contains_symbol_table(id))
+    }
+
     fn valid_optional_mapper(&self, id: Option<TypeMapperId>) -> bool {
         id.is_none_or(|id| self.mappers.get(id).is_some())
     }
@@ -1142,10 +1564,14 @@ mod tests {
 
     use super::{AstScope, SemanticStore};
     use crate::semantic::{
-        AliasSymbolLinks, AliasTargetState, CacheHashKey, DeclaredTypeLinks,
-        DecoratorSignatureState, EffectsSignatureState, NodeLinks, ResolvedSignatureState,
-        SignatureLinks, SymbolNodeLinks, SymbolReferenceLinks, TypeAliasLinks, TypeNodeLinks,
-        TypeRecord, TypeResolutionTarget, TypeSystemPropertyName, ValueSymbolLinks,
+        AliasSymbolLinks, AliasTargetState, ArrayLiteralLinks, AssertionLinks, CacheHashKey,
+        DeclaredTypeLinks, DecoratorSignatureState, DeferredSymbolLinks, EffectsSignatureState,
+        ExhaustiveState, ExportTypeLinks, JsxElementLinks, JsxFlags, LateBoundLinks,
+        MappedSymbolLinks, MarkedAssignmentSymbolLinks, MembersAndExportsLinks, ModuleSymbolLinks,
+        NodeLinks, ResolvedSignatureState, ReverseMappedSymbolLinks, SignatureLinks, SpreadLinks,
+        SwitchStatementLinks, SymbolNodeLinks, SymbolReferenceLinks, TypeAliasLinks, TypeNodeLinks,
+        TypeRecord, TypeResolutionTarget, TypeSystemPropertyName, ValueSymbolLinks, VarianceFlags,
+        VarianceLinks,
         signatures::{ElementFlags, SignatureFlags, TypePredicateKind},
         types::{ObjectFlags, TypeFlags},
     };
@@ -1760,6 +2186,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // Exercises all sparse stores and exact default states.
     fn sparse_semantic_links_preserve_absent_and_allocated_default_records() {
         let parsed = parse_source_file("type T = string;");
         let scope = AstScope::new(FileId::new(21), &parsed.arena);
@@ -1771,22 +2198,50 @@ mod tests {
         assert_eq!(store.node_links(node), None);
         assert_eq!(store.symbol_node_links(node), None);
         assert_eq!(store.type_node_links(node), None);
+        assert_eq!(store.assertion_links(node), None);
+        assert_eq!(store.array_literal_links(node), None);
+        assert_eq!(store.switch_statement_links(node), None);
+        assert_eq!(store.jsx_element_links(node), None);
         assert_eq!(store.signature_links(node), None);
         assert_eq!(store.symbol_reference_links(symbol), None);
         assert_eq!(store.value_symbol_links(symbol), None);
+        assert_eq!(store.mapped_symbol_links(symbol), None);
+        assert_eq!(store.deferred_symbol_links(symbol), None);
         assert_eq!(store.alias_symbol_links(symbol), None);
+        assert_eq!(store.module_symbol_links(symbol), None);
+        assert_eq!(store.late_bound_links(symbol), None);
+        assert_eq!(store.export_type_links(symbol), None);
+        assert_eq!(store.members_and_exports_links(symbol), None);
         assert_eq!(store.type_alias_links(symbol), None);
         assert_eq!(store.declared_type_links(symbol), None);
+        assert_eq!(store.spread_links(symbol), None);
+        assert_eq!(store.variance_links(symbol), None);
+        assert_eq!(store.reverse_mapped_symbol_links(symbol), None);
+        assert_eq!(store.marked_assignment_symbol_links(symbol), None);
 
         assert!(store.ensure_node_links(node));
         assert!(store.ensure_symbol_node_links(node));
         assert!(store.ensure_type_node_links(node));
+        assert!(store.ensure_assertion_links(node));
+        assert!(store.ensure_array_literal_links(node));
+        assert!(store.ensure_switch_statement_links(node));
+        assert!(store.ensure_jsx_element_links(node));
         assert!(store.ensure_signature_links(node));
         assert!(store.ensure_symbol_reference_links(symbol));
         assert!(store.ensure_value_symbol_links(symbol));
+        assert!(store.ensure_mapped_symbol_links(symbol));
+        assert!(store.ensure_deferred_symbol_links(symbol));
         assert!(store.ensure_alias_symbol_links(symbol));
+        assert!(store.ensure_module_symbol_links(symbol));
+        assert!(store.ensure_late_bound_links(symbol));
+        assert!(store.ensure_export_type_links(symbol));
+        assert!(store.ensure_members_and_exports_links(symbol));
         assert!(store.ensure_type_alias_links(symbol));
         assert!(store.ensure_declared_type_links(symbol));
+        assert!(store.ensure_spread_links(symbol));
+        assert!(store.ensure_variance_links(symbol));
+        assert!(store.ensure_reverse_mapped_symbol_links(symbol));
+        assert!(store.ensure_marked_assignment_symbol_links(symbol));
 
         assert_eq!(store.node_links(node), Some(&NodeLinks::default()));
         assert_eq!(
@@ -1794,6 +2249,22 @@ mod tests {
             Some(&SymbolNodeLinks::default())
         );
         assert_eq!(store.type_node_links(node), Some(&TypeNodeLinks::default()));
+        assert_eq!(
+            store.assertion_links(node),
+            Some(&AssertionLinks::default())
+        );
+        assert_eq!(
+            store.array_literal_links(node),
+            Some(&ArrayLiteralLinks::default())
+        );
+        assert_eq!(
+            store.switch_statement_links(node),
+            Some(&SwitchStatementLinks::default())
+        );
+        assert_eq!(
+            store.jsx_element_links(node),
+            Some(&JsxElementLinks::default())
+        );
         assert_eq!(
             store.signature_links(node),
             Some(&SignatureLinks::default())
@@ -1807,8 +2278,32 @@ mod tests {
             Some(&ValueSymbolLinks::default())
         );
         assert_eq!(
+            store.mapped_symbol_links(symbol),
+            Some(&MappedSymbolLinks::default())
+        );
+        assert_eq!(
+            store.deferred_symbol_links(symbol),
+            Some(&DeferredSymbolLinks::default())
+        );
+        assert_eq!(
             store.alias_symbol_links(symbol),
             Some(&AliasSymbolLinks::default())
+        );
+        assert_eq!(
+            store.module_symbol_links(symbol),
+            Some(&ModuleSymbolLinks::default())
+        );
+        assert_eq!(
+            store.late_bound_links(symbol),
+            Some(&LateBoundLinks::default())
+        );
+        assert_eq!(
+            store.export_type_links(symbol),
+            Some(&ExportTypeLinks::default())
+        );
+        assert_eq!(
+            store.members_and_exports_links(symbol),
+            Some(&MembersAndExportsLinks::default())
         );
         assert_eq!(
             store.type_alias_links(symbol),
@@ -1817,6 +2312,19 @@ mod tests {
         assert_eq!(
             store.declared_type_links(symbol),
             Some(&DeclaredTypeLinks::default())
+        );
+        assert_eq!(store.spread_links(symbol), Some(&SpreadLinks::default()));
+        assert_eq!(
+            store.variance_links(symbol),
+            Some(&VarianceLinks::default())
+        );
+        assert_eq!(
+            store.reverse_mapped_symbol_links(symbol),
+            Some(&ReverseMappedSymbolLinks::default())
+        );
+        assert_eq!(
+            store.marked_assignment_symbol_links(symbol),
+            Some(&MarkedAssignmentSymbolLinks::default())
         );
 
         let allocated_empty = TypeAliasLinks {
@@ -1833,6 +2341,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // Exercises every field in the dependency-closed link slice.
     fn semantic_link_commits_accept_owned_ids_and_exact_field_states() {
         let parsed = parse_source_file("const value = 1;");
         let scope = AstScope::new(FileId::new(22), &parsed.arena);
@@ -1847,6 +2356,7 @@ mod tests {
         let type_id = store.alloc_type("concrete unresolved/error type sentinel");
         let mapper = store.alloc_mapper("identity");
         let signature = empty_signature(&mut store);
+        let table = store.alloc_symbol_table();
 
         let symbol_node = SymbolNodeLinks {
             resolved_symbol: Some(target),
@@ -1918,6 +2428,121 @@ mod tests {
         };
         assert!(store.set_declared_type_links(symbol, declared_links.clone()));
         assert_eq!(store.declared_type_links(symbol), Some(&declared_links));
+
+        let assertion = AssertionLinks {
+            expr_type: Some(type_id),
+        };
+        assert!(store.set_assertion_links(node, assertion.clone()));
+        assert_eq!(store.assertion_links(node), Some(&assertion));
+
+        let array_literal = ArrayLiteralLinks {
+            indices_computed: true,
+            first_spread_index: -1,
+            last_spread_index: -1,
+        };
+        assert!(store.set_array_literal_links(node, array_literal.clone()));
+        assert_eq!(store.array_literal_links(node), Some(&array_literal));
+
+        let switch_statement = SwitchStatementLinks {
+            exhaustive_state: ExhaustiveState::True,
+            switch_types_computed: true,
+            witnesses_computed: true,
+            switch_types: Some(vec![type_id]),
+            witnesses: Some(Vec::new()),
+        };
+        assert!(store.set_switch_statement_links(node, switch_statement.clone()));
+        assert_eq!(store.switch_statement_links(node), Some(&switch_statement));
+
+        let jsx_element = JsxElementLinks {
+            jsx_flags: JsxFlags::INTRINSIC_ELEMENT,
+            resolved_jsx_element_attributes_type: Some(type_id),
+            jsx_namespace: Some(target),
+            jsx_implicit_import_container: Some(target),
+        };
+        assert!(store.set_jsx_element_links(node, jsx_element.clone()));
+        assert_eq!(store.jsx_element_links(node), Some(&jsx_element));
+
+        let mapped_links = MappedSymbolLinks {
+            key_type: Some(type_id),
+            synthetic_origin: Some(target),
+        };
+        assert!(store.set_mapped_symbol_links(symbol, mapped_links.clone()));
+        assert_eq!(store.mapped_symbol_links(symbol), Some(&mapped_links));
+
+        let deferred = DeferredSymbolLinks {
+            parent: Some(type_id),
+            constituents: Some(vec![type_id]),
+            write_constituents: Some(Vec::new()),
+        };
+        assert!(store.set_deferred_symbol_links(symbol, deferred.clone()));
+        assert_eq!(store.deferred_symbol_links(symbol), Some(&deferred));
+
+        let module = ModuleSymbolLinks {
+            resolved_exports: Some(table),
+            type_only_export_star_map: Some(HashMap::from([
+                (EscapedName::source("named"), Some(node)),
+                (EscapedName::source("cached-negative"), None),
+            ])),
+            exports_checked: true,
+        };
+        assert!(store.set_module_symbol_links(symbol, module.clone()));
+        assert_eq!(store.module_symbol_links(symbol), Some(&module));
+
+        let late_bound = LateBoundLinks {
+            late_symbol: Some(target),
+        };
+        assert!(store.set_late_bound_links(symbol, late_bound.clone()));
+        assert_eq!(store.late_bound_links(symbol), Some(&late_bound));
+
+        let export_type = ExportTypeLinks {
+            target: Some(target),
+            originating_import: Some(node),
+        };
+        assert!(store.set_export_type_links(symbol, export_type.clone()));
+        assert_eq!(store.export_type_links(symbol), Some(&export_type));
+
+        let members_and_exports = MembersAndExportsLinks {
+            tables: [Some(table), None],
+        };
+        assert!(store.set_members_and_exports_links(symbol, members_and_exports.clone()));
+        assert_eq!(
+            store.members_and_exports_links(symbol),
+            Some(&members_and_exports)
+        );
+
+        let spread = SpreadLinks {
+            left_spread: Some(target),
+            right_spread: Some(target),
+        };
+        assert!(store.set_spread_links(symbol, spread.clone()));
+        assert_eq!(store.spread_links(symbol), Some(&spread));
+
+        let variance = VarianceLinks {
+            variances: Some(vec![VarianceFlags::COVARIANT | VarianceFlags::UNRELIABLE]),
+        };
+        assert!(store.set_variance_links(symbol, variance.clone()));
+        assert_eq!(store.variance_links(symbol), Some(&variance));
+
+        let reverse_mapped = ReverseMappedSymbolLinks {
+            property_type: Some(type_id),
+            mapped_type: Some(type_id),
+            constraint_type: Some(type_id),
+        };
+        assert!(store.set_reverse_mapped_symbol_links(symbol, reverse_mapped.clone()));
+        assert_eq!(
+            store.reverse_mapped_symbol_links(symbol),
+            Some(&reverse_mapped)
+        );
+
+        let assignment = MarkedAssignmentSymbolLinks {
+            last_assignment_pos: -1,
+            has_definite_assignment: true,
+        };
+        assert!(store.set_marked_assignment_symbol_links(symbol, assignment.clone()));
+        assert_eq!(
+            store.marked_assignment_symbol_links(symbol),
+            Some(&assignment)
+        );
     }
 
     #[test]
@@ -1936,26 +2561,46 @@ mod tests {
         let foreign_type = first.alloc_type("foreign type");
         let foreign_mapper = first.alloc_mapper("foreign mapper");
         let foreign_signature = empty_signature(&mut first);
+        let foreign_table = first.alloc_symbol_table();
 
         let mut store = TestStore::new();
         assert!(store.register_ast_scope(second_scope));
         let symbol = alloc_test_symbol(&mut store, "local");
         let local_type = store.alloc_type("local type");
+        let local_table = store.alloc_symbol_table();
 
         assert!(!store.ensure_node_links(first_node));
         assert!(!store.ensure_symbol_node_links(first_node));
         assert!(!store.ensure_type_node_links(first_node));
+        assert!(!store.ensure_assertion_links(first_node));
+        assert!(!store.ensure_array_literal_links(first_node));
+        assert!(!store.ensure_switch_statement_links(first_node));
+        assert!(!store.ensure_jsx_element_links(first_node));
         assert!(!store.ensure_signature_links(first_node));
         assert_eq!(store.node_links(second_node), None);
         assert_eq!(store.symbol_node_links(second_node), None);
         assert_eq!(store.type_node_links(second_node), None);
+        assert_eq!(store.assertion_links(second_node), None);
+        assert_eq!(store.array_literal_links(second_node), None);
+        assert_eq!(store.switch_statement_links(second_node), None);
+        assert_eq!(store.jsx_element_links(second_node), None);
         assert_eq!(store.signature_links(second_node), None);
 
         assert!(!store.ensure_symbol_reference_links(foreign_symbol));
         assert!(!store.ensure_value_symbol_links(foreign_symbol));
+        assert!(!store.ensure_mapped_symbol_links(foreign_symbol));
+        assert!(!store.ensure_deferred_symbol_links(foreign_symbol));
         assert!(!store.ensure_alias_symbol_links(foreign_symbol));
+        assert!(!store.ensure_module_symbol_links(foreign_symbol));
+        assert!(!store.ensure_late_bound_links(foreign_symbol));
+        assert!(!store.ensure_export_type_links(foreign_symbol));
+        assert!(!store.ensure_members_and_exports_links(foreign_symbol));
         assert!(!store.ensure_type_alias_links(foreign_symbol));
         assert!(!store.ensure_declared_type_links(foreign_symbol));
+        assert!(!store.ensure_spread_links(foreign_symbol));
+        assert!(!store.ensure_variance_links(foreign_symbol));
+        assert!(!store.ensure_reverse_mapped_symbol_links(foreign_symbol));
+        assert!(!store.ensure_marked_assignment_symbol_links(foreign_symbol));
 
         assert!(!store.set_symbol_node_links(
             second_node,
@@ -1999,6 +2644,41 @@ mod tests {
         ));
         assert_eq!(store.type_node_links(second_node), None);
 
+        assert!(!store.set_assertion_links(
+            second_node,
+            AssertionLinks {
+                expr_type: Some(foreign_type),
+            },
+        ));
+        assert_eq!(store.assertion_links(second_node), None);
+
+        assert!(!store.set_switch_statement_links(
+            second_node,
+            SwitchStatementLinks {
+                switch_types: Some(vec![foreign_type]),
+                ..SwitchStatementLinks::default()
+            },
+        ));
+        assert_eq!(store.switch_statement_links(second_node), None);
+
+        for invalid in [
+            JsxElementLinks {
+                resolved_jsx_element_attributes_type: Some(foreign_type),
+                ..JsxElementLinks::default()
+            },
+            JsxElementLinks {
+                jsx_namespace: Some(foreign_symbol),
+                ..JsxElementLinks::default()
+            },
+            JsxElementLinks {
+                jsx_implicit_import_container: Some(foreign_symbol),
+                ..JsxElementLinks::default()
+            },
+        ] {
+            assert!(!store.set_jsx_element_links(second_node, invalid));
+            assert_eq!(store.jsx_element_links(second_node), None);
+        }
+
         let invalid_values = [
             ValueSymbolLinks {
                 resolved_type: Some(foreign_type),
@@ -2030,6 +2710,38 @@ mod tests {
             assert_eq!(store.value_symbol_links(symbol), None);
         }
 
+        for invalid in [
+            MappedSymbolLinks {
+                key_type: Some(foreign_type),
+                ..MappedSymbolLinks::default()
+            },
+            MappedSymbolLinks {
+                synthetic_origin: Some(foreign_symbol),
+                ..MappedSymbolLinks::default()
+            },
+        ] {
+            assert!(!store.set_mapped_symbol_links(symbol, invalid));
+            assert_eq!(store.mapped_symbol_links(symbol), None);
+        }
+
+        for invalid in [
+            DeferredSymbolLinks {
+                parent: Some(foreign_type),
+                ..DeferredSymbolLinks::default()
+            },
+            DeferredSymbolLinks {
+                constituents: Some(vec![foreign_type]),
+                ..DeferredSymbolLinks::default()
+            },
+            DeferredSymbolLinks {
+                write_constituents: Some(vec![foreign_type]),
+                ..DeferredSymbolLinks::default()
+            },
+        ] {
+            assert!(!store.set_deferred_symbol_links(symbol, invalid));
+            assert_eq!(store.deferred_symbol_links(symbol), None);
+        }
+
         assert!(!store.set_alias_symbol_links(
             symbol,
             AliasSymbolLinks {
@@ -2052,6 +2764,57 @@ mod tests {
             },
         ));
         assert_eq!(store.alias_symbol_links(symbol), None);
+
+        for invalid in [
+            ModuleSymbolLinks {
+                resolved_exports: Some(foreign_table),
+                ..ModuleSymbolLinks::default()
+            },
+            ModuleSymbolLinks {
+                type_only_export_star_map: Some(HashMap::from([(
+                    EscapedName::source("foreign"),
+                    Some(first_node),
+                )])),
+                ..ModuleSymbolLinks::default()
+            },
+        ] {
+            assert!(!store.set_module_symbol_links(symbol, invalid));
+            assert_eq!(store.module_symbol_links(symbol), None);
+        }
+
+        assert!(!store.set_late_bound_links(
+            symbol,
+            LateBoundLinks {
+                late_symbol: Some(foreign_symbol),
+            },
+        ));
+        assert_eq!(store.late_bound_links(symbol), None);
+
+        for invalid in [
+            ExportTypeLinks {
+                target: Some(foreign_symbol),
+                ..ExportTypeLinks::default()
+            },
+            ExportTypeLinks {
+                originating_import: Some(first_node),
+                ..ExportTypeLinks::default()
+            },
+        ] {
+            assert!(!store.set_export_type_links(symbol, invalid));
+            assert_eq!(store.export_type_links(symbol), None);
+        }
+
+        for invalid in [
+            MembersAndExportsLinks {
+                tables: [Some(foreign_table), None],
+            },
+            MembersAndExportsLinks {
+                tables: [None, Some(foreign_table)],
+            },
+        ] {
+            assert!(!store.set_members_and_exports_links(symbol, invalid));
+            assert_eq!(store.members_and_exports_links(symbol), None);
+        }
 
         let invalid_aliases = [
             TypeAliasLinks {
@@ -2083,6 +2846,56 @@ mod tests {
             },
         ));
         assert_eq!(store.declared_type_links(symbol), None);
+
+        for invalid in [
+            SpreadLinks {
+                left_spread: Some(foreign_symbol),
+                ..SpreadLinks::default()
+            },
+            SpreadLinks {
+                right_spread: Some(foreign_symbol),
+                ..SpreadLinks::default()
+            },
+        ] {
+            assert!(!store.set_spread_links(symbol, invalid));
+            assert_eq!(store.spread_links(symbol), None);
+        }
+
+        for invalid in [
+            ReverseMappedSymbolLinks {
+                property_type: Some(foreign_type),
+                ..ReverseMappedSymbolLinks::default()
+            },
+            ReverseMappedSymbolLinks {
+                mapped_type: Some(foreign_type),
+                ..ReverseMappedSymbolLinks::default()
+            },
+            ReverseMappedSymbolLinks {
+                constraint_type: Some(foreign_type),
+                ..ReverseMappedSymbolLinks::default()
+            },
+        ] {
+            assert!(!store.set_reverse_mapped_symbol_links(symbol, invalid));
+            assert_eq!(store.reverse_mapped_symbol_links(symbol), None);
+        }
+
+        let module_baseline = ModuleSymbolLinks {
+            resolved_exports: Some(local_table),
+            type_only_export_star_map: Some(HashMap::from([(
+                EscapedName::source("local"),
+                Some(second_node),
+            )])),
+            exports_checked: true,
+        };
+        assert!(store.set_module_symbol_links(symbol, module_baseline.clone()));
+        assert!(!store.set_module_symbol_links(
+            symbol,
+            ModuleSymbolLinks {
+                resolved_exports: Some(foreign_table),
+                ..ModuleSymbolLinks::default()
+            },
+        ));
+        assert_eq!(store.module_symbol_links(symbol), Some(&module_baseline));
 
         let baseline = ValueSymbolLinks {
             resolved_type: Some(local_type),

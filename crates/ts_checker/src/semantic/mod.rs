@@ -25,12 +25,17 @@ pub use ids::{
     ConditionalRootId, IndexInfoId, SignatureId, TypeAliasId, TypeId, TypeMapperId, TypePredicateId,
 };
 pub use links::{
-    AliasSymbolLinks, AliasTargetState, DeclaredTypeLinks, DecoratorSignatureState,
-    EffectsSignatureState, LinkHandle, LinkStore, NodeCheckFlags, NodeLinks,
-    ResolvedSignatureState, SignatureLinks, SymbolNodeLinks, SymbolReferenceLinks, Tristate,
-    TypeAliasLinks, TypeNodeLinks, TypeResolutionBoundary, TypeResolutionTarget,
-    TypeResolutionTargetError, TypeSystemPropertyName, ValueSymbolLinks,
+    AliasSymbolLinks, AliasTargetState, ArrayLiteralLinks, AssertionLinks, DeclaredTypeLinks,
+    DecoratorSignatureState, DeferredSymbolLinks, EffectsSignatureState, ExhaustiveState,
+    ExportTypeLinks, JsxElementLinks, JsxFlags, LateBoundLinks, LinkHandle, LinkStore,
+    MappedSymbolLinks, MarkedAssignmentSymbolLinks, MembersAndExportsLinks,
+    MembersOrExportsResolutionKind, ModuleSymbolLinks, NodeCheckFlags, NodeLinks,
+    ResolvedSignatureState, ReverseMappedSymbolLinks, SignatureLinks, SpreadLinks,
+    SwitchStatementLinks, SymbolNodeLinks, SymbolReferenceLinks, Tristate, TypeAliasLinks,
+    TypeNodeLinks, TypeResolutionBoundary, TypeResolutionTarget, TypeResolutionTargetError,
+    TypeSystemPropertyName, ValueSymbolLinks, VarianceLinks,
 };
 pub use mapper::{CanonicalTypeMapperStore, TypeMapper, TypeMapperKind};
 pub use store::SemanticStore;
 pub use type_records::{CacheHashKey, CanonicalSemanticStore, TypeData, TypeDataKind, TypeRecord};
+pub use types::VarianceFlags;
