@@ -22,8 +22,8 @@ use super::{
 
 /// The exact 128-bit key shape used by upstream semantic caches.
 ///
-/// Hash construction belongs to later checker algorithms; this record only
-/// preserves the complete key without substituting strings for identity.
+/// Relation-key construction lives in the canonical relation substrate; other
+/// cache algorithms use this record while their exact builders are ported.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[repr(transparent)]
 pub struct CacheHashKey(u128);
