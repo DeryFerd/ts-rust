@@ -27,7 +27,8 @@ use super::{
     object_members::PropertyObjectPlan,
     relater::{ResolvedDeclaredProperty, ResolvedDeclaredPropertyObject},
     source::{
-        PlannedExpression, PlannedExpressionKind, SourceCheckError, SourceCheckProvenanceError,
+        CheckedExpressionShape, CheckedExpressionTypes, PlannedExpression, PlannedExpressionKind,
+        SourceCheckError, SourceCheckProvenanceError,
     },
     spelling::get_spelling_suggestion,
     type_records::TypeData,
@@ -40,20 +41,22 @@ pub(super) fn diagnostics_for_failed_assignment(
     host: &DeclaredTypeHost<'_>,
     global_types: &CanonicalGlobalTypes,
     expression: &PlannedExpression,
-    source_type: TypeId,
+    checked: &CheckedExpressionTypes,
     target_type: TypeId,
     fallback_node: NodeRef,
     options: CanonicalCheckerOptions,
 ) -> Result<Vec<CanonicalCheckerDiagnostic>, SourceCheckError> {
+    validate_checked_expression_shape(expression, checked)?;
     let flags = display_flags(options);
-    let mut elaborated = elaborate_known_properties(
+    let mut elaborated = elaborate_expression(
         store,
         host,
         global_types,
         expression,
-        source_type,
+        checked,
         target_type,
         flags,
+        options,
     )?;
     if !elaborated.is_empty() {
         return Ok(elaborated);
@@ -63,12 +66,105 @@ pub(super) fn diagnostics_for_failed_assignment(
         host,
         global_types,
         expression,
-        source_type,
+        checked.result,
         target_type,
         fallback_node,
         flags,
     )?);
     Ok(elaborated)
+}
+
+/// Validates the complete retained execution tree before recursive diagnostic
+/// elaboration can run relation queries for any sibling.
+fn validate_checked_expression_shape(
+    expression: &PlannedExpression,
+    checked: &CheckedExpressionTypes,
+) -> Result<(), SourceCheckError> {
+    let expression = expression.unparenthesized();
+    match (&expression.kind, &checked.shape) {
+        (
+            PlannedExpressionKind::Object { plan, properties },
+            CheckedExpressionShape::Object(checked_properties),
+        ) => {
+            if plan.properties.len() != properties.len()
+                || properties.len() != checked_properties.len()
+            {
+                return Err(invalid_structure(checked.result));
+            }
+            for (property, checked_property) in properties.iter().zip(checked_properties) {
+                validate_checked_expression_shape(property, checked_property)?;
+            }
+            Ok(())
+        }
+        (
+            PlannedExpressionKind::Array(elements),
+            CheckedExpressionShape::Array(checked_elements),
+        ) => {
+            if elements.len() != checked_elements.len() {
+                return Err(invalid_structure(checked.result));
+            }
+            for (element, checked_element) in elements.iter().zip(checked_elements) {
+                validate_checked_expression_shape(element, checked_element)?;
+            }
+            Ok(())
+        }
+        (
+            PlannedExpressionKind::Object { .. } | PlannedExpressionKind::Array(_),
+            CheckedExpressionShape::Leaf,
+        )
+        | (_, CheckedExpressionShape::Array(_) | CheckedExpressionShape::Object(_)) => {
+            Err(invalid_structure(checked.result))
+        }
+        _ => Ok(()),
+    }
+}
+
+#[allow(clippy::too_many_arguments)] // Mirrors the pinned recursive elaboration boundary.
+fn elaborate_expression(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    expression: &PlannedExpression,
+    checked: &CheckedExpressionTypes,
+    target_type: TypeId,
+    flags: CanonicalTypeFormatFlags,
+    options: CanonicalCheckerOptions,
+) -> Result<Vec<CanonicalCheckerDiagnostic>, SourceCheckError> {
+    let expression = expression.unparenthesized();
+    match (&expression.kind, &checked.shape) {
+        (PlannedExpressionKind::Object { .. }, CheckedExpressionShape::Object(_)) => {
+            elaborate_known_properties(
+                store,
+                host,
+                global_types,
+                expression,
+                checked,
+                target_type,
+                flags,
+                options,
+            )
+        }
+        (PlannedExpressionKind::Array(_), CheckedExpressionShape::Array(_)) => Ok(
+            super::array_diagnostics::diagnostics_for_failed_array_assignment(
+                store,
+                host,
+                global_types,
+                expression,
+                checked,
+                target_type,
+                options,
+            )?
+            .unwrap_or_default(),
+        ),
+        (
+            PlannedExpressionKind::Object { .. } | PlannedExpressionKind::Array(_),
+            CheckedExpressionShape::Leaf,
+        )
+        | (_, CheckedExpressionShape::Array(_) | CheckedExpressionShape::Object(_)) => {
+            Err(invalid_structure(checked.result))
+        }
+        _ => Ok(Vec::new()),
+    }
 }
 
 fn display_flags(options: CanonicalCheckerOptions) -> CanonicalTypeFormatFlags {
@@ -82,31 +178,47 @@ fn display_flags(options: CanonicalCheckerOptions) -> CanonicalTypeFormatFlags {
 /// Mirrors `elaborateObjectLiteral`: every incompatible known source property
 /// is attempted in source order, and any successful elaboration suppresses all
 /// root fallback diagnostics.
+#[allow(clippy::too_many_arguments)] // Keeps recursive expression capabilities explicit.
 fn elaborate_known_properties(
     store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     global_types: &CanonicalGlobalTypes,
     expression: &PlannedExpression,
-    source_type: TypeId,
+    checked: &CheckedExpressionTypes,
     target_type: TypeId,
     flags: CanonicalTypeFormatFlags,
+    options: CanonicalCheckerOptions,
 ) -> Result<Vec<CanonicalCheckerDiagnostic>, SourceCheckError> {
     let expression = expression.unparenthesized();
     let PlannedExpressionKind::Object { plan, properties } = &expression.kind else {
         return Ok(Vec::new());
     };
+    let CheckedExpressionShape::Object(checked_properties) = &checked.shape else {
+        return Err(invalid_structure(checked.result));
+    };
     let Some(target) = store.resolved_declared_property_object(host, target_type)? else {
         return Ok(Vec::new());
     };
-    let source_types = resolved_source_property_types(store, plan, source_type)?;
-    if properties.len() != plan.properties.len() || source_types.len() != plan.properties.len() {
-        return Err(invalid_structure(source_type));
+    let source_types = resolved_source_property_types(store, plan, checked.result)?;
+    if properties.len() != plan.properties.len()
+        || source_types.len() != plan.properties.len()
+        || checked_properties.len() != plan.properties.len()
+    {
+        return Err(invalid_structure(checked.result));
     }
 
     let mut diagnostics = Vec::new();
-    for ((source_property, source_expression), source_property_type) in
-        plan.properties.iter().zip(properties).zip(source_types)
+    for (index, ((source_property, source_expression), source_property_type)) in plan
+        .properties
+        .iter()
+        .zip(properties)
+        .zip(source_types)
+        .enumerate()
     {
+        let checked_property = &checked_properties[index];
+        if checked_property.result != source_property_type {
+            return Err(invalid_structure(checked.result));
+        }
         let Some(target_property) = target.get_source(&source_property.name) else {
             continue;
         };
@@ -118,51 +230,26 @@ fn elaborate_known_properties(
             continue;
         }
 
-        if matches!(
-            &source_expression.unparenthesized().kind,
-            PlannedExpressionKind::Object { .. }
-        ) {
-            let nested = elaborate_known_properties(
-                store,
-                host,
-                global_types,
-                source_expression,
-                source_property_type,
-                target_property.type_,
-                flags,
-            )?;
-            if !nested.is_empty() {
-                diagnostics.extend(nested);
-                continue;
-            }
-
-            let mut diagnostic = shape_or_generic_diagnostic(
-                store,
-                host,
-                global_types,
-                source_expression,
-                source_property_type,
-                target_property.type_,
-                source_property.name_node,
-                flags,
-            )?;
-            append_expected_property_related(
-                &mut diagnostic,
-                store,
-                host,
-                global_types,
-                target_type,
-                target_property,
-                flags,
-            )?;
-            diagnostics.push(diagnostic);
-            continue;
-        }
-
-        let mut diagnostic = generic_assignability_diagnostic(
+        let nested = elaborate_expression(
             store,
             host,
             global_types,
+            source_expression,
+            checked_property,
+            target_property.type_,
+            flags,
+            options,
+        )?;
+        if !nested.is_empty() {
+            diagnostics.extend(nested);
+            continue;
+        }
+
+        let mut diagnostic = shape_or_generic_diagnostic(
+            store,
+            host,
+            global_types,
+            source_expression,
             source_property_type,
             target_property.type_,
             source_property.name_node,

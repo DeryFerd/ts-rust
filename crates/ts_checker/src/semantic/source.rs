@@ -1485,10 +1485,17 @@ fn expression_type(
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct CheckedExpressionTypes {
+pub(super) enum CheckedExpressionShape {
+    Leaf,
+    Array(Vec<CheckedExpressionTypes>),
+    Object(Vec<CheckedExpressionTypes>),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct CheckedExpressionTypes {
     raw: TypeId,
-    result: TypeId,
-    array_elements: Option<Vec<CheckedExpressionTypes>>,
+    pub(super) result: TypeId,
+    pub(super) shape: CheckedExpressionShape,
 }
 
 impl CheckedExpressionTypes {
@@ -1496,7 +1503,7 @@ impl CheckedExpressionTypes {
         Self {
             raw,
             result,
-            array_elements: None,
+            shape: CheckedExpressionShape::Leaf,
         }
     }
 }
@@ -1646,7 +1653,7 @@ fn execute_expression_types(
             Ok(CheckedExpressionTypes {
                 raw: array,
                 result: array,
-                array_elements: Some(checked_elements),
+                shape: CheckedExpressionShape::Array(checked_elements),
             })
         }
         (
@@ -1657,16 +1664,21 @@ fn execute_expression_types(
             debug_assert_eq!(properties.len(), prepared_properties.len());
             super::object_members::object_literal_state(store, plan)
                 .map_err(source_object_execution_error)?;
+            let mut checked_properties = Vec::with_capacity(properties.len());
             let mut property_types = Vec::with_capacity(properties.len());
             for (property, prepared) in properties.iter().zip(prepared_properties) {
-                property_types.push(
-                    execute_expression_types(store, global_types, property, prepared)?.result,
-                );
+                let checked = execute_expression_types(store, global_types, property, prepared)?;
+                property_types.push(checked.result);
+                checked_properties.push(checked);
             }
             let object =
                 super::object_members::publish_object_literal(store, plan, &property_types)
                     .map_err(source_object_execution_error)?;
-            Ok(CheckedExpressionTypes::leaf(object, object))
+            Ok(CheckedExpressionTypes {
+                raw: object,
+                result: object,
+                shape: CheckedExpressionShape::Object(checked_properties),
+            })
         }
         _ => unreachable!("a prepared expression must retain its planned expression shape"),
     }?;
@@ -2083,43 +2095,16 @@ fn check_planned_assignment(
     }
     let source_type = source_types.result;
     if !store.is_type_assignable_to_with_global_types(source_type, target, global_types)? {
-        let element_types = source_types.array_elements.as_deref().map(|elements| {
-            elements
-                .iter()
-                .map(|element| element.result)
-                .collect::<Vec<_>>()
-        });
-        let elaborated = element_types
-            .as_deref()
-            .map(|element_types| {
-                super::array_diagnostics::diagnostics_for_failed_array_assignment(
-                    store,
-                    host,
-                    global_types,
-                    expression,
-                    element_types,
-                    source_type,
-                    target,
-                    options,
-                )
-            })
-            .transpose()?
-            .flatten()
-            .filter(|diagnostics| !diagnostics.is_empty());
-        let staged = if let Some(elaborated) = elaborated {
-            elaborated
-        } else {
-            super::object_diagnostics::diagnostics_for_failed_assignment(
-                store,
-                host,
-                global_types,
-                expression,
-                source_type,
-                target,
-                fallback_node,
-                options,
-            )?
-        };
+        let staged = super::object_diagnostics::diagnostics_for_failed_assignment(
+            store,
+            host,
+            global_types,
+            expression,
+            &source_types,
+            target,
+            fallback_node,
+            options,
+        )?;
         for diagnostic in staged {
             merge_retry_diagnostic(diagnostics, diagnostic);
         }
@@ -3136,6 +3121,175 @@ mod tests {
             context.check_source_file(file).unwrap();
             assert_eq!(observable_state(&context, file), warm);
         }
+    }
+
+    #[test]
+    fn nested_array_properties_elaborate_at_the_incompatible_element() {
+        let library = parsed("interface Array<T> {}");
+        let library_file = FileId::new(127);
+        for (index, text) in [
+            r#"var value: { xs: number[] } = { xs: ["a"] };"#,
+            r#"var value: { xs: number[] } = { xs: (["a"]) };"#,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let source = parsed(text);
+            let file = FileId::new(128 + u32::try_from(index).unwrap());
+            let mut context = context(
+                &[(library_file, &library), (file, &source)],
+                CanonicalCheckerOptions::default(),
+            );
+            let object = variable_initializer(&source, file, "value");
+            let property_initializer = object_property_initializer(&source, file, object, "xs");
+            let array = match &source.arena.get(property_initializer.node).unwrap().data {
+                NodeData::ParenthesizedExpression(parenthesized) => {
+                    NodeRef::new(source.arena.id(), file, parenthesized.expression)
+                }
+                NodeData::ArrayLiteralExpression(_) => property_initializer,
+                _ => panic!("expected an array or parenthesized array"),
+            };
+            let elements = array_elements(&source, file, array);
+            let [element] = elements.as_slice() else {
+                panic!("expected one nested array element")
+            };
+            let element = *element;
+
+            context.check_source_file(file).unwrap();
+
+            assert_eq!(
+                context
+                    .type_to_string(resolved_node_type(&context, array))
+                    .unwrap(),
+                "string[]",
+            );
+            assert_eq!(
+                context
+                    .type_to_string(object_property_type(&context, object, "xs"))
+                    .unwrap(),
+                "string[]",
+            );
+            assert_eq!(
+                context
+                    .type_to_string(resolved_node_type(&context, element))
+                    .unwrap(),
+                "\"a\"",
+                "the element link retains its raw fresh literal identity",
+            );
+
+            let [diagnostic] = context.diagnostics().as_slice() else {
+                panic!("expected one nested array diagnostic")
+            };
+            assert_eq!(diagnostic.node, Some(element));
+            assert_eq!(diagnostic.diagnostic.code(), 2322);
+            assert_eq!(diagnostic.diagnostic.arguments, ["string", "number"]);
+            assert_eq!(
+                diagnostic.diagnostic.render().unwrap(),
+                "Type 'string' is not assignable to type 'number'.",
+            );
+            assert!(diagnostic.related_information.is_empty());
+            let range = source.arena.get(element.node).unwrap().range;
+            let start = u32::try_from(text.find("\"a\"").unwrap()).unwrap();
+            assert_eq!((range.start.get(), range.end.get()), (start, start + 3));
+            assert!(is_type_checked(&context, file));
+
+            let warm = observable_state(&context, file);
+            context.check_source_file(file).unwrap();
+            assert_eq!(observable_state(&context, file), warm);
+        }
+    }
+
+    #[test]
+    fn malformed_checked_expression_shapes_fail_atomically_before_elaboration() {
+        let source = parsed("var value: number[] = [1];");
+        let file = FileId::new(130);
+        let context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        let array = variable_initializer(&source, file, "value");
+        let planned = PlannedExpression::new(array, PlannedExpressionKind::Array(Vec::new()));
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        let checked_element = CheckedExpressionTypes::leaf(number, number);
+        let mismatched_length = CheckedExpressionTypes {
+            raw: number,
+            result: number,
+            shape: CheckedExpressionShape::Array(vec![checked_element]),
+        };
+        let mismatched_kind = CheckedExpressionTypes::leaf(number, number);
+        let before = observable_state(&context, file);
+
+        for checked in [&mismatched_length, &mismatched_kind] {
+            assert!(matches!(
+                super::super::array_diagnostics::checked_array_elements(&planned, checked),
+                Err(SourceCheckError::RelationUnavailable(
+                    RelationUnavailable::MalformedStructuredType(actual),
+                )) if actual == number
+            ));
+        }
+
+        assert_eq!(observable_state(&context, file), before);
+        assert!(context.diagnostics().is_empty());
+
+        let nested_source = parsed(
+            "var value: { ok: number; nested: { value: number } } = \
+             { ok: 1, nested: { value: 2 } };",
+        );
+        let nested_file = FileId::new(131);
+        let mut nested_context = context(
+            &[(nested_file, &nested_source)],
+            CanonicalCheckerOptions::default(),
+        );
+        let nested_plan = {
+            let (arena, bound) = nested_context.file(nested_file).unwrap();
+            let source = nested_context.source_file(nested_file).unwrap();
+            let host = DeclaredTypeHost::new([(arena, bound)]).unwrap();
+            let plan =
+                SourcePlanner::new_semantic(arena, bound, source, nested_context.store(), &host)
+                    .finish()
+                    .unwrap();
+            let [PlannedStatement::Variables(variables)] = plan.statements.as_slice() else {
+                panic!("expected one variable statement")
+            };
+            let [variable] = variables.as_slice() else {
+                panic!("expected one variable")
+            };
+            variable.initializer.clone()
+        };
+        let number = nested_context
+            .store()
+            .intrinsic_bootstrap()
+            .unwrap()
+            .number_type;
+        let checked = CheckedExpressionTypes {
+            raw: number,
+            result: number,
+            shape: CheckedExpressionShape::Object(vec![
+                CheckedExpressionTypes::leaf(number, number),
+                CheckedExpressionTypes::leaf(number, number),
+            ]),
+        };
+        let globals = nested_context.global_types().clone();
+        let options = nested_context.options();
+        let host = DeclaredTypeHost::new(std::iter::empty::<(&NodeArena, &BoundFile)>()).unwrap();
+        let before = observable_state(&nested_context, nested_file);
+
+        let result = super::super::object_diagnostics::diagnostics_for_failed_assignment(
+            nested_context.store_mut_for_test(),
+            &host,
+            &globals,
+            &nested_plan,
+            &checked,
+            number,
+            nested_plan.node,
+            options,
+        );
+
+        assert!(matches!(
+            result,
+            Err(SourceCheckError::RelationUnavailable(
+                RelationUnavailable::InvalidStructuredMembers(actual),
+            )) if actual == number
+        ));
+        assert_eq!(observable_state(&nested_context, nested_file), before);
+        assert!(nested_context.diagnostics().is_empty());
     }
 
     #[test]

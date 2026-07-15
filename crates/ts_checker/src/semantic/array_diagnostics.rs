@@ -10,7 +10,10 @@ use ts_ast::NodeRef;
 use super::{
     CanonicalCheckerDiagnostic, CanonicalCheckerOptions, CanonicalGlobalTypes,
     CanonicalTypeMapperStore, DeclaredTypeHost, RelationUnavailable, TypeId,
-    source::{PlannedExpression, PlannedExpressionKind, SourceCheckError},
+    source::{
+        CheckedExpressionShape, CheckedExpressionTypes, PlannedExpression, PlannedExpressionKind,
+        SourceCheckError,
+    },
 };
 
 /// Elaborates one failed ordinary-array assignment positionally.
@@ -24,17 +27,15 @@ pub(super) fn diagnostics_for_failed_array_assignment(
     host: &DeclaredTypeHost<'_>,
     global_types: &CanonicalGlobalTypes,
     expression: &PlannedExpression,
-    element_types: &[TypeId],
-    source_type: TypeId,
+    checked: &CheckedExpressionTypes,
     target_type: TypeId,
     options: CanonicalCheckerOptions,
 ) -> Result<Option<Vec<CanonicalCheckerDiagnostic>>, SourceCheckError> {
-    let expression = expression.unparenthesized();
-    let PlannedExpressionKind::Array(elements) = &expression.kind else {
+    let Some(elements) = checked_array_elements(expression, checked)? else {
         return Ok(None);
     };
     if store
-        .canonical_array_reference(global_types, source_type)?
+        .canonical_array_reference(global_types, checked.result)?
         .is_none()
     {
         return Ok(None);
@@ -43,14 +44,11 @@ pub(super) fn diagnostics_for_failed_array_assignment(
     else {
         return Ok(None);
     };
-    if elements.len() != element_types.len() {
-        return Err(RelationUnavailable::MalformedStructuredType(source_type).into());
-    }
 
     let mut diagnostics = Vec::new();
-    for (element, element_type) in elements.iter().zip(element_types.iter().copied()) {
+    for (element, checked_element) in elements.planned.iter().zip(elements.checked) {
         if store.is_type_assignable_to_with_global_types(
-            element_type,
+            checked_element.result,
             target_element,
             global_types,
         )? {
@@ -62,7 +60,7 @@ pub(super) fn diagnostics_for_failed_array_assignment(
                 host,
                 global_types,
                 element,
-                element_type,
+                checked_element,
                 target_element,
                 diagnostic_node(element),
                 options,
@@ -70,6 +68,33 @@ pub(super) fn diagnostics_for_failed_array_assignment(
         );
     }
     Ok(Some(diagnostics))
+}
+
+pub(super) struct CheckedArrayElements<'a> {
+    pub(super) planned: &'a [PlannedExpression],
+    pub(super) checked: &'a [CheckedExpressionTypes],
+}
+
+/// Validates the retained execution tree before diagnostic elaboration can
+/// mutate relation caches or publish a partial diagnostic batch.
+pub(super) fn checked_array_elements<'a>(
+    expression: &'a PlannedExpression,
+    checked: &'a CheckedExpressionTypes,
+) -> Result<Option<CheckedArrayElements<'a>>, SourceCheckError> {
+    let expression = expression.unparenthesized();
+    let PlannedExpressionKind::Array(planned) = &expression.kind else {
+        return Ok(None);
+    };
+    let CheckedExpressionShape::Array(checked_elements) = &checked.shape else {
+        return Err(RelationUnavailable::MalformedStructuredType(checked.result).into());
+    };
+    if planned.len() != checked_elements.len() {
+        return Err(RelationUnavailable::MalformedStructuredType(checked.result).into());
+    }
+    Ok(Some(CheckedArrayElements {
+        planned,
+        checked: checked_elements,
+    }))
 }
 
 fn diagnostic_node(expression: &PlannedExpression) -> NodeRef {
