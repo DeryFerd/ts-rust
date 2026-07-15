@@ -3524,25 +3524,175 @@ mod tests {
         }
     }
 
+    // Pinned tsgo 7.0-dev oracle matrix under `--noLib`: an empty `Array<T>`
+    // shell makes both `[[1], {}]` orders `number[][]`; adding required
+    // `length` makes both orders `{}[]`; a matching `{ length: number }`
+    // remains `number[][]`. This slice implements only the required-surface
+    // empty-object reduction and keeps the other mixed cases unavailable.
     #[test]
-    fn mixed_array_and_property_object_subtype_reduction_stays_typed_unavailable() {
-        let library = parsed("interface Array<T> {}");
-        let source = parsed("var mixed: any = [[1], { id: 1 }];");
-        let library_file = FileId::new(132);
-        let file = FileId::new(133);
+    fn unproven_array_shells_mixed_with_empty_objects_stay_typed_unavailable() {
+        for (library_text, source_text) in [
+            ("interface Array<T> {}", "var mixed: any = [[1], {}];"),
+            ("interface Array<T> {}", "var mixed: any = [{}, [1]];"),
+            (
+                "interface Array<T> { length?: number }",
+                "var mixed: any = [[1], {}];",
+            ),
+            (
+                "interface Array<T> { length?: number }",
+                "var mixed: any = [{}, [1]];",
+            ),
+            (
+                "interface Array<T> { push(value: T): number }",
+                "var mixed: any = [[1], {}];",
+            ),
+            (
+                "interface Array<T> { push(value: T): number }",
+                "var mixed: any = [{}, [1]];",
+            ),
+        ] {
+            let library = parsed(library_text);
+            let source = parsed(source_text);
+            let library_file = FileId::new(132);
+            let file = FileId::new(133);
+            let mut context = context(
+                &[(library_file, &library), (file, &source)],
+                CanonicalCheckerOptions::default(),
+            );
+
+            assert!(matches!(
+                context.check_source_file(file),
+                Err(SourceCheckError::LiteralCache(
+                    SourceLiteralCacheError::UnsupportedUnionConstituent(_)
+                )),
+            ));
+            assert!(context.diagnostics().is_empty());
+            assert!(!is_type_checked(&context, file));
+        }
+    }
+
+    #[test]
+    fn required_array_property_reduces_empty_objects_in_both_orders() {
+        let library = parsed("interface Array<T> { length: number }");
+        let source = parsed("var arrayFirst: any = [[1], {}]; var objectFirst: any = [{}, [1]];");
+        let library_file = FileId::new(134);
+        let file = FileId::new(135);
         let mut context = context(
             &[(library_file, &library), (file, &source)],
             CanonicalCheckerOptions::default(),
         );
 
-        assert!(matches!(
-            context.check_source_file(file),
-            Err(SourceCheckError::LiteralCache(
-                SourceLiteralCacheError::UnsupportedUnionConstituent(_)
-            )),
-        ));
+        context.check_source_file(file).unwrap();
+        for name in ["arrayFirst", "objectFirst"] {
+            let type_ = resolved_node_type(&context, variable_initializer(&source, file, name));
+            assert_eq!(context.type_to_string(type_).unwrap(), "{}[]");
+        }
         assert!(context.diagnostics().is_empty());
-        assert!(!is_type_checked(&context, file));
+        assert!(is_type_checked(&context, file));
+
+        let warm = observable_state(&context, file);
+        context.check_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn mixed_array_empty_union_preflight_preserves_typed_poison_and_retry() {
+        let library = parsed("interface Array<T> { length: number }");
+        let source = parsed("var arrayValue: any = [1]; var emptyValue: any = {};");
+        let library_file = FileId::new(136);
+        let file = FileId::new(137);
+        let mut context = context(
+            &[(library_file, &library), (file, &source)],
+            CanonicalCheckerOptions::default(),
+        );
+        context.check_source_file(file).unwrap();
+
+        let array = resolved_node_type(&context, variable_initializer(&source, file, "arrayValue"));
+        let empty = resolved_node_type(&context, variable_initializer(&source, file, "emptyValue"));
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        let global_types = context.global_types().clone();
+        assert_eq!(
+            context
+                .store_mut_for_test()
+                .expression_union_type_with_global_types(
+                    &global_types,
+                    &[array, empty],
+                    UnionReduction::Subtype,
+                )
+                .unwrap(),
+            empty
+        );
+
+        assert!(context.store_mut_for_test().set_type_reference_resolution(
+            array,
+            None,
+            Some(vec![empty])
+        ));
+        let poisoned = observable_state(&context, file);
+        assert_eq!(
+            context
+                .store_mut_for_test()
+                .expression_union_type_with_global_types(
+                    &global_types,
+                    &[array, empty],
+                    UnionReduction::Subtype,
+                ),
+            Err(LiteralTypeCacheError::ArrayType {
+                type_: array,
+                error: ArrayTypeError::InvalidReference(array),
+            })
+        );
+        assert_eq!(observable_state(&context, file), poisoned);
+
+        assert!(context.store_mut_for_test().set_type_reference_resolution(
+            array,
+            None,
+            Some(vec![number])
+        ));
+        assert_eq!(
+            context
+                .store_mut_for_test()
+                .expression_union_type_with_global_types(
+                    &global_types,
+                    &[empty, array],
+                    UnionReduction::Subtype,
+                )
+                .unwrap(),
+            empty
+        );
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn nonempty_array_property_relations_stay_typed_unavailable() {
+        for (library_text, source_text) in [
+            (
+                "interface Array<T> {}",
+                "var mixed: any = [[1], { id: 1 }];",
+            ),
+            (
+                "interface Array<T> { length: number }",
+                "var mixed: any = [[1], { length: 1 }];",
+            ),
+        ] {
+            let library = parsed(library_text);
+            let source = parsed(source_text);
+            let library_file = FileId::new(138);
+            let file = FileId::new(139);
+            let mut context = context(
+                &[(library_file, &library), (file, &source)],
+                CanonicalCheckerOptions::default(),
+            );
+
+            assert!(matches!(
+                context.check_source_file(file),
+                Err(SourceCheckError::LiteralCache(
+                    SourceLiteralCacheError::UnsupportedUnionConstituent(_)
+                )),
+            ));
+            assert!(context.diagnostics().is_empty());
+            assert!(!is_type_checked(&context, file));
+        }
     }
 
     #[test]
@@ -3550,9 +3700,9 @@ mod tests {
         let library = parsed("interface Array<T> {}");
         let expression = parsed("var nested: any = [[1], \"text\"];");
         let query = parsed("var target: string | number = 1;");
-        let library_file = FileId::new(134);
-        let expression_file = FileId::new(135);
-        let query_file = FileId::new(136);
+        let library_file = FileId::new(140);
+        let expression_file = FileId::new(141);
+        let query_file = FileId::new(142);
         let mut context = context(
             &[
                 (library_file, &library),

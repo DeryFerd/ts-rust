@@ -2175,11 +2175,14 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         // canonical unions, and fresh property objects, so the upstream type
         // parameter, discriminant fast path, and class-derivation branches are
         // unreachable here. Global-aware calls additionally admit canonical
-        // arrays. Mixed array/property-object comparisons remain a typed
-        // unavailable boundary until apparent Array members are installed;
-        // relation failure must not be treated as a negative subtype answer.
+        // arrays. The one mixed relation independent of generic Array members
+        // is Array -> regularized empty object; every nonempty mixed surface
+        // remains typed unavailable rather than becoming a negative answer.
         if types.len() < 2 {
             return Ok(());
+        }
+        if let Some(global_types) = global_types {
+            self.preflight_expression_union_array_object_pairs(types, global_types)?;
         }
         let has_empty_object = has_object_types
             && types
