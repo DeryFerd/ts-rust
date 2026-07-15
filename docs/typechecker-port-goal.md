@@ -334,12 +334,15 @@ remains the cluster-level source of truth.
   borrow that registry in O(1), including nested type references, recursive
   heritage, and global-library initialization; repeated queries no longer
   rebuild Program-wide maps or rescan sources.
-- T07's first semantic formatter slice is integrated through `9d61038`,
-  `763361f`, and `96fb33a`. Primitive, nullish, unique-symbol boundary, and
-  complete string/number/bigint literal display now live inside `ts_checker`,
-  including signed zero, NaN/infinity, quote selection, exact ordinary versus
-  `noErrorTruncation` budgets, and TS2322 literal-source generalization. General
-  union and symbol-aware object display remain the active formatter follow-up.
+- T07's semantic formatter is integrated through `9d61038`, `763361f`,
+  `96fb33a`, and `daf9a9d`. Primitive, nullish, unique-symbol boundary,
+  complete string/number/bigint literals, and canonical primitive unions now
+  display inside `ts_checker`. The independently reviewed union slice preserves
+  named aliases, denormalized origins, boolean collapse, nullable tail order,
+  the pinned approximate-length/elision algorithm, exact ordinary versus
+  `noErrorTruncation` byte budgets, and typed malformed/cycle failures without
+  formatter writes. Symbol-aware objects, functions, generic aliases, and
+  qualified names remain explicit follow-up work.
 - T06 and R01 now share a canonical primitive-union kernel. `af6096e`,
   `745fad1`, and `841dfd2` port parsed union type nodes, flattening,
   deduplication, literal reduction, nullable precedence, named origins, exact
@@ -348,9 +351,19 @@ remains the cluster-level source of truth.
   O(1). Independently reviewed `ca22d61` ports the pinned SOME/EACH branch
   order for identity, subtype, strict subtype, assignability, and comparability,
   plus nullable correspondence, literal-to-primitive shortcuts, named-union
-  identity, cache thresholds, and transactional publication. The merged stack
-  passes all 517 checker library tests, rustdoc with warnings denied, the
-  compile-fail doctest, and scoped all-target Clippy.
+  identity, cache thresholds, and transactional publication.
+- E00's first production source-checking slice is integrated through `625c143`
+  and `101fb48`. One context checks retained source files after a complete-tree
+  provenance preflight, supporting type aliases and explicitly typed ordinary
+  variables whose initializers are primitive literals. Target types include
+  named, anonymous, nullable, and literal unions. Successful checks publish an
+  idempotent source marker and exact TS2322 nodes, order, alias display, and
+  strict-null behavior; failed plans publish neither marker nor diagnostics,
+  and retry diagnostics stay privately partitioned by their owning source.
+  Unsupported statements and expressions remain typed boundaries with no
+  legacy fallback. The combined stack passes all 536 checker library tests;
+  its formatter review found no P0-P2 issue, and rustdoc, the compile-fail
+  doctest, and scoped all-target Clippy are green.
 
 No percentage in this section is a whole-corpus parity claim. A score is
 publishable only when its variant manifest and complete artifact comparison are
