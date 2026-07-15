@@ -289,6 +289,44 @@ remains the cluster-level source of truth.
   augmentation execution, full Program diagnostic elaboration, callback
   mappers, lazy global families, and complete compiler-to-canonical option
   plumbing are explicit later slices.
+- The alias path now extends through combined symbol meanings, immutable
+  module-resolution facts, and a production plain-TypeScript ESM target host.
+  `c7c1355` ports the pinned `getSymbolFlags`/`getSymbolFlagsEx` loop;
+  `69bad00` retains and validates an exact, node-keyed module-resolution
+  manifest; and `e2510d0` plus the independently reviewed boundary repair
+  `2215e61` resolve namespace imports, named imports, and named re-exports to
+  raw immediate targets. Direct-default namespace wrappers, default/local/star
+  and export-equals paths, CommonJS, JavaScript, missing manifest states, and
+  synthetic-module interop fail with typed retryable boundaries. Type-only
+  markers publish at the pinned syntactic point even when later target lookup
+  fails. Production-context orchestration and alias-aware lexical lookup remain
+  the next T04 consumer slices.
+- R00/R01 now have a usable exact base relation path. `d1f782f` and `c002752`
+  port the pinned fast/simple identity, subtype, strict-subtype, assignability,
+  comparability, literal, primitive, enum, nullable, unknown-like-union, and
+  cache-read branches. `fb420e2` adds uncached assignability for fully resolved
+  ordinary interface/type-literal property objects, including directional
+  relation keys, `Maybe` recursion, expansion and complexity budgets,
+  transactional cache publication, weak-target common-property checks,
+  optional-property semantics inside the supported nullability boundary, and
+  validated global `Object` fallback. Signatures, indexes, nominal members,
+  strict optional unions, generic structures, and other structural families
+  still fail typed rather than becoming false relations. The independent audit
+  found no P0-P2 issue, and all 29 focused relater tests pass on the merged tree.
+- T05/T06 now resolve useful declared aliases and source type nodes through
+  `8c2dc7d`, `22801bd`, `5938420`, and `aed8638`. The context-owned query
+  session supports intrinsic keyword and parenthesized nodes, non-generic
+  direct identifier references, recursive generic and non-generic type aliases
+  inside the installed boundary, and exact string/template, number, bigint,
+  boolean, null, and unary-minus literal type nodes. Literal queries preserve
+  upstream regular/fresh pairs, cross-node interning, operand-before-result
+  allocation, `+0`/`-0` cache identity, signed bigint behavior, null's link
+  bypass, checked batch capacity, and atomic retry. The literal audit found no
+  P0-P2 issue under the parser/binder/revision-validated production contract.
+  After integrating this alias/provider, relation, and literal wave, all 460
+  checker library tests, the checker compile-fail doctest, and scoped
+  all-target Clippy pass. Union/intersection, object/function, qualified and
+  import-alias type nodes remain explicit follow-up work.
 
 No percentage in this section is a whole-corpus parity claim. A score is
 publishable only when its variant manifest and complete artifact comparison are
