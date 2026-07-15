@@ -1602,6 +1602,7 @@ impl<'a> Parser<'a> {
         }
         let end = initializer
             .or(type_node)
+            .or(question_token)
             .and_then(|id| self.arena.get(id))
             .map_or_else(|| self.node_end(name), |node| node.range.end);
         let mut children = modifier_nodes;
@@ -16189,6 +16190,46 @@ export as namespace GlobalName;
                 .count()
                 == 2
         );
+    }
+
+    #[test]
+    fn untyped_optional_parameter_range_contains_its_question_token() {
+        let result = parse_source_file("const f: () => void = (a?, ...b) => {};");
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+
+        let (parameter_id, parameter_node) = result
+            .arena
+            .iter()
+            .find(|(_, node)| {
+                matches!(
+                    &node.data,
+                    NodeData::ParameterDeclaration(parameter)
+                        if parameter.question_token.is_some()
+                )
+            })
+            .expect("optional parameter");
+        let NodeData::ParameterDeclaration(parameter) = &parameter_node.data else {
+            unreachable!();
+        };
+        let question = result
+            .arena
+            .get(parameter.question_token.unwrap())
+            .unwrap();
+
+        assert_eq!(
+            (
+                parameter_node.range.start.get(),
+                parameter_node.range.end.get()
+            ),
+            (23, 25)
+        );
+        assert_eq!(
+            (question.range.start.get(), question.range.end.get()),
+            (24, 25)
+        );
+        assert_eq!(question.parent, Some(parameter_id));
+        assert!(parameter_node.range.start.get() <= question.range.start.get());
+        assert!(question.range.end.get() <= parameter_node.range.end.get());
     }
 
     #[test]
