@@ -44,7 +44,7 @@ impl CanonicalTypeFormatFlags {
 
     // `checker.(*Checker).typeToString` supplies this exact pair at the pinned
     // revision. Keep the wrapper default distinct from explicit `NONE`.
-    const TYPE_TO_STRING_DEFAULT: Self =
+    pub(super) const TYPE_TO_STRING_DEFAULT: Self =
         Self(Self::USE_ALIAS_DEFINED_OUTSIDE_CURRENT_SCOPE.0 | Self::ALLOW_UNIQUE_ES_SYMBOL_TYPE.0);
 
     #[must_use]
@@ -596,11 +596,11 @@ mod tests {
     };
     use ts_diagnostics::{Diagnostic, message_by_code};
     use ts_jsnum::{Number, PseudoBigInt};
-    use ts_parser::parse_source_file;
+    use ts_parser::{ParseResult, parse_source_file};
 
     use super::*;
     use crate::semantic::{
-        CanonicalCheckerContext, IntrinsicBootstrapOptions,
+        CanonicalCheckerContext, CanonicalCheckerOptions, IntrinsicBootstrapOptions,
         type_records::{LiteralValue, RegularLiteralLink},
     };
 
@@ -633,6 +633,47 @@ mod tests {
         let alias = store.alloc_type_alias(Some(symbol)).unwrap();
         assert!(store.set_type_alias(type_id, Some(alias)));
         alias
+    }
+
+    fn parsed_context(
+        parsed: &ParseResult,
+        file: FileId,
+        options: impl Into<CanonicalCheckerOptions>,
+    ) -> CanonicalCheckerContext<'_> {
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/formatter.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        CanonicalCheckerContext::new(binder.finish(), vec![(file, &parsed.arena)], options).unwrap()
+    }
+
+    fn type_alias_body(parsed: &ParseResult, file: FileId, expected: &str) -> NodeRef {
+        parsed
+            .arena
+            .iter()
+            .find_map(|(_, node)| {
+                let NodeData::TypeAliasDeclaration(alias) = &node.data else {
+                    return None;
+                };
+                let NodeData::Identifier(name) = &parsed.arena.get(alias.name)?.data else {
+                    return None;
+                };
+                (name.text == expected).then(|| NodeRef::new(parsed.arena.id(), file, alias.type_))
+            })
+            .expect("the test source contains the requested type alias")
     }
 
     #[test]
@@ -864,6 +905,89 @@ mod tests {
                 type_id: split,
                 boundary: 317,
             })
+        );
+    }
+
+    #[test]
+    fn context_no_error_truncation_controls_default_explicit_and_ts2322_display() {
+        let value = "x".repeat(400);
+        let parsed = parse_source_file(&format!("type Long = \"{value}\";"));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(93);
+        let long_node = type_alias_body(&parsed, file, "Long");
+        let complete = format!("\"{value}\"");
+        let truncated = format!("\"{}...", "x".repeat(316));
+
+        let mut default_context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+        let default_long = default_context.get_type_from_type_node(long_node).unwrap();
+        let default_never = default_context
+            .store()
+            .intrinsic_bootstrap()
+            .unwrap()
+            .never_type;
+        assert!(!default_context.options().no_error_truncation);
+        assert_eq!(
+            default_context.type_to_string(default_long).unwrap(),
+            truncated
+        );
+        assert_eq!(
+            default_context
+                .type_to_string_with_flags(default_long, CanonicalTypeFormatFlags::NO_TRUNCATION,)
+                .unwrap(),
+            complete
+        );
+        assert_eq!(
+            default_context
+                .get_type_names_for_assignability_error(default_long, default_never)
+                .unwrap(),
+            AssignabilityErrorDisplay {
+                source: truncated,
+                target: "never".into(),
+            }
+        );
+
+        let mut complete_context = parsed_context(
+            &parsed,
+            file,
+            CanonicalCheckerOptions {
+                no_error_truncation: true,
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+        let complete_long = complete_context.get_type_from_type_node(long_node).unwrap();
+        let complete_never = complete_context
+            .store()
+            .intrinsic_bootstrap()
+            .unwrap()
+            .never_type;
+        assert!(complete_context.options().no_error_truncation);
+        assert_eq!(
+            complete_context.type_to_string(complete_long).unwrap(),
+            complete
+        );
+        assert_eq!(
+            complete_context
+                .type_to_string_with_flags(complete_long, CanonicalTypeFormatFlags::NONE)
+                .unwrap(),
+            complete
+        );
+        assert_eq!(
+            complete_context
+                .type_to_string_with_flags(
+                    complete_long,
+                    CanonicalTypeFormatFlags::USE_SINGLE_QUOTES_FOR_STRING_LITERAL_TYPE,
+                )
+                .unwrap(),
+            format!("'{value}'")
+        );
+        assert_eq!(
+            complete_context
+                .get_type_names_for_assignability_error(complete_long, complete_never)
+                .unwrap(),
+            AssignabilityErrorDisplay {
+                source: complete,
+                target: "never".into(),
+            }
         );
     }
 

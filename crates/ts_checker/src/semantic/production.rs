@@ -45,12 +45,14 @@ use super::{
 /// The intrinsic pair controls bootstrap identity. `strict_bind_call_apply`
 /// selects the pinned `CallableFunction`/`NewableFunction` globals instead of
 /// aliasing both fields to `Function`. `strict_builtin_iterator_return` is
-/// retained for declared type-alias construction.
+/// retained for declared type-alias construction. `no_error_truncation`
+/// raises semantic type display to the pinned hard output cutoff.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CanonicalCheckerOptions {
     pub intrinsic: IntrinsicBootstrapOptions,
     pub strict_bind_call_apply: bool,
     pub strict_builtin_iterator_return: bool,
+    pub no_error_truncation: bool,
     pub name_resolution: CanonicalNameResolverOptions,
 }
 
@@ -60,6 +62,7 @@ impl From<IntrinsicBootstrapOptions> for CanonicalCheckerOptions {
             intrinsic,
             strict_bind_call_apply: false,
             strict_builtin_iterator_return: false,
+            no_error_truncation: false,
             name_resolution: CanonicalNameResolverOptions::default(),
         }
     }
@@ -336,18 +339,25 @@ impl<'arena> CanonicalCheckerContext<'arena> {
     }
 
     /// Formats one context-owned type through the dependency-closed canonical
-    /// semantic formatter.
+    /// semantic formatter. The retained `no_error_truncation` compiler option
+    /// is applied in addition to the ordinary pinned `TypeToString` flags.
     ///
     /// # Errors
     ///
     /// Returns [`TypeDisplayUnavailable`] when the type is foreign, malformed,
     /// or requires a display family not installed in the current checker cut.
     pub fn type_to_string(&self, type_id: TypeId) -> Result<String, TypeDisplayUnavailable> {
-        super::formatter::type_to_string(&self.store, type_id)
+        super::formatter::type_to_string_with_flags(
+            &self.store,
+            type_id,
+            self.type_format_flags(CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT),
+        )
     }
 
     /// Flag-aware form of [`Self::type_to_string`] for the exact format flags
-    /// observable in the installed primitive/literal prefix.
+    /// observable in the installed primitive/literal prefix. The retained
+    /// `no_error_truncation` compiler option takes effect even when the caller
+    /// does not supply [`CanonicalTypeFormatFlags::NO_TRUNCATION`].
     ///
     /// # Errors
     ///
@@ -358,11 +368,16 @@ impl<'arena> CanonicalCheckerContext<'arena> {
         type_id: TypeId,
         flags: CanonicalTypeFormatFlags,
     ) -> Result<String, TypeDisplayUnavailable> {
-        super::formatter::type_to_string_with_flags(&self.store, type_id, flags)
+        super::formatter::type_to_string_with_flags(
+            &self.store,
+            type_id,
+            self.type_format_flags(flags),
+        )
     }
 
     /// Computes exact TS2322 source and target display arguments without
-    /// mutating checker state.
+    /// mutating checker state. The retained `no_error_truncation` compiler
+    /// option is applied to both display arguments.
     ///
     /// # Errors
     ///
@@ -373,7 +388,19 @@ impl<'arena> CanonicalCheckerContext<'arena> {
         source: TypeId,
         target: TypeId,
     ) -> Result<AssignabilityErrorDisplay, TypeDisplayUnavailable> {
-        super::formatter::get_type_names_for_assignability_error(&self.store, source, target)
+        super::formatter::get_type_names_for_assignability_error_with_flags(
+            &self.store,
+            source,
+            target,
+            self.type_format_flags(CanonicalTypeFormatFlags::NONE),
+        )
+    }
+
+    fn type_format_flags(&self, mut flags: CanonicalTypeFormatFlags) -> CanonicalTypeFormatFlags {
+        if self.options.no_error_truncation {
+            flags |= CanonicalTypeFormatFlags::NO_TRUNCATION;
+        }
+        flags
     }
 
     /// The bootstrap-owned global symbol table after the supported
@@ -1701,7 +1728,9 @@ mod tests {
 
     #[test]
     fn checker_option_defaults_leave_strict_builtin_iterator_return_disabled() {
-        assert!(!CanonicalCheckerOptions::default().strict_builtin_iterator_return);
+        let defaults = CanonicalCheckerOptions::default();
+        assert!(!defaults.strict_builtin_iterator_return);
+        assert!(!defaults.no_error_truncation);
 
         let intrinsic = IntrinsicBootstrapOptions {
             strict_null_checks: true,
@@ -1710,6 +1739,7 @@ mod tests {
         let options = CanonicalCheckerOptions::from(intrinsic);
         assert_eq!(options.intrinsic, intrinsic);
         assert!(!options.strict_builtin_iterator_return);
+        assert!(!options.no_error_truncation);
     }
 
     #[test]
