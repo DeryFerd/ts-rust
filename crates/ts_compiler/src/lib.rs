@@ -386,10 +386,18 @@ fn array_type_error_is_unsupported(error: &ArrayTypeError) -> bool {
 }
 
 fn derived_type_error_is_unsupported(error: &DerivedTypeError) -> bool {
-    matches!(
-        error,
-        DerivedTypeError::UnsupportedWideningType(_) | DerivedTypeError::RecursiveObjectLiteral(_)
-    )
+    match error {
+        DerivedTypeError::ArrayType(error) => array_type_error_is_unsupported(error),
+        DerivedTypeError::UnsupportedWideningType(_)
+        | DerivedTypeError::RecursiveWideningType(_)
+        | DerivedTypeError::RecursiveObjectLiteral(_) => true,
+        DerivedTypeError::BootstrapUninitialized
+        | DerivedTypeError::Type(_)
+        | DerivedTypeError::MalformedObjectLiteral(_)
+        | DerivedTypeError::InvalidRegularObjectLiteralCache { .. }
+        | DerivedTypeError::InvalidWidenedTypeCache { .. }
+        | DerivedTypeError::Capacity(_) => false,
+    }
 }
 
 fn declared_type_error_is_unsupported(error: &DeclaredTypeError) -> bool {
@@ -6610,6 +6618,12 @@ mod tests {
                     type_id,
                 )),
             },
+            CanonicalProgramCheckError::SourceCheck {
+                file_name: "/project/input.ts".to_owned(),
+                error: SourceCheckError::DerivedType(DerivedTypeError::RecursiveWideningType(
+                    type_id,
+                )),
+            },
         ];
         assert!(
             unsupported
@@ -6781,6 +6795,12 @@ mod tests {
                     source: type_id,
                     cached: type_id,
                 }),
+            },
+            CanonicalProgramCheckError::SourceCheck {
+                file_name: "/project/input.ts".to_owned(),
+                error: SourceCheckError::DerivedType(DerivedTypeError::ArrayType(
+                    ArrayTypeError::InvalidReference(type_id),
+                )),
             },
             CanonicalProgramCheckError::SourceCheck {
                 file_name: "/project/input.ts".to_owned(),
