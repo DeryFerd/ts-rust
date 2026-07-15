@@ -4202,26 +4202,27 @@ impl<'a> Parser<'a> {
             None
         } else {
             let clause_start = self.current.range.start;
-            let phase_modifier = if self.current.kind == SyntaxKind::TypeKeyword {
+            let phase_modifier = self.import_phase_modifier();
+            if phase_modifier.is_some() {
                 self.bump();
-                Some(SyntaxKind::TypeKeyword)
-            } else {
-                None
-            };
-            let name = if is_import_binding_identifier_kind(self.current.kind)
-                || self.current.kind.is_keyword()
-            {
-                Some(self.parse_import_binding_identifier("Expected an import binding."))
+            }
+            let name = if self.import_token_is_identifier(self.current.kind) {
+                Some(self.parse_identifier_name("Expected an import binding."))
             } else {
                 None
             };
             if let Some(name) = name
-                && matches!(
+                && !matches!(
                     self.current.kind,
-                    SyntaxKind::EqualsToken | SyntaxKind::Identifier
+                    SyntaxKind::CommaToken | SyntaxKind::FromKeyword
                 )
+                && phase_modifier != Some(SyntaxKind::DeferKeyword)
             {
-                return self.parse_import_equals_declaration(start, name);
+                return self.parse_import_equals_declaration(
+                    start,
+                    name,
+                    phase_modifier == Some(SyntaxKind::TypeKeyword),
+                );
             }
             if name.is_none()
                 && !matches!(
@@ -4231,16 +4232,21 @@ impl<'a> Parser<'a> {
             {
                 None
             } else {
-                if name.is_some() && self.current.kind == SyntaxKind::CommaToken {
+                let parse_named_bindings = if name.is_none() {
+                    true
+                } else if self.current.kind == SyntaxKind::CommaToken {
                     self.bump();
-                }
-                let named_bindings = if self.current.kind == SyntaxKind::OpenBraceToken {
-                    Some(self.parse_named_imports())
-                } else if self.current.kind == SyntaxKind::AsteriskToken {
-                    Some(self.parse_namespace_import())
+                    true
                 } else {
-                    None
+                    false
                 };
+                let named_bindings = parse_named_bindings.then(|| {
+                    if self.current.kind == SyntaxKind::AsteriskToken {
+                        self.parse_namespace_import()
+                    } else {
+                        self.parse_named_imports()
+                    }
+                });
                 let end = named_bindings
                     .or(name)
                     .map_or(clause_start, |id| self.node_end(id));
@@ -4289,6 +4295,57 @@ impl<'a> Parser<'a> {
             })),
             &children,
         )
+    }
+
+    fn import_phase_modifier(&mut self) -> Option<SyntaxKind> {
+        // `type` and `defer` are contextual: keep them as binding names at the
+        // exact comma, equals, and `from "module"` ambiguity boundaries.
+        if !self.import_token_is_identifier(self.current.kind) {
+            return None;
+        }
+        let spelling = token_value(&self.current);
+        let next = self.next_token_kind();
+        if spelling == "type" {
+            let next_is_identifier = self.import_token_is_identifier(next);
+            let from_starts_phase_binding = if next == SyntaxKind::FromKeyword {
+                next_is_identifier
+                    && (self.next_tokens_are(
+                        SyntaxKind::FromKeyword,
+                        SyntaxKind::FromKeyword,
+                    ) || self.next_tokens_are(
+                        SyntaxKind::FromKeyword,
+                        SyntaxKind::EqualsToken,
+                    ))
+            } else {
+                true
+            };
+            let next_starts_phase_clause = next_is_identifier
+                || matches!(
+                    next,
+                    SyntaxKind::AsteriskToken | SyntaxKind::OpenBraceToken
+                );
+            let type_modifier_is_unambiguous =
+                from_starts_phase_binding && next_starts_phase_clause;
+            return type_modifier_is_unambiguous.then_some(SyntaxKind::TypeKeyword);
+        }
+        if spelling == "defer" {
+            let defer_modifier_is_unambiguous = if next == SyntaxKind::FromKeyword {
+                !self.next_tokens_are(SyntaxKind::FromKeyword, SyntaxKind::StringLiteral)
+            } else {
+                !matches!(next, SyntaxKind::CommaToken | SyntaxKind::EqualsToken)
+            };
+            return defer_modifier_is_unambiguous.then_some(SyntaxKind::DeferKeyword);
+        }
+        None
+    }
+
+    fn import_token_is_identifier(&self, kind: SyntaxKind) -> bool {
+        // The pinned parser ignores strict-mode reserved words here and leaves
+        // their grammar diagnostics to the checker.
+        kind == SyntaxKind::Identifier
+            || ((kind as u16) > (SyntaxKind::LAST_RESERVED_WORD as u16)
+                && (kind as u16) <= (SyntaxKind::LAST_KEYWORD as u16)
+                && !(kind == SyntaxKind::AwaitKeyword && self.await_context))
     }
 
     fn parse_import_module_specifier(&mut self, import_clause_is_missing: bool) -> NodeId {
@@ -4388,7 +4445,12 @@ impl<'a> Parser<'a> {
         )
     }
 
-    fn parse_import_equals_declaration(&mut self, start: TextPos, name: NodeId) -> NodeId {
+    fn parse_import_equals_declaration(
+        &mut self,
+        start: TextPos,
+        name: NodeId,
+        is_type_only: bool,
+    ) -> NodeId {
         self.expect_and_bump(SyntaxKind::EqualsToken, "Expected '='.");
         let module_reference = if self.current.kind == SyntaxKind::RequireKeyword {
             let reference_start = self.consume().range.start;
@@ -4422,7 +4484,7 @@ impl<'a> Parser<'a> {
             TextRange::new(start, end),
             NodeData::ImportEqualsDeclaration(Box::new(ImportEqualsDeclarationData {
                 flow_node: None,
-                is_type_only: false,
+                is_type_only,
                 local_symbol: None,
                 module_reference,
                 symbol: None,
@@ -13572,6 +13634,191 @@ export as namespace GlobalName;
     }
 
     #[test]
+    fn import_phase_disambiguates_type_imports_and_type_only_import_equals() {
+        let result = parse_source_file(
+            r#"
+                import type from "default-binding";
+                import type = require("value-equals");
+                import type Foo = require("type-equals");
+                import type from from "type-default-named-from";
+                import type from = require("type-equals-named-from");
+            "#,
+        );
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let statements = source_statements(&result);
+        assert_eq!(statements.len(), 5);
+
+        let default_import = import_declaration(&result, statements[0]);
+        let default_clause = import_clause(&result, default_import.import_clause.unwrap());
+        assert_eq!(default_clause.phase_modifier, None);
+        assert_eq!(
+            identifier_text(&result, default_clause.name.unwrap()),
+            "type"
+        );
+
+        let value_equals = import_equals_declaration(&result, statements[1]);
+        assert!(!value_equals.is_type_only);
+        assert_eq!(identifier_text(&result, value_equals.name), "type");
+        assert_eq!(
+            result.arena.get(value_equals.module_reference).unwrap().kind,
+            SyntaxKind::ExternalModuleReference
+        );
+
+        let type_equals = import_equals_declaration(&result, statements[2]);
+        assert!(type_equals.is_type_only);
+        assert_eq!(identifier_text(&result, type_equals.name), "Foo");
+        assert_eq!(
+            result.arena.get(type_equals.module_reference).unwrap().kind,
+            SyntaxKind::ExternalModuleReference
+        );
+
+        let named_from = import_declaration(&result, statements[3]);
+        let named_from_clause = import_clause(&result, named_from.import_clause.unwrap());
+        assert_eq!(
+            named_from_clause.phase_modifier,
+            Some(SyntaxKind::TypeKeyword)
+        );
+        assert_eq!(
+            identifier_text(&result, named_from_clause.name.unwrap()),
+            "from"
+        );
+
+        let named_from_equals = import_equals_declaration(&result, statements[4]);
+        assert!(named_from_equals.is_type_only);
+        assert_eq!(identifier_text(&result, named_from_equals.name), "from");
+    }
+
+    #[test]
+    fn import_phase_parses_deferred_namespace_import() {
+        let result = parse_source_file("import defer * as ns from \"deferred\";");
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let declaration = import_declaration(&result, source_statements(&result)[0]);
+        let clause = import_clause(&result, declaration.import_clause.unwrap());
+        assert_eq!(clause.phase_modifier, Some(SyntaxKind::DeferKeyword));
+        assert!(clause.name.is_none());
+        let namespace = clause.named_bindings.unwrap();
+        let NodeData::NamespaceImport(namespace) = &result.arena.get(namespace).unwrap().data else {
+            panic!("expected namespace import");
+        };
+        assert_eq!(identifier_text(&result, namespace.name), "ns");
+    }
+
+    #[test]
+    fn import_phase_keeps_type_and_defer_binding_boundaries_out_of_the_phase_slot() {
+        let result = parse_source_file(
+            r#"
+                import defer from "default-binding";
+                import defer = require("value-equals");
+                import defer, { value } from "default-and-named";
+                import type Default from "type-default";
+                import type * as ns from "type-namespace";
+                import type { Value } from "type-named";
+            "#,
+        );
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let statements = source_statements(&result);
+        assert_eq!(statements.len(), 6);
+
+        let defer_default = import_declaration(&result, statements[0]);
+        let defer_default_clause =
+            import_clause(&result, defer_default.import_clause.unwrap());
+        assert_eq!(defer_default_clause.phase_modifier, None);
+        assert_eq!(
+            identifier_text(&result, defer_default_clause.name.unwrap()),
+            "defer"
+        );
+
+        let defer_equals = import_equals_declaration(&result, statements[1]);
+        assert!(!defer_equals.is_type_only);
+        assert_eq!(identifier_text(&result, defer_equals.name), "defer");
+
+        let defer_comma = import_declaration(&result, statements[2]);
+        let defer_comma_clause = import_clause(&result, defer_comma.import_clause.unwrap());
+        assert_eq!(defer_comma_clause.phase_modifier, None);
+        assert_eq!(
+            identifier_text(&result, defer_comma_clause.name.unwrap()),
+            "defer"
+        );
+        assert_eq!(
+            result
+                .arena
+                .get(defer_comma_clause.named_bindings.unwrap())
+                .unwrap()
+                .kind,
+            SyntaxKind::NamedImports
+        );
+
+        for statement in &statements[3..] {
+            let declaration = import_declaration(&result, *statement);
+            let clause = import_clause(&result, declaration.import_clause.unwrap());
+            assert_eq!(clause.phase_modifier, Some(SyntaxKind::TypeKeyword));
+        }
+    }
+
+    #[test]
+    fn import_phase_preserves_invalid_deferred_imports_for_grammar_checking() {
+        let default = parse_source_file("import defer value from \"default\";");
+        assert!(default.diagnostics.is_empty(), "{:?}", default.diagnostics);
+        let declaration = import_declaration(&default, source_statements(&default)[0]);
+        let clause = import_clause(&default, declaration.import_clause.unwrap());
+        assert_eq!(clause.phase_modifier, Some(SyntaxKind::DeferKeyword));
+        assert_eq!(identifier_text(&default, clause.name.unwrap()), "value");
+
+        let named = parse_source_file("import defer { value } from \"named\";");
+        assert!(named.diagnostics.is_empty(), "{:?}", named.diagnostics);
+        let declaration = import_declaration(&named, source_statements(&named)[0]);
+        let clause = import_clause(&named, declaration.import_clause.unwrap());
+        assert_eq!(clause.phase_modifier, Some(SyntaxKind::DeferKeyword));
+        assert_eq!(
+            named.arena.get(clause.named_bindings.unwrap()).unwrap().kind,
+            SyntaxKind::NamedImports
+        );
+
+        let named_from = parse_source_file("import defer from from \"named-from\";");
+        assert!(
+            named_from.diagnostics.is_empty(),
+            "{:?}",
+            named_from.diagnostics
+        );
+        let declaration =
+            import_declaration(&named_from, source_statements(&named_from)[0]);
+        let clause = import_clause(&named_from, declaration.import_clause.unwrap());
+        assert_eq!(clause.phase_modifier, Some(SyntaxKind::DeferKeyword));
+        assert_eq!(identifier_text(&named_from, clause.name.unwrap()), "from");
+
+        let type_conflict =
+            parse_source_file("import defer type * as ns from \"type-conflict\";");
+        let declaration =
+            import_declaration(&type_conflict, source_statements(&type_conflict)[0]);
+        let clause = import_clause(&type_conflict, declaration.import_clause.unwrap());
+        assert_eq!(clause.phase_modifier, Some(SyntaxKind::DeferKeyword));
+        assert_eq!(identifier_text(&type_conflict, clause.name.unwrap()), "type");
+        assert!(clause.named_bindings.is_none());
+        assert!(
+            type_conflict
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message == "'from' expected."),
+            "{:?}",
+            type_conflict.diagnostics
+        );
+
+        let equals = parse_source_file("import defer value = require(\"equals\");");
+        let declaration = import_declaration(&equals, source_statements(&equals)[0]);
+        let clause = import_clause(&equals, declaration.import_clause.unwrap());
+        assert_eq!(clause.phase_modifier, Some(SyntaxKind::DeferKeyword));
+        assert_eq!(identifier_text(&equals, clause.name.unwrap()), "value");
+        assert!(
+            equals
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message == "'from' expected."),
+            "{:?}",
+            equals.diagnostics
+        );
+    }
+
+    #[test]
     fn parses_exported_import_equals_declarations() {
         let result = parse_source_file(
             r#"
@@ -15244,6 +15491,43 @@ export as namespace GlobalName;
             panic!("expected source file");
         };
         &data.statements.nodes
+    }
+
+    fn import_declaration(
+        result: &ParseResult,
+        statement: NodeId,
+    ) -> &ts_ast::ImportDeclarationData {
+        let NodeData::ImportDeclaration(declaration) = &result.arena.get(statement).unwrap().data
+        else {
+            panic!("expected import declaration");
+        };
+        declaration
+    }
+
+    fn import_clause(result: &ParseResult, clause: NodeId) -> &ts_ast::ImportClauseData {
+        let NodeData::ImportClause(clause) = &result.arena.get(clause).unwrap().data else {
+            panic!("expected import clause");
+        };
+        clause
+    }
+
+    fn import_equals_declaration(
+        result: &ParseResult,
+        statement: NodeId,
+    ) -> &ts_ast::ImportEqualsDeclarationData {
+        let NodeData::ImportEqualsDeclaration(declaration) =
+            &result.arena.get(statement).unwrap().data
+        else {
+            panic!("expected import-equals declaration");
+        };
+        declaration
+    }
+
+    fn identifier_text(result: &ParseResult, identifier: NodeId) -> &str {
+        let NodeData::Identifier(identifier) = &result.arena.get(identifier).unwrap().data else {
+            panic!("expected identifier");
+        };
+        &identifier.text
     }
 
     #[test]
