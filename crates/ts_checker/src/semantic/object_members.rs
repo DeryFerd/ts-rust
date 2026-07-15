@@ -1108,7 +1108,7 @@ fn declared_property_alias_is_generic(
 ) -> bool {
     store
         .type_alias(alias)
-        .and_then(|alias| alias.symbol())
+        .and_then(super::type_records::TypeAlias::symbol)
         .and_then(|symbol| store.type_alias_links(symbol))
         .is_some_and(|links| links.type_parameters.is_some() || links.instantiations.is_some())
 }

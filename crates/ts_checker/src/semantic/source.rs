@@ -3742,7 +3742,7 @@ mod tests {
                 let alias_symbol = record
                     .alias()
                     .and_then(|alias| context.store().type_alias(alias))
-                    .and_then(|alias| alias.symbol())
+                    .and_then(super::super::type_records::TypeAlias::symbol)
                     .unwrap();
                 let properties = structured.properties.clone().unwrap();
                 let property = properties[0];
@@ -3790,7 +3790,7 @@ mod tests {
                         None,
                         Some(owner),
                         None
-                    ))
+                    ));
                 }
                 Poison::PropertyLinks => {
                     let mut links = property_links.clone();
