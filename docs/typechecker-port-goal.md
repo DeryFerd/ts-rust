@@ -367,7 +367,8 @@ remains the cluster-level source of truth.
   legacy fallback. The combined stack passes all 539 checker library tests;
   its formatter and export-source reviews found no remaining P0-P2 issue, and
   rustdoc, the compile-fail doctest, and scoped all-target Clippy are green.
-- C00's first whole-Program route is integrated through `32d22b7`. The explicit
+- C00's first whole-Program route is integrated through `32d22b7` and exposed
+  to the fixture oracle through `439e652`. The explicit
   experimental constructor retains the ordinary Program graph and diagnostics
   but suppresses legacy binder/checker semantics, preflights every source fact,
   performs canonical traversal for all files before declaration replay, and
@@ -379,10 +380,15 @@ remains the cluster-level source of truth.
   declarations; TSX, fixed `.mts`/`.cts` formats, `import.meta`, Node implied
   formats, and unskipped non-default declarations fail typed before canonical
   binding. The independent facts re-review found no remaining P0-P2 issue, and
-  all eight canonical Program tests pass on the merged branch. Program-level
-  diagnostic sorting/deduplication and related-information ownership, fixture
-  CLI selection, full modern module facts, and canonical emit remain explicit
-  follow-up work.
+  all ten canonical Program tests pass on the merged branch. The diagnostics
+  runner's explicit `--canonical-checker` mode never emits or falls back to the
+  legacy checker. It records genuine capability gaps as unsupported coverage,
+  aborts on provenance/cache/phase invariants, and writes schema-3 scorecards
+  with an explicit `checkerMode`. The actual pinned 12,750-case oracle discovers
+  and checks `simpleTestMultiFile.ts` byte-for-byte exactly, including both
+  TS2322 paths, spans, messages, and order. Program-level diagnostic
+  sorting/deduplication and related-information ownership, full modern module
+  facts, and canonical emit remain explicit follow-up work.
 
 No percentage in this section is a whole-corpus parity claim. A score is
 publishable only when its variant manifest and complete artifact comparison are
