@@ -470,6 +470,25 @@ impl TypeData {
         }
     }
 
+    /// Borrows the fields embedded by every structured type without resolving
+    /// them. Relation fast paths use this only after observing upstream's
+    /// `MembersResolved` bit; lazy member construction remains checker-owned.
+    pub(super) const fn structured(&self) -> Option<&StructuredTypeData> {
+        match self {
+            Self::Object(data) => Some(&data.structured),
+            Self::TypeReference(data) => Some(&data.object.structured),
+            Self::Interface(data) => Some(&data.reference.object.structured),
+            Self::Tuple(data) => Some(&data.interface.reference.object.structured),
+            Self::InstantiationExpression(data) => Some(&data.object.structured),
+            Self::Mapped(data) => Some(&data.object.structured),
+            Self::ReverseMapped(data) => Some(&data.object.structured),
+            Self::EvolvingArray(data) => Some(&data.object.structured),
+            Self::Union(data) => Some(&data.union.structured),
+            Self::Intersection(data) => Some(&data.intersection.structured),
+            _ => None,
+        }
+    }
+
     fn constrained_mut(&mut self) -> Option<&mut ConstrainedTypeData> {
         match self {
             Self::Object(data) => Some(&mut data.structured.constrained),

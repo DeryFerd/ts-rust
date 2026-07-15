@@ -18,6 +18,7 @@ mod merge;
 pub mod name_resolution;
 pub mod production;
 pub mod relation;
+pub mod relater;
 pub mod signatures;
 mod store;
 pub mod type_records;
@@ -70,6 +71,7 @@ pub use relation::{
     RelationCacheSnapshot, RelationComparisonResult, RelationKind, RelationStateSnapshot,
     SignatureCheckMode,
 };
+pub use relater::RelationUnavailable;
 pub use store::SemanticStore;
 pub use type_records::{CacheHashKey, CanonicalSemanticStore, TypeData, TypeDataKind, TypeRecord};
 pub use types::VarianceFlags;
