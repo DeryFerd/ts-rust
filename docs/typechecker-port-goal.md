@@ -490,6 +490,27 @@ remains the cluster-level source of truth.
   display/relation, spreads, holes, tuples, and readonly-array syntax remain
   explicit boundaries. The combined checker passes 671/671 library tests,
   strict all-target checker Clippy, and doctest.
+- Contextual ordinary array literals are integrated through `a872db5`,
+  `cc7c4a0`, `a198e99`, `045cc36`, and `81b1482`. Expression unions now admit
+  primitives, literals, recursively canonical unions, and validated fresh
+  property objects; subtype reduction preserves excess-property-distinct
+  shapes. Checker-owned `Array<T>` references and array-literal clones have
+  separate stable cache identities, same-target Array/ReadonlyArray relations
+  are covariant, and global-aware display prints canonical suffix syntax.
+  Contextual elements consume the target element type at mutable locations,
+  retain literal AST identities while publishing widened effective types, and
+  preserve the distinct strict empty-array `implicitNever` element. Positional
+  no-spread elaboration uses retained element results, so `contextualTyping19`,
+  `contextualTyping20`, and `contextualTyping21` match the pinned zero-error,
+  TS2353, and TS2322 artifacts including exact spans and arguments. The first
+  global-aware apparent-type slice maps string-, number-, and boolean-like
+  sources through authoritative library wrapper identities without leaking
+  answers into context-free relation caches. Spreads and holes remain atomic
+  typed boundaries; nested/reference union constituents, loose nullish
+  elements, array-literal assertion widening, tuples, readonly syntax, const
+  contexts, evolving arrays, and cross-target Array-to-ReadonlyArray relations
+  remain explicit follow-ups. The combined checker passes 690/690 library
+  tests, doctest, and strict all-target checker Clippy.
 
 No percentage in this section is a whole-corpus parity claim. A score is
 publishable only when its variant manifest and complete artifact comparison are
