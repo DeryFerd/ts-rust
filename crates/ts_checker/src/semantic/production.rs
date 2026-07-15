@@ -14,13 +14,15 @@ use ts_ast::{
     FileId, NodeArena, NodeArenaId, NodeArenaRevision, NodeData, NodeId, NodeRef, SyntaxKind,
 };
 use ts_binder::{
-    BoundFile, CanonicalExtractionError, CanonicalPatternAmbientModule, CanonicalProgramBindings,
-    EscapedName, SemanticStoreId, SemanticSymbolId, SymbolFlags, SymbolStore, SymbolTableId,
+    BoundFile, CanonicalExtractionError, CanonicalNameResolverOptions,
+    CanonicalPatternAmbientModule, CanonicalProgramBindings, EscapedName, SemanticStoreId,
+    SemanticSymbolId, SymbolFlags, SymbolStore, SymbolTableId,
 };
 
 use super::{
     CanonicalTypeMapperStore, IntrinsicBootstrapError, IntrinsicBootstrapOptions, SourceFileRef,
     SymbolMergeError,
+    name_resolution::{ProductionNameResolverHost, ProductionNameResolverHostError},
 };
 
 #[derive(Debug)]
@@ -170,6 +172,28 @@ impl<'arena> CanonicalCheckerContext<'arena> {
     #[must_use]
     pub fn pattern_ambient_modules(&self) -> &[CanonicalPatternAmbientModule] {
         &self.pattern_ambient_modules
+    }
+
+    /// Creates the canonical checker callback host only after this context has
+    /// completed ordered global initialization.
+    ///
+    /// The host follows one merged-symbol redirect for declaration and table
+    /// lookups. Alias-target resolution and diagnostic callback ownership are
+    /// still explicit later checker capabilities.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed invariant error if the retained Program sources no
+    /// longer match the checker-owned semantic graph.
+    pub fn name_resolver_host(
+        &self,
+        options: CanonicalNameResolverOptions,
+    ) -> Result<ProductionNameResolverHost<'_, '_>, ProductionNameResolverHostError> {
+        ProductionNameResolverHost::new(
+            &self.store,
+            self.files.values().map(|file| (file.arena, &file.bound)),
+            options,
+        )
     }
 
     /// The brand shared by adopted binder symbols and checker-owned records.
@@ -952,8 +976,8 @@ impl From<CanonicalGlobalInitializationError> for CanonicalCheckerContextError {
 #[cfg(test)]
 mod tests {
     use ts_binder::{
-        CanonicalBinder, CanonicalModuleState, CanonicalSourceFileFacts, CanonicalSourceLanguage,
-        EscapedName,
+        CanonicalBinder, CanonicalModuleState, CanonicalNameResolverOptions,
+        CanonicalSourceFileFacts, CanonicalSourceLanguage, EscapedName, resolve_global_name,
     };
     use ts_parser::{ParseResult, parse_source_file};
 
@@ -1202,6 +1226,22 @@ mod tests {
             assert_eq!(declarations[0].file, first_file);
             assert_eq!(declarations[1].file, second_file);
         }
+
+        let mut resolver_host = context
+            .name_resolver_host(CanonicalNameResolverOptions::default())
+            .unwrap();
+        assert_eq!(
+            resolve_global_name(
+                context.store().symbol_store(),
+                &mut resolver_host,
+                "Shared",
+                SymbolFlags::TYPE,
+                None,
+                false,
+                false,
+            ),
+            Ok(global_symbol(&context, "Shared"))
+        );
     }
 
     #[test]
