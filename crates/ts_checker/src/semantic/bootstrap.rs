@@ -1963,13 +1963,13 @@ mod tests {
         index_occupied
             .alloc_index_info(index_type, index_type, false, None, Vec::new())
             .unwrap();
-        for mut occupied in [
-            mapper_occupied,
-            signature_occupied,
-            predicate_occupied,
-            alias_occupied,
-            index_occupied,
-        ] {
+        let mut occupied_stores = Vec::with_capacity(5);
+        occupied_stores.push(mapper_occupied);
+        occupied_stores.push(signature_occupied);
+        occupied_stores.push(predicate_occupied);
+        occupied_stores.push(alias_occupied);
+        occupied_stores.push(index_occupied);
+        for mut occupied in occupied_stores {
             let before = checker_state(&occupied);
             let symbol_count = occupied.symbol_len();
             let table_count = occupied.symbol_store().symbol_table_len();
