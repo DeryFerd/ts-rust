@@ -27,11 +27,13 @@ use super::{
 };
 
 /// Store-owned caches corresponding to pinned `CachedTypeKind` entries used
-/// by object-literal regularization and root-context widening.
+/// by object-literal regularization, root-context widening, and array-literal
+/// reference cloning.
 #[derive(Debug, Default)]
 pub(super) struct DerivedTypeCaches {
     regular_object_literals: HashMap<TypeId, TypeId>,
     widened_types: HashMap<TypeId, TypeId>,
+    pub(super) array_literal_types: HashMap<TypeId, TypeId>,
 }
 
 /// Exact relation-facing classification of an object type against the two
@@ -53,6 +55,10 @@ impl DerivedTypeCaches {
 
     fn try_reserve_widened(&mut self, additional: usize) -> bool {
         self.widened_types.try_reserve(additional).is_ok()
+    }
+
+    pub(super) fn try_reserve_array_literals(&mut self, additional: usize) -> bool {
+        self.array_literal_types.try_reserve(additional).is_ok()
     }
 }
 

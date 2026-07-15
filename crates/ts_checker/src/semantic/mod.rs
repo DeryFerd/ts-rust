@@ -9,6 +9,7 @@
 pub mod alias;
 pub mod alias_flags;
 pub mod alias_provider;
+mod array_types;
 mod assignment;
 pub mod bootstrap;
 mod contextual;
@@ -39,6 +40,7 @@ pub mod types;
 pub use ts_binder::{AstScope, SemanticStoreId, SemanticSymbolId, SymbolTableId};
 
 pub use alias_provider::{ProductionAliasTargetHost, ProductionAliasTargetHostError};
+pub use array_types::ArrayTypeError;
 pub use assignment::{AssignmentInvariant, AssignmentSyntaxRole, AssignmentUnsupported};
 pub use bootstrap::{
     CheckerLinkCounts, CheckerStateSnapshot, IntrinsicBootstrap, IntrinsicBootstrapError,
@@ -55,7 +57,10 @@ pub use diagnostics::{
 pub use formatter::{
     AssignabilityErrorDisplay, CanonicalTypeFormatFlags, TypeDisplayUnavailable,
     get_type_names_for_assignability_error, get_type_names_for_assignability_error_with_flags,
-    type_to_string, type_to_string_with_flags,
+    get_type_names_for_assignability_error_with_global_types,
+    get_type_names_for_assignability_error_with_global_types_and_flags, type_to_string,
+    type_to_string_with_flags, type_to_string_with_global_types,
+    type_to_string_with_global_types_and_flags,
 };
 pub use global_types::{
     CanonicalGlobalTypeDiagnostic, CanonicalGlobalTypeInitializationError, CanonicalGlobalTypes,

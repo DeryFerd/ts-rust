@@ -1,7 +1,7 @@
 //! Dependency-closed canonical semantic type display.
 //!
-//! This is the primitive, literal, canonical-union, and property-only object
-//! prefix of pinned
+//! This is the primitive, literal, canonical-union, global-array, and
+//! property-only object prefix of pinned
 //! `internal/checker/printer.go::typeToString`,
 //! `internal/checker/nodebuilderimpl.go::typeToTypeNode`, and
 //! `internal/checker/relater.go::reportRelationError` at
@@ -17,7 +17,8 @@ use ts_binder::{
 };
 
 use super::{
-    CanonicalTypeMapperStore, DeclaredTypeHost, TypeAliasId, TypeId,
+    ArrayTypeError, CanonicalGlobalTypes, CanonicalTypeMapperStore, DeclaredTypeHost, TypeAliasId,
+    TypeId,
     bootstrap::LiteralTypeCacheError,
     links::ValueSymbolLinks,
     type_records::{
@@ -97,6 +98,7 @@ pub enum TypeDisplayUnavailable {
     InvalidLiteralLinks(TypeId),
     UniqueSymbolName(TypeId),
     MissingBootstrap,
+    ArrayType(ArrayTypeError),
     FullyQualifiedName { source: TypeId, target: TypeId },
     Utf8TruncationBoundary { type_id: TypeId, boundary: usize },
 }
@@ -140,6 +142,7 @@ impl std::fmt::Display for TypeDisplayUnavailable {
             Self::MissingBootstrap => {
                 formatter.write_str("literal relation display requires intrinsic checker bootstrap")
             }
+            Self::ArrayType(error) => error.fmt(formatter),
             Self::FullyQualifiedName { source, target } => write!(
                 formatter,
                 "types {source:?} and {target:?} require symbol-aware fully qualified display"
@@ -152,7 +155,14 @@ impl std::fmt::Display for TypeDisplayUnavailable {
     }
 }
 
-impl std::error::Error for TypeDisplayUnavailable {}
+impl std::error::Error for TypeDisplayUnavailable {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::ArrayType(error) => Some(error),
+            _ => None,
+        }
+    }
+}
 
 /// Exact source and target arguments for the ordinary TS2322 relation error.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -194,7 +204,43 @@ pub fn type_to_string_with_flags(
     type_id: TypeId,
     flags: CanonicalTypeFormatFlags,
 ) -> Result<String, TypeDisplayUnavailable> {
-    type_to_string_with_optional_host_and_flags(store, None, type_id, flags)
+    type_to_string_with_optional_context_and_flags(store, None, None, type_id, flags)
+}
+
+/// Global-aware `TypeToString` for canonical `Array<T>` and
+/// `ReadonlyArray<T>` references in addition to the ordinary installed
+/// formatter prefix.
+///
+/// # Errors
+///
+/// Returns [`TypeDisplayUnavailable`] when the type or authoritative global
+/// identities are malformed, or the exact display family is unavailable.
+pub fn type_to_string_with_global_types(
+    store: &CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
+    type_id: TypeId,
+) -> Result<String, TypeDisplayUnavailable> {
+    type_to_string_with_global_types_and_flags(
+        store,
+        global_types,
+        type_id,
+        CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT,
+    )
+}
+
+/// Flag-aware form of [`type_to_string_with_global_types`].
+///
+/// # Errors
+///
+/// Returns [`TypeDisplayUnavailable`] under the same conditions as the
+/// default global-aware query.
+pub fn type_to_string_with_global_types_and_flags(
+    store: &CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
+    type_id: TypeId,
+    flags: CanonicalTypeFormatFlags,
+) -> Result<String, TypeDisplayUnavailable> {
+    type_to_string_with_optional_context_and_flags(store, None, Some(global_types), type_id, flags)
 }
 
 /// Host-aware form used by source-backed checker paths once they already own
@@ -208,18 +254,44 @@ pub(super) fn type_to_string_with_host_and_flags(
     type_id: TypeId,
     flags: CanonicalTypeFormatFlags,
 ) -> Result<String, TypeDisplayUnavailable> {
-    type_to_string_with_optional_host_and_flags(store, Some(host), type_id, flags)
+    type_to_string_with_optional_context_and_flags(store, Some(host), None, type_id, flags)
 }
 
-fn type_to_string_with_optional_host_and_flags(
+#[allow(dead_code)] // Source/production wiring is owned by the integration slice.
+pub(super) fn type_to_string_with_host_global_types_and_flags(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    type_id: TypeId,
+    flags: CanonicalTypeFormatFlags,
+) -> Result<String, TypeDisplayUnavailable> {
+    type_to_string_with_optional_context_and_flags(
+        store,
+        Some(host),
+        Some(global_types),
+        type_id,
+        flags,
+    )
+}
+
+fn type_to_string_with_optional_context_and_flags(
     store: &CanonicalTypeMapperStore,
     host: Option<&DeclaredTypeHost<'_>>,
+    global_types: Option<&CanonicalGlobalTypes>,
     type_id: TypeId,
     flags: CanonicalTypeFormatFlags,
 ) -> Result<String, TypeDisplayUnavailable> {
     let mut state = DisplayState::default();
     let mut visiting = HashSet::new();
-    let displayed = display_type_worker(store, host, type_id, flags, &mut state, &mut visiting)?;
+    let displayed = display_type_worker(
+        store,
+        host,
+        global_types,
+        type_id,
+        flags,
+        &mut state,
+        &mut visiting,
+    )?;
     truncate_display(type_id, displayed, flags)
 }
 
@@ -259,7 +331,52 @@ pub fn get_type_names_for_assignability_error_with_flags(
     flags: CanonicalTypeFormatFlags,
 ) -> Result<AssignabilityErrorDisplay, TypeDisplayUnavailable> {
     get_type_names_for_assignability_error_with_optional_host_and_flags(
-        store, None, source, target, flags,
+        store, None, None, source, target, flags,
+    )
+}
+
+/// Global-aware TS2322 source and target display arguments.
+///
+/// # Errors
+///
+/// Returns [`TypeDisplayUnavailable`] when either type or an authoritative
+/// global-array identity is malformed or outside the installed prefix.
+pub fn get_type_names_for_assignability_error_with_global_types(
+    store: &CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
+    source: TypeId,
+    target: TypeId,
+) -> Result<AssignabilityErrorDisplay, TypeDisplayUnavailable> {
+    get_type_names_for_assignability_error_with_global_types_and_flags(
+        store,
+        global_types,
+        source,
+        target,
+        CanonicalTypeFormatFlags::NONE,
+    )
+}
+
+/// Flag-aware form of
+/// [`get_type_names_for_assignability_error_with_global_types`].
+///
+/// # Errors
+///
+/// Returns [`TypeDisplayUnavailable`] under the same conditions as the
+/// default global-aware query.
+pub fn get_type_names_for_assignability_error_with_global_types_and_flags(
+    store: &CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
+    source: TypeId,
+    target: TypeId,
+    flags: CanonicalTypeFormatFlags,
+) -> Result<AssignabilityErrorDisplay, TypeDisplayUnavailable> {
+    get_type_names_for_assignability_error_with_optional_host_and_flags(
+        store,
+        None,
+        Some(global_types),
+        source,
+        target,
+        flags,
     )
 }
 
@@ -277,6 +394,26 @@ pub(super) fn get_type_names_for_assignability_error_with_host_and_flags(
     get_type_names_for_assignability_error_with_optional_host_and_flags(
         store,
         Some(host),
+        None,
+        source,
+        target,
+        flags,
+    )
+}
+
+#[allow(dead_code)] // Source/production wiring is owned by the integration slice.
+pub(super) fn get_type_names_for_assignability_error_with_host_global_types_and_flags(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    source: TypeId,
+    target: TypeId,
+    flags: CanonicalTypeFormatFlags,
+) -> Result<AssignabilityErrorDisplay, TypeDisplayUnavailable> {
+    get_type_names_for_assignability_error_with_optional_host_and_flags(
+        store,
+        Some(host),
+        Some(global_types),
         source,
         target,
         flags,
@@ -286,6 +423,7 @@ pub(super) fn get_type_names_for_assignability_error_with_host_and_flags(
 fn get_type_names_for_assignability_error_with_optional_host_and_flags(
     store: &CanonicalTypeMapperStore,
     host: Option<&DeclaredTypeHost<'_>>,
+    global_types: Option<&CanonicalGlobalTypes>,
     source: TypeId,
     target: TypeId,
     flags: CanonicalTypeFormatFlags,
@@ -297,8 +435,10 @@ fn get_type_names_for_assignability_error_with_optional_host_and_flags(
     let target_record = store
         .type_payload(target)
         .ok_or(TypeDisplayUnavailable::Type(target))?;
-    let mut source_name = type_to_string_with_optional_host_and_flags(store, host, source, flags)?;
-    let target_name = type_to_string_with_optional_host_and_flags(store, host, target, flags)?;
+    let mut source_name =
+        type_to_string_with_optional_context_and_flags(store, host, global_types, source, flags)?;
+    let target_name =
+        type_to_string_with_optional_context_and_flags(store, host, global_types, target, flags)?;
 
     // The pinned fallback asks for fully qualified names when the ordinary
     // strings collide. Primitive/literal names are invariant under that flag.
@@ -332,7 +472,13 @@ fn get_type_names_for_assignability_error_with_optional_host_and_flags(
             // value-symbol accessibility and can be `typeof <name>`.
             return Err(TypeDisplayUnavailable::UniqueSymbolName(generalized));
         }
-        source_name = type_to_string_with_optional_host_and_flags(store, host, generalized, flags)?;
+        source_name = type_to_string_with_optional_context_and_flags(
+            store,
+            host,
+            global_types,
+            generalized,
+            flags,
+        )?;
     }
 
     Ok(AssignabilityErrorDisplay {
@@ -344,6 +490,7 @@ fn get_type_names_for_assignability_error_with_optional_host_and_flags(
 fn display_type_worker(
     store: &CanonicalTypeMapperStore,
     host: Option<&DeclaredTypeHost<'_>>,
+    global_types: Option<&CanonicalGlobalTypes>,
     type_id: TypeId,
     flags: CanonicalTypeFormatFlags,
     state: &mut DisplayState,
@@ -486,10 +633,19 @@ fn display_type_worker(
         return Ok("object".to_owned());
     }
     if type_flags.intersects(TypeFlags::UNION) {
-        return display_union_type(store, host, type_id, flags, state, visiting);
+        return display_union_type(store, host, global_types, type_id, flags, state, visiting);
     }
     if type_flags.intersects(TypeFlags::OBJECT) {
-        return display_object_type(store, host, type_id, record, flags, state, visiting);
+        return display_object_type(
+            store,
+            host,
+            global_types,
+            type_id,
+            record,
+            flags,
+            state,
+            visiting,
+        );
     }
     if let Some(alias) = record.alias() {
         return Err(TypeDisplayUnavailable::Alias { type_id, alias });
@@ -532,9 +688,11 @@ enum StructuralObjectProof {
     DeclaredTypeLiteral(SemanticSymbolId),
 }
 
+#[allow(clippy::too_many_arguments)]
 fn display_object_type(
     store: &CanonicalTypeMapperStore,
     host: Option<&DeclaredTypeHost<'_>>,
+    global_types: Option<&CanonicalGlobalTypes>,
     type_id: TypeId,
     record: &TypeRecord,
     flags: CanonicalTypeFormatFlags,
@@ -543,6 +701,23 @@ fn display_object_type(
 ) -> Result<String, TypeDisplayUnavailable> {
     if record.flags() != TypeFlags::OBJECT {
         return Err(TypeDisplayUnavailable::MalformedType(type_id));
+    }
+    if let Some(global_types) = global_types
+        && let Some(array) = store
+            .canonical_array_reference(global_types, type_id)
+            .map_err(TypeDisplayUnavailable::ArrayType)?
+    {
+        return display_array_type(
+            store,
+            host,
+            global_types,
+            type_id,
+            array.element_type,
+            array.readonly,
+            flags,
+            state,
+            visiting,
+        );
     }
     if let Some(alias) = record.alias() {
         validate_property_object_alias(store, type_id, record, alias)?;
@@ -564,8 +739,61 @@ fn display_object_type(
     if !visiting.insert(type_id) {
         return Err(TypeDisplayUnavailable::CyclicType(type_id));
     }
-    let result =
-        display_structural_properties(store, host, type_id, record, proof, flags, state, visiting);
+    let result = display_structural_properties(
+        store,
+        host,
+        global_types,
+        type_id,
+        record,
+        proof,
+        flags,
+        state,
+        visiting,
+    );
+    visiting.remove(&type_id);
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn display_array_type(
+    store: &CanonicalTypeMapperStore,
+    host: Option<&DeclaredTypeHost<'_>>,
+    global_types: &CanonicalGlobalTypes,
+    type_id: TypeId,
+    element_type: TypeId,
+    readonly: bool,
+    flags: CanonicalTypeFormatFlags,
+    state: &mut DisplayState,
+    visiting: &mut HashSet<TypeId>,
+) -> Result<String, TypeDisplayUnavailable> {
+    if !visiting.insert(type_id) {
+        return Err(TypeDisplayUnavailable::CyclicType(type_id));
+    }
+    let result = (|| {
+        let element_record = store
+            .type_payload(element_type)
+            .ok_or(TypeDisplayUnavailable::Type(element_type))?;
+        let mut element = display_type_worker(
+            store,
+            host,
+            Some(global_types),
+            element_type,
+            flags,
+            state,
+            visiting,
+        )?;
+        if element_record.flags().intersects(TypeFlags::UNION) && element_record.alias().is_none() {
+            element = format!("({element})");
+            state.add(2);
+        }
+        if readonly {
+            state.add(9);
+            element.insert_str(0, "readonly ");
+        }
+        state.add(2);
+        element.push_str("[]");
+        Ok(element)
+    })();
     visiting.remove(&type_id);
     result
 }
@@ -1061,6 +1289,7 @@ fn validate_structural_owner(
 fn display_structural_properties(
     store: &CanonicalTypeMapperStore,
     host: Option<&DeclaredTypeHost<'_>>,
+    global_types: Option<&CanonicalGlobalTypes>,
     type_id: TypeId,
     record: &TypeRecord,
     proof: StructuralObjectProof,
@@ -1106,6 +1335,7 @@ fn display_structural_properties(
             append_structural_property(
                 store,
                 host,
+                global_types,
                 *properties
                     .last()
                     .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?,
@@ -1116,7 +1346,16 @@ fn display_structural_properties(
             )?;
             break;
         }
-        append_structural_property(store, host, property, flags, state, visiting, &mut result)?;
+        append_structural_property(
+            store,
+            host,
+            global_types,
+            property,
+            flags,
+            state,
+            visiting,
+            &mut result,
+        )?;
     }
     result.push('}');
     state.add(2);
@@ -1127,6 +1366,7 @@ fn display_structural_properties(
 fn append_structural_property(
     store: &CanonicalTypeMapperStore,
     host: Option<&DeclaredTypeHost<'_>>,
+    global_types: Option<&CanonicalGlobalTypes>,
     property: (&str, TypeId, bool, bool),
     flags: CanonicalTypeFormatFlags,
     state: &mut DisplayState,
@@ -1146,6 +1386,7 @@ fn append_structural_property(
     result.push_str(&display_type_worker(
         store,
         host,
+        global_types,
         property_type,
         flags,
         state,
@@ -1451,6 +1692,7 @@ fn is_plain_identifier(name: &str) -> bool {
 fn display_union_type(
     store: &CanonicalTypeMapperStore,
     host: Option<&DeclaredTypeHost<'_>>,
+    global_types: Option<&CanonicalGlobalTypes>,
     type_id: TypeId,
     flags: CanonicalTypeFormatFlags,
     state: &mut DisplayState,
@@ -1479,7 +1721,16 @@ fn display_union_type(
             return Err(TypeDisplayUnavailable::InvalidUnion(type_id));
         };
         let types = format_union_types(store, type_id, &display_data.union.types)?;
-        display_union_list(store, host, type_id, &types, flags, state, visiting)
+        display_union_list(
+            store,
+            host,
+            global_types,
+            type_id,
+            &types,
+            flags,
+            state,
+            visiting,
+        )
     })();
     visiting.remove(&type_id);
     result
@@ -1558,6 +1809,7 @@ fn format_union_types(
 fn display_union_list(
     store: &CanonicalTypeMapperStore,
     host: Option<&DeclaredTypeHost<'_>>,
+    global_types: Option<&CanonicalGlobalTypes>,
     union: TypeId,
     types: &[TypeId],
     flags: CanonicalTypeFormatFlags,
@@ -1565,13 +1817,15 @@ fn display_union_list(
     visiting: &mut HashSet<TypeId>,
 ) -> Result<String, TypeDisplayUnavailable> {
     if types.len() == 1 {
-        return display_type_worker(store, host, types[0], flags, state, visiting);
+        return display_type_worker(store, host, global_types, types[0], flags, state, visiting);
     }
     if state.check_truncation(flags) && types.len() > 2 {
-        let first = display_type_worker(store, host, types[0], flags, state, visiting)?;
+        let first =
+            display_type_worker(store, host, global_types, types[0], flags, state, visiting)?;
         let last = display_type_worker(
             store,
             host,
+            global_types,
             *types
                 .last()
                 .ok_or(TypeDisplayUnavailable::InvalidUnion(union))?,
@@ -1593,6 +1847,7 @@ fn display_union_list(
             displayed.push(display_type_worker(
                 store,
                 host,
+                global_types,
                 *types
                     .last()
                     .ok_or(TypeDisplayUnavailable::InvalidUnion(union))?,
@@ -1604,7 +1859,13 @@ fn display_union_list(
         }
         state.add(2);
         displayed.push(display_type_worker(
-            store, host, type_id, flags, state, visiting,
+            store,
+            host,
+            global_types,
+            type_id,
+            flags,
+            state,
+            visiting,
         )?);
     }
     Ok(displayed.join(" | "))
@@ -2196,6 +2457,89 @@ mod tests {
         assert_eq!(
             type_to_string(&store, object).unwrap(),
             "{ a: string; b?: number; child: { value: string; }; }",
+        );
+    }
+
+    #[test]
+    fn global_aware_array_display_uses_suffix_syntax_and_literal_clone_shape() {
+        let parsed = parse_source_file("interface Array<T> {} interface ReadonlyArray<T> {}");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let mut context = parsed_context(
+            &parsed,
+            FileId::new(195),
+            CanonicalCheckerOptions::default(),
+        );
+        let global_types = context.global_types().clone();
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        let (number, string) = (bootstrap.number_type, bootstrap.string_type);
+        let store = context.store_mut_for_test();
+
+        let number_array = store
+            .create_canonical_array_type(&global_types, number, false)
+            .unwrap();
+        let number_literal_array = store
+            .create_array_literal_type(&global_types, number_array)
+            .unwrap();
+        let id = alloc_typed_property(store, "id", number, false, false);
+        let object = alloc_structural_object(store, vec![id]);
+        let object_array = store
+            .create_canonical_array_type(&global_types, object, false)
+            .unwrap();
+        let object_literal_array = store
+            .create_array_literal_type(&global_types, object_array)
+            .unwrap();
+        let primitive_union = canonical_union(store, &[number, string]);
+        let union_array = store
+            .create_canonical_array_type(&global_types, primitive_union, false)
+            .unwrap();
+        let named_t = alloc_named_interface(store, "T");
+        let readonly_array = store
+            .create_canonical_array_type(&global_types, named_t, true)
+            .unwrap();
+
+        assert!(matches!(
+            type_to_string(store, number_array),
+            Err(TypeDisplayUnavailable::UnsupportedType {
+                type_id,
+                kind: TypeDataKind::TypeReference,
+            }) if type_id == number_array
+        ));
+        assert_eq!(
+            type_to_string_with_global_types(store, &global_types, number_array).unwrap(),
+            "number[]"
+        );
+        assert_eq!(
+            type_to_string_with_global_types(store, &global_types, number_literal_array).unwrap(),
+            "number[]"
+        );
+        assert_eq!(
+            type_to_string_with_global_types(store, &global_types, object_array).unwrap(),
+            "{ id: number; }[]"
+        );
+        assert_eq!(
+            type_to_string_with_global_types(store, &global_types, object_literal_array).unwrap(),
+            "{ id: number; }[]"
+        );
+        assert_eq!(
+            type_to_string_with_global_types(store, &global_types, union_array).unwrap(),
+            "(string | number)[]"
+        );
+        assert_eq!(
+            type_to_string_with_global_types(store, &global_types, readonly_array).unwrap(),
+            "readonly T[]"
+        );
+        assert_eq!(
+            get_type_names_for_assignability_error_with_global_types(
+                store,
+                &global_types,
+                object_literal_array,
+                number_array,
+            )
+            .unwrap(),
+            AssignabilityErrorDisplay {
+                source: "{ id: number; }[]".to_owned(),
+                target: "number[]".to_owned(),
+            }
         );
     }
 
