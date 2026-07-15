@@ -6894,7 +6894,7 @@ impl<'a> Parser<'a> {
                         initializer,
                         postfix_token,
                         symbol: None,
-                        type_: initializer,
+                        type_: None,
                         facts: 0,
                         modifiers,
                         name,
@@ -6946,7 +6946,7 @@ impl<'a> Parser<'a> {
                             object_assignment_initializer,
                             postfix_token,
                             symbol: None,
-                            type_: name,
+                            type_: None,
                             facts: 0,
                             modifiers,
                             name,
@@ -6972,7 +6972,7 @@ impl<'a> Parser<'a> {
                                 object_assignment_initializer: None,
                                 postfix_token: None,
                                 symbol: None,
-                                type_: recovered_name,
+                                type_: None,
                                 facts: 0,
                                 modifiers: None,
                                 name: recovered_name,
@@ -15765,6 +15765,63 @@ export as namespace GlobalName;
                 .diagnostics
                 .iter()
                 .any(|diagnostic| diagnostic.code == Some(17012))
+        );
+    }
+
+    #[test]
+    fn object_literal_property_type_slots_are_nil_and_children_are_unique() {
+        let result = parse_source_file(
+            "const shorthand = 2; const value = { property: 1, shorthand };",
+        );
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let object = find_descendant_kind(
+            &result,
+            result.source_file,
+            SyntaxKind::ObjectLiteralExpression,
+        )
+        .expect("object literal");
+        let NodeData::ObjectLiteralExpression(object) = &result.arena.get(object).unwrap().data
+        else {
+            panic!("expected object literal");
+        };
+        assert_eq!(object.properties.nodes.len(), 2);
+
+        let property_id = object.properties.nodes[0];
+        let NodeData::PropertyAssignment(property) =
+            &result.arena.get(property_id).unwrap().data
+        else {
+            panic!("expected property assignment");
+        };
+        assert_eq!(property.type_, None);
+        let mut property_children = Vec::new();
+        result
+            .arena
+            .get(property_id)
+            .unwrap()
+            .for_each_child(|child| property_children.push(child));
+        assert_eq!(property_children, [property.name, property.initializer]);
+        assert_eq!(
+            result.arena.get(property.initializer).unwrap().parent,
+            Some(property_id)
+        );
+
+        let shorthand_id = object.properties.nodes[1];
+        let NodeData::ShorthandPropertyAssignment(shorthand) =
+            &result.arena.get(shorthand_id).unwrap().data
+        else {
+            panic!("expected shorthand property assignment");
+        };
+        assert_eq!(shorthand.type_, None);
+        let mut shorthand_children = Vec::new();
+        result
+            .arena
+            .get(shorthand_id)
+            .unwrap()
+            .for_each_child(|child| shorthand_children.push(child));
+        assert_eq!(shorthand_children, [shorthand.name]);
+        assert_eq!(
+            result.arena.get(shorthand.name).unwrap().parent,
+            Some(shorthand_id)
         );
     }
 

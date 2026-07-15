@@ -1347,7 +1347,7 @@ pub struct PropertyAssignmentData {
     pub initializer: NodeId,
     pub postfix_token: Option<NodeId>,
     pub symbol: Option<SymbolId>,
-    pub type_: NodeId,
+    pub type_: Option<NodeId>,
     pub facts: u32,
     pub modifiers: Option<ModifierList>,
     pub name: NodeId,
@@ -1436,7 +1436,7 @@ pub struct ShorthandPropertyAssignmentData {
     pub object_assignment_initializer: Option<NodeId>,
     pub postfix_token: Option<NodeId>,
     pub symbol: Option<SymbolId>,
-    pub type_: NodeId,
+    pub type_: Option<NodeId>,
     pub facts: u32,
     pub modifiers: Option<ModifierList>,
     pub name: NodeId,
@@ -2626,7 +2626,7 @@ impl NodeData {
                 visit_optional_modifier_list(visitor, node.modifiers.as_ref())?;
                 visitor(node.name)?;
                 visit_optional_child(visitor, node.postfix_token)?;
-                visitor(node.type_)?;
+                visit_optional_child(visitor, node.type_)?;
                 visitor(node.initializer)
             }
             Self::PropertyDeclaration(node) => {
@@ -2668,7 +2668,7 @@ impl NodeData {
                 visit_optional_modifier_list(visitor, node.modifiers.as_ref())?;
                 visitor(node.name)?;
                 visit_optional_child(visitor, node.postfix_token)?;
-                visitor(node.type_)?;
+                visit_optional_child(visitor, node.type_)?;
                 visit_optional_child(visitor, node.equals_token)?;
                 visit_optional_child(visitor, node.object_assignment_initializer)
             }

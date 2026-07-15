@@ -5514,7 +5514,7 @@ mod tests {
             duplicate.parent = Some(property);
             let duplicate = parsed.arena.alloc(duplicate);
             match &mut parsed.arena.get_mut(property).unwrap().data {
-                NodeData::PropertyAssignment(data) => data.type_ = duplicate,
+                NodeData::PropertyAssignment(data) => data.type_ = Some(duplicate),
                 _ => unreachable!(),
             }
         }

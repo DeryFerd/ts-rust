@@ -3348,7 +3348,8 @@
                     },
                     {
                         "name": "Type",
-                        "type": "TypeNode"
+                        "type": "TypeNode",
+                        "optional": true
                     },
                     {
                         "name": "Initializer",
@@ -3379,7 +3380,8 @@
                     },
                     {
                         "name": "Type",
-                        "type": "TypeNode"
+                        "type": "TypeNode",
+                        "optional": true
                     },
                     {
                         "name": "EqualsToken",
