@@ -18,7 +18,7 @@ use std::{
 
 use ts_ast::{FileId, NodeRef};
 use ts_binder::{EscapedName, SemanticStoreId, SemanticSymbolId, SymbolFlags};
-use ts_jsnum::{Number, PseudoBigInt};
+use ts_jsnum::Number;
 
 use super::{SignatureId, TypeId, TypeMapperId, type_records::CacheHashKey, types::VarianceFlags};
 
@@ -505,16 +505,14 @@ pub struct MarkedAssignmentSymbolLinks {
 
 /// Exact value alternatives admitted by `evaluator.Result.Value`.
 ///
-/// The upstream field is `any`, but its evaluator operations define these
-/// four concrete alternatives. Absence is represented by
+/// The upstream field is `any`, but the pinned evaluator only produces these
+/// two concrete alternatives. Absence is represented by
 /// [`EvaluatorResult::value`] being `None`, rather than by a fabricated enum
 /// constant.
 #[derive(Clone, Debug, PartialEq)]
 pub enum EvaluatorValue {
     String(String),
     Number(Number),
-    Boolean(bool),
-    BigInt(PseudoBigInt),
 }
 
 /// Cached result of the pinned constant evaluator.
@@ -1299,7 +1297,7 @@ mod tests {
 
     use ts_ast::{FileId, NodeArena, NodeId, NodeRef};
     use ts_binder::SymbolFlags;
-    use ts_jsnum::{Number, PseudoBigInt};
+    use ts_jsnum::Number;
 
     use super::{
         AliasTargetState, ArrayLiteralLinks, CacheHashKey, ContainingSymbolLinks,
@@ -1490,10 +1488,11 @@ mod tests {
         let values = [
             EvaluatorValue::String("value".into()),
             EvaluatorValue::Number(Number::new(-0.0)),
-            EvaluatorValue::Boolean(true),
-            EvaluatorValue::BigInt(PseudoBigInt::parse_valid("123n")),
         ];
         for value in values {
+            match &value {
+                EvaluatorValue::String(_) | EvaluatorValue::Number(_) => {}
+            }
             let result = EvaluatorResult {
                 value: Some(value.clone()),
                 is_syntactically_string: true,
