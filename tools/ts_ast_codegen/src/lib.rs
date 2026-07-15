@@ -63,6 +63,8 @@ struct NodeDef {
     instantiation_aliases: BTreeMap<String, String>,
     #[serde(default)]
     hand_written: bool,
+    #[serde(default)]
+    hand_written_visitor: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -75,7 +77,7 @@ struct TypeParameterDef {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[allow(dead_code)]
+#[allow(dead_code, clippy::struct_excessive_bools)] // Mirrors boolean schema attributes.
 struct MemberDef {
     name: String,
     #[serde(default)]
@@ -90,11 +92,13 @@ struct MemberDef {
     go_only: bool,
     #[serde(default)]
     no_go: bool,
+    #[serde(default)]
+    no_factory: bool,
 }
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[allow(dead_code)]
+#[allow(dead_code, clippy::struct_excessive_bools)] // Mirrors boolean schema attributes.
 struct FieldDef {
     r#type: StringOrList,
     #[serde(default)]
@@ -105,6 +109,8 @@ struct FieldDef {
     go_only: bool,
     #[serde(default)]
     no_go: bool,
+    #[serde(default)]
+    no_factory: bool,
 }
 
 #[derive(Clone, Debug, Deserialize)]

@@ -64,11 +64,48 @@ impl NodeRef {
 
 #[cfg(test)]
 mod tests {
+    use std::ops::ControlFlow;
+
     use ts_core::TextRange;
 
     use super::{
-        FileId, ModifierFlags, Node, NodeArena, NodeData, NodeFlags, NodeRef, SyntaxKind, TokenData,
+        ConditionalExpressionData, DoStatementData, FileId, ImportDeclarationData,
+        JsDocParameterOrPropertyTagData, ModifierFlags, ModifierList, Node, NodeArena, NodeData,
+        NodeFlags, NodeId, NodeList, NodeRef, SourceFileData, SymbolTable, SyntaxKind,
+        SyntaxListData, TokenData,
     };
+
+    fn node_list(nodes: &[u32]) -> NodeList {
+        NodeList {
+            range: TextRange::default(),
+            nodes: nodes.iter().copied().map(NodeId::new).collect(),
+            has_trailing_comma: false,
+        }
+    }
+
+    fn modifier_list(nodes: &[u32]) -> ModifierList {
+        ModifierList {
+            list: node_list(nodes),
+            flags: ModifierFlags::default(),
+        }
+    }
+
+    fn direct_children(data: NodeData) -> Vec<NodeId> {
+        let node = Node {
+            kind: SyntaxKind::Unknown,
+            flags: NodeFlags::default(),
+            range: TextRange::default(),
+            parent: None,
+            data,
+        };
+        let mut children = Vec::new();
+        node.for_each_child(|child| children.push(child));
+        children
+    }
+
+    fn node_ids(nodes: &[u32]) -> Vec<NodeId> {
+        nodes.iter().copied().map(NodeId::new).collect()
+    }
 
     #[test]
     fn arena_assigns_stable_dense_node_ids() {
@@ -156,5 +193,118 @@ mod tests {
         assert_ne!(first, second);
         assert_eq!(first.node, second.node);
         assert!(!first.is_for(second_arena.id(), FileId::new(0)));
+    }
+
+    #[test]
+    fn direct_children_preserve_upstream_field_and_list_order() {
+        let cases = vec![
+            (
+                "do statement visits its body before its condition",
+                NodeData::DoStatement(Box::new(DoStatementData {
+                    expression: NodeId::new(2),
+                    flow_node: None,
+                    statement: NodeId::new(1),
+                    facts: 0,
+                })),
+                node_ids(&[1, 2]),
+            ),
+            (
+                "conditional expression includes punctuation tokens",
+                NodeData::ConditionalExpression(Box::new(ConditionalExpressionData {
+                    colon_token: NodeId::new(4),
+                    condition: NodeId::new(1),
+                    question_token: NodeId::new(2),
+                    when_false: NodeId::new(5),
+                    when_true: NodeId::new(3),
+                    facts: 0,
+                })),
+                node_ids(&[1, 2, 3, 4, 5]),
+            ),
+            (
+                "modifier and node lists flatten in place",
+                NodeData::ImportDeclaration(Box::new(ImportDeclarationData {
+                    attributes: Some(NodeId::new(6)),
+                    flow_node: None,
+                    import_clause: Some(NodeId::new(3)),
+                    module_specifier: NodeId::new(5),
+                    symbol: None,
+                    facts: 0,
+                    modifiers: Some(modifier_list(&[1, 2])),
+                })),
+                node_ids(&[1, 2, 3, 5, 6]),
+            ),
+            (
+                "source-file statements precede end-of-file",
+                NodeData::SourceFile(Box::new(SourceFileData {
+                    end_of_file_token: NodeId::new(4),
+                    locals: SymbolTable,
+                    next_container: None,
+                    statements: node_list(&[1, 2, 3]),
+                    symbol: None,
+                    facts: 0,
+                })),
+                node_ids(&[1, 2, 3, 4]),
+            ),
+            (
+                "raw syntax-list children retain their order",
+                NodeData::SyntaxList(Box::new(SyntaxListData {
+                    children: node_ids(&[3, 1, 2]),
+                })),
+                node_ids(&[3, 1, 2]),
+            ),
+        ];
+
+        for (description, data, expected) in cases {
+            assert_eq!(direct_children(data), expected, "{description}");
+        }
+    }
+
+    #[test]
+    fn jsdoc_parameter_child_order_uses_runtime_name_position() {
+        for (is_name_first, expected) in [
+            (true, node_ids(&[1, 2, 3, 4, 5])),
+            (false, node_ids(&[1, 3, 2, 4, 5])),
+        ] {
+            let data =
+                NodeData::JsDocParameterOrPropertyTag(Box::new(JsDocParameterOrPropertyTagData {
+                    comment: Some(node_list(&[4, 5])),
+                    is_bracketed: false,
+                    is_name_first,
+                    tag_name: NodeId::new(1),
+                    type_expression: Some(NodeId::new(3)),
+                    name: NodeId::new(2),
+                }));
+            assert_eq!(direct_children(data), expected);
+        }
+    }
+
+    #[test]
+    fn try_for_each_child_stops_at_the_first_break() {
+        let node = Node {
+            kind: SyntaxKind::SourceFile,
+            flags: NodeFlags::default(),
+            range: TextRange::default(),
+            parent: None,
+            data: NodeData::SourceFile(Box::new(SourceFileData {
+                end_of_file_token: NodeId::new(4),
+                locals: SymbolTable,
+                next_container: None,
+                statements: node_list(&[1, 2, 3]),
+                symbol: None,
+                facts: 0,
+            })),
+        };
+        let mut visited = Vec::new();
+        let result = node.try_for_each_child(|child| {
+            visited.push(child);
+            if child == NodeId::new(2) {
+                ControlFlow::Break(child)
+            } else {
+                ControlFlow::Continue(())
+            }
+        });
+
+        assert_eq!(result, ControlFlow::Break(NodeId::new(2)));
+        assert_eq!(visited, node_ids(&[1, 2]));
     }
 }

@@ -10,12 +10,27 @@ use crate::{
 };
 
 #[derive(Clone, Debug)]
+#[allow(clippy::struct_excessive_bools)] // Retains the independent upstream field attributes.
 struct ResolvedField {
     schema_name: String,
     ty: StringOrList,
     optional: bool,
     list: Option<ListKind>,
+    go_only: bool,
     no_go: bool,
+    no_factory: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ChildStorage {
+    Node,
+    OptionalNode,
+    NodeList,
+    OptionalNodeList,
+    ModifierList,
+    OptionalModifierList,
+    RawNodes,
+    OptionalRawNodes,
 }
 
 struct AstGenerator<'a> {
@@ -123,6 +138,10 @@ impl<'a> AstGenerator<'a> {
             if node.hand_written && name != "SourceFile" {
                 return Err(format!("unsupported handwritten node {name}"));
             }
+            if node.hand_written_visitor && name != "JSDocParameterOrPropertyTag" {
+                return Err(format!("unsupported handwritten visitor for {name}"));
+            }
+            self.child_fields(name, node)?;
         }
         for (name, alias) in &self.schema.nodes.aliases {
             match alias {
@@ -280,7 +299,9 @@ impl<'a> AstGenerator<'a> {
                         ty,
                         optional: member.optional.unwrap_or(false),
                         list: member.list,
+                        go_only: member.go_only,
                         no_go: member.no_go,
+                        no_factory: member.no_factory,
                     },
                 );
             }
@@ -309,8 +330,56 @@ impl<'a> AstGenerator<'a> {
         if let Some(list) = member.list {
             field.list = Some(list);
         }
+        field.go_only |= member.go_only;
         field.no_go |= member.no_go;
+        field.no_factory |= member.no_factory;
         Ok(())
+    }
+
+    fn child_fields(&self, name: &str, node: &NodeDef) -> Result<Vec<ResolvedField>, String> {
+        let fields = self.node_fields(name, node)?;
+        let mut children = Vec::new();
+        for member in &node.members {
+            if is_header_field(&member.name) {
+                continue;
+            }
+            let Some(field) = fields.iter().find(|field| field.schema_name == member.name) else {
+                if member.no_go {
+                    continue;
+                }
+                return Err(format!(
+                    "{name}.{} is missing from the generated Rust fields",
+                    member.name
+                ));
+            };
+            if field.go_only || field.no_factory {
+                continue;
+            }
+            if self.child_storage(field)?.is_some() {
+                children.push(field.clone());
+            }
+        }
+        Ok(children)
+    }
+
+    fn child_storage(&self, field: &ResolvedField) -> Result<Option<ChildStorage>, String> {
+        let scalar = self.scalar_rust_type(&field.ty)?;
+        let is_node = matches!(scalar.as_str(), "NodeId" | "Option<NodeId>");
+        if !is_node {
+            return Ok(None);
+        }
+        let optional = field.optional || scalar == "Option<NodeId>";
+        let storage = match (field.list, optional) {
+            (None, false) => ChildStorage::Node,
+            (None, true) => ChildStorage::OptionalNode,
+            (Some(ListKind::NodeList), false) => ChildStorage::NodeList,
+            (Some(ListKind::NodeList), true) => ChildStorage::OptionalNodeList,
+            (Some(ListKind::ModifierList), false) => ChildStorage::ModifierList,
+            (Some(ListKind::ModifierList), true) => ChildStorage::OptionalModifierList,
+            (Some(ListKind::Raw), false) => ChildStorage::RawNodes,
+            (Some(ListKind::Raw), true) => ChildStorage::OptionalRawNodes,
+        };
+        Ok(Some(storage))
     }
 
     fn rust_type(
@@ -383,6 +452,139 @@ impl<'a> AstGenerator<'a> {
             || self.node_alias_names.contains(name)
             || self.instantiation_alias_names.contains(name)
             || self.syntax_node_names.contains(name)
+    }
+
+    fn generate_child_traversal(&self, output: &mut String) -> Result<(), String> {
+        writeln!(output).unwrap();
+        writeln!(
+            output,
+            "    /// Visits direct AST children in TypeScript-Go `ForEachChild` order."
+        )
+        .unwrap();
+        writeln!(output, "    ///").unwrap();
+        writeln!(
+            output,
+            "    /// Returning [`std::ops::ControlFlow::Break`] stops traversal immediately."
+        )
+        .unwrap();
+        writeln!(
+            output,
+            "    #[allow(clippy::match_same_arms, clippy::too_many_lines)]"
+        )
+        .unwrap();
+        writeln!(output, "    pub fn try_for_each_child<B, F>(").unwrap();
+        writeln!(output, "        &self,").unwrap();
+        writeln!(output, "        visitor: &mut F,").unwrap();
+        writeln!(output, "    ) -> std::ops::ControlFlow<B>").unwrap();
+        writeln!(output, "    where").unwrap();
+        writeln!(
+            output,
+            "        F: FnMut(NodeId) -> std::ops::ControlFlow<B> + ?Sized,"
+        )
+        .unwrap();
+        writeln!(output, "    {{").unwrap();
+        writeln!(
+            output,
+            "        // BEGIN schema-exhaustive direct child visitor"
+        )
+        .unwrap();
+        writeln!(output, "        match self {{").unwrap();
+        for (name, node) in &self.schema.nodes.definitions {
+            let rust_name = rust_type_name(name);
+            if node.hand_written_visitor {
+                Self::generate_hand_written_child_arm(output, name, &rust_name)?;
+                continue;
+            }
+            let fields = self.child_fields(name, node)?;
+            if fields.is_empty() {
+                writeln!(
+                    output,
+                    "            Self::{rust_name}(..) => std::ops::ControlFlow::Continue(()),"
+                )
+                .unwrap();
+                continue;
+            }
+            writeln!(output, "            Self::{rust_name}(node) => {{").unwrap();
+            for (index, field) in fields.iter().enumerate() {
+                let call = self.child_visit_call(field)?;
+                if index + 1 == fields.len() {
+                    writeln!(output, "                {call}").unwrap();
+                } else {
+                    writeln!(output, "                {call}?;").unwrap();
+                }
+            }
+            writeln!(output, "            }}").unwrap();
+        }
+        writeln!(output, "        }}").unwrap();
+        writeln!(
+            output,
+            "        // END schema-exhaustive direct child visitor"
+        )
+        .unwrap();
+        writeln!(output, "    }}").unwrap();
+        Ok(())
+    }
+
+    fn generate_hand_written_child_arm(
+        output: &mut String,
+        schema_name: &str,
+        rust_name: &str,
+    ) -> Result<(), String> {
+        if schema_name != "JSDocParameterOrPropertyTag" {
+            return Err(format!("unsupported handwritten visitor for {schema_name}"));
+        }
+        writeln!(output, "            Self::{rust_name}(node) => {{").unwrap();
+        writeln!(output, "                visitor(node.tag_name)?;").unwrap();
+        writeln!(output, "                if node.is_name_first {{").unwrap();
+        writeln!(output, "                    visitor(node.name)?;").unwrap();
+        writeln!(
+            output,
+            "                    visit_optional_child(visitor, node.type_expression)?;"
+        )
+        .unwrap();
+        writeln!(output, "                }} else {{").unwrap();
+        writeln!(
+            output,
+            "                    visit_optional_child(visitor, node.type_expression)?;"
+        )
+        .unwrap();
+        writeln!(output, "                    visitor(node.name)?;").unwrap();
+        writeln!(output, "                }}").unwrap();
+        writeln!(
+            output,
+            "                visit_optional_node_list(visitor, node.comment.as_ref())"
+        )
+        .unwrap();
+        writeln!(output, "            }}").unwrap();
+        Ok(())
+    }
+
+    fn child_visit_call(&self, field: &ResolvedField) -> Result<String, String> {
+        let field_name = rust_field_name(&field.schema_name);
+        let call = match self
+            .child_storage(field)?
+            .ok_or_else(|| format!("{} is not an AST child", field.schema_name))?
+        {
+            ChildStorage::Node => format!("visitor(node.{field_name})"),
+            ChildStorage::OptionalNode => {
+                format!("visit_optional_child(visitor, node.{field_name})")
+            }
+            ChildStorage::NodeList => format!("visit_node_list(visitor, &node.{field_name})"),
+            ChildStorage::OptionalNodeList => {
+                format!("visit_optional_node_list(visitor, node.{field_name}.as_ref())")
+            }
+            ChildStorage::ModifierList => {
+                format!("visit_modifier_list(visitor, &node.{field_name})")
+            }
+            ChildStorage::OptionalModifierList => {
+                format!("visit_optional_modifier_list(visitor, node.{field_name}.as_ref())")
+            }
+            ChildStorage::RawNodes => format!("visit_children(visitor, &node.{field_name})"),
+            ChildStorage::OptionalRawNodes => {
+                format!("visit_optional_children(visitor, node.{field_name}.as_deref())")
+            }
+        };
+        Ok(call)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -469,8 +671,10 @@ impl<'a> AstGenerator<'a> {
         }
         writeln!(output, "        }}").unwrap();
         writeln!(output, "    }}").unwrap();
+        self.generate_child_traversal(&mut output)?;
         writeln!(output, "}}").unwrap();
         writeln!(output).unwrap();
+        write_child_traversal_helpers(&mut output);
 
         for name in self.schema.nodes.definitions.keys() {
             writeln!(output, "pub type {}Node = NodeId;", rust_type_name(name)).unwrap();
@@ -503,6 +707,108 @@ fn syntax_node_names<'a>(node_name: &'a str, node: &'a NodeDef) -> Vec<&'a str> 
     names
 }
 
+fn write_child_traversal_helpers(output: &mut String) {
+    output.push_str(
+        r"fn visit_optional_child<B, F>(
+    visitor: &mut F,
+    child: Option<NodeId>,
+) -> std::ops::ControlFlow<B>
+where
+    F: FnMut(NodeId) -> std::ops::ControlFlow<B> + ?Sized,
+{
+    match child {
+        Some(child) => visitor(child),
+        None => std::ops::ControlFlow::Continue(()),
+    }
+}
+
+fn visit_children<B, F>(visitor: &mut F, children: &[NodeId]) -> std::ops::ControlFlow<B>
+where
+    F: FnMut(NodeId) -> std::ops::ControlFlow<B> + ?Sized,
+{
+    for &child in children {
+        visitor(child)?;
+    }
+    std::ops::ControlFlow::Continue(())
+}
+
+fn visit_optional_children<B, F>(
+    visitor: &mut F,
+    children: Option<&[NodeId]>,
+) -> std::ops::ControlFlow<B>
+where
+    F: FnMut(NodeId) -> std::ops::ControlFlow<B> + ?Sized,
+{
+    match children {
+        Some(children) => visit_children(visitor, children),
+        None => std::ops::ControlFlow::Continue(()),
+    }
+}
+
+fn visit_node_list<B, F>(visitor: &mut F, list: &NodeList) -> std::ops::ControlFlow<B>
+where
+    F: FnMut(NodeId) -> std::ops::ControlFlow<B> + ?Sized,
+{
+    visit_children(visitor, &list.nodes)
+}
+
+fn visit_optional_node_list<B, F>(
+    visitor: &mut F,
+    list: Option<&NodeList>,
+) -> std::ops::ControlFlow<B>
+where
+    F: FnMut(NodeId) -> std::ops::ControlFlow<B> + ?Sized,
+{
+    match list {
+        Some(list) => visit_node_list(visitor, list),
+        None => std::ops::ControlFlow::Continue(()),
+    }
+}
+
+fn visit_modifier_list<B, F>(visitor: &mut F, list: &ModifierList) -> std::ops::ControlFlow<B>
+where
+    F: FnMut(NodeId) -> std::ops::ControlFlow<B> + ?Sized,
+{
+    visit_node_list(visitor, &list.list)
+}
+
+fn visit_optional_modifier_list<B, F>(
+    visitor: &mut F,
+    list: Option<&ModifierList>,
+) -> std::ops::ControlFlow<B>
+where
+    F: FnMut(NodeId) -> std::ops::ControlFlow<B> + ?Sized,
+{
+    match list {
+        Some(list) => visit_modifier_list(visitor, list),
+        None => std::ops::ControlFlow::Continue(()),
+    }
+}
+
+impl Node {
+    /// Visits every direct AST child in TypeScript-Go `ForEachChild` order.
+    pub fn for_each_child(&self, mut visitor: impl FnMut(NodeId)) {
+        let _ = self.data.try_for_each_child(&mut |child| {
+            visitor(child);
+            std::ops::ControlFlow::<()>::Continue(())
+        });
+    }
+
+    /// Tries to visit direct AST children in TypeScript-Go `ForEachChild` order.
+    ///
+    /// Returning [`std::ops::ControlFlow::Break`] stops traversal immediately.
+    pub fn try_for_each_child<B>(
+        &self,
+        mut visitor: impl FnMut(NodeId) -> std::ops::ControlFlow<B>,
+    ) -> std::ops::ControlFlow<B> {
+        self.data.try_for_each_child(&mut visitor)
+    }
+}
+
+",
+    );
+}
+
 fn type_names(ty: &StringOrList) -> impl Iterator<Item = &str> {
     match ty {
         StringOrList::One(name) => std::slice::from_ref(name).iter(),
@@ -521,7 +827,9 @@ fn resolved_base_field(name: &str, field: &FieldDef) -> ResolvedField {
         ty: field.r#type.clone(),
         optional: field.optional,
         list: field.list,
+        go_only: field.go_only,
         no_go: field.no_go,
+        no_factory: field.no_factory,
     }
 }
 
@@ -766,6 +1074,8 @@ impl NodeArena {
 
 #[cfg(test)]
 mod tests {
+    use crate::{Schema, rust_type_name};
+
     use super::generate_ast;
 
     const UPSTREAM_AST: &str = include_str!("../spec/ast.json");
@@ -805,5 +1115,51 @@ mod tests {
         assert!(output.contains("pub flow_node: Option<FlowNodeId>"));
         assert!(output.contains("pub type Expression = NodeId;"));
         assert!(output.contains("pub type StatementList = NodeList;"));
+    }
+
+    #[test]
+    fn current_schema_emits_one_direct_child_arm_per_payload() {
+        let output = generate_ast(UPSTREAM_AST).unwrap();
+        let visitor = output
+            .split("// BEGIN schema-exhaustive direct child visitor")
+            .nth(1)
+            .unwrap()
+            .split("// END schema-exhaustive direct child visitor")
+            .next()
+            .unwrap();
+        let schema: Schema = serde_json::from_str(UPSTREAM_AST).unwrap();
+
+        assert_eq!(
+            visitor.matches("            Self::").count(),
+            schema.nodes.definitions.len()
+        );
+        for name in schema.nodes.definitions.keys() {
+            let variant = rust_type_name(name);
+            assert!(
+                visitor.contains(&format!("            Self::{variant}(")),
+                "missing direct-child arm for {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn generated_child_order_covers_upstream_special_cases() {
+        let output = generate_ast(UPSTREAM_AST).unwrap();
+
+        assert!(output.contains(
+            "Self::DoStatement(node) => {\n                visitor(node.statement)?;\n                visitor(node.expression)"
+        ));
+        assert!(output.contains(
+            "Self::FunctionDeclaration(node) => {\n                visit_optional_modifier_list(visitor, node.modifiers.as_ref())?;\n                visit_optional_child(visitor, node.asterisk_token)?;\n                visit_optional_child(visitor, node.name)?;\n                visit_optional_node_list(visitor, node.type_parameters.as_ref())?;\n                visit_node_list(visitor, &node.parameters)?;\n                visit_optional_child(visitor, node.type_)?;\n                visit_optional_child(visitor, node.full_signature)?;\n                visit_optional_child(visitor, node.body)"
+        ));
+        assert!(output.contains(
+            "Self::ImportDeclaration(node) => {\n                visit_optional_modifier_list(visitor, node.modifiers.as_ref())?;\n                visit_optional_child(visitor, node.import_clause)?;\n                visitor(node.module_specifier)?;\n                visit_optional_child(visitor, node.attributes)"
+        ));
+        assert!(output.contains(
+            "Self::SourceFile(node) => {\n                visit_node_list(visitor, &node.statements)?;\n                visitor(node.end_of_file_token)"
+        ));
+        assert!(output.contains(
+            "Self::JsDocParameterOrPropertyTag(node) => {\n                visitor(node.tag_name)?;\n                if node.is_name_first"
+        ));
     }
 }
