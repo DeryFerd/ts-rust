@@ -10,15 +10,19 @@ use ts_jsnum::{Number, PseudoBigInt};
 use xxhash_rust::xxh3::Xxh3;
 
 use super::{
-    CanonicalCheckerDiagnostics, CanonicalCheckerOptions, CanonicalTypeMapperStore,
-    DeclaredTypeError, DeclaredTypeHost, DeclaredTypeUnavailable, TypeId, TypeResolutionTarget,
-    TypeSystemPropertyName, UnsupportedDeclaredTypeKind,
+    CanonicalCheckerDiagnostics, CanonicalCheckerOptions, CanonicalGlobalTypes,
+    CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHost, DeclaredTypeUnavailable, TypeId,
+    TypeResolutionTarget, TypeSystemPropertyName, UnsupportedDeclaredTypeKind,
     bootstrap::{LiteralTypeCacheError, PreparedTypeQueryTypes},
     declared::{
         cached_ordinary_type_parameter_owner, execute_type_parameter,
         explicit_type_parameter_symbols, get_declared_class_interface_or_type_parameter,
         malformed_alias_merge, preflight_class_or_interface_reference, preflight_node,
         preflight_type_parameter_symbol, type_list_key,
+    },
+    global_types::{
+        create_type_from_generic_global_type, preflight_generic_global_type_target,
+        validate_generic_global_type_instantiation,
     },
     object_members::{self, PropertyObjectError, PropertyObjectPlan, PropertyObjectState},
     type_records::{CacheHashKey, TypeData, TypeRecord},
@@ -166,12 +170,19 @@ enum PlannedLiteralType {
 
 #[derive(Debug, Default)]
 struct TypeQueryPlan {
+    arrays: BTreeMap<NodeRef, PlannedArrayType>,
     aliases: BTreeMap<SemanticSymbolId, TypeAliasPlan>,
     references: BTreeMap<NodeRef, PlannedTypeReference>,
     literals: BTreeMap<NodeRef, PlannedLiteralType>,
     unions: BTreeMap<NodeRef, PlannedUnionType>,
     type_literals: BTreeMap<NodeRef, PropertyObjectPlan>,
     interfaces: BTreeMap<SemanticSymbolId, PropertyObjectPlan>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PlannedArrayType {
+    element_type: NodeRef,
+    fallback: Option<TypeId>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -532,6 +543,7 @@ fn cached_alias_parameter_symbols(
 struct TypeQueryPlanner<'store, 'host, 'arena> {
     store: &'store CanonicalTypeMapperStore,
     host: &'host DeclaredTypeHost<'arena>,
+    array_type: Option<TypeId>,
     strict_builtin_iterator_return: bool,
     plan: TypeQueryPlan,
     planning_defaults: HashSet<(SemanticSymbolId, NodeRef)>,
@@ -543,11 +555,13 @@ impl<'store, 'host, 'arena> TypeQueryPlanner<'store, 'host, 'arena> {
     fn new(
         store: &'store CanonicalTypeMapperStore,
         host: &'host DeclaredTypeHost<'arena>,
+        array_type: Option<TypeId>,
         strict_builtin_iterator_return: bool,
     ) -> Self {
         Self {
             store,
             host,
+            array_type,
             strict_builtin_iterator_return,
             plan: TypeQueryPlan::default(),
             planning_defaults: HashSet::new(),
@@ -686,9 +700,10 @@ impl<'store, 'host, 'arena> TypeQueryPlanner<'store, 'host, 'arena> {
                 self.plan_type_node_in_context(inner, alias_owner, union_constituent)
             }
             SyntaxKind::LiteralType => self.plan_literal_type(node),
-            SyntaxKind::TypeLiteral if union_constituent => Err(type_node_unavailable(
-                TypeNodeUnavailable::UnsupportedUnionConstituent(node),
-            )),
+            SyntaxKind::ArrayType | SyntaxKind::TypeLiteral if union_constituent => Err(
+                type_node_unavailable(TypeNodeUnavailable::UnsupportedUnionConstituent(node)),
+            ),
+            SyntaxKind::ArrayType => self.plan_array_type(node, alias_owner),
             SyntaxKind::TypeLiteral => self.plan_property_type_literal(node, alias_owner),
             SyntaxKind::TypeReference => {
                 self.plan_type_reference(node, alias_owner, union_constituent)
@@ -701,6 +716,72 @@ impl<'store, 'host, 'arena> TypeQueryPlanner<'store, 'host, 'arena> {
                 TypeNodeUnavailable::UnsupportedSyntax { node, kind },
             )),
         }
+    }
+
+    fn plan_array_type(
+        &mut self,
+        node: NodeRef,
+        alias_owner: Option<SemanticSymbolId>,
+    ) -> Result<(), DeclaredTypeError> {
+        let array_type = self.array_type.ok_or_else(|| {
+            type_node_unavailable(TypeNodeUnavailable::UnsupportedSyntax {
+                node,
+                kind: SyntaxKind::ArrayType,
+            })
+        })?;
+        let record = preflight_node(self.store, self.host, node)?;
+        let NodeData::ArrayTypeNode(array) = &record.data else {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidTypeReference(node),
+            ));
+        };
+        let element_type = NodeRef::new(node.arena, node.file, array.element_type);
+        let element_record = preflight_node(self.store, self.host, element_type)?;
+        if record.kind != SyntaxKind::ArrayType
+            || element_record.parent != Some(node.node)
+            || element_record.range.start != record.range.start
+            || element_record.range.end >= record.range.end
+        {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidTypeReference(node),
+            ));
+        }
+        let fallback = preflight_generic_global_type_target(self.store, array_type)
+            .map_err(|_| type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node)))?;
+        if let Some(cached) = self
+            .store
+            .type_node_links(node)
+            .and_then(|links| links.resolved_type)
+        {
+            validate_generic_global_type_instantiation(self.store, array_type, cached).map_err(
+                |_| type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node)),
+            )?;
+        }
+        // A missing or malformed global Array resolves directly to the empty
+        // object fallback before the element type is consulted upstream.
+        if fallback.is_none() {
+            if let Some(alias) = alias_owner {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::GenericReferenceUnsupported {
+                        node,
+                        symbol: alias,
+                    },
+                ));
+            }
+            self.plan_type_node_in_context(element_type, None, false)?;
+        }
+        let planned = PlannedArrayType {
+            element_type,
+            fallback,
+        };
+        if let Some(existing) = self.plan.arrays.insert(node, planned)
+            && existing != planned
+        {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidTypeReference(node),
+            ));
+        }
+        Ok(())
     }
 
     fn plan_property_type_literal(
@@ -2461,6 +2542,7 @@ impl<'store, 'host, 'arena> TypeQueryPlanner<'store, 'host, 'arena> {
 pub(super) struct CanonicalTypeQuery<'store, 'host, 'arena, 'diagnostics> {
     store: &'store mut CanonicalTypeMapperStore,
     host: &'host DeclaredTypeHost<'arena>,
+    array_type: Option<TypeId>,
     options: CanonicalTypeQueryOptions,
     diagnostics: &'diagnostics mut CanonicalCheckerDiagnostics,
     resolving_property_interfaces: HashSet<SemanticSymbolId>,
@@ -2494,10 +2576,41 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         Ok(Self {
             store,
             host,
+            array_type: None,
             options,
             diagnostics,
             resolving_property_interfaces: HashSet::new(),
         })
+    }
+
+    /// Opens a query with the context-owned standard-library identities. Only
+    /// this capability may enable `T[]`; an ordinary query continues to fail
+    /// closed instead of discovering or synthesizing an `Array` lookalike.
+    #[allow(dead_code)] // The integration branch owns threading globals into production queries.
+    pub(super) fn new_with_global_types(
+        store: &'store mut CanonicalTypeMapperStore,
+        host: &'host DeclaredTypeHost<'arena>,
+        global_types: &CanonicalGlobalTypes,
+        options: impl Into<CanonicalTypeQueryOptions>,
+        diagnostics: &'diagnostics mut CanonicalCheckerDiagnostics,
+    ) -> Result<Self, DeclaredTypeError> {
+        let array_type = global_types.array_type;
+        let mut query = Self::new(store, host, options, diagnostics)?;
+        query.array_type = Some(array_type);
+        Ok(query)
+    }
+
+    #[cfg(test)]
+    fn new_with_array_type_for_test(
+        store: &'store mut CanonicalTypeMapperStore,
+        host: &'host DeclaredTypeHost<'arena>,
+        array_type: TypeId,
+        options: impl Into<CanonicalTypeQueryOptions>,
+        diagnostics: &'diagnostics mut CanonicalCheckerDiagnostics,
+    ) -> Result<Self, DeclaredTypeError> {
+        let mut query = Self::new(store, host, options, diagnostics)?;
+        query.array_type = Some(array_type);
+        Ok(query)
     }
 
     /// Resolves one dependency-closed type-node query.
@@ -2513,6 +2626,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         let mut planner = TypeQueryPlanner::new(
             self.store,
             self.host,
+            self.array_type,
             self.options.strict_builtin_iterator_return,
         );
         planner.plan_type_node(node)?;
@@ -2541,6 +2655,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         let mut planner = TypeQueryPlanner::new(
             self.store,
             self.host,
+            self.array_type,
             self.options.strict_builtin_iterator_return,
         );
         if !flags
@@ -2610,6 +2725,42 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             .iter()
             .filter(|union| union.alias_symbol.is_some())
             .count();
+        let array_references = plan
+            .arrays
+            .values()
+            .filter(|array| array.fallback.is_none())
+            .count();
+        let literal_values = strings
+            .len()
+            .checked_add(numbers.len())
+            .and_then(|count| count.checked_add(bigints.len()))
+            .ok_or_else(|| Self::literal_cache_error(LiteralTypeCacheError::Capacity))?;
+        let additional_types = literal_values
+            .checked_add(unions.len())
+            .and_then(|count| count.checked_mul(2))
+            .and_then(|count| count.checked_add(array_references))
+            .ok_or_else(|| Self::literal_cache_error(LiteralTypeCacheError::Capacity))?;
+        if !self.store.try_reserve_types(additional_types) {
+            return Err(Self::literal_cache_error(LiteralTypeCacheError::Capacity));
+        }
+        if array_references != 0 {
+            let array_type = self
+                .array_type
+                .expect("planned arrays have a global target");
+            if !self
+                .store
+                .try_reserve_object_instantiations(array_type, array_references)
+            {
+                let node = *plan
+                    .arrays
+                    .iter()
+                    .find_map(|(node, array)| array.fallback.is_none().then_some(node))
+                    .expect("an initialized array reference was counted");
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidTypeReference(node),
+                ));
+            }
+        }
         self.store
             .prepare_type_query_types(&strings, &numbers, &bigints, unions.len(), named_unions)
             .map_err(Self::literal_cache_error)
@@ -2884,6 +3035,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 )
             }
             SyntaxKind::LiteralType => self.execute_literal_type(node, plan),
+            SyntaxKind::ArrayType => self.execute_array_type(node, plan, prepared),
             SyntaxKind::TypeLiteral => self.execute_property_type_literal(node, plan, prepared),
             SyntaxKind::TypeReference => self.execute_type_reference(node, plan, prepared),
             SyntaxKind::UnionType => self.execute_union_type(node, plan, prepared),
@@ -2891,6 +3043,60 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 TypeNodeUnavailable::UnsupportedSyntax { node, kind },
             )),
         }
+    }
+
+    fn execute_array_type(
+        &mut self,
+        node: NodeRef,
+        plan: &TypeQueryPlan,
+        prepared: &mut PreparedTypeQueryTypes,
+    ) -> Result<TypeId, DeclaredTypeError> {
+        let array = plan.arrays.get(&node).copied().ok_or_else(|| {
+            type_node_unavailable(TypeNodeUnavailable::MissingPlannedTypeReference(node))
+        })?;
+        let cached = self
+            .store
+            .type_node_links(node)
+            .and_then(|links| links.resolved_type);
+        let resolved_type = if let Some(fallback) = array.fallback {
+            fallback
+        } else {
+            let element_type = self.execute_type_node(array.element_type, plan, prepared)?;
+            let array_type = self.array_type.ok_or_else(|| {
+                type_node_unavailable(TypeNodeUnavailable::UnsupportedSyntax {
+                    node,
+                    kind: SyntaxKind::ArrayType,
+                })
+            })?;
+            create_type_from_generic_global_type(
+                self.store,
+                array_type,
+                element_type,
+                ObjectFlags::FROM_TYPE_NODE,
+            )
+            .map_err(|_| type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node)))?
+        };
+        if let Some(cached) = cached {
+            return if cached == resolved_type {
+                Ok(cached)
+            } else {
+                Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidTypeReference(node),
+                ))
+            };
+        }
+        let mut links = self
+            .store
+            .type_node_links(node)
+            .cloned()
+            .unwrap_or_default();
+        links.resolved_type = Some(resolved_type);
+        if !self.store.set_type_node_links(node, links) {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidTypeReference(node),
+            ));
+        }
+        Ok(resolved_type)
     }
 
     fn direct_type_literal_plan_node(
@@ -3898,6 +4104,55 @@ mod tests {
             diagnostics,
         )?
         .get_type_from_type_node(node)
+    }
+
+    fn canonical_array_target(fixture: &mut Fixture) -> TypeId {
+        let symbol = named_symbol(fixture, SyntaxKind::InterfaceDeclaration, "Array");
+        let host = post_global_host(
+            &fixture.parsed.arena,
+            fixture.files.get(&fixture.file).unwrap(),
+        );
+        fixture
+            .store
+            .get_declared_type_of_symbol(&host, symbol)
+            .unwrap()
+    }
+
+    fn query_array_node(
+        fixture: &mut Fixture,
+        array_type: TypeId,
+        node: NodeRef,
+        diagnostics: &mut CanonicalCheckerDiagnostics,
+    ) -> Result<TypeId, DeclaredTypeError> {
+        let host = post_global_host(
+            &fixture.parsed.arena,
+            fixture.files.get(&fixture.file).unwrap(),
+        );
+        CanonicalTypeQuery::new_with_array_type_for_test(
+            &mut fixture.store,
+            &host,
+            array_type,
+            CanonicalTypeQueryOptions::default(),
+            diagnostics,
+        )?
+        .get_type_from_type_node(node)
+    }
+
+    fn array_element_node(fixture: &Fixture, array: NodeRef) -> NodeRef {
+        let NodeData::ArrayTypeNode(array_data) =
+            &fixture.parsed.arena.get(array.node).unwrap().data
+        else {
+            panic!("expected an array type node")
+        };
+        NodeRef::new(array.arena, array.file, array_data.element_type)
+    }
+
+    fn type_reference_arguments(store: &CanonicalTypeMapperStore, reference: TypeId) -> &[TypeId] {
+        let TypeData::TypeReference(reference) = store.type_payload(reference).unwrap().data()
+        else {
+            panic!("expected a canonical type reference")
+        };
+        reference.resolved_type_arguments.as_deref().unwrap()
     }
 
     fn assert_invalid_literal_query_is_atomic(fixture: &mut Fixture) {
@@ -8478,6 +8733,377 @@ mod tests {
         assert_eq!(
             query_node(&mut fixture, reference, &mut diagnostics),
             Ok(model_type)
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // One identity/cache/flag transition matrix.
+    fn array_type_nodes_share_the_authoritative_target_cache_and_first_allocation_flags() {
+        let mut fixture = fixture(
+            "interface Array<T> {} \
+             let any_values: any[]; let first: number[]; \
+             let second: number[]; let nested: number[][];",
+        );
+        let array_type = canonical_array_target(&mut fixture);
+        let (any_type, number_type) = {
+            let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+            (bootstrap.any_type, bootstrap.number_type)
+        };
+        let any_array = create_type_from_generic_global_type(
+            &mut fixture.store,
+            array_type,
+            any_type,
+            ObjectFlags::NONE,
+        )
+        .unwrap();
+        assert_eq!(
+            fixture
+                .store
+                .type_payload(any_array)
+                .unwrap()
+                .object_flags(),
+            ObjectFlags::REFERENCE
+        );
+
+        let any_node = variable_type_node(&fixture, "any_values");
+        let first_node = variable_type_node(&fixture, "first");
+        let second_node = variable_type_node(&fixture, "second");
+        let nested_node = variable_type_node(&fixture, "nested");
+        let nested_element = array_element_node(&fixture, nested_node);
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        assert_eq!(
+            query_array_node(&mut fixture, array_type, any_node, &mut diagnostics),
+            Ok(any_array)
+        );
+        let first =
+            query_array_node(&mut fixture, array_type, first_node, &mut diagnostics).unwrap();
+        let second =
+            query_array_node(&mut fixture, array_type, second_node, &mut diagnostics).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(
+            type_reference_arguments(&fixture.store, first),
+            [number_type]
+        );
+        assert_eq!(
+            fixture.store.type_payload(first).unwrap().object_flags(),
+            ObjectFlags::REFERENCE | ObjectFlags::FROM_TYPE_NODE
+        );
+        assert_eq!(
+            create_type_from_generic_global_type(
+                &mut fixture.store,
+                array_type,
+                number_type,
+                ObjectFlags::NONE,
+            ),
+            Ok(first)
+        );
+        assert!(
+            fixture
+                .store
+                .type_payload(first)
+                .unwrap()
+                .object_flags()
+                .contains(ObjectFlags::FROM_TYPE_NODE)
+        );
+
+        let nested =
+            query_array_node(&mut fixture, array_type, nested_node, &mut diagnostics).unwrap();
+        assert_ne!(nested, first);
+        assert_eq!(type_reference_arguments(&fixture.store, nested), [first]);
+        assert_eq!(
+            fixture
+                .store
+                .type_node_links(nested_element)
+                .and_then(|links| links.resolved_type),
+            Some(first)
+        );
+        let TypeData::TypeReference(nested_reference) =
+            fixture.store.type_payload(nested).unwrap().data()
+        else {
+            panic!("nested array must be a canonical reference")
+        };
+        assert_eq!(nested_reference.object.target, Some(array_type));
+
+        assert!(fixture.store.set_type_node_links(
+            first_node,
+            TypeNodeLinks {
+                resolved_type: Some(any_array),
+                ..TypeNodeLinks::default()
+            },
+        ));
+        let poisoned = store_state(&fixture.store);
+        assert!(matches!(
+            query_array_node(
+                &mut fixture,
+                array_type,
+                first_node,
+                &mut diagnostics,
+            ),
+            Err(DeclaredTypeError::TypeNodeUnavailable(
+                TypeNodeUnavailable::InvalidTypeReference(node)
+            )) if node == first_node
+        ));
+        assert_eq!(store_state(&fixture.store), poisoned);
+        assert!(fixture.store.set_type_node_links(
+            first_node,
+            TypeNodeLinks {
+                resolved_type: Some(first),
+                ..TypeNodeLinks::default()
+            },
+        ));
+        assert_eq!(
+            query_array_node(&mut fixture, array_type, first_node, &mut diagnostics,),
+            Ok(first)
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn property_object_array_elements_publish_the_exact_element_identity() {
+        let mut fixture = fixture("interface Array<T> {} let values: { id: number }[];");
+        let array_type = canonical_array_target(&mut fixture);
+        let node = variable_type_node(&fixture, "values");
+        let element_node = array_element_node(&fixture, node);
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let resolved = query_array_node(&mut fixture, array_type, node, &mut diagnostics).unwrap();
+        let element_type = fixture
+            .store
+            .type_node_links(element_node)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        assert_eq!(
+            type_reference_arguments(&fixture.store, resolved),
+            [element_type]
+        );
+        let TypeData::TypeReference(reference) =
+            fixture.store.type_payload(resolved).unwrap().data()
+        else {
+            panic!("array type syntax must create a reference")
+        };
+        assert_eq!(reference.object.target, Some(array_type));
+        assert!(
+            fixture
+                .store
+                .type_payload(resolved)
+                .unwrap()
+                .object_flags()
+                .contains(ObjectFlags::FROM_TYPE_NODE)
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn malformed_array_target_parameters_fail_before_query_writes() {
+        let mut fixture = fixture("interface Array<T> {} let values: number[];");
+        let array_type = canonical_array_target(&mut fixture);
+        let node = variable_type_node(&fixture, "values");
+        let number_type = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+        let (parameter, this_type) = {
+            let TypeData::Interface(interface) =
+                fixture.store.type_payload(array_type).unwrap().data()
+            else {
+                panic!("Array must have an interface target")
+            };
+            (
+                interface
+                    .reference
+                    .resolved_type_arguments
+                    .as_ref()
+                    .unwrap()[0],
+                interface.this_type.unwrap(),
+            )
+        };
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        assert!(fixture.store.set_type_parameter_resolution(
+            parameter,
+            None,
+            Some(number_type),
+            None,
+            None,
+        ));
+        let ordinary_poison = store_state(&fixture.store);
+        assert!(matches!(
+            query_array_node(&mut fixture, array_type, node, &mut diagnostics),
+            Err(DeclaredTypeError::TypeNodeUnavailable(
+                TypeNodeUnavailable::InvalidTypeReference(error_node)
+            )) if error_node == node
+        ));
+        assert_eq!(store_state(&fixture.store), ordinary_poison);
+        assert!(
+            fixture
+                .store
+                .set_type_parameter_resolution(parameter, None, None, None, None)
+        );
+
+        assert!(fixture.store.set_type_parameter_resolution(
+            this_type,
+            Some(array_type),
+            Some(number_type),
+            None,
+            None,
+        ));
+        let this_poison = store_state(&fixture.store);
+        assert!(matches!(
+            query_array_node(&mut fixture, array_type, node, &mut diagnostics),
+            Err(DeclaredTypeError::TypeNodeUnavailable(
+                TypeNodeUnavailable::InvalidTypeReference(error_node)
+            )) if error_node == node
+        ));
+        assert_eq!(store_state(&fixture.store), this_poison);
+        assert!(fixture.store.set_type_parameter_resolution(
+            this_type,
+            Some(array_type),
+            None,
+            None,
+            None,
+        ));
+
+        assert!(query_array_node(&mut fixture, array_type, node, &mut diagnostics).is_ok());
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn malformed_array_cache_fails_before_writes_and_reuses_repaired_first_identity() {
+        let mut fixture = fixture("interface Array<T> {} let values: number[];");
+        let array_type = canonical_array_target(&mut fixture);
+        let node = variable_type_node(&fixture, "values");
+        let target_symbol = fixture.store.type_payload(array_type).unwrap().symbol();
+        let (number_type, string_type) = {
+            let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+            (bootstrap.number_type, bootstrap.string_type)
+        };
+        let forged = fixture
+            .store
+            .alloc_type_reference(ObjectFlags::NONE, target_symbol)
+            .unwrap();
+        assert!(
+            fixture
+                .store
+                .set_object_target_and_mapper(forged, Some(array_type), None)
+        );
+        assert!(
+            fixture
+                .store
+                .set_type_reference_resolution(forged, None, Some(vec![string_type]),)
+        );
+        assert_eq!(
+            fixture.store.insert_object_instantiation(
+                array_type,
+                type_list_key(&[number_type]),
+                forged,
+            ),
+            Some(forged)
+        );
+
+        let poisoned = store_state(&fixture.store);
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        assert!(matches!(
+            query_array_node(&mut fixture, array_type, node, &mut diagnostics),
+            Err(DeclaredTypeError::TypeNodeUnavailable(
+                TypeNodeUnavailable::InvalidTypeReference(error_node)
+            )) if error_node == node
+        ));
+        assert_eq!(store_state(&fixture.store), poisoned);
+        assert!(fixture.store.type_node_links(node).is_none());
+
+        assert!(
+            fixture
+                .store
+                .set_type_reference_resolution(forged, None, Some(vec![number_type]),)
+        );
+        assert!(fixture.store.set_type_object_flags(
+            forged,
+            ObjectFlags::REFERENCE | ObjectFlags::ARRAY_LITERAL,
+        ));
+        let poisoned_flags = store_state(&fixture.store);
+        assert!(matches!(
+            query_array_node(&mut fixture, array_type, node, &mut diagnostics),
+            Err(DeclaredTypeError::TypeNodeUnavailable(
+                TypeNodeUnavailable::InvalidTypeReference(error_node)
+            )) if error_node == node
+        ));
+        assert_eq!(store_state(&fixture.store), poisoned_flags);
+        assert!(
+            fixture
+                .store
+                .set_type_object_flags(forged, ObjectFlags::REFERENCE)
+        );
+        assert_eq!(
+            query_array_node(&mut fixture, array_type, node, &mut diagnostics),
+            Ok(forged)
+        );
+        assert_eq!(fixture.store.type_len(), poisoned.0);
+        assert!(
+            !fixture
+                .store
+                .type_payload(forged)
+                .unwrap()
+                .object_flags()
+                .contains(ObjectFlags::FROM_TYPE_NODE)
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn absent_or_malformed_global_array_fails_closed_without_resolving_the_element() {
+        let mut fixture = fixture("let values: (() => string)[];");
+        let node = variable_type_node(&fixture, "values");
+        let element = array_element_node(&fixture, node);
+        let (empty_generic, empty_object, malformed_target) = {
+            let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+            (
+                bootstrap.empty_generic_type,
+                bootstrap.empty_object_type,
+                bootstrap.number_type,
+            )
+        };
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        let before = store_state(&fixture.store);
+        assert!(matches!(
+            query_node(&mut fixture, node, &mut diagnostics),
+            Err(DeclaredTypeError::TypeNodeUnavailable(
+                TypeNodeUnavailable::UnsupportedSyntax {
+                    node: error_node,
+                    kind: SyntaxKind::ArrayType,
+                }
+            )) if error_node == node
+        ));
+        assert_eq!(store_state(&fixture.store), before);
+
+        let before_malformed = store_state(&fixture.store);
+        assert!(matches!(
+            query_array_node(
+                &mut fixture,
+                malformed_target,
+                node,
+                &mut diagnostics,
+            ),
+            Err(DeclaredTypeError::TypeNodeUnavailable(
+                TypeNodeUnavailable::InvalidTypeReference(error_node)
+            )) if error_node == node
+        ));
+        assert_eq!(store_state(&fixture.store), before_malformed);
+
+        let type_count = fixture.store.type_len();
+        assert_eq!(
+            query_array_node(&mut fixture, empty_generic, node, &mut diagnostics,),
+            Ok(empty_object)
+        );
+        assert_eq!(fixture.store.type_len(), type_count);
+        assert_eq!(fixture.store.type_node_links(element), None);
+        assert_eq!(
+            fixture
+                .store
+                .type_node_links(node)
+                .and_then(|links| links.resolved_type),
+            Some(empty_object)
+        );
+        assert_eq!(
+            query_array_node(&mut fixture, empty_generic, node, &mut diagnostics,),
+            Ok(empty_object)
         );
         assert!(diagnostics.is_empty());
     }

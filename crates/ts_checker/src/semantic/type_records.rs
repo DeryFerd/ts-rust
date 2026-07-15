@@ -1386,6 +1386,25 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         true
     }
 
+    /// Reserves target-local instantiation slots without allocating a nil map.
+    /// Foreign, non-object, and unallocated-cache identities fail unchanged.
+    pub(super) fn try_reserve_object_instantiations(
+        &mut self,
+        id: TypeId,
+        additional: usize,
+    ) -> bool {
+        let Some(object) = self
+            .type_payload_mut(id)
+            .and_then(|record| record.data.object_mut())
+        else {
+            return false;
+        };
+        let TypeCacheState::Allocated(instantiations) = &mut object.instantiations else {
+            return false;
+        };
+        instantiations.try_reserve(additional).is_ok()
+    }
+
     /// Publishes one object instantiation without replacing an existing cache
     /// entry. Returns the canonical entry for `key`, whether pre-existing or
     /// newly inserted.
@@ -4125,6 +4144,65 @@ mod tests {
             !seeded
                 .store
                 .set_type_parameter_resolution(tuple_this, None, None, None, None,)
+        );
+    }
+
+    #[test]
+    fn object_instantiation_reservation_requires_an_owned_allocated_cache() {
+        let mut seeded = seeded_store("local");
+        let foreign = seeded_store("foreign");
+        let uninitialized = seeded
+            .store
+            .alloc_interface_type(ObjectFlags::INTERFACE, Some(seeded.symbol))
+            .unwrap();
+
+        assert!(
+            !seeded
+                .store
+                .try_reserve_object_instantiations(foreign.base, 1)
+        );
+        assert!(
+            !seeded
+                .store
+                .try_reserve_object_instantiations(seeded.base, 1)
+        );
+        assert!(
+            !seeded
+                .store
+                .try_reserve_object_instantiations(uninitialized, 1)
+        );
+        assert_eq!(
+            object_instantiation_snapshot(&seeded.store, uninitialized),
+            TypeCacheState::Unallocated
+        );
+
+        let parameter = seeded.store.alloc_type_parameter(None).unwrap();
+        let this_type = seeded.store.alloc_type_parameter(None).unwrap();
+        assert!(seeded.store.initialize_interface_type_parameters(
+            uninitialized,
+            vec![parameter, this_type],
+            0,
+            this_type,
+            CacheHashKey::new(1),
+        ));
+        let before_failure = object_instantiation_snapshot(&seeded.store, uninitialized);
+        assert!(
+            !seeded
+                .store
+                .try_reserve_object_instantiations(uninitialized, usize::MAX)
+        );
+        assert_eq!(
+            object_instantiation_snapshot(&seeded.store, uninitialized),
+            before_failure
+        );
+        assert!(
+            seeded
+                .store
+                .try_reserve_object_instantiations(uninitialized, 2)
+        );
+        assert_eq!(
+            object_instantiation_snapshot(&seeded.store, uninitialized),
+            before_failure
         );
     }
 
