@@ -10,6 +10,7 @@ pub mod bootstrap;
 pub mod ids;
 pub mod links;
 pub mod mapper;
+pub mod relation;
 pub mod signatures;
 mod store;
 pub mod type_records;
@@ -36,6 +37,11 @@ pub use links::{
     TypeSystemPropertyName, ValueSymbolLinks, VarianceLinks,
 };
 pub use mapper::{CanonicalTypeMapperStore, TypeMapper, TypeMapperKind};
+pub use relation::{
+    ExpandingFlags, IntersectionState, MinArgumentCountFlags, RecursionFlags,
+    RelationCacheSnapshot, RelationComparisonResult, RelationKind, RelationStateSnapshot,
+    SignatureCheckMode,
+};
 pub use store::SemanticStore;
 pub use type_records::{CacheHashKey, CanonicalSemanticStore, TypeData, TypeDataKind, TypeRecord};
 pub use types::VarianceFlags;

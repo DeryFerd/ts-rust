@@ -22,11 +22,12 @@ use super::{
         TypeResolutionBoundary, TypeResolutionStack, TypeResolutionTarget,
         TypeResolutionTargetError, TypeSystemPropertyName, ValueSymbolLinks, VarianceLinks,
     },
+    relation::{RelationCaches, RelationComparisonResult, RelationKind, RelationStateSnapshot},
     signatures::{
         CompositeSignature, IndexInfo, IndexInfoArena, Signature, SignatureArena, SignatureFlags,
         TupleElementInfo, TupleMetadata, TypePredicate, TypePredicateArena, TypePredicateKind,
     },
-    type_records::{ConditionalRoot, TypeAlias, TypeData, TypeRecord},
+    type_records::{CacheHashKey, ConditionalRoot, TypeAlias, TypeData, TypeRecord},
 };
 
 /// Sole allocator and owner of one canonical program's semantic graph.
@@ -45,6 +46,7 @@ pub struct SemanticStore<TypePayload, MapperPayload> {
     conditional_roots: TypedArena<ConditionalRootId, ConditionalRoot>,
     links: CheckerLinkStores,
     type_resolutions: TypeResolutionStack,
+    relations: RelationCaches,
     pub(super) intrinsic_bootstrap: Option<IntrinsicBootstrap>,
 }
 
@@ -84,6 +86,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             conditional_roots: TypedArena::new(id),
             links: CheckerLinkStores::default(),
             type_resolutions: TypeResolutionStack::new(id),
+            relations: RelationCaches::default(),
             intrinsic_bootstrap: None,
         }
     }
@@ -971,6 +974,108 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         true
     }
 
+    /// Reads one exact relation-cache result without allocating the lazy map.
+    ///
+    /// Relation-key construction is intentionally outside this substrate. The
+    /// caller must supply the canonical key produced by the eventual exact
+    /// `getRelationKey` port.
+    #[must_use]
+    pub fn relation_cache_get(
+        &self,
+        relation: RelationKind,
+        key: CacheHashKey,
+    ) -> RelationComparisonResult {
+        self.relations.get(relation, key)
+    }
+
+    /// Ports `Relation.set`, allocating the selected result map on its first
+    /// write and replacing any result already stored under `key`.
+    pub fn relation_cache_set(
+        &mut self,
+        relation: RelationKind,
+        key: CacheHashKey,
+        result: RelationComparisonResult,
+    ) {
+        self.relations.set(relation, key, result);
+    }
+
+    #[must_use]
+    pub fn relation_cache_size(&self, relation: RelationKind) -> usize {
+        self.relations.size(relation)
+    }
+
+    /// Distinguishes upstream's nil result map from an allocated map.
+    #[must_use]
+    pub fn relation_cache_is_allocated(&self, relation: RelationKind) -> bool {
+        self.relations.is_allocated(relation)
+    }
+
+    /// Exact initial work budget used by `checkTypeRelatedToEx` for this cache.
+    #[must_use]
+    pub fn relation_comparison_budget(&self, relation: RelationKind) -> isize {
+        self.relations.comparison_budget(relation)
+    }
+
+    #[must_use]
+    pub fn relation_state_snapshot(&self) -> RelationStateSnapshot {
+        self.relations.snapshot()
+    }
+
+    /// Reads the directional enum relation cache.
+    ///
+    /// A valid cache miss is `Some(RelationComparisonResult::NONE)`. `None`
+    /// rejects either foreign symbol before assigning either symbol's lazy
+    /// process-global ID or mutating cache state.
+    pub fn enum_relation_cache_get(
+        &mut self,
+        source: SemanticSymbolId,
+        target: SemanticSymbolId,
+    ) -> Option<RelationComparisonResult> {
+        let (source_id, target_id) = self.enum_relation_symbol_ids(source, target)?;
+        Some(self.relations.enum_get(source_id, target_id))
+    }
+
+    /// Writes the directional enum relation cache after validating both keys.
+    ///
+    /// Returns `false` without assigning global symbol IDs or changing cache
+    /// state when either handle is foreign.
+    pub fn enum_relation_cache_set(
+        &mut self,
+        source: SemanticSymbolId,
+        target: SemanticSymbolId,
+        result: RelationComparisonResult,
+    ) -> bool {
+        let Some((source_id, target_id)) = self.enum_relation_symbol_ids(source, target) else {
+            return false;
+        };
+        self.relations.enum_set(source_id, target_id, result);
+        true
+    }
+
+    #[must_use]
+    pub fn enum_relation_cache_size(&self) -> usize {
+        self.relations.enum_size()
+    }
+
+    fn enum_relation_symbol_ids(
+        &mut self,
+        source: SemanticSymbolId,
+        target: SemanticSymbolId,
+    ) -> Option<(u64, u64)> {
+        if !self.symbols.contains_symbol(source) || !self.symbols.contains_symbol(target) {
+            return None;
+        }
+        let source_id = self
+            .symbols
+            .global_symbol_id(source)
+            .expect("validated source symbol must receive a global ID");
+        let target_id = self
+            .symbols
+            .global_symbol_id(target)
+            .expect("validated target symbol must receive a global ID");
+        Some((source_id, target_id))
+    }
+
     /// Pops one query and returns whether its dependency chain remained
     /// cycle-free.
     pub fn pop_type_resolution(&mut self) -> Option<bool> {
@@ -1568,9 +1673,10 @@ mod tests {
         DeclaredTypeLinks, DecoratorSignatureState, DeferredSymbolLinks, EffectsSignatureState,
         ExhaustiveState, ExportTypeLinks, JsxElementLinks, JsxFlags, LateBoundLinks,
         MappedSymbolLinks, MarkedAssignmentSymbolLinks, MembersAndExportsLinks, ModuleSymbolLinks,
-        NodeLinks, ResolvedSignatureState, ReverseMappedSymbolLinks, SignatureLinks, SpreadLinks,
-        SwitchStatementLinks, SymbolNodeLinks, SymbolReferenceLinks, TypeAliasLinks, TypeNodeLinks,
-        TypeRecord, TypeResolutionTarget, TypeSystemPropertyName, ValueSymbolLinks, VarianceFlags,
+        NodeLinks, RelationComparisonResult, RelationKind, ResolvedSignatureState,
+        ReverseMappedSymbolLinks, SignatureLinks, SpreadLinks, SwitchStatementLinks,
+        SymbolNodeLinks, SymbolReferenceLinks, TypeAliasLinks, TypeNodeLinks, TypeRecord,
+        TypeResolutionTarget, TypeSystemPropertyName, ValueSymbolLinks, VarianceFlags,
         VarianceLinks,
         signatures::{ElementFlags, SignatureFlags, TypePredicateKind},
         types::{ObjectFlags, TypeFlags},
@@ -1713,6 +1819,78 @@ mod tests {
         assert_eq!(symbol.get(), foreign_symbol.get());
         assert_ne!(symbol, foreign_symbol);
         assert_eq!(store.global_symbol_id(foreign_symbol), None);
+    }
+
+    #[test]
+    fn relation_cache_owners_are_lazy_distinct_and_exact_through_the_store() {
+        let mut store = TestStore::new();
+        let key = CacheHashKey::from_halves(7, 11);
+        for relation in RelationKind::ALL {
+            assert!(!store.relation_cache_is_allocated(relation));
+            assert_eq!(store.relation_cache_size(relation), 0);
+            assert_eq!(store.relation_comparison_budget(relation), 2_000_000);
+            assert_eq!(
+                store.relation_cache_get(relation, key),
+                RelationComparisonResult::NONE
+            );
+            assert!(!store.relation_cache_is_allocated(relation));
+        }
+
+        let values = [
+            RelationComparisonResult::SUCCEEDED,
+            RelationComparisonResult::FAILED,
+            RelationComparisonResult::REPORTS_UNMEASURABLE,
+            RelationComparisonResult::REPORTS_UNRELIABLE,
+            RelationComparisonResult::STACK_DEPTH_OVERFLOW,
+        ];
+        for (relation, result) in RelationKind::ALL.into_iter().zip(values) {
+            store.relation_cache_set(relation, key, result);
+        }
+        for (relation, result) in RelationKind::ALL.into_iter().zip(values) {
+            assert_eq!(store.relation_cache_get(relation, key), result);
+            assert_eq!(store.relation_cache_size(relation), 1);
+            assert!(store.relation_cache_is_allocated(relation));
+            assert_eq!(store.relation_comparison_budget(relation), 1_999_999);
+        }
+    }
+
+    #[test]
+    fn enum_relation_cache_uses_directional_global_symbol_identity_atomically() {
+        let mut store = TestStore::new();
+        let source = alloc_test_symbol(&mut store, "Source");
+        let target = alloc_test_symbol(&mut store, "Target");
+        assert_eq!(store.enum_relation_cache_size(), 0);
+        assert_eq!(
+            store.enum_relation_cache_get(source, target),
+            Some(RelationComparisonResult::NONE)
+        );
+        assert_eq!(store.enum_relation_cache_size(), 0);
+
+        assert!(
+            store.enum_relation_cache_set(source, target, RelationComparisonResult::SUCCEEDED,)
+        );
+        assert_eq!(store.enum_relation_cache_size(), 1);
+        assert_eq!(
+            store.enum_relation_cache_get(source, target),
+            Some(RelationComparisonResult::SUCCEEDED)
+        );
+        assert_eq!(
+            store.enum_relation_cache_get(target, source),
+            Some(RelationComparisonResult::NONE)
+        );
+        assert!(store.enum_relation_cache_set(target, source, RelationComparisonResult::FAILED,));
+        assert_eq!(store.enum_relation_cache_size(), 2);
+
+        let mut foreign = TestStore::new();
+        let foreign_symbol = alloc_test_symbol(&mut foreign, "Foreign");
+        let before = store.relation_state_snapshot();
+        assert_eq!(store.enum_relation_cache_get(source, foreign_symbol), None);
+        assert!(!store.enum_relation_cache_set(
+            foreign_symbol,
+            target,
+            RelationComparisonResult::SUCCEEDED,
+        ));
+        assert_eq!(store.relation_state_snapshot(), before);
     }
 
     #[test]

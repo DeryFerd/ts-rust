@@ -8,10 +8,13 @@
 //! - `uniqueLiteralMapper`, the report mappers, and the restrictive/permissive
 //!   mappers own executable Go callbacks. [`TypeMapper`] intentionally has no
 //!   callback-shaped variant, so those five fields and their APIs remain absent.
-//! - name resolvers, file-global merges, global-library lookup, relations, flow
-//!   caches, and `initializeChecker` depend on Program/host behavior. The empty
-//!   globals table and `globalThis` insertion performed by `NewChecker` itself
-//!   are included; resolving or augmenting that table is not.
+//! - name resolvers, file-global merges, global-library lookup, relation-key
+//!   construction and relation algorithms, flow caches, and
+//!   `initializeChecker` depend on Program/host behavior. The relation cache
+//!   owners exist as exact empty state, but no relation result is fabricated.
+//!   The empty globals table and `globalThis` insertion performed by
+//!   `NewChecker` itself are included; resolving or augmenting that table is
+//!   not.
 //! - general literal, union, and template-literal reduction algorithms remain
 //!   outside this module. The closed bootstrap cases below encode their pinned
 //!   normalized results and seed the exact cache entries produced by upstream,
@@ -27,6 +30,7 @@ use ts_jsnum::{Number, PseudoBigInt};
 use super::{
     ids::{IndexInfoId, SignatureId, TypeId, TypePredicateId},
     mapper::TypeMapper,
+    relation::RelationStateSnapshot,
     signatures::{SignatureFlags, TypePredicateKind},
     store::SemanticStore,
     type_records::{LiteralValue, RegularLiteralLink, TypeCacheState, TypeRecord},
@@ -149,6 +153,7 @@ pub struct CheckerStateSnapshot {
     pub semantic_arenas: SemanticArenaCounts,
     pub links: CheckerLinkCounts,
     pub type_resolution: TypeResolutionStateSnapshot,
+    pub relations: RelationStateSnapshot,
 }
 
 impl CheckerStateSnapshot {
@@ -157,6 +162,7 @@ impl CheckerStateSnapshot {
             && self.semantic_arenas.is_empty()
             && self.links.is_empty()
             && self.type_resolution.is_pristine()
+            && self.relations.is_pristine()
     }
 }
 
@@ -401,6 +407,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 boundaries,
                 next_boundary_serial,
             },
+            relations: self.relation_state_snapshot(),
         };
         if !state.is_pristine() {
             return Err(IntrinsicBootstrapError::NonPristineCheckerState(Box::new(
@@ -1182,6 +1189,7 @@ mod tests {
                 boundaries,
                 next_boundary_serial,
             },
+            relations: store.relation_state_snapshot(),
         }
     }
 
@@ -2171,6 +2179,58 @@ mod tests {
             ))),
         );
         assert_eq!(checker_state(&boundary_history), before);
+
+        let mut symbols = SymbolStore::new();
+        let enum_source = symbols
+            .alloc_symbol(SymbolData::new(
+                SymbolFlags::REGULAR_ENUM,
+                EscapedName::source("Source"),
+            ))
+            .unwrap();
+        let enum_target = symbols
+            .alloc_symbol(SymbolData::new(
+                SymbolFlags::REGULAR_ENUM,
+                EscapedName::source("Target"),
+            ))
+            .unwrap();
+        let mut related = TestStore::from_symbol_store(symbols);
+        let relation_key = crate::semantic::CacheHashKey::from_halves(1, 2);
+        for relation in crate::semantic::RelationKind::ALL {
+            related.relation_cache_set(
+                relation,
+                relation_key,
+                crate::semantic::RelationComparisonResult::SUCCEEDED,
+            );
+        }
+        assert!(related.enum_relation_cache_set(
+            enum_source,
+            enum_target,
+            crate::semantic::RelationComparisonResult::FAILED,
+        ));
+        let before = checker_state(&related);
+        assert_eq!(before.relations.subtype.entries, 1);
+        assert_eq!(before.relations.strict_subtype.entries, 1);
+        assert_eq!(before.relations.assignable.entries, 1);
+        assert_eq!(before.relations.comparable.entries, 1);
+        assert_eq!(before.relations.identity.entries, 1);
+        assert_eq!(before.relations.enum_relation_entries, 1);
+        assert_eq!(
+            related.initialize_intrinsic_bootstrap(options),
+            Err(IntrinsicBootstrapError::NonPristineCheckerState(Box::new(
+                before,
+            ))),
+        );
+        assert_eq!(checker_state(&related), before);
+        for relation in crate::semantic::RelationKind::ALL {
+            assert_eq!(
+                related.relation_cache_get(relation, relation_key),
+                crate::semantic::RelationComparisonResult::SUCCEEDED
+            );
+        }
+        assert_eq!(
+            related.enum_relation_cache_get(enum_source, enum_target),
+            Some(crate::semantic::RelationComparisonResult::FAILED)
+        );
 
         let mut symbols = SymbolStore::new();
         let _ = symbols.alloc_transient_symbol(
