@@ -18,6 +18,7 @@ use ts_binder::{
 use super::{
     DeclaredTypeHost,
     bootstrap::LiteralTypeCacheError,
+    derived_types::DerivedObjectLiteralValidation,
     ids::TypeId,
     links::{MembersOrExportsResolutionKind, ValueSymbolLinks},
     mapper::TypeMapper,
@@ -220,7 +221,20 @@ const PINNED_EXPANDING_DEPTH: usize = 3;
 struct ResolvedObjectMembers {
     members: Option<SymbolTableId>,
     properties: Vec<SemanticSymbolId>,
-    object_literal_owner: Option<SemanticSymbolId>,
+    property_origin: ObjectPropertyOrigin,
+}
+
+#[derive(Clone, Copy)]
+enum ObjectPropertyOrigin {
+    Declared,
+    FreshObjectLiteral(SemanticSymbolId),
+    DerivedObjectLiteral(SemanticSymbolId),
+}
+
+impl ObjectPropertyOrigin {
+    fn is_declared(self) -> bool {
+        matches!(self, Self::Declared)
+    }
 }
 
 /// One validated property in a declared property-only object type.
@@ -1111,7 +1125,7 @@ impl<'store> RelaterSession<'store> {
         }
         for property in &target_members.properties {
             if !self
-                .property_symbol(*property, target_members.object_literal_owner)?
+                .property_symbol(*property, target_members.property_origin)?
                 .flags()
                 .intersects(SymbolFlags::OPTIONAL)
             {
@@ -1129,7 +1143,7 @@ impl<'store> RelaterSession<'store> {
         for property in source_members.properties {
             if target_table
                 .get(
-                    self.property_symbol(property, source_members.object_literal_owner)?
+                    self.property_symbol(property, source_members.property_origin)?
                         .name(),
                 )
                 .is_some()
@@ -1171,7 +1185,7 @@ impl<'store> RelaterSession<'store> {
             .ok_or(RelationUnavailable::InvalidStructuredMembers(target))?;
         for property in source_members.properties {
             let name = self
-                .property_symbol(property, source_members.object_literal_owner)?
+                .property_symbol(property, source_members.property_origin)?
                 .name();
             if target_table.get(name).is_none() {
                 return Ok(true);
@@ -1213,10 +1227,15 @@ impl<'store> RelaterSession<'store> {
         // property types. This ordering is observable through relation caches.
         for target_property in &target_members.properties {
             let target_symbol =
-                self.property_symbol(*target_property, target_members.object_literal_owner)?;
+                self.property_symbol(*target_property, target_members.property_origin)?;
             if !target_symbol.flags().intersects(SymbolFlags::OPTIONAL)
                 && self
-                    .lookup_source_property(source, source_members, *target_property)?
+                    .lookup_source_property(
+                        source,
+                        source_members,
+                        *target_property,
+                        target_members.property_origin,
+                    )?
                     .is_none()
             {
                 return Ok(Ternary::False);
@@ -1225,8 +1244,12 @@ impl<'store> RelaterSession<'store> {
 
         let mut result = Ternary::True;
         for target_property in &target_members.properties {
-            let Some(source_property) =
-                self.lookup_source_property(source, source_members, *target_property)?
+            let Some(source_property) = self.lookup_source_property(
+                source,
+                source_members,
+                *target_property,
+                target_members.property_origin,
+            )?
             else {
                 continue;
             };
@@ -1235,9 +1258,9 @@ impl<'store> RelaterSession<'store> {
             }
             let related = self.property_related_to(
                 source_property,
-                source_members.object_literal_owner,
+                source_members.property_origin,
                 *target_property,
-                target_members.object_literal_owner,
+                target_members.property_origin,
             )?;
             if related == Ternary::False {
                 return Ok(Ternary::False);
@@ -1250,15 +1273,15 @@ impl<'store> RelaterSession<'store> {
     fn property_related_to(
         &mut self,
         source_property: SemanticSymbolId,
-        source_object_literal_owner: Option<SemanticSymbolId>,
+        source_origin: ObjectPropertyOrigin,
         target_property: SemanticSymbolId,
-        target_object_literal_owner: Option<SemanticSymbolId>,
+        target_origin: ObjectPropertyOrigin,
     ) -> Result<Ternary, RelationUnavailable> {
         let source_flags = self
-            .property_symbol(source_property, source_object_literal_owner)?
+            .property_symbol(source_property, source_origin)?
             .flags();
         let target_flags = self
-            .property_symbol(target_property, target_object_literal_owner)?
+            .property_symbol(target_property, target_origin)?
             .flags();
         let source_type = self.property_type(source_property)?;
         let target_type = self.property_type(target_property)?;
@@ -1371,8 +1394,9 @@ impl<'store> RelaterSession<'store> {
         source: TypeId,
         source_members: &ResolvedObjectMembers,
         target_property: SemanticSymbolId,
+        target_origin: ObjectPropertyOrigin,
     ) -> Result<Option<SemanticSymbolId>, RelationUnavailable> {
-        let target_symbol = self.property_symbol(target_property, None)?;
+        let target_symbol = self.property_symbol(target_property, target_origin)?;
         let name = target_symbol.name();
         if let Some(members) = source_members.members {
             let table = self
@@ -1380,7 +1404,7 @@ impl<'store> RelaterSession<'store> {
                 .symbol_table(members)
                 .ok_or(RelationUnavailable::InvalidStructuredMembers(source))?;
             if let Some(property) = table.get(name) {
-                self.property_symbol(property, source_members.object_literal_owner)?;
+                self.property_symbol(property, source_members.property_origin)?;
                 return Ok(Some(property));
             }
         }
@@ -1481,7 +1505,7 @@ impl<'store> RelaterSession<'store> {
         let Some(property) = table.get(name) else {
             return Ok(None);
         };
-        self.property_symbol(property, None)?;
+        self.property_symbol(property, ObjectPropertyOrigin::Declared)?;
         Ok(Some(property))
     }
 
@@ -1539,18 +1563,32 @@ impl<'store> RelaterSession<'store> {
     fn property_symbol(
         &self,
         symbol: SemanticSymbolId,
-        object_literal_owner: Option<SemanticSymbolId>,
+        origin: ObjectPropertyOrigin,
     ) -> Result<&ts_binder::semantic::Symbol, RelationUnavailable> {
         let record = self
             .store
             .symbol(symbol)
             .ok_or(RelationUnavailable::Symbol(symbol))?;
-        if let Some(owner) = object_literal_owner {
-            return if self.is_canonical_object_literal_property(symbol, record, owner) {
-                Ok(record)
-            } else {
-                Err(RelationUnavailable::UnsupportedProperty(symbol))
-            };
+        match origin {
+            ObjectPropertyOrigin::FreshObjectLiteral(owner) => {
+                return if self.is_canonical_object_literal_property(symbol, record, owner) {
+                    Ok(record)
+                } else {
+                    Err(RelationUnavailable::UnsupportedProperty(symbol))
+                };
+            }
+            ObjectPropertyOrigin::DerivedObjectLiteral(owner) => {
+                // The object-wide warm-cache validator established the full
+                // clone/reuse chain before this marker was constructed.
+                return if record.parent() == Some(owner)
+                    && self.store.get_merged_symbol(symbol) == Some(symbol)
+                {
+                    Ok(record)
+                } else {
+                    Err(RelationUnavailable::UnsupportedProperty(symbol))
+                };
+            }
+            ObjectPropertyOrigin::Declared => {}
         }
         let allowed_flags = SymbolFlags::PROPERTY | SymbolFlags::OPTIONAL;
         let allowed_checks = CheckFlags::READONLY.bits();
@@ -1726,6 +1764,16 @@ impl<'store> RelaterSession<'store> {
         if record.flags() != TypeFlags::OBJECT || !self.supports_property_object_alias(type_id) {
             return Err(RelationUnavailable::UnsupportedStructuredType(type_id));
         }
+        match self
+            .store
+            .validate_derived_object_literal_for_relation(type_id)
+        {
+            DerivedObjectLiteralValidation::Valid { .. } => return Ok(()),
+            DerivedObjectLiteralValidation::Invalid => {
+                return Err(RelationUnavailable::InvalidStructuredMembers(type_id));
+            }
+            DerivedObjectLiteralValidation::NotDerived => {}
+        }
         let kind = record.object_flags() & ObjectFlags::OBJECT_TYPE_KIND_MASK;
         if kind != ObjectFlags::NONE
             && kind != ObjectFlags::INTERFACE
@@ -1838,17 +1886,28 @@ impl<'store> RelaterSession<'store> {
             .store
             .type_payload(type_id)
             .ok_or(RelationUnavailable::Type(type_id))?;
-        let object_literal_owner = if record
-            .object_flags()
-            .contains(ObjectFlags::OBJECT_LITERAL | ObjectFlags::FRESH_LITERAL)
+        let property_origin = match self
+            .store
+            .validate_derived_object_literal_for_relation(type_id)
         {
-            Some(
-                record
-                    .symbol()
-                    .ok_or(RelationUnavailable::UnsupportedStructuredType(type_id))?,
-            )
-        } else {
-            None
+            DerivedObjectLiteralValidation::Valid { owner } => {
+                ObjectPropertyOrigin::DerivedObjectLiteral(owner)
+            }
+            DerivedObjectLiteralValidation::Invalid => {
+                return Err(RelationUnavailable::InvalidStructuredMembers(type_id));
+            }
+            DerivedObjectLiteralValidation::NotDerived
+                if record
+                    .object_flags()
+                    .contains(ObjectFlags::OBJECT_LITERAL | ObjectFlags::FRESH_LITERAL) =>
+            {
+                ObjectPropertyOrigin::FreshObjectLiteral(
+                    record
+                        .symbol()
+                        .ok_or(RelationUnavailable::UnsupportedStructuredType(type_id))?,
+                )
+            }
+            DerivedObjectLiteralValidation::NotDerived => ObjectPropertyOrigin::Declared,
         };
         if !record
             .object_flags()
@@ -1881,15 +1940,15 @@ impl<'store> RelaterSession<'store> {
             if !property_set.insert(*property) {
                 return Err(RelationUnavailable::InvalidStructuredMembers(type_id));
             }
-            let property_record = self.property_symbol(*property, object_literal_owner)?;
+            let property_record = self.property_symbol(*property, property_origin)?;
             // This dependency-closed slice admits no interface heritage, so
             // every ordinary member is owned directly by this type's symbol.
             // Revisit this equality when inherited members become supported.
-            if object_literal_owner.is_none() && property_record.parent() != record.symbol() {
+            if property_origin.is_declared() && property_record.parent() != record.symbol() {
                 return Err(RelationUnavailable::InvalidStructuredMembers(type_id));
             }
         }
-        if let Some(owner) = object_literal_owner {
+        if let ObjectPropertyOrigin::FreshObjectLiteral(owner) = property_origin {
             let mut expected_flags = ObjectFlags::ANONYMOUS
                 | ObjectFlags::OBJECT_LITERAL
                 | ObjectFlags::FRESH_LITERAL
@@ -1963,7 +2022,7 @@ impl<'store> RelaterSession<'store> {
             }
         }
         match structured.members {
-            None if properties.is_empty() && object_literal_owner.is_none() => {}
+            None if properties.is_empty() && property_origin.is_declared() => {}
             None => return Err(RelationUnavailable::InvalidStructuredMembers(type_id)),
             Some(members) => {
                 let table = self
@@ -1974,13 +2033,13 @@ impl<'store> RelaterSession<'store> {
                     return Err(RelationUnavailable::InvalidStructuredMembers(type_id));
                 }
                 for (name, property) in table.iter() {
-                    let symbol = self.property_symbol(property, object_literal_owner)?;
+                    let symbol = self.property_symbol(property, property_origin)?;
                     if symbol.name() != name || !property_set.contains(&property) {
                         return Err(RelationUnavailable::InvalidStructuredMembers(type_id));
                     }
                 }
                 for property in &properties {
-                    let symbol = self.property_symbol(*property, object_literal_owner)?;
+                    let symbol = self.property_symbol(*property, property_origin)?;
                     if table.get(symbol.name()) != Some(*property) {
                         return Err(RelationUnavailable::InvalidStructuredMembers(type_id));
                     }
@@ -1990,7 +2049,7 @@ impl<'store> RelaterSession<'store> {
         Ok(ResolvedObjectMembers {
             members: structured.members,
             properties,
-            object_literal_owner,
+            property_origin,
         })
     }
 }
@@ -2137,7 +2196,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         let resolved = session.resolved_object_members(type_id, false)?;
         if let Some((plan, property_types)) = plan {
             if resolved.members != plan.members
-                || resolved.object_literal_owner.is_some()
+                || !resolved.property_origin.is_declared()
                 || resolved.properties
                     != plan
                         .properties
@@ -2171,7 +2230,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
 
         if !resolved.properties.is_empty()
             || resolved.members.is_some()
-            || resolved.object_literal_owner.is_some()
+            || !resolved.property_origin.is_declared()
         {
             return Err(RelationUnavailable::InvalidStructuredMembers(type_id));
         }
@@ -3067,7 +3126,11 @@ mod tests {
                 .unwrap(),
         );
         let scope = AstScope::new(file, &parsed.arena);
-        assert!(store.register_ast_scope(scope));
+        assert!(
+            store
+                .register_source_file(&parsed.arena, parsed.source_file, file)
+                .is_some()
+        );
         let object_literal = parsed
             .arena
             .iter()
@@ -4414,6 +4477,108 @@ mod tests {
             Err(RelationUnavailable::UnsupportedProperty(property))
         );
         assert_eq!(store.relation_state_snapshot(), before);
+    }
+
+    #[test]
+    fn cached_regular_and_widened_object_literals_relate_cold_and_warm() {
+        let mut store = initialized(false);
+        let (undefined_widening, any) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (bootstrap.undefined_widening_type, bootstrap.any_type)
+        };
+        let raw_seed = alloc_typed_property(&mut store, "value", undefined_widening, false);
+        let fixture = alloc_fresh_property_object_fixture(&mut store, vec![raw_seed]);
+        let regular = store
+            .get_regular_type_of_object_literal(fixture.type_)
+            .unwrap();
+        let widened = store.get_widened_type(regular).unwrap();
+        assert_ne!(regular, fixture.type_);
+        assert_ne!(widened, regular);
+
+        let regular_property = store
+            .type_payload(regular)
+            .and_then(|record| record.data().structured())
+            .and_then(|structured| structured.properties.as_deref())
+            .and_then(|properties| properties.first())
+            .copied()
+            .unwrap();
+        let widened_property = store
+            .type_payload(widened)
+            .and_then(|record| record.data().structured())
+            .and_then(|structured| structured.properties.as_deref())
+            .and_then(|properties| properties.first())
+            .copied()
+            .unwrap();
+        assert_eq!(regular_property, fixture.properties[0]);
+        assert_eq!(
+            store
+                .value_symbol_links(regular_property)
+                .and_then(|links| links.target),
+            Some(fixture.raw_properties[0])
+        );
+        assert_eq!(
+            store
+                .value_symbol_links(widened_property)
+                .and_then(|links| links.target),
+            Some(regular_property)
+        );
+
+        let target_property = alloc_typed_property(&mut store, "value", any, false);
+        let target = alloc_property_object(&mut store, vec![target_property]);
+        assert_eq!(store.is_type_assignable_to(regular, target), Ok(true));
+        let regular_warm = store.relation_state_snapshot();
+        assert_eq!(store.is_type_assignable_to(regular, target), Ok(true));
+        assert_eq!(store.relation_state_snapshot(), regular_warm);
+
+        assert_eq!(store.is_type_assignable_to(widened, target), Ok(true));
+        let widened_warm = store.relation_state_snapshot();
+        assert_eq!(store.is_type_assignable_to(widened, target), Ok(true));
+        assert_eq!(store.relation_state_snapshot(), widened_warm);
+        assert_eq!(store.is_type_comparable_to(target, widened), Ok(true));
+        assert_eq!(store.is_type_comparable_to(widened, target), Ok(true));
+    }
+
+    #[test]
+    fn poisoned_derived_property_clone_chain_is_retryable() {
+        let mut store = initialized(false);
+        let (undefined_widening, any) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (bootstrap.undefined_widening_type, bootstrap.any_type)
+        };
+        let raw_seed = alloc_typed_property(&mut store, "value", undefined_widening, false);
+        let fixture = alloc_fresh_property_object_fixture(&mut store, vec![raw_seed]);
+        let regular = store
+            .get_regular_type_of_object_literal(fixture.type_)
+            .unwrap();
+        let widened = store.get_widened_type(regular).unwrap();
+        let widened_property = store
+            .type_payload(widened)
+            .and_then(|record| record.data().structured())
+            .and_then(|structured| structured.properties.as_deref())
+            .and_then(|properties| properties.first())
+            .copied()
+            .unwrap();
+        let correct_links = store.value_symbol_links(widened_property).unwrap().clone();
+        let target_property = alloc_typed_property(&mut store, "value", any, false);
+        let target = alloc_property_object(&mut store, vec![target_property]);
+
+        assert!(store.set_value_symbol_links(
+            widened_property,
+            ValueSymbolLinks {
+                resolved_type: Some(any),
+                target: Some(fixture.raw_properties[0]),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        let poisoned = store.relation_state_snapshot();
+        assert_eq!(
+            store.is_type_assignable_to(widened, target),
+            Err(RelationUnavailable::InvalidStructuredMembers(widened))
+        );
+        assert_eq!(store.relation_state_snapshot(), poisoned);
+
+        assert!(store.set_value_symbol_links(widened_property, correct_links));
+        assert_eq!(store.is_type_assignable_to(widened, target), Ok(true));
     }
 
     #[test]

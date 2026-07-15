@@ -36,6 +36,18 @@ pub(super) struct DerivedTypeCaches {
     widened_types: HashMap<TypeId, TypeId>,
 }
 
+/// Exact relation-facing classification of an object type against the two
+/// derived object-literal caches.
+///
+/// `Invalid` means the type is named by a cache entry, but the entry no longer
+/// satisfies the same provenance checks used by a warm derived-type query.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum DerivedObjectLiteralValidation {
+    NotDerived,
+    Valid { owner: SemanticSymbolId },
+    Invalid,
+}
+
 impl DerivedTypeCaches {
     fn try_reserve_regular(&mut self, additional: usize) -> bool {
         self.regular_object_literals.try_reserve(additional).is_ok()
@@ -305,6 +317,59 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             return Err(DerivedTypeError::MalformedObjectLiteral(type_));
         }
         self.get_widened_type(type_)
+    }
+
+    /// Validates a relation operand that may be a cached regular or widened
+    /// object-literal type.
+    ///
+    /// The reverse cache lookup is intentionally unique and the selected
+    /// entry is checked by the existing warm-cache validator. This keeps the
+    /// structural relation boundary fail-closed without teaching the relater
+    /// a second, looser definition of checker-derived property clones.
+    pub(super) fn validate_derived_object_literal_for_relation(
+        &self,
+        type_: TypeId,
+    ) -> DerivedObjectLiteralValidation {
+        let mut regular_source = None;
+        for (source, cached) in &self.derived_types.regular_object_literals {
+            if *cached == type_ && regular_source.replace(*source).is_some() {
+                return DerivedObjectLiteralValidation::Invalid;
+            }
+        }
+        let mut widened_source = None;
+        for (source, cached) in &self.derived_types.widened_types {
+            if *cached == type_ && widened_source.replace(*source).is_some() {
+                return DerivedObjectLiteralValidation::Invalid;
+            }
+        }
+
+        let valid = match (regular_source, widened_source) {
+            (None, None) => return DerivedObjectLiteralValidation::NotDerived,
+            (Some(_), Some(_)) => return DerivedObjectLiteralValidation::Invalid,
+            (Some(source), None) => {
+                let mut visiting = HashSet::new();
+                self.regular_cache_entry_is_valid(source, type_, &mut visiting)
+            }
+            (None, Some(source)) => {
+                let mut visiting = HashSet::new();
+                let mut regular_visiting = HashSet::new();
+                self.widened_cache_entry_is_valid(
+                    source,
+                    type_,
+                    &mut visiting,
+                    &mut regular_visiting,
+                )
+            }
+        };
+        if !valid {
+            return DerivedObjectLiteralValidation::Invalid;
+        }
+        match self.resolved_object_shape(type_) {
+            Some(shape) => DerivedObjectLiteralValidation::Valid {
+                owner: shape.symbol,
+            },
+            None => DerivedObjectLiteralValidation::Invalid,
+        }
     }
 
     fn plan_regular_object(
