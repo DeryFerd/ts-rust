@@ -38,6 +38,7 @@ pub mod types;
 pub use ts_binder::{AstScope, SemanticStoreId, SemanticSymbolId, SymbolTableId};
 
 pub use alias_provider::{ProductionAliasTargetHost, ProductionAliasTargetHostError};
+pub use assignment::{AssignmentInvariant, AssignmentSyntaxRole, AssignmentUnsupported};
 pub use bootstrap::{
     CheckerLinkCounts, CheckerStateSnapshot, IntrinsicBootstrap, IntrinsicBootstrapError,
     IntrinsicBootstrapOptions, SemanticArenaCounts, TypeResolutionStateSnapshot,

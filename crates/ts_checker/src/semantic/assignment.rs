@@ -7,8 +7,6 @@
 //! Valid syntax outside that closure is a typed unsupported result; malformed AST,
 //! binder, or semantic-store provenance is an invariant failure.
 
-#![allow(dead_code)] // Source dispatch is intentionally owned by the following integration slice.
-
 use ts_ast::{
     FileId, Node, NodeArena, NodeArenaId, NodeArenaRevision, NodeData, NodeRef, SyntaxKind,
 };
@@ -32,7 +30,7 @@ pub(super) struct SimpleAssignmentPlan {
 
 /// The syntactic position at which the assignment slice ended.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum AssignmentSyntaxRole {
+pub enum AssignmentSyntaxRole {
     Statement,
     Expression,
     Operator,
@@ -44,7 +42,7 @@ pub(super) enum AssignmentSyntaxRole {
 
 /// Valid TypeScript semantics that are outside this dependency-closed slice.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum AssignmentUnsupported {
+pub enum AssignmentUnsupported {
     Syntax {
         node: NodeRef,
         kind: SyntaxKind,
@@ -92,7 +90,7 @@ pub(super) enum AssignmentUnsupported {
 
 /// Malformed AST, binder, resolver, or checker-store provenance.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum AssignmentInvariant {
+pub enum AssignmentInvariant {
     WrongArena {
         file: FileId,
         expected: NodeArenaId,
@@ -428,7 +426,7 @@ impl AssignmentPlanner<'_, '_> {
             self.store.symbol_store(),
             &mut callback_host,
         )
-        .map_err(AssignmentInvariant::NameResolution)?;
+        .map_err(|error| Self::name_resolution_error(left, error))?;
         match resolver.resolve(
             Some(CanonicalResolutionLocation::Bound(left)),
             name,
@@ -446,14 +444,24 @@ impl AssignmentPlanner<'_, '_> {
                     AssignmentUnsupported::AliasTarget { node: left, symbol },
                 ))
             }
-            Err(
-                error @ (CanonicalNameResolutionError::JavaScriptDeferred(_)
-                | CanonicalNameResolutionError::CommonJsDeferred(_)
-                | CanonicalNameResolutionError::JsDocDeferred(_)),
-            ) => Err(AssignmentPlanError::Unsupported(
-                AssignmentUnsupported::ResolverDeferred { node: left, error },
-            )),
-            Err(error) => Err(AssignmentInvariant::NameResolution(error).into()),
+            Err(error) => Err(Self::name_resolution_error(left, error)),
+        }
+    }
+
+    fn name_resolution_error(
+        node: NodeRef,
+        error: CanonicalNameResolutionError,
+    ) -> AssignmentPlanError {
+        match error {
+            error @ (CanonicalNameResolutionError::JavaScriptDeferred(_)
+            | CanonicalNameResolutionError::CommonJsDeferred(_)
+            | CanonicalNameResolutionError::JsDocDeferred(_)) => {
+                AssignmentPlanError::Unsupported(AssignmentUnsupported::ResolverDeferred {
+                    node,
+                    error,
+                })
+            }
+            error => AssignmentPlanError::Invariant(AssignmentInvariant::NameResolution(error)),
         }
     }
 
@@ -1187,6 +1195,26 @@ mod tests {
                 Err(AssignmentPlanError::Unsupported(
                     AssignmentUnsupported::NonVariableTarget { .. }
                 ))
+            ));
+        }
+    }
+
+    #[test]
+    fn deferred_source_families_are_capability_boundaries_from_resolver_construction() {
+        let fixture = Fixture::new("var target: number = 0; target = 1;");
+        let (left, _) = assignment_parts(&fixture.parsed, fixture.expression_statement(0));
+
+        for error in [
+            CanonicalNameResolutionError::JavaScriptDeferred(fixture.file),
+            CanonicalNameResolutionError::CommonJsDeferred(fixture.file),
+            CanonicalNameResolutionError::JsDocDeferred(left),
+        ] {
+            assert!(matches!(
+                AssignmentPlanner::name_resolution_error(left, error),
+                AssignmentPlanError::Unsupported(AssignmentUnsupported::ResolverDeferred {
+                    node,
+                    error: actual,
+                }) if node == left && actual == error
             ));
         }
     }

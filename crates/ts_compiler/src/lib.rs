@@ -360,6 +360,7 @@ fn source_check_error_is_unsupported(error: &SourceCheckError) -> bool {
         SourceCheckError::Provenance(_)
         | SourceCheckError::LiteralCache(_)
         | SourceCheckError::ObjectLiteral(_)
+        | SourceCheckError::Assignment(_)
         | SourceCheckError::MissingDiagnostic(_) => false,
     }
 }
@@ -6450,7 +6451,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use ts_checker::semantic::{
-        CanonicalCheckerContextError, CanonicalGlobalInitializationError,
+        AssignmentInvariant, CanonicalCheckerContextError, CanonicalGlobalInitializationError,
         CanonicalGlobalTypeInitializationError, CanonicalTypeMapperStore, DeclaredTypeError,
         DeclaredTypeUnavailable, IntrinsicBootstrapOptions, RelationKind, RelationUnavailable,
         SourceCheckError, SourceCheckProvenanceError, SourceLiteralCacheError,
@@ -6719,6 +6720,10 @@ mod tests {
             CanonicalProgramCheckError::SourceCheck {
                 file_name: "/project/input.ts".to_owned(),
                 error: SourceCheckError::MissingDiagnostic(2322),
+            },
+            CanonicalProgramCheckError::SourceCheck {
+                file_name: "/project/input.ts".to_owned(),
+                error: SourceCheckError::Assignment(AssignmentInvariant::MissingNode(node)),
             },
         ];
         assert!(

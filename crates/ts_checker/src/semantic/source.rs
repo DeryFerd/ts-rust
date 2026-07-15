@@ -1,10 +1,11 @@
 //! Atomic canonical checking for the first source-statement slice.
 //!
 //! This module deliberately supports only unmodified type aliases and simple
-//! interfaces, empty external-module markers, and explicitly typed ordinary
-//! variable declarations (optionally exported) with supported literal
-//! initializers. The complete source tree and the complete supported-statement plan are
-//! validated before checker state is touched. Unsupported syntax is therefore
+//! interfaces, empty external-module markers, explicitly typed ordinary
+//! variable declarations (optionally exported), and direct assignments back
+//! to supported `var` declarations. The complete source tree and the complete
+//! supported-statement plan are validated before checker state is touched.
+//! Unsupported syntax is therefore
 //! a typed boundary, never a request to fall back to the legacy checker or to
 //! synthesize `any`. Canonical memo caches are not rolled back after a later
 //! semantic failure; diagnostics coupled to those caches remain in private
@@ -18,9 +19,10 @@ use ts_core::TextRange;
 use ts_jsnum::{Number, PseudoBigInt};
 
 use super::{
-    CanonicalCheckerDiagnostic, CanonicalCheckerDiagnostics, CanonicalCheckerOptions,
-    CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHost, RelationUnavailable,
-    SourceFileLinks, SourceFileRef, TypeDisplayUnavailable, TypeId,
+    AssignmentInvariant, AssignmentUnsupported, CanonicalCheckerDiagnostic,
+    CanonicalCheckerDiagnostics, CanonicalCheckerOptions, CanonicalTypeMapperStore,
+    DeclaredTypeError, DeclaredTypeHost, RelationUnavailable, SourceFileLinks, SourceFileRef,
+    TypeDisplayUnavailable, TypeId,
     bootstrap::LiteralTypeCacheError,
     contextual::{LiteralTreatment, PreparedExpression, prepare_expression_context},
     type_nodes::{CanonicalTypeQuery, normalize_bigint_literal, normalize_numeric_separators},
@@ -74,6 +76,7 @@ pub enum UnsupportedSourceSyntax {
         node: NodeRef,
         operator: SyntaxKind,
     },
+    Assignment(AssignmentUnsupported),
 }
 
 /// Source and AST identity rejected before semantic execution.
@@ -160,6 +163,7 @@ pub enum SourceCheckError {
     TypeDisplayUnavailable(TypeDisplayUnavailable),
     LiteralCache(SourceLiteralCacheError),
     ObjectLiteral(SourceObjectLiteralError),
+    Assignment(AssignmentInvariant),
     MissingDiagnostic(u32),
 }
 
@@ -175,6 +179,7 @@ impl std::fmt::Display for SourceCheckError {
             Self::TypeDisplayUnavailable(error) => write!(formatter, "{error}"),
             Self::LiteralCache(error) => write!(formatter, "literal cache failed: {error:?}"),
             Self::ObjectLiteral(error) => write!(formatter, "object literal failed: {error:?}"),
+            Self::Assignment(error) => write!(formatter, "assignment planning failed: {error:?}"),
             Self::MissingDiagnostic(code) => {
                 write!(formatter, "diagnostic TS{code} is absent from the catalog")
             }
@@ -192,6 +197,7 @@ impl std::error::Error for SourceCheckError {
             | Self::Unsupported(_)
             | Self::LiteralCache(_)
             | Self::ObjectLiteral(_)
+            | Self::Assignment(_)
             | Self::MissingDiagnostic(_) => None,
         }
     }
@@ -249,11 +255,19 @@ struct PlannedVariable {
 }
 
 #[derive(Clone, Debug)]
+struct PlannedAssignment {
+    left: NodeRef,
+    target_type_node: NodeRef,
+    right: PlannedExpression,
+}
+
+#[derive(Clone, Debug)]
 enum PlannedStatement {
     TypeAlias(SemanticSymbolId),
     Interface(SemanticSymbolId),
     ExternalModuleMarker,
     Variables(Vec<PlannedVariable>),
+    Assignment(PlannedAssignment),
 }
 
 #[derive(Debug)]
@@ -450,6 +464,25 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         self.plan_variable_statement(statement, declaration_list)?,
                     ));
                 }
+                SyntaxKind::ExpressionStatement => {
+                    let Some((store, host)) = self.semantic else {
+                        return Err(self.unsupported(
+                            statement,
+                            SyntaxKind::ExpressionStatement,
+                            SourceSyntaxRole::Statement,
+                        ));
+                    };
+                    let assignment = super::assignment::plan_simple_assignment(
+                        self.arena, self.bound, store, host, statement,
+                    )
+                    .map_err(Self::assignment_plan_error)?;
+                    let right = self.plan_expression(assignment.right)?;
+                    statements.push(PlannedStatement::Assignment(PlannedAssignment {
+                        left: assignment.left,
+                        target_type_node: assignment.target_type_node,
+                        right,
+                    }));
+                }
                 kind => {
                     return Err(self.unsupported(statement, kind, SourceSyntaxRole::Statement));
                 }
@@ -461,6 +494,20 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             numbers: self.numbers,
             bigints: self.bigints,
         })
+    }
+
+    fn assignment_plan_error(error: super::assignment::AssignmentPlanError) -> SourceCheckError {
+        match error {
+            super::assignment::AssignmentPlanError::Unsupported(error) => {
+                SourceCheckError::Unsupported(UnsupportedSourceSyntax::Assignment(error))
+            }
+            super::assignment::AssignmentPlanError::Invariant(error) => {
+                SourceCheckError::Assignment(error)
+            }
+            super::assignment::AssignmentPlanError::DeclaredType(error) => {
+                SourceCheckError::DeclaredType(error)
+            }
+        }
     }
 
     fn plan_external_module_marker(&self, statement: NodeRef) -> Result<(), SourceCheckError> {
@@ -1369,6 +1416,39 @@ pub(super) fn merge_retry_diagnostics(
     }
 }
 
+fn check_planned_assignment(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    options: CanonicalCheckerOptions,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    target_type_node: NodeRef,
+    expression: &PlannedExpression,
+    fallback_node: NodeRef,
+) -> Result<(), SourceCheckError> {
+    let mut statement_diagnostics = CanonicalCheckerDiagnostics::default();
+    let target = CanonicalTypeQuery::new(store, host, options, &mut statement_diagnostics)?
+        .get_type_from_type_node(target_type_node);
+    merge_retry_diagnostics(diagnostics, statement_diagnostics);
+    let target = target?;
+    let prepared = prepare_expression_context(store, host, expression, target)?;
+    let source_type = expression_type(store, expression, &prepared)?;
+    if !store.is_type_assignable_to(source_type, target)? {
+        let staged = super::object_diagnostics::diagnostics_for_failed_assignment(
+            store,
+            host,
+            expression,
+            source_type,
+            target,
+            fallback_node,
+            options,
+        )?;
+        for diagnostic in staged {
+            merge_retry_diagnostic(diagnostics, diagnostic);
+        }
+    }
+    Ok(())
+}
+
 /// Checks one already-retained source into context-owned private staging.
 pub(super) fn check_source_file(
     arena: &NodeArena,
@@ -1407,31 +1487,26 @@ pub(super) fn check_source_file(
             PlannedStatement::ExternalModuleMarker => {}
             PlannedStatement::Variables(variables) => {
                 for variable in variables {
-                    let mut statement_diagnostics = CanonicalCheckerDiagnostics::default();
-                    let target =
-                        CanonicalTypeQuery::new(store, host, options, &mut statement_diagnostics)?
-                            .get_type_from_type_node(variable.type_node);
-                    merge_retry_diagnostics(diagnostics, statement_diagnostics);
-                    let target = target?;
-                    let prepared =
-                        prepare_expression_context(store, host, &variable.initializer, target)?;
-                    let source_type = expression_type(store, &variable.initializer, &prepared)?;
-                    if !store.is_type_assignable_to(source_type, target)? {
-                        let staged = super::object_diagnostics::diagnostics_for_failed_assignment(
-                            store,
-                            host,
-                            &variable.initializer,
-                            source_type,
-                            target,
-                            variable.name,
-                            options,
-                        )?;
-                        for diagnostic in staged {
-                            merge_retry_diagnostic(diagnostics, diagnostic);
-                        }
-                    }
+                    check_planned_assignment(
+                        store,
+                        host,
+                        options,
+                        diagnostics,
+                        variable.type_node,
+                        &variable.initializer,
+                        variable.name,
+                    )?;
                 }
             }
+            PlannedStatement::Assignment(assignment) => check_planned_assignment(
+                store,
+                host,
+                options,
+                diagnostics,
+                assignment.target_type_node,
+                &assignment.right,
+                assignment.left,
+            )?,
         }
     }
 
@@ -1462,6 +1537,7 @@ mod tests {
         CanonicalProgramBindings, CanonicalSourceFileFacts, CanonicalSourceLanguage, CheckFlags,
         EscapedName, InternalSymbolName, SymbolFlags,
     };
+    use ts_diagnostics::Category;
     use ts_parser::{ParseResult, parse_source_file};
 
     use super::*;
@@ -1649,7 +1725,37 @@ mod tests {
         NodeRef::new(parsed.arena.id(), file, type_node)
     }
 
-    fn node_text<'arena>(parsed: &'arena ParseResult, node: NodeRef) -> &'arena str {
+    fn assignment_parts(parsed: &ParseResult, file: FileId, index: usize) -> (NodeRef, NodeRef) {
+        let statement = parsed
+            .arena
+            .get(parsed.source_file)
+            .and_then(|source| match &source.data {
+                NodeData::SourceFile(source) => source
+                    .statements
+                    .nodes
+                    .iter()
+                    .filter_map(|statement| {
+                        let statement = parsed.arena.get(*statement)?;
+                        let NodeData::ExpressionStatement(statement) = &statement.data else {
+                            return None;
+                        };
+                        let expression = parsed.arena.get(statement.expression)?;
+                        let NodeData::BinaryExpression(binary) = &expression.data else {
+                            return None;
+                        };
+                        Some((binary.left, binary.right))
+                    })
+                    .nth(index),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("missing assignment {index}"));
+        (
+            NodeRef::new(parsed.arena.id(), file, statement.0),
+            NodeRef::new(parsed.arena.id(), file, statement.1),
+        )
+    }
+
+    fn node_text(parsed: &ParseResult, node: NodeRef) -> &str {
         let range = parsed.arena.get(node.node).unwrap().range;
         let source = parsed.arena.source_text().unwrap();
         &source
@@ -1820,6 +1926,127 @@ mod tests {
         );
         assert!(is_type_checked(&context, first_file));
         assert!(is_type_checked(&context, second_file));
+    }
+
+    #[test]
+    fn simple_assignments_contextually_type_rhs_and_match_contextual_typing_16_17() {
+        let accepted = parsed("var foo: {id:number;} = {id:4}; foo = {id:5};");
+        let accepted_file = FileId::new(109);
+        let options = CanonicalCheckerOptions {
+            no_error_truncation: true,
+            ..CanonicalCheckerOptions::default()
+        };
+        let mut accepted_context = context(&[(accepted_file, &accepted)], options);
+        let (_, accepted_rhs) = assignment_parts(&accepted, accepted_file, 0);
+
+        accepted_context.check_source_file(accepted_file).unwrap();
+
+        let number = accepted_context
+            .store()
+            .intrinsic_bootstrap()
+            .unwrap()
+            .number_type;
+        assert_eq!(
+            object_property_type(&accepted_context, accepted_rhs, "id"),
+            number
+        );
+        assert!(accepted_context.diagnostics().is_empty());
+        assert!(is_type_checked(&accepted_context, accepted_file));
+        let warm = observable_state(&accepted_context, accepted_file);
+        accepted_context.check_source_file(accepted_file).unwrap();
+        assert_eq!(observable_state(&accepted_context, accepted_file), warm);
+
+        let rejected = parsed(r#"var foo: {id:number;} = {id:4}; foo = {id: 5, name:"foo"};"#);
+        let rejected_file = FileId::new(110);
+        let mut rejected_context = context(&[(rejected_file, &rejected)], options);
+        let (left, rejected_rhs) = assignment_parts(&rejected, rejected_file, 0);
+
+        rejected_context.check_source_file(rejected_file).unwrap();
+
+        let number = rejected_context
+            .store()
+            .intrinsic_bootstrap()
+            .unwrap()
+            .number_type;
+        let string = rejected_context
+            .store()
+            .intrinsic_bootstrap()
+            .unwrap()
+            .string_type;
+        assert_eq!(
+            object_property_type(&rejected_context, rejected_rhs, "id"),
+            number
+        );
+        assert_eq!(
+            object_property_type(&rejected_context, rejected_rhs, "name"),
+            string
+        );
+        let [diagnostic] = rejected_context.diagnostics().as_slice() else {
+            panic!("expected the contextualTyping17 excess-property diagnostic")
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 2353);
+        assert_eq!(diagnostic.diagnostic.category(), Category::Error);
+        assert_eq!(diagnostic.diagnostic.arguments, ["name", "{ id: number; }"]);
+        assert!(diagnostic.diagnostic.details.is_empty());
+        assert_eq!(
+            diagnostic.diagnostic.render().unwrap(),
+            "Object literal may only specify known properties, and 'name' does not exist in type '{ id: number; }'."
+        );
+        let diagnostic_node = diagnostic.node.unwrap();
+        assert_ne!(diagnostic_node, left);
+        assert_eq!(diagnostic_node.arena, rejected.arena.id());
+        assert_eq!(diagnostic_node.file, rejected_file);
+        assert_property_name_span(&rejected, diagnostic_node, "name", true);
+        let diagnostic_range = rejected.arena.get(diagnostic_node.node).unwrap().range;
+        assert_eq!(diagnostic_range.start.get(), 46);
+        assert_eq!(diagnostic_range.end.get(), 50);
+        assert!(diagnostic.related_information.is_empty());
+        assert!(is_type_checked(&rejected_context, rejected_file));
+        let warm = observable_state(&rejected_context, rejected_file);
+        rejected_context.check_source_file(rejected_file).unwrap();
+        assert_eq!(observable_state(&rejected_context, rejected_file), warm);
+    }
+
+    #[test]
+    fn simple_assignment_mismatch_is_anchored_at_left_identifier() {
+        let source = parsed(r#"var target: number = 0; target = "wrong";"#);
+        let file = FileId::new(112);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        let (left, _) = assignment_parts(&source, file, 0);
+
+        context.check_source_file(file).unwrap();
+
+        let [diagnostic] = context.diagnostics().as_slice() else {
+            panic!("expected one assignment diagnostic")
+        };
+        assert_eq!(diagnostic.node, Some(left));
+        assert_eq!(diagnostic.diagnostic.code(), 2322);
+        assert_eq!(diagnostic.diagnostic.arguments, ["string", "number"]);
+        assert!(diagnostic.related_information.is_empty());
+        assert!(is_type_checked(&context, file));
+    }
+
+    #[test]
+    fn unsupported_assignment_target_rejects_the_source_plan_without_writes() {
+        let source = parsed(concat!(
+            "var earlier: number = 0; ",
+            "let target: number = 0; target = 1;",
+        ));
+        let file = FileId::new(113);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        let before = observable_state(&context, file);
+
+        assert!(matches!(
+            context.check_source_file(file),
+            Err(SourceCheckError::Unsupported(
+                UnsupportedSourceSyntax::Assignment(
+                    AssignmentUnsupported::BlockScopedTarget { .. }
+                )
+            ))
+        ));
+        assert_eq!(observable_state(&context, file), before);
+        assert!(context.diagnostics().is_empty());
+        assert!(!is_type_checked(&context, file));
     }
 
     #[test]
@@ -2643,22 +2870,45 @@ mod tests {
     }
 
     #[test]
-    fn fresh_object_literals_accept_empty_object_targets() {
-        let source = parsed("const empty: {} = { extra: 1 };");
+    fn fresh_object_literals_accept_empty_and_canonical_global_object_targets() {
+        let library = parsed(concat!(
+            "interface IArguments {} ",
+            "interface Array<T> {} ",
+            "interface Object {} ",
+            "declare var Object: unknown; ",
+            "interface Function {} ",
+            "interface String {} ",
+            "interface Number {} ",
+            "interface Boolean {} ",
+            "interface RegExp {}",
+        ));
+        let source = parsed(concat!(
+            "const empty: {} = { extra: 1 }; ",
+            "const global: Object = { extra: 1 };",
+        ));
+        let library_file = FileId::new(105);
         let file = FileId::new(106);
-        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        let mut context = context(
+            &[(library_file, &library), (file, &source)],
+            CanonicalCheckerOptions::default(),
+        );
 
         context.check_source_file(file).unwrap();
 
         assert!(context.diagnostics().is_empty());
         assert!(is_type_checked(&context, file));
-        assert!(
-            context
-                .store()
-                .type_node_links(variable_initializer(&source, file, "empty"))
-                .and_then(|links| links.resolved_type)
-                .is_some()
-        );
+        for variable in ["empty", "global"] {
+            assert!(
+                context
+                    .store()
+                    .type_node_links(variable_initializer(&source, file, variable))
+                    .and_then(|links| links.resolved_type)
+                    .is_some()
+            );
+        }
+        let warm = observable_state(&context, file);
+        context.check_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
     }
 
     #[test]
