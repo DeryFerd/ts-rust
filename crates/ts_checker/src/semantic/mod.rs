@@ -7,6 +7,7 @@
 //! same-named legacy checker IDs.
 
 pub mod ids;
+pub mod mapper;
 pub mod signatures;
 mod store;
 pub mod type_records;
@@ -17,5 +18,6 @@ pub use ts_binder::{AstScope, SemanticStoreId, SemanticSymbolId, SymbolTableId};
 pub use ids::{
     ConditionalRootId, IndexInfoId, SignatureId, TypeAliasId, TypeId, TypeMapperId, TypePredicateId,
 };
+pub use mapper::{CanonicalTypeMapperStore, TypeMapper, TypeMapperKind};
 pub use store::SemanticStore;
 pub use type_records::{CanonicalSemanticStore, TypeData, TypeDataKind, TypeRecord};
