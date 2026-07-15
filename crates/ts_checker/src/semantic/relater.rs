@@ -1,20 +1,25 @@
-//! Exact dependency-closed fast and simple type relations.
+//! Exact dependency-closed fast, simple, and property-only object relations.
 //!
 //! This module ports `isTypeRelatedTo`, `isSimpleTypeRelatedTo`, and their
-//! no-diagnostic entry points from pinned `internal/checker/relater.go` at
-//! `dc37b5249ab60e2bbce936f71b883e6c8136167e`. It deliberately stops before
-//! union decomposition and uncached structural comparison. Those paths return
-//! [`RelationUnavailable`] instead of being misreported as unrelated.
+//! no-diagnostic entry points plus the required-property object slice of
+//! `recursiveTypeRelatedTo` from pinned `internal/checker/relater.go` at
+//! `dc37b5249ab60e2bbce936f71b883e6c8136167e`. Unsupported structural paths
+//! return [`RelationUnavailable`] instead of being misreported as unrelated.
 
-use ts_binder::{SemanticSymbolId, SymbolFlags};
+use std::collections::{HashMap, HashSet};
+
+use ts_binder::{CheckFlags, SemanticSymbolId, SymbolFlags, SymbolTableId};
 
 use super::{
     ids::TypeId,
     links::MembersOrExportsResolutionKind,
-    relation::{IntersectionState, RelationComparisonResult, RelationKeyUnavailable, RelationKind},
+    relation::{
+        ExpandingFlags, IntersectionState, RecursionFlags, RecursionIdentityUnavailable,
+        RelationComparisonResult, RelationKeyUnavailable, RelationKind,
+    },
     signatures::Ternary,
     store::SemanticStore,
-    type_records::{TypeData, TypeRecord},
+    type_records::{CacheHashKey, TypeData, TypeRecord},
     types::{ObjectFlags, TypeFlags},
 };
 
@@ -40,6 +45,15 @@ pub enum RelationUnavailable {
     RelationKeyTypeParameterConstraint(TypeId),
     RelationKeyCyclicGenericArguments(TypeId),
     InvalidUnknownLikeUnionState(TypeId),
+    UnresolvedStructuredMembers(TypeId),
+    UnsupportedStructuredType(TypeId),
+    InvalidStructuredMembers(TypeId),
+    StructuredSignatures(TypeId),
+    StructuredIndexInfos(TypeId),
+    UnsupportedProperty(SemanticSymbolId),
+    UnresolvedPropertyType(SemanticSymbolId),
+    StrictOptionalProperty(SemanticSymbolId),
+    UnresolvedGlobalObject(SemanticSymbolId),
     StructuralRelation {
         source: TypeId,
         target: TypeId,
@@ -104,6 +118,42 @@ impl std::fmt::Display for RelationUnavailable {
                 formatter,
                 "type {type_id:?} rejected its unknown-like union cache state"
             ),
+            Self::UnresolvedStructuredMembers(type_id) => write!(
+                formatter,
+                "type {type_id:?} requires resolved structured members"
+            ),
+            Self::UnsupportedStructuredType(type_id) => write!(
+                formatter,
+                "type {type_id:?} is outside the property-only object relation domain"
+            ),
+            Self::InvalidStructuredMembers(type_id) => write!(
+                formatter,
+                "type {type_id:?} has inconsistent resolved member caches"
+            ),
+            Self::StructuredSignatures(type_id) => write!(
+                formatter,
+                "type {type_id:?} requires call or construct signature relations"
+            ),
+            Self::StructuredIndexInfos(type_id) => write!(
+                formatter,
+                "type {type_id:?} requires index-signature relations"
+            ),
+            Self::UnsupportedProperty(symbol) => write!(
+                formatter,
+                "property symbol {symbol:?} is outside the ordinary property relation domain"
+            ),
+            Self::UnresolvedPropertyType(symbol) => write!(
+                formatter,
+                "property symbol {symbol:?} has no resolved value type"
+            ),
+            Self::StrictOptionalProperty(symbol) => write!(
+                formatter,
+                "optional property symbol {symbol:?} requires strict optional-union semantics"
+            ),
+            Self::UnresolvedGlobalObject(symbol) => write!(
+                formatter,
+                "global Object symbol {symbol:?} has no resolved declared object type"
+            ),
             Self::StructuralRelation {
                 source,
                 target,
@@ -123,6 +173,823 @@ struct RelationBootstrapFacts {
     strict_null_checks: bool,
     wildcard_type: TypeId,
     any_function_type: TypeId,
+}
+
+const PINNED_RELATION_STACK_DEPTH: usize = 100;
+const PINNED_EXPANDING_DEPTH: usize = 3;
+
+struct ResolvedObjectMembers {
+    members: Option<SymbolTableId>,
+    properties: Vec<SemanticSymbolId>,
+}
+
+#[derive(Default)]
+struct PendingRelationCache {
+    latest: HashMap<CacheHashKey, RelationComparisonResult>,
+    writes: Vec<(CacheHashKey, RelationComparisonResult)>,
+}
+
+impl PendingRelationCache {
+    fn get<MapperPayload>(
+        &self,
+        store: &SemanticStore<TypeRecord, MapperPayload>,
+        relation: RelationKind,
+        key: CacheHashKey,
+    ) -> RelationComparisonResult {
+        self.latest
+            .get(&key)
+            .copied()
+            .unwrap_or_else(|| store.relation_cache_get(relation, key))
+    }
+
+    fn set(&mut self, key: CacheHashKey, result: RelationComparisonResult) {
+        self.latest.insert(key, result);
+        self.writes.push((key, result));
+    }
+}
+
+struct RelaterSession<'store, MapperPayload> {
+    store: &'store mut SemanticStore<TypeRecord, MapperPayload>,
+    relation: RelationKind,
+    bootstrap: RelationBootstrapFacts,
+    pending: PendingRelationCache,
+    maybe_keys: Vec<CacheHashKey>,
+    maybe_keys_set: HashSet<CacheHashKey>,
+    source_stack: Vec<TypeId>,
+    target_stack: Vec<TypeId>,
+    expanding_flags: ExpandingFlags,
+    overflow: bool,
+    relation_count: isize,
+    stack_depth_limit: usize,
+}
+
+impl<'store, MapperPayload> RelaterSession<'store, MapperPayload> {
+    fn new(
+        store: &'store mut SemanticStore<TypeRecord, MapperPayload>,
+        relation: RelationKind,
+        bootstrap: RelationBootstrapFacts,
+    ) -> Self {
+        let relation_count = store.relation_comparison_budget(relation);
+        Self::new_with_limits(
+            store,
+            relation,
+            bootstrap,
+            relation_count,
+            PINNED_RELATION_STACK_DEPTH,
+        )
+    }
+
+    fn new_with_limits(
+        store: &'store mut SemanticStore<TypeRecord, MapperPayload>,
+        relation: RelationKind,
+        bootstrap: RelationBootstrapFacts,
+        relation_count: isize,
+        stack_depth_limit: usize,
+    ) -> Self {
+        Self {
+            store,
+            relation,
+            bootstrap,
+            pending: PendingRelationCache::default(),
+            maybe_keys: Vec::new(),
+            maybe_keys_set: HashSet::new(),
+            source_stack: Vec::new(),
+            target_stack: Vec::new(),
+            expanding_flags: ExpandingFlags::NONE,
+            overflow: false,
+            relation_count,
+            stack_depth_limit,
+        }
+    }
+
+    fn finish(
+        mut self,
+        source: TypeId,
+        target: TypeId,
+        result: Ternary,
+    ) -> Result<bool, RelationUnavailable> {
+        if self.overflow {
+            let key = self
+                .store
+                .relation_key_if_available(
+                    source,
+                    target,
+                    IntersectionState::NONE,
+                    self.relation.is_identity(),
+                    false,
+                )
+                .map_err(relation_key_unavailable)?
+                .key();
+            let overflow = if self.relation_count <= 0 {
+                RelationComparisonResult::COMPLEXITY_OVERFLOW
+            } else {
+                RelationComparisonResult::STACK_DEPTH_OVERFLOW
+            };
+            self.pending
+                .set(key, RelationComparisonResult::FAILED | overflow);
+        }
+        for (key, value) in self.pending.writes {
+            self.store.relation_cache_set(self.relation, key, value);
+        }
+        Ok(result != Ternary::False)
+    }
+
+    fn cache_get(&self, key: CacheHashKey) -> RelationComparisonResult {
+        self.pending.get(self.store, self.relation, key)
+    }
+
+    fn cache_set(&mut self, key: CacheHashKey, result: RelationComparisonResult) {
+        self.pending.set(key, result);
+    }
+
+    fn is_related_to_ex(
+        &mut self,
+        source: TypeId,
+        target: TypeId,
+        recursion_flags: RecursionFlags,
+        intersection_state: IntersectionState,
+    ) -> Result<Ternary, RelationUnavailable> {
+        if source == target {
+            return Ok(Ternary::True);
+        }
+        if intersection_state != IntersectionState::NONE
+            || self.relation != RelationKind::Assignable
+        {
+            return Err(RelationUnavailable::StructuralRelation {
+                source,
+                target,
+                relation: self.relation,
+            });
+        }
+
+        let source = self.store.regular_type_if_fresh(source)?;
+        let target = self.store.regular_type_if_fresh(target)?;
+        if source == target {
+            return Ok(Ternary::True);
+        }
+        let source_flags = self.store.type_flags(source)?;
+        let target_flags = self.store.type_flags(target)?;
+
+        // Pinned pre-normalization object-to-primitive fast path. The current
+        // supported object records need no further normalization.
+        if source_flags.intersects(TypeFlags::OBJECT)
+            && target_flags.intersects(TypeFlags::PRIMITIVE)
+        {
+            return self
+                .store
+                .is_simple_type_related_to(source, target, self.relation, self.bootstrap)
+                .map(bool_to_ternary);
+        }
+        if self
+            .store
+            .is_simple_type_related_to(source, target, self.relation, self.bootstrap)?
+        {
+            return Ok(Ternary::True);
+        }
+
+        if source_flags.intersects(TypeFlags::OBJECT) && target_flags.intersects(TypeFlags::OBJECT)
+        {
+            if self.weak_target_lacks_common_properties(source, target)? {
+                return Ok(Ternary::False);
+            }
+            return self.recursive_type_related_to(
+                source,
+                target,
+                intersection_state,
+                recursion_flags,
+            );
+        }
+        if source_flags.intersects(TypeFlags::STRUCTURED_OR_INSTANTIABLE)
+            || target_flags.intersects(TypeFlags::STRUCTURED_OR_INSTANTIABLE)
+        {
+            return Err(RelationUnavailable::StructuralRelation {
+                source,
+                target,
+                relation: self.relation,
+            });
+        }
+        Ok(Ternary::False)
+    }
+
+    fn recursive_type_related_to(
+        &mut self,
+        source: TypeId,
+        target: TypeId,
+        intersection_state: IntersectionState,
+        recursion_flags: RecursionFlags,
+    ) -> Result<Ternary, RelationUnavailable> {
+        if self.overflow {
+            return Ok(Ternary::False);
+        }
+        let built_key = self
+            .store
+            .relation_key_if_available(
+                source,
+                target,
+                intersection_state,
+                self.relation.is_identity(),
+                false,
+            )
+            .map_err(relation_key_unavailable)?;
+        let key = built_key.key();
+        let entry = self.cache_get(key);
+        if !entry.is_empty() {
+            return Ok(if entry.intersects(RelationComparisonResult::SUCCEEDED) {
+                Ternary::True
+            } else {
+                Ternary::False
+            });
+        }
+        if self.relation_count <= 0 {
+            self.overflow = true;
+            return Ok(Ternary::False);
+        }
+        if self.maybe_keys_set.contains(&key) {
+            return Ok(Ternary::Maybe);
+        }
+        if built_key.constrained() {
+            let broadest = self
+                .store
+                .relation_key_if_available(
+                    source,
+                    target,
+                    intersection_state,
+                    self.relation.is_identity(),
+                    true,
+                )
+                .map_err(relation_key_unavailable)?;
+            if self.maybe_keys_set.contains(&broadest.key()) {
+                return Ok(Ternary::Maybe);
+            }
+        }
+        if self.source_stack.len() == self.stack_depth_limit
+            || self.target_stack.len() == self.stack_depth_limit
+        {
+            self.overflow = true;
+            return Ok(Ternary::False);
+        }
+
+        // Capability validation is side-effect free. It is intentionally after
+        // the pinned cache/active/depth checks, so cached answers remain usable
+        // even for structural families outside this slice.
+        self.ensure_supported_object_kind(source)?;
+        self.ensure_supported_object_kind(target)?;
+
+        let maybe_start = self.maybe_keys.len();
+        self.maybe_keys.push(key);
+        self.maybe_keys_set.insert(key);
+        let saved_expanding_flags = self.expanding_flags;
+        if recursion_flags.intersects(RecursionFlags::SOURCE) {
+            self.source_stack.push(source);
+            if !self.expanding_flags.intersects(ExpandingFlags::SOURCE)
+                && self.is_deeply_nested_type(source, true, PINNED_EXPANDING_DEPTH)?
+            {
+                self.expanding_flags |= ExpandingFlags::SOURCE;
+            }
+        }
+        if recursion_flags.intersects(RecursionFlags::TARGET) {
+            self.target_stack.push(target);
+            if !self.expanding_flags.intersects(ExpandingFlags::TARGET)
+                && self.is_deeply_nested_type(target, false, PINNED_EXPANDING_DEPTH)?
+            {
+                self.expanding_flags |= ExpandingFlags::TARGET;
+            }
+        }
+
+        let result = if self.expanding_flags == ExpandingFlags::BOTH {
+            Ok(Ternary::Maybe)
+        } else {
+            self.structured_type_related_to(source, target, intersection_state)
+        };
+
+        self.unwind_recursion(recursion_flags, saved_expanding_flags);
+
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => {
+                self.reset_maybe_stack(maybe_start, false);
+                return Err(error);
+            }
+        };
+        if result == Ternary::False {
+            self.cache_set(key, RelationComparisonResult::FAILED);
+            self.relation_count -= 1;
+            self.reset_maybe_stack(maybe_start, false);
+        } else if result == Ternary::True
+            || (self.source_stack.is_empty() && self.target_stack.is_empty())
+        {
+            self.reset_maybe_stack(
+                maybe_start,
+                result == Ternary::True || result == Ternary::Maybe,
+            );
+        }
+        Ok(result)
+    }
+
+    fn unwind_recursion(
+        &mut self,
+        recursion_flags: RecursionFlags,
+        saved_expanding_flags: ExpandingFlags,
+    ) {
+        if recursion_flags.intersects(RecursionFlags::SOURCE) {
+            self.source_stack.pop();
+        }
+        if recursion_flags.intersects(RecursionFlags::TARGET) {
+            self.target_stack.pop();
+        }
+        self.expanding_flags = saved_expanding_flags;
+    }
+
+    fn reset_maybe_stack(&mut self, maybe_start: usize, mark_all_as_succeeded: bool) {
+        for index in maybe_start..self.maybe_keys.len() {
+            let key = self.maybe_keys[index];
+            self.maybe_keys_set.remove(&key);
+            if mark_all_as_succeeded {
+                self.cache_set(key, RelationComparisonResult::SUCCEEDED);
+                self.relation_count -= 1;
+            }
+        }
+        self.maybe_keys.truncate(maybe_start);
+    }
+
+    fn is_deeply_nested_type(
+        &self,
+        type_id: TypeId,
+        source: bool,
+        max_depth: usize,
+    ) -> Result<bool, RelationUnavailable> {
+        let stack = if source {
+            &self.source_stack
+        } else {
+            &self.target_stack
+        };
+        if stack.len() < max_depth {
+            return Ok(false);
+        }
+        let identity = self
+            .store
+            .recursion_identity_if_available(type_id)
+            .map_err(recursion_identity_unavailable)?;
+        let mut count = 0;
+        let mut last_type_id = 0;
+        for candidate in stack {
+            let candidate_identity = self
+                .store
+                .recursion_identity_if_available(*candidate)
+                .map_err(recursion_identity_unavailable)?;
+            if candidate_identity == identity {
+                if candidate.get() >= last_type_id {
+                    count += 1;
+                    if count >= max_depth {
+                        return Ok(true);
+                    }
+                }
+                last_type_id = candidate.get();
+            }
+        }
+        Ok(false)
+    }
+
+    fn structured_type_related_to(
+        &mut self,
+        source: TypeId,
+        target: TypeId,
+        intersection_state: IntersectionState,
+    ) -> Result<Ternary, RelationUnavailable> {
+        if intersection_state != IntersectionState::NONE {
+            return Err(RelationUnavailable::StructuralRelation {
+                source,
+                target,
+                relation: self.relation,
+            });
+        }
+        let source_members = self.resolved_object_members(source)?;
+        let target_members = self.resolved_object_members(target)?;
+        self.properties_related_to(source, target, &source_members, &target_members)
+    }
+
+    fn weak_target_lacks_common_properties(
+        &self,
+        source: TypeId,
+        target: TypeId,
+    ) -> Result<bool, RelationUnavailable> {
+        let target_members = self.resolved_object_members(target)?;
+        if target_members.properties.is_empty() {
+            return Ok(false);
+        }
+        for property in &target_members.properties {
+            if !self
+                .property_symbol(*property)?
+                .flags()
+                .intersects(SymbolFlags::OPTIONAL)
+            {
+                return Ok(false);
+            }
+        }
+        let source_members = self.resolved_object_members(source)?;
+        if source_members.properties.is_empty() || self.global_object_type()? == Some(source) {
+            return Ok(false);
+        }
+        let target_table = target_members
+            .members
+            .and_then(|members| self.store.symbol_table(members))
+            .ok_or(RelationUnavailable::InvalidStructuredMembers(target))?;
+        for property in source_members.properties {
+            if target_table
+                .get(self.property_symbol(property)?.name())
+                .is_some()
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn properties_related_to(
+        &mut self,
+        source: TypeId,
+        target: TypeId,
+        source_members: &ResolvedObjectMembers,
+        target_members: &ResolvedObjectMembers,
+    ) -> Result<Ternary, RelationUnavailable> {
+        // Preserve upstream's unmatched-property pass before comparing any
+        // property types. This ordering is observable through relation caches.
+        for target_property in &target_members.properties {
+            let target_symbol = self.property_symbol(*target_property)?;
+            if !target_symbol.flags().intersects(SymbolFlags::OPTIONAL)
+                && self
+                    .lookup_source_property(source, source_members, *target_property)?
+                    .is_none()
+            {
+                return Ok(Ternary::False);
+            }
+        }
+
+        let mut result = Ternary::True;
+        for target_property in &target_members.properties {
+            let Some(source_property) =
+                self.lookup_source_property(source, source_members, *target_property)?
+            else {
+                continue;
+            };
+            if source_property == *target_property {
+                continue;
+            }
+            let related =
+                self.property_related_to(source, target, source_property, *target_property)?;
+            if related == Ternary::False {
+                return Ok(Ternary::False);
+            }
+            result &= related;
+        }
+        Ok(result)
+    }
+
+    fn property_related_to(
+        &mut self,
+        source: TypeId,
+        target: TypeId,
+        source_property: SemanticSymbolId,
+        target_property: SemanticSymbolId,
+    ) -> Result<Ternary, RelationUnavailable> {
+        let source_flags = self.property_symbol(source_property)?.flags();
+        let target_flags = self.property_symbol(target_property)?.flags();
+        let target_type = self.property_type(target_property)?;
+        if self.bootstrap.strict_null_checks && target_flags.intersects(SymbolFlags::OPTIONAL) {
+            return Err(RelationUnavailable::StrictOptionalProperty(target_property));
+        }
+        let target_type_flags = self.store.type_flags(target_type)?;
+        if target_type_flags.intersects(TypeFlags::ANY_OR_UNKNOWN) {
+            return self.optional_property_result(
+                source,
+                target,
+                source_property,
+                target_property,
+                Ternary::True,
+            );
+        }
+        if self.bootstrap.strict_null_checks && source_flags.intersects(SymbolFlags::OPTIONAL) {
+            return Err(RelationUnavailable::StrictOptionalProperty(source_property));
+        }
+        let source_type = self.property_type(source_property)?;
+        let related = self.is_related_to_ex(
+            source_type,
+            target_type,
+            RecursionFlags::BOTH,
+            IntersectionState::NONE,
+        )?;
+        self.optional_property_result(source, target, source_property, target_property, related)
+    }
+
+    fn optional_property_result(
+        &self,
+        _source: TypeId,
+        _target: TypeId,
+        source_property: SemanticSymbolId,
+        target_property: SemanticSymbolId,
+        related: Ternary,
+    ) -> Result<Ternary, RelationUnavailable> {
+        if related == Ternary::False {
+            return Ok(Ternary::False);
+        }
+        let source_flags = self.property_symbol(source_property)?.flags();
+        let target_flags = self.property_symbol(target_property)?.flags();
+        if source_flags.intersects(SymbolFlags::OPTIONAL)
+            && !target_flags.intersects(SymbolFlags::OPTIONAL)
+        {
+            return Ok(Ternary::False);
+        }
+        Ok(related)
+    }
+
+    fn property_type(&self, symbol: SemanticSymbolId) -> Result<TypeId, RelationUnavailable> {
+        self.store
+            .value_symbol_links(symbol)
+            .and_then(|links| links.resolved_type)
+            .ok_or(RelationUnavailable::UnresolvedPropertyType(symbol))
+    }
+
+    fn lookup_source_property(
+        &self,
+        source: TypeId,
+        source_members: &ResolvedObjectMembers,
+        target_property: SemanticSymbolId,
+    ) -> Result<Option<SemanticSymbolId>, RelationUnavailable> {
+        let target_symbol = self.property_symbol(target_property)?;
+        let name = target_symbol.name();
+        if let Some(members) = source_members.members {
+            let table = self
+                .store
+                .symbol_table(members)
+                .ok_or(RelationUnavailable::InvalidStructuredMembers(source))?;
+            if let Some(property) = table.get(name) {
+                self.property_symbol(property)?;
+                return Ok(Some(property));
+            }
+        }
+        self.global_object_property(name)
+    }
+
+    fn global_object_property(
+        &self,
+        name: ts_binder::EscapedNameRef<'_>,
+    ) -> Result<Option<SemanticSymbolId>, RelationUnavailable> {
+        let Some(global_object_type) = self.global_object_type()? else {
+            return Ok(None);
+        };
+        self.ensure_supported_object_kind(global_object_type)?;
+        let record = self
+            .store
+            .type_payload(global_object_type)
+            .ok_or(RelationUnavailable::Type(global_object_type))?;
+        if !record
+            .object_flags()
+            .intersects(ObjectFlags::MEMBERS_RESOLVED)
+        {
+            return Err(RelationUnavailable::UnresolvedStructuredMembers(
+                global_object_type,
+            ));
+        }
+        let structured =
+            record
+                .data()
+                .structured()
+                .ok_or(RelationUnavailable::MalformedStructuredType(
+                    global_object_type,
+                ))?;
+        let properties = structured.properties.as_deref().unwrap_or_default();
+        let mut property_set = HashSet::with_capacity(properties.len());
+        for property in properties {
+            if !property_set.insert(*property) || self.store.symbol(*property).is_none() {
+                return Err(RelationUnavailable::InvalidStructuredMembers(
+                    global_object_type,
+                ));
+            }
+        }
+        let Some(members) = structured.members else {
+            if properties.is_empty() {
+                return Ok(None);
+            }
+            return Err(RelationUnavailable::InvalidStructuredMembers(
+                global_object_type,
+            ));
+        };
+        let table = self.store.symbol_table(members).ok_or(
+            RelationUnavailable::InvalidStructuredMembers(global_object_type),
+        )?;
+        if table.len() != properties.len() {
+            return Err(RelationUnavailable::InvalidStructuredMembers(
+                global_object_type,
+            ));
+        }
+        for (member_name, property) in table.iter() {
+            let symbol = self.store.symbol(property).ok_or(
+                RelationUnavailable::InvalidStructuredMembers(global_object_type),
+            )?;
+            if symbol.name() != member_name || !property_set.contains(&property) {
+                return Err(RelationUnavailable::InvalidStructuredMembers(
+                    global_object_type,
+                ));
+            }
+        }
+        for property in properties {
+            let symbol = self.store.symbol(*property).ok_or(
+                RelationUnavailable::InvalidStructuredMembers(global_object_type),
+            )?;
+            if table.get(symbol.name()) != Some(*property) {
+                return Err(RelationUnavailable::InvalidStructuredMembers(
+                    global_object_type,
+                ));
+            }
+        }
+        let Some(property) = table.get(name) else {
+            return Ok(None);
+        };
+        self.property_symbol(property)?;
+        Ok(Some(property))
+    }
+
+    fn global_object_type(&self) -> Result<Option<TypeId>, RelationUnavailable> {
+        let globals = self
+            .store
+            .intrinsic_bootstrap
+            .as_ref()
+            .ok_or(RelationUnavailable::MissingBootstrap)?
+            .globals;
+        let globals = self
+            .store
+            .symbol_table(globals)
+            .ok_or(RelationUnavailable::MissingBootstrap)?;
+        let Some(global_object) = globals.get_source("Object") else {
+            return Ok(None);
+        };
+        let global_object = self
+            .store
+            .get_merged_symbol(global_object)
+            .ok_or(RelationUnavailable::Symbol(global_object))?;
+        let Some(global_object_type) = self
+            .store
+            .declared_type_links(global_object)
+            .and_then(|links| links.declared_type)
+        else {
+            return Err(RelationUnavailable::UnresolvedGlobalObject(global_object));
+        };
+        Ok(Some(global_object_type))
+    }
+
+    fn property_symbol(
+        &self,
+        symbol: SemanticSymbolId,
+    ) -> Result<&ts_binder::semantic::Symbol, RelationUnavailable> {
+        let record = self
+            .store
+            .symbol(symbol)
+            .ok_or(RelationUnavailable::Symbol(symbol))?;
+        let allowed_flags = SymbolFlags::PROPERTY | SymbolFlags::OPTIONAL;
+        let allowed_checks = CheckFlags::READONLY.bits();
+        if !record.flags().contains(SymbolFlags::PROPERTY)
+            || record.flags().without(allowed_flags) != SymbolFlags::NONE
+            || record.check_flags().bits() & !allowed_checks != 0
+            || record.name().is_reserved_member_name()
+            || record.name().is_private_identifier()
+            || record.name().is_late_bound()
+        {
+            return Err(RelationUnavailable::UnsupportedProperty(symbol));
+        }
+        if let Some(parent) = record.parent() {
+            let parent = self
+                .store
+                .symbol(parent)
+                .ok_or(RelationUnavailable::Symbol(parent))?;
+            if !parent
+                .flags()
+                .intersects(SymbolFlags::INTERFACE | SymbolFlags::TYPE_LITERAL)
+            {
+                return Err(RelationUnavailable::UnsupportedProperty(symbol));
+            }
+        } else if record
+            .declarations()
+            .is_some_and(|declarations| !declarations.is_empty())
+        {
+            return Err(RelationUnavailable::UnsupportedProperty(symbol));
+        }
+        Ok(record)
+    }
+
+    fn ensure_supported_object_kind(&self, type_id: TypeId) -> Result<(), RelationUnavailable> {
+        let record = self
+            .store
+            .type_payload(type_id)
+            .ok_or(RelationUnavailable::Type(type_id))?;
+        if record.flags() != TypeFlags::OBJECT || record.alias().is_some() {
+            return Err(RelationUnavailable::UnsupportedStructuredType(type_id));
+        }
+        let kind = record.object_flags() & ObjectFlags::OBJECT_TYPE_KIND_MASK;
+        if kind != ObjectFlags::NONE
+            && kind != ObjectFlags::INTERFACE
+            && kind != ObjectFlags::ANONYMOUS
+        {
+            return Err(RelationUnavailable::UnsupportedStructuredType(type_id));
+        }
+        let unsupported_flags = ObjectFlags::CLASS
+            | ObjectFlags::REFERENCE
+            | ObjectFlags::TUPLE
+            | ObjectFlags::MAPPED
+            | ObjectFlags::REVERSE_MAPPED
+            | ObjectFlags::EVOLVING_ARRAY
+            | ObjectFlags::INSTANTIATED
+            | ObjectFlags::OBJECT_LITERAL
+            | ObjectFlags::FRESH_LITERAL
+            | ObjectFlags::ARRAY_LITERAL
+            | ObjectFlags::JSX_ATTRIBUTES
+            | ObjectFlags::UNRESOLVED_MEMBERS;
+        if record.object_flags().intersects(unsupported_flags) {
+            return Err(RelationUnavailable::UnsupportedStructuredType(type_id));
+        }
+        match (kind, record.data()) {
+            (ObjectFlags::INTERFACE, TypeData::Interface(interface))
+                if interface
+                    .all_type_parameters
+                    .as_ref()
+                    .is_none_or(Vec::is_empty) => {}
+            (ObjectFlags::NONE | ObjectFlags::ANONYMOUS, TypeData::Object(_)) => {}
+            _ => return Err(RelationUnavailable::UnsupportedStructuredType(type_id)),
+        }
+        Ok(())
+    }
+
+    fn resolved_object_members(
+        &self,
+        type_id: TypeId,
+    ) -> Result<ResolvedObjectMembers, RelationUnavailable> {
+        self.ensure_supported_object_kind(type_id)?;
+        let record = self
+            .store
+            .type_payload(type_id)
+            .ok_or(RelationUnavailable::Type(type_id))?;
+        if !record
+            .object_flags()
+            .intersects(ObjectFlags::MEMBERS_RESOLVED)
+        {
+            return Err(RelationUnavailable::UnresolvedStructuredMembers(type_id));
+        }
+        let structured = record
+            .data()
+            .structured()
+            .ok_or(RelationUnavailable::MalformedStructuredType(type_id))?;
+        if structured.call_signature_count != 0
+            || structured
+                .signatures
+                .as_ref()
+                .is_some_and(|values| !values.is_empty())
+        {
+            return Err(RelationUnavailable::StructuredSignatures(type_id));
+        }
+        if structured
+            .index_infos
+            .as_ref()
+            .is_some_and(|values| !values.is_empty())
+        {
+            return Err(RelationUnavailable::StructuredIndexInfos(type_id));
+        }
+        let properties = structured.properties.clone().unwrap_or_default();
+        let mut property_set = HashSet::with_capacity(properties.len());
+        for property in &properties {
+            if !property_set.insert(*property) {
+                return Err(RelationUnavailable::InvalidStructuredMembers(type_id));
+            }
+            self.property_symbol(*property)?;
+        }
+        match structured.members {
+            None if properties.is_empty() => {}
+            None => return Err(RelationUnavailable::InvalidStructuredMembers(type_id)),
+            Some(members) => {
+                let table = self
+                    .store
+                    .symbol_table(members)
+                    .ok_or(RelationUnavailable::InvalidStructuredMembers(type_id))?;
+                if table.len() != properties.len() {
+                    return Err(RelationUnavailable::InvalidStructuredMembers(type_id));
+                }
+                for (name, property) in table.iter() {
+                    let symbol = self.property_symbol(property)?;
+                    if symbol.name() != name || !property_set.contains(&property) {
+                        return Err(RelationUnavailable::InvalidStructuredMembers(type_id));
+                    }
+                }
+                for property in &properties {
+                    let symbol = self.property_symbol(*property)?;
+                    if table.get(symbol.name()) != Some(*property) {
+                        return Err(RelationUnavailable::InvalidStructuredMembers(type_id));
+                    }
+                }
+            }
+        }
+        Ok(ResolvedObjectMembers {
+            members: structured.members,
+            properties,
+        })
+    }
 }
 
 impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
@@ -339,6 +1206,19 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         if source_flags.intersects(TypeFlags::STRUCTURED_OR_INSTANTIABLE)
             || target_flags.intersects(TypeFlags::STRUCTURED_OR_INSTANTIABLE)
         {
+            if relation == RelationKind::Assignable
+                && source_flags.intersects(TypeFlags::OBJECT)
+                && target_flags.intersects(TypeFlags::OBJECT)
+            {
+                let mut session = RelaterSession::new(self, relation, bootstrap);
+                let result = session.is_related_to_ex(
+                    source,
+                    target,
+                    RecursionFlags::BOTH,
+                    IntersectionState::NONE,
+                )?;
+                return session.finish(source, target, result);
+            }
             return Err(RelationUnavailable::StructuralRelation {
                 source,
                 target,
@@ -510,6 +1390,31 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
             wildcard_type: bootstrap.wildcard_type,
             any_function_type: bootstrap.any_function_type,
         })
+    }
+
+    #[cfg(test)]
+    fn is_type_assignable_to_with_test_limits(
+        &mut self,
+        source: TypeId,
+        target: TypeId,
+        relation_count: isize,
+        stack_depth_limit: usize,
+    ) -> Result<bool, RelationUnavailable> {
+        let bootstrap = self.relation_bootstrap_facts()?;
+        let mut session = RelaterSession::new_with_limits(
+            self,
+            RelationKind::Assignable,
+            bootstrap,
+            relation_count,
+            stack_depth_limit,
+        );
+        let result = session.is_related_to_ex(
+            source,
+            target,
+            RecursionFlags::BOTH,
+            IntersectionState::NONE,
+        )?;
+        session.finish(source, target, result)
     }
 
     fn type_flags(&self, type_id: TypeId) -> Result<TypeFlags, RelationUnavailable> {
@@ -746,6 +1651,19 @@ const fn relation_key_unavailable(error: RelationKeyUnavailable) -> RelationUnav
     }
 }
 
+const fn recursion_identity_unavailable(
+    error: RecursionIdentityUnavailable,
+) -> RelationUnavailable {
+    match error {
+        RecursionIdentityUnavailable::Type(type_id)
+        | RecursionIdentityUnavailable::TypeReferenceTarget(type_id)
+        | RecursionIdentityUnavailable::ConditionalRoot(type_id) => {
+            RelationUnavailable::UnsupportedStructuredType(type_id)
+        }
+        RecursionIdentityUnavailable::Symbol(symbol) => RelationUnavailable::Symbol(symbol),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use ts_binder::{EscapedName, SemanticSymbolId, SymbolData, SymbolFlags};
@@ -753,9 +1671,10 @@ mod tests {
 
     use super::RelationUnavailable;
     use crate::semantic::{
-        CanonicalTypeMapperStore, IntrinsicBootstrapOptions, MembersAndExportsLinks,
-        MembersOrExportsResolutionKind, RelationComparisonResult, RelationKind, TypeId,
-        signatures::Ternary,
+        CanonicalTypeMapperStore, DeclaredTypeLinks, IntrinsicBootstrapOptions,
+        MembersAndExportsLinks, MembersOrExportsResolutionKind, RelationComparisonResult,
+        RelationKind, TypeId, ValueSymbolLinks,
+        signatures::{SignatureFlags, Ternary},
         type_records::{LiteralValue, RegularLiteralLink, TypeData},
         types::{ObjectFlags, TypeFlags},
     };
@@ -793,6 +1712,94 @@ mod tests {
         let object = store.alloc_plain_object_type(object_flags, None).unwrap();
         assert!(store.set_structured_type_members(object, None, properties, None, None, None));
         object
+    }
+
+    fn alloc_typed_property(
+        store: &mut TestStore,
+        name: &str,
+        type_id: TypeId,
+        optional: bool,
+    ) -> SemanticSymbolId {
+        let flags = SymbolFlags::PROPERTY
+            | if optional {
+                SymbolFlags::OPTIONAL
+            } else {
+                SymbolFlags::NONE
+            };
+        let symbol = alloc_symbol(store, flags, name);
+        assert!(store.set_value_symbol_links(
+            symbol,
+            ValueSymbolLinks {
+                resolved_type: Some(type_id),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        symbol
+    }
+
+    fn alloc_object_shell(store: &mut TestStore) -> TypeId {
+        store
+            .alloc_plain_object_type(ObjectFlags::ANONYMOUS, None)
+            .unwrap()
+    }
+
+    fn set_object_properties(
+        store: &mut TestStore,
+        object: TypeId,
+        properties: Vec<SemanticSymbolId>,
+    ) {
+        let members = if properties.is_empty() {
+            None
+        } else {
+            let members = store.alloc_symbol_table();
+            for property in &properties {
+                let name = store
+                    .symbol(*property)
+                    .unwrap()
+                    .name()
+                    .as_utf8()
+                    .unwrap()
+                    .to_owned();
+                assert_eq!(
+                    store.insert_symbol(members, EscapedName::source(&name), *property),
+                    Some(None)
+                );
+            }
+            Some(members)
+        };
+        let properties = (!properties.is_empty()).then_some(properties);
+        assert!(store.set_structured_type_members(object, members, properties, None, None, None,));
+    }
+
+    fn alloc_property_object(store: &mut TestStore, properties: Vec<SemanticSymbolId>) -> TypeId {
+        let object = alloc_object_shell(store);
+        set_object_properties(store, object, properties);
+        object
+    }
+
+    fn install_global_object(store: &mut TestStore, object_type: TypeId) -> SemanticSymbolId {
+        let globals = store.intrinsic_bootstrap().unwrap().globals;
+        let object_symbol = alloc_symbol(store, SymbolFlags::INTERFACE, "Object");
+        assert_eq!(
+            store.insert_symbol(globals, EscapedName::source("Object"), object_symbol),
+            Some(None)
+        );
+        assert!(store.set_declared_type_links(
+            object_symbol,
+            DeclaredTypeLinks {
+                declared_type: Some(object_type),
+                ..DeclaredTypeLinks::default()
+            },
+        ));
+        object_symbol
+    }
+
+    fn alloc_global_property_query(store: &mut TestStore) -> (TypeId, TypeId) {
+        let string = store.intrinsic_bootstrap().unwrap().string_type;
+        let source = alloc_property_object(store, Vec::new());
+        let target_property = alloc_typed_property(store, "custom", string, false);
+        let target = alloc_property_object(store, vec![target_property]);
+        (source, target)
     }
 
     fn alloc_enum_type(store: &mut TestStore, symbol: SemanticSymbolId) -> TypeId {
@@ -1446,6 +2453,645 @@ mod tests {
         assert_eq!(
             store.compare_types_subtype_of(string, number),
             Ok(Ternary::False)
+        );
+    }
+
+    #[test]
+    fn resolved_property_objects_support_width_mismatch_and_missing_checks() {
+        let mut store = initialized(true);
+        let (string, number) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (bootstrap.string_type, bootstrap.number_type)
+        };
+        let source_x = alloc_typed_property(&mut store, "x", string, false);
+        let source_y = alloc_typed_property(&mut store, "y", number, false);
+        let source = alloc_property_object(&mut store, vec![source_x, source_y]);
+
+        let target_x = alloc_typed_property(&mut store, "x", string, false);
+        let target = alloc_property_object(&mut store, vec![target_x]);
+        assert_eq!(store.is_type_assignable_to(source, target), Ok(true));
+
+        let wrong_x = alloc_typed_property(&mut store, "x", number, false);
+        let wrong = alloc_property_object(&mut store, vec![wrong_x]);
+        assert_eq!(store.is_type_assignable_to(source, wrong), Ok(false));
+
+        let missing_z = alloc_typed_property(&mut store, "z", string, false);
+        let missing = alloc_property_object(&mut store, vec![missing_z]);
+        assert_eq!(store.is_type_assignable_to(source, missing), Ok(false));
+        assert_eq!(store.relation_cache_size(RelationKind::Assignable), 3);
+    }
+
+    #[test]
+    fn resolved_interface_properties_use_the_same_structural_path() {
+        let mut store = initialized(true);
+        let string = store.intrinsic_bootstrap().unwrap().string_type;
+        let source_symbol = alloc_symbol(&mut store, SymbolFlags::INTERFACE, "Source");
+        let target_symbol = alloc_symbol(&mut store, SymbolFlags::INTERFACE, "Target");
+        let source = store
+            .alloc_interface_type(ObjectFlags::INTERFACE, Some(source_symbol))
+            .unwrap();
+        let target = store
+            .alloc_interface_type(ObjectFlags::INTERFACE, Some(target_symbol))
+            .unwrap();
+        let source_property = alloc_typed_property(&mut store, "value", string, false);
+        let target_property = alloc_typed_property(&mut store, "value", string, false);
+        assert!(store.set_symbol_relationships(
+            source_property,
+            None,
+            None,
+            Some(source_symbol),
+            None,
+        ));
+        assert!(store.set_symbol_relationships(
+            target_property,
+            None,
+            None,
+            Some(target_symbol),
+            None,
+        ));
+        set_object_properties(&mut store, source, vec![source_property]);
+        set_object_properties(&mut store, target, vec![target_property]);
+        assert_eq!(store.is_type_assignable_to(source, target), Ok(true));
+    }
+
+    #[test]
+    fn optional_properties_are_exact_only_inside_the_supported_nullability_boundary() {
+        let mut loose = initialized(false);
+        let string = loose.intrinsic_bootstrap().unwrap().string_type;
+        let empty = alloc_property_object(&mut loose, Vec::new());
+        let optional_target_property = alloc_typed_property(&mut loose, "value", string, true);
+        let optional_target = alloc_property_object(&mut loose, vec![optional_target_property]);
+        assert_eq!(
+            loose.is_type_assignable_to(empty, optional_target),
+            Ok(true)
+        );
+
+        let optional_source_property = alloc_typed_property(&mut loose, "value", string, true);
+        let optional_source = alloc_property_object(&mut loose, vec![optional_source_property]);
+        let required_target_property = alloc_typed_property(&mut loose, "value", string, false);
+        let required_target = alloc_property_object(&mut loose, vec![required_target_property]);
+        assert_eq!(
+            loose.is_type_assignable_to(optional_source, required_target),
+            Ok(false)
+        );
+
+        let required_source_property = alloc_typed_property(&mut loose, "value", string, false);
+        let required_source = alloc_property_object(&mut loose, vec![required_source_property]);
+        assert_eq!(
+            loose.is_type_assignable_to(required_source, optional_target),
+            Ok(true)
+        );
+
+        let mut strict = initialized(true);
+        let string = strict.intrinsic_bootstrap().unwrap().string_type;
+        let empty = alloc_property_object(&mut strict, Vec::new());
+        let optional_target_property = alloc_typed_property(&mut strict, "value", string, true);
+        let optional_target = alloc_property_object(&mut strict, vec![optional_target_property]);
+        assert_eq!(
+            strict.is_type_assignable_to(empty, optional_target),
+            Ok(true),
+            "an absent optional remains exact after global Object lookup"
+        );
+
+        let required_source_property = alloc_typed_property(&mut strict, "value", string, false);
+        let required_source = alloc_property_object(&mut strict, vec![required_source_property]);
+        let before = strict.relation_state_snapshot();
+        assert_eq!(
+            strict.is_type_assignable_to(required_source, optional_target),
+            Err(RelationUnavailable::StrictOptionalProperty(
+                optional_target_property
+            ))
+        );
+        assert_eq!(strict.relation_state_snapshot(), before);
+
+        let optional_source_property = alloc_typed_property(&mut strict, "value", string, true);
+        let optional_source = alloc_property_object(&mut strict, vec![optional_source_property]);
+        let required_target_property = alloc_typed_property(&mut strict, "value", string, false);
+        let required_target = alloc_property_object(&mut strict, vec![required_target_property]);
+        let before = strict.relation_state_snapshot();
+        assert_eq!(
+            strict.is_type_assignable_to(optional_source, required_target),
+            Err(RelationUnavailable::StrictOptionalProperty(
+                optional_source_property
+            ))
+        );
+        assert_eq!(strict.relation_state_snapshot(), before);
+    }
+
+    #[test]
+    fn weak_targets_require_a_common_own_property_before_recursion() {
+        for strict_null_checks in [false, true] {
+            let mut store = initialized(strict_null_checks);
+            let (string, number) = {
+                let bootstrap = store.intrinsic_bootstrap().unwrap();
+                (bootstrap.string_type, bootstrap.number_type)
+            };
+            let source_property = alloc_typed_property(&mut store, "b", number, false);
+            let source = alloc_property_object(&mut store, vec![source_property]);
+            let target_property = alloc_typed_property(&mut store, "a", string, true);
+            let target = alloc_property_object(&mut store, vec![target_property]);
+
+            assert_eq!(store.is_type_assignable_to(source, target), Ok(false));
+            assert_eq!(
+                store.relation_cache_size(RelationKind::Assignable),
+                0,
+                "the weak-type check runs before recursive relation caching"
+            );
+        }
+
+        let mut loose = initialized(false);
+        let string = loose.intrinsic_bootstrap().unwrap().string_type;
+        let source_property = alloc_typed_property(&mut loose, "a", string, false);
+        let source = alloc_property_object(&mut loose, vec![source_property]);
+        let target_property = alloc_typed_property(&mut loose, "a", string, true);
+        let target = alloc_property_object(&mut loose, vec![target_property]);
+        assert_eq!(loose.is_type_assignable_to(source, target), Ok(true));
+
+        for strict_null_checks in [false, true] {
+            let mut store = initialized(strict_null_checks);
+            let string = store.intrinsic_bootstrap().unwrap().string_type;
+            let global_property = alloc_typed_property(&mut store, "a", string, false);
+            let global_object = alloc_property_object(&mut store, vec![global_property]);
+            install_global_object(&mut store, global_object);
+
+            let source_property = alloc_typed_property(&mut store, "b", string, false);
+            let source = alloc_property_object(&mut store, vec![source_property]);
+            let target_property = alloc_typed_property(&mut store, "a", string, true);
+            let target = alloc_property_object(&mut store, vec![target_property]);
+            assert_eq!(
+                store.is_type_assignable_to(source, target),
+                Ok(false),
+                "global Object augmentation is not an own common property"
+            );
+        }
+
+        let mut loose_global_source = initialized(false);
+        let string = loose_global_source
+            .intrinsic_bootstrap()
+            .unwrap()
+            .string_type;
+        let global_property =
+            alloc_typed_property(&mut loose_global_source, "global", string, false);
+        let global_object = alloc_property_object(&mut loose_global_source, vec![global_property]);
+        install_global_object(&mut loose_global_source, global_object);
+        let target_property = alloc_typed_property(&mut loose_global_source, "a", string, true);
+        let target = alloc_property_object(&mut loose_global_source, vec![target_property]);
+        assert_eq!(
+            loose_global_source.is_type_assignable_to(global_object, target),
+            Ok(true),
+            "the canonical global Object source is exempt from the weak-type check"
+        );
+    }
+
+    #[test]
+    fn nested_self_and_mutually_recursive_properties_terminate_and_cache_success() {
+        let mut nested = initialized(true);
+        let string = nested.intrinsic_bootstrap().unwrap().string_type;
+        let source_leaf_property = alloc_typed_property(&mut nested, "value", string, false);
+        let source_leaf = alloc_property_object(&mut nested, vec![source_leaf_property]);
+        let target_leaf_property = alloc_typed_property(&mut nested, "value", string, false);
+        let target_leaf = alloc_property_object(&mut nested, vec![target_leaf_property]);
+        let source_nested_property =
+            alloc_typed_property(&mut nested, "nested", source_leaf, false);
+        let source = alloc_property_object(&mut nested, vec![source_nested_property]);
+        let target_nested_property =
+            alloc_typed_property(&mut nested, "nested", target_leaf, false);
+        let target = alloc_property_object(&mut nested, vec![target_nested_property]);
+        assert_eq!(nested.is_type_assignable_to(source, target), Ok(true));
+        assert_eq!(
+            nested.relation_cache_size(RelationKind::Assignable),
+            2,
+            "the nested pair and root pair are both published"
+        );
+
+        let mut recursive = initialized(true);
+        let source = alloc_object_shell(&mut recursive);
+        let target = alloc_object_shell(&mut recursive);
+        let source_next = alloc_typed_property(&mut recursive, "next", source, false);
+        let target_next = alloc_typed_property(&mut recursive, "next", target, false);
+        set_object_properties(&mut recursive, source, vec![source_next]);
+        set_object_properties(&mut recursive, target, vec![target_next]);
+        assert_eq!(recursive.is_type_assignable_to(source, target), Ok(true));
+        assert_eq!(
+            recursive.relation_cache_size(RelationKind::Assignable),
+            1,
+            "depth-zero Maybe publishes the active root key"
+        );
+
+        let mut mutual = initialized(true);
+        let source_left = alloc_object_shell(&mut mutual);
+        let source_right = alloc_object_shell(&mut mutual);
+        let target_left = alloc_object_shell(&mut mutual);
+        let target_right = alloc_object_shell(&mut mutual);
+        let source_left_next = alloc_typed_property(&mut mutual, "next", source_right, false);
+        let source_right_next = alloc_typed_property(&mut mutual, "next", source_left, false);
+        let target_left_next = alloc_typed_property(&mut mutual, "next", target_right, false);
+        let target_right_next = alloc_typed_property(&mut mutual, "next", target_left, false);
+        set_object_properties(&mut mutual, source_left, vec![source_left_next]);
+        set_object_properties(&mut mutual, source_right, vec![source_right_next]);
+        set_object_properties(&mut mutual, target_left, vec![target_left_next]);
+        set_object_properties(&mut mutual, target_right, vec![target_right_next]);
+        assert_eq!(
+            mutual.is_type_assignable_to(source_left, target_left),
+            Ok(true)
+        );
+        assert_eq!(mutual.relation_cache_size(RelationKind::Assignable), 2);
+    }
+
+    #[test]
+    fn recursive_mismatch_turns_assumptions_into_a_directional_failure() {
+        let mut store = initialized(true);
+        let (string, number) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (bootstrap.string_type, bootstrap.number_type)
+        };
+        let source = alloc_object_shell(&mut store);
+        let target = alloc_object_shell(&mut store);
+        let source_next = alloc_typed_property(&mut store, "next", source, false);
+        let source_value = alloc_typed_property(&mut store, "value", string, false);
+        let target_next = alloc_typed_property(&mut store, "next", target, false);
+        let target_value = alloc_typed_property(&mut store, "value", number, false);
+        set_object_properties(&mut store, source, vec![source_next, source_value]);
+        set_object_properties(&mut store, target, vec![target_next, target_value]);
+
+        assert_eq!(store.is_type_assignable_to(source, target), Ok(false));
+        let key = store
+            .relation_key_if_available(source, target, super::IntersectionState::NONE, false, false)
+            .unwrap()
+            .key();
+        assert_eq!(
+            store.relation_cache_get(RelationKind::Assignable, key),
+            RelationComparisonResult::FAILED
+        );
+    }
+
+    #[test]
+    fn structural_cache_is_directional_isolated_and_reused() {
+        let mut store = initialized(true);
+        let string = store.intrinsic_bootstrap().unwrap().string_type;
+        let source_x = alloc_typed_property(&mut store, "x", string, false);
+        let source_y = alloc_typed_property(&mut store, "y", string, false);
+        let source = alloc_property_object(&mut store, vec![source_x, source_y]);
+        let target_x = alloc_typed_property(&mut store, "x", string, false);
+        let target = alloc_property_object(&mut store, vec![target_x]);
+
+        assert_eq!(store.is_type_assignable_to(source, target), Ok(true));
+        let after_first = store.relation_state_snapshot();
+        assert_eq!(store.is_type_assignable_to(source, target), Ok(true));
+        assert_eq!(store.relation_state_snapshot(), after_first);
+        assert_eq!(store.is_type_assignable_to(target, source), Ok(false));
+        assert_eq!(store.relation_cache_size(RelationKind::Assignable), 2);
+        assert_eq!(store.relation_cache_size(RelationKind::Subtype), 0);
+        let before_subtype = store.relation_state_snapshot();
+        assert_eq!(
+            store.is_type_subtype_of(source, target),
+            Err(RelationUnavailable::StructuralRelation {
+                source,
+                target,
+                relation: RelationKind::Subtype,
+            })
+        );
+        assert_eq!(store.relation_state_snapshot(), before_subtype);
+    }
+
+    #[test]
+    fn unavailable_or_malformed_structural_inputs_never_commit_pending_cache_entries() {
+        let mut store = initialized(true);
+        let string = store.intrinsic_bootstrap().unwrap().string_type;
+        let unresolved = alloc_object_shell(&mut store);
+        let target = alloc_property_object(&mut store, Vec::new());
+        let before = store.relation_state_snapshot();
+        assert_eq!(
+            store.is_type_assignable_to(unresolved, target),
+            Err(RelationUnavailable::UnresolvedStructuredMembers(unresolved))
+        );
+        assert_eq!(store.relation_state_snapshot(), before);
+
+        let source_property = alloc_symbol(&mut store, SymbolFlags::PROPERTY, "value");
+        let source = alloc_property_object(&mut store, vec![source_property]);
+        let target_property = alloc_typed_property(&mut store, "value", string, false);
+        let typed_target = alloc_property_object(&mut store, vec![target_property]);
+        let before = store.relation_state_snapshot();
+        assert_eq!(
+            store.is_type_assignable_to(source, typed_target),
+            Err(RelationUnavailable::UnresolvedPropertyType(source_property))
+        );
+        assert_eq!(store.relation_state_snapshot(), before);
+
+        let malformed_property = alloc_typed_property(&mut store, "value", string, false);
+        let malformed = alloc_object_shell(&mut store);
+        assert!(store.set_structured_type_members(
+            malformed,
+            None,
+            Some(vec![malformed_property]),
+            None,
+            None,
+            None,
+        ));
+        let before = store.relation_state_snapshot();
+        assert_eq!(
+            store.is_type_assignable_to(malformed, target),
+            Err(RelationUnavailable::InvalidStructuredMembers(malformed))
+        );
+        assert_eq!(store.relation_state_snapshot(), before);
+
+        let signature = store
+            .alloc_signature(
+                SignatureFlags::NONE,
+                None,
+                Vec::new(),
+                None,
+                Vec::new(),
+                None,
+                None,
+                0,
+            )
+            .unwrap();
+        let with_signature = alloc_object_shell(&mut store);
+        assert!(store.set_structured_type_members(
+            with_signature,
+            None,
+            None,
+            Some(vec![signature]),
+            None,
+            None,
+        ));
+        let before = store.relation_state_snapshot();
+        assert_eq!(
+            store.is_type_assignable_to(with_signature, target),
+            Err(RelationUnavailable::StructuredSignatures(with_signature))
+        );
+        assert_eq!(store.relation_state_snapshot(), before);
+
+        let index = store
+            .alloc_index_info(string, string, false, None, Vec::new())
+            .unwrap();
+        let with_index = alloc_object_shell(&mut store);
+        assert!(store.set_structured_type_members(
+            with_index,
+            None,
+            None,
+            None,
+            None,
+            Some(vec![index]),
+        ));
+        let before = store.relation_state_snapshot();
+        assert_eq!(
+            store.is_type_assignable_to(with_index, target),
+            Err(RelationUnavailable::StructuredIndexInfos(with_index))
+        );
+        assert_eq!(store.relation_state_snapshot(), before);
+
+        let source_leaf = alloc_property_object(&mut store, Vec::new());
+        let target_leaf = alloc_property_object(&mut store, Vec::new());
+        let source_first = alloc_typed_property(&mut store, "first", source_leaf, false);
+        let source_late = alloc_symbol(&mut store, SymbolFlags::PROPERTY, "late");
+        let source = alloc_property_object(&mut store, vec![source_first, source_late]);
+        let target_first = alloc_typed_property(&mut store, "first", target_leaf, false);
+        let target_late = alloc_typed_property(&mut store, "late", string, false);
+        let target = alloc_property_object(&mut store, vec![target_first, target_late]);
+        let before = store.relation_state_snapshot();
+        assert_eq!(
+            store.is_type_assignable_to(source, target),
+            Err(RelationUnavailable::UnresolvedPropertyType(source_late))
+        );
+        assert_eq!(
+            store.relation_state_snapshot(),
+            before,
+            "a later typed boundary discards an earlier nested success"
+        );
+    }
+
+    #[test]
+    fn global_object_fallback_distinguishes_absent_resolved_and_unresolved_states() {
+        let mut absent = initialized(true);
+        let string = absent.intrinsic_bootstrap().unwrap().string_type;
+        let source = alloc_property_object(&mut absent, Vec::new());
+        let target_property = alloc_typed_property(&mut absent, "custom", string, false);
+        let target = alloc_property_object(&mut absent, vec![target_property]);
+        assert_eq!(absent.is_type_assignable_to(source, target), Ok(false));
+
+        let mut unresolved = initialized(true);
+        let string = unresolved.intrinsic_bootstrap().unwrap().string_type;
+        let globals = unresolved.intrinsic_bootstrap().unwrap().globals;
+        let object_symbol = alloc_symbol(&mut unresolved, SymbolFlags::INTERFACE, "Object");
+        assert_eq!(
+            unresolved.insert_symbol(globals, EscapedName::source("Object"), object_symbol),
+            Some(None)
+        );
+        let source = alloc_property_object(&mut unresolved, Vec::new());
+        let target_property = alloc_typed_property(&mut unresolved, "custom", string, false);
+        let target = alloc_property_object(&mut unresolved, vec![target_property]);
+        let before = unresolved.relation_state_snapshot();
+        assert_eq!(
+            unresolved.is_type_assignable_to(source, target),
+            Err(RelationUnavailable::UnresolvedGlobalObject(object_symbol))
+        );
+        assert_eq!(unresolved.relation_state_snapshot(), before);
+
+        let object_type = unresolved
+            .alloc_interface_type(ObjectFlags::INTERFACE, Some(object_symbol))
+            .unwrap();
+        assert!(unresolved.set_declared_type_links(
+            object_symbol,
+            DeclaredTypeLinks {
+                declared_type: Some(object_type),
+                ..DeclaredTypeLinks::default()
+            },
+        ));
+        let before = unresolved.relation_state_snapshot();
+        assert_eq!(
+            unresolved.is_type_assignable_to(source, target),
+            Err(RelationUnavailable::UnresolvedStructuredMembers(
+                object_type
+            ))
+        );
+        assert_eq!(unresolved.relation_state_snapshot(), before);
+
+        let mut resolved = initialized(true);
+        let (string, number, globals) = {
+            let bootstrap = resolved.intrinsic_bootstrap().unwrap();
+            (
+                bootstrap.string_type,
+                bootstrap.number_type,
+                bootstrap.globals,
+            )
+        };
+        let object_symbol = alloc_symbol(&mut resolved, SymbolFlags::INTERFACE, "Object");
+        assert_eq!(
+            resolved.insert_symbol(globals, EscapedName::source("Object"), object_symbol),
+            Some(None)
+        );
+        let object_type = resolved
+            .alloc_interface_type(ObjectFlags::INTERFACE, Some(object_symbol))
+            .unwrap();
+        let global_property = alloc_typed_property(&mut resolved, "custom", string, false);
+        set_object_properties(&mut resolved, object_type, vec![global_property]);
+        assert!(resolved.set_declared_type_links(
+            object_symbol,
+            DeclaredTypeLinks {
+                declared_type: Some(object_type),
+                ..DeclaredTypeLinks::default()
+            },
+        ));
+
+        let source = alloc_property_object(&mut resolved, Vec::new());
+        let compatible_property = alloc_typed_property(&mut resolved, "custom", string, false);
+        let compatible = alloc_property_object(&mut resolved, vec![compatible_property]);
+        assert_eq!(resolved.is_type_assignable_to(source, compatible), Ok(true));
+
+        let incompatible_property = alloc_typed_property(&mut resolved, "custom", number, false);
+        let incompatible = alloc_property_object(&mut resolved, vec![incompatible_property]);
+        assert_eq!(
+            resolved.is_type_assignable_to(source, incompatible),
+            Ok(false)
+        );
+
+        let absent_property = alloc_typed_property(&mut resolved, "other", string, false);
+        let absent_target = alloc_property_object(&mut resolved, vec![absent_property]);
+        assert_eq!(
+            resolved.is_type_assignable_to(source, absent_target),
+            Ok(false)
+        );
+    }
+
+    #[test]
+    fn global_object_fallback_validates_the_complete_resolved_shape() {
+        let mut unsupported = initialized(true);
+        let global_object = unsupported
+            .alloc_type_reference(ObjectFlags::NONE, None)
+            .unwrap();
+        assert!(unsupported.set_structured_type_members(
+            global_object,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ));
+        install_global_object(&mut unsupported, global_object);
+        let (source, target) = alloc_global_property_query(&mut unsupported);
+        let before = unsupported.relation_state_snapshot();
+        assert_eq!(
+            unsupported.is_type_assignable_to(source, target),
+            Err(RelationUnavailable::UnsupportedStructuredType(
+                global_object
+            ))
+        );
+        assert_eq!(unsupported.relation_state_snapshot(), before);
+
+        let mut malformed = initialized(true);
+        let string = malformed.intrinsic_bootstrap().unwrap().string_type;
+        let global_object = alloc_object_shell(&mut malformed);
+        let global_property = alloc_typed_property(&mut malformed, "custom", string, false);
+        assert!(malformed.set_structured_type_members(
+            global_object,
+            None,
+            Some(vec![global_property]),
+            None,
+            None,
+            None,
+        ));
+        install_global_object(&mut malformed, global_object);
+        let (source, target) = alloc_global_property_query(&mut malformed);
+        let before = malformed.relation_state_snapshot();
+        assert_eq!(
+            malformed.is_type_assignable_to(source, target),
+            Err(RelationUnavailable::InvalidStructuredMembers(global_object))
+        );
+        assert_eq!(malformed.relation_state_snapshot(), before);
+
+        let mut unrelated = initialized(true);
+        let string = unrelated.intrinsic_bootstrap().unwrap().string_type;
+        let method = alloc_symbol(&mut unrelated, SymbolFlags::METHOD, "unrelated");
+        let members = unrelated.alloc_symbol_table();
+        assert_eq!(
+            unrelated.insert_symbol(members, EscapedName::source("unrelated"), method),
+            Some(None)
+        );
+        let signature = unrelated
+            .alloc_signature(
+                SignatureFlags::NONE,
+                None,
+                Vec::new(),
+                None,
+                Vec::new(),
+                None,
+                None,
+                0,
+            )
+            .unwrap();
+        let index = unrelated
+            .alloc_index_info(string, string, false, None, Vec::new())
+            .unwrap();
+        let global_object = alloc_object_shell(&mut unrelated);
+        assert!(unrelated.set_structured_type_members(
+            global_object,
+            Some(members),
+            Some(vec![method]),
+            Some(vec![signature]),
+            None,
+            Some(vec![index]),
+        ));
+        install_global_object(&mut unrelated, global_object);
+        let source = alloc_property_object(&mut unrelated, Vec::new());
+        let target_property = alloc_typed_property(&mut unrelated, "a", string, true);
+        let target = alloc_property_object(&mut unrelated, vec![target_property]);
+        assert_eq!(
+            unrelated.is_type_assignable_to(source, target),
+            Ok(true),
+            "unrelated global methods, signatures, and indexes do not affect an absent lookup"
+        );
+
+        let mut requested = initialized(true);
+        let method = alloc_symbol(&mut requested, SymbolFlags::METHOD, "custom");
+        let global_object = alloc_property_object(&mut requested, vec![method]);
+        install_global_object(&mut requested, global_object);
+        let (source, target) = alloc_global_property_query(&mut requested);
+        let before = requested.relation_state_snapshot();
+        assert_eq!(
+            requested.is_type_assignable_to(source, target),
+            Err(RelationUnavailable::UnsupportedProperty(method))
+        );
+        assert_eq!(requested.relation_state_snapshot(), before);
+    }
+
+    #[test]
+    fn test_limits_publish_exact_complexity_and_stack_overflow_results() {
+        let mut complexity = initialized(true);
+        let source = alloc_property_object(&mut complexity, Vec::new());
+        let target = alloc_property_object(&mut complexity, Vec::new());
+        assert_eq!(
+            complexity.is_type_assignable_to_with_test_limits(source, target, 0, 100),
+            Ok(false)
+        );
+        let key = complexity
+            .relation_key_if_available(source, target, super::IntersectionState::NONE, false, false)
+            .unwrap()
+            .key();
+        assert_eq!(
+            complexity.relation_cache_get(RelationKind::Assignable, key),
+            RelationComparisonResult::FAILED | RelationComparisonResult::COMPLEXITY_OVERFLOW
+        );
+
+        let mut depth = initialized(true);
+        let source_inner = alloc_property_object(&mut depth, Vec::new());
+        let target_inner = alloc_property_object(&mut depth, Vec::new());
+        let source_property = alloc_typed_property(&mut depth, "nested", source_inner, false);
+        let target_property = alloc_typed_property(&mut depth, "nested", target_inner, false);
+        let source = alloc_property_object(&mut depth, vec![source_property]);
+        let target = alloc_property_object(&mut depth, vec![target_property]);
+        assert_eq!(
+            depth.is_type_assignable_to_with_test_limits(source, target, 100, 1),
+            Ok(false)
+        );
+        let key = depth
+            .relation_key_if_available(source, target, super::IntersectionState::NONE, false, false)
+            .unwrap()
+            .key();
+        assert_eq!(
+            depth.relation_cache_get(RelationKind::Assignable, key),
+            RelationComparisonResult::FAILED | RelationComparisonResult::STACK_DEPTH_OVERFLOW
         );
     }
 
