@@ -367,6 +367,22 @@ remains the cluster-level source of truth.
   legacy fallback. The combined stack passes all 539 checker library tests;
   its formatter and export-source reviews found no remaining P0-P2 issue, and
   rustdoc, the compile-fail doctest, and scoped all-target Clippy are green.
+- C00's first whole-Program route is integrated through `32d22b7`. The explicit
+  experimental constructor retains the ordinary Program graph and diagnostics
+  but suppresses legacy binder/checker semantics, preflights every source fact,
+  performs canonical traversal for all files before declaration replay, and
+  creates one local `CanonicalCheckerContext` borrowing the Program's arenas.
+  Only owned diagnostics cross that scope, and they are appended only after
+  every eligible source succeeds; a later unsupported file therefore discards
+  all earlier semantic work. Emit is explicitly refused. The initial admitted
+  source-fact boundary is conservative: unambiguous `.ts` plus bundled library
+  declarations; TSX, fixed `.mts`/`.cts` formats, `import.meta`, Node implied
+  formats, and unskipped non-default declarations fail typed before canonical
+  binding. The independent facts re-review found no remaining P0-P2 issue, and
+  all eight canonical Program tests pass on the merged branch. Program-level
+  diagnostic sorting/deduplication and related-information ownership, fixture
+  CLI selection, full modern module facts, and canonical emit remain explicit
+  follow-up work.
 
 No percentage in this section is a whole-corpus parity claim. A score is
 publishable only when its variant manifest and complete artifact comparison are
