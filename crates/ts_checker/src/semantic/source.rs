@@ -3619,7 +3619,7 @@ mod tests {
 
     #[test]
     fn declared_property_objects_are_array_union_elements_cold_warm_and_recursive() {
-        let library = parsed("interface Array<T> {}");
+        let library = parsed("interface Array<T> {} interface ReadonlyArray<T> {}");
         let source = parsed(concat!(
             "interface Foo { value: string } ",
             "type Shape = { value: number }; ",
@@ -3629,11 +3629,15 @@ mod tests {
             "type InlineMaybe = ({ enabled: boolean })[] | null; ",
             "type EmptyMaybe = {}[] | null; ",
             "type NodeMaybe = Node[] | null; ",
+            "type DirectFooMaybe = Array<Foo> | null; ",
+            "type ReadonlyShapeMaybe = ReadonlyArray<Shape> | null; ",
             "let foo: FooMaybe = null; ",
             "let shape: ShapeMaybe = null; ",
             "let inline: InlineMaybe = null; ",
             "let empty: EmptyMaybe = null; ",
-            "let node: NodeMaybe = null;",
+            "let node: NodeMaybe = null; ",
+            "let directFoo: DirectFooMaybe = null; ",
+            "let readonlyShape: ReadonlyShapeMaybe = null;",
         ));
         let library_file = FileId::new(143);
         let file = FileId::new(144);
@@ -3658,6 +3662,11 @@ mod tests {
             ("InlineMaybe", DeclaredPropertyObjectProof::TypeLiteral),
             ("EmptyMaybe", DeclaredPropertyObjectProof::TypeLiteral),
             ("NodeMaybe", DeclaredPropertyObjectProof::Interface),
+            ("DirectFooMaybe", DeclaredPropertyObjectProof::Interface),
+            (
+                "ReadonlyShapeMaybe",
+                DeclaredPropertyObjectProof::TypeLiteral,
+            ),
         ] {
             let body = type_alias_body(&source, file, alias);
             let union = context.get_type_from_type_node(body).unwrap();
