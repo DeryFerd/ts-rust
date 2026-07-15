@@ -12,6 +12,7 @@ pub mod alias_provider;
 pub mod bootstrap;
 pub mod declared;
 pub mod diagnostics;
+pub mod formatter;
 mod global_types;
 pub mod ids;
 pub mod links;
@@ -41,6 +42,11 @@ pub use declared::{
 };
 pub use diagnostics::{
     CanonicalCheckerDiagnostic, CanonicalCheckerDiagnostics, CanonicalCheckerRelatedInformation,
+};
+pub use formatter::{
+    AssignabilityErrorDisplay, CanonicalTypeFormatFlags, TypeDisplayUnavailable,
+    get_type_names_for_assignability_error, get_type_names_for_assignability_error_with_flags,
+    type_to_string, type_to_string_with_flags,
 };
 pub use global_types::{
     CanonicalGlobalTypeDiagnostic, CanonicalGlobalTypeInitializationError, CanonicalGlobalTypes,

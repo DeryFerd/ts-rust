@@ -21,11 +21,12 @@ use ts_binder::{
 };
 
 use super::{
-    CanonicalCheckerDiagnostics, CanonicalGlobalTypeInitializationError, CanonicalGlobalTypes,
-    CanonicalModuleResolutionLookup, CanonicalModuleResolutionManifest,
+    AssignabilityErrorDisplay, CanonicalCheckerDiagnostics, CanonicalGlobalTypeInitializationError,
+    CanonicalGlobalTypes, CanonicalModuleResolutionLookup, CanonicalModuleResolutionManifest,
     CanonicalModuleResolutionManifestError, CanonicalModuleResolutionManifestInput,
-    CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHost, DeclaredTypeHostError,
-    IntrinsicBootstrapError, IntrinsicBootstrapOptions, SourceFileRef, SymbolMergeError, TypeId,
+    CanonicalTypeFormatFlags, CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHost,
+    DeclaredTypeHostError, IntrinsicBootstrapError, IntrinsicBootstrapOptions, SourceFileRef,
+    SymbolMergeError, TypeDisplayUnavailable, TypeId,
     alias::{CanonicalAliasResolution, CanonicalAliasResolutionError, CanonicalAliasResolver},
     alias_flags::{
         CanonicalSymbolFlagsError, CanonicalSymbolFlagsResolution, CanonicalSymbolFlagsResolver,
@@ -332,6 +333,47 @@ impl<'arena> CanonicalCheckerContext<'arena> {
     #[must_use]
     pub const fn store(&self) -> &CanonicalTypeMapperStore {
         &self.store
+    }
+
+    /// Formats one context-owned type through the dependency-closed canonical
+    /// semantic formatter.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TypeDisplayUnavailable`] when the type is foreign, malformed,
+    /// or requires a display family not installed in the current checker cut.
+    pub fn type_to_string(&self, type_id: TypeId) -> Result<String, TypeDisplayUnavailable> {
+        super::formatter::type_to_string(&self.store, type_id)
+    }
+
+    /// Flag-aware form of [`Self::type_to_string`] for the exact format flags
+    /// observable in the installed primitive/literal prefix.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TypeDisplayUnavailable`] under the same conditions as the
+    /// default query.
+    pub fn type_to_string_with_flags(
+        &self,
+        type_id: TypeId,
+        flags: CanonicalTypeFormatFlags,
+    ) -> Result<String, TypeDisplayUnavailable> {
+        super::formatter::type_to_string_with_flags(&self.store, type_id, flags)
+    }
+
+    /// Computes exact TS2322 source and target display arguments without
+    /// mutating checker state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TypeDisplayUnavailable`] when either type or its pinned
+    /// relation-diagnostic representation is outside the installed prefix.
+    pub fn get_type_names_for_assignability_error(
+        &self,
+        source: TypeId,
+        target: TypeId,
+    ) -> Result<AssignabilityErrorDisplay, TypeDisplayUnavailable> {
+        super::formatter::get_type_names_for_assignability_error(&self.store, source, target)
     }
 
     /// The bootstrap-owned global symbol table after the supported
