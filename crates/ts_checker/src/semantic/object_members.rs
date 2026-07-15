@@ -255,10 +255,58 @@ pub(super) fn plan_interface(
     let Some(symbol_record) = store.symbol(symbol) else {
         unreachable!("get_merged_symbol returned a store-owned symbol")
     };
-    let Some([declaration]) = symbol_record.declarations() else {
+    let Some(declarations) = symbol_record
+        .declarations()
+        .filter(|declarations| !declarations.is_empty())
+    else {
         return Err(PropertyObjectError::InvalidInterfaceSymbol(symbol));
     };
-    let declaration = *declaration;
+    // `resolveDeclaredMembers` reads the merged symbol's member table
+    // independently of its value side. A function-scoped value declaration
+    // such as the standard library's `declare var Object` is therefore inert
+    // for this property-only interface plan.
+    let mut declaration = None;
+    let mut value_declarations = Vec::new();
+    let mut seen_declarations = HashSet::new();
+    for candidate in declarations {
+        if !seen_declarations.insert(*candidate) {
+            return Err(PropertyObjectError::InvalidInterface {
+                declaration: *candidate,
+                symbol,
+            });
+        }
+        let record = preflight_node(store, host, *candidate).map_err(|_| {
+            PropertyObjectError::InvalidInterface {
+                declaration: *candidate,
+                symbol,
+            }
+        })?;
+        if !host.symbol_matches(store, *candidate, symbol) {
+            return Err(PropertyObjectError::InvalidInterface {
+                declaration: *candidate,
+                symbol,
+            });
+        }
+        match (record.kind, &record.data) {
+            (SyntaxKind::InterfaceDeclaration, NodeData::InterfaceDeclaration(_))
+                if declaration.is_none() =>
+            {
+                declaration = Some(*candidate);
+            }
+            (SyntaxKind::VariableDeclaration, NodeData::VariableDeclaration(_)) => {
+                value_declarations.push(*candidate);
+            }
+            _ => {
+                return Err(PropertyObjectError::InvalidInterface {
+                    declaration: *candidate,
+                    symbol,
+                });
+            }
+        }
+    }
+    let Some(declaration) = declaration else {
+        return Err(PropertyObjectError::InvalidInterfaceSymbol(symbol));
+    };
     let record = preflight_node(store, host, declaration).map_err(|_| {
         PropertyObjectError::InvalidInterface {
             declaration,
@@ -283,13 +331,23 @@ pub(super) fn plan_interface(
             symbol,
         });
     };
+    let expected_symbol_flags = SymbolFlags::INTERFACE
+        | if value_declarations.is_empty() {
+            SymbolFlags::NONE
+        } else {
+            SymbolFlags::FUNCTION_SCOPED_VARIABLE
+        };
+    let valid_value_declaration = match symbol_record.value_declaration() {
+        None => value_declarations.is_empty(),
+        Some(value) => value_declarations.contains(&value),
+    };
     if record.kind != SyntaxKind::InterfaceDeclaration
         || record.flags.0 != 0
         || !host.symbol_matches(store, declaration, symbol)
-        || symbol_record.flags() != SymbolFlags::INTERFACE
+        || symbol_record.flags() != expected_symbol_flags
         || symbol_record.check_flags() != CheckFlags::NONE
         || symbol_record.name().as_utf8() != Some(identifier.text.as_str())
-        || symbol_record.value_declaration().is_some()
+        || !valid_value_declaration
         || symbol_record.parent().is_some()
         || symbol_record.exports().is_some()
         || symbol_record.export_symbol().is_some()
@@ -795,7 +853,7 @@ fn validate_interface_record(
         return None;
     }
     if record.object_flags() == ObjectFlags::INTERFACE
-        && interface == &InterfaceTypeData::default()
+        && valid_unresolved_interface_members(interface)
         && unresolved_property_links(store, plan)
     {
         return Some(PropertyObjectState::Shell(type_));
@@ -846,6 +904,21 @@ fn valid_thisless_interface_identity(interface: &InterfaceTypeData) -> bool {
         && interface.reference.object.instantiations == TypeCacheState::Unallocated
         && interface.reference.node.is_none()
         && interface.reference.resolved_type_arguments.is_none()
+}
+
+fn valid_unresolved_interface_members(interface: &InterfaceTypeData) -> bool {
+    // Pinned `getBaseTypes` and `resolveDeclaredMembers` have independent
+    // caches. Resolving an empty base list before declared members is a valid
+    // shell state, not a corrupt partially initialized interface.
+    valid_thisless_interface_identity(interface)
+        && interface.reference.object.structured == StructuredTypeData::default()
+        && interface.resolved_base_constructor_type.is_none()
+        && interface.resolved_base_types.is_none()
+        && !interface.declared_members_resolved
+        && interface.declared_members.is_none()
+        && interface.declared_call_signatures.is_none()
+        && interface.declared_construct_signatures.is_none()
+        && interface.declared_index_infos.is_none()
 }
 
 fn valid_declared_structured_members(object: &ObjectTypeData, plan: &PropertyObjectPlan) -> bool {

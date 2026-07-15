@@ -7769,6 +7769,214 @@ mod tests {
     }
 
     #[test]
+    fn interface_member_cache_accepts_cold_bases_warm_and_members_warm_states() {
+        let mut cold = fixture("interface Model { value: string } let model: Model;");
+        let model = canonical_fixture_symbol(&cold, SyntaxKind::InterfaceDeclaration, "Model");
+        let reference = variable_type_node(&cold, "model");
+        let plan = {
+            let host = post_global_host(
+                &cold.parsed.arena,
+                cold.files.get(&cold.file).unwrap(),
+            );
+            object_members::plan_interface(&cold.store, &host, model).unwrap()
+        };
+        let declared_type = {
+            let host = post_global_host(
+                &cold.parsed.arena,
+                cold.files.get(&cold.file).unwrap(),
+            );
+            cold
+                .store
+                .get_declared_type_of_symbol(&host, model)
+                .unwrap()
+        };
+
+        assert_eq!(
+            object_members::interface_state(&cold.store, &plan, declared_type),
+            Ok(PropertyObjectState::Shell(declared_type)),
+            "a cold declared-member shell is valid"
+        );
+        assert!(
+            cold
+                .store
+                .publish_interface_no_base_resolution(declared_type)
+        );
+        assert_eq!(
+            object_members::interface_state(&cold.store, &plan, declared_type),
+            Ok(PropertyObjectState::Shell(declared_type)),
+            "base resolution and declared-member resolution are independent caches"
+        );
+
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        assert_eq!(
+            query_node(&mut cold, reference, &mut diagnostics),
+            Ok(declared_type)
+        );
+        assert_eq!(
+            object_members::interface_state(&cold.store, &plan, declared_type),
+            Ok(PropertyObjectState::Resolved(declared_type))
+        );
+        let TypeData::Interface(interface) =
+            cold.store.type_payload(declared_type).unwrap().data()
+        else {
+            panic!("interface member publication preserves its declared identity")
+        };
+        assert!(interface.base_types_resolved);
+        assert!(interface.declared_members_resolved);
+        let warm_state = store_state(&cold.store);
+        assert_eq!(
+            query_node(&mut cold, reference, &mut diagnostics),
+            Ok(declared_type)
+        );
+        assert_eq!(store_state(&cold.store), warm_state);
+        assert!(diagnostics.is_empty());
+
+        let mut poisoned = fixture("interface Model { value: string } let model: Model;");
+        let model =
+            canonical_fixture_symbol(&poisoned, SyntaxKind::InterfaceDeclaration, "Model");
+        let reference = variable_type_node(&poisoned, "model");
+        let plan = {
+            let host = post_global_host(
+                &poisoned.parsed.arena,
+                poisoned.files.get(&poisoned.file).unwrap(),
+            );
+            object_members::plan_interface(&poisoned.store, &host, model).unwrap()
+        };
+        let declared_type = {
+            let host = post_global_host(
+                &poisoned.parsed.arena,
+                poisoned.files.get(&poisoned.file).unwrap(),
+            );
+            poisoned
+                .store
+                .get_declared_type_of_symbol(&host, model)
+                .unwrap()
+        };
+        assert!(poisoned.store.set_interface_base_resolution(
+            declared_type,
+            true,
+            None,
+            Some(Vec::new()),
+        ));
+        assert_eq!(
+            object_members::interface_state(&poisoned.store, &plan, declared_type),
+            Err(PropertyObjectError::InvalidCachedInterface {
+                symbol: model,
+                type_: declared_type,
+            })
+        );
+        let poisoned_state = store_state(&poisoned.store);
+        assert_eq!(
+            query_node(&mut poisoned, reference, &mut diagnostics),
+            Err(DeclaredTypeError::Unavailable(
+                DeclaredTypeUnavailable::InvalidCachedDeclaredType {
+                    symbol: model,
+                    declared_type,
+                }
+            ))
+        );
+        assert_eq!(store_state(&poisoned.store), poisoned_state);
+    }
+
+    #[test]
+    fn global_object_interface_value_merge_resolves_the_type_side_only() {
+        let source = concat!(
+            "interface Object {} ",
+            "declare var Object: unknown; ",
+            "let value: Object;",
+        );
+        let mut merged = fixture(source);
+        let object =
+            canonical_fixture_symbol(&merged, SyntaxKind::InterfaceDeclaration, "Object");
+        let interface_declaration =
+            named_node(&merged, SyntaxKind::InterfaceDeclaration, "Object");
+        let value_declaration = named_node(&merged, SyntaxKind::VariableDeclaration, "Object");
+        let reference = variable_type_node(&merged, "value");
+        let symbol = merged.store.symbol(object).unwrap();
+        assert_eq!(
+            symbol.flags(),
+            SymbolFlags::INTERFACE | SymbolFlags::FUNCTION_SCOPED_VARIABLE
+        );
+        assert_eq!(symbol.value_declaration(), Some(value_declaration));
+        assert_eq!(
+            symbol.declarations(),
+            Some([interface_declaration, value_declaration].as_slice())
+        );
+        let plan = {
+            let host = post_global_host(
+                &merged.parsed.arena,
+                merged.files.get(&merged.file).unwrap(),
+            );
+            object_members::plan_interface(&merged.store, &host, object).unwrap()
+        };
+        assert!(plan.properties.is_empty());
+
+        let object_type = {
+            let host = post_global_host(
+                &merged.parsed.arena,
+                merged.files.get(&merged.file).unwrap(),
+            );
+            merged
+                .store
+                .get_declared_type_of_symbol(&host, object)
+                .unwrap()
+        };
+        assert!(
+            merged
+                .store
+                .publish_interface_no_base_resolution(object_type)
+        );
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        assert_eq!(
+            query_node(&mut merged, reference, &mut diagnostics),
+            Ok(object_type)
+        );
+        assert_eq!(
+            object_members::interface_state(&merged.store, &plan, object_type),
+            Ok(PropertyObjectState::Resolved(object_type))
+        );
+        assert!(diagnostics.is_empty());
+
+        let mut poisoned = fixture(source);
+        let object =
+            canonical_fixture_symbol(&poisoned, SyntaxKind::InterfaceDeclaration, "Object");
+        let declaration = named_node(&poisoned, SyntaxKind::InterfaceDeclaration, "Object");
+        assert!(poisoned.store.set_symbol_flags(
+            object,
+            SymbolFlags::INTERFACE
+                | SymbolFlags::FUNCTION_SCOPED_VARIABLE
+                | SymbolFlags::VALUE_MODULE,
+            CheckFlags::NONE,
+        ));
+        let before = store_state(&poisoned.store);
+        let result = {
+            let host = post_global_host(
+                &poisoned.parsed.arena,
+                poisoned.files.get(&poisoned.file).unwrap(),
+            );
+            object_members::plan_interface(&poisoned.store, &host, object)
+        };
+        assert_eq!(
+            result,
+            Err(PropertyObjectError::InvalidInterface {
+                declaration,
+                symbol: object,
+            })
+        );
+        assert_eq!(store_state(&poisoned.store), before);
+        assert!(
+            query_declared(
+                &mut poisoned,
+                object,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .is_err()
+        );
+        assert_eq!(store_state(&poisoned.store), before);
+    }
+
+    #[test]
     fn inline_empty_type_literal_reuses_bootstrap_but_aliased_empty_is_distinct() {
         let mut fixture = fixture("let inline: {}; type Empty = {};");
         let inline = variable_type_node(&fixture, "inline");
