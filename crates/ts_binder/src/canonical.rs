@@ -692,6 +692,13 @@ struct PreparedDeclaration {
     export_type_suggestion: Option<CanonicalRelatedInformation>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct ExpandoAssignmentInfo {
+    node: NodeId,
+    container: Option<NodeId>,
+    block_scope_container: Option<NodeId>,
+}
+
 #[derive(Debug, Default)]
 pub struct CanonicalBinder {
     symbols: SymbolStore,
@@ -784,8 +791,42 @@ impl CanonicalBinder {
         is_replaceable_by_method: bool,
         is_computed_name: bool,
     ) -> Result<SemanticSymbolId, CanonicalDeclarationError> {
+        self.declare_symbol_ex_worker(
+            arena,
+            file,
+            symbol_table,
+            parent,
+            node,
+            includes,
+            excludes,
+            is_replaceable_by_method,
+            is_computed_name,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    fn declare_symbol_ex_worker(
+        &mut self,
+        arena: &NodeArena,
+        file: FileId,
+        symbol_table: SymbolTableId,
+        parent: Option<SemanticSymbolId>,
+        node: NodeId,
+        includes: SymbolFlags,
+        excludes: SymbolFlags,
+        is_replaceable_by_method: bool,
+        is_computed_name: bool,
+        has_known_typescript_file_kind: bool,
+    ) -> Result<SemanticSymbolId, CanonicalDeclarationError> {
         let node_ref = self.preflight_declaration(arena, file, symbol_table, parent, node)?;
-        let prepared = self.prepare_declaration(arena, node_ref, parent, is_computed_name)?;
+        let prepared = self.prepare_declaration(
+            arena,
+            node_ref,
+            parent,
+            is_computed_name,
+            has_known_typescript_file_kind,
+        )?;
         let is_missing = prepared.name.as_ref() == InternalSymbolName::Missing.as_ref();
 
         let symbol = if is_missing {
@@ -1014,6 +1055,27 @@ impl CanonicalBinder {
                 NodeRef::new(arena.id(), file, node),
             ));
         }
+        // TypeScript-Go records these while traversing, including the exact
+        // scope pair active at the assignment. The immutable Rust traversal
+        // already captured that state, so build the same ordered queue before
+        // any declaration writes and replay it only after ordinary binding.
+        let expando_assignments = order
+            .iter()
+            .copied()
+            .filter(|node| is_typescript_expando_property_assignment(arena, *node))
+            .map(|node| {
+                let binding = self
+                    .files
+                    .get(&file)
+                    .and_then(|bound| bound.nodes.get(node.index()))
+                    .expect("expando assignment was captured by traversal");
+                ExpandoAssignmentInfo {
+                    node,
+                    container: binding.container,
+                    block_scope_container: binding.block_scope_container,
+                }
+            })
+            .collect::<Vec<_>>();
         let module_states = order
             .iter()
             .copied()
@@ -1027,6 +1089,7 @@ impl CanonicalBinder {
         for node in order {
             self.bind_declaration_node(arena, file, node, &facts, &module_states)?;
         }
+        self.bind_deferred_expando_assignments(arena, file, &expando_assignments);
         let bound = self
             .files
             .get_mut(&file)
@@ -1942,16 +2005,250 @@ impl CanonicalBinder {
             let container = self
                 .declaration_container(file, node)
                 .expect("anonymous member declarations have a container");
-            let parent = self
-                .bound_node_symbol(file, container)
-                .expect("anonymous member container is already declared");
-            assert!(
-                self.symbols
-                    .set_symbol_relationships(symbol, None, None, Some(parent), None)
-            );
+            // A script source file has no symbol. TypeScript-Go writes the
+            // current container's (possibly nil) symbol as the anonymous
+            // declaration's parent, so retain `None` for that exact case.
+            if let Some(parent) = self.bound_node_symbol(file, container) {
+                assert!(self.symbols.set_symbol_relationships(
+                    symbol,
+                    None,
+                    None,
+                    Some(parent),
+                    None,
+                ));
+            } else {
+                assert!(
+                    arena
+                        .get(container)
+                        .is_some_and(|container| container.kind == SyntaxKind::SourceFile)
+                        && self
+                            .files
+                            .get(&file)
+                            .and_then(|bound| bound.source_facts.as_ref())
+                            .is_some_and(|facts| !facts.is_external_module()),
+                    "only a script source container has an absent declaration symbol",
+                );
+            }
         }
         self.add_declaration_to_symbol(symbol, node_ref, includes, declaration_facts);
         symbol
+    }
+
+    fn bind_deferred_expando_assignments(
+        &mut self,
+        arena: &NodeArena,
+        file: FileId,
+        assignments: &[ExpandoAssignmentInfo],
+    ) {
+        for assignment in assignments {
+            self.bind_deferred_expando_assignment(arena, file, *assignment);
+        }
+    }
+
+    fn bind_deferred_expando_assignment(
+        &mut self,
+        arena: &NodeArena,
+        file: FileId,
+        assignment: ExpandoAssignmentInfo,
+    ) {
+        let parent = expando_assignment_parent(arena, assignment.node)
+            .expect("the TypeScript expando queue contains only access assignments");
+        let mut symbol = assignment
+            .block_scope_container
+            .and_then(|container| self.lookup_entity(arena, file, parent, container));
+        // A block-scope hit shadows the semantic-container table even when it
+        // is not an expando-capable initializer. Only an actual lookup miss
+        // takes the fallback, matching the pinned binder.
+        if symbol.is_none() {
+            symbol = assignment
+                .container
+                .and_then(|container| self.lookup_entity(arena, file, parent, container));
+        }
+        let Some(symbol) = symbol.and_then(|symbol| {
+            self.get_typescript_expando_initializer_symbol(arena, file, symbol)
+        }) else {
+            return;
+        };
+
+        if has_dynamic_name(arena, assignment.node) {
+            self.bind_anonymous_declaration(
+                arena,
+                file,
+                assignment.node,
+                SymbolFlags::PROPERTY | SymbolFlags::ASSIGNMENT,
+                EscapedName::internal(InternalSymbolName::Computed),
+            );
+            self.add_late_bound_assignment_declaration(arena, file, assignment.node, symbol);
+            return;
+        }
+
+        let exports = self.ensure_symbol_exports(symbol);
+        let name = self
+            .get_declaration_name(
+                arena,
+                NodeRef::new(arena.id(), file, assignment.node),
+            )
+            .expect("TypeScript expando name shapes were preflighted");
+        let may_declare = self
+            .symbols
+            .symbol_table(exports)
+            .expect("expando export table is store-owned")
+            .get(name.as_ref())
+            .is_none_or(|existing| {
+                self.symbols
+                    .symbol(existing)
+                    .expect("expando table entries are store-owned")
+                    .flags()
+                    .intersects(SymbolFlags::ASSIGNMENT)
+            });
+        if may_declare {
+            self.declare_symbol_ex_worker(
+                arena,
+                file,
+                exports,
+                Some(symbol),
+                assignment.node,
+                SymbolFlags::PROPERTY | SymbolFlags::ASSIGNMENT,
+                SymbolFlags::PROPERTY_EXCLUDES,
+                false,
+                false,
+                true,
+            )
+            .expect("TypeScript expando declarations were preflighted");
+        }
+    }
+
+    fn add_late_bound_assignment_declaration(
+        &mut self,
+        arena: &NodeArena,
+        file: FileId,
+        node: NodeId,
+        symbol: SemanticSymbolId,
+    ) {
+        let exports = self.ensure_symbol_exports(symbol);
+        let assignment = self
+            .symbols
+            .symbol_table(exports)
+            .expect("late-bound export table is store-owned")
+            .get(InternalSymbolName::AssignmentDeclaration.as_ref())
+            .unwrap_or_else(|| {
+                let assignment = self.new_symbol(
+                    file,
+                    EscapedName::internal(InternalSymbolName::AssignmentDeclaration),
+                );
+                assert_eq!(
+                    self.symbols.insert_symbol(
+                        exports,
+                        EscapedName::internal(InternalSymbolName::AssignmentDeclaration),
+                        assignment,
+                    ),
+                    Some(None),
+                );
+                assignment
+            });
+        let record = self
+            .symbols
+            .symbol(assignment)
+            .expect("late-bound assignment symbol is store-owned");
+        let mut declarations = record.declarations().map_or_else(Vec::new, <[NodeRef]>::to_vec);
+        declarations.push(NodeRef::new(arena.id(), file, node));
+        assert!(
+            self.symbols
+                .set_symbol_declarations(assignment, Some(declarations), None)
+        );
+    }
+
+    fn lookup_entity(
+        &self,
+        arena: &NodeArena,
+        file: FileId,
+        node: NodeId,
+        container: NodeId,
+    ) -> Option<SemanticSymbolId> {
+        if arena
+            .get(node)
+            .is_some_and(|node| node.kind == SyntaxKind::Identifier)
+        {
+            return self.lookup_name(arena, file, node, container);
+        }
+        let expression = access_expression_base(arena, node)?;
+        if arena
+            .get(expression)
+            .is_some_and(|expression| expression.kind == SyntaxKind::ThisKeyword)
+        {
+            // `this` access declarations are JavaScript-only in this closure.
+            return None;
+        }
+        let base = self.lookup_entity(arena, file, expression, container)?;
+        let base = self.get_typescript_expando_initializer_symbol(arena, file, base)?;
+        let exports = self.symbols.symbol(base)?.exports()?;
+        let name = element_or_property_access_name(arena, node)?;
+        self.symbols
+            .symbol_table(exports)?
+            .get_source(&node_text(arena, name)?)
+    }
+
+    fn lookup_name(
+        &self,
+        arena: &NodeArena,
+        file: FileId,
+        name: NodeId,
+        container: NodeId,
+    ) -> Option<SemanticSymbolId> {
+        let name = node_text(arena, name)?;
+        let binding = self.files.get(&file)?.nodes.get(container.index())?;
+        if let Some(local) = binding
+            .locals
+            .and_then(|locals| self.symbols.symbol_table(locals))
+            .and_then(|locals| locals.get_source(&name))
+        {
+            return Some(
+                self.symbols
+                    .symbol(local)
+                    .and_then(crate::semantic::Symbol::export_symbol)
+                    .unwrap_or(local),
+            );
+        }
+        let exports = binding
+            .symbol
+            .and_then(|symbol| self.symbols.symbol(symbol))
+            .and_then(crate::semantic::Symbol::exports)?;
+        self.symbols.symbol_table(exports)?.get_source(&name)
+    }
+
+    fn get_typescript_expando_initializer_symbol(
+        &self,
+        arena: &NodeArena,
+        file: FileId,
+        symbol: SemanticSymbolId,
+    ) -> Option<SemanticSymbolId> {
+        const NODE_FLAG_CONST: u32 = 1 << 1;
+
+        let declaration = self.symbols.symbol(symbol)?.value_declaration()?;
+        if !declaration.is_for(arena.id(), file) {
+            return None;
+        }
+        let declaration_node = arena.get(declaration.node)?;
+        if declaration_node.kind == SyntaxKind::FunctionDeclaration {
+            return Some(symbol);
+        }
+        let NodeData::VariableDeclaration(variable) = &declaration_node.data else {
+            return None;
+        };
+        let parent = declaration_node.parent.and_then(|parent| arena.get(parent))?;
+        if parent.flags.0 & NODE_FLAG_CONST == 0 {
+            return None;
+        }
+        let initializer = variable.initializer?;
+        if !arena.get(initializer).is_some_and(|initializer| {
+            matches!(
+                initializer.kind,
+                SyntaxKind::FunctionExpression | SyntaxKind::ArrowFunction
+            )
+        }) {
+            return None;
+        }
+        self.bound_node_symbol(file, initializer)
     }
 
     fn bind_property_or_method_or_accessor(
@@ -2294,8 +2591,12 @@ impl CanonicalBinder {
         node: NodeRef,
         parent: Option<SemanticSymbolId>,
         is_computed_name: bool,
+        has_known_typescript_file_kind: bool,
     ) -> Result<PreparedDeclaration, CanonicalDeclarationError> {
-        if !is_computed_name && assignment_name_requires_javascript_file_kind(arena, node.node) {
+        if !is_computed_name
+            && !has_known_typescript_file_kind
+            && assignment_name_requires_javascript_file_kind(arena, node.node)
+        {
             return Err(CanonicalDeclarationError::JavaScriptFileKindRequired(node));
         }
         if !is_computed_name && has_dynamic_name(arena, node.node) {
@@ -3008,7 +3309,7 @@ fn declaration_name_shape_unsupported(arena: &NodeArena, node: NodeId) -> bool {
             | SyntaxKind::MethodSignature
             | SyntaxKind::GetAccessor
             | SyntaxKind::SetAccessor
-    );
+    ) || is_typescript_expando_property_assignment(arena, node);
     if has_dynamic_name(arena, node) && !dynamic_is_handled {
         return true;
     }
@@ -3514,6 +3815,57 @@ fn access_expression_base(arena: &NodeArena, node: NodeId) -> Option<NodeId> {
         NodeData::ElementAccessExpression(access) => Some(access.expression),
         _ => None,
     }
+}
+
+fn element_or_property_access_name(arena: &NodeArena, node: NodeId) -> Option<NodeId> {
+    match arena.get(node).map(|node| &node.data) {
+        Some(NodeData::PropertyAccessExpression(access))
+            if arena
+                .get(access.name)
+                .is_some_and(|name| name.kind == SyntaxKind::Identifier) =>
+        {
+            Some(access.name)
+        }
+        Some(NodeData::ElementAccessExpression(access)) => {
+            let name = skip_parentheses(arena, access.argument_expression)?;
+            arena
+                .get(name)
+                .is_some_and(|name| is_string_or_numeric_literal_like(name.kind))
+                .then_some(name)
+        }
+        _ => None,
+    }
+}
+
+fn is_typescript_expando_property_assignment(arena: &NodeArena, node: NodeId) -> bool {
+    let Some(NodeData::BinaryExpression(binary)) = arena.get(node).map(|node| &node.data) else {
+        return false;
+    };
+    if !arena
+        .get(binary.operator_token)
+        .is_some_and(|operator| operator.kind == SyntaxKind::EqualsToken)
+    {
+        return false;
+    }
+    match arena.get(binary.left).map(|left| &left.data) {
+        Some(NodeData::PropertyAccessExpression(access)) => {
+            arena
+                .get(access.name)
+                .is_some_and(|name| name.kind == SyntaxKind::Identifier)
+                && is_entity_name_expression(arena, access.expression)
+        }
+        Some(NodeData::ElementAccessExpression(access)) => {
+            is_entity_name_expression(arena, access.expression)
+        }
+        _ => false,
+    }
+}
+
+fn expando_assignment_parent(arena: &NodeArena, node: NodeId) -> Option<NodeId> {
+    let NodeData::BinaryExpression(binary) = &arena.get(node)?.data else {
+        return None;
+    };
+    access_expression_base(arena, binary.left)
 }
 
 fn has_static_access_name(arena: &NodeArena, node: NodeId) -> bool {
@@ -4196,6 +4548,20 @@ mod tests {
                     .then_some(id)
             })
             .unwrap_or_else(|| panic!("missing {kind:?} with source {source:?}"))
+    }
+
+    fn variable_initializers_named(arena: &ts_ast::NodeArena, expected: &str) -> Vec<NodeId> {
+        arena
+            .iter()
+            .filter_map(|(_, node)| {
+                let NodeData::VariableDeclaration(variable) = &node.data else {
+                    return None;
+                };
+                (super::node_text(arena, variable.name).as_deref() == Some(expected))
+                    .then_some(variable.initializer)
+                    .flatten()
+            })
+            .collect()
     }
 
     #[test]
@@ -6704,6 +7070,497 @@ const object = {};
             SymbolFlags::SIGNATURE
         );
         assert!(bound.diagnostics().is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn typescript_expandos_bind_after_declarations_with_exact_static_and_dynamic_records() {
+        let parsed = parse_source_file(
+            r#"
+Forward.before = 0;
+Forward["literal"] = 1;
+Forward.same = 2;
+Forward.same = 3;
+Forward[key] = 4;
+Forward[other] = 5;
+Forward[+0] = 6;
+function Forward() {}
+function module() {}
+module.exports = 7;
+
+Arrow.before = 1;
+const Arrow = () => {};
+const Expression = function () {};
+Expression.property = 1;
+namespace NS {
+    export function nested() {}
+    nested.value = 1;
+}
+"#,
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(67);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/expandos\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+
+        let bound = binder.file(file).unwrap();
+        assert_eq!(bound.phase(), BindingPhase::Declarations);
+        let source_locals = binder
+            .symbol_store()
+            .symbol_table(bound.locals(bound.source_file()).unwrap())
+            .unwrap();
+        let forward = source_locals.get_source("Forward").unwrap();
+        let forward_record = binder.symbol_store().symbol(forward).unwrap();
+        assert_eq!(forward_record.flags(), SymbolFlags::FUNCTION);
+        let forward_exports = binder
+            .symbol_store()
+            .symbol_table(forward_record.exports().unwrap())
+            .unwrap();
+        for name in ["before", "literal", "same"] {
+            let property = forward_exports.get_source(name).unwrap();
+            let record = binder.symbol_store().symbol(property).unwrap();
+            assert_eq!(
+                record.flags(),
+                SymbolFlags::PROPERTY | SymbolFlags::ASSIGNMENT
+            );
+            assert_eq!(record.parent(), Some(forward));
+        }
+
+        let same_first = node_with_source(
+            &parsed.arena,
+            SyntaxKind::BinaryExpression,
+            "Forward.same = 2",
+        );
+        let same_second = node_with_source(
+            &parsed.arena,
+            SyntaxKind::BinaryExpression,
+            "Forward.same = 3",
+        );
+        let same = forward_exports.get_source("same").unwrap();
+        assert_eq!(
+            binder.symbol_store().symbol(same).unwrap().declarations(),
+            Some(
+                [
+                    node_ref(&parsed.arena, file, same_first),
+                    node_ref(&parsed.arena, file, same_second),
+                ]
+                .as_slice()
+            )
+        );
+        assert_eq!(
+            bound.symbol(node_ref(&parsed.arena, file, same_first)),
+            Some(same)
+        );
+        assert_eq!(
+            bound.symbol(node_ref(&parsed.arena, file, same_second)),
+            Some(same)
+        );
+
+        let dynamic_nodes = [
+            node_with_source(
+                &parsed.arena,
+                SyntaxKind::BinaryExpression,
+                "Forward[key] = 4",
+            ),
+            node_with_source(
+                &parsed.arena,
+                SyntaxKind::BinaryExpression,
+                "Forward[other] = 5",
+            ),
+        ];
+        for dynamic in dynamic_nodes {
+            let computed = bound
+                .symbol(node_ref(&parsed.arena, file, dynamic))
+                .unwrap();
+            let record = binder.symbol_store().symbol(computed).unwrap();
+            assert_eq!(record.name(), InternalSymbolName::Computed.as_ref());
+            assert_eq!(
+                record.flags(),
+                SymbolFlags::PROPERTY | SymbolFlags::ASSIGNMENT
+            );
+            assert_eq!(record.parent(), None);
+        }
+        let assignments = forward_exports
+            .get(InternalSymbolName::AssignmentDeclaration.as_ref())
+            .unwrap();
+        let assignment_record = binder.symbol_store().symbol(assignments).unwrap();
+        assert_eq!(assignment_record.flags(), SymbolFlags::NONE);
+        assert_eq!(assignment_record.parent(), None);
+        assert_eq!(assignment_record.value_declaration(), None);
+        assert_eq!(
+            assignment_record.declarations(),
+            Some(
+                dynamic_nodes
+                    .map(|node| node_ref(&parsed.arena, file, node))
+                    .as_slice()
+            )
+        );
+
+        // The pinned access-name helper deliberately does not turn signed
+        // numeric element names into a table key. It still creates the
+        // detached missing-name declaration because the name is not dynamic.
+        let signed = node_with_source(
+            &parsed.arena,
+            SyntaxKind::BinaryExpression,
+            "Forward[+0] = 6",
+        );
+        let signed_symbol = bound
+            .symbol(node_ref(&parsed.arena, file, signed))
+            .unwrap();
+        assert_eq!(
+            binder.symbol_store().symbol(signed_symbol).unwrap().name(),
+            InternalSymbolName::Missing.as_ref()
+        );
+        assert!(
+            forward_exports
+                .get(InternalSymbolName::Missing.as_ref())
+                .is_none()
+        );
+
+        // In a TypeScript file this is an ordinary property expando on a
+        // function named `module`; the JavaScript-only module.exports route
+        // must not be selected.
+        let module = source_locals.get_source("module").unwrap();
+        let module_exports = binder
+            .symbol_store()
+            .symbol_table(
+                binder
+                    .symbol_store()
+                    .symbol(module)
+                    .unwrap()
+                    .exports()
+                    .unwrap(),
+            )
+            .unwrap();
+        assert!(module_exports.get_source("exports").is_some());
+
+        let arrow = variable_initializers_named(&parsed.arena, "Arrow")[0];
+        let arrow_symbol = bound
+            .symbol(node_ref(&parsed.arena, file, arrow))
+            .unwrap();
+        let arrow_exports = binder
+            .symbol_store()
+            .symbol(arrow_symbol)
+            .unwrap()
+            .exports()
+            .unwrap();
+        assert!(
+            binder
+                .symbol_store()
+                .symbol_table(arrow_exports)
+                .unwrap()
+                .get_source("before")
+                .is_some()
+        );
+        assert_eq!(
+            binder
+                .symbol_store()
+                .symbol(source_locals.get_source("Arrow").unwrap())
+                .unwrap()
+                .exports(),
+            None
+        );
+
+        let expression = variable_initializers_named(&parsed.arena, "Expression")[0];
+        let expression_symbol = bound
+            .symbol(node_ref(&parsed.arena, file, expression))
+            .unwrap();
+        let expression_exports = binder
+            .symbol_store()
+            .symbol(expression_symbol)
+            .unwrap()
+            .exports()
+            .unwrap();
+        assert!(
+            binder
+                .symbol_store()
+                .symbol_table(expression_exports)
+                .unwrap()
+                .get_source("property")
+                .is_some()
+        );
+
+        let namespace = source_locals.get_source("NS").unwrap();
+        let namespace_exports = binder
+            .symbol_store()
+            .symbol_table(
+                binder
+                    .symbol_store()
+                    .symbol(namespace)
+                    .unwrap()
+                    .exports()
+                    .unwrap(),
+            )
+            .unwrap();
+        let nested = namespace_exports.get_source("nested").unwrap();
+        let nested_exports = binder
+            .symbol_store()
+            .symbol_table(
+                binder
+                    .symbol_store()
+                    .symbol(nested)
+                    .unwrap()
+                    .exports()
+                    .unwrap(),
+            )
+            .unwrap();
+        assert!(nested_exports.get_source("value").is_some());
+        assert!(bound.diagnostics().is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn typescript_expando_lookup_preserves_shadowing_and_fail_closed_boundaries() {
+        let parsed = parse_source_file(
+            r#"
+function Scope() {
+    const Target = () => {};
+    {
+        let Target = () => {};
+        Target.blocked = 1;
+    }
+    {
+        Target.fallback = 2;
+    }
+    Target.attached = 1;
+}
+let Loose = () => {};
+Loose.nope = 1;
+var VarFn = function () {};
+VarFn.nope = 1;
+const Classy = class {};
+Classy.nope = 1;
+function Declared() {}
+Object.defineProperty(Declared, "defined", { value: 1 });
+Declared["compound"] += 1;
+factory().ignored = 1;
+function Merged() {}
+namespace Merged { export const member = 1; }
+Merged.member = 2;
+Merged.fresh = 1;
+"#,
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(68);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/expando-boundaries\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+
+        let bound = binder.file(file).unwrap();
+        let targets = variable_initializers_named(&parsed.arena, "Target");
+        assert_eq!(targets.len(), 2);
+        let outer_target = bound
+            .symbol(node_ref(&parsed.arena, file, targets[0]))
+            .unwrap();
+        let inner_target = bound
+            .symbol(node_ref(&parsed.arena, file, targets[1]))
+            .unwrap();
+        let outer_exports = binder
+            .symbol_store()
+            .symbol(outer_target)
+            .unwrap()
+            .exports()
+            .unwrap();
+        assert!(
+            binder
+                .symbol_store()
+                .symbol_table(outer_exports)
+                .unwrap()
+                .get_source("attached")
+                .is_some()
+        );
+        assert!(
+            binder
+                .symbol_store()
+                .symbol_table(outer_exports)
+                .unwrap()
+                .get_source("fallback")
+                .is_some()
+        );
+        assert_eq!(
+            binder
+                .symbol_store()
+                .symbol(inner_target)
+                .unwrap()
+                .exports(),
+            None
+        );
+        let blocked = node_with_source(
+            &parsed.arena,
+            SyntaxKind::BinaryExpression,
+            "Target.blocked = 1",
+        );
+        assert_eq!(
+            bound.symbol(node_ref(&parsed.arena, file, blocked)),
+            None
+        );
+
+        for (name, assignment) in [
+            ("Loose", "Loose.nope = 1"),
+            ("VarFn", "VarFn.nope = 1"),
+            ("Classy", "Classy.nope = 1"),
+        ] {
+            let initializer = variable_initializers_named(&parsed.arena, name)[0];
+            let initializer_symbol = bound
+                .symbol(node_ref(&parsed.arena, file, initializer))
+                .unwrap();
+            let has_property = binder
+                .symbol_store()
+                .symbol(initializer_symbol)
+                .unwrap()
+                .exports()
+                .and_then(|exports| binder.symbol_store().symbol_table(exports))
+                .is_some_and(|exports| exports.get_source("nope").is_some());
+            assert!(!has_property, "unexpected expando on {name}");
+            let assignment = node_with_source(
+                &parsed.arena,
+                SyntaxKind::BinaryExpression,
+                assignment,
+            );
+            assert_eq!(
+                bound.symbol(node_ref(&parsed.arena, file, assignment)),
+                None
+            );
+        }
+
+        let source_locals = binder
+            .symbol_store()
+            .symbol_table(bound.locals(bound.source_file()).unwrap())
+            .unwrap();
+        let declared = source_locals.get_source("Declared").unwrap();
+        let declared_exports = binder
+            .symbol_store()
+            .symbol(declared)
+            .unwrap()
+            .exports();
+        assert!(declared_exports.is_none_or(|exports| {
+            let exports = binder.symbol_store().symbol_table(exports).unwrap();
+            exports.get_source("defined").is_none()
+                && exports.get_source("compound").is_none()
+        }));
+        let ignored = node_with_source(
+            &parsed.arena,
+            SyntaxKind::BinaryExpression,
+            "factory().ignored = 1",
+        );
+        assert_eq!(bound.symbol(node_ref(&parsed.arena, file, ignored)), None);
+
+        let merged = source_locals.get_source("Merged").unwrap();
+        let merged_exports = binder
+            .symbol_store()
+            .symbol_table(
+                binder
+                    .symbol_store()
+                    .symbol(merged)
+                    .unwrap()
+                    .exports()
+                    .unwrap(),
+            )
+            .unwrap();
+        assert!(merged_exports.get_source("member").is_some());
+        let existing_member = merged_exports.get_source("member").unwrap();
+        let member_assignment = node_with_source(
+            &parsed.arena,
+            SyntaxKind::BinaryExpression,
+            "Merged.member = 2",
+        );
+        assert_eq!(
+            bound.symbol(node_ref(&parsed.arena, file, member_assignment)),
+            None
+        );
+        assert!(
+            binder
+                .symbol_store()
+                .symbol(existing_member)
+                .unwrap()
+                .flags()
+                .intersects(SymbolFlags::BLOCK_SCOPED_VARIABLE)
+        );
+        let fresh_property = merged_exports.get_source("fresh").unwrap();
+        let fresh = node_with_source(
+            &parsed.arena,
+            SyntaxKind::BinaryExpression,
+            "Merged.fresh = 1",
+        );
+        assert_eq!(
+            bound.symbol(node_ref(&parsed.arena, file, fresh)),
+            Some(fresh_property)
+        );
+        assert_eq!(
+            binder
+                .symbol_store()
+                .symbol(fresh_property)
+                .unwrap()
+                .flags(),
+            SymbolFlags::PROPERTY | SymbolFlags::ASSIGNMENT
+        );
+        assert_eq!(bound.phase(), BindingPhase::Declarations);
+        assert!(bound.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn javascript_expandos_remain_deferred_without_partial_declaration_writes() {
+        let parsed = parse_source_file(
+            "F.staticName = 1; F[dynamic] = 2; function F() {}",
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(69);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/expando.js\""),
+                    CanonicalSourceLanguage::JavaScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        assert_eq!(
+            binder.bind_typescript_declaration_slice(&parsed.arena, file),
+            Err(CanonicalDeclarationError::JavaScriptDeclarationsDeferred(file))
+        );
+
+        let bound = binder.file(file).unwrap();
+        assert_eq!(bound.phase(), BindingPhase::Traversal);
+        assert!(!bound.declaration_slice_bound());
+        assert_eq!(bound.symbol_count(), 0);
+        assert_eq!(bound.locals(bound.source_file()), None);
+        assert!(bound.traversal_order().all(|node| bound.symbol(node).is_none()));
+        assert_eq!(binder.symbol_store().symbol_len(), 0);
+        assert_eq!(binder.symbol_store().symbol_table_len(), 0);
     }
 
     #[test]
