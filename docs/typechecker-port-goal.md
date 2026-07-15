@@ -101,10 +101,14 @@ remains the cluster-level source of truth.
   callback-, instantiation-, and inference-owned mapper variants remain
   explicit later dependencies. The combined semantic stack passes 219 checker
   tests, strict targeted Clippy, and the all-target workspace check after two
-  independent reviews. The canonical binder slice is still being repaired so
-  its container/declaration order comes from the sole flow-driven recursive
-  walk; no declaration phase will build on the rejected generated-order second
-  pass.
+  independent reviews. The canonical B01 traversal is integrated as
+  `a7d9159..a6a63bb`: one flow-driven recursive walk now owns exact enter/exit
+  state, container order, and full ordinary-child discovery even across
+  unsupported flow boundaries. It preflights root identity, kind/data pairs,
+  and every parent backlink before store mutation; preserves nil locals; and
+  prevents its symbol owner from reaching the checker until B02 declarations
+  complete. The merged stack passes 99 binder and 219 checker tests plus strict
+  binder Clippy and the all-target workspace check.
 
 No percentage in this section is a whole-corpus parity claim. A score is
 publishable only when its variant manifest and complete artifact comparison are
