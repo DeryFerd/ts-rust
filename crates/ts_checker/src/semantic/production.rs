@@ -8,7 +8,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use ts_ast::{FileId, NodeArena, NodeArenaId, NodeData, NodeRef, SyntaxKind};
+use ts_ast::{
+    FileId, NodeArena, NodeArenaId, NodeArenaRevision, NodeData, NodeId, NodeRef, SyntaxKind,
+};
 use ts_binder::{
     BoundFile, CanonicalExtractionError, CanonicalProgramBindings, SemanticStoreId, SymbolStore,
 };
@@ -195,6 +197,38 @@ fn preflight_program(
             return Err(CanonicalCheckerContextError::UnboundSourceFile(source));
         }
 
+        // Binder traversal has intentional declaration-hoisting order, so the
+        // production invariant is exact set equality rather than sequence
+        // equality with a generic root walk.
+        let bound_nodes = bound
+            .traversal_order()
+            .map(|node| node.node)
+            .collect::<BTreeSet<_>>();
+        let reachable = root_reachable_nodes(arena, source.node);
+        if let Some(node) = bound
+            .traversal_order()
+            .find(|node| !reachable.contains(&node.node))
+        {
+            return Err(CanonicalCheckerContextError::BoundNodeNowUnreachable(node));
+        }
+        if let Some(node) = reachable
+            .iter()
+            .copied()
+            .map(|node| NodeRef::new(arena.id(), file, node))
+            .find(|node| !bound_nodes.contains(&node.node))
+        {
+            return Err(CanonicalCheckerContextError::NewlyReachableUnboundNode(
+                node,
+            ));
+        }
+        if bound.node_arena_revision() != arena.revision() {
+            return Err(CanonicalCheckerContextError::ArenaRevisionMismatch {
+                file,
+                expected: bound.node_arena_revision(),
+                actual: arena.revision(),
+            });
+        }
+
         if let Some(unowned) = arena
             .iter()
             .map(|(node, _)| NodeRef::new(arena.id(), file, node))
@@ -212,6 +246,20 @@ fn preflight_program(
         return Err(CanonicalCheckerContextError::MissingOrderedFile(missing));
     }
     Ok(())
+}
+
+fn root_reachable_nodes(arena: &NodeArena, source_file: NodeId) -> BTreeSet<NodeId> {
+    let mut reachable = BTreeSet::new();
+    let mut pending = vec![source_file];
+    while let Some(node_id) = pending.pop() {
+        if !reachable.insert(node_id) {
+            continue;
+        }
+        if let Some(node) = arena.get(node_id) {
+            node.for_each_child(|child| pending.push(child));
+        }
+    }
+    reachable
 }
 
 /// Why canonical binder output could not become a complete checker context.
@@ -252,6 +300,16 @@ pub enum CanonicalCheckerContextError {
     },
     /// Binder side data does not mark its own source root as reached.
     UnboundSourceFile(NodeRef),
+    /// A node visited by the binder is no longer reachable from the source root.
+    BoundNodeNowUnreachable(NodeRef),
+    /// A node now reachable from the source root was never visited by the binder.
+    NewlyReachableUnboundNode(NodeRef),
+    /// The arena changed after the binder captured its traversal side data.
+    ArenaRevisionMismatch {
+        file: FileId,
+        expected: NodeArenaRevision,
+        actual: NodeArenaRevision,
+    },
     /// The adopted binder symbol store does not own a reached bound node.
     UnownedBoundNode(NodeRef),
     /// Full source-tree validation or internal source registration failed.
@@ -321,6 +379,19 @@ impl std::fmt::Display for CanonicalCheckerContextError {
             Self::UnboundSourceFile(source) => {
                 write!(formatter, "binder did not reach source root {source:?}")
             }
+            Self::BoundNodeNowUnreachable(node) => write!(
+                formatter,
+                "binder-visited node {node:?} is no longer reachable from its source root"
+            ),
+            Self::NewlyReachableUnboundNode(node) => write!(
+                formatter,
+                "source-root-reachable node {node:?} was not visited by the binder"
+            ),
+            Self::ArenaRevisionMismatch { file, .. } => write!(
+                formatter,
+                "arena changed after canonical binding for file {}",
+                file.index()
+            ),
             Self::UnownedBoundNode(node) => {
                 write!(
                     formatter,
@@ -405,6 +476,32 @@ mod tests {
         binder.finish()
     }
 
+    fn allocate_unattached_empty_statement(source: &mut ParseResult) -> NodeId {
+        let empty = source
+            .arena
+            .iter()
+            .find_map(|(node, data)| (data.kind == SyntaxKind::EmptyStatement).then_some(node))
+            .expect("the test source contains an empty statement");
+        let orphan = source
+            .arena
+            .get(empty)
+            .expect("the empty statement came from this arena")
+            .clone();
+        source.arena.alloc(orphan)
+    }
+
+    fn source_statements_mut(source: &mut ParseResult) -> &mut Vec<NodeId> {
+        let NodeData::SourceFile(data) = &mut source
+            .arena
+            .get_mut(source.source_file)
+            .expect("the parser source root exists")
+            .data
+        else {
+            panic!("the parser source root has SourceFile data");
+        };
+        &mut data.statements.nodes
+    }
+
     #[test]
     fn preserves_explicit_non_map_order_registers_all_roots_and_keeps_store_brand() {
         let low = parsed("interface Low { value: string }");
@@ -446,6 +543,7 @@ mod tests {
             assert_eq!(bound.file_id(), file);
             assert!(bound.declarations_complete());
             assert!(bound.source_facts().is_some());
+            assert_eq!(bound.node_arena_revision(), arena.revision());
             let source = context.source_file(file).unwrap();
             assert_eq!(source.node_ref(), bound.source_file());
             assert!(context.store().contains_source_file(source));
@@ -632,12 +730,13 @@ mod tests {
     }
 
     #[test]
-    fn late_registration_failure_cannot_expose_a_partial_context() {
+    fn same_closure_parent_mutation_is_rejected_before_checker_construction() {
         let first = parsed("interface First { value: string }");
         let mut malformed = parsed("interface Malformed { value: number }");
         let first_file = FileId::new(50);
         let malformed_file = FileId::new(51);
         let bindings = completed_bindings(&[(first_file, &first), (malformed_file, &malformed)]);
+        let expected = bindings.file(malformed_file).unwrap().node_arena_revision();
         let malformed_child = malformed
             .arena
             .iter()
@@ -646,6 +745,7 @@ mod tests {
             })
             .unwrap();
         malformed.arena.get_mut(malformed_child).unwrap().parent = None;
+        let actual = malformed.arena.revision();
 
         let result = CanonicalCheckerContext::new(
             bindings,
@@ -658,7 +758,193 @@ mod tests {
 
         assert_eq!(
             result.unwrap_err(),
-            CanonicalCheckerContextError::SourceRegistrationFailed(malformed_file)
+            CanonicalCheckerContextError::ArenaRevisionMismatch {
+                file: malformed_file,
+                expected,
+                actual,
+            }
         );
+    }
+
+    #[test]
+    fn rejects_same_closure_identifier_text_mutation_after_binding() {
+        let mut source = parsed("interface Before { value: string }");
+        let file = FileId::new(60);
+        let bindings = completed_bindings(&[(file, &source)]);
+        let expected = bindings.file(file).unwrap().node_arena_revision();
+        let identifier = source
+            .arena
+            .iter()
+            .find_map(|(node, data)| {
+                matches!(
+                    &data.data,
+                    NodeData::Identifier(identifier) if identifier.text == "Before"
+                )
+                .then_some(node)
+            })
+            .unwrap();
+        let NodeData::Identifier(identifier_data) =
+            &mut source.arena.get_mut(identifier).unwrap().data
+        else {
+            panic!("the selected node is an identifier");
+        };
+        identifier_data.text = "After".to_owned();
+        let actual = source.arena.revision();
+
+        let error = CanonicalCheckerContext::new(
+            bindings,
+            vec![(file, &source.arena)],
+            IntrinsicBootstrapOptions::default(),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            CanonicalCheckerContextError::ArenaRevisionMismatch {
+                file,
+                expected,
+                actual,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_source_text_mutation_after_binding() {
+        let mut source = parsed("interface Before {}");
+        let file = FileId::new(61);
+        let bindings = completed_bindings(&[(file, &source)]);
+        let expected = bindings.file(file).unwrap().node_arena_revision();
+        source.arena.set_source_text("interface After {}");
+        let actual = source.arena.revision();
+
+        let error = CanonicalCheckerContext::new(
+            bindings,
+            vec![(file, &source.arena)],
+            IntrinsicBootstrapOptions::default(),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            CanonicalCheckerContextError::ArenaRevisionMismatch {
+                file,
+                expected,
+                actual,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_unreachable_allocation_after_binding() {
+        let mut source = parsed("; interface Retained {}");
+        let file = FileId::new(62);
+        let bindings = completed_bindings(&[(file, &source)]);
+        let expected = bindings.file(file).unwrap().node_arena_revision();
+        let _unreachable = allocate_unattached_empty_statement(&mut source);
+        let actual = source.arena.revision();
+
+        let error = CanonicalCheckerContext::new(
+            bindings,
+            vec![(file, &source.arena)],
+            IntrinsicBootstrapOptions::default(),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            CanonicalCheckerContextError::ArenaRevisionMismatch {
+                file,
+                expected,
+                actual,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_a_formerly_bound_statement_removed_from_the_root_closure() {
+        let mut source = parsed("interface Removed {} interface Retained {}");
+        let file = FileId::new(70);
+        let removed = {
+            let NodeData::SourceFile(data) = &source
+                .arena
+                .get(source.source_file)
+                .expect("the parser source root exists")
+                .data
+            else {
+                panic!("the parser source root has SourceFile data");
+            };
+            data.statements.nodes[0]
+        };
+        let bindings = completed_bindings(&[(file, &source)]);
+        source_statements_mut(&mut source).retain(|statement| *statement != removed);
+
+        let error = CanonicalCheckerContext::new(
+            bindings,
+            vec![(file, &source.arena)],
+            IntrinsicBootstrapOptions::default(),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            CanonicalCheckerContextError::BoundNodeNowUnreachable(NodeRef::new(
+                source.arena.id(),
+                file,
+                removed,
+            ))
+        );
+    }
+
+    #[test]
+    fn rejects_a_formerly_unreachable_valid_node_attached_to_the_root_closure() {
+        let mut source = parsed("; interface Retained {}");
+        let file = FileId::new(71);
+        let formerly_unreachable = allocate_unattached_empty_statement(&mut source);
+        let still_unreachable = allocate_unattached_empty_statement(&mut source);
+        let bindings = completed_bindings(&[(file, &source)]);
+        source_statements_mut(&mut source).push(formerly_unreachable);
+
+        let error = CanonicalCheckerContext::new(
+            bindings,
+            vec![(file, &source.arena)],
+            IntrinsicBootstrapOptions::default(),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            CanonicalCheckerContextError::NewlyReachableUnboundNode(NodeRef::new(
+                source.arena.id(),
+                file,
+                formerly_unreachable,
+            ))
+        );
+        assert_ne!(formerly_unreachable, still_unreachable);
+    }
+
+    #[test]
+    fn permits_unreachable_arena_slots_outside_both_closures() {
+        let mut source = parsed("; interface Retained {}");
+        let file = FileId::new(72);
+        let orphan = allocate_unattached_empty_statement(&mut source);
+        let bindings = completed_bindings(&[(file, &source)]);
+
+        let context = CanonicalCheckerContext::new(
+            bindings,
+            vec![(file, &source.arena)],
+            IntrinsicBootstrapOptions::default(),
+        )
+        .unwrap();
+
+        assert!(
+            context
+                .store()
+                .contains_node_ref(NodeRef::new(source.arena.id(), file, orphan))
+        );
+        assert!(!context.file(file).unwrap().1.contains(NodeRef::new(
+            source.arena.id(),
+            file,
+            orphan,
+        )));
     }
 }

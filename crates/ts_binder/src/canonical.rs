@@ -11,7 +11,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use ts_ast::{
-    FileId, FlowRef, ModifierList, NodeArena, NodeArenaId, NodeData, NodeId, NodeRef, SyntaxKind,
+    FileId, FlowRef, ModifierList, NodeArena, NodeArenaId, NodeArenaRevision, NodeData, NodeId,
+    NodeRef, SyntaxKind,
 };
 use ts_diagnostics::{Diagnostic, message_by_code};
 
@@ -147,6 +148,12 @@ pub enum CanonicalDeclarationError {
         expected: NodeArenaId,
         actual: NodeArenaId,
     },
+    /// The arena changed after this file's canonical traversal completed.
+    ArenaRevisionMismatch {
+        file: FileId,
+        expected: NodeArenaRevision,
+        actual: NodeArenaRevision,
+    },
     /// The declaration is not reachable from the registered source file.
     UnboundNode(NodeRef),
     /// The table belongs to another store or was never allocated.
@@ -194,6 +201,11 @@ impl std::fmt::Display for CanonicalDeclarationError {
             Self::WrongArena { file, .. } => write!(
                 formatter,
                 "declaration arena does not match Program file slot {}",
+                file.index()
+            ),
+            Self::ArenaRevisionMismatch { file, .. } => write!(
+                formatter,
+                "declaration arena changed after traversal for Program file slot {}",
                 file.index()
             ),
             Self::UnboundNode(node) => {
@@ -411,6 +423,7 @@ struct NodeBinding {
 pub struct BoundFile {
     file: FileId,
     arena: NodeArenaId,
+    arena_revision: NodeArenaRevision,
     source_file: NodeId,
     source_facts: Option<CanonicalSourceFileFacts>,
     node_count: usize,
@@ -437,6 +450,12 @@ impl BoundFile {
     #[must_use]
     pub const fn node_arena_id(&self) -> NodeArenaId {
         self.arena
+    }
+
+    /// The exact arena mutation revision captured after traversal.
+    #[must_use]
+    pub const fn node_arena_revision(&self) -> NodeArenaRevision {
+        self.arena_revision
     }
 
     #[must_use]
@@ -1038,6 +1057,13 @@ impl CanonicalBinder {
                 file,
                 expected: bound.arena,
                 actual: arena.id(),
+            });
+        }
+        if bound.arena_revision != arena.revision() {
+            return Err(CanonicalDeclarationError::ArenaRevisionMismatch {
+                file,
+                expected: bound.arena_revision,
+                actual: arena.revision(),
             });
         }
         if bound.declaration_slice_bound {
@@ -2578,6 +2604,13 @@ impl CanonicalBinder {
                 file,
                 expected: bound.arena,
                 actual: arena.id(),
+            });
+        }
+        if bound.arena_revision != arena.revision() {
+            return Err(CanonicalDeclarationError::ArenaRevisionMismatch {
+                file,
+                expected: bound.arena_revision,
+                actual: arena.revision(),
             });
         }
         let node_ref = NodeRef::new(arena.id(), file, node);
@@ -4277,6 +4310,7 @@ impl<'a> FileTraversal<'a> {
         BoundFile {
             file: self.file,
             arena: self.arena.id(),
+            arena_revision: self.arena.revision(),
             source_file: self.source_file,
             source_facts: self.source_facts,
             node_count: self.arena.len(),
@@ -4575,7 +4609,7 @@ mod tests {
     use std::{collections::BTreeSet, panic::AssertUnwindSafe};
 
     use ts_ast::{FileId, NodeData, NodeFlags, NodeId, NodeRef, SyntaxKind};
-    use ts_parser::{parse_jsx_source_file, parse_source_file};
+    use ts_parser::{ParseResult, parse_jsx_source_file, parse_source_file};
 
     use super::{
         BindingPhase, CanonicalBindError, CanonicalBinder, CanonicalDeclarationError,
@@ -4638,6 +4672,48 @@ mod tests {
                 .then_some(id)
             })
             .unwrap_or_else(|| panic!("missing {kind:?} containing {fragment:?}"))
+    }
+
+    fn assert_focused_declaration_rejects_stale_revision(
+        mut parsed: ParseResult,
+        file: FileId,
+        mutate: impl FnOnce(&mut ts_ast::NodeArena),
+    ) {
+        let declaration = nodes_of_kind(&parsed.arena, SyntaxKind::VariableDeclaration)[0];
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file(&parsed.arena, parsed.source_file, file)
+            .unwrap();
+        let table = binder.create_symbol_table();
+        let before_file = binder.file(file).unwrap().clone();
+        let expected = before_file.node_arena_revision();
+        let symbol_count = binder.symbol_store().symbol_len();
+        let table_count = binder.symbol_store().symbol_table_len();
+        let declaration_fact_count = binder.declaration_facts.len();
+
+        mutate(&mut parsed.arena);
+        let actual = parsed.arena.revision();
+        assert_ne!(actual, expected);
+        assert_eq!(
+            binder.declare_symbol(
+                &parsed.arena,
+                file,
+                table,
+                None,
+                declaration,
+                SymbolFlags::BLOCK_SCOPED_VARIABLE,
+                SymbolFlags::BLOCK_SCOPED_VARIABLE_EXCLUDES,
+            ),
+            Err(CanonicalDeclarationError::ArenaRevisionMismatch {
+                file,
+                expected,
+                actual,
+            })
+        );
+        assert_eq!(binder.file(file), Some(&before_file));
+        assert_eq!(binder.symbol_store().symbol_len(), symbol_count);
+        assert_eq!(binder.symbol_store().symbol_table_len(), table_count);
+        assert_eq!(binder.declaration_facts.len(), declaration_fact_count);
     }
 
     fn variable_initializers_named(arena: &ts_ast::NodeArena, expected: &str) -> Vec<NodeId> {
@@ -4971,6 +5047,78 @@ mod tests {
             .bind_source_file(&parsed.arena, source, file)
             .unwrap();
         assert_eq!(bound.contains_this(interface_ref), Some(true));
+    }
+
+    #[test]
+    fn full_declaration_dispatch_rejects_stale_identifier_text_without_binder_writes() {
+        let mut parsed = parse_source_file("export interface Before { value: string }");
+        let file = FileId::new(86);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/revision.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::External,
+                ),
+            )
+            .unwrap();
+        let before_file = binder.file(file).unwrap().clone();
+        let expected = before_file.node_arena_revision();
+        let symbol_count = binder.symbol_store().symbol_len();
+        let table_count = binder.symbol_store().symbol_table_len();
+        let declaration_fact_count = binder.declaration_facts.len();
+
+        let identifier = node_with_source(&parsed.arena, SyntaxKind::Identifier, "Before");
+        let NodeData::Identifier(identifier_data) =
+            &mut parsed.arena.get_mut(identifier).unwrap().data
+        else {
+            panic!("the selected node is an identifier");
+        };
+        identifier_data.text = "After".to_owned();
+        let actual = parsed.arena.revision();
+
+        assert_eq!(
+            binder.bind_typescript_declaration_slice(&parsed.arena, file),
+            Err(CanonicalDeclarationError::ArenaRevisionMismatch {
+                file,
+                expected,
+                actual,
+            })
+        );
+        assert_eq!(binder.file(file), Some(&before_file));
+        assert_eq!(binder.symbol_store().symbol_len(), symbol_count);
+        assert_eq!(binder.symbol_store().symbol_table_len(), table_count);
+        assert_eq!(binder.declaration_facts.len(), declaration_fact_count);
+    }
+
+    #[test]
+    fn focused_declaration_rejects_stale_modifier_and_literal_content_without_writes() {
+        assert_focused_declaration_rejects_stale_revision(
+            parse_source_file("export const value = 1;"),
+            FileId::new(87),
+            |arena| {
+                let modifier = nodes_of_kind(arena, SyntaxKind::ExportKeyword)[0];
+                arena.get_mut(modifier).unwrap().kind = SyntaxKind::DefaultKeyword;
+            },
+        );
+        assert_focused_declaration_rejects_stale_revision(
+            parse_source_file("const value = 'before';"),
+            FileId::new(88),
+            |arena| {
+                let literal = nodes_of_kind(arena, SyntaxKind::StringLiteral)[0];
+                let NodeData::StringLiteral(literal_data) =
+                    &mut arena.get_mut(literal).unwrap().data
+                else {
+                    panic!("the selected node is a string literal");
+                };
+                literal_data.text = "after".to_owned();
+            },
+        );
     }
 
     #[test]

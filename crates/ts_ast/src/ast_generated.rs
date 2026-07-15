@@ -51,6 +51,27 @@ fn allocate_node_arena_id() -> NodeArenaId {
     allocate_node_arena_id_from(&LAST_NODE_ARENA_ID)
 }
 
+/// Opaque mutation revision for one node arena identity.
+///
+/// Revisions are comparable only for snapshots of the same [`NodeArenaId`].
+/// A new or cloned arena starts at revision zero.
+#[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct NodeArenaRevision(u64);
+
+impl std::fmt::Debug for NodeArenaRevision {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("NodeArenaRevision")
+    }
+}
+
+impl NodeArenaRevision {
+    const INITIAL: Self = Self(0);
+
+    fn checked_next(self) -> Option<Self> {
+        self.0.checked_add(1).map(Self)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub struct SymbolId(pub u32);
 
@@ -97,6 +118,7 @@ pub struct Node {
 #[derive(Debug)]
 pub struct NodeArena {
     id: NodeArenaId,
+    revision: NodeArenaRevision,
     nodes: Vec<Node>,
     source_text: Option<String>,
 }
@@ -105,6 +127,7 @@ impl Clone for NodeArena {
     fn clone(&self) -> Self {
         Self {
             id: allocate_node_arena_id(),
+            revision: NodeArenaRevision::INITIAL,
             nodes: self.nodes.clone(),
             source_text: self.source_text.clone(),
         }
@@ -112,6 +135,7 @@ impl Clone for NodeArena {
 
     fn clone_from(&mut self, source: &Self) {
         self.id = allocate_node_arena_id();
+        self.revision = NodeArenaRevision::INITIAL;
         self.nodes.clone_from(&source.nodes);
         self.source_text.clone_from(&source.source_text);
     }
@@ -133,6 +157,7 @@ impl NodeArena {
     pub fn new() -> Self {
         Self {
             id: allocate_node_arena_id(),
+            revision: NodeArenaRevision::INITIAL,
             nodes: Vec::new(),
             source_text: None,
         }
@@ -143,8 +168,20 @@ impl NodeArena {
         self.id
     }
 
+    #[must_use]
+    pub const fn revision(&self) -> NodeArenaRevision {
+        self.revision
+    }
+
+    /// Replaces the retained source text and advances this arena's revision.
+    ///
+    /// # Panics
+    ///
+    /// Panics before changing the source text if the revision is exhausted.
     pub fn set_source_text(&mut self, source_text: impl Into<String>) {
-        self.source_text = Some(source_text.into());
+        let source_text = source_text.into();
+        self.bump_revision();
+        self.source_text = Some(source_text);
     }
 
     #[must_use]
@@ -156,9 +193,11 @@ impl NodeArena {
     ///
     /// # Panics
     ///
-    /// Panics if the arena contains more than `u32::MAX` nodes.
+    /// Panics before adding the node if the arena contains more than
+    /// `u32::MAX` nodes or if the revision is exhausted.
     pub fn alloc(&mut self, node: Node) -> NodeId {
         let index = u32::try_from(self.nodes.len()).expect("AST node arena exceeds u32::MAX nodes");
+        self.bump_revision();
         self.nodes.push(node);
         NodeId::new(index)
     }
@@ -168,8 +207,17 @@ impl NodeArena {
         self.nodes.get(id.index())
     }
 
+    /// Returns mutable access to an existing node and advances the revision.
+    ///
+    /// # Panics
+    ///
+    /// Panics before returning mutable access if the revision is exhausted.
     #[must_use]
     pub fn get_mut(&mut self, id: NodeId) -> Option<&mut Node> {
+        if id.index() >= self.nodes.len() {
+            return None;
+        }
+        self.bump_revision();
         self.nodes.get_mut(id.index())
     }
 
@@ -194,6 +242,18 @@ impl NodeArena {
             let index = u32::try_from(index).expect("AST node arena exceeds u32::MAX nodes");
             (NodeId::new(index), node)
         })
+    }
+
+    fn bump_revision(&mut self) {
+        self.revision = self
+            .revision
+            .checked_next()
+            .unwrap_or_else(|| panic!("AST node arena revision space exhausted"));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn exhaust_revision_for_test(&mut self) {
+        self.revision = NodeArenaRevision(u64::MAX);
     }
 }
 

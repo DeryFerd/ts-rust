@@ -154,7 +154,7 @@ impl NodeRef {
 
 #[cfg(test)]
 mod tests {
-    use std::ops::ControlFlow;
+    use std::{ops::ControlFlow, panic::AssertUnwindSafe};
 
     use ts_core::TextRange;
 
@@ -197,6 +197,16 @@ mod tests {
         nodes.iter().copied().map(NodeId::new).collect()
     }
 
+    fn token_node() -> Node {
+        Node {
+            kind: SyntaxKind::EndOfFile,
+            flags: NodeFlags::default(),
+            range: TextRange::default(),
+            parent: None,
+            data: NodeData::Token(Box::new(TokenData)),
+        }
+    }
+
     #[test]
     fn arena_assigns_stable_dense_node_ids() {
         assert_eq!(NodeData::SCHEMA_NODE_COUNT, 192);
@@ -237,21 +247,89 @@ mod tests {
 
     #[test]
     fn arena_identity_survives_moves_and_changes_across_clones() {
-        let arena = NodeArena::new();
+        let mut arena = NodeArena::new();
         let identity = arena.id();
+        let initial_revision = arena.revision();
+        arena.set_source_text("const revised = true;");
+        assert!(arena.revision() > initial_revision);
+        let revision = arena.revision();
         let moved = arena;
         assert_eq!(moved.id(), identity);
+        assert_eq!(moved.revision(), revision);
 
         let cloned = moved.clone();
         assert_ne!(cloned.id(), identity);
+        assert_eq!(cloned.revision(), initial_revision);
         assert_ne!(NodeArena::default().id(), identity);
+        assert_eq!(NodeArena::default().revision(), initial_revision);
 
         let mut clone_target = NodeArena::new();
         let clone_target_identity = clone_target.id();
+        clone_target.set_source_text("const stale = true;");
         clone_target.clone_from(&moved);
         assert_ne!(clone_target.id(), clone_target_identity);
         assert_ne!(clone_target.id(), identity);
+        assert_eq!(clone_target.revision(), initial_revision);
         assert_eq!(format!("{identity:?}"), "NodeArenaId");
+        assert_eq!(format!("{revision:?}"), "NodeArenaRevision");
+    }
+
+    #[test]
+    fn arena_revision_tracks_only_successful_mutation_entry_points() {
+        let mut arena = NodeArena::new();
+        let initial = arena.revision();
+        assert!(arena.get_mut(NodeId::new(0)).is_none());
+        assert_eq!(arena.revision(), initial);
+
+        arena.set_source_text("const value = 1;");
+        let after_text = arena.revision();
+        assert!(after_text > initial);
+
+        let node = arena.alloc(token_node());
+        let after_alloc = arena.revision();
+        assert!(after_alloc > after_text);
+
+        arena.get_mut(node).unwrap().flags = NodeFlags::REPARSED;
+        assert!(arena.revision() > after_alloc);
+        assert_eq!(arena.get(node).unwrap().flags, NodeFlags::REPARSED);
+    }
+
+    #[test]
+    fn arena_revision_exhaustion_panics_before_each_mutation() {
+        let mut text_arena = NodeArena::new();
+        text_arena.set_source_text("before");
+        text_arena.exhaust_revision_for_test();
+        let exhausted = text_arena.revision();
+        assert!(
+            std::panic::catch_unwind(AssertUnwindSafe(|| {
+                text_arena.set_source_text("after");
+            }))
+            .is_err()
+        );
+        assert_eq!(text_arena.source_text(), Some("before"));
+        assert_eq!(text_arena.revision(), exhausted);
+
+        let mut alloc_arena = NodeArena::new();
+        alloc_arena.exhaust_revision_for_test();
+        assert!(
+            std::panic::catch_unwind(AssertUnwindSafe(|| alloc_arena.alloc(token_node()))).is_err()
+        );
+        assert!(alloc_arena.is_empty());
+        assert_eq!(alloc_arena.revision(), exhausted);
+
+        let mut mutable_arena = NodeArena::new();
+        let node = mutable_arena.alloc(token_node());
+        mutable_arena.exhaust_revision_for_test();
+        assert!(mutable_arena.get_mut(NodeId::new(1)).is_none());
+        assert_eq!(mutable_arena.revision(), exhausted);
+        assert!(
+            std::panic::catch_unwind(AssertUnwindSafe(|| {
+                let _ = mutable_arena.get_mut(node);
+            }))
+            .is_err()
+        );
+        assert_eq!(mutable_arena.get(node).unwrap().kind, SyntaxKind::EndOfFile);
+        assert_eq!(mutable_arena.revision(), exhausted);
     }
 
     #[test]
