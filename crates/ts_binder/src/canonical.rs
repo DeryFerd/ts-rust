@@ -1088,6 +1088,23 @@ impl CanonicalBinder {
         exports
     }
 
+    fn ensure_file_global_exports(&mut self, file: FileId) -> SymbolTableId {
+        if let Some(exports) = self
+            .files
+            .get(&file)
+            .expect("declaration-dispatch file is registered")
+            .global_exports
+        {
+            return exports;
+        }
+        let exports = self.symbols.alloc_symbol_table();
+        self.files
+            .get_mut(&file)
+            .expect("declaration-dispatch file is registered")
+            .global_exports = Some(exports);
+        exports
+    }
+
     fn declaration_container(&self, file: FileId, node: NodeId) -> Option<NodeId> {
         self.files.get(&file)?.nodes.get(node.index())?.container
     }
@@ -1532,6 +1549,43 @@ impl CanonicalBinder {
                     .expect("module state was preflighted for every module declaration");
                 self.bind_module_declaration(arena, file, node, facts, state)?;
             }
+            SyntaxKind::ImportEqualsDeclaration
+            | SyntaxKind::NamespaceImport
+            | SyntaxKind::ImportSpecifier
+            | SyntaxKind::ExportSpecifier => {
+                self.declare_symbol_and_add_to_symbol_table(
+                    arena,
+                    file,
+                    node,
+                    SymbolFlags::ALIAS,
+                    SymbolFlags::ALIAS_EXCLUDES,
+                    facts,
+                )?;
+            }
+            SyntaxKind::NamespaceExportDeclaration => {
+                self.bind_namespace_export_declaration(arena, file, node, facts)?;
+            }
+            SyntaxKind::ImportClause => {
+                if matches!(
+                    arena.get(node).map(|node| &node.data),
+                    Some(NodeData::ImportClause(clause)) if clause.name.is_some()
+                ) {
+                    self.declare_symbol_and_add_to_symbol_table(
+                        arena,
+                        file,
+                        node,
+                        SymbolFlags::ALIAS,
+                        SymbolFlags::ALIAS_EXCLUDES,
+                        facts,
+                    )?;
+                }
+            }
+            SyntaxKind::ExportDeclaration => {
+                self.bind_export_declaration(arena, file, node)?;
+            }
+            SyntaxKind::ExportAssignment => {
+                self.bind_export_assignment(arena, file, node)?;
+            }
             SyntaxKind::JsxAttributes => {
                 self.bind_anonymous_declaration(
                     arena,
@@ -1552,6 +1606,144 @@ impl CanonicalBinder {
                 )?;
             }
             _ => {}
+        }
+        Ok(())
+    }
+
+    fn bind_namespace_export_declaration(
+        &mut self,
+        arena: &NodeArena,
+        file: FileId,
+        node: NodeId,
+        facts: &CanonicalSourceFileFacts,
+    ) -> Result<(), CanonicalDeclarationError> {
+        if arena
+            .get(node)
+            .and_then(|node| modifier_list(&node.data))
+            .is_some()
+        {
+            self.push_bind_diagnostic(arena, file, node, 1184, std::iter::empty::<String>());
+        }
+        let parent = arena.get(node).and_then(|node| node.parent);
+        if !parent.is_some_and(|parent| {
+            arena
+                .get(parent)
+                .is_some_and(|parent| parent.kind == SyntaxKind::SourceFile)
+        }) {
+            self.push_bind_diagnostic(arena, file, node, 1316, std::iter::empty::<String>());
+        } else if !facts.is_external_module() {
+            self.push_bind_diagnostic(arena, file, node, 1314, std::iter::empty::<String>());
+        } else if !facts.is_declaration_file() {
+            self.push_bind_diagnostic(arena, file, node, 1315, std::iter::empty::<String>());
+        } else {
+            let source_file = self
+                .files
+                .get(&file)
+                .expect("namespace-export file is registered")
+                .source_file;
+            let parent = self
+                .bound_node_symbol(file, source_file)
+                .expect("external source file is declared before its children");
+            let exports = self.ensure_file_global_exports(file);
+            self.declare_symbol(
+                arena,
+                file,
+                exports,
+                Some(parent),
+                node,
+                SymbolFlags::ALIAS,
+                SymbolFlags::ALIAS_EXCLUDES,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn bind_export_declaration(
+        &mut self,
+        arena: &NodeArena,
+        file: FileId,
+        node: NodeId,
+    ) -> Result<(), CanonicalDeclarationError> {
+        let Some(NodeData::ExportDeclaration(export)) = arena.get(node).map(|node| &node.data)
+        else {
+            unreachable!("export declaration dispatch is kind checked");
+        };
+        let container = self
+            .declaration_container(file, node)
+            .expect("export declarations have a captured container");
+        let Some(parent) = self.bound_node_symbol(file, container) else {
+            let name = self.get_declaration_name(arena, NodeRef::new(arena.id(), file, node))?;
+            self.bind_anonymous_declaration(arena, file, node, SymbolFlags::EXPORT_STAR, name);
+            return Ok(());
+        };
+        if export.export_clause.is_none() {
+            let exports = self.ensure_symbol_exports(parent);
+            self.declare_symbol(
+                arena,
+                file,
+                exports,
+                Some(parent),
+                node,
+                SymbolFlags::EXPORT_STAR,
+                SymbolFlags::NONE,
+            )?;
+        } else if let Some(clause) = export.export_clause.filter(|clause| {
+            arena
+                .get(*clause)
+                .is_some_and(|clause| clause.kind == SyntaxKind::NamespaceExport)
+        }) {
+            let exports = self.ensure_symbol_exports(parent);
+            self.declare_symbol(
+                arena,
+                file,
+                exports,
+                Some(parent),
+                clause,
+                SymbolFlags::ALIAS,
+                SymbolFlags::ALIAS_EXCLUDES,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn bind_export_assignment(
+        &mut self,
+        arena: &NodeArena,
+        file: FileId,
+        node: NodeId,
+    ) -> Result<(), CanonicalDeclarationError> {
+        let Some(NodeData::ExportAssignment(assignment)) = arena.get(node).map(|node| &node.data)
+        else {
+            unreachable!("export-assignment dispatch is kind checked");
+        };
+        let container = self
+            .declaration_container(file, node)
+            .expect("export assignments have a captured container");
+        let Some(parent) = self.bound_node_symbol(file, container) else {
+            let name = self.get_declaration_name(arena, NodeRef::new(arena.id(), file, node))?;
+            self.bind_anonymous_declaration(arena, file, node, SymbolFlags::VALUE, name);
+            return Ok(());
+        };
+        let expression_is_alias = is_entity_name_expression(arena, assignment.expression)
+            || arena
+                .get(assignment.expression)
+                .is_some_and(|expression| expression.kind == SyntaxKind::ClassExpression);
+        let exports = self.ensure_symbol_exports(parent);
+        let symbol = self.declare_symbol(
+            arena,
+            file,
+            exports,
+            Some(parent),
+            node,
+            if expression_is_alias {
+                SymbolFlags::ALIAS
+            } else {
+                SymbolFlags::PROPERTY
+            },
+            SymbolFlags::ALL,
+        )?;
+        if assignment.is_export_equals {
+            self.set_value_declaration(symbol, NodeRef::new(arena.id(), file, node));
         }
         Ok(())
     }
@@ -2280,6 +2472,33 @@ impl CanonicalBinder {
         assert!(self.symbols.set_symbol_flags(symbol, combined, check_flags));
     }
 
+    fn set_value_declaration(&mut self, symbol: SemanticSymbolId, node: NodeRef) {
+        let record = self
+            .symbols
+            .symbol(symbol)
+            .expect("declared symbol is store-owned");
+        let declarations = record.declarations().map(<[NodeRef]>::to_vec);
+        let current = record.value_declaration();
+        let replace = current.is_none_or(|current| {
+            let current_facts = self
+                .declaration_facts
+                .get(&current)
+                .expect("value declarations were added by this binder");
+            let incoming_facts = self
+                .declaration_facts
+                .get(&node)
+                .expect("forced value declaration was already declared");
+            current_facts.is_assignment && !incoming_facts.is_assignment
+                || current_facts.kind != incoming_facts.kind && current_facts.is_effective_module
+        });
+        if replace {
+            assert!(
+                self.symbols
+                    .set_symbol_declarations(symbol, declarations, Some(node))
+            );
+        }
+    }
+
     fn add_declaration_to_symbol(
         &mut self,
         symbol: SemanticSymbolId,
@@ -2543,21 +2762,9 @@ fn assignment_variable_merge(incoming: SymbolFlags, existing: SymbolFlags) -> bo
 }
 
 fn declaration_family_supported(arena: &NodeArena, node: NodeId) -> bool {
-    !arena.get(node).is_some_and(|node| {
-        matches!(
-            node.kind,
-            SyntaxKind::ImportEqualsDeclaration
-                | SyntaxKind::NamespaceImport
-                | SyntaxKind::ImportSpecifier
-                | SyntaxKind::ExportSpecifier
-                | SyntaxKind::NamespaceExportDeclaration
-                | SyntaxKind::NamespaceExport
-                | SyntaxKind::ImportClause
-                | SyntaxKind::ExportDeclaration
-                | SyntaxKind::ExportAssignment
-                | SyntaxKind::JsTypeAliasDeclaration
-        )
-    })
+    !arena
+        .get(node)
+        .is_some_and(|node| node.kind == SyntaxKind::JsTypeAliasDeclaration)
 }
 
 fn get_module_instance_state(arena: &NodeArena, node: NodeId) -> ModuleInstanceState {
@@ -5974,6 +6181,295 @@ declare global { interface Window {} }
             bound.diagnostics()[0].diagnostic.arguments,
             ["bad**pattern"]
         );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn external_alias_dispatch_routes_imports_reexports_and_assignments_exactly() {
+        let parsed = parse_source_file(
+            r#"
+import defaultValue, { source as local, same } from "pkg";
+import * as namespaceValue from "namespace-pkg";
+import equalsValue = require("equals-pkg");
+export import exportedEquals = require("exported-equals-pkg");
+export { local as renamed, same as unchanged };
+export * from "star-pkg";
+export * as namespaceExport from "namespace-export-pkg";
+export default local;
+export = equalsValue;
+"#,
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(48);
+        let facts = CanonicalSourceFileFacts::new(
+            EscapedName::source("\"/project/aliases\""),
+            CanonicalSourceLanguage::TypeScript,
+            true,
+            CanonicalModuleState::External,
+        );
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(&parsed.arena, parsed.source_file, file, facts)
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+
+        let bound = binder.file(file).unwrap();
+        let source = bound.symbol(bound.source_file()).unwrap();
+        let source_record = binder.symbol_store().symbol(source).unwrap();
+        let locals = binder
+            .symbol_store()
+            .symbol_table(bound.locals(bound.source_file()).unwrap())
+            .unwrap();
+        let exports = binder
+            .symbol_store()
+            .symbol_table(source_record.exports().unwrap())
+            .unwrap();
+        for name in [
+            "defaultValue",
+            "local",
+            "same",
+            "namespaceValue",
+            "equalsValue",
+        ] {
+            let symbol = locals
+                .get_source(name)
+                .unwrap_or_else(|| panic!("missing {name}"));
+            assert_eq!(
+                binder.symbol_store().symbol(symbol).unwrap().flags(),
+                SymbolFlags::ALIAS
+            );
+        }
+        assert!(locals.get_source("exportedEquals").is_none());
+        for name in ["exportedEquals", "renamed", "unchanged", "namespaceExport"] {
+            let symbol = exports
+                .get_source(name)
+                .unwrap_or_else(|| panic!("missing {name}"));
+            let record = binder.symbol_store().symbol(symbol).unwrap();
+            assert_eq!(record.flags(), SymbolFlags::ALIAS);
+            assert_eq!(record.parent(), Some(source));
+        }
+
+        let export_star = exports
+            .get(InternalSymbolName::ExportStar.as_ref())
+            .unwrap();
+        assert_eq!(
+            binder.symbol_store().symbol(export_star).unwrap().flags(),
+            SymbolFlags::EXPORT_STAR
+        );
+        let default_export = exports.get(InternalSymbolName::Default.as_ref()).unwrap();
+        let default_record = binder.symbol_store().symbol(default_export).unwrap();
+        assert_eq!(default_record.flags(), SymbolFlags::ALIAS);
+        assert_eq!(default_record.value_declaration(), None);
+        let export_equals = exports
+            .get(InternalSymbolName::ExportEquals.as_ref())
+            .unwrap();
+        let export_equals_record = binder.symbol_store().symbol(export_equals).unwrap();
+        assert_eq!(export_equals_record.flags(), SymbolFlags::ALIAS);
+        let export_assignments = nodes_of_kind(&parsed.arena, SyntaxKind::ExportAssignment);
+        assert_eq!(export_assignments.len(), 2);
+        let export_equals_node = export_assignments
+            .iter()
+            .copied()
+            .find(|assignment| {
+                matches!(
+                    &parsed.arena.get(*assignment).unwrap().data,
+                    NodeData::ExportAssignment(assignment) if assignment.is_export_equals
+                )
+            })
+            .unwrap();
+        assert_eq!(
+            export_equals_record.value_declaration(),
+            Some(node_ref(&parsed.arena, file, export_equals_node))
+        );
+        assert!(export_assignments.iter().all(|assignment| {
+            matches!(
+                &parsed.arena.get(*assignment).unwrap().data,
+                NodeData::ExportAssignment(assignment) if assignment.type_.is_none()
+            )
+        }));
+
+        let import_clauses = nodes_of_kind(&parsed.arena, SyntaxKind::ImportClause);
+        assert_eq!(import_clauses.len(), 2);
+        assert_eq!(
+            import_clauses
+                .iter()
+                .filter(|clause| bound
+                    .symbol(node_ref(&parsed.arena, file, **clause))
+                    .is_some())
+                .count(),
+            1
+        );
+        let namespace_export = nodes_of_kind(&parsed.arena, SyntaxKind::NamespaceExport)[0];
+        assert_eq!(
+            bound.symbol(node_ref(&parsed.arena, file, namespace_export)),
+            exports.get_source("namespaceExport")
+        );
+        assert!(bound.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn empty_import_export_forms_preserve_nil_symbol_tables() {
+        let parsed = parse_source_file("import \"side-effect\"; export {};");
+        let file = FileId::new(54);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/empty-aliases\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::External,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+
+        let bound = binder.file(file).unwrap();
+        let source = bound.symbol(bound.source_file()).unwrap();
+        assert_eq!(bound.locals(bound.source_file()), None);
+        assert_eq!(
+            binder.symbol_store().symbol(source).unwrap().exports(),
+            None
+        );
+        assert_eq!(binder.symbol_store().symbol_table_len(), 0);
+        assert!(bound.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn module_instance_state_resolves_local_export_alias_targets() {
+        let parsed = parse_source_file(
+            r#"
+namespace Types { interface Shape {} export { Shape }; }
+namespace Values { const value = 1; export { value }; }
+namespace Constants { const enum E { A } export { E }; }
+namespace Ambiguous { import Imported = require("pkg"); export { Imported }; }
+"#,
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(49);
+        let facts = CanonicalSourceFileFacts::new(
+            EscapedName::source("\"/project/module-aliases\""),
+            CanonicalSourceLanguage::TypeScript,
+            false,
+            CanonicalModuleState::Script,
+        );
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(&parsed.arena, parsed.source_file, file, facts)
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+
+        let bound = binder.file(file).unwrap();
+        let locals = binder
+            .symbol_store()
+            .symbol_table(bound.locals(bound.source_file()).unwrap())
+            .unwrap();
+        let flags = |name: &str| {
+            binder
+                .symbol_store()
+                .symbol(locals.get_source(name).unwrap())
+                .unwrap()
+                .flags()
+        };
+        assert_eq!(flags("Types"), SymbolFlags::NAMESPACE_MODULE);
+        assert_eq!(flags("Values"), SymbolFlags::VALUE_MODULE);
+        assert_eq!(
+            flags("Constants"),
+            SymbolFlags::VALUE_MODULE | SymbolFlags::CONST_ENUM_ONLY_MODULE
+        );
+        assert_eq!(flags("Ambiguous"), SymbolFlags::VALUE_MODULE);
+        assert!(bound.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn namespace_export_declarations_allocate_global_tables_only_on_success() {
+        let valid = parse_source_file("export as namespace UMD;");
+        let valid_file = FileId::new(50);
+        let mut valid_binder = CanonicalBinder::new();
+        valid_binder
+            .bind_source_file_with_facts(
+                &valid.arena,
+                valid.source_file,
+                valid_file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/umd\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    true,
+                    CanonicalModuleState::External,
+                ),
+            )
+            .unwrap();
+        valid_binder
+            .bind_typescript_declaration_slice(&valid.arena, valid_file)
+            .unwrap();
+        let valid_bound = valid_binder.file(valid_file).unwrap();
+        let source = valid_bound.symbol(valid_bound.source_file()).unwrap();
+        let globals = valid_binder
+            .symbol_store()
+            .symbol_table(valid_bound.global_exports().unwrap())
+            .unwrap();
+        let umd = globals.get_source("UMD").unwrap();
+        let umd_record = valid_binder.symbol_store().symbol(umd).unwrap();
+        assert_eq!(umd_record.flags(), SymbolFlags::ALIAS);
+        assert_eq!(umd_record.parent(), Some(source));
+        assert!(valid_bound.diagnostics().is_empty());
+
+        for (index, source_text, declaration_file, module_state, code) in [
+            (
+                0,
+                "export as namespace ScriptGlobal;",
+                true,
+                CanonicalModuleState::Script,
+                1314,
+            ),
+            (
+                1,
+                "export as namespace RuntimeGlobal;",
+                false,
+                CanonicalModuleState::External,
+                1315,
+            ),
+            (
+                2,
+                "export namespace Wrapper { export as namespace NestedGlobal; }",
+                true,
+                CanonicalModuleState::External,
+                1316,
+            ),
+        ] {
+            let parsed = parse_source_file(source_text);
+            let file = FileId::new(51 + index);
+            let mut binder = CanonicalBinder::new();
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new(
+                        EscapedName::source(format!("\"/project/global-{index}\"")),
+                        CanonicalSourceLanguage::TypeScript,
+                        declaration_file,
+                        module_state,
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+            let bound = binder.file(file).unwrap();
+            assert_eq!(bound.global_exports(), None);
+            assert_eq!(bound.diagnostics().len(), 1);
+            assert_eq!(bound.diagnostics()[0].diagnostic.code(), code);
+        }
     }
 
     #[test]
