@@ -12,6 +12,12 @@ use super::{
         ConditionalRootId, IndexInfoId, SignatureId, TypeAliasId, TypeId, TypeMapperId,
         TypePredicateId, TypedArena,
     },
+    links::{
+        AliasSymbolLinks, CheckerLinkStores, DeclaredTypeLinks, NodeLinks, ResolutionState,
+        SignatureLinks, SymbolNodeLinks, SymbolReferenceLinks, TypeAliasLinks, TypeNodeLinks,
+        TypeResolutionStack, TypeResolutionTarget, TypeResolutionTargetError,
+        TypeSystemPropertyName, ValueSymbolLinks,
+    },
     signatures::{
         CompositeSignature, IndexInfo, IndexInfoArena, Signature, SignatureArena, SignatureFlags,
         TupleElementInfo, TupleMetadata, TypePredicate, TypePredicateArena, TypePredicateKind,
@@ -33,6 +39,8 @@ pub struct SemanticStore<TypePayload, MapperPayload> {
     index_infos: IndexInfoArena,
     type_aliases: TypedArena<TypeAliasId, TypeAlias>,
     conditional_roots: TypedArena<ConditionalRootId, ConditionalRoot>,
+    links: CheckerLinkStores,
+    type_resolutions: TypeResolutionStack,
 }
 
 impl<TypePayload, MapperPayload> Default for SemanticStore<TypePayload, MapperPayload> {
@@ -69,6 +77,8 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             index_infos: IndexInfoArena::new(id),
             type_aliases: TypedArena::new(id),
             conditional_roots: TypedArena::new(id),
+            links: CheckerLinkStores::default(),
+            type_resolutions: TypeResolutionStack::default(),
         }
     }
 
@@ -276,6 +286,339 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
     ) -> bool {
         self.symbols
             .set_symbol_relationships(symbol, members, exports, parent, export_symbol)
+    }
+
+    /// Reads already-allocated common node links without allocating on a miss.
+    #[must_use]
+    pub fn node_links(&self, node: NodeRef) -> Option<&NodeLinks> {
+        self.contains_node_ref(node)
+            .then(|| self.links.node.try_get(&node))
+            .flatten()
+    }
+
+    pub fn ensure_node_links(&mut self, node: NodeRef) -> bool {
+        if !self.contains_node_ref(node) {
+            return false;
+        }
+        self.links.node.get(node);
+        true
+    }
+
+    pub fn set_node_links(&mut self, node: NodeRef, links: NodeLinks) -> bool {
+        if !self.contains_node_ref(node) {
+            return false;
+        }
+        self.links.node.replace_key(node, links);
+        true
+    }
+
+    #[must_use]
+    pub fn symbol_node_links(&self, node: NodeRef) -> Option<&SymbolNodeLinks> {
+        self.contains_node_ref(node)
+            .then(|| self.links.symbol_node.try_get(&node))
+            .flatten()
+    }
+
+    pub fn ensure_symbol_node_links(&mut self, node: NodeRef) -> bool {
+        if !self.contains_node_ref(node) {
+            return false;
+        }
+        self.links.symbol_node.get(node);
+        true
+    }
+
+    pub fn set_symbol_node_links(&mut self, node: NodeRef, links: SymbolNodeLinks) -> bool {
+        if !self.contains_node_ref(node) || !self.valid_symbol_resolution(&links.resolved_symbol) {
+            return false;
+        }
+        self.links.symbol_node.replace_key(node, links);
+        true
+    }
+
+    #[must_use]
+    pub fn type_node_links(&self, node: NodeRef) -> Option<&TypeNodeLinks> {
+        self.contains_node_ref(node)
+            .then(|| self.links.type_node.try_get(&node))
+            .flatten()
+    }
+
+    pub fn ensure_type_node_links(&mut self, node: NodeRef) -> bool {
+        if !self.contains_node_ref(node) {
+            return false;
+        }
+        self.links.type_node.get(node);
+        true
+    }
+
+    pub fn set_type_node_links(&mut self, node: NodeRef, links: TypeNodeLinks) -> bool {
+        if !self.contains_node_ref(node)
+            || !self.valid_type_resolution(&links.resolved_type)
+            || !self.valid_optional_types(links.outer_type_parameters.as_deref())
+        {
+            return false;
+        }
+        self.links.type_node.replace_key(node, links);
+        true
+    }
+
+    #[must_use]
+    pub fn signature_links(&self, node: NodeRef) -> Option<&SignatureLinks> {
+        self.contains_node_ref(node)
+            .then(|| self.links.signature.try_get(&node))
+            .flatten()
+    }
+
+    pub fn ensure_signature_links(&mut self, node: NodeRef) -> bool {
+        if !self.contains_node_ref(node) {
+            return false;
+        }
+        self.links.signature.get(node);
+        true
+    }
+
+    pub fn set_signature_links(&mut self, node: NodeRef, links: SignatureLinks) -> bool {
+        if !self.contains_node_ref(node)
+            || !self.valid_signature_resolution(&links.resolved_signature)
+            || !self.valid_signature_resolution(&links.effects_signature)
+            || !self.valid_signature_resolution(&links.decorator_signature)
+        {
+            return false;
+        }
+        self.links.signature.replace_key(node, links);
+        true
+    }
+
+    #[must_use]
+    pub fn symbol_reference_links(
+        &self,
+        symbol: SemanticSymbolId,
+    ) -> Option<&SymbolReferenceLinks> {
+        self.symbols
+            .contains_symbol(symbol)
+            .then(|| self.links.symbol_reference.try_get(&symbol))
+            .flatten()
+    }
+
+    pub fn ensure_symbol_reference_links(&mut self, symbol: SemanticSymbolId) -> bool {
+        if !self.symbols.contains_symbol(symbol) {
+            return false;
+        }
+        self.links.symbol_reference.get(symbol);
+        true
+    }
+
+    pub fn set_symbol_reference_links(
+        &mut self,
+        symbol: SemanticSymbolId,
+        links: SymbolReferenceLinks,
+    ) -> bool {
+        if !self.symbols.contains_symbol(symbol) {
+            return false;
+        }
+        self.links.symbol_reference.replace_key(symbol, links);
+        true
+    }
+
+    #[must_use]
+    pub fn value_symbol_links(&self, symbol: SemanticSymbolId) -> Option<&ValueSymbolLinks> {
+        self.symbols
+            .contains_symbol(symbol)
+            .then(|| self.links.value_symbol.try_get(&symbol))
+            .flatten()
+    }
+
+    pub fn ensure_value_symbol_links(&mut self, symbol: SemanticSymbolId) -> bool {
+        if !self.symbols.contains_symbol(symbol) {
+            return false;
+        }
+        self.links.value_symbol.get(symbol);
+        true
+    }
+
+    pub fn set_value_symbol_links(
+        &mut self,
+        symbol: SemanticSymbolId,
+        links: ValueSymbolLinks,
+    ) -> bool {
+        if !self.symbols.contains_symbol(symbol)
+            || !self.valid_type_resolution(&links.resolved_type)
+            || !self.valid_type_resolution(&links.write_type)
+            || !self.valid_optional_symbol(links.target)
+            || !self.valid_optional_mapper(links.mapper)
+            || !self.valid_optional_type(links.name_type)
+            || !self.valid_optional_type(links.containing_type)
+        {
+            return false;
+        }
+        self.links.value_symbol.replace_key(symbol, links);
+        true
+    }
+
+    #[must_use]
+    pub fn alias_symbol_links(&self, symbol: SemanticSymbolId) -> Option<&AliasSymbolLinks> {
+        self.symbols
+            .contains_symbol(symbol)
+            .then(|| self.links.alias_symbol.try_get(&symbol))
+            .flatten()
+    }
+
+    pub fn ensure_alias_symbol_links(&mut self, symbol: SemanticSymbolId) -> bool {
+        if !self.symbols.contains_symbol(symbol) {
+            return false;
+        }
+        self.links.alias_symbol.get(symbol);
+        true
+    }
+
+    pub fn set_alias_symbol_links(
+        &mut self,
+        symbol: SemanticSymbolId,
+        links: AliasSymbolLinks,
+    ) -> bool {
+        if !self.symbols.contains_symbol(symbol)
+            || !self.valid_symbol_resolution(&links.immediate_target)
+            || !self.valid_symbol_resolution(&links.alias_target)
+            || !self.valid_optional_node(links.type_only_declaration)
+        {
+            return false;
+        }
+        self.links.alias_symbol.replace_key(symbol, links);
+        true
+    }
+
+    #[must_use]
+    pub fn type_alias_links(&self, symbol: SemanticSymbolId) -> Option<&TypeAliasLinks> {
+        self.symbols
+            .contains_symbol(symbol)
+            .then(|| self.links.type_alias.try_get(&symbol))
+            .flatten()
+    }
+
+    pub fn ensure_type_alias_links(&mut self, symbol: SemanticSymbolId) -> bool {
+        if !self.symbols.contains_symbol(symbol) {
+            return false;
+        }
+        self.links.type_alias.get(symbol);
+        true
+    }
+
+    pub fn set_type_alias_links(
+        &mut self,
+        symbol: SemanticSymbolId,
+        links: TypeAliasLinks,
+    ) -> bool {
+        if !self.symbols.contains_symbol(symbol)
+            || !self.valid_type_resolution(&links.declared_type)
+            || !self.valid_optional_types(links.type_parameters.as_deref())
+            || links.instantiations.as_ref().is_some_and(|instantiations| {
+                instantiations
+                    .values()
+                    .any(|type_id| self.types.get(*type_id).is_none())
+            })
+        {
+            return false;
+        }
+        self.links.type_alias.replace_key(symbol, links);
+        true
+    }
+
+    #[must_use]
+    pub fn declared_type_links(&self, symbol: SemanticSymbolId) -> Option<&DeclaredTypeLinks> {
+        self.symbols
+            .contains_symbol(symbol)
+            .then(|| self.links.declared_type.try_get(&symbol))
+            .flatten()
+    }
+
+    pub fn ensure_declared_type_links(&mut self, symbol: SemanticSymbolId) -> bool {
+        if !self.symbols.contains_symbol(symbol) {
+            return false;
+        }
+        self.links.declared_type.get(symbol);
+        true
+    }
+
+    pub fn set_declared_type_links(
+        &mut self,
+        symbol: SemanticSymbolId,
+        links: DeclaredTypeLinks,
+    ) -> bool {
+        if !self.symbols.contains_symbol(symbol)
+            || !self.valid_type_resolution(&links.declared_type)
+        {
+            return false;
+        }
+        self.links.declared_type.replace_key(symbol, links);
+        true
+    }
+
+    /// Pushes one validated lazy-property query onto this Program's cycle
+    /// stack.
+    ///
+    /// All IDs and nodes are checked against this aggregate owner before the
+    /// stack changes. `has_property` must consult snapshots captured before
+    /// this call; this keeps link borrows out of recursive checker work.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the property does not accept the target kind or
+    /// the target belongs to another semantic store/AST scope.
+    pub fn push_type_resolution(
+        &mut self,
+        target: TypeResolutionTarget,
+        property: TypeSystemPropertyName,
+        has_property: impl FnMut(TypeResolutionTarget, TypeSystemPropertyName) -> bool,
+    ) -> Result<bool, TypeResolutionTargetError> {
+        self.validate_type_resolution_target(target, property)?;
+        self.type_resolutions.push(target, property, has_property)
+    }
+
+    /// Finds a cycle start without changing the stack or allocating links.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the property does not accept the target kind or
+    /// the target belongs to another semantic store/AST scope.
+    pub fn find_type_resolution_cycle_start(
+        &self,
+        target: TypeResolutionTarget,
+        property: TypeSystemPropertyName,
+        has_property: impl FnMut(TypeResolutionTarget, TypeSystemPropertyName) -> bool,
+    ) -> Result<Option<usize>, TypeResolutionTargetError> {
+        self.validate_type_resolution_target(target, property)?;
+        self.type_resolutions
+            .find_cycle_start_index(target, property, has_property)
+    }
+
+    /// Pops one query and returns whether its dependency chain remained
+    /// cycle-free.
+    pub fn pop_type_resolution(&mut self) -> Option<bool> {
+        self.type_resolutions.pop()
+    }
+
+    #[must_use]
+    pub fn type_resolution_len(&self) -> usize {
+        self.type_resolutions.len()
+    }
+
+    #[must_use]
+    pub fn type_resolution_is_empty(&self) -> bool {
+        self.type_resolutions.is_empty()
+    }
+
+    #[must_use]
+    pub const fn type_resolution_start(&self) -> usize {
+        self.type_resolutions.resolution_start()
+    }
+
+    /// Starts cycle scanning at the current depth and returns the old boundary
+    /// for `restore_type_resolution_start`.
+    pub fn reset_type_resolution_start(&mut self) -> usize {
+        self.type_resolutions.reset_resolution_start()
+    }
+
+    pub fn restore_type_resolution_start(&mut self, previous: usize) -> bool {
+        self.type_resolutions.restore_resolution_start(previous)
     }
 
     /// Allocates a canonical type-mapper payload.
@@ -579,8 +922,18 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         ids.iter().all(|id| self.types.get(*id).is_some())
     }
 
+    fn valid_optional_types(&self, ids: Option<&[TypeId]>) -> bool {
+        ids.is_none_or(|ids| self.valid_types(ids))
+    }
+
     fn valid_optional_type(&self, id: Option<TypeId>) -> bool {
         id.is_none_or(|id| self.types.get(id).is_some())
+    }
+
+    fn valid_type_resolution(&self, state: &ResolutionState<TypeId>) -> bool {
+        state
+            .resolved()
+            .is_none_or(|id| self.types.get(*id).is_some())
     }
 
     fn valid_symbols(&self, ids: &[SemanticSymbolId]) -> bool {
@@ -591,12 +944,42 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         id.is_none_or(|id| self.symbols.contains_symbol(id))
     }
 
+    fn valid_symbol_resolution(&self, state: &ResolutionState<SemanticSymbolId>) -> bool {
+        state
+            .resolved()
+            .is_none_or(|id| self.symbols.contains_symbol(*id))
+    }
+
     fn valid_optional_mapper(&self, id: Option<TypeMapperId>) -> bool {
         id.is_none_or(|id| self.mappers.get(id).is_some())
     }
 
     fn valid_optional_signature(&self, id: Option<SignatureId>) -> bool {
         id.is_none_or(|id| self.signatures.get(id).is_some())
+    }
+
+    fn valid_signature_resolution(&self, state: &ResolutionState<SignatureId>) -> bool {
+        state
+            .resolved()
+            .is_none_or(|id| self.signatures.get(*id).is_some())
+    }
+
+    fn validate_type_resolution_target(
+        &self,
+        target: TypeResolutionTarget,
+        property: TypeSystemPropertyName,
+    ) -> Result<(), TypeResolutionTargetError> {
+        let belongs_to_store = match target {
+            TypeResolutionTarget::Symbol(symbol) => self.symbols.contains_symbol(symbol),
+            TypeResolutionTarget::Type(type_id) => self.types.get(type_id).is_some(),
+            TypeResolutionTarget::Signature(signature) => self.signatures.get(signature).is_some(),
+            TypeResolutionTarget::Node(node) => self.contains_node_ref(node),
+        };
+        if belongs_to_store && property.accepts(target) {
+            Ok(())
+        } else {
+            Err(TypeResolutionTargetError { target, property })
+        }
     }
 
     fn valid_optional_predicate(&self, id: Option<TypePredicateId>) -> bool {
@@ -606,12 +989,19 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use ts_ast::{FileId, NodeRef};
     use ts_binder::{EscapedName, SymbolData, SymbolFlags, SymbolStore};
     use ts_parser::parse_source_file;
 
     use super::{AstScope, SemanticStore};
-    use crate::semantic::signatures::{ElementFlags, SignatureFlags, TypePredicateKind};
+    use crate::semantic::{
+        AliasSymbolLinks, CacheHashKey, DeclaredTypeLinks, NodeLinks, ResolutionState,
+        SignatureLinks, SymbolNodeLinks, SymbolReferenceLinks, TypeAliasLinks, TypeNodeLinks,
+        TypeResolutionTarget, TypeSystemPropertyName, ValueSymbolLinks,
+        signatures::{ElementFlags, SignatureFlags, TypePredicateKind},
+    };
 
     type TestStore = SemanticStore<&'static str, &'static str>;
 
@@ -1200,5 +1590,486 @@ mod tests {
             store.index_info(index).unwrap().index_symbol(),
             Some(parameter)
         );
+    }
+
+    #[test]
+    fn sparse_semantic_links_preserve_absent_and_allocated_default_records() {
+        let parsed = parse_source_file("type T = string;");
+        let scope = AstScope::new(FileId::new(21), &parsed.arena);
+        let node = scope.node_ref(parsed.source_file).unwrap();
+        let mut store = TestStore::new();
+        assert!(store.register_ast_scope(scope));
+        let symbol = alloc_test_symbol(&mut store, "T");
+
+        assert_eq!(store.node_links(node), None);
+        assert_eq!(store.symbol_node_links(node), None);
+        assert_eq!(store.type_node_links(node), None);
+        assert_eq!(store.signature_links(node), None);
+        assert_eq!(store.symbol_reference_links(symbol), None);
+        assert_eq!(store.value_symbol_links(symbol), None);
+        assert_eq!(store.alias_symbol_links(symbol), None);
+        assert_eq!(store.type_alias_links(symbol), None);
+        assert_eq!(store.declared_type_links(symbol), None);
+
+        assert!(store.ensure_node_links(node));
+        assert!(store.ensure_symbol_node_links(node));
+        assert!(store.ensure_type_node_links(node));
+        assert!(store.ensure_signature_links(node));
+        assert!(store.ensure_symbol_reference_links(symbol));
+        assert!(store.ensure_value_symbol_links(symbol));
+        assert!(store.ensure_alias_symbol_links(symbol));
+        assert!(store.ensure_type_alias_links(symbol));
+        assert!(store.ensure_declared_type_links(symbol));
+
+        assert_eq!(store.node_links(node), Some(&NodeLinks::default()));
+        assert_eq!(
+            store.symbol_node_links(node),
+            Some(&SymbolNodeLinks::default())
+        );
+        assert_eq!(store.type_node_links(node), Some(&TypeNodeLinks::default()));
+        assert_eq!(
+            store.signature_links(node),
+            Some(&SignatureLinks::default())
+        );
+        assert_eq!(
+            store.symbol_reference_links(symbol),
+            Some(&SymbolReferenceLinks::default())
+        );
+        assert_eq!(
+            store.value_symbol_links(symbol),
+            Some(&ValueSymbolLinks::default())
+        );
+        assert_eq!(
+            store.alias_symbol_links(symbol),
+            Some(&AliasSymbolLinks::default())
+        );
+        assert_eq!(
+            store.type_alias_links(symbol),
+            Some(&TypeAliasLinks::default())
+        );
+        assert_eq!(
+            store.declared_type_links(symbol),
+            Some(&DeclaredTypeLinks::default())
+        );
+
+        let allocated_empty = TypeAliasLinks {
+            type_parameters: Some(Vec::new()),
+            instantiations: Some(HashMap::new()),
+            ..TypeAliasLinks::default()
+        };
+        assert!(store.set_type_alias_links(symbol, allocated_empty.clone()));
+        assert_eq!(store.type_alias_links(symbol), Some(&allocated_empty));
+        assert_ne!(
+            store.type_alias_links(symbol),
+            Some(&TypeAliasLinks::default())
+        );
+    }
+
+    #[test]
+    fn semantic_link_commits_accept_owned_ids_and_all_cache_states() {
+        let parsed = parse_source_file("const value = 1;");
+        let scope = AstScope::new(FileId::new(22), &parsed.arena);
+        let node = scope.node_ref(parsed.source_file).unwrap();
+        let mut store = TestStore::new();
+        assert!(store.register_ast_scope(scope));
+        let symbol = alloc_test_symbol(&mut store, "value");
+        let target = alloc_test_symbol(&mut store, "target");
+        let type_id = store.alloc_type("number");
+        let mapper = store.alloc_mapper("identity");
+        let signature = empty_signature(&mut store);
+
+        let symbol_node = SymbolNodeLinks {
+            resolved_symbol: ResolutionState::Resolved(target),
+        };
+        assert!(store.set_symbol_node_links(node, symbol_node.clone()));
+        assert_eq!(store.symbol_node_links(node), Some(&symbol_node));
+
+        let type_node = TypeNodeLinks {
+            resolved_type: ResolutionState::Resolving,
+            outer_type_parameters: Some(vec![type_id]),
+        };
+        assert!(store.set_type_node_links(node, type_node.clone()));
+        assert_eq!(store.type_node_links(node), Some(&type_node));
+
+        let signature_links = SignatureLinks {
+            resolved_signature: ResolutionState::Resolving,
+            effects_signature: ResolutionState::ResolvedAbsent,
+            decorator_signature: ResolutionState::Resolved(signature),
+        };
+        assert!(store.set_signature_links(node, signature_links.clone()));
+        assert_eq!(store.signature_links(node), Some(&signature_links));
+
+        let value_links = ValueSymbolLinks {
+            resolved_type: ResolutionState::Resolved(type_id),
+            write_type: ResolutionState::ResolvedAbsent,
+            target: Some(target),
+            mapper: Some(mapper),
+            name_type: Some(type_id),
+            containing_type: Some(type_id),
+            function_or_constructor_checked: true,
+        };
+        assert!(store.set_value_symbol_links(symbol, value_links.clone()));
+        assert_eq!(store.value_symbol_links(symbol), Some(&value_links));
+
+        let alias_links = AliasSymbolLinks {
+            immediate_target: ResolutionState::Resolved(target),
+            alias_target: ResolutionState::Resolving,
+            referenced: true,
+            type_only_declaration: Some(node),
+        };
+        assert!(store.set_alias_symbol_links(symbol, alias_links.clone()));
+        assert_eq!(store.alias_symbol_links(symbol), Some(&alias_links));
+
+        let type_alias_links = TypeAliasLinks {
+            declared_type: ResolutionState::Resolved(type_id),
+            type_parameters: Some(vec![type_id]),
+            instantiations: Some(HashMap::from([(CacheHashKey::from_halves(1, 2), type_id)])),
+            is_constructor_declared_property: true,
+        };
+        assert!(store.set_type_alias_links(symbol, type_alias_links.clone()));
+        assert_eq!(store.type_alias_links(symbol), Some(&type_alias_links));
+
+        let declared_links = DeclaredTypeLinks {
+            declared_type: ResolutionState::Resolved(type_id),
+            interface_checked: true,
+            index_signatures_checked: true,
+            type_parameters_checked: true,
+            enum_checked: true,
+        };
+        assert!(store.set_declared_type_links(symbol, declared_links.clone()));
+        assert_eq!(store.declared_type_links(symbol), Some(&declared_links));
+    }
+
+    #[test]
+    fn semantic_link_keys_and_payloads_reject_every_foreign_id_kind_atomically() {
+        let first_parse = parse_source_file("const value = 1;");
+        let second_parse = parse_source_file("const value = 1;");
+        let first_scope = AstScope::new(FileId::new(23), &first_parse.arena);
+        let second_scope = AstScope::new(FileId::new(23), &second_parse.arena);
+        let first_node = first_scope.node_ref(first_parse.source_file).unwrap();
+        let second_node = second_scope.node_ref(second_parse.source_file).unwrap();
+
+        let mut first = TestStore::new();
+        assert!(first.register_ast_scope(first_scope));
+        let foreign_symbol = alloc_test_symbol(&mut first, "foreign");
+        let foreign_type = first.alloc_type("foreign type");
+        let foreign_mapper = first.alloc_mapper("foreign mapper");
+        let foreign_signature = empty_signature(&mut first);
+
+        let mut store = TestStore::new();
+        assert!(store.register_ast_scope(second_scope));
+        let symbol = alloc_test_symbol(&mut store, "local");
+        let local_type = store.alloc_type("local type");
+
+        assert!(!store.ensure_node_links(first_node));
+        assert!(!store.ensure_symbol_node_links(first_node));
+        assert!(!store.ensure_type_node_links(first_node));
+        assert!(!store.ensure_signature_links(first_node));
+        assert_eq!(store.node_links(second_node), None);
+        assert_eq!(store.symbol_node_links(second_node), None);
+        assert_eq!(store.type_node_links(second_node), None);
+        assert_eq!(store.signature_links(second_node), None);
+
+        assert!(!store.ensure_symbol_reference_links(foreign_symbol));
+        assert!(!store.ensure_value_symbol_links(foreign_symbol));
+        assert!(!store.ensure_alias_symbol_links(foreign_symbol));
+        assert!(!store.ensure_type_alias_links(foreign_symbol));
+        assert!(!store.ensure_declared_type_links(foreign_symbol));
+
+        assert!(!store.set_symbol_node_links(
+            second_node,
+            SymbolNodeLinks {
+                resolved_symbol: ResolutionState::Resolved(foreign_symbol),
+            },
+        ));
+        assert_eq!(store.symbol_node_links(second_node), None);
+
+        for invalid in [
+            SignatureLinks {
+                resolved_signature: ResolutionState::Resolved(foreign_signature),
+                ..SignatureLinks::default()
+            },
+            SignatureLinks {
+                effects_signature: ResolutionState::Resolved(foreign_signature),
+                ..SignatureLinks::default()
+            },
+            SignatureLinks {
+                decorator_signature: ResolutionState::Resolved(foreign_signature),
+                ..SignatureLinks::default()
+            },
+        ] {
+            assert!(!store.set_signature_links(second_node, invalid));
+            assert_eq!(store.signature_links(second_node), None);
+        }
+
+        assert!(!store.set_type_node_links(
+            second_node,
+            TypeNodeLinks {
+                resolved_type: ResolutionState::Resolved(foreign_type),
+                ..TypeNodeLinks::default()
+            },
+        ));
+        assert!(!store.set_type_node_links(
+            second_node,
+            TypeNodeLinks {
+                outer_type_parameters: Some(vec![foreign_type]),
+                ..TypeNodeLinks::default()
+            },
+        ));
+        assert_eq!(store.type_node_links(second_node), None);
+
+        let invalid_values = [
+            ValueSymbolLinks {
+                resolved_type: ResolutionState::Resolved(foreign_type),
+                ..ValueSymbolLinks::default()
+            },
+            ValueSymbolLinks {
+                write_type: ResolutionState::Resolved(foreign_type),
+                ..ValueSymbolLinks::default()
+            },
+            ValueSymbolLinks {
+                target: Some(foreign_symbol),
+                ..ValueSymbolLinks::default()
+            },
+            ValueSymbolLinks {
+                mapper: Some(foreign_mapper),
+                ..ValueSymbolLinks::default()
+            },
+            ValueSymbolLinks {
+                name_type: Some(foreign_type),
+                ..ValueSymbolLinks::default()
+            },
+            ValueSymbolLinks {
+                containing_type: Some(foreign_type),
+                ..ValueSymbolLinks::default()
+            },
+        ];
+        for invalid in invalid_values {
+            assert!(!store.set_value_symbol_links(symbol, invalid));
+            assert_eq!(store.value_symbol_links(symbol), None);
+        }
+
+        assert!(!store.set_alias_symbol_links(
+            symbol,
+            AliasSymbolLinks {
+                immediate_target: ResolutionState::Resolved(foreign_symbol),
+                ..AliasSymbolLinks::default()
+            },
+        ));
+        assert!(!store.set_alias_symbol_links(
+            symbol,
+            AliasSymbolLinks {
+                alias_target: ResolutionState::Resolved(foreign_symbol),
+                ..AliasSymbolLinks::default()
+            },
+        ));
+        assert!(!store.set_alias_symbol_links(
+            symbol,
+            AliasSymbolLinks {
+                type_only_declaration: Some(first_node),
+                ..AliasSymbolLinks::default()
+            },
+        ));
+        assert_eq!(store.alias_symbol_links(symbol), None);
+
+        let invalid_aliases = [
+            TypeAliasLinks {
+                declared_type: ResolutionState::Resolved(foreign_type),
+                ..TypeAliasLinks::default()
+            },
+            TypeAliasLinks {
+                type_parameters: Some(vec![foreign_type]),
+                ..TypeAliasLinks::default()
+            },
+            TypeAliasLinks {
+                instantiations: Some(HashMap::from([(
+                    CacheHashKey::from_halves(3, 4),
+                    foreign_type,
+                )])),
+                ..TypeAliasLinks::default()
+            },
+        ];
+        for invalid in invalid_aliases {
+            assert!(!store.set_type_alias_links(symbol, invalid));
+            assert_eq!(store.type_alias_links(symbol), None);
+        }
+
+        assert!(!store.set_declared_type_links(
+            symbol,
+            DeclaredTypeLinks {
+                declared_type: ResolutionState::Resolved(foreign_type),
+                ..DeclaredTypeLinks::default()
+            },
+        ));
+        assert_eq!(store.declared_type_links(symbol), None);
+
+        let baseline = ValueSymbolLinks {
+            resolved_type: ResolutionState::Resolved(local_type),
+            ..ValueSymbolLinks::default()
+        };
+        assert!(store.set_value_symbol_links(symbol, baseline.clone()));
+        assert!(!store.set_value_symbol_links(
+            symbol,
+            ValueSymbolLinks {
+                resolved_type: ResolutionState::Resolved(foreign_type),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        assert_eq!(store.value_symbol_links(symbol), Some(&baseline));
+    }
+
+    #[test]
+    fn semantic_store_owns_and_validates_the_type_resolution_stack() {
+        let parsed = parse_source_file("const first = 1; const second = 2;");
+        let scope = AstScope::new(FileId::new(24), &parsed.arena);
+        let node = scope.node_ref(parsed.source_file).unwrap();
+        let mut store = TestStore::new();
+        assert!(store.register_ast_scope(scope));
+        let first = alloc_test_symbol(&mut store, "first");
+        let second = alloc_test_symbol(&mut store, "second");
+        let type_id = store.alloc_type("number");
+        let signature = empty_signature(&mut store);
+
+        let first_target = TypeResolutionTarget::Symbol(first);
+        let second_target = TypeResolutionTarget::Symbol(second);
+        assert_eq!(
+            store.push_type_resolution(first_target, TypeSystemPropertyName::Type, |_, _| false),
+            Ok(true)
+        );
+        assert_eq!(
+            store.push_type_resolution(second_target, TypeSystemPropertyName::Type, |_, _| false),
+            Ok(true)
+        );
+        assert_eq!(
+            store.push_type_resolution(first_target, TypeSystemPropertyName::Type, |_, _| false),
+            Ok(false)
+        );
+        assert_eq!(store.type_resolution_len(), 2);
+        assert_eq!(store.pop_type_resolution(), Some(false));
+        assert_eq!(store.pop_type_resolution(), Some(false));
+        assert!(store.type_resolution_is_empty());
+
+        for (target, property) in [
+            (
+                TypeResolutionTarget::Type(type_id),
+                TypeSystemPropertyName::ResolvedBaseConstraint,
+            ),
+            (
+                TypeResolutionTarget::Signature(signature),
+                TypeSystemPropertyName::ResolvedReturnType,
+            ),
+            (
+                TypeResolutionTarget::Node(node),
+                TypeSystemPropertyName::InitializerIsUndefined,
+            ),
+        ] {
+            assert_eq!(
+                store.push_type_resolution(target, property, |_, _| false),
+                Ok(true)
+            );
+            assert_eq!(store.pop_type_resolution(), Some(true));
+        }
+
+        let previous = store.reset_type_resolution_start();
+        assert_eq!(previous, 0);
+        assert_eq!(store.type_resolution_start(), 0);
+        assert!(store.restore_type_resolution_start(previous));
+
+        assert!(
+            store
+                .push_type_resolution(
+                    TypeResolutionTarget::Symbol(first),
+                    TypeSystemPropertyName::ResolvedReturnType,
+                    |_, _| false,
+                )
+                .is_err()
+        );
+        assert!(store.type_resolution_is_empty());
+    }
+
+    #[test]
+    fn type_resolution_stack_rejects_equal_local_foreign_targets_without_mutation() {
+        let first_parse = parse_source_file("const value = 1;");
+        let second_parse = parse_source_file("const value = 1;");
+        let first_scope = AstScope::new(FileId::new(25), &first_parse.arena);
+        let second_scope = AstScope::new(FileId::new(25), &second_parse.arena);
+        let first_node = first_scope.node_ref(first_parse.source_file).unwrap();
+        let second_node = second_scope.node_ref(second_parse.source_file).unwrap();
+
+        let mut first = TestStore::new();
+        assert!(first.register_ast_scope(first_scope));
+        let foreign_symbol = alloc_test_symbol(&mut first, "value");
+        let foreign_type = first.alloc_type("number");
+        let foreign_signature = empty_signature(&mut first);
+
+        let mut store = TestStore::new();
+        assert!(store.register_ast_scope(second_scope));
+        let local_symbol = alloc_test_symbol(&mut store, "value");
+        let local_type = store.alloc_type("number");
+        let local_signature = empty_signature(&mut store);
+
+        assert_eq!(foreign_symbol.get(), local_symbol.get());
+        assert_eq!(foreign_type.get(), local_type.get());
+        assert_eq!(foreign_signature.get(), local_signature.get());
+        assert_eq!(first_node.file, second_node.file);
+        assert_eq!(first_node.node, second_node.node);
+        assert_ne!(first_node.arena, second_node.arena);
+
+        let foreign_targets = [
+            (
+                TypeResolutionTarget::Symbol(foreign_symbol),
+                TypeSystemPropertyName::Type,
+            ),
+            (
+                TypeResolutionTarget::Type(foreign_type),
+                TypeSystemPropertyName::ResolvedBaseTypes,
+            ),
+            (
+                TypeResolutionTarget::Signature(foreign_signature),
+                TypeSystemPropertyName::ResolvedReturnType,
+            ),
+            (
+                TypeResolutionTarget::Node(first_node),
+                TypeSystemPropertyName::InitializerIsUndefined,
+            ),
+        ];
+        for (target, property) in foreign_targets {
+            assert!(
+                store
+                    .push_type_resolution(target, property, |_, _| false)
+                    .is_err()
+            );
+            assert!(
+                store
+                    .find_type_resolution_cycle_start(target, property, |_, _| false)
+                    .is_err()
+            );
+            assert!(store.type_resolution_is_empty());
+        }
+
+        for (target, property) in [
+            (
+                TypeResolutionTarget::Symbol(local_symbol),
+                TypeSystemPropertyName::AliasTarget,
+            ),
+            (
+                TypeResolutionTarget::Type(local_type),
+                TypeSystemPropertyName::ResolvedBaseTypes,
+            ),
+            (
+                TypeResolutionTarget::Signature(local_signature),
+                TypeSystemPropertyName::ResolvedReturnType,
+            ),
+            (
+                TypeResolutionTarget::Node(second_node),
+                TypeSystemPropertyName::InitializerIsUndefined,
+            ),
+        ] {
+            assert_eq!(
+                store.push_type_resolution(target, property, |_, _| false),
+                Ok(true)
+            );
+            assert_eq!(store.pop_type_resolution(), Some(true));
+        }
     }
 }
