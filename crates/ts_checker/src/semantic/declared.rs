@@ -246,6 +246,50 @@ fn malformed_alias_merge(flags: SymbolFlags) -> bool {
     flags.contains(SymbolFlags::ALIAS) && flags.without(SymbolFlags::ALIAS) != SymbolFlags::NONE
 }
 
+fn ordinary_type_parameter_symbol_flags(flags: SymbolFlags) -> bool {
+    flags.contains(SymbolFlags::TYPE_PARAMETER)
+        && !flags.intersects(SymbolFlags::TYPE_PARAMETER_EXCLUDES)
+        && !malformed_alias_merge(flags)
+}
+
+fn origin_type_parameter_object_flags(flags: ObjectFlags) -> bool {
+    flags == ObjectFlags::NONE
+        || flags
+            == (ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES_COMPUTED
+                | ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES)
+}
+
+fn cached_ordinary_type_parameter_owner(
+    store: &SemanticStore<TypeRecord, TypeMapper>,
+    declared_type: TypeId,
+) -> Option<SemanticSymbolId> {
+    let record = store.type_payload(declared_type)?;
+    let TypeData::TypeParameter(data) = record.data() else {
+        return None;
+    };
+    if record.flags() != TypeFlags::TYPE_PARAMETER
+        || !origin_type_parameter_object_flags(record.object_flags())
+        || record.alias().is_some()
+        || data.is_this_type
+        || data.target.is_some()
+        || data.mapper.is_some()
+    {
+        return None;
+    }
+    let symbol = record.symbol()?;
+    if !store
+        .symbol(symbol)
+        .is_some_and(|record| ordinary_type_parameter_symbol_flags(record.flags()))
+        || store
+            .declared_type_links(symbol)
+            .and_then(|links| links.declared_type)
+            != Some(declared_type)
+    {
+        return None;
+    }
+    Some(symbol)
+}
+
 fn cached_class_type(
     store: &SemanticStore<TypeRecord, TypeMapper>,
     symbol: SemanticSymbolId,
@@ -315,18 +359,15 @@ fn fully_initialized_class_type(
         || data.reference.object.target != Some(declared_type)
         || data.reference.object.mapper.is_some()
         || data.reference.node.is_some()
-        || !resolved_type_arguments.iter().all(|parameter| {
-            matches!(
-                store.type_payload(*parameter),
-                Some(record)
-                    if record.flags() == TypeFlags::TYPE_PARAMETER
-                        && record.object_flags() == ObjectFlags::NONE
-                        && matches!(
-                            record.data(),
-                            TypeData::TypeParameter(data) if !data.is_this_type
-                        )
-            )
-        })
+        || resolved_type_arguments
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>()
+            .len()
+            != resolved_type_arguments.len()
+        || !resolved_type_arguments
+            .iter()
+            .all(|parameter| cached_ordinary_type_parameter_owner(store, *parameter).is_some())
         || !all_type_parameters
             .iter()
             .all(|parameter| store.type_payload(*parameter).is_some())
@@ -337,12 +378,16 @@ fn fully_initialized_class_type(
         return false;
     };
     if this_record.flags() != TypeFlags::TYPE_PARAMETER
-        || this_record.object_flags() != ObjectFlags::NONE
+        || !origin_type_parameter_object_flags(this_record.object_flags())
+        || this_record.alias().is_some()
         || this_record.symbol() != Some(symbol)
         || !matches!(
             this_record.data(),
             TypeData::TypeParameter(data)
-                if data.is_this_type && data.constraint == Some(declared_type)
+                if data.is_this_type
+                    && data.constraint == Some(declared_type)
+                    && data.target.is_none()
+                    && data.mapper.is_none()
         )
     {
         return false;
@@ -365,15 +410,7 @@ fn cached_type_parameter(
     else {
         return Ok(None);
     };
-    let valid = store.type_payload(declared_type).is_some_and(|record| {
-        record.flags() == TypeFlags::TYPE_PARAMETER
-            && record.object_flags() == ObjectFlags::NONE
-            && record.symbol() == Some(symbol)
-            && matches!(
-                record.data(),
-                TypeData::TypeParameter(data) if !data.is_this_type
-            )
-    });
+    let valid = cached_ordinary_type_parameter_owner(store, declared_type) == Some(symbol);
     if valid {
         Ok(Some(declared_type))
     } else {
@@ -418,7 +455,7 @@ fn preflight_type_parameter_symbol(
             DeclaredTypeUnavailable::AliasMergedWithDeclaredSymbol(symbol),
         ));
     }
-    if !flags.contains(SymbolFlags::TYPE_PARAMETER) {
+    if !ordinary_type_parameter_symbol_flags(flags) {
         return Err(unavailable(
             DeclaredTypeUnavailable::InvalidTypeParameterSymbol(symbol),
         ));
@@ -1025,6 +1062,35 @@ mod tests {
             .collect()
     }
 
+    fn assert_invalid_cached_declared_type_is_atomic(
+        store: &mut TestStore,
+        symbol: SemanticSymbolId,
+        declared_type: TypeId,
+    ) {
+        let type_count = store.type_len();
+        let mapper_count = store.mapper_len();
+        let type_alias_count = store.type_alias_len();
+        let link_counts = store.checker_link_allocated_lengths();
+        let declared_links = store.declared_type_links(symbol).cloned();
+        let empty_host =
+            DeclaredTypeHost::new(std::iter::empty::<(&NodeArena, &BoundFile)>()).unwrap();
+
+        assert_eq!(
+            store.get_declared_type_of_symbol(&empty_host, symbol),
+            Err(unavailable(
+                DeclaredTypeUnavailable::InvalidCachedDeclaredType {
+                    symbol,
+                    declared_type,
+                }
+            ))
+        );
+        assert_eq!(store.type_len(), type_count);
+        assert_eq!(store.mapper_len(), mapper_count);
+        assert_eq!(store.type_alias_len(), type_alias_count);
+        assert_eq!(store.checker_link_allocated_lengths(), link_counts);
+        assert_eq!(store.declared_type_links(symbol), declared_links.as_ref());
+    }
+
     #[test]
     fn zero_generic_class_gets_exact_recursive_this_identity() {
         let mut fixture = fixture("class Plain {}");
@@ -1082,6 +1148,106 @@ mod tests {
         );
         assert_eq!(fixture.store.type_len(), repeat_type_count);
         assert_eq!(fixture.store.checker_link_allocated_lengths(), link_counts);
+    }
+
+    #[test]
+    fn cached_class_accepts_exact_lazy_type_parameter_flags_and_rejects_extra_flags() {
+        let mut fixture = fixture("class Cached<T> {}");
+        let class = named_symbol(&fixture, SyntaxKind::ClassDeclaration, "Cached");
+        let bound = fixture.files.get(&fixture.file).unwrap();
+        let host = host(&fixture.parsed.arena, bound);
+        let declared_type = fixture
+            .store
+            .get_declared_type_of_symbol(&host, class)
+            .unwrap();
+        let data = interface_data(&fixture.store, declared_type);
+        let argument = data.reference.resolved_type_arguments.as_ref().unwrap()[0];
+        let this_type = data.this_type.unwrap();
+        let lazy_flags = ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES_COMPUTED
+            | ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES;
+        assert!(fixture.store.add_type_object_flags(argument, lazy_flags));
+        assert!(fixture.store.add_type_object_flags(this_type, lazy_flags));
+        let type_count = fixture.store.type_len();
+        let link_counts = fixture.store.checker_link_allocated_lengths();
+
+        assert_eq!(
+            fixture.store.get_declared_type_of_symbol(&host, class),
+            Ok(declared_type)
+        );
+        assert_eq!(fixture.store.type_len(), type_count);
+        assert_eq!(fixture.store.checker_link_allocated_lengths(), link_counts);
+
+        assert!(
+            fixture
+                .store
+                .add_type_object_flags(argument, ObjectFlags::NON_INFERRABLE_TYPE)
+        );
+        assert_invalid_cached_declared_type_is_atomic(&mut fixture.store, class, declared_type);
+    }
+
+    #[test]
+    fn exported_class_uses_export_identity_and_ignores_local_placeholder() {
+        let mut fixture = fixture_with_module_state(
+            "export class Exported<T> {}",
+            CanonicalModuleState::External,
+        );
+        let class_declaration = named_node(&fixture, SyntaxKind::ClassDeclaration, "Exported");
+        let parameter = named_symbol(&fixture, SyntaxKind::TypeParameter, "T");
+        let bound = fixture.files.get(&fixture.file).unwrap();
+        let export = bound.symbol(class_declaration).unwrap();
+        let local = bound.local_symbol(class_declaration).unwrap();
+
+        assert_ne!(local, export);
+        let local_record = fixture.store.symbol(local).unwrap();
+        assert_eq!(local_record.flags(), SymbolFlags::EXPORT_VALUE);
+        assert_eq!(local_record.export_symbol(), Some(export));
+        assert_eq!(
+            fixture.store.symbol(export).unwrap().flags(),
+            SymbolFlags::CLASS
+        );
+        assert!(fixture.store.declared_type_links(export).is_none());
+        assert!(fixture.store.declared_type_links(local).is_none());
+
+        let host = host(&fixture.parsed.arena, bound);
+        let declared_type = fixture
+            .store
+            .get_declared_type_of_symbol(&host, export)
+            .unwrap();
+        let arguments = interface_data(&fixture.store, declared_type)
+            .reference
+            .resolved_type_arguments
+            .as_deref()
+            .unwrap();
+        assert_eq!(arguments.len(), 1);
+        assert_eq!(
+            fixture.store.type_payload(declared_type).unwrap().symbol(),
+            Some(export)
+        );
+        assert_eq!(
+            fixture.store.type_payload(arguments[0]).unwrap().symbol(),
+            Some(parameter)
+        );
+        assert_eq!(
+            fixture
+                .store
+                .declared_type_links(export)
+                .and_then(|links| links.declared_type),
+            Some(declared_type)
+        );
+        assert_eq!(
+            fixture
+                .store
+                .declared_type_links(parameter)
+                .and_then(|links| links.declared_type),
+            Some(arguments[0])
+        );
+        assert!(fixture.store.declared_type_links(local).is_none());
+        let error_type = fixture.store.intrinsic_bootstrap().unwrap().error_type;
+        assert_eq!(
+            fixture.store.get_declared_type_of_symbol(&host, local),
+            Ok(error_type)
+        );
+        assert!(fixture.store.declared_type_links(local).is_none());
     }
 
     #[test]
@@ -1463,6 +1629,195 @@ mod tests {
             assert_eq!(fixture.store.type_len(), type_count);
             assert_eq!(fixture.store.checker_link_allocated_lengths(), link_counts);
         }
+    }
+
+    #[test]
+    fn cached_class_rejects_argument_owned_by_class_symbol_atomically() {
+        let mut fixture = fixture("class Corrupt<T> {}");
+        let class = named_symbol(&fixture, SyntaxKind::ClassDeclaration, "Corrupt");
+        let origin = fixture
+            .store
+            .alloc_interface_type(ObjectFlags::CLASS, Some(class))
+            .unwrap();
+        let malformed_argument = fixture.store.alloc_type_parameter(Some(class)).unwrap();
+        let this_type = fixture.store.alloc_type_parameter(Some(class)).unwrap();
+        assert!(fixture.store.initialize_interface_type_parameters(
+            origin,
+            vec![malformed_argument, this_type],
+            0,
+            this_type,
+            type_list_key(&[malformed_argument]),
+        ));
+        assert!(fixture.store.set_declared_type_links(
+            class,
+            DeclaredTypeLinks {
+                declared_type: Some(origin),
+                ..DeclaredTypeLinks::default()
+            },
+        ));
+
+        assert_invalid_cached_declared_type_is_atomic(&mut fixture.store, class, origin);
+    }
+
+    #[test]
+    fn cached_class_rejects_duplicate_ordinary_type_parameter_prefix() {
+        let mut fixture = fixture("class Duplicate<A, B> {}");
+        let class = named_symbol(&fixture, SyntaxKind::ClassDeclaration, "Duplicate");
+        let parameter = named_symbol(&fixture, SyntaxKind::TypeParameter, "A");
+        let argument = fixture.store.alloc_type_parameter(Some(parameter)).unwrap();
+        assert!(fixture.store.set_declared_type_links(
+            parameter,
+            DeclaredTypeLinks {
+                declared_type: Some(argument),
+                ..DeclaredTypeLinks::default()
+            },
+        ));
+        let origin = fixture
+            .store
+            .alloc_interface_type(ObjectFlags::CLASS, Some(class))
+            .unwrap();
+        let this_type = fixture.store.alloc_type_parameter(Some(class)).unwrap();
+        assert!(fixture.store.initialize_interface_type_parameters(
+            origin,
+            vec![argument, argument, this_type],
+            0,
+            this_type,
+            type_list_key(&[argument, argument]),
+        ));
+        assert!(fixture.store.set_declared_type_links(
+            class,
+            DeclaredTypeLinks {
+                declared_type: Some(origin),
+                ..DeclaredTypeLinks::default()
+            },
+        ));
+
+        assert_invalid_cached_declared_type_is_atomic(&mut fixture.store, class, origin);
+    }
+
+    #[test]
+    fn cached_ordinary_type_parameter_rejects_published_clone() {
+        let mut fixture = fixture("class Cloned<T> {}");
+        let class = named_symbol(&fixture, SyntaxKind::ClassDeclaration, "Cloned");
+        let parameter = named_symbol(&fixture, SyntaxKind::TypeParameter, "T");
+        let target = fixture.store.alloc_type_parameter(Some(parameter)).unwrap();
+        let clone = fixture.store.alloc_type_parameter(Some(parameter)).unwrap();
+        let mapper = fixture
+            .store
+            .new_simple_type_mapper(target, target)
+            .unwrap();
+        assert!(fixture.store.set_type_parameter_resolution(
+            clone,
+            None,
+            Some(target),
+            Some(mapper),
+            None,
+        ));
+        assert!(fixture.store.set_declared_type_links(
+            parameter,
+            DeclaredTypeLinks {
+                declared_type: Some(clone),
+                ..DeclaredTypeLinks::default()
+            },
+        ));
+        let origin = fixture
+            .store
+            .alloc_interface_type(ObjectFlags::CLASS, Some(class))
+            .unwrap();
+        let this_type = fixture.store.alloc_type_parameter(Some(class)).unwrap();
+        assert!(fixture.store.initialize_interface_type_parameters(
+            origin,
+            vec![clone, this_type],
+            0,
+            this_type,
+            type_list_key(&[clone]),
+        ));
+        assert!(fixture.store.set_declared_type_links(
+            class,
+            DeclaredTypeLinks {
+                declared_type: Some(origin),
+                ..DeclaredTypeLinks::default()
+            },
+        ));
+
+        assert_invalid_cached_declared_type_is_atomic(&mut fixture.store, parameter, clone);
+        assert_invalid_cached_declared_type_is_atomic(&mut fixture.store, class, origin);
+    }
+
+    #[test]
+    fn cached_class_rejects_instantiated_synthetic_this_type() {
+        let mut fixture = fixture("class ThisClone<T> {}");
+        let class = named_symbol(&fixture, SyntaxKind::ClassDeclaration, "ThisClone");
+        let parameter = named_symbol(&fixture, SyntaxKind::TypeParameter, "T");
+        let argument = fixture.store.alloc_type_parameter(Some(parameter)).unwrap();
+        assert!(fixture.store.set_declared_type_links(
+            parameter,
+            DeclaredTypeLinks {
+                declared_type: Some(argument),
+                ..DeclaredTypeLinks::default()
+            },
+        ));
+        let origin = fixture
+            .store
+            .alloc_interface_type(ObjectFlags::CLASS, Some(class))
+            .unwrap();
+        let this_type = fixture.store.alloc_type_parameter(Some(class)).unwrap();
+        assert!(fixture.store.initialize_interface_type_parameters(
+            origin,
+            vec![argument, this_type],
+            0,
+            this_type,
+            type_list_key(&[argument]),
+        ));
+        let mapper = fixture
+            .store
+            .new_simple_type_mapper(argument, argument)
+            .unwrap();
+        assert!(fixture.store.set_type_parameter_resolution(
+            this_type,
+            Some(origin),
+            None,
+            Some(mapper),
+            None,
+        ));
+        assert!(fixture.store.set_declared_type_links(
+            class,
+            DeclaredTypeLinks {
+                declared_type: Some(origin),
+                ..DeclaredTypeLinks::default()
+            },
+        ));
+
+        assert_invalid_cached_declared_type_is_atomic(&mut fixture.store, class, origin);
+    }
+
+    #[test]
+    fn cached_declared_type_rejects_alias_on_ordinary_or_this_parameter() {
+        let mut fixture = fixture("class Aliased<T> {}");
+        let class = named_symbol(&fixture, SyntaxKind::ClassDeclaration, "Aliased");
+        let parameter = named_symbol(&fixture, SyntaxKind::TypeParameter, "T");
+        let bound = fixture.files.get(&fixture.file).unwrap();
+        let host = host(&fixture.parsed.arena, bound);
+        let declared_type = fixture
+            .store
+            .get_declared_type_of_symbol(&host, class)
+            .unwrap();
+        let data = interface_data(&fixture.store, declared_type);
+        let argument = data.reference.resolved_type_arguments.as_ref().unwrap()[0];
+        let this_type = data.this_type.unwrap();
+        let alias = fixture.store.alloc_type_alias(Some(class)).unwrap();
+
+        assert!(fixture.store.set_type_alias(argument, Some(alias)));
+        assert_invalid_cached_declared_type_is_atomic(&mut fixture.store, parameter, argument);
+        assert_invalid_cached_declared_type_is_atomic(&mut fixture.store, class, declared_type);
+
+        assert!(fixture.store.set_type_alias(argument, None));
+        assert_eq!(
+            fixture.store.get_declared_type_of_symbol(&host, class),
+            Ok(declared_type)
+        );
+        assert!(fixture.store.set_type_alias(this_type, Some(alias)));
+        assert_invalid_cached_declared_type_is_atomic(&mut fixture.store, class, declared_type);
     }
 
     #[test]
