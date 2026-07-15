@@ -8,6 +8,85 @@ pub use ast_generated::*;
 pub use flow::*;
 pub use syntax_kind::SyntaxKind;
 
+impl NodeData {
+    /// Whether this generated node payload is structurally compatible with a
+    /// syntax kind. Most schema names match directly; shared payloads and the
+    /// handful of public kind aliases are listed explicitly.
+    #[must_use]
+    pub fn matches_syntax_kind(&self, kind: SyntaxKind) -> bool {
+        match self {
+            Self::Token(_) => kind.is_token(),
+            Self::KeywordExpression(_) => kind.is_keyword_expression(),
+            Self::KeywordTypeNode(_) => kind.is_keyword_type(),
+            Self::ForInOrOfStatement(_) => {
+                matches!(
+                    kind,
+                    SyntaxKind::ForInStatement | SyntaxKind::ForOfStatement
+                )
+            }
+            Self::CaseOrDefaultClause(_) => {
+                matches!(kind, SyntaxKind::CaseClause | SyntaxKind::DefaultClause)
+            }
+            Self::BindingPattern(_) => matches!(
+                kind,
+                SyntaxKind::ObjectBindingPattern | SyntaxKind::ArrayBindingPattern
+            ),
+            Self::JsDocParameterOrPropertyTag(_) => matches!(
+                kind,
+                SyntaxKind::JsDocParameterTag | SyntaxKind::JsDocPropertyTag
+            ),
+            Self::TypeAliasDeclaration(_) => matches!(
+                kind,
+                SyntaxKind::TypeAliasDeclaration | SyntaxKind::JsTypeAliasDeclaration
+            ),
+            Self::ImportDeclaration(_) => matches!(
+                kind,
+                SyntaxKind::ImportDeclaration | SyntaxKind::JsImportDeclaration
+            ),
+            Self::ParameterDeclaration(_) => kind == SyntaxKind::Parameter,
+            Self::CallSignatureDeclaration(_) => kind == SyntaxKind::CallSignature,
+            Self::ConstructSignatureDeclaration(_) => kind == SyntaxKind::ConstructSignature,
+            Self::ConstructorDeclaration(_) => kind == SyntaxKind::Constructor,
+            Self::GetAccessorDeclaration(_) => kind == SyntaxKind::GetAccessor,
+            Self::SetAccessorDeclaration(_) => kind == SyntaxKind::SetAccessor,
+            Self::IndexSignatureDeclaration(_) => kind == SyntaxKind::IndexSignature,
+            Self::MethodSignatureDeclaration(_) => kind == SyntaxKind::MethodSignature,
+            Self::PropertySignatureDeclaration(_) => kind == SyntaxKind::PropertySignature,
+            Self::TypeParameterDeclaration(_) => kind == SyntaxKind::TypeParameter,
+            Self::TypeAssertion(_) => kind == SyntaxKind::TypeAssertionExpression,
+            Self::UnionTypeNode(_) => kind == SyntaxKind::UnionType,
+            Self::IntersectionTypeNode(_) => kind == SyntaxKind::IntersectionType,
+            Self::ConditionalTypeNode(_) => kind == SyntaxKind::ConditionalType,
+            Self::TypeOperatorNode(_) => kind == SyntaxKind::TypeOperator,
+            Self::InferTypeNode(_) => kind == SyntaxKind::InferType,
+            Self::ArrayTypeNode(_) => kind == SyntaxKind::ArrayType,
+            Self::IndexedAccessTypeNode(_) => kind == SyntaxKind::IndexedAccessType,
+            Self::TypeReferenceNode(_) => kind == SyntaxKind::TypeReference,
+            Self::LiteralTypeNode(_) => kind == SyntaxKind::LiteralType,
+            Self::ThisTypeNode(_) => kind == SyntaxKind::ThisType,
+            Self::TypePredicateNode(_) => kind == SyntaxKind::TypePredicate,
+            Self::TypeQueryNode(_) => kind == SyntaxKind::TypeQuery,
+            Self::MappedTypeNode(_) => kind == SyntaxKind::MappedType,
+            Self::TypeLiteralNode(_) => kind == SyntaxKind::TypeLiteral,
+            Self::TupleTypeNode(_) => kind == SyntaxKind::TupleType,
+            Self::OptionalTypeNode(_) => kind == SyntaxKind::OptionalType,
+            Self::RestTypeNode(_) => kind == SyntaxKind::RestType,
+            Self::ParenthesizedTypeNode(_) => kind == SyntaxKind::ParenthesizedType,
+            Self::FunctionTypeNode(_) => kind == SyntaxKind::FunctionType,
+            Self::ConstructorTypeNode(_) => kind == SyntaxKind::ConstructorType,
+            Self::TemplateLiteralTypeNode(_) => kind == SyntaxKind::TemplateLiteralType,
+            Self::ImportTypeNode(_) => kind == SyntaxKind::ImportType,
+            Self::JsxText(_) => {
+                matches!(
+                    kind,
+                    SyntaxKind::JsxText | SyntaxKind::JsxTextAllWhiteSpaces
+                )
+            }
+            _ => self.schema_name() == kind.as_str(),
+        }
+    }
+}
+
 impl NodeFlags {
     /// The parser synthesized this node while representing source grammar.
     pub const REPARSED: Self = Self(1 << 3);

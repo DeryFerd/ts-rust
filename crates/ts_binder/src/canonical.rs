@@ -14,7 +14,7 @@ use ts_ast::{FileId, FlowRef, NodeArena, NodeArenaId, NodeData, NodeId, NodeRef,
 
 use crate::{
     AstScope, BoundFlowGraph, SemanticSymbolId, SymbolStore, SymbolTableId,
-    flow_builder::build_flow_graph,
+    flow_builder::{FlowTraversalHooks, build_flow_graph_with_hooks},
 };
 
 /// The last completed phase of the canonical binder.
@@ -29,6 +29,25 @@ pub enum BindingPhase {
     /// handoff to the B02 declaration slice.
     Declarations,
 }
+
+/// Why canonical bindings cannot yet be separated for checker adoption.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CanonicalExtractionError {
+    /// At least one bound file has not completed declaration binding.
+    DeclarationsIncomplete,
+}
+
+impl std::fmt::Display for CanonicalExtractionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DeclarationsIncomplete => {
+                formatter.write_str("canonical declarations are incomplete")
+            }
+        }
+    }
+}
+
+impl std::error::Error for CanonicalExtractionError {}
 
 /// A structural failure that prevents canonical binding from starting.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -45,6 +64,19 @@ pub enum CanonicalBindError {
     /// A reachable AST node occurs twice in the generated child graph. Binder
     /// state is path-dependent, so accepting a DAG here would be ambiguous.
     RepeatedNode(NodeRef),
+    /// A node's generated payload cannot represent its advertised syntax kind.
+    MismatchedNodeKind {
+        node: NodeRef,
+        kind: SyntaxKind,
+        data: &'static str,
+    },
+    /// A reachable node's parent backlink disagrees with the generated child
+    /// edge used to reach it. Source-file roots must have no parent.
+    InvalidParent {
+        node: NodeRef,
+        expected: Option<NodeId>,
+        actual: Option<NodeId>,
+    },
 }
 
 impl std::fmt::Display for CanonicalBindError {
@@ -81,6 +113,20 @@ impl std::fmt::Display for CanonicalBindError {
                     node.node
                 )
             }
+            Self::MismatchedNodeKind { node, kind, data } => write!(
+                formatter,
+                "AST node {:?} advertises {kind:?} but stores {data}",
+                node.node
+            ),
+            Self::InvalidParent {
+                node,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "AST node {:?} has parent {actual:?}, expected {expected:?}",
+                node.node
+            ),
         }
     }
 }
@@ -282,10 +328,23 @@ impl CanonicalProgramBindings {
     }
 
     /// Separates immutable AST side data from the symbol owner consumed by the
-    /// checker. Both retain the same unforgeable semantic-store brand.
-    #[must_use]
-    pub fn into_parts(self) -> (SymbolStore, BTreeMap<FileId, BoundFile>) {
-        (self.symbols, self.files)
+    /// checker, but only once declaration binding is complete.
+    ///
+    /// On failure, the traversal-only symbol owner is not exposed as a checker
+    /// store.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CanonicalExtractionError::DeclarationsIncomplete`] while any
+    /// file remains in the traversal-only phase.
+    pub fn try_into_parts(
+        self,
+    ) -> Result<(SymbolStore, BTreeMap<FileId, BoundFile>), CanonicalExtractionError> {
+        if self.declarations_complete() {
+            Ok((self.symbols, self.files))
+        } else {
+            Err(CanonicalExtractionError::DeclarationsIncomplete)
+        }
     }
 }
 
@@ -318,10 +377,9 @@ impl CanonicalBinder {
 
     /// Traverses one Program source file into canonical side data.
     ///
-    /// The exact generated child visitor drives declaration order. The existing
-    /// `flow_builder` then performs a temporary second pass over the same child
-    /// graph; it remains the only CFG implementation. Interleaving flow with
-    /// declaration binding later does not change [`BoundFile`]'s contract.
+    /// The existing flow traversal is the sole recursive walk. Canonical
+    /// enter/exit hooks capture declaration-order state while that same walk
+    /// builds the one control-flow graph.
     ///
     /// # Errors
     ///
@@ -331,9 +389,9 @@ impl CanonicalBinder {
     ///
     /// # Panics
     ///
-    /// Panics if a canonical symbol-table identity cannot be represented, or
-    /// if the inserted file disappears from the private file map. The latter
-    /// indicates an internal invariant violation.
+    /// Panics if the preflighted tree violates the flow walk's internal enter/
+    /// exit invariants, or if the inserted file disappears from the private
+    /// file map.
     pub fn bind_source_file(
         &mut self,
         arena: &NodeArena,
@@ -345,8 +403,10 @@ impl CanonicalBinder {
             return Err(CanonicalBindError::DuplicateFile(file));
         }
         if !matches!(
-            arena.get(source_file).map(|node| &node.data),
-            Some(NodeData::SourceFile(_))
+            arena.get(source_file),
+            Some(node)
+                if node.kind == SyntaxKind::SourceFile
+                    && matches!(node.data, NodeData::SourceFile(_))
         ) {
             return Err(CanonicalBindError::InvalidSourceFile(root));
         }
@@ -361,8 +421,9 @@ impl CanonicalBinder {
             });
         }
 
-        let file_binding =
-            FileTraversal::new(arena, source_file, file, &children, &mut self.symbols).bind()?;
+        let mut traversal = FileTraversal::new(arena, source_file, file);
+        let flow = build_flow_graph_with_hooks(arena, &children, source_file, file, &mut traversal);
+        let file_binding = traversal.finish(flow);
         self.files.insert(file, file_binding);
         Ok(self
             .files
@@ -385,6 +446,13 @@ fn collect_children(
 ) -> Result<HashMap<NodeId, Vec<NodeId>>, CanonicalBindError> {
     let mut result = HashMap::with_capacity(arena.len());
     for (parent, node) in arena.iter() {
+        if !node.data.matches_syntax_kind(node.kind) {
+            return Err(CanonicalBindError::MismatchedNodeKind {
+                node: NodeRef::new(arena.id(), file, parent),
+                kind: node.kind,
+                data: node.data.schema_name(),
+            });
+        }
         let mut children = Vec::new();
         node.for_each_child(|child| children.push(child));
         if let Some(child) = children
@@ -409,22 +477,33 @@ fn validate_reachable_tree(
     children: &HashMap<NodeId, Vec<NodeId>>,
 ) -> Result<(), CanonicalBindError> {
     let mut seen = vec![false; arena.len()];
-    let mut pending = vec![source_file];
-    while let Some(node) = pending.pop() {
-        if std::mem::replace(&mut seen[node.index()], true) {
+    let mut pending = vec![(source_file, None)];
+    while let Some((node_id, expected_parent)) = pending.pop() {
+        if std::mem::replace(&mut seen[node_id.index()], true) {
             return Err(CanonicalBindError::RepeatedNode(NodeRef::new(
                 arena.id(),
                 file,
-                node,
+                node_id,
             )));
+        }
+        let node = arena
+            .get(node_id)
+            .expect("all generated child references were validated");
+        let node_ref = NodeRef::new(arena.id(), file, node_id);
+        if node.parent != expected_parent {
+            return Err(CanonicalBindError::InvalidParent {
+                node: node_ref,
+                expected: expected_parent,
+                actual: node.parent,
+            });
         }
         pending.extend(
             children
-                .get(&node)
+                .get(&node_id)
                 .expect("every arena node has a generated child entry")
                 .iter()
                 .rev()
-                .copied(),
+                .map(|child| (*child, Some(node_id))),
         );
     }
     Ok(())
@@ -441,45 +520,35 @@ struct FileTraversal<'a> {
     arena: &'a NodeArena,
     source_file: NodeId,
     file: FileId,
-    children: &'a HashMap<NodeId, Vec<NodeId>>,
-    symbols: &'a mut SymbolStore,
     nodes: Vec<NodeBinding>,
     traversal_order: Vec<NodeId>,
     container_chain: Vec<NodeId>,
     last_container: Option<NodeId>,
     state: TraversalState,
+    state_stack: Vec<(NodeId, TraversalState)>,
 }
 
 impl<'a> FileTraversal<'a> {
-    fn new(
-        arena: &'a NodeArena,
-        source_file: NodeId,
-        file: FileId,
-        children: &'a HashMap<NodeId, Vec<NodeId>>,
-        symbols: &'a mut SymbolStore,
-    ) -> Self {
+    fn new(arena: &'a NodeArena, source_file: NodeId, file: FileId) -> Self {
         Self {
             arena,
             source_file,
             file,
-            children,
-            symbols,
             nodes: vec![NodeBinding::default(); arena.len()],
             traversal_order: Vec::with_capacity(arena.len()),
             container_chain: Vec::new(),
             last_container: None,
             state: TraversalState::default(),
+            state_stack: Vec::new(),
         }
     }
 
-    fn bind(mut self) -> Result<BoundFile, CanonicalBindError> {
-        self.bind_node(self.source_file)?;
-
-        // This is the existing, shared flow implementation, not a parallel CFG
-        // model. B01a keeps it as an explicit second pass until declarations and
-        // flow can be interleaved without changing observable side data.
-        let flow = build_flow_graph(self.arena, self.children, self.source_file, self.file);
-        Ok(BoundFile {
+    fn finish(self, flow: BoundFlowGraph) -> BoundFile {
+        assert!(
+            self.state_stack.is_empty(),
+            "canonical traversal exits every entered node"
+        );
+        BoundFile {
             file: self.file,
             arena: self.arena.id(),
             source_file: self.source_file,
@@ -489,15 +558,12 @@ impl<'a> FileTraversal<'a> {
             traversal_order: self.traversal_order,
             container_chain: self.container_chain,
             flow,
-        })
+        }
     }
 
-    fn bind_node(&mut self, node_id: NodeId) -> Result<(), CanonicalBindError> {
-        let node_ref = NodeRef::new(self.arena.id(), self.file, node_id);
+    fn enter(&mut self, node_id: NodeId) {
         let binding = &mut self.nodes[node_id.index()];
-        if binding.visited {
-            return Err(CanonicalBindError::RepeatedNode(node_ref));
-        }
+        assert!(!binding.visited, "reachable tree was preflighted");
 
         // Pinned binder.go performs declaration work before bindContainer.
         // Capture the state at that exact boundary for B02.
@@ -511,12 +577,11 @@ impl<'a> FileTraversal<'a> {
         self.traversal_order.push(node_id);
 
         let flags = container_flags(self.arena, node_id);
-        let saved = self.state;
+        self.state_stack.push((node_id, self.state));
         if flags.contains(ContainerFlags::IS_CONTAINER) {
             self.state.container = Some(node_id);
             self.state.block_scope_container = Some(node_id);
             if flags.contains(ContainerFlags::HAS_LOCALS) {
-                self.nodes[node_id.index()].locals = Some(self.symbols.alloc_symbol_table());
                 self.add_to_container_chain(node_id);
             }
         } else if flags.contains(ContainerFlags::IS_BLOCK_SCOPED_CONTAINER) {
@@ -528,61 +593,15 @@ impl<'a> FileTraversal<'a> {
         if flags.contains(ContainerFlags::IS_THIS_CONTAINER) {
             self.state.this_container = Some(node_id);
         }
+    }
 
-        self.bind_children(node_id)?;
+    fn exit(&mut self, node_id: NodeId) {
+        let (entered, saved) = self
+            .state_stack
+            .pop()
+            .expect("every canonical exit has a matching enter");
+        assert_eq!(entered, node_id, "canonical traversal exits in stack order");
         self.state = saved;
-        Ok(())
-    }
-
-    fn bind_children(&mut self, node_id: NodeId) -> Result<(), CanonicalBindError> {
-        match self
-            .arena
-            .get(node_id)
-            .expect("all generated child references were validated")
-            .data
-            .clone()
-        {
-            NodeData::SourceFile(data) => {
-                self.bind_statements_functions_first(&data.statements.nodes)?;
-                self.bind_node(data.end_of_file_token)
-            }
-            NodeData::Block(data) => self.bind_statements_functions_first(&data.statements.nodes),
-            NodeData::ModuleBlock(data) => {
-                self.bind_statements_functions_first(&data.statements.nodes)
-            }
-            _ => {
-                let children = self
-                    .children
-                    .get(&node_id)
-                    .expect("every arena node has a generated child entry")
-                    .clone();
-                for child in children {
-                    self.bind_node(child)?;
-                }
-                Ok(())
-            }
-        }
-    }
-
-    fn bind_statements_functions_first(
-        &mut self,
-        statements: &[NodeId],
-    ) -> Result<(), CanonicalBindError> {
-        for statement in statements.iter().copied().filter(|statement| {
-            self.arena
-                .get(*statement)
-                .is_some_and(|node| node.kind == SyntaxKind::FunctionDeclaration)
-        }) {
-            self.bind_node(statement)?;
-        }
-        for statement in statements.iter().copied().filter(|statement| {
-            self.arena
-                .get(*statement)
-                .is_some_and(|node| node.kind != SyntaxKind::FunctionDeclaration)
-        }) {
-            self.bind_node(statement)?;
-        }
-        Ok(())
     }
 
     fn add_to_container_chain(&mut self, node: NodeId) {
@@ -591,6 +610,16 @@ impl<'a> FileTraversal<'a> {
         }
         self.last_container = Some(node);
         self.container_chain.push(node);
+    }
+}
+
+impl FlowTraversalHooks for FileTraversal<'_> {
+    fn enter_node(&mut self, node: NodeId) {
+        self.enter(node);
+    }
+
+    fn exit_node(&mut self, node: NodeId) {
+        self.exit(node);
     }
 }
 
@@ -918,9 +947,8 @@ mod tests {
         );
         assert_eq!(bound.this_container(body_ref), Some(function_ref));
 
-        let source_locals = bound.locals(source_ref).unwrap();
-        let function_locals = bound.locals(function_ref).unwrap();
-        assert_ne!(source_locals, function_locals);
+        assert_eq!(bound.locals(source_ref), None);
+        assert_eq!(bound.locals(function_ref), None);
         assert_eq!(bound.locals(body_ref), None);
         assert_eq!(bound.locals(nested_block_ref), None);
         let chain = bound.container_chain().collect::<Vec<_>>();
@@ -942,21 +970,7 @@ mod tests {
             Some(function_expression_ref)
         );
         assert_eq!(bound.next_container(function_expression_ref), None);
-
-        assert!(
-            binder
-                .symbol_store()
-                .symbol_table(source_locals)
-                .unwrap()
-                .is_empty()
-        );
-        assert!(
-            binder
-                .symbol_store()
-                .symbol_table(function_locals)
-                .unwrap()
-                .is_empty()
-        );
+        assert_eq!(binder.symbol_store().symbol_table_len(), 0);
     }
 
     #[test]
@@ -986,26 +1000,16 @@ mod tests {
         let second_root = second_bound.source_file();
         assert!(files.symbol_store().contains_node_ref(first_root));
         assert!(files.symbol_store().contains_node_ref(second_root));
-        assert!(
-            files
-                .symbol_store()
-                .contains_symbol_table(first_bound.locals(first_root).unwrap())
-        );
-        assert!(
-            files
-                .symbol_store()
-                .contains_symbol_table(second_bound.locals(second_root).unwrap())
-        );
+        assert_eq!(files.symbol_store().symbol_table_len(), 0);
+        assert_eq!(first_bound.locals(first_root), None);
+        assert_eq!(second_bound.locals(second_root), None);
 
         let wrong_file = NodeRef::new(first.arena.id(), FileId::new(7), first.source_file);
         let wrong_arena = NodeRef::new(second.arena.id(), FileId::new(3), first.source_file);
         assert!(!first_bound.contains(wrong_file));
         assert!(!first_bound.contains(wrong_arena));
 
-        let (symbols, bound_files) = files.into_parts();
-        assert_eq!(bound_files.len(), 2);
-        assert!(symbols.contains_node_ref(first_root));
-        assert!(symbols.contains_node_ref(second_root));
+        assert!(files.try_into_parts().is_err());
     }
 
     #[test]
@@ -1064,6 +1068,269 @@ mod tests {
     }
 
     #[test]
+    fn follows_pinned_loop_and_iife_child_orders() {
+        let parsed = parse_source_file(
+            r"
+                for (init(); condition(); increment()) body();
+                for (left in right()) inBody();
+                for await (item of asyncItems()) ofBody();
+                (function () {})(argument());
+            ",
+        );
+        let statements = match &parsed.arena.get(parsed.source_file).unwrap().data {
+            NodeData::SourceFile(source) => &source.statements.nodes,
+            _ => unreachable!(),
+        };
+        let (for_initializer, for_condition, for_statement, for_incrementor) =
+            match &parsed.arena.get(statements[0]).unwrap().data {
+                NodeData::ForStatement(statement) => (
+                    statement.initializer.unwrap(),
+                    statement.condition.unwrap(),
+                    statement.statement,
+                    statement.incrementor.unwrap(),
+                ),
+                _ => unreachable!(),
+            };
+        let (in_expression, in_initializer) = match &parsed.arena.get(statements[1]).unwrap().data {
+            NodeData::ForInOrOfStatement(statement) => {
+                (statement.expression, statement.initializer)
+            }
+            _ => unreachable!(),
+        };
+        let (of_expression, of_await, of_initializer) =
+            match &parsed.arena.get(statements[2]).unwrap().data {
+                NodeData::ForInOrOfStatement(statement) => (
+                    statement.expression,
+                    statement.await_modifier.unwrap(),
+                    statement.initializer,
+                ),
+                _ => unreachable!(),
+            };
+        let iife_call = match &parsed.arena.get(statements[3]).unwrap().data {
+            NodeData::ExpressionStatement(statement) => statement.expression,
+            _ => unreachable!(),
+        };
+        let (iife_callee, iife_argument) = match &parsed.arena.get(iife_call).unwrap().data {
+            NodeData::CallExpression(call) => (call.expression, call.arguments.nodes[0]),
+            _ => unreachable!(),
+        };
+
+        let mut binder = CanonicalBinder::new();
+        let bound = binder
+            .bind_source_file(&parsed.arena, parsed.source_file, FileId::new(10))
+            .unwrap();
+        let order = bound.traversal_order().collect::<Vec<_>>();
+
+        assert!(position(&order, for_initializer) < position(&order, for_condition));
+        assert!(position(&order, for_condition) < position(&order, for_statement));
+        assert!(position(&order, for_statement) < position(&order, for_incrementor));
+        assert!(position(&order, in_expression) < position(&order, in_initializer));
+        assert!(position(&order, of_expression) < position(&order, of_await));
+        assert!(position(&order, of_await) < position(&order, of_initializer));
+        assert!(position(&order, iife_argument) < position(&order, iife_callee));
+    }
+
+    #[test]
+    fn unreachable_blocks_use_generated_statement_order() {
+        let parsed = parse_source_file(
+            r"
+                function outer() {
+                    return;
+                    {
+                        const before = 0;
+                        function after() {}
+                    }
+                }
+            ",
+        );
+        let outer = match &parsed.arena.get(parsed.source_file).unwrap().data {
+            NodeData::SourceFile(source) => source.statements.nodes[0],
+            _ => unreachable!(),
+        };
+        let outer_body = match &parsed.arena.get(outer).unwrap().data {
+            NodeData::FunctionDeclaration(function) => function.body.unwrap(),
+            _ => unreachable!(),
+        };
+        let unreachable_block = match &parsed.arena.get(outer_body).unwrap().data {
+            NodeData::Block(block) => block.statements.nodes[1],
+            _ => unreachable!(),
+        };
+        let (variable, function) = match &parsed.arena.get(unreachable_block).unwrap().data {
+            NodeData::Block(block) => (block.statements.nodes[0], block.statements.nodes[1]),
+            _ => unreachable!(),
+        };
+
+        let mut binder = CanonicalBinder::new();
+        let bound = binder
+            .bind_source_file(&parsed.arena, parsed.source_file, FileId::new(11))
+            .unwrap();
+        let order = bound.traversal_order().collect::<Vec<_>>();
+
+        assert!(position(&order, variable) < position(&order, function));
+    }
+
+    #[test]
+    fn unsupported_flow_still_walks_all_ordinary_children() {
+        let parsed = parse_source_file(
+            r"
+                try {
+                    const ordinary = 1;
+                    function nested() {}
+                } finally {
+                    cleanup();
+                }
+            ",
+        );
+        let try_statement = match &parsed.arena.get(parsed.source_file).unwrap().data {
+            NodeData::SourceFile(source) => source.statements.nodes[0],
+            _ => unreachable!(),
+        };
+        let try_block = match &parsed.arena.get(try_statement).unwrap().data {
+            NodeData::TryStatement(statement) => statement.try_block,
+            _ => unreachable!(),
+        };
+        let (ordinary, nested) = match &parsed.arena.get(try_block).unwrap().data {
+            NodeData::Block(block) => (block.statements.nodes[0], block.statements.nodes[1]),
+            _ => unreachable!(),
+        };
+
+        let mut binder = CanonicalBinder::new();
+        let bound = binder
+            .bind_source_file(&parsed.arena, parsed.source_file, FileId::new(16))
+            .unwrap();
+        let order = bound.traversal_order().collect::<Vec<_>>();
+
+        assert!(!bound.flow_graph().is_complete());
+        assert!(bound.contains(NodeRef::new(parsed.arena.id(), FileId::new(16), ordinary)));
+        assert!(position(&order, nested) < position(&order, ordinary));
+        assert_eq!(
+            order.iter().map(|node| node.node).collect::<BTreeSet<_>>(),
+            reachable_nodes(&parsed.arena, parsed.source_file)
+        );
+    }
+
+    #[test]
+    fn nested_destructuring_defaults_preserve_assignment_pattern_order() {
+        let parsed = parse_source_file("[[value] = inner()] = outer();");
+        let outer_assignment = match &parsed.arena.get(parsed.source_file).unwrap().data {
+            NodeData::SourceFile(source) => {
+                match &parsed.arena.get(source.statements.nodes[0]).unwrap().data {
+                    NodeData::ExpressionStatement(statement) => statement.expression,
+                    _ => unreachable!(),
+                }
+            }
+            _ => unreachable!(),
+        };
+        let outer_pattern = match &parsed.arena.get(outer_assignment).unwrap().data {
+            NodeData::BinaryExpression(expression) => expression.left,
+            _ => unreachable!(),
+        };
+        let inner_assignment = match &parsed.arena.get(outer_pattern).unwrap().data {
+            NodeData::ArrayLiteralExpression(pattern) => pattern.elements.nodes[0],
+            _ => unreachable!(),
+        };
+        let (inner_pattern, inner_operator, inner_default) =
+            match &parsed.arena.get(inner_assignment).unwrap().data {
+                NodeData::BinaryExpression(expression) => {
+                    (expression.left, expression.operator_token, expression.right)
+                }
+                _ => unreachable!(),
+            };
+
+        let mut binder = CanonicalBinder::new();
+        let bound = binder
+            .bind_source_file(&parsed.arena, parsed.source_file, FileId::new(17))
+            .unwrap();
+        let order = bound.traversal_order().collect::<Vec<_>>();
+
+        assert!(position(&order, inner_operator) < position(&order, inner_default));
+        assert!(position(&order, inner_default) < position(&order, inner_pattern));
+    }
+
+    #[test]
+    fn malformed_parent_backlinks_are_rejected_atomically() {
+        let mut parsed = parse_source_file("const value = 1;");
+        let source = parsed.source_file;
+        let statement = match &parsed.arena.get(source).unwrap().data {
+            NodeData::SourceFile(source) => source.statements.nodes[0],
+            _ => unreachable!(),
+        };
+        parsed.arena.get_mut(statement).unwrap().parent = None;
+        let file = FileId::new(12);
+        let statement_ref = NodeRef::new(parsed.arena.id(), file, statement);
+        let root_ref = NodeRef::new(parsed.arena.id(), file, source);
+        let mut binder = CanonicalBinder::new();
+
+        assert_eq!(
+            binder.bind_source_file(&parsed.arena, source, file),
+            Err(CanonicalBindError::InvalidParent {
+                node: statement_ref,
+                expected: Some(source),
+                actual: None,
+            })
+        );
+        assert_eq!(binder.symbol_store().symbol_len(), 0);
+        assert_eq!(binder.symbol_store().symbol_table_len(), 0);
+        assert!(!binder.symbol_store().contains_node_ref(root_ref));
+        assert!(binder.file(file).is_none());
+    }
+
+    #[test]
+    fn malformed_root_parent_is_rejected_atomically() {
+        let mut parsed = parse_source_file("");
+        let source = parsed.source_file;
+        let end_of_file = match &parsed.arena.get(source).unwrap().data {
+            NodeData::SourceFile(source) => source.end_of_file_token,
+            _ => unreachable!(),
+        };
+        parsed.arena.get_mut(source).unwrap().parent = Some(end_of_file);
+        let file = FileId::new(13);
+        let root_ref = NodeRef::new(parsed.arena.id(), file, source);
+        let mut binder = CanonicalBinder::new();
+
+        assert_eq!(
+            binder.bind_source_file(&parsed.arena, source, file),
+            Err(CanonicalBindError::InvalidParent {
+                node: root_ref,
+                expected: None,
+                actual: Some(end_of_file),
+            })
+        );
+        assert_eq!(binder.symbol_store().symbol_len(), 0);
+        assert_eq!(binder.symbol_store().symbol_table_len(), 0);
+        assert!(!binder.symbol_store().contains_node_ref(root_ref));
+        assert!(binder.file(file).is_none());
+    }
+
+    #[test]
+    fn mismatched_kind_and_data_are_rejected_atomically() {
+        let mut parsed = parse_source_file("function f() {}");
+        let source = parsed.source_file;
+        let function = match &parsed.arena.get(source).unwrap().data {
+            NodeData::SourceFile(source) => source.statements.nodes[0],
+            _ => unreachable!(),
+        };
+        parsed.arena.get_mut(function).unwrap().kind = SyntaxKind::Block;
+        let file = FileId::new(14);
+        let function_ref = NodeRef::new(parsed.arena.id(), file, function);
+        let root_ref = NodeRef::new(parsed.arena.id(), file, source);
+        let mut binder = CanonicalBinder::new();
+
+        assert_eq!(
+            binder.bind_source_file(&parsed.arena, source, file),
+            Err(CanonicalBindError::MismatchedNodeKind {
+                node: function_ref,
+                kind: SyntaxKind::Block,
+                data: "FunctionDeclaration",
+            })
+        );
+        assert_eq!(binder.symbol_store().symbol_len(), 0);
+        assert_eq!(binder.symbol_store().symbol_table_len(), 0);
+        assert!(!binder.symbol_store().contains_node_ref(root_ref));
+        assert!(binder.file(file).is_none());
+    }
+
+    #[test]
     fn malformed_child_graph_is_rejected_before_store_mutation() {
         let mut parsed = parse_source_file("const value = 1;");
         let source = parsed.source_file;
@@ -1072,14 +1339,14 @@ mod tests {
             _ => unreachable!(),
         }
         let mut binder = CanonicalBinder::new();
-        let root = NodeRef::new(parsed.arena.id(), FileId::new(12), source);
+        let root = NodeRef::new(parsed.arena.id(), FileId::new(15), source);
 
         assert_eq!(
-            binder.bind_source_file(&parsed.arena, source, FileId::new(12)),
+            binder.bind_source_file(&parsed.arena, source, FileId::new(15)),
             Err(CanonicalBindError::RepeatedNode(root))
         );
         assert_eq!(binder.symbol_store().symbol_table_len(), 0);
         assert!(!binder.symbol_store().contains_node_ref(root));
-        assert!(binder.file(FileId::new(12)).is_none());
+        assert!(binder.file(FileId::new(15)).is_none());
     }
 }

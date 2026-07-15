@@ -6,7 +6,8 @@ mod flow_builder;
 pub mod semantic;
 
 pub use canonical::{
-    BindingPhase, BoundFile, CanonicalBindError, CanonicalBinder, CanonicalProgramBindings,
+    BindingPhase, BoundFile, CanonicalBindError, CanonicalBinder, CanonicalExtractionError,
+    CanonicalProgramBindings,
 };
 pub use escaped_name::{
     EscapedDisplay, EscapedName, EscapedNameRef, INTERNAL_SYMBOL_NAME_PREFIX, InternalSymbolName,

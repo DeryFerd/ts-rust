@@ -7,13 +7,37 @@ use ts_ast::{
 
 use crate::{BoundFlowGraph, UnsupportedFlow, UnsupportedFlowKind};
 
+pub(super) trait FlowTraversalHooks {
+    fn enter_node(&mut self, node: NodeId);
+
+    fn exit_node(&mut self, node: NodeId);
+}
+
+struct NoopTraversalHooks;
+
+impl FlowTraversalHooks for NoopTraversalHooks {
+    fn enter_node(&mut self, _node: NodeId) {}
+
+    fn exit_node(&mut self, _node: NodeId) {}
+}
+
 pub(super) fn build_flow_graph(
     arena: &NodeArena,
     children: &HashMap<NodeId, Vec<NodeId>>,
     source_file: NodeId,
     file: FileId,
 ) -> BoundFlowGraph {
-    FlowBuilder::new(arena, children, file).build(source_file)
+    build_flow_graph_with_hooks(arena, children, source_file, file, &mut NoopTraversalHooks)
+}
+
+pub(super) fn build_flow_graph_with_hooks(
+    arena: &NodeArena,
+    children: &HashMap<NodeId, Vec<NodeId>>,
+    source_file: NodeId,
+    file: FileId,
+    hooks: &mut dyn FlowTraversalHooks,
+) -> BoundFlowGraph {
+    FlowBuilder::new(arena, children, file, hooks).build(source_file)
 }
 
 struct SavedFlow {
@@ -46,9 +70,10 @@ enum JumpKind {
     Continue,
 }
 
-struct FlowBuilder<'a> {
+struct FlowBuilder<'a, 'hooks> {
     ast: &'a NodeArena,
     children: &'a HashMap<NodeId, Vec<NodeId>>,
+    hooks: &'hooks mut dyn FlowTraversalHooks,
     graph: BoundFlowGraph,
     current: Option<FlowRef>,
     container: NodeId,
@@ -58,15 +83,23 @@ struct FlowBuilder<'a> {
     active_labels: Vec<ActiveLabel>,
     pre_switch_case_flow: Option<FlowRef>,
     has_flow_effects: bool,
+    in_assignment_pattern: bool,
     effect_dependency_containers: Vec<NodeId>,
     built_containers: BTreeSet<NodeId>,
+    visited: Vec<bool>,
 }
 
-impl<'a> FlowBuilder<'a> {
-    fn new(ast: &'a NodeArena, children: &'a HashMap<NodeId, Vec<NodeId>>, file: FileId) -> Self {
+impl<'a, 'hooks> FlowBuilder<'a, 'hooks> {
+    fn new(
+        ast: &'a NodeArena,
+        children: &'a HashMap<NodeId, Vec<NodeId>>,
+        file: FileId,
+        hooks: &'hooks mut dyn FlowTraversalHooks,
+    ) -> Self {
         Self {
             ast,
             children,
+            hooks,
             graph: BoundFlowGraph::new(ast.id(), file),
             current: None,
             container: NodeId::new(0),
@@ -76,8 +109,10 @@ impl<'a> FlowBuilder<'a> {
             active_labels: Vec::new(),
             pre_switch_case_flow: None,
             has_flow_effects: false,
+            in_assignment_pattern: false,
             effect_dependency_containers: Vec::new(),
             built_containers: BTreeSet::new(),
+            visited: vec![false; ast.len()],
         }
     }
 
@@ -88,19 +123,26 @@ impl<'a> FlowBuilder<'a> {
         self.graph.container_starts.insert(source_file, start);
         self.current = Some(start);
 
-        let Some(NodeData::SourceFile(source)) = self.ast.get(source_file).map(|node| &node.data)
-        else {
-            return self.graph;
-        };
-        let statements = source.statements.nodes.clone();
-        let end_of_file = source.end_of_file_token;
-        self.bind_statement_list(&statements);
-        self.bind_node(end_of_file);
+        self.bind_node(source_file);
         self.finish_container(source_file, true);
         self.graph
     }
 
     fn bind_node(&mut self, node_id: NodeId) {
+        if std::mem::replace(&mut self.visited[node_id.index()], true) {
+            return;
+        }
+        self.hooks.enter_node(node_id);
+        self.bind_node_worker(node_id);
+        for child in self.children_in_pinned_order(node_id) {
+            if !self.visited[child.index()] {
+                self.bind_node(child);
+            }
+        }
+        self.hooks.exit_node(node_id);
+    }
+
+    fn bind_node_worker(&mut self, node_id: NodeId) {
         let Some(node) = self.ast.get(node_id) else {
             self.mark_unsupported(node_id, UnsupportedFlowKind::DestructuringAssignment);
             return;
@@ -110,14 +152,14 @@ impl<'a> FlowBuilder<'a> {
 
         if kind == SyntaxKind::ClassStaticBlockDeclaration {
             self.mark_unsupported(node_id, UnsupportedFlowKind::ClassStaticBlock);
-            self.discover_nested_containers(node_id);
+            self.bind_children_without_flow(node_id);
             return;
         }
 
         if let Some(function) = self.function_container(node_id) {
             if let Some(kind) = self.unsupported_direct_function_call_kind(node_id) {
                 self.mark_unsupported(node_id, kind);
-                self.discover_nested_containers(node_id);
+                self.bind_children_without_flow(node_id);
                 return;
             }
             if function.start_payload {
@@ -143,7 +185,7 @@ impl<'a> FlowBuilder<'a> {
         }
 
         if self.current.is_none() {
-            self.discover_nested_containers(node_id);
+            self.bind_children_without_flow(node_id);
             return;
         }
 
@@ -162,7 +204,7 @@ impl<'a> FlowBuilder<'a> {
 
         if is_optional_chain(kind, flags) {
             self.mark_unsupported(node_id, UnsupportedFlowKind::OptionalChain);
-            self.discover_nested_containers(node_id);
+            self.bind_children_without_flow(node_id);
             return;
         }
 
@@ -184,7 +226,7 @@ impl<'a> FlowBuilder<'a> {
             }
             SyntaxKind::TryStatement | SyntaxKind::CatchClause => {
                 self.mark_unsupported(node_id, UnsupportedFlowKind::TryStatement);
-                self.discover_nested_containers(node_id);
+                self.bind_children_without_flow(node_id);
             }
             SyntaxKind::BreakStatement => {
                 self.bind_break_or_continue_statement(node_id, JumpKind::Break);
@@ -195,9 +237,9 @@ impl<'a> FlowBuilder<'a> {
             SyntaxKind::LabeledStatement => self.bind_labeled_statement(node_id),
             SyntaxKind::WithStatement => {
                 self.mark_unsupported(node_id, UnsupportedFlowKind::WithStatement);
-                self.discover_nested_containers(node_id);
+                self.bind_children_without_flow(node_id);
             }
-            SyntaxKind::SourceFile => {}
+            SyntaxKind::SourceFile => self.bind_source_file(node_id),
             SyntaxKind::Block => self.bind_block(node_id),
             SyntaxKind::IfStatement => self.bind_if_statement(node_id),
             SyntaxKind::ReturnStatement => self.bind_return_statement(node_id),
@@ -241,6 +283,17 @@ impl<'a> FlowBuilder<'a> {
             _ => return,
         };
         self.bind_statement_list(&statements);
+    }
+
+    fn bind_source_file(&mut self, source_file: NodeId) {
+        let (statements, end_of_file) = match self.ast.get(source_file).map(|node| &node.data) {
+            Some(NodeData::SourceFile(data)) => {
+                (data.statements.nodes.clone(), data.end_of_file_token)
+            }
+            _ => return,
+        };
+        self.bind_statement_list(&statements);
+        self.bind_node(end_of_file);
     }
 
     fn bind_statement_list(&mut self, statements: &[NodeId]) {
@@ -295,7 +348,6 @@ impl<'a> FlowBuilder<'a> {
         self.current = Some(pre_while_label);
         self.bind_condition(expression, pre_body_label, post_while_label);
         if self.current.is_none() {
-            self.discover_nested_containers(statement);
             return;
         }
         self.current = self.finish_label(pre_body_label);
@@ -320,7 +372,6 @@ impl<'a> FlowBuilder<'a> {
         self.current = Some(pre_do_label);
         self.bind_iterative_statement(statement, post_do_label, pre_condition_label);
         if self.current.is_none() {
-            self.discover_nested_containers(expression);
             return;
         }
         self.add_current_antecedent(pre_condition_label);
@@ -352,31 +403,17 @@ impl<'a> FlowBuilder<'a> {
             self.bind_node(initializer);
         }
         if self.current.is_none() {
-            if let Some(condition) = condition {
-                self.discover_nested_containers(condition);
-            }
-            if let Some(incrementor) = incrementor {
-                self.discover_nested_containers(incrementor);
-            }
-            self.discover_nested_containers(statement);
             return;
         }
         self.add_current_antecedent(pre_loop_label);
         self.current = Some(pre_loop_label);
         self.bind_optional_condition(condition, pre_body_label, post_loop_label);
         if self.current.is_none() {
-            self.discover_nested_containers(statement);
-            if let Some(incrementor) = incrementor {
-                self.discover_nested_containers(incrementor);
-            }
             return;
         }
         self.current = self.finish_label(pre_body_label);
         self.bind_iterative_statement(statement, post_loop_label, pre_incrementor_label);
         if self.current.is_none() {
-            if let Some(incrementor) = incrementor {
-                self.discover_nested_containers(incrementor);
-            }
             return;
         }
         self.add_current_antecedent(pre_incrementor_label);
@@ -407,8 +444,6 @@ impl<'a> FlowBuilder<'a> {
         let post_loop_label = self.alloc_label();
         self.bind_node(expression);
         if self.current.is_none() {
-            self.discover_nested_containers(initializer);
-            self.discover_nested_containers(statement);
             return;
         }
         self.add_current_antecedent(pre_loop_label);
@@ -426,13 +461,10 @@ impl<'a> FlowBuilder<'a> {
             )
         {
             self.mark_unsupported(initializer, UnsupportedFlowKind::DestructuringAssignment);
-            self.discover_nested_containers(initializer);
-            self.discover_nested_containers(statement);
             return;
         }
         self.bind_node(initializer);
         if self.current.is_none() {
-            self.discover_nested_containers(statement);
             return;
         }
         if self.node_kind(initializer) != Some(SyntaxKind::VariableDeclarationList) {
@@ -454,7 +486,6 @@ impl<'a> FlowBuilder<'a> {
         let post_switch_label = self.alloc_label();
         self.bind_node(expression);
         let Some(pre_switch_case_flow) = self.current else {
-            self.discover_nested_containers(case_block);
             return;
         };
 
@@ -511,9 +542,6 @@ impl<'a> FlowBuilder<'a> {
                 }
                 self.bind_node(clauses[index]);
                 if self.current.is_none() {
-                    for clause in &clauses[index + 1..] {
-                        self.discover_nested_containers(*clause);
-                    }
                     return;
                 }
                 index += 1;
@@ -537,9 +565,6 @@ impl<'a> FlowBuilder<'a> {
             let clause = clauses[index];
             self.bind_node(clause);
             let Some(current) = self.current else {
-                for remaining in &clauses[index + 1..] {
-                    self.discover_nested_containers(*remaining);
-                }
                 return;
             };
             fallthrough_flow = current;
@@ -646,7 +671,6 @@ impl<'a> FlowBuilder<'a> {
         };
         let Some(name) = self.identifier_text(label).map(str::to_owned) else {
             self.mark_unsupported(node_id, UnsupportedFlowKind::DestructuringAssignment);
-            self.discover_nested_containers(statement);
             return;
         };
         let post_statement_label = self.alloc_label();
@@ -686,10 +710,6 @@ impl<'a> FlowBuilder<'a> {
         let post_if_label = self.alloc_label();
         self.bind_condition(expression, then_label, else_label);
         if self.current.is_none() {
-            self.discover_nested_containers(then_statement);
-            if let Some(else_statement) = else_statement {
-                self.discover_nested_containers(else_statement);
-            }
             return;
         }
         let Some(then_flow) = self.finish_label(then_label) else {
@@ -698,9 +718,6 @@ impl<'a> FlowBuilder<'a> {
         self.current = Some(then_flow);
         self.bind_node(then_statement);
         if !self.add_current_antecedent(post_if_label) {
-            if let Some(else_statement) = else_statement {
-                self.discover_nested_containers(else_statement);
-            }
             return;
         }
         let Some(else_flow) = self.finish_label(else_label) else {
@@ -811,8 +828,6 @@ impl<'a> FlowBuilder<'a> {
 
         self.bind_condition(condition, true_label, false_label);
         if self.current.is_none() {
-            self.discover_nested_containers(when_true);
-            self.discover_nested_containers(when_false);
             self.has_flow_effects |= saved_effects;
             return;
         }
@@ -860,7 +875,6 @@ impl<'a> FlowBuilder<'a> {
         };
         if is_logical_operator(operator) {
             self.mark_unsupported(node_id, UnsupportedFlowKind::LogicalExpression);
-            self.discover_nested_containers(node_id);
             return;
         }
         if operator.is_assignment_operator()
@@ -870,7 +884,7 @@ impl<'a> FlowBuilder<'a> {
             )
         {
             self.mark_unsupported(node_id, UnsupportedFlowKind::DestructuringAssignment);
-            self.discover_nested_containers(node_id);
+            self.bind_children_without_flow(node_id);
             return;
         }
 
@@ -921,7 +935,6 @@ impl<'a> FlowBuilder<'a> {
             )
         {
             self.mark_unsupported(node_id, UnsupportedFlowKind::DestructuringAssignment);
-            self.discover_nested_containers(node_id);
             return;
         }
         self.bind_node(name);
@@ -962,7 +975,6 @@ impl<'a> FlowBuilder<'a> {
             )
         {
             self.mark_unsupported(node_id, UnsupportedFlowKind::DestructuringAssignment);
-            self.discover_nested_containers(node_id);
             return;
         }
         for modifier in modifiers {
@@ -997,7 +1009,6 @@ impl<'a> FlowBuilder<'a> {
             };
         if initializer.is_some() {
             self.mark_unsupported(node_id, UnsupportedFlowKind::DestructuringAssignment);
-            self.discover_nested_containers(node_id);
             return;
         }
         if let Some(dot_dot_dot) = dot_dot_dot {
@@ -1084,7 +1095,6 @@ impl<'a> FlowBuilder<'a> {
                 .unsupported_direct_function_call_kind(function)
                 .expect("direct function call target has an unsupported boundary kind");
             self.mark_unsupported(function, kind);
-            self.discover_nested_containers(node_id);
             return;
         }
         self.bind_node(expression);
@@ -1200,34 +1210,144 @@ impl<'a> FlowBuilder<'a> {
         }
     }
 
-    fn discover_nested_containers(&mut self, node_id: NodeId) {
-        let children = self.children.get(&node_id).cloned().unwrap_or_default();
-        for child in children {
-            if let Some(function) = self.function_container(child) {
-                if let Some(kind) = self.unsupported_direct_function_call_kind(child) {
-                    self.mark_unsupported(child, kind);
-                    self.discover_nested_containers(child);
-                } else {
-                    if function.start_payload {
-                        self.record_node_flow_including_unreachable(child);
-                    }
-                    self.bind_function_container(child, function);
-                }
-            } else if self.node_kind(child) == Some(SyntaxKind::ClassStaticBlockDeclaration) {
-                self.mark_unsupported(child, UnsupportedFlowKind::ClassStaticBlock);
-                self.discover_nested_containers(child);
-            } else if self.node_kind(child) == Some(SyntaxKind::ModuleBlock) {
-                self.bind_module_block(child);
-            } else if self.node_kind(child) == Some(SyntaxKind::PropertyDeclaration)
-                && matches!(
-                    self.ast.get(child).map(|node| &node.data),
-                    Some(NodeData::PropertyDeclaration(data)) if data.initializer.is_some()
-                )
-            {
-                self.bind_property_initializer_container(child);
-            } else {
-                self.discover_nested_containers(child);
+    /// Continues the one canonical walk after the current CFG container has
+    /// failed closed. Flow recording stays disabled, but every ordinary child
+    /// is still entered and exited in pinned binder order. Nested flow
+    /// containers may independently build their own graphs and then restore the
+    /// disabled outer state.
+    fn bind_children_without_flow(&mut self, node_id: NodeId) {
+        let saved_in_assignment_pattern = self.in_assignment_pattern;
+        self.in_assignment_pattern = false;
+
+        if self.is_destructuring_assignment(node_id) {
+            self.in_assignment_pattern = saved_in_assignment_pattern;
+            self.bind_destructuring_assignment_children(node_id);
+            debug_assert_eq!(self.in_assignment_pattern, saved_in_assignment_pattern);
+            return;
+        }
+
+        if matches!(
+            self.node_kind(node_id),
+            Some(
+                SyntaxKind::ObjectLiteralExpression
+                    | SyntaxKind::ArrayLiteralExpression
+                    | SyntaxKind::PropertyAssignment
+                    | SyntaxKind::SpreadElement
+            )
+        ) {
+            self.in_assignment_pattern = saved_in_assignment_pattern;
+        }
+        for child in self.children_in_pinned_order(node_id) {
+            self.bind_node(child);
+        }
+        self.in_assignment_pattern = saved_in_assignment_pattern;
+    }
+
+    fn bind_destructuring_assignment_children(&mut self, node_id: NodeId) {
+        let (left, type_, operator, right) = match self.ast.get(node_id).map(|node| &node.data) {
+            Some(NodeData::BinaryExpression(data)) => {
+                (data.left, data.type_, data.operator_token, data.right)
             }
+            _ => return,
+        };
+        if self.in_assignment_pattern {
+            self.in_assignment_pattern = false;
+            self.bind_node(operator);
+            self.bind_node(right);
+            self.in_assignment_pattern = true;
+            self.bind_node(left);
+            if let Some(type_) = type_ {
+                self.bind_node(type_);
+            }
+        } else {
+            self.in_assignment_pattern = true;
+            self.bind_node(left);
+            if let Some(type_) = type_ {
+                self.bind_node(type_);
+            }
+            self.in_assignment_pattern = false;
+            self.bind_node(operator);
+            self.bind_node(right);
+        }
+    }
+
+    fn children_in_pinned_order(&self, node_id: NodeId) -> Vec<NodeId> {
+        let Some(node) = self.ast.get(node_id) else {
+            return Vec::new();
+        };
+        match &node.data {
+            NodeData::SourceFile(data) => {
+                let mut children = statements_in_pinned_order(self.ast, &data.statements.nodes);
+                children.push(data.end_of_file_token);
+                children
+            }
+            NodeData::Block(data) => statements_in_pinned_order(self.ast, &data.statements.nodes),
+            NodeData::ModuleBlock(data) => {
+                statements_in_pinned_order(self.ast, &data.statements.nodes)
+            }
+            NodeData::ForStatement(data) => {
+                let mut children = Vec::with_capacity(4);
+                children.extend(data.initializer);
+                children.extend(data.condition);
+                children.push(data.statement);
+                children.extend(data.incrementor);
+                children
+            }
+            NodeData::ForInOrOfStatement(data) => {
+                let mut children = Vec::with_capacity(4);
+                children.push(data.expression);
+                if node.kind == SyntaxKind::ForOfStatement
+                    && let Some(await_modifier) = data.await_modifier
+                {
+                    children.push(await_modifier);
+                }
+                children.push(data.initializer);
+                children.push(data.statement);
+                children
+            }
+            NodeData::BinaryExpression(data) => {
+                let mut children = Vec::with_capacity(4);
+                children.push(data.left);
+                children.extend(data.type_);
+                children.push(data.operator_token);
+                children.push(data.right);
+                children
+            }
+            NodeData::CallExpression(data)
+                if !is_optional_chain(node.kind, node.flags)
+                    && self
+                        .directly_invoked_function_target(data.expression)
+                        .is_some() =>
+            {
+                let mut children = Vec::new();
+                if let Some(type_arguments) = &data.type_arguments {
+                    children.extend(type_arguments.nodes.iter().copied());
+                }
+                children.extend(data.arguments.nodes.iter().copied());
+                children.push(data.expression);
+                children
+            }
+            NodeData::ParameterDeclaration(data) => {
+                let mut children = Vec::new();
+                if let Some(modifiers) = &data.modifiers {
+                    children.extend(modifiers.list.nodes.iter().copied());
+                }
+                children.extend(data.dot_dot_dot_token);
+                children.extend(data.question_token);
+                children.extend(data.type_);
+                children.extend(data.initializer);
+                children.push(data.name);
+                children
+            }
+            NodeData::BindingElement(data) => {
+                let mut children = Vec::with_capacity(4);
+                children.extend(data.dot_dot_dot_token);
+                children.extend(data.property_name);
+                children.extend(data.initializer);
+                children.extend(data.name);
+                children
+            }
+            _ => self.children.get(&node_id).cloned().unwrap_or_default(),
         }
     }
 
@@ -1891,6 +2011,18 @@ impl<'a> FlowBuilder<'a> {
         }
     }
 
+    fn is_destructuring_assignment(&self, node_id: NodeId) -> bool {
+        let Some(NodeData::BinaryExpression(data)) = self.ast.get(node_id).map(|node| &node.data)
+        else {
+            return false;
+        };
+        self.node_kind(data.operator_token) == Some(SyntaxKind::EqualsToken)
+            && matches!(
+                self.node_kind(data.left),
+                Some(SyntaxKind::ArrayLiteralExpression | SyntaxKind::ObjectLiteralExpression)
+            )
+    }
+
     fn skip_parentheses(&self, mut node: NodeId) -> NodeId {
         while let Some(NodeData::ParenthesizedExpression(data)) =
             self.ast.get(node).map(|node| &node.data)
@@ -1965,6 +2097,19 @@ impl<'a> FlowBuilder<'a> {
             Some(NodeData::FunctionExpression(data)) if data.asterisk_token.is_some()
         )
     }
+}
+
+fn statements_in_pinned_order(ast: &NodeArena, statements: &[NodeId]) -> Vec<NodeId> {
+    let mut ordered = Vec::with_capacity(statements.len());
+    ordered.extend(statements.iter().copied().filter(|statement| {
+        ast.get(*statement)
+            .is_some_and(|node| node.kind == SyntaxKind::FunctionDeclaration)
+    }));
+    ordered.extend(statements.iter().copied().filter(|statement| {
+        ast.get(*statement)
+            .is_none_or(|node| node.kind != SyntaxKind::FunctionDeclaration)
+    }));
+    ordered
 }
 
 const NODE_FLAG_LET: u32 = 1 << 0;
