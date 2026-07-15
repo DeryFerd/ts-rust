@@ -237,20 +237,38 @@ struct RelationBootstrapFacts {
 
 #[derive(Clone, Copy)]
 struct RelationGlobalTypes {
-    array_type: TypeId,
-    readonly_array_type: TypeId,
+    array: TypeId,
+    readonly_array: TypeId,
+    string_wrapper: TypeId,
+    number_wrapper: TypeId,
+    boolean_wrapper: TypeId,
 }
 
 impl RelationGlobalTypes {
     const fn from_global_types(global_types: &CanonicalGlobalTypes) -> Self {
         Self {
-            array_type: global_types.array_type,
-            readonly_array_type: global_types.readonly_array_type,
+            array: global_types.array_type,
+            readonly_array: global_types.readonly_array_type,
+            string_wrapper: global_types.string_type,
+            number_wrapper: global_types.number_type,
+            boolean_wrapper: global_types.boolean_type,
         }
     }
 
     fn contains_array_target(self, target: TypeId) -> bool {
-        target == self.array_type || target == self.readonly_array_type
+        target == self.array || target == self.readonly_array
+    }
+
+    fn apparent_primitive_type(self, flags: TypeFlags) -> Option<TypeId> {
+        if flags.intersects(TypeFlags::STRING_LIKE) {
+            Some(self.string_wrapper)
+        } else if flags.intersects(TypeFlags::NUMBER_LIKE) {
+            Some(self.number_wrapper)
+        } else if flags.intersects(TypeFlags::BOOLEAN_LIKE) {
+            Some(self.boolean_wrapper)
+        } else {
+            None
+        }
     }
 }
 
@@ -781,6 +799,19 @@ impl<'store> RelaterSession<'store> {
         if source_flags.intersects(TypeFlags::STRUCTURED_OR_INSTANTIABLE)
             || target_flags.intersects(TypeFlags::STRUCTURED_OR_INSTANTIABLE)
         {
+            if self.relation != RelationKind::Identity
+                && target_flags.intersects(TypeFlags::OBJECT)
+                && let Some(apparent_source) = self
+                    .global_types
+                    .and_then(|global_types| global_types.apparent_primitive_type(source_flags))
+            {
+                return self.is_related_to_ex(
+                    apparent_source,
+                    target,
+                    recursion_flags,
+                    intersection_state,
+                );
+            }
             if let Some((source_argument, target_argument)) =
                 self.canonical_array_reference_arguments(source, target)?
             {
@@ -2807,6 +2838,15 @@ impl SemanticStore<TypeRecord, TypeMapper> {
 
         let source_flags = self.type_flags(source)?;
         let target_flags = self.type_flags(target)?;
+        if source_flags.intersects(TypeFlags::OBJECT)
+            && target_flags.intersects(TypeFlags::PRIMITIVE)
+        {
+            let related = (relation == RelationKind::Comparable
+                && !target_flags.intersects(TypeFlags::NEVER)
+                && self.is_simple_type_related_to(target, source, relation, bootstrap)?)
+                || self.is_simple_type_related_to(source, target, relation, bootstrap)?;
+            return Ok(related);
+        }
         if !relation.is_identity() {
             if (relation == RelationKind::Comparable
                 && !target_flags.intersects(TypeFlags::NEVER)
@@ -2832,6 +2872,11 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         let supported_array_relation = source_flags.intersects(TypeFlags::OBJECT)
             && target_flags.intersects(TypeFlags::OBJECT)
             && matching_configured_array_reference_target(self, global_types, source, target)?
+                .is_some();
+        let supported_apparent_primitive_relation = relation != RelationKind::Identity
+            && target_flags.intersects(TypeFlags::OBJECT)
+            && global_types
+                .and_then(|global_types| global_types.apparent_primitive_type(source_flags))
                 .is_some();
         if source_flags.intersects(TypeFlags::OBJECT)
             && target_flags.intersects(TypeFlags::OBJECT)
@@ -2860,7 +2905,11 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             let supported_object_relation = supports_property_object_relation(relation)
                 && source_flags.intersects(TypeFlags::OBJECT)
                 && target_flags.intersects(TypeFlags::OBJECT);
-            if union_relation || supported_object_relation || supported_array_relation {
+            if union_relation
+                || supported_object_relation
+                || supported_array_relation
+                || supported_apparent_primitive_relation
+            {
                 let mut session =
                     RelaterSession::new_with_global_types(self, relation, bootstrap, global_types);
                 let result = session.is_related_to_ex(
@@ -2869,7 +2918,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     RecursionFlags::BOTH,
                     IntersectionState::NONE,
                 )?;
-                return if supported_array_relation {
+                return if supported_array_relation || supported_apparent_primitive_relation {
                     Ok(session.finish_without_specialized_root_cache(result))
                 } else {
                     session.finish(source, target, result)
@@ -4417,6 +4466,88 @@ mod tests {
     }
 
     #[test]
+    fn object_to_primitive_relations_fail_without_requesting_structural_support() {
+        let mut store = initialized(true);
+        let (number, string) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (bootstrap.number_type, bootstrap.string_type)
+        };
+        let object = alloc_resolved_object(&mut store, ObjectFlags::ANONYMOUS, None);
+
+        assert_eq!(store.is_type_assignable_to(object, number), Ok(false));
+        assert_eq!(store.is_type_strict_subtype_of(object, string), Ok(false));
+        assert_eq!(store.is_type_comparable_to(object, number), Ok(false));
+        assert_eq!(
+            store.is_type_identical_to(object, number),
+            Ok(false),
+            "the object/primitive fast path also preserves identity disjointness"
+        );
+    }
+
+    #[test]
+    fn global_primitive_wrappers_supply_apparent_types_without_legacy_cache_leaks() {
+        let mut store = initialized(true);
+        let (number, empty_object, empty_generic) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (
+                bootstrap.number_type,
+                bootstrap.empty_object_type,
+                bootstrap.empty_generic_type,
+            )
+        };
+        let wrapper_value = alloc_typed_property(&mut store, "value", number, false);
+        let number_wrapper = alloc_property_object(&mut store, vec![wrapper_value]);
+        let matching_value = alloc_typed_property(&mut store, "value", number, false);
+        let matching_target = alloc_property_object(&mut store, vec![matching_value]);
+        let missing_id = alloc_typed_property(&mut store, "id", number, false);
+        let mismatching_target = alloc_property_object(&mut store, vec![missing_id]);
+        let global_types = RelationGlobalTypes {
+            array: empty_generic,
+            readonly_array: empty_generic,
+            string_wrapper: empty_object,
+            number_wrapper,
+            boolean_wrapper: empty_object,
+        };
+
+        assert_eq!(
+            store.is_type_assignable_to(number, matching_target),
+            Err(RelationUnavailable::StructuralRelation {
+                source: number,
+                target: matching_target,
+                relation: RelationKind::Assignable,
+            })
+        );
+        assert_eq!(
+            store.is_type_related_to_with_optional_global_types(
+                number,
+                matching_target,
+                RelationKind::Assignable,
+                Some(global_types),
+            ),
+            Ok(true)
+        );
+        assert_eq!(
+            store.is_type_related_to_with_optional_global_types(
+                number,
+                mismatching_target,
+                RelationKind::Assignable,
+                Some(global_types),
+            ),
+            Ok(false)
+        );
+        let after_global_warmup = store.relation_state_snapshot();
+        assert_eq!(
+            store.is_type_assignable_to(number, matching_target),
+            Err(RelationUnavailable::StructuralRelation {
+                source: number,
+                target: matching_target,
+                relation: RelationKind::Assignable,
+            })
+        );
+        assert_eq!(store.relation_state_snapshot(), after_global_warmup);
+    }
+
+    #[test]
     fn late_bound_type_literal_members_require_and_honor_the_resolved_members_cache() {
         let mut store = initialized(true);
         let non_primitive = store.intrinsic_bootstrap().unwrap().non_primitive_type;
@@ -4935,16 +5066,23 @@ mod tests {
     #[test]
     fn explicit_global_array_relations_are_covariant_and_target_local() {
         let mut store = initialized(true);
-        let (number, string) = {
+        let (number, string, empty_object) = {
             let bootstrap = store.intrinsic_bootstrap().unwrap();
-            (bootstrap.number_type, bootstrap.string_type)
+            (
+                bootstrap.number_type,
+                bootstrap.string_type,
+                bootstrap.empty_object_type,
+            )
         };
         let number_or_string = canonical_union(&mut store, &[number, string]);
         let array = alloc_canonical_array_target(&mut store, "Array");
         let readonly_array = alloc_canonical_array_target(&mut store, "ReadonlyArray");
         let global_types = RelationGlobalTypes {
-            array_type: array.target,
-            readonly_array_type: readonly_array.target,
+            array: array.target,
+            readonly_array: readonly_array.target,
+            string_wrapper: empty_object,
+            number_wrapper: empty_object,
+            boolean_wrapper: empty_object,
         };
         let array_number = canonical_array_reference(&mut store, array.target, number);
         let array_union = canonical_array_reference(&mut store, array.target, number_or_string);
@@ -5025,11 +5163,17 @@ mod tests {
     #[test]
     fn canonical_array_literal_clones_and_malformed_references_are_distinguished() {
         let mut store = initialized(true);
-        let number = store.intrinsic_bootstrap().unwrap().number_type;
+        let (number, empty_object) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (bootstrap.number_type, bootstrap.empty_object_type)
+        };
         let array = alloc_canonical_array_target(&mut store, "Array");
         let global_types = RelationGlobalTypes {
-            array_type: array.target,
-            readonly_array_type: array.target,
+            array: array.target,
+            readonly_array: array.target,
+            string_wrapper: empty_object,
+            number_wrapper: empty_object,
+            boolean_wrapper: empty_object,
         };
         let base = canonical_array_reference(&mut store, array.target, number);
         let literal = alloc_array_literal_clone(&mut store, array, number);
@@ -5106,19 +5250,23 @@ mod tests {
     #[test]
     fn poisoned_or_fallback_array_targets_fail_without_relation_cache_writes() {
         let mut store = initialized(true);
-        let (number, string, empty_generic) = {
+        let (number, string, empty_object, empty_generic) = {
             let bootstrap = store.intrinsic_bootstrap().unwrap();
             (
                 bootstrap.number_type,
                 bootstrap.string_type,
+                bootstrap.empty_object_type,
                 bootstrap.empty_generic_type,
             )
         };
         let number_or_string = canonical_union(&mut store, &[number, string]);
         let array = alloc_canonical_array_target(&mut store, "Array");
         let global_types = RelationGlobalTypes {
-            array_type: array.target,
-            readonly_array_type: array.target,
+            array: array.target,
+            readonly_array: array.target,
+            string_wrapper: empty_object,
+            number_wrapper: empty_object,
+            boolean_wrapper: empty_object,
         };
         let array_number = canonical_array_reference(&mut store, array.target, number);
         let array_union = canonical_array_reference(&mut store, array.target, number_or_string);
@@ -5140,8 +5288,11 @@ mod tests {
         let fallback_source = alloc_reference(&mut store, empty_generic, vec![number]);
         let fallback_target = alloc_reference(&mut store, empty_generic, vec![string]);
         let fallback_globals = RelationGlobalTypes {
-            array_type: empty_generic,
-            readonly_array_type: empty_generic,
+            array: empty_generic,
+            readonly_array: empty_generic,
+            string_wrapper: empty_object,
+            number_wrapper: empty_object,
+            boolean_wrapper: empty_object,
         };
         let before_fallback = store.relation_state_snapshot();
         assert_eq!(

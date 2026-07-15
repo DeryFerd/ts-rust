@@ -257,7 +257,6 @@ pub(super) fn type_to_string_with_host_and_flags(
     type_to_string_with_optional_context_and_flags(store, Some(host), None, type_id, flags)
 }
 
-#[allow(dead_code)] // Source/production wiring is owned by the integration slice.
 pub(super) fn type_to_string_with_host_global_types_and_flags(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -401,7 +400,6 @@ pub(super) fn get_type_names_for_assignability_error_with_host_and_flags(
     )
 }
 
-#[allow(dead_code)] // Source/production wiring is owned by the integration slice.
 pub(super) fn get_type_names_for_assignability_error_with_host_global_types_and_flags(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -1806,6 +1804,7 @@ fn format_union_types(
     Ok(result)
 }
 
+#[allow(clippy::too_many_arguments)] // Keeps recursive display capabilities explicit.
 fn display_union_list(
     store: &CanonicalTypeMapperStore,
     host: Option<&DeclaredTypeHost<'_>>,

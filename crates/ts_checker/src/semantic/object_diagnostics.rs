@@ -18,11 +18,11 @@ use ts_diagnostics::{Diagnostic, message_by_code};
 
 use super::{
     AssignabilityErrorDisplay, CanonicalCheckerDiagnostic, CanonicalCheckerOptions,
-    CanonicalCheckerRelatedInformation, CanonicalTypeFormatFlags, CanonicalTypeMapperStore,
-    DeclaredTypeHost, RelationUnavailable, TypeId,
+    CanonicalCheckerRelatedInformation, CanonicalGlobalTypes, CanonicalTypeFormatFlags,
+    CanonicalTypeMapperStore, DeclaredTypeHost, RelationUnavailable, TypeId,
     formatter::{
-        get_type_names_for_assignability_error_with_host_and_flags,
-        type_to_string_with_host_and_flags,
+        get_type_names_for_assignability_error_with_host_global_types_and_flags,
+        type_to_string_with_host_global_types_and_flags,
     },
     object_members::PropertyObjectPlan,
     relater::{ResolvedDeclaredProperty, ResolvedDeclaredPropertyObject},
@@ -34,9 +34,11 @@ use super::{
 };
 
 /// Builds the complete diagnostic batch for one already-failed assignment.
+#[allow(clippy::too_many_arguments)] // Keeps diagnostic inputs explicit and immutable.
 pub(super) fn diagnostics_for_failed_assignment(
     store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
     expression: &PlannedExpression,
     source_type: TypeId,
     target_type: TypeId,
@@ -44,14 +46,22 @@ pub(super) fn diagnostics_for_failed_assignment(
     options: CanonicalCheckerOptions,
 ) -> Result<Vec<CanonicalCheckerDiagnostic>, SourceCheckError> {
     let flags = display_flags(options);
-    let mut elaborated =
-        elaborate_known_properties(store, host, expression, source_type, target_type, flags)?;
+    let mut elaborated = elaborate_known_properties(
+        store,
+        host,
+        global_types,
+        expression,
+        source_type,
+        target_type,
+        flags,
+    )?;
     if !elaborated.is_empty() {
         return Ok(elaborated);
     }
     elaborated.push(shape_or_generic_diagnostic(
         store,
         host,
+        global_types,
         expression,
         source_type,
         target_type,
@@ -75,6 +85,7 @@ fn display_flags(options: CanonicalCheckerOptions) -> CanonicalTypeFormatFlags {
 fn elaborate_known_properties(
     store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
     expression: &PlannedExpression,
     source_type: TypeId,
     target_type: TypeId,
@@ -99,7 +110,11 @@ fn elaborate_known_properties(
         let Some(target_property) = target.get_source(&source_property.name) else {
             continue;
         };
-        if store.is_type_assignable_to(source_property_type, target_property.type_)? {
+        if store.is_type_assignable_to_with_global_types(
+            source_property_type,
+            target_property.type_,
+            global_types,
+        )? {
             continue;
         }
 
@@ -110,6 +125,7 @@ fn elaborate_known_properties(
             let nested = elaborate_known_properties(
                 store,
                 host,
+                global_types,
                 source_expression,
                 source_property_type,
                 target_property.type_,
@@ -123,6 +139,7 @@ fn elaborate_known_properties(
             let mut diagnostic = shape_or_generic_diagnostic(
                 store,
                 host,
+                global_types,
                 source_expression,
                 source_property_type,
                 target_property.type_,
@@ -133,6 +150,7 @@ fn elaborate_known_properties(
                 &mut diagnostic,
                 store,
                 host,
+                global_types,
                 target_type,
                 target_property,
                 flags,
@@ -144,6 +162,7 @@ fn elaborate_known_properties(
         let mut diagnostic = generic_assignability_diagnostic(
             store,
             host,
+            global_types,
             source_property_type,
             target_property.type_,
             source_property.name_node,
@@ -153,6 +172,7 @@ fn elaborate_known_properties(
             &mut diagnostic,
             store,
             host,
+            global_types,
             target_type,
             target_property,
             flags,
@@ -162,9 +182,11 @@ fn elaborate_known_properties(
     Ok(diagnostics)
 }
 
+#[allow(clippy::too_many_arguments)] // Mirrors the pinned elaboration boundary.
 fn shape_or_generic_diagnostic(
     store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
     expression: &PlannedExpression,
     source_type: TypeId,
     target_type: TypeId,
@@ -176,6 +198,7 @@ fn shape_or_generic_diagnostic(
         return generic_assignability_diagnostic(
             store,
             host,
+            global_types,
             source_type,
             target_type,
             fallback_node,
@@ -186,6 +209,7 @@ fn shape_or_generic_diagnostic(
         return generic_assignability_diagnostic(
             store,
             host,
+            global_types,
             source_type,
             target_type,
             fallback_node,
@@ -198,7 +222,15 @@ fn shape_or_generic_diagnostic(
         .iter()
         .find(|property| target.get_source(&property.name).is_none())
     {
-        return excess_property_diagnostic(store, host, &target, target_type, excess, flags);
+        return excess_property_diagnostic(
+            store,
+            host,
+            global_types,
+            &target,
+            target_type,
+            excess,
+            flags,
+        );
     }
 
     let source_names = plan
@@ -217,6 +249,7 @@ fn shape_or_generic_diagnostic(
         return missing_property_diagnostic(
             store,
             host,
+            global_types,
             source_type,
             target_type,
             fallback_node,
@@ -225,18 +258,33 @@ fn shape_or_generic_diagnostic(
         );
     }
 
-    generic_assignability_diagnostic(store, host, source_type, target_type, fallback_node, flags)
+    generic_assignability_diagnostic(
+        store,
+        host,
+        global_types,
+        source_type,
+        target_type,
+        fallback_node,
+        flags,
+    )
 }
 
 fn excess_property_diagnostic(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
     target: &ResolvedDeclaredPropertyObject,
     target_type: TypeId,
     excess: &super::object_members::PlannedProperty,
     flags: CanonicalTypeFormatFlags,
 ) -> Result<CanonicalCheckerDiagnostic, SourceCheckError> {
-    let target_display = type_to_string_with_host_and_flags(store, host, target_type, flags)?;
+    let target_display = type_to_string_with_host_global_types_and_flags(
+        store,
+        host,
+        global_types,
+        target_type,
+        flags,
+    )?;
     let suggestion = get_spelling_suggestion(
         &excess.name,
         target.properties().iter().enumerate(),
@@ -259,9 +307,11 @@ fn excess_property_diagnostic(
     }
 }
 
+#[allow(clippy::too_many_arguments)] // The complete diagnostic record is built transactionally.
 fn missing_property_diagnostic(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
     source_type: TypeId,
     target_type: TypeId,
     fallback_node: NodeRef,
@@ -269,9 +319,10 @@ fn missing_property_diagnostic(
     flags: CanonicalTypeFormatFlags,
 ) -> Result<CanonicalCheckerDiagnostic, SourceCheckError> {
     let AssignabilityErrorDisplay { source, target } =
-        get_type_names_for_assignability_error_with_host_and_flags(
+        get_type_names_for_assignability_error_with_host_global_types_and_flags(
             store,
             host,
+            global_types,
             source_type,
             target_type,
             flags,
@@ -310,15 +361,17 @@ fn missing_property_diagnostic(
 fn generic_assignability_diagnostic(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
     source_type: TypeId,
     target_type: TypeId,
     node: NodeRef,
     flags: CanonicalTypeFormatFlags,
 ) -> Result<CanonicalCheckerDiagnostic, SourceCheckError> {
     let AssignabilityErrorDisplay { source, target } =
-        get_type_names_for_assignability_error_with_host_and_flags(
+        get_type_names_for_assignability_error_with_host_global_types_and_flags(
             store,
             host,
+            global_types,
             source_type,
             target_type,
             flags,
@@ -331,6 +384,7 @@ fn append_expected_property_related(
     diagnostic: &mut CanonicalCheckerDiagnostic,
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
     target_type: TypeId,
     property: &ResolvedDeclaredProperty,
     flags: CanonicalTypeFormatFlags,
@@ -345,7 +399,13 @@ fn append_expected_property_related(
         return Ok(());
     }
     let property_name = property_name(property)?.to_owned();
-    let target_display = type_to_string_with_host_and_flags(store, host, target_type, flags)?;
+    let target_display = type_to_string_with_host_global_types_and_flags(
+        store,
+        host,
+        global_types,
+        target_type,
+        flags,
+    )?;
     diagnostic.related_information.push(related(
         6500,
         declared_property_name_node(host, target_type, property)?,

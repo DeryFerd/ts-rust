@@ -379,8 +379,9 @@ impl<'arena> CanonicalCheckerContext<'arena> {
     /// Returns [`TypeDisplayUnavailable`] when the type is foreign, malformed,
     /// or requires a display family not installed in the current checker cut.
     pub fn type_to_string(&self, type_id: TypeId) -> Result<String, TypeDisplayUnavailable> {
-        super::formatter::type_to_string_with_flags(
+        super::formatter::type_to_string_with_global_types_and_flags(
             &self.store,
+            &self.global_types,
             type_id,
             self.type_format_flags(CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT),
         )
@@ -400,8 +401,9 @@ impl<'arena> CanonicalCheckerContext<'arena> {
         type_id: TypeId,
         flags: CanonicalTypeFormatFlags,
     ) -> Result<String, TypeDisplayUnavailable> {
-        super::formatter::type_to_string_with_flags(
+        super::formatter::type_to_string_with_global_types_and_flags(
             &self.store,
+            &self.global_types,
             type_id,
             self.type_format_flags(flags),
         )
@@ -420,8 +422,9 @@ impl<'arena> CanonicalCheckerContext<'arena> {
         source: TypeId,
         target: TypeId,
     ) -> Result<AssignabilityErrorDisplay, TypeDisplayUnavailable> {
-        super::formatter::get_type_names_for_assignability_error_with_flags(
+        super::formatter::get_type_names_for_assignability_error_with_global_types_and_flags(
             &self.store,
+            &self.global_types,
             source,
             target,
             self.type_format_flags(CanonicalTypeFormatFlags::NONE),

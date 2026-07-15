@@ -1929,7 +1929,6 @@ impl SemanticStore<TypeRecord, TypeMapper> {
 
     /// Constructs an anonymous expression union using the requested pinned
     /// reduction mode. Empty inputs reduce to the canonical `never` identity.
-    #[allow(dead_code)] // Consumed by the companion array-expression source slice.
     pub(super) fn expression_union_type(
         &mut self,
         types: &[TypeId],

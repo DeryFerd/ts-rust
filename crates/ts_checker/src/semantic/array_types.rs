@@ -130,7 +130,6 @@ impl CanonicalTypeMapperStore {
 
     /// Returns the sole resolved element argument of a canonical direct array
     /// reference, including a validated array-literal clone.
-    #[allow(dead_code)] // Contextual array-expression wiring lands in the integration slice.
     pub(super) fn canonical_array_element_type(
         &self,
         global_types: &CanonicalGlobalTypes,
@@ -144,7 +143,6 @@ impl CanonicalTypeMapperStore {
     /// Creates or reuses the target-cache-owned `Array<T>` or
     /// `ReadonlyArray<T>` reference. A missing global target returns the
     /// canonical non-reference fallback unchanged.
-    #[allow(dead_code)] // Source array-expression construction lands in the integration slice.
     pub(super) fn create_canonical_array_type(
         &mut self,
         global_types: &CanonicalGlobalTypes,
@@ -167,7 +165,6 @@ impl CanonicalTypeMapperStore {
     /// Creates or reuses the derived array-literal clone of an ordinary
     /// canonical array reference. Passing an already validated clone is
     /// idempotent; a non-reference fallback is returned unchanged.
-    #[allow(dead_code)] // Source array-expression construction lands in the integration slice.
     pub(super) fn create_array_literal_type(
         &mut self,
         global_types: &CanonicalGlobalTypes,
@@ -248,7 +245,7 @@ impl CanonicalTypeMapperStore {
         instantiations.get(&type_list_key(&[element_type])).copied()
     }
 
-    fn validate_array_literal_clone(
+    pub(super) fn validate_array_literal_clone(
         &self,
         base_type: TypeId,
         cached: TypeId,
@@ -292,7 +289,8 @@ impl CanonicalTypeMapperStore {
             || clone_reference.object.mapper.is_some()
             || clone_reference.object.instantiations != TypeCacheState::Unallocated
             || !clone.object_flags().contains(ObjectFlags::MEMBERS_RESOLVED)
-                && clone_reference.object.structured != Default::default()
+                && clone_reference.object.structured
+                    != super::type_records::StructuredTypeData::default()
             || clone_reference.node.is_some()
             || clone_reference.resolved_type_arguments != base_reference.resolved_type_arguments
         {

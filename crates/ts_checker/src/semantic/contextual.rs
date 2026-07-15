@@ -9,7 +9,7 @@
 use std::collections::HashSet;
 
 use super::{
-    CanonicalTypeMapperStore, DeclaredTypeHost, RelationUnavailable, TypeId,
+    CanonicalGlobalTypes, CanonicalTypeMapperStore, DeclaredTypeHost, RelationUnavailable, TypeId,
     source::{PlannedExpression, PlannedExpressionKind, SourceCheckError, UnsupportedSourceSyntax},
     type_records::{TypeData, TypeRecord},
     types::TypeFlags,
@@ -35,6 +35,7 @@ pub(super) enum LiteralTreatment {
 pub(super) enum PreparedExpression {
     Literal(LiteralTreatment),
     Parenthesized(Box<PreparedExpression>),
+    Array(Vec<PreparedExpression>),
     Object(Vec<PreparedExpression>),
 }
 
@@ -49,9 +50,31 @@ enum LiteralKind {
 /// Prepares the contextual decisions for one cached variable initializer.
 ///
 /// All target and union validation completes before source object publication.
+#[cfg(test)]
 pub(super) fn prepare_expression_context(
     store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
+    expression: &PlannedExpression,
+    contextual_type: TypeId,
+) -> Result<PreparedExpression, SourceCheckError> {
+    prepare_expression_context_worker(store, host, None, expression, contextual_type)
+}
+
+/// Prepares a contextual expression with authoritative generic-global identities.
+pub(super) fn prepare_expression_context_with_global_types(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    expression: &PlannedExpression,
+    contextual_type: TypeId,
+) -> Result<PreparedExpression, SourceCheckError> {
+    prepare_expression_context_worker(store, host, Some(global_types), expression, contextual_type)
+}
+
+fn prepare_expression_context_worker(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: Option<&CanonicalGlobalTypes>,
     expression: &PlannedExpression,
     contextual_type: TypeId,
 ) -> Result<PreparedExpression, SourceCheckError> {
@@ -67,22 +90,37 @@ pub(super) fn prepare_expression_context(
     prepare_expression(
         store,
         host,
+        global_types,
         expression,
         Some(contextual_type),
         ExpressionLocation::Cached,
     )
 }
 
-/// Prepares an expression that is checked without a contextual type.
-///
-/// Assertion operands use this path: the asserted type controls the result of
-/// the assertion, but it does not contextually type the operand.
-pub(super) fn prepare_expression_without_context(
+/// Prepares a non-contextual expression with authoritative generic-global identities.
+pub(super) fn prepare_expression_without_context_with_global_types(
     store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
     expression: &PlannedExpression,
 ) -> Result<PreparedExpression, SourceCheckError> {
-    prepare_expression(store, host, expression, None, ExpressionLocation::Cached)
+    prepare_expression_without_context_worker(store, host, Some(global_types), expression)
+}
+
+fn prepare_expression_without_context_worker(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: Option<&CanonicalGlobalTypes>,
+    expression: &PlannedExpression,
+) -> Result<PreparedExpression, SourceCheckError> {
+    prepare_expression(
+        store,
+        host,
+        global_types,
+        expression,
+        None,
+        ExpressionLocation::Cached,
+    )
 }
 
 /// Validates every type reachable from the contextual target before source
@@ -136,6 +174,7 @@ fn preflight_contextual_type_graph(
 fn prepare_expression(
     store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
+    global_types: Option<&CanonicalGlobalTypes>,
     expression: &PlannedExpression,
     contextual_type: Option<TypeId>,
     location: ExpressionLocation,
@@ -169,12 +208,32 @@ fn prepare_expression(
             location,
         )?),
         PlannedExpressionKind::Parenthesized(inner) => PreparedExpression::Parenthesized(Box::new(
-            prepare_expression(store, host, inner, contextual_type, location)?,
+            prepare_expression(store, host, global_types, inner, contextual_type, location)?,
         )),
         PlannedExpressionKind::Assertion { .. } => {
             return Err(SourceCheckError::Unsupported(
                 UnsupportedSourceSyntax::NestedAssertion(expression.node),
             ));
+        }
+        PlannedExpressionKind::Array(elements) => {
+            let element_context = match (global_types, contextual_type) {
+                (Some(global_types), Some(contextual_type)) => {
+                    store.canonical_array_element_type(global_types, contextual_type)?
+                }
+                _ => None,
+            };
+            let mut prepared = Vec::with_capacity(elements.len());
+            for element in elements {
+                prepared.push(prepare_expression(
+                    store,
+                    host,
+                    global_types,
+                    element,
+                    element_context,
+                    ExpressionLocation::Mutable,
+                )?);
+            }
+            PreparedExpression::Array(prepared)
         }
         PlannedExpressionKind::Object { plan, properties } => {
             debug_assert_eq!(plan.properties.len(), properties.len());
@@ -188,6 +247,7 @@ fn prepare_expression(
                 prepared.push(prepare_expression(
                     store,
                     host,
+                    global_types,
                     expression,
                     property_context,
                     ExpressionLocation::Mutable,

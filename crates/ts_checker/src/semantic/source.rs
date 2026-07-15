@@ -20,17 +20,19 @@ use ts_diagnostics::{Diagnostic, message_by_code};
 use ts_jsnum::{Number, PseudoBigInt};
 
 use super::{
-    AssertionLinks, AssignmentInvariant, AssignmentUnsupported, CanonicalCheckerDiagnostic,
-    CanonicalCheckerDiagnostics, CanonicalCheckerOptions, CanonicalGlobalTypes,
-    CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHost, DerivedTypeError,
-    RelationUnavailable, SourceFileLinks, SourceFileRef, TypeDisplayUnavailable, TypeId,
-    bootstrap::LiteralTypeCacheError,
+    ArrayTypeError, AssertionLinks, AssignmentInvariant, AssignmentUnsupported,
+    CanonicalCheckerDiagnostic, CanonicalCheckerDiagnostics, CanonicalCheckerOptions,
+    CanonicalGlobalTypes, CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHost,
+    DerivedTypeError, RelationUnavailable, SourceFileLinks, SourceFileRef, TypeDisplayUnavailable,
+    TypeId,
+    bootstrap::{LiteralTypeCacheError, UnionReduction},
     contextual::{
-        LiteralTreatment, PreparedExpression, prepare_expression_context,
-        prepare_expression_without_context,
+        LiteralTreatment, PreparedExpression, prepare_expression_context_with_global_types,
+        prepare_expression_without_context_with_global_types,
     },
     formatter::{
-        CanonicalTypeFormatFlags, get_type_names_for_assignability_error_with_host_and_flags,
+        CanonicalTypeFormatFlags,
+        get_type_names_for_assignability_error_with_host_global_types_and_flags,
     },
     type_nodes::{CanonicalTypeQuery, normalize_bigint_literal, normalize_numeric_separators},
     type_records::TypeRecord,
@@ -60,6 +62,8 @@ pub enum SourceSyntaxRole {
     PrefixUnaryOperand,
     AssertionType,
     AssertionOperand,
+    ArrayLiteral,
+    ArrayElement,
     ObjectLiteral,
     ObjectProperty,
 }
@@ -192,6 +196,7 @@ pub enum SourceCheckError {
     TypeDisplayUnavailable(TypeDisplayUnavailable),
     LiteralCache(SourceLiteralCacheError),
     ObjectLiteral(SourceObjectLiteralError),
+    ArrayType(ArrayTypeError),
     DerivedType(DerivedTypeError),
     Assertion(SourceAssertionError),
     Assignment(AssignmentInvariant),
@@ -210,6 +215,7 @@ impl std::fmt::Display for SourceCheckError {
             Self::TypeDisplayUnavailable(error) => write!(formatter, "{error}"),
             Self::LiteralCache(error) => write!(formatter, "literal cache failed: {error:?}"),
             Self::ObjectLiteral(error) => write!(formatter, "object literal failed: {error:?}"),
+            Self::ArrayType(error) => write!(formatter, "array type failed: {error}"),
             Self::DerivedType(error) => write!(formatter, "{error}"),
             Self::Assertion(error) => write!(formatter, "assertion checking failed: {error:?}"),
             Self::Assignment(error) => write!(formatter, "assignment planning failed: {error:?}"),
@@ -227,6 +233,7 @@ impl std::error::Error for SourceCheckError {
             Self::RelationUnavailable(error) => Some(error),
             Self::TypeDisplayUnavailable(error) => Some(error),
             Self::DerivedType(error) => Some(error),
+            Self::ArrayType(error) => Some(error),
             Self::Provenance(_)
             | Self::Unsupported(_)
             | Self::LiteralCache(_)
@@ -265,6 +272,12 @@ impl From<LiteralTypeCacheError> for SourceCheckError {
 impl From<DerivedTypeError> for SourceCheckError {
     fn from(error: DerivedTypeError) -> Self {
         Self::DerivedType(error)
+    }
+}
+
+impl From<ArrayTypeError> for SourceCheckError {
+    fn from(error: ArrayTypeError) -> Self {
+        Self::ArrayType(error)
     }
 }
 
@@ -307,6 +320,7 @@ pub(super) enum PlannedExpressionKind {
         type_node: NodeRef,
         operand: Box<PlannedExpression>,
     },
+    Array(Vec<PlannedExpression>),
     Object {
         plan: super::object_members::PropertyObjectPlan,
         properties: Vec<PlannedExpression>,
@@ -1038,6 +1052,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             SyntaxKind::TypeAssertionExpression | SyntaxKind::AsExpression => {
                 self.plan_assertion(expression)
             }
+            SyntaxKind::ArrayLiteralExpression => self.plan_array_literal(expression),
             SyntaxKind::ObjectLiteralExpression => self.plan_object_literal(expression),
             _ => Err(self.unsupported(expression, kind, SourceSyntaxRole::VariableInitializer)),
         }
@@ -1136,6 +1151,48 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 store.get_merged_symbol(symbol) != Some(bootstrap.undefined_symbol)
             });
         global_matches && !locally_shadowed
+    }
+
+    fn plan_array_literal(
+        &mut self,
+        expression: NodeRef,
+    ) -> Result<PlannedExpression, SourceCheckError> {
+        let elements = {
+            let node = self.node(expression)?;
+            let NodeData::ArrayLiteralExpression(array) = &node.data else {
+                return Err(self.unsupported(
+                    expression,
+                    node.kind,
+                    SourceSyntaxRole::ArrayLiteral,
+                ));
+            };
+            if node.flags.0 != 0 || array.facts != 0 {
+                return Err(self.unsupported(
+                    expression,
+                    node.kind,
+                    SourceSyntaxRole::ArrayLiteral,
+                ));
+            }
+            array.elements.nodes.clone()
+        };
+        let mut planned = Vec::with_capacity(elements.len());
+        for element in elements {
+            let element = self.reference(element);
+            let record = self.node(element)?;
+            if record.parent != Some(expression.node)
+                || matches!(
+                    record.kind,
+                    SyntaxKind::SpreadElement | SyntaxKind::OmittedExpression
+                )
+            {
+                return Err(self.unsupported(element, record.kind, SourceSyntaxRole::ArrayElement));
+            }
+            planned.push(self.plan_expression(element)?);
+        }
+        Ok(PlannedExpression::new(
+            expression,
+            PlannedExpressionKind::Array(planned),
+        ))
     }
 
     fn plan_object_literal(
@@ -1424,17 +1481,29 @@ fn expression_type(
     expression: &PlannedExpression,
     prepared: &PreparedExpression,
 ) -> Result<TypeId, SourceCheckError> {
-    Ok(execute_expression_types(store, expression, prepared)?.result)
+    Ok(execute_expression_types(store, None, expression, prepared)?.result)
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct CheckedExpressionTypes {
     raw: TypeId,
     result: TypeId,
+    array_elements: Option<Vec<CheckedExpressionTypes>>,
+}
+
+impl CheckedExpressionTypes {
+    fn leaf(raw: TypeId, result: TypeId) -> Self {
+        Self {
+            raw,
+            result,
+            array_elements: None,
+        }
+    }
 }
 
 fn execute_expression_types(
     store: &mut CanonicalTypeMapperStore,
+    global_types: Option<&CanonicalGlobalTypes>,
     expression: &PlannedExpression,
     prepared: &PreparedExpression,
 ) -> Result<CheckedExpressionTypes, SourceCheckError> {
@@ -1442,9 +1511,11 @@ fn execute_expression_types(
         (PlannedExpressionKind::Null, PreparedExpression::Literal(LiteralTreatment::Identity)) => {
             store
                 .intrinsic_bootstrap()
-                .map(|bootstrap| CheckedExpressionTypes {
-                    raw: bootstrap.null_widening_type,
-                    result: bootstrap.null_widening_type,
+                .map(|bootstrap| {
+                    CheckedExpressionTypes::leaf(
+                        bootstrap.null_widening_type,
+                        bootstrap.null_widening_type,
+                    )
                 })
                 .ok_or(SourceCheckError::LiteralCache(
                     SourceLiteralCacheError::BootstrapUninitialized,
@@ -1473,9 +1544,11 @@ fn execute_expression_types(
             PreparedExpression::Literal(LiteralTreatment::Identity),
         ) => store
             .intrinsic_bootstrap()
-            .map(|bootstrap| CheckedExpressionTypes {
-                raw: bootstrap.undefined_widening_type,
-                result: bootstrap.undefined_widening_type,
+            .map(|bootstrap| {
+                CheckedExpressionTypes::leaf(
+                    bootstrap.undefined_widening_type,
+                    bootstrap.undefined_widening_type,
+                )
             })
             .ok_or(SourceCheckError::LiteralCache(
                 SourceLiteralCacheError::BootstrapUninitialized,
@@ -1531,7 +1604,47 @@ fn execute_expression_types(
         (
             PlannedExpressionKind::Parenthesized(inner),
             PreparedExpression::Parenthesized(prepared),
-        ) => execute_expression_types(store, inner, prepared),
+        ) => execute_expression_types(store, global_types, inner, prepared),
+        (PlannedExpressionKind::Array(elements), PreparedExpression::Array(prepared_elements)) => {
+            debug_assert_eq!(elements.len(), prepared_elements.len());
+            let global_types = global_types.ok_or(SourceCheckError::Unsupported(
+                UnsupportedSourceSyntax::Syntax {
+                    node: expression.node,
+                    kind: SyntaxKind::ArrayLiteralExpression,
+                    role: SourceSyntaxRole::ArrayLiteral,
+                },
+            ))?;
+            let mut checked_elements = Vec::with_capacity(elements.len());
+            let mut element_types = Vec::with_capacity(elements.len());
+            for (element, prepared) in elements.iter().zip(prepared_elements) {
+                let checked =
+                    execute_expression_types(store, Some(global_types), element, prepared)?;
+                element_types.push(checked.result);
+                checked_elements.push(checked);
+            }
+            let element_type = if element_types.is_empty() {
+                let bootstrap =
+                    store
+                        .intrinsic_bootstrap()
+                        .ok_or(SourceCheckError::LiteralCache(
+                            SourceLiteralCacheError::BootstrapUninitialized,
+                        ))?;
+                if bootstrap.options.strict_null_checks {
+                    bootstrap.implicit_never_type
+                } else {
+                    bootstrap.undefined_widening_type
+                }
+            } else {
+                store.expression_union_type(&element_types, UnionReduction::Subtype)?
+            };
+            let base = store.create_canonical_array_type(global_types, element_type, false)?;
+            let array = store.create_array_literal_type(global_types, base)?;
+            Ok(CheckedExpressionTypes {
+                raw: array,
+                result: array,
+                array_elements: Some(checked_elements),
+            })
+        }
         (
             PlannedExpressionKind::Object { plan, properties },
             PreparedExpression::Object(prepared_properties),
@@ -1542,15 +1655,14 @@ fn execute_expression_types(
                 .map_err(source_object_execution_error)?;
             let mut property_types = Vec::with_capacity(properties.len());
             for (property, prepared) in properties.iter().zip(prepared_properties) {
-                property_types.push(execute_expression_types(store, property, prepared)?.result);
+                property_types.push(
+                    execute_expression_types(store, global_types, property, prepared)?.result,
+                );
             }
             let object =
                 super::object_members::publish_object_literal(store, plan, &property_types)
                     .map_err(source_object_execution_error)?;
-            Ok(CheckedExpressionTypes {
-                raw: object,
-                result: object,
-            })
+            Ok(CheckedExpressionTypes::leaf(object, object))
         }
         _ => unreachable!("a prepared expression must retain its planned expression shape"),
     }?;
@@ -1566,7 +1678,7 @@ fn checked_literal_types(
 ) -> Result<CheckedExpressionTypes, SourceCheckError> {
     let raw = store.fresh_type_of_literal_type(regular)?;
     let result = prepared_literal_type(store, regular, widened, treatment)?;
-    Ok(CheckedExpressionTypes { raw, result })
+    Ok(CheckedExpressionTypes::leaf(raw, result))
 }
 
 fn prepared_literal_type(
@@ -1778,18 +1890,26 @@ fn check_expression_type(
                 operand_type: operand_types.result,
                 target_type: target,
             });
-            Ok(CheckedExpressionTypes {
-                raw: target,
-                result: target,
-            })
+            Ok(CheckedExpressionTypes::leaf(target, target))
         }
         _ => {
             let prepared = if let Some(contextual_type) = contextual_type {
-                prepare_expression_context(store, host, expression, contextual_type)?
+                prepare_expression_context_with_global_types(
+                    store,
+                    host,
+                    global_types,
+                    expression,
+                    contextual_type,
+                )?
             } else {
-                prepare_expression_without_context(store, host, expression)?
+                prepare_expression_without_context_with_global_types(
+                    store,
+                    host,
+                    global_types,
+                    expression,
+                )?
             };
-            execute_expression_types(store, expression, &prepared)
+            execute_expression_types(store, Some(global_types), expression, &prepared)
         }
     }
 }
@@ -1845,6 +1965,7 @@ fn assertion_operand_types(
 fn check_deferred_assertions(
     store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
     options: CanonicalCheckerOptions,
     diagnostics: &mut CanonicalCheckerDiagnostics,
     deferred: &[DeferredAssertion],
@@ -1855,12 +1976,17 @@ fn check_deferred_assertions(
     }
     for assertion in deferred {
         let (operand, widened) = assertion_operand_types(store, assertion.operand_type)?;
-        if store.is_type_comparable_to(assertion.target_type, widened)? {
+        if store.is_type_comparable_to_with_global_types(
+            assertion.target_type,
+            widened,
+            global_types,
+        )? {
             continue;
         }
-        let display = get_type_names_for_assignability_error_with_host_and_flags(
+        let display = get_type_names_for_assignability_error_with_host_global_types_and_flags(
             store,
             host,
+            global_types,
             operand,
             assertion.target_type,
             flags,
@@ -1950,16 +2076,44 @@ fn check_planned_assignment(
         publish_expression_type(store, assignment_expression, source_types.result)?;
     }
     let source_type = source_types.result;
-    if !store.is_type_assignable_to(source_type, target)? {
-        let staged = super::object_diagnostics::diagnostics_for_failed_assignment(
-            store,
-            host,
-            expression,
-            source_type,
-            target,
-            fallback_node,
-            options,
-        )?;
+    if !store.is_type_assignable_to_with_global_types(source_type, target, global_types)? {
+        let element_types = source_types.array_elements.as_deref().map(|elements| {
+            elements
+                .iter()
+                .map(|element| element.result)
+                .collect::<Vec<_>>()
+        });
+        let elaborated = element_types
+            .as_deref()
+            .map(|element_types| {
+                super::array_diagnostics::diagnostics_for_failed_array_assignment(
+                    store,
+                    host,
+                    global_types,
+                    expression,
+                    element_types,
+                    source_type,
+                    target,
+                    options,
+                )
+            })
+            .transpose()?
+            .flatten()
+            .filter(|diagnostics| !diagnostics.is_empty());
+        let staged = if let Some(elaborated) = elaborated {
+            elaborated
+        } else {
+            super::object_diagnostics::diagnostics_for_failed_assignment(
+                store,
+                host,
+                global_types,
+                expression,
+                source_type,
+                target,
+                fallback_node,
+                options,
+            )?
+        };
         for diagnostic in staged {
             merge_retry_diagnostic(diagnostics, diagnostic);
         }
@@ -2045,7 +2199,7 @@ pub(super) fn check_source_file(
     }
 
     validate_deferred_assertions(store, source, &deferred)?;
-    check_deferred_assertions(store, host, options, diagnostics, &deferred)?;
+    check_deferred_assertions(store, host, global_types, options, diagnostics, &deferred)?;
 
     Ok(())
 }
@@ -2290,6 +2444,19 @@ mod tests {
             NodeRef::new(parsed.arena.id(), file, statement.0),
             NodeRef::new(parsed.arena.id(), file, statement.1),
         )
+    }
+
+    fn array_elements(parsed: &ParseResult, file: FileId, array: NodeRef) -> Vec<NodeRef> {
+        let NodeData::ArrayLiteralExpression(array) = &parsed.arena.get(array.node).unwrap().data
+        else {
+            panic!("expected array literal")
+        };
+        array
+            .elements
+            .nodes
+            .iter()
+            .map(|element| NodeRef::new(parsed.arena.id(), file, *element))
+            .collect()
     }
 
     fn node_text(parsed: &ParseResult, node: NodeRef) -> &str {
@@ -2653,6 +2820,256 @@ mod tests {
         let warm = observable_state(&context, file);
         context.check_source_file(file).unwrap();
         assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn contextual_array_literals_match_contextual_typing_19_through_21() {
+        let library = parsed("interface Array<T> {}");
+        let library_file = FileId::new(118);
+        let cases = [
+            (
+                FileId::new(119),
+                "// @target: es2015\nvar foo:{id:number;}[] = [{id:1}]; foo = [{id:1}, {id:2}];",
+                "{ id: number; }[]",
+                None,
+            ),
+            (
+                FileId::new(120),
+                "// @target: es2015\nvar foo:{id:number;}[] = [{id:1}]; foo = [{id:1}, {id:2, name:\"foo\"}];",
+                "({ id: number; } | { id: number; name: string; })[]",
+                Some((2353, 76, 80, "name")),
+            ),
+            (
+                FileId::new(121),
+                "// @target: es2015\nvar foo:{id:number;}[] = [{id:1}]; foo = [{id:1}, 1];",
+                "(number | { id: number; })[]",
+                Some((2322, 69, 70, "1")),
+            ),
+        ];
+
+        for (file, text, expected_rhs, expected_diagnostic) in cases {
+            let source = parsed(text);
+            let mut context = context(
+                &[(library_file, &library), (file, &source)],
+                CanonicalCheckerOptions::default(),
+            );
+            let initial = variable_initializer(&source, file, "foo");
+            let (left, right) = assignment_parts(&source, file, 0);
+            let assignment = NodeRef::new(
+                source.arena.id(),
+                file,
+                source.arena.get(right.node).unwrap().parent.unwrap(),
+            );
+
+            context.check_source_file(file).unwrap();
+
+            assert_eq!(
+                context
+                    .type_to_string(resolved_node_type(&context, initial))
+                    .unwrap(),
+                "{ id: number; }[]",
+            );
+            assert_eq!(
+                context
+                    .type_to_string(resolved_node_type(&context, right))
+                    .unwrap(),
+                expected_rhs,
+            );
+            assert_eq!(
+                resolved_node_type(&context, assignment),
+                resolved_node_type(&context, right),
+            );
+            assert_eq!(
+                resolved_node_type(&context, left),
+                context
+                    .get_type_from_type_node(variable_type_node(&source, file, "foo"))
+                    .unwrap(),
+            );
+
+            let initial_elements = array_elements(&source, file, initial);
+            let assignment_elements = array_elements(&source, file, right);
+            assert_eq!(initial_elements.len(), 1);
+            assert_eq!(
+                context
+                    .type_to_string(resolved_node_type(&context, initial_elements[0]))
+                    .unwrap(),
+                "{ id: number; }",
+            );
+            assert_eq!(
+                context
+                    .type_to_string(resolved_node_type(&context, assignment_elements[0]))
+                    .unwrap(),
+                "{ id: number; }",
+            );
+            assert_eq!(
+                object_property_type(&context, assignment_elements[0], "id"),
+                context.store().intrinsic_bootstrap().unwrap().number_type,
+            );
+            let first_id = object_property_initializer(&source, file, assignment_elements[0], "id");
+            assert_eq!(
+                context
+                    .type_to_string(resolved_node_type(&context, first_id))
+                    .unwrap(),
+                "1",
+            );
+            match source.arena.get(assignment_elements[1].node).unwrap().kind {
+                SyntaxKind::ObjectLiteralExpression => {
+                    assert_eq!(
+                        object_property_type(&context, assignment_elements[1], "id"),
+                        context.store().intrinsic_bootstrap().unwrap().number_type,
+                    );
+                    let id =
+                        object_property_initializer(&source, file, assignment_elements[1], "id");
+                    assert_eq!(
+                        context
+                            .type_to_string(resolved_node_type(&context, id))
+                            .unwrap(),
+                        "2",
+                    );
+                    if node_text(&source, assignment_elements[1]).contains("name") {
+                        assert_eq!(
+                            object_property_type(&context, assignment_elements[1], "name"),
+                            context.store().intrinsic_bootstrap().unwrap().string_type,
+                        );
+                        let name = object_property_initializer(
+                            &source,
+                            file,
+                            assignment_elements[1],
+                            "name",
+                        );
+                        assert_eq!(
+                            context
+                                .type_to_string(resolved_node_type(&context, name))
+                                .unwrap(),
+                            "\"foo\"",
+                        );
+                    }
+                }
+                SyntaxKind::NumericLiteral => assert_eq!(
+                    context
+                        .type_to_string(resolved_node_type(&context, assignment_elements[1]))
+                        .unwrap(),
+                    "1",
+                ),
+                kind => panic!("unexpected contextual array element {kind:?}"),
+            }
+
+            match expected_diagnostic {
+                None => assert!(context.diagnostics().is_empty()),
+                Some((code, start, end, text)) => {
+                    let [diagnostic] = context.diagnostics().as_slice() else {
+                        panic!("expected one contextual array diagnostic")
+                    };
+                    assert_eq!(diagnostic.diagnostic.code(), code);
+                    assert_eq!(node_text(&source, diagnostic.node.unwrap()), text);
+                    let range = source
+                        .arena
+                        .get(diagnostic.node.unwrap().node)
+                        .unwrap()
+                        .range;
+                    assert_eq!((range.start.get(), range.end.get()), (start, end));
+                    match code {
+                        2353 => {
+                            assert_eq!(
+                                diagnostic.diagnostic.arguments,
+                                ["name", "{ id: number; }"],
+                            );
+                            assert_eq!(
+                                diagnostic.diagnostic.render().unwrap(),
+                                "Object literal may only specify known properties, and 'name' does not exist in type '{ id: number; }'.",
+                            );
+                        }
+                        2322 => {
+                            assert_eq!(
+                                diagnostic.diagnostic.arguments,
+                                ["number", "{ id: number; }"],
+                            );
+                            assert_eq!(
+                                diagnostic.diagnostic.render().unwrap(),
+                                "Type 'number' is not assignable to type '{ id: number; }'.",
+                            );
+                        }
+                        _ => unreachable!(),
+                    }
+                    assert!(diagnostic.related_information.is_empty());
+                }
+            }
+            assert!(is_type_checked(&context, file));
+            let warm = observable_state(&context, file);
+            context.check_source_file(file).unwrap();
+            assert_eq!(observable_state(&context, file), warm);
+        }
+    }
+
+    #[test]
+    fn spread_and_omitted_array_elements_remain_atomic_typed_boundaries() {
+        let library = parsed("interface Array<T> {}");
+        let library_file = FileId::new(122);
+        for (index, text) in [
+            "var value: number[] = [...[1]];",
+            "var value: number[] = [, 1];",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let source = parsed(text);
+            let file = FileId::new(123 + u32::try_from(index).unwrap());
+            let mut context = context(
+                &[(library_file, &library), (file, &source)],
+                CanonicalCheckerOptions::default(),
+            );
+            let before = observable_state(&context, file);
+
+            assert!(matches!(
+                context.check_source_file(file),
+                Err(SourceCheckError::Unsupported(
+                    UnsupportedSourceSyntax::Syntax {
+                        role: SourceSyntaxRole::ArrayElement,
+                        ..
+                    }
+                ))
+            ));
+            assert_eq!(observable_state(&context, file), before);
+            assert!(context.diagnostics().is_empty());
+            assert!(!is_type_checked(&context, file));
+        }
+    }
+
+    #[test]
+    fn strict_empty_array_literals_use_the_distinct_implicit_never_element() {
+        let library = parsed("interface Array<T> {}");
+        let source = parsed("var values: number[] = [];");
+        let library_file = FileId::new(125);
+        let file = FileId::new(126);
+        let mut context = context(
+            &[(library_file, &library), (file, &source)],
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    exact_optional_property_types: false,
+                },
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+        let initializer = variable_initializer(&source, file, "values");
+
+        context.check_source_file(file).unwrap();
+
+        let implicit_never = context
+            .store()
+            .intrinsic_bootstrap()
+            .unwrap()
+            .implicit_never_type;
+        let source_type = resolved_node_type(&context, initializer);
+        assert_eq!(
+            context
+                .store()
+                .canonical_array_element_type(context.global_types(), source_type),
+            Ok(Some(implicit_never)),
+        );
+        assert_eq!(context.type_to_string(source_type).unwrap(), "never[]");
+        assert!(context.diagnostics().is_empty());
+        assert!(is_type_checked(&context, file));
     }
 
     #[test]
