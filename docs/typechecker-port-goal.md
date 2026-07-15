@@ -226,9 +226,15 @@ remains the cluster-level source of truth.
   pre-global hosts fail atomically, as do uncached recursive, qualified, and
   alias-dependent heritage paths. Thirty-six declared-type tests and the
   expanded 339-test checker suite pass. Independent pinned-source audits found
-  no remaining P0-P2 issue. Recursive heritage and the remaining alias, enum,
-  reverse-mapped, and JSDoc families stay explicit follow-up work rather than
-  being approximated.
+  no remaining P0-P2 issue. The recursive direct-identifier follow-up is now
+  integrated through `9ff7991` and `5b30edb`: uncached interface graphs publish
+  root-first shells, terminate self and mutual cycles, preserve the pin's
+  order-sensitive active-shell behavior, propagate real and synthetic `this`,
+  and leave base-type caches untouched. Pure class bases force a derived
+  interface reference without allocating the class identity. The independent
+  review found no P0/P1 defect, and all 44 focused declared-type tests pass.
+  Qualified/alias heritage plus alias, enum, reverse-mapped, and JSDoc declared
+  families stay explicit follow-up work rather than being approximated.
 - T04B0's production construction boundary is verified through `21e69fb`,
   `0005257`, and `a426cd9`. It consumes declaration-complete binder ownership,
   validates exact file/arena/root/source-fact correspondence and exact bound
@@ -261,10 +267,14 @@ remains the cluster-level source of truth.
   closed that phase hole plus the auto-array resolved-members mismatch, then
   reported no remaining P0-P2 issue. 162 binder tests, 339 checker tests, the
   checker compile-fail doctest, strict targeted Clippy, and the all-target
-  workspace check pass. T04 remains in progress: alias targets, late ambient
-  module merging, non-global augmentations, full diagnostic callback/spelling
-  elaboration, callback mappers, lazy global families, and compiler-option
-  normalization are explicit later slices.
+  workspace check pass. Compiler-option normalization now retains explicit
+  `strictBindCallApply` provenance and exact inheritance through `653017f`, and
+  binder output retains whether each module augmentation was declared in an
+  ambient context through `aaeb11f`. T04 remains in progress: alias targets,
+  late ambient-module merging, non-global augmentation execution, full
+  diagnostic callback/spelling elaboration, callback mappers, lazy global
+  families, and compiler-to-canonical option plumbing are explicit later
+  slices.
 
 No percentage in this section is a whole-corpus parity claim. A score is
 publishable only when its variant manifest and complete artifact comparison are
