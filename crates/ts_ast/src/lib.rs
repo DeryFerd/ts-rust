@@ -8,6 +8,16 @@ pub use ast_generated::*;
 pub use flow::*;
 pub use syntax_kind::SyntaxKind;
 
+impl NodeFlags {
+    /// The parser synthesized this node while representing source grammar.
+    pub const REPARSED: Self = Self(1 << 3);
+}
+
+impl ModifierFlags {
+    /// An `export` declaration modifier.
+    pub const EXPORT: Self = Self(1 << 5);
+}
+
 /// Stable source-file slot during the lifetime of one compiler `Program`.
 ///
 /// `NodeId` is intentionally dense and file-local. Pair it with `FileId` before
@@ -56,7 +66,9 @@ impl NodeRef {
 mod tests {
     use ts_core::TextRange;
 
-    use super::{FileId, Node, NodeArena, NodeData, NodeFlags, NodeRef, SyntaxKind, TokenData};
+    use super::{
+        FileId, ModifierFlags, Node, NodeArena, NodeData, NodeFlags, NodeRef, SyntaxKind, TokenData,
+    };
 
     #[test]
     fn arena_assigns_stable_dense_node_ids() {
@@ -87,6 +99,12 @@ mod tests {
         assert_eq!(arena.get(first).unwrap().kind, SyntaxKind::EndOfFile);
         assert_eq!(arena.iter().count(), 2);
         assert_eq!(arena.source_text(), Some("const value = 1;"));
+    }
+
+    #[test]
+    fn reparsed_node_flag_matches_upstream_bit() {
+        assert_eq!(NodeFlags::REPARSED, NodeFlags(1 << 3));
+        assert_eq!(ModifierFlags::EXPORT, ModifierFlags(1 << 5));
     }
 
     #[test]

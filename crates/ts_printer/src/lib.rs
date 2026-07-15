@@ -87353,6 +87353,17 @@ class Board {
     }
 
     #[test]
+    fn declaration_emit_keeps_synthetic_dotted_exports_implicit() {
+        let output = emit_declarations_with_semantics(
+            "namespace A.B.C { export interface Value {} }",
+        );
+        assert!(output.contains("declare namespace A.B.C {"), "{output}");
+        assert!(output.contains("interface Value"), "{output}");
+        assert_eq!(output.matches("namespace").count(), 1, "{output}");
+        assert!(!output.contains("export namespace"), "{output}");
+    }
+
+    #[test]
     fn declaration_emit_retains_import_equals_for_inferred_new_type() {
         let output = emit_declarations_with_semantics(concat!(
             "/** dependency */\n",

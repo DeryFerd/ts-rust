@@ -3893,7 +3893,7 @@ impl<'a> Parser<'a> {
             self.parse_module_block()
         };
         let declaration =
-            self.alloc_module_declaration(keyword.range.start, keyword.kind, name, body);
+            self.alloc_module_declaration(keyword.range.start, keyword.kind, None, name, body);
         if let Some(end) = terminator_end {
             self.arena.get_mut(declaration).unwrap().range.end = end;
         }
@@ -3902,6 +3902,21 @@ impl<'a> Parser<'a> {
 
     fn parse_nested_module_declaration(&mut self, keyword: SyntaxKind) -> NodeId {
         let start = self.current.range.start;
+        let export_modifier = self.alloc_node_with_flags(
+            SyntaxKind::ExportKeyword,
+            NodeFlags::REPARSED,
+            TextRange::new(start, start),
+            NodeData::Token(Box::new(TokenData)),
+            &[],
+        );
+        let modifiers = ModifierList {
+            list: NodeList {
+                range: TextRange::new(start, start),
+                nodes: vec![export_modifier],
+                has_trailing_comma: false,
+            },
+            flags: ts_ast::ModifierFlags::EXPORT,
+        };
         let name = self.parse_identifier_name("Expected a module name.");
         let body = if self.current.kind == SyntaxKind::DotToken {
             self.bump();
@@ -3909,7 +3924,7 @@ impl<'a> Parser<'a> {
         } else {
             self.parse_module_block()
         };
-        self.alloc_module_declaration(start, keyword, name, body)
+        self.alloc_module_declaration(start, keyword, Some(modifiers), name, body)
     }
 
     fn parse_module_block(&mut self) -> Option<NodeId> {
@@ -3939,11 +3954,15 @@ impl<'a> Parser<'a> {
         &mut self,
         start: TextPos,
         keyword: SyntaxKind,
+        modifiers: Option<ModifierList>,
         name: NodeId,
         body: Option<NodeId>,
     ) -> NodeId {
         let end = body.map_or_else(|| self.node_end(name), |id| self.node_end(id));
-        let mut children = vec![name];
+        let mut children = modifiers
+            .as_ref()
+            .map_or_else(Vec::new, |modifiers| modifiers.list.nodes.clone());
+        children.push(name);
         children.extend(body);
         self.alloc_node(
             SyntaxKind::ModuleDeclaration,
@@ -3959,7 +3978,7 @@ impl<'a> Parser<'a> {
                 next_container: None,
                 symbol: None,
                 facts: 0,
-                modifiers: None,
+                modifiers,
                 name,
             })),
             &children,
@@ -9304,7 +9323,7 @@ fn binary_precedence(kind: SyntaxKind) -> Option<(u8, bool)> {
 
 #[cfg(test)]
 mod tests {
-    use ts_ast::{NodeData, NodeFlags, NodeId, SyntaxKind};
+    use ts_ast::{ModifierFlags, NodeData, NodeFlags, NodeId, SyntaxKind};
     use ts_core::DiagnosticCategory;
 
     use super::{
@@ -11967,7 +11986,18 @@ mod tests {
             u32::try_from(source.find("Bar").unwrap()).unwrap()
         );
         assert_eq!(inner_node.range.end, outer_node.range.end);
-        assert!(inner.modifiers.is_none());
+        let inner_modifiers = inner.modifiers.as_ref().unwrap();
+        assert_eq!(inner_modifiers.flags, ModifierFlags::EXPORT);
+        assert_eq!(inner_modifiers.list.nodes.len(), 1);
+        let inner_export = result
+            .arena
+            .get(inner_modifiers.list.nodes[0])
+            .unwrap();
+        assert_eq!(inner_export.kind, SyntaxKind::ExportKeyword);
+        assert_eq!(inner_export.flags, NodeFlags::REPARSED);
+        assert_eq!(inner_export.range.start, inner_export.range.end);
+        assert_eq!(inner_export.range.start, inner_node.range.start);
+        assert_eq!(inner_export.parent, Some(inner_id));
         assert_eq!(result.arena.get(inner.name).unwrap().parent, Some(inner_id));
 
         let block_id = inner.body.unwrap();
@@ -11981,6 +12011,75 @@ mod tests {
             result.arena.get(block.statements.nodes[0]).unwrap().parent,
             Some(block_id)
         );
+    }
+
+    #[test]
+    fn synthesizes_reparsed_exports_for_each_dotted_namespace_segment() {
+        for (source, has_declare_modifier) in [
+            ("namespace A.B.C {}", false),
+            ("declare namespace A.B.C {}", true),
+        ] {
+            let result = parse_source_file(source);
+            assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+            let [outer_id] = source_statements(&result) else {
+                panic!("expected one namespace declaration");
+            };
+            let outer_node = result.arena.get(*outer_id).unwrap();
+            let NodeData::ModuleDeclaration(outer) = &outer_node.data else {
+                panic!("expected outer namespace");
+            };
+
+            if has_declare_modifier {
+                let outer_modifiers = outer.modifiers.as_ref().unwrap();
+                let [declare_modifier] = outer_modifiers.list.nodes.as_slice() else {
+                    panic!("expected only the source declare modifier");
+                };
+                let declare_node = result.arena.get(*declare_modifier).unwrap();
+                assert_eq!(declare_node.kind, SyntaxKind::DeclareKeyword);
+                assert_eq!(declare_node.flags, NodeFlags::default());
+                assert_eq!(declare_node.parent, Some(*outer_id));
+                assert_eq!(
+                    &source[declare_node.range.start.get() as usize
+                        ..declare_node.range.end.get() as usize],
+                    "declare"
+                );
+            } else {
+                assert!(outer.modifiers.is_none());
+            }
+
+            let mut nested_id = outer.body.unwrap();
+            for nested_name in ["B", "C"] {
+                let nested_position = u32::try_from(source.find(nested_name).unwrap()).unwrap();
+                let nested_node = result.arena.get(nested_id).unwrap();
+                let NodeData::ModuleDeclaration(nested) = &nested_node.data else {
+                    panic!("expected nested namespace segment");
+                };
+                assert_eq!(nested_node.range.start.get(), nested_position);
+                let modifiers = nested.modifiers.as_ref().unwrap();
+                assert_eq!(modifiers.flags, ModifierFlags::EXPORT);
+                assert_eq!(modifiers.list.range.start.get(), nested_position);
+                assert_eq!(modifiers.list.range.end.get(), nested_position);
+                assert_eq!(modifiers.list.nodes.len(), 1);
+                let export_id = modifiers.list.nodes[0];
+                let export = result.arena.get(export_id).unwrap();
+                assert_eq!(export.kind, SyntaxKind::ExportKeyword);
+                assert_eq!(export.flags, NodeFlags::REPARSED);
+                assert_eq!(export.flags.0, 1 << 3);
+                assert_eq!(export.range.start.get(), nested_position);
+                assert_eq!(export.range.end.get(), nested_position);
+                assert_eq!(export.parent, Some(nested_id));
+                assert_eq!(
+                    &source[export.range.start.get() as usize..export.range.end.get() as usize],
+                    ""
+                );
+                assert_eq!(result.arena.get(nested.name).unwrap().parent, Some(nested_id));
+                nested_id = nested.body.unwrap();
+            }
+            assert!(matches!(
+                result.arena.get(nested_id).map(|node| &node.data),
+                Some(NodeData::ModuleBlock(_))
+            ));
+        }
     }
 
     #[test]
@@ -12020,15 +12119,55 @@ mod tests {
 
     #[test]
     fn retains_namespace_recovery_after_a_missing_dotted_name() {
-        let result = parse_source_file(
-            "namespace Plain { const value = 1; } namespace Broken. { const recovered = 2; }",
-        );
+        let source =
+            "namespace Plain { const value = 1; } namespace Broken. { const recovered = 2; }";
+        let result = parse_source_file(source);
         assert_eq!(result.diagnostics.len(), 1, "{:?}", result.diagnostics);
         let statements = source_statements(&result);
         assert_eq!(statements.len(), 2);
         assert!(statements.iter().all(|statement| {
             result.arena.get(*statement).unwrap().kind == SyntaxKind::ModuleDeclaration
         }));
+
+        let NodeData::ModuleDeclaration(broken) = &result.arena.get(statements[1]).unwrap().data
+        else {
+            panic!("expected recovered outer namespace");
+        };
+        let recovered_id = broken.body.unwrap();
+        let recovered_node = result.arena.get(recovered_id).unwrap();
+        let NodeData::ModuleDeclaration(recovered) = &recovered_node.data else {
+            panic!("expected recovered nested namespace");
+        };
+        let missing_position = u32::try_from(source.find("{ const recovered").unwrap()).unwrap();
+        assert_eq!(recovered_node.range.start.get(), missing_position);
+        let NodeData::Identifier(missing_name) =
+            &result.arena.get(recovered.name).unwrap().data
+        else {
+            panic!("expected recovered missing identifier");
+        };
+        assert!(missing_name.text.is_empty());
+        assert_eq!(
+            result.arena.get(recovered.name).unwrap().range.start.get(),
+            missing_position
+        );
+        let recovered_modifiers = recovered.modifiers.as_ref().unwrap();
+        assert_eq!(recovered_modifiers.flags, ModifierFlags::EXPORT);
+        let [export_id] = recovered_modifiers.list.nodes.as_slice() else {
+            panic!("expected synthesized export modifier");
+        };
+        let export = result.arena.get(*export_id).unwrap();
+        assert_eq!(export.kind, SyntaxKind::ExportKeyword);
+        assert_eq!(export.flags, NodeFlags::REPARSED);
+        assert_eq!(export.range.start.get(), missing_position);
+        assert_eq!(export.range.end.get(), missing_position);
+        assert_eq!(export.parent, Some(recovered_id));
+        assert!(matches!(
+            recovered
+                .body
+                .and_then(|body| result.arena.get(body))
+                .map(|node| &node.data),
+            Some(NodeData::ModuleBlock(_))
+        ));
     }
 
     #[test]

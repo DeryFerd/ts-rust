@@ -5246,6 +5246,28 @@ mod tests {
     }
 
     #[test]
+    fn binds_non_ambient_dotted_namespaces_as_nested_exports() {
+        let parsed = parse_source_file(
+            "namespace Root.Middle.Leaf { export const value = 1; }",
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let result = bind_source_file(&parsed.arena, parsed.source_file);
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let root_scope = result.root_scope().unwrap();
+
+        let root_id = root_scope.symbols.get("Root").unwrap();
+        let root = result.symbols.get(root_id).unwrap();
+        let middle_id = root.members.get("Middle").unwrap();
+        let middle = result.symbols.get(middle_id).unwrap();
+        assert_eq!(middle.parent, Some(root_id));
+        let leaf_id = middle.members.get("Leaf").unwrap();
+        let leaf = result.symbols.get(leaf_id).unwrap();
+        assert_eq!(leaf.parent, Some(middle_id));
+        let value_id = leaf.members.get("value").unwrap();
+        assert_eq!(result.symbols.get(value_id).unwrap().parent, Some(leaf_id));
+    }
+
+    #[test]
     fn merges_functions_classes_and_enums_with_namespaces() {
         let parsed = parse_source_file(
             r#"
