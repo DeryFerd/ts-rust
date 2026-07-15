@@ -1,7 +1,8 @@
 //! Atomic canonical checking for the first source-statement slice.
 //!
-//! This module deliberately supports only type aliases and explicitly typed
-//! ordinary variable declarations with primitive literal initializers. The
+//! This module deliberately supports only unmodified type aliases, empty
+//! external-module markers, and explicitly typed ordinary variable
+//! declarations (optionally exported) with primitive literal initializers. The
 //! complete source tree and the complete supported-statement plan are
 //! validated before checker state is touched. Unsupported syntax is therefore
 //! a typed boundary, never a request to fall back to the legacy checker or to
@@ -11,7 +12,7 @@
 
 use std::collections::HashSet;
 
-use ts_ast::{FileId, Node, NodeArena, NodeData, NodeId, NodeRef, SyntaxKind};
+use ts_ast::{FileId, ModifierList, Node, NodeArena, NodeData, NodeId, NodeRef, SyntaxKind};
 use ts_binder::{BoundFile, SemanticSymbolId};
 use ts_core::TextRange;
 use ts_diagnostics::{Diagnostic, message_by_code};
@@ -36,7 +37,11 @@ const NODE_FLAG_CONST: u32 = 1 << 1;
 pub enum SourceSyntaxRole {
     SourceFile,
     Statement,
+    TypeAliasDeclaration,
+    ExportDeclaration,
+    ExportClause,
     VariableStatement,
+    VariableModifier,
     VariableDeclarationList,
     VariableDeclaration,
     VariableName,
@@ -51,6 +56,10 @@ pub enum UnsupportedSourceSyntax {
     Syntax {
         node: NodeRef,
         kind: SyntaxKind,
+        role: SourceSyntaxRole,
+    },
+    MissingExternalModuleFact {
+        node: NodeRef,
         role: SourceSyntaxRole,
     },
     JsDoc(NodeRef),
@@ -223,6 +232,7 @@ struct PlannedVariable {
 #[derive(Clone, Debug)]
 enum PlannedStatement {
     TypeAlias(SemanticSymbolId),
+    ExternalModuleMarker,
     Variables(Vec<PlannedVariable>),
 }
 
@@ -271,7 +281,9 @@ impl<'arena> SourcePlanner<'arena> {
             .ok_or(SourceCheckError::Provenance(
                 SourceCheckProvenanceError::MissingSourceFacts(self.source.file()),
             ))?;
-        if facts.is_javascript_file() {
+        let is_javascript_file = facts.is_javascript_file();
+        let is_external_module = facts.is_external_module();
+        if is_javascript_file {
             return Err(SourceCheckError::Unsupported(
                 UnsupportedSourceSyntax::JavaScriptSource(self.source),
             ));
@@ -284,12 +296,19 @@ impl<'arena> SourcePlanner<'arena> {
             match self.node(statement)?.kind {
                 SyntaxKind::TypeAliasDeclaration => {
                     let node = self.node(statement)?;
-                    if !matches!(node.data, NodeData::TypeAliasDeclaration(_)) {
+                    let NodeData::TypeAliasDeclaration(alias) = &node.data else {
                         return Err(SourceCheckError::Provenance(
                             SourceCheckProvenanceError::MismatchedNodeData {
                                 node: statement,
                                 kind: node.kind,
                             },
+                        ));
+                    };
+                    if node.flags.0 != 0 || alias.modifiers.is_some() {
+                        return Err(self.unsupported(
+                            statement,
+                            node.kind,
+                            SourceSyntaxRole::TypeAliasDeclaration,
                         ));
                     }
                     let symbol =
@@ -299,6 +318,18 @@ impl<'arena> SourcePlanner<'arena> {
                                 SourceCheckProvenanceError::MissingDeclarationSymbol(statement),
                             ))?;
                     statements.push(PlannedStatement::TypeAlias(symbol));
+                }
+                SyntaxKind::ExportDeclaration => {
+                    if !is_external_module {
+                        return Err(SourceCheckError::Unsupported(
+                            UnsupportedSourceSyntax::MissingExternalModuleFact {
+                                node: statement,
+                                role: SourceSyntaxRole::ExportDeclaration,
+                            },
+                        ));
+                    }
+                    self.plan_external_module_marker(statement)?;
+                    statements.push(PlannedStatement::ExternalModuleMarker);
                 }
                 SyntaxKind::VariableStatement => {
                     let declaration_list = {
@@ -311,15 +342,28 @@ impl<'arena> SourcePlanner<'arena> {
                                 },
                             ));
                         };
-                        if node.flags.0 != 0
-                            || variable.modifiers.is_some()
-                            || variable.flow_node.is_some()
-                            || variable.facts != 0
+                        if node.flags.0 != 0 || variable.flow_node.is_some() || variable.facts != 0
                         {
                             return Err(self.unsupported(
                                 statement,
                                 node.kind,
                                 SourceSyntaxRole::VariableStatement,
+                            ));
+                        }
+                        let export_modifier = self.validate_variable_modifiers(
+                            statement,
+                            node.range,
+                            variable.declaration_list,
+                            variable.modifiers.as_ref(),
+                        )?;
+                        if let Some(export_modifier) = export_modifier
+                            && !is_external_module
+                        {
+                            return Err(SourceCheckError::Unsupported(
+                                UnsupportedSourceSyntax::MissingExternalModuleFact {
+                                    node: export_modifier,
+                                    role: SourceSyntaxRole::VariableModifier,
+                                },
                             ));
                         }
                         variable.declaration_list
@@ -339,6 +383,104 @@ impl<'arena> SourcePlanner<'arena> {
             numbers: self.numbers,
             bigints: self.bigints,
         })
+    }
+
+    fn plan_external_module_marker(&self, statement: NodeRef) -> Result<(), SourceCheckError> {
+        let statement_node = self.node(statement)?;
+        let NodeData::ExportDeclaration(export) = &statement_node.data else {
+            return Err(SourceCheckError::Provenance(
+                SourceCheckProvenanceError::MismatchedNodeData {
+                    node: statement,
+                    kind: statement_node.kind,
+                },
+            ));
+        };
+        if statement_node.flags.0 != 0
+            || export.attributes.is_some()
+            || export.flow_node.is_some()
+            || export.is_type_only
+            || export.module_specifier.is_some()
+            || export.symbol.is_some()
+            || export.facts != 0
+            || export.modifiers.is_some()
+        {
+            return Err(self.unsupported(
+                statement,
+                statement_node.kind,
+                SourceSyntaxRole::ExportDeclaration,
+            ));
+        }
+
+        let clause = export
+            .export_clause
+            .map(|node| self.reference(node))
+            .ok_or_else(|| {
+                self.unsupported(
+                    statement,
+                    statement_node.kind,
+                    SourceSyntaxRole::ExportDeclaration,
+                )
+            })?;
+        let clause_node = self.node(clause)?;
+        let NodeData::NamedExports(exports) = &clause_node.data else {
+            return Err(self.unsupported(clause, clause_node.kind, SourceSyntaxRole::ExportClause));
+        };
+        if clause_node.kind != SyntaxKind::NamedExports
+            || clause_node.flags.0 != 0
+            || clause_node.parent != Some(statement.node)
+            || exports.elements.range != clause_node.range
+            || !exports.elements.nodes.is_empty()
+            || exports.elements.has_trailing_comma
+            || exports.facts != 0
+        {
+            return Err(self.unsupported(clause, clause_node.kind, SourceSyntaxRole::ExportClause));
+        }
+        Ok(())
+    }
+
+    fn validate_variable_modifiers(
+        &self,
+        statement: NodeRef,
+        statement_range: TextRange,
+        declaration_list: NodeId,
+        modifiers: Option<&ModifierList>,
+    ) -> Result<Option<NodeRef>, SourceCheckError> {
+        let Some(modifiers) = modifiers else {
+            return Ok(None);
+        };
+        let [modifier_id] = modifiers.list.nodes.as_slice() else {
+            return Err(self.unsupported(
+                statement,
+                SyntaxKind::VariableStatement,
+                SourceSyntaxRole::VariableStatement,
+            ));
+        };
+        let modifier = self.reference(*modifier_id);
+        let modifier_node = self.node(modifier)?;
+        let declaration_start = self
+            .node(self.reference(declaration_list))?
+            .range
+            .start
+            .get();
+        if modifiers.flags.0 != 0
+            || modifiers.list.has_trailing_comma
+            || modifiers.list.range.start != statement_range.start
+            || modifiers.list.range.end.get() >= declaration_start
+            || modifier_node.kind != SyntaxKind::ExportKeyword
+            || !matches!(modifier_node.data, NodeData::Token(_))
+            || modifier_node.flags.0 != 0
+            || modifier_node.parent != Some(statement.node)
+            || modifier_node.range.start != statement_range.start
+            || modifier_node.range.end.get() >= modifiers.list.range.end.get()
+            || !self.source_spelling_matches(modifier, "export")
+        {
+            return Err(self.unsupported(
+                modifier,
+                modifier_node.kind,
+                SourceSyntaxRole::VariableModifier,
+            ));
+        }
+        Ok(Some(modifier))
     }
 
     fn validate_complete_tree(&self) -> Result<(), SourceCheckError> {
@@ -967,6 +1109,7 @@ pub(super) fn check_source_file(
                 merge_retry_diagnostics(diagnostics, statement_diagnostics);
                 result?;
             }
+            PlannedStatement::ExternalModuleMarker => {}
             PlannedStatement::Variables(variables) => {
                 for variable in variables {
                     let mut statement_diagnostics = CanonicalCheckerDiagnostics::default();
@@ -1050,16 +1193,26 @@ mod tests {
         parsed
     }
 
-    fn source_facts(file: FileId) -> CanonicalSourceFileFacts {
+    fn source_facts_with_module_state(
+        file: FileId,
+        module_state: CanonicalModuleState,
+    ) -> CanonicalSourceFileFacts {
         CanonicalSourceFileFacts::new(
             EscapedName::source(format!("\"/project/{}.ts\"", file.index())),
             CanonicalSourceLanguage::TypeScript,
             false,
-            CanonicalModuleState::Script,
+            module_state,
         )
     }
 
     fn completed_bindings(files: &[(FileId, &ParseResult)]) -> CanonicalProgramBindings {
+        completed_bindings_with_module_state(files, CanonicalModuleState::Script)
+    }
+
+    fn completed_bindings_with_module_state(
+        files: &[(FileId, &ParseResult)],
+        module_state: CanonicalModuleState,
+    ) -> CanonicalProgramBindings {
         let mut binder = CanonicalBinder::new();
         for &(file, parsed) in files {
             binder
@@ -1067,7 +1220,7 @@ mod tests {
                     &parsed.arena,
                     parsed.source_file,
                     file,
-                    source_facts(file),
+                    source_facts_with_module_state(file, module_state),
                 )
                 .unwrap();
         }
@@ -1083,8 +1236,16 @@ mod tests {
         files: &[(FileId, &'arena ParseResult)],
         options: CanonicalCheckerOptions,
     ) -> CanonicalCheckerContext<'arena> {
+        context_with_module_state(files, CanonicalModuleState::Script, options)
+    }
+
+    fn context_with_module_state<'arena>(
+        files: &[(FileId, &'arena ParseResult)],
+        module_state: CanonicalModuleState,
+        options: CanonicalCheckerOptions,
+    ) -> CanonicalCheckerContext<'arena> {
         CanonicalCheckerContext::new(
-            completed_bindings(files),
+            completed_bindings_with_module_state(files, module_state),
             files
                 .iter()
                 .map(|(file, parsed)| (*file, &parsed.arena))
@@ -1253,6 +1414,141 @@ mod tests {
             "Type 'boolean' is not assignable to type 'string | number | null'."
         );
         assert!(is_type_checked(&context, file));
+    }
+
+    #[test]
+    fn empty_export_marker_and_exported_ordinary_variables_check_idempotently() {
+        let source = parsed(concat!(
+            "export {}; ",
+            r#"export const text: string = "ok"; "#,
+            "export let count: number = 1; ",
+            "export var enabled: boolean = true; ",
+            r#"export const scalar: string | number = "ok";"#,
+        ));
+        let file = FileId::new(56);
+        let mut context = context_with_module_state(
+            &[(file, &source)],
+            CanonicalModuleState::External,
+            CanonicalCheckerOptions::default(),
+        );
+
+        context.check_source_file(file).unwrap();
+        let after_first = observable_state(&context, file);
+
+        assert!(context.diagnostics().is_empty());
+        assert!(is_type_checked(&context, file));
+        context.check_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), after_first);
+    }
+
+    #[test]
+    fn exported_variables_issue_ordered_ts2322_diagnostics_at_identifiers() {
+        let source = parsed(concat!(
+            "export {}; ",
+            r#"export const first: number = "wrong", second: string = 1;"#,
+        ));
+        let file = FileId::new(57);
+        let mut context = context_with_module_state(
+            &[(file, &source)],
+            CanonicalModuleState::External,
+            CanonicalCheckerOptions::default(),
+        );
+
+        context.check_source_file(file).unwrap();
+
+        let diagnostics = context.diagnostics().as_slice();
+        assert_eq!(diagnostics.len(), 2);
+        assert_eq!(
+            diagnostics[0].node,
+            Some(variable_name(&source, file, "first"))
+        );
+        assert_eq!(diagnostics[0].diagnostic.code(), 2322);
+        assert_eq!(
+            diagnostics[0].diagnostic.render().unwrap(),
+            "Type 'string' is not assignable to type 'number'."
+        );
+        assert_eq!(
+            diagnostics[1].node,
+            Some(variable_name(&source, file, "second"))
+        );
+        assert_eq!(diagnostics[1].diagnostic.code(), 2322);
+        assert_eq!(
+            diagnostics[1].diagnostic.render().unwrap(),
+            "Type 'number' is not assignable to type 'string'."
+        );
+        assert!(is_type_checked(&context, file));
+    }
+
+    #[test]
+    fn export_near_misses_reject_the_whole_plan_without_writes() {
+        let near_misses = [
+            ("export { A };", SourceSyntaxRole::ExportClause),
+            (
+                r#"export {} from "./dependency";"#,
+                SourceSyntaxRole::ExportDeclaration,
+            ),
+            ("export type {};", SourceSyntaxRole::ExportDeclaration),
+            (
+                r#"export declare const value: string = "ok";"#,
+                SourceSyntaxRole::VariableStatement,
+            ),
+            (
+                "export type Alias = string;",
+                SourceSyntaxRole::TypeAliasDeclaration,
+            ),
+        ];
+
+        for (index, (near_miss, expected_role)) in near_misses.into_iter().enumerate() {
+            let source = parsed(&format!("type A = A; {near_miss}"));
+            let file = FileId::new(58 + u32::try_from(index).unwrap());
+            let mut context = context_with_module_state(
+                &[(file, &source)],
+                CanonicalModuleState::External,
+                CanonicalCheckerOptions::default(),
+            );
+            let before = observable_state(&context, file);
+
+            assert!(matches!(
+                context.check_source_file(file),
+                Err(SourceCheckError::Unsupported(
+                    UnsupportedSourceSyntax::Syntax { role, .. }
+                )) if role == expected_role
+            ));
+            assert_eq!(observable_state(&context, file), before);
+            assert!(context.diagnostics().is_empty());
+            assert!(!is_type_checked(&context, file));
+        }
+    }
+
+    #[test]
+    fn export_forms_require_external_module_facts_before_any_writes() {
+        let cases = [
+            (
+                "type A = A; export {};",
+                SourceSyntaxRole::ExportDeclaration,
+            ),
+            (
+                r#"type A = A; export const value: string = "ok";"#,
+                SourceSyntaxRole::VariableModifier,
+            ),
+        ];
+
+        for (index, (text, expected_role)) in cases.into_iter().enumerate() {
+            let source = parsed(text);
+            let file = FileId::new(63 + u32::try_from(index).unwrap());
+            let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+            let before = observable_state(&context, file);
+
+            assert!(matches!(
+                context.check_source_file(file),
+                Err(SourceCheckError::Unsupported(
+                    UnsupportedSourceSyntax::MissingExternalModuleFact { role, .. }
+                )) if role == expected_role
+            ));
+            assert_eq!(observable_state(&context, file), before);
+            assert!(context.diagnostics().is_empty());
+            assert!(!is_type_checked(&context, file));
+        }
     }
 
     #[test]
