@@ -171,6 +171,17 @@ pub enum CanonicalDeclarationError {
     JavaScriptFileKindRequired(NodeRef),
     /// A private declaration was reached before its containing class symbol.
     MissingContainingClassSymbol(NodeRef),
+    /// Declaration dispatch requires parser/Program source-file facts.
+    MissingSourceFileFacts(FileId),
+    /// JavaScript declaration dispatch remains outside the B02b closure.
+    JavaScriptDeclarationsDeferred(FileId),
+    /// `CommonJS` declaration dispatch remains outside the B02b closure.
+    CommonJsDeclarationsDeferred(FileId),
+    /// The dependency-closed declaration slice may run only once per file.
+    DuplicateDeclarationDispatch(FileId),
+    /// This declaration family is outside the currently installed exact
+    /// dependency closure. The whole file is rejected before symbol writes.
+    UnsupportedDeclarationFamily(NodeRef),
 }
 
 impl std::fmt::Display for CanonicalDeclarationError {
@@ -211,6 +222,31 @@ impl std::fmt::Display for CanonicalDeclarationError {
             Self::MissingContainingClassSymbol(node) => write!(
                 formatter,
                 "private declaration {:?} has no bound containing class symbol",
+                node.node
+            ),
+            Self::MissingSourceFileFacts(file) => write!(
+                formatter,
+                "Program file slot {} has no canonical source-file facts",
+                file.index()
+            ),
+            Self::JavaScriptDeclarationsDeferred(file) => write!(
+                formatter,
+                "JavaScript declaration dispatch is deferred for Program file slot {}",
+                file.index()
+            ),
+            Self::CommonJsDeclarationsDeferred(file) => write!(
+                formatter,
+                "CommonJS declaration dispatch is deferred for Program file slot {}",
+                file.index()
+            ),
+            Self::DuplicateDeclarationDispatch(file) => write!(
+                formatter,
+                "Program file slot {} already ran canonical declaration dispatch",
+                file.index()
+            ),
+            Self::UnsupportedDeclarationFamily(node) => write!(
+                formatter,
+                "AST node {:?} is outside the installed canonical declaration closure",
                 node.node
             ),
         }
@@ -340,6 +376,7 @@ pub struct BoundFile {
     source_facts: Option<CanonicalSourceFileFacts>,
     node_count: usize,
     phase: BindingPhase,
+    declaration_slice_bound: bool,
     nodes: Vec<NodeBinding>,
     traversal_order: Vec<NodeId>,
     container_chain: Vec<NodeId>,
@@ -369,6 +406,14 @@ impl BoundFile {
     #[must_use]
     pub fn declarations_complete(&self) -> bool {
         self.phase == BindingPhase::Declarations
+    }
+
+    /// Whether the currently ported non-JavaScript declaration slice ran.
+    /// This remains distinct from [`Self::declarations_complete`] until every
+    /// parser-reachable family in the claimed source kinds is audited exact.
+    #[must_use]
+    pub const fn declaration_slice_bound(&self) -> bool {
+        self.declaration_slice_bound
     }
 
     #[must_use]
@@ -858,6 +903,947 @@ impl CanonicalBinder {
         Ok(())
     }
 
+    /// Runs the dependency-closed non-JavaScript declaration-dispatch slice
+    /// over B01's captured visitation order and container state.
+    ///
+    /// This is a linear replay of declaration entry points, not a second AST
+    /// traversal. Locals, members, and exports remain nil until the exact
+    /// declaration route first requests their table.
+    ///
+    /// # Errors
+    ///
+    /// Missing/foreign source facts, JavaScript/CommonJS files, duplicate
+    /// dispatch, and declaration-provenance failures are rejected.
+    ///
+    /// # Panics
+    ///
+    /// Panics if preflighted captured binder state disappears during the
+    /// sealed dispatch, or on the pinned declaration-parent mismatch path.
+    pub fn bind_typescript_declaration_slice(
+        &mut self,
+        arena: &NodeArena,
+        file: FileId,
+    ) -> Result<&BoundFile, CanonicalDeclarationError> {
+        let Some(bound) = self.files.get(&file) else {
+            return Err(CanonicalDeclarationError::UnboundFile(file));
+        };
+        if bound.arena != arena.id() {
+            return Err(CanonicalDeclarationError::WrongArena {
+                file,
+                expected: bound.arena,
+                actual: arena.id(),
+            });
+        }
+        if bound.declaration_slice_bound {
+            return Err(CanonicalDeclarationError::DuplicateDeclarationDispatch(
+                file,
+            ));
+        }
+        let Some(facts) = bound.source_facts.clone() else {
+            return Err(CanonicalDeclarationError::MissingSourceFileFacts(file));
+        };
+        if facts.is_javascript_file() {
+            return Err(CanonicalDeclarationError::JavaScriptDeclarationsDeferred(
+                file,
+            ));
+        }
+        if facts.is_common_js_module() {
+            return Err(CanonicalDeclarationError::CommonJsDeclarationsDeferred(
+                file,
+            ));
+        }
+        let order = bound.traversal_order.clone();
+        if let Some(node) = order.iter().copied().find(|node| {
+            !declaration_family_supported(arena, *node)
+                || is_misclassified_constructor_method(arena, *node)
+                || declaration_name_shape_unsupported(arena, *node)
+        }) {
+            return Err(CanonicalDeclarationError::UnsupportedDeclarationFamily(
+                NodeRef::new(arena.id(), file, node),
+            ));
+        }
+        for node in order {
+            self.bind_declaration_node(arena, file, node, &facts)?;
+        }
+        self.files
+            .get_mut(&file)
+            .expect("declaration-dispatch file remains registered")
+            .declaration_slice_bound = true;
+        Ok(self
+            .files
+            .get(&file)
+            .expect("declaration-dispatch file remains registered"))
+    }
+
+    fn ensure_node_locals(&mut self, file: FileId, node: NodeId) -> SymbolTableId {
+        let bound = self
+            .files
+            .get_mut(&file)
+            .expect("declaration-dispatch file is registered");
+        let binding = &mut bound.nodes[node.index()];
+        if let Some(locals) = binding.locals {
+            return locals;
+        }
+        let locals = self.symbols.alloc_symbol_table();
+        binding.locals = Some(locals);
+        locals
+    }
+
+    fn ensure_symbol_members(&mut self, symbol: SemanticSymbolId) -> SymbolTableId {
+        let record = self
+            .symbols
+            .symbol(symbol)
+            .expect("declaration container symbol is store-owned");
+        if let Some(members) = record.members() {
+            return members;
+        }
+        let (exports, parent, export_symbol) =
+            (record.exports(), record.parent(), record.export_symbol());
+        let members = self.symbols.alloc_symbol_table();
+        assert!(self.symbols.set_symbol_relationships(
+            symbol,
+            Some(members),
+            exports,
+            parent,
+            export_symbol,
+        ));
+        members
+    }
+
+    fn ensure_symbol_exports(&mut self, symbol: SemanticSymbolId) -> SymbolTableId {
+        let record = self
+            .symbols
+            .symbol(symbol)
+            .expect("declaration container symbol is store-owned");
+        if let Some(exports) = record.exports() {
+            return exports;
+        }
+        let (members, parent, export_symbol) =
+            (record.members(), record.parent(), record.export_symbol());
+        let exports = self.symbols.alloc_symbol_table();
+        assert!(self.symbols.set_symbol_relationships(
+            symbol,
+            members,
+            Some(exports),
+            parent,
+            export_symbol,
+        ));
+        exports
+    }
+
+    fn declaration_container(&self, file: FileId, node: NodeId) -> Option<NodeId> {
+        self.files.get(&file)?.nodes.get(node.index())?.container
+    }
+
+    fn bound_node_symbol(&self, file: FileId, node: NodeId) -> Option<SemanticSymbolId> {
+        self.files.get(&file)?.nodes.get(node.index())?.symbol
+    }
+
+    fn declare_symbol_and_add_to_symbol_table(
+        &mut self,
+        arena: &NodeArena,
+        file: FileId,
+        node: NodeId,
+        includes: SymbolFlags,
+        excludes: SymbolFlags,
+        facts: &CanonicalSourceFileFacts,
+    ) -> Result<SemanticSymbolId, CanonicalDeclarationError> {
+        let container = self
+            .declaration_container(file, node)
+            .expect("ordinary declarations have a captured container");
+        let container_kind = arena
+            .get(container)
+            .expect("captured containers are reachable")
+            .kind;
+        match container_kind {
+            SyntaxKind::ModuleDeclaration => {
+                self.declare_module_member(arena, file, node, includes, excludes, facts)
+            }
+            SyntaxKind::SourceFile => {
+                self.declare_source_file_member(arena, file, node, includes, excludes, facts)
+            }
+            SyntaxKind::ClassExpression | SyntaxKind::ClassDeclaration => {
+                let parent = self
+                    .bound_node_symbol(file, container)
+                    .expect("class declaration precedes its members");
+                let table = if is_static_declaration(arena, node) {
+                    self.ensure_symbol_exports(parent)
+                } else {
+                    self.ensure_symbol_members(parent)
+                };
+                self.declare_symbol(arena, file, table, Some(parent), node, includes, excludes)
+            }
+            SyntaxKind::EnumDeclaration => {
+                let parent = self
+                    .bound_node_symbol(file, container)
+                    .expect("enum declaration precedes its members");
+                let table = self.ensure_symbol_exports(parent);
+                self.declare_symbol(arena, file, table, Some(parent), node, includes, excludes)
+            }
+            SyntaxKind::TypeLiteral
+            | SyntaxKind::ObjectLiteralExpression
+            | SyntaxKind::InterfaceDeclaration
+            | SyntaxKind::JsxAttributes => {
+                let parent = self
+                    .bound_node_symbol(file, container)
+                    .expect("member container declaration precedes its members");
+                let table = self.ensure_symbol_members(parent);
+                self.declare_symbol(arena, file, table, Some(parent), node, includes, excludes)
+            }
+            SyntaxKind::FunctionType
+            | SyntaxKind::ConstructorType
+            | SyntaxKind::CallSignature
+            | SyntaxKind::ConstructSignature
+            | SyntaxKind::IndexSignature
+            | SyntaxKind::MethodDeclaration
+            | SyntaxKind::MethodSignature
+            | SyntaxKind::Constructor
+            | SyntaxKind::GetAccessor
+            | SyntaxKind::SetAccessor
+            | SyntaxKind::FunctionDeclaration
+            | SyntaxKind::FunctionExpression
+            | SyntaxKind::ArrowFunction
+            | SyntaxKind::ClassStaticBlockDeclaration
+            | SyntaxKind::TypeAliasDeclaration
+            | SyntaxKind::MappedType => {
+                let table = self.ensure_node_locals(file, container);
+                self.declare_symbol(arena, file, table, None, node, includes, excludes)
+            }
+            _ => panic!("unhandled canonical declaration container {container_kind:?}"),
+        }
+    }
+
+    fn declare_source_file_member(
+        &mut self,
+        arena: &NodeArena,
+        file: FileId,
+        node: NodeId,
+        includes: SymbolFlags,
+        excludes: SymbolFlags,
+        facts: &CanonicalSourceFileFacts,
+    ) -> Result<SemanticSymbolId, CanonicalDeclarationError> {
+        if facts.is_external_module() {
+            self.declare_module_member(arena, file, node, includes, excludes, facts)
+        } else {
+            let source_file = self
+                .files
+                .get(&file)
+                .expect("declaration file is registered")
+                .source_file;
+            let table = self.ensure_node_locals(file, source_file);
+            self.declare_symbol(arena, file, table, None, node, includes, excludes)
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn declare_module_member(
+        &mut self,
+        arena: &NodeArena,
+        file: FileId,
+        node: NodeId,
+        includes: SymbolFlags,
+        excludes: SymbolFlags,
+        facts: &CanonicalSourceFileFacts,
+    ) -> Result<SemanticSymbolId, CanonicalDeclarationError> {
+        let container = self
+            .declaration_container(file, node)
+            .expect("module members have a captured container");
+        let parent = self
+            .bound_node_symbol(file, container)
+            .expect("module/source declaration precedes its members");
+        let has_export_modifier = has_combined_modifier(arena, node, SyntaxKind::ExportKeyword);
+        if includes.intersects(SymbolFlags::ALIAS) {
+            if arena
+                .get(node)
+                .is_some_and(|node| node.kind == SyntaxKind::ExportSpecifier)
+                || (arena
+                    .get(node)
+                    .is_some_and(|node| node.kind == SyntaxKind::ImportEqualsDeclaration)
+                    && has_export_modifier)
+            {
+                let table = self.ensure_symbol_exports(parent);
+                return self.declare_symbol(
+                    arena,
+                    file,
+                    table,
+                    Some(parent),
+                    node,
+                    includes,
+                    excludes,
+                );
+            }
+            let table = self.ensure_node_locals(file, container);
+            return self.declare_symbol(arena, file, table, None, node, includes, excludes);
+        }
+
+        let implicitly_exported =
+            has_export_modifier || container_has_export_context(arena, container, facts);
+        if !is_ambient_module(arena, node) && implicitly_exported {
+            let unnamed_default = has_syntactic_modifier(arena, node, SyntaxKind::DefaultKeyword)
+                && get_name_of_declaration(arena, node).is_none();
+            if !container_flags(arena, container).contains(ContainerFlags::HAS_LOCALS)
+                || unnamed_default
+            {
+                let table = self.ensure_symbol_exports(parent);
+                return self.declare_symbol(
+                    arena,
+                    file,
+                    table,
+                    Some(parent),
+                    node,
+                    includes,
+                    excludes,
+                );
+            }
+            let local_table = self.ensure_node_locals(file, container);
+            let local_flags = if includes.intersects(SymbolFlags::VALUE) {
+                SymbolFlags::EXPORT_VALUE
+            } else {
+                SymbolFlags::NONE
+            };
+            let local =
+                self.declare_symbol(arena, file, local_table, None, node, local_flags, excludes)?;
+            let export_table = self.ensure_symbol_exports(parent);
+            let export = self.declare_symbol(
+                arena,
+                file,
+                export_table,
+                Some(parent),
+                node,
+                includes,
+                excludes,
+            )?;
+            self.link_exported_declaration(NodeRef::new(arena.id(), file, node), local, export)?;
+            return Ok(local);
+        }
+        let table = self.ensure_node_locals(file, container);
+        self.declare_symbol(arena, file, table, None, node, includes, excludes)
+    }
+
+    fn bind_block_scoped_declaration(
+        &mut self,
+        arena: &NodeArena,
+        file: FileId,
+        node: NodeId,
+        includes: SymbolFlags,
+        excludes: SymbolFlags,
+        facts: &CanonicalSourceFileFacts,
+    ) -> Result<SemanticSymbolId, CanonicalDeclarationError> {
+        let block_container = self
+            .files
+            .get(&file)
+            .and_then(|file| file.nodes.get(node.index()))
+            .and_then(|binding| binding.block_scope_container)
+            .expect("block-scoped declarations have a captured block container");
+        match arena
+            .get(block_container)
+            .expect("captured block container is reachable")
+            .kind
+        {
+            SyntaxKind::ModuleDeclaration => {
+                self.declare_module_member(arena, file, node, includes, excludes, facts)
+            }
+            SyntaxKind::SourceFile if facts.is_external_module() => {
+                self.declare_module_member(arena, file, node, includes, excludes, facts)
+            }
+            _ => {
+                let table = self.ensure_node_locals(file, block_container);
+                self.declare_symbol(arena, file, table, None, node, includes, excludes)
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn bind_declaration_node(
+        &mut self,
+        arena: &NodeArena,
+        file: FileId,
+        node: NodeId,
+        facts: &CanonicalSourceFileFacts,
+    ) -> Result<(), CanonicalDeclarationError> {
+        let kind = arena
+            .get(node)
+            .expect("declaration dispatch uses captured reachable nodes")
+            .kind;
+        match kind {
+            SyntaxKind::SourceFile if facts.is_external_module() => {
+                self.bind_anonymous_declaration(
+                    arena,
+                    file,
+                    node,
+                    SymbolFlags::VALUE_MODULE,
+                    facts.source_file_symbol_name.clone(),
+                );
+            }
+            SyntaxKind::TypeParameter => self.bind_type_parameter(arena, file, node, facts)?,
+            SyntaxKind::Parameter => self.bind_parameter(arena, file, node, facts)?,
+            SyntaxKind::VariableDeclaration | SyntaxKind::BindingElement => {
+                self.bind_variable_declaration_or_binding_element(arena, file, node, facts)?;
+            }
+            SyntaxKind::PropertyDeclaration | SyntaxKind::PropertySignature => {
+                let is_accessor = has_syntactic_modifier(arena, node, SyntaxKind::AccessorKeyword);
+                let includes = if is_accessor {
+                    SymbolFlags::ACCESSOR
+                } else {
+                    SymbolFlags::PROPERTY
+                } | optional_symbol_flag(arena, node);
+                let excludes = if is_accessor {
+                    SymbolFlags::ACCESSOR_EXCLUDES
+                } else {
+                    SymbolFlags::PROPERTY_EXCLUDES
+                };
+                self.bind_property_or_method_or_accessor(
+                    arena, file, node, includes, excludes, facts,
+                )?;
+            }
+            SyntaxKind::PropertyAssignment | SyntaxKind::ShorthandPropertyAssignment => {
+                self.bind_property_or_method_or_accessor(
+                    arena,
+                    file,
+                    node,
+                    SymbolFlags::PROPERTY,
+                    SymbolFlags::PROPERTY_EXCLUDES,
+                    facts,
+                )?;
+            }
+            SyntaxKind::EnumMember => {
+                self.bind_property_or_method_or_accessor(
+                    arena,
+                    file,
+                    node,
+                    SymbolFlags::ENUM_MEMBER,
+                    SymbolFlags::ENUM_MEMBER_EXCLUDES,
+                    facts,
+                )?;
+            }
+            SyntaxKind::CallSignature
+            | SyntaxKind::ConstructSignature
+            | SyntaxKind::IndexSignature => {
+                self.declare_symbol_and_add_to_symbol_table(
+                    arena,
+                    file,
+                    node,
+                    SymbolFlags::SIGNATURE,
+                    SymbolFlags::NONE,
+                    facts,
+                )?;
+            }
+            SyntaxKind::MethodDeclaration | SyntaxKind::MethodSignature => {
+                let excludes = if arena
+                    .get(node)
+                    .and_then(|node| node.parent)
+                    .and_then(|parent| arena.get(parent))
+                    .is_some_and(|parent| parent.kind == SyntaxKind::ObjectLiteralExpression)
+                {
+                    SymbolFlags::VALUE
+                } else {
+                    SymbolFlags::METHOD_EXCLUDES
+                };
+                self.bind_property_or_method_or_accessor(
+                    arena,
+                    file,
+                    node,
+                    SymbolFlags::METHOD | optional_symbol_flag(arena, node),
+                    excludes,
+                    facts,
+                )?;
+            }
+            SyntaxKind::FunctionDeclaration => {
+                self.bind_block_scoped_declaration(
+                    arena,
+                    file,
+                    node,
+                    SymbolFlags::FUNCTION,
+                    SymbolFlags::FUNCTION_EXCLUDES,
+                    facts,
+                )?;
+            }
+            SyntaxKind::Constructor => {
+                self.declare_symbol_and_add_to_symbol_table(
+                    arena,
+                    file,
+                    node,
+                    SymbolFlags::CONSTRUCTOR,
+                    SymbolFlags::NONE,
+                    facts,
+                )?;
+            }
+            SyntaxKind::GetAccessor => {
+                self.bind_property_or_method_or_accessor(
+                    arena,
+                    file,
+                    node,
+                    SymbolFlags::GET_ACCESSOR | optional_symbol_flag(arena, node),
+                    SymbolFlags::GET_ACCESSOR_EXCLUDES,
+                    facts,
+                )?;
+            }
+            SyntaxKind::SetAccessor => {
+                self.bind_property_or_method_or_accessor(
+                    arena,
+                    file,
+                    node,
+                    SymbolFlags::SET_ACCESSOR | optional_symbol_flag(arena, node),
+                    SymbolFlags::SET_ACCESSOR_EXCLUDES,
+                    facts,
+                )?;
+            }
+            SyntaxKind::FunctionType | SyntaxKind::ConstructorType => {
+                self.bind_function_or_constructor_type(arena, file, node)?;
+            }
+            SyntaxKind::TypeLiteral | SyntaxKind::MappedType => {
+                self.bind_anonymous_declaration(
+                    arena,
+                    file,
+                    node,
+                    SymbolFlags::TYPE_LITERAL,
+                    EscapedName::internal(InternalSymbolName::Type),
+                );
+            }
+            SyntaxKind::ObjectLiteralExpression => {
+                self.bind_anonymous_declaration(
+                    arena,
+                    file,
+                    node,
+                    SymbolFlags::OBJECT_LITERAL,
+                    EscapedName::internal(InternalSymbolName::Object),
+                );
+            }
+            SyntaxKind::FunctionExpression | SyntaxKind::ArrowFunction => {
+                let name = match &arena
+                    .get(node)
+                    .expect("function expression is reachable")
+                    .data
+                {
+                    NodeData::FunctionExpression(function) => function
+                        .name
+                        .and_then(|name| node_text(arena, name))
+                        .map_or_else(
+                            || EscapedName::internal(InternalSymbolName::Function),
+                            EscapedName::source,
+                        ),
+                    _ => EscapedName::internal(InternalSymbolName::Function),
+                };
+                self.bind_anonymous_declaration(arena, file, node, SymbolFlags::FUNCTION, name);
+            }
+            SyntaxKind::ClassExpression | SyntaxKind::ClassDeclaration => {
+                self.bind_class_like_declaration(arena, file, node, facts)?;
+            }
+            SyntaxKind::InterfaceDeclaration => {
+                self.bind_block_scoped_declaration(
+                    arena,
+                    file,
+                    node,
+                    SymbolFlags::INTERFACE,
+                    SymbolFlags::INTERFACE_EXCLUDES,
+                    facts,
+                )?;
+            }
+            SyntaxKind::TypeAliasDeclaration => {
+                self.bind_block_scoped_declaration(
+                    arena,
+                    file,
+                    node,
+                    SymbolFlags::TYPE_ALIAS,
+                    SymbolFlags::TYPE_ALIAS_EXCLUDES,
+                    facts,
+                )?;
+            }
+            SyntaxKind::EnumDeclaration => {
+                let is_const = has_combined_modifier(arena, node, SyntaxKind::ConstKeyword);
+                self.bind_block_scoped_declaration(
+                    arena,
+                    file,
+                    node,
+                    if is_const {
+                        SymbolFlags::CONST_ENUM
+                    } else {
+                        SymbolFlags::REGULAR_ENUM
+                    },
+                    if is_const {
+                        SymbolFlags::CONST_ENUM_EXCLUDES
+                    } else {
+                        SymbolFlags::REGULAR_ENUM_EXCLUDES
+                    },
+                    facts,
+                )?;
+            }
+            SyntaxKind::JsxAttributes => {
+                self.bind_anonymous_declaration(
+                    arena,
+                    file,
+                    node,
+                    SymbolFlags::OBJECT_LITERAL,
+                    EscapedName::internal(InternalSymbolName::JsxAttributes),
+                );
+            }
+            SyntaxKind::JsxAttribute => {
+                self.declare_symbol_and_add_to_symbol_table(
+                    arena,
+                    file,
+                    node,
+                    SymbolFlags::PROPERTY,
+                    SymbolFlags::PROPERTY_EXCLUDES,
+                    facts,
+                )?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn declaration_facts_for(
+        arena: &NodeArena,
+        node: NodeRef,
+        name: &EscapedName,
+    ) -> DeclarationFacts {
+        let declaration = arena
+            .get(node.node)
+            .expect("anonymous declarations are reachable");
+        let diagnostic_node = get_name_of_declaration(arena, node.node)
+            .map_or(node, |name| NodeRef::new(node.arena, node.file, name));
+        DeclarationFacts {
+            kind: declaration.kind,
+            diagnostic_node,
+            display_name: if name.as_ref() == InternalSymbolName::Missing.as_ref() {
+                "(Missing)".to_owned()
+            } else {
+                name.escaped_display().to_string()
+            },
+            is_assignment: is_assignment_declaration(declaration.kind),
+            is_effective_module: matches!(
+                declaration.kind,
+                SyntaxKind::ModuleDeclaration | SyntaxKind::Identifier
+            ),
+        }
+    }
+
+    fn bind_anonymous_declaration(
+        &mut self,
+        arena: &NodeArena,
+        file: FileId,
+        node: NodeId,
+        includes: SymbolFlags,
+        name: EscapedName,
+    ) -> SemanticSymbolId {
+        let node_ref = NodeRef::new(arena.id(), file, node);
+        let declaration_facts = Self::declaration_facts_for(arena, node_ref, &name);
+        let symbol = self.new_symbol(file, name);
+        if includes.intersects(SymbolFlags::ENUM_MEMBER | SymbolFlags::CLASS_MEMBER) {
+            let container = self
+                .declaration_container(file, node)
+                .expect("anonymous member declarations have a container");
+            let parent = self
+                .bound_node_symbol(file, container)
+                .expect("anonymous member container is already declared");
+            assert!(
+                self.symbols
+                    .set_symbol_relationships(symbol, None, None, Some(parent), None)
+            );
+        }
+        self.add_declaration_to_symbol(symbol, node_ref, includes, declaration_facts);
+        symbol
+    }
+
+    fn bind_property_or_method_or_accessor(
+        &mut self,
+        arena: &NodeArena,
+        file: FileId,
+        node: NodeId,
+        includes: SymbolFlags,
+        excludes: SymbolFlags,
+        facts: &CanonicalSourceFileFacts,
+    ) -> Result<SemanticSymbolId, CanonicalDeclarationError> {
+        if has_dynamic_name(arena, node) {
+            Ok(self.bind_anonymous_declaration(
+                arena,
+                file,
+                node,
+                includes,
+                EscapedName::internal(InternalSymbolName::Computed),
+            ))
+        } else {
+            self.declare_symbol_and_add_to_symbol_table(
+                arena, file, node, includes, excludes, facts,
+            )
+        }
+    }
+
+    fn bind_function_or_constructor_type(
+        &mut self,
+        arena: &NodeArena,
+        file: FileId,
+        node: NodeId,
+    ) -> Result<(), CanonicalDeclarationError> {
+        let node_ref = NodeRef::new(arena.id(), file, node);
+        let name = self.get_declaration_name(arena, node_ref)?;
+        let signature = self.new_symbol(file, name.clone());
+        let signature_facts = Self::declaration_facts_for(arena, node_ref, &name);
+        self.add_declaration_to_symbol(
+            signature,
+            node_ref,
+            SymbolFlags::SIGNATURE,
+            signature_facts,
+        );
+        let type_name = EscapedName::internal(InternalSymbolName::Type);
+        let type_literal = self.new_symbol(file, type_name.clone());
+        let type_facts = Self::declaration_facts_for(arena, node_ref, &type_name);
+        self.add_declaration_to_symbol(
+            type_literal,
+            node_ref,
+            SymbolFlags::TYPE_LITERAL,
+            type_facts,
+        );
+        let members = self.ensure_symbol_members(type_literal);
+        assert_eq!(
+            self.symbols.insert_symbol(members, name, signature),
+            Some(None)
+        );
+        Ok(())
+    }
+
+    fn bind_class_like_declaration(
+        &mut self,
+        arena: &NodeArena,
+        file: FileId,
+        node: NodeId,
+        facts: &CanonicalSourceFileFacts,
+    ) -> Result<(), CanonicalDeclarationError> {
+        match &arena
+            .get(node)
+            .expect("class declaration is reachable")
+            .data
+        {
+            NodeData::ClassDeclaration(_) => {
+                self.bind_block_scoped_declaration(
+                    arena,
+                    file,
+                    node,
+                    SymbolFlags::CLASS,
+                    SymbolFlags::CLASS_EXCLUDES,
+                    facts,
+                )?;
+            }
+            NodeData::ClassExpression(class) => {
+                let name = class.name.and_then(|name| node_text(arena, name));
+                let symbol_name = name.as_ref().map_or_else(
+                    || EscapedName::internal(InternalSymbolName::Class),
+                    |name| EscapedName::source(name.clone()),
+                );
+                if let Some(name) = name {
+                    self.files
+                        .get_mut(&file)
+                        .expect("class-expression file is registered")
+                        .classifiable_names
+                        .insert(EscapedName::source(name));
+                }
+                self.bind_anonymous_declaration(arena, file, node, SymbolFlags::CLASS, symbol_name);
+            }
+            _ => unreachable!("class-like dispatch is kind checked"),
+        }
+
+        let class_symbol = self
+            .bound_node_symbol(file, node)
+            .expect("class-like declaration writes its node symbol");
+        let prototype_name = EscapedName::source("prototype");
+        let prototype = self.new_symbol(file, prototype_name.clone());
+        self.or_symbol_flags(prototype, SymbolFlags::PROPERTY | SymbolFlags::PROTOTYPE);
+        let exports = self.ensure_symbol_exports(class_symbol);
+        let existing = self
+            .symbols
+            .symbol_table(exports)
+            .expect("class exports were just allocated")
+            .get(prototype_name.as_ref());
+        if let Some(existing) = existing
+            && let Some(first) = self
+                .symbols
+                .symbol(existing)
+                .expect("class export is store-owned")
+                .declarations()
+                .and_then(|declarations| declarations.first())
+                .copied()
+        {
+            self.files
+                .get_mut(&file)
+                .expect("class file is registered")
+                .diagnostics
+                .push(CanonicalBindDiagnostic {
+                    node: first,
+                    diagnostic: make_diagnostic(2300, ["prototype"]),
+                    related_information: Vec::new(),
+                });
+        }
+        assert_eq!(
+            self.symbols
+                .insert_symbol(exports, prototype_name, prototype),
+            Some(existing)
+        );
+        assert!(self.symbols.set_symbol_relationships(
+            prototype,
+            None,
+            None,
+            Some(class_symbol),
+            None,
+        ));
+        Ok(())
+    }
+
+    fn bind_type_parameter(
+        &mut self,
+        arena: &NodeArena,
+        file: FileId,
+        node: NodeId,
+        facts: &CanonicalSourceFileFacts,
+    ) -> Result<(), CanonicalDeclarationError> {
+        let parent = arena.get(node).and_then(|node| node.parent);
+        if parent.is_some_and(|parent| {
+            arena
+                .get(parent)
+                .is_some_and(|parent| parent.kind == SyntaxKind::InferType)
+        }) {
+            if let Some(container) = infer_type_container(arena, parent.expect("checked above")) {
+                let table = self.ensure_node_locals(file, container);
+                self.declare_symbol(
+                    arena,
+                    file,
+                    table,
+                    None,
+                    node,
+                    SymbolFlags::TYPE_PARAMETER,
+                    SymbolFlags::TYPE_PARAMETER_EXCLUDES,
+                )?;
+            } else {
+                let name =
+                    self.get_declaration_name(arena, NodeRef::new(arena.id(), file, node))?;
+                self.bind_anonymous_declaration(
+                    arena,
+                    file,
+                    node,
+                    SymbolFlags::TYPE_PARAMETER,
+                    name,
+                );
+            }
+        } else {
+            self.declare_symbol_and_add_to_symbol_table(
+                arena,
+                file,
+                node,
+                SymbolFlags::TYPE_PARAMETER,
+                SymbolFlags::TYPE_PARAMETER_EXCLUDES,
+                facts,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn bind_parameter(
+        &mut self,
+        arena: &NodeArena,
+        file: FileId,
+        node: NodeId,
+        facts: &CanonicalSourceFileFacts,
+    ) -> Result<(), CanonicalDeclarationError> {
+        let Some(NodeData::ParameterDeclaration(parameter)) =
+            arena.get(node).map(|node| &node.data)
+        else {
+            unreachable!("parameter dispatch is kind checked");
+        };
+        if is_binding_pattern(arena, parameter.name) {
+            let parent = arena
+                .get(node)
+                .and_then(|node| node.parent)
+                .expect("parameters have a function-like parent");
+            let index = function_like_parameters(arena, parent)
+                .and_then(|parameters| parameters.iter().position(|parameter| *parameter == node))
+                .expect("parameter occurs in its parent's parameter list");
+            self.bind_anonymous_declaration(
+                arena,
+                file,
+                node,
+                SymbolFlags::FUNCTION_SCOPED_VARIABLE,
+                EscapedName::source(format!("__{index}")),
+            );
+        } else {
+            self.declare_symbol_and_add_to_symbol_table(
+                arena,
+                file,
+                node,
+                SymbolFlags::FUNCTION_SCOPED_VARIABLE,
+                SymbolFlags::PARAMETER_EXCLUDES,
+                facts,
+            )?;
+        }
+
+        if is_parameter_property_declaration(arena, node) {
+            let constructor = arena
+                .get(node)
+                .and_then(|node| node.parent)
+                .expect("parameter property has a constructor parent");
+            let class = arena
+                .get(constructor)
+                .and_then(|constructor| constructor.parent)
+                .expect("constructor has a containing class");
+            let parent = self
+                .bound_node_symbol(file, class)
+                .expect("class declaration precedes constructor parameters");
+            let members = self.ensure_symbol_members(parent);
+            self.declare_symbol(
+                arena,
+                file,
+                members,
+                Some(parent),
+                node,
+                SymbolFlags::PROPERTY | optional_symbol_flag(arena, node),
+                SymbolFlags::PROPERTY_EXCLUDES,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn bind_variable_declaration_or_binding_element(
+        &mut self,
+        arena: &NodeArena,
+        file: FileId,
+        node: NodeId,
+        facts: &CanonicalSourceFileFacts,
+    ) -> Result<(), CanonicalDeclarationError> {
+        let Some(name) = get_name_of_declaration(arena, node) else {
+            return Ok(());
+        };
+        if is_binding_pattern(arena, name) {
+            return Ok(());
+        }
+        if is_block_or_catch_scoped(arena, node) {
+            self.bind_block_scoped_declaration(
+                arena,
+                file,
+                node,
+                SymbolFlags::BLOCK_SCOPED_VARIABLE,
+                SymbolFlags::BLOCK_SCOPED_VARIABLE_EXCLUDES,
+                facts,
+            )?;
+        } else if is_part_of_parameter_declaration(arena, node) {
+            self.declare_symbol_and_add_to_symbol_table(
+                arena,
+                file,
+                node,
+                SymbolFlags::FUNCTION_SCOPED_VARIABLE,
+                SymbolFlags::PARAMETER_EXCLUDES,
+                facts,
+            )?;
+        } else {
+            self.declare_symbol_and_add_to_symbol_table(
+                arena,
+                file,
+                node,
+                SymbolFlags::FUNCTION_SCOPED_VARIABLE,
+                SymbolFlags::FUNCTION_SCOPED_VARIABLE_EXCLUDES,
+                facts,
+            )?;
+        }
+        Ok(())
+    }
+
     fn preflight_declaration(
         &self,
         arena: &NodeArena,
@@ -1344,6 +2330,302 @@ fn assignment_variable_merge(incoming: SymbolFlags, existing: SymbolFlags) -> bo
     incoming.intersects(SymbolFlags::VARIABLE) && existing.intersects(SymbolFlags::ASSIGNMENT)
         || incoming.intersects(SymbolFlags::ASSIGNMENT)
             && existing.intersects(SymbolFlags::VARIABLE)
+}
+
+fn declaration_family_supported(arena: &NodeArena, node: NodeId) -> bool {
+    !arena.get(node).is_some_and(|node| {
+        matches!(
+            node.kind,
+            SyntaxKind::ModuleDeclaration
+                | SyntaxKind::ImportEqualsDeclaration
+                | SyntaxKind::NamespaceImport
+                | SyntaxKind::ImportSpecifier
+                | SyntaxKind::ExportSpecifier
+                | SyntaxKind::NamespaceExportDeclaration
+                | SyntaxKind::NamespaceExport
+                | SyntaxKind::ImportClause
+                | SyntaxKind::ExportDeclaration
+                | SyntaxKind::ExportAssignment
+                | SyntaxKind::JsTypeAliasDeclaration
+        )
+    })
+}
+
+fn declaration_name_shape_unsupported(arena: &NodeArena, node: NodeId) -> bool {
+    let Some(declaration) = arena.get(node) else {
+        return true;
+    };
+    let dynamic_is_handled = matches!(
+        declaration.kind,
+        SyntaxKind::PropertyDeclaration
+            | SyntaxKind::PropertySignature
+            | SyntaxKind::PropertyAssignment
+            | SyntaxKind::ShorthandPropertyAssignment
+            | SyntaxKind::EnumMember
+            | SyntaxKind::MethodDeclaration
+            | SyntaxKind::MethodSignature
+            | SyntaxKind::GetAccessor
+            | SyntaxKind::SetAccessor
+    );
+    if has_dynamic_name(arena, node) && !dynamic_is_handled {
+        return true;
+    }
+    get_name_of_declaration(arena, node)
+        .and_then(|name| arena.get(name))
+        .is_some_and(|name| name.kind == SyntaxKind::PrivateIdentifier)
+        && containing_class(arena, node).is_none()
+}
+
+fn is_misclassified_constructor_method(arena: &NodeArena, node: NodeId) -> bool {
+    let Some(NodeData::MethodDeclaration(method)) = arena.get(node).map(|node| &node.data) else {
+        return false;
+    };
+    let in_class = arena
+        .get(node)
+        .and_then(|node| node.parent)
+        .and_then(|parent| arena.get(parent))
+        .is_some_and(|parent| {
+            matches!(
+                parent.kind,
+                SyntaxKind::ClassDeclaration | SyntaxKind::ClassExpression
+            )
+        });
+    in_class
+        && arena.get(method.name).is_some_and(|name| {
+            matches!(
+                name.kind,
+                SyntaxKind::Identifier | SyntaxKind::StringLiteral
+            )
+        })
+        && node_text(arena, method.name).as_deref() == Some("constructor")
+}
+
+fn root_declaration(arena: &NodeArena, mut node: NodeId) -> NodeId {
+    while arena
+        .get(node)
+        .is_some_and(|node| node.kind == SyntaxKind::BindingElement)
+    {
+        let Some(parent) = arena.get(node).and_then(|node| node.parent) else {
+            break;
+        };
+        let Some(grandparent) = arena.get(parent).and_then(|parent| parent.parent) else {
+            break;
+        };
+        node = grandparent;
+    }
+    node
+}
+
+fn has_combined_modifier(arena: &NodeArena, node: NodeId, modifier: SyntaxKind) -> bool {
+    let mut declaration = root_declaration(arena, node);
+    if has_syntactic_modifier(arena, declaration, modifier) {
+        return true;
+    }
+    if arena
+        .get(declaration)
+        .is_some_and(|node| node.kind == SyntaxKind::VariableDeclaration)
+        && let Some(parent) = arena.get(declaration).and_then(|node| node.parent)
+    {
+        declaration = parent;
+    }
+    if has_syntactic_modifier(arena, declaration, modifier) {
+        return true;
+    }
+    if arena
+        .get(declaration)
+        .is_some_and(|node| node.kind == SyntaxKind::VariableDeclarationList)
+        && let Some(parent) = arena.get(declaration).and_then(|node| node.parent)
+    {
+        declaration = parent;
+    }
+    has_syntactic_modifier(arena, declaration, modifier)
+}
+
+fn combined_node_flags(arena: &NodeArena, node: NodeId) -> u32 {
+    let mut declaration = root_declaration(arena, node);
+    let mut flags = arena.get(declaration).map_or(0, |node| node.flags.0);
+    if arena
+        .get(declaration)
+        .is_some_and(|node| node.kind == SyntaxKind::VariableDeclaration)
+        && let Some(parent) = arena.get(declaration).and_then(|node| node.parent)
+    {
+        declaration = parent;
+        flags |= arena.get(declaration).map_or(0, |node| node.flags.0);
+    }
+    if arena
+        .get(declaration)
+        .is_some_and(|node| node.kind == SyntaxKind::VariableDeclarationList)
+        && let Some(parent) = arena.get(declaration).and_then(|node| node.parent)
+    {
+        flags |= arena.get(parent).map_or(0, |node| node.flags.0);
+    }
+    flags
+}
+
+fn is_block_or_catch_scoped(arena: &NodeArena, node: NodeId) -> bool {
+    const BLOCK_SCOPED_FLAGS: u32 = (1 << 0) | (1 << 1) | (1 << 2);
+    if combined_node_flags(arena, node) & BLOCK_SCOPED_FLAGS != 0 {
+        return true;
+    }
+    let root = root_declaration(arena, node);
+    arena
+        .get(root)
+        .filter(|root| root.kind == SyntaxKind::VariableDeclaration)
+        .and_then(|root| root.parent)
+        .and_then(|parent| arena.get(parent))
+        .is_some_and(|parent| parent.kind == SyntaxKind::CatchClause)
+}
+
+fn is_part_of_parameter_declaration(arena: &NodeArena, node: NodeId) -> bool {
+    arena
+        .get(root_declaration(arena, node))
+        .is_some_and(|node| node.kind == SyntaxKind::Parameter)
+}
+
+fn is_binding_pattern(arena: &NodeArena, node: NodeId) -> bool {
+    arena.get(node).is_some_and(|node| {
+        matches!(
+            node.kind,
+            SyntaxKind::ObjectBindingPattern | SyntaxKind::ArrayBindingPattern
+        )
+    })
+}
+
+fn infer_type_container(arena: &NodeArena, mut node: NodeId) -> Option<NodeId> {
+    loop {
+        let parent = arena.get(node)?.parent?;
+        if let NodeData::ConditionalTypeNode(conditional) = &arena.get(parent)?.data
+            && conditional.extends_type == node
+        {
+            return Some(parent);
+        }
+        node = parent;
+    }
+}
+
+fn function_like_parameters(arena: &NodeArena, node: NodeId) -> Option<&[NodeId]> {
+    let parameters = match &arena.get(node)?.data {
+        NodeData::ArrowFunction(data) => &data.parameters,
+        NodeData::CallSignatureDeclaration(data) => &data.parameters,
+        NodeData::ConstructSignatureDeclaration(data) => &data.parameters,
+        NodeData::ConstructorDeclaration(data) => &data.parameters,
+        NodeData::ConstructorTypeNode(data) => &data.parameters,
+        NodeData::FunctionDeclaration(data) => &data.parameters,
+        NodeData::FunctionExpression(data) => &data.parameters,
+        NodeData::FunctionTypeNode(data) => &data.parameters,
+        NodeData::GetAccessorDeclaration(data) => &data.parameters,
+        NodeData::IndexSignatureDeclaration(data) => &data.parameters,
+        NodeData::MethodDeclaration(data) => &data.parameters,
+        NodeData::MethodSignatureDeclaration(data) => &data.parameters,
+        NodeData::SetAccessorDeclaration(data) => &data.parameters,
+        _ => return None,
+    };
+    Some(&parameters.nodes)
+}
+
+fn is_parameter_property_declaration(arena: &NodeArena, node: NodeId) -> bool {
+    let Some(parent) = arena.get(node).and_then(|node| node.parent) else {
+        return false;
+    };
+    arena
+        .get(parent)
+        .is_some_and(|parent| parent.kind == SyntaxKind::Constructor)
+        && [
+            SyntaxKind::PublicKeyword,
+            SyntaxKind::PrivateKeyword,
+            SyntaxKind::ProtectedKeyword,
+            SyntaxKind::ReadonlyKeyword,
+            SyntaxKind::OverrideKeyword,
+        ]
+        .into_iter()
+        .any(|modifier| has_syntactic_modifier(arena, node, modifier))
+}
+
+fn optional_symbol_flag(arena: &NodeArena, node: NodeId) -> SymbolFlags {
+    let token = match arena.get(node).map(|node| &node.data) {
+        Some(NodeData::GetAccessorDeclaration(data)) => data.postfix_token,
+        Some(NodeData::MethodDeclaration(data)) => data.postfix_token,
+        Some(NodeData::MethodSignatureDeclaration(data)) => data.postfix_token,
+        Some(NodeData::ParameterDeclaration(data)) => data.question_token,
+        Some(NodeData::PropertyDeclaration(data)) => data.postfix_token,
+        Some(NodeData::PropertySignatureDeclaration(data)) => data.postfix_token,
+        Some(NodeData::SetAccessorDeclaration(data)) => data.postfix_token,
+        _ => None,
+    };
+    if token.is_some_and(|token| {
+        arena
+            .get(token)
+            .is_some_and(|token| token.kind == SyntaxKind::QuestionToken)
+    }) {
+        SymbolFlags::OPTIONAL
+    } else {
+        SymbolFlags::NONE
+    }
+}
+
+fn is_static_declaration(arena: &NodeArena, node: NodeId) -> bool {
+    arena
+        .get(node)
+        .is_some_and(|node| node.kind == SyntaxKind::ClassStaticBlockDeclaration)
+        || has_syntactic_modifier(arena, node, SyntaxKind::StaticKeyword)
+}
+
+fn is_ambient_module(arena: &NodeArena, node: NodeId) -> bool {
+    let Some(NodeData::ModuleDeclaration(module)) = arena.get(node).map(|node| &node.data) else {
+        return false;
+    };
+    module.keyword == SyntaxKind::GlobalKeyword
+        || arena
+            .get(module.name)
+            .is_some_and(|name| name.kind == SyntaxKind::StringLiteral)
+}
+
+fn is_ambient_node(arena: &NodeArena, mut node: NodeId, facts: &CanonicalSourceFileFacts) -> bool {
+    if facts.is_declaration_file() {
+        return true;
+    }
+    loop {
+        if has_syntactic_modifier(arena, node, SyntaxKind::DeclareKeyword)
+            || is_ambient_module(arena, node)
+        {
+            return true;
+        }
+        let Some(parent) = arena.get(node).and_then(|node| node.parent) else {
+            return false;
+        };
+        node = parent;
+    }
+}
+
+fn container_has_export_context(
+    arena: &NodeArena,
+    container: NodeId,
+    facts: &CanonicalSourceFileFacts,
+) -> bool {
+    is_ambient_node(arena, container, facts) && !has_export_declarations(arena, container)
+}
+
+fn has_export_declarations(arena: &NodeArena, node: NodeId) -> bool {
+    let statements = match arena.get(node).map(|node| &node.data) {
+        Some(NodeData::SourceFile(source)) => Some(&source.statements.nodes),
+        Some(NodeData::ModuleDeclaration(module)) => module.body.and_then(|body| {
+            let NodeData::ModuleBlock(block) = &arena.get(body)?.data else {
+                return None;
+            };
+            Some(&block.statements.nodes)
+        }),
+        _ => None,
+    };
+    statements.is_some_and(|statements| {
+        statements.iter().any(|statement| {
+            arena.get(*statement).is_some_and(|statement| {
+                matches!(
+                    statement.kind,
+                    SyntaxKind::ExportDeclaration | SyntaxKind::ExportAssignment
+                )
+            })
+        })
+    })
 }
 
 fn make_diagnostic<I, S>(code: u32, arguments: I) -> Diagnostic
@@ -1973,6 +3255,7 @@ impl<'a> FileTraversal<'a> {
             source_facts: self.source_facts,
             node_count: self.arena.len(),
             phase: BindingPhase::Traversal,
+            declaration_slice_bound: false,
             nodes: self.nodes,
             traversal_order: self.traversal_order,
             container_chain: self.container_chain,
@@ -4128,6 +5411,290 @@ mod tests {
             traversal_only.file(FileId::new(42)).unwrap().source_facts(),
             None
         );
+    }
+
+    #[test]
+    fn declaration_slice_preflight_rejects_atomically_and_retry_is_stable() {
+        let parsed = parse_source_file("namespace Deferred { export const value = 1; }");
+        let file = FileId::new(43);
+        let facts = CanonicalSourceFileFacts::new(
+            EscapedName::source("\"/project/deferred\""),
+            CanonicalSourceLanguage::TypeScript,
+            false,
+            CanonicalModuleState::Script,
+        );
+        let module = nodes_of_kind(&parsed.arena, SyntaxKind::ModuleDeclaration)[0];
+        let expected = Err(CanonicalDeclarationError::UnsupportedDeclarationFamily(
+            node_ref(&parsed.arena, file, module),
+        ));
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(&parsed.arena, parsed.source_file, file, facts)
+            .unwrap();
+
+        assert_eq!(
+            binder.bind_typescript_declaration_slice(&parsed.arena, file),
+            expected
+        );
+        assert_eq!(
+            binder.bind_typescript_declaration_slice(&parsed.arena, file),
+            expected
+        );
+        let bound = binder.file(file).unwrap();
+        assert!(!bound.declaration_slice_bound());
+        assert_eq!(bound.phase(), BindingPhase::Traversal);
+        assert_eq!(bound.symbol_count(), 0);
+        assert_eq!(bound.locals(bound.source_file()), None);
+        assert_eq!(bound.symbol(bound.source_file()), None);
+        assert!(bound.diagnostics().is_empty());
+        assert_eq!(binder.symbol_store().symbol_len(), 0);
+        assert_eq!(binder.symbol_store().symbol_table_len(), 0);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn ordinary_typescript_dispatch_routes_scopes_members_and_anonymous_symbols() {
+        let parsed = parse_source_file(
+            r"
+interface Box<T> {
+    value?: T;
+    method?<U>(input: U): T;
+    get item(): T;
+    set item(value: T);
+    (input: T): T;
+    new (input: T): Box<T>;
+    [key: string]: T;
+}
+type Mapper<T> = { result: T };
+type Callable = (input: number) => string;
+const [first, { nested }] = source;
+var loose;
+function make<T>({ value }: Box<T>, extra?: T): T { return extra; }
+enum E { A }
+const enum CE { B }
+class Model<T> {
+    static count: number;
+    value?: T;
+    method<U>(input: U): U { return input; }
+    get item(): T { return this.value; }
+    set item(value: T) { this.value = value; }
+}
+const expression = class Named { field = 1; };
+const object = {};
+",
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(44);
+        let facts = CanonicalSourceFileFacts::new(
+            EscapedName::source("\"/project/ordinary\""),
+            CanonicalSourceLanguage::TypeScript,
+            false,
+            CanonicalModuleState::Script,
+        );
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(&parsed.arena, parsed.source_file, file, facts)
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+
+        let bound = binder.file(file).unwrap();
+        assert!(bound.declaration_slice_bound());
+        assert_eq!(bound.phase(), BindingPhase::Traversal);
+        assert_eq!(bound.symbol(bound.source_file()), None);
+        let source_locals = bound.locals(bound.source_file()).unwrap();
+        let source_table = binder.symbol_store().symbol_table(source_locals).unwrap();
+        for name in [
+            "Box",
+            "Mapper",
+            "Callable",
+            "first",
+            "nested",
+            "loose",
+            "make",
+            "E",
+            "CE",
+            "Model",
+            "expression",
+            "object",
+        ] {
+            assert!(source_table.get_source(name).is_some(), "missing {name}");
+        }
+
+        let interface = node_with_source(
+            &parsed.arena,
+            SyntaxKind::InterfaceDeclaration,
+            "interface Box<T> {\n    value?: T;\n    method?<U>(input: U): T;\n    get item(): T;\n    set item(value: T);\n    (input: T): T;\n    new (input: T): Box<T>;\n    [key: string]: T;\n}",
+        );
+        let interface_symbol = bound
+            .symbol(node_ref(&parsed.arena, file, interface))
+            .unwrap();
+        let interface_record = binder.symbol_store().symbol(interface_symbol).unwrap();
+        assert_eq!(interface_record.flags(), SymbolFlags::INTERFACE);
+        let interface_members = binder
+            .symbol_store()
+            .symbol_table(interface_record.members().unwrap())
+            .unwrap();
+        for name in ["T", "value", "method", "item"] {
+            assert!(
+                interface_members.get_source(name).is_some(),
+                "missing interface member {name}"
+            );
+        }
+        assert!(
+            interface_members
+                .get(InternalSymbolName::Call.as_ref())
+                .is_some()
+        );
+        assert!(
+            interface_members
+                .get(InternalSymbolName::New.as_ref())
+                .is_some()
+        );
+        assert!(
+            interface_members
+                .get(InternalSymbolName::Index.as_ref())
+                .is_some()
+        );
+
+        let class = node_with_source(
+            &parsed.arena,
+            SyntaxKind::ClassDeclaration,
+            "class Model<T> {\n    static count: number;\n    value?: T;\n    method<U>(input: U): U { return input; }\n    get item(): T { return this.value; }\n    set item(value: T) { this.value = value; }\n}",
+        );
+        let class_symbol = bound.symbol(node_ref(&parsed.arena, file, class)).unwrap();
+        let class_record = binder.symbol_store().symbol(class_symbol).unwrap();
+        let class_members = binder
+            .symbol_store()
+            .symbol_table(class_record.members().unwrap())
+            .unwrap();
+        for name in ["T", "value", "method", "item"] {
+            assert!(class_members.get_source(name).is_some());
+        }
+        let class_exports = binder
+            .symbol_store()
+            .symbol_table(class_record.exports().unwrap())
+            .unwrap();
+        assert!(class_exports.get_source("count").is_some());
+        let prototype = class_exports.get_source("prototype").unwrap();
+        let prototype_record = binder.symbol_store().symbol(prototype).unwrap();
+        assert_eq!(
+            prototype_record.flags(),
+            SymbolFlags::PROPERTY | SymbolFlags::PROTOTYPE
+        );
+        assert_eq!(prototype_record.parent(), Some(class_symbol));
+        assert!(prototype_record.declarations().is_none());
+
+        let function_type = nodes_of_kind(&parsed.arena, SyntaxKind::FunctionType)[0];
+        let function_type_symbol = bound
+            .symbol(node_ref(&parsed.arena, file, function_type))
+            .unwrap();
+        let function_type_record = binder.symbol_store().symbol(function_type_symbol).unwrap();
+        assert_eq!(function_type_record.flags(), SymbolFlags::TYPE_LITERAL);
+        let signature = binder
+            .symbol_store()
+            .symbol_table(function_type_record.members().unwrap())
+            .unwrap()
+            .get(InternalSymbolName::Call.as_ref())
+            .unwrap();
+        assert_eq!(
+            binder.symbol_store().symbol(signature).unwrap().flags(),
+            SymbolFlags::SIGNATURE
+        );
+        assert!(bound.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn external_module_dispatch_preserves_pair_and_hoisted_allocation_order() {
+        let parsed = parse_source_file(
+            "export class C {} export interface I { value: string } export const value = 1; export function fn() {}",
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(45);
+        let facts = CanonicalSourceFileFacts::new(
+            EscapedName::source("\"/project/external\""),
+            CanonicalSourceLanguage::TypeScript,
+            false,
+            CanonicalModuleState::External,
+        );
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(&parsed.arena, parsed.source_file, file, facts)
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+
+        let bound = binder.file(file).unwrap();
+        let source = bound.symbol(bound.source_file()).unwrap();
+        assert_eq!(source.get(), 1);
+        let source_record = binder.symbol_store().symbol(source).unwrap();
+        assert_eq!(source_record.flags(), SymbolFlags::VALUE_MODULE);
+        assert_eq!(
+            source_record.name().escaped_display().to_string(),
+            "\"/project/external\""
+        );
+        let locals = binder
+            .symbol_store()
+            .symbol_table(bound.locals(bound.source_file()).unwrap())
+            .unwrap();
+        let exports = binder
+            .symbol_store()
+            .symbol_table(source_record.exports().unwrap())
+            .unwrap();
+
+        let named_function = node_with_source(
+            &parsed.arena,
+            SyntaxKind::FunctionDeclaration,
+            "export function fn() {}",
+        );
+        let named_ref = node_ref(&parsed.arena, file, named_function);
+        let named_export = bound.symbol(named_ref).unwrap();
+        let named_local = bound.local_symbol(named_ref).unwrap();
+        assert_eq!(named_local.get(), 2);
+        assert_eq!(named_export.get(), 3);
+        assert_eq!(locals.get_source("fn"), Some(named_local));
+        assert_eq!(exports.get_source("fn"), Some(named_export));
+        assert_eq!(
+            binder.symbol_store().symbol(named_local).unwrap().flags(),
+            SymbolFlags::EXPORT_VALUE
+        );
+        assert_eq!(
+            binder
+                .symbol_store()
+                .symbol(named_local)
+                .unwrap()
+                .export_symbol(),
+            Some(named_export)
+        );
+
+        let class = nodes_of_kind(&parsed.arena, SyntaxKind::ClassDeclaration)[0];
+        let class_ref = node_ref(&parsed.arena, file, class);
+        let class_export = bound.symbol(class_ref).unwrap();
+        let class_local = bound.local_symbol(class_ref).unwrap();
+        assert_eq!(locals.get_source("C"), Some(class_local));
+        assert_eq!(exports.get_source("C"), Some(class_export));
+        assert_eq!(
+            binder.symbol_store().symbol(class_export).unwrap().flags(),
+            SymbolFlags::CLASS
+        );
+        assert!(
+            binder
+                .symbol_store()
+                .symbol_table(
+                    binder
+                        .symbol_store()
+                        .symbol(class_export)
+                        .unwrap()
+                        .exports()
+                        .unwrap()
+                )
+                .unwrap()
+                .get_source("prototype")
+                .is_some()
+        );
+        assert!(bound.diagnostics().is_empty());
     }
 
     #[test]
