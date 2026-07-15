@@ -10,6 +10,7 @@ use ts_binder::{SemanticSymbolId, SymbolFlags};
 
 use super::{
     ids::TypeId,
+    links::MembersOrExportsResolutionKind,
     relation::{IntersectionState, RelationComparisonResult, RelationKeyUnavailable, RelationKind},
     signatures::Ternary,
     store::SemanticStore,
@@ -569,7 +570,7 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
     }
 
     fn enum_types_related_if_available(
-        &self,
+        &mut self,
         source: SemanticSymbolId,
         target: SemanticSymbolId,
     ) -> Result<bool, RelationUnavailable> {
@@ -590,7 +591,13 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         {
             return Ok(false);
         }
-        Err(RelationUnavailable::EnumRelation { source, target })
+        let cached = self
+            .enum_relation_cache_get(source, target)
+            .ok_or(RelationUnavailable::Symbol(source))?;
+        if cached.is_empty() {
+            return Err(RelationUnavailable::EnumRelation { source, target });
+        }
+        Ok(cached.intersects(RelationComparisonResult::SUCCEEDED))
     }
 
     fn enum_parent_or_self(
@@ -627,10 +634,13 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
                 .data()
                 .structured()
                 .ok_or(RelationUnavailable::MalformedStructuredType(type_id))?;
-            return Ok(type_id != any_function_type
+            let is_empty_resolved = type_id != any_function_type
                 && structured.properties.as_ref().is_none_or(Vec::is_empty)
                 && structured.signatures.as_ref().is_none_or(Vec::is_empty)
-                && structured.index_infos.as_ref().is_none_or(Vec::is_empty));
+                && structured.index_infos.as_ref().is_none_or(Vec::is_empty);
+            if is_empty_resolved {
+                return Ok(true);
+            }
         }
         let Some(symbol) = record.symbol() else {
             return Ok(false);
@@ -645,7 +655,14 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
             .flags()
             .intersects(SymbolFlags::LATE_BINDING_CONTAINER)
         {
-            return Err(RelationUnavailable::LateBoundMembers(symbol));
+            let members = self
+                .members_and_exports_links(symbol)
+                .and_then(|links| links.table(MembersOrExportsResolutionKind::ResolvedMembers))
+                .ok_or(RelationUnavailable::LateBoundMembers(symbol))?;
+            return self
+                .symbol_table(members)
+                .map(ts_binder::semantic::SymbolTable::is_empty)
+                .ok_or(RelationUnavailable::InvalidSymbolMembers(symbol));
         }
         match symbol_record.members() {
             None => Ok(true),
@@ -736,8 +753,8 @@ mod tests {
 
     use super::RelationUnavailable;
     use crate::semantic::{
-        CanonicalTypeMapperStore, IntrinsicBootstrapOptions, RelationComparisonResult,
-        RelationKind, TypeId,
+        CanonicalTypeMapperStore, IntrinsicBootstrapOptions, MembersAndExportsLinks,
+        MembersOrExportsResolutionKind, RelationComparisonResult, RelationKind, TypeId,
         signatures::Ternary,
         type_records::{LiteralValue, RegularLiteralLink, TypeData},
         types::{ObjectFlags, TypeFlags},
@@ -789,6 +806,16 @@ mod tests {
         assert!(store.set_object_target_and_mapper(reference, Some(target), None));
         assert!(store.set_type_reference_resolution(reference, None, Some(arguments)));
         reference
+    }
+
+    fn cache_resolved_members(
+        store: &mut TestStore,
+        symbol: SemanticSymbolId,
+        members: ts_binder::SymbolTableId,
+    ) {
+        let mut links = MembersAndExportsLinks::default();
+        links.tables[MembersOrExportsResolutionKind::ResolvedMembers as usize] = Some(members);
+        assert!(store.set_members_and_exports_links(symbol, links));
     }
 
     #[test]
@@ -1063,7 +1090,7 @@ mod tests {
     }
 
     #[test]
-    fn unresolved_type_literal_members_fail_closed_without_cache_mutation() {
+    fn late_bound_type_literal_members_require_and_honor_the_resolved_members_cache() {
         let mut store = initialized(true);
         let non_primitive = store.intrinsic_bootstrap().unwrap().non_primitive_type;
         let symbol = alloc_symbol(&mut store, SymbolFlags::TYPE_LITERAL, "__type");
@@ -1076,6 +1103,58 @@ mod tests {
             Err(RelationUnavailable::LateBoundMembers(symbol))
         );
         assert_eq!(store.relation_state_snapshot(), before);
+
+        let members = store.alloc_symbol_table();
+        cache_resolved_members(&mut store, symbol, members);
+        assert_eq!(
+            store.is_type_strict_subtype_of(object, non_primitive),
+            Err(RelationUnavailable::StructuralRelation {
+                source: object,
+                target: non_primitive,
+                relation: RelationKind::StrictSubtype,
+            })
+        );
+
+        let property = alloc_symbol(&mut store, SymbolFlags::PROPERTY, "value");
+        assert_eq!(
+            store.insert_symbol(members, EscapedName::source("value"), property),
+            Some(None)
+        );
+        assert_eq!(
+            store.is_type_strict_subtype_of(object, non_primitive),
+            Ok(true)
+        );
+    }
+
+    #[test]
+    fn resolved_nonempty_type_literal_falls_through_to_cached_symbol_members() {
+        let mut store = initialized(true);
+        let non_primitive = store.intrinsic_bootstrap().unwrap().non_primitive_type;
+        let symbol = alloc_symbol(&mut store, SymbolFlags::TYPE_LITERAL, "__inconsistent");
+        let structured_property =
+            alloc_symbol(&mut store, SymbolFlags::PROPERTY, "structuredProperty");
+        let object = store
+            .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(symbol))
+            .unwrap();
+        assert!(store.set_structured_type_members(
+            object,
+            None,
+            Some(vec![structured_property]),
+            None,
+            None,
+            None,
+        ));
+        let cached_members = store.alloc_symbol_table();
+        cache_resolved_members(&mut store, symbol, cached_members);
+
+        assert_eq!(
+            store.is_type_strict_subtype_of(object, non_primitive),
+            Err(RelationUnavailable::StructuralRelation {
+                source: object,
+                target: non_primitive,
+                relation: RelationKind::StrictSubtype,
+            })
+        );
     }
 
     #[test]
@@ -1154,6 +1233,38 @@ mod tests {
             store.is_type_assignable_to(computed_enum, other_enum),
             Ok(false)
         );
+    }
+
+    #[test]
+    fn enum_relation_cache_answers_success_failure_and_miss_directionally() {
+        let mut store = initialized(true);
+        let source_symbol = alloc_symbol(&mut store, SymbolFlags::REGULAR_ENUM, "E");
+        let target_symbol = alloc_symbol(&mut store, SymbolFlags::REGULAR_ENUM, "E");
+        let miss_symbol = alloc_symbol(&mut store, SymbolFlags::REGULAR_ENUM, "E");
+        let source = alloc_enum_type(&mut store, source_symbol);
+        let target = alloc_enum_type(&mut store, target_symbol);
+        let miss = alloc_enum_type(&mut store, miss_symbol);
+
+        assert!(store.enum_relation_cache_set(
+            source_symbol,
+            target_symbol,
+            RelationComparisonResult::SUCCEEDED,
+        ));
+        assert!(store.enum_relation_cache_set(
+            target_symbol,
+            source_symbol,
+            RelationComparisonResult::FAILED,
+        ));
+        assert_eq!(store.is_type_assignable_to(source, target), Ok(true));
+        assert_eq!(store.is_type_assignable_to(target, source), Ok(false));
+        assert_eq!(
+            store.is_type_assignable_to(source, miss),
+            Err(RelationUnavailable::EnumRelation {
+                source: source_symbol,
+                target: miss_symbol,
+            })
+        );
+        assert_eq!(store.enum_relation_cache_size(), 2);
     }
 
     #[test]
