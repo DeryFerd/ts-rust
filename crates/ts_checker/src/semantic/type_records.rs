@@ -3,11 +3,11 @@
 //! The field inventory is pinned to `internal/checker/types.go` at
 //! `dc37b5249ab60e2bbce936f71b883e6c8136167e`, especially `TypeAlias`, `Type`,
 //! and the concrete `TypeData` records at lines 643-1245. Go pointer identity is
-//! represented by store-branded IDs. `Option<Vec<_>>` and the explicit cache
-//! states preserve nil versus allocated-empty slices/maps; vector order is
-//! retained exactly.
+//! represented by store-branded IDs. `Option<Vec<_>>` preserves nil versus
+//! allocated-empty slices, while explicit `HashMap` states preserve nil versus
+//! allocated-empty maps without turning checker hot paths into linear scans.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 use ts_ast::NodeRef;
 use ts_jsnum::{Number, PseudoBigInt};
@@ -52,26 +52,12 @@ impl CacheHashKey {
     }
 }
 
-/// One `map[CacheHashKey]*Type` entry in insertion/canonical construction order.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct TypeCacheEntry {
-    pub key: CacheHashKey,
-    pub value: TypeId,
-}
-
 /// Nil versus allocated state of an upstream type-instantiation map.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub enum TypeCacheState {
     #[default]
     Unallocated,
-    Allocated(Vec<TypeCacheEntry>),
-}
-
-/// One unit-discriminant entry from `UnionType.constituentMap`.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ConstituentEntry {
-    pub key: TypeId,
-    pub value: TypeId,
+    Allocated(HashMap<CacheHashKey, TypeId>),
 }
 
 /// Nil versus allocated state of `map[*Type]*Type`.
@@ -79,7 +65,7 @@ pub struct ConstituentEntry {
 pub enum ConstituentMapState {
     #[default]
     Unallocated,
-    Allocated(Vec<ConstituentEntry>),
+    Allocated(HashMap<TypeId, TypeId>),
 }
 
 /// Literal values accepted by pinned `LiteralType.value`.
@@ -102,39 +88,17 @@ pub enum RegularLiteralLink {
     Type(TypeId),
 }
 
-/// Provisional B02 symbol-table contract.
+/// Provisional, quarantined B02 symbol-table contract.
 ///
 /// B02 has not yet supplied the canonical symbol-table owner. Until it does,
-/// this minimal record preserves entry order and brands the complete table by
-/// semantic store. It cannot be constructed without validating every symbol.
+/// this private-shape record brands the complete table by semantic store. Its
+/// `String` representation and by-value storage are deliberately not exposed;
+/// B02 must replace it with byte `EscapedName` keys and `SymbolTableId` before
+/// checker algorithms consume this layer.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SemanticSymbolTable {
     store: SemanticStoreId,
     entries: Vec<(String, SemanticSymbolId)>,
-}
-
-impl SemanticSymbolTable {
-    #[must_use]
-    pub fn entries(&self) -> &[(String, SemanticSymbolId)] {
-        &self.entries
-    }
-
-    #[must_use]
-    pub fn get(&self, name: &str) -> Option<SemanticSymbolId> {
-        self.entries
-            .iter()
-            .find_map(|(entry, symbol)| (entry == name).then_some(*symbol))
-    }
-
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.entries.len()
-    }
-
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
 }
 
 /// Arena-owned equivalent of upstream `TypeAlias`.
@@ -229,6 +193,8 @@ pub struct LiteralTypeData {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UniqueEsSymbolTypeData {
+    /// Quarantined B02 placeholder for upstream's escaped property name.
+    /// No checker API may rely on UTF-8 round-tripping this value.
     pub name: String,
 }
 
@@ -287,6 +253,8 @@ pub struct UnionTypeData {
     pub resolved_reduced_type: Option<TypeId>,
     pub regular_type: Option<TypeId>,
     pub origin: Option<TypeId>,
+    /// Quarantined B02 placeholder for upstream's escaped property name.
+    /// No checker API may rely on UTF-8 round-tripping this value.
     pub key_property_name: String,
     pub constituent_map: ConstituentMapState,
 }
@@ -678,10 +646,12 @@ impl<SymbolPayload, MapperPayload> SemanticStore<TypeRecord, SymbolPayload, Mapp
         true
     }
 
-    /// Constructs the provisional B02 symbol table after validating store
-    /// provenance and rejecting duplicate escaped names.
+    /// Temporary B02-only construction seam. This is intentionally not part of
+    /// the public checker API because both its key and ownership shapes change
+    /// when `EscapedName` and `SymbolTableId` land.
+    #[allow(dead_code)]
     #[must_use]
-    pub fn create_semantic_symbol_table(
+    pub(super) fn create_semantic_symbol_table(
         &self,
         entries: Vec<(String, SemanticSymbolId)>,
     ) -> Option<SemanticSymbolTable> {
@@ -775,7 +745,7 @@ impl<SymbolPayload, MapperPayload> SemanticStore<TypeRecord, SymbolPayload, Mapp
         &mut self,
         flags: TypeFlags,
         intrinsic_name: impl Into<String>,
-    ) -> TypeId {
+    ) -> Option<TypeId> {
         self.alloc_intrinsic_type_ex(flags, intrinsic_name, ObjectFlags::NONE)
     }
 
@@ -784,16 +754,22 @@ impl<SymbolPayload, MapperPayload> SemanticStore<TypeRecord, SymbolPayload, Mapp
         flags: TypeFlags,
         intrinsic_name: impl Into<String>,
         object_flags: ObjectFlags,
-    ) -> TypeId {
+    ) -> Option<TypeId> {
+        let object_flags = object_flags.normalized_for_new_type();
+        if !Self::valid_intrinsic_flags(flags)
+            || !Self::object_flags_are_subset(object_flags, ObjectFlags::PROPAGATING_FLAGS)
+        {
+            return None;
+        }
         let intrinsic_name = intrinsic_name.into();
-        self.alloc_type_with(|id| TypeRecord {
+        Some(self.alloc_type_with(|id| TypeRecord {
             id,
             flags,
-            object_flags: object_flags.normalized_for_new_type(),
+            object_flags,
             symbol: None,
             alias: None,
             data: TypeData::Intrinsic(IntrinsicTypeData { intrinsic_name }),
-        })
+        }))
     }
 
     pub fn alloc_literal_type(
@@ -802,10 +778,14 @@ impl<SymbolPayload, MapperPayload> SemanticStore<TypeRecord, SymbolPayload, Mapp
         value: LiteralValue,
         regular_type: RegularLiteralLink,
     ) -> Option<TypeId> {
-        if let RegularLiteralLink::Type(regular_type) = regular_type
-            && !self.valid_record_type(regular_type)
-        {
+        if !Self::valid_literal_flags(&value, flags) {
             return None;
+        }
+        if let RegularLiteralLink::Type(regular_type) = regular_type {
+            let regular_record = self.type_payload(regular_type)?;
+            if !Self::record_is_compatible_literal(regular_record, flags, &value) {
+                return None;
+            }
         }
         self.alloc_record(flags, ObjectFlags::NONE, None, |id| {
             TypeData::Literal(LiteralTypeData {
@@ -819,7 +799,8 @@ impl<SymbolPayload, MapperPayload> SemanticStore<TypeRecord, SymbolPayload, Mapp
         })
     }
 
-    pub fn alloc_unique_es_symbol_type(
+    #[allow(dead_code)] // Public construction waits for B02 EscapedName.
+    pub(super) fn alloc_unique_es_symbol_type(
         &mut self,
         symbol: Option<SemanticSymbolId>,
         name: impl Into<String>,
@@ -872,11 +853,9 @@ impl<SymbolPayload, MapperPayload> SemanticStore<TypeRecord, SymbolPayload, Mapp
         object_flags: ObjectFlags,
         symbol: Option<SemanticSymbolId>,
     ) -> Option<TypeId> {
-        if !object_flags.intersects(ObjectFlags::CLASS_OR_INTERFACE)
-            || !Self::object_kind_matches(
-                object_flags,
-                ObjectFlags::CLASS_OR_INTERFACE | ObjectFlags::REFERENCE,
-            )
+        if !Self::has_exactly_one_interface_origin(object_flags)
+            || object_flags.intersects(ObjectFlags::REFERENCE)
+            || !Self::object_kind_matches(object_flags, ObjectFlags::CLASS_OR_INTERFACE)
         {
             return None;
         }
@@ -1004,7 +983,8 @@ impl<SymbolPayload, MapperPayload> SemanticStore<TypeRecord, SymbolPayload, Mapp
         object_flags: ObjectFlags,
         types: Vec<TypeId>,
     ) -> Option<TypeId> {
-        if !self.valid_record_types(&types) {
+        let object_flags = object_flags.normalized_for_new_type();
+        if !self.valid_record_types(&types) || !Self::valid_union_object_flags(object_flags) {
             return None;
         }
         self.alloc_record(TypeFlags::UNION, object_flags, None, |_| {
@@ -1023,7 +1003,9 @@ impl<SymbolPayload, MapperPayload> SemanticStore<TypeRecord, SymbolPayload, Mapp
         object_flags: ObjectFlags,
         types: Vec<TypeId>,
     ) -> Option<TypeId> {
-        if !self.valid_record_types(&types) {
+        let object_flags = object_flags.normalized_for_new_type();
+        if !self.valid_record_types(&types) || !Self::valid_intersection_object_flags(object_flags)
+        {
             return None;
         }
         self.alloc_record(TypeFlags::INTERSECTION, object_flags, None, |_| {
@@ -1161,11 +1143,78 @@ impl<SymbolPayload, MapperPayload> SemanticStore<TypeRecord, SymbolPayload, Mapp
         })
     }
 
+    /// Replaces cached/modifier object flags without permitting a payload-kind
+    /// transition. Interface `Reference` state is changed atomically by
+    /// [`Self::set_interface_type_parameters`], not through this method.
     pub fn set_type_object_flags(&mut self, id: TypeId, object_flags: ObjectFlags) -> bool {
+        let Some(record) = self.type_payload(id) else {
+            return false;
+        };
+        if !Self::valid_object_flag_transition(record, object_flags) {
+            return false;
+        }
         let Some(record) = self.type_payload_mut(id) else {
             return false;
         };
         record.object_flags = object_flags;
+        true
+    }
+
+    /// Adds lazy, propagation, or payload-specific object flags atomically.
+    pub fn add_type_object_flags(&mut self, id: TypeId, added: ObjectFlags) -> bool {
+        let Some(current) = self.type_payload(id).map(TypeRecord::object_flags) else {
+            return false;
+        };
+        self.set_type_object_flags(id, current | added)
+    }
+
+    /// Copies compatible object flags while clearing caller-selected cache or
+    /// freshness bits, as required by cloning and object-literal regularization.
+    pub fn copy_type_object_flags(
+        &mut self,
+        target: TypeId,
+        source: TypeId,
+        excluded: ObjectFlags,
+    ) -> bool {
+        let Some(source_flags) = self.type_payload(source).map(TypeRecord::object_flags) else {
+            return false;
+        };
+        self.set_type_object_flags(target, source_flags & !excluded)
+    }
+
+    /// Adds the only post-construction `TypeFlags` refinements used upstream:
+    /// `Boolean` and `EnumLiteral` on union payloads.
+    pub fn add_type_flags(&mut self, id: TypeId, added: TypeFlags) -> bool {
+        let Some(record) = self.type_payload(id) else {
+            return false;
+        };
+        let candidate = record.flags | added;
+        if !Self::valid_type_flag_transition(record, candidate) {
+            return false;
+        }
+        let Some(record) = self.type_payload_mut(id) else {
+            return false;
+        };
+        record.flags = candidate;
+        true
+    }
+
+    /// Copies flags only when the target payload can legally carry them and
+    /// the copy does not remove an existing refinement.
+    pub fn copy_type_flags(&mut self, target: TypeId, source: TypeId) -> bool {
+        let Some(source_flags) = self.type_payload(source).map(TypeRecord::flags) else {
+            return false;
+        };
+        let Some(target_record) = self.type_payload(target) else {
+            return false;
+        };
+        if !Self::valid_type_flag_transition(target_record, source_flags) {
+            return false;
+        }
+        let Some(target_record) = self.type_payload_mut(target) else {
+            return false;
+        };
+        target_record.flags = source_flags;
         true
     }
 
@@ -1336,24 +1385,53 @@ impl<SymbolPayload, MapperPayload> SemanticStore<TypeRecord, SymbolPayload, Mapp
         outer_type_parameter_count: usize,
         this_type: Option<TypeId>,
     ) -> bool {
-        if !self.valid_optional_record_types(all_type_parameters.as_deref())
-            || !self.valid_optional_record_type(this_type)
-            || outer_type_parameter_count > all_type_parameters.as_ref().map_or(0, Vec::len)
-            || all_type_parameters.as_ref().is_some_and(|parameters| {
-                this_type.is_some() && parameters.last().copied() != this_type
-            })
-        {
+        let Some(record) = self.type_payload(id) else {
+            return false;
+        };
+        let is_tuple = matches!(record.data, TypeData::Tuple(_));
+        if !matches!(record.data, TypeData::Interface(_) | TypeData::Tuple(_)) {
             return false;
         }
-        let Some(interface) = self
-            .type_payload_mut(id)
-            .and_then(|record| record.data.interface_mut())
-        else {
+
+        let reference_state = match (&all_type_parameters, this_type) {
+            (None, None) if outer_type_parameter_count == 0 && !is_tuple => false,
+            (Some(parameters), Some(this_type))
+                if !parameters.is_empty()
+                    && parameters.last().copied() == Some(this_type)
+                    && outer_type_parameter_count < parameters.len()
+                    && self.valid_record_types(parameters)
+                    && parameters.iter().all(|parameter| {
+                        matches!(
+                            self.type_payload(*parameter).map(TypeRecord::data),
+                            Some(TypeData::TypeParameter(_))
+                        )
+                    })
+                    && matches!(
+                        self.type_payload(this_type).map(TypeRecord::data),
+                        Some(TypeData::TypeParameter(data))
+                            if data.is_this_type && data.constraint == Some(id)
+                    ) =>
+            {
+                true
+            }
+            _ => return false,
+        };
+
+        let object_flags = if reference_state {
+            record.object_flags | ObjectFlags::REFERENCE
+        } else {
+            record.object_flags & !ObjectFlags::REFERENCE
+        };
+        let Some(record) = self.type_payload_mut(id) else {
+            return false;
+        };
+        let Some(interface) = record.data.interface_mut() else {
             return false;
         };
         interface.all_type_parameters = all_type_parameters;
         interface.outer_type_parameter_count = outer_type_parameter_count;
         interface.this_type = this_type;
+        record.object_flags = object_flags;
         true
     }
 
@@ -1541,7 +1619,8 @@ impl<SymbolPayload, MapperPayload> SemanticStore<TypeRecord, SymbolPayload, Mapp
     }
 
     #[allow(clippy::too_many_arguments)] // Mirrors the union-only lazy caches.
-    pub fn set_union_caches(
+    #[allow(dead_code)] // Public mutation waits for B02 EscapedName.
+    pub(super) fn set_union_caches(
         &mut self,
         id: TypeId,
         resolved_reduced_type: Option<TypeId>,
@@ -1627,7 +1706,19 @@ impl<SymbolPayload, MapperPayload> SemanticStore<TypeRecord, SymbolPayload, Mapp
         fresh_type: Option<TypeId>,
         regular_type: TypeId,
     ) -> bool {
-        if !self.valid_optional_record_type(fresh_type) || !self.valid_record_type(regular_type) {
+        let compatible = self.type_payload(id).is_some_and(|record| {
+            let TypeData::Literal(data) = &record.data else {
+                return false;
+            };
+            self.type_payload(regular_type).is_some_and(|candidate| {
+                Self::record_is_compatible_literal(candidate, record.flags, &data.value)
+            }) && fresh_type.is_none_or(|fresh_type| {
+                self.type_payload(fresh_type).is_some_and(|candidate| {
+                    Self::record_is_compatible_literal(candidate, record.flags, &data.value)
+                })
+            })
+        });
+        if !compatible {
             return false;
         }
         let Some(TypeData::Literal(data)) =
@@ -1686,7 +1777,219 @@ impl<SymbolPayload, MapperPayload> SemanticStore<TypeRecord, SymbolPayload, Mapp
     }
 
     fn object_kind_matches(flags: ObjectFlags, allowed: ObjectFlags) -> bool {
-        (flags & ObjectFlags::OBJECT_TYPE_KIND_MASK & !allowed).is_empty()
+        flags.bits() & (1 << 31) == 0
+            && (flags & ObjectFlags::OBJECT_TYPE_KIND_MASK & !allowed).is_empty()
+    }
+
+    fn has_exactly_one_interface_origin(flags: ObjectFlags) -> bool {
+        let origin = flags & ObjectFlags::CLASS_OR_INTERFACE;
+        origin == ObjectFlags::CLASS || origin == ObjectFlags::INTERFACE
+    }
+
+    fn object_flags_are_subset(flags: ObjectFlags, allowed: ObjectFlags) -> bool {
+        flags.bits() & !allowed.bits() == 0
+    }
+
+    fn valid_intrinsic_flags(flags: TypeFlags) -> bool {
+        flags.bits().is_power_of_two() && TypeFlags::INTRINSIC.contains(flags)
+    }
+
+    fn valid_literal_flags(value: &LiteralValue, flags: TypeFlags) -> bool {
+        match value {
+            LiteralValue::String(_) => {
+                flags == TypeFlags::STRING_LITERAL
+                    || flags == TypeFlags::STRING_LITERAL | TypeFlags::ENUM_LITERAL
+            }
+            LiteralValue::Number(_) => {
+                flags == TypeFlags::NUMBER_LITERAL
+                    || flags == TypeFlags::NUMBER_LITERAL | TypeFlags::ENUM_LITERAL
+            }
+            LiteralValue::Boolean(_) => flags == TypeFlags::BOOLEAN_LITERAL,
+            LiteralValue::BigInt(_) => flags == TypeFlags::BIG_INT_LITERAL,
+            LiteralValue::ComputedEnum => flags == TypeFlags::ENUM,
+        }
+    }
+
+    fn literal_values_are_equal(left: &LiteralValue, right: &LiteralValue) -> bool {
+        match (left, right) {
+            (LiteralValue::String(left), LiteralValue::String(right)) => left == right,
+            (LiteralValue::Number(left), LiteralValue::Number(right)) => {
+                left == right || left.is_nan() && right.is_nan()
+            }
+            (LiteralValue::Boolean(left), LiteralValue::Boolean(right)) => left == right,
+            (LiteralValue::BigInt(left), LiteralValue::BigInt(right)) => left == right,
+            (LiteralValue::ComputedEnum, LiteralValue::ComputedEnum) => true,
+            _ => false,
+        }
+    }
+
+    fn record_is_compatible_literal(
+        record: &TypeRecord,
+        flags: TypeFlags,
+        value: &LiteralValue,
+    ) -> bool {
+        matches!(
+            &record.data,
+            TypeData::Literal(data)
+                if record.flags == flags && Self::literal_values_are_equal(&data.value, value)
+        )
+    }
+
+    fn valid_type_flags_for_record(record: &TypeRecord, flags: TypeFlags) -> bool {
+        match &record.data {
+            TypeData::Intrinsic(_) => Self::valid_intrinsic_flags(flags),
+            TypeData::Literal(data) => Self::valid_literal_flags(&data.value, flags),
+            TypeData::UniqueEsSymbol(_) => flags == TypeFlags::UNIQUE_ES_SYMBOL,
+            TypeData::Object(_)
+            | TypeData::TypeReference(_)
+            | TypeData::Interface(_)
+            | TypeData::Tuple(_)
+            | TypeData::InstantiationExpression(_)
+            | TypeData::Mapped(_)
+            | TypeData::ReverseMapped(_)
+            | TypeData::EvolvingArray(_) => flags == TypeFlags::OBJECT,
+            TypeData::Union(_) => {
+                let allowed = TypeFlags::UNION | TypeFlags::BOOLEAN | TypeFlags::ENUM_LITERAL;
+                flags.contains(TypeFlags::UNION)
+                    && flags.bits() & !allowed.bits() == 0
+                    && !(flags.contains(TypeFlags::BOOLEAN)
+                        && flags.contains(TypeFlags::ENUM_LITERAL))
+            }
+            TypeData::Intersection(_) => flags == TypeFlags::INTERSECTION,
+            TypeData::TypeParameter(_) => flags == TypeFlags::TYPE_PARAMETER,
+            TypeData::Index(_) => flags == TypeFlags::INDEX,
+            TypeData::IndexedAccess(_) => flags == TypeFlags::INDEXED_ACCESS,
+            TypeData::TemplateLiteral(_) => flags == TypeFlags::TEMPLATE_LITERAL,
+            TypeData::StringMapping(_) => flags == TypeFlags::STRING_MAPPING,
+            TypeData::Substitution(_) => flags == TypeFlags::SUBSTITUTION,
+            TypeData::Conditional(_) => flags == TypeFlags::CONDITIONAL,
+        }
+    }
+
+    fn valid_type_flag_transition(record: &TypeRecord, candidate: TypeFlags) -> bool {
+        candidate.contains(record.flags) && Self::valid_type_flags_for_record(record, candidate)
+    }
+
+    fn common_non_object_flags() -> ObjectFlags {
+        ObjectFlags::PROPAGATING_FLAGS
+            | ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES_COMPUTED
+            | ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES
+    }
+
+    fn valid_union_object_flags(flags: ObjectFlags) -> bool {
+        let allowed = Self::common_non_object_flags()
+            | ObjectFlags::MEMBERS_RESOLVED
+            | ObjectFlags::PRIMITIVE_UNION
+            | ObjectFlags::IS_GENERIC_TYPE_COMPUTED
+            | ObjectFlags::IS_GENERIC_TYPE
+            | ObjectFlags::CONTAINS_INTERSECTIONS
+            | ObjectFlags::IS_UNKNOWN_LIKE_UNION_COMPUTED
+            | ObjectFlags::IS_UNKNOWN_LIKE_UNION;
+        Self::object_flags_are_subset(flags, allowed)
+    }
+
+    fn valid_intersection_object_flags(flags: ObjectFlags) -> bool {
+        let allowed = Self::common_non_object_flags()
+            | ObjectFlags::MEMBERS_RESOLVED
+            | ObjectFlags::IS_GENERIC_TYPE_COMPUTED
+            | ObjectFlags::IS_GENERIC_TYPE
+            | ObjectFlags::IS_NEVER_INTERSECTION_COMPUTED
+            | ObjectFlags::IS_NEVER_INTERSECTION
+            | ObjectFlags::IS_CONSTRAINED_TYPE_VARIABLE;
+        Self::object_flags_are_subset(flags, allowed)
+    }
+
+    fn valid_object_flags_for_record(record: &TypeRecord, flags: ObjectFlags) -> bool {
+        let base_mask = ObjectFlags::CLASS_OR_INTERFACE
+            | ObjectFlags::REFERENCE
+            | ObjectFlags::TUPLE
+            | ObjectFlags::ANONYMOUS
+            | ObjectFlags::MAPPED
+            | ObjectFlags::REVERSE_MAPPED
+            | ObjectFlags::EVOLVING_ARRAY
+            | ObjectFlags::INSTANTIATION_EXPRESSION_TYPE;
+        let base = flags & base_mask;
+        let object_payload_matches = match &record.data {
+            TypeData::Object(_) => base == ObjectFlags::ANONYMOUS,
+            TypeData::TypeReference(_) => {
+                base == ObjectFlags::REFERENCE
+                    && !flags.intersects(ObjectFlags::SINGLE_SIGNATURE_TYPE)
+            }
+            TypeData::Interface(data) => {
+                let reference_state = data.all_type_parameters.is_some();
+                let expected_base = (flags & ObjectFlags::CLASS_OR_INTERFACE)
+                    | if reference_state {
+                        ObjectFlags::REFERENCE
+                    } else {
+                        ObjectFlags::NONE
+                    };
+                Self::has_exactly_one_interface_origin(flags)
+                    && base == expected_base
+                    && flags.intersects(ObjectFlags::REFERENCE) == reference_state
+                    && !flags.intersects(ObjectFlags::SINGLE_SIGNATURE_TYPE)
+            }
+            TypeData::Tuple(_) => {
+                base == ObjectFlags::REFERENCE | ObjectFlags::TUPLE
+                    && !flags.intersects(ObjectFlags::SINGLE_SIGNATURE_TYPE)
+            }
+            TypeData::InstantiationExpression(_) => {
+                base == ObjectFlags::ANONYMOUS | ObjectFlags::INSTANTIATION_EXPRESSION_TYPE
+                    && !flags.intersects(ObjectFlags::SINGLE_SIGNATURE_TYPE)
+            }
+            TypeData::Mapped(_) => {
+                base == ObjectFlags::MAPPED && !flags.intersects(ObjectFlags::SINGLE_SIGNATURE_TYPE)
+            }
+            TypeData::ReverseMapped(_) => {
+                base == ObjectFlags::ANONYMOUS | ObjectFlags::REVERSE_MAPPED
+                    && !flags.intersects(ObjectFlags::SINGLE_SIGNATURE_TYPE)
+            }
+            TypeData::EvolvingArray(_) => {
+                base == ObjectFlags::EVOLVING_ARRAY
+                    && !flags.intersects(ObjectFlags::SINGLE_SIGNATURE_TYPE)
+            }
+            _ => false,
+        };
+        if record.flags == TypeFlags::OBJECT {
+            return flags.bits() & (1 << 31) == 0 && object_payload_matches;
+        }
+
+        let allowed = match &record.data {
+            TypeData::Intrinsic(_) => ObjectFlags::PROPAGATING_FLAGS,
+            TypeData::Literal(_) | TypeData::UniqueEsSymbol(_) => ObjectFlags::NONE,
+            TypeData::Union(_) => return Self::valid_union_object_flags(flags),
+            TypeData::Intersection(_) => return Self::valid_intersection_object_flags(flags),
+            TypeData::Substitution(_) => {
+                Self::common_non_object_flags()
+                    | ObjectFlags::IS_GENERIC_TYPE_COMPUTED
+                    | ObjectFlags::IS_GENERIC_TYPE
+            }
+            TypeData::TypeParameter(_)
+            | TypeData::Index(_)
+            | TypeData::IndexedAccess(_)
+            | TypeData::TemplateLiteral(_)
+            | TypeData::StringMapping(_)
+            | TypeData::Conditional(_) => Self::common_non_object_flags(),
+            TypeData::Object(_)
+            | TypeData::TypeReference(_)
+            | TypeData::Interface(_)
+            | TypeData::Tuple(_)
+            | TypeData::InstantiationExpression(_)
+            | TypeData::Mapped(_)
+            | TypeData::ReverseMapped(_)
+            | TypeData::EvolvingArray(_) => return false,
+        };
+        Self::object_flags_are_subset(flags, allowed)
+    }
+
+    fn valid_object_flag_transition(record: &TypeRecord, candidate: ObjectFlags) -> bool {
+        if !Self::valid_object_flags_for_record(record, candidate) {
+            return false;
+        }
+        if matches!(record.data, TypeData::Interface(_)) {
+            return record.object_flags & ObjectFlags::CLASS_OR_INTERFACE
+                == candidate & ObjectFlags::CLASS_OR_INTERFACE;
+        }
+        true
     }
 
     fn valid_record_types(&self, ids: &[TypeId]) -> bool {
@@ -1743,42 +2046,41 @@ impl<SymbolPayload, MapperPayload> SemanticStore<TypeRecord, SymbolPayload, Mapp
         let TypeCacheState::Allocated(entries) = cache else {
             return true;
         };
-        let mut keys = BTreeSet::new();
-        entries
-            .iter()
-            .all(|entry| keys.insert(entry.key) && self.valid_record_type(entry.value))
+        entries.values().all(|value| self.valid_record_type(*value))
     }
 
     fn valid_constituent_map(&self, map: &ConstituentMapState) -> bool {
         let ConstituentMapState::Allocated(entries) = map else {
             return true;
         };
-        let mut keys = BTreeSet::new();
-        entries.iter().all(|entry| {
-            keys.insert(entry.key)
-                && self.valid_record_type(entry.key)
-                && self.valid_record_type(entry.value)
-        })
+        entries
+            .iter()
+            .all(|(key, value)| self.valid_record_type(*key) && self.valid_record_type(*value))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use ts_ast::FileId;
+    use std::collections::HashMap;
+
+    use ts_ast::{FileId, SyntaxKind};
     use ts_jsnum::{Number, PseudoBigInt};
     use ts_parser::parse_source_file;
 
     use super::*;
     use crate::semantic::{
-        AstScope,
         signatures::{ElementFlags, SignatureFlags},
+        AstScope,
     };
 
     type TestStore = CanonicalSemanticStore<&'static str, &'static str>;
 
     struct SeededStore {
         store: TestStore,
-        node: NodeRef,
+        conditional_node: NodeRef,
+        mapped_node: NodeRef,
+        reference_node: NodeRef,
+        tuple_label_node: NodeRef,
         base: TypeId,
         symbol: SemanticSymbolId,
         mapper: TypeMapperId,
@@ -1789,22 +2091,42 @@ mod tests {
     }
 
     fn seeded_store(payload: &'static str) -> SeededStore {
-        let parsed = parse_source_file("type Result<T> = T extends string ? T : never;");
+        let parsed = parse_source_file(
+            "type Result<T> = T extends string ? T : never;\n\
+             type Mapping<T> = { [K in keyof T]: T[K] };\n\
+             type Reference = Array<string>;\n\
+             type Tuple = [label: string];\n\
+             declare function f(parameter: string): void;",
+        );
         let scope = AstScope::new(FileId::new(0), &parsed.arena);
-        let node = scope.node_ref(parsed.source_file).unwrap();
+        let node_of_kind = |kind| {
+            let (node, _) = parsed
+                .arena
+                .iter()
+                .find(|(_, node)| node.kind == kind)
+                .unwrap_or_else(|| panic!("fixture is missing {kind:?}"));
+            scope.node_ref(node).unwrap()
+        };
+        let conditional_node = node_of_kind(SyntaxKind::ConditionalType);
+        let mapped_node = node_of_kind(SyntaxKind::MappedType);
+        let reference_node = node_of_kind(SyntaxKind::TypeReference);
+        let tuple_label_node = node_of_kind(SyntaxKind::NamedTupleMember);
+        let declaration_node = node_of_kind(SyntaxKind::Parameter);
         let mut store = TestStore::new();
         assert!(store.register_ast_scope(scope));
-        let base = store.alloc_intrinsic_type(TypeFlags::STRING, "string");
+        let base = store
+            .alloc_intrinsic_type(TypeFlags::STRING, "string")
+            .unwrap();
         let symbol = store.alloc_symbol(payload);
         let mapper = store.alloc_mapper(payload);
         let alias = store.alloc_type_alias(Some(symbol)).unwrap();
         let root = store
-            .alloc_conditional_root(node, base, base, true, None, None, Some(alias))
+            .alloc_conditional_root(conditional_node, base, base, true, None, None, Some(alias))
             .unwrap();
         let signature = store
             .alloc_signature(
                 SignatureFlags::NONE,
-                Some(node),
+                Some(declaration_node),
                 vec![base],
                 Some(symbol),
                 vec![symbol],
@@ -1814,11 +2136,20 @@ mod tests {
             )
             .unwrap();
         let index_info = store
-            .alloc_index_info(base, base, false, Some(node), vec![node])
+            .alloc_index_info(
+                base,
+                base,
+                false,
+                Some(declaration_node),
+                vec![declaration_node],
+            )
             .unwrap();
         SeededStore {
             store,
-            node,
+            conditional_node,
+            mapped_node,
+            reference_node,
+            tuple_label_node,
             base,
             symbol,
             mapper,
@@ -1834,7 +2165,7 @@ mod tests {
         let mut seeded = seeded_store("local");
         let store = &mut seeded.store;
         let element = store
-            .create_tuple_element_info(ElementFlags::REQUIRED, Some(seeded.node))
+            .create_tuple_element_info(ElementFlags::REQUIRED, Some(seeded.tuple_label_node))
             .unwrap();
         let tuple_metadata = store.create_tuple_metadata(vec![element], true).unwrap();
 
@@ -1866,11 +2197,15 @@ mod tests {
                 .alloc_instantiation_expression_type(
                     ObjectFlags::NONE,
                     Some(seeded.symbol),
-                    Some(seeded.node),
+                    Some(seeded.reference_node),
                 )
                 .unwrap(),
             store
-                .alloc_mapped_type(ObjectFlags::NONE, Some(seeded.symbol), Some(seeded.node))
+                .alloc_mapped_type(
+                    ObjectFlags::NONE,
+                    Some(seeded.symbol),
+                    Some(seeded.mapped_node),
+                )
                 .unwrap(),
             store
                 .alloc_reverse_mapped_type(ObjectFlags::NONE, None)
@@ -1950,7 +2285,8 @@ mod tests {
             | ObjectFlags::CONTAINS_WIDENING_TYPE;
         let intrinsic = seeded
             .store
-            .alloc_intrinsic_type_ex(TypeFlags::UNKNOWN, "unknown", reset);
+            .alloc_intrinsic_type_ex(TypeFlags::UNKNOWN, "unknown", reset)
+            .unwrap();
         assert_eq!(
             seeded.store.type_payload(intrinsic).unwrap().object_flags(),
             ObjectFlags::CONTAINS_WIDENING_TYPE
@@ -2025,29 +2361,33 @@ mod tests {
             Some(vec![seeded.signature, seeded.signature])
         );
         assert_eq!(object_data.structured.call_signature_count, 1);
-        assert!(
-            seeded
-                .store
-                .type_payload(object)
-                .unwrap()
-                .object_flags()
-                .contains(ObjectFlags::MEMBERS_RESOLVED)
-        );
+        assert!(seeded
+            .store
+            .type_payload(object)
+            .unwrap()
+            .object_flags()
+            .contains(ObjectFlags::MEMBERS_RESOLVED));
     }
 
     #[test]
     fn literal_values_preserve_all_upstream_alternatives() {
         let mut store = TestStore::new();
-        let values = [
-            LiteralValue::String("s".into()),
-            LiteralValue::Number(Number::new(-0.0)),
-            LiteralValue::Boolean(false),
-            LiteralValue::BigInt(PseudoBigInt::parse_valid("0x10n")),
-            LiteralValue::ComputedEnum,
+        let cases = [
+            (TypeFlags::STRING_LITERAL, LiteralValue::String("s".into())),
+            (
+                TypeFlags::NUMBER_LITERAL,
+                LiteralValue::Number(Number::new(-0.0)),
+            ),
+            (TypeFlags::BOOLEAN_LITERAL, LiteralValue::Boolean(false)),
+            (
+                TypeFlags::BIG_INT_LITERAL,
+                LiteralValue::BigInt(PseudoBigInt::parse_valid("0x10n")),
+            ),
+            (TypeFlags::ENUM, LiteralValue::ComputedEnum),
         ];
-        let ids = values.map(|value| {
+        let ids = cases.map(|(flags, value)| {
             store
-                .alloc_literal_type(TypeFlags::ENUM_LITERAL, value, RegularLiteralLink::SelfType)
+                .alloc_literal_type(flags, value, RegularLiteralLink::SelfType)
                 .unwrap()
         });
         assert!(matches!(
@@ -2106,11 +2446,9 @@ mod tests {
                 RegularLiteralLink::Type(regular),
             )
             .unwrap();
-        assert!(
-            seeded
-                .store
-                .set_literal_links(regular, Some(fresh), regular)
-        );
+        assert!(seeded
+            .store
+            .set_literal_links(regular, Some(fresh), regular));
 
         let interface = seeded
             .store
@@ -2121,20 +2459,40 @@ mod tests {
             Some(interface),
             Some(seeded.mapper)
         ));
+        let outer_type_parameter = seeded.store.alloc_type_parameter(None).unwrap();
+        let this_type = seeded.store.alloc_type_parameter(None).unwrap();
+        assert!(seeded.store.set_type_parameter_resolution(
+            this_type,
+            Some(interface),
+            None,
+            None,
+            true,
+            None,
+        ));
+        assert!(!seeded.store.set_interface_type_parameters(
+            interface,
+            Some(vec![this_type, outer_type_parameter]),
+            1,
+            Some(this_type),
+        ));
         assert!(seeded.store.set_interface_type_parameters(
             interface,
-            Some(vec![interface]),
-            0,
-            Some(interface),
+            Some(vec![outer_type_parameter, this_type]),
+            1,
+            Some(this_type),
         ));
+        assert!(seeded
+            .store
+            .type_payload(interface)
+            .unwrap()
+            .object_flags()
+            .contains(ObjectFlags::REFERENCE));
 
         let alias = seeded.store.alloc_type_alias(Some(seeded.symbol)).unwrap();
         assert!(seeded.store.set_type_alias(interface, Some(alias)));
-        assert!(
-            seeded
-                .store
-                .set_type_alias_arguments(alias, Some(vec![interface]))
-        );
+        assert!(seeded
+            .store
+            .set_type_alias_arguments(alias, Some(vec![interface])));
 
         let conditional = seeded
             .store
@@ -2148,10 +2506,10 @@ mod tests {
             .unwrap();
         assert!(seeded.store.set_conditional_root_instantiations(
             seeded.root,
-            TypeCacheState::Allocated(vec![TypeCacheEntry {
-                key: CacheHashKey::from_halves(1, 2),
-                value: conditional,
-            }]),
+            TypeCacheState::Allocated(HashMap::from([(
+                CacheHashKey::from_halves(1, 2),
+                conditional,
+            )])),
         ));
 
         let TypeData::Literal(regular_data) = seeded.store.type_payload(regular).unwrap().data()
@@ -2173,16 +2531,16 @@ mod tests {
                 .conditional_root(seeded.root)
                 .unwrap()
                 .instantiations(),
-            &TypeCacheState::Allocated(vec![TypeCacheEntry {
-                key: CacheHashKey::from_halves(1, 2),
-                value: conditional,
-            }])
+            &TypeCacheState::Allocated(HashMap::from([(
+                CacheHashKey::from_halves(1, 2),
+                conditional,
+            )]))
         );
     }
 
     #[test]
     fn foreign_handles_are_rejected_per_slot_before_mutation() {
-        let first = seeded_store("first");
+        let mut first = seeded_store("first");
         let mut second = seeded_store("second");
         assert_eq!(first.base.get(), second.base.get());
         assert_eq!(first.symbol.get(), second.symbol.get());
@@ -2192,15 +2550,45 @@ mod tests {
         assert_eq!(second.store.type_alias(first.alias), None);
         assert_eq!(second.store.conditional_root(first.root), None);
 
+        let first_literal = first
+            .store
+            .alloc_literal_type(
+                TypeFlags::STRING_LITERAL,
+                LiteralValue::String("x".into()),
+                RegularLiteralLink::SelfType,
+            )
+            .unwrap();
+        let second_literal = second
+            .store
+            .alloc_literal_type(
+                TypeFlags::STRING_LITERAL,
+                LiteralValue::String("x".into()),
+                RegularLiteralLink::SelfType,
+            )
+            .unwrap();
+        assert_eq!(first_literal.get(), second_literal.get());
+
         let type_count = second.store.type_len();
         assert_eq!(
             second.store.alloc_literal_type(
                 TypeFlags::STRING_LITERAL,
                 LiteralValue::String("x".into()),
-                RegularLiteralLink::Type(first.base),
+                RegularLiteralLink::Type(first_literal),
             ),
             None
         );
+        assert!(!second.store.set_literal_links(
+            second_literal,
+            Some(first_literal),
+            second_literal
+        ));
+        let TypeData::Literal(second_literal_data) =
+            second.store.type_payload(second_literal).unwrap().data()
+        else {
+            panic!("expected literal")
+        };
+        assert_eq!(second_literal_data.fresh_type, None);
+        assert_eq!(second_literal_data.regular_type, second_literal);
         assert_eq!(
             second
                 .store
@@ -2273,11 +2661,9 @@ mod tests {
             .unwrap();
         assert!(!second.store.set_type_symbol(object, Some(first.symbol)));
         assert!(!second.store.set_type_alias(object, Some(first.alias)));
-        assert!(
-            !second
-                .store
-                .set_resolved_base_constraint(object, Some(first.base))
-        );
+        assert!(!second
+            .store
+            .set_resolved_base_constraint(object, Some(first.base)));
         assert!(!second.store.set_object_target_and_mapper(
             object,
             Some(first.base),
@@ -2290,10 +2676,7 @@ mod tests {
         ));
         assert!(!second.store.set_object_instantiations(
             object,
-            TypeCacheState::Allocated(vec![TypeCacheEntry {
-                key: CacheHashKey::new(1),
-                value: first.base,
-            }]),
+            TypeCacheState::Allocated(HashMap::from([(CacheHashKey::new(1), first.base)])),
         ));
         let foreign_table = first
             .store
@@ -2351,34 +2734,23 @@ mod tests {
     }
 
     #[test]
-    fn nested_tables_and_caches_reject_duplicates_without_mutation() {
-        let mut seeded = seeded_store("local");
-        assert!(
-            seeded
-                .store
-                .create_semantic_symbol_table(vec![
-                    ("same".into(), seeded.symbol),
-                    ("same".into(), seeded.symbol),
-                ])
-                .is_none()
-        );
+    fn nested_tables_and_hash_maps_reject_foreign_keys_and_values_without_mutation() {
+        let first = seeded_store("first");
+        let mut seeded = seeded_store("second");
+        assert!(seeded
+            .store
+            .create_semantic_symbol_table(vec![
+                ("same".into(), seeded.symbol),
+                ("same".into(), seeded.symbol),
+            ])
+            .is_none());
         let object = seeded
             .store
             .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(seeded.symbol))
             .unwrap();
-        let duplicate_key = CacheHashKey::new(7);
         assert!(!seeded.store.set_object_instantiations(
             object,
-            TypeCacheState::Allocated(vec![
-                TypeCacheEntry {
-                    key: duplicate_key,
-                    value: seeded.base,
-                },
-                TypeCacheEntry {
-                    key: duplicate_key,
-                    value: object,
-                },
-            ]),
+            TypeCacheState::Allocated(HashMap::from([(CacheHashKey::new(7), first.base)])),
         ));
         let union = seeded
             .store
@@ -2390,16 +2762,15 @@ mod tests {
             None,
             None,
             "key",
-            ConstituentMapState::Allocated(vec![
-                ConstituentEntry {
-                    key: seeded.base,
-                    value: object,
-                },
-                ConstituentEntry {
-                    key: seeded.base,
-                    value: union,
-                },
-            ]),
+            ConstituentMapState::Allocated(HashMap::from([(first.base, object)])),
+        ));
+        assert!(!seeded.store.set_union_caches(
+            union,
+            None,
+            None,
+            None,
+            "key",
+            ConstituentMapState::Allocated(HashMap::from([(seeded.base, first.base)])),
         ));
         let TypeData::Object(object_data) = seeded.store.type_payload(object).unwrap().data()
         else {
@@ -2414,7 +2785,7 @@ mod tests {
     }
 
     #[test]
-    fn allocated_empty_states_and_entry_order_remain_observable() {
+    fn allocated_empty_states_and_hash_map_lookup_remain_observable() {
         assert_eq!(std::mem::size_of::<CacheHashKey>(), 16);
         let mut seeded = seeded_store("local");
         let second_symbol = seeded.store.alloc_symbol("second");
@@ -2426,7 +2797,7 @@ mod tests {
             ])
             .unwrap();
         assert_eq!(
-            table.entries(),
+            table.entries,
             [
                 ("z".to_owned(), seeded.symbol),
                 ("a".to_owned(), second_symbol),
@@ -2436,13 +2807,11 @@ mod tests {
             .store
             .create_semantic_symbol_table(Vec::new())
             .unwrap();
-        assert!(empty_table.is_empty());
+        assert!(empty_table.entries.is_empty());
 
-        assert!(
-            seeded
-                .store
-                .set_type_alias_arguments(seeded.alias, Some(Vec::new()))
-        );
+        assert!(seeded
+            .store
+            .set_type_alias_arguments(seeded.alias, Some(Vec::new())));
         assert_eq!(
             seeded
                 .store
@@ -2456,18 +2825,16 @@ mod tests {
             .store
             .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(seeded.symbol))
             .unwrap();
-        assert!(
-            seeded
-                .store
-                .set_object_instantiations(object, TypeCacheState::Allocated(Vec::new()),)
-        );
+        assert!(seeded
+            .store
+            .set_object_instantiations(object, TypeCacheState::Allocated(HashMap::new()),));
         let TypeData::Object(object_data) = seeded.store.type_payload(object).unwrap().data()
         else {
             panic!("expected object")
         };
         assert_eq!(
             object_data.instantiations,
-            TypeCacheState::Allocated(Vec::new())
+            TypeCacheState::Allocated(HashMap::new())
         );
 
         let union = seeded
@@ -2479,16 +2846,10 @@ mod tests {
         assert_eq!(first_key.get(), (0x0123_u128 << 64) | 0x4567);
         assert!(seeded.store.set_object_instantiations(
             object,
-            TypeCacheState::Allocated(vec![
-                TypeCacheEntry {
-                    key: second_key,
-                    value: union,
-                },
-                TypeCacheEntry {
-                    key: first_key,
-                    value: seeded.base,
-                },
-            ]),
+            TypeCacheState::Allocated(HashMap::from([
+                (second_key, union),
+                (first_key, seeded.base),
+            ])),
         ));
         assert!(seeded.store.set_union_caches(
             union,
@@ -2496,69 +2857,42 @@ mod tests {
             None,
             None,
             "kind",
-            ConstituentMapState::Allocated(vec![
-                ConstituentEntry {
-                    key: object,
-                    value: union,
-                },
-                ConstituentEntry {
-                    key: seeded.base,
-                    value: object,
-                },
-            ]),
+            ConstituentMapState::Allocated(HashMap::from(
+                [(object, union), (seeded.base, object),]
+            )),
         ));
         let TypeData::Object(object_data) = seeded.store.type_payload(object).unwrap().data()
         else {
             panic!("expected object")
         };
-        assert_eq!(
-            object_data.instantiations,
-            TypeCacheState::Allocated(vec![
-                TypeCacheEntry {
-                    key: second_key,
-                    value: union,
-                },
-                TypeCacheEntry {
-                    key: first_key,
-                    value: seeded.base,
-                },
-            ])
-        );
+        let TypeCacheState::Allocated(instantiations) = &object_data.instantiations else {
+            panic!("expected allocated instantiations")
+        };
+        assert_eq!(instantiations.get(&second_key), Some(&union));
+        assert_eq!(instantiations.get(&first_key), Some(&seeded.base));
         let TypeData::Union(union_data) = seeded.store.type_payload(union).unwrap().data() else {
             panic!("expected union")
         };
-        assert_eq!(
-            union_data.constituent_map,
-            ConstituentMapState::Allocated(vec![
-                ConstituentEntry {
-                    key: object,
-                    value: union,
-                },
-                ConstituentEntry {
-                    key: seeded.base,
-                    value: object,
-                },
-            ])
-        );
+        let ConstituentMapState::Allocated(constituents) = &union_data.constituent_map else {
+            panic!("expected allocated constituents")
+        };
+        assert_eq!(constituents.get(&object), Some(&union));
+        assert_eq!(constituents.get(&seeded.base), Some(&object));
     }
 
     #[test]
     fn auxiliary_records_and_node_slots_reject_foreign_provenance() {
         let first = seeded_store("first");
         let mut second = seeded_store("second");
-        assert!(
-            second
-                .store
-                .create_semantic_symbol_table(vec![("x".into(), first.symbol)])
-                .is_none()
-        );
+        assert!(second
+            .store
+            .create_semantic_symbol_table(vec![("x".into(), first.symbol)])
+            .is_none());
         assert_eq!(second.store.alloc_type_alias(Some(first.symbol)), None);
         assert!(!second.store.set_type_alias_arguments(first.alias, None));
-        assert!(
-            !second
-                .store
-                .set_type_alias_arguments(second.alias, Some(vec![first.base]))
-        );
+        assert!(!second
+            .store
+            .set_type_alias_arguments(second.alias, Some(vec![first.base])));
         assert_eq!(
             second
                 .store
@@ -2571,7 +2905,7 @@ mod tests {
         let root_count = second.store.conditional_root_len();
         assert_eq!(
             second.store.alloc_conditional_root(
-                first.node,
+                first.conditional_node,
                 second.base,
                 second.base,
                 true,
@@ -2583,7 +2917,7 @@ mod tests {
         );
         assert_eq!(
             second.store.alloc_conditional_root(
-                second.node,
+                second.conditional_node,
                 first.base,
                 second.base,
                 true,
@@ -2595,7 +2929,7 @@ mod tests {
         );
         assert_eq!(
             second.store.alloc_conditional_root(
-                second.node,
+                second.conditional_node,
                 second.base,
                 first.base,
                 true,
@@ -2607,7 +2941,7 @@ mod tests {
         );
         assert_eq!(
             second.store.alloc_conditional_root(
-                second.node,
+                second.conditional_node,
                 second.base,
                 second.base,
                 true,
@@ -2619,7 +2953,7 @@ mod tests {
         );
         assert_eq!(
             second.store.alloc_conditional_root(
-                second.node,
+                second.conditional_node,
                 second.base,
                 second.base,
                 true,
@@ -2631,7 +2965,7 @@ mod tests {
         );
         assert_eq!(
             second.store.alloc_conditional_root(
-                second.node,
+                second.conditional_node,
                 second.base,
                 second.base,
                 true,
@@ -2642,16 +2976,12 @@ mod tests {
             None
         );
         assert_eq!(second.store.conditional_root_len(), root_count);
-        assert!(
-            !second
-                .store
-                .set_conditional_root_instantiations(first.root, TypeCacheState::Unallocated)
-        );
-        assert!(
-            !second
-                .store
-                .set_conditional_root_alias(second.root, Some(first.alias))
-        );
+        assert!(!second
+            .store
+            .set_conditional_root_instantiations(first.root, TypeCacheState::Unallocated));
+        assert!(!second
+            .store
+            .set_conditional_root_alias(second.root, Some(first.alias)));
         assert_eq!(
             second.store.conditional_root(second.root).unwrap().alias(),
             Some(second.alias)
@@ -2663,12 +2993,12 @@ mod tests {
             .unwrap();
         assert!(!second.store.set_type_reference_resolution(
             reference,
-            Some(first.node),
+            Some(first.reference_node),
             Some(vec![second.base]),
         ));
         assert!(!second.store.set_type_reference_resolution(
             reference,
-            Some(second.node),
+            Some(second.reference_node),
             Some(vec![first.base]),
         ));
         let TypeData::TypeReference(reference_data) =
@@ -2683,11 +3013,9 @@ mod tests {
             .store
             .alloc_instantiation_expression_type(ObjectFlags::NONE, Some(second.symbol), None)
             .unwrap();
-        assert!(
-            !second
-                .store
-                .set_instantiation_expression_node(expression, Some(first.node))
-        );
+        assert!(!second
+            .store
+            .set_instantiation_expression_node(expression, Some(first.reference_node)));
         let TypeData::InstantiationExpression(expression_data) =
             second.store.type_payload(expression).unwrap().data()
         else {
@@ -2697,7 +3025,7 @@ mod tests {
 
         let foreign_element = first
             .store
-            .create_tuple_element_info(ElementFlags::REQUIRED, Some(first.node))
+            .create_tuple_element_info(ElementFlags::REQUIRED, Some(first.tuple_label_node))
             .unwrap();
         let foreign_metadata = first
             .store
@@ -2711,6 +3039,358 @@ mod tests {
             None
         );
         assert_eq!(second.store.type_len(), type_count);
+    }
+
+    #[test]
+    fn type_and_object_flag_transitions_preserve_payload_dispatch() {
+        let mut seeded = seeded_store("local");
+        let source = seeded
+            .store
+            .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(seeded.symbol))
+            .unwrap();
+        let regular = seeded
+            .store
+            .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(seeded.symbol))
+            .unwrap();
+        assert!(seeded.store.add_type_object_flags(
+            source,
+            ObjectFlags::OBJECT_LITERAL
+                | ObjectFlags::FRESH_LITERAL
+                | ObjectFlags::CONTAINS_OBJECT_OR_ARRAY_LITERAL,
+        ));
+        assert!(seeded
+            .store
+            .copy_type_object_flags(regular, source, ObjectFlags::FRESH_LITERAL,));
+        let regular_flags = seeded.store.type_payload(regular).unwrap().object_flags();
+        assert!(regular_flags.contains(ObjectFlags::ANONYMOUS | ObjectFlags::OBJECT_LITERAL));
+        assert!(!regular_flags.contains(ObjectFlags::FRESH_LITERAL));
+        assert!(seeded.store.copy_type_flags(regular, source));
+        assert_eq!(
+            seeded.store.type_payload(regular).unwrap().flags(),
+            TypeFlags::OBJECT
+        );
+
+        let before = seeded.store.type_payload(regular).unwrap().object_flags();
+        assert!(!seeded
+            .store
+            .set_type_object_flags(regular, ObjectFlags::ANONYMOUS | ObjectFlags::MAPPED,));
+        assert!(!seeded
+            .store
+            .set_type_object_flags(regular, ObjectFlags::MAPPED));
+        assert_eq!(
+            seeded.store.type_payload(regular).unwrap().object_flags(),
+            before
+        );
+
+        let false_type = seeded
+            .store
+            .alloc_literal_type(
+                TypeFlags::BOOLEAN_LITERAL,
+                LiteralValue::Boolean(false),
+                RegularLiteralLink::SelfType,
+            )
+            .unwrap();
+        let true_type = seeded
+            .store
+            .alloc_literal_type(
+                TypeFlags::BOOLEAN_LITERAL,
+                LiteralValue::Boolean(true),
+                RegularLiteralLink::SelfType,
+            )
+            .unwrap();
+        let boolean_union = seeded
+            .store
+            .alloc_union_type(ObjectFlags::NONE, vec![false_type, true_type])
+            .unwrap();
+        assert!(seeded
+            .store
+            .add_type_flags(boolean_union, TypeFlags::BOOLEAN));
+        assert_eq!(
+            seeded.store.type_payload(boolean_union).unwrap().flags(),
+            TypeFlags::UNION | TypeFlags::BOOLEAN
+        );
+
+        let enum_a = seeded
+            .store
+            .alloc_literal_type(
+                TypeFlags::STRING_LITERAL | TypeFlags::ENUM_LITERAL,
+                LiteralValue::String("a".into()),
+                RegularLiteralLink::SelfType,
+            )
+            .unwrap();
+        let enum_b = seeded
+            .store
+            .alloc_literal_type(
+                TypeFlags::STRING_LITERAL | TypeFlags::ENUM_LITERAL,
+                LiteralValue::String("b".into()),
+                RegularLiteralLink::SelfType,
+            )
+            .unwrap();
+        let enum_union = seeded
+            .store
+            .alloc_union_type(ObjectFlags::NONE, vec![enum_a, enum_b])
+            .unwrap();
+        assert!(seeded
+            .store
+            .add_type_flags(enum_union, TypeFlags::ENUM_LITERAL));
+        assert_eq!(
+            seeded.store.type_payload(enum_union).unwrap().flags(),
+            TypeFlags::UNION | TypeFlags::ENUM_LITERAL
+        );
+
+        assert!(!seeded
+            .store
+            .add_type_flags(boolean_union, TypeFlags::STRING_LITERAL));
+        assert!(!seeded.store.add_type_flags(enum_union, TypeFlags::BOOLEAN));
+        assert!(!seeded.store.copy_type_flags(regular, boolean_union));
+        assert_eq!(
+            seeded.store.type_payload(boolean_union).unwrap().flags(),
+            TypeFlags::UNION | TypeFlags::BOOLEAN
+        );
+        assert_eq!(
+            seeded.store.type_payload(enum_union).unwrap().flags(),
+            TypeFlags::UNION | TypeFlags::ENUM_LITERAL
+        );
+        assert_eq!(
+            seeded.store.type_payload(regular).unwrap().flags(),
+            TypeFlags::OBJECT
+        );
+    }
+
+    #[test]
+    fn literal_flags_and_links_require_exact_kind_and_value() {
+        let mut store = TestStore::new();
+        let invalid = [
+            (
+                TypeFlags::NUMBER_LITERAL,
+                LiteralValue::String("value".into()),
+            ),
+            (
+                TypeFlags::ENUM_LITERAL,
+                LiteralValue::String("value".into()),
+            ),
+            (
+                TypeFlags::STRING_LITERAL,
+                LiteralValue::Number(Number::new(1.0)),
+            ),
+            (
+                TypeFlags::BIG_INT_LITERAL | TypeFlags::ENUM_LITERAL,
+                LiteralValue::BigInt(PseudoBigInt::parse_valid("1n")),
+            ),
+            (TypeFlags::BOOLEAN, LiteralValue::Boolean(true)),
+            (TypeFlags::ENUM_LITERAL, LiteralValue::ComputedEnum),
+        ];
+        let count = store.type_len();
+        for (flags, value) in invalid {
+            assert_eq!(
+                store.alloc_literal_type(flags, value, RegularLiteralLink::SelfType),
+                None
+            );
+        }
+        assert_eq!(store.type_len(), count);
+
+        let regular = store
+            .alloc_literal_type(
+                TypeFlags::STRING_LITERAL,
+                LiteralValue::String("same".into()),
+                RegularLiteralLink::SelfType,
+            )
+            .unwrap();
+        let different_value = store
+            .alloc_literal_type(
+                TypeFlags::STRING_LITERAL,
+                LiteralValue::String("different".into()),
+                RegularLiteralLink::SelfType,
+            )
+            .unwrap();
+        let different_flags = store
+            .alloc_literal_type(
+                TypeFlags::STRING_LITERAL | TypeFlags::ENUM_LITERAL,
+                LiteralValue::String("same".into()),
+                RegularLiteralLink::SelfType,
+            )
+            .unwrap();
+        let number = store
+            .alloc_literal_type(
+                TypeFlags::NUMBER_LITERAL,
+                LiteralValue::Number(Number::new(1.0)),
+                RegularLiteralLink::SelfType,
+            )
+            .unwrap();
+        let count = store.type_len();
+        assert_eq!(
+            store.alloc_literal_type(
+                TypeFlags::STRING_LITERAL,
+                LiteralValue::String("same".into()),
+                RegularLiteralLink::Type(different_value),
+            ),
+            None
+        );
+        assert_eq!(store.type_len(), count);
+        assert!(!store.set_literal_links(regular, Some(different_value), regular));
+        assert!(!store.set_literal_links(regular, Some(different_flags), regular));
+        assert!(!store.set_literal_links(regular, Some(number), regular));
+        let TypeData::Literal(data) = store.type_payload(regular).unwrap().data() else {
+            panic!("expected literal")
+        };
+        assert_eq!(data.fresh_type, None);
+        assert_eq!(data.regular_type, regular);
+
+        let regular_nan = store
+            .alloc_literal_type(
+                TypeFlags::NUMBER_LITERAL,
+                LiteralValue::Number(Number::nan()),
+                RegularLiteralLink::SelfType,
+            )
+            .unwrap();
+        let fresh_nan = store
+            .alloc_literal_type(
+                TypeFlags::NUMBER_LITERAL,
+                LiteralValue::Number(Number::nan()),
+                RegularLiteralLink::Type(regular_nan),
+            )
+            .unwrap();
+        assert!(store.set_literal_links(regular_nan, Some(fresh_nan), regular_nan));
+    }
+
+    #[test]
+    fn interface_reference_initialization_is_exact_and_atomic() {
+        let mut seeded = seeded_store("local");
+        let count = seeded.store.type_len();
+        assert_eq!(
+            seeded.store.alloc_interface_type(
+                ObjectFlags::CLASS | ObjectFlags::INTERFACE,
+                Some(seeded.symbol),
+            ),
+            None
+        );
+        assert_eq!(seeded.store.type_len(), count);
+
+        let interface = seeded
+            .store
+            .alloc_interface_type(ObjectFlags::CLASS, Some(seeded.symbol))
+            .unwrap();
+        let ordinary = seeded.store.alloc_type_parameter(None).unwrap();
+        let unconstrained_this = seeded.store.alloc_type_parameter(None).unwrap();
+        let wrong_constraint_this = seeded.store.alloc_type_parameter(None).unwrap();
+        assert!(seeded.store.set_type_parameter_resolution(
+            wrong_constraint_this,
+            Some(seeded.base),
+            None,
+            None,
+            true,
+            None,
+        ));
+
+        assert!(!seeded
+            .store
+            .set_interface_type_parameters(interface, Some(Vec::new()), 0, None,));
+        assert!(!seeded.store.set_interface_type_parameters(
+            interface,
+            Some(vec![ordinary]),
+            0,
+            Some(ordinary),
+        ));
+        assert!(!seeded.store.set_interface_type_parameters(
+            interface,
+            Some(vec![ordinary, unconstrained_this]),
+            2,
+            Some(unconstrained_this),
+        ));
+        assert!(!seeded.store.set_interface_type_parameters(
+            interface,
+            Some(vec![ordinary, wrong_constraint_this]),
+            1,
+            Some(wrong_constraint_this),
+        ));
+        assert!(!seeded.store.set_interface_type_parameters(
+            interface,
+            Some(vec![seeded.base, wrong_constraint_this]),
+            1,
+            Some(wrong_constraint_this),
+        ));
+        assert!(!seeded
+            .store
+            .set_type_object_flags(interface, ObjectFlags::CLASS | ObjectFlags::REFERENCE,));
+        let TypeData::Interface(data) = seeded.store.type_payload(interface).unwrap().data() else {
+            panic!("expected interface")
+        };
+        assert_eq!(data.all_type_parameters, None);
+        assert_eq!(data.outer_type_parameter_count, 0);
+        assert_eq!(data.this_type, None);
+        assert_eq!(
+            seeded.store.type_payload(interface).unwrap().object_flags(),
+            ObjectFlags::CLASS
+        );
+
+        let this_type = seeded.store.alloc_type_parameter(None).unwrap();
+        assert!(seeded.store.set_type_parameter_resolution(
+            this_type,
+            Some(interface),
+            None,
+            None,
+            true,
+            None,
+        ));
+        assert!(seeded.store.set_interface_type_parameters(
+            interface,
+            Some(vec![ordinary, this_type]),
+            1,
+            Some(this_type),
+        ));
+        assert_eq!(
+            seeded.store.type_payload(interface).unwrap().object_flags(),
+            ObjectFlags::CLASS | ObjectFlags::REFERENCE
+        );
+        assert!(seeded.store.add_type_object_flags(
+            interface,
+            ObjectFlags::CONTAINS_WIDENING_TYPE
+                | ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES_COMPUTED
+                | ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES,
+        ));
+        assert!(!seeded
+            .store
+            .set_type_object_flags(interface, ObjectFlags::CLASS));
+        assert!(!seeded
+            .store
+            .set_type_object_flags(interface, ObjectFlags::INTERFACE | ObjectFlags::REFERENCE));
+        let TypeData::Interface(data) = seeded.store.type_payload(interface).unwrap().data() else {
+            panic!("expected interface")
+        };
+        assert_eq!(data.all_type_parameters, Some(vec![ordinary, this_type]));
+        assert_eq!(data.outer_type_parameter_count, 1);
+        assert_eq!(data.this_type, Some(this_type));
+        assert!(seeded
+            .store
+            .type_payload(interface)
+            .unwrap()
+            .object_flags()
+            .contains(
+                ObjectFlags::CLASS
+                    | ObjectFlags::REFERENCE
+                    | ObjectFlags::CONTAINS_WIDENING_TYPE
+                    | ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES_COMPUTED
+                    | ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES,
+            ));
+    }
+
+    #[test]
+    fn intrinsic_construction_rejects_dispatch_mismatches_without_allocation() {
+        let mut store = TestStore::new();
+        let count = store.type_len();
+        assert_eq!(
+            store.alloc_intrinsic_type(TypeFlags::STRING | TypeFlags::NUMBER, "invalid"),
+            None
+        );
+        assert_eq!(
+            store.alloc_intrinsic_type(TypeFlags::BOOLEAN, "invalid"),
+            None
+        );
+        assert_eq!(
+            store.alloc_intrinsic_type_ex(TypeFlags::STRING, "invalid", ObjectFlags::ANONYMOUS,),
+            None
+        );
+        assert_eq!(store.type_len(), count);
     }
 
     #[test]
