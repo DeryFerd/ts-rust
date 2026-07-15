@@ -234,7 +234,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             return None;
         }
 
-        let source = SourceFileRef::new(NodeRef::new(arena.id(), file, source_file));
+        let source = SourceFileRef::new(self.id(), NodeRef::new(arena.id(), file, source_file));
         let node_facts = Self::validated_source_node_facts(arena, source_file)?;
         if self
             .source_files
@@ -311,9 +311,11 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
 
     #[must_use]
     pub fn contains_source_file(&self, source_file: SourceFileRef) -> bool {
-        self.source_files
-            .get(&source_file.file())
-            .is_some_and(|registered| *registered == source_file)
+        source_file.owner() == self.id()
+            && self
+                .source_files
+                .get(&source_file.file())
+                .is_some_and(|registered| *registered == source_file)
             && self.contains_node_ref(source_file.node_ref())
     }
 
@@ -2945,6 +2947,27 @@ mod tests {
             FileId::new(33),
             invalid_root
         )));
+    }
+
+    #[test]
+    fn source_file_tokens_reject_the_same_root_registered_by_another_store() {
+        let parsed = parse_source_file("type Value = string;");
+        let file = FileId::new(34);
+        let mut first = TestStore::new();
+        let mut second = TestStore::new();
+        let first_source = first
+            .register_source_file(&parsed.arena, parsed.source_file, file)
+            .unwrap();
+        let second_source = second
+            .register_source_file(&parsed.arena, parsed.source_file, file)
+            .unwrap();
+
+        assert_eq!(first_source.node_ref(), second_source.node_ref());
+        assert_ne!(first_source, second_source);
+        assert!(first.contains_source_file(first_source));
+        assert!(!first.contains_source_file(second_source));
+        assert!(second.contains_source_file(second_source));
+        assert!(!second.contains_source_file(first_source));
     }
 
     #[test]

@@ -556,21 +556,28 @@ pub struct EnumMemberLinks {
 /// the exact arena node, root parent, file slot, and AST registration before
 /// issuing this token.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct SourceFileRef(NodeRef);
+pub struct SourceFileRef {
+    owner: SemanticStoreId,
+    node: NodeRef,
+}
 
 impl SourceFileRef {
-    pub(super) const fn new(node: NodeRef) -> Self {
-        Self(node)
+    pub(super) const fn new(owner: SemanticStoreId, node: NodeRef) -> Self {
+        Self { owner, node }
+    }
+
+    pub(super) const fn owner(self) -> SemanticStoreId {
+        self.owner
     }
 
     #[must_use]
     pub const fn node_ref(self) -> NodeRef {
-        self.0
+        self.node
     }
 
     #[must_use]
     pub const fn file(self) -> FileId {
-        self.0.file
+        self.node.file
     }
 }
 

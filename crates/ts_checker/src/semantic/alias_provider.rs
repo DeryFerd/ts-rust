@@ -1892,6 +1892,43 @@ mod tests {
     }
 
     #[test]
+    fn registry_rejects_a_same_root_source_token_from_another_store() {
+        let source = parsed("export const value = 1;");
+        let file = FileId::new(62);
+        let files = [(file, &source, CanonicalModuleState::External)];
+        let (symbols, mut bound_files) = bindings(&files);
+        let mut store = TestStore::from_symbol_store(symbols);
+        let local_source = store
+            .register_source_file(&source.arena, source.source_file, file)
+            .unwrap();
+        let mut other_store = TestStore::new();
+        let foreign_source = other_store
+            .register_source_file(&source.arena, source.source_file, file)
+            .unwrap();
+        let expected = bound_files.get(&file).unwrap().source_file();
+
+        assert_eq!(local_source.node_ref(), foreign_source.node_ref());
+        assert_ne!(local_source, foreign_source);
+        let error = ProductionAliasSourceRegistry::new(
+            &store,
+            [(
+                &source.arena,
+                bound_files.remove(&file).unwrap(),
+                foreign_source,
+            )],
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            ProductionAliasTargetHostError::InvalidRegisteredSourceFile {
+                file,
+                expected,
+                actual: foreign_source,
+            }
+        );
+    }
+
+    #[test]
     fn registry_validates_once_and_query_hosts_borrow_its_owned_sources() {
         let importer = parsed("import { value } from './target';");
         let target = parsed("export const value = 1;");
