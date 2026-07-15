@@ -3,9 +3,10 @@
 //! TypeScript-Go writes binder results directly onto mutable AST nodes. Rust
 //! keeps the parse tree immutable, so [`BoundFile`] is the provenance-bearing
 //! equivalent of those node slots. This slice freezes the traversal, container,
-//! locals, and flow contracts and exposes the dependency-closed declaration
-//! primitive used by the pinned binder. Full declaration dispatch is still a
-//! later phase; callers can observe that boundary through [`BindingPhase`].
+//! locals, and flow contracts and provides complete TypeScript-family
+//! declaration dispatch. Callers can observe the traversal/declaration boundary
+//! through [`BindingPhase`]. JavaScript, `CommonJS`, and JSON remain separate
+//! source-kind closures.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -27,9 +28,7 @@ pub enum BindingPhase {
     /// Symbol declaration and merge behavior has not run yet.
     Traversal,
     /// Declaration symbols and merge diagnostics are complete.
-    ///
-    /// No B01a entry point produces this phase. It is reserved as the explicit
-    /// handoff to the B02 declaration slice.
+    /// Produced only by successful full TypeScript-family dispatch.
     Declarations,
 }
 
@@ -173,9 +172,9 @@ pub enum CanonicalDeclarationError {
     MissingContainingClassSymbol(NodeRef),
     /// Declaration dispatch requires parser/Program source-file facts.
     MissingSourceFileFacts(FileId),
-    /// JavaScript declaration dispatch remains outside the B02b closure.
+    /// JavaScript/JSX and `allowJs` declaration dispatch is deferred.
     JavaScriptDeclarationsDeferred(FileId),
-    /// `CommonJS` declaration dispatch remains outside the B02b closure.
+    /// `CommonJS` declaration dispatch is deferred.
     CommonJsDeclarationsDeferred(FileId),
     /// The dependency-closed declaration slice may run only once per file.
     DuplicateDeclarationDispatch(FileId),
@@ -276,9 +275,15 @@ pub struct CanonicalBindDiagnostic {
 /// These facts are deliberately supplied by the caller. The immutable Rust
 /// AST does not retain TypeScript-Go's `SourceFile` file-kind and module slots,
 /// and the binder must not reconstruct them from a file name or syntax.
+/// Caller-supplied text source family. JSON is intentionally not representable
+/// until its distinct pinned source-file binding path is ported.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CanonicalSourceLanguage {
+    /// TypeScript-family inputs, including TS, TSX, declaration files, MTS,
+    /// and CTS when the caller's module facts do not classify them as
+    /// `CommonJS`.
     TypeScript,
+    /// JavaScript/JSX inputs, including `allowJs` Program files.
     JavaScript,
 }
 
@@ -443,9 +448,9 @@ impl BoundFile {
         self.phase == BindingPhase::Declarations
     }
 
-    /// Whether the currently ported non-JavaScript declaration slice ran.
-    /// This remains distinct from [`Self::declarations_complete`] until every
-    /// parser-reachable family in the claimed source kinds is audited exact.
+    /// Whether the complete TypeScript-family declaration dispatch ran.
+    /// Rejected JavaScript, `CommonJS`, and structurally unsupported files remain
+    /// in traversal phase with this bit clear.
     #[must_use]
     pub const fn declaration_slice_bound(&self) -> bool {
         self.declaration_slice_bound
@@ -617,7 +622,7 @@ impl BoundFile {
 ///
 /// Consume this value and pass the returned [`SymbolStore`] to
 /// `SemanticStore::from_symbol_store` only after all Program files have been
-/// traversed (and, once B02 lands, declaration-bound).
+/// declaration-bound.
 #[derive(Debug)]
 pub struct CanonicalProgramBindings {
     symbols: SymbolStore,
@@ -951,8 +956,8 @@ impl CanonicalBinder {
         Ok(())
     }
 
-    /// Runs the dependency-closed non-JavaScript declaration-dispatch slice
-    /// over B01's captured visitation order and container state.
+    /// Runs complete TypeScript-family declaration dispatch over the captured
+    /// visitation order and container state.
     ///
     /// This is a linear replay of declaration entry points, not a second AST
     /// traversal. Locals, members, and exports remain nil until the exact
@@ -1022,10 +1027,12 @@ impl CanonicalBinder {
         for node in order {
             self.bind_declaration_node(arena, file, node, &facts, &module_states)?;
         }
-        self.files
+        let bound = self
+            .files
             .get_mut(&file)
-            .expect("declaration-dispatch file remains registered")
-            .declaration_slice_bound = true;
+            .expect("declaration-dispatch file remains registered");
+        bound.declaration_slice_bound = true;
+        bound.phase = BindingPhase::Declarations;
         Ok(self
             .files
             .get(&file)
@@ -2689,8 +2696,9 @@ impl CanonicalBinder {
     /// Traverses one Program source file while retaining the exact
     /// parser/Program source facts required by declaration binding.
     ///
-    /// This B02b entry point still completes only the traversal phase until
-    /// the dependency-closed non-JavaScript declaration switch is installed.
+    /// This entry point intentionally completes only traversal. Call
+    /// [`Self::bind_typescript_declaration_slice`] after every Program file has
+    /// supplied its facts to complete declaration binding.
     ///
     /// # Errors
     ///
@@ -3004,10 +3012,7 @@ fn declaration_name_shape_unsupported(arena: &NodeArena, node: NodeId) -> bool {
     if has_dynamic_name(arena, node) && !dynamic_is_handled {
         return true;
     }
-    get_name_of_declaration(arena, node)
-        .and_then(|name| arena.get(name))
-        .is_some_and(|name| name.kind == SyntaxKind::PrivateIdentifier)
-        && containing_class(arena, node).is_none()
+    false
 }
 
 fn root_declaration(arena: &NodeArena, mut node: NodeId) -> NodeId {
@@ -4144,7 +4149,7 @@ mod tests {
     use std::{collections::BTreeSet, panic::AssertUnwindSafe};
 
     use ts_ast::{FileId, NodeData, NodeId, NodeRef, SyntaxKind};
-    use ts_parser::parse_source_file;
+    use ts_parser::{parse_jsx_source_file, parse_source_file};
 
     use super::{
         BindingPhase, CanonicalBindError, CanonicalBinder, CanonicalDeclarationError,
@@ -6077,6 +6082,45 @@ mod tests {
     }
 
     #[test]
+    fn private_name_outside_a_class_follows_the_pinned_missing_name_path() {
+        let parsed = parse_source_file("const #orphan = 1;");
+        let file = FileId::new(66);
+        let variable = nodes_of_kind(&parsed.arena, SyntaxKind::VariableDeclaration)[0];
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/private-recovery\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+
+        let bound = binder.file(file).unwrap();
+        assert_eq!(bound.phase(), BindingPhase::Declarations);
+        let symbol = bound
+            .symbol(node_ref(&parsed.arena, file, variable))
+            .unwrap();
+        let record = binder.symbol_store().symbol(symbol).unwrap();
+        assert_eq!(record.name(), InternalSymbolName::Missing.as_ref());
+        assert_eq!(record.flags(), SymbolFlags::BLOCK_SCOPED_VARIABLE);
+        let locals = binder
+            .symbol_store()
+            .symbol_table(bound.locals(bound.source_file()).unwrap())
+            .unwrap();
+        assert!(locals.is_empty());
+        assert_eq!(bound.symbol_count(), 1);
+    }
+
+    #[test]
     fn module_dispatch_uses_exact_instance_state_and_const_enum_marker_rules() {
         let parsed = parse_source_file(
             r"
@@ -6523,7 +6567,8 @@ const object = {};
 
         let bound = binder.file(file).unwrap();
         assert!(bound.declaration_slice_bound());
-        assert_eq!(bound.phase(), BindingPhase::Traversal);
+        assert_eq!(bound.phase(), BindingPhase::Declarations);
+        assert!(bound.declarations_complete());
         assert_eq!(bound.symbol(bound.source_file()), None);
         let source_locals = bound.locals(bound.source_file()).unwrap();
         let source_table = binder.symbol_store().symbol_table(source_locals).unwrap();
@@ -6659,6 +6704,122 @@ const object = {};
             SymbolFlags::SIGNATURE
         );
         assert!(bound.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn completed_typescript_family_files_extract_one_canonical_symbol_store() {
+        let ts = parse_source_file("export interface Box<T> { value: T }");
+        let tsx = parse_jsx_source_file(
+            "export const view = <Component value={1} />; export type View = typeof view;",
+        );
+        let declaration = parse_source_file(
+            "export as namespace Library; export interface PublicShape { id: string }",
+        );
+        let inputs = [
+            (
+                &ts,
+                FileId::new(61),
+                false,
+                CanonicalModuleState::External,
+                "\"/project/index.mts\"",
+            ),
+            (
+                &tsx,
+                FileId::new(62),
+                false,
+                CanonicalModuleState::External,
+                "\"/project/view.tsx\"",
+            ),
+            (
+                &declaration,
+                FileId::new(63),
+                true,
+                CanonicalModuleState::External,
+                "\"/project/library.d.cts\"",
+            ),
+        ];
+        assert!(inputs.iter().all(|(parsed, ..)| {
+            nodes_of_kind(&parsed.arena, SyntaxKind::JsTypeAliasDeclaration).is_empty()
+        }));
+        let mut binder = CanonicalBinder::new();
+        for (parsed, file, is_declaration, module_state, name) in inputs {
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new(
+                        EscapedName::source(name),
+                        CanonicalSourceLanguage::TypeScript,
+                        is_declaration,
+                        module_state,
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+            let bound = binder.file(file).unwrap();
+            assert_eq!(bound.phase(), BindingPhase::Declarations);
+            assert!(bound.declarations_complete());
+        }
+
+        let program = binder.finish();
+        assert!(program.declarations_complete());
+        let store_id = program.symbol_store().id();
+        for file in program.files() {
+            let source = file.symbol(file.source_file()).unwrap();
+            assert!(program.symbol_store().contains_symbol(source));
+        }
+        let (symbols, files) = program.try_into_parts().unwrap();
+        assert_eq!(symbols.id(), store_id);
+        assert_eq!(files.len(), 3);
+    }
+
+    #[test]
+    fn deferred_javascript_and_commonjs_files_keep_program_extraction_closed() {
+        let javascript = parse_source_file("export const value = 1;");
+        let commonjs = parse_source_file("export const other = 2;");
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &javascript.arena,
+                javascript.source_file,
+                FileId::new(64),
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/allow-js.jsx\""),
+                    CanonicalSourceLanguage::JavaScript,
+                    false,
+                    CanonicalModuleState::External,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_source_file_with_facts(
+                &commonjs.arena,
+                commonjs.source_file,
+                FileId::new(65),
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/common.cts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::ExternalAndCommonJs,
+                ),
+            )
+            .unwrap();
+        assert_eq!(
+            binder.bind_typescript_declaration_slice(&javascript.arena, FileId::new(64)),
+            Err(CanonicalDeclarationError::JavaScriptDeclarationsDeferred(
+                FileId::new(64)
+            ))
+        );
+        assert_eq!(
+            binder.bind_typescript_declaration_slice(&commonjs.arena, FileId::new(65)),
+            Err(CanonicalDeclarationError::CommonJsDeclarationsDeferred(
+                FileId::new(65)
+            ))
+        );
+        assert!(binder.finish().try_into_parts().is_err());
     }
 
     #[test]
