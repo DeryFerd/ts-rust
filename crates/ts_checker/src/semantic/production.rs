@@ -26,6 +26,11 @@ use super::{
     CanonicalModuleResolutionManifestError, CanonicalModuleResolutionManifestInput,
     CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHost, DeclaredTypeHostError,
     IntrinsicBootstrapError, IntrinsicBootstrapOptions, SourceFileRef, SymbolMergeError, TypeId,
+    alias::{CanonicalAliasResolution, CanonicalAliasResolutionError, CanonicalAliasResolver},
+    alias_flags::{
+        CanonicalSymbolFlagsError, CanonicalSymbolFlagsResolution, CanonicalSymbolFlagsResolver,
+    },
+    alias_provider::{ProductionAliasTargetHost, ProductionAliasTargetHostError},
     global_types::initialize_global_library_types,
     module_resolution::validate_module_resolution_manifest,
     name_resolution::{ProductionNameResolverHost, ProductionNameResolverHostError},
@@ -103,6 +108,56 @@ pub struct CanonicalCheckerContext<'arena> {
     diagnostics: CanonicalCheckerDiagnostics,
     pending_ambient_modules: Vec<SemanticSymbolId>,
     pattern_ambient_modules: Vec<CanonicalPatternAmbientModule>,
+}
+
+/// Construction or kernel failure from a context-owned production alias query.
+///
+/// Variants preserve the exact underlying error so callers can distinguish a
+/// stale or malformed retained Program from an unavailable target provider and
+/// from a symbol-flags invariant failure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CanonicalAliasQueryError {
+    TargetHost(ProductionAliasTargetHostError),
+    AliasResolution(CanonicalAliasResolutionError),
+    SymbolFlags(CanonicalSymbolFlagsError),
+}
+
+impl std::fmt::Display for CanonicalAliasQueryError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TargetHost(error) => error.fmt(formatter),
+            Self::AliasResolution(error) => error.fmt(formatter),
+            Self::SymbolFlags(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for CanonicalAliasQueryError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::TargetHost(error) => Some(error),
+            Self::AliasResolution(error) => Some(error),
+            Self::SymbolFlags(error) => Some(error),
+        }
+    }
+}
+
+impl From<ProductionAliasTargetHostError> for CanonicalAliasQueryError {
+    fn from(error: ProductionAliasTargetHostError) -> Self {
+        Self::TargetHost(error)
+    }
+}
+
+impl From<CanonicalAliasResolutionError> for CanonicalAliasQueryError {
+    fn from(error: CanonicalAliasResolutionError) -> Self {
+        Self::AliasResolution(error)
+    }
+}
+
+impl From<CanonicalSymbolFlagsError> for CanonicalAliasQueryError {
+    fn from(error: CanonicalSymbolFlagsError) -> Self {
+        Self::SymbolFlags(error)
+    }
 }
 
 impl<'arena> CanonicalCheckerContext<'arena> {
@@ -320,6 +375,71 @@ impl<'arena> CanonicalCheckerContext<'arena> {
     #[must_use]
     pub const fn diagnostics(&self) -> &CanonicalCheckerDiagnostics {
         &self.diagnostics
+    }
+
+    /// Resolves a bound alias through the retained production sources and
+    /// immutable module-resolution manifest.
+    ///
+    /// The returned events are the exact one-time cycle events produced by the
+    /// alias kernel. This slice does not issue diagnostics for them because the
+    /// pinned diagnostic callback is not dependency-closed; callers retain
+    /// ownership of event-to-diagnostic conversion. The query starts from an
+    /// already-bound symbol and performs no alias-aware lexical name lookup.
+    ///
+    /// # Errors
+    ///
+    /// Returns the exact production-host construction or alias-kernel error.
+    /// Provider failures remain retryable and do not publish an alias target.
+    pub fn resolve_alias(
+        &mut self,
+        alias: SemanticSymbolId,
+    ) -> Result<CanonicalAliasResolution, CanonicalAliasQueryError> {
+        let Self {
+            files,
+            store,
+            module_resolutions,
+            ..
+        } = self;
+        let mut host = ProductionAliasTargetHost::new(
+            store,
+            files.values().map(|file| (file.arena, &file.bound)),
+            module_resolutions,
+        )?;
+        CanonicalAliasResolver::new(store, &mut host)
+            .resolve_alias(alias)
+            .map_err(Into::into)
+    }
+
+    /// Gets the pinned combined meanings of a bound symbol through production
+    /// alias resolution.
+    ///
+    /// Cycle events are returned unchanged in
+    /// [`CanonicalSymbolFlagsResolution::events`]. As with
+    /// [`Self::resolve_alias`], exact diagnostic issuance and alias-aware
+    /// lexical name lookup are outside this dependency-closed slice.
+    ///
+    /// # Errors
+    ///
+    /// Returns the exact production-host construction or symbol-flags kernel
+    /// error, including any nested alias-resolution failure.
+    pub fn get_symbol_flags(
+        &mut self,
+        symbol: SemanticSymbolId,
+    ) -> Result<CanonicalSymbolFlagsResolution, CanonicalAliasQueryError> {
+        let Self {
+            files,
+            store,
+            module_resolutions,
+            ..
+        } = self;
+        let mut host = ProductionAliasTargetHost::new(
+            store,
+            files.values().map(|file| (file.arena, &file.bound)),
+            module_resolutions,
+        )?;
+        CanonicalSymbolFlagsResolver::new(store, &mut host)
+            .get_symbol_flags(symbol)
+            .map_err(Into::into)
     }
 
     /// Resolves one declared type through the context-owned query session.
@@ -1250,7 +1370,13 @@ mod tests {
     use ts_parser::{ParseResult, parse_source_file};
 
     use super::*;
-    use crate::semantic::{TypeData, type_records::TypeCacheState, types::ObjectFlags};
+    use crate::semantic::{
+        AliasTargetState, CanonicalModuleResolutionEntry, CanonicalModuleResolutionManifestInput,
+        CanonicalModuleResolutionMode, CanonicalResolvedModuleInput, TypeData,
+        alias::{CanonicalAliasResolutionEvent, CanonicalAliasTargetUnavailable},
+        type_records::TypeCacheState,
+        types::ObjectFlags,
+    };
 
     fn parsed(source: &str) -> ParseResult {
         let parsed = parse_source_file(source);
@@ -1315,6 +1441,142 @@ mod tests {
                 .unwrap();
         }
         binder.finish()
+    }
+
+    fn external_context<'arena>(
+        files: &[(FileId, &'arena ParseResult)],
+        module_resolutions: CanonicalModuleResolutionManifestInput,
+    ) -> CanonicalCheckerContext<'arena> {
+        let files_with_facts = files
+            .iter()
+            .map(|&(file, parsed)| (file, parsed, false, CanonicalModuleState::External))
+            .collect::<Vec<_>>();
+        CanonicalCheckerContext::new_with_module_resolutions(
+            completed_bindings_with_facts(&files_with_facts),
+            files
+                .iter()
+                .map(|&(file, parsed)| (file, &parsed.arena))
+                .collect(),
+            CanonicalCheckerOptions::default(),
+            module_resolutions,
+        )
+        .unwrap()
+    }
+
+    fn external_context_without_module_resolutions<'arena>(
+        files: &[(FileId, &'arena ParseResult)],
+    ) -> CanonicalCheckerContext<'arena> {
+        let files_with_facts = files
+            .iter()
+            .map(|&(file, parsed)| (file, parsed, false, CanonicalModuleState::External))
+            .collect::<Vec<_>>();
+        CanonicalCheckerContext::new(
+            completed_bindings_with_facts(&files_with_facts),
+            files
+                .iter()
+                .map(|&(file, parsed)| (file, &parsed.arena))
+                .collect(),
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap()
+    }
+
+    fn node_ref(parsed: &ParseResult, file: FileId, node: NodeId) -> NodeRef {
+        NodeRef::new(parsed.arena.id(), file, node)
+    }
+
+    fn module_specifiers(parsed: &ParseResult) -> Vec<NodeId> {
+        let mut specifiers = parsed
+            .arena
+            .iter()
+            .filter_map(|(_, node)| match &node.data {
+                NodeData::ImportDeclaration(import) => Some(import.module_specifier),
+                NodeData::ExportDeclaration(export) => export.module_specifier,
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        specifiers.sort_unstable_by_key(|node| parsed.arena.get(*node).unwrap().range.start);
+        specifiers
+    }
+
+    fn module_export_name(arena: &NodeArena, name: NodeId) -> Option<&str> {
+        match &arena.get(name)?.data {
+            NodeData::Identifier(identifier) => Some(&identifier.text),
+            NodeData::StringLiteral(literal) => Some(&literal.text),
+            _ => None,
+        }
+    }
+
+    fn alias_declaration_named(parsed: &ParseResult, file: FileId, name: &str) -> NodeRef {
+        parsed
+            .arena
+            .iter()
+            .find_map(|(node, data)| {
+                let name_node = match &data.data {
+                    NodeData::ImportClause(clause) => clause.name,
+                    NodeData::ImportSpecifier(specifier) => Some(specifier.name),
+                    NodeData::ExportSpecifier(specifier) => Some(specifier.name),
+                    NodeData::NamespaceImport(namespace) => Some(namespace.name),
+                    _ => None,
+                }?;
+                (module_export_name(&parsed.arena, name_node) == Some(name))
+                    .then_some(node_ref(parsed, file, node))
+            })
+            .unwrap_or_else(|| panic!("missing alias declaration {name}"))
+    }
+
+    fn alias_symbol(
+        context: &CanonicalCheckerContext<'_>,
+        declaration: NodeRef,
+    ) -> SemanticSymbolId {
+        context
+            .file(declaration.file)
+            .and_then(|(_, bound)| bound.symbol(declaration))
+            .expect("alias declaration has a canonical symbol")
+    }
+
+    fn source_module(context: &CanonicalCheckerContext<'_>, file: FileId) -> SemanticSymbolId {
+        let (_, bound) = context.file(file).expect("context retains source file");
+        bound
+            .symbol(bound.source_file())
+            .expect("external source file has a canonical module symbol")
+    }
+
+    fn direct_export(
+        context: &CanonicalCheckerContext<'_>,
+        file: FileId,
+        name: &str,
+    ) -> SemanticSymbolId {
+        let module = source_module(context, file);
+        let exports = context
+            .store()
+            .symbol(module)
+            .and_then(ts_binder::semantic::Symbol::exports)
+            .expect("module has an exports table");
+        context
+            .store()
+            .symbol_table(exports)
+            .and_then(|exports| exports.get_source(name))
+            .unwrap_or_else(|| panic!("module has direct export {name}"))
+    }
+
+    fn esm(target: FileId) -> CanonicalResolvedModuleInput {
+        CanonicalResolvedModuleInput::new(
+            target,
+            CanonicalModuleResolutionMode::Esm,
+            CanonicalModuleResolutionMode::Esm,
+        )
+    }
+
+    fn alias_query_unavailable_reason(
+        error: CanonicalAliasQueryError,
+    ) -> CanonicalAliasTargetUnavailable {
+        match error {
+            CanonicalAliasQueryError::AliasResolution(
+                CanonicalAliasResolutionError::TargetUnavailable { reason, .. },
+            ) => reason,
+            other => panic!("expected unavailable alias target, got {other:?}"),
+        }
     }
 
     fn global_symbol(
@@ -1481,6 +1743,403 @@ mod tests {
             Some(true)
         );
         assert_eq!(context.diagnostics().len(), 2);
+    }
+
+    #[test]
+    fn production_alias_queries_resolve_named_and_namespace_imports_and_combine_flags() {
+        let importer = parsed(
+            r#"
+                import * as namespace from "./target";
+                import { value as local } from "./target";
+            "#,
+        );
+        let target = parsed("export const value = 1;");
+        let importer_file = FileId::new(201);
+        let target_file = FileId::new(202);
+        let specifiers = module_specifiers(&importer);
+        let entries = specifiers.iter().map(|specifier| {
+            CanonicalModuleResolutionEntry::resolved(
+                node_ref(&importer, importer_file, *specifier),
+                esm(target_file),
+            )
+        });
+        let mut context = external_context(
+            &[(importer_file, &importer), (target_file, &target)],
+            CanonicalModuleResolutionManifestInput::new(entries),
+        );
+        let namespace_declaration = alias_declaration_named(&importer, importer_file, "namespace");
+        let local_declaration = alias_declaration_named(&importer, importer_file, "local");
+        let namespace_alias = alias_symbol(&context, namespace_declaration);
+        let local_alias = alias_symbol(&context, local_declaration);
+        let target_module = source_module(&context, target_file);
+        let value = direct_export(&context, target_file, "value");
+        let diagnostics_before = context.diagnostics().clone();
+
+        let namespace_resolution = context.resolve_alias(namespace_alias).unwrap();
+        assert_eq!(
+            namespace_resolution.target,
+            AliasTargetState::Resolved(target_module)
+        );
+        assert!(namespace_resolution.events.is_empty());
+
+        let local_resolution = context.resolve_alias(local_alias).unwrap();
+        assert_eq!(local_resolution.target, AliasTargetState::Resolved(value));
+        assert!(local_resolution.events.is_empty());
+
+        let local_flags = context.get_symbol_flags(local_alias).unwrap();
+        let expected_flags = context.store().symbol(local_alias).unwrap().flags()
+            | context.store().symbol(value).unwrap().flags();
+        assert_eq!(local_flags.flags, expected_flags);
+        assert!(local_flags.events.is_empty());
+
+        let cached_namespace = context.resolve_alias(namespace_alias).unwrap();
+        assert_eq!(cached_namespace.target, namespace_resolution.target);
+        assert!(cached_namespace.events.is_empty());
+        assert_eq!(context.diagnostics(), &diagnostics_before);
+    }
+
+    #[test]
+    fn production_alias_queries_resolve_transitive_reexports_and_propagate_type_only_markers() {
+        let base = parsed("export interface Value { field: string }");
+        let middle = parsed("export type { Value as Mid } from './base';");
+        let consumer = parsed(
+            r#"
+                import { Mid as Local } from "./middle";
+                import type * as Types from "./base";
+            "#,
+        );
+        let base_file = FileId::new(203);
+        let middle_file = FileId::new(204);
+        let consumer_file = FileId::new(205);
+        let middle_specifier = node_ref(
+            &middle,
+            middle_file,
+            module_specifiers(&middle).into_iter().next().unwrap(),
+        );
+        let consumer_specifiers = module_specifiers(&consumer);
+        let entries = [
+            CanonicalModuleResolutionEntry::resolved(middle_specifier, esm(base_file)),
+            CanonicalModuleResolutionEntry::resolved(
+                node_ref(&consumer, consumer_file, consumer_specifiers[0]),
+                esm(middle_file),
+            ),
+            CanonicalModuleResolutionEntry::resolved(
+                node_ref(&consumer, consumer_file, consumer_specifiers[1]),
+                esm(base_file),
+            ),
+        ];
+        let mut context = external_context(
+            &[
+                (base_file, &base),
+                (middle_file, &middle),
+                (consumer_file, &consumer),
+            ],
+            CanonicalModuleResolutionManifestInput::new(entries),
+        );
+        let middle_declaration = alias_declaration_named(&middle, middle_file, "Mid");
+        let local_declaration = alias_declaration_named(&consumer, consumer_file, "Local");
+        let namespace_declaration = alias_declaration_named(&consumer, consumer_file, "Types");
+        let middle_alias = alias_symbol(&context, middle_declaration);
+        let local_alias = alias_symbol(&context, local_declaration);
+        let namespace_alias = alias_symbol(&context, namespace_declaration);
+        let value = direct_export(&context, base_file, "Value");
+        let base_module = source_module(&context, base_file);
+
+        let resolution = context.resolve_alias(local_alias).unwrap();
+        assert_eq!(resolution.target, AliasTargetState::Resolved(value));
+        assert!(resolution.events.is_empty());
+        assert_eq!(
+            context
+                .store()
+                .alias_symbol_links(middle_alias)
+                .unwrap()
+                .type_only_declaration,
+            Some(middle_declaration)
+        );
+        assert_eq!(
+            context
+                .store()
+                .alias_symbol_links(local_alias)
+                .unwrap()
+                .type_only_declaration,
+            Some(middle_declaration),
+            "the transitive marker comes from the re-export declaration"
+        );
+
+        let namespace = context.resolve_alias(namespace_alias).unwrap();
+        assert_eq!(namespace.target, AliasTargetState::Resolved(base_module));
+        assert!(namespace.events.is_empty());
+        assert_eq!(
+            context
+                .store()
+                .alias_symbol_links(namespace_alias)
+                .unwrap()
+                .type_only_declaration,
+            Some(namespace_declaration)
+        );
+        assert!(context.store().type_resolution_is_empty());
+    }
+
+    #[test]
+    fn production_alias_queries_keep_manifest_failures_retryable_with_type_only_markers() {
+        let importer = parsed(
+            r#"
+                import type * as UnavailableTypes from "./target";
+                import { type value as AbsentValue } from "./target";
+                import type { value as UnresolvedValue } from "./target";
+            "#,
+        );
+        let target = parsed("export const value = 1;");
+        let importer_file = FileId::new(206);
+        let target_file = FileId::new(207);
+        let specifiers = module_specifiers(&importer)
+            .into_iter()
+            .map(|specifier| node_ref(&importer, importer_file, specifier))
+            .collect::<Vec<_>>();
+        let unavailable_declaration =
+            alias_declaration_named(&importer, importer_file, "UnavailableTypes");
+
+        let mut unavailable = external_context_without_module_resolutions(&[
+            (importer_file, &importer),
+            (target_file, &target),
+        ]);
+        let unavailable_alias = alias_symbol(&unavailable, unavailable_declaration);
+        let unavailable_diagnostics = unavailable.diagnostics().clone();
+        for _ in 0..2 {
+            assert_eq!(
+                alias_query_unavailable_reason(
+                    unavailable.resolve_alias(unavailable_alias).unwrap_err()
+                ),
+                CanonicalAliasTargetUnavailable::ModuleResolutionCapabilityUnavailable(
+                    specifiers[0]
+                )
+            );
+            let links = unavailable
+                .store()
+                .alias_symbol_links(unavailable_alias)
+                .unwrap();
+            assert_eq!(links.immediate_target, None);
+            assert_eq!(links.alias_target, AliasTargetState::Unresolved);
+            assert_eq!(links.type_only_declaration, Some(unavailable_declaration));
+            assert!(unavailable.store().type_resolution_is_empty());
+            assert_eq!(unavailable.diagnostics(), &unavailable_diagnostics);
+        }
+
+        let mut available = external_context(
+            &[(importer_file, &importer), (target_file, &target)],
+            CanonicalModuleResolutionManifestInput::new([
+                CanonicalModuleResolutionEntry::unresolved(specifiers[2]),
+            ]),
+        );
+        let absent_declaration = alias_declaration_named(&importer, importer_file, "AbsentValue");
+        let unresolved_declaration =
+            alias_declaration_named(&importer, importer_file, "UnresolvedValue");
+        let absent_alias = alias_symbol(&available, absent_declaration);
+        let unresolved_alias = alias_symbol(&available, unresolved_declaration);
+        let available_diagnostics = available.diagnostics().clone();
+
+        for (alias, declaration, expected) in [
+            (
+                absent_alias,
+                absent_declaration,
+                CanonicalAliasTargetUnavailable::ModuleResolutionEntryAbsent(specifiers[1]),
+            ),
+            (
+                unresolved_alias,
+                unresolved_declaration,
+                CanonicalAliasTargetUnavailable::ModuleResolutionUnresolved(specifiers[2]),
+            ),
+        ] {
+            for _ in 0..2 {
+                assert_eq!(
+                    alias_query_unavailable_reason(available.resolve_alias(alias).unwrap_err()),
+                    expected
+                );
+                let links = available.store().alias_symbol_links(alias).unwrap();
+                assert_eq!(links.immediate_target, None);
+                assert_eq!(links.alias_target, AliasTargetState::Unresolved);
+                assert_eq!(links.type_only_declaration, Some(declaration));
+                assert!(available.store().type_resolution_is_empty());
+                assert_eq!(available.diagnostics(), &available_diagnostics);
+            }
+        }
+    }
+
+    #[test]
+    fn production_alias_queries_preserve_foreign_and_non_alias_error_layers() {
+        let target = parsed("export const value = 1;");
+        let target_file = FileId::new(208);
+        let mut context = external_context(
+            &[(target_file, &target)],
+            CanonicalModuleResolutionManifestInput::new([]),
+        );
+        let value = direct_export(&context, target_file, "value");
+
+        let foreign = parsed("import { value as ForeignValue } from './foreign';");
+        let foreign_file = FileId::new(209);
+        let foreign_declaration = alias_declaration_named(&foreign, foreign_file, "ForeignValue");
+        let foreign_alias = {
+            let foreign_context =
+                external_context_without_module_resolutions(&[(foreign_file, &foreign)]);
+            alias_symbol(&foreign_context, foreign_declaration)
+        };
+        let diagnostics_before = context.diagnostics().clone();
+
+        assert_eq!(
+            context.resolve_alias(value),
+            Err(CanonicalAliasQueryError::AliasResolution(
+                CanonicalAliasResolutionError::SymbolIsNotAlias(value)
+            ))
+        );
+        assert_eq!(
+            context.resolve_alias(foreign_alias),
+            Err(CanonicalAliasQueryError::AliasResolution(
+                CanonicalAliasResolutionError::InvalidSymbol(foreign_alias)
+            ))
+        );
+        assert_eq!(
+            context.get_symbol_flags(foreign_alias),
+            Err(CanonicalAliasQueryError::SymbolFlags(
+                CanonicalSymbolFlagsError::InvalidSymbol(foreign_alias)
+            ))
+        );
+
+        let expected_flags = context.store().symbol(value).unwrap().flags();
+        let flags = context.get_symbol_flags(value).unwrap();
+        assert_eq!(flags.flags, expected_flags);
+        assert!(flags.events.is_empty());
+        assert_eq!(context.diagnostics(), &diagnostics_before);
+    }
+
+    #[test]
+    fn production_alias_cycle_events_are_returned_once_without_issuing_diagnostics() {
+        let first = parsed("export { B as A } from './second';");
+        let second = parsed("export { A as B } from './first';");
+        let first_file = FileId::new(210);
+        let second_file = FileId::new(211);
+        let first_specifier = node_ref(
+            &first,
+            first_file,
+            module_specifiers(&first).into_iter().next().unwrap(),
+        );
+        let second_specifier = node_ref(
+            &second,
+            second_file,
+            module_specifiers(&second).into_iter().next().unwrap(),
+        );
+        let mut context = external_context(
+            &[(first_file, &first), (second_file, &second)],
+            CanonicalModuleResolutionManifestInput::new([
+                CanonicalModuleResolutionEntry::resolved(first_specifier, esm(second_file)),
+                CanonicalModuleResolutionEntry::resolved(second_specifier, esm(first_file)),
+            ]),
+        );
+        let first_declaration = alias_declaration_named(&first, first_file, "A");
+        let second_declaration = alias_declaration_named(&second, second_file, "B");
+        let first_alias = alias_symbol(&context, first_declaration);
+        let second_alias = alias_symbol(&context, second_declaration);
+        let diagnostics_before = context.diagnostics().clone();
+
+        let initial = context.get_symbol_flags(first_alias).unwrap();
+        assert_eq!(initial.flags, SymbolFlags::ALL);
+        assert_eq!(
+            initial.events,
+            [
+                CanonicalAliasResolutionEvent::CircularDefinitionOfImportAlias {
+                    alias: second_alias,
+                },
+                CanonicalAliasResolutionEvent::CircularDefinitionOfImportAlias {
+                    alias: first_alias,
+                },
+            ]
+        );
+        assert!(
+            initial
+                .events
+                .iter()
+                .all(|event| event.diagnostic_code() == 2303)
+        );
+        assert_eq!(context.diagnostics(), &diagnostics_before);
+
+        let cached = context.resolve_alias(first_alias).unwrap();
+        assert_eq!(cached.target, AliasTargetState::Unknown);
+        assert!(cached.events.is_empty());
+        assert_eq!(
+            context
+                .store()
+                .alias_symbol_links(second_alias)
+                .unwrap()
+                .alias_target,
+            AliasTargetState::Unknown
+        );
+        assert!(context.store().type_resolution_is_empty());
+        assert_eq!(context.diagnostics(), &diagnostics_before);
+    }
+
+    #[test]
+    fn alias_query_host_construction_errors_leave_store_and_diagnostics_unchanged() {
+        let importer = parsed("import { value as local } from './target';");
+        let target = parsed("export const value = 1;");
+        let wrong_arena = parsed("export const unrelated = 2;");
+        let importer_file = FileId::new(212);
+        let target_file = FileId::new(213);
+        let specifier = node_ref(
+            &importer,
+            importer_file,
+            module_specifiers(&importer).into_iter().next().unwrap(),
+        );
+        let mut context = external_context(
+            &[(importer_file, &importer), (target_file, &target)],
+            CanonicalModuleResolutionManifestInput::new([
+                CanonicalModuleResolutionEntry::resolved(specifier, esm(target_file)),
+            ]),
+        );
+        let declaration = alias_declaration_named(&importer, importer_file, "local");
+        let alias = alias_symbol(&context, declaration);
+        let expected_arena = context.file(importer_file).unwrap().1.node_arena_id();
+        let actual_arena = wrong_arena.arena.id();
+        context.files.get_mut(&importer_file).unwrap().arena = &wrong_arena.arena;
+
+        let links_before = context.store().checker_link_allocated_lengths();
+        let resolution_before = context.store().type_resolution_internal_state();
+        let alias_links_before = context.store().alias_symbol_links(alias).cloned();
+        let diagnostics_before = context.diagnostics().clone();
+        let expected_error =
+            CanonicalAliasQueryError::TargetHost(ProductionAliasTargetHostError::ArenaMismatch {
+                file: importer_file,
+                expected: expected_arena,
+                actual: actual_arena,
+            });
+
+        assert_eq!(context.resolve_alias(alias), Err(expected_error));
+        assert_eq!(
+            context.store().checker_link_allocated_lengths(),
+            links_before
+        );
+        assert_eq!(
+            context.store().type_resolution_internal_state(),
+            resolution_before
+        );
+        assert_eq!(
+            context.store().alias_symbol_links(alias).cloned(),
+            alias_links_before
+        );
+        assert_eq!(context.diagnostics(), &diagnostics_before);
+
+        assert_eq!(context.get_symbol_flags(alias), Err(expected_error));
+        assert_eq!(
+            context.store().checker_link_allocated_lengths(),
+            links_before
+        );
+        assert_eq!(
+            context.store().type_resolution_internal_state(),
+            resolution_before
+        );
+        assert_eq!(
+            context.store().alias_symbol_links(alias).cloned(),
+            alias_links_before
+        );
+        assert_eq!(context.diagnostics(), &diagnostics_before);
     }
 
     #[test]

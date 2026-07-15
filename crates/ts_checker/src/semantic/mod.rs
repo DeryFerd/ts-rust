@@ -74,8 +74,8 @@ pub use module_resolution::{
 };
 pub use name_resolution::{ProductionNameResolverHost, ProductionNameResolverHostError};
 pub use production::{
-    CanonicalCheckerContext, CanonicalCheckerContextError, CanonicalCheckerOptions,
-    CanonicalGlobalInitializationError,
+    CanonicalAliasQueryError, CanonicalCheckerContext, CanonicalCheckerContextError,
+    CanonicalCheckerOptions, CanonicalGlobalInitializationError,
 };
 pub use relation::{
     ExpandingFlags, IntersectionState, MinArgumentCountFlags, RecursionFlags,
