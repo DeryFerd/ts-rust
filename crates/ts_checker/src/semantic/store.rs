@@ -15,6 +15,7 @@ use ts_parser::{IsolatedEntityName, parse_isolated_entity_name};
 
 use super::{
     bootstrap::IntrinsicBootstrap,
+    derived_types::DerivedTypeCaches,
     ids::{
         ConditionalRootId, IndexInfoId, SignatureId, TypeAliasId, TypeId, TypeMapperId,
         TypePredicateId, TypedArena,
@@ -127,6 +128,8 @@ pub struct SemanticStore<TypePayload, MapperPayload> {
     declared_types_in_progress: HashSet<SemanticSymbolId>,
     type_resolutions: TypeResolutionStack,
     relations: RelationCaches,
+    #[allow(dead_code)] // Read by the sibling assertion-dispatch integration.
+    pub(super) derived_types: DerivedTypeCaches,
     pub(super) intrinsic_bootstrap: Option<IntrinsicBootstrap>,
     claimed_strict_builtin_iterator_return: Option<bool>,
     pub(super) union_cache_needs_validation: bool,
@@ -177,6 +180,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             declared_types_in_progress: HashSet::new(),
             type_resolutions: TypeResolutionStack::new(id),
             relations: RelationCaches::default(),
+            derived_types: DerivedTypeCaches::default(),
             intrinsic_bootstrap: None,
             claimed_strict_builtin_iterator_return: None,
             union_cache_needs_validation: false,

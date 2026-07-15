@@ -13,6 +13,7 @@ mod assignment;
 pub mod bootstrap;
 mod contextual;
 pub mod declared;
+mod derived_types;
 pub mod diagnostics;
 pub mod formatter;
 mod global_types;
@@ -47,6 +48,7 @@ pub use declared::{
     DeclaredTypeError, DeclaredTypeHost, DeclaredTypeHostError, DeclaredTypeUnavailable,
     UnsupportedDeclaredTypeKind, UnsupportedOuterTypeParameterContext,
 };
+pub use derived_types::DerivedTypeError;
 pub use diagnostics::{
     CanonicalCheckerDiagnostic, CanonicalCheckerDiagnostics, CanonicalCheckerRelatedInformation,
 };
