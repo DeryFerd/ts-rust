@@ -746,6 +746,32 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             })
     }
 
+    fn signature_owns_callable_type(&self, signature: SignatureId) -> bool {
+        let Some(declaration) = self.signature(signature).and_then(Signature::declaration) else {
+            return false;
+        };
+        if self.signature_links(declaration).is_none_or(|links| {
+            links.resolved_signature != ResolvedSignatureState::Resolved(signature)
+        }) {
+            return false;
+        }
+        let type_ = if self.node_is_function_type(declaration) {
+            self.type_node_links(declaration)
+                .and_then(|links| links.resolved_type)
+                .filter(|type_| self.type_has_function_type_provenance(*type_))
+        } else {
+            self.source_callable_type_for_signature(signature)
+                .filter(|type_| {
+                    self.source_callable_provenance(*type_)
+                        .is_some_and(|provenance| {
+                            provenance.declaration == declaration
+                                && provenance.signature == signature
+                        })
+                })
+        };
+        type_.is_some()
+    }
+
     #[must_use]
     pub fn types(&self) -> impl ExactSizeIterator<Item = (TypeId, &TypePayload)> {
         self.types.iter()
@@ -2227,7 +2253,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                 || self
                     .callable_signature_parameter_types
                     .contains_key(signature)
-                || !self.signature_is_callable(*signature)
+                || !self.signature_owns_callable_type(*signature)
                 || self
                     .signature(*signature)
                     .is_none_or(|record| record.parameters().len() != types.len())
