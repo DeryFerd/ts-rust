@@ -345,6 +345,20 @@ pub struct SymbolTable {
     entries: HashMap<EscapedName, SemanticSymbolId>,
 }
 
+/// An empty symbol table whose entry capacity was allocated before a
+/// dependency-closed checker transaction begins publishing semantic records.
+#[derive(Debug, Eq, PartialEq)]
+pub struct PreparedSymbolTable(SymbolTable);
+
+impl PreparedSymbolTable {
+    /// Stages one empty table with room for every planned entry.
+    pub fn new(entry_capacity: usize) -> Option<Self> {
+        let mut entries = HashMap::new();
+        entries.try_reserve(entry_capacity).ok()?;
+        Some(Self(SymbolTable { entries }))
+    }
+}
+
 impl SymbolTable {
     #[must_use]
     pub fn len(&self) -> usize {
@@ -561,6 +575,18 @@ impl SymbolStore {
             local,
         };
         self.tables.push(SymbolTable::default());
+        id
+    }
+
+    /// Moves a capacity-staged table into the already-reserved table arena.
+    #[must_use]
+    pub fn alloc_prepared_symbol_table(&mut self, prepared: PreparedSymbolTable) -> SymbolTableId {
+        let local = local_id_for_len(self.tables.len(), "symbol table identity space exhausted");
+        let id = SymbolTableId {
+            store: self.id,
+            local,
+        };
+        self.tables.push(prepared.0);
         id
     }
 
@@ -1048,6 +1074,35 @@ mod tests {
             SymbolFlags::PROPERTY | SymbolFlags::TRANSIENT,
             CheckFlags::LATE,
         ));
+    }
+
+    #[test]
+    fn prepared_symbol_table_carries_entry_capacity_into_a_reserved_slot() {
+        let mut store = SymbolStore::new();
+        let prepared = PreparedSymbolTable::new(2).unwrap();
+        assert!(PreparedSymbolTable::new(usize::MAX).is_none());
+        assert!(store.try_reserve_checker_allocations(2, 1));
+        let first = store.alloc_transient_symbol(
+            SymbolFlags::PROPERTY,
+            EscapedName::source("first"),
+            CheckFlags::NONE,
+        );
+        let second = store.alloc_transient_symbol(
+            SymbolFlags::PROPERTY,
+            EscapedName::source("second"),
+            CheckFlags::NONE,
+        );
+
+        let table = store.alloc_prepared_symbol_table(prepared);
+        assert_eq!(
+            store.insert_symbol(table, EscapedName::source("first"), first),
+            Some(None),
+        );
+        assert_eq!(
+            store.insert_symbol(table, EscapedName::source("second"), second),
+            Some(None),
+        );
+        assert_eq!(store.symbol_table(table).unwrap().len(), 2);
     }
 
     #[test]
