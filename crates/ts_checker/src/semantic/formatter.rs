@@ -18,7 +18,7 @@ use ts_binder::{
 
 use super::{
     ArrayTypeError, CanonicalGlobalTypes, CanonicalTypeMapperStore, DeclaredTypeHost,
-    DeclaredTypeHostError, SignatureId, TypeAliasId, TypeId,
+    DeclaredTypeHostError, IndexInfoId, SignatureId, TypeAliasId, TypeId,
     array_types::CanonicalArrayTargets,
     bootstrap::LiteralTypeCacheError,
     functions::{
@@ -1047,15 +1047,17 @@ fn validate_unbranded_callable_cache(
         return Err(TypeDisplayUnavailable::MalformedType(type_id));
     }
 
-    let properties = structured.properties.as_deref().unwrap_or_default();
-    validate_structured_member_table(store, type_id, structured.members, properties)?;
-
-    let mut unique_signatures = HashSet::with_capacity(signatures.len());
-    for signature in signatures {
-        if !unique_signatures.insert(*signature) {
+    for (index, signature) in signatures.iter().enumerate() {
+        validate_unbranded_signature_record(store, type_id, *signature)?;
+        let construct = index >= structured.call_signature_count;
+        if store.signature(*signature).is_none_or(|signature| {
+            signature
+                .flags()
+                .contains(super::signatures::SignatureFlags::CONSTRUCT)
+                != construct
+        }) {
             return Err(TypeDisplayUnavailable::MalformedType(type_id));
         }
-        validate_unbranded_signature_record(store, type_id, *signature)?;
     }
 
     let indexes = structured.index_infos.as_deref().unwrap_or_default();
@@ -1083,7 +1085,205 @@ fn validate_unbranded_callable_cache(
             return Err(TypeDisplayUnavailable::MalformedType(type_id));
         }
     }
+    let properties = structured.properties.as_deref().unwrap_or_default();
+    validate_callable_member_table(
+        store,
+        type_id,
+        record.symbol(),
+        structured.members,
+        properties,
+        &signatures[..structured.call_signature_count],
+        &signatures[structured.call_signature_count..],
+        indexes,
+    )?;
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_callable_member_table(
+    store: &CanonicalTypeMapperStore,
+    type_id: TypeId,
+    owner: Option<SemanticSymbolId>,
+    members: Option<ts_binder::SymbolTableId>,
+    properties: &[SemanticSymbolId],
+    call_signatures: &[SignatureId],
+    construct_signatures: &[SignatureId],
+    indexes: &[IndexInfoId],
+) -> Result<(), TypeDisplayUnavailable> {
+    let property_set = properties.iter().copied().collect::<HashSet<_>>();
+    if property_set.len() != properties.len()
+        || owner.is_some_and(|owner| store.symbol(owner).is_none())
+    {
+        return Err(TypeDisplayUnavailable::MalformedType(type_id));
+    }
+    let Some(members) = members else {
+        return if properties.is_empty() {
+            Ok(())
+        } else {
+            Err(TypeDisplayUnavailable::MalformedType(type_id))
+        };
+    };
+    let table = store
+        .symbol_table(members)
+        .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+    for property in properties {
+        let property_record = store
+            .symbol(*property)
+            .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+        if property_record.name().is_reserved_member_name()
+            || table.get(property_record.name()) != Some(*property)
+        {
+            return Err(TypeDisplayUnavailable::MalformedType(type_id));
+        }
+    }
+
+    let call = table.get(InternalSymbolName::Call.as_ref());
+    let construct = table.get(InternalSymbolName::New.as_ref());
+    let index = table.get(InternalSymbolName::Index.as_ref());
+    let reserved_count = usize::from(call.is_some())
+        .saturating_add(usize::from(construct.is_some()))
+        .saturating_add(usize::from(index.is_some()));
+    if table.len() != properties.len().saturating_add(reserved_count)
+        || table.iter().any(|(name, symbol)| {
+            if name == InternalSymbolName::Call.as_ref()
+                || name == InternalSymbolName::New.as_ref()
+                || name == InternalSymbolName::Index.as_ref()
+            {
+                return false;
+            }
+            name.is_reserved_member_name()
+                || !property_set.contains(&symbol)
+                || store
+                    .symbol(symbol)
+                    .is_none_or(|symbol| symbol.name() != name)
+        })
+    {
+        return Err(TypeDisplayUnavailable::MalformedType(type_id));
+    }
+
+    validate_reserved_signature_member(
+        store,
+        type_id,
+        owner,
+        InternalSymbolName::Call,
+        call,
+        call_signatures,
+        &[SyntaxKind::CallSignature, SyntaxKind::FunctionType],
+    )?;
+    validate_reserved_signature_member(
+        store,
+        type_id,
+        owner,
+        InternalSymbolName::New,
+        construct,
+        construct_signatures,
+        &[SyntaxKind::ConstructSignature, SyntaxKind::ConstructorType],
+    )?;
+    validate_reserved_index_member(store, type_id, owner, index, indexes)?;
+    Ok(())
+}
+
+fn validate_reserved_signature_member(
+    store: &CanonicalTypeMapperStore,
+    type_id: TypeId,
+    owner: Option<SemanticSymbolId>,
+    name: InternalSymbolName,
+    symbol: Option<SemanticSymbolId>,
+    signatures: &[SignatureId],
+    declaration_kinds: &[SyntaxKind],
+) -> Result<(), TypeDisplayUnavailable> {
+    let Some(symbol) = symbol else {
+        return Ok(());
+    };
+    let symbol_record = validate_reserved_callable_symbol(store, type_id, owner, name, symbol)?;
+    if signatures.is_empty() {
+        return Err(TypeDisplayUnavailable::MalformedType(type_id));
+    }
+    let Some(declarations) = symbol_record.declarations() else {
+        return Ok(());
+    };
+    if declarations.is_empty()
+        || declarations.iter().enumerate().any(|(index, declaration)| {
+            declarations[..index].contains(declaration)
+                || !declaration_kinds.contains(
+                    &store
+                        .source_node_kind(*declaration)
+                        .unwrap_or(SyntaxKind::Unknown),
+                )
+                || !signatures.iter().any(|signature| {
+                    store
+                        .signature(*signature)
+                        .is_some_and(|signature| signature.declaration() == Some(*declaration))
+                })
+        })
+    {
+        return Err(TypeDisplayUnavailable::MalformedType(type_id));
+    }
+    Ok(())
+}
+
+fn validate_reserved_index_member(
+    store: &CanonicalTypeMapperStore,
+    type_id: TypeId,
+    owner: Option<SemanticSymbolId>,
+    symbol: Option<SemanticSymbolId>,
+    indexes: &[IndexInfoId],
+) -> Result<(), TypeDisplayUnavailable> {
+    let Some(symbol) = symbol else {
+        return Ok(());
+    };
+    let symbol_record = validate_reserved_callable_symbol(
+        store,
+        type_id,
+        owner,
+        InternalSymbolName::Index,
+        symbol,
+    )?;
+    if indexes.is_empty() {
+        return Err(TypeDisplayUnavailable::MalformedType(type_id));
+    }
+    let Some(declarations) = symbol_record.declarations() else {
+        return Ok(());
+    };
+    if declarations.is_empty()
+        || declarations.iter().enumerate().any(|(index, declaration)| {
+            declarations[..index].contains(declaration)
+                || store.source_node_kind(*declaration) != Some(SyntaxKind::IndexSignature)
+                || !indexes.iter().any(|index| {
+                    store
+                        .index_info(*index)
+                        .is_some_and(|index| index.declaration() == Some(*declaration))
+                })
+        })
+    {
+        return Err(TypeDisplayUnavailable::MalformedType(type_id));
+    }
+    Ok(())
+}
+
+fn validate_reserved_callable_symbol<'a>(
+    store: &'a CanonicalTypeMapperStore,
+    type_id: TypeId,
+    owner: Option<SemanticSymbolId>,
+    name: InternalSymbolName,
+    symbol: SemanticSymbolId,
+) -> Result<&'a ts_binder::semantic::Symbol, TypeDisplayUnavailable> {
+    let record = store
+        .symbol(symbol)
+        .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+    if record.flags() != SymbolFlags::SIGNATURE
+        || record.check_flags() != CheckFlags::NONE
+        || record.name() != name.as_ref()
+        || record.value_declaration().is_some()
+        || record.members().is_some()
+        || record.exports().is_some()
+        || record.parent() != owner
+        || record.export_symbol().is_some()
+        || store.get_merged_symbol(symbol) != Some(symbol)
+    {
+        return Err(TypeDisplayUnavailable::MalformedType(type_id));
+    }
+    Ok(record)
 }
 
 fn validate_unbranded_signature_record(
@@ -1127,7 +1327,8 @@ fn validate_unbranded_signature_record(
     if signature.flags().bits() & !allowed_flags.bits() != 0
         || minimum.is_none()
         || resolved_minimum < -1
-        || usize::try_from(resolved_minimum).is_ok_and(|minimum| minimum > parameter_count)
+        || !signature.has_rest_parameter()
+            && usize::try_from(resolved_minimum).is_ok_and(|minimum| minimum > parameter_count)
         || !parameters_unique
         || !type_parameters_unique
         || signature
@@ -2957,6 +3158,31 @@ mod tests {
             .expect("the test source contains the requested type alias")
     }
 
+    fn type_literal_member(
+        parsed: &ParseResult,
+        file: FileId,
+        alias: &str,
+        kind: SyntaxKind,
+    ) -> (NodeRef, NodeRef) {
+        let literal = type_alias_body(parsed, file, alias);
+        let NodeData::TypeLiteralNode(data) = &parsed.arena.get(literal.node).unwrap().data else {
+            panic!("the requested alias does not contain a type literal")
+        };
+        let member = data
+            .members
+            .nodes
+            .iter()
+            .copied()
+            .find(|member| {
+                parsed
+                    .arena
+                    .get(*member)
+                    .is_some_and(|member| member.kind == kind)
+            })
+            .expect("the type literal contains the requested member kind");
+        (literal, NodeRef::new(parsed.arena.id(), file, member))
+    }
+
     fn variable_type_node(parsed: &ParseResult, file: FileId, expected: &str) -> NodeRef {
         parsed
             .arena
@@ -4762,6 +4988,18 @@ mod tests {
                 0,
             )
             .unwrap();
+        let construct_signature = store
+            .alloc_signature(
+                crate::semantic::signatures::SignatureFlags::CONSTRUCT,
+                None,
+                Vec::new(),
+                None,
+                Vec::new(),
+                Some(number),
+                None,
+                0,
+            )
+            .unwrap();
         let unvalidated = store
             .alloc_plain_object_type(ObjectFlags::ANONYMOUS, None)
             .unwrap();
@@ -4825,6 +5063,25 @@ mod tests {
             })
         );
 
+        let repeated_inherited_signature = store
+            .alloc_plain_object_type(ObjectFlags::ANONYMOUS, None)
+            .unwrap();
+        assert!(store.set_structured_type_members(
+            repeated_inherited_signature,
+            None,
+            Some(Vec::new()),
+            Some(vec![first, first]),
+            None,
+            None,
+        ));
+        assert_eq!(
+            type_to_string(&store, repeated_inherited_signature),
+            Err(TypeDisplayUnavailable::FunctionType {
+                type_id: repeated_inherited_signature,
+                reason: FunctionTypeDisplayUnavailable::Overloads,
+            })
+        );
+
         let construct = store
             .alloc_plain_object_type(ObjectFlags::ANONYMOUS, None)
             .unwrap();
@@ -4833,7 +5090,7 @@ mod tests {
             None,
             Some(Vec::new()),
             None,
-            Some(vec![first]),
+            Some(vec![construct_signature]),
             None,
         ));
         assert_eq!(
@@ -4841,6 +5098,44 @@ mod tests {
             Err(TypeDisplayUnavailable::FunctionType {
                 type_id: construct,
                 reason: FunctionTypeDisplayUnavailable::ConstructSignatures,
+            })
+        );
+
+        let rest_parameter = store
+            .alloc_symbol(SymbolData::new(
+                SymbolFlags::FUNCTION_SCOPED_VARIABLE,
+                EscapedName::source("values"),
+            ))
+            .unwrap();
+        let rest_signature = store
+            .alloc_signature(
+                crate::semantic::signatures::SignatureFlags::HAS_REST_PARAMETER,
+                None,
+                Vec::new(),
+                None,
+                vec![rest_parameter],
+                Some(number),
+                None,
+                0,
+            )
+            .unwrap();
+        assert!(store.set_signature_resolved_min_argument_count(rest_signature, 2));
+        let rest_callable = store
+            .alloc_plain_object_type(ObjectFlags::ANONYMOUS, None)
+            .unwrap();
+        assert!(store.set_structured_type_members(
+            rest_callable,
+            None,
+            Some(Vec::new()),
+            Some(vec![rest_signature]),
+            None,
+            None,
+        ));
+        assert_eq!(
+            type_to_string(&store, rest_callable),
+            Err(TypeDisplayUnavailable::FunctionType {
+                type_id: rest_callable,
+                reason: FunctionTypeDisplayUnavailable::RestParameter,
             })
         );
 
@@ -4862,6 +5157,139 @@ mod tests {
             type_to_string(&store, indexed),
             Err(TypeDisplayUnavailable::FunctionType {
                 type_id: indexed,
+                reason: FunctionTypeDisplayUnavailable::IndexSignatures,
+            })
+        );
+    }
+
+    #[test]
+    fn source_callable_member_tables_preserve_typed_capability_boundaries() {
+        let parsed = parse_source_file(concat!(
+            "type Callable = { (): number; }; ",
+            "type Constructable = { new (): object; }; ",
+            "type Indexed = { [key: string]: number; };",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(210);
+        let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+        let (call_literal, call_declaration) =
+            type_literal_member(&parsed, file, "Callable", SyntaxKind::CallSignature);
+        let (construct_literal, construct_declaration) = type_literal_member(
+            &parsed,
+            file,
+            "Constructable",
+            SyntaxKind::ConstructSignature,
+        );
+        let (index_literal, index_declaration) =
+            type_literal_member(&parsed, file, "Indexed", SyntaxKind::IndexSignature);
+        let bound = &context.file(file).unwrap().1;
+        let call_owner = bound.symbol(call_literal).unwrap();
+        let construct_owner = bound.symbol(construct_literal).unwrap();
+        let index_owner = bound.symbol(index_literal).unwrap();
+        let call_members = context
+            .store()
+            .symbol(call_owner)
+            .unwrap()
+            .members()
+            .unwrap();
+        let construct_members = context
+            .store()
+            .symbol(construct_owner)
+            .unwrap()
+            .members()
+            .unwrap();
+        let index_members = context
+            .store()
+            .symbol(index_owner)
+            .unwrap()
+            .members()
+            .unwrap();
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        let number = bootstrap.number_type;
+        let string = bootstrap.string_type;
+
+        let store = context.store_mut_for_test();
+        let call_signature = store
+            .alloc_signature(
+                crate::semantic::signatures::SignatureFlags::NONE,
+                Some(call_declaration),
+                Vec::new(),
+                None,
+                Vec::new(),
+                Some(number),
+                None,
+                0,
+            )
+            .unwrap();
+        let call_type = store
+            .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(call_owner))
+            .unwrap();
+        assert!(store.set_structured_type_members(
+            call_type,
+            Some(call_members),
+            Some(Vec::new()),
+            Some(vec![call_signature]),
+            None,
+            None,
+        ));
+
+        let construct_signature = store
+            .alloc_signature(
+                crate::semantic::signatures::SignatureFlags::CONSTRUCT,
+                Some(construct_declaration),
+                Vec::new(),
+                None,
+                Vec::new(),
+                Some(number),
+                None,
+                0,
+            )
+            .unwrap();
+        let construct_type = store
+            .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(construct_owner))
+            .unwrap();
+        assert!(store.set_structured_type_members(
+            construct_type,
+            Some(construct_members),
+            Some(Vec::new()),
+            None,
+            Some(vec![construct_signature]),
+            None,
+        ));
+
+        let index_info = store
+            .alloc_index_info(string, number, false, Some(index_declaration), Vec::new())
+            .unwrap();
+        let index_type = store
+            .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(index_owner))
+            .unwrap();
+        assert!(store.set_structured_type_members(
+            index_type,
+            Some(index_members),
+            Some(Vec::new()),
+            None,
+            None,
+            Some(vec![index_info]),
+        ));
+
+        assert_eq!(
+            type_to_string(context.store(), call_type),
+            Err(TypeDisplayUnavailable::FunctionType {
+                type_id: call_type,
+                reason: FunctionTypeDisplayUnavailable::UnvalidatedCallable,
+            })
+        );
+        assert_eq!(
+            type_to_string(context.store(), construct_type),
+            Err(TypeDisplayUnavailable::FunctionType {
+                type_id: construct_type,
+                reason: FunctionTypeDisplayUnavailable::ConstructSignatures,
+            })
+        );
+        assert_eq!(
+            type_to_string(context.store(), index_type),
+            Err(TypeDisplayUnavailable::FunctionType {
+                type_id: index_type,
                 reason: FunctionTypeDisplayUnavailable::IndexSignatures,
             })
         );
@@ -4925,6 +5353,37 @@ mod tests {
         assert_eq!(
             type_to_string(&store, duplicate_properties),
             Err(TypeDisplayUnavailable::MalformedType(duplicate_properties,))
+        );
+
+        let invalid_call_symbol = store
+            .alloc_symbol(SymbolData::new(
+                SymbolFlags::PROPERTY,
+                EscapedName::internal(InternalSymbolName::Call),
+            ))
+            .unwrap();
+        let invalid_call_members = store.alloc_symbol_table();
+        assert_eq!(
+            store.insert_symbol(
+                invalid_call_members,
+                EscapedName::internal(InternalSymbolName::Call),
+                invalid_call_symbol,
+            ),
+            Some(None),
+        );
+        let invalid_call_table = store
+            .alloc_plain_object_type(ObjectFlags::ANONYMOUS, None)
+            .unwrap();
+        assert!(store.set_structured_type_members(
+            invalid_call_table,
+            Some(invalid_call_members),
+            Some(Vec::new()),
+            Some(vec![signature]),
+            None,
+            None,
+        ));
+        assert_eq!(
+            type_to_string(&store, invalid_call_table),
+            Err(TypeDisplayUnavailable::MalformedType(invalid_call_table))
         );
 
         let malformed_signature = store
