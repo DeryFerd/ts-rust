@@ -662,9 +662,16 @@ mod tests {
         let two_big = store
             .regular_bigint_literal_type(PseudoBigInt::parse_valid("2n"))
             .unwrap();
-        let (boolean, any) = {
+        let fresh_one = store.fresh_type_of_literal_type(one).unwrap();
+        let fresh_two_big = store.fresh_type_of_literal_type(two_big).unwrap();
+        let (number, bigint, boolean, any) = {
             let bootstrap = store.intrinsic_bootstrap().unwrap();
-            (bootstrap.boolean_type, bootstrap.any_type)
+            (
+                bootstrap.number_type,
+                bootstrap.bigint_type,
+                bootstrap.boolean_type,
+                bootstrap.any_type,
+            )
         };
 
         let close = check_primitive_binary(
@@ -679,6 +686,36 @@ mod tests {
                 nodes.expression,
                 2365,
                 "Operator '+' cannot be applied to types '1' and '2n'.".to_owned(),
+            )]
+        );
+
+        let mixed_left_literal = check_primitive_binary(
+            &mut store,
+            request(nodes, SyntaxKind::PlusToken, fresh_one, bigint),
+        )
+        .unwrap();
+        assert_eq!(mixed_left_literal.result_type, any);
+        assert_eq!(
+            rendered(&mixed_left_literal),
+            [(
+                nodes.expression,
+                2365,
+                "Operator '+' cannot be applied to types '1' and 'bigint'.".to_owned(),
+            )]
+        );
+
+        let mixed_right_literal = check_primitive_binary(
+            &mut store,
+            request(nodes, SyntaxKind::PlusToken, number, fresh_two_big),
+        )
+        .unwrap();
+        assert_eq!(mixed_right_literal.result_type, any);
+        assert_eq!(
+            rendered(&mixed_right_literal),
+            [(
+                nodes.expression,
+                2365,
+                "Operator '+' cannot be applied to types 'number' and '2n'.".to_owned(),
             )]
         );
 
@@ -706,6 +743,8 @@ mod tests {
         let mut store = initialized_store();
         let one = store.regular_number_literal_type(Number::new(1.0)).unwrap();
         let two = store.regular_number_literal_type(Number::new(2.0)).unwrap();
+        let fresh_one = store.fresh_type_of_literal_type(one).unwrap();
+        let fresh_two = store.fresh_type_of_literal_type(two).unwrap();
         let a = store.regular_string_literal_type("a".to_owned()).unwrap();
         let boolean = store.intrinsic_bootstrap().unwrap().boolean_type;
 
@@ -738,6 +777,19 @@ mod tests {
                 "This comparison appears to be unintentional because the types '1' and '2' have no overlap.".to_owned(),
             )]
         );
+
+        let fresh_same_family = check_primitive_binary(
+            &mut store,
+            request(
+                nodes,
+                SyntaxKind::ExclamationEqualsEqualsToken,
+                fresh_one,
+                fresh_two,
+            ),
+        )
+        .unwrap();
+        assert_eq!(fresh_same_family.result_type, boolean);
+        assert_eq!(rendered(&fresh_same_family), rendered(&same_family));
 
         let cross_family = check_primitive_binary(
             &mut store,
