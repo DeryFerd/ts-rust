@@ -51,3 +51,61 @@ fn canonical_program_checks_importer_first_array_values_through_bundler_manifest
         )]
     );
 }
+
+#[test]
+fn canonical_program_combines_type_imports_with_imported_generic_calls() {
+    let fs = MemoryFileSystem::new(true);
+    fs.write_file(
+        "/project/importer.ts",
+        concat!(
+            "import type { User } from './target'; ",
+            "import { identity } from './target'; ",
+            "export const user: User = { id: 1 }; ",
+            "export const result: User = identity(user); ",
+            "export const literal = identity('x'); ",
+            "export const explicit = identity<string>('x'); ",
+            "export const bad: { id: string } = identity(user);",
+        ),
+    )
+    .unwrap();
+    fs.write_file(
+        "/project/target.ts",
+        concat!(
+            "export type User = { id: number }; ",
+            "export function identity<T>(value: T): T { return value; }",
+        ),
+    )
+    .unwrap();
+
+    let program = Program::try_new_with_canonical_checker(
+        &fs,
+        "/project",
+        &["importer.ts".to_owned()],
+        CompilerOptions {
+            module: ModuleKind::EsNext,
+            module_specified: true,
+            module_resolution: ModuleResolutionKind::Bundler,
+            lib: Some(vec!["es5".to_owned()]),
+            strict: true,
+            ..CompilerOptions::default()
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        program
+            .diagnostics()
+            .iter()
+            .map(|diagnostic| (
+                diagnostic.file_name.as_deref(),
+                diagnostic.code,
+                diagnostic.message.as_str(),
+            ))
+            .collect::<Vec<_>>(),
+        [(
+            Some("/project/importer.ts"),
+            Some(2322),
+            "Type 'User' is not assignable to type '{ id: string; }'.\n  Types of property 'id' are incompatible.\n    Type 'number' is not assignable to type 'string'.",
+        )]
+    );
+}

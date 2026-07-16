@@ -10232,6 +10232,131 @@ mod tests {
     }
 
     #[test]
+    fn leaf_declared_property_relation_details_use_target_order_and_plain_fallbacks() {
+        let source = parsed(concat!(
+            "type Source = { second: number; first: number }; ",
+            "type Target = { first: string; second: string }; ",
+            "type Disjoint = { other: number }; ",
+            "const source: Source = { second: 2, first: 1 }; ",
+            "const disjoint: Disjoint = { other: 1 }; ",
+            "const chained: Target = source; ",
+            "const primitive: string = 1; ",
+            "const missing: Target = disjoint;",
+        ));
+        let file = FileId::new(132);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let diagnostics = context.diagnostics().as_slice();
+        assert_eq!(diagnostics.len(), 3);
+        assert_eq!(diagnostics[0].diagnostic.code(), 2322);
+        assert_eq!(
+            diagnostics[0].diagnostic.render().unwrap(),
+            concat!(
+                "Type 'Source' is not assignable to type 'Target'.\n",
+                "  Types of property 'first' are incompatible.\n",
+                "    Type 'number' is not assignable to type 'string'.",
+            ),
+            "the first incompatible target property controls the relation chain"
+        );
+        assert_eq!(
+            diagnostics[1].diagnostic.render().unwrap(),
+            "Type 'number' is not assignable to type 'string'."
+        );
+        assert!(diagnostics[1].diagnostic.details.is_empty());
+        assert_eq!(
+            diagnostics[2].diagnostic.render().unwrap(),
+            "Type 'Disjoint' is not assignable to type 'Target'."
+        );
+        assert!(diagnostics[2].diagnostic.details.is_empty());
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.related_information.is_empty())
+        );
+
+        let warm = observable_state(&context, file);
+        context.check_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn nonterminal_nested_declared_property_details_fall_back_to_plain_root() {
+        let source = parsed(concat!(
+            "type SourceChild = { id: number }; ",
+            "type TargetChild = { id: string }; ",
+            "type Source = { child: SourceChild }; ",
+            "type Target = { child: TargetChild }; ",
+            "const child: SourceChild = { id: 1 }; ",
+            "const source: Source = { child: child }; ",
+            "const value: Target = source;",
+        ));
+        let file = FileId::new(134);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let [diagnostic] = context.diagnostics().as_slice() else {
+            panic!("expected one nested declared-property diagnostic")
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 2322);
+        assert_eq!(
+            diagnostic.diagnostic.render().unwrap(),
+            "Type 'Source' is not assignable to type 'Target'."
+        );
+        assert!(diagnostic.diagnostic.details.is_empty());
+    }
+
+    #[test]
+    fn malformed_leaf_declared_property_graph_fails_without_diagnostic_publication() {
+        let source = parsed(concat!(
+            "type Source = { value: number }; ",
+            "type Target = { value: string }; ",
+            "const source: Source = { value: 1 }; ",
+            "const target: Target = { value: 'ok' };",
+        ));
+        let file = FileId::new(133);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let source_type = context
+            .get_type_from_type_node(variable_type_node(&source, file, "source"))
+            .unwrap();
+        let target_type = context
+            .get_type_from_type_node(variable_type_node(&source, file, "target"))
+            .unwrap();
+        let property = declared_object_property_symbol(&context, source_type, "value");
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_value_symbol_links(property, ValueSymbolLinks::default())
+        );
+        let globals = context.global_types().clone();
+        let host = DeclaredTypeHost::new(std::iter::empty::<(&NodeArena, &BoundFile)>()).unwrap();
+        let before = observable_state(&context, file);
+
+        let result = super::super::object_diagnostics::declared_property_mismatch_details(
+            context.store_mut_for_test(),
+            &host,
+            &globals,
+            source_type,
+            target_type,
+            CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT,
+            CanonicalCheckerOptions::default(),
+        );
+
+        assert!(matches!(
+            result,
+            Err(SourceCheckError::RelationUnavailable(
+                RelationUnavailable::InvalidStructuredMembers(actual),
+            )) if actual == source_type
+        ));
+        assert_eq!(observable_state(&context, file), before);
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
     fn object_literal_excess_properties_use_exact_names_and_pinned_messages_in_source_order() {
         let source = parsed(concat!(
             "interface Child { id: number; value: string } ",

@@ -27,7 +27,10 @@ use super::{
         type_to_string_with_host_global_types_and_flags,
     },
     functions::{StoredFunctionTypeValidation, validate_stored_function_type},
-    object_members::PropertyObjectPlan,
+    object_members::{
+        DeclaredPropertyTypeGraphValidation, PropertyObjectPlan,
+        validate_resolved_declared_property_type_graph,
+    },
     relater::{ResolvedDeclaredProperty, ResolvedDeclaredPropertyObject},
     source::{
         CheckedExpressionShape, CheckedExpressionTypes, PlannedExpression, PlannedExpressionKind,
@@ -36,6 +39,7 @@ use super::{
     spelling::get_spelling_suggestion,
     type_nodes::CanonicalTypeQuery,
     type_records::TypeData,
+    types::TypeFlags,
 };
 
 /// Builds the complete diagnostic batch for one already-failed assignment.
@@ -93,6 +97,24 @@ pub(super) fn diagnostics_for_failed_assignment(
                 prerequisite_diagnostics.extend(resolution_diagnostics.into_vec());
                 resolved?;
             }
+            Err(SourceCheckError::RelationUnavailable(
+                RelationUnavailable::UnresolvedSignatureReturn(signature),
+            )) => {
+                if !resolved_signatures.insert(signature) {
+                    return Err(RelationUnavailable::UnresolvedSignatureReturn(signature).into());
+                }
+                let mut resolution_diagnostics = super::CanonicalCheckerDiagnostics::default();
+                let resolved = CanonicalTypeQuery::new_with_global_types(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    &mut resolution_diagnostics,
+                )?
+                .get_return_type_of_signature(signature);
+                prerequisite_diagnostics.extend(resolution_diagnostics.into_vec());
+                resolved?;
+            }
             Err(error) => return Err(error),
         }
     }
@@ -133,6 +155,7 @@ fn diagnostics_for_failed_assignment_once(
         target_type,
         fallback_node,
         flags,
+        options,
     )?);
     Ok(elaborated)
 }
@@ -332,6 +355,7 @@ fn elaborate_known_properties(
             target_property.type_,
             source_property.name_node,
             flags,
+            options,
         )?;
         append_expected_property_related(
             &mut diagnostic,
@@ -357,6 +381,7 @@ fn shape_or_generic_diagnostic(
     target_type: TypeId,
     fallback_node: NodeRef,
     flags: CanonicalTypeFormatFlags,
+    options: CanonicalCheckerOptions,
 ) -> Result<CanonicalCheckerDiagnostic, SourceCheckError> {
     let expression = expression.unparenthesized();
     let PlannedExpressionKind::Object { plan, .. } = &expression.kind else {
@@ -368,6 +393,7 @@ fn shape_or_generic_diagnostic(
             target_type,
             fallback_node,
             flags,
+            options,
         );
     };
     let Some(target) = store.resolved_declared_property_object(host, target_type)? else {
@@ -379,6 +405,7 @@ fn shape_or_generic_diagnostic(
             target_type,
             fallback_node,
             flags,
+            options,
         );
     };
 
@@ -431,6 +458,7 @@ fn shape_or_generic_diagnostic(
         target_type,
         fallback_node,
         flags,
+        options,
     )
 }
 
@@ -523,14 +551,16 @@ fn missing_property_diagnostic(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn generic_assignability_diagnostic(
-    store: &CanonicalTypeMapperStore,
+    store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     global_types: &CanonicalGlobalTypes,
     source_type: TypeId,
     target_type: TypeId,
     node: NodeRef,
     flags: CanonicalTypeFormatFlags,
+    options: CanonicalCheckerOptions,
 ) -> Result<CanonicalCheckerDiagnostic, SourceCheckError> {
     let AssignabilityErrorDisplay { source, target } =
         get_type_names_for_assignability_error_with_host_global_types_and_flags(
@@ -541,7 +571,123 @@ fn generic_assignability_diagnostic(
             target_type,
             flags,
         )?;
-    primary(2322, node, vec![source, target])
+    let mut diagnostic = primary(2322, node, vec![source, target])?;
+    diagnostic.diagnostic.details = declared_property_mismatch_details(
+        store,
+        host,
+        global_types,
+        source_type,
+        target_type,
+        flags,
+        options,
+    )?;
+    Ok(diagnostic)
+}
+
+pub(super) fn declared_property_mismatch_details(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    source_type: TypeId,
+    target_type: TypeId,
+    flags: CanonicalTypeFormatFlags,
+    options: CanonicalCheckerOptions,
+) -> Result<Vec<String>, SourceCheckError> {
+    for type_ in [source_type, target_type] {
+        match validate_resolved_declared_property_type_graph(store, type_) {
+            DeclaredPropertyTypeGraphValidation::Traversable(_) => {}
+            DeclaredPropertyTypeGraphValidation::Opaque => return Ok(Vec::new()),
+            DeclaredPropertyTypeGraphValidation::Malformed => {
+                return Err(invalid_structure(type_));
+            }
+        }
+    }
+    let source = store
+        .resolved_declared_property_object(host, source_type)?
+        .ok_or_else(|| invalid_structure(source_type))?;
+    let target = store
+        .resolved_declared_property_object(host, target_type)?
+        .ok_or_else(|| invalid_structure(target_type))?;
+    for target_property in target.properties() {
+        let name = property_name(target_property)?;
+        let Some(source_property) = source.get_source(name) else {
+            continue;
+        };
+        if store.is_type_assignable_to_with_global_types_and_strict_function_types(
+            source_property.type_,
+            target_property.type_,
+            global_types,
+            options.strict_function_types,
+        )? {
+            continue;
+        }
+        // The complete upstream relation chain is recursive. Until those
+        // nested object, array, callable, and type-variable messages are
+        // ported, only elaborate a child pair whose terminal scalar shape is
+        // independently proven. Falling back to the root TS2322 is preferable
+        // to publishing a plausible but truncated diagnostic chain.
+        if !is_terminal_scalar_relation_leaf(store, source_property.type_)
+            || !is_terminal_scalar_relation_leaf(store, target_property.type_)
+        {
+            return Ok(Vec::new());
+        }
+        let property_message = Diagnostic::with_arguments(
+            message_by_code(2326).ok_or(SourceCheckError::MissingDiagnostic(2326))?,
+            [name],
+        )
+        .render()
+        .expect("TS2326 has one formatting argument");
+        let AssignabilityErrorDisplay { source, target } =
+            get_type_names_for_assignability_error_with_host_global_types_and_flags(
+                store,
+                host,
+                global_types,
+                source_property.type_,
+                target_property.type_,
+                flags,
+            )?;
+        let nested_message = Diagnostic::with_arguments(
+            message_by_code(2322).ok_or(SourceCheckError::MissingDiagnostic(2322))?,
+            [source, target],
+        )
+        .render()
+        .expect("TS2322 has two formatting arguments");
+        return Ok(vec![
+            format!("  {property_message}"),
+            format!("    {nested_message}"),
+        ]);
+    }
+    Ok(Vec::new())
+}
+
+fn is_terminal_scalar_relation_leaf(store: &CanonicalTypeMapperStore, type_: TypeId) -> bool {
+    let Some(record) = store.type_payload(type_) else {
+        return false;
+    };
+    if record.alias().is_some() || record.symbol().is_some() || !record.object_flags().is_empty() {
+        return false;
+    }
+    match record.data() {
+        TypeData::Intrinsic(_) => matches!(
+            record.flags(),
+            TypeFlags::STRING
+                | TypeFlags::NUMBER
+                | TypeFlags::BIG_INT
+                | TypeFlags::BOOLEAN
+                | TypeFlags::ES_SYMBOL
+                | TypeFlags::NULL
+                | TypeFlags::UNDEFINED
+                | TypeFlags::VOID
+        ),
+        TypeData::Literal(_) => matches!(
+            record.flags(),
+            TypeFlags::STRING_LITERAL
+                | TypeFlags::NUMBER_LITERAL
+                | TypeFlags::BIG_INT_LITERAL
+                | TypeFlags::BOOLEAN_LITERAL
+        ),
+        _ => false,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
