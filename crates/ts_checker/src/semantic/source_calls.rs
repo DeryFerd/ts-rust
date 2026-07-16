@@ -269,7 +269,8 @@ fn is_context_insensitive_argument_plan(expression: &PlannedExpression) -> bool 
         | PlannedExpressionKind::TypeImportValueUse(_)
         | PlannedExpressionKind::Array(_)
         | PlannedExpressionKind::Object { .. }
-        | PlannedExpressionKind::Call(_) => false,
+        | PlannedExpressionKind::Call(_)
+        | PlannedExpressionKind::Binary(_) => false,
     }
 }
 

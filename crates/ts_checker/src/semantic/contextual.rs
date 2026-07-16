@@ -357,6 +357,15 @@ fn prepare_expression(
                 UnsupportedSourceSyntax::Call(expression.node),
             ));
         }
+        PlannedExpressionKind::Binary(_) => {
+            return Err(SourceCheckError::Unsupported(
+                UnsupportedSourceSyntax::Syntax {
+                    node: expression.node,
+                    kind: ts_ast::SyntaxKind::BinaryExpression,
+                    role: super::source::SourceSyntaxRole::BinaryExpression,
+                },
+            ));
+        }
     };
     Ok(prepared)
 }

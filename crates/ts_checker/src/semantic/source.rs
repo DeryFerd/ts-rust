@@ -7,8 +7,9 @@
 //! annotations,
 //! annotated top-level function declarations, initialized identifier-named
 //! top-level variables (optionally exported), ordinary direct identifier
-//! calls, required own-property reads, and direct assignments back to
-//! supported `var` declarations.
+//! calls, atomic primitive/literal scalar binary operators, required
+//! own-property reads, and direct assignments back to supported `var`
+//! declarations.
 //! The complete source tree and complete supported-statement plan are validated
 //! before semantic execution begins. Execution may retain safe canonical memo
 //! caches while discovering a type-dependent capability boundary.
@@ -47,6 +48,10 @@ use super::{
     formatter::{
         CanonicalTypeFormatFlags,
         get_type_names_for_assignability_error_with_host_global_types_and_flags,
+    },
+    primitive_operators::{
+        PrimitiveBigIntExponentiationTarget, PrimitiveBinaryError, PrimitiveBinaryRecovery,
+        PrimitiveBinaryRequest, PrimitiveBinaryUnsupported, check_primitive_binary,
     },
     source_arrows::{
         ResolvedSourceContextualArrowPlan, SourceArrowBodyPlan, SourceArrowError, SourceArrowPlan,
@@ -127,6 +132,9 @@ pub enum SourceSyntaxRole {
     ArrayElement,
     ObjectLiteral,
     ObjectProperty,
+    BinaryExpression,
+    BinaryOperator,
+    BinaryOperand,
 }
 
 /// Syntax that cannot be checked exactly by the installed source slice.
@@ -152,6 +160,7 @@ pub enum UnsupportedSourceSyntax {
         node: NodeRef,
         operator: SyntaxKind,
     },
+    BigIntExponentiationTarget(NodeRef),
     ConstAssertion(NodeRef),
     NestedAssertion(NodeRef),
     Assignment(AssignmentUnsupported),
@@ -277,6 +286,7 @@ pub enum SourceCheckError {
     Enum(NodeRef),
     Import(NodeRef),
     Property(NodeRef),
+    PrimitiveOperator(NodeRef),
     MissingDiagnostic(u32),
 }
 
@@ -303,6 +313,9 @@ impl std::fmt::Display for SourceCheckError {
             Self::Enum(node) => write!(formatter, "enum checking failed at {node:?}"),
             Self::Import(node) => write!(formatter, "import checking failed at {node:?}"),
             Self::Property(node) => write!(formatter, "property checking failed at {node:?}"),
+            Self::PrimitiveOperator(node) => {
+                write!(formatter, "primitive operator checking failed at {node:?}")
+            }
             Self::MissingDiagnostic(code) => {
                 write!(formatter, "diagnostic TS{code} is absent from the catalog")
             }
@@ -332,6 +345,7 @@ impl std::error::Error for SourceCheckError {
             | Self::Enum(_)
             | Self::Import(_)
             | Self::Property(_)
+            | Self::PrimitiveOperator(_)
             | Self::MissingDiagnostic(_) => None,
         }
     }
@@ -393,6 +407,15 @@ impl PlannedExpression {
     }
 }
 
+/// Fully preflighted scalar-binary source shape with recursive operands.
+#[derive(Clone, Debug)]
+pub(super) struct PrimitiveBinaryPlan {
+    node: NodeRef,
+    left: PlannedExpression,
+    operator: SyntaxKind,
+    right: PlannedExpression,
+}
+
 #[derive(Clone, Debug)]
 pub(super) enum PlannedExpressionKind {
     Null,
@@ -421,6 +444,7 @@ pub(super) enum PlannedExpressionKind {
     },
     Property(Box<SourcePropertyPlan>),
     Call(Box<SourceCallPlan>),
+    Binary(Box<PrimitiveBinaryPlan>),
 }
 
 /// A direct expression read of one clause-level type-only import. It remains
@@ -2437,6 +2461,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     PlannedExpressionKind::Parenthesized(Box::new(self.plan_expression(inner)?)),
                 ))
             }
+            SyntaxKind::BinaryExpression => self.plan_primitive_binary(expression),
             SyntaxKind::PrefixUnaryExpression => self.plan_prefix_unary(expression),
             SyntaxKind::TypeAssertionExpression | SyntaxKind::AsExpression => {
                 self.plan_assertion(expression)
@@ -2480,6 +2505,157 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 ))
             }
             _ => Err(self.unsupported(expression, kind, SourceSyntaxRole::VariableInitializer)),
+        }
+    }
+
+    fn plan_primitive_binary(
+        &mut self,
+        expression: NodeRef,
+    ) -> Result<PlannedExpression, SourceCheckError> {
+        let (left_id, operator_id, right_id) = {
+            let record = self.node(expression)?;
+            let NodeData::BinaryExpression(binary) = &record.data else {
+                return Err(self.unsupported(
+                    expression,
+                    record.kind,
+                    SourceSyntaxRole::BinaryExpression,
+                ));
+            };
+            if record.kind != SyntaxKind::BinaryExpression
+                || record.flags.0 != 0
+                || binary.symbol.is_some()
+                || binary.type_.is_some()
+                || binary.facts != 0
+                || binary.modifiers.is_some()
+            {
+                return Err(self.unsupported(
+                    expression,
+                    record.kind,
+                    SourceSyntaxRole::BinaryExpression,
+                ));
+            }
+            (binary.left, binary.operator_token, binary.right)
+        };
+        if !self.primitive_binary_position_is_supported(expression)? {
+            return Err(self.unsupported(
+                expression,
+                SyntaxKind::BinaryExpression,
+                SourceSyntaxRole::BinaryExpression,
+            ));
+        }
+
+        let Some((store, _)) = self.semantic else {
+            return Err(self.unsupported(
+                expression,
+                SyntaxKind::BinaryExpression,
+                SourceSyntaxRole::BinaryExpression,
+            ));
+        };
+        if let Some(links) = store.type_node_links(expression) {
+            let expected = TypeNodeLinks {
+                resolved_type: links.resolved_type,
+                ..TypeNodeLinks::default()
+            };
+            if links != &expected
+                || links
+                    .resolved_type
+                    .is_some_and(|type_| store.type_payload(type_).is_none())
+            {
+                return Err(SourceCheckError::PrimitiveOperator(expression));
+            }
+        }
+
+        let left = self.reference(left_id);
+        let operator = self.reference(operator_id);
+        let right = self.reference(right_id);
+        let left_record = self.node(left)?;
+        let operator_record = self.node(operator)?;
+        let right_record = self.node(right)?;
+        if left_record.parent != Some(expression.node)
+            || operator_record.parent != Some(expression.node)
+            || right_record.parent != Some(expression.node)
+            || left_record.range.end > operator_record.range.start
+            || operator_record.range.end > right_record.range.start
+        {
+            return Err(SourceCheckError::PrimitiveOperator(expression));
+        }
+        let left_kind = left_record.kind;
+        let right_kind = right_record.kind;
+        if operator_record.flags.0 != 0 || !matches!(operator_record.data, NodeData::Token(_)) {
+            return Err(SourceCheckError::PrimitiveOperator(operator));
+        }
+        let operator_kind = operator_record.kind;
+        let Some(operator_text) = primitive_binary_operator_text(operator_kind) else {
+            return Err(self.unsupported(
+                operator,
+                operator_kind,
+                SourceSyntaxRole::BinaryOperator,
+            ));
+        };
+        if !self.source_spelling_matches(operator, operator_text) {
+            return Err(SourceCheckError::PrimitiveOperator(operator));
+        }
+
+        let left_plan = self.plan_expression(left)?;
+        if !primitive_binary_operand_plan_is_supported(&left_plan) {
+            return Err(self.unsupported(left, left_kind, SourceSyntaxRole::BinaryOperand));
+        }
+        let right_plan = self.plan_expression(right)?;
+        if !primitive_binary_operand_plan_is_supported(&right_plan) {
+            return Err(self.unsupported(right, right_kind, SourceSyntaxRole::BinaryOperand));
+        }
+        Ok(PlannedExpression::new(
+            expression,
+            PlannedExpressionKind::Binary(Box::new(PrimitiveBinaryPlan {
+                node: expression,
+                left: left_plan,
+                operator: operator_kind,
+                right: right_plan,
+            })),
+        ))
+    }
+
+    fn primitive_binary_position_is_supported(
+        &self,
+        expression: NodeRef,
+    ) -> Result<bool, SourceCheckError> {
+        let mut current = expression;
+        loop {
+            let Some(parent_id) = self.node(current)?.parent else {
+                return Ok(false);
+            };
+            let parent = self.reference(parent_id);
+            let record = self.node(parent)?;
+            match &record.data {
+                NodeData::ParenthesizedExpression(parenthesized)
+                    if parenthesized.expression == current.node =>
+                {
+                    current = parent;
+                }
+                NodeData::BinaryExpression(binary)
+                    if binary.left == current.node || binary.right == current.node =>
+                {
+                    current = parent;
+                }
+                NodeData::AsExpression(assertion) if assertion.expression == current.node => {
+                    current = parent;
+                }
+                NodeData::TypeAssertion(assertion) if assertion.expression == current.node => {
+                    current = parent;
+                }
+                NodeData::VariableDeclaration(variable)
+                    if variable.initializer == Some(current.node) =>
+                {
+                    return Ok(true);
+                }
+                NodeData::ReturnStatement(statement)
+                    if statement.expression == Some(current.node) =>
+                {
+                    return Ok(true);
+                }
+                NodeData::ArrowFunction(arrow) if arrow.body == current.node => return Ok(true),
+                _ => return Ok(false),
+            }
         }
     }
 
@@ -2925,6 +3101,52 @@ fn valid_range(
     source_text.is_none_or(|text| usize::try_from(end).is_ok_and(|end| end <= text.len()))
 }
 
+fn primitive_binary_operand_plan_is_supported(expression: &PlannedExpression) -> bool {
+    match &expression.kind {
+        PlannedExpressionKind::String(_)
+        | PlannedExpressionKind::Number { .. }
+        | PlannedExpressionKind::BigInt { .. }
+        | PlannedExpressionKind::Boolean(_)
+        | PlannedExpressionKind::Identifier(_)
+        | PlannedExpressionKind::Call(_) => true,
+        PlannedExpressionKind::Parenthesized(inner) => {
+            primitive_binary_operand_plan_is_supported(inner)
+        }
+        PlannedExpressionKind::Binary(binary) => {
+            binary.node == expression.node
+                && primitive_binary_operand_plan_is_supported(&binary.left)
+                && primitive_binary_operand_plan_is_supported(&binary.right)
+        }
+        PlannedExpressionKind::Null
+        | PlannedExpressionKind::GlobalUndefined
+        | PlannedExpressionKind::TypeImportValueUse(_)
+        | PlannedExpressionKind::Assertion { .. }
+        | PlannedExpressionKind::Array(_)
+        | PlannedExpressionKind::Object { .. }
+        | PlannedExpressionKind::Property(_) => false,
+    }
+}
+
+const fn primitive_binary_operator_text(kind: SyntaxKind) -> Option<&'static str> {
+    match kind {
+        SyntaxKind::PlusToken => Some("+"),
+        SyntaxKind::MinusToken => Some("-"),
+        SyntaxKind::AsteriskToken => Some("*"),
+        SyntaxKind::SlashToken => Some("/"),
+        SyntaxKind::PercentToken => Some("%"),
+        SyntaxKind::AsteriskAsteriskToken => Some("**"),
+        SyntaxKind::LessThanToken => Some("<"),
+        SyntaxKind::LessThanEqualsToken => Some("<="),
+        SyntaxKind::GreaterThanToken => Some(">"),
+        SyntaxKind::GreaterThanEqualsToken => Some(">="),
+        SyntaxKind::EqualsEqualsToken => Some("=="),
+        SyntaxKind::ExclamationEqualsToken => Some("!="),
+        SyntaxKind::EqualsEqualsEqualsToken => Some("==="),
+        SyntaxKind::ExclamationEqualsEqualsToken => Some("!=="),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 fn expression_type(
     store: &mut CanonicalTypeMapperStore,
@@ -2946,6 +3168,7 @@ pub(super) struct CheckedExpressionTypes {
     raw: TypeId,
     pub(super) result: TypeId,
     pub(super) shape: CheckedExpressionShape,
+    primitive_binary_recovery: Option<PrimitiveBinaryRecovery>,
 }
 
 impl CheckedExpressionTypes {
@@ -2954,6 +3177,16 @@ impl CheckedExpressionTypes {
             raw,
             result,
             shape: CheckedExpressionShape::Leaf,
+            primitive_binary_recovery: None,
+        }
+    }
+
+    fn primitive_binary(type_: TypeId, recovery: Option<PrimitiveBinaryRecovery>) -> Self {
+        Self {
+            raw: type_,
+            result: type_,
+            shape: CheckedExpressionShape::Leaf,
+            primitive_binary_recovery: recovery,
         }
     }
 }
@@ -3125,6 +3358,7 @@ fn execute_expression_types(
                 raw: array,
                 result: array,
                 shape: CheckedExpressionShape::Array(checked_elements),
+                primitive_binary_recovery: None,
             })
         }
         (
@@ -3155,6 +3389,7 @@ fn execute_expression_types(
                 raw: object,
                 result: object,
                 shape: CheckedExpressionShape::Object(checked_properties),
+                primitive_binary_recovery: None,
             })
         }
         (
@@ -3535,6 +3770,57 @@ fn check_expression_type(
             preflighted_type_import_value_uses,
             read,
         ),
+        PlannedExpressionKind::Binary(binary) => {
+            let left = check_expression_type(
+                store,
+                host,
+                global_types,
+                source,
+                options,
+                diagnostics,
+                current_flow_types,
+                preflighted_type_import_value_uses,
+                &binary.left,
+                None,
+                deferred,
+            )?;
+            let right = check_expression_type(
+                store,
+                host,
+                global_types,
+                source,
+                options,
+                diagnostics,
+                current_flow_types,
+                preflighted_type_import_value_uses,
+                &binary.right,
+                None,
+                deferred,
+            )?;
+            let resolution = check_primitive_binary(
+                store,
+                PrimitiveBinaryRequest {
+                    expression: binary.node,
+                    left: binary.left.node,
+                    operator: binary.operator,
+                    right: binary.right.node,
+                    left_type: left.result,
+                    right_type: right.result,
+                    left_recovery: left.primitive_binary_recovery,
+                    right_recovery: right.primitive_binary_recovery,
+                    bigint_exponentiation_target: PrimitiveBigIntExponentiationTarget::Unknown,
+                },
+            )
+            .map_err(|error| primitive_binary_check_error(host, binary.node, &error))?;
+            for diagnostic in resolution.diagnostics {
+                merge_retry_diagnostic(diagnostics, diagnostic);
+            }
+            publish_expression_type(store, binary.node, resolution.result_type)?;
+            Ok(CheckedExpressionTypes::primitive_binary(
+                resolution.result_type,
+                resolution.recovery,
+            ))
+        }
         PlannedExpressionKind::Call(call) => {
             let callee = check_expression_type(
                 store,
@@ -3662,6 +3948,40 @@ fn check_expression_type(
                 &prepared,
             )
         }
+    }
+}
+
+fn primitive_binary_check_error(
+    host: &DeclaredTypeHost<'_>,
+    expression: NodeRef,
+    error: &PrimitiveBinaryError,
+) -> SourceCheckError {
+    match error {
+        PrimitiveBinaryError::Unsupported(PrimitiveBinaryUnsupported::Operator(kind)) => {
+            SourceCheckError::Unsupported(UnsupportedSourceSyntax::Syntax {
+                node: expression,
+                kind: *kind,
+                role: SourceSyntaxRole::BinaryOperator,
+            })
+        }
+        PrimitiveBinaryError::Unsupported(PrimitiveBinaryUnsupported::Operand { node, .. }) => {
+            SourceCheckError::Unsupported(UnsupportedSourceSyntax::Syntax {
+                node: *node,
+                kind: host
+                    .node(*node)
+                    .map_or(SyntaxKind::Unknown, |record| record.kind),
+                role: SourceSyntaxRole::BinaryOperand,
+            })
+        }
+        PrimitiveBinaryError::Unsupported(
+            PrimitiveBinaryUnsupported::BigIntExponentiationTarget(node),
+        ) => SourceCheckError::Unsupported(UnsupportedSourceSyntax::BigIntExponentiationTarget(
+            *node,
+        )),
+        PrimitiveBinaryError::Invariant(_) => SourceCheckError::PrimitiveOperator(expression),
+        PrimitiveBinaryError::Literal(error) => (*error).into(),
+        PrimitiveBinaryError::Relation(error) => (*error).into(),
+        PrimitiveBinaryError::Display(error) => (*error).into(),
     }
 }
 
@@ -5783,6 +6103,21 @@ mod tests {
         (
             NodeRef::new(parsed.arena.id(), file, statement.0),
             NodeRef::new(parsed.arena.id(), file, statement.1),
+        )
+    }
+
+    fn primitive_binary_parts(
+        parsed: &ParseResult,
+        file: FileId,
+        expression: NodeRef,
+    ) -> (NodeRef, NodeRef) {
+        let NodeData::BinaryExpression(binary) = &parsed.arena.get(expression.node).unwrap().data
+        else {
+            panic!("expected binary expression")
+        };
+        (
+            NodeRef::new(parsed.arena.id(), file, binary.left),
+            NodeRef::new(parsed.arena.id(), file, binary.right),
         )
     }
 
@@ -8619,6 +8954,7 @@ mod tests {
             raw: number,
             result: number,
             shape: CheckedExpressionShape::Array(vec![checked_element]),
+            primitive_binary_recovery: None,
         };
         let mismatched_kind = CheckedExpressionTypes::leaf(number, number);
         let before = observable_state(&array_context, file);
@@ -8672,6 +9008,7 @@ mod tests {
                 CheckedExpressionTypes::leaf(number, number),
                 CheckedExpressionTypes::leaf(number, number),
             ]),
+            primitive_binary_recovery: None,
         };
         let globals = nested_context.global_types().clone();
         let options = nested_context.options();
@@ -12995,5 +13332,242 @@ mod tests {
         assert_eq!(truncated.arguments[0], format!("\"{}...", "x".repeat(316)));
         assert_eq!(complete.arguments[0], format!("\"{value}\""));
         assert_eq!(complete.arguments[1], "\"other\"");
+    }
+
+    #[test]
+    fn unknown_bigint_exponentiation_target_fails_closed_with_stable_safe_memos() {
+        let source = parsed("const ready = 1 + 2; const blocked = 1n ** 2n;");
+        let file = FileId::new(401);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        let ready = variable_initializer(&source, file, "ready");
+        let blocked = variable_initializer(&source, file, "blocked");
+        let ready_symbol = variable_symbol(&context, &source, file, "ready");
+        let blocked_symbol = variable_symbol(&context, &source, file, "blocked");
+        let expected = SourceCheckError::Unsupported(
+            UnsupportedSourceSyntax::BigIntExponentiationTarget(blocked),
+        );
+
+        assert_eq!(context.check_source_file(file), Err(expected));
+
+        assert!(context.diagnostics().is_empty());
+        assert!(!is_type_checked(&context, file));
+        assert!(context.store().type_node_links(blocked).is_none());
+        assert_eq!(
+            resolved_node_type(&context, ready),
+            context.store().intrinsic_bootstrap().unwrap().number_type,
+        );
+        assert!(context.store().value_symbol_links(ready_symbol).is_none());
+        assert!(context.store().value_symbol_links(blocked_symbol).is_none());
+        let rejected = observable_state(&context, file);
+
+        assert_eq!(context.check_source_file(file), Err(expected));
+        assert_eq!(observable_state(&context, file), rejected);
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn nested_binary_positions_fail_during_whole_source_preflight() {
+        for (file, text) in [
+            (FileId::new(402), "const value = [1 + 2];"),
+            (FileId::new(403), "const value = { item: 1 + 2 };"),
+            (
+                FileId::new(404),
+                concat!(
+                    "function id(value: number): number { return value; } ",
+                    "const value = id(1 + 2);",
+                ),
+            ),
+        ] {
+            let source = parsed(text);
+            let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+            let binary = source
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::BinaryExpression)
+                        .then(|| NodeRef::new(source.arena.id(), file, node))
+                })
+                .expect("fixture must contain a binary expression");
+            let value = variable_symbol(&context, &source, file, "value");
+            let before = observable_state(&context, file);
+
+            assert_eq!(
+                context.check_source_file(file),
+                Err(SourceCheckError::Unsupported(
+                    UnsupportedSourceSyntax::Syntax {
+                        node: binary,
+                        kind: SyntaxKind::BinaryExpression,
+                        role: SourceSyntaxRole::BinaryExpression,
+                    },
+                )),
+            );
+
+            assert_eq!(observable_state(&context, file), before, "source: {text}");
+            assert!(context.store().type_node_links(binary).is_none());
+            assert!(context.store().value_symbol_links(value).is_none());
+            assert!(context.diagnostics().is_empty());
+            assert!(!is_type_checked(&context, file));
+        }
+    }
+
+    #[test]
+    fn primitive_binary_operator_kind_must_match_its_exact_source_spelling() {
+        let mut source = parsed("const value = 1 + 2;");
+        let file = FileId::new(409);
+        let binary = variable_initializer(&source, file, "value");
+        let operator_id = match &source.arena.get(binary.node).unwrap().data {
+            NodeData::BinaryExpression(binary) => binary.operator_token,
+            _ => unreachable!(),
+        };
+        source.arena.get_mut(operator_id).unwrap().kind = SyntaxKind::MinusToken;
+        let operator = NodeRef::new(source.arena.id(), file, operator_id);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        let before = observable_state(&context, file);
+
+        assert_eq!(
+            context.check_source_file(file),
+            Err(SourceCheckError::PrimitiveOperator(operator)),
+        );
+
+        assert_eq!(observable_state(&context, file), before);
+        assert!(context.store().type_node_links(binary).is_none());
+        assert!(context.diagnostics().is_empty());
+        assert!(!is_type_checked(&context, file));
+    }
+
+    #[test]
+    fn primitive_binary_root_cache_poison_retains_diagnostics_only_until_repair() {
+        let source = parsed("const value = 1 + true;");
+        let file = FileId::new(405);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        let binary = variable_initializer(&source, file, "value");
+        let (poison, expected) = {
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            (bootstrap.number_type, bootstrap.any_type)
+        };
+        assert_ne!(poison, expected);
+        assert!(context.store_mut_for_test().set_type_node_links(
+            binary,
+            TypeNodeLinks {
+                resolved_type: Some(poison),
+                ..TypeNodeLinks::default()
+            },
+        ));
+
+        let error = SourceCheckError::Assertion(SourceAssertionError::InvalidExpressionCache {
+            node: binary,
+            cached: Some(poison),
+            expected,
+        });
+        assert_eq!(context.check_source_file(file), Err(error));
+        assert!(context.diagnostics().is_empty());
+        assert!(!is_type_checked(&context, file));
+        let rejected = observable_state(&context, file);
+        assert_eq!(context.check_source_file(file), Err(error));
+        assert_eq!(observable_state(&context, file), rejected);
+
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_type_node_links(binary, TypeNodeLinks::default())
+        );
+        context.check_source_file(file).unwrap();
+        let [diagnostic] = context.diagnostics().as_slice() else {
+            panic!("expected the retained operator diagnostic")
+        };
+        assert_eq!(diagnostic.node, Some(binary));
+        assert_eq!(diagnostic.diagnostic.code(), 2365);
+        assert_eq!(diagnostic.diagnostic.arguments, ["+", "number", "boolean"]);
+        assert_eq!(resolved_node_type(&context, binary), expected);
+        assert!(is_type_checked(&context, file));
+    }
+
+    #[test]
+    fn primitive_binary_child_cache_poison_is_retry_stable_and_publishes_no_root() {
+        let source = parsed("const value = 1 + true;");
+        let file = FileId::new(406);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        let binary = variable_initializer(&source, file, "value");
+        let (left, right) = primitive_binary_parts(&source, file, binary);
+        let poison = context.store().intrinsic_bootstrap().unwrap().number_type;
+        assert!(context.store_mut_for_test().set_type_node_links(
+            left,
+            TypeNodeLinks {
+                resolved_type: Some(poison),
+                ..TypeNodeLinks::default()
+            },
+        ));
+
+        let first = context.check_source_file(file).unwrap_err();
+        assert!(matches!(
+            first,
+            SourceCheckError::Assertion(SourceAssertionError::InvalidExpressionCache {
+                node,
+                cached: Some(cached),
+                expected,
+            }) if node == left && cached == poison && expected != poison
+        ));
+        assert!(context.store().type_node_links(binary).is_none());
+        assert!(context.store().type_node_links(right).is_none());
+        assert!(context.diagnostics().is_empty());
+        assert!(!is_type_checked(&context, file));
+        let rejected = observable_state(&context, file);
+
+        assert_eq!(context.check_source_file(file), Err(first));
+        assert_eq!(observable_state(&context, file), rejected);
+
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_type_node_links(left, TypeNodeLinks::default())
+        );
+        context.check_source_file(file).unwrap();
+        assert_eq!(
+            resolved_node_type(&context, binary),
+            context.store().intrinsic_bootstrap().unwrap().any_type,
+        );
+        assert_eq!(context.diagnostics().len(), 1);
+        assert!(is_type_checked(&context, file));
+    }
+
+    #[test]
+    fn untagged_any_identifiers_and_calls_remain_typed_binary_boundaries() {
+        for (file, text) in [
+            (
+                FileId::new(407),
+                "const input: any = 1; const result = input + 2;",
+            ),
+            (
+                FileId::new(408),
+                concat!(
+                    "function identity(value: any): any { return value; } ",
+                    "const result = identity(1) + 2;",
+                ),
+            ),
+        ] {
+            let source = parsed(text);
+            let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+            let binary = variable_initializer(&source, file, "result");
+            let (left, _) = primitive_binary_parts(&source, file, binary);
+            let kind = source.arena.get(left.node).unwrap().kind;
+
+            assert_eq!(
+                context.check_source_file(file),
+                Err(SourceCheckError::Unsupported(
+                    UnsupportedSourceSyntax::Syntax {
+                        node: left,
+                        kind,
+                        role: SourceSyntaxRole::BinaryOperand,
+                    },
+                )),
+            );
+
+            assert!(context.store().type_node_links(binary).is_none());
+            assert!(context.diagnostics().is_empty());
+            assert!(!is_type_checked(&context, file));
+            let rejected = observable_state(&context, file);
+            assert!(context.check_source_file(file).is_err());
+            assert_eq!(observable_state(&context, file), rejected);
+        }
     }
 }

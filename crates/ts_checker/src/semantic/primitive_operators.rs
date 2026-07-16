@@ -7,8 +7,6 @@
 //! publishing expression links; source integration owns publication after the
 //! complete result and diagnostic batch have been staged.
 
-#![allow(dead_code)] // Installed one commit ahead of its source dispatch consumer.
-
 use ts_ast::{NodeRef, SyntaxKind};
 use ts_diagnostics::{Diagnostic, message_by_code};
 
@@ -22,11 +20,22 @@ use super::{
 };
 
 /// Target capability needed only by `bigint ** bigint`.
+#[allow(dead_code)] // Known targets are retained for the future compiler-option handoff.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum PrimitiveBigIntExponentiationTarget {
     KnownAtLeastEs2016,
     KnownBeforeEs2016,
     Unknown,
+}
+
+/// Unforgeable-at-source provenance for a result recovered by this kernel.
+///
+/// The source executor retains this tag only on a completed primitive binary
+/// result and validates it against the exact bootstrap identity on reuse.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum PrimitiveBinaryRecovery {
+    Any,
+    Error,
 }
 
 /// Syntax-neutral input after both operands have been checked left-to-right.
@@ -38,6 +47,8 @@ pub(super) struct PrimitiveBinaryRequest {
     pub(super) right: NodeRef,
     pub(super) left_type: TypeId,
     pub(super) right_type: TypeId,
+    pub(super) left_recovery: Option<PrimitiveBinaryRecovery>,
+    pub(super) right_recovery: Option<PrimitiveBinaryRecovery>,
     pub(super) bigint_exponentiation_target: PrimitiveBigIntExponentiationTarget,
 }
 
@@ -45,6 +56,7 @@ pub(super) struct PrimitiveBinaryRequest {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct PrimitiveBinaryResolution {
     pub(super) result_type: TypeId,
+    pub(super) recovery: Option<PrimitiveBinaryRecovery>,
     pub(super) diagnostics: Vec<CanonicalCheckerDiagnostic>,
 }
 
@@ -61,6 +73,10 @@ pub(super) enum PrimitiveBinaryUnsupported {
 pub(super) enum PrimitiveBinaryInvariant {
     MissingBootstrap,
     InvalidType(TypeId),
+    InvalidRecovery {
+        type_: TypeId,
+        recovery: PrimitiveBinaryRecovery,
+    },
     MissingDiagnostic(u32),
 }
 
@@ -134,6 +150,50 @@ struct PrimitiveScalar {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PrimitiveBinaryOperand {
+    Scalar(PrimitiveScalar),
+    Recovery(PrimitiveBinaryRecovery),
+}
+
+impl PrimitiveBinaryOperand {
+    const fn scalar(self) -> Option<PrimitiveScalar> {
+        match self {
+            Self::Scalar(scalar) => Some(scalar),
+            Self::Recovery(_) => None,
+        }
+    }
+
+    const fn recovery(self) -> Option<PrimitiveBinaryRecovery> {
+        match self {
+            Self::Scalar(_) => None,
+            Self::Recovery(recovery) => Some(recovery),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PrimitiveBinaryValue {
+    type_: TypeId,
+    recovery: Option<PrimitiveBinaryRecovery>,
+}
+
+impl PrimitiveBinaryValue {
+    const fn plain(type_: TypeId) -> Self {
+        Self {
+            type_,
+            recovery: None,
+        }
+    }
+
+    const fn recovered(type_: TypeId, recovery: PrimitiveBinaryRecovery) -> Self {
+        Self {
+            type_,
+            recovery: Some(recovery),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PrimitiveBinaryOperator {
     Plus,
     Arithmetic(SyntaxKind),
@@ -196,11 +256,21 @@ pub(super) fn check_primitive_binary(
     request: PrimitiveBinaryRequest,
 ) -> Result<PrimitiveBinaryResolution, PrimitiveBinaryError> {
     let operator = PrimitiveBinaryOperator::from_syntax(request.operator)?;
-    let left = primitive_scalar(store, request.left, request.left_type)?;
-    let right = primitive_scalar(store, request.right, request.right_type)?;
+    let left = primitive_binary_operand(
+        store,
+        request.left,
+        request.left_type,
+        request.left_recovery,
+    )?;
+    let right = primitive_binary_operand(
+        store,
+        request.right,
+        request.right_type,
+        request.right_recovery,
+    )?;
     let mut diagnostics = Vec::new();
 
-    let result_type = match operator {
+    let result = match operator {
         PrimitiveBinaryOperator::Plus => check_plus(store, request, left, right, &mut diagnostics)?,
         PrimitiveBinaryOperator::Arithmetic(kind) => {
             check_arithmetic(store, request, kind, left, right, &mut diagnostics)?
@@ -214,9 +284,32 @@ pub(super) fn check_primitive_binary(
     };
 
     Ok(PrimitiveBinaryResolution {
-        result_type,
+        result_type: result.type_,
+        recovery: result.recovery,
         diagnostics,
     })
+}
+
+fn primitive_binary_operand(
+    store: &CanonicalTypeMapperStore,
+    node: NodeRef,
+    type_: TypeId,
+    recovery: Option<PrimitiveBinaryRecovery>,
+) -> Result<PrimitiveBinaryOperand, PrimitiveBinaryError> {
+    let Some(recovery) = recovery else {
+        return primitive_scalar(store, node, type_).map(PrimitiveBinaryOperand::Scalar);
+    };
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or(PrimitiveBinaryInvariant::MissingBootstrap)?;
+    let expected = match recovery {
+        PrimitiveBinaryRecovery::Any => bootstrap.any_type,
+        PrimitiveBinaryRecovery::Error => bootstrap.error_type,
+    };
+    if type_ != expected {
+        return Err(PrimitiveBinaryInvariant::InvalidRecovery { type_, recovery }.into());
+    }
+    Ok(PrimitiveBinaryOperand::Recovery(recovery))
 }
 
 fn primitive_scalar(
@@ -272,25 +365,44 @@ fn primitive_scalar(
 fn check_plus(
     store: &mut CanonicalTypeMapperStore,
     request: PrimitiveBinaryRequest,
-    left: PrimitiveScalar,
-    right: PrimitiveScalar,
+    left: PrimitiveBinaryOperand,
+    right: PrimitiveBinaryOperand,
     diagnostics: &mut Vec<CanonicalCheckerDiagnostic>,
-) -> Result<TypeId, PrimitiveBinaryError> {
+) -> Result<PrimitiveBinaryValue, PrimitiveBinaryError> {
     let bootstrap = store
         .intrinsic_bootstrap()
         .ok_or(PrimitiveBinaryInvariant::MissingBootstrap)?;
+    if left
+        .scalar()
+        .is_some_and(|scalar| scalar.family == PrimitiveScalarFamily::String)
+        || right
+            .scalar()
+            .is_some_and(|scalar| scalar.family == PrimitiveScalarFamily::String)
+    {
+        return Ok(PrimitiveBinaryValue::plain(bootstrap.string_type));
+    }
+    if let Some(recovery) = combined_recovery(left, right) {
+        let type_ = match recovery {
+            PrimitiveBinaryRecovery::Any => bootstrap.any_type,
+            PrimitiveBinaryRecovery::Error => bootstrap.error_type,
+        };
+        return Ok(PrimitiveBinaryValue::recovered(type_, recovery));
+    }
+
+    let left = left
+        .scalar()
+        .expect("an operand without recovery is a scalar");
+    let right = right
+        .scalar()
+        .expect("an operand without recovery is a scalar");
     let result = if left.family == PrimitiveScalarFamily::Number
         && right.family == PrimitiveScalarFamily::Number
     {
-        bootstrap.number_type
+        PrimitiveBinaryValue::plain(bootstrap.number_type)
     } else if left.family == PrimitiveScalarFamily::BigInt
         && right.family == PrimitiveScalarFamily::BigInt
     {
-        bootstrap.bigint_type
-    } else if left.family == PrimitiveScalarFamily::String
-        || right.family == PrimitiveScalarFamily::String
-    {
-        bootstrap.string_type
+        PrimitiveBinaryValue::plain(bootstrap.bigint_type)
     } else {
         let (display_left, display_right) =
             if left.family.is_plus_close_enough() && right.family.is_plus_close_enough() {
@@ -305,50 +417,70 @@ fn check_plus(
             display_left,
             display_right,
         )?);
-        bootstrap.any_type
+        PrimitiveBinaryValue::recovered(bootstrap.any_type, PrimitiveBinaryRecovery::Any)
     };
     Ok(result)
+}
+
+const fn combined_recovery(
+    left: PrimitiveBinaryOperand,
+    right: PrimitiveBinaryOperand,
+) -> Option<PrimitiveBinaryRecovery> {
+    match (left.recovery(), right.recovery()) {
+        (Some(PrimitiveBinaryRecovery::Error), _) | (_, Some(PrimitiveBinaryRecovery::Error)) => {
+            Some(PrimitiveBinaryRecovery::Error)
+        }
+        (Some(PrimitiveBinaryRecovery::Any), _) | (_, Some(PrimitiveBinaryRecovery::Any)) => {
+            Some(PrimitiveBinaryRecovery::Any)
+        }
+        (None, None) => None,
+    }
 }
 
 fn check_arithmetic(
     store: &mut CanonicalTypeMapperStore,
     request: PrimitiveBinaryRequest,
     kind: SyntaxKind,
-    left: PrimitiveScalar,
-    right: PrimitiveScalar,
+    left: PrimitiveBinaryOperand,
+    right: PrimitiveBinaryOperand,
     diagnostics: &mut Vec<CanonicalCheckerDiagnostic>,
-) -> Result<TypeId, PrimitiveBinaryError> {
-    if !left.family.is_numeric() {
+) -> Result<PrimitiveBinaryValue, PrimitiveBinaryError> {
+    if left
+        .scalar()
+        .is_some_and(|scalar| !scalar.family.is_numeric())
+    {
         diagnostics.push(fixed_diagnostic(request.left, 2362)?);
     }
-    if !right.family.is_numeric() {
+    if right
+        .scalar()
+        .is_some_and(|scalar| !scalar.family.is_numeric())
+    {
         diagnostics.push(fixed_diagnostic(request.right, 2363)?);
     }
 
     let bootstrap = store
         .intrinsic_bootstrap()
         .ok_or(PrimitiveBinaryInvariant::MissingBootstrap)?;
-    if !left.family.is_bigint() && !right.family.is_bigint() {
-        return Ok(bootstrap.number_type);
+    let left_bigint = left
+        .scalar()
+        .is_some_and(|scalar| scalar.family.is_bigint());
+    let right_bigint = right
+        .scalar()
+        .is_some_and(|scalar| scalar.family.is_bigint());
+    if left.recovery().is_some() && right.recovery().is_some() || !left_bigint && !right_bigint {
+        return Ok(PrimitiveBinaryValue::plain(bootstrap.number_type));
     }
-    if left.family.is_bigint() && right.family.is_bigint() {
-        if kind == SyntaxKind::AsteriskAsteriskToken {
-            match request.bigint_exponentiation_target {
-                PrimitiveBigIntExponentiationTarget::KnownAtLeastEs2016 => {}
-                PrimitiveBigIntExponentiationTarget::KnownBeforeEs2016 => {
-                    diagnostics.push(fixed_diagnostic(request.expression, 2791)?);
-                }
-                PrimitiveBigIntExponentiationTarget::Unknown => {
-                    return Err(PrimitiveBinaryUnsupported::BigIntExponentiationTarget(
-                        request.expression,
-                    )
-                    .into());
-                }
-            }
-        }
-        return Ok(bootstrap.bigint_type);
+    if (left_bigint || left.recovery().is_some()) && (right_bigint || right.recovery().is_some()) {
+        check_bigint_exponentiation_target(request, kind, diagnostics)?;
+        return Ok(PrimitiveBinaryValue::plain(bootstrap.bigint_type));
     }
 
+    let left = left
+        .scalar()
+        .expect("mixed bigint failure has two scalar operands");
+    let right = right
+        .scalar()
+        .expect("mixed bigint failure has two scalar operands");
     diagnostics.push(operator_diagnostic(
         store,
         request.expression,
@@ -356,17 +488,53 @@ fn check_arithmetic(
         left.base,
         right.base,
     )?);
-    Ok(bootstrap.error_type)
+    Ok(PrimitiveBinaryValue::recovered(
+        bootstrap.error_type,
+        PrimitiveBinaryRecovery::Error,
+    ))
+}
+
+fn check_bigint_exponentiation_target(
+    request: PrimitiveBinaryRequest,
+    kind: SyntaxKind,
+    diagnostics: &mut Vec<CanonicalCheckerDiagnostic>,
+) -> Result<(), PrimitiveBinaryError> {
+    if kind != SyntaxKind::AsteriskAsteriskToken {
+        return Ok(());
+    }
+    match request.bigint_exponentiation_target {
+        PrimitiveBigIntExponentiationTarget::KnownAtLeastEs2016 => Ok(()),
+        PrimitiveBigIntExponentiationTarget::KnownBeforeEs2016 => {
+            diagnostics.push(fixed_diagnostic(request.expression, 2791)?);
+            Ok(())
+        }
+        PrimitiveBigIntExponentiationTarget::Unknown => {
+            Err(PrimitiveBinaryUnsupported::BigIntExponentiationTarget(request.expression).into())
+        }
+    }
 }
 
 fn check_relational(
     store: &mut CanonicalTypeMapperStore,
     request: PrimitiveBinaryRequest,
     operator: PrimitiveBinaryOperator,
-    left: PrimitiveScalar,
-    right: PrimitiveScalar,
+    left: PrimitiveBinaryOperand,
+    right: PrimitiveBinaryOperand,
     diagnostics: &mut Vec<CanonicalCheckerDiagnostic>,
-) -> Result<TypeId, PrimitiveBinaryError> {
+) -> Result<PrimitiveBinaryValue, PrimitiveBinaryError> {
+    let boolean = store
+        .intrinsic_bootstrap()
+        .map(|bootstrap| bootstrap.boolean_type)
+        .ok_or(PrimitiveBinaryInvariant::MissingBootstrap)?;
+    if left.recovery().is_some() || right.recovery().is_some() {
+        return Ok(PrimitiveBinaryValue::plain(boolean));
+    }
+    let left = left
+        .scalar()
+        .expect("an operand without recovery is a scalar");
+    let right = right
+        .scalar()
+        .expect("an operand without recovery is a scalar");
     let left_numeric = left.family.is_numeric();
     let right_numeric = right.family.is_numeric();
     let compatible = left_numeric && right_numeric
@@ -380,20 +548,30 @@ fn check_relational(
             right.base,
         )?);
     }
-    store
-        .intrinsic_bootstrap()
-        .map(|bootstrap| bootstrap.boolean_type)
-        .ok_or(PrimitiveBinaryInvariant::MissingBootstrap.into())
+    Ok(PrimitiveBinaryValue::plain(boolean))
 }
 
 fn check_equality(
     store: &mut CanonicalTypeMapperStore,
     request: PrimitiveBinaryRequest,
     _operator: PrimitiveBinaryOperator,
-    left: PrimitiveScalar,
-    right: PrimitiveScalar,
+    left: PrimitiveBinaryOperand,
+    right: PrimitiveBinaryOperand,
     diagnostics: &mut Vec<CanonicalCheckerDiagnostic>,
-) -> Result<TypeId, PrimitiveBinaryError> {
+) -> Result<PrimitiveBinaryValue, PrimitiveBinaryError> {
+    let boolean = store
+        .intrinsic_bootstrap()
+        .map(|bootstrap| bootstrap.boolean_type)
+        .ok_or(PrimitiveBinaryInvariant::MissingBootstrap)?;
+    if left.recovery().is_some() || right.recovery().is_some() {
+        return Ok(PrimitiveBinaryValue::plain(boolean));
+    }
+    let left = left
+        .scalar()
+        .expect("an operand without recovery is a scalar");
+    let right = right
+        .scalar()
+        .expect("an operand without recovery is a scalar");
     // Pinned `isTypeEqualityComparableTo` adds only a nullable-target escape.
     // Both operands have already been proven non-null atomic scalars, so its
     // two directional calls are exactly ordinary `areTypesComparable` here.
@@ -410,10 +588,7 @@ fn check_equality(
             display_right,
         )?);
     }
-    store
-        .intrinsic_bootstrap()
-        .map(|bootstrap| bootstrap.boolean_type)
-        .ok_or(PrimitiveBinaryInvariant::MissingBootstrap.into())
+    Ok(PrimitiveBinaryValue::plain(boolean))
 }
 
 fn fixed_diagnostic(
@@ -525,6 +700,8 @@ mod tests {
             right: nodes.right,
             left_type,
             right_type,
+            left_recovery: None,
+            right_recovery: None,
             bigint_exponentiation_target: PrimitiveBigIntExponentiationTarget::KnownAtLeastEs2016,
         }
     }
@@ -613,6 +790,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(invalid.result_type, number);
+        assert_eq!(invalid.recovery, None);
         assert_eq!(
             rendered(&invalid),
             [
@@ -635,6 +813,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(mixed.result_type, error);
+        assert_eq!(mixed.recovery, Some(PrimitiveBinaryRecovery::Error));
         assert_eq!(
             rendered(&mixed),
             [
@@ -680,6 +859,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(close.result_type, any);
+        assert_eq!(close.recovery, Some(PrimitiveBinaryRecovery::Any));
         assert_eq!(
             rendered(&close),
             [(
@@ -805,6 +985,111 @@ mod tests {
                 "This comparison appears to be unintentional because the types 'number' and 'string' have no overlap.".to_owned(),
             )]
         );
+    }
+
+    #[test]
+    fn kernel_recoveries_propagate_only_through_explicit_validated_capabilities() {
+        let parsed = parse_source_file("const value = left + right;");
+        assert!(parsed.diagnostics.is_empty());
+        let nodes = binary_nodes(&parsed);
+        let mut store = initialized_store();
+        let (string, number, bigint, boolean, any, error) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (
+                bootstrap.string_type,
+                bootstrap.number_type,
+                bootstrap.bigint_type,
+                bootstrap.boolean_type,
+                bootstrap.any_type,
+                bootstrap.error_type,
+            )
+        };
+
+        for (recovery, type_) in [
+            (PrimitiveBinaryRecovery::Any, any),
+            (PrimitiveBinaryRecovery::Error, error),
+        ] {
+            let mut plus = request(nodes, SyntaxKind::PlusToken, type_, number);
+            plus.left_recovery = Some(recovery);
+            let plus = check_primitive_binary(&mut store, plus).unwrap();
+            assert_eq!(plus.result_type, type_);
+            assert_eq!(plus.recovery, Some(recovery));
+            assert!(plus.diagnostics.is_empty());
+
+            let mut string_wins = request(nodes, SyntaxKind::PlusToken, type_, string);
+            string_wins.left_recovery = Some(recovery);
+            let string_wins = check_primitive_binary(&mut store, string_wins).unwrap();
+            assert_eq!(string_wins.result_type, string);
+            assert_eq!(string_wins.recovery, None);
+            assert!(string_wins.diagnostics.is_empty());
+
+            let mut invalid_peer = request(nodes, SyntaxKind::MinusToken, type_, string);
+            invalid_peer.left_recovery = Some(recovery);
+            let invalid_peer = check_primitive_binary(&mut store, invalid_peer).unwrap();
+            assert_eq!(invalid_peer.result_type, number);
+            assert_eq!(invalid_peer.recovery, None);
+            assert_eq!(
+                rendered(&invalid_peer),
+                [(
+                    nodes.right,
+                    2363,
+                    "The right-hand side of an arithmetic operation must be of type 'any', 'number', 'bigint' or an enum type.".to_owned(),
+                )]
+            );
+
+            let mut bigint_peer = request(nodes, SyntaxKind::AsteriskToken, type_, bigint);
+            bigint_peer.left_recovery = Some(recovery);
+            let bigint_peer = check_primitive_binary(&mut store, bigint_peer).unwrap();
+            assert_eq!(bigint_peer.result_type, bigint);
+            assert_eq!(bigint_peer.recovery, None);
+            assert!(bigint_peer.diagnostics.is_empty());
+
+            for operator in [
+                SyntaxKind::LessThanToken,
+                SyntaxKind::EqualsEqualsEqualsToken,
+            ] {
+                let mut comparison = request(nodes, operator, type_, boolean);
+                comparison.left_recovery = Some(recovery);
+                let comparison = check_primitive_binary(&mut store, comparison).unwrap();
+                assert_eq!(comparison.result_type, boolean);
+                assert_eq!(comparison.recovery, None);
+                assert!(comparison.diagnostics.is_empty());
+            }
+        }
+
+        let mut two_recoveries = request(nodes, SyntaxKind::SlashToken, any, error);
+        two_recoveries.left_recovery = Some(PrimitiveBinaryRecovery::Any);
+        two_recoveries.right_recovery = Some(PrimitiveBinaryRecovery::Error);
+        let two_recoveries = check_primitive_binary(&mut store, two_recoveries).unwrap();
+        assert_eq!(two_recoveries.result_type, number);
+        assert_eq!(two_recoveries.recovery, None);
+        assert!(two_recoveries.diagnostics.is_empty());
+
+        let mut forged = request(nodes, SyntaxKind::PlusToken, number, boolean);
+        forged.left_recovery = Some(PrimitiveBinaryRecovery::Any);
+        assert_eq!(
+            check_primitive_binary(&mut store, forged),
+            Err(PrimitiveBinaryError::Invariant(
+                PrimitiveBinaryInvariant::InvalidRecovery {
+                    type_: number,
+                    recovery: PrimitiveBinaryRecovery::Any,
+                },
+            )),
+        );
+        for unsupported in [any, error] {
+            assert_eq!(
+                check_primitive_binary(
+                    &mut store,
+                    request(nodes, SyntaxKind::PlusToken, unsupported, boolean),
+                ),
+                Err(PrimitiveBinaryError::Unsupported(
+                    PrimitiveBinaryUnsupported::Operand {
+                        node: nodes.left,
+                        type_: unsupported,
+                    },
+                )),
+            );
+        }
     }
 
     #[test]
