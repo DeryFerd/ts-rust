@@ -3355,6 +3355,27 @@ pub(super) fn check_source_file(
                 },
             ));
         }
+        let signature = store
+            .source_callable_provenance(type_)
+            .filter(|provenance| {
+                provenance.declaration == function.callable.declaration
+                    && provenance.owner_symbol == owner
+            })
+            .map(|provenance| provenance.signature)
+            .ok_or(SourceCheckError::Function(
+                SourceFunctionInvariant::MissingCallableType(owner),
+            ))?;
+        let mut return_diagnostics = CanonicalCheckerDiagnostics::default();
+        let return_result = CanonicalTypeQuery::new_with_global_types(
+            store,
+            host,
+            global_types,
+            options,
+            &mut return_diagnostics,
+        )
+        .and_then(|mut query| query.get_return_type_of_signature(signature));
+        merge_retry_diagnostics(diagnostics, return_diagnostics);
+        return_result?;
         if current_flow_types.insert(owner, type_).is_some() {
             return Err(SourceCheckError::Function(
                 SourceFunctionInvariant::DuplicateDeclaration(function.callable.declaration),
@@ -9297,6 +9318,24 @@ mod tests {
         strict.check_source_file(relation_file).unwrap();
         bivariant.check_source_file(relation_file).unwrap();
 
+        let owner = function_symbol(&strict, &relation, relation_file, "narrow");
+        let callable = strict
+            .store()
+            .source_callable_type_for_owner(owner)
+            .unwrap();
+        let signature = strict
+            .store()
+            .source_callable_provenance(callable)
+            .unwrap()
+            .signature;
+        assert!(
+            strict
+                .store()
+                .signature(signature)
+                .unwrap()
+                .resolved_return_type()
+                .is_some()
+        );
         assert_eq!(strict.diagnostics().len(), 1);
         assert_eq!(strict.diagnostics().as_slice()[0].diagnostic.code(), 2322);
         assert_eq!(
