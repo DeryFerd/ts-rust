@@ -2342,8 +2342,15 @@ fn check_planned_assignment(
         publish_expression_type(store, assignment_expression, source_types.result)?;
     }
     let source_type = source_types.result;
-    let assignable =
-        store.is_type_assignable_to_with_global_types(source_type, target, global_types)?;
+    let assignable = source_type_is_assignable_to(
+        store,
+        host,
+        global_types,
+        options,
+        diagnostics,
+        source_type,
+        target,
+    )?;
     if !assignable {
         let staged = super::object_diagnostics::diagnostics_for_failed_assignment(
             store,
@@ -2365,9 +2372,51 @@ fn check_planned_assignment(
     })
 }
 
+fn source_type_is_assignable_to(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    source: TypeId,
+    target: TypeId,
+) -> Result<bool, SourceCheckError> {
+    let mut resolved_signatures = HashSet::new();
+    loop {
+        match store.is_type_assignable_to_with_global_types_and_strict_function_types(
+            source,
+            target,
+            global_types,
+            options.strict_function_types,
+        ) {
+            Ok(assignable) => return Ok(assignable),
+            Err(RelationUnavailable::UnresolvedSignatureReturn(signature)) => {
+                if !resolved_signatures.insert(signature) {
+                    return Err(RelationUnavailable::UnresolvedSignatureReturn(signature).into());
+                }
+                let mut resolution_diagnostics = CanonicalCheckerDiagnostics::default();
+                let resolved = CanonicalTypeQuery::new_with_global_types(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    &mut resolution_diagnostics,
+                )?
+                .get_return_type_of_signature(signature);
+                merge_retry_diagnostics(diagnostics, resolution_diagnostics);
+                resolved?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
 fn current_flow_type_after_assignment(
     store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
     global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
     assignment: CheckedAssignment,
 ) -> Result<TypeId, SourceCheckError> {
     let CheckedAssignment {
@@ -2422,7 +2471,10 @@ fn current_flow_type_after_assignment(
     for target in &declared_constituents {
         if assignment_type_maybe_assignable_to(
             store,
+            host,
             global_types,
+            options,
+            diagnostics,
             &assigned_constituents,
             *target,
         )? {
@@ -2434,7 +2486,10 @@ fn current_flow_type_after_assignment(
     }
     let filtered = filtered_assignment_union_type(
         store,
+        host,
         global_types,
+        options,
+        diagnostics,
         declared_type,
         &declared_constituents,
         declared_origin,
@@ -2446,7 +2501,15 @@ fn current_flow_type_after_assignment(
     } else {
         filtered
     };
-    if store.is_type_assignable_to_with_global_types(assigned_type, candidate, global_types)? {
+    if source_type_is_assignable_to(
+        store,
+        host,
+        global_types,
+        options,
+        diagnostics,
+        assigned_type,
+        candidate,
+    )? {
         Ok(candidate)
     } else {
         Ok(declared_type)
@@ -2455,7 +2518,10 @@ fn current_flow_type_after_assignment(
 
 fn assignment_type_maybe_assignable_to(
     store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
     global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
     assigned_constituents: &[TypeId],
     target: TypeId,
 ) -> Result<bool, SourceCheckError> {
@@ -2463,7 +2529,15 @@ fn assignment_type_maybe_assignable_to(
         if is_definitely_unassignable_to_structured(store, *source, target)? {
             continue;
         }
-        if store.is_type_assignable_to_with_global_types(*source, target, global_types)? {
+        if source_type_is_assignable_to(
+            store,
+            host,
+            global_types,
+            options,
+            diagnostics,
+            *source,
+            target,
+        )? {
             return Ok(true);
         }
     }
@@ -2473,7 +2547,10 @@ fn assignment_type_maybe_assignable_to(
 #[allow(clippy::too_many_arguments)]
 fn filtered_assignment_union_type(
     store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
     global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
     declared_type: TypeId,
     declared_constituents: &[TypeId],
     declared_origin: Option<TypeId>,
@@ -2501,7 +2578,10 @@ fn filtered_assignment_union_type(
             if flags.intersects(TypeFlags::UNION)
                 || assignment_type_maybe_assignable_to(
                     store,
+                    host,
                     global_types,
+                    options,
+                    diagnostics,
                     assigned_constituents,
                     *constituent,
                 )?
@@ -2864,7 +2944,14 @@ pub(super) fn check_source_file(
                         )?;
                         (
                             assignment.declared_type,
-                            current_flow_type_after_assignment(store, global_types, assignment)?,
+                            current_flow_type_after_assignment(
+                                store,
+                                host,
+                                global_types,
+                                options,
+                                diagnostics,
+                                assignment,
+                            )?,
                         )
                     } else {
                         let initializer = check_expression_type(
@@ -2887,7 +2974,10 @@ pub(super) fn check_source_file(
                         )?;
                         let current_flow_type = current_flow_type_after_assignment(
                             store,
+                            host,
                             global_types,
+                            options,
+                            diagnostics,
                             CheckedAssignment {
                                 declared_type,
                                 assigned_type: initializer.result,
@@ -2946,8 +3036,14 @@ pub(super) fn check_source_file(
                         },
                     ));
                 }
-                let current_flow_type =
-                    current_flow_type_after_assignment(store, global_types, checked)?;
+                let current_flow_type = current_flow_type_after_assignment(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    diagnostics,
+                    checked,
+                )?;
                 current_flow_types.insert(assignment.target_symbol, current_flow_type);
             }
         }
@@ -8363,6 +8459,72 @@ mod tests {
         );
         assert!(is_type_checked(&loose, file));
         assert!(is_type_checked(&strict, file));
+    }
+
+    #[test]
+    fn source_assignments_use_retained_strict_function_types() {
+        let source = parsed(concat!(
+            "const narrow: (input: 'only') => void = null as any; ",
+            "const value: (input: string) => void = narrow;",
+        ));
+        let file = FileId::new(55);
+        let mut strict = context(
+            &[(file, &source)],
+            CanonicalCheckerOptions {
+                strict_function_types: true,
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+        let mut bivariant = context(
+            &[(file, &source)],
+            CanonicalCheckerOptions {
+                strict_function_types: false,
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+
+        strict.check_source_file(file).unwrap();
+        bivariant.check_source_file(file).unwrap();
+
+        assert_eq!(strict.diagnostics().len(), 1);
+        assert_eq!(strict.diagnostics().as_slice()[0].diagnostic.code(), 2322);
+        assert_eq!(
+            strict.diagnostics().as_slice()[0]
+                .diagnostic
+                .render()
+                .unwrap(),
+            "Type '(input: \"only\") => void' is not assignable to type '(input: string) => void'."
+        );
+        assert!(bivariant.diagnostics().is_empty());
+        assert!(is_type_checked(&strict, file));
+        assert!(is_type_checked(&bivariant, file));
+        strict.check_source_file(file).unwrap();
+        bivariant.check_source_file(file).unwrap();
+        assert_eq!(strict.diagnostics().len(), 1);
+        assert!(bivariant.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn callable_union_flow_resolves_returns_through_the_source_relation_boundary() {
+        let source = parsed(concat!(
+            "type A = (input: string) => void; ",
+            "type B = (input: string) => number; ",
+            "const a: A = null as any; ",
+            "const value: A | B = a;",
+        ));
+        let file = FileId::new(56);
+        let mut context = context(
+            &[(file, &source)],
+            CanonicalCheckerOptions {
+                strict_function_types: true,
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+
+        context.check_source_file(file).unwrap();
+
+        assert!(context.diagnostics().is_empty());
+        assert!(is_type_checked(&context, file));
     }
 
     #[test]

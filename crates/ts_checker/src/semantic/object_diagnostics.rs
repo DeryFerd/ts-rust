@@ -19,11 +19,14 @@ use ts_diagnostics::{Diagnostic, message_by_code};
 use super::{
     AssignabilityErrorDisplay, CanonicalCheckerDiagnostic, CanonicalCheckerOptions,
     CanonicalCheckerRelatedInformation, CanonicalGlobalTypes, CanonicalTypeFormatFlags,
-    CanonicalTypeMapperStore, DeclaredTypeHost, RelationUnavailable, TypeId,
+    CanonicalTypeMapperStore, DeclaredTypeHost, RelationUnavailable, SignatureId,
+    TypeDisplayUnavailable, TypeId,
     formatter::{
+        FunctionTypeDisplayUnavailable,
         get_type_names_for_assignability_error_with_host_global_types_and_flags,
         type_to_string_with_host_global_types_and_flags,
     },
+    functions::{StoredFunctionTypeValidation, validate_stored_function_type},
     object_members::PropertyObjectPlan,
     relater::{ResolvedDeclaredProperty, ResolvedDeclaredPropertyObject},
     source::{
@@ -31,12 +34,72 @@ use super::{
         SourceCheckError, SourceCheckProvenanceError,
     },
     spelling::get_spelling_suggestion,
+    type_nodes::CanonicalTypeQuery,
     type_records::TypeData,
 };
 
 /// Builds the complete diagnostic batch for one already-failed assignment.
 #[allow(clippy::too_many_arguments)] // Keeps diagnostic inputs explicit and immutable.
 pub(super) fn diagnostics_for_failed_assignment(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    expression: &PlannedExpression,
+    checked: &CheckedExpressionTypes,
+    target_type: TypeId,
+    fallback_node: NodeRef,
+    options: CanonicalCheckerOptions,
+) -> Result<Vec<CanonicalCheckerDiagnostic>, SourceCheckError> {
+    let mut prerequisite_diagnostics = Vec::new();
+    let mut resolved_signatures = HashSet::new();
+    loop {
+        match diagnostics_for_failed_assignment_once(
+            store,
+            host,
+            global_types,
+            expression,
+            checked,
+            target_type,
+            fallback_node,
+            options,
+        ) {
+            Ok(mut diagnostics) => {
+                prerequisite_diagnostics.append(&mut diagnostics);
+                return Ok(prerequisite_diagnostics);
+            }
+            Err(
+                error @ SourceCheckError::TypeDisplayUnavailable(
+                    TypeDisplayUnavailable::FunctionType {
+                        type_id,
+                        reason: FunctionTypeDisplayUnavailable::UnresolvedReturn,
+                    },
+                ),
+            ) => {
+                let Some(signature) = exact_function_type_signature(store, type_id) else {
+                    return Err(error);
+                };
+                if !resolved_signatures.insert(signature) {
+                    return Err(error);
+                }
+                let mut resolution_diagnostics = super::CanonicalCheckerDiagnostics::default();
+                let resolved = CanonicalTypeQuery::new_with_global_types(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    &mut resolution_diagnostics,
+                )?
+                .get_return_type_of_signature(signature);
+                prerequisite_diagnostics.extend(resolution_diagnostics.into_vec());
+                resolved?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)] // Keeps one diagnostic retry immutable and explicit.
+fn diagnostics_for_failed_assignment_once(
     store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     global_types: &CanonicalGlobalTypes,
@@ -72,6 +135,21 @@ pub(super) fn diagnostics_for_failed_assignment(
         flags,
     )?);
     Ok(elaborated)
+}
+
+fn exact_function_type_signature(
+    store: &CanonicalTypeMapperStore,
+    type_id: TypeId,
+) -> Option<SignatureId> {
+    if !matches!(
+        validate_stored_function_type(store, type_id),
+        StoredFunctionTypeValidation::Valid(_)
+    ) {
+        return None;
+    }
+    let structured = store.type_payload(type_id)?.data().structured()?;
+    let signatures = structured.signatures.as_deref()?;
+    (structured.call_signature_count == 1 && signatures.len() == 1).then_some(signatures[0])
 }
 
 /// Validates the complete retained execution tree before recursive diagnostic
