@@ -3,14 +3,11 @@ use ts_binder::{
     CanonicalBinder, CanonicalModuleState, CanonicalSourceFileFacts, CanonicalSourceLanguage,
     EscapedName,
 };
-use ts_checker::semantic::{
-    CanonicalCheckerContext, CanonicalCheckerOptions, SourceCheckError, UnsupportedSourceSyntax,
-    VariableUnsupported,
-};
+use ts_checker::semantic::{CanonicalCheckerContext, CanonicalCheckerOptions};
 use ts_parser::parse_source_file;
 
 #[test]
-fn generic_identity_body_parameter_read_remains_an_explicit_boundary() {
+fn generic_identity_body_parameter_read_checks_cold_and_warm() {
     let parsed = parse_source_file("function identity<T>(value: T): T { return value; }");
     assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
     let file = FileId::new(0);
@@ -38,11 +35,7 @@ fn generic_identity_body_parameter_read_remains_an_explicit_boundary() {
     )
     .unwrap();
 
-    assert!(matches!(
-        context.check_source_file(file),
-        Err(SourceCheckError::Unsupported(
-            UnsupportedSourceSyntax::Variable(VariableUnsupported::IdentifierNotPrior { .. })
-        ))
-    ));
+    context.check_source_file(file).unwrap();
+    context.check_source_file(file).unwrap();
     assert!(context.diagnostics().is_empty());
 }

@@ -10614,7 +10614,7 @@ mod tests {
     fn unsupported_source_function_plans_are_atomic_and_preserve_variable_errors() {
         let source = parsed(concat!(
             "function ready(): void {} ",
-            "function generic<T>(value: T): T { return value; }",
+            "function generic<T, U>(value: T): T { return value; }",
         ));
         let file = FileId::new(304);
         let mut blocked = context(&[(file, &source)], CanonicalCheckerOptions::default());
