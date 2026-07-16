@@ -45,6 +45,31 @@ pub(super) struct CanonicalTypeQueryOptions {
     pub strict_builtin_iterator_return: bool,
 }
 
+/// Immutable proof that one importer type reference names one alias whose
+/// direct type-only target was independently derived from the program's exact
+/// module-resolution manifest.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct CanonicalTypeReferenceAliasTarget {
+    reference: NodeRef,
+    alias: SemanticSymbolId,
+    target: SemanticSymbolId,
+}
+
+impl CanonicalTypeReferenceAliasTarget {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) const fn new(
+        reference: NodeRef,
+        alias: SemanticSymbolId,
+        target: SemanticSymbolId,
+    ) -> Self {
+        Self {
+            reference,
+            alias,
+            target,
+        }
+    }
+}
+
 impl From<CanonicalCheckerOptions> for CanonicalTypeQueryOptions {
     fn from(options: CanonicalCheckerOptions) -> Self {
         Self {
@@ -74,6 +99,11 @@ pub enum TypeNodeUnavailable {
     ImportAliasTypeReference {
         node: NodeRef,
         alias: SemanticSymbolId,
+    },
+    InvalidImportAliasTarget {
+        node: NodeRef,
+        alias: SemanticSymbolId,
+        target: SemanticSymbolId,
     },
     UnsupportedReferenceTarget {
         node: NodeRef,
@@ -153,6 +183,7 @@ struct PlannedTypeParameter {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct PlannedTypeReference {
     symbol: SemanticSymbolId,
+    import_alias: Option<SemanticSymbolId>,
     type_arguments: Vec<NodeRef>,
     alias_owner: Option<SemanticSymbolId>,
     arity: PlannedTypeReferenceArity,
@@ -647,12 +678,13 @@ fn cached_alias_parameter_symbols(
     .map(Some)
 }
 
-struct TypeQueryPlanner<'store, 'host, 'arena> {
+struct TypeQueryPlanner<'store, 'host, 'arena, 'aliases> {
     store: &'store CanonicalTypeMapperStore,
     host: &'host DeclaredTypeHost<'arena>,
     array_type: Option<TypeId>,
     array_targets: Option<CanonicalArrayTargets>,
     strict_builtin_iterator_return: bool,
+    type_reference_alias_targets: &'aliases HashMap<NodeRef, CanonicalTypeReferenceAliasTarget>,
     plan: TypeQueryPlan,
     planning_defaults: HashSet<(SemanticSymbolId, NodeRef)>,
     planning_interfaces: HashSet<SemanticSymbolId>,
@@ -660,13 +692,14 @@ struct TypeQueryPlanner<'store, 'host, 'arena> {
     function_indirection_depth: usize,
 }
 
-impl<'store, 'host, 'arena> TypeQueryPlanner<'store, 'host, 'arena> {
+impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'aliases> {
     fn new(
         store: &'store CanonicalTypeMapperStore,
         host: &'host DeclaredTypeHost<'arena>,
         array_type: Option<TypeId>,
         array_targets: Option<CanonicalArrayTargets>,
         strict_builtin_iterator_return: bool,
+        type_reference_alias_targets: &'aliases HashMap<NodeRef, CanonicalTypeReferenceAliasTarget>,
     ) -> Self {
         Self {
             store,
@@ -674,6 +707,7 @@ impl<'store, 'host, 'arena> TypeQueryPlanner<'store, 'host, 'arena> {
             array_type,
             array_targets,
             strict_builtin_iterator_return,
+            type_reference_alias_targets,
             plan: TypeQueryPlan::default(),
             planning_defaults: HashSet::new(),
             planning_interfaces: HashSet::new(),
@@ -2247,8 +2281,10 @@ impl<'store, 'host, 'arena> TypeQueryPlanner<'store, 'host, 'arena> {
         };
         let cached_syntax_contains_builtin_array = cached_type.is_some()
             && self.type_node_contains_builtin_array_reference(node, &mut HashSet::new())?;
+        let exact_import = self.type_reference_alias_targets.get(&node).copied();
 
         if !union_constituent
+            && exact_import.is_none()
             && cached_type.is_some()
             && !cached_array_capability_missing
             && !cached_pending_function
@@ -2266,7 +2302,15 @@ impl<'store, 'host, 'arena> TypeQueryPlanner<'store, 'host, 'arena> {
             .and_then(|links| links.resolved_symbol);
         let possible_global_array_name = self.array_targets.is_some()
             && matches!(identifier.text.as_str(), "Array" | "ReadonlyArray");
-        let symbol = if possible_global_array_name {
+        let symbol = if let Some(capability) = exact_import {
+            self.resolve_type_reference_alias_target(
+                node,
+                name,
+                &identifier.text,
+                capability,
+                cached_symbol,
+            )?
+        } else if possible_global_array_name {
             let resolved = self.resolve_uncached_type_reference_symbol(node)?;
             let canonical = self.store.get_merged_symbol(resolved).ok_or_else(|| {
                 type_node_unavailable(TypeNodeUnavailable::InvalidCachedSymbol {
@@ -2557,6 +2601,7 @@ impl<'store, 'host, 'arena> TypeQueryPlanner<'store, 'host, 'arena> {
 
         let planned = PlannedTypeReference {
             symbol,
+            import_alias: exact_import.map(|capability| capability.alias),
             type_arguments,
             alias_owner: effective_alias_owner,
             arity,
@@ -2842,6 +2887,86 @@ impl<'store, 'host, 'arena> TypeQueryPlanner<'store, 'host, 'arena> {
             }
             _ => Ok(()),
         }
+    }
+
+    fn resolve_type_reference_alias_target(
+        &self,
+        node: NodeRef,
+        name: NodeRef,
+        name_text: &str,
+        capability: CanonicalTypeReferenceAliasTarget,
+        cached_symbol: Option<SemanticSymbolId>,
+    ) -> Result<SemanticSymbolId, DeclaredTypeError> {
+        let invalid = || {
+            type_node_unavailable(TypeNodeUnavailable::InvalidImportAliasTarget {
+                node,
+                alias: capability.alias,
+                target: capability.target,
+            })
+        };
+        if capability.reference != node {
+            return Err(invalid());
+        }
+        let (arena, bound) = self.host.source(node).ok_or({
+            DeclaredTypeError::Unavailable(DeclaredTypeUnavailable::MissingOrForeignFacts(node))
+        })?;
+        let mut callback_host = self.host.name_resolver_host(self.store)?;
+        let resolved = CanonicalNameResolver::new(
+            arena,
+            bound,
+            self.store.symbol_store(),
+            &mut callback_host,
+        )?
+        .resolve(
+            Some(CanonicalResolutionLocation::Bound(name)),
+            name_text,
+            SymbolFlags::TYPE,
+            None,
+            true,
+            false,
+        );
+        if !matches!(
+            resolved,
+            Err(CanonicalNameResolutionError::AliasResolutionUnavailable(alias))
+                if alias == capability.alias
+        ) {
+            return Err(invalid());
+        }
+        let target = self
+            .store
+            .get_merged_symbol(capability.target)
+            .ok_or_else(&invalid)?;
+        let target_flags = self.store.symbol(target).ok_or_else(&invalid)?.flags();
+        let alias_links = self
+            .store
+            .alias_symbol_links(capability.alias)
+            .ok_or_else(&invalid)?;
+        if target != capability.target
+            || !target_flags.intersects(SymbolFlags::TYPE_ALIAS | SymbolFlags::INTERFACE)
+            || target_flags.intersects(SymbolFlags::ALIAS)
+            || alias_links.immediate_target != Some(target)
+            || alias_links.alias_target != super::AliasTargetState::Resolved(target)
+            || alias_links.type_only_declaration.is_none()
+        {
+            return Err(invalid());
+        }
+        if let Some(cached) = cached_symbol {
+            let canonical = self.store.get_merged_symbol(cached).ok_or_else(|| {
+                type_node_unavailable(TypeNodeUnavailable::InvalidCachedSymbol {
+                    node,
+                    symbol: cached,
+                })
+            })?;
+            if canonical != target {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidCachedSymbol {
+                        node,
+                        symbol: cached,
+                    },
+                ));
+            }
+        }
+        Ok(target)
     }
 
     fn resolve_uncached_type_reference_symbol(
@@ -3341,6 +3466,7 @@ pub(super) struct CanonicalTypeQuery<'store, 'host, 'arena, 'diagnostics> {
     array_type: Option<TypeId>,
     global_types: Option<CanonicalGlobalTypes>,
     options: CanonicalTypeQueryOptions,
+    type_reference_alias_targets: HashMap<NodeRef, CanonicalTypeReferenceAliasTarget>,
     diagnostics: &'diagnostics mut CanonicalCheckerDiagnostics,
     resolving_property_interfaces: HashSet<SemanticSymbolId>,
     pending_function_parameters: Vec<FunctionTypePlan>,
@@ -3378,6 +3504,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             global_types: None,
             options,
             diagnostics,
+            type_reference_alias_targets: HashMap::new(),
             resolving_property_interfaces: HashSet::new(),
             pending_function_parameters: Vec::new(),
         })
@@ -3398,6 +3525,64 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         query.array_type = Some(array_type);
         query.global_types = Some(global_types.clone());
         Ok(query)
+    }
+
+    /// Adds exact, importer-node-scoped type-only alias capabilities.
+    ///
+    /// The capability is validated against the current alias links before it
+    /// becomes visible to any planner. Later planning still re-resolves the
+    /// importer name and validates warm node links against the proven target.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) fn with_type_reference_alias_targets(
+        mut self,
+        targets: impl IntoIterator<Item = CanonicalTypeReferenceAliasTarget>,
+    ) -> Result<Self, DeclaredTypeError> {
+        for capability in targets {
+            let alias_flags = self.symbol_flags(capability.alias)?;
+            let target = self.canonical_symbol(capability.target)?;
+            let target_flags = self.symbol_flags(target)?;
+            let links = self
+                .store
+                .alias_symbol_links(capability.alias)
+                .ok_or_else(|| {
+                    type_node_unavailable(TypeNodeUnavailable::InvalidImportAliasTarget {
+                        node: capability.reference,
+                        alias: capability.alias,
+                        target: capability.target,
+                    })
+                })?;
+            if !self.store.contains_node_ref(capability.reference)
+                || alias_flags != SymbolFlags::ALIAS
+                || target != capability.target
+                || !target_flags.intersects(SymbolFlags::TYPE_ALIAS | SymbolFlags::INTERFACE)
+                || target_flags.intersects(SymbolFlags::ALIAS)
+                || links.immediate_target != Some(target)
+                || links.alias_target != super::AliasTargetState::Resolved(target)
+                || links.type_only_declaration.is_none()
+            {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidImportAliasTarget {
+                        node: capability.reference,
+                        alias: capability.alias,
+                        target: capability.target,
+                    },
+                ));
+            }
+            if let Some(existing) = self
+                .type_reference_alias_targets
+                .insert(capability.reference, capability)
+                && existing != capability
+            {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidImportAliasTarget {
+                        node: capability.reference,
+                        alias: capability.alias,
+                        target: capability.target,
+                    },
+                ));
+            }
+        }
+        Ok(self)
     }
 
     #[cfg(test)]
@@ -3436,6 +3621,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 .as_ref()
                 .map(CanonicalArrayTargets::from_global_types),
             self.options.strict_builtin_iterator_return,
+            &self.type_reference_alias_targets,
         );
         let direct_alias = planner.direct_type_alias_owner(node)?;
         planner.plan_type_node(node)?;
@@ -3508,6 +3694,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             self.array_type,
             array_targets,
             self.options.strict_builtin_iterator_return,
+            &self.type_reference_alias_targets,
         );
         for parameter in &callable.parameters {
             planner.plan_type_node(parameter.type_node)?;
@@ -3647,6 +3834,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 .as_ref()
                 .map(CanonicalArrayTargets::from_global_types),
             self.options.strict_builtin_iterator_return,
+            &self.type_reference_alias_targets,
         );
         parameter_planner.plan_type_node(declaration)?;
         let parameter_plan = parameter_planner.finish();
@@ -3692,6 +3880,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 .as_ref()
                 .map(CanonicalArrayTargets::from_global_types),
             self.options.strict_builtin_iterator_return,
+            &self.type_reference_alias_targets,
         );
         planner.plan_type_node(declaration)?;
         planner.plan_function_return_type(declaration)?;
@@ -3825,6 +4014,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             self.array_type,
             array_targets,
             self.options.strict_builtin_iterator_return,
+            &self.type_reference_alias_targets,
         );
         planner.plan_type_node(callable.return_type)?;
         let plan = planner.finish();
@@ -3933,6 +4123,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 .as_ref()
                 .map(CanonicalArrayTargets::from_global_types),
             self.options.strict_builtin_iterator_return,
+            &self.type_reference_alias_targets,
         );
         if !flags
             .intersects(SymbolFlags::CLASS | SymbolFlags::INTERFACE | SymbolFlags::TYPE_PARAMETER)
@@ -4756,7 +4947,8 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         let planned_reference = plan.references.get(&node);
         if let Some(resolved_type) = cached_resolved_type
             && !planned_reference.is_some_and(|reference| {
-                reference.global_array_target.is_some()
+                reference.import_alias.is_some()
+                    || reference.global_array_target.is_some()
                     || plan.interfaces.contains_key(&reference.symbol)
             })
         {
