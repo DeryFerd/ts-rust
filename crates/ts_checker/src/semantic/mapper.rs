@@ -145,6 +145,36 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         Some((*source, *target))
     }
 
+    /// Validates the exact ordered endpoints and representation selected by
+    /// pinned `newTypeMapper`. Evaluating a mapper is insufficient for cache
+    /// validation because unmatched inputs are preserved by identity.
+    pub(super) fn type_mapper_has_exact_endpoints(
+        &self,
+        mapper: TypeMapperId,
+        sources: &[TypeId],
+        targets: &[TypeId],
+    ) -> Option<bool> {
+        let exact = match &self.mapper_payload(mapper)?.data {
+            TypeMapperData::Simple { source, target } => {
+                sources.len() == 1
+                    && targets.len() == 1
+                    && sources == [*source]
+                    && targets == [*target]
+            }
+            TypeMapperData::Array {
+                sources: actual_sources,
+                targets: actual_targets,
+            } => {
+                sources.len() != 1
+                    && targets.len() != 1
+                    && sources == actual_sources.as_slice()
+                    && targets == actual_targets.as_slice()
+            }
+            TypeMapperData::ArrayToSingle { .. } | TypeMapperData::Merged { .. } => false,
+        };
+        Some(exact)
+    }
+
     /// Pinned `newArrayTypeMapper` with exact parallel-array semantics.
     pub fn new_array_type_mapper(
         &mut self,
