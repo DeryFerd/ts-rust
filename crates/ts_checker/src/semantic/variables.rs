@@ -80,8 +80,9 @@ pub enum VariableUnsupported {
         symbol: SemanticSymbolId,
         declaration: NodeRef,
     },
-    /// Reading this prior declaration requires upstream control-flow/current-type
-    /// state. The installed slice only proves unannotated inferred `const` reads.
+    /// The caller has not proved an exact current type for this prior declaration.
+    /// Source checking admits the symbol only after its complete statement tree
+    /// has passed the bounded straight-line preflight.
     IdentifierRequiresFlowType {
         node: NodeRef,
         symbol: SemanticSymbolId,
@@ -137,11 +138,18 @@ pub enum VariableInvariant {
     },
     InvalidValueLinks(SemanticSymbolId),
     MissingStagedValueType(SemanticSymbolId),
+    MissingCurrentFlowType(SemanticSymbolId),
     DuplicateStagedValueType(SemanticSymbolId),
+    DuplicateCurrentFlowType(SemanticSymbolId),
     UnexpectedStagedValueType(SemanticSymbolId),
     InvalidStagedValueType {
         symbol: SemanticSymbolId,
         type_: TypeId,
+    },
+    AssignmentDeclaredTypeMismatch {
+        symbol: SemanticSymbolId,
+        staged: TypeId,
+        resolved: TypeId,
     },
     DuplicateIdentifierRead(NodeRef),
     CachedValueTypeMismatch {

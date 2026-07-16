@@ -26,6 +26,7 @@ pub(super) struct SimpleAssignmentPlan {
     pub expression: NodeRef,
     pub left: NodeRef,
     pub right: NodeRef,
+    pub target_symbol: SemanticSymbolId,
     pub target_type_node: NodeRef,
 }
 
@@ -83,6 +84,10 @@ pub enum AssignmentUnsupported {
     },
     MissingTargetType(NodeRef),
     MissingTargetInitializer(NodeRef),
+    TargetNotPrior {
+        node: NodeRef,
+        symbol: SemanticSymbolId,
+    },
     ChainedAssignment(NodeRef),
     NestedTarget(NodeRef),
     NonOrdinaryAssignment(NodeRef),
@@ -389,6 +394,7 @@ impl AssignmentPlanner<'_, '_> {
             expression,
             left,
             right,
+            target_symbol: target,
             target_type_node,
         })
     }
@@ -1049,6 +1055,10 @@ mod tests {
                 expression,
                 left,
                 right,
+                target_symbol: fixture
+                    .bound
+                    .symbol(declaration)
+                    .expect("target declaration symbol"),
                 target_type_node: variable_type(&fixture.parsed, declaration),
             })
         );

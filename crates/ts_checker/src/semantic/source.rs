@@ -352,6 +352,7 @@ struct PlannedVariable {
 struct PlannedAssignment {
     expression: NodeRef,
     left: NodeRef,
+    target_symbol: SemanticSymbolId,
     target_type_node: NodeRef,
     right: PlannedExpression,
 }
@@ -588,10 +589,21 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         self.arena, self.bound, store, host, statement,
                     )
                     .map_err(Self::assignment_plan_error)?;
+                    if !self.prior_variables.contains(&assignment.target_symbol) {
+                        return Err(SourceCheckError::Unsupported(
+                            UnsupportedSourceSyntax::Assignment(
+                                AssignmentUnsupported::TargetNotPrior {
+                                    node: assignment.left,
+                                    symbol: assignment.target_symbol,
+                                },
+                            ),
+                        ));
+                    }
                     let right = self.plan_expression(assignment.right)?;
                     statements.push(PlannedStatement::Assignment(PlannedAssignment {
                         expression: assignment.expression,
                         left: assignment.left,
+                        target_symbol: assignment.target_symbol,
                         target_type_node: assignment.target_type_node,
                         right,
                     }));
@@ -993,10 +1005,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 VariableInvariant::InvalidSymbolShape(variable_symbol),
             ));
         }
-        if binding.is_const()
-            && type_node.is_none()
-            && !self.readable_variables.insert(variable_symbol)
-        {
+        if !self.readable_variables.insert(variable_symbol) {
             return Err(SourceCheckError::Variable(
                 VariableInvariant::InvalidSymbolShape(variable_symbol),
             ));
@@ -1645,7 +1654,7 @@ impl CheckedExpressionTypes {
 fn execute_expression_types(
     store: &mut CanonicalTypeMapperStore,
     global_types: Option<&CanonicalGlobalTypes>,
-    value_types: &HashMap<SemanticSymbolId, TypeId>,
+    current_flow_types: &HashMap<SemanticSymbolId, TypeId>,
     expression: &PlannedExpression,
     prepared: &PreparedExpression,
 ) -> Result<CheckedExpressionTypes, SourceCheckError> {
@@ -1699,8 +1708,8 @@ fn execute_expression_types(
             PlannedExpressionKind::Identifier(read),
             PreparedExpression::Identifier(treatment),
         ) => {
-            let raw = *value_types.get(&read.value_symbol).ok_or(
-                SourceCheckError::Variable(VariableInvariant::MissingStagedValueType(
+            let raw = *current_flow_types.get(&read.value_symbol).ok_or(
+                SourceCheckError::Variable(VariableInvariant::MissingCurrentFlowType(
                     read.value_symbol,
                 )),
             )?;
@@ -1758,7 +1767,7 @@ fn execute_expression_types(
         (
             PlannedExpressionKind::Parenthesized(inner),
             PreparedExpression::Parenthesized(prepared),
-        ) => execute_expression_types(store, global_types, value_types, inner, prepared),
+        ) => execute_expression_types(store, global_types, current_flow_types, inner, prepared),
         (PlannedExpressionKind::Array(elements), PreparedExpression::Array(prepared_elements)) => {
             debug_assert_eq!(elements.len(), prepared_elements.len());
             let global_types = global_types.ok_or(SourceCheckError::Unsupported(
@@ -1774,7 +1783,7 @@ fn execute_expression_types(
                 let checked = execute_expression_types(
                     store,
                     Some(global_types),
-                    value_types,
+                    current_flow_types,
                     element,
                     prepared,
                 )?;
@@ -1822,7 +1831,7 @@ fn execute_expression_types(
                 let checked = execute_expression_types(
                     store,
                     global_types,
-                    value_types,
+                    current_flow_types,
                     property,
                     prepared,
                 )?;
@@ -2075,7 +2084,7 @@ fn check_expression_type(
     source: SourceFileRef,
     options: CanonicalCheckerOptions,
     diagnostics: &mut CanonicalCheckerDiagnostics,
-    value_types: &HashMap<SemanticSymbolId, TypeId>,
+    current_flow_types: &HashMap<SemanticSymbolId, TypeId>,
     expression: &PlannedExpression,
     contextual_type: Option<TypeId>,
     deferred: &mut Vec<DeferredAssertion>,
@@ -2089,7 +2098,7 @@ fn check_expression_type(
                 source,
                 options,
                 diagnostics,
-                value_types,
+                current_flow_types,
                 inner,
                 contextual_type,
                 deferred,
@@ -2105,7 +2114,7 @@ fn check_expression_type(
                 source,
                 options,
                 diagnostics,
-                value_types,
+                current_flow_types,
                 operand,
                 None,
                 deferred,
@@ -2137,7 +2146,7 @@ fn check_expression_type(
                     store,
                     host,
                     global_types,
-                    value_types,
+                    current_flow_types,
                     expression,
                     contextual_type,
                 )?
@@ -2146,14 +2155,14 @@ fn check_expression_type(
                     store,
                     host,
                     global_types,
-                    value_types,
+                    current_flow_types,
                     expression,
                 )?
             };
             execute_expression_types(
                 store,
                 Some(global_types),
-                value_types,
+                current_flow_types,
                 expression,
                 &prepared,
             )
@@ -2282,6 +2291,12 @@ pub(super) fn merge_retry_diagnostics(
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CheckedAssignment {
+    declared_type: TypeId,
+    assigned_type: TypeId,
+}
+
 #[allow(clippy::too_many_arguments)] // Keeps the source execution capabilities explicit.
 fn check_planned_assignment(
     store: &mut CanonicalTypeMapperStore,
@@ -2290,13 +2305,13 @@ fn check_planned_assignment(
     source: SourceFileRef,
     options: CanonicalCheckerOptions,
     diagnostics: &mut CanonicalCheckerDiagnostics,
-    value_types: &HashMap<SemanticSymbolId, TypeId>,
+    flow_types: &HashMap<SemanticSymbolId, TypeId>,
     deferred: &mut Vec<DeferredAssertion>,
     target_type_node: NodeRef,
     expression: &PlannedExpression,
     fallback_node: NodeRef,
     assignment_expression: Option<NodeRef>,
-) -> Result<TypeId, SourceCheckError> {
+) -> Result<CheckedAssignment, SourceCheckError> {
     let mut statement_diagnostics = CanonicalCheckerDiagnostics::default();
     let target = CanonicalTypeQuery::new_with_global_types(
         store,
@@ -2318,7 +2333,7 @@ fn check_planned_assignment(
         source,
         options,
         diagnostics,
-        value_types,
+        flow_types,
         expression,
         Some(target),
         deferred,
@@ -2327,7 +2342,9 @@ fn check_planned_assignment(
         publish_expression_type(store, assignment_expression, source_types.result)?;
     }
     let source_type = source_types.result;
-    if !store.is_type_assignable_to_with_global_types(source_type, target, global_types)? {
+    let assignable =
+        store.is_type_assignable_to_with_global_types(source_type, target, global_types)?;
+    if !assignable {
         let staged = super::object_diagnostics::diagnostics_for_failed_assignment(
             store,
             host,
@@ -2342,7 +2359,278 @@ fn check_planned_assignment(
             merge_retry_diagnostic(diagnostics, diagnostic);
         }
     }
-    Ok(target)
+    Ok(CheckedAssignment {
+        declared_type: target,
+        assigned_type: source_type,
+    })
+}
+
+fn current_flow_type_after_assignment(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
+    assignment: CheckedAssignment,
+) -> Result<TypeId, SourceCheckError> {
+    let CheckedAssignment {
+        declared_type,
+        assigned_type,
+    } = assignment;
+    if declared_type == assigned_type {
+        return Ok(declared_type);
+    }
+    let declared_record = store
+        .type_payload(declared_type)
+        .ok_or(RelationUnavailable::Type(declared_type))?;
+    if !declared_record.flags().intersects(TypeFlags::UNION) {
+        return Ok(declared_type);
+    }
+    let assigned_flags = store
+        .type_payload(assigned_type)
+        .map(TypeRecord::flags)
+        .ok_or(RelationUnavailable::Type(assigned_type))?;
+    if assigned_flags.intersects(TypeFlags::NEVER) {
+        return Ok(assigned_type);
+    }
+    let TypeData::Union(declared_union) = declared_record.data() else {
+        return Err(RelationUnavailable::MalformedUnion(declared_type).into());
+    };
+    let declared_constituents = declared_union.union.types.clone();
+    let declared_origin = declared_union.origin;
+    store
+        .validate_union_constituent_with_global_types(global_types, declared_type)
+        .map_err(|error| {
+            super::relater::union_validation_unavailable(declared_type, error)
+        })?;
+
+    let assigned_constituents = match store.type_payload(assigned_type) {
+        Some(record) if record.flags().intersects(TypeFlags::UNION) => {
+            let TypeData::Union(union) = record.data() else {
+                return Err(RelationUnavailable::MalformedUnion(assigned_type).into());
+            };
+            let constituents = union.union.types.clone();
+            store
+                .validate_union_constituent_with_global_types(global_types, assigned_type)
+                .map_err(|error| {
+                    super::relater::union_validation_unavailable(assigned_type, error)
+                })?;
+            constituents
+        }
+        Some(_) => vec![assigned_type],
+        None => return Err(RelationUnavailable::Type(assigned_type).into()),
+    };
+
+    let mut reduced = Vec::with_capacity(declared_constituents.len());
+    for target in &declared_constituents {
+        if assignment_type_maybe_assignable_to(
+            store,
+            global_types,
+            &assigned_constituents,
+            *target,
+        )? {
+            reduced.push(*target);
+        }
+    }
+    if reduced.is_empty() {
+        return Ok(declared_type);
+    }
+    let filtered = filtered_assignment_union_type(
+        store,
+        global_types,
+        declared_type,
+        &declared_constituents,
+        declared_origin,
+        &assigned_constituents,
+        &reduced,
+    )?;
+    let candidate = if is_fresh_boolean_literal(store, assigned_type)? {
+        map_fresh_boolean_type(store, global_types, filtered)?
+    } else {
+        filtered
+    };
+    if store.is_type_assignable_to_with_global_types(assigned_type, candidate, global_types)? {
+        Ok(candidate)
+    } else {
+        Ok(declared_type)
+    }
+}
+
+fn assignment_type_maybe_assignable_to(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
+    assigned_constituents: &[TypeId],
+    target: TypeId,
+) -> Result<bool, SourceCheckError> {
+    for source in assigned_constituents {
+        if is_definitely_unassignable_to_structured(store, *source, target)? {
+            continue;
+        }
+        if store.is_type_assignable_to_with_global_types(*source, target, global_types)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn filtered_assignment_union_type(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
+    declared_type: TypeId,
+    declared_constituents: &[TypeId],
+    declared_origin: Option<TypeId>,
+    assigned_constituents: &[TypeId],
+    reduced: &[TypeId],
+) -> Result<TypeId, SourceCheckError> {
+    if reduced.len() == declared_constituents.len() {
+        return Ok(declared_type);
+    }
+
+    if let Some(origin) = declared_origin {
+        let origin_record = store
+            .type_payload(origin)
+            .ok_or(RelationUnavailable::Type(origin))?;
+        let TypeData::Union(origin_union) = origin_record.data() else {
+            return Err(RelationUnavailable::MalformedUnion(origin).into());
+        };
+        let origin_constituents = origin_union.union.types.clone();
+        let mut filtered_origin = Vec::with_capacity(origin_constituents.len());
+        for constituent in &origin_constituents {
+            let flags = store
+                .type_payload(*constituent)
+                .map(TypeRecord::flags)
+                .ok_or(RelationUnavailable::Type(*constituent))?;
+            if flags.intersects(TypeFlags::UNION)
+                || assignment_type_maybe_assignable_to(
+                    store,
+                    global_types,
+                    assigned_constituents,
+                    *constituent,
+                )?
+            {
+                filtered_origin.push(*constituent);
+            }
+        }
+        if origin_constituents.len() - filtered_origin.len()
+            == declared_constituents.len() - reduced.len()
+        {
+            return store
+                .expression_union_type_with_global_types(
+                    global_types,
+                    &filtered_origin,
+                    UnionReduction::None,
+                )
+                .map_err(Into::into);
+        }
+    }
+
+    store
+        .expression_union_type_with_global_types(global_types, reduced, UnionReduction::None)
+        .map_err(Into::into)
+}
+
+fn map_fresh_boolean_type(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
+    type_: TypeId,
+) -> Result<TypeId, SourceCheckError> {
+    let record = store
+        .type_payload(type_)
+        .ok_or(RelationUnavailable::Type(type_))?;
+    let TypeData::Union(union) = record.data() else {
+        return fresh_literal_reduction_constituent(store, type_);
+    };
+    let constituents = if let Some(origin) = union.origin {
+        let origin_record = store
+            .type_payload(origin)
+            .ok_or(RelationUnavailable::Type(origin))?;
+        let TypeData::Union(origin_union) = origin_record.data() else {
+            return Err(RelationUnavailable::MalformedUnion(origin).into());
+        };
+        origin_union.union.types.clone()
+    } else {
+        union.union.types.clone()
+    };
+    let mut mapped = Vec::with_capacity(constituents.len());
+    let mut changed = false;
+    for constituent in constituents {
+        let mapped_constituent = map_fresh_boolean_type(store, global_types, constituent)?;
+        changed |= mapped_constituent != constituent;
+        mapped.push(mapped_constituent);
+    }
+    if !changed {
+        return Ok(type_);
+    }
+    store
+        .expression_union_type_with_global_types(global_types, &mapped, UnionReduction::Literal)
+        .map_err(Into::into)
+}
+
+fn fresh_literal_reduction_constituent(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+) -> Result<TypeId, SourceCheckError> {
+    let record = store
+        .type_payload(type_)
+        .ok_or(RelationUnavailable::Type(type_))?;
+    let TypeData::Literal(literal) = record.data() else {
+        return Ok(type_);
+    };
+    store.validate_union_constituent(type_)?;
+    if literal.regular_type == type_ {
+        return store.fresh_type_of_literal_type(type_).map_err(Into::into);
+    }
+    if literal.fresh_type == Some(type_) {
+        return Ok(type_);
+    }
+    Err(SourceCheckError::LiteralCache(
+        SourceLiteralCacheError::InvalidCachedLiteral(type_),
+    ))
+}
+
+fn is_definitely_unassignable_to_structured(
+    store: &CanonicalTypeMapperStore,
+    source: TypeId,
+    target: TypeId,
+) -> Result<bool, SourceCheckError> {
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or(RelationUnavailable::MissingBootstrap)?;
+    let source_flags = store
+        .type_payload(source)
+        .map(TypeRecord::flags)
+        .ok_or(RelationUnavailable::Type(source))?;
+    let target_flags = store
+        .type_payload(target)
+        .map(TypeRecord::flags)
+        .ok_or(RelationUnavailable::Type(target))?;
+    if target_flags.intersects(TypeFlags::STRUCTURED_OR_INSTANTIABLE)
+        && (source_flags.intersects(TypeFlags::VOID)
+            || (bootstrap.options.strict_null_checks
+                && source_flags.intersects(TypeFlags::NULLABLE)))
+    {
+        store.validate_union_constituent(source)?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+fn is_fresh_boolean_literal(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+) -> Result<bool, SourceCheckError> {
+    let Some(record) = store.type_payload(type_) else {
+        return Err(RelationUnavailable::Type(type_).into());
+    };
+    let TypeData::Literal(literal) = record.data() else {
+        return Ok(false);
+    };
+    if !record.flags().intersects(TypeFlags::BOOLEAN_LITERAL)
+        || literal.fresh_type != Some(type_)
+        || literal.regular_type == type_
+    {
+        return Ok(false);
+    }
+    store.validate_union_constituent(type_)?;
+    Ok(true)
 }
 
 fn inferred_variable_type(
@@ -2537,7 +2825,8 @@ pub(super) fn check_source_file(
     } = SourcePlanner::new_semantic(arena, bound, source, store, host).finish()?;
     store.prepare_regular_literal_types(&strings, &numbers, &bigints)?;
     let mut deferred = Vec::new();
-    let mut value_types = HashMap::new();
+    let mut declared_types = HashMap::new();
+    let mut current_flow_types = HashMap::new();
     let mut value_order = Vec::new();
 
     for statement in statements {
@@ -2558,21 +2847,25 @@ pub(super) fn check_source_file(
             PlannedStatement::ExternalModuleMarker => {}
             PlannedStatement::Variables(variables) => {
                 for variable in variables {
-                    let resolved_type = if let Some(type_node) = variable.type_node {
-                        check_planned_assignment(
+                    let (declared_type, current_flow_type) = if let Some(type_node) = variable.type_node {
+                        let assignment = check_planned_assignment(
                             store,
                             host,
                             global_types,
                             source,
                             options,
                             diagnostics,
-                            &value_types,
+                            &current_flow_types,
                             &mut deferred,
                             type_node,
                             &variable.initializer,
                             variable.name,
                             None,
-                        )?
+                        )?;
+                        (
+                            assignment.declared_type,
+                            current_flow_type_after_assignment(store, global_types, assignment)?,
+                        )
                     } else {
                         let initializer = check_expression_type(
                             store,
@@ -2581,49 +2874,88 @@ pub(super) fn check_source_file(
                             source,
                             options,
                             diagnostics,
-                            &value_types,
+                            &current_flow_types,
                             &variable.initializer,
                             None,
                             &mut deferred,
                         )?;
-                        inferred_variable_type(
+                        let declared_type = inferred_variable_type(
                             store,
                             global_types,
                             variable.binding,
                             initializer.result,
-                        )?
+                        )?;
+                        let current_flow_type = current_flow_type_after_assignment(
+                            store,
+                            global_types,
+                            CheckedAssignment {
+                                declared_type,
+                                assigned_type: initializer.result,
+                            },
+                        )?;
+                        (declared_type, current_flow_type)
                     };
                     stage_value_type(
                         store,
-                        &mut value_types,
+                        &mut declared_types,
                         &mut value_order,
                         variable.symbol,
-                        resolved_type,
+                        declared_type,
                     )?;
+                    if current_flow_types
+                        .insert(variable.symbol, current_flow_type)
+                        .is_some()
+                    {
+                        return Err(SourceCheckError::Variable(
+                            VariableInvariant::DuplicateCurrentFlowType(variable.symbol),
+                        ));
+                    }
                 }
             }
             PlannedStatement::Assignment(assignment) => {
-                check_planned_assignment(
+                let staged_declared_type = *declared_types.get(&assignment.target_symbol).ok_or(
+                    SourceCheckError::Variable(VariableInvariant::MissingStagedValueType(
+                        assignment.target_symbol,
+                    )),
+                )?;
+                if !current_flow_types.contains_key(&assignment.target_symbol) {
+                    return Err(SourceCheckError::Variable(
+                        VariableInvariant::MissingCurrentFlowType(assignment.target_symbol),
+                    ));
+                }
+                let checked = check_planned_assignment(
                     store,
                     host,
                     global_types,
                     source,
                     options,
                     diagnostics,
-                    &value_types,
+                    &current_flow_types,
                     &mut deferred,
                     assignment.target_type_node,
                     &assignment.right,
                     assignment.left,
                     Some(assignment.expression),
                 )?;
+                if checked.declared_type != staged_declared_type {
+                    return Err(SourceCheckError::Variable(
+                        VariableInvariant::AssignmentDeclaredTypeMismatch {
+                            symbol: assignment.target_symbol,
+                            staged: staged_declared_type,
+                            resolved: checked.declared_type,
+                        },
+                    ));
+                }
+                let current_flow_type =
+                    current_flow_type_after_assignment(store, global_types, checked)?;
+                current_flow_types.insert(assignment.target_symbol, current_flow_type);
             }
         }
     }
 
     validate_deferred_assertions(store, source, &deferred)?;
     check_deferred_assertions(store, host, global_types, options, diagnostics, &deferred)?;
-    publish_staged_variable_state(store, &value_types, &value_order, &identifier_reads)?;
+    publish_staged_variable_state(store, &declared_types, &value_order, &identifier_reads)?;
 
     Ok(())
 }
@@ -2650,7 +2982,7 @@ mod tests {
     use ts_binder::{
         CanonicalBinder, CanonicalModuleState, CanonicalNameResolverOptions,
         CanonicalProgramBindings, CanonicalSourceFileFacts, CanonicalSourceLanguage, CheckFlags,
-        EscapedName, InternalSymbolName, SymbolFlags,
+        EscapedName, InternalSymbolName, SymbolData, SymbolFlags,
     };
     use ts_diagnostics::Category;
     use ts_parser::{ParseResult, parse_source_file};
@@ -3649,73 +3981,403 @@ mod tests {
     }
 
     #[test]
-    fn identifier_reads_requiring_current_flow_types_fail_closed() {
-        // Pinned tsgo-oracle (`typescript-go@dc37b524`) observes the current
-        // flow type, not the declaration/symbol type: fixed and the initial v
-        // read are 1, b is false, and the post-assignment v read is 2. Until
-        // canonical CFA is installed, only unannotated inferred const reads are
-        // admitted by this source slice.
-        let cases = [
-            (
-                "export const fixed: 1 | 2 = 1; export const observed = fixed;",
-                "fixed",
-                "observed",
-            ),
-            (
-                "export let b = false; export const observed = b;",
-                "b",
-                "observed",
-            ),
-            (
-                "export const b: boolean = false; export const observed = b;",
-                "b",
-                "observed",
-            ),
-            (
-                "export var v: 1 | 2 = 1; export const before = v;",
-                "v",
-                "before",
-            ),
-            (
-                "export var v: 1 | 2 = 1; v = 2; export const after = v;",
-                "v",
-                "after",
-            ),
-        ];
-        for (index, (text, target, observer)) in cases.into_iter().enumerate() {
-            let source = parsed(text);
-            let file = FileId::new(217 + u32::try_from(index).unwrap());
-            let mut context = context_with_module_state(
-                &[(file, &source)],
-                CanonicalModuleState::External,
-                CanonicalCheckerOptions::default(),
-            );
-            let node = variable_initializer(&source, file, observer);
-            let symbol = variable_symbol(&context, &source, file, target);
-            let declaration = variable_declaration(&source, file, target);
-            let before = observable_state(&context, file);
+    fn straight_line_variable_reads_track_exact_current_flow_types() {
+        let library = parsed("interface Array<T> {} interface Boolean {}");
+        let source = parsed(concat!(
+            "interface Shape { value: number } ",
+            "type NumericA = 1 | 2; type NumericB = NumericA | 3; ",
+            "export const fixed: 1 | 2 = 1; export const fixedObserved = fixed; ",
+            "export const annotatedBoolean: boolean = false; ",
+            "export const annotatedBooleanObserved = annotatedBoolean; ",
+            "export let mutableBoolean = false; ",
+            "export const mutableBooleanObserved = mutableBoolean; ",
+            "export const sameFixed: 1 | 2 = 1, sameObserved = sameFixed; ",
+            "export var value: 1 | 2 = 1; export const before = value; ",
+            "value = 2; export const after = value; ",
+            "export var scalar: string | number = \"x\"; ",
+            "export const scalarBefore = scalar; scalar = 2; ",
+            "export const scalarAfter = scalar; ",
+            "export var asserted: 1 | 2 = 1; asserted = 2 as 1 | 2; ",
+            "export const afterAssertion = asserted; ",
+            "export var shape: Shape = { value: 1 }; export const shapeBefore = shape; ",
+            "shape = { value: 2 }; export const shapeAfter = shape; ",
+            "export var values: number[] = [1]; export const valuesBefore = values; ",
+            "values = [2]; export const valuesAfter = values; ",
+            "export var neverInitial: 1 | 2 = 1 as never; ",
+            "export const neverInitialObserved = neverInitial; ",
+            "export var neverAssigned: 1 | 2 = 1; neverAssigned = 1 as never; ",
+            "export const neverAssignedObserved = neverAssigned; ",
+            "export var failed: 1 | 2 = 1; failed = 3; ",
+            "export const afterFailed = failed; ",
+            "export var partialFailure: 1 | 2 = 1; ",
+            "partialFailure = 1 as 1 | string; ",
+            "export const afterPartialFailure = partialFailure; ",
+            "export var originValue: NumericB = 1 as NumericA; ",
+            "export const originObserved = originValue; ",
+            "export const emptyObject = {}; ",
+            "export var voidOrValues: void | number[] = undefined as void; ",
+            "export const voidOrValuesObserved = voidOrValues; ",
+            "export var exactFalse: false = false; ",
+            "export const exactFalseBefore = exactFalse; exactFalse = false; ",
+            "export const exactFalseAfter = exactFalse; ",
+            "export var nonUnionNever: number = 1 as never; ",
+            "export const nonUnionNeverBefore = nonUnionNever; ",
+            "nonUnionNever = 1 as never; ",
+            "export const nonUnionNeverAfter = nonUnionNever;",
+        ));
+        let library_file = FileId::new(217);
+        let file = FileId::new(218);
+        let mut context = context_with_file_module_states(
+            &[
+                (library_file, &library, CanonicalModuleState::Script),
+                (file, &source, CanonicalModuleState::External),
+            ],
+            CanonicalCheckerOptions::default(),
+        );
 
+        context.check_source_file(file).unwrap();
+
+        let regular_literal = |context: &CanonicalCheckerContext<'_>, node| {
+            let fresh = resolved_node_type(context, node);
+            let TypeData::Literal(literal) = context.store().type_payload(fresh).unwrap().data()
+            else {
+                panic!("expected a fresh literal for {node:?}")
+            };
+            assert_eq!(literal.fresh_type, Some(fresh));
+            literal.regular_type
+        };
+        assert_eq!(
+            resolved_node_type(&context, variable_initializer(&source, file, "fixedObserved")),
+            regular_literal(&context, variable_initializer(&source, file, "fixed")),
+        );
+        assert_eq!(
+            resolved_node_type(
+                &context,
+                variable_initializer(&source, file, "annotatedBooleanObserved"),
+            ),
+            resolved_node_type(
+                &context,
+                variable_initializer(&source, file, "annotatedBoolean"),
+            ),
+        );
+        assert_eq!(
+            resolved_node_type(
+                &context,
+                variable_initializer(&source, file, "mutableBooleanObserved"),
+            ),
+            resolved_node_type(
+                &context,
+                variable_initializer(&source, file, "mutableBoolean"),
+            ),
+        );
+        assert_eq!(
+            resolved_node_type(&context, variable_initializer(&source, file, "sameObserved")),
+            regular_literal(&context, variable_initializer(&source, file, "sameFixed")),
+        );
+        assert_eq!(
+            resolved_node_type(&context, variable_initializer(&source, file, "before")),
+            regular_literal(&context, variable_initializer(&source, file, "value")),
+        );
+        let (_, assigned_two) = assignment_parts(&source, file, 0);
+        assert_eq!(
+            resolved_node_type(&context, variable_initializer(&source, file, "after")),
+            regular_literal(&context, assigned_two),
+        );
+        let (_, assigned_scalar_number) = assignment_parts(&source, file, 1);
+        let (string, number) = {
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            (bootstrap.string_type, bootstrap.number_type)
+        };
+        assert_eq!(
+            resolved_node_type(
+                &context,
+                variable_initializer(&source, file, "scalarBefore"),
+            ),
+            string,
+        );
+        assert_eq!(
+            resolved_node_type(
+                &context,
+                variable_initializer(&source, file, "scalarAfter"),
+            ),
+            number,
+        );
+        assert_ne!(resolved_node_type(&context, assigned_scalar_number), number);
+
+        for (target, observers) in [
+            ("shape", ["shapeBefore", "shapeAfter"]),
+            ("values", ["valuesBefore", "valuesAfter"]),
+        ] {
+            let declared = variable_value_type(&context, &source, file, target);
+            for observer in observers {
+                assert_eq!(
+                    resolved_node_type(&context, variable_initializer(&source, file, observer)),
+                    declared,
+                );
+            }
+        }
+        assert_eq!(
+            resolved_node_type(
+                &context,
+                variable_initializer(&source, file, "afterAssertion"),
+            ),
+            variable_value_type(&context, &source, file, "asserted"),
+        );
+        let never = context.store().intrinsic_bootstrap().unwrap().never_type;
+        for observer in ["neverInitialObserved", "neverAssignedObserved"] {
             assert_eq!(
-                context.check_source_file(file),
-                Err(SourceCheckError::Unsupported(
-                    UnsupportedSourceSyntax::Variable(
-                        VariableUnsupported::IdentifierRequiresFlowType {
-                            node,
-                            symbol,
-                            declaration,
-                        }
-                    )
-                ))
+                resolved_node_type(&context, variable_initializer(&source, file, observer)),
+                never,
             );
-            assert_eq!(observable_state(&context, file), before);
+        }
+        assert_eq!(
+            resolved_node_type(&context, variable_initializer(&source, file, "afterFailed")),
+            variable_value_type(&context, &source, file, "failed"),
+            "an invalid assignment resets the current flow type to the declaration type",
+        );
+        assert_eq!(
+            resolved_node_type(
+                &context,
+                variable_initializer(&source, file, "afterPartialFailure"),
+            ),
+            variable_value_type(&context, &source, file, "partialFailure"),
+            "a nonempty but invalid crude reduction must fall back to the declaration type",
+        );
+
+        let [empty_reduction, partial_reduction] = context.diagnostics().as_slice() else {
+            panic!("expected the two failed assignment diagnostics")
+        };
+        assert_eq!(empty_reduction.diagnostic.code(), 2322);
+        assert_eq!(empty_reduction.diagnostic.arguments, ["3", "1 | 2"]);
+        assert_eq!(partial_reduction.diagnostic.code(), 2322);
+
+        let origin_flow = resolved_node_type(
+            &context,
+            variable_initializer(&source, file, "originObserved"),
+        );
+        assert_eq!(
+            origin_flow,
+            resolved_node_type(&context, variable_initializer(&source, file, "originValue")),
+            "filterType must preserve the sole retained named origin union",
+        );
+        assert_ne!(
+            origin_flow,
+            variable_value_type(&context, &source, file, "originValue"),
+        );
+
+        let void_type = context.store().intrinsic_bootstrap().unwrap().void_type;
+        assert_eq!(
+            resolved_node_type(
+                &context,
+                variable_initializer(&source, file, "voidOrValuesObserved"),
+            ),
+            void_type,
+            "void must not survive a reducer probe against the array constituent",
+        );
+
+        let exact_false_initializer =
+            resolved_node_type(&context, variable_initializer(&source, file, "exactFalse"));
+        let (_, exact_false_rhs) = assignment_parts(&source, file, 8);
+        assert_eq!(resolved_node_type(&context, exact_false_rhs), exact_false_initializer);
+        let exact_false_declared = variable_value_type(&context, &source, file, "exactFalse");
+        assert_ne!(exact_false_declared, exact_false_initializer);
+        for observer in ["exactFalseBefore", "exactFalseAfter"] {
+            assert_eq!(
+                resolved_node_type(&context, variable_initializer(&source, file, observer)),
+                exact_false_declared,
+                "non-union declared false must retain the declaration identity",
+            );
+        }
+        let non_union_never_declared =
+            variable_value_type(&context, &source, file, "nonUnionNever");
+        for observer in ["nonUnionNeverBefore", "nonUnionNeverAfter"] {
+            assert_eq!(
+                resolved_node_type(&context, variable_initializer(&source, file, observer)),
+                non_union_never_declared,
+                "non-union declarations must not enter assignment reduction for never",
+            );
+        }
+
+        let annotated_boolean = variable_initializer(&source, file, "annotatedBoolean");
+        let fresh_false = resolved_node_type(&context, annotated_boolean);
+        let regular_false = regular_literal(&context, annotated_boolean);
+        let empty_object =
+            resolved_node_type(&context, variable_initializer(&source, file, "emptyObject"));
+        let global_types = context.global_types().clone();
+        let (boolean_object, non_literal_named, nested_boolean) = {
+            let store = context.store_mut_for_test();
+            let boolean_object = store
+                .expression_union_type_with_global_types(
+                    &global_types,
+                    &[regular_false, empty_object],
+                    UnionReduction::Literal,
+                )
+                .unwrap();
+            let non_literal_alias = store
+                .alloc_symbol(SymbolData::new(
+                    SymbolFlags::TYPE_ALIAS,
+                    EscapedName::source("__FlowUnchanged"),
+                ))
+                .unwrap();
+            let non_literal_named = store
+                .literal_union_type(&[string, number], Some(non_literal_alias))
+                .unwrap();
+            let inner_alias = store
+                .alloc_symbol(SymbolData::new(
+                    SymbolFlags::TYPE_ALIAS,
+                    EscapedName::source("__FlowNested"),
+                ))
+                .unwrap();
+            let inner_boolean = store
+                .literal_union_type(&[regular_false, string], Some(inner_alias))
+                .unwrap();
+            let nested_boolean = store
+                .expression_union_type_with_global_types(
+                    &global_types,
+                    &[inner_boolean, number],
+                    UnionReduction::Literal,
+                )
+                .unwrap();
+            (boolean_object, non_literal_named, nested_boolean)
+        };
+        let mapped_boolean_object = map_fresh_boolean_type(
+            context.store_mut_for_test(),
+            &global_types,
+            boolean_object,
+        )
+        .unwrap();
+        let TypeData::Union(boolean_object_union) = context
+            .store()
+            .type_payload(mapped_boolean_object)
+            .unwrap()
+            .data()
+        else {
+            panic!("fresh false plus an empty object must remain a mapped union")
+        };
+        assert!(boolean_object_union.union.types.contains(&fresh_false));
+        assert!(boolean_object_union.union.types.contains(&empty_object));
+        assert_eq!(
+            map_fresh_boolean_type(
+                context.store_mut_for_test(),
+                &global_types,
+                non_literal_named,
+            )
+            .unwrap(),
+            non_literal_named,
+            "an unchanged recursive map must preserve the named union identity",
+        );
+        let mapped_nested_boolean = map_fresh_boolean_type(
+            context.store_mut_for_test(),
+            &global_types,
+            nested_boolean,
+        )
+        .unwrap();
+        assert_ne!(
+            mapped_nested_boolean,
+            nested_boolean,
+            "a fresh boolean nested inside a named origin must be mapped recursively",
+        );
+        let TypeData::Union(nested_boolean_union) = context
+            .store()
+            .type_payload(mapped_nested_boolean)
+            .unwrap()
+            .data()
+        else {
+            panic!("nested fresh boolean mapping must remain a union")
+        };
+        assert!(nested_boolean_union.union.types.contains(&fresh_false));
+        let scalar_initializer = variable_initializer(&source, file, "scalar");
+        let fresh_string = resolved_node_type(&context, scalar_initializer);
+        assert_eq!(
+            fresh_literal_reduction_constituent(
+                context.store(),
+                regular_literal(&context, scalar_initializer),
+            )
+            .unwrap(),
+            fresh_string,
+            "the recursive mapper must use generic getFreshTypeOfLiteralType semantics",
+        );
+        assert!(is_type_checked(&context, file));
+
+        // Pinned tsgo-oracle (`typescript-go@dc37b524`): annotated unions
+        // reduce to their assigned regular constituent, boolean unions retain
+        // the assigned fresh boolean, and union-declared `never` remains
+        // `never`. Non-unions retain the declaration type even for fresh
+        // booleans and `never`; assertions retain their asserted union; and
+        // erroneous empty and nonempty crude reductions both fall back to the
+        // declaration type. A retry must reproduce every identity without
+        // duplicating TS2322.
+        let warm = observable_state(&context, file);
+        mark_source_unchecked(&mut context, file);
+        context.check_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn straight_line_flow_rejects_assignment_before_declaration_without_publication() {
+        let source = parsed("target = 2; export var target: 1 | 2 = 1;");
+        let file = FileId::new(219);
+        let mut context = context_with_module_state(
+            &[(file, &source)],
+            CanonicalModuleState::External,
+            CanonicalCheckerOptions::default(),
+        );
+        let (left, _) = assignment_parts(&source, file, 0);
+        let symbol = variable_symbol(&context, &source, file, "target");
+        let before = observable_state(&context, file);
+
+        assert_eq!(
+            context.check_source_file(file),
+            Err(SourceCheckError::Unsupported(
+                UnsupportedSourceSyntax::Assignment(AssignmentUnsupported::TargetNotPrior {
+                    node: left,
+                    symbol,
+                })
+            ))
+        );
+        assert_eq!(observable_state(&context, file), before);
+        assert!(
+            context
+                .store()
+                .value_symbol_links(symbol)
+                .and_then(|links| links.resolved_type)
+                .is_none()
+        );
+        assert!(!is_type_checked(&context, file));
+
+        let chained = parsed(
+            "export var first: 1 | 2 = 1; export var second: 1 | 2 = 1; first = second = 2;",
+        );
+        let chained_file = FileId::new(220);
+        let mut chained_context = context_with_module_state(
+            &[(chained_file, &chained)],
+            CanonicalModuleState::External,
+            CanonicalCheckerOptions::default(),
+        );
+        let chained_before = observable_state(&chained_context, chained_file);
+        assert!(matches!(
+            chained_context.check_source_file(chained_file),
+            Err(SourceCheckError::Unsupported(
+                UnsupportedSourceSyntax::Assignment(AssignmentUnsupported::ChainedAssignment(_))
+            ))
+        ));
+        assert_eq!(
+            observable_state(&chained_context, chained_file),
+            chained_before
+        );
+        for name in ["first", "second"] {
             assert!(
-                context
+                chained_context
                     .store()
-                    .value_symbol_links(symbol)
+                    .value_symbol_links(variable_symbol(
+                        &chained_context,
+                        &chained,
+                        chained_file,
+                        name,
+                    ))
                     .and_then(|links| links.resolved_type)
                     .is_none()
             );
-            assert!(!is_type_checked(&context, file));
         }
     }
 

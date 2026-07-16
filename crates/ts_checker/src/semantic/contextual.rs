@@ -76,7 +76,7 @@ pub(super) fn prepare_expression_context_with_global_types(
     store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     global_types: &CanonicalGlobalTypes,
-    value_types: &HashMap<SemanticSymbolId, TypeId>,
+    current_flow_types: &HashMap<SemanticSymbolId, TypeId>,
     expression: &PlannedExpression,
     contextual_type: TypeId,
 ) -> Result<PreparedExpression, SourceCheckError> {
@@ -84,7 +84,7 @@ pub(super) fn prepare_expression_context_with_global_types(
         store,
         host,
         Some(global_types),
-        value_types,
+        current_flow_types,
         expression,
         contextual_type,
     )
@@ -94,7 +94,7 @@ fn prepare_expression_context_worker(
     store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     global_types: Option<&CanonicalGlobalTypes>,
-    value_types: &HashMap<SemanticSymbolId, TypeId>,
+    current_flow_types: &HashMap<SemanticSymbolId, TypeId>,
     expression: &PlannedExpression,
     contextual_type: TypeId,
 ) -> Result<PreparedExpression, SourceCheckError> {
@@ -112,7 +112,7 @@ fn prepare_expression_context_worker(
         store,
         host,
         global_types,
-        value_types,
+        current_flow_types,
         expression,
         Some(contextual_type),
         ExpressionLocation::Cached,
@@ -124,14 +124,14 @@ pub(super) fn prepare_expression_without_context_with_global_types(
     store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     global_types: &CanonicalGlobalTypes,
-    value_types: &HashMap<SemanticSymbolId, TypeId>,
+    current_flow_types: &HashMap<SemanticSymbolId, TypeId>,
     expression: &PlannedExpression,
 ) -> Result<PreparedExpression, SourceCheckError> {
     prepare_expression_without_context_worker(
         store,
         host,
         Some(global_types),
-        value_types,
+        current_flow_types,
         expression,
     )
 }
@@ -140,14 +140,14 @@ fn prepare_expression_without_context_worker(
     store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     global_types: Option<&CanonicalGlobalTypes>,
-    value_types: &HashMap<SemanticSymbolId, TypeId>,
+    current_flow_types: &HashMap<SemanticSymbolId, TypeId>,
     expression: &PlannedExpression,
 ) -> Result<PreparedExpression, SourceCheckError> {
     prepare_expression(
         store,
         host,
         global_types,
-        value_types,
+        current_flow_types,
         expression,
         None,
         ExpressionLocation::Cached,
@@ -227,7 +227,7 @@ fn prepare_expression(
     store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     global_types: Option<&CanonicalGlobalTypes>,
-    value_types: &HashMap<SemanticSymbolId, TypeId>,
+    current_flow_types: &HashMap<SemanticSymbolId, TypeId>,
     expression: &PlannedExpression,
     contextual_type: Option<TypeId>,
     location: ExpressionLocation,
@@ -240,10 +240,10 @@ fn prepare_expression(
             PreparedExpression::Identifier(identifier_treatment(
                 store,
                 global_types,
-                *value_types
+                *current_flow_types
                     .get(&read.value_symbol)
                     .ok_or(SourceCheckError::Variable(
-                        VariableInvariant::MissingStagedValueType(read.value_symbol),
+                        VariableInvariant::MissingCurrentFlowType(read.value_symbol),
                     ))?,
                 contextual_type,
                 location,
@@ -282,7 +282,7 @@ fn prepare_expression(
                 store,
                 host,
                 global_types,
-                value_types,
+                current_flow_types,
                 inner,
                 contextual_type,
                 location,
@@ -306,7 +306,7 @@ fn prepare_expression(
                     store,
                     host,
                     global_types,
-                    value_types,
+                    current_flow_types,
                     element,
                     element_context,
                     ExpressionLocation::Mutable,
@@ -327,7 +327,7 @@ fn prepare_expression(
                     store,
                     host,
                     global_types,
-                    value_types,
+                    current_flow_types,
                     expression,
                     property_context,
                     ExpressionLocation::Mutable,
