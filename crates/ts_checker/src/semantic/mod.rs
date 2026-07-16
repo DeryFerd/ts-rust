@@ -46,6 +46,8 @@ mod source_arrows;
 mod source_callables;
 mod source_calls;
 mod source_enums;
+#[allow(dead_code)] // The source dispatcher is wired by the integration owner.
+mod source_elements;
 mod source_functions;
 mod source_imports;
 mod source_properties;
