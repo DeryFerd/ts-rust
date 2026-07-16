@@ -36,14 +36,15 @@ use super::{
         CanonicalTypeFormatFlags,
         get_type_names_for_assignability_error_with_host_global_types_and_flags,
     },
-    type_nodes::{CanonicalTypeQuery, normalize_bigint_literal, normalize_numeric_separators},
-    type_records::{TypeData, TypeRecord},
-    types::TypeFlags,
+    source_arrows::{SourceArrowBodyPlan, SourceArrowError, SourceArrowPlan, plan_source_arrow},
     source_callables::{SourceCallableError, SourceCallablePlan, plan_source_callable},
     source_functions::{
         PlannedFunctionRead, SourceFunctionInvariant, SourceFunctionPlanError,
         SourceFunctionUnsupported, plan_function_identifier_read, plan_top_level_function,
     },
+    type_nodes::{CanonicalTypeQuery, normalize_bigint_literal, normalize_numeric_separators},
+    type_records::{TypeData, TypeRecord},
+    types::TypeFlags,
     variables::{
         PlannedIdentifierRead as PlannedVariableRead, VariableBindingKind, VariablePlanError,
         plan_identifier_read, plan_top_level_variable,
@@ -110,6 +111,7 @@ pub enum UnsupportedSourceSyntax {
     ConstAssertion(NodeRef),
     NestedAssertion(NodeRef),
     Assignment(AssignmentUnsupported),
+    Arrow(NodeRef),
     Function(SourceFunctionUnsupported),
     Variable(VariableUnsupported),
 }
@@ -220,6 +222,7 @@ pub enum SourceCheckError {
     DerivedType(DerivedTypeError),
     Assertion(SourceAssertionError),
     Assignment(AssignmentInvariant),
+    Arrow(NodeRef),
     Function(SourceFunctionInvariant),
     Variable(VariableInvariant),
     MissingDiagnostic(u32),
@@ -241,6 +244,7 @@ impl std::fmt::Display for SourceCheckError {
             Self::DerivedType(error) => write!(formatter, "{error}"),
             Self::Assertion(error) => write!(formatter, "assertion checking failed: {error:?}"),
             Self::Assignment(error) => write!(formatter, "assignment planning failed: {error:?}"),
+            Self::Arrow(node) => write!(formatter, "arrow checking failed at {node:?}"),
             Self::Function(error) => write!(formatter, "function checking failed: {error:?}"),
             Self::Variable(error) => write!(formatter, "variable checking failed: {error:?}"),
             Self::MissingDiagnostic(code) => {
@@ -265,6 +269,7 @@ impl std::error::Error for SourceCheckError {
             | Self::ObjectLiteral(_)
             | Self::Assertion(_)
             | Self::Assignment(_)
+            | Self::Arrow(_)
             | Self::Function(_)
             | Self::Variable(_)
             | Self::MissingDiagnostic(_) => None,
@@ -403,6 +408,21 @@ struct PlannedFunction {
 }
 
 #[derive(Clone, Debug)]
+struct PlannedArrow {
+    source: SourceArrowPlan,
+    body: PlannedArrowBody,
+}
+
+#[derive(Clone, Debug)]
+enum PlannedArrowBody {
+    Empty,
+    Return {
+        diagnostic_node: NodeRef,
+        expression: PlannedExpression,
+    },
+}
+
+#[derive(Clone, Debug)]
 enum PlannedFunctionBody {
     Empty,
     Return {
@@ -433,6 +453,7 @@ enum PlannedStatement {
     Interface(SemanticSymbolId),
     ExternalModuleMarker,
     Function(usize),
+    Arrow(usize),
     Variables(Vec<PlannedVariable>),
     Assignment(PlannedAssignment),
 }
@@ -441,10 +462,16 @@ enum PlannedStatement {
 struct SourceCheckPlan {
     statements: Vec<PlannedStatement>,
     functions: Vec<PlannedFunction>,
+    arrows: Vec<PlannedArrow>,
     identifier_reads: Vec<(NodeRef, SemanticSymbolId)>,
     strings: Vec<String>,
     numbers: Vec<Number>,
     bigints: Vec<PseudoBigInt>,
+}
+
+enum PlannedVariableStatement {
+    Arrow(SourceArrowPlan),
+    Variables(Vec<PlannedVariable>),
 }
 
 struct SourcePlanner<'arena, 'semantic, 'sources> {
@@ -561,6 +588,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
 
         let mut statements = Vec::with_capacity(source_statements.len());
         let mut functions = Vec::with_capacity(preplanned_functions.len());
+        let mut arrows = Vec::new();
         for statement in source_statements {
             let statement = self.reference(statement);
             match self.node(statement)?.kind {
@@ -683,9 +711,16 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         }
                         (variable.declaration_list, export_modifier.is_some())
                     };
-                    statements.push(PlannedStatement::Variables(
-                        self.plan_variable_statement(statement, declaration_list, exported)?,
-                    ));
+                    match self.plan_variable_statement(statement, declaration_list, exported)? {
+                        PlannedVariableStatement::Arrow(arrow) => {
+                            let index = arrows.len();
+                            arrows.push(arrow);
+                            statements.push(PlannedStatement::Arrow(index));
+                        }
+                        PlannedVariableStatement::Variables(variables) => {
+                            statements.push(PlannedStatement::Variables(variables));
+                        }
+                    }
                 }
                 SyntaxKind::ExpressionStatement => {
                     let Some((store, host)) = self.semantic else {
@@ -723,9 +758,14 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 }
             }
         }
+        let arrows = arrows
+            .into_iter()
+            .map(|arrow| self.plan_arrow_body(arrow))
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(SourceCheckPlan {
             statements,
             functions,
+            arrows,
             identifier_reads: self.identifier_reads,
             strings: self.strings,
             numbers: self.numbers,
@@ -785,6 +825,22 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         }
     }
 
+    fn arrow_plan_error(error: SourceArrowError) -> SourceCheckError {
+        let node = error.node();
+        match error {
+            SourceArrowError::Unsupported(_) => {
+                SourceCheckError::Unsupported(UnsupportedSourceSyntax::Arrow(
+                    node.expect("source arrow unsupported errors retain their syntax node"),
+                ))
+            }
+            SourceArrowError::Invariant(_) => SourceCheckError::Arrow(
+                node.expect("source arrow invariant errors retain their syntax node"),
+            ),
+            SourceArrowError::DeclaredType(error) => SourceCheckError::DeclaredType(error),
+            SourceArrowError::LiteralCache(error) => error.into(),
+        }
+    }
+
     fn preplan_function_declaration(
         &mut self,
         declaration: NodeRef,
@@ -836,12 +892,8 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             }
             (identifier.text.clone(), node.range.start.get())
         };
-        let export_modifier = self.validate_function_modifiers(
-            declaration,
-            range,
-            name_start,
-            modifiers.as_ref(),
-        )?;
+        let export_modifier =
+            self.validate_function_modifiers(declaration, range, name_start, modifiers.as_ref())?;
         if let Some(export_modifier) = export_modifier
             && !is_external_module
         {
@@ -915,11 +967,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             || node.range.end.get() > modifiers.list.range.end.get()
             || !self.source_spelling_matches(modifier, "export")
         {
-            return Err(self.unsupported(
-                modifier,
-                node.kind,
-                SourceSyntaxRole::FunctionModifier,
-            ));
+            return Err(self.unsupported(modifier, node.kind, SourceSyntaxRole::FunctionModifier));
         }
         Ok(Some(modifier))
     }
@@ -949,9 +997,9 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         let [] = statements.as_slice() else {
             let [statement_id] = statements.as_slice() else {
                 return Err(SourceCheckError::Unsupported(
-                    UnsupportedSourceSyntax::Function(
-                        SourceFunctionUnsupported::FunctionBody(body),
-                    ),
+                    UnsupportedSourceSyntax::Function(SourceFunctionUnsupported::FunctionBody(
+                        body,
+                    )),
                 ));
             };
             let statement = self.reference(*statement_id);
@@ -976,17 +1024,16 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         SourceSyntaxRole::ReturnStatement,
                     ));
                 }
-                return_statement.expression.map(|node| self.reference(node)).ok_or_else(|| {
-                    self.unsupported(statement, node.kind, SourceSyntaxRole::ReturnStatement)
-                })?
+                return_statement
+                    .expression
+                    .map(|node| self.reference(node))
+                    .ok_or_else(|| {
+                        self.unsupported(statement, node.kind, SourceSyntaxRole::ReturnStatement)
+                    })?
             };
             if self.node(expression)?.parent != Some(statement.node) {
                 let kind = self.node(expression)?.kind;
-                return Err(self.unsupported(
-                    expression,
-                    kind,
-                    SourceSyntaxRole::ReturnStatement,
-                ));
+                return Err(self.unsupported(expression, kind, SourceSyntaxRole::ReturnStatement));
             }
             return Ok(PlannedFunctionBody::Return {
                 statement,
@@ -999,6 +1046,57 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             ));
         }
         Ok(PlannedFunctionBody::Empty)
+    }
+
+    fn plan_arrow_body(
+        &mut self,
+        source: SourceArrowPlan,
+    ) -> Result<PlannedArrow, SourceCheckError> {
+        for parameter in &source.callable.parameters {
+            if !self.prior_variables.insert(parameter.symbol)
+                || !self.readable_variables.insert(parameter.symbol)
+            {
+                return Err(SourceCheckError::Arrow(parameter.declaration));
+            }
+        }
+        let body = match source.body {
+            SourceArrowBodyPlan::EmptyBlock { block } => {
+                if self.function_empty_body_return_supported(source.callable.return_type)? {
+                    Ok(PlannedArrowBody::Empty)
+                } else {
+                    Err(SourceCheckError::Unsupported(
+                        UnsupportedSourceSyntax::Arrow(block),
+                    ))
+                }
+            }
+            SourceArrowBodyPlan::ReturnExpression {
+                statement,
+                expression,
+                ..
+            } => self
+                .plan_expression(expression)
+                .map(|expression| PlannedArrowBody::Return {
+                    diagnostic_node: statement,
+                    expression,
+                }),
+            SourceArrowBodyPlan::ConciseExpression { expression } => self
+                .plan_expression(expression)
+                .map(|expression| PlannedArrowBody::Return {
+                    diagnostic_node: expression.node,
+                    expression,
+                }),
+        };
+        for parameter in &source.callable.parameters {
+            if !self.prior_variables.remove(&parameter.symbol)
+                || !self.readable_variables.remove(&parameter.symbol)
+            {
+                return Err(SourceCheckError::Arrow(parameter.declaration));
+            }
+        }
+        Ok(PlannedArrow {
+            source,
+            body: body?,
+        })
     }
 
     fn function_empty_body_return_supported(
@@ -1198,7 +1296,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         statement: NodeRef,
         declaration_list: NodeId,
         exported: bool,
-    ) -> Result<Vec<PlannedVariable>, SourceCheckError> {
+    ) -> Result<PlannedVariableStatement, SourceCheckError> {
         let list = self.reference(declaration_list);
         let (kind, parent, flags, range, declarations, declaration_range, trailing_comma, facts) = {
             let list_node = self.node(list)?;
@@ -1241,6 +1339,37 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             _ => unreachable!("the declaration-list flag gate accepted one exact binding kind"),
         };
 
+        for declaration in &declarations {
+            let declaration = self.reference(*declaration);
+            let declaration_node = self.node(declaration)?;
+            let NodeData::VariableDeclaration(variable) = &declaration_node.data else {
+                continue;
+            };
+            let Some(initializer) = variable.initializer.map(|node| self.reference(node)) else {
+                continue;
+            };
+            if self.node(initializer)?.kind != SyntaxKind::ArrowFunction {
+                continue;
+            }
+            let Some((store, host)) = self.semantic else {
+                return Err(self.unsupported(
+                    initializer,
+                    SyntaxKind::ArrowFunction,
+                    SourceSyntaxRole::VariableInitializer,
+                ));
+            };
+            let arrow = plan_source_arrow(store, host, declaration, self.array_targets)
+                .map_err(Self::arrow_plan_error)?;
+            if !self.prior_variables.insert(arrow.variable_symbol)
+                || !self.readable_variables.insert(arrow.variable_symbol)
+            {
+                return Err(SourceCheckError::Variable(
+                    VariableInvariant::InvalidSymbolShape(arrow.variable_symbol),
+                ));
+            }
+            return Ok(PlannedVariableStatement::Arrow(arrow));
+        }
+
         let mut variables = Vec::with_capacity(declarations.len());
         for declaration in declarations {
             variables.push(self.plan_variable_declaration(
@@ -1250,7 +1379,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 exported,
             )?);
         }
-        Ok(variables)
+        Ok(PlannedVariableStatement::Variables(variables))
     }
 
     fn plan_variable_declaration(
@@ -1362,9 +1491,9 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             && matches!(&initializer.kind, PlannedExpressionKind::Array(elements) if elements.is_empty())
         {
             return Err(SourceCheckError::Unsupported(
-                UnsupportedSourceSyntax::Variable(
-                    VariableUnsupported::InferredEmptyArrayOption(declaration),
-                ),
+                UnsupportedSourceSyntax::Variable(VariableUnsupported::InferredEmptyArrayOption(
+                    declaration,
+                )),
             ));
         }
         if type_node.is_none()
@@ -2104,18 +2233,18 @@ fn execute_expression_types(
             .ok_or(SourceCheckError::LiteralCache(
                 SourceLiteralCacheError::BootstrapUninitialized,
             )),
-        (
-            PlannedExpressionKind::Identifier(read),
-            PreparedExpression::Identifier(treatment),
-        ) => {
-            let raw = *current_flow_types.get(&read.value_symbol).ok_or_else(|| match read.kind {
-                PlannedIdentifierReadKind::Variable => SourceCheckError::Variable(
-                    VariableInvariant::MissingCurrentFlowType(read.value_symbol),
-                ),
-                PlannedIdentifierReadKind::Function => SourceCheckError::Function(
-                    SourceFunctionInvariant::MissingCallableType(read.value_symbol),
-                ),
-            })?;
+        (PlannedExpressionKind::Identifier(read), PreparedExpression::Identifier(treatment)) => {
+            let raw =
+                *current_flow_types
+                    .get(&read.value_symbol)
+                    .ok_or_else(|| match read.kind {
+                        PlannedIdentifierReadKind::Variable => SourceCheckError::Variable(
+                            VariableInvariant::MissingCurrentFlowType(read.value_symbol),
+                        ),
+                        PlannedIdentifierReadKind::Function => SourceCheckError::Function(
+                            SourceFunctionInvariant::MissingCallableType(read.value_symbol),
+                        ),
+                    })?;
             let result = identifier_expression_type(store, raw, *treatment)?;
             Ok(CheckedExpressionTypes::leaf(raw, result))
         }
@@ -2849,9 +2978,7 @@ fn current_flow_type_after_assignment(
     let declared_origin = declared_union.origin;
     store
         .validate_union_constituent_with_global_types(global_types, declared_type)
-        .map_err(|error| {
-            super::relater::union_validation_unavailable(declared_type, error)
-        })?;
+        .map_err(|error| super::relater::union_validation_unavailable(declared_type, error))?;
 
     let assigned_constituents = match store.type_payload(assigned_type) {
         Some(record) if record.flags().intersects(TypeFlags::UNION) => {
@@ -3190,7 +3317,10 @@ fn publish_staged_variable_state(
                 },
             ));
         }
-        let mut links = store.value_symbol_links(symbol).cloned().unwrap_or_default();
+        let mut links = store
+            .value_symbol_links(symbol)
+            .cloned()
+            .unwrap_or_default();
         if links.write_type.is_some()
             || links.target.is_some()
             || links.mapper.is_some()
@@ -3275,6 +3405,73 @@ fn publish_staged_variable_state(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)] // Keeps callable source capabilities explicit.
+fn materialize_checked_source_callable(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    callable: &SourceCallablePlan,
+) -> Result<TypeId, SourceCheckError> {
+    let mut callable_diagnostics = CanonicalCheckerDiagnostics::default();
+    let type_result = CanonicalTypeQuery::new_with_global_types(
+        store,
+        host,
+        global_types,
+        options,
+        &mut callable_diagnostics,
+    )
+    .and_then(|mut query| {
+        query.get_type_of_source_callable(callable.declaration, callable.owner_symbol)
+    });
+    merge_retry_diagnostics(diagnostics, callable_diagnostics);
+    let type_ = type_result?;
+    let owner = callable.owner_symbol;
+    let linked = store
+        .value_symbol_links(owner)
+        .and_then(|links| links.resolved_type)
+        .ok_or(SourceCheckError::Function(
+            SourceFunctionInvariant::MissingCallableType(owner),
+        ))?;
+    let registered =
+        store
+            .source_callable_type_for_owner(owner)
+            .ok_or(SourceCheckError::Function(
+                SourceFunctionInvariant::MissingCallableType(owner),
+            ))?;
+    if linked != type_ || registered != type_ {
+        return Err(SourceCheckError::Function(
+            SourceFunctionInvariant::CallableTypeMismatch {
+                symbol: owner,
+                expected: type_,
+                actual: if linked != type_ { linked } else { registered },
+            },
+        ));
+    }
+    let signature = store
+        .source_callable_provenance(type_)
+        .filter(|provenance| {
+            provenance.declaration == callable.declaration && provenance.owner_symbol == owner
+        })
+        .map(|provenance| provenance.signature)
+        .ok_or(SourceCheckError::Function(
+            SourceFunctionInvariant::MissingCallableType(owner),
+        ))?;
+    let mut return_diagnostics = CanonicalCheckerDiagnostics::default();
+    let return_result = CanonicalTypeQuery::new_with_global_types(
+        store,
+        host,
+        global_types,
+        options,
+        &mut return_diagnostics,
+    )
+    .and_then(|mut query| query.get_return_type_of_signature(signature));
+    merge_retry_diagnostics(diagnostics, return_diagnostics);
+    return_result?;
+    Ok(type_)
+}
+
 /// Checks one already-retained source into context-owned private staging.
 #[allow(clippy::too_many_arguments)] // Mirrors the context-owned source execution boundary.
 pub(super) fn check_source_file(
@@ -3302,6 +3499,7 @@ pub(super) fn check_source_file(
     let SourceCheckPlan {
         statements,
         functions,
+        arrows,
         identifier_reads,
         strings,
         numbers,
@@ -3322,60 +3520,16 @@ pub(super) fn check_source_file(
     let mut value_order = Vec::new();
 
     for function in &functions {
-        let mut statement_diagnostics = CanonicalCheckerDiagnostics::default();
-        let type_ = CanonicalTypeQuery::new_with_global_types(
+        let type_ = materialize_checked_source_callable(
             store,
             host,
             global_types,
             options,
-            &mut statement_diagnostics,
-        )?
-        .get_type_of_source_callable(
-            function.callable.declaration,
-            function.callable.owner_symbol,
+            diagnostics,
+            &function.callable,
         );
-        merge_retry_diagnostics(diagnostics, statement_diagnostics);
         let type_ = type_?;
         let owner = function.callable.owner_symbol;
-        let linked = store
-            .value_symbol_links(owner)
-            .and_then(|links| links.resolved_type)
-            .ok_or(SourceCheckError::Function(
-                SourceFunctionInvariant::MissingCallableType(owner),
-            ))?;
-        let registered = store.source_callable_type_for_owner(owner).ok_or(
-            SourceCheckError::Function(SourceFunctionInvariant::MissingCallableType(owner)),
-        )?;
-        if linked != type_ || registered != type_ {
-            return Err(SourceCheckError::Function(
-                SourceFunctionInvariant::CallableTypeMismatch {
-                    symbol: owner,
-                    expected: type_,
-                    actual: if linked != type_ { linked } else { registered },
-                },
-            ));
-        }
-        let signature = store
-            .source_callable_provenance(type_)
-            .filter(|provenance| {
-                provenance.declaration == function.callable.declaration
-                    && provenance.owner_symbol == owner
-            })
-            .map(|provenance| provenance.signature)
-            .ok_or(SourceCheckError::Function(
-                SourceFunctionInvariant::MissingCallableType(owner),
-            ))?;
-        let mut return_diagnostics = CanonicalCheckerDiagnostics::default();
-        let return_result = CanonicalTypeQuery::new_with_global_types(
-            store,
-            host,
-            global_types,
-            options,
-            &mut return_diagnostics,
-        )
-        .and_then(|mut query| query.get_return_type_of_signature(signature));
-        merge_retry_diagnostics(diagnostics, return_diagnostics);
-        return_result?;
         if current_flow_types.insert(owner, type_).is_some() {
             return Err(SourceCheckError::Function(
                 SourceFunctionInvariant::DuplicateDeclaration(function.callable.declaration),
@@ -3426,66 +3580,111 @@ pub(super) fn check_source_file(
                     }
                 }
             }
+            PlannedStatement::Arrow(index) => {
+                let arrow = arrows
+                    .get(index)
+                    .ok_or(SourceCheckError::Arrow(source.node_ref()))?;
+                let type_ = materialize_checked_source_callable(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    diagnostics,
+                    &arrow.source.callable,
+                )?;
+                stage_value_type(
+                    store,
+                    &mut declared_types,
+                    &mut value_order,
+                    arrow.source.variable_symbol,
+                    type_,
+                )?;
+                if current_flow_types
+                    .insert(arrow.source.variable_symbol, type_)
+                    .is_some()
+                {
+                    return Err(SourceCheckError::Variable(
+                        VariableInvariant::DuplicateCurrentFlowType(arrow.source.variable_symbol),
+                    ));
+                }
+                for parameter in &arrow.source.callable.parameters {
+                    let parameter_type = store
+                        .value_symbol_links(parameter.symbol)
+                        .and_then(|links| links.resolved_type)
+                        .ok_or(SourceCheckError::Variable(
+                            VariableInvariant::MissingCurrentFlowType(parameter.symbol),
+                        ))?;
+                    if current_flow_types
+                        .insert(parameter.symbol, parameter_type)
+                        .is_some()
+                    {
+                        return Err(SourceCheckError::Variable(
+                            VariableInvariant::DuplicateCurrentFlowType(parameter.symbol),
+                        ));
+                    }
+                }
+            }
             PlannedStatement::Variables(variables) => {
                 for variable in variables {
-                    let (declared_type, current_flow_type) = if let Some(type_node) = variable.type_node {
-                        let assignment = check_planned_assignment(
-                            store,
-                            host,
-                            global_types,
-                            source,
-                            options,
-                            diagnostics,
-                            &current_flow_types,
-                            &mut deferred,
-                            type_node,
-                            &variable.initializer,
-                            variable.name,
-                            None,
-                        )?;
-                        (
-                            assignment.declared_type,
-                            current_flow_type_after_assignment(
+                    let (declared_type, current_flow_type) =
+                        if let Some(type_node) = variable.type_node {
+                            let assignment = check_planned_assignment(
+                                store,
+                                host,
+                                global_types,
+                                source,
+                                options,
+                                diagnostics,
+                                &current_flow_types,
+                                &mut deferred,
+                                type_node,
+                                &variable.initializer,
+                                variable.name,
+                                None,
+                            )?;
+                            (
+                                assignment.declared_type,
+                                current_flow_type_after_assignment(
+                                    store,
+                                    host,
+                                    global_types,
+                                    options,
+                                    diagnostics,
+                                    assignment,
+                                )?,
+                            )
+                        } else {
+                            let initializer = check_expression_type(
+                                store,
+                                host,
+                                global_types,
+                                source,
+                                options,
+                                diagnostics,
+                                &current_flow_types,
+                                &variable.initializer,
+                                None,
+                                &mut deferred,
+                            )?;
+                            let declared_type = inferred_variable_type(
+                                store,
+                                global_types,
+                                variable.binding,
+                                initializer.result,
+                            )?;
+                            let current_flow_type = current_flow_type_after_assignment(
                                 store,
                                 host,
                                 global_types,
                                 options,
                                 diagnostics,
-                                assignment,
-                            )?,
-                        )
-                    } else {
-                        let initializer = check_expression_type(
-                            store,
-                            host,
-                            global_types,
-                            source,
-                            options,
-                            diagnostics,
-                            &current_flow_types,
-                            &variable.initializer,
-                            None,
-                            &mut deferred,
-                        )?;
-                        let declared_type = inferred_variable_type(
-                            store,
-                            global_types,
-                            variable.binding,
-                            initializer.result,
-                        )?;
-                        let current_flow_type = current_flow_type_after_assignment(
-                            store,
-                            host,
-                            global_types,
-                            options,
-                            diagnostics,
-                            CheckedAssignment {
-                                declared_type,
-                                assigned_type: initializer.result,
-                            },
-                        )?;
-                        (declared_type, current_flow_type)
-                    };
+                                CheckedAssignment {
+                                    declared_type,
+                                    assigned_type: initializer.result,
+                                },
+                            )?;
+                            (declared_type, current_flow_type)
+                        };
                     stage_value_type(
                         store,
                         &mut declared_types,
@@ -3546,6 +3745,31 @@ pub(super) fn check_source_file(
                     checked,
                 )?;
                 current_flow_types.insert(assignment.target_symbol, current_flow_type);
+            }
+        }
+    }
+
+    for arrow in &arrows {
+        match &arrow.body {
+            PlannedArrowBody::Empty => {}
+            PlannedArrowBody::Return {
+                diagnostic_node,
+                expression,
+            } => {
+                check_planned_assignment(
+                    store,
+                    host,
+                    global_types,
+                    source,
+                    options,
+                    diagnostics,
+                    &current_flow_types,
+                    &mut deferred,
+                    arrow.source.callable.return_type,
+                    expression,
+                    *diagnostic_node,
+                    None,
+                )?;
             }
         }
     }
@@ -3784,8 +4008,7 @@ mod tests {
                 let NodeData::Identifier(identifier) = &name.data else {
                     return None;
                 };
-                (identifier.text == expected)
-                    .then(|| NodeRef::new(parsed.arena.id(), file, node))
+                (identifier.text == expected).then(|| NodeRef::new(parsed.arena.id(), file, node))
             })
             .unwrap_or_else(|| panic!("missing function {expected}"))
     }
@@ -3802,11 +4025,7 @@ mod tests {
         context.store().get_merged_symbol(raw).unwrap()
     }
 
-    fn function_return_statement(
-        parsed: &ParseResult,
-        file: FileId,
-        expected: &str,
-    ) -> NodeRef {
+    fn function_return_statement(parsed: &ParseResult, file: FileId, expected: &str) -> NodeRef {
         let declaration = function_declaration(parsed, file, expected);
         let NodeData::FunctionDeclaration(function) =
             &parsed.arena.get(declaration.node).unwrap().data
@@ -3819,6 +4038,21 @@ mod tests {
         };
         let [statement] = block.statements.nodes.as_slice() else {
             panic!("function {expected} does not have one statement")
+        };
+        NodeRef::new(parsed.arena.id(), file, *statement)
+    }
+
+    fn arrow_return_statement(parsed: &ParseResult, file: FileId, expected: &str) -> NodeRef {
+        let initializer = variable_initializer(parsed, file, expected);
+        let NodeData::ArrowFunction(arrow) = &parsed.arena.get(initializer.node).unwrap().data
+        else {
+            panic!("variable {expected} does not have an arrow initializer")
+        };
+        let NodeData::Block(block) = &parsed.arena.get(arrow.body).unwrap().data else {
+            panic!("arrow {expected} does not have a block body")
+        };
+        let [statement] = block.statements.nodes.as_slice() else {
+            panic!("arrow {expected} does not have one statement")
         };
         NodeRef::new(parsed.arena.id(), file, *statement)
     }
@@ -3869,11 +4103,7 @@ mod tests {
         NodeRef::new(parsed.arena.id(), file, initializer)
     }
 
-    fn identifier_expressions(
-        parsed: &ParseResult,
-        file: FileId,
-        expected: &str,
-    ) -> Vec<NodeRef> {
+    fn identifier_expressions(parsed: &ParseResult, file: FileId, expected: &str) -> Vec<NodeRef> {
         parsed
             .arena
             .iter()
@@ -3894,6 +4124,9 @@ mod tests {
                         ) || matches!(
                             &parent.data,
                             NodeData::FunctionDeclaration(function) if function.name == Some(node)
+                        ) || matches!(
+                            &parent.data,
+                            NodeData::ParameterDeclaration(parameter) if parameter.name == node
                         )
                     });
                 (!is_declaration_name).then(|| NodeRef::new(parsed.arena.id(), file, node))
@@ -4122,11 +4355,7 @@ mod tests {
 
     fn mark_source_unchecked(context: &mut CanonicalCheckerContext<'_>, file: FileId) {
         let source = context.source_file(file).unwrap();
-        let mut links = context
-            .store()
-            .source_file_links(source)
-            .cloned()
-            .unwrap();
+        let mut links = context.store().source_file_links(source).cloned().unwrap();
         links.type_checked = false;
         assert!(
             context
@@ -4199,7 +4428,13 @@ mod tests {
             variable_value_type(&context, &source, file, "constAlias"),
             first
         );
-        for name in ["mutableNumber", "varNumber", "letAlias", "varAlias", "annotated"] {
+        for name in [
+            "mutableNumber",
+            "varNumber",
+            "letAlias",
+            "varAlias",
+            "annotated",
+        ] {
             assert_eq!(variable_value_type(&context, &source, file, name), number);
         }
         assert_ne!(
@@ -4326,7 +4561,10 @@ mod tests {
                 .unwrap(),
             "number[]"
         );
-        assert_eq!(object_property_type(&context, mutable_object, "value"), number);
+        assert_eq!(
+            object_property_type(&context, mutable_object, "value"),
+            number
+        );
         let TypeData::Literal(seed_literal) = context.store().type_payload(seed).unwrap().data()
         else {
             panic!("expected a fresh seed literal")
@@ -4439,10 +4677,7 @@ mod tests {
             assert_eq!(variable_value_type(&strict, &source, file, name), null);
         }
         for name in ["missing", "missingAlias", "exportedMissing"] {
-            assert_eq!(
-                variable_value_type(&strict, &source, file, name),
-                undefined
-            );
+            assert_eq!(variable_value_type(&strict, &source, file, name), undefined);
         }
         let any = loose.store().intrinsic_bootstrap().unwrap().any_type;
         for name in [
@@ -4487,12 +4722,7 @@ mod tests {
             assert!(
                 context
                     .store()
-                    .value_symbol_links(variable_symbol(
-                        &context,
-                        &blocked,
-                        blocked_file,
-                        "prior"
-                    ))
+                    .value_symbol_links(variable_symbol(&context, &blocked, blocked_file, "prior"))
                     .and_then(|links| links.resolved_type)
                     .is_none()
             );
@@ -4516,14 +4746,8 @@ mod tests {
             (library_file, &library, CanonicalModuleState::Script),
             (file, &source, CanonicalModuleState::External),
         ];
-        let mut strict = context_with_file_module_states(
-            &files,
-            strict_options,
-        );
-        let mut loose = context_with_file_module_states(
-            &files,
-            CanonicalCheckerOptions::default(),
-        );
+        let mut strict = context_with_file_module_states(&files, strict_options);
+        let mut loose = context_with_file_module_states(&files, CanonicalCheckerOptions::default());
 
         strict.check_source_file(file).unwrap();
         loose.check_source_file(file).unwrap();
@@ -4569,12 +4793,7 @@ mod tests {
         assert!(
             context
                 .store()
-                .value_symbol_links(variable_symbol(
-                    &context,
-                    &blocked,
-                    blocked_file,
-                    "prior"
-                ))
+                .value_symbol_links(variable_symbol(&context, &blocked, blocked_file, "prior"))
                 .and_then(|links| links.resolved_type)
                 .is_none()
         );
@@ -4620,12 +4839,10 @@ mod tests {
         assert_eq!(
             context.check_source_file(file),
             Err(SourceCheckError::Unsupported(
-                UnsupportedSourceSyntax::Variable(
-                    VariableUnsupported::CrossFileDeclaration {
-                        node: read,
-                        declaration,
-                    }
-                )
+                UnsupportedSourceSyntax::Variable(VariableUnsupported::CrossFileDeclaration {
+                    node: read,
+                    declaration,
+                })
             ))
         );
         assert_eq!(observable_state(&context, file), before);
@@ -4699,7 +4916,10 @@ mod tests {
             literal.regular_type
         };
         assert_eq!(
-            resolved_node_type(&context, variable_initializer(&source, file, "fixedObserved")),
+            resolved_node_type(
+                &context,
+                variable_initializer(&source, file, "fixedObserved")
+            ),
             regular_literal(&context, variable_initializer(&source, file, "fixed")),
         );
         assert_eq!(
@@ -4723,7 +4943,10 @@ mod tests {
             ),
         );
         assert_eq!(
-            resolved_node_type(&context, variable_initializer(&source, file, "sameObserved")),
+            resolved_node_type(
+                &context,
+                variable_initializer(&source, file, "sameObserved")
+            ),
             regular_literal(&context, variable_initializer(&source, file, "sameFixed")),
         );
         assert_eq!(
@@ -4748,10 +4971,7 @@ mod tests {
             string,
         );
         assert_eq!(
-            resolved_node_type(
-                &context,
-                variable_initializer(&source, file, "scalarAfter"),
-            ),
+            resolved_node_type(&context, variable_initializer(&source, file, "scalarAfter"),),
             number,
         );
         assert_ne!(resolved_node_type(&context, assigned_scalar_number), number);
@@ -4830,7 +5050,10 @@ mod tests {
         let exact_false_initializer =
             resolved_node_type(&context, variable_initializer(&source, file, "exactFalse"));
         let (_, exact_false_rhs) = assignment_parts(&source, file, 8);
-        assert_eq!(resolved_node_type(&context, exact_false_rhs), exact_false_initializer);
+        assert_eq!(
+            resolved_node_type(&context, exact_false_rhs),
+            exact_false_initializer
+        );
         let exact_false_declared = variable_value_type(&context, &source, file, "exactFalse");
         assert_ne!(exact_false_declared, exact_false_initializer);
         for observer in ["exactFalseBefore", "exactFalseAfter"] {
@@ -4892,12 +5115,9 @@ mod tests {
                 .unwrap();
             (boolean_object, non_literal_named, nested_boolean)
         };
-        let mapped_boolean_object = map_fresh_boolean_type(
-            context.store_mut_for_test(),
-            &global_types,
-            boolean_object,
-        )
-        .unwrap();
+        let mapped_boolean_object =
+            map_fresh_boolean_type(context.store_mut_for_test(), &global_types, boolean_object)
+                .unwrap();
         let TypeData::Union(boolean_object_union) = context
             .store()
             .type_payload(mapped_boolean_object)
@@ -4918,15 +5138,11 @@ mod tests {
             non_literal_named,
             "an unchanged recursive map must preserve the named union identity",
         );
-        let mapped_nested_boolean = map_fresh_boolean_type(
-            context.store_mut_for_test(),
-            &global_types,
-            nested_boolean,
-        )
-        .unwrap();
+        let mapped_nested_boolean =
+            map_fresh_boolean_type(context.store_mut_for_test(), &global_types, nested_boolean)
+                .unwrap();
         assert_ne!(
-            mapped_nested_boolean,
-            nested_boolean,
+            mapped_nested_boolean, nested_boolean,
             "a fresh boolean nested inside a named origin must be mapped recursively",
         );
         let TypeData::Union(nested_boolean_union) = context
@@ -5075,10 +5291,11 @@ mod tests {
                     .is_none()
             );
         }
-        assert!(context.store_mut_for_test().set_symbol_node_links(
-            second_read,
-            SymbolNodeLinks::default(),
-        ));
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_symbol_node_links(second_read, SymbolNodeLinks::default(),)
+        );
 
         assert!(context.store_mut_for_test().set_value_symbol_links(
             third_symbol,
@@ -5095,10 +5312,11 @@ mod tests {
             ))
         );
         assert_eq!(observable_state(&context, file), poisoned);
-        assert!(context.store_mut_for_test().set_value_symbol_links(
-            third_symbol,
-            ValueSymbolLinks::default(),
-        ));
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_value_symbol_links(third_symbol, ValueSymbolLinks::default(),)
+        );
 
         assert!(context.store_mut_for_test().set_value_symbol_links(
             second_symbol,
@@ -5108,10 +5326,8 @@ mod tests {
             },
         ));
         let result = context.check_source_file(file);
-        let expected_second = resolved_node_type(
-            &context,
-            variable_initializer(&source, file, "first"),
-        );
+        let expected_second =
+            resolved_node_type(&context, variable_initializer(&source, file, "first"));
         assert_eq!(
             result,
             Err(SourceCheckError::Variable(
@@ -5137,10 +5353,11 @@ mod tests {
                 .and_then(|links| links.resolved_symbol),
             None
         );
-        assert!(context.store_mut_for_test().set_value_symbol_links(
-            second_symbol,
-            ValueSymbolLinks::default(),
-        ));
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_value_symbol_links(second_symbol, ValueSymbolLinks::default(),)
+        );
 
         context.check_source_file(file).unwrap();
         assert_eq!(
@@ -6798,26 +7015,17 @@ mod tests {
             CanonicalCheckerOptions::default(),
         );
         let array_alias_body = type_alias_body(&source, file, "ArrayAlias");
-        let array_alias = ordered
-            .get_type_from_type_node(array_alias_body)
-            .unwrap();
+        let array_alias = ordered.get_type_from_type_node(array_alias_body).unwrap();
         assert_eq!(ordered.type_to_string(array_alias).unwrap(), "number[]");
         let ordered_outer = ordered.get_type_from_type_node(outer_body).unwrap();
         assert_eq!(ordered.type_to_string(ordered_outer).unwrap(), "Outer");
 
         let array_union_body = type_alias_body(&source, file, "ArrayUnion");
         let nested_union_body = type_alias_body(&source, file, "NestedUnion");
-        let array_union = ordered
-            .get_type_from_type_node(array_union_body)
-            .unwrap();
+        let array_union = ordered.get_type_from_type_node(array_union_body).unwrap();
         assert_eq!(ordered.type_to_string(array_union).unwrap(), "ArrayUnion");
-        let nested_union = ordered
-            .get_type_from_type_node(nested_union_body)
-            .unwrap();
-        assert_eq!(
-            ordered.type_to_string(nested_union).unwrap(),
-            "NestedUnion",
-        );
+        let nested_union = ordered.get_type_from_type_node(nested_union_body).unwrap();
+        assert_eq!(ordered.type_to_string(nested_union).unwrap(), "NestedUnion",);
 
         let ordered_warm = observable_state(&ordered, file);
         assert_eq!(
@@ -9219,10 +9427,15 @@ mod tests {
         else {
             panic!("strict optional parameter must include undefined")
         };
-        assert!(union
-            .union
-            .types
-            .contains(&context.store().intrinsic_bootstrap().unwrap().undefined_type));
+        assert!(
+            union.union.types.contains(
+                &context
+                    .store()
+                    .intrinsic_bootstrap()
+                    .unwrap()
+                    .undefined_type
+            )
+        );
         assert!(context.diagnostics().is_empty());
         assert!(is_type_checked(&context, file));
     }
@@ -9246,10 +9459,12 @@ mod tests {
         ));
         assert_eq!(observable_state(&blocked, file), before);
         assert!(blocked.store().value_symbol_links(ready).is_none());
-        assert!(blocked
-            .store()
-            .source_callable_type_for_owner(ready)
-            .is_none());
+        assert!(
+            blocked
+                .store()
+                .source_callable_type_for_owner(ready)
+                .is_none()
+        );
         assert!(!is_type_checked(&blocked, file));
 
         let unresolved = parsed("const value = missing;");
@@ -9262,9 +9477,7 @@ mod tests {
         assert_eq!(
             unresolved_context.check_source_file(unresolved_file),
             Err(SourceCheckError::Unsupported(
-                UnsupportedSourceSyntax::Variable(
-                    VariableUnsupported::UnresolvedIdentifier(read)
-                )
+                UnsupportedSourceSyntax::Variable(VariableUnsupported::UnresolvedIdentifier(read))
             ))
         );
     }
@@ -9349,6 +9562,195 @@ mod tests {
         assert!(bivariant.diagnostics().is_empty());
         assert!(is_type_checked(&strict, relation_file));
         assert!(is_type_checked(&bivariant, relation_file));
+    }
+
+    #[test]
+    fn direct_source_arrows_infer_exact_callable_identity_and_retry_warm() {
+        let source = parsed(concat!(
+            "const f = (value: string, optional?: number): string => value; ",
+            "const forward = (): string => later; ",
+            "const later = 'ok'; ",
+            "const copy = f;",
+        ));
+        let file = FileId::new(308);
+        let mut context = context(
+            &[(file, &source)],
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    exact_optional_property_types: false,
+                },
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+
+        context.check_source_file(file).unwrap();
+
+        let variable = variable_symbol(&context, &source, file, "f");
+        let declaration = variable_declaration(&source, file, "f");
+        let arrow = variable_initializer(&source, file, "f");
+        let (_, bound) = context.file(file).unwrap();
+        let owner = bound.symbol(arrow).unwrap();
+        assert_ne!(variable, owner);
+        assert_eq!(bound.symbol(declaration), Some(variable));
+        let callable = variable_value_type(&context, &source, file, "f");
+        assert_eq!(
+            variable_value_type(&context, &source, file, "copy"),
+            callable
+        );
+        assert_eq!(
+            context.store().source_callable_type_for_owner(owner),
+            Some(callable)
+        );
+        assert_eq!(
+            context
+                .store()
+                .value_symbol_links(owner)
+                .and_then(|links| links.resolved_type),
+            Some(callable)
+        );
+        let provenance = context
+            .store()
+            .source_callable_provenance(callable)
+            .unwrap();
+        assert_eq!(provenance.declaration, arrow);
+        assert_eq!(provenance.owner_symbol, owner);
+        let signature = context.store().signature(provenance.signature).unwrap();
+        assert!(signature.resolved_return_type().is_some());
+        let [value, optional] = signature.parameters() else {
+            panic!("expected two arrow parameters")
+        };
+        assert!([*value, *optional].iter().all(|parameter| {
+            context
+                .store()
+                .value_symbol_links(*parameter)
+                .and_then(|links| links.resolved_type)
+                .is_some()
+        }));
+        let value_reads = identifier_expressions(&source, file, "value");
+        let [value_read] = value_reads.as_slice() else {
+            panic!("expected one arrow parameter read")
+        };
+        assert_eq!(
+            context
+                .store()
+                .symbol_node_links(*value_read)
+                .and_then(|links| links.resolved_symbol),
+            Some(*value)
+        );
+        assert!(context.diagnostics().is_empty());
+        assert!(is_type_checked(&context, file));
+
+        let warm = observable_state(&context, file);
+        mark_source_unchecked(&mut context, file);
+        context.check_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+        assert_eq!(variable_value_type(&context, &source, file, "f"), callable);
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn source_arrow_concise_and_block_returns_report_exact_nodes() {
+        let source = parsed(concat!(
+            "const concise = (): string => 1; ",
+            "const blocked = (): string => { return 2; };",
+        ));
+        let file = FileId::new(309);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let concise = variable_initializer(&source, file, "concise");
+        let NodeData::ArrowFunction(concise_arrow) = &source.arena.get(concise.node).unwrap().data
+        else {
+            unreachable!()
+        };
+        let concise_body = NodeRef::new(source.arena.id(), file, concise_arrow.body);
+        let blocked_return = arrow_return_statement(&source, file, "blocked");
+        assert_eq!(context.diagnostics().len(), 2);
+        for node in [concise_body, blocked_return] {
+            let diagnostic = context
+                .diagnostics()
+                .as_slice()
+                .iter()
+                .find(|diagnostic| diagnostic.node == Some(node))
+                .unwrap_or_else(|| panic!("missing arrow return diagnostic at {node:?}"));
+            assert_eq!(diagnostic.diagnostic.code(), 2322);
+            assert_eq!(
+                diagnostic.diagnostic.render().unwrap(),
+                "Type 'number' is not assignable to type 'string'."
+            );
+        }
+        assert!(is_type_checked(&context, file));
+    }
+
+    #[test]
+    fn source_arrow_consumers_use_strict_callable_relations() {
+        let source = parsed(concat!(
+            "const narrow = (input: 'only'): void => {}; ",
+            "const value: (input: string) => void = narrow;",
+        ));
+        let file = FileId::new(310);
+        let mut strict = context(
+            &[(file, &source)],
+            CanonicalCheckerOptions {
+                strict_function_types: true,
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+        let mut bivariant = context(
+            &[(file, &source)],
+            CanonicalCheckerOptions {
+                strict_function_types: false,
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+
+        strict.check_source_file(file).unwrap();
+        bivariant.check_source_file(file).unwrap();
+
+        let [diagnostic] = strict.diagnostics().as_slice() else {
+            panic!("expected one strict arrow relation diagnostic")
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 2322);
+        assert_eq!(
+            diagnostic.diagnostic.render().unwrap(),
+            "Type '(input: \"only\") => void' is not assignable to type '(input: string) => void'."
+        );
+        assert!(bivariant.diagnostics().is_empty());
+        assert!(is_type_checked(&strict, file));
+        assert!(is_type_checked(&bivariant, file));
+    }
+
+    #[test]
+    fn unsupported_source_arrow_keeps_the_complete_plan_atomic() {
+        let source = parsed(concat!(
+            "const ready = (): void => {}; ",
+            "const generic = <T>(value: T): T => value;",
+        ));
+        let file = FileId::new(311);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        let ready = variable_initializer(&source, file, "ready");
+        let generic = variable_initializer(&source, file, "generic");
+        let (_, bound) = context.file(file).unwrap();
+        let ready_owner = bound.symbol(ready).unwrap();
+        let before = observable_state(&context, file);
+
+        assert_eq!(
+            context.check_source_file(file),
+            Err(SourceCheckError::Unsupported(
+                UnsupportedSourceSyntax::Arrow(generic)
+            ))
+        );
+        assert_eq!(observable_state(&context, file), before);
+        assert!(
+            context
+                .store()
+                .source_callable_type_for_owner(ready_owner)
+                .is_none()
+        );
+        assert!(context.store().value_symbol_links(ready_owner).is_none());
+        assert!(!is_type_checked(&context, file));
     }
 
     #[test]

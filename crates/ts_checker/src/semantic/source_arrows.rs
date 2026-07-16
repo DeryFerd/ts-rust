@@ -330,10 +330,13 @@ pub(super) fn plan_source_arrow(
             initializer,
         )));
     }
-    if initializer_record.kind != SyntaxKind::ArrowFunction
-        || !matches!(initializer_record.data, NodeData::ArrowFunction(_))
-    {
+    let NodeData::ArrowFunction(initializer_data) = &initializer_record.data else {
         return Err(unsupported(SourceArrowUnsupported::NonArrowInitializer(
+            initializer,
+        )));
+    };
+    if initializer_record.kind != SyntaxKind::ArrowFunction || initializer_data.facts != 0 {
+        return Err(invariant(SourceArrowInvariant::InvalidInitializer(
             initializer,
         )));
     }
@@ -557,6 +560,10 @@ mod tests {
         fn new(source: &str) -> Self {
             let parsed = parse_source_file(source);
             assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            Self::from_parsed(parsed)
+        }
+
+        fn from_parsed(parsed: ParseResult) -> Self {
             let file = FileId::new(913);
             let mut binder = CanonicalBinder::new();
             binder
@@ -690,6 +697,43 @@ mod tests {
         assert_eq!(
             source_callable_state(&fixture.store, &plan.callable, true).unwrap(),
             SourceCallableState::Cold
+        );
+    }
+
+    #[test]
+    fn rejects_nonzero_arrow_parser_facts_before_callable_publication() {
+        let mut parsed = parse_source_file("const f = (): void => {};");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(913);
+        let declaration = variable_declarations(&parsed, file)[0];
+        let NodeData::VariableDeclaration(variable) =
+            &parsed.arena.get(declaration.node).unwrap().data
+        else {
+            unreachable!()
+        };
+        let initializer = NodeRef::new(parsed.arena.id(), file, variable.initializer.unwrap());
+        let NodeData::ArrowFunction(arrow) = &mut parsed
+            .arena
+            .get_mut(initializer.node)
+            .expect("arrow initializer remains in the parsed arena")
+            .data
+        else {
+            unreachable!()
+        };
+        arrow.facts = 1;
+        let fixture = Fixture::from_parsed(parsed);
+
+        assert_eq!(
+            fixture.plan(0),
+            Err(SourceArrowError::Invariant(
+                SourceArrowInvariant::InvalidInitializer(initializer)
+            ))
+        );
+        assert!(
+            fixture
+                .store
+                .source_callable_type_for_owner(fixture.bound.symbol(initializer).unwrap())
+                .is_none()
         );
     }
 
