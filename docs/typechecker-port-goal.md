@@ -725,8 +725,11 @@ describes a successful strategy that is unusually relevant here:
 - preserve architecture, function names, and recognizable control flow during
   the port, accepting temporarily unidiomatic Rust;
 - inventory the work before scaling it out;
-- use independent reviewers to find code that compiles but is semantically
-  wrong;
+- use one implementer plus at least two independent reviewers and a separate
+  fixer to find code that compiles but is semantically wrong;
+- shard work across a small number of isolated worktrees, keep slow Cargo work
+  out of leaf workers, and turn compiler/test failures into explicit queues
+  only after the mechanical source inventory exists;
 - forbid stubs whose purpose is merely to make the build green; and
 - refactor only after parity.
 
