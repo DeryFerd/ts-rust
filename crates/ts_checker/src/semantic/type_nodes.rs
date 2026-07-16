@@ -4023,6 +4023,14 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             self.options.strict_builtin_iterator_return,
             &self.type_reference_alias_targets,
         );
+        for type_parameter in &callable.type_parameters {
+            if let Some(constraint) = type_parameter.constraint {
+                planner.plan_type_node(constraint)?;
+            }
+            if let Some(default_type) = type_parameter.default_type {
+                planner.plan_type_node(default_type)?;
+            }
+        }
         for parameter in &callable.parameters {
             planner.plan_type_node(parameter.type_node)?;
         }
@@ -4040,8 +4048,62 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             prepared.clear_pending_function_types();
             return Err(error);
         }
-        let pending = match source_callables::begin_source_callable(self.store, &callable)
-            .map_err(|error| source_callable_error(error, callable.family))?
+        let type_parameter_ids = callable
+            .type_parameters
+            .iter()
+            .map(|type_parameter| execute_type_parameter(self.store, type_parameter.symbol))
+            .collect::<Vec<_>>();
+        let no_constraint = self
+            .store
+            .intrinsic_bootstrap()
+            .ok_or(DeclaredTypeError::Unavailable(
+                DeclaredTypeUnavailable::IntrinsicBootstrapNotInitialized,
+            ))?
+            .no_constraint_type;
+        let mut resolved_type_parameters = Vec::with_capacity(callable.type_parameters.len());
+        for (type_parameter, type_parameter_id) in
+            callable.type_parameters.iter().zip(type_parameter_ids)
+        {
+            let constraint = match type_parameter.constraint {
+                Some(node) => match self.execute_type_node(node, &plan, &mut prepared) {
+                    Ok(type_) => type_,
+                    Err(error) => {
+                        self.pending_function_parameters.clear();
+                        prepared.clear_pending_function_types();
+                        return Err(error);
+                    }
+                },
+                None => no_constraint,
+            };
+            let default_type = match type_parameter.default_type {
+                Some(node) => match self.execute_type_node(node, &plan, &mut prepared) {
+                    Ok(type_) => type_,
+                    Err(error) => {
+                        self.pending_function_parameters.clear();
+                        prepared.clear_pending_function_types();
+                        return Err(error);
+                    }
+                },
+                None => no_constraint,
+            };
+            resolved_type_parameters.push(super::store::ResolvedSourceCallableTypeParameter {
+                provenance: super::store::SourceCallableTypeParameterProvenance {
+                    declaration: type_parameter.declaration,
+                    symbol: type_parameter.symbol,
+                    type_parameter: type_parameter_id,
+                    constraint: type_parameter.constraint,
+                    default_type: type_parameter.default_type,
+                },
+                constraint,
+                default_type,
+            });
+        }
+        let pending = match source_callables::begin_source_callable(
+            self.store,
+            &callable,
+            &resolved_type_parameters,
+        )
+        .map_err(|error| source_callable_error(error, callable.family))?
         {
             Ok(pending) => pending,
             Err(resolved) => {

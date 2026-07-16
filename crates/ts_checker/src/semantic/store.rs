@@ -106,6 +106,9 @@ pub(super) struct SourceCallableProvenance {
     pub(super) owner_parent: Option<SemanticSymbolId>,
     pub(super) export_local: Option<SemanticSymbolId>,
     pub(super) signature: SignatureId,
+    /// Exact declared identity named by a naked generic return annotation.
+    /// Fixed keyword returns and non-generic/contextual callables retain None.
+    pub(super) generic_return_type_parameter: Option<TypeId>,
     /// The annotation that contextually typed an inferred source arrow.
     ///
     /// Annotated source callables retain `None` and instead own an exact
@@ -161,6 +164,7 @@ pub(super) struct PreparedSourceGenericCallablePublication<'a> {
     pub(super) min_argument_count: i32,
     pub(super) return_annotation: NodeRef,
     pub(super) return_null_literal_identity: bool,
+    pub(super) generic_return_type_parameter: Option<TypeId>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3146,6 +3150,13 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
             prepared.declaration,
             &prepared.type_parameters,
         )?;
+        let generic_return_type_parameter_valid = self
+            .source_generic_return_type_parameter_is_exact(
+                prepared.syntax,
+                prepared.return_annotation,
+                prepared.generic_return_type_parameter,
+                &prepared.type_parameters,
+            );
         let owner = self.symbol(prepared.owner_symbol)?;
         let owner_valid = owner.flags() == SymbolFlags::FUNCTION
             && owner.check_flags() == CheckFlags::NONE
@@ -3221,6 +3232,7 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
             || !owner_links_cold
             || !signature_links_cold
             || !return_annotation_valid
+            || !generic_return_type_parameter_valid
             || prepared
                 .export_local
                 .is_some_and(|local| !self.symbols.contains_symbol(local))
@@ -3319,6 +3331,7 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
             owner_parent: prepared.owner_parent,
             export_local: prepared.export_local,
             signature,
+            generic_return_type_parameter: prepared.generic_return_type_parameter,
             contextual_target: None,
             contextual_variable: None,
         };
@@ -3369,6 +3382,50 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
             },
         ));
         Some((type_, signature))
+    }
+
+    fn source_generic_return_type_parameter_is_exact(
+        &self,
+        syntax: &SourceCallableTypeParameterSyntaxProof,
+        annotation: NodeRef,
+        return_type_parameter: Option<TypeId>,
+        resolved: &[ResolvedSourceCallableTypeParameter],
+    ) -> bool {
+        match (
+            syntax.generic_return_type_parameter_declaration(),
+            return_type_parameter,
+            syntax.generic_fixed_return_is_exact(),
+        ) {
+            (None, None, true) => {
+                self.source_node_kind(annotation) != Some(SyntaxKind::TypeReference)
+            }
+            (Some(declaration), Some(type_parameter), false) => {
+                let Some(row) = resolved.iter().find(|row| {
+                    row.provenance.declaration == declaration
+                        && row.provenance.type_parameter == type_parameter
+                }) else {
+                    return false;
+                };
+                if self.source_node_kind(annotation) != Some(SyntaxKind::TypeReference) {
+                    return false;
+                }
+                let symbol_links = self.symbol_node_links(annotation);
+                let type_links = self.type_node_links(annotation);
+                let cold = symbol_links.is_none_or(|links| links == &SymbolNodeLinks::default())
+                    && type_links.is_none_or(|links| links == &TypeNodeLinks::default());
+                let warm = symbol_links
+                    == Some(&SymbolNodeLinks {
+                        resolved_symbol: Some(row.provenance.symbol),
+                    })
+                    && type_links
+                        == Some(&TypeNodeLinks {
+                            resolved_type: Some(type_parameter),
+                            outer_type_parameters: None,
+                        });
+                cold || warm
+            }
+            _ => false,
+        }
     }
 
     fn validate_source_generic_type_parameters(
@@ -3435,6 +3492,9 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
             };
             let trailing_default_valid = !default_seen || provenance.default_type.is_some();
             default_seen |= provenance.default_type.is_some();
+            let exact_constraint_default_pair = provenance.constraint.is_none()
+                || provenance.default_type.is_none()
+                || row.constraint == row.default_type;
             if record.flags() != super::types::TypeFlags::TYPE_PARAMETER
                 || (record.object_flags() != super::types::ObjectFlags::NONE
                     && record.object_flags() != computed_type_variable_flags)
@@ -3457,6 +3517,7 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
                 || !constraint_link_valid
                 || !default_link_valid
                 || !trailing_default_valid
+                || !exact_constraint_default_pair
                 || self.type_payload(row.constraint).is_none()
                 || self.type_payload(row.default_type).is_none()
             {
@@ -3531,7 +3592,7 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
             )
     }
 
-    fn source_type_node_result_is_exact(
+    pub(super) fn source_type_node_result_is_exact(
         &self,
         node: NodeRef,
         result: TypeId,
