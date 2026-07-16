@@ -2912,10 +2912,10 @@ impl<'store> RelaterSession<'store> {
                 .store
                 .type_payload(type_id)
                 .and_then(|record| record.data().structured())
-                .and_then(|structured| structured.members)
+                .map(|structured| structured.members)
                 .ok_or(RelationUnavailable::MalformedFunctionType(type_id))?;
             return Ok(ResolvedObjectMembers {
-                members: Some(members),
+                members,
                 properties: Vec::new(),
                 property_origin: ObjectPropertyOrigin::Declared,
                 call_signature: Some(call_signature),
