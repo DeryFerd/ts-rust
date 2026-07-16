@@ -45,11 +45,12 @@ pub(super) struct CanonicalTypeQueryOptions {
     pub strict_builtin_iterator_return: bool,
 }
 
-/// Immutable proof that one importer type reference names one alias whose
-/// direct type-only target was independently derived from the program's exact
-/// module-resolution manifest.
+/// Immutable proof that one leaf in an exact importer annotation root names
+/// one alias whose direct type-only target was independently derived from the
+/// program's exact module-resolution manifest.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct CanonicalTypeReferenceAliasTarget {
+    root: NodeRef,
     reference: NodeRef,
     binding_declaration: NodeRef,
     alias: SemanticSymbolId,
@@ -59,12 +60,14 @@ pub(super) struct CanonicalTypeReferenceAliasTarget {
 impl CanonicalTypeReferenceAliasTarget {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(super) const fn new(
+        root: NodeRef,
         reference: NodeRef,
         binding_declaration: NodeRef,
         alias: SemanticSymbolId,
         target: SemanticSymbolId,
     ) -> Self {
         Self {
+            root,
             reference,
             binding_declaration,
             alias,
@@ -812,7 +815,8 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                     ));
                 }
                 match self.validate_cached_union_result(cached, alias_owner.or(derived_alias)) {
-                    Ok(()) => return Ok(()),
+                    Ok(()) if self.type_reference_alias_targets.is_empty() => return Ok(()),
+                    Ok(()) => {}
                     Err(LiteralTypeCacheError::InvalidCachedUnion(type_))
                         if self.is_pending_stored_function_type(type_) =>
                     {
@@ -981,7 +985,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         }
         // A missing or malformed global Array resolves directly to the empty
         // object fallback before the element type is consulted upstream.
-        if fallback.is_none() {
+        if fallback.is_none() || !self.type_reference_alias_targets.is_empty() {
             if let Some(alias) = alias_owner
                 && self
                     .plan
@@ -997,7 +1001,9 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 ));
             }
             self.plan_type_node_in_context(element_type, None, false)?;
-            if let Some(cached) = cached {
+            if fallback.is_none()
+                && let Some(cached) = cached
+            {
                 let TypeData::TypeReference(reference) = self
                     .store
                     .type_payload(cached)
@@ -3582,11 +3588,13 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         Ok(query)
     }
 
-    /// Adds exact, importer-node-scoped type-only alias capabilities.
+    /// Adds exact, annotation-root-scoped type-only alias capabilities.
     ///
     /// The capability is validated against the current alias links before it
     /// becomes visible to any planner. Later planning still re-resolves the
     /// importer name and validates warm node links against the proven target.
+    /// A query must present every reference leaf in the root's supported
+    /// union/parenthesized/array graph and no reference outside that graph.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn with_type_reference_alias_targets(
         mut self,
@@ -3610,7 +3618,11 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                         target: capability.target,
                     })
                 })?;
-            if !self.store.contains_node_ref(capability.reference)
+            if !self.store.contains_node_ref(capability.root)
+                || !capability
+                    .root
+                    .is_for(capability.reference.arena, capability.reference.file)
+                || !self.store.contains_node_ref(capability.reference)
                 || !capability
                     .binding_declaration
                     .is_for(capability.reference.arena, capability.reference.file)
@@ -3672,17 +3684,11 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         Ok(())
     }
 
-    fn require_direct_type_reference_alias_capability(
+    fn require_type_reference_alias_root_capability(
         &self,
         node: NodeRef,
     ) -> Result<(), DeclaredTypeError> {
         if self.type_reference_alias_targets.is_empty() {
-            return Ok(());
-        }
-        if self.type_reference_alias_targets.len() == 1
-            && self.type_reference_alias_targets.contains_key(&node)
-            && preflight_node(self.store, self.host, node)?.kind == SyntaxKind::TypeReference
-        {
             return Ok(());
         }
         let reference = self
@@ -3691,9 +3697,111 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             .min()
             .copied()
             .expect("a nonempty capability map has a first key");
-        Err(type_node_unavailable(
-            TypeNodeUnavailable::ImportAliasCapabilityUnsupported(reference),
-        ))
+        if self
+            .type_reference_alias_targets
+            .values()
+            .any(|capability| capability.root != node)
+        {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::ImportAliasCapabilityUnsupported(reference),
+            ));
+        }
+        let mut visited = HashSet::new();
+        let mut graph_references = HashSet::new();
+        self.collect_type_reference_alias_root_graph(node, &mut visited, &mut graph_references)?;
+        if graph_references.len() != self.type_reference_alias_targets.len()
+            || graph_references
+                .iter()
+                .any(|reference| !self.type_reference_alias_targets.contains_key(reference))
+        {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::ImportAliasCapabilityUnsupported(reference),
+            ));
+        }
+        Ok(())
+    }
+
+    fn collect_type_reference_alias_root_graph(
+        &self,
+        node: NodeRef,
+        visited: &mut HashSet<NodeRef>,
+        references: &mut HashSet<NodeRef>,
+    ) -> Result<(), DeclaredTypeError> {
+        let unsupported = || {
+            let reference = self
+                .type_reference_alias_targets
+                .keys()
+                .min()
+                .copied()
+                .expect("a nonempty capability map has a first key");
+            type_node_unavailable(TypeNodeUnavailable::ImportAliasCapabilityUnsupported(
+                reference,
+            ))
+        };
+        if !visited.insert(node) {
+            return Err(unsupported());
+        }
+        let record = preflight_node(self.store, self.host, node)?;
+        if record.flags.0 & NODE_FLAG_JSDOC != 0 {
+            return Err(unsupported());
+        }
+        match &record.data {
+            NodeData::TypeReferenceNode(reference)
+                if record.kind == SyntaxKind::TypeReference
+                    && reference.type_arguments.is_none() =>
+            {
+                if !references.insert(node) {
+                    return Err(unsupported());
+                }
+            }
+            NodeData::ParenthesizedTypeNode(parenthesized)
+                if record.kind == SyntaxKind::ParenthesizedType =>
+            {
+                let child = NodeRef::new(node.arena, node.file, parenthesized.type_);
+                if preflight_node(self.store, self.host, child)?.parent != Some(node.node) {
+                    return Err(unsupported());
+                }
+                self.collect_type_reference_alias_root_graph(child, visited, references)?;
+            }
+            NodeData::ArrayTypeNode(array) if record.kind == SyntaxKind::ArrayType => {
+                let child = NodeRef::new(node.arena, node.file, array.element_type);
+                if preflight_node(self.store, self.host, child)?.parent != Some(node.node) {
+                    return Err(unsupported());
+                }
+                self.collect_type_reference_alias_root_graph(child, visited, references)?;
+            }
+            NodeData::UnionTypeNode(union) if record.kind == SyntaxKind::UnionType => {
+                if union.types.nodes.len() < 2 || union.types.has_trailing_comma {
+                    return Err(unsupported());
+                }
+                for child in &union.types.nodes {
+                    let child = NodeRef::new(node.arena, node.file, *child);
+                    if preflight_node(self.store, self.host, child)?.parent != Some(node.node) {
+                        return Err(unsupported());
+                    }
+                    self.collect_type_reference_alias_root_graph(child, visited, references)?;
+                }
+            }
+            _ if matches!(
+                record.kind,
+                SyntaxKind::AnyKeyword
+                    | SyntaxKind::UnknownKeyword
+                    | SyntaxKind::StringKeyword
+                    | SyntaxKind::NumberKeyword
+                    | SyntaxKind::BigIntKeyword
+                    | SyntaxKind::BooleanKeyword
+                    | SyntaxKind::SymbolKeyword
+                    | SyntaxKind::VoidKeyword
+                    | SyntaxKind::UndefinedKeyword
+                    | SyntaxKind::NullKeyword
+                    | SyntaxKind::NeverKeyword
+                    | SyntaxKind::ObjectKeyword
+                    | SyntaxKind::IntrinsicKeyword
+                    | SyntaxKind::LiteralType
+            ) => {}
+            _ => return Err(unsupported()),
+        }
+        Ok(())
     }
 
     /// Resolves one dependency-closed type-node query.
@@ -3706,7 +3814,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         &mut self,
         node: NodeRef,
     ) -> Result<TypeId, DeclaredTypeError> {
-        self.require_direct_type_reference_alias_capability(node)?;
+        self.require_type_reference_alias_root_capability(node)?;
         if !self.pending_function_parameters.is_empty() {
             return Err(type_node_unavailable(
                 TypeNodeUnavailable::InvalidFunctionType(node),

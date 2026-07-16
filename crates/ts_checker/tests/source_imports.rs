@@ -77,6 +77,22 @@ fn variable_initializer(parsed: &ParseResult, file: FileId, expected: &str) -> N
         .unwrap_or_else(|| panic!("fixture has variable {expected}"))
 }
 
+fn node_text(parsed: &ParseResult, node: NodeRef) -> &str {
+    let range = parsed.arena.get(node.node).unwrap().range;
+    &parsed.arena.source_text().unwrap()
+        [usize::try_from(range.start.get()).unwrap()..usize::try_from(range.end.get()).unwrap()]
+}
+
+fn source_is_checked(context: &CanonicalCheckerContext<'_>, file: FileId) -> bool {
+    let source = context
+        .source_file(file)
+        .expect("fixture source is retained");
+    context
+        .store()
+        .source_file_links(source)
+        .is_some_and(|links| links.type_checked)
+}
+
 fn make_context<'arena>(
     importer: &'arena ParseResult,
     target: &'arena ParseResult,
@@ -268,6 +284,166 @@ fn importer_first_type_only_imports_check_annotations_and_reject_value_uses() {
 }
 
 #[test]
+fn composite_type_alias_imports_check_union_array_and_multi_leaf_roots() {
+    let importer = parse_source_file(concat!(
+        "import type { Count as LocalCount, Text as LocalText } from './target'; ",
+        "const unionGood: LocalCount | null = 1; ",
+        "const unionNull: LocalCount | null = null; ",
+        "const unionBad: LocalCount | null = 'wrong'; ",
+        "const arrayGood: (LocalCount | null)[] = [1, null]; ",
+        "const multiGood: LocalCount | LocalText = 'text'; ",
+        "const multiBad: LocalCount | LocalText = false;",
+    ));
+    let target = parse_source_file(concat!(
+        "export type Count = number; ",
+        "export type Text = string;",
+    ));
+    let importer_file = FileId::new(14);
+    let target_file = FileId::new(15);
+    let (mut importer_first, _) = make_context(&importer, &target, importer_file, target_file);
+
+    importer_first.check_source_file(importer_file).unwrap();
+    assert_eq!(
+        importer_first
+            .diagnostics()
+            .as_slice()
+            .iter()
+            .map(|diagnostic| {
+                (
+                    node_text(&importer, diagnostic.node.unwrap()).to_owned(),
+                    diagnostic.diagnostic.render().unwrap(),
+                )
+            })
+            .collect::<Vec<_>>(),
+        [
+            (
+                "unionBad".to_owned(),
+                "Type 'string' is not assignable to type 'number'.".to_owned(),
+            ),
+            (
+                "multiBad".to_owned(),
+                "Type 'boolean' is not assignable to type 'string | number'.".to_owned(),
+            ),
+        ]
+    );
+    assert!(source_is_checked(&importer_first, importer_file));
+    assert!(!source_is_checked(&importer_first, target_file));
+
+    importer_first.check_source_file(importer_file).unwrap();
+    assert_eq!(importer_first.diagnostics().as_slice().len(), 2);
+
+    let (mut target_first, _) = make_context(&importer, &target, importer_file, target_file);
+    target_first.check_source_file(target_file).unwrap();
+    target_first.check_source_file(importer_file).unwrap();
+    assert_eq!(
+        target_first
+            .diagnostics()
+            .as_slice()
+            .iter()
+            .map(|diagnostic| {
+                (
+                    node_text(&importer, diagnostic.node.unwrap()).to_owned(),
+                    diagnostic.diagnostic.render().unwrap(),
+                )
+            })
+            .collect::<Vec<_>>(),
+        [
+            (
+                "unionBad".to_owned(),
+                "Type 'string' is not assignable to type 'number'.".to_owned(),
+            ),
+            (
+                "multiBad".to_owned(),
+                "Type 'boolean' is not assignable to type 'string | number'.".to_owned(),
+            ),
+        ]
+    );
+}
+
+#[test]
+fn composite_interface_imports_check_direct_and_parenthesized_array_roots() {
+    let importer = parse_source_file(concat!(
+        "import type { User as LocalUser } from './target'; ",
+        "const directGood: LocalUser = { id: 1 }; ",
+        "const directBad: LocalUser = { id: 'wrong' }; ",
+        "const arrayGood: LocalUser[] = []; ",
+        "const nestedGood: (LocalUser[])[] = [];",
+    ));
+    let target = parse_source_file("export interface User { id: number }");
+    let importer_file = FileId::new(16);
+    let target_file = FileId::new(17);
+    let (mut importer_first, _) = make_context(&importer, &target, importer_file, target_file);
+
+    importer_first.check_source_file(importer_file).unwrap();
+    assert_eq!(
+        importer_first
+            .diagnostics()
+            .as_slice()
+            .iter()
+            .map(|diagnostic| {
+                (
+                    node_text(&importer, diagnostic.node.unwrap()).to_owned(),
+                    diagnostic.diagnostic.render().unwrap(),
+                )
+            })
+            .collect::<Vec<_>>(),
+        [(
+            "id".to_owned(),
+            "Type 'string' is not assignable to type 'number'.".to_owned(),
+        )]
+    );
+    assert!(source_is_checked(&importer_first, importer_file));
+    assert!(!source_is_checked(&importer_first, target_file));
+    importer_first.check_source_file(importer_file).unwrap();
+    assert_eq!(importer_first.diagnostics().as_slice().len(), 1);
+
+    let (mut target_first, _) = make_context(&importer, &target, importer_file, target_file);
+    target_first.check_source_file(target_file).unwrap();
+    target_first.check_source_file(importer_file).unwrap();
+    assert_eq!(
+        target_first
+            .diagnostics()
+            .as_slice()
+            .iter()
+            .map(|diagnostic| {
+                (
+                    node_text(&importer, diagnostic.node.unwrap()).to_owned(),
+                    diagnostic.diagnostic.render().unwrap(),
+                )
+            })
+            .collect::<Vec<_>>(),
+        [(
+            "id".to_owned(),
+            "Type 'string' is not assignable to type 'number'.".to_owned(),
+        )]
+    );
+}
+
+#[test]
+fn composite_import_capabilities_do_not_escape_direct_annotation_roots() {
+    let importer = parse_source_file(concat!(
+        "import type { User } from './target'; ",
+        "const direct: User | null = null; ",
+        "type LocalText = string; ",
+        "const mixed: User | LocalText = 'text';",
+    ));
+    let target = parse_source_file("export type User = { id: number };");
+    let importer_file = FileId::new(18);
+    let target_file = FileId::new(19);
+    let (mut context, _) = make_context(&importer, &target, importer_file, target_file);
+
+    assert!(matches!(
+        context.check_source_file(importer_file),
+        Err(SourceCheckError::Unsupported(
+            UnsupportedSourceSyntax::Import(_)
+        ))
+    ));
+    assert!(!source_is_checked(&context, importer_file));
+    assert!(!source_is_checked(&context, target_file));
+    assert!(context.diagnostics().is_empty());
+}
+
+#[test]
 #[allow(clippy::too_many_lines)]
 fn exported_simple_interfaces_work_target_first_and_importer_first() {
     let importer = parse_source_file(concat!(
@@ -315,7 +491,10 @@ fn exported_simple_interfaces_work_target_first_and_importer_first() {
             .symbol(),
         Some(declared_target_symbol)
     );
-    assert_eq!(target_first.type_to_string(target_first_type).unwrap(), "User");
+    assert_eq!(
+        target_first.type_to_string(target_first_type).unwrap(),
+        "User"
+    );
     target_first.check_source_file(target_file).unwrap();
     assert!(target_first.diagnostics().is_empty());
     assert!(

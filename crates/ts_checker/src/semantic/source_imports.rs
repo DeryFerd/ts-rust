@@ -910,18 +910,21 @@ fn resolve_source_import_binding_phase(
     })
 }
 
-/// Proves that one exact importer annotation references a resolved type-only
-/// binding and returns the immutable capability consumed by
-/// [`CanonicalTypeQuery`]. No node or type links are published here.
+/// Proves that one leaf of an exact importer annotation root references a
+/// resolved type-only binding and returns the immutable capability consumed
+/// by [`CanonicalTypeQuery`]. No node or type links are published here.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn plan_source_type_import_reference(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     resolved: &ResolvedSourceTypeImportBinding,
+    root: NodeRef,
     reference: NodeRef,
 ) -> Result<CanonicalTypeReferenceAliasTarget, SourceImportError> {
     let binding = &resolved.binding;
-    if !reference.is_for(binding.declaration.arena, binding.declaration.file) {
+    if !root.is_for(binding.declaration.arena, binding.declaration.file)
+        || !reference.is_for(root.arena, root.file)
+    {
         return Err(unsupported(SourceImportUnsupported::TypeReference(
             reference,
         )));
@@ -1024,6 +1027,7 @@ pub(super) fn plan_source_type_import_reference(
     }
 
     Ok(CanonicalTypeReferenceAliasTarget::new(
+        root,
         reference,
         binding.declaration,
         binding.alias_symbol,
@@ -2367,6 +2371,31 @@ mod tests {
             .unwrap_or_else(|| panic!("fixture contains type reference {name}"))
     }
 
+    fn variable_type_node(fixture: &Fixture, source: usize, name: &str) -> NodeRef {
+        let file = &fixture.files[source];
+        file.parsed
+            .arena
+            .iter()
+            .find_map(|(_, record)| {
+                let NodeData::VariableDeclaration(variable) = &record.data else {
+                    return None;
+                };
+                let name_node = file.parsed.arena.get(variable.name)?;
+                matches!(
+                    &name_node.data,
+                    NodeData::Identifier(identifier) if identifier.text == name
+                )
+                .then(|| {
+                    NodeRef::new(
+                        file.parsed.arena.id(),
+                        file.file,
+                        variable.type_.expect("fixture variable is annotated"),
+                    )
+                })
+            })
+            .unwrap_or_else(|| panic!("fixture contains annotated variable {name}"))
+    }
+
     fn plan_type_reference_capability(
         fixture: &Fixture,
         resolved: &ResolvedSourceTypeImportBinding,
@@ -2375,9 +2404,27 @@ mod tests {
         try_plan_type_reference_capability(fixture, resolved, reference).unwrap()
     }
 
+    fn plan_type_reference_capability_for_root(
+        fixture: &Fixture,
+        resolved: &ResolvedSourceTypeImportBinding,
+        root: NodeRef,
+        reference: NodeRef,
+    ) -> CanonicalTypeReferenceAliasTarget {
+        try_plan_type_reference_capability_for_root(fixture, resolved, root, reference).unwrap()
+    }
+
     fn try_plan_type_reference_capability(
         fixture: &Fixture,
         resolved: &ResolvedSourceTypeImportBinding,
+        reference: NodeRef,
+    ) -> Result<CanonicalTypeReferenceAliasTarget, SourceImportError> {
+        try_plan_type_reference_capability_for_root(fixture, resolved, reference, reference)
+    }
+
+    fn try_plan_type_reference_capability_for_root(
+        fixture: &Fixture,
+        resolved: &ResolvedSourceTypeImportBinding,
+        root: NodeRef,
         reference: NodeRef,
     ) -> Result<CanonicalTypeReferenceAliasTarget, SourceImportError> {
         let sources = || {
@@ -2396,13 +2443,21 @@ mod tests {
             GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
         )
         .unwrap();
-        plan_source_type_import_reference(&fixture.store, &declared_host, resolved, reference)
+        plan_source_type_import_reference(&fixture.store, &declared_host, resolved, root, reference)
     }
 
     fn query_type_with_import_capability(
         fixture: &mut Fixture,
         node: NodeRef,
         capability: CanonicalTypeReferenceAliasTarget,
+    ) -> Result<TypeId, DeclaredTypeError> {
+        query_type_with_import_capabilities(fixture, node, [capability])
+    }
+
+    fn query_type_with_import_capabilities(
+        fixture: &mut Fixture,
+        node: NodeRef,
+        capabilities: impl IntoIterator<Item = CanonicalTypeReferenceAliasTarget>,
     ) -> Result<TypeId, DeclaredTypeError> {
         let Fixture {
             files,
@@ -2431,7 +2486,7 @@ mod tests {
             CanonicalCheckerOptions::default(),
             &mut CanonicalCheckerDiagnostics::default(),
         )?
-        .with_type_reference_alias_targets([capability])?
+        .with_type_reference_alias_targets(capabilities)?
         .get_type_from_type_node(node)
     }
 
@@ -2778,6 +2833,129 @@ mod tests {
             )) if node == reference
         ));
         assert_eq!(store_state(&fixture.store), before);
+    }
+
+    #[test]
+    fn composite_import_root_revalidates_warm_leaf_capabilities_and_poison() {
+        let mut fixture = fixture(
+            &[
+                r#"
+                    import type { User } from "./target";
+                    const users: (User | null)[] = [];
+                "#,
+                r"export type User = number;",
+            ],
+            &[Route {
+                source: 0,
+                specifier: 0,
+                target: Some(1),
+            }],
+        );
+        let plan = fixture.plan_type_import(0, 0);
+        let root = variable_type_node(&fixture, 0, "users");
+        let reference = type_reference(&fixture, 0, "User");
+        let resolved = resolve_all_types(&mut fixture, &plan.bindings).unwrap();
+        let capability =
+            plan_type_reference_capability_for_root(&fixture, &resolved[0], root, reference);
+        let resolved_root =
+            query_type_with_import_capability(&mut fixture, root, capability).unwrap();
+        let warm = store_state(&fixture.store);
+        let warm_capability =
+            plan_type_reference_capability_for_root(&fixture, &resolved[0], root, reference);
+        assert_eq!(
+            query_type_with_import_capability(&mut fixture, root, warm_capability),
+            Ok(resolved_root)
+        );
+        assert_eq!(store_state(&fixture.store), warm);
+
+        let leaf_only = plan_type_reference_capability(&fixture, &resolved[0], reference);
+        assert!(matches!(
+            query_type_with_import_capability(&mut fixture, root, leaf_only),
+            Err(DeclaredTypeError::TypeNodeUnavailable(
+                super::super::type_nodes::TypeNodeUnavailable::ImportAliasCapabilityUnsupported(
+                    node
+                )
+            )) if node == reference
+        ));
+        assert_eq!(store_state(&fixture.store), warm);
+
+        assert!(fixture.store.set_symbol_node_links(
+            reference,
+            SymbolNodeLinks {
+                resolved_symbol: Some(plan.bindings[0].alias_symbol),
+            },
+        ));
+        let poisoned = store_state(&fixture.store);
+        assert!(matches!(
+            query_type_with_import_capability(&mut fixture, root, capability),
+            Err(DeclaredTypeError::TypeNodeUnavailable(
+                super::super::type_nodes::TypeNodeUnavailable::InvalidCachedSymbol {
+                    node,
+                    symbol,
+                }
+            )) if node == reference && symbol == plan.bindings[0].alias_symbol
+        ));
+        assert_eq!(store_state(&fixture.store), poisoned);
+    }
+
+    #[test]
+    fn composite_import_root_requires_every_type_reference_leaf_capability() {
+        let mut fixture = fixture(
+            &[
+                r#"
+                    import type { Count, Text } from "./target";
+                    const value: Count | Text = 1;
+                "#,
+                r"export type Count = number; export type Text = string;",
+            ],
+            &[Route {
+                source: 0,
+                specifier: 0,
+                target: Some(1),
+            }],
+        );
+        let plan = fixture.plan_type_import(0, 0);
+        let root = variable_type_node(&fixture, 0, "value");
+        let count = type_reference(&fixture, 0, "Count");
+        let text = type_reference(&fixture, 0, "Text");
+        let resolved = resolve_all_types(&mut fixture, &plan.bindings).unwrap();
+        let count_binding = plan
+            .bindings
+            .iter()
+            .position(|binding| binding.local_text == "Count")
+            .unwrap();
+        let text_binding = plan
+            .bindings
+            .iter()
+            .position(|binding| binding.local_text == "Text")
+            .unwrap();
+        let count_capability = plan_type_reference_capability_for_root(
+            &fixture,
+            &resolved[count_binding],
+            root,
+            count,
+        );
+        let text_capability =
+            plan_type_reference_capability_for_root(&fixture, &resolved[text_binding], root, text);
+
+        let before = store_state(&fixture.store);
+        assert!(matches!(
+            query_type_with_import_capability(&mut fixture, root, count_capability),
+            Err(DeclaredTypeError::TypeNodeUnavailable(
+                super::super::type_nodes::TypeNodeUnavailable::ImportAliasCapabilityUnsupported(
+                    node
+                )
+            )) if node == count
+        ));
+        assert_eq!(store_state(&fixture.store), before);
+        assert!(
+            query_type_with_import_capabilities(
+                &mut fixture,
+                root,
+                [count_capability, text_capability],
+            )
+            .is_ok()
+        );
     }
 
     #[test]
