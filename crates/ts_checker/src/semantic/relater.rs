@@ -1,10 +1,11 @@
-//! Exact dependency-closed fast, primitive-union, and property-only relations.
+//! Exact dependency-closed fast, primitive-union, property, and function relations.
 //!
 //! This module ports `isTypeRelatedTo`, `isSimpleTypeRelatedTo`, and their
 //! no-diagnostic entry points plus primitive/literal/nullable unions and the
-//! property-only object slice of `recursiveTypeRelatedTo` for assignable,
-//! comparable, subtype, and strict-subtype relations, including fresh
-//! excess-property checks and strict/exact optional-property relations, from pinned
+//! property-object and annotated non-generic function slices of
+//! `recursiveTypeRelatedTo` for assignable, comparable, subtype, and
+//! strict-subtype relations, including fresh excess-property checks,
+//! strict/exact optional-property relations, and single call signatures, from pinned
 //! `internal/checker/relater.go` at
 //! `dc37b5249ab60e2bbce936f71b883e6c8136167e`. Unsupported structural paths
 //! return [`RelationUnavailable`] instead of being misreported as unrelated.
@@ -22,13 +23,14 @@ use super::{
     bootstrap::LiteralTypeCacheError,
     declared::type_list_key,
     derived_types::DerivedObjectLiteralValidation,
+    functions::{StoredFunctionTypeValidation, validate_stored_function_type},
     global_types::preflight_generic_global_type_target,
-    ids::TypeId,
+    ids::{SignatureId, TypeId},
     links::{MembersOrExportsResolutionKind, ValueSymbolLinks},
     mapper::TypeMapper,
     relation::{
         ExpandingFlags, IntersectionState, RecursionFlags, RecursionIdentityUnavailable,
-        RelationComparisonResult, RelationKeyUnavailable, RelationKind,
+        RelationComparisonResult, RelationKeyUnavailable, RelationKind, SignatureCheckMode,
     },
     signatures::Ternary,
     store::SemanticStore,
@@ -67,6 +69,9 @@ pub enum RelationUnavailable {
     UnsupportedStructuredType(TypeId),
     InvalidStructuredMembers(TypeId),
     StructuredSignatures(TypeId),
+    UnresolvedFunctionType(TypeId),
+    UnresolvedSignatureReturn(SignatureId),
+    MalformedFunctionType(TypeId),
     StructuredIndexInfos(TypeId),
     UnsupportedProperty(SemanticSymbolId),
     UnresolvedPropertyType(SemanticSymbolId),
@@ -174,6 +179,18 @@ impl std::fmt::Display for RelationUnavailable {
                 formatter,
                 "type {type_id:?} requires call or construct signature relations"
             ),
+            Self::UnresolvedFunctionType(type_id) => write!(
+                formatter,
+                "function type {type_id:?} has not finished publishing its signature"
+            ),
+            Self::UnresolvedSignatureReturn(signature) => write!(
+                formatter,
+                "signature {signature:?} requires lazy return-type resolution"
+            ),
+            Self::MalformedFunctionType(type_id) => write!(
+                formatter,
+                "function type {type_id:?} has inconsistent callable caches"
+            ),
             Self::StructuredIndexInfos(type_id) => write!(
                 formatter,
                 "type {type_id:?} requires index-signature relations"
@@ -226,6 +243,8 @@ impl std::error::Error for RelationUnavailable {}
 struct RelationBootstrapFacts {
     strict_null_checks: bool,
     exact_optional_property_types: bool,
+    any_type: TypeId,
+    void_type: TypeId,
     wildcard_type: TypeId,
     any_function_type: TypeId,
     never_type: TypeId,
@@ -279,6 +298,22 @@ struct ResolvedObjectMembers {
     members: Option<SymbolTableId>,
     properties: Vec<SemanticSymbolId>,
     property_origin: ObjectPropertyOrigin,
+    call_signature: Option<ResolvedCallSignature>,
+    exact_function_type: bool,
+}
+
+/// Read-only projection consumed by signature relation after a callable
+/// family has proved its own storage invariants. Keeping comparison detached
+/// from `FunctionTypeNode` layout lets source functions feed the same worker
+/// once their distinct symbol/object proof is installed.
+#[derive(Clone, Debug)]
+struct ResolvedCallSignature {
+    owner: TypeId,
+    id: SignatureId,
+    parameters: Vec<TypeId>,
+    min_argument_count: usize,
+    return_type: Option<TypeId>,
+    strict_variance_exempt: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -363,6 +398,7 @@ struct RelaterSession<'store> {
     relation: RelationKind,
     bootstrap: RelationBootstrapFacts,
     global_types: Option<RelationGlobalTypes>,
+    strict_function_types: Option<bool>,
     validated_array_targets: HashSet<TypeId>,
     validated_unions: HashMap<TypeId, Vec<TypeId>>,
     pending: PendingRelationCache,
@@ -370,6 +406,7 @@ struct RelaterSession<'store> {
     maybe_keys_set: HashSet<CacheHashKey>,
     source_stack: Vec<TypeId>,
     target_stack: Vec<TypeId>,
+    active_signature_pairs: HashSet<(SignatureId, SignatureId, u32)>,
     expanding_flags: ExpandingFlags,
     overflow: bool,
     relation_count: isize,
@@ -382,7 +419,7 @@ impl<'store> RelaterSession<'store> {
         relation: RelationKind,
         bootstrap: RelationBootstrapFacts,
     ) -> Self {
-        Self::new_with_global_types(store, relation, bootstrap, None)
+        Self::new_with_global_types_and_options(store, relation, bootstrap, None, None)
     }
 
     fn new_with_global_types(
@@ -391,12 +428,23 @@ impl<'store> RelaterSession<'store> {
         bootstrap: RelationBootstrapFacts,
         global_types: Option<RelationGlobalTypes>,
     ) -> Self {
+        Self::new_with_global_types_and_options(store, relation, bootstrap, global_types, None)
+    }
+
+    fn new_with_global_types_and_options(
+        store: &'store mut SemanticStore<TypeRecord, TypeMapper>,
+        relation: RelationKind,
+        bootstrap: RelationBootstrapFacts,
+        global_types: Option<RelationGlobalTypes>,
+        strict_function_types: Option<bool>,
+    ) -> Self {
         let relation_count = store.relation_comparison_budget(relation);
         Self::new_with_limits_and_global_types(
             store,
             relation,
             bootstrap,
             global_types,
+            strict_function_types,
             relation_count,
             PINNED_RELATION_STACK_DEPTH,
         )
@@ -415,6 +463,7 @@ impl<'store> RelaterSession<'store> {
             relation,
             bootstrap,
             None,
+            None,
             relation_count,
             stack_depth_limit,
         )
@@ -425,6 +474,7 @@ impl<'store> RelaterSession<'store> {
         relation: RelationKind,
         bootstrap: RelationBootstrapFacts,
         global_types: Option<RelationGlobalTypes>,
+        strict_function_types: Option<bool>,
         relation_count: isize,
         stack_depth_limit: usize,
     ) -> Self {
@@ -433,6 +483,7 @@ impl<'store> RelaterSession<'store> {
             relation,
             bootstrap,
             global_types,
+            strict_function_types,
             validated_array_targets: HashSet::new(),
             validated_unions: HashMap::new(),
             pending: PendingRelationCache::default(),
@@ -440,6 +491,7 @@ impl<'store> RelaterSession<'store> {
             maybe_keys_set: HashSet::new(),
             source_stack: Vec::new(),
             target_stack: Vec::new(),
+            active_signature_pairs: HashSet::new(),
             expanding_flags: ExpandingFlags::NONE,
             overflow: false,
             relation_count,
@@ -961,6 +1013,17 @@ impl<'store> RelaterSession<'store> {
                     intersection_state,
                 );
             }
+            if self.strict_function_types.is_some()
+                && source_flags.intersects(TypeFlags::OBJECT)
+                && target_flags.intersects(TypeFlags::OBJECT)
+            {
+                return self.recursive_type_related_to(
+                    source,
+                    target,
+                    intersection_state,
+                    recursion_flags,
+                );
+            }
             if !source_flags.intersects(TypeFlags::STRUCTURED_OR_INSTANTIABLE) {
                 return Ok(Ternary::False);
             }
@@ -1062,7 +1125,7 @@ impl<'store> RelaterSession<'store> {
             {
                 return Ok(related);
             }
-            if supports_property_object_relation(self.relation)
+            if supports_structured_object_relation(self.relation, self.strict_function_types)
                 && source_flags.intersects(TypeFlags::OBJECT)
                 && target_flags.intersects(TypeFlags::OBJECT)
             {
@@ -1318,19 +1381,12 @@ impl<'store> RelaterSession<'store> {
         }
         let source_flags = self.store.type_flags(source)?;
         let target_flags = self.store.type_flags(target)?;
-        if self.relation.is_identity() {
-            if source_flags.intersects(TypeFlags::UNION) {
-                let mut result = self.each_type_related_to_some_type(source, target)?;
-                if result != Ternary::False {
-                    result &= self.each_type_related_to_some_type(target, source)?;
-                }
-                return Ok(result);
+        if self.relation.is_identity() && source_flags.intersects(TypeFlags::UNION) {
+            let mut result = self.each_type_related_to_some_type(source, target)?;
+            if result != Ternary::False {
+                result &= self.each_type_related_to_some_type(target, source)?;
             }
-            return Err(RelationUnavailable::StructuralRelation {
-                source,
-                target,
-                relation: self.relation,
-            });
+            return Ok(result);
         }
         if source_flags.intersects(TypeFlags::UNION) || target_flags.intersects(TypeFlags::UNION) {
             return self.union_or_intersection_related_to(source, target, intersection_state);
@@ -1346,8 +1402,20 @@ impl<'store> RelaterSession<'store> {
             });
         }
         let source_members = self.resolved_object_members(source, true)?;
-        let target_members =
-            self.resolved_object_members(target, self.allows_fresh_object_target())?;
+        let allow_fresh_target = self.allows_fresh_object_target();
+        let target_members = self.resolved_object_members(target, allow_fresh_target)?;
+        if self.relation.is_identity()
+            && !source_members.exact_function_type
+            && !target_members.exact_function_type
+            && source != self.bootstrap.any_function_type
+            && target != self.bootstrap.any_function_type
+        {
+            return Err(RelationUnavailable::StructuralRelation {
+                source,
+                target,
+                relation: self.relation,
+            });
+        }
         if matches!(
             self.relation,
             RelationKind::Subtype | RelationKind::StrictSubtype
@@ -1357,7 +1425,17 @@ impl<'store> RelaterSession<'store> {
         {
             return Ok(Ternary::False);
         }
-        self.properties_related_to(source, &source_members, &target_members)
+        let mut result = self.properties_related_to(source, &source_members, &target_members)?;
+        if result != Ternary::False {
+            result &= self.call_signatures_related_to(
+                source,
+                target,
+                source_members.call_signature.as_ref(),
+                target_members.call_signature.as_ref(),
+                intersection_state,
+            )?;
+        }
+        Ok(result)
     }
 
     fn union_or_intersection_related_to(
@@ -1617,12 +1695,12 @@ impl<'store> RelaterSession<'store> {
     }
 
     fn weak_target_lacks_common_properties(
-        &self,
+        &mut self,
         source: TypeId,
         target: TypeId,
     ) -> Result<bool, RelationUnavailable> {
-        let target_members =
-            self.resolved_object_members(target, self.allows_fresh_object_target())?;
+        let allow_fresh_target = self.allows_fresh_object_target();
+        let target_members = self.resolved_object_members(target, allow_fresh_target)?;
         if target_members.properties.is_empty() {
             return Ok(false);
         }
@@ -1668,12 +1746,12 @@ impl<'store> RelaterSession<'store> {
     }
 
     fn has_excess_properties(
-        &self,
+        &mut self,
         source: TypeId,
         target: TypeId,
     ) -> Result<bool, RelationUnavailable> {
-        let target_members =
-            self.resolved_object_members(target, self.allows_fresh_object_target())?;
+        let allow_fresh_target = self.allows_fresh_object_target();
+        let target_members = self.resolved_object_members(target, allow_fresh_target)?;
 
         // Pinned `hasExcessProperties` treats the empty object as an open
         // target and exempts the global Object target only for assignable and
@@ -1781,6 +1859,260 @@ impl<'store> RelaterSession<'store> {
             result &= related;
         }
         Ok(result)
+    }
+
+    fn call_signatures_related_to(
+        &mut self,
+        source: TypeId,
+        target: TypeId,
+        source_signature: Option<&ResolvedCallSignature>,
+        target_signature: Option<&ResolvedCallSignature>,
+        intersection_state: IntersectionState,
+    ) -> Result<Ternary, RelationUnavailable> {
+        if self.relation.is_identity() {
+            return match (source_signature, target_signature) {
+                (None, None) => Ok(Ternary::True),
+                (Some(source), Some(target)) => {
+                    self.compare_signatures_identical(source, target, intersection_state)
+                }
+                _ => Ok(Ternary::False),
+            };
+        }
+
+        // Pinned `signaturesRelatedTo` treats this intrinsic as a directional
+        // wildcard before reading either signature list.
+        if source == self.bootstrap.any_function_type {
+            return Ok(Ternary::True);
+        }
+        if target == self.bootstrap.any_function_type {
+            return Ok(Ternary::False);
+        }
+        match (source_signature, target_signature) {
+            (_, None) => Ok(Ternary::True),
+            (None, Some(_)) => Ok(Ternary::False),
+            (Some(source), Some(target)) => {
+                let mode = match self.relation {
+                    RelationKind::Subtype => SignatureCheckMode::STRICT_TOP_SIGNATURE,
+                    RelationKind::StrictSubtype => {
+                        SignatureCheckMode::STRICT_TOP_SIGNATURE | SignatureCheckMode::STRICT_ARITY
+                    }
+                    _ => SignatureCheckMode::NONE,
+                };
+                self.compare_signatures_related(source, target, mode, intersection_state)
+            }
+        }
+    }
+
+    fn compare_signatures_identical(
+        &mut self,
+        source: &ResolvedCallSignature,
+        target: &ResolvedCallSignature,
+        intersection_state: IntersectionState,
+    ) -> Result<Ternary, RelationUnavailable> {
+        if source.id == target.id {
+            return Ok(Ternary::True);
+        }
+        if source.parameters.len() != target.parameters.len()
+            || source.min_argument_count != target.min_argument_count
+        {
+            return Ok(Ternary::False);
+        }
+        let key = (source.id, target.id, u32::MAX);
+        if !self.active_signature_pairs.insert(key) {
+            return Ok(Ternary::Maybe);
+        }
+        let result = (|| {
+            let mut result = Ternary::True;
+            for (source_type, target_type) in source.parameters.iter().zip(&target.parameters) {
+                let related = self.is_related_to_ex(
+                    *target_type,
+                    *source_type,
+                    RecursionFlags::BOTH,
+                    intersection_state,
+                )?;
+                if related == Ternary::False {
+                    return Ok(Ternary::False);
+                }
+                result &= related;
+            }
+            let source_return = source
+                .return_type
+                .ok_or(RelationUnavailable::UnresolvedSignatureReturn(source.id))?;
+            let target_return = target
+                .return_type
+                .ok_or(RelationUnavailable::UnresolvedSignatureReturn(target.id))?;
+            let returns = self.is_related_to_ex(
+                source_return,
+                target_return,
+                RecursionFlags::BOTH,
+                intersection_state,
+            )?;
+            Ok(result & returns)
+        })();
+        self.active_signature_pairs.remove(&key);
+        result
+    }
+
+    #[allow(clippy::too_many_lines)] // Mirrors pinned compareSignaturesRelated branch order.
+    fn compare_signatures_related(
+        &mut self,
+        source: &ResolvedCallSignature,
+        target: &ResolvedCallSignature,
+        check_mode: SignatureCheckMode,
+        intersection_state: IntersectionState,
+    ) -> Result<Ternary, RelationUnavailable> {
+        if source.id == target.id {
+            return Ok(Ternary::True);
+        }
+        let key = (source.id, target.id, check_mode.bits());
+        if !self.active_signature_pairs.insert(key) {
+            return Ok(Ternary::Maybe);
+        }
+        let result =
+            self.compare_signatures_related_worker(source, target, check_mode, intersection_state);
+        self.active_signature_pairs.remove(&key);
+        result
+    }
+
+    fn compare_signatures_related_worker(
+        &mut self,
+        source: &ResolvedCallSignature,
+        target: &ResolvedCallSignature,
+        check_mode: SignatureCheckMode,
+        intersection_state: IntersectionState,
+    ) -> Result<Ternary, RelationUnavailable> {
+        let target_count = target.parameters.len();
+        let source_has_more_parameters = if check_mode.intersects(SignatureCheckMode::STRICT_ARITY)
+        {
+            source.parameters.len() > target_count
+        } else {
+            source.min_argument_count > target_count
+        };
+        if source_has_more_parameters {
+            return Ok(Ternary::False);
+        }
+
+        let strict_variance = !check_mode.intersects(SignatureCheckMode::CALLBACK)
+            && self
+                .strict_function_types
+                .ok_or(RelationUnavailable::StructuredSignatures(target.owner))?
+            && !target.strict_variance_exempt;
+        let mut result = Ternary::True;
+        let parameter_count = source.parameters.len().max(target.parameters.len());
+        for index in 0..parameter_count {
+            let (Some(source_type), Some(target_type)) = (
+                source.parameters.get(index).copied(),
+                target.parameters.get(index).copied(),
+            ) else {
+                continue;
+            };
+            if source_type == target_type
+                && !check_mode.intersects(SignatureCheckMode::STRICT_ARITY)
+            {
+                continue;
+            }
+
+            let (source_callback, source_nullable_facts) =
+                if !check_mode.intersects(SignatureCheckMode::CALLBACK) {
+                    self.project_non_nullable_function_call_signature(source_type)?
+                } else {
+                    (None, 0)
+                };
+            let (target_callback, target_nullable_facts) =
+                if !check_mode.intersects(SignatureCheckMode::CALLBACK) {
+                    self.project_non_nullable_function_call_signature(target_type)?
+                } else {
+                    (None, 0)
+                };
+            let mut related = if let (Some(source_callback), Some(target_callback)) =
+                (source_callback.as_ref(), target_callback.as_ref())
+                && source_nullable_facts == target_nullable_facts
+            {
+                let callback_mode = check_mode & SignatureCheckMode::STRICT_ARITY
+                    | if strict_variance {
+                        SignatureCheckMode::STRICT_CALLBACK
+                    } else {
+                        SignatureCheckMode::BIVARIANT_CALLBACK
+                    };
+                self.compare_signatures_related(
+                    target_callback,
+                    source_callback,
+                    callback_mode,
+                    intersection_state,
+                )?
+            } else {
+                let mut related = Ternary::False;
+                if !check_mode.intersects(SignatureCheckMode::CALLBACK) && !strict_variance {
+                    related = self.is_related_to_ex(
+                        source_type,
+                        target_type,
+                        RecursionFlags::BOTH,
+                        intersection_state,
+                    )?;
+                }
+                if related == Ternary::False {
+                    related = self.is_related_to_ex(
+                        target_type,
+                        source_type,
+                        RecursionFlags::BOTH,
+                        intersection_state,
+                    )?;
+                }
+                related
+            };
+
+            // Pinned strict subtype arity distinguishes an optional source
+            // position from a required target position even after the type
+            // relation itself succeeds.
+            if related != Ternary::False
+                && check_mode.intersects(SignatureCheckMode::STRICT_ARITY)
+                && index >= source.min_argument_count
+                && index < target.min_argument_count
+                && self.is_related_to_ex(
+                    source_type,
+                    target_type,
+                    RecursionFlags::BOTH,
+                    intersection_state,
+                )? != Ternary::False
+            {
+                related = Ternary::False;
+            }
+            if related == Ternary::False {
+                return Ok(Ternary::False);
+            }
+            result &= related;
+        }
+
+        if check_mode.intersects(SignatureCheckMode::IGNORE_RETURN_TYPES) {
+            return Ok(result);
+        }
+        let target_return = target
+            .return_type
+            .ok_or(RelationUnavailable::UnresolvedSignatureReturn(target.id))?;
+        if target_return == self.bootstrap.void_type || target_return == self.bootstrap.any_type {
+            return Ok(result);
+        }
+        let source_return = source
+            .return_type
+            .ok_or(RelationUnavailable::UnresolvedSignatureReturn(source.id))?;
+        let mut related = Ternary::False;
+        if check_mode.intersects(SignatureCheckMode::BIVARIANT_CALLBACK) {
+            related = self.is_related_to_ex(
+                target_return,
+                source_return,
+                RecursionFlags::BOTH,
+                intersection_state,
+            )?;
+        }
+        if related == Ternary::False {
+            related = self.is_related_to_ex(
+                source_return,
+                target_return,
+                RecursionFlags::BOTH,
+                intersection_state,
+            )?;
+        }
+        Ok(result & related)
     }
 
     fn property_related_to(
@@ -2248,7 +2580,7 @@ impl<'store> RelaterSession<'store> {
         if source_is_union || target_is_union {
             return Ok(());
         }
-        if supports_property_object_relation(self.relation)
+        if supports_structured_object_relation(self.relation, self.strict_function_types)
             && source_flags.intersects(TypeFlags::OBJECT)
             && target_flags.intersects(TypeFlags::OBJECT)
         {
@@ -2387,12 +2719,139 @@ impl<'store> RelaterSession<'store> {
             })
     }
 
+    fn project_exact_function_call_signature(
+        &mut self,
+        type_: TypeId,
+    ) -> Result<Option<ResolvedCallSignature>, RelationUnavailable> {
+        match validate_stored_function_type(self.store, type_) {
+            StoredFunctionTypeValidation::NotFunctionType => return Ok(None),
+            StoredFunctionTypeValidation::Pending => {
+                return Err(if self.strict_function_types.is_some() {
+                    RelationUnavailable::UnresolvedFunctionType(type_)
+                } else {
+                    RelationUnavailable::StructuredSignatures(type_)
+                });
+            }
+            StoredFunctionTypeValidation::Malformed => {
+                return Err(RelationUnavailable::MalformedFunctionType(type_));
+            }
+            StoredFunctionTypeValidation::Valid(_) => {}
+        }
+        if self.strict_function_types.is_none() {
+            return Err(RelationUnavailable::StructuredSignatures(type_));
+        }
+        let record = self
+            .store
+            .type_payload(type_)
+            .ok_or(RelationUnavailable::Type(type_))?;
+        let structured = record
+            .data()
+            .structured()
+            .ok_or(RelationUnavailable::MalformedFunctionType(type_))?;
+        let Some([signature]) = structured.signatures.as_deref() else {
+            return Err(RelationUnavailable::MalformedFunctionType(type_));
+        };
+        let signature = *signature;
+        let signature_record = self
+            .store
+            .signature(signature)
+            .ok_or(RelationUnavailable::MalformedFunctionType(type_))?;
+        let parameter_symbols = signature_record.parameters().to_vec();
+        let mut min_argument_count = usize::try_from(signature_record.min_argument_count())
+            .map_err(|_| RelationUnavailable::MalformedFunctionType(type_))?;
+        let return_type = signature_record.resolved_return_type();
+        let mut parameters = Vec::with_capacity(parameter_symbols.len());
+        for parameter in parameter_symbols {
+            let parameter_type = self
+                .store
+                .value_symbol_links(parameter)
+                .and_then(|links| links.resolved_type)
+                .ok_or(RelationUnavailable::MalformedFunctionType(type_))?;
+            parameters.push(parameter_type);
+        }
+        while min_argument_count != 0
+            && self.type_contains_void(parameters[min_argument_count - 1])?
+        {
+            min_argument_count -= 1;
+        }
+        Ok(Some(ResolvedCallSignature {
+            owner: type_,
+            id: signature,
+            parameters,
+            min_argument_count,
+            return_type,
+            // This admission path contains only FunctionTypeNode signatures.
+            // Method/constructor validators can set this bit when they feed
+            // the shared projection in a later source-callable wave.
+            strict_variance_exempt: false,
+        }))
+    }
+
+    fn project_non_nullable_function_call_signature(
+        &mut self,
+        type_: TypeId,
+    ) -> Result<(Option<ResolvedCallSignature>, u8), RelationUnavailable> {
+        let flags = self.store.type_flags(type_)?;
+        if !flags.intersects(TypeFlags::UNION) {
+            return Ok((self.project_exact_function_call_signature(type_)?, 0));
+        }
+        let mut nullable_facts = 0u8;
+        let mut non_nullable = Vec::new();
+        for constituent in self.union_types(type_)? {
+            let flags = self.store.type_flags(constituent)?;
+            if flags.intersects(TypeFlags::UNDEFINED) {
+                nullable_facts |= 1;
+            } else if flags.intersects(TypeFlags::NULL) {
+                nullable_facts |= 2;
+            } else {
+                non_nullable.push(constituent);
+            }
+        }
+        let [non_nullable] = non_nullable.as_slice() else {
+            return Ok((None, nullable_facts));
+        };
+        Ok((
+            self.project_exact_function_call_signature(*non_nullable)?,
+            nullable_facts,
+        ))
+    }
+
+    fn type_contains_void(&mut self, type_: TypeId) -> Result<bool, RelationUnavailable> {
+        let flags = self.store.type_flags(type_)?;
+        if flags.intersects(TypeFlags::VOID) {
+            return Ok(true);
+        }
+        if !flags.intersects(TypeFlags::UNION) {
+            return Ok(false);
+        }
+        Ok(self.union_types(type_)?.into_iter().any(|constituent| {
+            self.store
+                .type_payload(constituent)
+                .is_some_and(|record| record.flags().intersects(TypeFlags::VOID))
+        }))
+    }
+
     fn resolved_object_members(
-        &self,
+        &mut self,
         type_id: TypeId,
         allow_fresh_literal: bool,
     ) -> Result<ResolvedObjectMembers, RelationUnavailable> {
         self.ensure_supported_object_kind(type_id, allow_fresh_literal)?;
+        if let Some(call_signature) = self.project_exact_function_call_signature(type_id)? {
+            let members = self
+                .store
+                .type_payload(type_id)
+                .and_then(|record| record.data().structured())
+                .and_then(|structured| structured.members)
+                .ok_or(RelationUnavailable::MalformedFunctionType(type_id))?;
+            return Ok(ResolvedObjectMembers {
+                members: Some(members),
+                properties: Vec::new(),
+                property_origin: ObjectPropertyOrigin::Declared,
+                call_signature: Some(call_signature),
+                exact_function_type: true,
+            });
+        }
         let record = self
             .store
             .type_payload(type_id)
@@ -2561,6 +3020,8 @@ impl<'store> RelaterSession<'store> {
             members: structured.members,
             properties,
             property_origin,
+            call_signature: None,
+            exact_function_type: false,
         })
     }
 }
@@ -2703,7 +3164,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         };
 
         let bootstrap = self.relation_bootstrap_facts()?;
-        let session = RelaterSession::new(self, RelationKind::Assignable, bootstrap);
+        let mut session = RelaterSession::new(self, RelationKind::Assignable, bootstrap);
         let resolved = session.resolved_object_members(type_id, false)?;
         if let Some((plan, property_types)) = plan {
             if resolved.members != plan.members
@@ -2907,6 +3368,45 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         )
     }
 
+    /// Option-aware assignability for exact stored callable types.
+    ///
+    /// `strictFunctionTypes` is checker-context state in the pinned checker,
+    /// not mutable semantic-store state. Callers that admit function
+    /// signatures must therefore supply the retained option explicitly.
+    #[cfg(test)]
+    pub(super) fn is_type_assignable_to_with_strict_function_types(
+        &mut self,
+        source: TypeId,
+        target: TypeId,
+        strict_function_types: bool,
+    ) -> Result<bool, RelationUnavailable> {
+        self.is_type_related_to_with_optional_global_types_and_options(
+            source,
+            target,
+            RelationKind::Assignable,
+            None,
+            Some(strict_function_types),
+        )
+    }
+
+    /// Global-aware option-aware assignability for exact stored callables.
+    #[allow(dead_code)] // Called by the context wrapper installed with this relation slice.
+    pub(super) fn is_type_assignable_to_with_global_types_and_strict_function_types(
+        &mut self,
+        source: TypeId,
+        target: TypeId,
+        global_types: &CanonicalGlobalTypes,
+        strict_function_types: bool,
+    ) -> Result<bool, RelationUnavailable> {
+        self.is_type_related_to_with_optional_global_types_and_options(
+            source,
+            target,
+            RelationKind::Assignable,
+            Some(RelationGlobalTypes::from_global_types(global_types)),
+            Some(strict_function_types),
+        )
+    }
+
     /// Pinned `isTypeSubtypeOf`.
     ///
     /// # Errors
@@ -3063,6 +3563,24 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         self.is_type_related_to_with_optional_global_types(source, target, relation, None)
     }
 
+    /// Option-aware relation entry point for exact stored callable types.
+    #[cfg(test)]
+    pub(super) fn is_type_related_to_with_strict_function_types(
+        &mut self,
+        source: TypeId,
+        target: TypeId,
+        relation: RelationKind,
+        strict_function_types: bool,
+    ) -> Result<bool, RelationUnavailable> {
+        self.is_type_related_to_with_optional_global_types_and_options(
+            source,
+            target,
+            relation,
+            None,
+            Some(strict_function_types),
+        )
+    }
+
     /// Pinned `isTypeRelatedTo` with authoritative standard-library identities
     /// for relation families that require them.
     ///
@@ -3091,6 +3609,23 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         target: TypeId,
         relation: RelationKind,
         global_types: Option<RelationGlobalTypes>,
+    ) -> Result<bool, RelationUnavailable> {
+        self.is_type_related_to_with_optional_global_types_and_options(
+            source,
+            target,
+            relation,
+            global_types,
+            None,
+        )
+    }
+
+    fn is_type_related_to_with_optional_global_types_and_options(
+        &mut self,
+        source: TypeId,
+        target: TypeId,
+        relation: RelationKind,
+        global_types: Option<RelationGlobalTypes>,
+        strict_function_types: Option<bool>,
     ) -> Result<bool, RelationUnavailable> {
         let bootstrap = self.relation_bootstrap_facts()?;
         let source = self.regular_type_if_fresh(source)?;
@@ -3165,16 +3700,22 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         {
             let union_relation = source_flags.intersects(TypeFlags::UNION)
                 || target_flags.intersects(TypeFlags::UNION);
-            let supported_object_relation = supports_property_object_relation(relation)
-                && source_flags.intersects(TypeFlags::OBJECT)
-                && target_flags.intersects(TypeFlags::OBJECT);
+            let supported_object_relation =
+                supports_structured_object_relation(relation, strict_function_types)
+                    && source_flags.intersects(TypeFlags::OBJECT)
+                    && target_flags.intersects(TypeFlags::OBJECT);
             if union_relation
                 || supported_object_relation
                 || supported_array_relation
                 || supported_apparent_primitive_relation
             {
-                let mut session =
-                    RelaterSession::new_with_global_types(self, relation, bootstrap, global_types);
+                let mut session = RelaterSession::new_with_global_types_and_options(
+                    self,
+                    relation,
+                    bootstrap,
+                    global_types,
+                    strict_function_types,
+                );
                 let result = session.is_related_to_ex(
                     source,
                     target,
@@ -3356,6 +3897,8 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         Ok(RelationBootstrapFacts {
             strict_null_checks: bootstrap.options.strict_null_checks,
             exact_optional_property_types: bootstrap.options.exact_optional_property_types,
+            any_type: bootstrap.any_type,
+            void_type: bootstrap.void_type,
             wildcard_type: bootstrap.wildcard_type,
             any_function_type: bootstrap.any_function_type,
             never_type: bootstrap.never_type,
@@ -3703,6 +4246,14 @@ const fn supports_property_object_relation(relation: RelationKind) -> bool {
     )
 }
 
+const fn supports_structured_object_relation(
+    relation: RelationKind,
+    strict_function_types: Option<bool>,
+) -> bool {
+    supports_property_object_relation(relation)
+        || relation.is_identity() && strict_function_types.is_some()
+}
+
 pub(super) const fn union_validation_unavailable(
     union: TypeId,
     error: LiteralTypeCacheError,
@@ -3769,23 +4320,29 @@ const fn recursion_identity_unavailable(
 
 #[cfg(test)]
 mod tests {
-    use ts_ast::{FileId, SyntaxKind};
+    use std::collections::BTreeMap;
+
+    use ts_ast::{FileId, NodeArena, NodeData, NodeRef, SyntaxKind};
     use ts_binder::{
-        AstScope, CheckFlags, EscapedName, InternalSymbolName, SemanticSymbolId, SymbolData,
-        SymbolFlags,
+        AstScope, BoundFile, CanonicalBinder, CanonicalModuleState, CanonicalNameResolverOptions,
+        CanonicalSourceFileFacts, CanonicalSourceLanguage, CheckFlags, EscapedName,
+        InternalSymbolName, SemanticSymbolId, SymbolData, SymbolFlags,
     };
     use ts_jsnum::{Number, PseudoBigInt};
-    use ts_parser::parse_source_file;
+    use ts_parser::{ParseResult, parse_source_file};
 
     use super::{ArrayTypeError, LiteralTypeCacheError, RelationGlobalTypes, RelationUnavailable};
     use crate::semantic::{
-        CanonicalGlobalTypeInitializationError, CanonicalTypeMapperStore, DeclaredTypeLinks,
-        IntrinsicBootstrapOptions, MembersAndExportsLinks, MembersOrExportsResolutionKind,
-        RelationComparisonResult, RelationKind, TypeAliasLinks, TypeId, ValueSymbolLinks,
+        CanonicalCheckerDiagnostics, CanonicalGlobalTypeInitializationError,
+        CanonicalTypeMapperStore, DeclaredTypeHost, DeclaredTypeLinks, IntrinsicBootstrapOptions,
+        MembersAndExportsLinks, MembersOrExportsResolutionKind, RelationComparisonResult,
+        RelationKind, SignatureId, TypeAliasLinks, TypeId, ValueSymbolLinks,
         array_types::CanonicalArrayTargets,
         declared::type_list_key,
         global_types::create_type_from_generic_global_type,
+        production::GlobalMergeCompletion,
         signatures::{SignatureFlags, Ternary},
+        type_nodes::{CanonicalTypeQuery, CanonicalTypeQueryOptions},
         type_records::{LiteralValue, RegularLiteralLink, TypeData},
         types::{ObjectFlags, TypeFlags},
     };
@@ -3808,6 +4365,479 @@ mod tests {
             })
             .unwrap();
         store
+    }
+
+    struct FunctionRelationFixture {
+        parsed: ParseResult,
+        file: FileId,
+        files: BTreeMap<FileId, BoundFile>,
+        store: TestStore,
+    }
+
+    fn function_relation_fixture(source: &str) -> FunctionRelationFixture {
+        let parsed = parse_source_file(source);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(97);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/signature-relations.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        let (symbols, files) = binder.finish().try_into_parts().unwrap();
+        let mut store = TestStore::from_symbol_store(symbols);
+        assert!(
+            store
+                .register_source_file(&parsed.arena, parsed.source_file, file)
+                .is_some()
+        );
+        store
+            .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions {
+                strict_null_checks: true,
+                exact_optional_property_types: false,
+            })
+            .unwrap();
+        let bound = files.get(&file).unwrap();
+        let locals = bound.locals(bound.source_file()).unwrap();
+        let mut symbols = store
+            .symbol_table(locals)
+            .unwrap()
+            .iter()
+            .map(|(name, symbol)| (name.as_bytes().to_vec(), symbol))
+            .collect::<Vec<_>>();
+        symbols.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        let globals = store.intrinsic_bootstrap().unwrap().globals;
+        for (_, symbol) in symbols {
+            store.merge_global_symbol(globals, symbol).unwrap();
+        }
+        FunctionRelationFixture {
+            parsed,
+            file,
+            files,
+            store,
+        }
+    }
+
+    fn relation_host<'a>(arena: &'a NodeArena, bound: &'a BoundFile) -> DeclaredTypeHost<'a> {
+        DeclaredTypeHost::new_after_global_merge(
+            [(arena, bound)],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap()
+    }
+
+    fn alias_function_node(fixture: &FunctionRelationFixture, name: &str) -> NodeRef {
+        fixture
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::TypeAliasDeclaration(alias) = &record.data else {
+                    return None;
+                };
+                let NodeData::Identifier(identifier) = &fixture
+                    .parsed
+                    .arena
+                    .get(alias.name)
+                    .expect("alias name belongs to the arena")
+                    .data
+                else {
+                    return None;
+                };
+                (record.kind == SyntaxKind::TypeAliasDeclaration && identifier.text == name)
+                    .then(|| NodeRef::new(fixture.parsed.arena.id(), fixture.file, alias.type_))
+            })
+            .unwrap_or_else(|| panic!("missing function alias {name}"))
+    }
+
+    fn query_function_alias(
+        fixture: &mut FunctionRelationFixture,
+        name: &str,
+    ) -> (TypeId, SignatureId) {
+        let node = alias_function_node(fixture, name);
+        assert_eq!(
+            fixture.parsed.arena.get(node.node).unwrap().kind,
+            SyntaxKind::FunctionType
+        );
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let type_ = {
+            let host = relation_host(
+                &fixture.parsed.arena,
+                fixture.files.get(&fixture.file).unwrap(),
+            );
+            CanonicalTypeQuery::new(
+                &mut fixture.store,
+                &host,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_type_from_type_node(node)
+            .unwrap()
+        };
+        assert!(diagnostics.is_empty());
+        let signature = fixture
+            .store
+            .signature_links(node)
+            .and_then(|links| links.resolved_signature.signature())
+            .expect("the function type has a resolved signature");
+        (type_, signature)
+    }
+
+    fn resolve_all_function_returns(fixture: &mut FunctionRelationFixture) {
+        let signatures = fixture
+            .parsed
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                (record.kind == SyntaxKind::FunctionType)
+                    .then(|| NodeRef::new(fixture.parsed.arena.id(), fixture.file, node))
+            })
+            .filter_map(|node| {
+                fixture
+                    .store
+                    .signature_links(node)
+                    .and_then(|links| links.resolved_signature.signature())
+            })
+            .collect::<Vec<_>>();
+        for signature in signatures {
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            let host = relation_host(
+                &fixture.parsed.arena,
+                fixture.files.get(&fixture.file).unwrap(),
+            );
+            CanonicalTypeQuery::new(
+                &mut fixture.store,
+                &host,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_return_type_of_signature(signature)
+            .unwrap();
+            assert!(diagnostics.is_empty());
+        }
+    }
+
+    #[test]
+    fn exact_function_aliases_compare_identically_after_lazy_returns_resolve() {
+        let mut fixture = function_relation_fixture(
+            r#"
+                type Left = (value: string) => number;
+                type Right = (value: string) => number;
+                type Optional = (value?: string) => number;
+            "#,
+        );
+        let (left, _) = query_function_alias(&mut fixture, "Left");
+        let (right, _) = query_function_alias(&mut fixture, "Right");
+        let (optional, _) = query_function_alias(&mut fixture, "Optional");
+        resolve_all_function_returns(&mut fixture);
+
+        assert_eq!(
+            fixture.store.is_type_related_to_with_strict_function_types(
+                left,
+                right,
+                RelationKind::Identity,
+                true,
+            ),
+            Ok(true)
+        );
+        assert_eq!(
+            fixture.store.is_type_related_to_with_strict_function_types(
+                left,
+                optional,
+                RelationKind::Identity,
+                true,
+            ),
+            Ok(false)
+        );
+    }
+
+    #[test]
+    fn strict_function_option_is_explicit_and_changes_parameter_variance() {
+        fn relation(strict_function_types: bool) -> bool {
+            let mut fixture = function_relation_fixture(
+                r#"
+                    type Narrow = (value: "fixed") => void;
+                    type Wide = (value: string) => void;
+                "#,
+            );
+            let (narrow, _) = query_function_alias(&mut fixture, "Narrow");
+            let (wide, _) = query_function_alias(&mut fixture, "Wide");
+            resolve_all_function_returns(&mut fixture);
+            fixture
+                .store
+                .is_type_assignable_to_with_strict_function_types(
+                    narrow,
+                    wide,
+                    strict_function_types,
+                )
+                .unwrap()
+        }
+
+        assert!(!relation(true));
+        assert!(relation(false));
+
+        let mut fixture =
+            function_relation_fixture("type Left = () => void; type Right = () => void;");
+        let (left, _) = query_function_alias(&mut fixture, "Left");
+        let (right, _) = query_function_alias(&mut fixture, "Right");
+        resolve_all_function_returns(&mut fixture);
+        assert_eq!(
+            fixture.store.is_type_assignable_to(left, right),
+            Err(RelationUnavailable::StructuredSignatures(left)),
+            "store-only callers must opt into immutable checker option state"
+        );
+    }
+
+    #[test]
+    fn signature_arity_distinguishes_required_optional_and_strict_subtypes() {
+        let mut fixture = function_relation_fixture(
+            r#"
+                type Zero = () => void;
+                type Required = (value: string) => void;
+                type Optional = (value?: string) => void;
+                type VoidParameter = (value: void) => void;
+            "#,
+        );
+        let (zero, _) = query_function_alias(&mut fixture, "Zero");
+        let (required, _) = query_function_alias(&mut fixture, "Required");
+        let (optional, _) = query_function_alias(&mut fixture, "Optional");
+        let (void_parameter, _) = query_function_alias(&mut fixture, "VoidParameter");
+        resolve_all_function_returns(&mut fixture);
+
+        assert_eq!(
+            fixture
+                .store
+                .is_type_assignable_to_with_strict_function_types(required, zero, true),
+            Ok(false)
+        );
+        assert_eq!(
+            fixture
+                .store
+                .is_type_assignable_to_with_strict_function_types(optional, zero, true),
+            Ok(true)
+        );
+        assert_eq!(
+            fixture
+                .store
+                .is_type_assignable_to_with_strict_function_types(void_parameter, zero, true),
+            Ok(true)
+        );
+        assert_eq!(
+            fixture
+                .store
+                .is_type_assignable_to_with_strict_function_types(zero, required, true),
+            Ok(true)
+        );
+        assert_eq!(
+            fixture.store.is_type_related_to_with_strict_function_types(
+                optional,
+                zero,
+                RelationKind::StrictSubtype,
+                true,
+            ),
+            Ok(false)
+        );
+    }
+
+    #[test]
+    fn signature_returns_are_covariant_with_void_and_any_targets() {
+        let mut fixture = function_relation_fixture(
+            r#"
+                type Literal = () => "fixed";
+                type Wide = () => string;
+                type Number = () => number;
+                type Void = () => void;
+                type Any = () => any;
+            "#,
+        );
+        let (literal, _) = query_function_alias(&mut fixture, "Literal");
+        let (wide, _) = query_function_alias(&mut fixture, "Wide");
+        let (number, _) = query_function_alias(&mut fixture, "Number");
+        let (void, _) = query_function_alias(&mut fixture, "Void");
+        let (any, _) = query_function_alias(&mut fixture, "Any");
+        resolve_all_function_returns(&mut fixture);
+
+        for (source, target, expected) in [
+            (literal, wide, true),
+            (wide, literal, false),
+            (number, void, true),
+            (number, any, true),
+        ] {
+            assert_eq!(
+                fixture
+                    .store
+                    .is_type_assignable_to_with_strict_function_types(source, target, true),
+                Ok(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn nested_callback_parameters_use_the_pinned_reversed_comparison() {
+        let mut fixture = function_relation_fixture(
+            r#"
+                type WideCallback = (value: string) => void;
+                type NarrowCallback = (value: "fixed") => void;
+                type WideOuter = (callback: WideCallback) => void;
+                type NarrowOuter = (callback: NarrowCallback) => void;
+                type WideOptional = (callback?: WideCallback) => void;
+                type NarrowOptional = (callback?: NarrowCallback) => void;
+            "#,
+        );
+        let (wide_outer, _) = query_function_alias(&mut fixture, "WideOuter");
+        let (narrow_outer, _) = query_function_alias(&mut fixture, "NarrowOuter");
+        let (wide_optional, _) = query_function_alias(&mut fixture, "WideOptional");
+        let (narrow_optional, _) = query_function_alias(&mut fixture, "NarrowOptional");
+        resolve_all_function_returns(&mut fixture);
+
+        assert_eq!(
+            fixture
+                .store
+                .is_type_assignable_to_with_strict_function_types(wide_outer, narrow_outer, true),
+            Ok(false)
+        );
+        assert_eq!(
+            fixture
+                .store
+                .is_type_assignable_to_with_strict_function_types(narrow_outer, wide_outer, true),
+            Ok(true)
+        );
+        assert_eq!(
+            fixture
+                .store
+                .is_type_assignable_to_with_strict_function_types(
+                    wide_optional,
+                    narrow_optional,
+                    true,
+                ),
+            Ok(false)
+        );
+        assert_eq!(
+            fixture
+                .store
+                .is_type_assignable_to_with_strict_function_types(
+                    narrow_optional,
+                    wide_optional,
+                    true,
+                ),
+            Ok(true)
+        );
+    }
+
+    #[test]
+    fn function_empty_object_and_any_function_relations_are_directional() {
+        let mut fixture = function_relation_fixture("type Callable = () => void;");
+        let (callable, _) = query_function_alias(&mut fixture, "Callable");
+        let (empty, any_function) = {
+            let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+            (bootstrap.empty_object_type, bootstrap.any_function_type)
+        };
+
+        for (source, target, expected) in [
+            (callable, empty, true),
+            (empty, callable, false),
+            (any_function, callable, true),
+            (callable, any_function, false),
+        ] {
+            assert_eq!(
+                fixture
+                    .store
+                    .is_type_assignable_to_with_strict_function_types(source, target, true),
+                Ok(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn unresolved_signature_return_is_typed_retryable_and_cache_atomic() {
+        let mut fixture =
+            function_relation_fixture("type Left = () => string; type Right = () => string;");
+        let (left, _) = query_function_alias(&mut fixture, "Left");
+        let (right, right_signature) = query_function_alias(&mut fixture, "Right");
+        let before = fixture.store.relation_state_snapshot();
+        assert_eq!(
+            fixture
+                .store
+                .is_type_assignable_to_with_strict_function_types(left, right, true),
+            Err(RelationUnavailable::UnresolvedSignatureReturn(
+                right_signature
+            ))
+        );
+        assert_eq!(fixture.store.relation_state_snapshot(), before);
+
+        resolve_all_function_returns(&mut fixture);
+        assert_eq!(
+            fixture
+                .store
+                .is_type_assignable_to_with_strict_function_types(left, right, true),
+            Ok(true)
+        );
+    }
+
+    #[test]
+    fn recursive_callback_comparison_propagates_maybe_before_root_commit() {
+        let mut fixture = function_relation_fixture(
+            r#"
+                type Left = (next: Left) => void;
+                type Right = (next: Right) => void;
+            "#,
+        );
+        let (left, _) = query_function_alias(&mut fixture, "Left");
+        let (right, _) = query_function_alias(&mut fixture, "Right");
+        resolve_all_function_returns(&mut fixture);
+        let bootstrap = fixture.store.relation_bootstrap_facts().unwrap();
+        let mut session = super::RelaterSession::new_with_global_types_and_options(
+            &mut fixture.store,
+            RelationKind::Assignable,
+            bootstrap,
+            None,
+            Some(true),
+        );
+        let result = session
+            .is_related_to_ex(
+                left,
+                right,
+                super::RecursionFlags::BOTH,
+                super::IntersectionState::NONE,
+            )
+            .unwrap();
+        assert_eq!(result, Ternary::Maybe);
+        assert!(session.finish(left, right, result).unwrap());
+    }
+
+    #[test]
+    fn malformed_function_signature_fails_closed_without_relation_writes() {
+        let mut fixture =
+            function_relation_fixture("type Left = () => string; type Right = () => string;");
+        let (left, left_signature) = query_function_alias(&mut fixture, "Left");
+        let (right, _) = query_function_alias(&mut fixture, "Right");
+        resolve_all_function_returns(&mut fixture);
+        assert!(
+            fixture
+                .store
+                .set_signature_flags(left_signature, SignatureFlags::ABSTRACT)
+        );
+        let before = fixture.store.relation_state_snapshot();
+        assert_eq!(
+            fixture
+                .store
+                .is_type_assignable_to_with_strict_function_types(left, right, true),
+            Err(RelationUnavailable::MalformedFunctionType(left))
+        );
+        assert_eq!(fixture.store.relation_state_snapshot(), before);
     }
 
     fn alloc_symbol(store: &mut TestStore, flags: SymbolFlags, name: &str) -> SemanticSymbolId {
