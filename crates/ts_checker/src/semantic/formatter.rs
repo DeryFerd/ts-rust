@@ -11,7 +11,7 @@
 
 use std::{collections::HashSet, fmt::Write as _, ops};
 
-use ts_ast::{NodeData, SyntaxKind};
+use ts_ast::{NodeData, NodeRef, SyntaxKind};
 use ts_binder::{
     CheckFlags, InternalSymbolName, SemanticSymbolId, SymbolFlags, canonical_has_syntactic_modifier,
 };
@@ -28,6 +28,7 @@ use super::{
     enums,
     functions::{FunctionTypeDisplayError, FunctionTypeUnsupported},
     links::ValueSymbolLinks,
+    object_members,
     source_callables::{SourceCallableDisplayError, SourceCallableUnsupported},
     type_records::{
         LiteralTypeData, LiteralValue, TypeCacheState, TypeData, TypeDataKind, TypeRecord,
@@ -307,9 +308,9 @@ pub fn type_to_string_with_global_types_and_flags(
 }
 
 /// Host-aware form used by source-backed checker paths once they already own
-/// a validated declared-type view. The host is required only for structural
-/// declared type literals whose `readonly` modifiers are not retained by
-/// binder-owned symbol records.
+/// a validated declared-type view. The host proves source-backed owners such
+/// as exported interfaces and structural type literals whose `readonly`
+/// modifiers are not retained by binder-owned symbol records.
 #[allow(dead_code)] // Source/production wiring is owned by the next integration slice.
 pub(super) fn type_to_string_with_host_and_flags(
     store: &CanonicalTypeMapperStore,
@@ -820,7 +821,7 @@ fn display_object_type(
 
     let kind = record.object_flags() & ObjectFlags::OBJECT_TYPE_KIND_MASK;
     if kind == ObjectFlags::INTERFACE {
-        return display_interface_name(store, type_id, record, state);
+        return display_interface_name(store, host, type_id, record, state);
     }
     if kind != ObjectFlags::ANONYMOUS || !matches!(record.data(), TypeData::Object(_)) {
         return Err(TypeDisplayUnavailable::UnsupportedType {
@@ -1512,6 +1513,7 @@ fn display_array_type(
 
 fn display_interface_name(
     store: &CanonicalTypeMapperStore,
+    host: Option<&DeclaredTypeHost<'_>>,
     type_id: TypeId,
     record: &TypeRecord,
     state: &mut DisplayState,
@@ -1545,18 +1547,20 @@ fn display_interface_name(
     let declarations = symbol
         .declarations()
         .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+    let [declaration] = declarations else {
+        return Err(TypeDisplayUnavailable::MalformedType(type_id));
+    };
     if store.get_merged_symbol(symbol_id) != Some(symbol_id)
         || symbol.flags() != SymbolFlags::INTERFACE
         || symbol.check_flags() != CheckFlags::NONE
         || symbol.value_declaration().is_some()
-        || symbol.parent().is_some()
+        || !valid_display_interface_owner(store, host, symbol_id, symbol, *declaration)
         || symbol.exports().is_some()
         || symbol.export_symbol().is_some()
         || store
             .declared_type_links(symbol_id)
             .is_none_or(|links| links.declared_type != Some(type_id))
-        || !matches!(declarations, [declaration] if store.source_node_kind(*declaration)
-            == Some(SyntaxKind::InterfaceDeclaration))
+        || store.source_node_kind(*declaration) != Some(SyntaxKind::InterfaceDeclaration)
     {
         return Err(TypeDisplayUnavailable::MalformedType(type_id));
     }
@@ -1567,6 +1571,23 @@ fn display_interface_name(
     }
     display_symbol_name(store, type_id, symbol_id, state)
         .ok_or(TypeDisplayUnavailable::MalformedType(type_id))
+}
+
+fn valid_display_interface_owner(
+    store: &CanonicalTypeMapperStore,
+    host: Option<&DeclaredTypeHost<'_>>,
+    symbol_id: SemanticSymbolId,
+    symbol: &ts_binder::semantic::Symbol,
+    declaration: NodeRef,
+) -> bool {
+    match (store.source_node_is_exported(declaration), symbol.parent()) {
+        (Some(false), None) => true,
+        (Some(true), Some(_)) => host.is_some_and(|host| {
+            object_members::plan_interface(store, host, symbol_id)
+                .is_ok_and(|plan| plan.node == declaration && plan.symbol == symbol_id)
+        }),
+        _ => false,
+    }
 }
 
 fn validate_resolved_named_interface(

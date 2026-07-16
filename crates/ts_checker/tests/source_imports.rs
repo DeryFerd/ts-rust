@@ -268,6 +268,117 @@ fn importer_first_type_only_imports_check_annotations_and_reject_value_uses() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
+fn exported_simple_interfaces_work_target_first_and_importer_first() {
+    let importer = parse_source_file(concat!(
+        "import type { User as LocalUser } from './target'; ",
+        "const good: LocalUser = { id: 1 }; ",
+        "const bad: LocalUser = { id: 'wrong' };",
+    ));
+    let target = parse_source_file("export interface User { id: number }");
+    let importer_file = FileId::new(12);
+    let target_file = FileId::new(13);
+
+    let (mut target_first, binding) = make_context(&importer, &target, importer_file, target_file);
+    let target_source = target_first.source_file(target_file).unwrap();
+    let alias = target_first
+        .file(importer_file)
+        .unwrap()
+        .1
+        .symbol(binding)
+        .unwrap();
+    let target_declaration = target
+        .arena
+        .iter()
+        .find_map(|(node, record)| {
+            (record.kind == ts_ast::SyntaxKind::InterfaceDeclaration).then_some(NodeRef::new(
+                target.arena.id(),
+                target_file,
+                node,
+            ))
+        })
+        .expect("fixture has one interface declaration");
+    let declared_target_symbol = target_first
+        .file(target_file)
+        .unwrap()
+        .1
+        .symbol(target_declaration)
+        .unwrap();
+    let target_first_type = target_first
+        .get_declared_type_of_symbol(declared_target_symbol)
+        .unwrap();
+    assert_eq!(
+        target_first
+            .store()
+            .type_payload(target_first_type)
+            .unwrap()
+            .symbol(),
+        Some(declared_target_symbol)
+    );
+    assert_eq!(target_first.type_to_string(target_first_type).unwrap(), "User");
+    target_first.check_source_file(target_file).unwrap();
+    assert!(target_first.diagnostics().is_empty());
+    assert!(
+        target_first
+            .store()
+            .source_file_links(target_source)
+            .is_some_and(|links| links.type_checked)
+    );
+    target_first.check_source_file(importer_file).unwrap();
+    assert_eq!(
+        target_first
+            .diagnostics()
+            .as_slice()
+            .iter()
+            .map(|diagnostic| diagnostic.diagnostic.code())
+            .collect::<Vec<_>>(),
+        [2322]
+    );
+    let target_symbol = match target_first
+        .store()
+        .alias_symbol_links(alias)
+        .expect("type import resolves its interface alias")
+        .alias_target
+    {
+        AliasTargetState::Resolved(target) => target,
+        state => panic!("interface import alias is not resolved: {state:?}"),
+    };
+    assert_eq!(target_symbol, declared_target_symbol);
+    assert!(target_first.store().value_symbol_links(alias).is_none());
+    assert!(
+        target_first
+            .store()
+            .value_symbol_links(target_symbol)
+            .is_none()
+    );
+    target_first.check_source_file(target_file).unwrap();
+    target_first.check_source_file(importer_file).unwrap();
+    assert_eq!(target_first.diagnostics().as_slice().len(), 1);
+
+    let (mut importer_first, _) = make_context(&importer, &target, importer_file, target_file);
+    let importer_first_target = importer_first.source_file(target_file).unwrap();
+    importer_first.check_source_file(importer_file).unwrap();
+    assert_eq!(
+        importer_first
+            .diagnostics()
+            .as_slice()
+            .iter()
+            .map(|diagnostic| diagnostic.diagnostic.code())
+            .collect::<Vec<_>>(),
+        [2322]
+    );
+    assert!(
+        !importer_first
+            .store()
+            .source_file_links(importer_first_target)
+            .is_some_and(|links| links.type_checked),
+        "importer-first interface lookup must not recursively check the target source"
+    );
+    importer_first.check_source_file(target_file).unwrap();
+    assert_eq!(importer_first.diagnostics().as_slice().len(), 1);
+}
+
+#[test]
 fn imported_values_feed_property_and_call_expression_verticals() {
     let importer = parse_source_file(concat!(
         "import { object, take } from './target'; ",

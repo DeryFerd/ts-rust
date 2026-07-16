@@ -368,6 +368,14 @@ pub(super) fn plan_interface(
             symbol,
         });
     };
+    let expected_parent = interface_declaration_parent(
+        store,
+        host,
+        declaration,
+        symbol,
+        name,
+        interface.modifiers.as_ref(),
+    )?;
     let expected_symbol_flags = SymbolFlags::INTERFACE
         | if value_declarations.is_empty() {
             SymbolFlags::NONE
@@ -385,7 +393,7 @@ pub(super) fn plan_interface(
         || symbol_record.check_flags() != CheckFlags::NONE
         || symbol_record.name().as_utf8() != Some(identifier.text.as_str())
         || !valid_value_declaration
-        || symbol_record.parent().is_some()
+        || symbol_record.parent() != expected_parent
         || symbol_record.exports().is_some()
         || symbol_record.export_symbol().is_some()
         || name_record.kind != SyntaxKind::Identifier
@@ -393,7 +401,6 @@ pub(super) fn plan_interface(
         || interface.flow_node.is_some()
         || interface.local_symbol.is_some()
         || interface.symbol.is_some()
-        || interface.modifiers.is_some()
         || interface.type_parameters.is_some()
         || interface.heritage_clauses.is_some()
         || interface.members.has_trailing_comma
@@ -415,6 +422,132 @@ pub(super) fn plan_interface(
         &interface.members,
         None,
     )
+}
+
+fn interface_declaration_parent(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    declaration: NodeRef,
+    symbol: SemanticSymbolId,
+    name: NodeRef,
+    modifiers: Option<&ts_ast::ModifierList>,
+) -> Result<Option<SemanticSymbolId>, PropertyObjectError> {
+    let invalid = || PropertyObjectError::InvalidInterface {
+        declaration,
+        symbol,
+    };
+    let Some(modifiers) = modifiers else {
+        return Ok(None);
+    };
+    let (_, bound) = host.source(declaration).ok_or_else(invalid)?;
+    let declaration_record = preflight_node(store, host, declaration).map_err(|_| invalid())?;
+    let name_record = preflight_node(store, host, name).map_err(|_| invalid())?;
+    let NodeData::Identifier(identifier) = &name_record.data else {
+        return Err(invalid());
+    };
+    let source = bound.source_file();
+    let source_record = preflight_node(store, host, source).map_err(|_| invalid())?;
+    let NodeData::SourceFile(source_data) = &source_record.data else {
+        return Err(invalid());
+    };
+    if declaration_record.parent != Some(source.node)
+        || source_data
+            .statements
+            .nodes
+            .iter()
+            .filter(|node| **node == declaration.node)
+            .count()
+            != 1
+        || bound
+            .symbol(declaration)
+            .and_then(|symbol| store.get_merged_symbol(symbol))
+            != Some(symbol)
+    {
+        return Err(invalid());
+    }
+    if !is_exact_export_modifier(
+        store,
+        host,
+        declaration,
+        declaration_record,
+        name_record,
+        modifiers,
+    ) {
+        return Err(invalid());
+    }
+    let facts = bound.source_facts().ok_or_else(invalid)?;
+    if facts.is_javascript_file() || !facts.is_external_module() || facts.is_common_js_module() {
+        return Err(invalid());
+    }
+    let source_symbol = bound.symbol(source).ok_or_else(invalid)?;
+    let source_symbol_record = store.symbol(source_symbol).ok_or_else(invalid)?;
+    let local = bound.local_symbol(declaration).ok_or_else(invalid)?;
+    let local_record = store.symbol(local).ok_or_else(invalid)?;
+    if store.get_merged_symbol(source_symbol) != Some(source_symbol)
+        || source_symbol_record.flags() != SymbolFlags::VALUE_MODULE
+        || source_symbol_record.check_flags() != CheckFlags::NONE
+        || source_symbol_record.name() != facts.source_file_symbol_name()
+        || source_symbol_record.declarations() != Some(&[source])
+        || source_symbol_record.value_declaration() != Some(source)
+        || source_symbol_record.members().is_some()
+        || source_symbol_record.exports().is_none()
+        || source_symbol_record.parent().is_some()
+        || source_symbol_record.export_symbol().is_some()
+        || local == symbol
+        || store.get_merged_symbol(local) != Some(local)
+        || local_record.flags() != SymbolFlags::NONE
+        || local_record.check_flags() != CheckFlags::NONE
+        || local_record.name().as_utf8() != Some(identifier.text.as_str())
+        || local_record.declarations() != Some(&[declaration])
+        || local_record.value_declaration().is_some()
+        || local_record.members().is_some()
+        || local_record.exports().is_some()
+        || local_record.parent().is_some()
+        || local_record.export_symbol() != Some(symbol)
+        || source_symbol_record
+            .exports()
+            .and_then(|exports| store.symbol_table(exports))
+            .and_then(|exports| exports.get_source(&identifier.text))
+            != Some(symbol)
+    {
+        return Err(invalid());
+    }
+    Ok(Some(source_symbol))
+}
+
+fn is_exact_export_modifier(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    declaration: NodeRef,
+    declaration_record: &ts_ast::Node,
+    name_record: &ts_ast::Node,
+    modifiers: &ts_ast::ModifierList,
+) -> bool {
+    let [modifier] = modifiers.list.nodes.as_slice() else {
+        return false;
+    };
+    let modifier = NodeRef::new(declaration.arena, declaration.file, *modifier);
+    let Ok(modifier_record) = preflight_node(store, host, modifier) else {
+        return false;
+    };
+    modifiers.flags.0 == 0
+        && !modifiers.list.has_trailing_comma
+        && modifiers.list.range.start == declaration_record.range.start
+        && modifiers.list.range.end <= name_record.range.start
+        && modifier_record.kind == SyntaxKind::ExportKeyword
+        && matches!(modifier_record.data, NodeData::Token(_))
+        && modifier_record.flags.0 == 0
+        && modifier_record.parent == Some(declaration.node)
+        && modifier_record.range.start == declaration_record.range.start
+        && modifier_record.range.end <= modifiers.list.range.end
+        && host.source(modifier).is_some_and(|(arena, _)| {
+            arena.source_text().is_none_or(|source| {
+                source.get(
+                    modifier_record.range.start.get() as usize
+                        ..modifier_record.range.end.get() as usize,
+                ) == Some("export")
+            })
+        })
 }
 
 fn bound_symbol(

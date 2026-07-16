@@ -790,11 +790,13 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                             SourceSyntaxRole::TypeAliasDeclaration,
                         ));
                     }
-                    let export_modifier = self.validate_type_alias_modifiers(
+                    let export_modifier = self.validate_named_type_modifiers(
                         statement,
                         node.range,
                         alias.name,
                         alias.modifiers.as_ref(),
+                        SyntaxKind::TypeAliasDeclaration,
+                        SourceSyntaxRole::TypeAliasDeclaration,
                     )?;
                     if let Some(export_modifier) = export_modifier
                         && !is_external_module
@@ -828,12 +830,29 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         || interface.flow_node.is_some()
                         || interface.local_symbol.is_some()
                         || interface.symbol.is_some()
-                        || interface.modifiers.is_some()
                     {
                         return Err(self.unsupported(
                             statement,
                             node.kind,
                             SourceSyntaxRole::InterfaceDeclaration,
+                        ));
+                    }
+                    let export_modifier = self.validate_named_type_modifiers(
+                        statement,
+                        node.range,
+                        interface.name,
+                        interface.modifiers.as_ref(),
+                        SyntaxKind::InterfaceDeclaration,
+                        SourceSyntaxRole::InterfaceDeclaration,
+                    )?;
+                    if let Some(export_modifier) = export_modifier
+                        && !is_external_module
+                    {
+                        return Err(SourceCheckError::Unsupported(
+                            UnsupportedSourceSyntax::MissingExternalModuleFact {
+                                node: export_modifier,
+                                role: SourceSyntaxRole::InterfaceDeclaration,
+                            },
                         ));
                     }
                     let symbol =
@@ -1424,22 +1443,20 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         Ok(callable)
     }
 
-    fn validate_type_alias_modifiers(
+    fn validate_named_type_modifiers(
         &self,
         declaration: NodeRef,
         declaration_range: TextRange,
         name: NodeId,
         modifiers: Option<&ModifierList>,
+        declaration_kind: SyntaxKind,
+        role: SourceSyntaxRole,
     ) -> Result<Option<NodeRef>, SourceCheckError> {
         let Some(modifiers) = modifiers else {
             return Ok(None);
         };
         let [modifier_id] = modifiers.list.nodes.as_slice() else {
-            return Err(self.unsupported(
-                declaration,
-                SyntaxKind::TypeAliasDeclaration,
-                SourceSyntaxRole::TypeAliasDeclaration,
-            ));
+            return Err(self.unsupported(declaration, declaration_kind, role));
         };
         let modifier = self.reference(*modifier_id);
         let modifier_node = self.node(modifier)?;
@@ -1456,11 +1473,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             || modifier_node.range.end.get() > modifiers.list.range.end.get()
             || !self.source_spelling_matches(modifier, "export")
         {
-            return Err(self.unsupported(
-                modifier,
-                modifier_node.kind,
-                SourceSyntaxRole::TypeAliasDeclaration,
-            ));
+            return Err(self.unsupported(modifier, modifier_node.kind, role));
         }
         Ok(Some(modifier))
     }
@@ -10721,10 +10734,11 @@ mod tests {
     #[test]
     fn unsupported_interfaces_reject_the_complete_source_plan_atomically() {
         let cases = [
-            "type Earlier = Earlier; export interface Bad { value: string }",
-            "type Earlier = Earlier; interface Bad<T> { value: T }",
-            "type Earlier = Earlier; interface Base {} interface Bad extends Base {}",
-            "type Earlier = Earlier; interface Bad { method(): string }",
+            "type Earlier = Earlier; export declare interface Bad { value: string }",
+            "type Earlier = Earlier; export default interface Bad { value: string }",
+            "type Earlier = Earlier; export interface Bad<T> { value: T }",
+            "type Earlier = Earlier; interface Base {} export interface Bad extends Base {}",
+            "type Earlier = Earlier; export interface Bad { method(): string }",
         ];
         for (index, text) in cases.into_iter().enumerate() {
             let source = parsed(text);

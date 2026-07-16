@@ -10714,6 +10714,99 @@ mod tests {
     }
 
     #[test]
+    fn exported_interface_source_and_local_owner_poison_fails_atomically_and_retries() {
+        let mut fixture = fixture_with_module_state(
+            "export interface Model { value: string }",
+            CanonicalModuleState::External,
+        );
+        let declaration = named_node(&fixture, SyntaxKind::InterfaceDeclaration, "Model");
+        let model = canonical_fixture_symbol(&fixture, SyntaxKind::InterfaceDeclaration, "Model");
+        let (local, source) = {
+            let bound = fixture.files.get(&fixture.file).unwrap();
+            (
+                bound.local_symbol(declaration).unwrap(),
+                fixture
+                    .store
+                    .get_merged_symbol(bound.symbol(bound.source_file()).unwrap())
+                    .unwrap(),
+            )
+        };
+        assert_eq!(fixture.store.symbol(model).unwrap().parent(), Some(source));
+        let local_record = fixture.store.symbol(local).unwrap();
+        let (members, exports, parent) = (
+            local_record.members(),
+            local_record.exports(),
+            local_record.parent(),
+        );
+        assert_eq!(local_record.export_symbol(), Some(model));
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        assert!(fixture.store.set_symbol_flags(
+            source,
+            SymbolFlags::NAMESPACE_MODULE,
+            CheckFlags::NONE,
+        ));
+        let poisoned_source = store_state(&fixture.store);
+        assert!(
+            query_declared(
+                &mut fixture,
+                model,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .is_err()
+        );
+        assert_eq!(store_state(&fixture.store), poisoned_source);
+        assert!(fixture.store.declared_type_links(model).is_none());
+        assert!(diagnostics.is_empty());
+        assert!(fixture.store.set_symbol_flags(
+            source,
+            SymbolFlags::VALUE_MODULE,
+            CheckFlags::NONE,
+        ));
+
+        assert!(
+            fixture
+                .store
+                .set_symbol_relationships(local, members, exports, parent, None,)
+        );
+        let before = store_state(&fixture.store);
+
+        assert!(
+            query_declared(
+                &mut fixture,
+                model,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .is_err()
+        );
+        assert_eq!(store_state(&fixture.store), before);
+        assert!(fixture.store.declared_type_links(model).is_none());
+        assert!(diagnostics.is_empty());
+
+        assert!(fixture.store.set_symbol_relationships(
+            local,
+            members,
+            exports,
+            parent,
+            Some(model),
+        ));
+        let resolved = query_declared(
+            &mut fixture,
+            model,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        assert_eq!(
+            fixture.store.type_payload(resolved).unwrap().symbol(),
+            Some(model)
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
     fn merged_interface_flags_and_parented_property_object_owners_fail_before_allocation() {
         let mut interface = fixture("interface Model { value: string }");
         let model = canonical_fixture_symbol(&interface, SyntaxKind::InterfaceDeclaration, "Model");
