@@ -2060,14 +2060,20 @@ mod tests {
         ));
 
         let initialized = Fixture::new("const f = (x: number = 0): number => x;");
-        assert!(matches!(
-            initialized.plan(0),
-            Err(SourceArrowError::Unsupported(
-                SourceArrowUnsupported::Callable(SourceCallableUnsupported::InitializedParameter(
-                    _
-                ))
-            ))
-        ));
+        let initialized = initialized.plan(0).unwrap();
+        assert_eq!(initialized.callable.min_argument_count, 0);
+        assert!(!initialized.callable.parameters[0].optional);
+        assert!(initialized.callable.parameters[0].initializer.is_some());
+
+        let rest = Fixture::new("const f = (head: string, ...values: number[]): string => head;");
+        let rest = rest.plan(0).unwrap();
+        assert_eq!(rest.callable.min_argument_count, 1);
+        assert!(
+            rest.callable
+                .flags
+                .contains(SignatureFlags::HAS_REST_PARAMETER)
+        );
+        assert!(rest.callable.parameters[1].rest);
 
         let predicate = Fixture::new("const f = (x: unknown): x is string => true;");
         assert!(matches!(

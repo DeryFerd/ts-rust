@@ -916,10 +916,12 @@ const fn source_callable_display_unavailable(
             SourceCallableUnsupported::ThisParameter(_) => {
                 FunctionTypeDisplayUnavailable::ThisParameter
             }
-            SourceCallableUnsupported::RestParameter(_) => {
+            SourceCallableUnsupported::RestParameterNotLast(_)
+            | SourceCallableUnsupported::OptionalRestParameter(_) => {
                 FunctionTypeDisplayUnavailable::RestParameter
             }
-            SourceCallableUnsupported::InitializedParameter(_) => {
+            SourceCallableUnsupported::InitializedRestParameter(_)
+            | SourceCallableUnsupported::OptionalInitializedParameter(_) => {
                 FunctionTypeDisplayUnavailable::InitializedParameter
             }
             SourceCallableUnsupported::DestructuredParameter(_) => {

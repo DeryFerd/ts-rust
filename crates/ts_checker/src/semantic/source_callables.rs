@@ -50,6 +50,8 @@ pub(super) struct SourceCallableParameterPlan {
     identity_node: NodeRef,
     null_literal_identity: bool,
     pub(super) optional: bool,
+    pub(super) initializer: Option<NodeRef>,
+    pub(super) rest: bool,
 }
 
 /// One exact declared type-parameter identity owned by a source signature.
@@ -141,8 +143,10 @@ pub(super) enum SourceCallableUnsupported {
     Modifiers(NodeRef),
     OverloadDeclaration(NodeRef),
     ThisParameter(NodeRef),
-    RestParameter(NodeRef),
-    InitializedParameter(NodeRef),
+    RestParameterNotLast(NodeRef),
+    OptionalRestParameter(NodeRef),
+    InitializedRestParameter(NodeRef),
+    OptionalInitializedParameter(NodeRef),
     DestructuredParameter(NodeRef),
     ParameterModifiers(NodeRef),
     MissingParameterType(NodeRef),
@@ -184,8 +188,10 @@ impl SourceCallableError {
                 | SourceCallableUnsupported::Modifiers(node)
                 | SourceCallableUnsupported::OverloadDeclaration(node)
                 | SourceCallableUnsupported::ThisParameter(node)
-                | SourceCallableUnsupported::RestParameter(node)
-                | SourceCallableUnsupported::InitializedParameter(node)
+                | SourceCallableUnsupported::RestParameterNotLast(node)
+                | SourceCallableUnsupported::OptionalRestParameter(node)
+                | SourceCallableUnsupported::InitializedRestParameter(node)
+                | SourceCallableUnsupported::OptionalInitializedParameter(node)
                 | SourceCallableUnsupported::DestructuredParameter(node)
                 | SourceCallableUnsupported::ParameterModifiers(node)
                 | SourceCallableUnsupported::MissingParameterType(node)
@@ -460,16 +466,6 @@ pub(super) fn plan_source_callable(
             )));
         }
         previous_end = parameter_record.range.end;
-        if data.dot_dot_dot_token.is_some() {
-            return Err(SourceCallableError::Unsupported(
-                SourceCallableUnsupported::RestParameter(parameter),
-            ));
-        }
-        if data.initializer.is_some() {
-            return Err(SourceCallableError::Unsupported(
-                SourceCallableUnsupported::InitializedParameter(parameter),
-            ));
-        }
         if data.modifiers.is_some() {
             return Err(SourceCallableError::Unsupported(
                 SourceCallableUnsupported::ParameterModifiers(parameter),
@@ -496,6 +492,27 @@ pub(super) fn plan_source_callable(
                 SourceCallableUnsupported::ThisParameter(parameter),
             ));
         }
+        let rest = if let Some(dot_id) = data.dot_dot_dot_token {
+            let dot = NodeRef::new(declaration.arena, declaration.file, dot_id);
+            let dot_record = preflight_node(store, host, dot)?;
+            if dot_record.kind != SyntaxKind::DotDotDotToken
+                || dot_record.parent != Some(parameter.node)
+                || dot_record.range.start < parameter_record.range.start
+                || dot_record.range.end > name_record.range.start
+            {
+                return Err(invariant(SourceCallableInvariant::InvalidParameter(
+                    parameter,
+                )));
+            }
+            true
+        } else {
+            false
+        };
+        if rest && parameters.len() + 1 != view.parameters.nodes.len() {
+            return Err(SourceCallableError::Unsupported(
+                SourceCallableUnsupported::RestParameterNotLast(parameter),
+            ));
+        }
         let Some(type_id) = data.type_ else {
             return Err(SourceCallableError::Unsupported(
                 SourceCallableUnsupported::MissingParameterType(parameter),
@@ -519,13 +536,45 @@ pub(super) fn plan_source_callable(
             name_record.range.end,
             type_record.range.start,
         )?;
-        if optional {
+        let initializer = data
+            .initializer
+            .map(|initializer| NodeRef::new(declaration.arena, declaration.file, initializer));
+        if let Some(initializer) = initializer {
+            let initializer_record = preflight_node(store, host, initializer)?;
+            if initializer_record.parent != Some(parameter.node)
+                || initializer_record.range.start < type_record.range.end
+                || initializer_record.range.end > parameter_record.range.end
+            {
+                return Err(invariant(SourceCallableInvariant::InvalidParameter(
+                    parameter,
+                )));
+            }
+        }
+        if rest && optional {
+            return Err(SourceCallableError::Unsupported(
+                SourceCallableUnsupported::OptionalRestParameter(parameter),
+            ));
+        }
+        if rest && initializer.is_some() {
+            return Err(SourceCallableError::Unsupported(
+                SourceCallableUnsupported::InitializedRestParameter(parameter),
+            ));
+        }
+        if optional && initializer.is_some() {
+            return Err(SourceCallableError::Unsupported(
+                SourceCallableUnsupported::OptionalInitializedParameter(parameter),
+            ));
+        }
+        if rest {
+            flags |= SignatureFlags::HAS_REST_PARAMETER;
+        } else if optional {
             optional_seen = true;
-        } else if optional_seen {
+        } else if optional_seen && initializer.is_none() {
             return Err(SourceCallableError::Unsupported(
                 SourceCallableUnsupported::RequiredAfterOptional(parameter),
             ));
-        } else {
+        }
+        if !optional && initializer.is_none() && !rest {
             min_argument_count = parameters.len() + 1;
         }
         let raw_symbol = bound
@@ -563,6 +612,8 @@ pub(super) fn plan_source_callable(
             identity_node,
             null_literal_identity: is_null_literal_type(store, host, identity_node)?,
             optional,
+            initializer,
+            rest,
         });
     }
 
@@ -996,7 +1047,7 @@ fn validate_exact_generic_annotation_shape(
                 type_parameter,
             )?;
         }
-        if parameter.optional || !exact {
+        if parameter.optional || parameter.initializer.is_some() || parameter.rest || !exact {
             return Err(SourceCallableError::Unsupported(
                 SourceCallableUnsupported::GenericSignature(plan.declaration),
             ));
@@ -1565,7 +1616,7 @@ pub(super) fn reserve_source_callable_capacities(
                 .checked_add(
                     plan.parameters
                         .iter()
-                        .filter(|parameter| parameter.optional)
+                        .filter(|parameter| parameter.optional || parameter.initializer.is_some())
                         .count(),
                 )
                 .ok_or_else(|| invariant(SourceCallableInvariant::Capacity(plan.declaration)))?;
@@ -2032,7 +2083,7 @@ pub(super) fn publish_source_callable_parameter_types(
         let signature = exact_signature_link(store, callable.plan.declaration)?;
         let mut callable_parameter_types = Vec::with_capacity(callable.plan.parameters.len());
         for (parameter, base) in callable.plan.parameters.iter().zip(&callable.base_types) {
-            let type_ = if strict && parameter.optional {
+            let call_type = if strict && (parameter.optional || parameter.initializer.is_some()) {
                 let already_contains_undefined = *base == undefined
                     || store.type_payload(*base).is_some_and(|record| {
                         matches!(
@@ -2061,15 +2112,20 @@ pub(super) fn publish_source_callable_parameter_types(
                 *base
             };
             if store
-                .validate_cached_array_capability_prepared(type_, global_types, prepared)
+                .validate_cached_array_capability_prepared(call_type, global_types, prepared)
                 .is_err()
             {
                 return Err(invariant(SourceCallableInvariant::InvalidParameterCache(
                     parameter.declaration,
                 )));
             }
-            resolved.push((parameter.symbol, type_));
-            callable_parameter_types.push(type_);
+            let value_type = if parameter.initializer.is_some() {
+                *base
+            } else {
+                call_type
+            };
+            resolved.push((parameter.symbol, value_type));
+            callable_parameter_types.push(call_type);
         }
         expected_parameter_types.push((signature, callable_parameter_types));
     }
@@ -2355,7 +2411,7 @@ pub(super) fn source_callable_display_projection(
         parameters.push(ValidatedSingleCallParameterDisplay {
             name: identifier.text.clone(),
             value_type,
-            optional: parameter.optional,
+            optional: parameter.optional || parameter.initializer.is_some(),
         });
     }
     Ok(ValidatedSingleCallSignatureDisplay {
@@ -2495,17 +2551,24 @@ pub(super) fn validate_stored_source_callable(
                     }
                     Some(links) if links.resolved_type.is_some() => {
                         let resolved = links.resolved_type.expect("the branch checked the type");
+                        let expected = expected_parameter_types
+                            .and_then(|types| types.get(index))
+                            .copied();
                         let valid = links
                             == &(ValueSymbolLinks {
                                 resolved_type: Some(resolved),
                                 ..ValueSymbolLinks::default()
                             })
-                            && expected_parameter_types
-                                .and_then(|types| types.get(index))
-                                .copied()
-                                == Some(resolved);
+                            && expected.is_some_and(|expected| {
+                                store.type_payload(expected).is_some()
+                                    && (expected == resolved
+                                        || valid_optional_type(store, None, resolved, expected))
+                            });
                         if valid {
                             edges.push(resolved);
+                            if expected != Some(resolved) {
+                                edges.push(expected.expect("the optional call type was validated"));
+                            }
                         }
                         valid
                     }
@@ -2561,7 +2624,7 @@ pub(super) fn validate_stored_source_callable(
             & !(if contextual.is_some() {
                 SignatureFlags::HAS_REST_PARAMETER
             } else {
-                SignatureFlags::HAS_LITERAL_TYPES
+                SignatureFlags::HAS_LITERAL_TYPES | SignatureFlags::HAS_REST_PARAMETER
             })
             .bits()
             != 0
@@ -3137,12 +3200,11 @@ fn validate_parameter_links(
             parameter.declaration,
         )));
     };
-    if resolved != expected
-        || links
-            != &(ValueSymbolLinks {
-                resolved_type: Some(resolved),
-                ..ValueSymbolLinks::default()
-            })
+    if links
+        != &(ValueSymbolLinks {
+            resolved_type: Some(resolved),
+            ..ValueSymbolLinks::default()
+        })
     {
         return Err(invariant(SourceCallableInvariant::InvalidParameterCache(
             parameter.declaration,
@@ -3167,12 +3229,17 @@ fn validate_parameter_links(
         })?
         .options
         .strict_null_checks;
-    let valid = if strict && parameter.optional {
+    let call_type_valid = if strict && (parameter.optional || parameter.initializer.is_some()) {
+        valid_optional_type(store, plan.array_targets, base, expected)
+    } else {
+        base == expected
+    };
+    let value_type_valid = if strict && parameter.optional {
         valid_optional_type(store, plan.array_targets, base, resolved)
     } else {
         base == resolved
     };
-    if !valid {
+    if !call_type_valid || !value_type_valid {
         return Err(invariant(SourceCallableInvariant::InvalidParameterCache(
             parameter.declaration,
         )));
