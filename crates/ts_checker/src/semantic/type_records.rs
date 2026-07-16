@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 
-use ts_ast::NodeRef;
+use ts_ast::{NodeRef, SyntaxKind};
 use ts_binder::{EscapedName, InternalSymbolName, SemanticSymbolId, SymbolTableId};
 use ts_jsnum::{Number, PseudoBigInt};
 
@@ -608,6 +608,16 @@ impl TypeRecord {
 pub type CanonicalSemanticStore<MapperPayload> = SemanticStore<TypeRecord, MapperPayload>;
 
 impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
+    pub(super) fn type_is_function_type_object(&self, type_: TypeId) -> bool {
+        self.type_payload(type_)
+            .and_then(TypeRecord::symbol)
+            .and_then(|symbol| self.symbol(symbol))
+            .and_then(ts_binder::semantic::Symbol::declarations)
+            .is_some_and(|declarations| {
+                matches!(declarations, [declaration] if self.source_node_kind(*declaration) == Some(SyntaxKind::FunctionType))
+            })
+    }
+
     fn alloc_record(
         &mut self,
         flags: TypeFlags,
@@ -1262,6 +1272,7 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         if !self.valid_optional_record_type(constraint) {
             return false;
         }
+        let dirty = self.type_is_function_type_object(id);
         let Some(constrained) = self
             .type_payload_mut(id)
             .and_then(|record| record.data.constrained_mut())
@@ -1269,6 +1280,9 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
             return false;
         };
         constrained.resolved_base_constraint = constraint;
+        if dirty {
+            self.mark_union_cache_validation_dirty();
+        }
         true
     }
 
@@ -1291,6 +1305,11 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
             return false;
         }
         let call_count = call_signatures.as_ref().map_or(0, Vec::len);
+        let dirty = self.type_is_function_type_object(id)
+            && self
+                .type_payload(id)
+                .and_then(|record| record.data().structured())
+                .is_some_and(|structured| structured != &StructuredTypeData::default());
         let signatures = match (call_signatures, construct_signatures) {
             (None, None) => None,
             (Some(call), None) if call.is_empty() => None,
@@ -1303,18 +1322,23 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
                     .collect(),
             ),
         };
-        let Some(record) = self.type_payload_mut(id) else {
-            return false;
-        };
-        let Some(structured) = record.data.structured_mut() else {
-            return false;
-        };
-        structured.members = members;
-        structured.properties = properties;
-        structured.signatures = signatures;
-        structured.call_signature_count = call_count;
-        structured.index_infos = index_infos;
-        record.object_flags |= ObjectFlags::MEMBERS_RESOLVED;
+        {
+            let Some(record) = self.type_payload_mut(id) else {
+                return false;
+            };
+            let Some(structured) = record.data.structured_mut() else {
+                return false;
+            };
+            structured.members = members;
+            structured.properties = properties;
+            structured.signatures = signatures;
+            structured.call_signature_count = call_count;
+            structured.index_infos = index_infos;
+            record.object_flags |= ObjectFlags::MEMBERS_RESOLVED;
+        }
+        if dirty {
+            self.mark_union_cache_validation_dirty();
+        }
         true
     }
 
@@ -1326,6 +1350,7 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         if !self.valid_optional_record_type(value) {
             return false;
         }
+        let dirty = self.type_is_function_type_object(id);
         let Some(structured) = self
             .type_payload_mut(id)
             .and_then(|record| record.data.structured_mut())
@@ -1333,6 +1358,9 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
             return false;
         };
         structured.object_type_without_abstract_construct_signatures = value;
+        if dirty {
+            self.mark_union_cache_validation_dirty();
+        }
         true
     }
 
@@ -1351,6 +1379,7 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         ) {
             return false;
         }
+        let dirty = self.type_is_function_type_object(id);
         let Some(object) = self
             .type_payload_mut(id)
             .and_then(|record| record.data.object_mut())
@@ -1359,6 +1388,9 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         };
         object.target = target;
         object.mapper = mapper;
+        if dirty {
+            self.mark_union_cache_validation_dirty();
+        }
         true
     }
 
@@ -1376,6 +1408,7 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         ) {
             return false;
         }
+        let dirty = self.type_is_function_type_object(id);
         let Some(object) = self
             .type_payload_mut(id)
             .and_then(|record| record.data.object_mut())
@@ -1383,6 +1416,9 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
             return false;
         };
         object.instantiations = instantiations;
+        if dirty {
+            self.mark_union_cache_validation_dirty();
+        }
         true
     }
 

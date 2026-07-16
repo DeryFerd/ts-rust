@@ -25,8 +25,9 @@ use super::{
     CanonicalGlobalTypes, CanonicalModuleResolutionLookup, CanonicalModuleResolutionManifest,
     CanonicalModuleResolutionManifestError, CanonicalModuleResolutionManifestInput,
     CanonicalTypeFormatFlags, CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHost,
-    DeclaredTypeHostError, IntrinsicBootstrapError, IntrinsicBootstrapOptions, SourceCheckError,
-    SourceCheckProvenanceError, SourceFileRef, SymbolMergeError, TypeDisplayUnavailable, TypeId,
+    DeclaredTypeHostError, IntrinsicBootstrapError, IntrinsicBootstrapOptions, SignatureId,
+    SourceCheckError, SourceCheckProvenanceError, SourceFileRef, SymbolMergeError,
+    TypeDisplayUnavailable, TypeId,
     alias::{CanonicalAliasResolution, CanonicalAliasResolutionError, CanonicalAliasResolver},
     alias_flags::{
         CanonicalSymbolFlagsError, CanonicalSymbolFlagsResolution, CanonicalSymbolFlagsResolver,
@@ -587,6 +588,40 @@ impl<'arena> CanonicalCheckerContext<'arena> {
             diagnostics,
         )?
         .get_type_from_type_node(node)
+    }
+
+    /// Resolves the lazy return type of one exact annotated function-type
+    /// signature through the context-owned query session.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed host, provenance, cache, or unavailable error when the
+    /// signature is foreign or is outside the installed function-type cut.
+    pub fn get_return_type_of_signature(
+        &mut self,
+        signature: SignatureId,
+    ) -> Result<TypeId, DeclaredTypeError> {
+        let Self {
+            options,
+            files,
+            store,
+            diagnostics,
+            global_types,
+            ..
+        } = self;
+        let host = DeclaredTypeHost::from_registry(
+            store,
+            files,
+            GlobalMergeCompletion::new(options.name_resolution),
+        )?;
+        CanonicalTypeQuery::new_with_global_types(
+            store,
+            &host,
+            global_types,
+            *options,
+            diagnostics,
+        )?
+        .get_return_type_of_signature(signature)
     }
 
     /// Checks the supported statements in one retained source file.

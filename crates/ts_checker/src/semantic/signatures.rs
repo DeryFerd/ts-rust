@@ -429,6 +429,10 @@ impl SignatureArena {
         self.signatures.len()
     }
 
+    pub(super) fn try_reserve(&mut self, additional: usize) -> bool {
+        self.signatures.try_reserve(additional)
+    }
+
     #[must_use]
     pub(super) fn iter(&self) -> impl ExactSizeIterator<Item = (SignatureId, &Signature)> {
         self.signatures.iter()

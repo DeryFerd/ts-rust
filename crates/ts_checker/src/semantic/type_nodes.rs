@@ -11,8 +11,8 @@ use xxhash_rust::xxh3::Xxh3;
 
 use super::{
     CanonicalCheckerDiagnostics, CanonicalCheckerOptions, CanonicalGlobalTypes,
-    CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHost, DeclaredTypeUnavailable, TypeId,
-    TypeResolutionTarget, TypeSystemPropertyName, UnsupportedDeclaredTypeKind,
+    CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHost, DeclaredTypeUnavailable,
+    SignatureId, TypeId, TypeResolutionTarget, TypeSystemPropertyName, UnsupportedDeclaredTypeKind,
     array_types::CanonicalArrayTargets,
     bootstrap::{LiteralTypeCacheError, PreparedTypeQueryTypes},
     declared::{
@@ -21,11 +21,15 @@ use super::{
         malformed_alias_merge, preflight_class_or_interface_reference, preflight_node,
         preflight_type_parameter_symbol, type_list_key,
     },
+    functions::{
+        self, FunctionTypeError, FunctionTypePlan, PendingFunctionTypeProof, PendingParameterTypes,
+    },
     global_types::{
         create_type_from_generic_global_type, preflight_generic_global_type_target,
         validate_generic_global_type_instantiation,
     },
     object_members::{self, PropertyObjectError, PropertyObjectPlan, PropertyObjectState},
+    signatures::Signature,
     type_records::{CacheHashKey, TypeData, TypeRecord},
     types::ObjectFlags,
 };
@@ -120,6 +124,8 @@ pub enum TypeNodeUnavailable {
     UnsupportedUnionConstituentType(TypeId),
     InvalidCachedUnionType(TypeId),
     InvalidCachedArrayType(TypeId),
+    InvalidFunctionType(NodeRef),
+    InvalidFunctionSignature(SignatureId),
     InvalidUnionAlias(SemanticSymbolId),
     InvalidPreparedTypeQuery,
     LiteralTypeCapacity,
@@ -180,6 +186,8 @@ struct TypeQueryPlan {
     unions: BTreeMap<NodeRef, PlannedUnionType>,
     type_literals: BTreeMap<NodeRef, PropertyObjectPlan>,
     interfaces: BTreeMap<SemanticSymbolId, PropertyObjectPlan>,
+    functions: BTreeMap<NodeRef, FunctionTypePlan>,
+    pending_function_proofs: Vec<PendingFunctionTypeProof>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -233,6 +241,7 @@ enum CachedTypeAliasRhs {
     DirectUnion,
     TypeReference(NodeRef),
     TypeLiteral(NodeRef),
+    FunctionType(NodeRef),
     NonUnion,
 }
 
@@ -266,6 +275,39 @@ fn property_object_error(error: PropertyObjectError) -> DeclaredTypeError {
         }
         PropertyObjectError::Capacity(_) => {
             type_node_unavailable(TypeNodeUnavailable::LiteralTypeCapacity)
+        }
+    }
+}
+
+fn function_type_error(error: FunctionTypeError) -> DeclaredTypeError {
+    match error {
+        FunctionTypeError::DeclaredType(error) => error,
+        FunctionTypeError::LiteralCache(error) => type_construction_error(error),
+        error @ (FunctionTypeError::Unsupported(_) | FunctionTypeError::Invariant(_)) => {
+            let node = error
+                .node()
+                .expect("syntax and invariant function errors retain their node");
+            type_node_unavailable(match error {
+                FunctionTypeError::Unsupported(_) => TypeNodeUnavailable::UnsupportedSyntax {
+                    node,
+                    kind: SyntaxKind::FunctionType,
+                },
+                FunctionTypeError::Invariant(_) => TypeNodeUnavailable::InvalidFunctionType(node),
+                FunctionTypeError::DeclaredType(_) | FunctionTypeError::LiteralCache(_) => {
+                    unreachable!("covered above")
+                }
+            })
+        }
+    }
+}
+
+fn function_signature_error(error: FunctionTypeError, signature: SignatureId) -> DeclaredTypeError {
+    match error {
+        FunctionTypeError::DeclaredType(error) => error,
+        FunctionTypeError::LiteralCache(error) => type_construction_error(error),
+        FunctionTypeError::Unsupported(_) => function_type_error(error),
+        FunctionTypeError::Invariant(_) => {
+            type_node_unavailable(TypeNodeUnavailable::InvalidFunctionSignature(signature))
         }
     }
 }
@@ -570,7 +612,8 @@ struct TypeQueryPlanner<'store, 'host, 'arena> {
     plan: TypeQueryPlan,
     planning_defaults: HashSet<(SemanticSymbolId, NodeRef)>,
     planning_interfaces: HashSet<SemanticSymbolId>,
-    active_structural_aliases: Vec<SemanticSymbolId>,
+    active_structural_aliases: Vec<(SemanticSymbolId, usize)>,
+    function_indirection_depth: usize,
 }
 
 impl<'store, 'host, 'arena> TypeQueryPlanner<'store, 'host, 'arena> {
@@ -591,6 +634,7 @@ impl<'store, 'host, 'arena> TypeQueryPlanner<'store, 'host, 'arena> {
             planning_defaults: HashSet::new(),
             planning_interfaces: HashSet::new(),
             active_structural_aliases: Vec::new(),
+            function_indirection_depth: 0,
         }
     }
 
@@ -672,11 +716,12 @@ impl<'store, 'host, 'arena> TypeQueryPlanner<'store, 'host, 'arena> {
         if record.flags.0 & NODE_FLAG_JSDOC != 0 {
             return Err(type_node_unavailable(TypeNodeUnavailable::JsDoc(node)));
         }
-        if let Some(cached) = self
+        let cached = self
             .store
             .type_node_links(node)
-            .and_then(|links| links.resolved_type)
-        {
+            .and_then(|links| links.resolved_type);
+        let mut deferred_cached_validation = false;
+        if let Some(cached) = cached {
             if record.kind == SyntaxKind::UnionType {
                 let derived_alias = self.direct_union_alias(node)?;
                 if alias_owner.is_some() && derived_alias != alias_owner {
@@ -684,16 +729,33 @@ impl<'store, 'host, 'arena> TypeQueryPlanner<'store, 'host, 'arena> {
                         TypeNodeUnavailable::InvalidUnionType(node),
                     ));
                 }
-                self.validate_cached_union_result(cached, alias_owner.or(derived_alias))
-                    .map_err(type_construction_error)?;
-                return Ok(());
-            }
-            if union_constituent {
-                self.validate_cached_union_result(cached, None)
-                    .map_err(type_construction_error)?;
+                match self.validate_cached_union_result(cached, alias_owner.or(derived_alias)) {
+                    Ok(()) => return Ok(()),
+                    Err(LiteralTypeCacheError::InvalidCachedUnion(type_))
+                        if self.is_pending_stored_function_type(type_) =>
+                    {
+                        deferred_cached_validation = true;
+                    }
+                    Err(error) => return Err(type_construction_error(error)),
+                }
+            } else if union_constituent
+                && !matches!(
+                    record.kind,
+                    SyntaxKind::FunctionType | SyntaxKind::TypeReference
+                )
+            {
+                match self.validate_cached_union_result(cached, None) {
+                    Ok(()) => {}
+                    Err(LiteralTypeCacheError::InvalidCachedUnion(type_))
+                        if self.is_pending_stored_function_type(type_) =>
+                    {
+                        deferred_cached_validation = true;
+                    }
+                    Err(error) => return Err(type_construction_error(error)),
+                }
             }
         }
-        match record.kind {
+        let result = match record.kind {
             SyntaxKind::AnyKeyword
             | SyntaxKind::UnknownKeyword
             | SyntaxKind::StringKeyword
@@ -733,6 +795,7 @@ impl<'store, 'host, 'arena> TypeQueryPlanner<'store, 'host, 'arena> {
             )),
             SyntaxKind::ArrayType => self.plan_array_type(node, alias_owner),
             SyntaxKind::TypeLiteral => self.plan_property_type_literal(node, alias_owner),
+            SyntaxKind::FunctionType => self.plan_function_type(node, alias_owner),
             SyntaxKind::TypeReference => {
                 self.plan_type_reference(node, alias_owner, union_constituent)
             }
@@ -743,7 +806,25 @@ impl<'store, 'host, 'arena> TypeQueryPlanner<'store, 'host, 'arena> {
             kind => Err(type_node_unavailable(
                 TypeNodeUnavailable::UnsupportedSyntax { node, kind },
             )),
+        };
+        result?;
+        if let Some(cached) = cached {
+            if deferred_cached_validation && record.kind == SyntaxKind::UnionType {
+                let derived_alias = self.direct_union_alias(node)?;
+                self.validate_cached_union_result(cached, alias_owner.or(derived_alias))
+                    .map_err(type_construction_error)?;
+            } else if deferred_cached_validation
+                || union_constituent
+                    && matches!(
+                        record.kind,
+                        SyntaxKind::FunctionType | SyntaxKind::TypeReference
+                    )
+            {
+                self.validate_cached_union_result(cached, None)
+                    .map_err(type_construction_error)?;
+            }
         }
+        Ok(())
     }
 
     fn validate_cached_union_result(
@@ -751,28 +832,30 @@ impl<'store, 'host, 'arena> TypeQueryPlanner<'store, 'host, 'arena> {
         cached: TypeId,
         expected_alias: Option<SemanticSymbolId>,
     ) -> Result<(), LiteralTypeCacheError> {
-        match self.array_targets {
-            Some(targets) => self.store.validate_cached_union_result_with_array_targets(
-                targets,
+        self.store
+            .validate_cached_union_result_with_pending_functions(
+                self.array_targets,
                 cached,
                 expected_alias,
-            ),
-            None => self
-                .store
-                .validate_cached_union_result(cached, expected_alias),
-        }
+                &self.plan.pending_function_proofs,
+            )
     }
 
     fn validate_cached_array_capability(
         &self,
         cached: TypeId,
     ) -> Result<(), LiteralTypeCacheError> {
-        match self.array_targets {
-            Some(targets) => self
-                .store
-                .validate_cached_array_capability_with_array_targets(targets, cached),
-            None => self.store.validate_cached_array_capability(cached),
-        }
+        self.store
+            .validate_cached_array_capability_with_pending_functions(
+                self.array_targets,
+                cached,
+                &self.plan.pending_function_proofs,
+            )
+    }
+
+    fn is_pending_stored_function_type(&self, type_: TypeId) -> bool {
+        functions::validate_stored_function_type(self.store, type_)
+            == functions::StoredFunctionTypeValidation::Pending
     }
 
     fn plan_array_type(
@@ -940,7 +1023,11 @@ impl<'store, 'host, 'arena> TypeQueryPlanner<'store, 'host, 'arena> {
         self.plan.type_literals.insert(node, planned.clone());
 
         let pushed_alias = if let Some(alias) = alias_owner {
-            if self.active_structural_aliases.contains(&alias) {
+            if self
+                .active_structural_aliases
+                .iter()
+                .any(|(active, _)| *active == alias)
+            {
                 return Err(type_node_unavailable(
                     TypeNodeUnavailable::GenericReferenceUnsupported {
                         node,
@@ -948,7 +1035,8 @@ impl<'store, 'host, 'arena> TypeQueryPlanner<'store, 'host, 'arena> {
                     },
                 ));
             }
-            self.active_structural_aliases.push(alias);
+            self.active_structural_aliases
+                .push((alias, self.function_indirection_depth));
             true
         } else {
             false
@@ -957,9 +1045,69 @@ impl<'store, 'host, 'arena> TypeQueryPlanner<'store, 'host, 'arena> {
             .property_type_nodes()
             .try_for_each(|property| self.plan_type_node_in_context(property, None, false));
         if pushed_alias {
-            assert_eq!(self.active_structural_aliases.pop(), alias_owner);
+            assert_eq!(
+                self.active_structural_aliases.pop().map(|(alias, _)| alias),
+                alias_owner
+            );
         }
         result
+    }
+
+    fn plan_function_type(
+        &mut self,
+        node: NodeRef,
+        alias_owner: Option<SemanticSymbolId>,
+    ) -> Result<(), DeclaredTypeError> {
+        let alias_is_generic = alias_owner.is_some_and(|alias| {
+            self.plan
+                .aliases
+                .get(&alias)
+                .is_some_and(|plan| !plan.type_parameters.is_empty())
+        });
+        let planned = functions::plan_function_type(
+            self.store,
+            self.host,
+            node,
+            alias_owner,
+            alias_is_generic,
+            self.array_targets,
+        )
+        .map_err(function_type_error)?;
+        if let Some(existing) = self.plan.functions.get(&node) {
+            return if existing == &planned {
+                Ok(())
+            } else {
+                Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidFunctionType(node),
+                ))
+            };
+        }
+        self.plan.functions.insert(node, planned.clone());
+        if let Some(proof) = functions::pending_function_type_proof(self.store, &planned)
+            .map_err(function_type_error)?
+            && !self.plan.pending_function_proofs.contains(&proof)
+        {
+            self.plan.pending_function_proofs.push(proof);
+        }
+        self.function_indirection_depth = self
+            .function_indirection_depth
+            .checked_add(1)
+            .ok_or_else(|| type_node_unavailable(TypeNodeUnavailable::InvalidFunctionType(node)))?;
+        let result = planned.parameters.iter().try_for_each(|parameter| {
+            self.plan_type_node_in_context(parameter.type_node, None, false)
+        });
+        self.function_indirection_depth -= 1;
+        result
+    }
+
+    fn plan_function_return_type(&mut self, node: NodeRef) -> Result<(), DeclaredTypeError> {
+        let return_type = self
+            .plan
+            .functions
+            .get(&node)
+            .map(|function| function.return_type)
+            .ok_or_else(|| type_node_unavailable(TypeNodeUnavailable::InvalidFunctionType(node)))?;
+        self.plan_type_node_in_context(return_type, None, false)
     }
 
     fn plan_property_interface(
@@ -1179,6 +1327,7 @@ impl<'store, 'host, 'arena> TypeQueryPlanner<'store, 'host, 'arena> {
                     SyntaxKind::UnionType => CachedTypeAliasRhs::DirectUnion,
                     SyntaxKind::TypeReference => CachedTypeAliasRhs::TypeReference(type_node),
                     SyntaxKind::TypeLiteral => CachedTypeAliasRhs::TypeLiteral(type_node),
+                    SyntaxKind::FunctionType => CachedTypeAliasRhs::FunctionType(type_node),
                     _ => CachedTypeAliasRhs::NonUnion,
                 });
             }
@@ -1206,9 +1355,8 @@ impl<'store, 'host, 'arena> TypeQueryPlanner<'store, 'host, 'arena> {
         let declared_type = cached.declared_type;
         let declared_data = self.store.type_payload(declared_type).map(TypeRecord::data);
         let remains_union = matches!(declared_data, Some(TypeData::Union(_)));
-        let cached_array_capability_error = self
-            .validate_cached_array_capability(declared_type)
-            .err();
+        let cached_array_capability_error =
+            self.validate_cached_array_capability(declared_type).err();
         if let Some(error) = cached_array_capability_error
             && !matches!(error, LiteralTypeCacheError::UnsupportedUnionConstituent(_))
         {
@@ -1326,6 +1474,22 @@ impl<'store, 'host, 'arena> TypeQueryPlanner<'store, 'host, 'arena> {
                     }
                     return Ok(());
                 }
+                CachedTypeAliasRhs::FunctionType(function_type) => {
+                    if !missing_generic_metadata.is_empty()
+                        || remains_union
+                        || self
+                            .store
+                            .type_node_links(function_type)
+                            .and_then(|links| links.resolved_type)
+                            != Some(declared_type)
+                        || !matches!(declared_data, Some(TypeData::Object(_)))
+                    {
+                        return Err(type_node_unavailable(
+                            TypeNodeUnavailable::InvalidCachedTypeAlias(root_symbol),
+                        ));
+                    }
+                    return Ok(());
+                }
                 CachedTypeAliasRhs::TypeReference(reference) => {
                     if self
                         .store
@@ -1391,15 +1555,13 @@ impl<'store, 'host, 'arena> TypeQueryPlanner<'store, 'host, 'arena> {
                                 declared_type,
                             )
                             .map_err(|_| {
-                                type_node_unavailable(
-                                    TypeNodeUnavailable::InvalidCachedTypeAlias(root_symbol),
-                                )
+                                type_node_unavailable(TypeNodeUnavailable::InvalidCachedTypeAlias(
+                                    root_symbol,
+                                ))
                             })?;
-                            let cached_argument = generic_global_instantiation_argument(
-                                self.store,
-                                declared_type,
-                            )
-                            .expect("the generic-global cache was preflighted");
+                            let cached_argument =
+                                generic_global_instantiation_argument(self.store, declared_type)
+                                    .expect("the generic-global cache was preflighted");
                             return if self.cached_array_element_identity(arguments[0])?
                                 == Some(cached_argument)
                             {
@@ -2003,10 +2165,17 @@ impl<'store, 'host, 'arena> TypeQueryPlanner<'store, 'host, 'arena> {
             .store
             .type_node_links(node)
             .and_then(|links| links.resolved_type);
+        let mut cached_pending_function = false;
         let cached_array_capability_missing = if let Some(cached) = cached_type {
             match self.validate_cached_array_capability(cached) {
                 Ok(()) => false,
                 Err(LiteralTypeCacheError::UnsupportedUnionConstituent(_)) => true,
+                Err(LiteralTypeCacheError::InvalidCachedUnion(type_))
+                    if self.is_pending_stored_function_type(type_) =>
+                {
+                    cached_pending_function = true;
+                    false
+                }
                 Err(error) => return Err(type_construction_error(error)),
             }
         } else {
@@ -2018,6 +2187,7 @@ impl<'store, 'host, 'arena> TypeQueryPlanner<'store, 'host, 'arena> {
         if !union_constituent
             && cached_type.is_some()
             && !cached_array_capability_missing
+            && !cached_pending_function
             && !cached_syntax_contains_builtin_array
             && !self.cached_property_interface_reference(node)
             && !matches!(identifier.text.as_str(), "Array" | "ReadonlyArray")
@@ -2115,7 +2285,11 @@ impl<'store, 'host, 'arena> TypeQueryPlanner<'store, 'host, 'arena> {
         }
 
         if flags.contains(SymbolFlags::TYPE_ALIAS)
-            && self.active_structural_aliases.contains(&symbol)
+            && self
+                .active_structural_aliases
+                .iter()
+                .find_map(|(active, depth)| (*active == symbol).then_some(*depth))
+                .is_some_and(|depth| self.function_indirection_depth <= depth)
         {
             return Err(type_node_unavailable(
                 TypeNodeUnavailable::GenericReferenceUnsupported { node, symbol },
@@ -2288,9 +2462,7 @@ impl<'store, 'host, 'arena> TypeQueryPlanner<'store, 'host, 'arena> {
                 )?;
                 let cached_argument = generic_global_instantiation_argument(self.store, cached)
                     .expect("the generic-global cache was preflighted");
-                if self.cached_array_element_identity(type_arguments[0])?
-                    != Some(cached_argument)
-                {
+                if self.cached_array_element_identity(type_arguments[0])? != Some(cached_argument) {
                     return Err(type_node_unavailable(
                         TypeNodeUnavailable::InvalidTypeReference(node),
                     ));
@@ -2316,6 +2488,10 @@ impl<'store, 'host, 'arena> TypeQueryPlanner<'store, 'host, 'arena> {
         if let Some(existing) = self.plan.references.insert(node, planned.clone()) {
             assert_eq!(existing, planned, "one type-reference node has one plan");
         }
+        if cached_pending_function && let Some(cached) = cached_type {
+            self.validate_cached_array_capability(cached)
+                .map_err(type_construction_error)?;
+        }
         Ok(())
     }
 
@@ -2339,12 +2515,9 @@ impl<'store, 'host, 'arena> TypeQueryPlanner<'store, 'host, 'arena> {
             let Some(target_symbol) = record.symbol() else {
                 continue;
             };
-            let target_symbol = self
-                .store
-                .get_merged_symbol(target_symbol)
-                .ok_or_else(|| {
-                    type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node))
-                })?;
+            let target_symbol = self.store.get_merged_symbol(target_symbol).ok_or_else(|| {
+                type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node))
+            })?;
             if target_symbol == symbol {
                 preflight_generic_global_type_target(self.store, target).map_err(|_| {
                     type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node))
@@ -2365,11 +2538,7 @@ impl<'store, 'host, 'arena> TypeQueryPlanner<'store, 'host, 'arena> {
                 TypeNodeUnavailable::InvalidTypeReference(reference),
             ));
         };
-        let name = NodeRef::new(
-            reference.arena,
-            reference.file,
-            reference_data.type_name,
-        );
+        let name = NodeRef::new(reference.arena, reference.file, reference_data.type_name);
         let name_node = preflight_node(self.store, self.host, name)?;
         let NodeData::Identifier(identifier) = &name_node.data else {
             return Ok(None);
@@ -2723,19 +2892,26 @@ impl<'store, 'host, 'arena> TypeQueryPlanner<'store, 'host, 'arena> {
             symbol,
             self.strict_builtin_iterator_return,
         )?;
-        if let Some(cached) = cached {
-            self.validate_cached_type_alias_identity(symbol, cached, union_constituent)?;
-        }
-        let cached_array_capability_missing = cached.is_some_and(|cached| {
-            matches!(
-                self.validate_cached_array_capability(cached.declared_type),
-                Err(LiteralTypeCacheError::UnsupportedUnionConstituent(_))
-            )
-        });
         if let Some(plan) = self.plan.aliases.get(&symbol) {
+            if let Some(cached) = cached {
+                self.validate_cached_type_alias_identity(symbol, cached, union_constituent)?;
+            }
             return Ok(cached.map_or(plan.type_parameters.len(), |cached| {
                 cached.type_parameter_count
             }));
+        }
+
+        let mut cached_pending_function = false;
+        if let Some(cached) = cached {
+            match self.validate_cached_type_alias_identity(symbol, cached, union_constituent) {
+                Ok(()) => {}
+                Err(DeclaredTypeError::TypeNodeUnavailable(
+                    TypeNodeUnavailable::InvalidCachedUnionType(type_),
+                )) if self.is_pending_stored_function_type(type_) => {
+                    cached_pending_function = true;
+                }
+                Err(error) => return Err(error),
+            }
         }
 
         let record = self.store.symbol(symbol).ok_or({
@@ -2764,8 +2940,25 @@ impl<'store, 'host, 'arena> TypeQueryPlanner<'store, 'host, 'arena> {
                 .first()
                 .is_some_and(|declaration| self.host.source(*declaration).is_none())
         {
+            self.validate_cached_type_alias_identity(symbol, cached_alias, union_constituent)?;
             return Ok(cached_alias.type_parameter_count);
         }
+
+        let cached_array_capability_missing = if let Some(cached) = cached {
+            match self.validate_cached_array_capability(cached.declared_type) {
+                Ok(()) => false,
+                Err(LiteralTypeCacheError::UnsupportedUnionConstituent(_)) => true,
+                Err(LiteralTypeCacheError::InvalidCachedUnion(type_))
+                    if self.is_pending_stored_function_type(type_) =>
+                {
+                    cached_pending_function = true;
+                    false
+                }
+                Err(error) => return Err(type_construction_error(error)),
+            }
+        } else {
+            false
+        };
 
         let mut first = None;
         let mut type_parameters = Vec::new();
@@ -2885,13 +3078,15 @@ impl<'store, 'host, 'arena> TypeQueryPlanner<'store, 'host, 'arena> {
         );
         if cached.is_none()
             || cached_array_capability_missing
+            || cached_pending_function
             || self.direct_type_literal_rhs(type_node)?
-            || self.type_node_contains_builtin_array_reference(
-                type_node,
-                &mut HashSet::new(),
-            )?
+            || self.direct_function_type_rhs(type_node)?
+            || self.type_node_contains_builtin_array_reference(type_node, &mut HashSet::new())?
         {
             self.plan_type_node_in_context(type_node, Some(symbol), union_constituent)?;
+        }
+        if cached_pending_function && let Some(cached) = cached {
+            self.validate_cached_type_alias_identity(symbol, cached, union_constituent)?;
         }
         Ok(type_parameter_count)
     }
@@ -2977,8 +3172,7 @@ impl<'store, 'host, 'arena> TypeQueryPlanner<'store, 'host, 'arena> {
                         type_node_unavailable(TypeNodeUnavailable::InvalidLiteralType(node))
                     })?;
                     let type_node = NodeRef::new(member.arena, member.file, type_node);
-                    if preflight_node(self.store, self.host, type_node)?.parent
-                        != Some(member.node)
+                    if preflight_node(self.store, self.host, type_node)?.parent != Some(member.node)
                     {
                         return Err(type_node_unavailable(
                             TypeNodeUnavailable::InvalidLiteralType(node),
@@ -2987,6 +3181,43 @@ impl<'store, 'host, 'arena> TypeQueryPlanner<'store, 'host, 'arena> {
                     contains |=
                         self.type_node_contains_builtin_array_reference(type_node, visited)?;
                 }
+                contains
+            }
+            NodeData::FunctionTypeNode(function) => {
+                if record.kind != SyntaxKind::FunctionType {
+                    return Err(type_node_unavailable(
+                        TypeNodeUnavailable::InvalidFunctionType(node),
+                    ));
+                }
+                let mut contains = false;
+                for parameter in &function.parameters.nodes {
+                    let parameter = NodeRef::new(node.arena, node.file, *parameter);
+                    let parameter_record = preflight_node(self.store, self.host, parameter)?;
+                    let NodeData::ParameterDeclaration(parameter_data) = &parameter_record.data
+                    else {
+                        return Err(type_node_unavailable(
+                            TypeNodeUnavailable::InvalidFunctionType(node),
+                        ));
+                    };
+                    let Some(type_node) = parameter_data.type_ else {
+                        return Err(type_node_unavailable(
+                            TypeNodeUnavailable::InvalidFunctionType(node),
+                        ));
+                    };
+                    contains |= self.type_node_contains_builtin_array_reference(
+                        NodeRef::new(node.arena, node.file, type_node),
+                        visited,
+                    )?;
+                }
+                let Some(return_type) = function.type_ else {
+                    return Err(type_node_unavailable(
+                        TypeNodeUnavailable::InvalidFunctionType(node),
+                    ));
+                };
+                contains |= self.type_node_contains_builtin_array_reference(
+                    NodeRef::new(node.arena, node.file, return_type),
+                    visited,
+                )?;
                 contains
             }
             _ => false,
@@ -3007,6 +3238,19 @@ impl<'store, 'host, 'arena> TypeQueryPlanner<'store, 'host, 'arena> {
             node = NodeRef::new(node.arena, node.file, parenthesized.type_);
         }
     }
+
+    fn direct_function_type_rhs(&self, mut node: NodeRef) -> Result<bool, DeclaredTypeError> {
+        loop {
+            let record = preflight_node(self.store, self.host, node)?;
+            if record.kind == SyntaxKind::FunctionType {
+                return Ok(true);
+            }
+            let NodeData::ParenthesizedTypeNode(parenthesized) = &record.data else {
+                return Ok(false);
+            };
+            node = NodeRef::new(node.arena, node.file, parenthesized.type_);
+        }
+    }
 }
 
 pub(super) struct CanonicalTypeQuery<'store, 'host, 'arena, 'diagnostics> {
@@ -3017,6 +3261,7 @@ pub(super) struct CanonicalTypeQuery<'store, 'host, 'arena, 'diagnostics> {
     options: CanonicalTypeQueryOptions,
     diagnostics: &'diagnostics mut CanonicalCheckerDiagnostics,
     resolving_property_interfaces: HashSet<SemanticSymbolId>,
+    pending_function_parameters: Vec<FunctionTypePlan>,
 }
 
 impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'arena, 'diagnostics> {
@@ -3052,6 +3297,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             options,
             diagnostics,
             resolving_property_interfaces: HashSet::new(),
+            pending_function_parameters: Vec::new(),
         })
     }
 
@@ -3095,6 +3341,11 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         &mut self,
         node: NodeRef,
     ) -> Result<TypeId, DeclaredTypeError> {
+        if !self.pending_function_parameters.is_empty() {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidFunctionType(node),
+            ));
+        }
         let mut planner = TypeQueryPlanner::new(
             self.store,
             self.host,
@@ -3104,10 +3355,191 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 .map(CanonicalArrayTargets::from_global_types),
             self.options.strict_builtin_iterator_return,
         );
+        let direct_alias = planner.direct_type_alias_owner(node)?;
         planner.plan_type_node(node)?;
         let plan = planner.finish();
         let mut prepared = self.prepare_literal_types(&plan)?;
-        self.execute_type_node(node, &plan, &mut prepared)
+        if let Err(error) = self.seed_pending_function_parameters(&plan, &mut prepared) {
+            self.pending_function_parameters.clear();
+            prepared.clear_pending_function_types();
+            return Err(error);
+        }
+        let direct_function_alias = direct_alias.filter(|alias| {
+            plan.aliases.get(alias).is_some_and(|alias| {
+                self.direct_function_type_plan_node(alias.type_node, &plan)
+                    .is_some()
+            })
+        });
+        let result = match direct_function_alias {
+            Some(alias) => self.execute_declared_type(alias, &plan, &mut prepared),
+            None => self.execute_type_node(node, &plan, &mut prepared),
+        };
+        self.complete_type_query(result, &plan, &mut prepared)
+    }
+
+    /// Resolves the explicitly annotated return type of an exact function-type
+    /// signature. Return annotations remain lazy after the function object and
+    /// its parameter value types have been published.
+    pub(super) fn get_return_type_of_signature(
+        &mut self,
+        signature: SignatureId,
+    ) -> Result<TypeId, DeclaredTypeError> {
+        if !self.pending_function_parameters.is_empty() {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidFunctionSignature(signature),
+            ));
+        }
+        let declaration = self
+            .store
+            .signature(signature)
+            .and_then(Signature::declaration)
+            .ok_or_else(|| {
+                type_node_unavailable(TypeNodeUnavailable::InvalidFunctionSignature(signature))
+            })?;
+        if preflight_node(self.store, self.host, declaration)?.kind != SyntaxKind::FunctionType {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidFunctionSignature(signature),
+            ));
+        }
+
+        let mut parameter_planner = TypeQueryPlanner::new(
+            self.store,
+            self.host,
+            self.array_type,
+            self.global_types
+                .as_ref()
+                .map(CanonicalArrayTargets::from_global_types),
+            self.options.strict_builtin_iterator_return,
+        );
+        parameter_planner.plan_type_node(declaration)?;
+        let parameter_plan = parameter_planner.finish();
+        let parameter_function = parameter_plan
+            .functions
+            .get(&declaration)
+            .cloned()
+            .ok_or_else(|| {
+                type_node_unavailable(TypeNodeUnavailable::InvalidFunctionSignature(signature))
+            })?;
+        functions::validate_function_type_signature_identity(
+            self.store,
+            &parameter_function,
+            signature,
+        )
+        .map_err(|error| function_signature_error(error, signature))?;
+        let mut parameter_prepared = self.prepare_literal_types(&parameter_plan)?;
+        if let Err(error) =
+            self.seed_pending_function_parameters(&parameter_plan, &mut parameter_prepared)
+        {
+            self.pending_function_parameters.clear();
+            parameter_prepared.clear_pending_function_types();
+            return Err(error);
+        }
+        let parameter_result =
+            self.flush_pending_function_parameters(&parameter_plan, &mut parameter_prepared);
+        self.pending_function_parameters.clear();
+        parameter_prepared.clear_pending_function_types();
+        parameter_result?;
+
+        if let Some(return_type) =
+            functions::validate_lazy_return_signature(self.store, &parameter_function, signature)
+                .map_err(|error| function_signature_error(error, signature))?
+        {
+            return Ok(return_type);
+        }
+
+        let mut planner = TypeQueryPlanner::new(
+            self.store,
+            self.host,
+            self.array_type,
+            self.global_types
+                .as_ref()
+                .map(CanonicalArrayTargets::from_global_types),
+            self.options.strict_builtin_iterator_return,
+        );
+        planner.plan_type_node(declaration)?;
+        planner.plan_function_return_type(declaration)?;
+        let plan = planner.finish();
+        let function = plan.functions.get(&declaration).cloned().ok_or_else(|| {
+            type_node_unavailable(TypeNodeUnavailable::InvalidFunctionSignature(signature))
+        })?;
+        if let Some(return_type) =
+            functions::validate_lazy_return_signature(self.store, &function, signature)
+                .map_err(|error| function_signature_error(error, signature))?
+        {
+            return Ok(return_type);
+        }
+
+        let mut prepared = self.prepare_literal_types(&plan)?;
+        if !self.store.try_reserve_circular_return_signatures(1) {
+            prepared.clear_pending_function_types();
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidFunctionSignature(signature),
+            ));
+        }
+        if !self.store.push_type_resolution(
+            TypeResolutionTarget::Signature(signature),
+            TypeSystemPropertyName::ResolvedReturnType,
+        )? {
+            self.pending_function_parameters.clear();
+            prepared.clear_pending_function_types();
+            return self.error_type();
+        }
+        if let Err(error) = self.seed_pending_function_parameters(&plan, &mut prepared) {
+            let popped = self.store.pop_type_resolution();
+            self.pending_function_parameters.clear();
+            prepared.clear_pending_function_types();
+            if popped.is_none() {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidFunctionSignature(signature),
+                ));
+            }
+            return Err(error);
+        }
+        let resolved = match self.execute_type_node(function.return_type, &plan, &mut prepared) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                if self.store.pop_type_resolution().is_none() {
+                    self.pending_function_parameters.clear();
+                    prepared.clear_pending_function_types();
+                    return Err(type_node_unavailable(
+                        TypeNodeUnavailable::InvalidFunctionSignature(signature),
+                    ));
+                }
+                self.pending_function_parameters.clear();
+                prepared.clear_pending_function_types();
+                return Err(error);
+            }
+        };
+        let Some(cycle_free) = self.store.pop_type_resolution() else {
+            self.pending_function_parameters.clear();
+            prepared.clear_pending_function_types();
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidFunctionSignature(signature),
+            ));
+        };
+        if let Err(error) = self.flush_pending_function_parameters(&plan, &mut prepared) {
+            self.pending_function_parameters.clear();
+            prepared.clear_pending_function_types();
+            return Err(error);
+        }
+        self.pending_function_parameters.clear();
+        prepared.clear_pending_function_types();
+        if cycle_free {
+            functions::publish_lazy_return_type(self.store, &function, signature, resolved)
+                .map_err(|error| function_signature_error(error, signature))
+        } else {
+            let return_type = functions::publish_circular_lazy_return_type(
+                self.store, &function, signature, resolved,
+            )
+            .map_err(|error| function_signature_error(error, signature))?;
+            self.diagnostics.add(
+                Some(function.return_type),
+                Diagnostic::new(
+                    message_by_code(2577).expect("TS2577 is in the diagnostic catalog"),
+                ),
+            );
+            Ok(return_type)
+        }
     }
 
     /// Resolves the declared type identity of one symbol.
@@ -3120,6 +3552,11 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         &mut self,
         symbol: SemanticSymbolId,
     ) -> Result<TypeId, DeclaredTypeError> {
+        if !self.pending_function_parameters.is_empty() {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidCachedTypeAlias(symbol),
+            ));
+        }
         let symbol = self.canonical_symbol(symbol)?;
         let flags = self.symbol_flags(symbol)?;
         if malformed_alias_merge(flags) {
@@ -3146,7 +3583,66 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         }
         let plan = planner.finish();
         let mut prepared = self.prepare_literal_types(&plan)?;
-        self.execute_declared_type(symbol, &plan, &mut prepared)
+        if let Err(error) = self.seed_pending_function_parameters(&plan, &mut prepared) {
+            self.pending_function_parameters.clear();
+            prepared.clear_pending_function_types();
+            return Err(error);
+        }
+        let result = self.execute_declared_type(symbol, &plan, &mut prepared);
+        self.complete_type_query(result, &plan, &mut prepared)
+    }
+
+    fn seed_pending_function_parameters(
+        &mut self,
+        plan: &TypeQueryPlan,
+        prepared: &mut PreparedTypeQueryTypes,
+    ) -> Result<(), DeclaredTypeError> {
+        for function in plan.functions.values() {
+            if self
+                .pending_function_parameters
+                .iter()
+                .any(|pending| pending.node == function.node)
+            {
+                continue;
+            }
+            let Some(pending) = functions::resumable_function_type(self.store, function)
+                .map_err(function_type_error)?
+            else {
+                continue;
+            };
+            functions::finalize_function_structure(self.store, function, pending)
+                .map_err(function_type_error)?;
+            if function.parameters.is_empty() {
+                continue;
+            }
+            let proof = functions::pending_function_type_proof(self.store, function)
+                .map_err(function_type_error)?
+                .ok_or_else(|| {
+                    type_node_unavailable(TypeNodeUnavailable::InvalidFunctionType(function.node))
+                })?;
+            prepared
+                .authorize_pending_function(self.store, &proof)
+                .map_err(Self::literal_cache_error)?;
+            self.pending_function_parameters.push(function.clone());
+        }
+        Ok(())
+    }
+
+    fn complete_type_query(
+        &mut self,
+        result: Result<TypeId, DeclaredTypeError>,
+        plan: &TypeQueryPlan,
+        prepared: &mut PreparedTypeQueryTypes,
+    ) -> Result<TypeId, DeclaredTypeError> {
+        let result = match result {
+            Ok(type_) => self
+                .flush_pending_function_parameters(plan, prepared)
+                .map(|()| type_),
+            Err(error) => Err(error),
+        };
+        self.pending_function_parameters.clear();
+        prepared.clear_pending_function_types();
+        result
     }
 
     fn prepare_literal_types(
@@ -3199,6 +3695,14 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             })
             .map(|(_, union)| union)
             .collect::<Vec<_>>();
+        let function_plans = plan.functions.values().collect::<Vec<_>>();
+        let (cold_function_types, function_type_aliases, optional_parameter_unions) =
+            functions::reserve_function_type_capacities(self.store, &function_plans)
+                .map_err(function_type_error)?;
+        let union_operation_count = unions
+            .len()
+            .checked_add(optional_parameter_unions)
+            .ok_or_else(|| Self::literal_cache_error(LiteralTypeCacheError::Capacity))?;
         let named_unions = unions
             .iter()
             .filter(|union| union.alias_symbol.is_some())
@@ -3211,7 +3715,9 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             let target = self
                 .array_type
                 .expect("planned arrays have a global target");
-            let entry = array_references_by_target.entry(target).or_insert((0, *node));
+            let entry = array_references_by_target
+                .entry(target)
+                .or_insert((0, *node));
             entry.0 = entry
                 .0
                 .checked_add(1)
@@ -3230,7 +3736,9 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             {
                 continue;
             }
-            let entry = array_references_by_target.entry(target).or_insert((0, *node));
+            let entry = array_references_by_target
+                .entry(target)
+                .or_insert((0, *node));
             entry.0 = entry
                 .0
                 .checked_add(1)
@@ -3246,41 +3754,34 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             .and_then(|count| count.checked_add(bigints.len()))
             .ok_or_else(|| Self::literal_cache_error(LiteralTypeCacheError::Capacity))?;
         let additional_types = literal_values
-            .checked_add(unions.len())
+            .checked_add(union_operation_count)
             .and_then(|count| count.checked_mul(2))
             .and_then(|count| count.checked_add(array_references))
+            .and_then(|count| count.checked_add(cold_function_types))
             .ok_or_else(|| Self::literal_cache_error(LiteralTypeCacheError::Capacity))?;
         if !self.store.try_reserve_types(additional_types) {
             return Err(Self::literal_cache_error(LiteralTypeCacheError::Capacity));
         }
         for (target, (count, node)) in array_references_by_target {
-            if !self
-                .store
-                .try_reserve_object_instantiations(target, count)
-            {
+            if !self.store.try_reserve_object_instantiations(target, count) {
                 return Err(type_node_unavailable(
                     TypeNodeUnavailable::InvalidTypeReference(node),
                 ));
             }
         }
-        match self.global_types.as_ref() {
-            Some(global_types) => self.store.prepare_type_query_types_with_global_types(
+        self.store
+            .prepare_type_query_types_with_pending_functions(
                 &strings,
                 &numbers,
                 &bigints,
-                unions.len(),
+                union_operation_count,
                 named_unions,
-                global_types,
-            ),
-            None => self.store.prepare_type_query_types(
-                &strings,
-                &numbers,
-                &bigints,
-                unions.len(),
-                named_unions,
-            ),
-        }
-        .map_err(Self::literal_cache_error)
+                self.global_types.as_ref(),
+                &plan.pending_function_proofs,
+                function_plans.len(),
+                function_type_aliases,
+            )
+            .map_err(Self::literal_cache_error)
     }
 
     fn literal_cache_error(error: LiteralTypeCacheError) -> DeclaredTypeError {
@@ -3413,9 +3914,13 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             self.options.strict_builtin_iterator_return,
         )? {
             if let Some(alias) = plan.aliases.get(&symbol)
-                && self
+                && let Some(structural_node) = self
                     .direct_type_literal_plan_node(alias.type_node, plan)
-                    .is_some()
+                    .or_else(|| self.direct_function_type_plan_node(alias.type_node, plan))
+                && !self
+                    .pending_function_parameters
+                    .iter()
+                    .any(|pending| pending.node == structural_node)
             {
                 let resolved = self.execute_type_node(alias.type_node, plan, prepared)?;
                 if resolved != cached.declared_type {
@@ -3554,12 +4059,83 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             SyntaxKind::LiteralType => self.execute_literal_type(node, plan),
             SyntaxKind::ArrayType => self.execute_array_type(node, plan, prepared),
             SyntaxKind::TypeLiteral => self.execute_property_type_literal(node, plan, prepared),
+            SyntaxKind::FunctionType => self.execute_function_type(node, plan, prepared),
             SyntaxKind::TypeReference => self.execute_type_reference(node, plan, prepared),
             SyntaxKind::UnionType => self.execute_union_type(node, plan, prepared),
             kind => Err(type_node_unavailable(
                 TypeNodeUnavailable::UnsupportedSyntax { node, kind },
             )),
         }
+    }
+
+    fn execute_function_type(
+        &mut self,
+        node: NodeRef,
+        plan: &TypeQueryPlan,
+        prepared: &mut PreparedTypeQueryTypes,
+    ) -> Result<TypeId, DeclaredTypeError> {
+        if let Some(pending) = self
+            .pending_function_parameters
+            .iter()
+            .find(|pending| pending.node == node)
+        {
+            return functions::active_alias_shell(self.store, pending).map_err(function_type_error);
+        }
+        let function =
+            plan.functions.get(&node).cloned().ok_or_else(|| {
+                type_node_unavailable(TypeNodeUnavailable::InvalidFunctionType(node))
+            })?;
+        let pending = match functions::begin_function_type(self.store, &function)
+            .map_err(function_type_error)?
+        {
+            Ok(pending) => pending,
+            Err(resolved) => return Ok(resolved),
+        };
+        functions::finalize_function_structure(self.store, &function, pending)
+            .map_err(function_type_error)?;
+        let resolved_type = pending.type_;
+        if !function.parameters.is_empty() {
+            let proof = functions::pending_function_type_proof(self.store, &function)
+                .map_err(function_type_error)?
+                .ok_or_else(|| {
+                    type_node_unavailable(TypeNodeUnavailable::InvalidFunctionType(node))
+                })?;
+            prepared
+                .authorize_pending_function(self.store, &proof)
+                .map_err(Self::literal_cache_error)?;
+            self.pending_function_parameters.push(function);
+        }
+        Ok(resolved_type)
+    }
+
+    fn flush_pending_function_parameters(
+        &mut self,
+        plan: &TypeQueryPlan,
+        prepared: &mut PreparedTypeQueryTypes,
+    ) -> Result<(), DeclaredTypeError> {
+        let mut resolved = Vec::new();
+        let mut index = 0usize;
+        while index < self.pending_function_parameters.len() {
+            let function = self.pending_function_parameters[index].clone();
+            let mut base_types = Vec::with_capacity(function.parameters.len());
+            for parameter in &function.parameters {
+                base_types.push(self.execute_type_node(parameter.type_node, plan, prepared)?);
+            }
+            resolved.push(PendingParameterTypes {
+                plan: function,
+                base_types,
+            });
+            index += 1;
+        }
+        functions::publish_parameter_types(
+            self.store,
+            self.global_types.as_ref(),
+            &resolved,
+            prepared,
+        )
+        .map_err(function_type_error)?;
+        self.pending_function_parameters.clear();
+        Ok(())
     }
 
     fn execute_array_type(
@@ -3617,6 +4193,22 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
     ) -> Option<NodeRef> {
         loop {
             if plan.type_literals.contains_key(&node) {
+                return Some(node);
+            }
+            let NodeData::ParenthesizedTypeNode(parenthesized) = &self.host.node(node)?.data else {
+                return None;
+            };
+            node = NodeRef::new(node.arena, node.file, parenthesized.type_);
+        }
+    }
+
+    fn direct_function_type_plan_node(
+        &self,
+        mut node: NodeRef,
+        plan: &TypeQueryPlan,
+    ) -> Option<NodeRef> {
+        loop {
+            if plan.functions.contains_key(&node) {
                 return Some(node);
             }
             let NodeData::ParenthesizedTypeNode(parenthesized) = &self.host.node(node)?.data else {
@@ -3798,11 +4390,10 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             .and_then(|links| links.resolved_type);
         let planned_reference = plan.references.get(&node);
         if let Some(resolved_type) = cached_resolved_type
-            && !planned_reference
-                .is_some_and(|reference| {
-                    reference.global_array_target.is_some()
-                        || plan.interfaces.contains_key(&reference.symbol)
-                })
+            && !planned_reference.is_some_and(|reference| {
+                reference.global_array_target.is_some()
+                    || plan.interfaces.contains_key(&reference.symbol)
+            })
         {
             return Ok(resolved_type);
         }
@@ -3886,7 +4477,8 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                         .type_alias_links(symbol)
                         .and_then(|links| links.type_parameters.as_ref())
                         .map(Vec::len);
-                    let is_type_alias = self.symbol_flags(symbol)?.contains(SymbolFlags::TYPE_ALIAS);
+                    let is_type_alias =
+                        self.symbol_flags(symbol)?.contains(SymbolFlags::TYPE_ALIAS);
                     if is_type_alias
                         && !reference.type_arguments.is_empty()
                         && alias_parameter_count.is_none()
@@ -4304,7 +4896,9 @@ mod tests {
         TypeAliasLinks, TypeNodeLinks, ValueSymbolLinks,
         bootstrap::UnionReduction,
         global_types::initialize_global_library_types,
+        links::{ResolvedSignatureState, SignatureLinks},
         production::GlobalMergeCompletion,
+        signatures::SignatureFlags,
         type_records::{LiteralValue, TypeAlias},
         types::{ObjectFlags, TypeFlags},
     };
@@ -4534,6 +5128,83 @@ mod tests {
         )
     }
 
+    fn function_type_node(fixture: &Fixture, alias: &str) -> NodeRef {
+        let declaration = alias_parts(fixture, alias).0;
+        let functions = fixture
+            .parsed
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                if record.kind != SyntaxKind::FunctionType {
+                    return None;
+                }
+                let mut current = node;
+                loop {
+                    let parent = fixture.parsed.arena.get(current)?.parent?;
+                    if parent == declaration.node {
+                        return Some(NodeRef::new(declaration.arena, declaration.file, node));
+                    }
+                    current = parent;
+                }
+            })
+            .collect::<Vec<_>>();
+        let [function] = functions.as_slice() else {
+            panic!("type alias {alias} must own exactly one function type")
+        };
+        *function
+    }
+
+    fn function_parameter_nodes(fixture: &Fixture, function: NodeRef) -> Vec<NodeRef> {
+        let NodeData::FunctionTypeNode(function_data) =
+            &fixture.parsed.arena.get(function.node).unwrap().data
+        else {
+            unreachable!()
+        };
+        function_data
+            .parameters
+            .nodes
+            .iter()
+            .map(|node| NodeRef::new(function.arena, function.file, *node))
+            .collect()
+    }
+
+    fn function_return_node(fixture: &Fixture, function: NodeRef) -> NodeRef {
+        let NodeData::FunctionTypeNode(function_data) =
+            &fixture.parsed.arena.get(function.node).unwrap().data
+        else {
+            unreachable!()
+        };
+        NodeRef::new(
+            function.arena,
+            function.file,
+            function_data
+                .type_
+                .expect("function has a return annotation"),
+        )
+    }
+
+    fn parameter_type_node(fixture: &Fixture, parameter: NodeRef) -> NodeRef {
+        let NodeData::ParameterDeclaration(parameter_data) =
+            &fixture.parsed.arena.get(parameter.node).unwrap().data
+        else {
+            unreachable!()
+        };
+        NodeRef::new(
+            parameter.arena,
+            parameter.file,
+            parameter_data
+                .type_
+                .expect("parameter has a type annotation"),
+        )
+    }
+
+    fn function_signature(store: &CanonicalTypeMapperStore, function: NodeRef) -> SignatureId {
+        store
+            .signature_links(function)
+            .and_then(|links| links.resolved_signature.signature())
+            .expect("function has a resolved signature")
+    }
+
     fn alias_type_parameter_default(fixture: &Fixture, name: &str, index: usize) -> NodeRef {
         let declaration = named_node(fixture, SyntaxKind::TypeAliasDeclaration, name);
         let NodeData::TypeAliasDeclaration(alias) =
@@ -4647,6 +5318,19 @@ mod tests {
         )
     }
 
+    fn function_store_state(
+        store: &CanonicalTypeMapperStore,
+    ) -> (StoreState, usize, usize, usize, usize) {
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        (
+            store_state(store),
+            store.signature_len(),
+            store.type_alias_len(),
+            bootstrap.union_cache_len(),
+            bootstrap.union_of_union_cache_len(),
+        )
+    }
+
     fn union_types(store: &CanonicalTypeMapperStore, union: TypeId) -> &[TypeId] {
         let TypeData::Union(data) = store.type_payload(union).unwrap().data() else {
             panic!("expected union type")
@@ -4742,6 +5426,44 @@ mod tests {
             diagnostics,
         )?
         .get_type_from_type_node(node)
+    }
+
+    fn query_signature_return(
+        fixture: &mut Fixture,
+        signature: SignatureId,
+        diagnostics: &mut CanonicalCheckerDiagnostics,
+    ) -> Result<TypeId, DeclaredTypeError> {
+        let host = post_global_host(
+            &fixture.parsed.arena,
+            fixture.files.get(&fixture.file).unwrap(),
+        );
+        CanonicalTypeQuery::new(
+            &mut fixture.store,
+            &host,
+            CanonicalTypeQueryOptions::default(),
+            diagnostics,
+        )?
+        .get_return_type_of_signature(signature)
+    }
+
+    fn query_global_signature_return(
+        fixture: &mut Fixture,
+        global_types: &CanonicalGlobalTypes,
+        signature: SignatureId,
+        diagnostics: &mut CanonicalCheckerDiagnostics,
+    ) -> Result<TypeId, DeclaredTypeError> {
+        let host = post_global_host(
+            &fixture.parsed.arena,
+            fixture.files.get(&fixture.file).unwrap(),
+        );
+        CanonicalTypeQuery::new_with_global_types(
+            &mut fixture.store,
+            &host,
+            global_types,
+            CanonicalTypeQueryOptions::default(),
+            diagnostics,
+        )?
+        .get_return_type_of_signature(signature)
     }
 
     fn canonical_array_target(fixture: &mut Fixture) -> TypeId {
@@ -8383,7 +9105,6 @@ mod tests {
             "declare const value: string; ",
             "type ArrayAlias = string[]; type TupleAlias = [string]; ",
             "type IntersectionAlias = object & {}; ",
-            "type FunctionAlias = () => string; ",
             "type OperatorAlias = keyof object; type IndexedAlias = { a: string }['a']; ",
             "type MappedAlias<T> = { [K in keyof T]: T[K] }; ",
             "type ConditionalAlias<T> = T extends string ? string : number; ",
@@ -8395,7 +9116,6 @@ mod tests {
             "ArrayAlias",
             "TupleAlias",
             "IntersectionAlias",
-            "FunctionAlias",
             "OperatorAlias",
             "IndexedAlias",
             "MappedAlias",
@@ -8765,19 +9485,12 @@ mod tests {
         let model = canonical_fixture_symbol(&cold, SyntaxKind::InterfaceDeclaration, "Model");
         let reference = variable_type_node(&cold, "model");
         let plan = {
-            let host = post_global_host(
-                &cold.parsed.arena,
-                cold.files.get(&cold.file).unwrap(),
-            );
+            let host = post_global_host(&cold.parsed.arena, cold.files.get(&cold.file).unwrap());
             object_members::plan_interface(&cold.store, &host, model).unwrap()
         };
         let declared_type = {
-            let host = post_global_host(
-                &cold.parsed.arena,
-                cold.files.get(&cold.file).unwrap(),
-            );
-            cold
-                .store
+            let host = post_global_host(&cold.parsed.arena, cold.files.get(&cold.file).unwrap());
+            cold.store
                 .get_declared_type_of_symbol(&host, model)
                 .unwrap()
         };
@@ -8788,8 +9501,7 @@ mod tests {
             "a cold declared-member shell is valid"
         );
         assert!(
-            cold
-                .store
+            cold.store
                 .publish_interface_no_base_resolution(declared_type)
         );
         assert_eq!(
@@ -8807,8 +9519,7 @@ mod tests {
             object_members::interface_state(&cold.store, &plan, declared_type),
             Ok(PropertyObjectState::Resolved(declared_type))
         );
-        let TypeData::Interface(interface) =
-            cold.store.type_payload(declared_type).unwrap().data()
+        let TypeData::Interface(interface) = cold.store.type_payload(declared_type).unwrap().data()
         else {
             panic!("interface member publication preserves its declared identity")
         };
@@ -8823,8 +9534,7 @@ mod tests {
         assert!(diagnostics.is_empty());
 
         let mut poisoned = fixture("interface Model { value: string } let model: Model;");
-        let model =
-            canonical_fixture_symbol(&poisoned, SyntaxKind::InterfaceDeclaration, "Model");
+        let model = canonical_fixture_symbol(&poisoned, SyntaxKind::InterfaceDeclaration, "Model");
         let reference = variable_type_node(&poisoned, "model");
         let plan = {
             let host = post_global_host(
@@ -8877,10 +9587,8 @@ mod tests {
             "let value: Object;",
         );
         let mut merged = fixture(source);
-        let object =
-            canonical_fixture_symbol(&merged, SyntaxKind::InterfaceDeclaration, "Object");
-        let interface_declaration =
-            named_node(&merged, SyntaxKind::InterfaceDeclaration, "Object");
+        let object = canonical_fixture_symbol(&merged, SyntaxKind::InterfaceDeclaration, "Object");
+        let interface_declaration = named_node(&merged, SyntaxKind::InterfaceDeclaration, "Object");
         let value_declaration = named_node(&merged, SyntaxKind::VariableDeclaration, "Object");
         let reference = variable_type_node(&merged, "value");
         let symbol = merged.store.symbol(object).unwrap();
@@ -9921,13 +10629,8 @@ mod tests {
         };
         let mut diagnostics = CanonicalCheckerDiagnostics::default();
 
-        let shorthand_type = query_global_node(
-            &mut fixture,
-            &global_types,
-            shorthand,
-            &mut diagnostics,
-        )
-        .unwrap();
+        let shorthand_type =
+            query_global_node(&mut fixture, &global_types, shorthand, &mut diagnostics).unwrap();
         assert_eq!(
             query_global_node(&mut fixture, &global_types, direct, &mut diagnostics),
             Ok(shorthand_type),
@@ -9957,16 +10660,16 @@ mod tests {
             readonly_reference.object.target,
             Some(global_types.readonly_array_type)
         );
-        assert_eq!(readonly_reference.resolved_type_arguments.as_deref(), Some(&[string][..]));
+        assert_eq!(
+            readonly_reference.resolved_type_arguments.as_deref(),
+            Some(&[string][..])
+        );
 
-        let union_element_type = query_global_node(
-            &mut fixture,
-            &global_types,
-            union_element,
-            &mut diagnostics,
-        )
-        .unwrap();
-        let union_element_argument = type_reference_arguments(&fixture.store, union_element_type)[0];
+        let union_element_type =
+            query_global_node(&mut fixture, &global_types, union_element, &mut diagnostics)
+                .unwrap();
+        let union_element_argument =
+            type_reference_arguments(&fixture.store, union_element_type)[0];
         assert_eq!(
             union_types(&fixture.store, union_element_argument),
             [string, number]
@@ -9987,7 +10690,10 @@ mod tests {
             readonly_number_reference.object.target,
             Some(global_types.readonly_array_type)
         );
-        let number_array = readonly_number_reference.resolved_type_arguments.as_deref().unwrap()[0];
+        let number_array = readonly_number_reference
+            .resolved_type_arguments
+            .as_deref()
+            .unwrap()[0];
         assert_eq!(
             fixture
                 .store
@@ -9998,13 +10704,8 @@ mod tests {
             number
         );
 
-        let maybe_type = query_global_declared(
-            &mut fixture,
-            &global_types,
-            maybe,
-            &mut diagnostics,
-        )
-        .unwrap();
+        let maybe_type =
+            query_global_declared(&mut fixture, &global_types, maybe, &mut diagnostics).unwrap();
         assert_eq!(
             maybe_type, shorthand_type,
             "loose nullish reduction preserves the direct array identity"
@@ -10019,12 +10720,7 @@ mod tests {
             Ok(readonly_type)
         );
         assert_eq!(
-            query_global_node(
-                &mut fixture,
-                &global_types,
-                union_element,
-                &mut diagnostics,
-            ),
+            query_global_node(&mut fixture, &global_types, union_element, &mut diagnostics,),
             Ok(union_element_type)
         );
         assert_eq!(
@@ -10075,22 +10771,10 @@ mod tests {
                 ))
                 .collect::<Vec<_>>(),
             [
-                (
-                    2314,
-                    vec!["Array<Element>".to_owned(), "1".to_owned()],
-                ),
-                (
-                    2314,
-                    vec!["Array<Element>".to_owned(), "1".to_owned()],
-                ),
-                (
-                    2314,
-                    vec!["ReadonlyArray<Item>".to_owned(), "1".to_owned()],
-                ),
-                (
-                    2314,
-                    vec!["ReadonlyArray<Item>".to_owned(), "1".to_owned()],
-                ),
+                (2314, vec!["Array<Element>".to_owned(), "1".to_owned()],),
+                (2314, vec!["Array<Element>".to_owned(), "1".to_owned()],),
+                (2314, vec!["ReadonlyArray<Item>".to_owned(), "1".to_owned()],),
+                (2314, vec!["ReadonlyArray<Item>".to_owned(), "1".to_owned()],),
             ]
         );
         let warm = store_state(&fixture.store);
@@ -10101,7 +10785,11 @@ mod tests {
             );
         }
         assert_eq!(store_state(&fixture.store), warm);
-        assert_eq!(diagnostics.len(), 4, "warm queries must not repeat diagnostics");
+        assert_eq!(
+            diagnostics.len(),
+            4,
+            "warm queries must not repeat diagnostics"
+        );
     }
 
     #[test]
@@ -10123,12 +10811,7 @@ mod tests {
         let mut diagnostics = CanonicalCheckerDiagnostics::default();
 
         assert_eq!(
-            query_global_node(
-                &mut fixture,
-                &global_types,
-                local_mutable,
-                &mut diagnostics,
-            ),
+            query_global_node(&mut fixture, &global_types, local_mutable, &mut diagnostics,),
             Ok(string)
         );
         assert_eq!(
@@ -10162,7 +10845,7 @@ mod tests {
                     .type_payload(global_types.readonly_array_type)
                     .unwrap()
                     .symbol()
-                .unwrap()
+                    .unwrap()
             );
         }
         let warm = store_state(&fixture.store);
@@ -10190,8 +10873,7 @@ mod tests {
         let global_types = initialize_fixture_global_types(&mut fixture);
         let direct = variable_type_node(&fixture, "direct");
         let union = variable_type_node(&fixture, "union");
-        let direct_alias =
-            named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "DirectAlias");
+        let direct_alias = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "DirectAlias");
         let union_alias = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "UnionAlias");
         let nested_union_alias = named_symbol(
             &fixture,
@@ -10204,13 +10886,8 @@ mod tests {
             query_global_node(&mut fixture, &global_types, direct, &mut diagnostics).unwrap();
         assert!(query_global_node(&mut fixture, &global_types, union, &mut diagnostics).is_ok());
         assert!(
-            query_global_declared(
-                &mut fixture,
-                &global_types,
-                direct_alias,
-                &mut diagnostics,
-            )
-            .is_ok()
+            query_global_declared(&mut fixture, &global_types, direct_alias, &mut diagnostics,)
+                .is_ok()
         );
         assert!(
             query_global_declared(
@@ -10222,13 +10899,8 @@ mod tests {
             .is_ok()
         );
         assert!(
-            query_global_declared(
-                &mut fixture,
-                &global_types,
-                union_alias,
-                &mut diagnostics,
-            )
-            .is_ok()
+            query_global_declared(&mut fixture, &global_types, union_alias, &mut diagnostics,)
+                .is_ok()
         );
         let warm = store_state(&fixture.store);
 
@@ -10290,26 +10962,16 @@ mod tests {
             "type Reduced = Through | null;",
         ));
         let global_types = initialize_fixture_global_types(&mut fixture);
-        let aliases = ["Direct", "Shorthand", "Through", "Reduced"].map(|name| {
-            named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, name)
-        });
+        let aliases = ["Direct", "Shorthand", "Through", "Reduced"]
+            .map(|name| named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, name));
         let mut diagnostics = CanonicalCheckerDiagnostics::default();
 
-        let array_type = query_global_declared(
-            &mut fixture,
-            &global_types,
-            aliases[0],
-            &mut diagnostics,
-        )
-        .unwrap();
+        let array_type =
+            query_global_declared(&mut fixture, &global_types, aliases[0], &mut diagnostics)
+                .unwrap();
         for alias in aliases.iter().skip(1) {
             assert_eq!(
-                query_global_declared(
-                    &mut fixture,
-                    &global_types,
-                    *alias,
-                    &mut diagnostics,
-                ),
+                query_global_declared(&mut fixture, &global_types, *alias, &mut diagnostics,),
                 Ok(array_type),
                 "loose null reduction and transitive aliases retain the array root",
             );
@@ -10404,12 +11066,7 @@ mod tests {
             (shorthand, shorthand_type),
         ] {
             assert_eq!(
-                query_global_node(
-                    &mut fixture,
-                    &global_types,
-                    node,
-                    &mut diagnostics,
-                ),
+                query_global_node(&mut fixture, &global_types, node, &mut diagnostics,),
                 Ok(expected),
             );
             assert_eq!(store_state(&fixture.store), warm);
@@ -10439,12 +11096,7 @@ mod tests {
 
         for node in [direct, readonly, shorthand, plain] {
             assert_eq!(
-                query_global_node(
-                    &mut fixture,
-                    &global_types,
-                    node,
-                    &mut diagnostics,
-                ),
+                query_global_node(&mut fixture, &global_types, node, &mut diagnostics,),
                 Ok(number),
             );
         }
@@ -10477,12 +11129,7 @@ mod tests {
 
         for node in [direct, readonly, shorthand] {
             assert_eq!(
-                query_global_node(
-                    &mut fixture,
-                    &global_types,
-                    node,
-                    &mut diagnostics,
-                ),
+                query_global_node(&mut fixture, &global_types, node, &mut diagnostics,),
                 Ok(number),
             );
             assert_eq!(store_state(&fixture.store), warm);
@@ -10522,12 +11169,7 @@ mod tests {
 
         for node in [direct, readonly, shorthand] {
             assert_eq!(
-                query_global_node(
-                    &mut fixture,
-                    &global_types,
-                    node,
-                    &mut diagnostics,
-                ),
+                query_global_node(&mut fixture, &global_types, node, &mut diagnostics,),
                 Ok(number),
             );
         }
@@ -10555,12 +11197,7 @@ mod tests {
 
         for node in [direct, readonly, shorthand] {
             assert_eq!(
-                query_global_node(
-                    &mut fixture,
-                    &global_types,
-                    node,
-                    &mut diagnostics,
-                ),
+                query_global_node(&mut fixture, &global_types, node, &mut diagnostics,),
                 Ok(number),
             );
             assert_eq!(store_state(&fixture.store), warm);
@@ -10579,28 +11216,20 @@ mod tests {
             "type ThroughItem = Item;",
         ));
         let global_types = initialize_fixture_global_types(&mut fixture);
-        let holder_alias =
-            named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "MaybeHolder");
+        let holder_alias = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "MaybeHolder");
         let node_alias = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "MaybeNode");
         let through_item_alias =
             named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "ThroughItem");
-        let item_array_node = property_type_literal_child(&fixture, alias_parts(&fixture, "Item").2, 0);
+        let item_array_node =
+            property_type_literal_child(&fixture, alias_parts(&fixture, "Item").2, 0);
         let mut diagnostics = CanonicalCheckerDiagnostics::default();
 
-        let holder_type = query_global_declared(
-            &mut fixture,
-            &global_types,
-            holder_alias,
-            &mut diagnostics,
-        )
-        .unwrap();
-        let node_type = query_global_declared(
-            &mut fixture,
-            &global_types,
-            node_alias,
-            &mut diagnostics,
-        )
-        .unwrap();
+        let holder_type =
+            query_global_declared(&mut fixture, &global_types, holder_alias, &mut diagnostics)
+                .unwrap();
+        let node_type =
+            query_global_declared(&mut fixture, &global_types, node_alias, &mut diagnostics)
+                .unwrap();
         let item_type = query_global_declared(
             &mut fixture,
             &global_types,
@@ -10630,13 +11259,11 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            fixture
-                .store
-                .expression_union_type_with_global_types(
-                    &global_types,
-                    &[node_array, node_type],
-                    UnionReduction::None,
-                ),
+            fixture.store.expression_union_type_with_global_types(
+                &global_types,
+                &[node_array, node_type],
+                UnionReduction::None,
+            ),
             Ok(node_or_array),
         );
         let targets = CanonicalArrayTargets::from_global_types(&global_types);
@@ -10644,11 +11271,7 @@ mod tests {
             assert_eq!(
                 fixture
                     .store
-                    .validate_cached_union_result_with_array_targets(
-                        targets,
-                        node_or_array,
-                        None,
-                    ),
+                    .validate_cached_union_result_with_array_targets(targets, node_or_array, None,),
                 Ok(()),
                 "declared-object graph visits must not poison the strict union stack",
             );
@@ -10680,13 +11303,15 @@ mod tests {
                 )),
             );
             assert_eq!(store_state(&fixture.store), warm);
-            assert!(query_empty_host_global_declared(
-                &mut fixture,
-                &global_types,
-                alias,
-                &mut diagnostics,
-            )
-            .is_ok());
+            assert!(
+                query_empty_host_global_declared(
+                    &mut fixture,
+                    &global_types,
+                    alias,
+                    &mut diagnostics,
+                )
+                .is_ok()
+            );
             assert_eq!(store_state(&fixture.store), warm);
         }
 
@@ -10745,13 +11370,9 @@ mod tests {
         let reduced_alias = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Reduced");
         let mut diagnostics = CanonicalCheckerDiagnostics::default();
 
-        let item = query_global_declared(
-            &mut fixture,
-            &global_types,
-            reduced_alias,
-            &mut diagnostics,
-        )
-        .unwrap();
+        let item =
+            query_global_declared(&mut fixture, &global_types, reduced_alias, &mut diagnostics)
+                .unwrap();
         let alias = fixture
             .store
             .type_payload(item)
@@ -10842,18 +11463,12 @@ mod tests {
 
     #[test]
     fn exported_property_alias_boundaries_still_scan_hidden_array_types() {
-        let mut fixture =
-            global_array_fixture("export type Item = { values: Array<number> };");
+        let mut fixture = global_array_fixture("export type Item = { values: Array<number> };");
         let global_types = initialize_fixture_global_types(&mut fixture);
         let item_alias = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Item");
         let mut diagnostics = CanonicalCheckerDiagnostics::default();
-        let item = query_global_declared(
-            &mut fixture,
-            &global_types,
-            item_alias,
-            &mut diagnostics,
-        )
-        .unwrap();
+        let item = query_global_declared(&mut fixture, &global_types, item_alias, &mut diagnostics)
+            .unwrap();
         let hidden_array =
             object_members::resolved_declared_property_types(&fixture.store, item).unwrap()[0];
         assert_eq!(
@@ -10913,13 +11528,8 @@ mod tests {
         ));
         assert_eq!(store_state(&fixture.store), cold);
 
-        let item = query_global_declared(
-            &mut fixture,
-            &global_types,
-            through,
-            &mut diagnostics,
-        )
-        .unwrap();
+        let item =
+            query_global_declared(&mut fixture, &global_types, through, &mut diagnostics).unwrap();
         let hidden_array =
             object_members::resolved_declared_property_types(&fixture.store, item).unwrap()[0];
         assert_eq!(
@@ -10955,13 +11565,9 @@ mod tests {
         let item_symbol = named_symbol(&fixture, SyntaxKind::InterfaceDeclaration, "Item");
         let array_symbol = named_symbol(&fixture, SyntaxKind::InterfaceDeclaration, "Array");
         let mut diagnostics = CanonicalCheckerDiagnostics::default();
-        let item = query_global_declared(
-            &mut fixture,
-            &global_types,
-            item_symbol,
-            &mut diagnostics,
-        )
-        .unwrap();
+        let item =
+            query_global_declared(&mut fixture, &global_types, item_symbol, &mut diagnostics)
+                .unwrap();
         assert_eq!(
             object_members::validate_resolved_declared_property_object(&fixture.store, item),
             object_members::DeclaredPropertyObjectValidation::Valid(
@@ -11045,7 +11651,12 @@ mod tests {
         let global_types = initialize_fixture_global_types(&mut fixture);
         let item_symbol = named_symbol(&fixture, SyntaxKind::InterfaceDeclaration, "Item");
         let mut diagnostics = CanonicalCheckerDiagnostics::default();
-        let members = fixture.store.symbol(item_symbol).unwrap().members().unwrap();
+        let members = fixture
+            .store
+            .symbol(item_symbol)
+            .unwrap()
+            .members()
+            .unwrap();
         let item_property = fixture
             .store
             .symbol_table(members)
@@ -11062,18 +11673,12 @@ mod tests {
         assert_eq!(declarations.len(), 2);
         assert_ne!(declarations[0], declarations[1]);
         assert!(declarations.iter().all(|declaration| {
-            fixture.store.source_node_kind(*declaration)
-                == Some(SyntaxKind::PropertyDeclaration)
+            fixture.store.source_node_kind(*declaration) == Some(SyntaxKind::PropertyDeclaration)
         }));
         let cold = store_state(&fixture.store);
 
         assert!(matches!(
-            query_global_declared(
-                &mut fixture,
-                &global_types,
-                item_symbol,
-                &mut diagnostics,
-            ),
+            query_global_declared(&mut fixture, &global_types, item_symbol, &mut diagnostics,),
             Err(DeclaredTypeError::Unavailable(
                 DeclaredTypeUnavailable::InvalidInterfaceDeclaration(_)
             ))
@@ -11118,9 +11723,7 @@ mod tests {
 
     #[test]
     fn direct_global_array_cache_poison_fails_atomically_and_retries() {
-        let mut fixture = global_array_fixture(
-            "let literal: Array<'x'>; let warm: Array<number>;",
-        );
+        let mut fixture = global_array_fixture("let literal: Array<'x'>; let warm: Array<number>;");
         let global_types = initialize_fixture_global_types(&mut fixture);
         let literal = variable_type_node(&fixture, "literal");
         let literal_argument = type_reference_argument_node(&fixture, literal, 0);
@@ -11257,6 +11860,1335 @@ mod tests {
             query_global_node(&mut fixture, &global_types, warm, &mut diagnostics),
             Ok(warm_type)
         );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn function_type_cold_warm_signature_parameters_and_optionality_are_exact() {
+        let mut fixture = fixture_with_intrinsic(
+            "type Fn = (required: 1, optional?: (2),) => 3;",
+            IntrinsicBootstrapOptions {
+                strict_null_checks: true,
+                ..IntrinsicBootstrapOptions::default()
+            },
+        );
+        let alias = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Fn");
+        let function = function_type_node(&fixture, "Fn");
+        let parameters = function_parameter_nodes(&fixture, function);
+        let parameter_symbols = parameters
+            .iter()
+            .map(|parameter| node_symbol(&fixture, *parameter))
+            .collect::<Vec<_>>();
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let type_ = query_node(&mut fixture, function, &mut diagnostics).unwrap();
+        assert_eq!(
+            fixture.store.type_alias_links(alias),
+            Some(&TypeAliasLinks {
+                declared_type: Some(type_),
+                ..TypeAliasLinks::default()
+            })
+        );
+        let signature_id = function_signature(&fixture.store, function);
+        let signature = fixture.store.signature(signature_id).unwrap();
+        assert_eq!(signature.flags(), SignatureFlags::HAS_LITERAL_TYPES);
+        assert_eq!(signature.min_argument_count(), 1);
+        assert_eq!(signature.resolved_min_argument_count(), -1);
+        assert_eq!(signature.declaration(), Some(function));
+        assert!(signature.type_parameters().is_empty());
+        assert_eq!(signature.parameters(), parameter_symbols);
+        assert!(signature.this_parameter().is_none());
+        assert!(signature.resolved_return_type().is_none());
+        assert!(signature.resolved_type_predicate().is_none());
+        assert!(signature.target().is_none());
+        assert!(signature.mapper().is_none());
+        assert!(signature.isolated_signature_type().is_none());
+        assert!(signature.composite().is_none());
+
+        let record = fixture.store.type_payload(type_).unwrap();
+        assert_eq!(record.flags(), TypeFlags::OBJECT);
+        assert_eq!(
+            record.object_flags(),
+            ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED
+        );
+        assert_eq!(record.symbol(), Some(node_symbol(&fixture, function)));
+        assert_eq!(
+            record
+                .alias()
+                .and_then(|alias| fixture.store.type_alias(alias))
+                .and_then(TypeAlias::symbol),
+            Some(alias)
+        );
+        let structured = record.data().structured().unwrap();
+        assert_eq!(
+            structured.members,
+            fixture
+                .store
+                .symbol(node_symbol(&fixture, function))
+                .unwrap()
+                .members()
+        );
+        assert_eq!(structured.properties.as_deref(), Some(&[][..]));
+        assert_eq!(structured.signatures.as_deref(), Some(&[signature_id][..]));
+        assert_eq!(structured.call_signature_count, 1);
+        assert!(structured.index_infos.is_none());
+
+        let required = fixture
+            .store
+            .value_symbol_links(parameter_symbols[0])
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        assert_eq!(
+            fixture.store.type_payload(required).unwrap().flags(),
+            TypeFlags::NUMBER_LITERAL
+        );
+        let optional = fixture
+            .store
+            .value_symbol_links(parameter_symbols[1])
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        let undefined = fixture.store.intrinsic_bootstrap().unwrap().undefined_type;
+        assert!(union_types(&fixture.store, optional).contains(&undefined));
+        assert!(union_types(&fixture.store, optional).iter().any(|type_| {
+            fixture
+                .store
+                .type_payload(*type_)
+                .is_some_and(|record| record.flags() == TypeFlags::NUMBER_LITERAL)
+        }));
+        let return_node = function_return_node(&fixture, function);
+        assert!(fixture.store.type_node_links(return_node).is_none());
+
+        let warm = function_store_state(&fixture.store);
+        assert_eq!(
+            query_declared(
+                &mut fixture,
+                alias,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Ok(type_)
+        );
+        assert_eq!(function_store_state(&fixture.store), warm);
+
+        let return_type =
+            query_signature_return(&mut fixture, signature_id, &mut diagnostics).unwrap();
+        assert_eq!(
+            fixture.store.type_payload(return_type).unwrap().flags(),
+            TypeFlags::NUMBER_LITERAL
+        );
+        let return_warm = function_store_state(&fixture.store);
+        assert_eq!(
+            query_signature_return(&mut fixture, signature_id, &mut diagnostics),
+            Ok(return_type)
+        );
+        assert_eq!(function_store_state(&fixture.store), return_warm);
+        assert!(diagnostics.is_empty());
+
+        let mut loose = self::fixture("type Loose = (value?: void) => void;");
+        let loose_alias = named_symbol(&loose, SyntaxKind::TypeAliasDeclaration, "Loose");
+        let loose_function = function_type_node(&loose, "Loose");
+        let loose_parameter = function_parameter_nodes(&loose, loose_function)[0];
+        let loose_parameter_symbol = node_symbol(&loose, loose_parameter);
+        let loose_type = query_declared(
+            &mut loose,
+            loose_alias,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        let loose_signature = loose
+            .store
+            .signature(function_signature(&loose.store, loose_function))
+            .unwrap();
+        assert_eq!(loose_signature.flags(), SignatureFlags::NONE);
+        assert_eq!(loose_signature.min_argument_count(), 0);
+        assert_eq!(
+            loose
+                .store
+                .value_symbol_links(loose_parameter_symbol)
+                .and_then(|links| links.resolved_type),
+            Some(loose.store.intrinsic_bootstrap().unwrap().void_type)
+        );
+        let loose_warm = function_store_state(&loose.store);
+        assert_eq!(
+            query_declared(
+                &mut loose,
+                loose_alias,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Ok(loose_type)
+        );
+        assert_eq!(function_store_state(&loose.store), loose_warm);
+
+        let mut parenthesized = self::fixture("type Parenthesized = (value: (1)) => void;");
+        let parenthesized_alias = named_symbol(
+            &parenthesized,
+            SyntaxKind::TypeAliasDeclaration,
+            "Parenthesized",
+        );
+        let parenthesized_function = function_type_node(&parenthesized, "Parenthesized");
+        query_declared(
+            &mut parenthesized,
+            parenthesized_alias,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        assert_eq!(
+            parenthesized
+                .store
+                .signature(function_signature(
+                    &parenthesized.store,
+                    parenthesized_function,
+                ))
+                .unwrap()
+                .flags(),
+            SignatureFlags::NONE
+        );
+
+        let mut named = fixture_with_intrinsic(
+            "type Maybe = number | undefined; type Named = (value?: Maybe) => void;",
+            IntrinsicBootstrapOptions {
+                strict_null_checks: true,
+                ..IntrinsicBootstrapOptions::default()
+            },
+        );
+        let maybe = named_symbol(&named, SyntaxKind::TypeAliasDeclaration, "Maybe");
+        let named_alias = named_symbol(&named, SyntaxKind::TypeAliasDeclaration, "Named");
+        let named_function = function_type_node(&named, "Named");
+        let named_parameter = function_parameter_nodes(&named, named_function)[0];
+        let named_parameter_symbol = node_symbol(&named, named_parameter);
+        let maybe_type = query_declared(
+            &mut named,
+            maybe,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        let named_union_state = (
+            named.store.intrinsic_bootstrap().unwrap().union_cache_len(),
+            named
+                .store
+                .intrinsic_bootstrap()
+                .unwrap()
+                .union_of_union_cache_len(),
+        );
+        let named_type = query_declared(
+            &mut named,
+            named_alias,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                named.store.intrinsic_bootstrap().unwrap().union_cache_len(),
+                named
+                    .store
+                    .intrinsic_bootstrap()
+                    .unwrap()
+                    .union_of_union_cache_len(),
+            ),
+            named_union_state
+        );
+        assert_eq!(
+            named
+                .store
+                .value_symbol_links(named_parameter_symbol)
+                .and_then(|links| links.resolved_type),
+            Some(maybe_type)
+        );
+        let named_warm = function_store_state(&named.store);
+        assert_eq!(
+            query_declared(
+                &mut named,
+                named_alias,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Ok(named_type)
+        );
+        assert_eq!(function_store_state(&named.store), named_warm);
+
+        let mut edges = fixture_with_intrinsic(
+            concat!(
+                "type Pair = string | number; ",
+                "type Edges = (voidValue?: void, nullValue?: null, pair?: Pair) => void;",
+            ),
+            IntrinsicBootstrapOptions {
+                strict_null_checks: true,
+                ..IntrinsicBootstrapOptions::default()
+            },
+        );
+        let pair = named_symbol(&edges, SyntaxKind::TypeAliasDeclaration, "Pair");
+        let edges_alias = named_symbol(&edges, SyntaxKind::TypeAliasDeclaration, "Edges");
+        let edges_function = function_type_node(&edges, "Edges");
+        let edge_parameters = function_parameter_nodes(&edges, edges_function);
+        let edges_type = query_declared(
+            &mut edges,
+            edges_alias,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        let pair_type = edges
+            .store
+            .type_alias_links(pair)
+            .and_then(|links| links.declared_type)
+            .unwrap();
+        let (void_type, null_type, undefined_type) = {
+            let bootstrap = edges.store.intrinsic_bootstrap().unwrap();
+            (
+                bootstrap.void_type,
+                bootstrap.null_type,
+                bootstrap.undefined_type,
+            )
+        };
+        for (index, base) in [(0, void_type), (1, null_type)] {
+            let parameter_type = edges
+                .store
+                .value_symbol_links(node_symbol(&edges, edge_parameters[index]))
+                .and_then(|links| links.resolved_type)
+                .unwrap();
+            assert!(union_types(&edges.store, parameter_type).contains(&base));
+            assert!(union_types(&edges.store, parameter_type).contains(&undefined_type));
+        }
+        let optional_pair = edges
+            .store
+            .value_symbol_links(node_symbol(&edges, edge_parameters[2]))
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        assert_ne!(optional_pair, pair_type);
+        assert!(union_types(&edges.store, optional_pair).contains(&undefined_type));
+        let edge_warm = function_store_state(&edges.store);
+        assert_eq!(
+            query_declared(
+                &mut edges,
+                edges_alias,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Ok(edges_type)
+        );
+        assert_eq!(function_store_state(&edges.store), edge_warm);
+
+        let mut arrays = global_array_fixture("type Fn = (value: Array<number>) => void;");
+        let global_types = initialize_fixture_global_types(&mut arrays);
+        let array_alias = named_symbol(&arrays, SyntaxKind::TypeAliasDeclaration, "Fn");
+        let array_function = function_type_node(&arrays, "Fn");
+        let array_parameter = function_parameter_nodes(&arrays, array_function)[0];
+        let array_function_type =
+            query_global_declared(&mut arrays, &global_types, array_alias, &mut diagnostics)
+                .unwrap();
+        let array_parameter_type = arrays
+            .store
+            .value_symbol_links(node_symbol(&arrays, array_parameter))
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        let array_warm = function_store_state(&arrays.store);
+        assert_eq!(
+            query_empty_host_declared(&mut arrays, array_alias, &mut diagnostics),
+            Err(DeclaredTypeError::TypeNodeUnavailable(
+                TypeNodeUnavailable::UnsupportedUnionConstituentType(array_parameter_type)
+            ))
+        );
+        assert_eq!(function_store_state(&arrays.store), array_warm);
+        assert_eq!(
+            query_empty_host_global_declared(
+                &mut arrays,
+                &global_types,
+                array_alias,
+                &mut diagnostics,
+            ),
+            Ok(array_function_type)
+        );
+        assert_eq!(function_store_state(&arrays.store), array_warm);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn function_type_recursive_alias_shells_cover_direct_and_mutual_optional_unions() {
+        let mut fixture = fixture_with_intrinsic(
+            concat!(
+                "type SelfRef = (next: SelfRef) => SelfRef; ",
+                "type UnionSelf = (next: UnionSelf | undefined) => void; ",
+                "type Left = (right: Right | undefined) => Right; ",
+                "type Right = (left: Left | undefined) => Left; ",
+                "type Outer = ((next: Outer) => void) | undefined; ",
+                "type OuterLeft = ((right: OuterRight) => void) | undefined; ",
+                "type OuterRight = ((left: OuterLeft) => void) | undefined; ",
+                "type Callback = { cb: (next: Callback) => void }; ",
+                "type DirectObject = { next: DirectObject }; ",
+                "type ThroughDirectObject = (value: ReachedDirectObject) => void; ",
+                "type ReachedDirectObject = { next: ReachedDirectObject };",
+            ),
+            IntrinsicBootstrapOptions {
+                strict_null_checks: true,
+                ..IntrinsicBootstrapOptions::default()
+            },
+        );
+        let self_symbol = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "SelfRef");
+        let union_self_symbol =
+            named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "UnionSelf");
+        let left_symbol = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Left");
+        let right_symbol = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Right");
+        let outer_symbol = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Outer");
+        let outer_left_symbol =
+            named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "OuterLeft");
+        let outer_right_symbol =
+            named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "OuterRight");
+        let callback_symbol = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Callback");
+        let direct_object_symbol =
+            named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "DirectObject");
+        let through_direct_object_symbol = named_symbol(
+            &fixture,
+            SyntaxKind::TypeAliasDeclaration,
+            "ThroughDirectObject",
+        );
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let self_type = query_declared(
+            &mut fixture,
+            self_symbol,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        let union_self_type = query_declared(
+            &mut fixture,
+            union_self_symbol,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        let left_type = query_declared(
+            &mut fixture,
+            left_symbol,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        let right_type = fixture
+            .store
+            .type_alias_links(right_symbol)
+            .and_then(|links| links.declared_type)
+            .unwrap();
+        assert_eq!(
+            query_declared(
+                &mut fixture,
+                right_symbol,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Ok(right_type)
+        );
+        let outer_type = query_declared(
+            &mut fixture,
+            outer_symbol,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        let outer_left_type = query_declared(
+            &mut fixture,
+            outer_left_symbol,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        let outer_right_type = fixture
+            .store
+            .type_alias_links(outer_right_symbol)
+            .and_then(|links| links.declared_type)
+            .unwrap();
+        let callback_type = query_declared(
+            &mut fixture,
+            callback_symbol,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+
+        let resolved_parameter = |fixture: &Fixture, alias: &str| {
+            let parameter =
+                function_parameter_nodes(fixture, function_type_node(fixture, alias))[0];
+            fixture
+                .store
+                .value_symbol_links(node_symbol(fixture, parameter))
+                .and_then(|links| links.resolved_type)
+                .unwrap()
+        };
+        assert_eq!(resolved_parameter(&fixture, "SelfRef"), self_type);
+        let undefined = fixture.store.intrinsic_bootstrap().unwrap().undefined_type;
+        let union_self_parameter = resolved_parameter(&fixture, "UnionSelf");
+        assert!(union_types(&fixture.store, union_self_parameter).contains(&union_self_type));
+        assert!(union_types(&fixture.store, union_self_parameter).contains(&undefined));
+        let left_parameter = resolved_parameter(&fixture, "Left");
+        assert!(union_types(&fixture.store, left_parameter).contains(&right_type));
+        assert!(union_types(&fixture.store, left_parameter).contains(&undefined));
+        let right_parameter = resolved_parameter(&fixture, "Right");
+        assert!(union_types(&fixture.store, right_parameter).contains(&left_type));
+        assert!(union_types(&fixture.store, right_parameter).contains(&undefined));
+        let outer_function_type = fixture
+            .store
+            .type_node_links(function_type_node(&fixture, "Outer"))
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        assert!(union_types(&fixture.store, outer_type).contains(&outer_function_type));
+        assert!(union_types(&fixture.store, outer_type).contains(&undefined));
+        assert_eq!(resolved_parameter(&fixture, "Outer"), outer_type);
+        assert_eq!(resolved_parameter(&fixture, "OuterLeft"), outer_right_type);
+        assert_eq!(resolved_parameter(&fixture, "OuterRight"), outer_left_type);
+        assert_eq!(resolved_parameter(&fixture, "Callback"), callback_type);
+
+        let before_direct_object = function_store_state(&fixture.store);
+        assert!(matches!(
+            query_declared(
+                &mut fixture,
+                direct_object_symbol,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Err(DeclaredTypeError::TypeNodeUnavailable(
+                TypeNodeUnavailable::GenericReferenceUnsupported { .. }
+            ))
+        ));
+        assert_eq!(function_store_state(&fixture.store), before_direct_object);
+        assert!(matches!(
+            query_declared(
+                &mut fixture,
+                through_direct_object_symbol,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Err(DeclaredTypeError::TypeNodeUnavailable(
+                TypeNodeUnavailable::GenericReferenceUnsupported { .. }
+            ))
+        ));
+        assert_eq!(function_store_state(&fixture.store), before_direct_object);
+
+        let self_signature =
+            function_signature(&fixture.store, function_type_node(&fixture, "SelfRef"));
+        let union_self_signature =
+            function_signature(&fixture.store, function_type_node(&fixture, "UnionSelf"));
+        let left_signature =
+            function_signature(&fixture.store, function_type_node(&fixture, "Left"));
+        let right_signature =
+            function_signature(&fixture.store, function_type_node(&fixture, "Right"));
+        assert_eq!(
+            query_signature_return(&mut fixture, self_signature, &mut diagnostics),
+            Ok(self_type)
+        );
+        assert_eq!(
+            query_signature_return(&mut fixture, union_self_signature, &mut diagnostics),
+            Ok(fixture.store.intrinsic_bootstrap().unwrap().void_type)
+        );
+        assert_eq!(
+            query_signature_return(&mut fixture, left_signature, &mut diagnostics),
+            Ok(right_type)
+        );
+        assert_eq!(
+            query_signature_return(&mut fixture, right_signature, &mut diagnostics),
+            Ok(left_type)
+        );
+        for (symbol, expected) in [
+            (outer_symbol, outer_type),
+            (outer_left_symbol, outer_left_type),
+            (outer_right_symbol, outer_right_type),
+            (callback_symbol, callback_type),
+        ] {
+            assert_eq!(
+                query_declared(
+                    &mut fixture,
+                    symbol,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut diagnostics,
+                ),
+                Ok(expected)
+            );
+        }
+        let warm = function_store_state(&fixture.store);
+        for (symbol, expected) in [
+            (outer_symbol, outer_type),
+            (outer_left_symbol, outer_left_type),
+            (outer_right_symbol, outer_right_type),
+            (callback_symbol, callback_type),
+        ] {
+            assert_eq!(
+                query_declared(
+                    &mut fixture,
+                    symbol,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut diagnostics,
+                ),
+                Ok(expected)
+            );
+        }
+        assert_eq!(function_store_state(&fixture.store), warm);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn function_type_lazy_return_cycles_cache_any_once_and_balance_resolution() {
+        let mut fixture = fixture("type Loop = Loop; type Fn = () => Loop;");
+        let function_alias = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Fn");
+        let loop_alias = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Loop");
+        let function = function_type_node(&fixture, "Fn");
+        let return_node = function_return_node(&fixture, function);
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        query_declared(
+            &mut fixture,
+            function_alias,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        let signature = function_signature(&fixture.store, function);
+        let (error_type, any_type) = {
+            let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+            (bootstrap.error_type, bootstrap.any_type)
+        };
+
+        assert!(
+            fixture
+                .store
+                .push_type_resolution(
+                    TypeResolutionTarget::Signature(signature),
+                    TypeSystemPropertyName::ResolvedReturnType,
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            query_signature_return(&mut fixture, signature, &mut diagnostics),
+            Ok(error_type)
+        );
+        assert!(
+            fixture
+                .store
+                .signature(signature)
+                .unwrap()
+                .resolved_return_type()
+                .is_none()
+        );
+        assert_eq!(fixture.store.pop_type_resolution(), Some(false));
+        assert!(diagnostics.is_empty());
+
+        assert!(
+            fixture
+                .store
+                .push_type_resolution(
+                    TypeResolutionTarget::Symbol(loop_alias),
+                    TypeSystemPropertyName::DeclaredType,
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            query_signature_return(&mut fixture, signature, &mut diagnostics),
+            Ok(any_type)
+        );
+        assert_eq!(fixture.store.pop_type_resolution(), Some(false));
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics.as_slice()[0].diagnostic.code(), 2577);
+        assert_eq!(diagnostics.as_slice()[0].node, Some(return_node));
+        assert_eq!(
+            fixture
+                .store
+                .type_node_links(return_node)
+                .and_then(|links| links.resolved_type),
+            Some(error_type)
+        );
+        assert_eq!(
+            fixture
+                .store
+                .signature(signature)
+                .unwrap()
+                .resolved_return_type(),
+            Some(any_type)
+        );
+        assert!(fixture.store.signature_has_circular_return_type(signature));
+        let warm = function_store_state(&fixture.store);
+        assert_eq!(
+            query_signature_return(&mut fixture, signature, &mut diagnostics),
+            Ok(any_type)
+        );
+        assert_eq!(function_store_state(&fixture.store), warm);
+        assert_eq!(diagnostics.len(), 1);
+        let function_type = fixture
+            .store
+            .type_node_links(function)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        let string_type = fixture.store.intrinsic_bootstrap().unwrap().string_type;
+        assert!(fixture.store.set_type_node_links(
+            return_node,
+            TypeNodeLinks {
+                resolved_type: Some(string_type),
+                ..TypeNodeLinks::default()
+            },
+        ));
+        assert!(matches!(
+            fixture.store.validate_union_constituent(function_type),
+            Err(LiteralTypeCacheError::InvalidCachedUnion(type_)) if type_ == function_type
+        ));
+        let poisoned = function_store_state(&fixture.store);
+        assert!(matches!(
+            query_signature_return(&mut fixture, signature, &mut diagnostics),
+            Err(DeclaredTypeError::TypeNodeUnavailable(
+                TypeNodeUnavailable::InvalidCachedUnionType(type_)
+            )) if type_ == function_type
+        ));
+        assert_eq!(function_store_state(&fixture.store), poisoned);
+        assert!(fixture.store.set_type_node_links(
+            return_node,
+            TypeNodeLinks {
+                resolved_type: Some(error_type),
+                ..TypeNodeLinks::default()
+            },
+        ));
+        assert_eq!(
+            fixture.store.validate_union_constituent(function_type),
+            Ok(())
+        );
+        assert_eq!(
+            query_signature_return(&mut fixture, signature, &mut diagnostics),
+            Ok(any_type)
+        );
+        assert_eq!(diagnostics.len(), 1);
+        assert!(
+            fixture
+                .store
+                .set_signature_resolved_return_type(signature, Some(any_type))
+        );
+        assert!(!fixture.store.signature_has_circular_return_type(signature));
+        assert!(matches!(
+            fixture.store.validate_union_constituent(function_type),
+            Err(LiteralTypeCacheError::InvalidCachedUnion(type_)) if type_ == function_type
+        ));
+
+        let mut cleared = self::fixture("type Loop = Loop; type Fn = () => Loop;");
+        let cleared_alias = named_symbol(&cleared, SyntaxKind::TypeAliasDeclaration, "Fn");
+        let cleared_loop = named_symbol(&cleared, SyntaxKind::TypeAliasDeclaration, "Loop");
+        let cleared_function = function_type_node(&cleared, "Fn");
+        let mut cleared_diagnostics = CanonicalCheckerDiagnostics::default();
+        query_declared(
+            &mut cleared,
+            cleared_alias,
+            CanonicalTypeQueryOptions::default(),
+            &mut cleared_diagnostics,
+        )
+        .unwrap();
+        let cleared_signature = function_signature(&cleared.store, cleared_function);
+        assert!(
+            cleared
+                .store
+                .push_type_resolution(
+                    TypeResolutionTarget::Symbol(cleared_loop),
+                    TypeSystemPropertyName::DeclaredType,
+                )
+                .unwrap()
+        );
+        assert!(
+            query_signature_return(&mut cleared, cleared_signature, &mut cleared_diagnostics,)
+                .is_ok()
+        );
+        assert_eq!(cleared.store.pop_type_resolution(), Some(false));
+        assert!(
+            cleared
+                .store
+                .signature_has_circular_return_type(cleared_signature)
+        );
+        let foreign = self::fixture("type Foreign = string;")
+            .store
+            .intrinsic_bootstrap()
+            .unwrap()
+            .string_type;
+        assert!(
+            !cleared
+                .store
+                .set_signature_resolved_return_type(cleared_signature, Some(foreign))
+        );
+        assert!(
+            cleared
+                .store
+                .signature_has_circular_return_type(cleared_signature)
+        );
+        assert!(
+            cleared
+                .store
+                .set_signature_resolved_return_type(cleared_signature, None)
+        );
+        assert!(
+            !cleared
+                .store
+                .signature_has_circular_return_type(cleared_signature)
+        );
+        assert!(
+            cleared
+                .store
+                .signature(cleared_signature)
+                .unwrap()
+                .resolved_return_type()
+                .is_none()
+        );
+        let cleared_type = cleared
+            .store
+            .type_node_links(cleared_function)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        assert_eq!(
+            cleared.store.validate_union_constituent(cleared_type),
+            Ok(())
+        );
+
+        let mut wrapped = global_array_fixture("type Loop = Loop; type Fn = () => Loop[];");
+        let wrapped_globals = initialize_fixture_global_types(&mut wrapped);
+        let wrapped_alias = named_symbol(&wrapped, SyntaxKind::TypeAliasDeclaration, "Fn");
+        let wrapped_loop = named_symbol(&wrapped, SyntaxKind::TypeAliasDeclaration, "Loop");
+        let wrapped_function = function_type_node(&wrapped, "Fn");
+        let wrapped_return = function_return_node(&wrapped, wrapped_function);
+        let mut wrapped_diagnostics = CanonicalCheckerDiagnostics::default();
+        query_global_declared(
+            &mut wrapped,
+            &wrapped_globals,
+            wrapped_alias,
+            &mut wrapped_diagnostics,
+        )
+        .unwrap();
+        let wrapped_signature = function_signature(&wrapped.store, wrapped_function);
+        assert!(
+            wrapped
+                .store
+                .push_type_resolution(
+                    TypeResolutionTarget::Symbol(wrapped_loop),
+                    TypeSystemPropertyName::DeclaredType,
+                )
+                .unwrap()
+        );
+        let wrapped_any = wrapped.store.intrinsic_bootstrap().unwrap().any_type;
+        assert_eq!(
+            query_global_signature_return(
+                &mut wrapped,
+                &wrapped_globals,
+                wrapped_signature,
+                &mut wrapped_diagnostics,
+            ),
+            Ok(wrapped_any)
+        );
+        assert_eq!(wrapped.store.pop_type_resolution(), Some(false));
+        let wrapped_annotation = wrapped
+            .store
+            .type_node_links(wrapped_return)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        assert_eq!(
+            wrapped
+                .store
+                .circular_return_annotation_type(wrapped_signature),
+            Some(wrapped_annotation)
+        );
+        assert_ne!(
+            wrapped_annotation,
+            wrapped.store.intrinsic_bootstrap().unwrap().error_type
+        );
+        assert_eq!(wrapped_diagnostics.len(), 1);
+        assert_eq!(wrapped_diagnostics.as_slice()[0].diagnostic.code(), 2577);
+        assert_eq!(
+            query_global_signature_return(
+                &mut wrapped,
+                &wrapped_globals,
+                wrapped_signature,
+                &mut wrapped_diagnostics,
+            ),
+            Ok(wrapped_any)
+        );
+        assert_eq!(wrapped_diagnostics.len(), 1);
+
+        let mut forged = self::fixture("type Loop = Loop; type Fn = () => Loop;");
+        let function_alias = named_symbol(&forged, SyntaxKind::TypeAliasDeclaration, "Fn");
+        let loop_alias = named_symbol(&forged, SyntaxKind::TypeAliasDeclaration, "Loop");
+        let function = function_type_node(&forged, "Fn");
+        let mut forged_diagnostics = CanonicalCheckerDiagnostics::default();
+        query_declared(
+            &mut forged,
+            function_alias,
+            CanonicalTypeQueryOptions::default(),
+            &mut forged_diagnostics,
+        )
+        .unwrap();
+        let forged_signature = function_signature(&forged.store, function);
+        let error_type = forged.store.intrinsic_bootstrap().unwrap().error_type;
+        let any_type = forged.store.intrinsic_bootstrap().unwrap().any_type;
+        assert_eq!(
+            query_declared(
+                &mut forged,
+                loop_alias,
+                CanonicalTypeQueryOptions::default(),
+                &mut forged_diagnostics,
+            ),
+            Ok(error_type)
+        );
+        assert!(
+            forged
+                .store
+                .set_signature_resolved_return_type(forged_signature, Some(any_type))
+        );
+        assert!(
+            !forged
+                .store
+                .signature_has_circular_return_type(forged_signature)
+        );
+        let forged_function_type = forged
+            .store
+            .type_node_links(function)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        assert!(matches!(
+            forged.store.validate_union_constituent(forged_function_type),
+            Err(LiteralTypeCacheError::InvalidCachedUnion(type_))
+                if type_ == forged_function_type
+        ));
+        let forged_state = function_store_state(&forged.store);
+        assert!(matches!(
+            query_signature_return(
+                &mut forged,
+                forged_signature,
+                &mut forged_diagnostics,
+            ),
+            Err(DeclaredTypeError::TypeNodeUnavailable(
+                TypeNodeUnavailable::InvalidCachedUnionType(type_)
+            )) if type_ == forged_function_type
+        ));
+        assert_eq!(function_store_state(&forged.store), forged_state);
+        assert_eq!(forged_diagnostics.len(), 1);
+        assert_eq!(forged_diagnostics.as_slice()[0].diagnostic.code(), 2456);
+    }
+
+    #[test]
+    fn function_type_poison_is_read_only_and_exact_shells_retry_with_identity() {
+        let mut signature_poison = fixture("type Fn = (value: string) => number;");
+        let alias = named_symbol(&signature_poison, SyntaxKind::TypeAliasDeclaration, "Fn");
+        let function = function_type_node(&signature_poison, "Fn");
+        assert!(signature_poison.store.set_signature_links(
+            function,
+            SignatureLinks {
+                resolved_signature: ResolvedSignatureState::Resolving,
+                ..SignatureLinks::default()
+            },
+        ));
+        let poisoned = function_store_state(&signature_poison.store);
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        assert!(matches!(
+            query_declared(
+                &mut signature_poison,
+                alias,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Err(DeclaredTypeError::TypeNodeUnavailable(
+                TypeNodeUnavailable::InvalidFunctionType(node)
+            )) if node == function
+        ));
+        assert_eq!(function_store_state(&signature_poison.store), poisoned);
+        assert!(
+            signature_poison
+                .store
+                .set_signature_links(function, SignatureLinks::default())
+        );
+        query_declared(
+            &mut signature_poison,
+            alias,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+
+        let mut fixture = fixture("type Fn = (value: { nested: string }) => number;");
+        let alias = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Fn");
+        let function = function_type_node(&fixture, "Fn");
+        let parameter = function_parameter_nodes(&fixture, function)[0];
+        let annotation = parameter_type_node(&fixture, parameter);
+        let poison = fixture.store.intrinsic_bootstrap().unwrap().string_type;
+        assert!(fixture.store.set_type_node_links(
+            annotation,
+            TypeNodeLinks {
+                resolved_type: Some(poison),
+                ..TypeNodeLinks::default()
+            },
+        ));
+        assert!(matches!(
+            query_declared(
+                &mut fixture,
+                alias,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Err(DeclaredTypeError::TypeNodeUnavailable(
+                TypeNodeUnavailable::InvalidLiteralType(node)
+            )) if node == annotation
+        ));
+        let shell = fixture
+            .store
+            .type_node_links(function)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        let shell_signature = function_signature(&fixture.store, function);
+        let structured = fixture
+            .store
+            .type_payload(shell)
+            .unwrap()
+            .data()
+            .structured()
+            .unwrap();
+        assert_eq!(structured.call_signature_count, 1);
+        assert_eq!(
+            structured.signatures.as_deref(),
+            Some(&[shell_signature][..])
+        );
+        assert!(
+            fixture
+                .store
+                .value_symbol_links(node_symbol(&fixture, parameter))
+                .is_none_or(|links| links == &ValueSymbolLinks::default())
+        );
+        assert!(
+            fixture
+                .store
+                .set_type_node_links(annotation, TypeNodeLinks::default())
+        );
+        assert_eq!(
+            query_declared(
+                &mut fixture,
+                alias,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Ok(shell)
+        );
+        assert_eq!(
+            function_signature(&fixture.store, function),
+            shell_signature
+        );
+
+        let parameter_symbol = node_symbol(&fixture, parameter);
+        let correct_links = fixture
+            .store
+            .value_symbol_links(parameter_symbol)
+            .unwrap()
+            .clone();
+        assert!(fixture.store.set_value_symbol_links(
+            parameter_symbol,
+            ValueSymbolLinks {
+                resolved_type: Some(poison),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        let warm_poison = function_store_state(&fixture.store);
+        assert!(matches!(
+            query_declared(
+                &mut fixture,
+                alias,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Err(DeclaredTypeError::TypeNodeUnavailable(
+                TypeNodeUnavailable::InvalidFunctionType(node)
+            )) if node == parameter
+        ));
+        assert_eq!(function_store_state(&fixture.store), warm_poison);
+        assert!(
+            fixture
+                .store
+                .set_value_symbol_links(parameter_symbol, correct_links)
+        );
+        assert_eq!(
+            query_declared(
+                &mut fixture,
+                alias,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Ok(shell)
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn function_type_unsupported_phase_one_matrix_is_atomic() {
+        let assert_unsupported = |mut fixture: Fixture| {
+            let alias = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Fn");
+            let before = function_store_state(&fixture.store);
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            assert!(matches!(
+                query_declared(
+                    &mut fixture,
+                    alias,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut diagnostics,
+                ),
+                Err(DeclaredTypeError::TypeNodeUnavailable(
+                    TypeNodeUnavailable::UnsupportedSyntax {
+                        kind: SyntaxKind::FunctionType,
+                        ..
+                    }
+                ))
+            ));
+            assert_eq!(function_store_state(&fixture.store), before);
+            assert!(diagnostics.is_empty());
+        };
+        for source in [
+            "type Fn<T> = (value: string) => number;",
+            "type Fn = <T>(value: T) => T;",
+            "type Fn = (this: object, value: string) => number;",
+            "type Fn = (...value: string[]) => number;",
+            "type Fn = ([value]: [string]) => number;",
+            "type Fn = (value: string = \"\") => number;",
+        ] {
+            assert_unsupported(fixture(source));
+        }
+        assert_unsupported(fixture_with_mutation(
+            "type Fn = (value: string) => number;",
+            |parsed| {
+                let parameter = parsed
+                    .arena
+                    .iter()
+                    .find_map(|(node, record)| {
+                        (record.kind == SyntaxKind::Parameter).then_some(node)
+                    })
+                    .unwrap();
+                let NodeData::ParameterDeclaration(data) =
+                    &mut parsed.arena.get_mut(parameter).unwrap().data
+                else {
+                    unreachable!()
+                };
+                data.type_ = None;
+            },
+        ));
+        assert_unsupported(fixture_with_mutation(
+            "type Fn = (value: string) => number;",
+            |parsed| {
+                let function = parsed
+                    .arena
+                    .iter()
+                    .find_map(|(node, record)| {
+                        (record.kind == SyntaxKind::FunctionType).then_some(node)
+                    })
+                    .unwrap();
+                let NodeData::FunctionTypeNode(data) =
+                    &mut parsed.arena.get_mut(function).unwrap().data
+                else {
+                    unreachable!()
+                };
+                data.type_ = None;
+            },
+        ));
+        let mut lazy_boundary = fixture("type Fn = (value: string) => [string];");
+        let alias = named_symbol(&lazy_boundary, SyntaxKind::TypeAliasDeclaration, "Fn");
+        let function = function_type_node(&lazy_boundary, "Fn");
+        let return_node = function_return_node(&lazy_boundary, function);
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        assert!(
+            query_declared(
+                &mut lazy_boundary,
+                alias,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .is_ok()
+        );
+        let signature = function_signature(&lazy_boundary.store, function);
+        let before_return = function_store_state(&lazy_boundary.store);
+        assert_eq!(
+            query_signature_return(&mut lazy_boundary, signature, &mut diagnostics),
+            Err(DeclaredTypeError::TypeNodeUnavailable(
+                TypeNodeUnavailable::UnsupportedSyntax {
+                    node: return_node,
+                    kind: SyntaxKind::TupleType,
+                }
+            ))
+        );
+        assert_eq!(function_store_state(&lazy_boundary.store), before_return);
+        assert!(
+            lazy_boundary
+                .store
+                .signature(signature)
+                .unwrap()
+                .resolved_return_type()
+                .is_none()
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn function_type_union_hook_rejects_barrier_and_signature_poison() {
+        let mut fixture = fixture_with_intrinsic(
+            "type Fn = (value: string) => number; type Maybe = Fn | undefined;",
+            IntrinsicBootstrapOptions {
+                strict_null_checks: true,
+                ..IntrinsicBootstrapOptions::default()
+            },
+        );
+        let function_alias = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Fn");
+        let maybe_alias = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Maybe");
+        let function = function_type_node(&fixture, "Fn");
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let function_type = query_declared(
+            &mut fixture,
+            function_alias,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        let signature = function_signature(&fixture.store, function);
+        let members = fixture
+            .store
+            .type_payload(function_type)
+            .unwrap()
+            .data()
+            .structured()
+            .unwrap()
+            .members
+            .unwrap();
+        assert_eq!(
+            fixture.store.validate_union_constituent(function_type),
+            Ok(())
+        );
+
+        assert!(fixture.store.set_structured_type_members(
+            function_type,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ));
+        assert!(matches!(
+            fixture.store.validate_union_constituent(function_type),
+            Err(LiteralTypeCacheError::InvalidCachedUnion(type_)) if type_ == function_type
+        ));
+        assert!(fixture.store.set_structured_type_members(
+            function_type,
+            Some(members),
+            Some(Vec::new()),
+            Some(vec![signature]),
+            None,
+            None,
+        ));
+        assert_eq!(
+            fixture.store.validate_union_constituent(function_type),
+            Ok(())
+        );
+
+        assert!(fixture.store.set_signature_links(
+            function,
+            SignatureLinks {
+                resolved_signature: ResolvedSignatureState::Resolving,
+                ..SignatureLinks::default()
+            },
+        ));
+        assert!(matches!(
+            fixture.store.validate_union_constituent(function_type),
+            Err(LiteralTypeCacheError::InvalidCachedUnion(type_)) if type_ == function_type
+        ));
+        assert!(fixture.store.set_signature_links(
+            function,
+            SignatureLinks {
+                resolved_signature: ResolvedSignatureState::Resolved(signature),
+                ..SignatureLinks::default()
+            },
+        ));
+        assert_eq!(
+            fixture.store.validate_union_constituent(function_type),
+            Ok(())
+        );
+
+        let parameter = function_parameter_nodes(&fixture, function)[0];
+        let parameter_symbol = node_symbol(&fixture, parameter);
+        let parameter_links = fixture
+            .store
+            .value_symbol_links(parameter_symbol)
+            .unwrap()
+            .clone();
+        assert!(
+            fixture
+                .store
+                .set_value_symbol_links(parameter_symbol, ValueSymbolLinks::default())
+        );
+        assert!(matches!(
+            fixture.store.validate_union_constituent(function_type),
+            Err(LiteralTypeCacheError::InvalidCachedUnion(type_)) if type_ == function_type
+        ));
+        assert!(
+            fixture
+                .store
+                .set_value_symbol_links(parameter_symbol, parameter_links)
+        );
+        assert_eq!(
+            fixture.store.validate_union_constituent(function_type),
+            Ok(())
+        );
+
+        let alias_links = fixture
+            .store
+            .type_alias_links(function_alias)
+            .unwrap()
+            .clone();
+        assert!(
+            fixture
+                .store
+                .set_type_alias_links(function_alias, TypeAliasLinks::default())
+        );
+        assert!(matches!(
+            fixture.store.validate_union_constituent(function_type),
+            Err(LiteralTypeCacheError::InvalidCachedUnion(type_)) if type_ == function_type
+        ));
+        assert!(
+            fixture
+                .store
+                .set_type_alias_links(function_alias, alias_links)
+        );
+        assert_eq!(
+            fixture.store.validate_union_constituent(function_type),
+            Ok(())
+        );
+
+        let maybe = query_declared(
+            &mut fixture,
+            maybe_alias,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        assert!(union_types(&fixture.store, maybe).contains(&function_type));
+        assert!(
+            union_types(&fixture.store, maybe)
+                .contains(&fixture.store.intrinsic_bootstrap().unwrap().undefined_type)
+        );
+
+        let function_symbol = node_symbol(&fixture, function);
+        assert!(
+            fixture
+                .store
+                .set_symbol_declarations(function_symbol, None, None)
+        );
+        assert!(fixture.store.set_structured_type_members(
+            function_type,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ));
+        assert!(matches!(
+            fixture.store.validate_union_constituent(function_type),
+            Err(LiteralTypeCacheError::InvalidCachedUnion(type_)) if type_ == function_type
+        ));
+        let erased = function_store_state(&fixture.store);
+        assert_eq!(
+            query_empty_host_declared(&mut fixture, function_alias, &mut diagnostics),
+            Err(DeclaredTypeError::TypeNodeUnavailable(
+                TypeNodeUnavailable::InvalidCachedUnionType(function_type)
+            ))
+        );
+        assert_eq!(function_store_state(&fixture.store), erased);
         assert!(diagnostics.is_empty());
     }
 }

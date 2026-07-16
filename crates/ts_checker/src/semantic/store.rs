@@ -135,6 +135,9 @@ pub struct SemanticStore<TypePayload, MapperPayload> {
     merged_symbols: HashMap<SemanticSymbolId, SemanticSymbolId>,
     links: CheckerLinkStores,
     declared_types_in_progress: HashSet<SemanticSymbolId>,
+    function_type_provenance: HashSet<TypeId>,
+    function_signature_return_annotations: HashMap<SignatureId, (NodeRef, bool)>,
+    circular_return_signatures: HashMap<SignatureId, TypeId>,
     type_resolutions: TypeResolutionStack,
     relations: RelationCaches,
     pub(super) derived_types: DerivedTypeCaches,
@@ -187,6 +190,9 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             merged_symbols: HashMap::new(),
             links: CheckerLinkStores::default(),
             declared_types_in_progress: HashSet::new(),
+            function_type_provenance: HashSet::new(),
+            function_signature_return_annotations: HashMap::new(),
+            circular_return_signatures: HashMap::new(),
             type_resolutions: TypeResolutionStack::new(id),
             relations: RelationCaches::default(),
             derived_types: DerivedTypeCaches::default(),
@@ -488,10 +494,64 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         self.type_aliases.try_reserve(additional)
     }
 
+    pub(super) fn try_reserve_function_type_provenance(&mut self, additional: usize) -> bool {
+        self.function_type_provenance
+            .try_reserve(additional)
+            .is_ok()
+    }
+
+    pub(super) fn set_function_type_provenance(&mut self, type_: TypeId) -> bool {
+        if self.types.get(type_).is_none() || self.function_type_provenance.contains(&type_) {
+            return false;
+        }
+        self.function_type_provenance.insert(type_)
+    }
+
+    pub(super) fn type_has_function_type_provenance(&self, type_: TypeId) -> bool {
+        self.function_type_provenance.contains(&type_)
+    }
+
     pub(super) fn mark_union_cache_validation_dirty(&mut self) {
         if self.intrinsic_bootstrap.is_some() {
             self.union_cache_needs_validation = true;
         }
+    }
+
+    fn node_is_function_type(&self, node: NodeRef) -> bool {
+        self.source_node_kind(node) == Some(SyntaxKind::FunctionType)
+    }
+
+    fn node_has_function_type_ancestor(&self, mut node: NodeRef) -> bool {
+        let mut visited = HashSet::new();
+        loop {
+            if !visited.insert(node) {
+                return false;
+            }
+            if self.node_is_function_type(node) {
+                return true;
+            }
+            let Some(SourceNodeParent::Parent(parent)) = self.source_node_parent(node) else {
+                return false;
+            };
+            node = parent;
+        }
+    }
+
+    fn symbol_is_function_type_parameter(&self, symbol: SemanticSymbolId) -> bool {
+        let Some([declaration]) = self.symbol(symbol).and_then(Symbol::declarations) else {
+            return false;
+        };
+        self.source_node_kind(*declaration) == Some(SyntaxKind::Parameter)
+            && matches!(
+                self.source_node_parent(*declaration),
+                Some(SourceNodeParent::Parent(parent)) if self.node_is_function_type(parent)
+            )
+    }
+
+    fn signature_is_function_type(&self, signature: SignatureId) -> bool {
+        self.signature(signature)
+            .and_then(Signature::declaration)
+            .is_some_and(|declaration| self.node_is_function_type(declaration))
     }
 
     #[must_use]
@@ -576,7 +636,9 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         }
 
         let previous = self.merged_symbols.insert(source, target);
-        self.mark_union_cache_validation_dirty();
+        if !self.function_type_provenance.is_empty() {
+            self.mark_union_cache_validation_dirty();
+        }
         Ok(previous)
     }
 
@@ -641,7 +703,11 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         name: EscapedName,
         symbol: SemanticSymbolId,
     ) -> Option<Option<SemanticSymbolId>> {
-        self.symbols.insert_symbol(table, name, symbol)
+        let previous = self.symbols.insert_symbol(table, name, symbol)?;
+        if !self.function_type_provenance.is_empty() {
+            self.mark_union_cache_validation_dirty();
+        }
+        Some(previous)
     }
 
     pub fn clone_symbol_table(&mut self, source: SymbolTableId) -> Option<SymbolTableId> {
@@ -657,7 +723,9 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         if !self.symbols.set_symbol_flags(symbol, flags, check_flags) {
             return false;
         }
-        self.mark_union_cache_validation_dirty();
+        if !self.function_type_provenance.is_empty() {
+            self.mark_union_cache_validation_dirty();
+        }
         true
     }
 
@@ -667,8 +735,16 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         declarations: Option<Vec<NodeRef>>,
         value_declaration: Option<NodeRef>,
     ) -> bool {
-        self.symbols
+        if !self
+            .symbols
             .set_symbol_declarations(symbol, declarations, value_declaration)
+        {
+            return false;
+        }
+        if !self.function_type_provenance.is_empty() {
+            self.mark_union_cache_validation_dirty();
+        }
+        true
     }
 
     pub fn set_symbol_relationships(
@@ -679,8 +755,16 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         parent: Option<SemanticSymbolId>,
         export_symbol: Option<SemanticSymbolId>,
     ) -> bool {
-        self.symbols
+        if !self
+            .symbols
             .set_symbol_relationships(symbol, members, exports, parent, export_symbol)
+        {
+            return false;
+        }
+        if !self.function_type_provenance.is_empty() {
+            self.mark_union_cache_validation_dirty();
+        }
+        true
     }
 
     /// Reads already-allocated common node links without allocating on a miss.
@@ -752,7 +836,14 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         {
             return false;
         }
+        let dirty = self.node_has_function_type_ancestor(node)
+            && self
+                .type_node_links(node)
+                .is_some_and(|current| current != &TypeNodeLinks::default() && current != &links);
         self.links.type_node.replace_key(node, links);
+        if dirty {
+            self.mark_union_cache_validation_dirty();
+        }
         true
     }
 
@@ -819,7 +910,14 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         {
             return false;
         }
+        let dirty = self.node_is_function_type(node)
+            && self
+                .signature_links(node)
+                .is_some_and(|current| current != &SignatureLinks::default() && current != &links);
         self.links.signature.replace_key(node, links);
+        if dirty {
+            self.mark_union_cache_validation_dirty();
+        }
         true
     }
 
@@ -885,7 +983,14 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         {
             return false;
         }
+        let dirty = self.symbol_is_function_type_parameter(symbol)
+            && self.value_symbol_links(symbol).is_some_and(|current| {
+                current != &ValueSymbolLinks::default() && current != &links
+            });
         self.links.value_symbol.replace_key(symbol, links);
+        if dirty {
+            self.mark_union_cache_validation_dirty();
+        }
         true
     }
 
@@ -958,6 +1063,14 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         {
             return false;
         }
+        let dirty = self.type_alias_links(symbol).is_some_and(|current| {
+            current != &TypeAliasLinks::default()
+                && current != &links
+                && [current.declared_type, links.declared_type]
+                    .into_iter()
+                    .flatten()
+                    .any(|type_| self.function_type_provenance.contains(&type_))
+        });
         let previous = self
             .links
             .type_alias
@@ -984,6 +1097,9 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                     .or_default()
                     .insert(symbol);
             }
+        }
+        if dirty {
+            self.mark_union_cache_validation_dirty();
         }
         true
     }
@@ -1836,6 +1952,63 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         self.signatures.len()
     }
 
+    pub(super) fn try_reserve_signatures(&mut self, additional: usize) -> bool {
+        self.signatures.try_reserve(additional)
+    }
+
+    pub(super) fn try_reserve_function_signature_return_annotations(
+        &mut self,
+        additional: usize,
+    ) -> bool {
+        self.function_signature_return_annotations
+            .try_reserve(additional)
+            .is_ok()
+    }
+
+    pub(super) fn set_function_signature_return_annotation(
+        &mut self,
+        id: SignatureId,
+        annotation: NodeRef,
+        null_literal_identity: bool,
+    ) -> bool {
+        let Some(declaration) = self.signature(id).and_then(Signature::declaration) else {
+            return false;
+        };
+        if !self.node_is_function_type(declaration)
+            || self.function_signature_return_annotations.contains_key(&id)
+        {
+            return false;
+        }
+        let mut current = annotation;
+        loop {
+            let Some(SourceNodeParent::Parent(parent)) = self.source_node_parent(current) else {
+                return false;
+            };
+            if parent == declaration {
+                break;
+            }
+            if self.source_node_kind(parent) != Some(SyntaxKind::ParenthesizedType) {
+                return false;
+            }
+            current = parent;
+        }
+        let previous = self
+            .function_signature_return_annotations
+            .insert(id, (annotation, null_literal_identity));
+        assert!(
+            previous.is_none(),
+            "the return annotation was checked absent"
+        );
+        true
+    }
+
+    pub(super) fn function_signature_return_annotation(
+        &self,
+        id: SignatureId,
+    ) -> Option<(NodeRef, bool)> {
+        self.function_signature_return_annotations.get(&id).copied()
+    }
+
     #[must_use]
     pub fn signatures(&self) -> impl ExactSizeIterator<Item = (SignatureId, &Signature)> {
         self.signatures.iter()
@@ -1846,7 +2019,14 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         id: SignatureId,
         count: i32,
     ) -> bool {
-        self.signatures.set_resolved_min_argument_count(id, count)
+        let dirty = self.signature_is_function_type(id);
+        if !self.signatures.set_resolved_min_argument_count(id, count) {
+            return false;
+        }
+        if dirty {
+            self.mark_union_cache_validation_dirty();
+        }
+        true
     }
 
     pub fn set_signature_resolved_return_type(
@@ -1857,7 +2037,60 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         if !self.valid_optional_type(type_id) {
             return false;
         }
-        self.signatures.set_resolved_return_type(id, type_id)
+        let dirty = self.signature_is_function_type(id);
+        if !self.signatures.set_resolved_return_type(id, type_id) {
+            return false;
+        }
+        let cleared_circular_provenance = self.circular_return_signatures.remove(&id).is_some();
+        if dirty || cleared_circular_provenance {
+            self.mark_union_cache_validation_dirty();
+        }
+        true
+    }
+
+    pub(super) fn try_reserve_circular_return_signatures(&mut self, additional: usize) -> bool {
+        self.circular_return_signatures
+            .try_reserve(additional)
+            .is_ok()
+    }
+
+    pub(super) fn signature_has_circular_return_type(&self, id: SignatureId) -> bool {
+        self.circular_return_signatures.contains_key(&id)
+    }
+
+    pub(super) fn circular_return_annotation_type(&self, id: SignatureId) -> Option<TypeId> {
+        self.circular_return_signatures.get(&id).copied()
+    }
+
+    pub(super) fn set_function_signature_circular_return_type(
+        &mut self,
+        id: SignatureId,
+        type_id: TypeId,
+        annotation_type: TypeId,
+    ) -> bool {
+        let valid = self.signature_is_function_type(id)
+            && self.function_signature_return_annotations.contains_key(&id)
+            && self.types.get(annotation_type).is_some()
+            && self
+                .intrinsic_bootstrap
+                .as_ref()
+                .is_some_and(|bootstrap| type_id == bootstrap.any_type)
+            && self
+                .signature(id)
+                .is_some_and(|signature| signature.resolved_return_type().is_none())
+            && !self.circular_return_signatures.contains_key(&id);
+        if !valid {
+            return false;
+        }
+        let previous = self.circular_return_signatures.insert(id, annotation_type);
+        assert!(
+            previous.is_none(),
+            "the circular-return marker was checked absent"
+        );
+        let published = self.signatures.set_resolved_return_type(id, Some(type_id));
+        assert!(published, "the local function signature was prevalidated");
+        self.mark_union_cache_validation_dirty();
+        true
     }
 
     pub fn set_signature_resolved_type_predicate(
@@ -1868,7 +2101,14 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         if !self.valid_optional_predicate(predicate) {
             return false;
         }
-        self.signatures.set_resolved_type_predicate(id, predicate)
+        let dirty = self.signature_is_function_type(id);
+        if !self.signatures.set_resolved_type_predicate(id, predicate) {
+            return false;
+        }
+        if dirty {
+            self.mark_union_cache_validation_dirty();
+        }
+        true
     }
 
     pub fn set_signature_isolated_type(
@@ -1879,7 +2119,14 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         if !self.valid_optional_type(type_id) {
             return false;
         }
-        self.signatures.set_isolated_signature_type(id, type_id)
+        let dirty = self.signature_is_function_type(id);
+        if !self.signatures.set_isolated_signature_type(id, type_id) {
+            return false;
+        }
+        if dirty {
+            self.mark_union_cache_validation_dirty();
+        }
+        true
     }
 
     pub fn set_signature_target_and_mapper(
@@ -1891,7 +2138,14 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         if !self.valid_optional_signature(target) || !self.valid_optional_mapper(mapper) {
             return false;
         }
-        self.signatures.set_target_and_mapper(id, target, mapper)
+        let dirty = self.signature_is_function_type(id);
+        if !self.signatures.set_target_and_mapper(id, target, mapper) {
+            return false;
+        }
+        if dirty {
+            self.mark_union_cache_validation_dirty();
+        }
+        true
     }
 
     pub fn set_signature_composite(
@@ -1907,7 +2161,14 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         }) {
             return false;
         }
-        self.signatures.set_composite(id, composite)
+        let dirty = self.signature_is_function_type(id);
+        if !self.signatures.set_composite(id, composite) {
+            return false;
+        }
+        if dirty {
+            self.mark_union_cache_validation_dirty();
+        }
+        true
     }
 
     /// Creates validated union or intersection signature provenance.
@@ -1929,7 +2190,14 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
     /// Replaces flags after construction, as required when class constructor
     /// signatures gain or lose upstream's `Abstract` flag.
     pub fn set_signature_flags(&mut self, id: SignatureId, flags: SignatureFlags) -> bool {
-        self.signatures.set_flags(id, flags)
+        let dirty = self.signature_is_function_type(id);
+        if !self.signatures.set_flags(id, flags) {
+            return false;
+        }
+        if dirty {
+            self.mark_union_cache_validation_dirty();
+        }
+        true
     }
 
     /// Replaces contextual or inferred type parameters after validating that
@@ -1942,7 +2210,14 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         if !self.valid_types(&type_parameters) {
             return false;
         }
-        self.signatures.set_type_parameters(id, type_parameters)
+        let dirty = self.signature_is_function_type(id);
+        if !self.signatures.set_type_parameters(id, type_parameters) {
+            return false;
+        }
+        if dirty {
+            self.mark_union_cache_validation_dirty();
+        }
+        true
     }
 
     /// Replaces the contextual or union-combined `this` parameter after
@@ -1955,7 +2230,14 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         if !self.valid_optional_symbol(this_parameter) {
             return false;
         }
-        self.signatures.set_this_parameter(id, this_parameter)
+        let dirty = self.signature_is_function_type(id);
+        if !self.signatures.set_this_parameter(id, this_parameter) {
+            return false;
+        }
+        if dirty {
+            self.mark_union_cache_validation_dirty();
+        }
+        true
     }
 
     /// Allocates a type predicate after validating its optional narrowed type.
@@ -2130,30 +2412,24 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                 kind: node.kind,
                 parent: node.parent,
                 exported: match &node.data {
-                    NodeData::TypeAliasDeclaration(declaration) => declaration
-                        .modifiers
-                        .as_ref()
-                        .is_some_and(|modifiers| {
+                    NodeData::TypeAliasDeclaration(declaration) => {
+                        declaration.modifiers.as_ref().is_some_and(|modifiers| {
                             modifiers.list.nodes.iter().any(|modifier| {
-                                arena
-                                    .get(*modifier)
-                                    .is_some_and(|modifier| {
-                                        modifier.kind == SyntaxKind::ExportKeyword
-                                    })
+                                arena.get(*modifier).is_some_and(|modifier| {
+                                    modifier.kind == SyntaxKind::ExportKeyword
+                                })
                             })
-                        }),
-                    NodeData::InterfaceDeclaration(declaration) => declaration
-                        .modifiers
-                        .as_ref()
-                        .is_some_and(|modifiers| {
+                        })
+                    }
+                    NodeData::InterfaceDeclaration(declaration) => {
+                        declaration.modifiers.as_ref().is_some_and(|modifiers| {
                             modifiers.list.nodes.iter().any(|modifier| {
-                                arena
-                                    .get(*modifier)
-                                    .is_some_and(|modifier| {
-                                        modifier.kind == SyntaxKind::ExportKeyword
-                                    })
+                                arena.get(*modifier).is_some_and(|modifier| {
+                                    modifier.kind == SyntaxKind::ExportKeyword
+                                })
                             })
-                        }),
+                        })
+                    }
                     _ => false,
                 },
                 signature_links_eligible: Self::is_signature_links_eligible(arena, node),

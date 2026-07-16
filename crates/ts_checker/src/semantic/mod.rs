@@ -18,6 +18,7 @@ pub mod declared;
 mod derived_types;
 pub mod diagnostics;
 pub mod formatter;
+mod functions;
 mod global_types;
 pub mod ids;
 pub mod links;

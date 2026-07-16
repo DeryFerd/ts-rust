@@ -8228,11 +8228,7 @@ mod tests {
 
     #[test]
     fn cross_source_retry_diagnostic_publishes_when_its_owner_succeeds() {
-        let first = parsed(concat!(
-            "type Blocked<T> = T; ",
-            "const first: B = 1; ",
-            r#"const blocked: Blocked<() => string> = "";"#,
-        ));
+        let first = parsed("const first: B = 1; const blocked: string = true;");
         let second = parsed("type B = B;");
         let first_file = FileId::new(53);
         let second_file = FileId::new(54);
@@ -8240,19 +8236,23 @@ mod tests {
             &[(first_file, &first), (second_file, &second)],
             CanonicalCheckerOptions::default(),
         );
+        let (fresh_true, regular_true) = {
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            (bootstrap.true_type, bootstrap.regular_true_type)
+        };
+        assert!(context.store_mut_for_test().set_literal_links(
+            fresh_true,
+            Some(fresh_true),
+            fresh_true,
+        ));
 
         let result = context.check_source_file(first_file);
         assert!(
             matches!(
                 result,
-                Err(SourceCheckError::DeclaredType(
-                    DeclaredTypeError::TypeNodeUnavailable(
-                        TypeNodeUnavailable::UnsupportedSyntax {
-                            kind: SyntaxKind::FunctionType,
-                            ..
-                        }
-                    )
-                ))
+                Err(SourceCheckError::LiteralCache(
+                    SourceLiteralCacheError::InvalidCachedLiteral(id)
+                )) if id == regular_true
             ),
             "unexpected first-file result: {result:?}"
         );

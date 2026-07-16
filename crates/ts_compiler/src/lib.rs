@@ -471,6 +471,8 @@ fn type_node_error_is_unsupported(error: &TypeNodeUnavailable) -> bool {
         | TypeNodeUnavailable::MissingPlannedUnionType(_)
         | TypeNodeUnavailable::InvalidCachedUnionType(_)
         | TypeNodeUnavailable::InvalidCachedArrayType(_)
+        | TypeNodeUnavailable::InvalidFunctionType(_)
+        | TypeNodeUnavailable::InvalidFunctionSignature(_)
         | TypeNodeUnavailable::InvalidUnionAlias(_)
         | TypeNodeUnavailable::InvalidPreparedTypeQuery
         | TypeNodeUnavailable::LiteralTypeCapacity
@@ -6700,6 +6702,7 @@ mod tests {
             .unwrap();
         let type_id = bootstrap.any_type;
         let symbol = bootstrap.undefined_symbol;
+        let signature = bootstrap.any_signature;
         let invariant = [
             CanonicalProgramCheckError::Bind {
                 file_name: "/project/input.ts".to_owned(),
@@ -6772,6 +6775,18 @@ mod tests {
                 file_name: "/project/input.ts".to_owned(),
                 error: SourceCheckError::DeclaredType(DeclaredTypeError::TypeNodeUnavailable(
                     TypeNodeUnavailable::InvalidCachedArrayType(type_id),
+                )),
+            },
+            CanonicalProgramCheckError::SourceCheck {
+                file_name: "/project/input.ts".to_owned(),
+                error: SourceCheckError::DeclaredType(DeclaredTypeError::TypeNodeUnavailable(
+                    TypeNodeUnavailable::InvalidFunctionType(node),
+                )),
+            },
+            CanonicalProgramCheckError::SourceCheck {
+                file_name: "/project/input.ts".to_owned(),
+                error: SourceCheckError::DeclaredType(DeclaredTypeError::TypeNodeUnavailable(
+                    TypeNodeUnavailable::InvalidFunctionSignature(signature),
                 )),
             },
             CanonicalProgramCheckError::SourceCheck {
