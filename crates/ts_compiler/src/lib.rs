@@ -6529,6 +6529,7 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::time::{Duration, Instant};
 
+    use ts_checker::semantic::formatter::FunctionTypeDisplayUnavailable;
     use ts_checker::semantic::{
         ArrayTypeError, AssignmentInvariant, CanonicalCheckerContextError,
         CanonicalGlobalInitializationError, CanonicalGlobalTypeInitializationError,
