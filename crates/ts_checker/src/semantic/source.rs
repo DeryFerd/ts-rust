@@ -977,6 +977,15 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                             ),
                         ));
                     }
+                    if self
+                        .type_import_references
+                        .iter()
+                        .any(|reference| reference.root == assignment.target_type_node)
+                    {
+                        return Err(SourceCheckError::Unsupported(
+                            UnsupportedSourceSyntax::Import(assignment.target_type_node),
+                        ));
+                    }
                     let right = self.plan_expression(assignment.right)?;
                     statements.push(PlannedStatement::Assignment(PlannedAssignment {
                         expression: assignment.expression,
@@ -1135,7 +1144,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             return Ok(());
         }
         let record = self.node(node)?;
-        if record.flags.0 & NODE_FLAG_JSDOC != 0 {
+        if record.flags.0 != 0 {
             unsupported.get_or_insert(node);
             return Ok(());
         }
@@ -4837,6 +4846,8 @@ pub(super) fn check_source_file(
     let mut type_import_capabilities =
         HashMap::<NodeRef, Vec<CanonicalTypeReferenceAliasTarget>>::new();
     let mut type_import_capability_references = HashSet::new();
+    let mut type_import_root_order = Vec::new();
+    let mut type_import_roots = HashSet::new();
     for reference in &type_import_references {
         let resolved = resolved_type_imports
             .get(&reference.alias_symbol)
@@ -4852,11 +4863,34 @@ pub(super) fn check_source_file(
         if !type_import_capability_references.insert(reference.node) {
             return Err(SourceCheckError::Import(reference.node));
         }
+        if type_import_roots.insert(reference.root) {
+            type_import_root_order.push(reference.root);
+        }
         type_import_capabilities
             .entry(reference.root)
             .or_default()
             .push(capability);
     }
+
+    let mut type_import_preflight_diagnostics = CanonicalCheckerDiagnostics::default();
+    for root in type_import_root_order {
+        CanonicalTypeQuery::new_with_global_types(
+            store,
+            host,
+            global_types,
+            options,
+            &mut type_import_preflight_diagnostics,
+        )?
+        .with_type_reference_alias_targets(
+            type_import_capabilities
+                .get(&root)
+                .ok_or(SourceCheckError::Import(root))?
+                .iter()
+                .copied(),
+        )?
+        .preflight_type_from_type_node(root)?;
+    }
+    debug_assert!(type_import_preflight_diagnostics.is_empty());
 
     let mut preflighted_type_import_value_uses = HashMap::new();
     for read in &type_import_value_uses {
@@ -5289,6 +5323,7 @@ pub(super) fn publish_type_checked(
 
 #[cfg(test)]
 mod tests {
+    use ts_ast::NodeFlags;
     use ts_binder::{
         CanonicalBinder, CanonicalModuleState, CanonicalNameResolverOptions,
         CanonicalProgramBindings, CanonicalSourceFileFacts, CanonicalSourceLanguage, CheckFlags,
@@ -6338,6 +6373,7 @@ mod tests {
             "type Wrapped = Local;",
             "function accept(value: Local): void {}",
             "const asserted = null as Local;",
+            "function identity<T>(value: T): T { return value; } const called = identity<Local>(1);",
         ]
         .into_iter()
         .enumerate()
@@ -6375,7 +6411,104 @@ mod tests {
     }
 
     #[test]
-    fn declaration_capability_is_not_reused_by_a_later_assignment() {
+    fn composite_import_source_roots_reject_nonzero_wrapper_flags_without_publication() {
+        let target = parsed("export type User = number;");
+        for (index, kind) in [
+            SyntaxKind::UnionType,
+            SyntaxKind::ParenthesizedType,
+            SyntaxKind::ArrayType,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut importer = parsed(
+                "import type { User as Local } from './target'; const value: (Local | null)[] = [];",
+            );
+            let flagged = importer
+                .arena
+                .iter()
+                .find_map(|(node, record)| (record.kind == kind).then_some(node))
+                .expect("fixture contains every composite wrapper");
+            importer.arena.get_mut(flagged).unwrap().flags = NodeFlags(1);
+            let importer_file = FileId::new(950 + u32::try_from(index).unwrap() * 2);
+            let target_file = FileId::new(951 + u32::try_from(index).unwrap() * 2);
+            let files = [(importer_file, &importer), (target_file, &target)];
+            let mut context = external_context_with_import_routes(
+                &files,
+                &[SourceImportRoute {
+                    source: 0,
+                    specifier: 0,
+                    target: 1,
+                }],
+            );
+            let cold = observable_state(&context, importer_file);
+
+            for _ in 0..2 {
+                assert!(matches!(
+                    context.check_source_file(importer_file),
+                    Err(SourceCheckError::Unsupported(
+                        UnsupportedSourceSyntax::Import(_)
+                    ))
+                ));
+                assert_eq!(observable_state(&context, importer_file), cold);
+                assert!(context.diagnostics().is_empty());
+                assert!(!is_type_checked(&context, importer_file));
+            }
+        }
+    }
+
+    #[test]
+    fn composite_declaration_capability_is_closed_to_later_assignment_before_execution() {
+        let importer = parsed(
+            r#"
+                import type { User as Local } from "./target";
+                let value: Local | null = null;
+                value = null;
+            "#,
+        );
+        let target = parsed("export type User = number;");
+        let importer_file = FileId::new(910);
+        let target_file = FileId::new(911);
+        let files = [(importer_file, &importer), (target_file, &target)];
+        let mut context = external_context_with_import_routes(
+            &files,
+            &[SourceImportRoute {
+                source: 0,
+                specifier: 0,
+                target: 1,
+            }],
+        );
+        let root = variable_type_node(&importer, importer_file, "value");
+        let alias = source_import_alias_symbol(&context, &importer, importer_file, "Local");
+        let cold = observable_state(&context, importer_file);
+
+        for _ in 0..2 {
+            assert_eq!(
+                context.check_source_file(importer_file),
+                Err(SourceCheckError::Unsupported(
+                    UnsupportedSourceSyntax::Import(root)
+                ))
+            );
+            assert_eq!(observable_state(&context, importer_file), cold);
+            assert!(
+                context
+                    .store()
+                    .value_symbol_links(variable_symbol(
+                        &context,
+                        &importer,
+                        importer_file,
+                        "value",
+                    ))
+                    .is_none()
+            );
+            assert!(context.store().value_symbol_links(alias).is_none());
+            assert!(!is_type_checked(&context, importer_file));
+            assert!(context.diagnostics().is_empty());
+        }
+    }
+
+    #[test]
+    fn direct_declaration_capability_is_not_reused_by_a_later_assignment() {
         let importer = parsed(
             r#"
                 import type { User as Local } from "./target";
@@ -6384,8 +6517,8 @@ mod tests {
             "#,
         );
         let target = parsed("export type User = { id: number };");
-        let importer_file = FileId::new(910);
-        let target_file = FileId::new(911);
+        let importer_file = FileId::new(912);
+        let target_file = FileId::new(913);
         let files = [(importer_file, &importer), (target_file, &target)];
         let mut context = external_context_with_import_routes(
             &files,
@@ -6400,27 +6533,31 @@ mod tests {
             panic!("expected one imported type reference")
         };
         let alias = source_import_alias_symbol(&context, &importer, importer_file, "Local");
+        let cold = observable_state(&context, importer_file);
 
-        assert!(matches!(
-            context.check_source_file(importer_file),
-            Err(SourceCheckError::DeclaredType(
-                DeclaredTypeError::TypeNodeUnavailable(
-                    TypeNodeUnavailable::ImportAliasTypeReference {
-                        node,
-                        alias: failed_alias,
-                    }
-                )
-            )) if node == *reference && failed_alias == alias
-        ));
-        assert!(
-            context
-                .store()
-                .value_symbol_links(variable_symbol(&context, &importer, importer_file, "value"))
-                .is_none()
-        );
-        assert!(context.store().value_symbol_links(alias).is_none());
-        assert!(!is_type_checked(&context, importer_file));
-        assert!(context.diagnostics().is_empty());
+        for _ in 0..2 {
+            assert_eq!(
+                context.check_source_file(importer_file),
+                Err(SourceCheckError::Unsupported(
+                    UnsupportedSourceSyntax::Import(*reference)
+                ))
+            );
+            assert_eq!(observable_state(&context, importer_file), cold);
+            assert!(
+                context
+                    .store()
+                    .value_symbol_links(variable_symbol(
+                        &context,
+                        &importer,
+                        importer_file,
+                        "value",
+                    ))
+                    .is_none()
+            );
+            assert!(context.store().value_symbol_links(alias).is_none());
+            assert!(!is_type_checked(&context, importer_file));
+            assert!(context.diagnostics().is_empty());
+        }
     }
 
     #[test]
@@ -6473,6 +6610,116 @@ mod tests {
         assert!(context.store().type_node_links(*first_reference).is_none());
         assert!(!is_type_checked(&context, importer_file));
         assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn poisoned_composite_import_roots_preflight_before_variables_and_callables() {
+        let target = parsed("export type Count = number;");
+        for (index, poisoned_name) in ["unionValue", "arrayValue"].into_iter().enumerate() {
+            let importer = parsed(
+                r#"
+                    import type { Count as LocalCount } from "./target";
+                    const earlier: number = 1;
+                    function callable(value: number): number { return value; }
+                    const unionValue: LocalCount | null = null;
+                    const arrayValue: LocalCount[] = [];
+                "#,
+            );
+            let importer_file = FileId::new(940 + u32::try_from(index).unwrap() * 2);
+            let target_file = FileId::new(941 + u32::try_from(index).unwrap() * 2);
+            let files = [(importer_file, &importer), (target_file, &target)];
+            let mut context = external_context_with_import_routes(
+                &files,
+                &[SourceImportRoute {
+                    source: 0,
+                    specifier: 0,
+                    target: 1,
+                }],
+            );
+            let root = variable_type_node(&importer, importer_file, poisoned_name);
+            let other_root = variable_type_node(
+                &importer,
+                importer_file,
+                if poisoned_name == "unionValue" {
+                    "arrayValue"
+                } else {
+                    "unionValue"
+                },
+            );
+            let earlier_type = variable_type_node(&importer, importer_file, "earlier");
+            let earlier_initializer = variable_initializer(&importer, importer_file, "earlier");
+            let earlier = variable_symbol(&context, &importer, importer_file, "earlier");
+            let callable_declaration = function_declaration(&importer, importer_file, "callable");
+            let callable = function_symbol(&context, &importer, importer_file, "callable");
+            let imported_references = type_reference_nodes(&importer, importer_file, "LocalCount");
+            let alias =
+                source_import_alias_symbol(&context, &importer, importer_file, "LocalCount");
+            let poison = context.store().intrinsic_bootstrap().unwrap().number_type;
+            assert!(context.store_mut_for_test().set_type_node_links(
+                root,
+                TypeNodeLinks {
+                    resolved_type: Some(poison),
+                    ..TypeNodeLinks::default()
+                },
+            ));
+
+            let first = context.check_source_file(importer_file).unwrap_err();
+            if poisoned_name == "unionValue" {
+                assert_eq!(
+                    first,
+                    SourceCheckError::DeclaredType(DeclaredTypeError::TypeNodeUnavailable(
+                        TypeNodeUnavailable::InvalidCachedUnionType(poison),
+                    ))
+                );
+            } else {
+                assert_eq!(
+                    first,
+                    SourceCheckError::DeclaredType(DeclaredTypeError::TypeNodeUnavailable(
+                        TypeNodeUnavailable::InvalidTypeReference(root),
+                    ))
+                );
+            }
+            let target = resolved_import_target(&context, alias);
+            assert!(context.store().alias_symbol_links(alias).is_some());
+            assert!(context.store().value_symbol_links(alias).is_none());
+            assert!(context.store().value_symbol_links(target).is_none());
+            assert!(context.store().type_alias_links(target).is_none());
+            assert!(context.store().value_symbol_links(earlier).is_none());
+            assert!(context.store().value_symbol_links(callable).is_none());
+            assert!(context.store().type_node_links(earlier_type).is_none());
+            assert!(
+                context
+                    .store()
+                    .type_node_links(earlier_initializer)
+                    .is_none()
+            );
+            assert!(
+                context
+                    .store()
+                    .type_node_links(callable_declaration)
+                    .is_none()
+            );
+            assert!(context.store().type_node_links(other_root).is_none());
+            for reference in &imported_references {
+                assert!(context.store().type_node_links(*reference).is_none());
+                assert!(context.store().symbol_node_links(*reference).is_none());
+            }
+            assert!(!is_type_checked(&context, importer_file));
+            assert!(context.diagnostics().is_empty());
+            assert_eq!(resolved_node_type(&context, root), poison);
+
+            let failed = observable_state(&context, importer_file);
+            for _ in 0..2 {
+                assert_eq!(context.check_source_file(importer_file), Err(first));
+                assert_eq!(observable_state(&context, importer_file), failed);
+                assert!(context.store().value_symbol_links(earlier).is_none());
+                assert!(context.store().value_symbol_links(callable).is_none());
+                assert!(context.store().type_node_links(earlier_type).is_none());
+                assert!(context.store().type_node_links(other_root).is_none());
+                assert!(!is_type_checked(&context, importer_file));
+                assert!(context.diagnostics().is_empty());
+            }
+        }
     }
 
     #[test]

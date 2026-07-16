@@ -2088,7 +2088,7 @@ fn validate_prepared_import_value(
 mod tests {
     use std::collections::BTreeMap;
 
-    use ts_ast::{FileId, NodeId};
+    use ts_ast::{FileId, NodeFlags, NodeId};
     use ts_binder::{
         CanonicalBinder, CanonicalModuleState, CanonicalNameResolverOptions,
         CanonicalSourceFileFacts, CanonicalSourceLanguage, EscapedName,
@@ -2177,12 +2177,12 @@ mod tests {
         parsed
     }
 
-    fn facts(file: FileId) -> CanonicalSourceFileFacts {
+    fn facts(file: FileId, module_state: CanonicalModuleState) -> CanonicalSourceFileFacts {
         CanonicalSourceFileFacts::new(
             EscapedName::source(format!("\"/project/{}.ts\"", file.index())),
             CanonicalSourceLanguage::TypeScript,
             false,
-            CanonicalModuleState::External,
+            module_state,
         )
     }
 
@@ -2201,6 +2201,19 @@ mod tests {
     }
 
     fn fixture(sources: &[&str], routes: &[Route]) -> Fixture {
+        fixture_with_module_states(
+            sources,
+            routes,
+            &vec![CanonicalModuleState::External; sources.len()],
+        )
+    }
+
+    fn fixture_with_module_states(
+        sources: &[&str],
+        routes: &[Route],
+        module_states: &[CanonicalModuleState],
+    ) -> Fixture {
+        assert_eq!(sources.len(), module_states.len());
         let files = sources
             .iter()
             .enumerate()
@@ -2213,13 +2226,13 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let mut binder = CanonicalBinder::new();
-        for file in &files {
+        for (file, module_state) in files.iter().zip(module_states.iter().copied()) {
             binder
                 .bind_source_file_with_facts(
                     &file.parsed.arena,
                     file.parsed.source_file,
                     file.file,
-                    facts(file.file),
+                    facts(file.file, module_state),
                 )
                 .unwrap();
         }
@@ -2786,6 +2799,146 @@ mod tests {
             )) if node == reference && alias == plan.bindings[0].alias_symbol
         ));
         assert_eq!(store_state(&fixture.store), before);
+    }
+
+    fn assert_warmed_composite_root_requires_exact_import_capability(
+        fixture: &mut Fixture,
+        variable: &str,
+    ) {
+        let plan = fixture.plan_type_import(0, 0);
+        let root = variable_type_node(fixture, 0, variable);
+        let reference = type_reference(fixture, 0, "User");
+        let resolved = resolve_all_types(fixture, &plan.bindings).unwrap();
+        let capability =
+            plan_type_reference_capability_for_root(fixture, &resolved[0], root, reference);
+        query_type_with_import_capability(fixture, root, capability).unwrap();
+
+        let warm = store_state(&fixture.store);
+        assert!(matches!(
+            query_type_without_import_capability(fixture, root),
+            Err(DeclaredTypeError::TypeNodeUnavailable(
+                super::super::type_nodes::TypeNodeUnavailable::ImportAliasTypeReference {
+                    node,
+                    alias,
+                }
+            )) if node == reference && alias == plan.bindings[0].alias_symbol
+        ));
+        assert_eq!(store_state(&fixture.store), warm);
+    }
+
+    #[test]
+    fn warmed_composite_import_roots_do_not_retain_capabilities() {
+        for source in [
+            r#"
+                import type { User } from "./target";
+                const value: User | null = null;
+            "#,
+            r#"
+                import type { User } from "./target";
+                const value: (User | null) = null;
+            "#,
+            r#"
+                import type { User } from "./target";
+                const value: User[] = [];
+            "#,
+        ] {
+            let mut fixture = fixture(
+                &[source, r"export type User = number;"],
+                &[Route {
+                    source: 0,
+                    specifier: 0,
+                    target: Some(1),
+                }],
+            );
+            assert_warmed_composite_root_requires_exact_import_capability(&mut fixture, "value");
+        }
+
+        let mut initialized_array = fixture_with_module_states(
+            &[
+                r#"
+                    import type { User } from "./target";
+                    const value: User[] = [];
+                "#,
+                r"export type User = number;",
+                r"interface Array<T> {} interface ReadonlyArray<T> {}",
+            ],
+            &[Route {
+                source: 0,
+                specifier: 0,
+                target: Some(1),
+            }],
+            &[
+                CanonicalModuleState::External,
+                CanonicalModuleState::External,
+                CanonicalModuleState::Script,
+            ],
+        );
+        assert!(
+            initialized_array
+                .store
+                .type_payload(initialized_array.global_types.array_type)
+                .unwrap()
+                .symbol()
+                .is_some(),
+            "the initialized-array case must use the global Array<T> interface"
+        );
+        assert_warmed_composite_root_requires_exact_import_capability(
+            &mut initialized_array,
+            "value",
+        );
+    }
+
+    #[test]
+    fn composite_import_capability_roots_reject_nonzero_wrapper_flags() {
+        for kind in [
+            SyntaxKind::UnionType,
+            SyntaxKind::ParenthesizedType,
+            SyntaxKind::ArrayType,
+        ] {
+            let mut fixture = fixture(
+                &[
+                    r#"
+                        import type { User } from "./target";
+                        const value: (User | null)[] = [];
+                    "#,
+                    r"export type User = number;",
+                ],
+                &[Route {
+                    source: 0,
+                    specifier: 0,
+                    target: Some(1),
+                }],
+            );
+            let plan = fixture.plan_type_import(0, 0);
+            let root = variable_type_node(&fixture, 0, "value");
+            let reference = type_reference(&fixture, 0, "User");
+            let resolved = resolve_all_types(&mut fixture, &plan.bindings).unwrap();
+            let capability =
+                plan_type_reference_capability_for_root(&fixture, &resolved[0], root, reference);
+            let flagged = fixture.files[0]
+                .parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| (record.kind == kind).then_some(node))
+                .expect("fixture contains every composite wrapper");
+            fixture.files[0]
+                .parsed
+                .arena
+                .get_mut(flagged)
+                .unwrap()
+                .flags = NodeFlags(1);
+
+            let before = store_state(&fixture.store);
+            assert!(matches!(
+                query_type_with_import_capability(&mut fixture, root, capability),
+                Err(DeclaredTypeError::TypeNodeUnavailable(
+                    super::super::type_nodes::TypeNodeUnavailable::ImportAliasCapabilityUnsupported(
+                        node
+                    )
+                )) if node == reference
+            ));
+            assert_eq!(store_state(&fixture.store), before);
+        }
     }
 
     #[test]

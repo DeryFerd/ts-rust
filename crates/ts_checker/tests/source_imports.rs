@@ -444,6 +444,31 @@ fn composite_import_capabilities_do_not_escape_direct_annotation_roots() {
 }
 
 #[test]
+fn type_imports_in_explicit_call_type_arguments_remain_a_boundary() {
+    let importer = parse_source_file(concat!(
+        "import type { Count as LocalCount } from './target'; ",
+        "function identity<T>(value: T): T { return value; } ",
+        "const result = identity<LocalCount>(1);",
+    ));
+    let target = parse_source_file("export type Count = number;");
+    let importer_file = FileId::new(20);
+    let target_file = FileId::new(21);
+    let (mut context, _) = make_context(&importer, &target, importer_file, target_file);
+
+    for _ in 0..2 {
+        assert!(matches!(
+            context.check_source_file(importer_file),
+            Err(SourceCheckError::Unsupported(
+                UnsupportedSourceSyntax::Import(_)
+            ))
+        ));
+        assert!(!source_is_checked(&context, importer_file));
+        assert!(!source_is_checked(&context, target_file));
+        assert!(context.diagnostics().is_empty());
+    }
+}
+
+#[test]
 #[allow(clippy::too_many_lines)]
 fn exported_simple_interfaces_work_target_first_and_importer_first() {
     let importer = parse_source_file(concat!(

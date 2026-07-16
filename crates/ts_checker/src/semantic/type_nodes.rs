@@ -815,7 +815,15 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                     ));
                 }
                 match self.validate_cached_union_result(cached, alias_owner.or(derived_alias)) {
-                    Ok(()) if self.type_reference_alias_targets.is_empty() => return Ok(()),
+                    Ok(())
+                        if self.type_reference_alias_targets.is_empty()
+                            && !self.type_node_contains_import_alias_reference(
+                                node,
+                                &mut HashSet::new(),
+                            )? =>
+                    {
+                        return Ok(());
+                    }
                     Ok(()) => {}
                     Err(LiteralTypeCacheError::InvalidCachedUnion(type_))
                         if self.is_pending_stored_function_type(type_) =>
@@ -985,7 +993,13 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         }
         // A missing or malformed global Array resolves directly to the empty
         // object fallback before the element type is consulted upstream.
-        if fallback.is_none() || !self.type_reference_alias_targets.is_empty() {
+        let fallback_contains_import = fallback.is_some()
+            && self.type_reference_alias_targets.is_empty()
+            && self.type_node_contains_import_alias_reference(element_type, &mut HashSet::new())?;
+        if fallback.is_none()
+            || !self.type_reference_alias_targets.is_empty()
+            || fallback_contains_import
+        {
             if let Some(alias) = alias_owner
                 && self
                     .plan
@@ -1035,6 +1049,77 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             ));
         }
         Ok(())
+    }
+
+    fn type_node_contains_import_alias_reference(
+        &self,
+        node: NodeRef,
+        visited: &mut HashSet<NodeRef>,
+    ) -> Result<bool, DeclaredTypeError> {
+        if !visited.insert(node) {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidTypeReference(node),
+            ));
+        }
+        let record = preflight_node(self.store, self.host, node)?;
+        let contains = match &record.data {
+            NodeData::TypeReferenceNode(reference) if record.kind == SyntaxKind::TypeReference => {
+                let name = NodeRef::new(node.arena, node.file, reference.type_name);
+                let name_record = preflight_node(self.store, self.host, name)?;
+                let NodeData::Identifier(identifier) = &name_record.data else {
+                    return Ok(false);
+                };
+                let (arena, bound) = self.host.source(node).ok_or({
+                    DeclaredTypeError::Unavailable(DeclaredTypeUnavailable::MissingOrForeignFacts(
+                        node,
+                    ))
+                })?;
+                let mut callback_host = self.host.name_resolver_host(self.store)?;
+                match CanonicalNameResolver::new(
+                    arena,
+                    bound,
+                    self.store.symbol_store(),
+                    &mut callback_host,
+                )?
+                .resolve(
+                    Some(CanonicalResolutionLocation::Bound(name)),
+                    &identifier.text,
+                    SymbolFlags::TYPE,
+                    None,
+                    true,
+                    false,
+                ) {
+                    Err(CanonicalNameResolutionError::AliasResolutionUnavailable(_)) => true,
+                    Ok(_) => false,
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            NodeData::ParenthesizedTypeNode(parenthesized)
+                if record.kind == SyntaxKind::ParenthesizedType =>
+            {
+                self.type_node_contains_import_alias_reference(
+                    NodeRef::new(node.arena, node.file, parenthesized.type_),
+                    visited,
+                )?
+            }
+            NodeData::ArrayTypeNode(array) if record.kind == SyntaxKind::ArrayType => self
+                .type_node_contains_import_alias_reference(
+                    NodeRef::new(node.arena, node.file, array.element_type),
+                    visited,
+                )?,
+            NodeData::UnionTypeNode(union) if record.kind == SyntaxKind::UnionType => {
+                let mut contains = false;
+                for child in &union.types.nodes {
+                    contains |= self.type_node_contains_import_alias_reference(
+                        NodeRef::new(node.arena, node.file, *child),
+                        visited,
+                    )?;
+                }
+                contains
+            }
+            _ => false,
+        };
+        Ok(contains)
     }
 
     fn cached_array_element_identity(
@@ -3742,7 +3827,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             return Err(unsupported());
         }
         let record = preflight_node(self.store, self.host, node)?;
-        if record.flags.0 & NODE_FLAG_JSDOC != 0 {
+        if record.flags.0 != 0 {
             return Err(unsupported());
         }
         match &record.data {
@@ -3801,6 +3886,37 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             ) => {}
             _ => return Err(unsupported()),
         }
+        Ok(())
+    }
+
+    /// Proves one complete type-node dependency closure without executing or
+    /// publishing any part of its semantic graph.
+    pub(super) fn preflight_type_from_type_node(
+        &self,
+        node: NodeRef,
+    ) -> Result<(), DeclaredTypeError> {
+        self.require_type_reference_alias_root_capability(node)?;
+        if !self.pending_function_parameters.is_empty() {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidFunctionType(node),
+            ));
+        }
+        let mut planner = TypeQueryPlanner::new(
+            self.store,
+            self.host,
+            self.array_type,
+            self.global_types
+                .as_ref()
+                .map(CanonicalArrayTargets::from_global_types),
+            self.options.strict_builtin_iterator_return,
+            &self.type_reference_alias_targets,
+        );
+        let direct_alias = planner.direct_type_alias_owner(node)?;
+        if direct_alias.is_some() && !self.type_reference_alias_targets.is_empty() {
+            self.reject_type_reference_alias_capabilities()?;
+        }
+        planner.plan_type_node(node)?;
+        drop(planner.finish());
         Ok(())
     }
 
