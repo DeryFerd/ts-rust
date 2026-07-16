@@ -2974,7 +2974,7 @@ mod tests {
         assert_eq!(diagnostics[0].diagnostic.code(), 2345);
         assert_eq!(
             diagnostics[0].diagnostic.render().unwrap(),
-            "Argument of type '\"bad\"' is not assignable to parameter of type 'number | undefined'."
+            "Argument of type 'string' is not assignable to parameter of type 'number'."
         );
         let owner = first_function_symbol(&parsed, &context, file);
         let callable = context
