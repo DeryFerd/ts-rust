@@ -11,10 +11,10 @@ use ts_parser::{ParseResult, parse_source_file};
 
 const FLOW_SOURCE: &str = concat!(
     "function sequential(flag: boolean): number {\n",
-    "  let first: number = 1;\n",
-    "  const second: number = first;\n",
+    "  let first: number = 1, intermediate: number = first;\n",
+    "  const second: number = intermediate;\n",
     "  let third: number = second;\n",
-    "  if (flag) {\n",
+    "  if (((flag))) {\n",
     "    const result: number = third;\n",
     "    return result;\n",
     "  } else {\n",
@@ -233,7 +233,7 @@ fn final_if_flow_checks_sequential_locals_narrowing_shadowing_and_warm_state() {
     context.check_source_file(file).unwrap();
     assert!(context.diagnostics().is_empty());
 
-    for variable in ["second", "third"] {
+    for variable in ["intermediate", "second", "third"] {
         assert_eq!(rendered_type(&context, &parsed, file, variable), "number");
     }
     for declaration in variable_declarations(&parsed, file, "result") {
