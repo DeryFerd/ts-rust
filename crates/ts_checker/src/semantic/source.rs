@@ -9062,9 +9062,17 @@ mod tests {
                 .and_then(|links| links.resolved_type),
             Some(callable)
         );
+        let annotated_before = variable_value_type(&context, &source, file, "before");
+        assert_ne!(annotated_before, callable);
         assert_eq!(
-            variable_value_type(&context, &source, file, "before"),
-            callable
+            context
+                .store_mut_for_test()
+                .is_type_assignable_to_with_strict_function_types(
+                    callable,
+                    annotated_before,
+                    false,
+                ),
+            Ok(true)
         );
         assert_eq!(
             variable_value_type(&context, &source, file, "after"),
@@ -9134,7 +9142,8 @@ mod tests {
             variable_value_type(&context, &source, file, "copy"),
             callable
         );
-        let [read] = identifier_expressions(&source, file, "fn").as_slice() else {
+        let reads = identifier_expressions(&source, file, "fn");
+        let [read] = reads.as_slice() else {
             panic!("expected one exported function read")
         };
         assert_eq!(
@@ -9203,23 +9212,23 @@ mod tests {
             "function generic<T>(value: T): T { return value; }",
         ));
         let file = FileId::new(304);
-        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
-        let ready = function_symbol(&context, &source, file, "ready");
-        let before = observable_state(&context, file);
+        let mut blocked = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        let ready = function_symbol(&blocked, &source, file, "ready");
+        let before = observable_state(&blocked, file);
 
         assert!(matches!(
-            context.check_source_file(file),
+            blocked.check_source_file(file),
             Err(SourceCheckError::Unsupported(
                 UnsupportedSourceSyntax::Function(SourceFunctionUnsupported::Callable(_))
             ))
         ));
-        assert_eq!(observable_state(&context, file), before);
-        assert!(context.store().value_symbol_links(ready).is_none());
-        assert!(context
+        assert_eq!(observable_state(&blocked, file), before);
+        assert!(blocked.store().value_symbol_links(ready).is_none());
+        assert!(blocked
             .store()
             .source_callable_type_for_owner(ready)
             .is_none());
-        assert!(!is_type_checked(&context, file));
+        assert!(!is_type_checked(&blocked, file));
 
         let unresolved = parsed("const value = missing;");
         let unresolved_file = FileId::new(305);
