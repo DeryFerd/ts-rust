@@ -4976,8 +4976,7 @@ pub(super) fn check_source_file(
                                 type_node,
                                 type_import_capabilities
                                     .get(&type_node)
-                                    .map(std::slice::from_ref)
-                                    .unwrap_or(&[]),
+                                    .map_or(&[], std::slice::from_ref),
                                 &variable.initializer,
                                 variable.name,
                                 None,
