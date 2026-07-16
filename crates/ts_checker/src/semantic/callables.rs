@@ -150,9 +150,9 @@ pub(super) fn validate_stored_single_callable(
                 return StoredSingleCallableValidation::NotCallable;
             }
             let mut call_signatures = projection.call_signatures.into_vec();
-            let callable = call_signatures
-                .pop()
-                .expect("the exact-one callable shape was checked above");
+            let Some(callable) = call_signatures.pop() else {
+                return StoredSingleCallableValidation::Malformed { family };
+            };
             StoredSingleCallableValidation::Valid {
                 family,
                 callable,

@@ -146,14 +146,14 @@ fn validate_stored_callable_set_projection_with(
             return None;
         }
         let minimum = usize::try_from(record.min_argument_count()).ok()?;
-        if minimum > parameters.len() {
-            return None;
-        }
         let rest_parameter = if record.has_rest_parameter() {
             Some(parameters.pop()?)
         } else {
             None
         };
+        if minimum > parameters.len() {
+            return None;
+        }
 
         if is_construct {
             construct_signatures.push(signature);
@@ -374,15 +374,52 @@ mod tests {
             0,
             number,
         );
-        let parameter_types =
-            HashMap::from([(invalid_minimum, Vec::new()), (missing_rest, Vec::new())]);
+        let invalid_rest_minimum = signature(
+            &mut store,
+            SignatureFlags::HAS_REST_PARAMETER,
+            &[number],
+            1,
+            number,
+        );
+        let parameter_types = HashMap::from([
+            (invalid_minimum, Vec::new()),
+            (missing_rest, Vec::new()),
+            (invalid_rest_minimum, vec![number]),
+        ]);
         let invalid_minimum_owner = owner(&mut store, vec![invalid_minimum], Vec::new());
         let missing_rest_owner = owner(&mut store, vec![missing_rest], Vec::new());
+        let invalid_rest_minimum_owner =
+            owner(&mut store, vec![invalid_rest_minimum], Vec::new());
 
         assert_eq!(
             project(&store, invalid_minimum_owner, &parameter_types),
             None
         );
         assert_eq!(project(&store, missing_rest_owner, &parameter_types), None);
+        assert_eq!(
+            project(&store, invalid_rest_minimum_owner, &parameter_types),
+            None,
+        );
+    }
+
+    #[test]
+    fn rest_only_callables_have_zero_fixed_arity() {
+        let mut store = initialized_store();
+        let number = store.intrinsic_bootstrap().unwrap().number_type;
+        let rest = signature(
+            &mut store,
+            SignatureFlags::HAS_REST_PARAMETER,
+            &[number],
+            0,
+            number,
+        );
+        let owner = owner(&mut store, vec![rest], Vec::new());
+        let projected = project(&store, owner, &HashMap::from([(rest, vec![number])])).unwrap();
+        let [callable] = projected.call_signatures.as_ref() else {
+            panic!("expected one call signature")
+        };
+        assert!(callable.parameters.is_empty());
+        assert_eq!(callable.rest_parameter, Some(number));
+        assert_eq!(callable.min_argument_count, 0);
     }
 }
