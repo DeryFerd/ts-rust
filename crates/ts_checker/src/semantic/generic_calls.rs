@@ -13,17 +13,19 @@ use ts_binder::{CheckFlags, SymbolData, SymbolFlags};
 
 use super::{
     CanonicalGlobalTypes, CanonicalTypeMapperStore, RelationUnavailable, SemanticSymbolId,
-    SignatureId, TypeId, TypeMapperId, TypeMapperKind, ValueSymbolLinks,
+    SignatureId, TypeId, TypeMapperId, ValueSymbolLinks,
     callables::{
         StoredSingleCallableValidation, ValidatedSingleCallable, validate_stored_single_callable,
     },
     calls::{
         DirectCallApplicability, DirectCallArgumentTarget, DirectCallForm, DirectCallReturnKind,
     },
+    declared::{cached_ordinary_type_parameter_owner, type_list_key},
     inference::{NakedTypeInferenceError, infer_naked_type_parameter, validate_inference_leaf},
-    instantiate::{InstantiationError, instantiate_type},
     signatures::SignatureFlags,
-    type_records::{ConstrainedTypeData, TypeData},
+    source_callables::{StoredSourceCallableValidation, validate_stored_source_callable},
+    store::CachedSignatureLookup,
+    type_records::TypeData,
     types::{ObjectFlags, TypeFlags},
 };
 
@@ -101,8 +103,17 @@ pub(super) enum IdentityGenericCallInvariant {
         expected: TypeId,
         actual: TypeId,
     },
+    InvalidCachedInstantiation {
+        target: SignatureId,
+        type_argument: TypeId,
+        signature: SignatureId,
+    },
+    InstantiationCacheHashCollision {
+        target: SignatureId,
+        type_argument: TypeId,
+        cached: SignatureId,
+    },
     Capacity(SignatureId),
-    Publication(SignatureId),
 }
 
 /// Capability, provenance, inference, instantiation, or relation failure.
@@ -111,7 +122,6 @@ pub(super) enum IdentityGenericCallError {
     Unsupported(IdentityGenericCallUnsupported),
     Invariant(IdentityGenericCallInvariant),
     Inference(NakedTypeInferenceError),
-    Instantiation(InstantiationError),
     Relation(RelationUnavailable),
 }
 
@@ -130,12 +140,6 @@ impl From<IdentityGenericCallInvariant> for IdentityGenericCallError {
 impl From<NakedTypeInferenceError> for IdentityGenericCallError {
     fn from(error: NakedTypeInferenceError) -> Self {
         Self::Inference(error)
-    }
-}
-
-impl From<InstantiationError> for IdentityGenericCallError {
-    fn from(error: InstantiationError) -> Self {
-        Self::Instantiation(error)
     }
 }
 
@@ -173,6 +177,16 @@ struct IdentitySignatureShape {
     parameter_symbol: SemanticSymbolId,
 }
 
+/// Proof carried from the exact callable provider into type-parameter cache
+/// validation. Only source syntax validation can prove that cold constraint
+/// and default caches mean "declared absent"; every other provider must have
+/// published the canonical no-constraint sentinels.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IdentityTypeParameterCacheProvenance {
+    RequireResolvedCaches,
+    ExactDefaultFreeSource,
+}
+
 /// Resolves the first generic call branch through the store's callable
 /// provider and authoritative relation context.
 pub(super) fn resolve_identity_generic_call(
@@ -196,7 +210,10 @@ pub(super) fn resolve_identity_generic_call(
         }
         StoredSingleCallableValidation::Valid { callable, .. } => callable,
     };
-    let mut resolution = project_validated_identity_call(store, request, &callable)?;
+    let cache_provenance =
+        identity_type_parameter_cache_provenance(store, request.callee, &callable);
+    let mut resolution =
+        project_validated_identity_call(store, request, &callable, cache_provenance)?;
     resolution.applicability =
         check_identity_argument_applicability(&resolution.projection, |source, target| {
             store.is_type_assignable_to_with_global_types_and_strict_function_types(
@@ -207,6 +224,30 @@ pub(super) fn resolve_identity_generic_call(
             )
         })?;
     Ok(resolution)
+}
+
+fn identity_type_parameter_cache_provenance(
+    store: &CanonicalTypeMapperStore,
+    callee: TypeId,
+    callable: &ValidatedSingleCallable,
+) -> IdentityTypeParameterCacheProvenance {
+    let Some(signature) = store.signature(callable.signature) else {
+        return IdentityTypeParameterCacheProvenance::RequireResolvedCaches;
+    };
+    let [type_parameter] = signature.type_parameters() else {
+        return IdentityTypeParameterCacheProvenance::RequireResolvedCaches;
+    };
+    if store.source_callable_type_for_signature(callable.signature) != Some(callee) {
+        return IdentityTypeParameterCacheProvenance::RequireResolvedCaches;
+    }
+    match validate_stored_source_callable(store, callee) {
+        StoredSourceCallableValidation::Valid(edges)
+            if edges.first().copied() == Some(*type_parameter) =>
+        {
+            IdentityTypeParameterCacheProvenance::ExactDefaultFreeSource
+        }
+        _ => IdentityTypeParameterCacheProvenance::RequireResolvedCaches,
+    }
 }
 
 fn validate_request_form(
@@ -262,22 +303,24 @@ fn project_validated_identity_call(
     store: &mut CanonicalTypeMapperStore,
     request: IdentityGenericCallRequest<'_>,
     callable: &ValidatedSingleCallable,
+    cache_provenance: IdentityTypeParameterCacheProvenance,
 ) -> Result<IdentityGenericCallResolution, IdentityGenericCallError> {
     validate_request_form(store, request)?;
-    let shape = validate_identity_signature_shape(store, request.callee, callable)?;
+    let shape =
+        validate_identity_signature_shape(store, request.callee, callable, cache_provenance)?;
     let argument = request.arguments[0];
     let type_argument = match request.explicit_type_arguments {
         Some(type_arguments) => {
             let type_argument = type_arguments[0];
             validate_inference_leaf(store, type_argument)
-                .map_err(|_| IdentityGenericCallUnsupported::TypeArgumentLeaf(type_argument))?;
+                .map_err(|error| map_inference_leaf_error(error, type_argument, true))?;
             type_argument
         }
         None => infer_naked_type_parameter(store, argument)
-            .map_err(|_| IdentityGenericCallUnsupported::ArgumentLeaf(argument))?,
+            .map_err(|error| map_inference_leaf_error(error, argument, false))?,
     };
     validate_inference_leaf(store, argument)
-        .map_err(|_| IdentityGenericCallUnsupported::ArgumentLeaf(argument))?;
+        .map_err(|error| map_inference_leaf_error(error, argument, false))?;
 
     let (signature, mapper, parameter_type, return_type) =
         get_or_create_identity_instantiation(store, shape, type_argument)?;
@@ -314,10 +357,30 @@ fn project_validated_identity_call(
     })
 }
 
+fn map_inference_leaf_error(
+    error: NakedTypeInferenceError,
+    candidate: TypeId,
+    type_argument: bool,
+) -> IdentityGenericCallError {
+    if matches!(
+        error,
+        NakedTypeInferenceError::InvalidCandidate(_)
+            | NakedTypeInferenceError::InvalidCanonicalCandidate { .. }
+    ) {
+        return IdentityGenericCallError::Inference(error);
+    }
+    if type_argument {
+        IdentityGenericCallUnsupported::TypeArgumentLeaf(candidate).into()
+    } else {
+        IdentityGenericCallUnsupported::ArgumentLeaf(candidate).into()
+    }
+}
+
 fn validate_identity_signature_shape(
     store: &CanonicalTypeMapperStore,
     callee: TypeId,
     callable: &ValidatedSingleCallable,
+    cache_provenance: IdentityTypeParameterCacheProvenance,
 ) -> Result<IdentitySignatureShape, IdentityGenericCallError> {
     if callable.owner != callee {
         return Err(IdentityGenericCallInvariant::CallableOwnerMismatch {
@@ -399,7 +462,7 @@ fn validate_identity_signature_shape(
     {
         return Err(IdentityGenericCallInvariant::InvalidParameterSymbol(parameter_symbol).into());
     }
-    validate_unconstrained_default_free_parameter(store, type_parameter)?;
+    validate_unconstrained_default_free_parameter(store, type_parameter, cache_provenance)?;
     Ok(IdentitySignatureShape {
         signature: callable.signature,
         type_parameter,
@@ -410,6 +473,7 @@ fn validate_identity_signature_shape(
 fn validate_unconstrained_default_free_parameter(
     store: &CanonicalTypeMapperStore,
     type_parameter: TypeId,
+    cache_provenance: IdentityTypeParameterCacheProvenance,
 ) -> Result<(), IdentityGenericCallError> {
     let record = store.type_payload(type_parameter).ok_or(
         IdentityGenericCallInvariant::InvalidTypeParameter(type_parameter),
@@ -428,13 +492,16 @@ fn validate_unconstrained_default_free_parameter(
             .ok_or(IdentityGenericCallInvariant::InvalidTypeParameter(
                 type_parameter,
             ))?;
+    let computed_type_variable_flags = ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES_COMPUTED
+        | ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES;
     if record.flags() != TypeFlags::TYPE_PARAMETER
-        || record.object_flags() != ObjectFlags::NONE
+        || (record.object_flags() != ObjectFlags::NONE
+            && record.object_flags() != computed_type_variable_flags)
         || record.alias().is_some()
         || symbol_record.flags() != SymbolFlags::TYPE_PARAMETER
         || symbol_record.check_flags() != CheckFlags::NONE
         || store.get_merged_symbol(symbol) != Some(symbol)
-        || data.constrained != ConstrainedTypeData::default()
+        || cached_ordinary_type_parameter_owner(store, type_parameter) != Some(symbol)
         || data.is_this_type
     {
         return Err(IdentityGenericCallInvariant::InvalidTypeParameter(type_parameter).into());
@@ -451,6 +518,12 @@ fn validate_unconstrained_default_free_parameter(
             type_parameter,
         ))?;
     match data.constraint {
+        // The exact callable provider has already proved that the source
+        // declaration has no constraint. A cold cache is therefore valid, but
+        // only for the canonical declared type-parameter identity proved
+        // above. This must not admit an arbitrary synthetic TypeParameter.
+        None if cache_provenance
+            == IdentityTypeParameterCacheProvenance::ExactDefaultFreeSource => {}
         None => {
             return Err(
                 IdentityGenericCallUnsupported::UnresolvedTypeParameterConstraint(type_parameter)
@@ -464,17 +537,26 @@ fn validate_unconstrained_default_free_parameter(
         }
         Some(_) => {}
     }
+    if data
+        .constrained
+        .resolved_base_constraint
+        .is_some_and(|base| base != no_constraint)
+    {
+        return Err(IdentityGenericCallInvariant::InvalidTypeParameter(type_parameter).into());
+    }
     match data.resolved_default_type {
-        None => {
-            return Err(
-                IdentityGenericCallUnsupported::UnresolvedTypeParameterDefault(type_parameter)
-                    .into(),
-            );
+        // As with the constraint, absence is the untouched cache state for an
+        // exact default-free declaration, not evidence of a default.
+        None if cache_provenance
+            == IdentityTypeParameterCacheProvenance::ExactDefaultFreeSource =>
+        {
+            Ok(())
         }
+        None => Err(
+            IdentityGenericCallUnsupported::UnresolvedTypeParameterDefault(type_parameter).into(),
+        ),
         Some(default) if default != no_constraint => {
-            return Err(
-                IdentityGenericCallUnsupported::DefaultedTypeParameter(type_parameter).into(),
-            );
+            Err(IdentityGenericCallUnsupported::DefaultedTypeParameter(type_parameter).into())
         }
         Some(_) => Ok(()),
     }
@@ -485,34 +567,12 @@ fn get_or_create_identity_instantiation(
     shape: IdentitySignatureShape,
     type_argument: TypeId,
 ) -> Result<(SignatureId, TypeMapperId, TypeId, TypeId), IdentityGenericCallError> {
-    if let Some((signature, mapper)) = cached_identity_instantiation(store, shape, type_argument) {
+    if let Some((signature, mapper)) = cached_identity_instantiation(store, shape, type_argument)? {
         return Ok((signature, mapper, type_argument, type_argument));
     }
-    if !store.try_reserve_checker_symbol_allocations(1, 0) || !store.try_reserve_signatures(1) {
-        return Err(IdentityGenericCallInvariant::Capacity(shape.signature).into());
-    }
-    let mapper = store
-        .new_simple_type_mapper(shape.type_parameter, type_argument)
-        .ok_or(IdentityGenericCallInvariant::Publication(shape.signature))?;
-    let parameter_type = instantiate_type(store, shape.type_parameter, mapper)?;
-    let return_type = instantiate_type(store, shape.type_parameter, mapper)?;
-    if parameter_type != type_argument {
-        return Err(IdentityGenericCallInvariant::InvalidInstantiation {
-            source: shape.type_parameter,
-            expected: type_argument,
-            actual: parameter_type,
-        }
-        .into());
-    }
-    if return_type != type_argument {
-        return Err(IdentityGenericCallInvariant::InvalidInstantiation {
-            source: shape.type_parameter,
-            expected: type_argument,
-            actual: return_type,
-        }
-        .into());
-    }
 
+    let exact_type_arguments: Box<[TypeId]> = Box::new([type_argument]);
+    let type_arguments_key = type_list_key(&exact_type_arguments);
     let (mut parameter_data, name_type) = {
         let parameter = store.symbol(shape.parameter_symbol).ok_or(
             IdentityGenericCallInvariant::InvalidParameterSymbol(shape.parameter_symbol),
@@ -530,88 +590,173 @@ fn get_or_create_identity_instantiation(
             .and_then(|links| links.name_type);
         (data, name_type)
     };
+    let (signature_flags, declaration, min_argument_count) = {
+        let original = store.signature(shape.signature).ok_or(
+            IdentityGenericCallInvariant::InvalidSignature(shape.signature),
+        )?;
+        (
+            original.flags() & SignatureFlags::PROPAGATING_FLAGS,
+            original.declaration(),
+            original.min_argument_count(),
+        )
+    };
     parameter_data.members = None;
     parameter_data.exports = None;
     parameter_data.export_symbol = None;
+    let mut instantiated_parameters = Vec::with_capacity(1);
+
+    if !store.try_reserve_mappers(1)
+        || !store.try_reserve_checker_symbol_allocations(1, 0)
+        || !store.try_reserve_value_symbol_links(1)
+        || !store.try_reserve_signatures(1)
+        || !store.try_reserve_cached_signatures(1)
+    {
+        return Err(IdentityGenericCallInvariant::Capacity(shape.signature).into());
+    }
+
+    // Every validation and fallible reservation precedes this point. The
+    // remaining writes form one dependency-ordered publication suffix, with
+    // the authoritative cachedSignatures entry committed last.
+    let mapper = store
+        .new_simple_type_mapper(shape.type_parameter, type_argument)
+        .expect("preflighted simple mapper endpoints belong to the store");
+    assert_eq!(
+        store.simple_type_mapper_endpoints(mapper),
+        Some((shape.type_parameter, type_argument)),
+        "newSimpleTypeMapper must preserve its exact endpoints"
+    );
     let instantiated_parameter = store
         .alloc_symbol(parameter_data)
-        .ok_or(IdentityGenericCallInvariant::Publication(shape.signature))?;
-    if !store.set_value_symbol_links(
+        .expect("reserved transient parameter allocation must succeed");
+    instantiated_parameters.push(instantiated_parameter);
+    assert!(store.set_value_symbol_links(
         instantiated_parameter,
         ValueSymbolLinks {
-            resolved_type: Some(parameter_type),
+            resolved_type: Some(type_argument),
             target: Some(shape.parameter_symbol),
             mapper: Some(mapper),
             name_type,
             ..ValueSymbolLinks::default()
         },
-    ) {
-        return Err(IdentityGenericCallInvariant::Publication(shape.signature).into());
-    }
-    let original =
-        store
-            .signature(shape.signature)
-            .ok_or(IdentityGenericCallInvariant::InvalidSignature(
-                shape.signature,
-            ))?;
+    ));
     let signature = store
         .alloc_signature(
-            original.flags() & SignatureFlags::PROPAGATING_FLAGS,
-            original.declaration(),
+            signature_flags,
+            declaration,
             Vec::new(),
             None,
-            vec![instantiated_parameter],
-            Some(return_type),
+            instantiated_parameters,
+            Some(type_argument),
             None,
-            original.min_argument_count(),
+            min_argument_count,
         )
-        .ok_or(IdentityGenericCallInvariant::Publication(shape.signature))?;
-    if !store.set_signature_target_and_mapper(signature, Some(shape.signature), Some(mapper)) {
-        return Err(IdentityGenericCallInvariant::Publication(shape.signature).into());
-    }
-    Ok((signature, mapper, parameter_type, return_type))
+        .expect("reserved instantiated signature allocation must succeed");
+    assert!(store.set_signature_target_and_mapper(signature, Some(shape.signature), Some(mapper)));
+    assert_eq!(
+        valid_cached_identity_instantiation(
+            store,
+            shape,
+            type_argument,
+            store
+                .signature(shape.signature)
+                .expect("validated generic signature must remain present"),
+            store
+                .signature(signature)
+                .expect("published instantiated signature must remain present"),
+        ),
+        Some(mapper),
+        "the publication suffix must build an exact cache entry"
+    );
+    assert!(store.set_cached_signature(
+        shape.signature,
+        type_arguments_key,
+        exact_type_arguments,
+        signature
+    ));
+    Ok((signature, mapper, type_argument, type_argument))
 }
 
 fn cached_identity_instantiation(
     store: &CanonicalTypeMapperStore,
     shape: IdentitySignatureShape,
     type_argument: TypeId,
-) -> Option<(SignatureId, TypeMapperId)> {
-    let original = store.signature(shape.signature)?;
-    for (signature_id, signature) in store.signatures() {
-        let Some(mapper) = signature.mapper() else {
-            continue;
-        };
-        let [parameter] = signature.parameters() else {
-            continue;
-        };
-        let parameter = *parameter;
-        if signature.flags() != original.flags() & SignatureFlags::PROPAGATING_FLAGS
-            || signature.declaration() != original.declaration()
-            || !signature.type_parameters().is_empty()
-            || signature.this_parameter().is_some()
-            || signature.resolved_return_type() != Some(type_argument)
-            || signature.resolved_type_predicate().is_some()
-            || signature.min_argument_count() != original.min_argument_count()
-            || signature.resolved_min_argument_count() != -1
-            || signature.target() != Some(shape.signature)
-            || store.mapper_kind(mapper) != Some(TypeMapperKind::Simple)
-            || store.map_type(mapper, shape.type_parameter) != Some(type_argument)
-            || signature.isolated_signature_type().is_some()
-            || signature.composite().is_some()
-            || !cached_instantiated_parameter(
-                store,
-                parameter,
-                shape.parameter_symbol,
-                mapper,
-                type_argument,
-            )
-        {
-            continue;
+) -> Result<Option<(SignatureId, TypeMapperId)>, IdentityGenericCallError> {
+    let original =
+        store
+            .signature(shape.signature)
+            .ok_or(IdentityGenericCallInvariant::InvalidSignature(
+                shape.signature,
+            ))?;
+    let type_arguments_key = type_list_key(&[type_argument]);
+    let cached = match store.cached_signature(shape.signature, type_arguments_key, &[type_argument])
+    {
+        CachedSignatureLookup::Missing => return Ok(None),
+        CachedSignatureLookup::Hit(signature) => signature,
+        CachedSignatureLookup::HashCollision(cached) => {
+            return Err(
+                IdentityGenericCallInvariant::InstantiationCacheHashCollision {
+                    target: shape.signature,
+                    type_argument,
+                    cached,
+                }
+                .into(),
+            );
         }
-        return Some((signature_id, mapper));
+        CachedSignatureLookup::Invalid => {
+            return Err(IdentityGenericCallInvariant::InvalidSignature(shape.signature).into());
+        }
+    };
+    let signature = store.signature(cached).ok_or(
+        IdentityGenericCallInvariant::InvalidCachedInstantiation {
+            target: shape.signature,
+            type_argument,
+            signature: cached,
+        },
+    )?;
+    let mapper =
+        valid_cached_identity_instantiation(store, shape, type_argument, original, signature)
+            .ok_or(IdentityGenericCallInvariant::InvalidCachedInstantiation {
+                target: shape.signature,
+                type_argument,
+                signature: cached,
+            })?;
+    Ok(Some((cached, mapper)))
+}
+
+fn valid_cached_identity_instantiation(
+    store: &CanonicalTypeMapperStore,
+    shape: IdentitySignatureShape,
+    type_argument: TypeId,
+    original: &super::signatures::Signature,
+    signature: &super::signatures::Signature,
+) -> Option<TypeMapperId> {
+    let mapper = signature.mapper()?;
+    let [parameter] = signature.parameters() else {
+        return None;
+    };
+    if signature.flags() != original.flags() & SignatureFlags::PROPAGATING_FLAGS
+        || signature.declaration() != original.declaration()
+        || !signature.type_parameters().is_empty()
+        || signature.this_parameter().is_some()
+        || signature.resolved_return_type() != Some(type_argument)
+        || signature.resolved_type_predicate().is_some()
+        || signature.min_argument_count() != original.min_argument_count()
+        || signature.resolved_min_argument_count() != -1
+        || signature.target() != Some(shape.signature)
+        || store.simple_type_mapper_endpoints(mapper) != Some((shape.type_parameter, type_argument))
+        || signature.isolated_signature_type().is_some()
+        || signature.composite().is_some()
+        || !cached_instantiated_parameter(
+            store,
+            *parameter,
+            shape.parameter_symbol,
+            mapper,
+            type_argument,
+        )
+    {
+        return None;
     }
-    None
+    Some(mapper)
 }
 
 fn cached_instantiated_parameter(
@@ -672,8 +817,12 @@ mod tests {
 
     use super::*;
     use crate::semantic::{
-        IntrinsicBootstrapOptions, SemanticStore, mapper::TypeMapper, type_records::TypeRecord,
+        DeclaredTypeLinks, IntrinsicBootstrapOptions, SemanticStore, mapper::TypeMapper,
+        type_records::TypeRecord, types::ObjectFlags,
     };
+
+    const EXACT_SOURCE: IdentityTypeParameterCacheProvenance =
+        IdentityTypeParameterCacheProvenance::ExactDefaultFreeSource;
 
     fn initialized_store() -> CanonicalTypeMapperStore {
         let mut store = SemanticStore::<TypeRecord, TypeMapper>::new();
@@ -695,13 +844,12 @@ mod tests {
         let type_parameter = store
             .alloc_type_parameter(Some(type_parameter_symbol))
             .unwrap();
-        let no_constraint = store.intrinsic_bootstrap().unwrap().no_constraint_type;
-        assert!(store.set_type_parameter_resolution(
-            type_parameter,
-            Some(no_constraint),
-            None,
-            None,
-            Some(no_constraint),
+        assert!(store.set_declared_type_links(
+            type_parameter_symbol,
+            DeclaredTypeLinks {
+                declared_type: Some(type_parameter),
+                ..DeclaredTypeLinks::default()
+            },
         ));
         let parameter = store
             .alloc_symbol(SymbolData::new(
@@ -771,6 +919,7 @@ mod tests {
                 &mut store,
                 inferred_request(callable.owner, &[candidate]),
                 &callable,
+                EXACT_SOURCE,
             )
             .unwrap();
             assert_eq!(resolution.projection.type_parameter, type_parameter);
@@ -804,6 +953,7 @@ mod tests {
                 ..inferred_request(callable.owner, &[number])
             },
             &callable,
+            EXACT_SOURCE,
         )
         .unwrap();
 
@@ -831,6 +981,7 @@ mod tests {
             &mut store,
             inferred_request(callable.owner, &arguments),
             &callable,
+            EXACT_SOURCE,
         )
         .unwrap();
         let counts = (
@@ -842,6 +993,7 @@ mod tests {
             &mut store,
             inferred_request(callable.owner, &arguments),
             &callable,
+            EXACT_SOURCE,
         )
         .unwrap();
 
@@ -855,6 +1007,254 @@ mod tests {
             ),
             counts
         );
+    }
+
+    #[test]
+    fn cached_instantiation_requires_exact_simple_mapper_endpoints() {
+        let mut store = initialized_store();
+        let (callable, _) = identity_callable(&mut store);
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        let string = bootstrap.string_type;
+        let number = bootstrap.number_type;
+        let first = project_validated_identity_call(
+            &mut store,
+            inferred_request(callable.owner, &[string]),
+            &callable,
+            EXACT_SOURCE,
+        )
+        .unwrap();
+        let wrong_mapper = store.new_simple_type_mapper(number, string).unwrap();
+        assert_eq!(
+            store.simple_type_mapper_endpoints(wrong_mapper),
+            Some((number, string))
+        );
+        assert!(store.set_signature_target_and_mapper(
+            first.projection.signature,
+            Some(first.projection.generic_signature),
+            Some(wrong_mapper)
+        ));
+        let counts = (
+            store.mapper_len(),
+            store.symbol_len(),
+            store.signature_len(),
+            store.cached_signature_len(),
+        );
+
+        assert_eq!(
+            project_validated_identity_call(
+                &mut store,
+                inferred_request(callable.owner, &[string]),
+                &callable,
+                EXACT_SOURCE,
+            ),
+            Err(IdentityGenericCallError::Invariant(
+                IdentityGenericCallInvariant::InvalidCachedInstantiation {
+                    target: first.projection.generic_signature,
+                    type_argument: string,
+                    signature: first.projection.signature,
+                }
+            ))
+        );
+        assert_eq!(
+            (
+                store.mapper_len(),
+                store.symbol_len(),
+                store.signature_len(),
+                store.cached_signature_len(),
+            ),
+            counts
+        );
+
+        assert!(store.set_signature_target_and_mapper(
+            first.projection.signature,
+            Some(first.projection.generic_signature),
+            Some(first.projection.mapper)
+        ));
+        let repaired = project_validated_identity_call(
+            &mut store,
+            inferred_request(callable.owner, &[string]),
+            &callable,
+            EXACT_SOURCE,
+        )
+        .unwrap();
+        assert_eq!(repaired.projection.signature, first.projection.signature);
+        assert_eq!(repaired.projection.mapper, first.projection.mapper);
+    }
+
+    #[test]
+    fn cold_parameter_caches_require_exact_provenance_and_accept_computed_state() {
+        let mut store = initialized_store();
+        let (callable, type_parameter) = identity_callable(&mut store);
+        let string = store.intrinsic_bootstrap().unwrap().string_type;
+        let record = store.type_payload(type_parameter).unwrap();
+        let TypeData::TypeParameter(data) = record.data() else {
+            panic!("expected type parameter")
+        };
+        let symbol = record.symbol().unwrap();
+        assert_eq!(data.constraint, None);
+        assert_eq!(data.resolved_default_type, None);
+        assert_eq!(
+            cached_ordinary_type_parameter_owner(&store, type_parameter),
+            Some(symbol)
+        );
+        assert_eq!(
+            project_validated_identity_call(
+                &mut store,
+                inferred_request(callable.owner, &[string]),
+                &callable,
+                IdentityTypeParameterCacheProvenance::RequireResolvedCaches,
+            ),
+            Err(IdentityGenericCallError::Unsupported(
+                IdentityGenericCallUnsupported::UnresolvedTypeParameterConstraint(type_parameter)
+            ))
+        );
+
+        let computed = ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES_COMPUTED
+            | ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES;
+        assert!(store.set_type_object_flags(type_parameter, computed));
+        let resolution = project_validated_identity_call(
+            &mut store,
+            inferred_request(callable.owner, &[string]),
+            &callable,
+            EXACT_SOURCE,
+        )
+        .unwrap();
+        assert_eq!(resolution.projection.type_argument, string);
+
+        assert!(store.set_type_object_flags(
+            type_parameter,
+            ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES_COMPUTED
+        ));
+        assert_eq!(
+            project_validated_identity_call(
+                &mut store,
+                inferred_request(callable.owner, &[string]),
+                &callable,
+                EXACT_SOURCE,
+            ),
+            Err(IdentityGenericCallError::Invariant(
+                IdentityGenericCallInvariant::InvalidTypeParameter(type_parameter)
+            ))
+        );
+        assert!(store.set_type_object_flags(type_parameter, computed));
+        assert!(store.set_declared_type_links(symbol, DeclaredTypeLinks::default()));
+        assert_eq!(
+            project_validated_identity_call(
+                &mut store,
+                inferred_request(callable.owner, &[string]),
+                &callable,
+                EXACT_SOURCE,
+            ),
+            Err(IdentityGenericCallError::Invariant(
+                IdentityGenericCallInvariant::InvalidTypeParameter(type_parameter)
+            ))
+        );
+    }
+
+    #[test]
+    fn source_parameter_warm_base_constraint_accepts_both_cache_orders() {
+        for base_constraint_first in [false, true] {
+            let mut store = initialized_store();
+            let (callable, type_parameter) = identity_callable(&mut store);
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            let no_constraint = bootstrap.no_constraint_type;
+            let string = bootstrap.string_type;
+
+            if base_constraint_first {
+                assert!(store.set_resolved_base_constraint(type_parameter, Some(no_constraint)));
+            }
+            assert!(store.set_type_parameter_resolution(
+                type_parameter,
+                Some(no_constraint),
+                None,
+                None,
+                Some(no_constraint),
+            ));
+            if !base_constraint_first {
+                assert!(store.set_resolved_base_constraint(type_parameter, Some(no_constraint)));
+            }
+
+            let resolution = project_validated_identity_call(
+                &mut store,
+                inferred_request(callable.owner, &[string]),
+                &callable,
+                EXACT_SOURCE,
+            )
+            .unwrap();
+            assert_eq!(resolution.projection.type_argument, string);
+        }
+    }
+
+    #[test]
+    fn poisoned_base_constraint_is_an_invariant() {
+        let mut store = initialized_store();
+        let (callable, type_parameter) = identity_callable(&mut store);
+        let string = store.intrinsic_bootstrap().unwrap().string_type;
+        assert!(store.set_resolved_base_constraint(type_parameter, Some(string)));
+
+        assert_eq!(
+            project_validated_identity_call(
+                &mut store,
+                inferred_request(callable.owner, &[string]),
+                &callable,
+                EXACT_SOURCE,
+            ),
+            Err(IdentityGenericCallError::Invariant(
+                IdentityGenericCallInvariant::InvalidTypeParameter(type_parameter)
+            ))
+        );
+    }
+
+    #[test]
+    fn malformed_inference_leaf_is_atomic_and_repairable() {
+        let mut store = initialized_store();
+        let (callable, _) = identity_callable(&mut store);
+        let regular = store.regular_string_literal_type("x".into()).unwrap();
+        let fresh = store.fresh_type_of_literal_type(regular).unwrap();
+        assert!(store.set_literal_links(fresh, None, regular));
+        let counts = (
+            store.mapper_len(),
+            store.symbol_len(),
+            store.signature_len(),
+            store.cached_signature_len(),
+        );
+
+        assert_eq!(
+            project_validated_identity_call(
+                &mut store,
+                inferred_request(callable.owner, &[fresh]),
+                &callable,
+                EXACT_SOURCE,
+            ),
+            Err(IdentityGenericCallError::Inference(
+                NakedTypeInferenceError::InvalidCanonicalCandidate {
+                    candidate: fresh,
+                    error: super::super::bootstrap::LiteralTypeCacheError::InvalidCachedLiteral(
+                        fresh
+                    ),
+                }
+            ))
+        );
+        assert_eq!(
+            (
+                store.mapper_len(),
+                store.symbol_len(),
+                store.signature_len(),
+                store.cached_signature_len(),
+            ),
+            counts
+        );
+
+        assert!(store.set_literal_links(fresh, Some(fresh), regular));
+        let repaired = project_validated_identity_call(
+            &mut store,
+            inferred_request(callable.owner, &[fresh]),
+            &callable,
+            EXACT_SOURCE,
+        )
+        .unwrap();
+        assert_eq!(repaired.projection.type_argument, fresh);
+        assert_eq!(store.cached_signature_len(), counts.3 + 1);
     }
 
     #[test]
@@ -873,6 +1273,7 @@ mod tests {
                     ..inferred_request(callable.owner, &[string])
                 },
                 &callable,
+                EXACT_SOURCE,
             ),
             Err(IdentityGenericCallError::Unsupported(
                 IdentityGenericCallUnsupported::TypeArgumentArity {
@@ -894,6 +1295,7 @@ mod tests {
                 &mut store,
                 inferred_request(callable.owner, &[string]),
                 &callable,
+                EXACT_SOURCE,
             ),
             Err(IdentityGenericCallError::Unsupported(
                 IdentityGenericCallUnsupported::ConstrainedTypeParameter(type_parameter)
@@ -912,6 +1314,7 @@ mod tests {
                 &mut store,
                 inferred_request(callable.owner, &[string]),
                 &callable,
+                EXACT_SOURCE,
             ),
             Err(IdentityGenericCallError::Unsupported(
                 IdentityGenericCallUnsupported::DefaultedTypeParameter(type_parameter)
@@ -932,6 +1335,7 @@ mod tests {
                 &mut store,
                 inferred_request(callable.owner, &[string]),
                 &non_identity,
+                EXACT_SOURCE,
             ),
             Err(IdentityGenericCallError::Unsupported(
                 IdentityGenericCallUnsupported::NonNakedReturn(callable.signature)

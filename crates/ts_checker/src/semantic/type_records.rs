@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use ts_ast::{NodeRef, SyntaxKind};
 use ts_binder::{EscapedName, InternalSymbolName, SemanticSymbolId, SymbolTableId};
 use ts_jsnum::{Number, PseudoBigInt};
+use xxhash_rust::xxh3::Xxh3;
 
 use super::{
     ids::{ConditionalRootId, IndexInfoId, SignatureId, TypeAliasId, TypeId, TypeMapperId},
@@ -48,6 +49,22 @@ impl CacheHashKey {
     pub const fn is_zero(self) -> bool {
         self.0 == 0
     }
+}
+
+/// Ordered type-list hash shared by every pinned instantiation cache. The
+/// exact list must still be retained by caches where collisions are
+/// semantically distinguishable.
+pub(super) fn type_list_key(types: &[TypeId]) -> CacheHashKey {
+    let mut hasher = Xxh3::new();
+    hasher.update(
+        &u64::try_from(types.len())
+            .expect("type-list length must fit the pinned uint64 encoding")
+            .to_le_bytes(),
+    );
+    for type_id in types {
+        hasher.update(&type_id.get().to_le_bytes());
+    }
+    CacheHashKey::new(hasher.digest128())
 }
 
 /// Nil versus allocated state of an upstream type-instantiation map.

@@ -951,6 +951,12 @@ impl<K: Eq + Hash, V: Default> LinkStore<K, V> {
 }
 
 impl<K: Eq + Hash, V> LinkStore<K, V> {
+    /// Reserves one dependency-closed publication suffix without allocating a
+    /// semantic link record. Capacity growth is intentionally unobservable.
+    pub(super) fn try_reserve(&mut self, additional: usize) -> bool {
+        self.arena.try_reserve(additional).is_ok() && self.entries.try_reserve(additional).is_ok()
+    }
+
     /// Tests allocation state without allocating a record.
     #[must_use]
     pub fn has(&self, key: &K) -> bool {

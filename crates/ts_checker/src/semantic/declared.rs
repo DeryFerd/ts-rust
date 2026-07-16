@@ -17,16 +17,6 @@
 
 use std::collections::{BTreeMap, HashSet};
 
-use ts_ast::{
-    FileId, Node, NodeArena, NodeArenaId, NodeArenaRevision, NodeData, NodeList, NodeRef,
-    SyntaxKind,
-};
-use ts_binder::{
-    BoundFile, CanonicalNameResolutionError, CanonicalNameResolver, CanonicalNameResolverOptions,
-    CanonicalResolutionLocation, SemanticStoreId, SemanticSymbolId, SymbolFlags,
-};
-use xxhash_rust::xxh3::Xxh3;
-
 use super::{
     TypeResolutionTargetError,
     alias_provider::ProductionAliasSourceRegistry,
@@ -37,9 +27,19 @@ use super::{
     production::GlobalMergeCompletion,
     store::SemanticStore,
     type_nodes::TypeNodeUnavailable,
-    type_records::{CacheHashKey, InterfaceTypeData, TypeCacheState, TypeData, TypeRecord},
+    type_records::{InterfaceTypeData, TypeCacheState, TypeData, TypeRecord},
     types::{ObjectFlags, TypeFlags},
 };
+use ts_ast::{
+    FileId, Node, NodeArena, NodeArenaId, NodeArenaRevision, NodeData, NodeList, NodeRef,
+    SyntaxKind,
+};
+use ts_binder::{
+    BoundFile, CanonicalNameResolutionError, CanonicalNameResolver, CanonicalNameResolverOptions,
+    CanonicalResolutionLocation, SemanticStoreId, SemanticSymbolId, SymbolFlags,
+};
+
+pub(super) use super::type_records::type_list_key;
 
 #[derive(Clone, Copy, Debug)]
 struct DeclaredTypeSource<'a> {
@@ -1435,19 +1435,6 @@ pub(super) fn execute_type_parameter(
     declared_type
 }
 
-pub(super) fn type_list_key(types: &[TypeId]) -> CacheHashKey {
-    let mut hasher = Xxh3::new();
-    hasher.update(
-        &u64::try_from(types.len())
-            .expect("type-list length must fit the pinned uint64 encoding")
-            .to_le_bytes(),
-    );
-    for type_id in types {
-        hasher.update(&type_id.get().to_le_bytes());
-    }
-    CacheHashKey::new(hasher.digest128())
-}
-
 fn execute_class_plan(
     store: &mut SemanticStore<TypeRecord, TypeMapper>,
     plan: ClassPlan,
@@ -1743,7 +1730,9 @@ mod tests {
 
     use super::*;
     use crate::semantic::links::DeclaredTypeLinks;
-    use crate::semantic::{IntrinsicBootstrapOptions, type_records::TypeParameterData};
+    use crate::semantic::{
+        CacheHashKey, IntrinsicBootstrapOptions, type_records::TypeParameterData,
+    };
 
     type TestStore = SemanticStore<TypeRecord, TypeMapper>;
 

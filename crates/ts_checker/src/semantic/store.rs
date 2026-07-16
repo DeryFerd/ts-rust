@@ -37,7 +37,7 @@ use super::{
         CompositeSignature, IndexInfo, IndexInfoArena, Signature, SignatureArena, SignatureFlags,
         TupleElementInfo, TupleMetadata, TypePredicate, TypePredicateArena, TypePredicateKind,
     },
-    type_records::{CacheHashKey, ConditionalRoot, TypeAlias, TypeData, TypeRecord},
+    type_records::{CacheHashKey, ConditionalRoot, TypeAlias, TypeData, TypeRecord, type_list_key},
 };
 
 #[derive(Debug)]
@@ -61,6 +61,23 @@ struct SourceNodeFacts {
     parent: Option<NodeId>,
     exported: bool,
     signature_links_eligible: bool,
+}
+
+#[derive(Debug)]
+struct CachedSignatureEntry {
+    type_arguments: Box<[TypeId]>,
+    instantiated: SignatureId,
+}
+
+/// Exact lookup state for pinned checker `cachedSignatures`. The hash remains
+/// the upstream key, while the retained ordered arguments make a rare hash
+/// collision observable and fail-closed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum CachedSignatureLookup {
+    Missing,
+    Hit(SignatureId),
+    HashCollision(SignatureId),
+    Invalid,
 }
 
 /// Source syntax family that owns one exact callable value object.
@@ -184,6 +201,9 @@ pub struct SemanticStore<TypePayload, MapperPayload> {
     source_callable_types_by_declaration: HashMap<NodeRef, TypeId>,
     source_callable_types_by_owner: HashMap<SemanticSymbolId, TypeId>,
     source_callable_types_by_signature: HashMap<SignatureId, TypeId>,
+    /// Pinned checker `cachedSignatures`, keyed by generic target and the
+    /// ordered type-argument hash.
+    cached_signatures: HashMap<(SignatureId, CacheHashKey), CachedSignatureEntry>,
     function_signature_return_annotations: HashMap<SignatureId, (NodeRef, bool)>,
     callable_signature_parameter_types: HashMap<SignatureId, Vec<TypeId>>,
     circular_return_signatures: HashMap<SignatureId, TypeId>,
@@ -246,6 +266,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             source_callable_types_by_declaration: HashMap::new(),
             source_callable_types_by_owner: HashMap::new(),
             source_callable_types_by_signature: HashMap::new(),
+            cached_signatures: HashMap::new(),
             function_signature_return_annotations: HashMap::new(),
             callable_signature_parameter_types: HashMap::new(),
             circular_return_signatures: HashMap::new(),
@@ -2200,6 +2221,11 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         self.mappers.alloc_with(|_| payload)
     }
 
+    /// Reserves mapper identities before an infallible publication suffix.
+    pub(super) fn try_reserve_mappers(&mut self, additional: usize) -> bool {
+        self.mappers.try_reserve(additional)
+    }
+
     #[must_use]
     pub fn mapper_payload(&self, id: TypeMapperId) -> Option<&MapperPayload> {
         self.mappers.get(id)
@@ -2260,6 +2286,80 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
 
     pub(super) fn try_reserve_signatures(&mut self, additional: usize) -> bool {
         self.signatures.try_reserve(additional)
+    }
+
+    /// Reserves upstream `cachedSignatures` entries without publishing one.
+    pub(super) fn try_reserve_cached_signatures(&mut self, additional: usize) -> bool {
+        self.cached_signatures.try_reserve(additional).is_ok()
+    }
+
+    /// Reads one exact upstream `cachedSignatures` entry.
+    #[must_use]
+    pub(super) fn cached_signature(
+        &self,
+        target: SignatureId,
+        type_arguments: CacheHashKey,
+        exact_type_arguments: &[TypeId],
+    ) -> CachedSignatureLookup {
+        if self.signature(target).is_none()
+            || !self.valid_types(exact_type_arguments)
+            || type_list_key(exact_type_arguments) != type_arguments
+        {
+            return CachedSignatureLookup::Invalid;
+        }
+        let Some(entry) = self.cached_signatures.get(&(target, type_arguments)) else {
+            return CachedSignatureLookup::Missing;
+        };
+        if self.signature(entry.instantiated).is_none() {
+            CachedSignatureLookup::Invalid
+        } else if entry.type_arguments.as_ref() == exact_type_arguments {
+            CachedSignatureLookup::Hit(entry.instantiated)
+        } else {
+            CachedSignatureLookup::HashCollision(entry.instantiated)
+        }
+    }
+
+    /// Publishes one prevalidated instantiated signature. The instantiated
+    /// signature must already point at `target`; callers commit this cache
+    /// entry last so every visible entry is dependency-closed.
+    pub(super) fn set_cached_signature(
+        &mut self,
+        target: SignatureId,
+        type_arguments: CacheHashKey,
+        exact_type_arguments: Box<[TypeId]>,
+        instantiated: SignatureId,
+    ) -> bool {
+        if self.signature(target).is_none()
+            || !self.valid_types(&exact_type_arguments)
+            || type_list_key(&exact_type_arguments) != type_arguments
+            || !self.signature(instantiated).is_some_and(|signature| {
+                signature.target() == Some(target) && signature.mapper().is_some()
+            })
+            || self
+                .cached_signatures
+                .contains_key(&(target, type_arguments))
+        {
+            return false;
+        }
+        self.cached_signatures.insert(
+            (target, type_arguments),
+            CachedSignatureEntry {
+                type_arguments: exact_type_arguments,
+                instantiated,
+            },
+        );
+        true
+    }
+
+    #[must_use]
+    pub(super) fn cached_signature_len(&self) -> usize {
+        self.cached_signatures.len()
+    }
+
+    /// Reserves a transient parameter's value-link slot before publishing its
+    /// symbol, mapper, and instantiated signature.
+    pub(super) fn try_reserve_value_symbol_links(&mut self, additional: usize) -> bool {
+        self.links.value_symbol.try_reserve(additional)
     }
 
     pub(super) fn try_reserve_function_signature_return_annotations(
@@ -3096,7 +3196,7 @@ mod tests {
     use ts_core::TextRange;
     use ts_parser::{parse_isolated_entity_name, parse_source_file};
 
-    use super::{AstScope, SemanticStore};
+    use super::{AstScope, CachedSignatureLookup, SemanticStore, type_list_key};
     use crate::semantic::{
         AccessibleChainCacheKey, AliasSymbolLinks, AliasTargetState, ArrayLiteralLinks,
         AssertionLinks, CacheHashKey, ContainingSymbolLinks, DeclaredTypeLinks,
@@ -3131,6 +3231,68 @@ mod tests {
         assert_eq!(disabled.claim_strict_function_types(false), Ok(()));
         assert_eq!(disabled.claim_strict_function_types(true), Err(false));
         assert_eq!(disabled.claimed_strict_function_types(), Some(false));
+    }
+
+    #[test]
+    fn cached_signatures_retain_exact_arguments_and_publish_insert_only() {
+        let mut store = TestStore::new();
+        let argument = store.alloc_type("argument");
+        let collision_argument = store.alloc_type("collision");
+        let target = empty_signature(&mut store);
+        let mapper = store.alloc_mapper("mapper");
+        let instantiated = store
+            .alloc_signature(
+                SignatureFlags::NONE,
+                None,
+                Vec::new(),
+                None,
+                Vec::new(),
+                Some(argument),
+                None,
+                0,
+            )
+            .unwrap();
+        assert!(store.set_signature_target_and_mapper(instantiated, Some(target), Some(mapper)));
+        let key = type_list_key(&[argument]);
+        assert_eq!(
+            store.cached_signature(target, key, &[argument]),
+            CachedSignatureLookup::Missing
+        );
+        assert!(store.try_reserve_cached_signatures(1));
+        assert!(store.set_cached_signature(target, key, Box::new([argument]), instantiated));
+        assert_eq!(store.cached_signature_len(), 1);
+        assert_eq!(
+            store.cached_signature(target, key, &[argument]),
+            CachedSignatureLookup::Hit(instantiated)
+        );
+        assert_eq!(
+            store.cached_signature(target, key, &[collision_argument]),
+            CachedSignatureLookup::Invalid
+        );
+        let collision_key = type_list_key(&[collision_argument]);
+        assert_eq!(
+            store.cached_signature(target, collision_key, &[collision_argument]),
+            CachedSignatureLookup::Missing
+        );
+        let wrong_key = CacheHashKey::new(collision_key.get() ^ 1);
+        assert!(!store.set_cached_signature(
+            target,
+            wrong_key,
+            Box::new([collision_argument]),
+            instantiated
+        ));
+        assert!(!store.set_cached_signature(target, key, Box::new([argument]), instantiated));
+        assert_eq!(store.cached_signature_len(), 1);
+    }
+
+    #[test]
+    fn mapper_reservation_failure_preserves_counts_and_allows_retry() {
+        let mut store = TestStore::new();
+        assert!(!store.try_reserve_mappers(usize::MAX));
+        assert_eq!(store.mapper_len(), 0);
+        assert!(store.try_reserve_mappers(1));
+        store.alloc_mapper("mapper");
+        assert_eq!(store.mapper_len(), 1);
     }
 
     fn alloc_test_symbol<TypePayload, MapperPayload>(

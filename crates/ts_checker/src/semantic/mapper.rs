@@ -132,6 +132,19 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         Some(self.alloc_mapper(TypeMapper::simple(source, target)))
     }
 
+    /// Returns the exact endpoints only for the simple mapper representation.
+    /// Evaluating a mapper is insufficient for cache validation because an
+    /// unrelated simple mapper preserves an input by identity.
+    pub(super) fn simple_type_mapper_endpoints(
+        &self,
+        mapper: TypeMapperId,
+    ) -> Option<(TypeId, TypeId)> {
+        let TypeMapperData::Simple { source, target } = &self.mapper_payload(mapper)?.data else {
+            return None;
+        };
+        Some((*source, *target))
+    }
+
     /// Pinned `newArrayTypeMapper` with exact parallel-array semantics.
     pub fn new_array_type_mapper(
         &mut self,

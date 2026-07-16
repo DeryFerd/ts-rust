@@ -4,34 +4,49 @@
 //! resolution. When the target is the inference context's type parameter,
 //! upstream records the source type itself as a covariant candidate. The
 //! bounded Rust branch accepts only primitive, literal, unique-symbol, and
-//! anonymous primitive-union candidates. In particular, it preserves fresh
-//! literal identity for `<T>(value: T): T`; widening is intentionally not
-//! performed because `T` occurs at top level in the return type.
+//! anonymous primitive-union candidates. It preserves candidates that do not
+//! require widening, including fresh literals. Widening sentinels remain a
+//! typed boundary until the exact final `getWidenedType` step is available.
 
 #![allow(dead_code)] // Installed ahead of the generic-call dispatch consumer.
 
 use std::collections::HashSet;
 
-use super::{TypeId, mapper::CanonicalTypeMapperStore, type_records::TypeData, types::TypeFlags};
+use super::{
+    TypeId,
+    bootstrap::LiteralTypeCacheError,
+    mapper::CanonicalTypeMapperStore,
+    type_records::TypeData,
+    types::{ObjectFlags, TypeFlags},
+};
 
 /// A missing dependency or shape outside naked leaf inference.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum NakedTypeInferenceError {
     InvalidCandidate(TypeId),
+    InvalidCanonicalCandidate {
+        candidate: TypeId,
+        error: LiteralTypeCacheError,
+    },
     UnsupportedCandidate(TypeId),
+    RequiresWidening(TypeId),
     AliasedUnion(TypeId),
     OriginUnion(TypeId),
     EmptyUnion(TypeId),
-    NestedUnion { union: TypeId, constituent: TypeId },
-    DuplicateUnionConstituent { union: TypeId, constituent: TypeId },
+    NestedUnion {
+        union: TypeId,
+        constituent: TypeId,
+    },
+    DuplicateUnionConstituent {
+        union: TypeId,
+        constituent: TypeId,
+    },
 }
 
 /// Infers one naked type parameter from one already-typed argument.
 ///
-/// The return is deliberately the exact candidate identity. Pinned
-/// `getCovariantInference` does not widen fresh literals when the inferred type
-/// parameter occurs at top level in the signature return, which is the only
-/// signature shape admitted by the first generic-call consumer.
+/// The return is the exact candidate identity only after proving that pinned
+/// `getCovariantInference` would not take its final widening path.
 pub(super) fn infer_naked_type_parameter(
     store: &CanonicalTypeMapperStore,
     candidate: TypeId,
@@ -48,6 +63,21 @@ pub(super) fn validate_inference_leaf(
     let record = store
         .type_payload(candidate)
         .ok_or(NakedTypeInferenceError::InvalidCandidate(candidate))?;
+    match store.validate_union_constituent(candidate) {
+        Ok(()) => {}
+        Err(LiteralTypeCacheError::UnsupportedUnionConstituent(_)) => {
+            return Err(NakedTypeInferenceError::UnsupportedCandidate(candidate));
+        }
+        Err(error) => {
+            return Err(NakedTypeInferenceError::InvalidCanonicalCandidate { candidate, error });
+        }
+    }
+    if record
+        .object_flags()
+        .intersects(ObjectFlags::REQUIRES_WIDENING)
+    {
+        return Err(NakedTypeInferenceError::RequiresWidening(candidate));
+    }
     match record.data() {
         TypeData::Intrinsic(_) if intrinsic_leaf_flags(record.flags()) => Ok(()),
         TypeData::Literal(_) if literal_leaf_flags(record.flags()) => Ok(()),
@@ -111,18 +141,27 @@ fn literal_leaf_flags(flags: TypeFlags) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use ts_binder::{EscapedName, SymbolData, SymbolFlags};
+
     use super::*;
     use crate::semantic::{
-        IntrinsicBootstrapOptions, SemanticStore, mapper::TypeMapper, type_records::TypeRecord,
-        types::ObjectFlags,
+        IntrinsicBootstrapOptions, SemanticStore, bootstrap::UnionReduction, mapper::TypeMapper,
+        type_records::TypeRecord,
     };
 
-    fn initialized_store() -> CanonicalTypeMapperStore {
+    fn initialized_store_with(strict_null_checks: bool) -> CanonicalTypeMapperStore {
         let mut store = SemanticStore::<TypeRecord, TypeMapper>::new();
         store
-            .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions::default())
+            .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions {
+                strict_null_checks,
+                ..IntrinsicBootstrapOptions::default()
+            })
             .unwrap();
         store
+    }
+
+    fn initialized_store() -> CanonicalTypeMapperStore {
+        initialized_store_with(false)
     }
 
     #[test]
@@ -142,7 +181,7 @@ mod tests {
         let string = bootstrap.string_type;
         let number = bootstrap.number_type;
         let union = store
-            .alloc_union_type(ObjectFlags::PRIMITIVE_UNION, vec![string, number])
+            .expression_union_type(&[string, number], UnionReduction::None)
             .unwrap();
 
         assert_eq!(infer_naked_type_parameter(&store, string), Ok(string));
@@ -150,34 +189,86 @@ mod tests {
     }
 
     #[test]
-    fn aliases_origins_and_nested_unions_fail_closed() {
+    fn aliases_and_origins_fail_closed() {
         let mut store = initialized_store();
         let bootstrap = store.intrinsic_bootstrap().unwrap();
         let string = bootstrap.string_type;
         let number = bootstrap.number_type;
+        let bigint = bootstrap.bigint_type;
 
-        let aliased = store
-            .alloc_union_type(ObjectFlags::PRIMITIVE_UNION, vec![string, number])
+        let alias_symbol = store
+            .alloc_symbol(SymbolData::new(
+                SymbolFlags::TYPE_ALIAS,
+                EscapedName::source("Alias"),
+            ))
             .unwrap();
-        let alias = store.alloc_type_alias(None).unwrap();
-        assert!(store.set_type_alias(aliased, Some(alias)));
+        let aliased = store
+            .literal_union_type(&[string, number], Some(alias_symbol))
+            .unwrap();
         assert_eq!(
             infer_naked_type_parameter(&store, aliased),
             Err(NakedTypeInferenceError::AliasedUnion(aliased))
         );
 
-        let inner = store
-            .alloc_union_type(ObjectFlags::PRIMITIVE_UNION, vec![string, number])
-            .unwrap();
         let outer = store
-            .alloc_union_type(ObjectFlags::PRIMITIVE_UNION, vec![inner, string])
+            .expression_union_type(&[aliased, bigint], UnionReduction::None)
             .unwrap();
         assert_eq!(
             infer_naked_type_parameter(&store, outer),
-            Err(NakedTypeInferenceError::NestedUnion {
-                union: outer,
-                constituent: inner,
+            Err(NakedTypeInferenceError::OriginUnion(outer))
+        );
+    }
+
+    #[test]
+    fn malformed_literal_cache_is_an_invariant() {
+        let mut store = initialized_store();
+        let regular = store.regular_string_literal_type("x".into()).unwrap();
+        let fresh = store.fresh_type_of_literal_type(regular).unwrap();
+        assert!(store.set_literal_links(fresh, None, regular));
+
+        assert_eq!(
+            infer_naked_type_parameter(&store, fresh),
+            Err(NakedTypeInferenceError::InvalidCanonicalCandidate {
+                candidate: fresh,
+                error: LiteralTypeCacheError::InvalidCachedLiteral(fresh),
             })
+        );
+    }
+
+    #[test]
+    fn null_and_undefined_widening_follow_strictness() {
+        let strict = initialized_store_with(true);
+        let strict_bootstrap = strict.intrinsic_bootstrap().unwrap();
+        assert_eq!(
+            infer_naked_type_parameter(&strict, strict_bootstrap.undefined_widening_type),
+            Ok(strict_bootstrap.undefined_type)
+        );
+        assert_eq!(
+            infer_naked_type_parameter(&strict, strict_bootstrap.null_widening_type),
+            Ok(strict_bootstrap.null_type)
+        );
+
+        let non_strict = initialized_store_with(false);
+        let non_strict_bootstrap = non_strict.intrinsic_bootstrap().unwrap();
+        assert_eq!(
+            infer_naked_type_parameter(&non_strict, non_strict_bootstrap.undefined_type),
+            Ok(non_strict_bootstrap.undefined_type)
+        );
+        assert_eq!(
+            infer_naked_type_parameter(&non_strict, non_strict_bootstrap.null_type),
+            Ok(non_strict_bootstrap.null_type)
+        );
+        assert_eq!(
+            infer_naked_type_parameter(&non_strict, non_strict_bootstrap.undefined_widening_type),
+            Err(NakedTypeInferenceError::RequiresWidening(
+                non_strict_bootstrap.undefined_widening_type
+            ))
+        );
+        assert_eq!(
+            infer_naked_type_parameter(&non_strict, non_strict_bootstrap.null_widening_type),
+            Err(NakedTypeInferenceError::RequiresWidening(
+                non_strict_bootstrap.null_widening_type
+            ))
         );
     }
 }
