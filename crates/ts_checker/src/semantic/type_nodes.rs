@@ -30,6 +30,9 @@ use super::{
     },
     object_members::{self, PropertyObjectError, PropertyObjectPlan, PropertyObjectState},
     signatures::Signature,
+    source_callables::{
+        self, PendingSourceCallableParameterTypes, SourceCallableError, SourceCallableFamily,
+    },
     type_records::{CacheHashKey, TypeData, TypeRecord},
     types::ObjectFlags,
 };
@@ -307,6 +310,46 @@ fn function_signature_error(error: FunctionTypeError, signature: SignatureId) ->
         FunctionTypeError::LiteralCache(error) => type_construction_error(error),
         FunctionTypeError::Unsupported(_) => function_type_error(error),
         FunctionTypeError::Invariant(_) => {
+            type_node_unavailable(TypeNodeUnavailable::InvalidFunctionSignature(signature))
+        }
+    }
+}
+
+fn source_callable_error(
+    error: SourceCallableError,
+    family: SourceCallableFamily,
+) -> DeclaredTypeError {
+    match error {
+        SourceCallableError::DeclaredType(error) => error,
+        SourceCallableError::LiteralCache(error) => type_construction_error(error),
+        error @ SourceCallableError::Unsupported(_) => {
+            let node = error
+                .node()
+                .expect("unsupported source-callable errors retain their node");
+            type_node_unavailable(TypeNodeUnavailable::UnsupportedSyntax {
+                node,
+                kind: family.syntax_kind(),
+            })
+        }
+        error @ SourceCallableError::Invariant(_) => {
+            let node = error
+                .node()
+                .expect("source-callable invariants retain their node");
+            type_node_unavailable(TypeNodeUnavailable::InvalidFunctionType(node))
+        }
+    }
+}
+
+fn source_callable_signature_error(
+    error: SourceCallableError,
+    family: SourceCallableFamily,
+    signature: SignatureId,
+) -> DeclaredTypeError {
+    match error {
+        SourceCallableError::DeclaredType(error) => error,
+        SourceCallableError::LiteralCache(error) => type_construction_error(error),
+        SourceCallableError::Unsupported(_) => source_callable_error(error, family),
+        SourceCallableError::Invariant(_) => {
             type_node_unavailable(TypeNodeUnavailable::InvalidFunctionSignature(signature))
         }
     }
@@ -3377,6 +3420,140 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         self.complete_type_query(result, &plan, &mut prepared)
     }
 
+    /// Resolves one exact annotated FunctionDeclaration or ArrowFunction into
+    /// the callable value owned by its binder FUNCTION symbol.
+    pub(super) fn get_type_of_source_callable(
+        &mut self,
+        declaration: NodeRef,
+        owner_symbol: SemanticSymbolId,
+    ) -> Result<TypeId, DeclaredTypeError> {
+        if !self.pending_function_parameters.is_empty() {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidFunctionType(declaration),
+            ));
+        }
+        let array_targets = self
+            .global_types
+            .as_ref()
+            .map(CanonicalArrayTargets::from_global_types);
+        let family = match preflight_node(self.store, self.host, declaration)?.kind {
+            SyntaxKind::FunctionDeclaration => SourceCallableFamily::FunctionDeclaration,
+            SyntaxKind::ArrowFunction => SourceCallableFamily::ArrowFunction,
+            kind => {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::UnsupportedSyntax {
+                        node: declaration,
+                        kind,
+                    },
+                ));
+            }
+        };
+        let callable = source_callables::plan_source_callable(
+            self.store,
+            self.host,
+            declaration,
+            owner_symbol,
+            array_targets,
+        )
+        .map_err(|error| source_callable_error(error, family))?;
+        if let source_callables::SourceCallableState::Resolved { type_, .. } =
+            source_callables::source_callable_state(self.store, &callable, true)
+                .map_err(|error| source_callable_error(error, callable.family))?
+        {
+            return Ok(type_);
+        }
+
+        let mut planner = TypeQueryPlanner::new(
+            self.store,
+            self.host,
+            self.array_type,
+            array_targets,
+            self.options.strict_builtin_iterator_return,
+        );
+        for parameter in &callable.parameters {
+            planner.plan_type_node(parameter.type_node)?;
+        }
+        let plan = planner.finish();
+        let (cold_source_types, source_optional_unions) =
+            source_callables::reserve_source_callable_capacities(self.store, &[&callable])
+                .map_err(|error| source_callable_error(error, callable.family))?;
+        let mut prepared = self.prepare_literal_types_with_additional(
+            &plan,
+            source_optional_unions,
+            cold_source_types,
+        )?;
+        if let Err(error) = self.seed_pending_function_parameters(&plan, &mut prepared) {
+            self.pending_function_parameters.clear();
+            prepared.clear_pending_function_types();
+            return Err(error);
+        }
+        let pending = match source_callables::begin_source_callable(self.store, &callable)
+            .map_err(|error| source_callable_error(error, callable.family))?
+        {
+            Ok(pending) => pending,
+            Err(resolved) => {
+                self.pending_function_parameters.clear();
+                prepared.clear_pending_function_types();
+                return Ok(resolved);
+            }
+        };
+        if let Err(error) =
+            source_callables::finalize_source_callable_structure(self.store, &callable, pending)
+                .map_err(|error| source_callable_error(error, callable.family))
+        {
+            self.pending_function_parameters.clear();
+            prepared.clear_pending_function_types();
+            return Err(error);
+        }
+        if callable.parameters.is_empty() {
+            self.pending_function_parameters.clear();
+            prepared.clear_pending_function_types();
+            return match source_callables::source_callable_state(self.store, &callable, false)
+                .map_err(|error| source_callable_error(error, callable.family))?
+            {
+                source_callables::SourceCallableState::Resolved { type_, .. }
+                    if type_ == pending.type_ =>
+                {
+                    Ok(type_)
+                }
+                _ => Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidFunctionType(declaration),
+                )),
+            };
+        }
+
+        let mut base_types = Vec::with_capacity(callable.parameters.len());
+        for parameter in &callable.parameters {
+            match self.execute_type_node(parameter.type_node, &plan, &mut prepared) {
+                Ok(type_) => base_types.push(type_),
+                Err(error) => {
+                    self.pending_function_parameters.clear();
+                    prepared.clear_pending_function_types();
+                    return Err(error);
+                }
+            }
+        }
+        if let Err(error) = self.flush_pending_function_parameters(&plan, &mut prepared) {
+            self.pending_function_parameters.clear();
+            prepared.clear_pending_function_types();
+            return Err(error);
+        }
+        let publication = source_callables::publish_source_callable_parameter_types(
+            self.store,
+            self.global_types.as_ref(),
+            &[PendingSourceCallableParameterTypes {
+                plan: callable.clone(),
+                base_types,
+            }],
+            &mut prepared,
+        )
+        .map_err(|error| source_callable_error(error, callable.family));
+        self.pending_function_parameters.clear();
+        prepared.clear_pending_function_types();
+        publication?;
+        Ok(pending.type_)
+    }
+
     /// Resolves the explicitly annotated return type of an exact function-type
     /// signature. Return annotations remain lazy after the function object and
     /// its parameter value types have been published.
@@ -3396,10 +3573,16 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             .ok_or_else(|| {
                 type_node_unavailable(TypeNodeUnavailable::InvalidFunctionSignature(signature))
             })?;
-        if preflight_node(self.store, self.host, declaration)?.kind != SyntaxKind::FunctionType {
-            return Err(type_node_unavailable(
-                TypeNodeUnavailable::InvalidFunctionSignature(signature),
-            ));
+        match preflight_node(self.store, self.host, declaration)?.kind {
+            SyntaxKind::FunctionDeclaration | SyntaxKind::ArrowFunction => {
+                return self.get_return_type_of_source_callable_signature(signature, declaration);
+            }
+            SyntaxKind::FunctionType => {}
+            _ => {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidFunctionSignature(signature),
+                ));
+            }
         }
 
         let mut parameter_planner = TypeQueryPlanner::new(
@@ -3542,6 +3725,130 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         }
     }
 
+    fn get_return_type_of_source_callable_signature(
+        &mut self,
+        signature: SignatureId,
+        declaration: NodeRef,
+    ) -> Result<TypeId, DeclaredTypeError> {
+        let provenance = self
+            .store
+            .source_callable_type_for_signature(signature)
+            .and_then(|type_| self.store.source_callable_provenance(type_))
+            .filter(|provenance| {
+                provenance.signature == signature && provenance.declaration == declaration
+            })
+            .ok_or_else(|| {
+                type_node_unavailable(TypeNodeUnavailable::InvalidFunctionSignature(signature))
+            })?;
+        let array_targets = self
+            .global_types
+            .as_ref()
+            .map(CanonicalArrayTargets::from_global_types);
+        let callable = source_callables::plan_source_callable(
+            self.store,
+            self.host,
+            declaration,
+            provenance.owner_symbol,
+            array_targets,
+        )
+        .map_err(|error| source_callable_signature_error(error, provenance.family, signature))?;
+        source_callables::validate_source_callable_signature_identity(
+            self.store, &callable, signature,
+        )
+        .map_err(|error| source_callable_signature_error(error, callable.family, signature))?;
+        if let Some(return_type) =
+            source_callables::validate_lazy_source_callable_return(self.store, &callable, signature)
+                .map_err(|error| {
+                    source_callable_signature_error(error, callable.family, signature)
+                })?
+        {
+            return Ok(return_type);
+        }
+
+        let mut planner = TypeQueryPlanner::new(
+            self.store,
+            self.host,
+            self.array_type,
+            array_targets,
+            self.options.strict_builtin_iterator_return,
+        );
+        planner.plan_type_node(callable.return_type)?;
+        let plan = planner.finish();
+        let mut prepared = self.prepare_literal_types(&plan)?;
+        if !self.store.try_reserve_circular_return_signatures(1) {
+            prepared.clear_pending_function_types();
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidFunctionSignature(signature),
+            ));
+        }
+        if !self.store.push_type_resolution(
+            TypeResolutionTarget::Signature(signature),
+            TypeSystemPropertyName::ResolvedReturnType,
+        )? {
+            self.pending_function_parameters.clear();
+            prepared.clear_pending_function_types();
+            return self.error_type();
+        }
+        if let Err(error) = self.seed_pending_function_parameters(&plan, &mut prepared) {
+            let popped = self.store.pop_type_resolution();
+            self.pending_function_parameters.clear();
+            prepared.clear_pending_function_types();
+            if popped.is_none() {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidFunctionSignature(signature),
+                ));
+            }
+            return Err(error);
+        }
+        let resolved = match self.execute_type_node(callable.return_type, &plan, &mut prepared) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                if self.store.pop_type_resolution().is_none() {
+                    self.pending_function_parameters.clear();
+                    prepared.clear_pending_function_types();
+                    return Err(type_node_unavailable(
+                        TypeNodeUnavailable::InvalidFunctionSignature(signature),
+                    ));
+                }
+                self.pending_function_parameters.clear();
+                prepared.clear_pending_function_types();
+                return Err(error);
+            }
+        };
+        let Some(cycle_free) = self.store.pop_type_resolution() else {
+            self.pending_function_parameters.clear();
+            prepared.clear_pending_function_types();
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidFunctionSignature(signature),
+            ));
+        };
+        if let Err(error) = self.flush_pending_function_parameters(&plan, &mut prepared) {
+            self.pending_function_parameters.clear();
+            prepared.clear_pending_function_types();
+            return Err(error);
+        }
+        self.pending_function_parameters.clear();
+        prepared.clear_pending_function_types();
+        if cycle_free {
+            source_callables::publish_lazy_source_callable_return(
+                self.store, &callable, signature, resolved,
+            )
+            .map_err(|error| source_callable_signature_error(error, callable.family, signature))
+        } else {
+            let return_type = source_callables::publish_circular_lazy_source_callable_return(
+                self.store, &callable, signature, resolved,
+            )
+            .map_err(|error| source_callable_signature_error(error, callable.family, signature))?;
+            self.diagnostics.add(
+                Some(callable.return_type),
+                Diagnostic::new(
+                    message_by_code(2577).expect("TS2577 is in the diagnostic catalog"),
+                ),
+            );
+            Ok(return_type)
+        }
+    }
+
     /// Resolves the declared type identity of one symbol.
     ///
     /// # Errors
@@ -3649,6 +3956,15 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         &mut self,
         plan: &TypeQueryPlan,
     ) -> Result<PreparedTypeQueryTypes, DeclaredTypeError> {
+        self.prepare_literal_types_with_additional(plan, 0, 0)
+    }
+
+    fn prepare_literal_types_with_additional(
+        &mut self,
+        plan: &TypeQueryPlan,
+        additional_union_operations: usize,
+        additional_source_types: usize,
+    ) -> Result<PreparedTypeQueryTypes, DeclaredTypeError> {
         let mut strings = Vec::new();
         let mut numbers = Vec::new();
         let mut bigints = Vec::new();
@@ -3702,6 +4018,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         let union_operation_count = unions
             .len()
             .checked_add(optional_parameter_unions)
+            .and_then(|count| count.checked_add(additional_union_operations))
             .ok_or_else(|| Self::literal_cache_error(LiteralTypeCacheError::Capacity))?;
         let named_unions = unions
             .iter()
@@ -3758,6 +4075,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             .and_then(|count| count.checked_mul(2))
             .and_then(|count| count.checked_add(array_references))
             .and_then(|count| count.checked_add(cold_function_types))
+            .and_then(|count| count.checked_add(additional_source_types))
             .ok_or_else(|| Self::literal_cache_error(LiteralTypeCacheError::Capacity))?;
         if !self.store.try_reserve_types(additional_types) {
             return Err(Self::literal_cache_error(LiteralTypeCacheError::Capacity));
@@ -4892,13 +5210,19 @@ mod tests {
 
     use super::*;
     use crate::semantic::{
-        DeclaredTypeHostError, DeclaredTypeLinks, IntrinsicBootstrapOptions, SymbolNodeLinks,
-        TypeAliasLinks, TypeNodeLinks, ValueSymbolLinks,
+        CanonicalTypeFormatFlags, DeclaredTypeHostError, DeclaredTypeLinks,
+        IntrinsicBootstrapOptions, SymbolNodeLinks, TypeAliasLinks, TypeNodeLinks,
+        ValueSymbolLinks,
         bootstrap::UnionReduction,
+        callables::{
+            CallableFamily, StoredSingleCallableValidation, validate_stored_single_callable,
+        },
+        formatter::type_to_string_with_host_and_flags,
         global_types::initialize_global_library_types,
         links::{ResolvedSignatureState, SignatureLinks},
         production::GlobalMergeCompletion,
         signatures::SignatureFlags,
+        source_callables::{StoredSourceCallableValidation, validate_stored_source_callable},
         type_records::{LiteralValue, TypeAlias},
         types::{ObjectFlags, TypeFlags},
     };
@@ -5082,6 +5406,7 @@ mod tests {
             NodeData::ClassDeclaration(data) => data.name?,
             NodeData::TypeParameterDeclaration(data) => data.name,
             NodeData::VariableDeclaration(data) => data.name,
+            NodeData::FunctionDeclaration(data) => data.name?,
             NodeData::ImportSpecifier(data) => data.name,
             _ => return None,
         };
@@ -5444,6 +5769,25 @@ mod tests {
             diagnostics,
         )?
         .get_return_type_of_signature(signature)
+    }
+
+    fn query_source_callable(
+        fixture: &mut Fixture,
+        declaration: NodeRef,
+        owner: SemanticSymbolId,
+        diagnostics: &mut CanonicalCheckerDiagnostics,
+    ) -> Result<TypeId, DeclaredTypeError> {
+        let host = post_global_host(
+            &fixture.parsed.arena,
+            fixture.files.get(&fixture.file).unwrap(),
+        );
+        CanonicalTypeQuery::new(
+            &mut fixture.store,
+            &host,
+            CanonicalTypeQueryOptions::default(),
+            diagnostics,
+        )?
+        .get_type_of_source_callable(declaration, owner)
     }
 
     fn query_global_signature_return(
@@ -13189,6 +13533,241 @@ mod tests {
             ))
         );
         assert_eq!(function_store_state(&fixture.store), erased);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn source_callable_query_materializes_both_families_and_shared_consumers() {
+        let source = concat!(
+            "type Target = (value: string, optional?: number) => boolean; ",
+            "export function exported(value: string, optional?: number): boolean { return true; } ",
+            "const arrow = (value: string, optional?: number): boolean => true;",
+        );
+        let mut fixture = fixture_with_options(
+            source,
+            CanonicalModuleState::External,
+            IntrinsicBootstrapOptions {
+                strict_null_checks: true,
+                ..IntrinsicBootstrapOptions::default()
+            },
+            |_| {},
+        );
+        let declaration = named_node(&fixture, SyntaxKind::FunctionDeclaration, "exported");
+        let arrow = fixture
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ArrowFunction).then_some(NodeRef::new(
+                    fixture.parsed.arena.id(),
+                    fixture.file,
+                    node,
+                ))
+            })
+            .expect("source has one arrow function");
+        let (owner, export_local, arrow_owner) = {
+            let bound = fixture.files.get(&fixture.file).unwrap();
+            (
+                bound.symbol(declaration).unwrap(),
+                bound.local_symbol(declaration).unwrap(),
+                bound.symbol(arrow).unwrap(),
+            )
+        };
+        assert!(fixture.store.symbol(owner).unwrap().parent().is_some());
+        assert!(
+            fixture
+                .store
+                .symbol(export_local)
+                .unwrap()
+                .value_declaration()
+                .is_none(),
+            "direct-export locals are EXPORT_VALUE markers, not value declarations",
+        );
+
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let declaration_type =
+            query_source_callable(&mut fixture, declaration, owner, &mut diagnostics).unwrap();
+        let arrow_type =
+            query_source_callable(&mut fixture, arrow, arrow_owner, &mut diagnostics).unwrap();
+        assert_ne!(declaration_type, arrow_type);
+        assert_eq!(
+            fixture
+                .store
+                .source_callable_provenance(declaration_type)
+                .unwrap()
+                .family,
+            SourceCallableFamily::FunctionDeclaration,
+        );
+        assert_eq!(
+            fixture
+                .store
+                .source_callable_provenance(arrow_type)
+                .unwrap()
+                .family,
+            SourceCallableFamily::ArrowFunction,
+        );
+        assert!(matches!(
+            validate_stored_source_callable(&fixture.store, declaration_type),
+            StoredSourceCallableValidation::Valid(_)
+        ));
+        assert!(matches!(
+            validate_stored_source_callable(&fixture.store, arrow_type),
+            StoredSourceCallableValidation::Valid(_)
+        ));
+
+        let declaration_signature = function_signature(&fixture.store, declaration);
+        let arrow_signature = function_signature(&fixture.store, arrow);
+        for signature_id in [declaration_signature, arrow_signature] {
+            let signature = fixture.store.signature(signature_id).unwrap();
+            assert_eq!(signature.min_argument_count(), 1);
+            let [required, optional] = signature.parameters() else {
+                panic!("source callable has two parameters")
+            };
+            let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+            assert_eq!(
+                fixture
+                    .store
+                    .value_symbol_links(*required)
+                    .unwrap()
+                    .resolved_type,
+                Some(bootstrap.string_type),
+            );
+            let optional_type = fixture
+                .store
+                .value_symbol_links(*optional)
+                .unwrap()
+                .resolved_type
+                .unwrap();
+            assert!(union_types(&fixture.store, optional_type).contains(&bootstrap.number_type));
+            assert!(union_types(&fixture.store, optional_type).contains(&bootstrap.undefined_type));
+            assert!(signature.resolved_return_type().is_none());
+        }
+
+        let before_warm = (
+            function_store_state(&fixture.store),
+            fixture.store.source_callable_provenance_lengths(),
+        );
+        assert_eq!(
+            query_source_callable(&mut fixture, declaration, owner, &mut diagnostics),
+            Ok(declaration_type),
+        );
+        assert_eq!(
+            (
+                function_store_state(&fixture.store),
+                fixture.store.source_callable_provenance_lengths(),
+            ),
+            before_warm,
+        );
+
+        let boolean = fixture.store.intrinsic_bootstrap().unwrap().boolean_type;
+        assert_eq!(
+            query_signature_return(&mut fixture, declaration_signature, &mut diagnostics),
+            Ok(boolean),
+        );
+        let resolved_return_state = function_store_state(&fixture.store);
+        assert_eq!(
+            query_signature_return(&mut fixture, declaration_signature, &mut diagnostics),
+            Ok(boolean),
+        );
+        assert_eq!(function_store_state(&fixture.store), resolved_return_state);
+        assert_eq!(
+            query_signature_return(&mut fixture, arrow_signature, &mut diagnostics),
+            Ok(boolean),
+        );
+
+        let displayed = {
+            let host = post_global_host(
+                &fixture.parsed.arena,
+                fixture.files.get(&fixture.file).unwrap(),
+            );
+            type_to_string_with_host_and_flags(
+                &fixture.store,
+                &host,
+                declaration_type,
+                CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT,
+            )
+        };
+        assert_eq!(
+            displayed.as_deref(),
+            Ok("(value: string, optional?: number | undefined) => boolean"),
+        );
+
+        let target_symbol = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Target");
+        let target = query_declared(
+            &mut fixture,
+            target_symbol,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        let target_node = function_type_node(&fixture, "Target");
+        let target_signature = function_signature(&fixture.store, target_node);
+        query_signature_return(&mut fixture, target_signature, &mut diagnostics).unwrap();
+        assert_eq!(
+            fixture
+                .store
+                .is_type_assignable_to_with_strict_function_types(declaration_type, target, true,),
+            Ok(true),
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn stored_source_callable_rejects_export_route_and_owner_parent_corruption() {
+        let mut fixture = fixture_with_options(
+            "export function exported(value: string): boolean { return true; }",
+            CanonicalModuleState::External,
+            IntrinsicBootstrapOptions::default(),
+            |_| {},
+        );
+        let declaration = named_node(&fixture, SyntaxKind::FunctionDeclaration, "exported");
+        let (owner, export_local) = {
+            let bound = fixture.files.get(&fixture.file).unwrap();
+            (
+                bound.symbol(declaration).unwrap(),
+                bound.local_symbol(declaration).unwrap(),
+            )
+        };
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let type_ =
+            query_source_callable(&mut fixture, declaration, owner, &mut diagnostics).unwrap();
+        assert!(matches!(
+            validate_stored_source_callable(&fixture.store, type_),
+            StoredSourceCallableValidation::Valid(_)
+        ));
+        assert!(fixture.store.set_symbol_declarations(
+            export_local,
+            Some(vec![declaration]),
+            Some(declaration),
+        ));
+        assert_eq!(
+            validate_stored_source_callable(&fixture.store, type_),
+            StoredSourceCallableValidation::Malformed,
+        );
+        assert!(matches!(
+            validate_stored_single_callable(&fixture.store, type_),
+            StoredSingleCallableValidation::Malformed {
+                family: CallableFamily::FunctionDeclaration
+            }
+        ));
+        assert!(
+            fixture
+                .store
+                .set_symbol_declarations(export_local, Some(vec![declaration]), None,)
+        );
+        assert!(matches!(
+            validate_stored_source_callable(&fixture.store, type_),
+            StoredSourceCallableValidation::Valid(_)
+        ));
+        assert!(
+            fixture
+                .store
+                .set_symbol_relationships(owner, None, None, None, None)
+        );
+        assert_eq!(
+            validate_stored_source_callable(&fixture.store, type_),
+            StoredSourceCallableValidation::Malformed,
+        );
         assert!(diagnostics.is_empty());
     }
 }

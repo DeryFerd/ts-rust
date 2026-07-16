@@ -176,6 +176,10 @@ impl TypeResolutionStateSnapshot {
 pub struct CheckerStateSnapshot {
     pub checker_symbols: usize,
     pub merged_symbols: usize,
+    pub source_callable_types: usize,
+    pub source_callable_declarations: usize,
+    pub source_callable_owners: usize,
+    pub source_callable_signatures: usize,
     pub semantic_arenas: SemanticArenaCounts,
     pub links: CheckerLinkCounts,
     pub type_resolution: TypeResolutionStateSnapshot,
@@ -186,6 +190,10 @@ impl CheckerStateSnapshot {
     const fn is_pristine(self) -> bool {
         self.checker_symbols == 0
             && self.merged_symbols == 0
+            && self.source_callable_types == 0
+            && self.source_callable_declarations == 0
+            && self.source_callable_owners == 0
+            && self.source_callable_signatures == 0
             && self.semantic_arenas.is_empty()
             && self.links.is_empty()
             && self.type_resolution.is_pristine()
@@ -1959,11 +1967,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                             || object.structured.call_signature_count != 0
                 );
                 match validate_stored_single_callable(self, type_) {
-                    StoredSingleCallableValidation::Valid {
-                        family: CallableFamily::FunctionType,
-                        edges,
-                        ..
-                    } => {
+                    StoredSingleCallableValidation::Valid { edges, .. } => {
                         for edge in edges {
                             self.validate_cached_array_capability_worker(
                                 edge,
@@ -1974,9 +1978,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                         }
                         return Ok(());
                     }
-                    StoredSingleCallableValidation::Malformed {
-                        family: CallableFamily::FunctionType,
-                    } => {
+                    StoredSingleCallableValidation::Malformed { .. } => {
                         return Err(LiteralTypeCacheError::InvalidCachedUnion(type_));
                     }
                     StoredSingleCallableValidation::Pending {
@@ -1984,9 +1986,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     } if allowed_pending.contains(&type_) => {
                         return Ok(());
                     }
-                    StoredSingleCallableValidation::Pending {
-                        family: CallableFamily::FunctionType,
-                    } => {
+                    StoredSingleCallableValidation::Pending { .. } => {
                         return Err(LiteralTypeCacheError::InvalidCachedUnion(type_));
                     }
                     StoredSingleCallableValidation::NotCallable if unsupported_callable => {
@@ -2238,11 +2238,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     return Ok(());
                 }
                 match validate_stored_single_callable(self, type_) {
-                    StoredSingleCallableValidation::Valid {
-                        family: CallableFamily::FunctionType,
-                        edges,
-                        ..
-                    } => {
+                    StoredSingleCallableValidation::Valid { edges, .. } => {
                         if !visiting.insert(type_) {
                             return Ok(());
                         }
@@ -2256,9 +2252,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                         }
                         return Ok(());
                     }
-                    StoredSingleCallableValidation::Malformed {
-                        family: CallableFamily::FunctionType,
-                    } => {
+                    StoredSingleCallableValidation::Malformed { .. } => {
                         return Err(LiteralTypeCacheError::InvalidCachedUnion(type_));
                     }
                     StoredSingleCallableValidation::Pending {
@@ -2266,9 +2260,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     } if allowed_pending.contains(&type_) => {
                         return Ok(());
                     }
-                    StoredSingleCallableValidation::Pending {
-                        family: CallableFamily::FunctionType,
-                    } => {
+                    StoredSingleCallableValidation::Pending { .. } => {
                         return Err(LiteralTypeCacheError::InvalidCachedUnion(type_));
                     }
                     StoredSingleCallableValidation::NotCallable
@@ -3329,9 +3321,19 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         ] = self.checker_link_allocated_lengths();
         let (entries, resolution_start, boundaries, next_boundary_serial) =
             self.type_resolution_internal_state();
+        let [
+            source_callable_types,
+            source_callable_declarations,
+            source_callable_owners,
+            source_callable_signatures,
+        ] = self.source_callable_provenance_lengths();
         let state = CheckerStateSnapshot {
             checker_symbols: self.symbol_store().checker_created_symbol_len(),
             merged_symbols: self.merged_symbol_len(),
+            source_callable_types,
+            source_callable_declarations,
+            source_callable_owners,
+            source_callable_signatures,
             semantic_arenas: SemanticArenaCounts {
                 types: self.type_len(),
                 mappers: self.mapper_len(),
@@ -4269,9 +4271,19 @@ mod tests {
         ] = store.checker_link_allocated_lengths();
         let (entries, resolution_start, boundaries, next_boundary_serial) =
             store.type_resolution_internal_state();
+        let [
+            source_callable_types,
+            source_callable_declarations,
+            source_callable_owners,
+            source_callable_signatures,
+        ] = store.source_callable_provenance_lengths();
         CheckerStateSnapshot {
             checker_symbols: store.symbol_store().checker_created_symbol_len(),
             merged_symbols: store.merged_symbol_len(),
+            source_callable_types,
+            source_callable_declarations,
+            source_callable_owners,
+            source_callable_signatures,
             semantic_arenas: semantic_counts(store),
             links: CheckerLinkCounts {
                 node,

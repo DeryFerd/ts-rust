@@ -63,6 +63,33 @@ struct SourceNodeFacts {
     signature_links_eligible: bool,
 }
 
+/// Source syntax family that owns one exact callable value object.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SourceCallableFamily {
+    FunctionDeclaration,
+    ArrowFunction,
+}
+
+impl SourceCallableFamily {
+    pub(super) const fn syntax_kind(self) -> SyntaxKind {
+        match self {
+            Self::FunctionDeclaration => SyntaxKind::FunctionDeclaration,
+            Self::ArrowFunction => SyntaxKind::ArrowFunction,
+        }
+    }
+}
+
+/// Immutable owner tuple distinguishing source values from FunctionType nodes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct SourceCallableProvenance {
+    pub(super) family: SourceCallableFamily,
+    pub(super) declaration: NodeRef,
+    pub(super) owner_symbol: SemanticSymbolId,
+    pub(super) owner_parent: Option<SemanticSymbolId>,
+    pub(super) export_local: Option<SemanticSymbolId>,
+    pub(super) signature: SignatureId,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum SourceNodeParent {
     Root,
@@ -136,6 +163,10 @@ pub struct SemanticStore<TypePayload, MapperPayload> {
     links: CheckerLinkStores,
     declared_types_in_progress: HashSet<SemanticSymbolId>,
     function_type_provenance: HashSet<TypeId>,
+    source_callable_provenance: HashMap<TypeId, SourceCallableProvenance>,
+    source_callable_types_by_declaration: HashMap<NodeRef, TypeId>,
+    source_callable_types_by_owner: HashMap<SemanticSymbolId, TypeId>,
+    source_callable_types_by_signature: HashMap<SignatureId, TypeId>,
     function_signature_return_annotations: HashMap<SignatureId, (NodeRef, bool)>,
     circular_return_signatures: HashMap<SignatureId, TypeId>,
     type_resolutions: TypeResolutionStack,
@@ -192,6 +223,10 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             links: CheckerLinkStores::default(),
             declared_types_in_progress: HashSet::new(),
             function_type_provenance: HashSet::new(),
+            source_callable_provenance: HashMap::new(),
+            source_callable_types_by_declaration: HashMap::new(),
+            source_callable_types_by_owner: HashMap::new(),
+            source_callable_types_by_signature: HashMap::new(),
             function_signature_return_annotations: HashMap::new(),
             circular_return_signatures: HashMap::new(),
             type_resolutions: TypeResolutionStack::new(id),
@@ -535,6 +570,116 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         self.function_type_provenance.contains(&type_)
     }
 
+    pub(super) fn try_reserve_source_callable_provenance(&mut self, additional: usize) -> bool {
+        self.source_callable_provenance
+            .try_reserve(additional)
+            .is_ok()
+            && self
+                .source_callable_types_by_declaration
+                .try_reserve(additional)
+                .is_ok()
+            && self
+                .source_callable_types_by_owner
+                .try_reserve(additional)
+                .is_ok()
+            && self
+                .source_callable_types_by_signature
+                .try_reserve(additional)
+                .is_ok()
+    }
+
+    pub(super) fn set_source_callable_provenance(
+        &mut self,
+        type_: TypeId,
+        provenance: SourceCallableProvenance,
+    ) -> bool {
+        if self.types.get(type_).is_none()
+            || self.source_callable_provenance.contains_key(&type_)
+            || self.source_node_kind(provenance.declaration)
+                != Some(provenance.family.syntax_kind())
+            || !self.symbols.contains_symbol(provenance.owner_symbol)
+            || provenance
+                .owner_parent
+                .is_some_and(|parent| !self.symbols.contains_symbol(parent))
+            || provenance
+                .export_local
+                .is_some_and(|local| !self.symbols.contains_symbol(local))
+            || provenance.export_local == Some(provenance.owner_symbol)
+            || self.signatures.get(provenance.signature).is_none()
+            || self
+                .source_callable_types_by_declaration
+                .contains_key(&provenance.declaration)
+            || self
+                .source_callable_types_by_owner
+                .contains_key(&provenance.owner_symbol)
+            || self
+                .source_callable_types_by_signature
+                .contains_key(&provenance.signature)
+        {
+            return false;
+        }
+        let by_type = self.source_callable_provenance.insert(type_, provenance);
+        let by_declaration = self
+            .source_callable_types_by_declaration
+            .insert(provenance.declaration, type_);
+        let by_owner = self
+            .source_callable_types_by_owner
+            .insert(provenance.owner_symbol, type_);
+        let by_signature = self
+            .source_callable_types_by_signature
+            .insert(provenance.signature, type_);
+        assert!(
+            by_type.is_none()
+                && by_declaration.is_none()
+                && by_owner.is_none()
+                && by_signature.is_none(),
+            "source callable reverse maps were prevalidated absent"
+        );
+        true
+    }
+
+    pub(super) fn source_callable_provenance(
+        &self,
+        type_: TypeId,
+    ) -> Option<SourceCallableProvenance> {
+        self.source_callable_provenance.get(&type_).copied()
+    }
+
+    pub(super) fn source_callable_type_for_owner(&self, owner: SemanticSymbolId) -> Option<TypeId> {
+        self.source_callable_types_by_owner.get(&owner).copied()
+    }
+
+    pub(super) fn source_callable_type_for_signature(
+        &self,
+        signature: SignatureId,
+    ) -> Option<TypeId> {
+        self.source_callable_types_by_signature
+            .get(&signature)
+            .copied()
+    }
+
+    pub(super) fn source_callable_type_for_declaration(
+        &self,
+        declaration: NodeRef,
+    ) -> Option<TypeId> {
+        self.source_callable_types_by_declaration
+            .get(&declaration)
+            .copied()
+    }
+
+    pub(super) fn source_callable_provenance_lengths(&self) -> [usize; 4] {
+        [
+            self.source_callable_provenance.len(),
+            self.source_callable_types_by_declaration.len(),
+            self.source_callable_types_by_owner.len(),
+            self.source_callable_types_by_signature.len(),
+        ]
+    }
+
+    fn has_callable_provenance(&self) -> bool {
+        !self.function_type_provenance.is_empty() || !self.source_callable_provenance.is_empty()
+    }
+
     pub(super) fn mark_union_cache_validation_dirty(&mut self) {
         if self.intrinsic_bootstrap.is_some() {
             self.union_cache_needs_validation = true;
@@ -545,13 +690,22 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         self.source_node_kind(node) == Some(SyntaxKind::FunctionType)
     }
 
-    fn node_has_function_type_ancestor(&self, mut node: NodeRef) -> bool {
+    fn node_is_source_callable_declaration(&self, node: NodeRef) -> bool {
+        self.source_callable_type_for_declaration(node)
+            .and_then(|type_| self.source_callable_provenance(type_))
+            .is_some_and(|provenance| {
+                provenance.declaration == node
+                    && self.source_node_kind(node) == Some(provenance.family.syntax_kind())
+            })
+    }
+
+    fn node_has_callable_ancestor(&self, mut node: NodeRef) -> bool {
         let mut visited = HashSet::new();
         loop {
             if !visited.insert(node) {
                 return false;
             }
-            if self.node_is_function_type(node) {
+            if self.node_is_function_type(node) || self.node_is_source_callable_declaration(node) {
                 return true;
             }
             let Some(SourceNodeParent::Parent(parent)) = self.source_node_parent(node) else {
@@ -561,21 +715,33 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         }
     }
 
-    fn symbol_is_function_type_parameter(&self, symbol: SemanticSymbolId) -> bool {
+    fn symbol_is_callable_parameter(&self, symbol: SemanticSymbolId) -> bool {
         let Some([declaration]) = self.symbol(symbol).and_then(Symbol::declarations) else {
             return false;
         };
         self.source_node_kind(*declaration) == Some(SyntaxKind::Parameter)
             && matches!(
                 self.source_node_parent(*declaration),
-                Some(SourceNodeParent::Parent(parent)) if self.node_is_function_type(parent)
+                Some(SourceNodeParent::Parent(parent))
+                    if self.node_is_function_type(parent)
+                        || self.node_is_source_callable_declaration(parent)
             )
     }
 
-    fn signature_is_function_type(&self, signature: SignatureId) -> bool {
+    fn symbol_is_source_callable_owner(&self, symbol: SemanticSymbolId) -> bool {
+        self.source_callable_types_by_owner.contains_key(&symbol)
+    }
+
+    fn signature_is_callable(&self, signature: SignatureId) -> bool {
         self.signature(signature)
             .and_then(Signature::declaration)
-            .is_some_and(|declaration| self.node_is_function_type(declaration))
+            .is_some_and(|declaration| {
+                self.node_is_function_type(declaration)
+                    || self
+                        .source_callable_type_for_signature(signature)
+                        .and_then(|type_| self.source_callable_provenance(type_))
+                        .is_some_and(|provenance| provenance.declaration == declaration)
+            })
     }
 
     #[must_use]
@@ -660,7 +826,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         }
 
         let previous = self.merged_symbols.insert(source, target);
-        if !self.function_type_provenance.is_empty() {
+        if self.has_callable_provenance() {
             self.mark_union_cache_validation_dirty();
         }
         Ok(previous)
@@ -728,7 +894,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         symbol: SemanticSymbolId,
     ) -> Option<Option<SemanticSymbolId>> {
         let previous = self.symbols.insert_symbol(table, name, symbol)?;
-        if !self.function_type_provenance.is_empty() {
+        if self.has_callable_provenance() {
             self.mark_union_cache_validation_dirty();
         }
         Some(previous)
@@ -747,7 +913,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         if !self.symbols.set_symbol_flags(symbol, flags, check_flags) {
             return false;
         }
-        if !self.function_type_provenance.is_empty() {
+        if self.has_callable_provenance() {
             self.mark_union_cache_validation_dirty();
         }
         true
@@ -765,7 +931,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         {
             return false;
         }
-        if !self.function_type_provenance.is_empty() {
+        if self.has_callable_provenance() {
             self.mark_union_cache_validation_dirty();
         }
         true
@@ -785,7 +951,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         {
             return false;
         }
-        if !self.function_type_provenance.is_empty() {
+        if self.has_callable_provenance() {
             self.mark_union_cache_validation_dirty();
         }
         true
@@ -860,7 +1026,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         {
             return false;
         }
-        let dirty = self.node_has_function_type_ancestor(node)
+        let dirty = self.node_has_callable_ancestor(node)
             && self
                 .type_node_links(node)
                 .is_some_and(|current| current != &TypeNodeLinks::default() && current != &links);
@@ -934,7 +1100,8 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         {
             return false;
         }
-        let dirty = self.node_is_function_type(node)
+        let dirty = (self.node_is_function_type(node)
+            || self.node_is_source_callable_declaration(node))
             && self
                 .signature_links(node)
                 .is_some_and(|current| current != &SignatureLinks::default() && current != &links);
@@ -1007,7 +1174,8 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         {
             return false;
         }
-        let dirty = self.symbol_is_function_type_parameter(symbol)
+        let dirty = (self.symbol_is_callable_parameter(symbol)
+            || self.symbol_is_source_callable_owner(symbol))
             && self.value_symbol_links(symbol).is_some_and(|current| {
                 current != &ValueSymbolLinks::default() && current != &links
             });
@@ -1998,9 +2166,12 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         let Some(declaration) = self.signature(id).and_then(Signature::declaration) else {
             return false;
         };
-        if !self.node_is_function_type(declaration)
-            || self.function_signature_return_annotations.contains_key(&id)
-        {
+        let valid_callable = self.node_is_function_type(declaration)
+            || self
+                .source_callable_type_for_signature(id)
+                .and_then(|type_| self.source_callable_provenance(type_))
+                .is_some_and(|provenance| provenance.declaration == declaration);
+        if !valid_callable || self.function_signature_return_annotations.contains_key(&id) {
             return false;
         }
         let mut current = annotation;
@@ -2043,7 +2214,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         id: SignatureId,
         count: i32,
     ) -> bool {
-        let dirty = self.signature_is_function_type(id);
+        let dirty = self.signature_is_callable(id);
         if !self.signatures.set_resolved_min_argument_count(id, count) {
             return false;
         }
@@ -2061,7 +2232,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         if !self.valid_optional_type(type_id) {
             return false;
         }
-        let dirty = self.signature_is_function_type(id);
+        let dirty = self.signature_is_callable(id);
         if !self.signatures.set_resolved_return_type(id, type_id) {
             return false;
         }
@@ -2092,7 +2263,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         type_id: TypeId,
         annotation_type: TypeId,
     ) -> bool {
-        let valid = self.signature_is_function_type(id)
+        let valid = self.signature_is_callable(id)
             && self.function_signature_return_annotations.contains_key(&id)
             && self.types.get(annotation_type).is_some()
             && self
@@ -2125,7 +2296,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         if !self.valid_optional_predicate(predicate) {
             return false;
         }
-        let dirty = self.signature_is_function_type(id);
+        let dirty = self.signature_is_callable(id);
         if !self.signatures.set_resolved_type_predicate(id, predicate) {
             return false;
         }
@@ -2143,7 +2314,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         if !self.valid_optional_type(type_id) {
             return false;
         }
-        let dirty = self.signature_is_function_type(id);
+        let dirty = self.signature_is_callable(id);
         if !self.signatures.set_isolated_signature_type(id, type_id) {
             return false;
         }
@@ -2162,7 +2333,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         if !self.valid_optional_signature(target) || !self.valid_optional_mapper(mapper) {
             return false;
         }
-        let dirty = self.signature_is_function_type(id);
+        let dirty = self.signature_is_callable(id);
         if !self.signatures.set_target_and_mapper(id, target, mapper) {
             return false;
         }
@@ -2185,7 +2356,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         }) {
             return false;
         }
-        let dirty = self.signature_is_function_type(id);
+        let dirty = self.signature_is_callable(id);
         if !self.signatures.set_composite(id, composite) {
             return false;
         }
@@ -2214,7 +2385,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
     /// Replaces flags after construction, as required when class constructor
     /// signatures gain or lose upstream's `Abstract` flag.
     pub fn set_signature_flags(&mut self, id: SignatureId, flags: SignatureFlags) -> bool {
-        let dirty = self.signature_is_function_type(id);
+        let dirty = self.signature_is_callable(id);
         if !self.signatures.set_flags(id, flags) {
             return false;
         }
@@ -2234,7 +2405,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         if !self.valid_types(&type_parameters) {
             return false;
         }
-        let dirty = self.signature_is_function_type(id);
+        let dirty = self.signature_is_callable(id);
         if !self.signatures.set_type_parameters(id, type_parameters) {
             return false;
         }
@@ -2254,7 +2425,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         if !self.valid_optional_symbol(this_parameter) {
             return false;
         }
-        let dirty = self.signature_is_function_type(id);
+        let dirty = self.signature_is_callable(id);
         if !self.signatures.set_this_parameter(id, this_parameter) {
             return false;
         }

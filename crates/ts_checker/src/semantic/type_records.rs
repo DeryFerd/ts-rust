@@ -608,8 +608,9 @@ impl TypeRecord {
 pub type CanonicalSemanticStore<MapperPayload> = SemanticStore<TypeRecord, MapperPayload>;
 
 impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
-    pub(super) fn type_is_function_type_object(&self, type_: TypeId) -> bool {
-        self.type_payload(type_)
+    pub(super) fn type_is_exact_callable_object(&self, type_: TypeId) -> bool {
+        self.source_callable_provenance(type_).is_some()
+            || self.type_payload(type_)
             .and_then(TypeRecord::symbol)
             .and_then(|symbol| self.symbol(symbol))
             .and_then(ts_binder::semantic::Symbol::declarations)
@@ -1272,7 +1273,7 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         if !self.valid_optional_record_type(constraint) {
             return false;
         }
-        let dirty = self.type_is_function_type_object(id);
+        let dirty = self.type_is_exact_callable_object(id);
         let Some(constrained) = self
             .type_payload_mut(id)
             .and_then(|record| record.data.constrained_mut())
@@ -1305,7 +1306,7 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
             return false;
         }
         let call_count = call_signatures.as_ref().map_or(0, Vec::len);
-        let dirty = self.type_is_function_type_object(id)
+        let dirty = self.type_is_exact_callable_object(id)
             && self
                 .type_payload(id)
                 .and_then(|record| record.data().structured())
@@ -1350,7 +1351,7 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         if !self.valid_optional_record_type(value) {
             return false;
         }
-        let dirty = self.type_is_function_type_object(id);
+        let dirty = self.type_is_exact_callable_object(id);
         let Some(structured) = self
             .type_payload_mut(id)
             .and_then(|record| record.data.structured_mut())
@@ -1379,7 +1380,7 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         ) {
             return false;
         }
-        let dirty = self.type_is_function_type_object(id);
+        let dirty = self.type_is_exact_callable_object(id);
         let Some(object) = self
             .type_payload_mut(id)
             .and_then(|record| record.data.object_mut())
@@ -1408,7 +1409,7 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         ) {
             return false;
         }
-        let dirty = self.type_is_function_type_object(id);
+        let dirty = self.type_is_exact_callable_object(id);
         let Some(object) = self
             .type_payload_mut(id)
             .and_then(|record| record.data.object_mut())

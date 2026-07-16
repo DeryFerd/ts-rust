@@ -14,12 +14,28 @@ use super::{
         FunctionTypeDisplayError, StoredFunctionTypeValidation, function_type_display_projection,
         validate_stored_function_type,
     },
+    source_callables::{
+        SourceCallableDisplayError, SourceCallableFamily, StoredSourceCallableValidation,
+        source_callable_display_projection, stored_source_callable_family,
+        validate_stored_source_callable,
+    },
 };
 
 /// Provider family for an exact, independently validated callable object.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum CallableFamily {
     FunctionType,
+    FunctionDeclaration,
+    ArrowFunction,
+}
+
+impl From<SourceCallableFamily> for CallableFamily {
+    fn from(family: SourceCallableFamily) -> Self {
+        match family {
+            SourceCallableFamily::FunctionDeclaration => Self::FunctionDeclaration,
+            SourceCallableFamily::ArrowFunction => Self::ArrowFunction,
+        }
+    }
 }
 
 /// Immutable signature view consumed by structural relation.
@@ -81,6 +97,7 @@ pub(super) struct ValidatedSingleCallSignatureDisplay {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum SingleCallableDisplayError {
     FunctionType(FunctionTypeDisplayError),
+    SourceCallable(SourceCallableDisplayError),
 }
 
 /// Returns the installed provider brand without attempting cache validation.
@@ -93,9 +110,13 @@ pub(super) fn single_callable_family(
     store: &CanonicalTypeMapperStore,
     type_: TypeId,
 ) -> Option<CallableFamily> {
-    store
-        .type_has_function_type_provenance(type_)
-        .then_some(CallableFamily::FunctionType)
+    if store.type_has_function_type_provenance(type_) {
+        Some(CallableFamily::FunctionType)
+    } else {
+        store
+            .source_callable_provenance(type_)
+            .map(|provenance| provenance.family.into())
+    }
 }
 
 /// Validates an exact callable using only retained semantic-store state.
@@ -103,25 +124,61 @@ pub(super) fn validate_stored_single_callable(
     store: &CanonicalTypeMapperStore,
     type_: TypeId,
 ) -> StoredSingleCallableValidation {
-    const FAMILY: CallableFamily = CallableFamily::FunctionType;
     match validate_stored_function_type(store, type_) {
-        StoredFunctionTypeValidation::NotFunctionType => {
-            StoredSingleCallableValidation::NotCallable
-        }
+        StoredFunctionTypeValidation::NotFunctionType => {}
         StoredFunctionTypeValidation::Pending => {
-            StoredSingleCallableValidation::Pending { family: FAMILY }
+            return StoredSingleCallableValidation::Pending {
+                family: CallableFamily::FunctionType,
+            };
         }
         StoredFunctionTypeValidation::Malformed => {
-            StoredSingleCallableValidation::Malformed { family: FAMILY }
+            return StoredSingleCallableValidation::Malformed {
+                family: CallableFamily::FunctionType,
+            };
         }
         StoredFunctionTypeValidation::Valid(edges) => {
-            let Some(callable) = validated_function_type_callable(store, type_) else {
-                return StoredSingleCallableValidation::Malformed { family: FAMILY };
+            let Some(callable) = validated_single_callable(store, type_) else {
+                return StoredSingleCallableValidation::Malformed {
+                    family: CallableFamily::FunctionType,
+                };
             };
-            StoredSingleCallableValidation::Valid {
-                family: FAMILY,
+            return StoredSingleCallableValidation::Valid {
+                family: CallableFamily::FunctionType,
                 callable,
                 edges,
+            };
+        }
+    }
+    match validate_stored_source_callable(store, type_) {
+        StoredSourceCallableValidation::NotSourceCallable => {
+            StoredSingleCallableValidation::NotCallable
+        }
+        validation => {
+            let Some(family) =
+                stored_source_callable_family(store, type_).map(CallableFamily::from)
+            else {
+                return StoredSingleCallableValidation::NotCallable;
+            };
+            match validation {
+                StoredSourceCallableValidation::NotSourceCallable => {
+                    StoredSingleCallableValidation::NotCallable
+                }
+                StoredSourceCallableValidation::Pending => {
+                    StoredSingleCallableValidation::Pending { family }
+                }
+                StoredSourceCallableValidation::Malformed => {
+                    StoredSingleCallableValidation::Malformed { family }
+                }
+                StoredSourceCallableValidation::Valid(edges) => {
+                    let Some(callable) = validated_single_callable(store, type_) else {
+                        return StoredSingleCallableValidation::Malformed { family };
+                    };
+                    StoredSingleCallableValidation::Valid {
+                        family,
+                        callable,
+                        edges,
+                    }
+                }
             }
         }
     }
@@ -146,10 +203,20 @@ pub(super) fn single_callable_display_projection(
         )
         .map(Some)
         .map_err(SingleCallableDisplayError::FunctionType),
+        CallableFamily::FunctionDeclaration | CallableFamily::ArrowFunction => {
+            source_callable_display_projection(
+                store,
+                host,
+                type_,
+                global_types.map(CanonicalArrayTargets::from_global_types),
+            )
+            .map(Some)
+            .map_err(SingleCallableDisplayError::SourceCallable)
+        }
     }
 }
 
-fn validated_function_type_callable(
+fn validated_single_callable(
     store: &CanonicalTypeMapperStore,
     type_: TypeId,
 ) -> Option<ValidatedSingleCallable> {
@@ -175,7 +242,7 @@ fn validated_function_type_callable(
         parameters,
         min_argument_count,
         return_type: signature_record.resolved_return_type(),
-        // FunctionTypeNode declarations are neither methods nor constructors.
+        // These exact source/type-node providers are neither methods nor constructors.
         strict_variance_exempt: false,
     })
 }

@@ -22,8 +22,7 @@ use super::{
     array_types::{ArrayTypeError, CanonicalArrayTargets},
     bootstrap::LiteralTypeCacheError,
     callables::{
-        CallableFamily, StoredSingleCallableValidation, ValidatedSingleCallable,
-        validate_stored_single_callable,
+        StoredSingleCallableValidation, ValidatedSingleCallable, validate_stored_single_callable,
     },
     declared::type_list_key,
     derived_types::DerivedObjectLiteralValidation,
@@ -2796,25 +2795,17 @@ impl<'store> RelaterSession<'store> {
     ) -> Result<Option<ValidatedSingleCallable>, RelationUnavailable> {
         let mut callable = match validate_stored_single_callable(self.store, type_) {
             StoredSingleCallableValidation::NotCallable => return Ok(None),
-            StoredSingleCallableValidation::Pending {
-                family: CallableFamily::FunctionType,
-            } => {
+            StoredSingleCallableValidation::Pending { .. } => {
                 return Err(if self.strict_function_types.is_some() {
                     RelationUnavailable::UnresolvedFunctionType(type_)
                 } else {
                     RelationUnavailable::StructuredSignatures(type_)
                 });
             }
-            StoredSingleCallableValidation::Malformed {
-                family: CallableFamily::FunctionType,
-            } => {
+            StoredSingleCallableValidation::Malformed { .. } => {
                 return Err(RelationUnavailable::MalformedFunctionType(type_));
             }
-            StoredSingleCallableValidation::Valid {
-                family: CallableFamily::FunctionType,
-                callable,
-                ..
-            } => callable,
+            StoredSingleCallableValidation::Valid { callable, .. } => callable,
         };
         if self.strict_function_types.is_none() {
             return Err(RelationUnavailable::StructuredSignatures(type_));
@@ -3113,26 +3104,23 @@ impl SemanticStore<TypeRecord, TypeMapper> {
     ) -> Result<bool, RelationUnavailable> {
         match validate_stored_single_callable(self, type_) {
             StoredSingleCallableValidation::NotCallable => Ok(false),
-            StoredSingleCallableValidation::Pending {
-                family: CallableFamily::FunctionType,
-            } => Err(if strict_function_types.is_some() {
-                RelationUnavailable::UnresolvedFunctionType(type_)
-            } else {
-                RelationUnavailable::StructuredSignatures(type_)
-            }),
-            StoredSingleCallableValidation::Valid {
-                family: CallableFamily::FunctionType,
-                ..
-            } => {
+            StoredSingleCallableValidation::Pending { .. } => {
+                Err(if strict_function_types.is_some() {
+                    RelationUnavailable::UnresolvedFunctionType(type_)
+                } else {
+                    RelationUnavailable::StructuredSignatures(type_)
+                })
+            }
+            StoredSingleCallableValidation::Valid { .. } => {
                 if strict_function_types.is_some() {
                     Ok(true)
                 } else {
                     Err(RelationUnavailable::StructuredSignatures(type_))
                 }
             }
-            StoredSingleCallableValidation::Malformed {
-                family: CallableFamily::FunctionType,
-            } => Err(RelationUnavailable::MalformedFunctionType(type_)),
+            StoredSingleCallableValidation::Malformed { .. } => {
+                Err(RelationUnavailable::MalformedFunctionType(type_))
+            }
         }
     }
 

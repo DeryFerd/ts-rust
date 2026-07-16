@@ -27,6 +27,7 @@ use super::{
     },
     functions::{FunctionTypeDisplayError, FunctionTypeUnsupported},
     links::ValueSymbolLinks,
+    source_callables::{SourceCallableDisplayError, SourceCallableUnsupported},
     type_records::{
         LiteralTypeData, LiteralValue, TypeCacheState, TypeData, TypeDataKind, TypeRecord,
     },
@@ -851,9 +852,11 @@ fn validate_opaque_single_callable_alias(
             reason: FunctionTypeDisplayUnavailable::PendingSignature,
         }),
         StoredSingleCallableValidation::NotCallable
-        | StoredSingleCallableValidation::Malformed {
-            family: CallableFamily::FunctionType,
-        } => Err(TypeDisplayUnavailable::MalformedType(type_id)),
+        | StoredSingleCallableValidation::Malformed { .. }
+        | StoredSingleCallableValidation::Pending { .. }
+        | StoredSingleCallableValidation::Valid { .. } => {
+            Err(TypeDisplayUnavailable::MalformedType(type_id))
+        }
     }
 }
 
@@ -882,7 +885,61 @@ const fn callable_display_unavailable(
         SingleCallableDisplayError::FunctionType(error) => {
             function_display_unavailable(type_id, error)
         }
+        SingleCallableDisplayError::SourceCallable(error) => {
+            source_callable_display_unavailable(type_id, error)
+        }
     }
+}
+
+const fn source_callable_display_unavailable(
+    type_id: TypeId,
+    error: SourceCallableDisplayError,
+) -> TypeDisplayUnavailable {
+    let reason = match error {
+        SourceCallableDisplayError::Unsupported(reason) => match reason {
+            SourceCallableUnsupported::GenericSignature(_) => {
+                FunctionTypeDisplayUnavailable::GenericSignature
+            }
+            SourceCallableUnsupported::ThisParameter(_) => {
+                FunctionTypeDisplayUnavailable::ThisParameter
+            }
+            SourceCallableUnsupported::RestParameter(_) => {
+                FunctionTypeDisplayUnavailable::RestParameter
+            }
+            SourceCallableUnsupported::InitializedParameter(_) => {
+                FunctionTypeDisplayUnavailable::InitializedParameter
+            }
+            SourceCallableUnsupported::DestructuredParameter(_) => {
+                FunctionTypeDisplayUnavailable::DestructuredParameter
+            }
+            SourceCallableUnsupported::ParameterModifiers(_) => {
+                FunctionTypeDisplayUnavailable::ParameterModifiers
+            }
+            SourceCallableUnsupported::MissingParameterType(_) => {
+                FunctionTypeDisplayUnavailable::MissingParameterType
+            }
+            SourceCallableUnsupported::MissingReturnType(_) => {
+                FunctionTypeDisplayUnavailable::MissingReturnType
+            }
+            SourceCallableUnsupported::TypePredicate(_) => {
+                FunctionTypeDisplayUnavailable::TypePredicate
+            }
+            SourceCallableUnsupported::OverloadDeclaration(_) => {
+                FunctionTypeDisplayUnavailable::Overloads
+            }
+            SourceCallableUnsupported::Async(_)
+            | SourceCallableUnsupported::Generator(_)
+            | SourceCallableUnsupported::Modifiers(_)
+            | SourceCallableUnsupported::RequiredAfterOptional(_) => {
+                FunctionTypeDisplayUnavailable::UnvalidatedCallable
+            }
+        },
+        SourceCallableDisplayError::Pending => FunctionTypeDisplayUnavailable::PendingSignature,
+        SourceCallableDisplayError::Malformed => {
+            return TypeDisplayUnavailable::MalformedType(type_id);
+        }
+    };
+    TypeDisplayUnavailable::FunctionType { type_id, reason }
 }
 
 const fn function_display_unavailable(
