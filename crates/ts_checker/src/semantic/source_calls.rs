@@ -671,8 +671,10 @@ fn resolve_source_call_once(
                 signature,
             )),
         ) => return Err(SourceCallResolutionError::Retry(signature)),
-        Err(GenericCallVectorError::Relation(error))
-        | Err(GenericCallVectorError::Inference(NakedTypeCandidateError::Relation(error))) => {
+        Err(
+            GenericCallVectorError::Relation(error)
+            | GenericCallVectorError::Inference(NakedTypeCandidateError::Relation(error)),
+        ) => {
             return Err(SourceCallResolutionError::Relation(error));
         }
         Err(error)

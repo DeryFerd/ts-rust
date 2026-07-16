@@ -263,11 +263,11 @@ fn imported_ordered_generics_share_checked_signatures_but_not_recoveries() {
             .unwrap()
     };
     let good_signature = signature(&context, *good);
-    let bad_a_signature = signature(&context, *bad_a);
-    let bad_b_signature = signature(&context, *bad_b);
-    assert_ne!(bad_a_signature, bad_b_signature);
-    assert_ne!(bad_a_signature, good_signature);
-    assert_ne!(bad_b_signature, good_signature);
+    let first_recovery = signature(&context, *bad_a);
+    let second_recovery = signature(&context, *bad_b);
+    assert_ne!(first_recovery, second_recovery);
+    assert_ne!(first_recovery, good_signature);
+    assert_ne!(second_recovery, good_signature);
     assert_ne!(signature(&context, *too_few), good_signature);
 
     context.check_source_file(target_file).unwrap();
