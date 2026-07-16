@@ -68,7 +68,7 @@ use super::{
         SourceCallableFamily, SourceCallableParameterPlan, SourceCallablePlan,
         SourceCallableReturnPlan, StoredSourceCallableValidation, plan_source_callable,
         publish_contextual_source_callable, publish_inferred_source_callable_return,
-        validate_inferred_source_callable_return, validate_stored_source_callable,
+        validate_stored_source_callable,
     },
     source_calls::{
         SourceCallPlan, check_direct_source_call, emit_call_type_argument_grammar_diagnostics,
@@ -5674,11 +5674,6 @@ fn publish_checked_source_callable_return(
     signature: SignatureId,
     expression: Option<&PlannedExpression>,
 ) -> Result<TypeId, SourceCheckError> {
-    if let Some(existing) = validate_inferred_source_callable_return(store, callable, signature)
-        .map_err(SourcePlanner::callable_plan_error)?
-    {
-        return Ok(existing);
-    }
     let inferred = match expression {
         Some(expression) => {
             let checked = check_expression_type(
@@ -5706,6 +5701,23 @@ fn publish_checked_source_callable_return(
     };
     publish_inferred_source_callable_return(store, callable, signature, inferred)
         .map_err(SourcePlanner::callable_plan_error)
+}
+
+fn captured_callable_flow_types(
+    current_flow_types: &HashMap<SemanticSymbolId, TypeId>,
+    declared_types: &HashMap<SemanticSymbolId, TypeId>,
+    mutable_variables: &HashSet<SemanticSymbolId>,
+) -> Result<HashMap<SemanticSymbolId, TypeId>, SourceCheckError> {
+    let mut captured = current_flow_types.clone();
+    for symbol in mutable_variables {
+        let declared_type = *declared_types
+            .get(symbol)
+            .ok_or(SourceCheckError::Variable(
+                VariableInvariant::MissingStagedValueType(*symbol),
+            ))?;
+        captured.insert(*symbol, declared_type);
+    }
+    Ok(captured)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6206,17 +6218,23 @@ pub(super) fn check_source_file(
         }
         materialized_functions.push(materialized);
     }
-    for (function, materialized) in functions.iter().zip(&materialized_functions) {
+    let mut inferred_function_diagnostics = (0..functions.len())
+        .map(|_| None)
+        .collect::<Vec<Option<CanonicalCheckerDiagnostics>>>();
+    for (index, (function, materialized)) in
+        functions.iter().zip(&materialized_functions).enumerate()
+    {
         if !function.callable.return_type.is_inferred() {
             continue;
         }
+        let mut function_diagnostics = CanonicalCheckerDiagnostics::default();
         let body_flow_types = check_callable_parameter_initializers(
             store,
             host,
             global_types,
             source,
             options,
-            diagnostics,
+            &mut function_diagnostics,
             &current_flow_types,
             &preflighted_type_import_value_uses,
             &mut deferred,
@@ -6233,7 +6251,7 @@ pub(super) fn check_source_file(
             global_types,
             source,
             options,
-            diagnostics,
+            &mut function_diagnostics,
             &body_flow_types,
             &preflighted_type_import_value_uses,
             &mut deferred,
@@ -6241,6 +6259,7 @@ pub(super) fn check_source_file(
             materialized.signature,
             expression,
         )?;
+        inferred_function_diagnostics[index] = Some(function_diagnostics);
     }
 
     for statement in statements {
@@ -6283,6 +6302,13 @@ pub(super) fn check_source_file(
                     SourceFunctionInvariant::InvalidStatementIndex(index),
                 ))?;
                 if function.callable.return_type.is_inferred() {
+                    let function_diagnostics = inferred_function_diagnostics
+                        .get_mut(index)
+                        .and_then(Option::take)
+                        .ok_or(SourceCheckError::Function(
+                            SourceFunctionInvariant::Callable(function.callable.declaration),
+                        ))?;
+                    merge_retry_diagnostics(diagnostics, function_diagnostics);
                     continue;
                 }
                 let Some(return_type) = function.callable.return_type.type_node() else {
@@ -6341,6 +6367,11 @@ pub(super) fn check_source_file(
                     &arrow.source.callable,
                 )?;
                 if arrow.source.callable.return_type.is_inferred() {
+                    let captured_flow_types = captured_callable_flow_types(
+                        &current_flow_types,
+                        &declared_types,
+                        &mutable_variables,
+                    )?;
                     let body_flow_types = check_callable_parameter_initializers(
                         store,
                         host,
@@ -6348,7 +6379,7 @@ pub(super) fn check_source_file(
                         source,
                         options,
                         diagnostics,
-                        &current_flow_types,
+                        &captured_flow_types,
                         &preflighted_type_import_value_uses,
                         &mut deferred,
                         &arrow.source.callable,
@@ -6554,15 +6585,11 @@ pub(super) fn check_source_file(
         }
     }
 
-    let mut captured_flow_types = current_flow_types.clone();
-    for symbol in mutable_variables {
-        let declared_type = *declared_types
-            .get(&symbol)
-            .ok_or(SourceCheckError::Variable(
-                VariableInvariant::MissingStagedValueType(symbol),
-            ))?;
-        captured_flow_types.insert(symbol, declared_type);
-    }
+    let captured_flow_types = captured_callable_flow_types(
+        &current_flow_types,
+        &declared_types,
+        &mutable_variables,
+    )?;
     for arrow in &arrows {
         if arrow.source.callable.return_type.is_inferred() {
             continue;
@@ -14541,6 +14568,131 @@ mod tests {
             context.store().intrinsic_bootstrap().unwrap().any_type,
         );
         assert_eq!(context.diagnostics().len(), 1);
+        assert!(is_type_checked(&context, file));
+    }
+
+    #[test]
+    fn forced_inferred_return_replay_rejects_signature_and_body_cache_poison() {
+        let source = parsed("function inferred() { return 1; } const value = inferred();");
+        let file = FileId::new(409);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        let declaration = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::FunctionDeclaration).then_some(NodeRef::new(
+                    source.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let body_expression = source
+            .arena
+            .iter()
+            .find_map(|(_, record)| {
+                let NodeData::ReturnStatement(statement) = &record.data else {
+                    return None;
+                };
+                statement
+                    .expression
+                    .map(|node| NodeRef::new(source.arena.id(), file, node))
+            })
+            .unwrap();
+
+        context.check_source_file(file).unwrap();
+        let callable = context
+            .store()
+            .source_callable_type_for_declaration(declaration)
+            .unwrap();
+        let signature = context
+            .store()
+            .source_callable_provenance(callable)
+            .unwrap()
+            .signature;
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        let number = bootstrap.number_type;
+        let string = bootstrap.string_type;
+        let body_links = context
+            .store()
+            .type_node_links(body_expression)
+            .cloned()
+            .unwrap();
+        assert_eq!(
+            context
+                .store()
+                .signature(signature)
+                .unwrap()
+                .resolved_return_type(),
+            Some(number),
+        );
+
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_signature_resolved_return_type(signature, Some(string))
+        );
+        let source_ref = context.source_file(file).unwrap();
+        let mut source_links = context
+            .store()
+            .source_file_links(source_ref)
+            .cloned()
+            .unwrap();
+        source_links.type_checked = false;
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_source_file_links(source_ref, source_links)
+        );
+
+        assert!(matches!(
+            context.check_source_file(file),
+            Err(SourceCheckError::Function(SourceFunctionInvariant::Callable(node)))
+                if node == declaration
+        ));
+        assert_eq!(
+            context
+                .store()
+                .signature(signature)
+                .unwrap()
+                .resolved_return_type(),
+            Some(string),
+        );
+        assert!(context.diagnostics().is_empty());
+        assert!(!is_type_checked(&context, file));
+
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_signature_resolved_return_type(signature, Some(number))
+        );
+        assert!(context.store_mut_for_test().set_type_node_links(
+            body_expression,
+            TypeNodeLinks {
+                resolved_type: Some(string),
+                ..TypeNodeLinks::default()
+            },
+        ));
+        assert!(matches!(
+            context.check_source_file(file),
+            Err(SourceCheckError::Assertion(
+                SourceAssertionError::InvalidExpressionCache {
+                    node,
+                    cached: Some(cached),
+                    ..
+                }
+            )) if node == body_expression && cached == string
+        ));
+        assert!(context.diagnostics().is_empty());
+        assert!(!is_type_checked(&context, file));
+
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_type_node_links(body_expression, body_links)
+        );
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
         assert!(is_type_checked(&context, file));
     }
 

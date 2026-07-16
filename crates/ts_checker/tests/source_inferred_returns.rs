@@ -23,6 +23,7 @@ const SUCCESS_SOURCE: &str = concat!(
     "function defaultArray(xs: number[] = [1]) { return xs; }\n",
     "function arrayValue() { return [1, 2]; }\n",
     "function objectValue() { return { value: 1 }; }\n",
+    "function nestedArrayObject() { return { values: [1] }; }\n",
     "const emptyResult = empty();\n",
     "const echoed = echo(\"value\");\n",
     "const annotatedResult = throughAnnotated();\n",
@@ -31,6 +32,7 @@ const SUCCESS_SOURCE: &str = concat!(
     "const defaultArrayResult = defaultArray();\n",
     "const arrayResult = arrayValue();\n",
     "const objectResult = objectValue();\n",
+    "const nestedArrayObjectResult: { values: number[] } = nestedArrayObject();\n",
     "const concise = (value: number) => value;\n",
     "const conciseResult = concise(1);\n",
     "const defaultedArrow = (value: number = 2) => value;\n",
@@ -39,6 +41,18 @@ const SUCCESS_SOURCE: &str = concat!(
     "const blockResult = block();\n",
     "const emptyArrow = () => {};\n",
     "const emptyArrowResult = emptyArrow();\n",
+);
+
+const MUTABLE_CAPTURE_SOURCE: &str = concat!(
+    "let x: string | number = 1;\n",
+    "const f = () => x;\n",
+    "const n: number = f();\n",
+);
+
+const INFERRED_DIAGNOSTIC_ORDER_SOURCE: &str = concat!(
+    "const before = inferred();\n",
+    "const top: string = 1;\n",
+    "function inferred(value: number = \"bad\") { return value + true; }\n",
 );
 
 fn context(parsed: &ParseResult, file: FileId) -> CanonicalCheckerContext<'_> {
@@ -169,6 +183,7 @@ fn inferred_functions_and_arrows_publish_before_direct_use_and_replay_warm() {
         ("defaultArray()", "number[]"),
         ("arrayValue()", "number[]"),
         ("objectValue()", "{ value: number; }"),
+        ("nestedArrayObject()", "{ values: number[]; }"),
         ("concise(1)", "number"),
         ("defaultedArrow()", "number"),
         ("block()", "boolean"),
@@ -187,6 +202,82 @@ fn inferred_functions_and_arrows_publish_before_direct_use_and_replay_warm() {
     assert_eq!(
         (context.store().type_len(), context.store().signature_len()),
         counts
+    );
+    assert_eq!(context.diagnostics(), &diagnostics);
+}
+
+#[test]
+fn inferred_arrow_mutable_capture_uses_declared_type_and_replays_diagnostic() {
+    let parsed = parse_source_file(MUTABLE_CAPTURE_SOURCE);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(7);
+    let mut context = context(&parsed, file);
+
+    context.check_source_file(file).unwrap();
+    let call = call_expression(MUTABLE_CAPTURE_SOURCE, &parsed, file, "f()");
+    assert_eq!(
+        context
+            .type_to_string(resolved_type(&context, call))
+            .unwrap(),
+        "string | number",
+    );
+    let [diagnostic] = context.diagnostics().as_slice() else {
+        panic!("expected one capture assignment diagnostic")
+    };
+    assert_eq!(diagnostic.diagnostic.code(), 2322);
+    assert_eq!(
+        diagnostic.diagnostic.render().unwrap(),
+        "Type 'string | number' is not assignable to type 'number'.",
+    );
+
+    let counts = (context.store().type_len(), context.store().signature_len());
+    let diagnostics = context.diagnostics().clone();
+    context.check_source_file(file).unwrap();
+    assert_eq!(
+        (context.store().type_len(), context.store().signature_len()),
+        counts,
+    );
+    assert_eq!(context.diagnostics(), &diagnostics);
+}
+
+#[test]
+fn inferred_function_diagnostics_replay_at_the_declaration_slot() {
+    let parsed = parse_source_file(INFERRED_DIAGNOSTIC_ORDER_SOURCE);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(8);
+    let mut context = context(&parsed, file);
+
+    context.check_source_file(file).unwrap();
+    let diagnostics = context
+        .diagnostics()
+        .as_slice()
+        .iter()
+        .map(|diagnostic| {
+            (
+                diagnostic.diagnostic.code(),
+                node_text(
+                    INFERRED_DIAGNOSTIC_ORDER_SOURCE,
+                    &parsed,
+                    diagnostic.node.unwrap(),
+                ),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        diagnostics,
+        [
+            (2322, "top"),
+            (2322, "value: number = \"bad\""),
+            (2365, "value + true"),
+        ],
+    );
+
+    let counts = (context.store().type_len(), context.store().signature_len());
+    let diagnostics = context.diagnostics().clone();
+    context.check_source_file(file).unwrap();
+    assert_eq!(
+        (context.store().type_len(), context.store().signature_len()),
+        counts,
     );
     assert_eq!(context.diagnostics(), &diagnostics);
 }
