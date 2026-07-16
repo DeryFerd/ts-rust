@@ -2906,6 +2906,10 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         self.index_infos.len()
     }
 
+    pub(super) fn try_reserve_index_infos(&mut self, additional: usize) -> bool {
+        self.index_infos.try_reserve(additional)
+    }
+
     pub fn set_index_info_symbol(
         &mut self,
         id: IndexInfoId,
@@ -4041,6 +4045,22 @@ mod tests {
         assert!(store.try_reserve_mappers(1));
         store.alloc_mapper("mapper");
         assert_eq!(store.mapper_len(), 1);
+    }
+
+    #[test]
+    fn index_info_reservation_failure_preserves_counts_and_allows_retry() {
+        let mut store = TestStore::new();
+        assert!(!store.try_reserve_index_infos(usize::MAX));
+        assert_eq!(store.index_info_len(), 0);
+        let key = store.alloc_type("key");
+        let value = store.alloc_type("value");
+        assert!(store.try_reserve_index_infos(1));
+        assert!(
+            store
+                .alloc_index_info(key, value, false, None, Vec::new())
+                .is_some()
+        );
+        assert_eq!(store.index_info_len(), 1);
     }
 
     fn alloc_test_symbol<TypePayload, MapperPayload>(
