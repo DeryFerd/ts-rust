@@ -8,24 +8,28 @@
 //! syntactic-array rest element. General variadic normalization remains at the
 //! type-node boundary.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, ops::Range};
 
-use ts_binder::{CheckFlags, EscapedName, SymbolFlags};
+use ts_ast::NodeRef;
+use ts_binder::{
+    CheckFlags, EscapedName, SemanticStoreId, SymbolFlags, semantic::PreparedSymbolTable,
+};
 use ts_jsnum::Number;
 
 use super::{
-    CanonicalTypeMapperStore, TypeId,
+    CanonicalGlobalTypes, CanonicalTypeMapperStore, TypeId,
     array_types::{ArrayTypeError, CanonicalArrayTargets},
-    bootstrap::LiteralTypeCacheError,
+    bootstrap::{LiteralTypeCacheError, PreparedTypeQueryTypes},
     declared::type_list_key,
+    global_types::preflight_generic_global_type_target,
     links::ValueSymbolLinks,
     signatures::{ElementFlags, TupleElementInfo, TupleMetadata},
     store::{
         CanonicalEmptyTupleProvenance, CanonicalTupleTargetKey, CanonicalTupleTargetProvenance,
     },
     type_records::{
-        ConstrainedTypeData, LiteralValue, StructuredTypeData, TypeCacheState, TypeData,
-        TypeParameterData, TypeRecord,
+        CacheHashKey, ConstrainedTypeData, LiteralValue, StructuredTypeData, TypeCacheState,
+        TypeData, TypeParameterData, TypeRecord,
     },
     types::{ObjectFlags, TypeFlags},
 };
@@ -75,6 +79,121 @@ impl<'a> CanonicalTupleTypeRequest<'a> {
     pub(super) const fn with_array_targets(mut self, targets: CanonicalArrayTargets) -> Self {
         self.array_targets = Some(targets);
         self
+    }
+}
+
+/// Exact canonical destination retained by one cold tuple type-node plan.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum CanonicalTupleTypeNodePrepareDestination<'a> {
+    Tuple {
+        key: &'a CanonicalTupleTargetKey,
+        existing_target: Option<TypeId>,
+    },
+    Array {
+        target: TypeId,
+        fallback: Option<TypeId>,
+    },
+}
+
+/// Read-only handoff from syntax planning into the query mutation barrier.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct CanonicalTupleTypeNodePrepareRequest<'a> {
+    pub(super) node: NodeRef,
+    pub(super) cached_type: Option<TypeId>,
+    pub(super) destination: CanonicalTupleTypeNodePrepareDestination<'a>,
+}
+
+/// A tuple-query preparation failure attributed to the exact annotation root.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct TupleTypeQueryPreparationError {
+    pub(super) node: NodeRef,
+    pub(super) error: TupleTypeError,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct PreparedTuplePropertyName {
+    symbol: EscapedName,
+    table: EscapedName,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(super) struct PreparedColdCanonicalTupleType {
+    metadata: TupleMetadata,
+    length_type: Option<TypeId>,
+    length_constituents: Vec<TypeId>,
+    instantiations: HashMap<CacheHashKey, TypeId>,
+    resolved_type_arguments: Vec<TypeId>,
+    all_type_parameters: Vec<TypeId>,
+    provenance_type_parameters: Vec<TypeId>,
+    element_symbols: Vec<ts_binder::SemanticSymbolId>,
+    property_names: Vec<PreparedTuplePropertyName>,
+    length_name: PreparedTuplePropertyName,
+    declared_members: PreparedSymbolTable,
+}
+
+/// Opaque, single-use authorization consumed by tuple-node execution.
+#[derive(Debug, Eq, PartialEq)]
+pub(super) enum PreparedCanonicalTupleType {
+    Tuple {
+        key: CanonicalTupleTargetKey,
+        target_at_preflight: Option<TypeId>,
+        arguments: Vec<TypeId>,
+        cold: Option<PreparedColdCanonicalTupleType>,
+    },
+    Array {
+        target: TypeId,
+        arguments: Vec<TypeId>,
+    },
+}
+
+struct ColdTupleLengthPreparation {
+    node: NodeRef,
+    key: CanonicalTupleTargetKey,
+    values: Range<usize>,
+    constituents: Vec<TypeId>,
+}
+
+struct TargetInstantiationReservation {
+    node: NodeRef,
+    target: TypeId,
+    count: usize,
+}
+
+/// Fully local staging plus store reservation counts for one query.
+pub(super) struct CanonicalTupleTypeQueryPreflight {
+    store: SemanticStoreId,
+    array_targets: Option<CanonicalArrayTargets>,
+    first_node: Option<NodeRef>,
+    tokens: HashMap<NodeRef, PreparedCanonicalTupleType>,
+    length_values: Vec<Number>,
+    length_union_operations: usize,
+    cold_lengths: Vec<ColdTupleLengthPreparation>,
+    target_instantiations: Vec<TargetInstantiationReservation>,
+    additional_types: usize,
+    additional_symbols: usize,
+    additional_tables: usize,
+    additional_targets: usize,
+}
+
+impl CanonicalTupleTypeQueryPreflight {
+    pub(super) fn length_values(&self) -> &[Number] {
+        &self.length_values
+    }
+
+    pub(super) const fn length_union_operations(&self) -> usize {
+        self.length_union_operations
+    }
+
+    pub(super) const fn additional_types(&self) -> usize {
+        self.additional_types
+    }
+
+    pub(super) fn target_instantiation_reservations(
+        &self,
+    ) -> impl Iterator<Item = (NodeRef, TypeId, usize)> + '_ {
+        self.target_instantiations
+            .iter()
+            .map(|reservation| (reservation.node, reservation.target, reservation.count))
     }
 }
 
@@ -158,6 +277,7 @@ pub(super) enum TupleTypeError {
         target: TypeId,
         instance: TypeId,
     },
+    InvalidPreparedQuery,
     Capacity,
 }
 
@@ -211,6 +331,9 @@ impl std::fmt::Display for TupleTypeError {
                 formatter,
                 "tuple target {target:?} has invalid instantiation {instance:?}"
             ),
+            Self::InvalidPreparedQuery => {
+                formatter.write_str("tuple type used an invalid prepared-query proof")
+            }
             Self::Capacity => formatter.write_str("tuple type capacity was exhausted"),
         }
     }
@@ -254,7 +377,574 @@ fn clone_with_capacity<T: Copy>(values: &[T]) -> Result<Vec<T>, TupleTypeError> 
     Ok(result)
 }
 
+fn clone_tuple_target_key(
+    key: &CanonicalTupleTargetKey,
+) -> Result<CanonicalTupleTargetKey, TupleTypeError> {
+    Ok(CanonicalTupleTargetKey {
+        element_infos: clone_with_capacity(&key.element_infos)?,
+        readonly: key.readonly,
+    })
+}
+
+fn preparation_error(node: NodeRef, error: TupleTypeError) -> TupleTypeQueryPreparationError {
+    TupleTypeQueryPreparationError { node, error }
+}
+
+struct TuplePreparationGroup {
+    key: CanonicalTupleTargetKey,
+    existing_target: Option<TypeId>,
+    nodes: Vec<NodeRef>,
+}
+
+struct ArrayPreparationGroup {
+    target: TypeId,
+    nodes: Vec<NodeRef>,
+}
+
+fn prepared_vec<T>(capacity: usize) -> Result<Vec<T>, TupleTypeError> {
+    let mut values = Vec::new();
+    values
+        .try_reserve(capacity)
+        .map_err(|_| TupleTypeError::Capacity)?;
+    Ok(values)
+}
+
+fn stage_cold_tuple_type(
+    key: &CanonicalTupleTargetKey,
+    metadata: TupleMetadata,
+    instance_count: usize,
+    length_count: usize,
+) -> Result<PreparedColdCanonicalTupleType, TupleTypeError> {
+    let arity = key.element_infos.len();
+    let mut instantiations = HashMap::new();
+    instantiations
+        .try_reserve(
+            1usize
+                .checked_add(instance_count)
+                .ok_or(TupleTypeError::Capacity)?,
+        )
+        .map_err(|_| TupleTypeError::Capacity)?;
+    let mut property_names = prepared_vec(metadata.fixed_length())?;
+    for index in 0..metadata.fixed_length() {
+        property_names.push(PreparedTuplePropertyName {
+            symbol: EscapedName::source(index.to_string()),
+            table: EscapedName::source(index.to_string()),
+        });
+    }
+    let declared_members = PreparedSymbolTable::new(
+        metadata
+            .fixed_length()
+            .checked_add(1)
+            .ok_or(TupleTypeError::Capacity)?,
+    )
+    .ok_or(TupleTypeError::Capacity)?;
+    Ok(PreparedColdCanonicalTupleType {
+        metadata,
+        length_type: None,
+        length_constituents: prepared_vec(length_count)?,
+        instantiations,
+        resolved_type_arguments: prepared_vec(arity)?,
+        all_type_parameters: prepared_vec(arity.checked_add(1).ok_or(TupleTypeError::Capacity)?)?,
+        provenance_type_parameters: prepared_vec(arity)?,
+        element_symbols: prepared_vec(key.element_infos.len())?,
+        property_names,
+        length_name: PreparedTuplePropertyName {
+            symbol: EscapedName::source(LENGTH),
+            table: EscapedName::source(LENGTH),
+        },
+        declared_members,
+    })
+}
+
+fn add_target_instantiation_reservation(
+    reservations: &mut Vec<TargetInstantiationReservation>,
+    node: NodeRef,
+    target: TypeId,
+    count: usize,
+) -> Result<(), TupleTypeQueryPreparationError> {
+    if let Some(reservation) = reservations
+        .iter_mut()
+        .find(|reservation| reservation.target == target)
+    {
+        reservation.count = reservation
+            .count
+            .checked_add(count)
+            .ok_or_else(|| preparation_error(node, TupleTypeError::Capacity))?;
+        return Ok(());
+    }
+    reservations.push(TargetInstantiationReservation {
+        node,
+        target,
+        count,
+    });
+    Ok(())
+}
+
 impl CanonicalTypeMapperStore {
+    fn validate_tuple_target_key(
+        &self,
+        key: &CanonicalTupleTargetKey,
+    ) -> Result<(), TupleTypeError> {
+        if self.intrinsic_bootstrap().is_none() {
+            return Err(TupleTypeError::BootstrapUninitialized);
+        }
+        let mut saw_optional = false;
+        for (index, info) in key.element_infos.iter().copied().enumerate() {
+            if info
+                .labeled_declaration()
+                .is_some_and(|node| !self.contains_node_ref(node))
+            {
+                return Err(TupleTypeError::InvalidElementInfo { index });
+            }
+            match info.flags() {
+                ElementFlags::REQUIRED if !saw_optional => {}
+                ElementFlags::REQUIRED => {
+                    return Err(TupleTypeError::UnsupportedElementOrder { index });
+                }
+                ElementFlags::OPTIONAL => saw_optional = true,
+                ElementFlags::REST if index + 1 == key.element_infos.len() => {}
+                ElementFlags::REST => {
+                    return Err(TupleTypeError::UnsupportedElementOrder { index });
+                }
+                flags => {
+                    return Err(TupleTypeError::UnsupportedElementFlags { index, flags });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Validates and stages every cold tuple annotation in one query before
+    /// any element dependency can publish semantic links.
+    #[allow(clippy::too_many_lines)]
+    pub(super) fn preflight_canonical_tuple_type_query<'a>(
+        &self,
+        array_targets: Option<CanonicalArrayTargets>,
+        requests: impl IntoIterator<Item = CanonicalTupleTypeNodePrepareRequest<'a>>,
+    ) -> Result<CanonicalTupleTypeQueryPreflight, TupleTypeQueryPreparationError> {
+        let mut requests = requests.into_iter().peekable();
+        let first_node = requests.peek().map(|request| request.node);
+        let request_capacity = requests
+            .size_hint()
+            .1
+            .unwrap_or_else(|| requests.size_hint().0);
+        let mut tuple_groups = Vec::<TuplePreparationGroup>::new();
+        let mut array_groups = Vec::<ArrayPreparationGroup>::new();
+        tuple_groups.try_reserve(request_capacity).map_err(|_| {
+            preparation_error(
+                first_node.expect("a positive request capacity has a first tuple node"),
+                TupleTypeError::Capacity,
+            )
+        })?;
+        array_groups.try_reserve(request_capacity).map_err(|_| {
+            preparation_error(
+                first_node.expect("a positive request capacity has a first tuple node"),
+                TupleTypeError::Capacity,
+            )
+        })?;
+
+        for request in requests {
+            if request.cached_type.is_some() {
+                continue;
+            }
+            match request.destination {
+                CanonicalTupleTypeNodePrepareDestination::Array { target, fallback } => {
+                    let observed =
+                        preflight_generic_global_type_target(self, target).map_err(|error| {
+                            preparation_error(
+                                request.node,
+                                TupleTypeError::ArrayType(ArrayTypeError::GlobalType(error)),
+                            )
+                        })?;
+                    if observed != fallback {
+                        return Err(preparation_error(
+                            request.node,
+                            TupleTypeError::InvalidTargetCache(target),
+                        ));
+                    }
+                    if fallback.is_some() {
+                        continue;
+                    }
+                    let index = array_groups
+                        .iter()
+                        .position(|group| group.target == target)
+                        .unwrap_or(array_groups.len());
+                    if index == array_groups.len() {
+                        let mut nodes = prepared_vec(1)
+                            .map_err(|error| preparation_error(request.node, error))?;
+                        nodes.push(request.node);
+                        array_groups.push(ArrayPreparationGroup { target, nodes });
+                    } else {
+                        array_groups[index].nodes.try_reserve(1).map_err(|_| {
+                            preparation_error(request.node, TupleTypeError::Capacity)
+                        })?;
+                        array_groups[index].nodes.push(request.node);
+                    }
+                }
+                CanonicalTupleTypeNodePrepareDestination::Tuple {
+                    key,
+                    existing_target,
+                } => {
+                    self.validate_tuple_target_key(key)
+                        .map_err(|error| preparation_error(request.node, error))?;
+                    let observed = self
+                        .canonical_tuple_target(key)
+                        .map(|provenance| provenance.target);
+                    if observed != existing_target {
+                        return Err(preparation_error(
+                            request.node,
+                            TupleTypeError::InvalidTargetCache(
+                                observed.or(existing_target).unwrap_or_else(|| {
+                                    self.intrinsic_bootstrap()
+                                        .expect("tuple key validation requires bootstrap")
+                                        .error_type
+                                }),
+                            ),
+                        ));
+                    }
+                    if let Some(target) = observed {
+                        self.validate_canonical_tuple_target(target)
+                            .map_err(|error| preparation_error(request.node, error))?;
+                        if key.element_infos.is_empty() && !key.readonly {
+                            self.validate_canonical_empty_tuple_type(target)
+                                .map_err(|_| {
+                                    preparation_error(
+                                        request.node,
+                                        TupleTypeError::InvalidTargetCache(target),
+                                    )
+                                })?;
+                        }
+                    } else if key.element_infos.is_empty()
+                        && !key.readonly
+                        && let Some(cached) = self.canonical_empty_tuple_type_cache()
+                    {
+                        return Err(preparation_error(
+                            request.node,
+                            TupleTypeError::InvalidTargetCache(cached),
+                        ));
+                    }
+                    let index = tuple_groups
+                        .iter()
+                        .position(|group| group.key.eq(key))
+                        .unwrap_or(tuple_groups.len());
+                    if index == tuple_groups.len() {
+                        let mut nodes = prepared_vec(1)
+                            .map_err(|error| preparation_error(request.node, error))?;
+                        nodes.push(request.node);
+                        tuple_groups.push(TuplePreparationGroup {
+                            key: clone_tuple_target_key(key)
+                                .map_err(|error| preparation_error(request.node, error))?,
+                            existing_target,
+                            nodes,
+                        });
+                    } else {
+                        if tuple_groups[index].existing_target != existing_target {
+                            return Err(preparation_error(
+                                request.node,
+                                TupleTypeError::InvalidPreparedQuery,
+                            ));
+                        }
+                        tuple_groups[index].nodes.try_reserve(1).map_err(|_| {
+                            preparation_error(request.node, TupleTypeError::Capacity)
+                        })?;
+                        tuple_groups[index].nodes.push(request.node);
+                    }
+                }
+            }
+        }
+
+        let token_count = tuple_groups
+            .iter()
+            .try_fold(0usize, |count, group| count.checked_add(group.nodes.len()))
+            .and_then(|count| {
+                array_groups
+                    .iter()
+                    .try_fold(count, |count, group| count.checked_add(group.nodes.len()))
+            })
+            .ok_or_else(|| {
+                preparation_error(
+                    first_node.expect("nonempty groups have a first tuple node"),
+                    TupleTypeError::Capacity,
+                )
+            })?;
+        let mut tokens = HashMap::new();
+        tokens.try_reserve(token_count).map_err(|_| {
+            preparation_error(
+                first_node.expect("nonempty tokens have a first tuple node"),
+                TupleTypeError::Capacity,
+            )
+        })?;
+        let mut length_values = prepared_vec(0).map_err(|error| {
+            preparation_error(
+                first_node.expect("a failed tuple allocation has a first tuple node"),
+                error,
+            )
+        })?;
+        let mut cold_lengths = Vec::new();
+        cold_lengths.try_reserve(tuple_groups.len()).map_err(|_| {
+            preparation_error(
+                first_node.expect("nonempty groups have a first tuple node"),
+                TupleTypeError::Capacity,
+            )
+        })?;
+        let mut target_instantiations = Vec::<TargetInstantiationReservation>::new();
+        target_instantiations
+            .try_reserve(tuple_groups.len() + array_groups.len())
+            .map_err(|_| {
+                preparation_error(
+                    first_node.expect("nonempty groups have a first tuple node"),
+                    TupleTypeError::Capacity,
+                )
+            })?;
+        let mut length_union_operations = 0usize;
+        let mut additional_types = 0usize;
+        let mut additional_symbols = 0usize;
+        let mut additional_tables = 0usize;
+        let mut additional_targets = 0usize;
+
+        for group in array_groups {
+            additional_types = additional_types
+                .checked_add(group.nodes.len())
+                .ok_or_else(|| preparation_error(group.nodes[0], TupleTypeError::Capacity))?;
+            add_target_instantiation_reservation(
+                &mut target_instantiations,
+                group.nodes[0],
+                group.target,
+                group.nodes.len(),
+            )?;
+            for node in group.nodes {
+                let token = PreparedCanonicalTupleType::Array {
+                    target: group.target,
+                    arguments: prepared_vec(1).map_err(|error| preparation_error(node, error))?,
+                };
+                if tokens.insert(node, token).is_some() {
+                    return Err(preparation_error(
+                        node,
+                        TupleTypeError::InvalidPreparedQuery,
+                    ));
+                }
+            }
+        }
+
+        for group in tuple_groups {
+            let node = group.nodes[0];
+            let arity = group.key.element_infos.len();
+            let metadata_infos = clone_with_capacity(&group.key.element_infos)
+                .map_err(|error| preparation_error(node, error))?;
+            let metadata = TupleMetadata::new(metadata_infos, group.key.readonly);
+            let instance_count = if arity == 0 { 0 } else { group.nodes.len() };
+            let length_start = length_values.len();
+            let variable_length = metadata.combined_flags().intersects(ElementFlags::VARIABLE);
+            if group.existing_target.is_none() && !variable_length {
+                let length_count = arity
+                    .checked_sub(metadata.min_length())
+                    .and_then(|count| count.checked_add(1))
+                    .ok_or_else(|| preparation_error(node, TupleTypeError::Capacity))?;
+                length_values
+                    .try_reserve(length_count)
+                    .map_err(|_| preparation_error(node, TupleTypeError::Capacity))?;
+                for value in metadata.min_length()..=arity {
+                    length_values.push(
+                        checked_number(value).map_err(|error| preparation_error(node, error))?,
+                    );
+                }
+            }
+            let length_end = length_values.len();
+            let length_count = length_end - length_start;
+            if group.existing_target.is_none() && length_count > 1 {
+                length_union_operations = length_union_operations
+                    .checked_add(1)
+                    .ok_or_else(|| preparation_error(node, TupleTypeError::Capacity))?;
+            }
+
+            if let Some(target) = group.existing_target {
+                additional_types = additional_types
+                    .checked_add(instance_count)
+                    .ok_or_else(|| preparation_error(node, TupleTypeError::Capacity))?;
+                if instance_count != 0 {
+                    add_target_instantiation_reservation(
+                        &mut target_instantiations,
+                        node,
+                        target,
+                        instance_count,
+                    )?;
+                }
+            } else {
+                additional_targets = additional_targets
+                    .checked_add(1)
+                    .ok_or_else(|| preparation_error(node, TupleTypeError::Capacity))?;
+                additional_tables = additional_tables
+                    .checked_add(1)
+                    .ok_or_else(|| preparation_error(node, TupleTypeError::Capacity))?;
+                additional_symbols = additional_symbols
+                    .checked_add(
+                        metadata
+                            .fixed_length()
+                            .checked_add(1)
+                            .ok_or_else(|| preparation_error(node, TupleTypeError::Capacity))?,
+                    )
+                    .ok_or_else(|| preparation_error(node, TupleTypeError::Capacity))?;
+                additional_types = additional_types
+                    .checked_add(arity)
+                    .and_then(|count| count.checked_add(2))
+                    .and_then(|count| count.checked_add(instance_count))
+                    .ok_or_else(|| preparation_error(node, TupleTypeError::Capacity))?;
+                cold_lengths.push(ColdTupleLengthPreparation {
+                    node,
+                    key: clone_tuple_target_key(&group.key)
+                        .map_err(|error| preparation_error(node, error))?,
+                    values: length_start..length_end,
+                    constituents: prepared_vec(length_count)
+                        .map_err(|error| preparation_error(node, error))?,
+                });
+            }
+
+            for node in group.nodes {
+                let arguments =
+                    prepared_vec(arity).map_err(|error| preparation_error(node, error))?;
+                let cold = if group.existing_target.is_none() {
+                    let infos = clone_with_capacity(&group.key.element_infos)
+                        .map_err(|error| preparation_error(node, error))?;
+                    Some(
+                        stage_cold_tuple_type(
+                            &group.key,
+                            TupleMetadata::new(infos, group.key.readonly),
+                            instance_count,
+                            length_count,
+                        )
+                        .map_err(|error| preparation_error(node, error))?,
+                    )
+                } else {
+                    None
+                };
+                let token = PreparedCanonicalTupleType::Tuple {
+                    key: clone_tuple_target_key(&group.key)
+                        .map_err(|error| preparation_error(node, error))?,
+                    target_at_preflight: group.existing_target,
+                    arguments,
+                    cold,
+                };
+                if tokens.insert(node, token).is_some() {
+                    return Err(preparation_error(
+                        node,
+                        TupleTypeError::InvalidPreparedQuery,
+                    ));
+                }
+            }
+        }
+
+        Ok(CanonicalTupleTypeQueryPreflight {
+            store: self.id(),
+            array_targets,
+            first_node,
+            tokens,
+            length_values,
+            length_union_operations,
+            cold_lengths,
+            target_instantiations,
+            additional_types,
+            additional_symbols,
+            additional_tables,
+            additional_targets,
+        })
+    }
+
+    /// Completes every fallible store reservation and length-type cache write,
+    /// then installs the single-use tuple-node construction proofs.
+    pub(super) fn install_canonical_tuple_type_query(
+        &mut self,
+        mut preflight: CanonicalTupleTypeQueryPreflight,
+        global_types: Option<&CanonicalGlobalTypes>,
+        prepared: &mut PreparedTypeQueryTypes,
+    ) -> Result<(), TupleTypeQueryPreparationError> {
+        let array_targets = global_types.map(CanonicalArrayTargets::from_global_types);
+        let Some(error_node) = preflight.first_node else {
+            return Ok(());
+        };
+        if preflight.store != self.id()
+            || preflight.array_targets != array_targets
+            || !prepared.accepts_tuple_preparation(self.id(), array_targets)
+        {
+            return Err(preparation_error(
+                error_node,
+                TupleTypeError::InvalidPreparedQuery,
+            ));
+        }
+        if !self.try_reserve_canonical_tuple_targets(preflight.additional_targets)
+            || !self.try_reserve_checker_symbol_allocations(
+                preflight.additional_symbols,
+                preflight.additional_tables,
+            )
+            || !self.try_reserve_value_symbol_links(preflight.additional_symbols)
+        {
+            return Err(preparation_error(error_node, TupleTypeError::Capacity));
+        }
+        for length in &mut preflight.cold_lengths {
+            for value in &preflight.length_values[length.values.clone()] {
+                length.constituents.push(
+                    self.regular_number_literal_type(*value)
+                        .map_err(length_type_error)
+                        .map_err(|error| preparation_error(length.node, error))?,
+                );
+            }
+            let length_type = if length.constituents.is_empty() {
+                self.intrinsic_bootstrap()
+                    .expect("tuple preflight validated bootstrap")
+                    .number_type
+            } else if length.constituents.len() == 1 {
+                length.constituents[0]
+            } else {
+                match global_types {
+                    Some(global_types) => self.literal_union_type_prepared_with_global_types(
+                        global_types,
+                        &length.constituents,
+                        None,
+                        prepared,
+                    ),
+                    None => self.literal_union_type_prepared(&length.constituents, None, prepared),
+                }
+                .map_err(length_type_error)
+                .map_err(|error| preparation_error(length.node, error))?
+            };
+            for token in preflight.tokens.values_mut() {
+                let PreparedCanonicalTupleType::Tuple {
+                    key,
+                    cold: Some(cold),
+                    ..
+                } = token
+                else {
+                    continue;
+                };
+                if &*key != &length.key {
+                    continue;
+                }
+                cold.length_type = Some(length_type);
+                cold.length_constituents
+                    .extend_from_slice(&length.constituents);
+            }
+        }
+        if preflight.tokens.values().any(|token| {
+            matches!(
+                token,
+                PreparedCanonicalTupleType::Tuple {
+                    cold: Some(PreparedColdCanonicalTupleType {
+                        length_type: None,
+                        ..
+                    }),
+                    ..
+                }
+            )
+        }) {
+            return Err(preparation_error(
+                error_node,
+                TupleTypeError::InvalidPreparedQuery,
+            ));
+        }
+        prepared
+            .install_canonical_tuple_types(self.id(), array_targets, preflight.tokens)
+            .map_err(|_| preparation_error(error_node, TupleTypeError::InvalidPreparedQuery))
+    }
+
     /// Creates or reuses one supported concrete tuple identity.
     ///
     /// Target ownership is keyed only by element flags, label declarations,
@@ -312,6 +1002,341 @@ impl CanonicalTypeMapperStore {
         }
 
         self.create_cold_canonical_tuple_type(key, request)
+    }
+
+    /// Consumes one exact query-preparation proof. All cache validation,
+    /// backing allocation, and target-local reservation completed before any
+    /// element type was executed.
+    pub(super) fn create_canonical_tuple_type_prepared(
+        &mut self,
+        node: NodeRef,
+        request: CanonicalTupleTypeRequest<'_>,
+        prepared: &mut PreparedTypeQueryTypes,
+    ) -> Result<TypeId, TupleTypeError> {
+        self.validate_tuple_request(request)?;
+        let token = prepared
+            .take_canonical_tuple_type(self.id(), node)
+            .map_err(|_| TupleTypeError::InvalidPreparedQuery)?;
+        match token {
+            PreparedCanonicalTupleType::Array {
+                target,
+                mut arguments,
+            } => {
+                let Some(targets) = request.array_targets else {
+                    return Err(TupleTypeError::InvalidPreparedQuery);
+                };
+                let expected_target = if request.readonly {
+                    targets.readonly_array_type()
+                } else {
+                    targets.array_type()
+                };
+                if request.element_infos.len() != 1
+                    || request.element_infos[0].flags() != ElementFlags::REST
+                    || request.element_types.len() != 1
+                    || target != expected_target
+                {
+                    return Err(TupleTypeError::InvalidPreparedQuery);
+                }
+                Ok(self.create_prepared_generic_global_reference(
+                    target,
+                    request.element_types[0],
+                    request.creation_flags,
+                    &mut arguments,
+                ))
+            }
+            PreparedCanonicalTupleType::Tuple {
+                key,
+                target_at_preflight,
+                mut arguments,
+                cold,
+            } => {
+                if key.readonly != request.readonly
+                    || key.element_infos.as_slice() != request.element_infos
+                    || key.element_infos.len() != request.element_types.len()
+                {
+                    return Err(TupleTypeError::InvalidPreparedQuery);
+                }
+                let target = self
+                    .canonical_tuple_target(&key)
+                    .map(|provenance| provenance.target);
+                if target_at_preflight.is_some() && target != target_at_preflight {
+                    return Err(TupleTypeError::InvalidPreparedQuery);
+                }
+                if let Some(target) = target {
+                    return Ok(self.create_prepared_canonical_tuple_instance(
+                        target,
+                        request.element_types,
+                        request.creation_flags,
+                        &mut arguments,
+                    ));
+                }
+                let cold = cold.ok_or(TupleTypeError::InvalidPreparedQuery)?;
+                self.create_prepared_cold_canonical_tuple_type(key, request, arguments, cold)
+            }
+        }
+    }
+
+    fn create_prepared_generic_global_reference(
+        &mut self,
+        target: TypeId,
+        type_argument: TypeId,
+        creation_flags: ObjectFlags,
+        arguments: &mut Vec<TypeId>,
+    ) -> TypeId {
+        let key = type_list_key(&[type_argument]);
+        let (existing, symbol) = {
+            let record = self
+                .type_payload(target)
+                .expect("prepared generic-global target remains owned");
+            let TypeData::Interface(interface) = record.data() else {
+                unreachable!("prepared generic-global target remains an interface")
+            };
+            let TypeCacheState::Allocated(instantiations) =
+                &interface.reference.object.instantiations
+            else {
+                unreachable!("prepared generic-global cache remains allocated")
+            };
+            (instantiations.get(&key).copied(), record.symbol())
+        };
+        if let Some(existing) = existing {
+            return existing;
+        }
+        let argument_flags = self
+            .type_payload(type_argument)
+            .expect("an executed tuple element returns an owned type")
+            .object_flags()
+            & ObjectFlags::PROPAGATING_FLAGS;
+        let reference = self
+            .alloc_type_reference(argument_flags | creation_flags, symbol)
+            .expect("prepared generic-global reference allocation is valid");
+        arguments.push(type_argument);
+        assert!(self.set_object_target_and_mapper(reference, Some(target), None));
+        assert!(self.set_type_reference_resolution(
+            reference,
+            None,
+            Some(std::mem::take(arguments)),
+        ));
+        assert_eq!(
+            self.insert_object_instantiation(target, key, reference),
+            Some(reference),
+        );
+        reference
+    }
+
+    fn create_prepared_canonical_tuple_instance(
+        &mut self,
+        target: TypeId,
+        element_types: &[TypeId],
+        creation_flags: ObjectFlags,
+        arguments: &mut Vec<TypeId>,
+    ) -> TypeId {
+        if element_types.is_empty() {
+            return target;
+        }
+        let key = type_list_key(element_types);
+        let existing = match self
+            .type_payload(target)
+            .expect("prepared tuple target remains owned")
+            .data()
+        {
+            TypeData::Tuple(tuple) => {
+                let TypeCacheState::Allocated(instantiations) =
+                    &tuple.interface.reference.object.instantiations
+                else {
+                    unreachable!("prepared tuple target cache remains allocated")
+                };
+                instantiations.get(&key).copied()
+            }
+            _ => unreachable!("prepared tuple target remains a tuple"),
+        };
+        if let Some(existing) = existing {
+            return existing;
+        }
+        arguments.extend_from_slice(element_types);
+        let propagating_flags = element_types
+            .iter()
+            .fold(ObjectFlags::NONE, |flags, type_| {
+                flags
+                    | self
+                        .type_payload(*type_)
+                        .expect("an executed tuple element returns an owned type")
+                        .object_flags()
+                        & ObjectFlags::PROPAGATING_FLAGS
+            });
+        let reference = self
+            .alloc_type_reference(propagating_flags | creation_flags, None)
+            .expect("prepared tuple reference allocation is valid");
+        assert!(self.set_object_target_and_mapper(reference, Some(target), None));
+        assert!(self.set_type_reference_resolution(
+            reference,
+            None,
+            Some(std::mem::take(arguments)),
+        ));
+        assert_eq!(
+            self.insert_object_instantiation(target, key, reference),
+            Some(reference),
+        );
+        reference
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn create_prepared_cold_canonical_tuple_type(
+        &mut self,
+        key: CanonicalTupleTargetKey,
+        request: CanonicalTupleTypeRequest<'_>,
+        mut concrete_arguments: Vec<TypeId>,
+        mut prepared: PreparedColdCanonicalTupleType,
+    ) -> Result<TypeId, TupleTypeError> {
+        let arity = request.element_types.len();
+        concrete_arguments.extend_from_slice(request.element_types);
+        let declared_members = self.alloc_prepared_symbol_table(prepared.declared_members);
+        for (info, names) in request.element_infos[..prepared.metadata.fixed_length()]
+            .iter()
+            .copied()
+            .zip(prepared.property_names.into_iter())
+        {
+            let type_parameter = self
+                .alloc_type_parameter(None)
+                .expect("prepared tuple type parameter is valid");
+            prepared.resolved_type_arguments.push(type_parameter);
+            prepared.all_type_parameters.push(type_parameter);
+            prepared.provenance_type_parameters.push(type_parameter);
+            let flags = SymbolFlags::PROPERTY
+                | if info.flags() == ElementFlags::OPTIONAL {
+                    SymbolFlags::OPTIONAL
+                } else {
+                    SymbolFlags::NONE
+                };
+            let symbol = self.alloc_transient_symbol(
+                flags,
+                names.symbol,
+                if request.readonly {
+                    CheckFlags::READONLY
+                } else {
+                    CheckFlags::NONE
+                },
+            );
+            assert!(self.set_value_symbol_links(
+                symbol,
+                ValueSymbolLinks {
+                    resolved_type: Some(type_parameter),
+                    ..ValueSymbolLinks::default()
+                },
+            ));
+            assert_eq!(
+                self.insert_symbol(declared_members, names.table, symbol),
+                Some(None),
+            );
+            prepared.element_symbols.push(symbol);
+        }
+        for _ in prepared.metadata.fixed_length()..arity {
+            let type_parameter = self
+                .alloc_type_parameter(None)
+                .expect("prepared tuple rest type parameter is valid");
+            prepared.resolved_type_arguments.push(type_parameter);
+            prepared.all_type_parameters.push(type_parameter);
+            prepared.provenance_type_parameters.push(type_parameter);
+        }
+
+        let length_type = prepared
+            .length_type
+            .ok_or(TupleTypeError::InvalidPreparedQuery)?;
+        let length_symbol = self.alloc_transient_symbol(
+            SymbolFlags::PROPERTY,
+            prepared.length_name.symbol,
+            if request.readonly {
+                CheckFlags::READONLY
+            } else {
+                CheckFlags::NONE
+            },
+        );
+        assert!(self.set_value_symbol_links(
+            length_symbol,
+            ValueSymbolLinks {
+                resolved_type: Some(length_type),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        assert_eq!(
+            self.insert_symbol(declared_members, prepared.length_name.table, length_symbol,),
+            Some(None),
+        );
+
+        let target = self
+            .alloc_tuple_type(
+                ObjectFlags::REFERENCE | ObjectFlags::TUPLE,
+                None,
+                prepared.metadata,
+            )
+            .expect("prepared tuple target shell is valid");
+        let this_type = self
+            .alloc_type_parameter(None)
+            .expect("prepared tuple this type is valid");
+        prepared.all_type_parameters.push(this_type);
+        prepared
+            .instantiations
+            .insert(type_list_key(&prepared.resolved_type_arguments), target);
+        assert!(self.initialize_tuple_target(
+            target,
+            prepared.resolved_type_arguments,
+            prepared.all_type_parameters,
+            this_type,
+            declared_members,
+            TypeCacheState::Allocated(prepared.instantiations),
+        ));
+
+        let result = if arity == 0 {
+            target
+        } else {
+            let propagating_flags =
+                request
+                    .element_types
+                    .iter()
+                    .fold(ObjectFlags::NONE, |flags, type_| {
+                        flags
+                            | self
+                                .type_payload(*type_)
+                                .expect("an executed tuple element returns an owned type")
+                                .object_flags()
+                                & ObjectFlags::PROPAGATING_FLAGS
+                    });
+            let reference = self
+                .alloc_type_reference(propagating_flags | request.creation_flags, None)
+                .expect("prepared tuple reference is valid");
+            assert!(self.set_object_target_and_mapper(reference, Some(target), None));
+            let instance_key = type_list_key(&concrete_arguments);
+            assert!(self.set_type_reference_resolution(reference, None, Some(concrete_arguments),));
+            assert_eq!(
+                self.insert_object_instantiation(target, instance_key, reference),
+                Some(reference),
+            );
+            reference
+        };
+
+        assert!(self.publish_canonical_tuple_target(
+            key,
+            CanonicalTupleTargetProvenance {
+                target,
+                type_parameters: prepared.provenance_type_parameters,
+                this_type,
+                declared_members,
+                element_symbols: prepared.element_symbols,
+                length_symbol,
+                length_type,
+                length_constituents: prepared.length_constituents,
+            },
+        ));
+        if arity == 0 && !request.readonly {
+            assert!(
+                self.publish_canonical_empty_tuple_type(CanonicalEmptyTupleProvenance {
+                    type_: target,
+                    this_type,
+                    declared_members,
+                    length_symbol,
+                },)
+            );
+        }
+        Ok(result)
     }
 
     fn validate_tuple_request(

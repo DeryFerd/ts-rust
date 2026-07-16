@@ -28,7 +28,7 @@ use std::{
     collections::{HashMap, HashSet},
 };
 
-use ts_ast::SyntaxKind;
+use ts_ast::{NodeRef, SyntaxKind};
 use ts_binder::{
     CheckFlags, EscapedName, InternalSymbolName, SemanticStoreId, SemanticSymbolId, SymbolFlags,
     SymbolTableId,
@@ -48,6 +48,7 @@ use super::{
     relation::RelationStateSnapshot,
     signatures::{SignatureFlags, TypePredicateKind},
     store::SemanticStore,
+    tuple_types::PreparedCanonicalTupleType,
     type_records::{
         ConstituentMapState, ConstrainedTypeData, LiteralValue, ObjectTypeData, RegularLiteralLink,
         TypeCacheState, TypeData, TypeRecord,
@@ -373,9 +374,46 @@ pub(super) struct PreparedTypeQueryTypes {
     union_operations_remaining: usize,
     named_union_operations_remaining: usize,
     pending_function_types: HashSet<TypeId>,
+    canonical_tuple_types: HashMap<NodeRef, PreparedCanonicalTupleType>,
 }
 
 impl PreparedTypeQueryTypes {
+    pub(super) fn accepts_tuple_preparation(
+        &self,
+        store: SemanticStoreId,
+        array_targets: Option<CanonicalArrayTargets>,
+    ) -> bool {
+        self.store == store
+            && self.array_targets == array_targets
+            && self.canonical_tuple_types.is_empty()
+    }
+
+    pub(super) fn install_canonical_tuple_types(
+        &mut self,
+        store: SemanticStoreId,
+        array_targets: Option<CanonicalArrayTargets>,
+        prepared: HashMap<NodeRef, PreparedCanonicalTupleType>,
+    ) -> Result<(), LiteralTypeCacheError> {
+        if !self.accepts_tuple_preparation(store, array_targets) {
+            return Err(LiteralTypeCacheError::InvalidPreparedQuery);
+        }
+        self.canonical_tuple_types = prepared;
+        Ok(())
+    }
+
+    pub(super) fn take_canonical_tuple_type(
+        &mut self,
+        store: SemanticStoreId,
+        node: NodeRef,
+    ) -> Result<PreparedCanonicalTupleType, LiteralTypeCacheError> {
+        if self.store != store {
+            return Err(LiteralTypeCacheError::InvalidPreparedQuery);
+        }
+        self.canonical_tuple_types
+            .remove(&node)
+            .ok_or(LiteralTypeCacheError::InvalidPreparedQuery)
+    }
+
     fn consume_union(
         &mut self,
         store: SemanticStoreId,
@@ -782,6 +820,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             union_operations_remaining: union_operations,
             named_union_operations_remaining: named_union_operations,
             pending_function_types: pending,
+            canonical_tuple_types: HashMap::new(),
         })
     }
 

@@ -19,6 +19,7 @@ use super::{
     },
     signatures::{ElementFlags, TupleElementInfo},
     store::CanonicalTupleTargetKey,
+    tuple_types::{CanonicalTupleTypeNodePrepareDestination, CanonicalTupleTypeNodePrepareRequest},
     type_records::{TypeData, TypeRecord},
     types::{ObjectFlags, TypeFlags},
 };
@@ -112,6 +113,29 @@ impl TupleTypeNodePlan {
             .iter()
             .filter(|element| element.info.flags() == ElementFlags::OPTIONAL)
             .count()
+    }
+
+    pub(super) fn preparation_request(&self) -> CanonicalTupleTypeNodePrepareRequest<'_> {
+        let destination = match &self.destination {
+            TupleTypeNodeDestination::Tuple {
+                key,
+                existing_target,
+            } => CanonicalTupleTypeNodePrepareDestination::Tuple {
+                key,
+                existing_target: *existing_target,
+            },
+            TupleTypeNodeDestination::Array { target, fallback } => {
+                CanonicalTupleTypeNodePrepareDestination::Array {
+                    target: *target,
+                    fallback: *fallback,
+                }
+            }
+        };
+        CanonicalTupleTypeNodePrepareRequest {
+            node: self.tuple,
+            cached_type: self.cached_type,
+            destination,
+        }
     }
 }
 

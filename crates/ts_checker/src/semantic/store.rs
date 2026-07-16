@@ -9,7 +9,7 @@ use ts_ast::{FileId, NodeArena, NodeArenaId, NodeData, NodeId, NodeRef, SyntaxKi
 use ts_binder::{
     AstScope, CheckFlags, EscapedName, SemanticStoreId, SemanticSymbolId, SymbolData, SymbolFlags,
     SymbolStore, SymbolTableId,
-    semantic::{Symbol, SymbolTable},
+    semantic::{PreparedSymbolTable, Symbol, SymbolTable},
 };
 use ts_parser::{IsolatedEntityName, parse_isolated_entity_name};
 
@@ -1352,6 +1352,14 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
     }
 
     #[must_use]
+    pub(super) fn alloc_prepared_symbol_table(
+        &mut self,
+        prepared: PreparedSymbolTable,
+    ) -> SymbolTableId {
+        self.symbols.alloc_prepared_symbol_table(prepared)
+    }
+
+    #[must_use]
     pub fn symbol_table(&self, id: SymbolTableId) -> Option<&SymbolTable> {
         self.symbols.symbol_table(id)
     }
@@ -1504,6 +1512,10 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             self.mark_union_cache_validation_dirty();
         }
         true
+    }
+
+    pub(super) fn try_reserve_type_node_links(&mut self, additional: usize) -> bool {
+        self.links.type_node.try_reserve(additional)
     }
 
     #[must_use]

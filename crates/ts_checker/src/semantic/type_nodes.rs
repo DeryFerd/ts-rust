@@ -39,7 +39,7 @@ use super::{
         self, PendingSourceCallableParameterTypes, SourceCallableError, SourceCallableFamily,
     },
     tuple_type_nodes::{self, TupleTypeNodeError, TupleTypeNodePlan, validate_warm_tuple_elements},
-    tuple_types::{CanonicalTupleTypeRequest, TupleTypeError},
+    tuple_types::{CanonicalTupleTypeRequest, TupleTypeError, TupleTypeQueryPreparationError},
     type_records::{CacheHashKey, TypeData, TypeRecord},
     types::ObjectFlags,
 };
@@ -489,6 +489,10 @@ fn tuple_type_error(error: TupleTypeError, node: NodeRef) -> DeclaredTypeError {
         } => type_node_unavailable(TypeNodeUnavailable::InvalidCachedTupleType(type_)),
         _ => type_node_unavailable(TypeNodeUnavailable::InvalidTupleType(node)),
     }
+}
+
+fn tuple_type_query_preparation_error(error: TupleTypeQueryPreparationError) -> DeclaredTypeError {
+    tuple_type_error(error.error, error.node)
 }
 
 fn generic_global_instantiation_argument(
@@ -4970,6 +4974,56 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         self.prepare_literal_types_with_additional(plan, 0, 0)
     }
 
+    fn missing_planned_type_node_links(
+        &self,
+        plan: &TypeQueryPlan,
+    ) -> Result<usize, DeclaredTypeError> {
+        let capacity = plan
+            .arrays
+            .len()
+            .checked_add(plan.references.len())
+            .and_then(|count| count.checked_add(plan.literals.len()))
+            .and_then(|count| count.checked_add(plan.unions.len()))
+            .and_then(|count| count.checked_add(plan.type_literals.len()))
+            .and_then(|count| count.checked_add(plan.functions.len()))
+            .and_then(|count| {
+                plan.tuples
+                    .len()
+                    .checked_mul(2)
+                    .and_then(|tuples| count.checked_add(tuples))
+            })
+            .ok_or_else(|| Self::literal_cache_error(LiteralTypeCacheError::Capacity))?;
+        let mut nodes = Vec::new();
+        nodes
+            .try_reserve(capacity)
+            .map_err(|_| Self::literal_cache_error(LiteralTypeCacheError::Capacity))?;
+        for node in plan
+            .arrays
+            .keys()
+            .chain(plan.references.keys())
+            .chain(plan.literals.keys())
+            .chain(plan.unions.keys())
+            .chain(plan.type_literals.keys())
+            .chain(plan.functions.keys())
+            .chain(plan.tuples.keys())
+        {
+            if !nodes.contains(node) {
+                nodes.push(*node);
+            }
+        }
+        for tuple in plan.tuples.values() {
+            if let Some(operator) = tuple.readonly_operator()
+                && !nodes.contains(&operator)
+            {
+                nodes.push(operator);
+            }
+        }
+        Ok(nodes
+            .into_iter()
+            .filter(|node| self.store.type_node_links(*node).is_none())
+            .count())
+    }
+
     fn prepare_literal_types_with_additional(
         &mut self,
         plan: &TypeQueryPlan,
@@ -5011,6 +5065,21 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 PlannedLiteralType::Null | PlannedLiteralType::Boolean(_) => {}
             }
         }
+        let tuple_preflight = self
+            .store
+            .preflight_canonical_tuple_type_query(
+                self.global_types
+                    .as_ref()
+                    .map(CanonicalArrayTargets::from_global_types),
+                plan.tuples
+                    .values()
+                    .map(TupleTypeNodePlan::preparation_request),
+            )
+            .map_err(tuple_type_query_preparation_error)?;
+        numbers
+            .try_reserve(tuple_preflight.length_values().len())
+            .map_err(|_| Self::literal_cache_error(LiteralTypeCacheError::Capacity))?;
+        numbers.extend_from_slice(tuple_preflight.length_values());
         let unions = plan
             .unions
             .iter()
@@ -5046,6 +5115,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             .len()
             .checked_add(optional_parameter_unions)
             .and_then(|count| count.checked_add(optional_tuple_unions))
+            .and_then(|count| count.checked_add(tuple_preflight.length_union_operations()))
             .and_then(|count| count.checked_add(additional_union_operations))
             .ok_or_else(|| Self::literal_cache_error(LiteralTypeCacheError::Capacity))?;
         let named_unions = unions
@@ -5089,10 +5159,19 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 .checked_add(1)
                 .ok_or_else(|| Self::literal_cache_error(LiteralTypeCacheError::Capacity))?;
         }
-        let array_references = array_references_by_target
+        let array_reference_types = array_references_by_target
             .values()
             .try_fold(0usize, |total, (count, _)| total.checked_add(*count))
             .ok_or_else(|| Self::literal_cache_error(LiteralTypeCacheError::Capacity))?;
+        for (node, target, count) in tuple_preflight.target_instantiation_reservations() {
+            let entry = array_references_by_target
+                .entry(target)
+                .or_insert((0, node));
+            entry.0 = entry
+                .0
+                .checked_add(count)
+                .ok_or_else(|| Self::literal_cache_error(LiteralTypeCacheError::Capacity))?;
+        }
         let literal_values = strings
             .len()
             .checked_add(numbers.len())
@@ -5101,7 +5180,8 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         let additional_types = literal_values
             .checked_add(union_operation_count)
             .and_then(|count| count.checked_mul(2))
-            .and_then(|count| count.checked_add(array_references))
+            .and_then(|count| count.checked_add(array_reference_types))
+            .and_then(|count| count.checked_add(tuple_preflight.additional_types()))
             .and_then(|count| count.checked_add(cold_function_types))
             .and_then(|count| count.checked_add(additional_source_types))
             .ok_or_else(|| Self::literal_cache_error(LiteralTypeCacheError::Capacity))?;
@@ -5119,8 +5199,10 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                         .ok_or_else(|| Self::literal_cache_error(LiteralTypeCacheError::Capacity))
                 }
             })?;
+        let type_node_links = self.missing_planned_type_node_links(plan)?;
         if !self.store.try_reserve_index_infos(index_infos)
             || !self.store.try_reserve_types(additional_types)
+            || !self.store.try_reserve_type_node_links(type_node_links)
         {
             return Err(Self::literal_cache_error(LiteralTypeCacheError::Capacity));
         }
@@ -5131,7 +5213,8 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 ));
             }
         }
-        self.store
+        let mut prepared = self
+            .store
             .prepare_type_query_types_with_pending_functions(
                 &strings,
                 &numbers,
@@ -5143,7 +5226,15 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 function_plans.len(),
                 function_type_aliases,
             )
-            .map_err(Self::literal_cache_error)
+            .map_err(Self::literal_cache_error)?;
+        self.store
+            .install_canonical_tuple_type_query(
+                tuple_preflight,
+                self.global_types.as_ref(),
+                &mut prepared,
+            )
+            .map_err(tuple_type_query_preparation_error)?;
+        Ok(prepared)
     }
 
     fn literal_cache_error(error: LiteralTypeCacheError) -> DeclaredTypeError {
@@ -5568,7 +5659,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         }
         let resolved = self
             .store
-            .create_canonical_tuple_type(request)
+            .create_canonical_tuple_type_prepared(tuple, request, prepared)
             .map_err(|error| tuple_type_error(error, tuple))?;
         self.publish_tuple_type_node_links(&tuple_plan, resolved)?;
         Ok(resolved)
@@ -5613,14 +5704,11 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         plan: &TupleTypeNodePlan,
         resolved: TypeId,
     ) -> Result<(), DeclaredTypeError> {
-        let mut nodes = vec![plan.tuple()];
-        if let Some(operator) = plan.readonly_operator() {
-            nodes.push(operator);
-        }
-        for node in &nodes {
+        let nodes = [Some(plan.tuple()), plan.readonly_operator()];
+        for node in nodes.into_iter().flatten() {
             if let Some(cached) = self
                 .store
-                .type_node_links(*node)
+                .type_node_links(node)
                 .and_then(|links| links.resolved_type)
                 && cached != resolved
             {
@@ -5629,7 +5717,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 ));
             }
         }
-        for node in nodes {
+        for node in nodes.into_iter().flatten() {
             let mut links = self
                 .store
                 .type_node_links(node)
@@ -16198,6 +16286,133 @@ mod tests {
                 .type_node_links(repair)
                 .and_then(|links| links.resolved_type),
             Some(established_type),
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn nested_duplicate_tuple_shapes_share_one_prepared_target() {
+        let mut fixture = fixture("let nested: [[string], [number]];");
+        let nested = variable_type_node(&fixture, "nested");
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let nested_type = query_node(&mut fixture, nested, &mut diagnostics).unwrap();
+        let nested_shape = fixture
+            .store
+            .canonical_tuple_shape(nested_type)
+            .unwrap()
+            .unwrap();
+        let [first, second] = nested_shape.element_types() else {
+            panic!("outer tuple has two elements")
+        };
+        let first_shape = fixture
+            .store
+            .canonical_tuple_shape(*first)
+            .unwrap()
+            .unwrap();
+        let second_shape = fixture
+            .store
+            .canonical_tuple_shape(*second)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first_shape.target(), second_shape.target());
+        assert_ne!(first_shape.type_(), second_shape.type_());
+        assert_eq!(
+            first_shape.element_types(),
+            &[fixture.store.intrinsic_bootstrap().unwrap().string_type],
+        );
+        assert_eq!(
+            second_shape.element_types(),
+            &[fixture.store.intrinsic_bootstrap().unwrap().number_type],
+        );
+        assert_eq!(fixture.store.canonical_tuple_target_len(), 2);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn shorthand_array_and_sole_rest_tuple_share_one_target_reservation() {
+        let mut fixture = global_array_fixture("let mixed: [string[], [...number[]]];");
+        let global_types = initialize_fixture_global_types(&mut fixture);
+        let mixed = variable_type_node(&fixture, "mixed");
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let mixed_type =
+            query_global_node(&mut fixture, &global_types, mixed, &mut diagnostics).unwrap();
+        let mixed_shape = fixture
+            .store
+            .canonical_tuple_shape(mixed_type)
+            .unwrap()
+            .unwrap();
+        let [shorthand, rest_tuple] = mixed_shape.element_types() else {
+            panic!("outer tuple has two elements")
+        };
+        let shorthand = fixture
+            .store
+            .canonical_array_reference(&global_types, *shorthand)
+            .unwrap()
+            .unwrap();
+        let rest_tuple = fixture
+            .store
+            .canonical_array_reference(&global_types, *rest_tuple)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            shorthand.base_type,
+            *mixed_shape.element_types().first().unwrap()
+        );
+        for type_ in [shorthand.base_type, rest_tuple.base_type] {
+            let TypeData::TypeReference(reference) =
+                fixture.store.type_payload(type_).unwrap().data()
+            else {
+                panic!("canonical array is a direct reference")
+            };
+            assert_eq!(reference.object.target, Some(global_types.array_type));
+        }
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn poisoned_tuple_target_is_rejected_before_child_links_or_writes() {
+        let mut fixture = fixture("let seed: [string]; let victim: [() => number];");
+        let seed = variable_type_node(&fixture, "seed");
+        let victim = variable_type_node(&fixture, "victim");
+        let NodeData::TupleTypeNode(victim_tuple) =
+            &fixture.parsed.arena.get(victim.node).unwrap().data
+        else {
+            panic!("expected victim tuple")
+        };
+        let child = NodeRef::new(victim.arena, victim.file, victim_tuple.elements.nodes[0]);
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let seed_type = query_node(&mut fixture, seed, &mut diagnostics).unwrap();
+        let target = fixture
+            .store
+            .canonical_tuple_shape(seed_type)
+            .unwrap()
+            .unwrap()
+            .target();
+        assert!(
+            fixture
+                .store
+                .set_type_object_flags(target, ObjectFlags::REFERENCE)
+        );
+        let before = (
+            store_state(&fixture.store),
+            fixture.store.symbol_len(),
+            fixture.store.canonical_tuple_target_len(),
+        );
+
+        assert_eq!(
+            query_node(&mut fixture, victim, &mut diagnostics),
+            Err(DeclaredTypeError::TypeNodeUnavailable(
+                TypeNodeUnavailable::InvalidCachedTupleType(target),
+            )),
+        );
+        assert_eq!(fixture.store.type_node_links(child), None);
+        assert_eq!(
+            (
+                store_state(&fixture.store),
+                fixture.store.symbol_len(),
+                fixture.store.canonical_tuple_target_len(),
+            ),
+            before,
         );
         assert!(diagnostics.is_empty());
     }
