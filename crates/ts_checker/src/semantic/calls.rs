@@ -15,7 +15,7 @@ use super::{
         StoredSingleCallableValidation, ValidatedSingleCallable, validate_stored_single_callable,
     },
     signatures::SignatureFlags,
-    type_records::{TypeData, TypeRecord},
+    type_records::TypeData,
     types::TypeFlags,
 };
 
@@ -23,7 +23,9 @@ use super::{
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum DirectCallForm {
     Call,
+    #[allow(dead_code)] // Retained as an explicit typed rejection seam.
     New,
+    #[allow(dead_code)] // Retained as an explicit typed rejection seam.
     TaggedTemplate,
 }
 
@@ -213,7 +215,7 @@ pub(super) fn resolve_direct_call(
         }
         StoredSingleCallableValidation::Valid { callable, .. } => callable,
     };
-    let mut resolution = project_validated_direct_call(store, request, callable)?;
+    let mut resolution = project_validated_direct_call(store, request, &callable)?;
     if resolution.applicability != DirectCallApplicability::Applicable {
         return Ok(resolution);
     }
@@ -264,7 +266,7 @@ fn validate_argument_types(
 fn project_validated_direct_call(
     store: &CanonicalTypeMapperStore,
     request: DirectCallRequest<'_>,
-    callable: ValidatedSingleCallable,
+    callable: &ValidatedSingleCallable,
 ) -> Result<DirectCallResolution, DirectCallError> {
     if callable.owner != request.callee {
         return Err(DirectCallInvariant::CallableOwnerMismatch {
@@ -343,7 +345,7 @@ fn project_validated_direct_call(
         DirectCallReturnKind::Value
     };
 
-    let minimum_argument_count = effective_minimum_argument_count(store, &callable)?;
+    let minimum_argument_count = effective_minimum_argument_count(store, callable)?;
     let argument_targets = request
         .arguments
         .iter()
@@ -539,7 +541,7 @@ mod tests {
         }
     }
 
-    fn request<'a>(callee: TypeId, arguments: &'a [TypeId]) -> DirectCallRequest<'a> {
+    fn request(callee: TypeId, arguments: &[TypeId]) -> DirectCallRequest<'_> {
         DirectCallRequest {
             form: DirectCallForm::Call,
             optional_chain: false,
@@ -612,12 +614,9 @@ mod tests {
             Some(string),
         );
         let arguments = [number];
-        let resolution = project_validated_direct_call(
-            &store,
-            request(callable.owner, &arguments),
-            callable.clone(),
-        )
-        .unwrap();
+        let resolution =
+            project_validated_direct_call(&store, request(callable.owner, &arguments), &callable)
+                .unwrap();
 
         assert_eq!(
             resolution.applicability,
@@ -655,12 +654,9 @@ mod tests {
             Some(string),
         );
 
-        let too_few = project_validated_direct_call(
-            &store,
-            request(callable.owner, &[number]),
-            callable.clone(),
-        )
-        .unwrap();
+        let too_few =
+            project_validated_direct_call(&store, request(callable.owner, &[number]), &callable)
+                .unwrap();
         assert_eq!(
             too_few.applicability,
             DirectCallApplicability::TooFewArguments {
@@ -672,7 +668,7 @@ mod tests {
         let too_many = project_validated_direct_call(
             &store,
             request(callable.owner, &[number, string, number]),
-            callable,
+            &callable,
         )
         .unwrap();
         assert_eq!(
@@ -699,7 +695,7 @@ mod tests {
             Some(void),
         );
         let resolution =
-            project_validated_direct_call(&store, request(callable.owner, &[number]), callable)
+            project_validated_direct_call(&store, request(callable.owner, &[number]), &callable)
                 .unwrap();
 
         assert_eq!(resolution.projection.minimum_argument_count, 1);
@@ -729,7 +725,7 @@ mod tests {
         let resolution = project_validated_direct_call(
             &store,
             request(callable.owner, &[number, string]),
-            callable,
+            &callable,
         )
         .unwrap();
         let applicability =
@@ -759,7 +755,7 @@ mod tests {
             project_validated_direct_call(
                 &store,
                 request(unresolved.owner, &[number]),
-                unresolved.clone(),
+                &unresolved,
             ),
             Err(DirectCallError::Unsupported(
                 DirectCallUnsupported::UnresolvedReturnType(unresolved.signature)
@@ -774,7 +770,7 @@ mod tests {
             Some(number),
         );
         assert_eq!(
-            project_validated_direct_call(&store, request(rest.owner, &[number]), rest.clone(),),
+            project_validated_direct_call(&store, request(rest.owner, &[number]), &rest,),
             Err(DirectCallError::Unsupported(
                 DirectCallUnsupported::RestSignature(rest.signature)
             ))

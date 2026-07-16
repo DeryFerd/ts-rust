@@ -335,6 +335,11 @@ fn prepare_expression(
             }
             PreparedExpression::Object(prepared)
         }
+        PlannedExpressionKind::Call(_) => {
+            return Err(SourceCheckError::Unsupported(
+                UnsupportedSourceSyntax::Call(expression.node),
+            ));
+        }
     };
     Ok(prepared)
 }

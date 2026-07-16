@@ -51,6 +51,10 @@ use super::{
         SourceCallableFamily, SourceCallablePlan, StoredSourceCallableValidation,
         plan_source_callable, publish_contextual_source_callable, validate_stored_source_callable,
     },
+    source_calls::{
+        SourceCallPlan, check_direct_source_call, finish_direct_source_call_plan,
+        plan_direct_source_call_syntax,
+    },
     source_functions::{
         PlannedFunctionRead, SourceFunctionInvariant, SourceFunctionPlanError,
         SourceFunctionUnsupported, plan_function_identifier_read, plan_top_level_function,
@@ -127,6 +131,7 @@ pub enum UnsupportedSourceSyntax {
     Arrow(NodeRef),
     Function(SourceFunctionUnsupported),
     Variable(VariableUnsupported),
+    Call(NodeRef),
 }
 
 /// Source and AST identity rejected before semantic execution.
@@ -238,6 +243,7 @@ pub enum SourceCheckError {
     Arrow(NodeRef),
     Function(SourceFunctionInvariant),
     Variable(VariableInvariant),
+    Call(NodeRef),
     MissingDiagnostic(u32),
 }
 
@@ -260,6 +266,7 @@ impl std::fmt::Display for SourceCheckError {
             Self::Arrow(node) => write!(formatter, "arrow checking failed at {node:?}"),
             Self::Function(error) => write!(formatter, "function checking failed: {error:?}"),
             Self::Variable(error) => write!(formatter, "variable checking failed: {error:?}"),
+            Self::Call(node) => write!(formatter, "call checking failed at {node:?}"),
             Self::MissingDiagnostic(code) => {
                 write!(formatter, "diagnostic TS{code} is absent from the catalog")
             }
@@ -285,6 +292,7 @@ impl std::error::Error for SourceCheckError {
             | Self::Arrow(_)
             | Self::Function(_)
             | Self::Variable(_)
+            | Self::Call(_)
             | Self::MissingDiagnostic(_) => None,
         }
     }
@@ -371,6 +379,7 @@ pub(super) enum PlannedExpressionKind {
         plan: super::object_members::PropertyObjectPlan,
         properties: Vec<PlannedExpression>,
     },
+    Call(Box<SourceCallPlan>),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1788,6 +1797,26 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             }
             SyntaxKind::ArrayLiteralExpression => self.plan_array_literal(expression),
             SyntaxKind::ObjectLiteralExpression => self.plan_object_literal(expression),
+            SyntaxKind::CallExpression => {
+                let Some((store, _)) = self.semantic else {
+                    return Err(SourceCheckError::Unsupported(
+                        UnsupportedSourceSyntax::Call(expression),
+                    ));
+                };
+                let syntax = plan_direct_source_call_syntax(self.arena, store, expression)?;
+                let callee_node = syntax.callee();
+                let argument_nodes = syntax.arguments().to_vec();
+                let callee = self.plan_expression(callee_node)?;
+                let arguments = argument_nodes
+                    .into_iter()
+                    .map(|argument| self.plan_expression(argument))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let call = finish_direct_source_call_plan(&syntax, callee, arguments)?;
+                Ok(PlannedExpression::new(
+                    expression,
+                    PlannedExpressionKind::Call(Box::new(call)),
+                ))
+            }
             _ => Err(self.unsupported(expression, kind, SourceSyntaxRole::VariableInitializer)),
         }
     }
@@ -2683,6 +2712,52 @@ fn check_expression_type(
     deferred: &mut Vec<DeferredAssertion>,
 ) -> Result<CheckedExpressionTypes, SourceCheckError> {
     match &expression.kind {
+        PlannedExpressionKind::Call(call) => {
+            let callee = check_expression_type(
+                store,
+                host,
+                global_types,
+                source,
+                options,
+                diagnostics,
+                current_flow_types,
+                &call.callee,
+                None,
+                deferred,
+            )?;
+            let mut argument_types = Vec::with_capacity(call.arguments.len());
+            for argument in &call.arguments {
+                argument_types.push(
+                    check_expression_type(
+                        store,
+                        host,
+                        global_types,
+                        source,
+                        options,
+                        diagnostics,
+                        current_flow_types,
+                        argument,
+                        None,
+                        deferred,
+                    )?
+                    .result,
+                );
+            }
+            let checked = check_direct_source_call(
+                store,
+                host,
+                global_types,
+                options,
+                diagnostics,
+                call,
+                callee.result,
+                &argument_types,
+            )?;
+            Ok(CheckedExpressionTypes::leaf(
+                checked.return_type,
+                checked.return_type,
+            ))
+        }
         PlannedExpressionKind::Parenthesized(inner) => {
             let types = check_expression_type(
                 store,
