@@ -4532,10 +4532,8 @@ mod tests {
             .parsed
             .arena
             .iter()
-            .filter_map(|(node, record)| {
-                (record.kind == SyntaxKind::FunctionType)
-                    .then(|| NodeRef::new(fixture.parsed.arena.id(), fixture.file, node))
-            })
+            .filter(|(_, record)| record.kind == SyntaxKind::FunctionType)
+            .map(|(node, _)| NodeRef::new(fixture.parsed.arena.id(), fixture.file, node))
             .filter_map(|node| {
                 fixture
                     .store
@@ -4565,11 +4563,11 @@ mod tests {
     #[test]
     fn exact_function_aliases_compare_identically_after_lazy_returns_resolve() {
         let mut fixture = function_relation_fixture(
-            r#"
+            r"
                 type Left = (value: string) => number;
                 type Right = (value: string) => number;
                 type Optional = (value?: string) => number;
-            "#,
+            ",
         );
         let (left, _) = query_function_alias(&mut fixture, "Left");
         let (right, _) = query_function_alias(&mut fixture, "Right");
@@ -4636,12 +4634,12 @@ mod tests {
     #[test]
     fn signature_arity_distinguishes_required_optional_and_strict_subtypes() {
         let mut fixture = function_relation_fixture(
-            r#"
+            r"
                 type Zero = () => void;
                 type Required = (value: string) => void;
                 type Optional = (value?: string) => void;
                 type VoidParameter = (value: void) => void;
-            "#,
+            ",
         );
         let (zero, _) = query_function_alias(&mut fixture, "Zero");
         let (required, _) = query_function_alias(&mut fixture, "Required");
@@ -4822,10 +4820,10 @@ mod tests {
     #[test]
     fn recursive_callback_comparison_propagates_maybe_before_root_commit() {
         let mut fixture = function_relation_fixture(
-            r#"
+            r"
                 type Left = (next: Left) => void;
                 type Right = (next: Right) => void;
-            "#,
+            ",
         );
         let (left, _) = query_function_alias(&mut fixture, "Left");
         let (right, _) = query_function_alias(&mut fixture, "Right");
