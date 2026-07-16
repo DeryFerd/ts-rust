@@ -266,6 +266,7 @@ fn is_context_insensitive_argument_plan(expression: &PlannedExpression) -> bool 
         | PlannedExpressionKind::Property(_) => true,
         PlannedExpressionKind::Parenthesized(inner) => is_context_insensitive_argument_plan(inner),
         PlannedExpressionKind::Assertion { .. }
+        | PlannedExpressionKind::TypeImportValueUse(_)
         | PlannedExpressionKind::Array(_)
         | PlannedExpressionKind::Object { .. }
         | PlannedExpressionKind::Call(_) => false,

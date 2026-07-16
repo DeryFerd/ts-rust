@@ -250,6 +250,11 @@ fn prepare_expression(
                 location,
             )?)
         }
+        PlannedExpressionKind::TypeImportValueUse(_) => {
+            return Err(SourceCheckError::Unsupported(
+                UnsupportedSourceSyntax::Import(expression.node),
+            ));
+        }
         PlannedExpressionKind::String(_) => PreparedExpression::Literal(literal_treatment(
             store,
             global_types,

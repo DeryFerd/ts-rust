@@ -52,6 +52,31 @@ fn import_specifier(parsed: &ParseResult, file: FileId, declaration: NodeRef) ->
     NodeRef::new(parsed.arena.id(), file, import.module_specifier)
 }
 
+fn variable_initializer(parsed: &ParseResult, file: FileId, expected: &str) -> NodeRef {
+    parsed
+        .arena
+        .iter()
+        .find_map(|(_, record)| {
+            let NodeData::VariableDeclaration(variable) = &record.data else {
+                return None;
+            };
+            let name = parsed.arena.get(variable.name)?;
+            let NodeData::Identifier(identifier) = &name.data else {
+                return None;
+            };
+            (identifier.text == expected).then(|| {
+                NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    variable
+                        .initializer
+                        .expect("fixture variable has an initializer"),
+                )
+            })
+        })
+        .unwrap_or_else(|| panic!("fixture has variable {expected}"))
+}
+
 fn make_context<'arena>(
     importer: &'arena ParseResult,
     target: &'arena ParseResult,
@@ -162,6 +187,84 @@ fn importer_first_named_value_reads_are_exact_and_warm_stable() {
             .collect::<Vec<_>>(),
         [2322]
     );
+}
+
+#[test]
+fn importer_first_type_only_imports_check_annotations_and_reject_value_uses() {
+    let importer = parse_source_file(concat!(
+        "import type { User as LocalUser } from './target'; ",
+        "const good: LocalUser = 1; ",
+        "const bad: LocalUser = 'wrong'; ",
+        "const invalid = LocalUser;",
+    ));
+    let target = parse_source_file("export type User = number;");
+    let importer_file = FileId::new(10);
+    let target_file = FileId::new(11);
+    let (mut context, binding) = make_context(&importer, &target, importer_file, target_file);
+    let alias = context
+        .file(importer_file)
+        .unwrap()
+        .1
+        .symbol(binding)
+        .unwrap();
+    let invalid_initializer = variable_initializer(&importer, importer_file, "invalid");
+    let target_source = context.source_file(target_file).unwrap();
+
+    context.check_source_file(importer_file).unwrap();
+
+    let codes = context
+        .diagnostics()
+        .as_slice()
+        .iter()
+        .map(|diagnostic| diagnostic.diagnostic.code())
+        .collect::<Vec<_>>();
+    assert_eq!(codes, [2322, 1361]);
+    let type_only_value_use = context
+        .diagnostics()
+        .as_slice()
+        .iter()
+        .find(|diagnostic| diagnostic.diagnostic.code() == 1361)
+        .expect("type-only value use reports TS1361");
+    assert_eq!(
+        type_only_value_use.diagnostic.render().unwrap(),
+        "'LocalUser' cannot be used as a value because it was imported using 'import type'."
+    );
+    let target_symbol = match context
+        .store()
+        .alias_symbol_links(alias)
+        .expect("type import resolves its alias")
+        .alias_target
+    {
+        AliasTargetState::Resolved(target) => target,
+        state => panic!("type import alias is not resolved: {state:?}"),
+    };
+    assert!(context.store().value_symbol_links(alias).is_none());
+    assert!(context.store().value_symbol_links(target_symbol).is_none());
+    assert_eq!(
+        context
+            .store()
+            .symbol_node_links(invalid_initializer)
+            .and_then(|links| links.resolved_symbol),
+        Some(alias)
+    );
+    let error_type = context.store().intrinsic_bootstrap().unwrap().error_type;
+    assert_eq!(
+        context
+            .store()
+            .type_node_links(invalid_initializer)
+            .and_then(|links| links.resolved_type),
+        Some(error_type)
+    );
+    assert!(
+        !context
+            .store()
+            .source_file_links(target_source)
+            .is_some_and(|links| links.type_checked),
+        "importer-first type lookup must not recursively check the target source"
+    );
+
+    context.check_source_file(importer_file).unwrap();
+    assert_eq!(context.diagnostics().as_slice().len(), 2);
 }
 
 #[test]

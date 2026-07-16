@@ -2,7 +2,8 @@
 //!
 //! This module deliberately supports only unmodified type aliases and simple
 //! interfaces, top-level literal enums, empty external-module markers,
-//! leading direct named ESM value imports,
+//! leading direct named ESM value imports, clause-level type-only named ESM
+//! imports in exact top-level variable annotations,
 //! annotated top-level function declarations, initialized identifier-named
 //! top-level variables (optionally exported), ordinary direct identifier
 //! calls, required own-property reads, and direct assignments back to
@@ -19,7 +20,9 @@
 use std::collections::{HashMap, HashSet};
 
 use ts_ast::{FileId, ModifierList, Node, NodeArena, NodeData, NodeId, NodeRef, SyntaxKind};
-use ts_binder::{BoundFile, SemanticSymbolId};
+use ts_binder::{
+    BoundFile, CanonicalNameResolver, CanonicalResolutionLocation, SemanticSymbolId, SymbolFlags,
+};
 use ts_core::TextRange;
 use ts_diagnostics::{Diagnostic, message_by_code};
 use ts_jsnum::{Number, PseudoBigInt};
@@ -66,17 +69,23 @@ use super::{
     },
     source_imports::{
         PlannedSourceImportRead, PreparedSourceImportPublication, PreparedSourceImportValue,
-        ResolvedSourceImportBinding, SourceImportBindingPlan, SourceImportError, SourceImportPlan,
-        plan_source_import_identifier_read, plan_top_level_named_value_import,
+        ResolvedSourceImportBinding, ResolvedSourceTypeImportBinding, SourceImportBindingPlan,
+        SourceImportError, SourceImportPlan, SourceImportUnsupported,
+        plan_source_import_identifier_read, plan_source_type_import_reference,
+        plan_top_level_named_type_import, plan_top_level_named_value_import,
         preflight_prepared_source_import_publications, prepare_source_import_value,
-        resolve_source_import_binding,
+        reject_source_type_import_value_use, resolve_source_import_binding,
+        resolve_source_type_import_binding,
     },
     source_properties::{
         SourcePropertyError, SourcePropertyPlan, SourcePropertyUnsupported,
         check_direct_source_property, finish_direct_source_property_plan,
         plan_direct_source_property_syntax,
     },
-    type_nodes::{CanonicalTypeQuery, normalize_bigint_literal, normalize_numeric_separators},
+    type_nodes::{
+        CanonicalTypeQuery, CanonicalTypeReferenceAliasTarget, normalize_bigint_literal,
+        normalize_numeric_separators,
+    },
     type_records::{TypeData, TypeRecord},
     types::TypeFlags,
     variables::{
@@ -398,6 +407,7 @@ pub(super) enum PlannedExpressionKind {
     Boolean(bool),
     GlobalUndefined,
     Identifier(PlannedIdentifierRead),
+    TypeImportValueUse(PlannedSourceTypeImportValueUse),
     Parenthesized(Box<PlannedExpression>),
     Assertion {
         type_node: NodeRef,
@@ -410,6 +420,30 @@ pub(super) enum PlannedExpressionKind {
     },
     Property(Box<SourcePropertyPlan>),
     Call(Box<SourceCallPlan>),
+}
+
+/// A direct expression read of one clause-level type-only import. It remains
+/// separate from value-family identifier reads so execution cannot consult or
+/// populate the alias's current-flow or value-symbol state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct PlannedSourceTypeImportValueUse {
+    node: NodeRef,
+    alias_symbol: SemanticSymbolId,
+    name: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PreparedSourceTypeImportValueUse {
+    diagnostic: CanonicalCheckerDiagnostic,
+    error_type: TypeId,
+    prior_links: Option<TypeNodeLinks>,
+    publication: TypeNodeLinks,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PlannedSourceTypeImportReference {
+    node: NodeRef,
+    alias_symbol: SemanticSymbolId,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -529,8 +563,11 @@ enum PlannedStatement {
 #[derive(Debug)]
 struct SourceCheckPlan {
     statements: Vec<PlannedStatement>,
-    imports: Vec<SourceImportPlan>,
+    value_imports: Vec<SourceImportPlan>,
+    type_imports: Vec<SourceImportPlan>,
     import_reads: Vec<PlannedSourceImportRead>,
+    type_import_references: Vec<PlannedSourceTypeImportReference>,
+    type_import_value_uses: Vec<PlannedSourceTypeImportValueUse>,
     functions: Vec<PlannedFunction>,
     arrows: Vec<PlannedArrow>,
     contextual_arrows: Vec<PlannedContextualArrow>,
@@ -554,8 +591,11 @@ struct SourcePlanner<'arena, 'semantic, 'sources> {
     numbers: Vec<Number>,
     bigints: Vec<PseudoBigInt>,
     identifier_reads: Vec<(NodeRef, SemanticSymbolId)>,
-    import_bindings: HashMap<SemanticSymbolId, SourceImportBindingPlan>,
+    value_import_bindings: HashMap<SemanticSymbolId, SourceImportBindingPlan>,
+    type_import_bindings: HashMap<SemanticSymbolId, SourceImportBindingPlan>,
     import_reads: Vec<PlannedSourceImportRead>,
+    type_import_references: Vec<PlannedSourceTypeImportReference>,
+    type_import_value_uses: Vec<PlannedSourceTypeImportValueUse>,
     semantic: Option<(
         &'semantic CanonicalTypeMapperStore,
         &'semantic DeclaredTypeHost<'sources>,
@@ -577,8 +617,11 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             numbers: Vec::new(),
             bigints: Vec::new(),
             identifier_reads: Vec::new(),
-            import_bindings: HashMap::new(),
+            value_import_bindings: HashMap::new(),
+            type_import_bindings: HashMap::new(),
             import_reads: Vec::new(),
+            type_import_references: Vec::new(),
+            type_import_value_uses: Vec::new(),
             semantic: None,
             array_targets: None,
             hoisted_functions: HashSet::new(),
@@ -602,8 +645,11 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             numbers: Vec::new(),
             bigints: Vec::new(),
             identifier_reads: Vec::new(),
-            import_bindings: HashMap::new(),
+            value_import_bindings: HashMap::new(),
+            type_import_bindings: HashMap::new(),
             import_reads: Vec::new(),
+            type_import_references: Vec::new(),
+            type_import_value_uses: Vec::new(),
             semantic: Some((store, host)),
             array_targets: None,
             hoisted_functions: HashSet::new(),
@@ -650,8 +696,8 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         }
 
         let source_statements = source_data.statements.nodes.clone();
-        let mut preplanned_functions = HashMap::new();
-        let mut imports = Vec::new();
+        let mut value_imports = Vec::new();
+        let mut type_imports = Vec::new();
         let mut leading_import_prefix = true;
         for statement in &source_statements {
             let statement = self.reference(*statement);
@@ -662,36 +708,60 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                             UnsupportedSourceSyntax::Import(statement),
                         ));
                     };
-                    let import =
+                    let type_only = self.import_is_type_only(statement)?;
+                    let import = if type_only {
+                        plan_top_level_named_type_import(self.arena, self.bound, store, statement)
+                    } else {
                         plan_top_level_named_value_import(self.arena, self.bound, store, statement)
-                            .map_err(|error| Self::import_plan_error(statement, &error))?;
+                    }
+                    .map_err(|error| Self::import_plan_error(statement, &error))?;
                     for binding in &import.bindings {
-                        if self
-                            .import_bindings
-                            .insert(binding.alias_symbol, binding.clone())
-                            .is_some()
-                        {
+                        let duplicate = if type_only {
+                            self.value_import_bindings
+                                .contains_key(&binding.alias_symbol)
+                                || self
+                                    .type_import_bindings
+                                    .insert(binding.alias_symbol, binding.clone())
+                                    .is_some()
+                        } else {
+                            self.type_import_bindings
+                                .contains_key(&binding.alias_symbol)
+                                || self
+                                    .value_import_bindings
+                                    .insert(binding.alias_symbol, binding.clone())
+                                    .is_some()
+                        };
+                        if duplicate {
                             return Err(SourceCheckError::Import(binding.declaration));
                         }
                     }
-                    imports.push(import);
+                    if type_only {
+                        type_imports.push(import);
+                    } else {
+                        value_imports.push(import);
+                    }
                 }
                 SyntaxKind::ImportDeclaration => {
                     return Err(SourceCheckError::Unsupported(
                         UnsupportedSourceSyntax::Import(statement),
                     ));
                 }
-                SyntaxKind::FunctionDeclaration => {
-                    leading_import_prefix = false;
-                    let callable =
-                        self.preplan_function_declaration(statement, is_external_module)?;
-                    if preplanned_functions.insert(statement, callable).is_some() {
-                        return Err(SourceCheckError::Function(
-                            SourceFunctionInvariant::DuplicateDeclaration(statement),
-                        ));
-                    }
-                }
                 _ => leading_import_prefix = false,
+            }
+        }
+        self.validate_type_import_reference_boundaries()?;
+
+        let mut preplanned_functions = HashMap::new();
+        for statement in &source_statements {
+            let statement = self.reference(*statement);
+            if self.node(statement)?.kind != SyntaxKind::FunctionDeclaration {
+                continue;
+            }
+            let callable = self.preplan_function_declaration(statement, is_external_module)?;
+            if preplanned_functions.insert(statement, callable).is_some() {
+                return Err(SourceCheckError::Function(
+                    SourceFunctionInvariant::DuplicateDeclaration(statement),
+                ));
             }
         }
 
@@ -908,8 +978,11 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             .collect::<Result<Vec<_>, _>>()?;
         Ok(SourceCheckPlan {
             statements,
-            imports,
+            value_imports,
+            type_imports,
             import_reads: self.import_reads,
+            type_import_references: self.type_import_references,
+            type_import_value_uses: self.type_import_value_uses,
             functions,
             arrows,
             contextual_arrows,
@@ -918,6 +991,195 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             numbers: self.numbers,
             bigints: self.bigints,
         })
+    }
+
+    fn import_is_type_only(&self, declaration: NodeRef) -> Result<bool, SourceCheckError> {
+        let record = self.node(declaration)?;
+        let NodeData::ImportDeclaration(import) = &record.data else {
+            return Ok(false);
+        };
+        let Some(clause) = import.import_clause.map(|node| self.reference(node)) else {
+            return Ok(false);
+        };
+        let clause = self.node(clause)?;
+        let NodeData::ImportClause(clause) = &clause.data else {
+            return Ok(false);
+        };
+        Ok(clause.phase_modifier == Some(SyntaxKind::TypeKeyword))
+    }
+
+    fn type_import_alias_for_type_reference(
+        &self,
+        reference: NodeRef,
+    ) -> Result<Option<SemanticSymbolId>, SourceCheckError> {
+        let record = self.node(reference)?;
+        let NodeData::TypeReferenceNode(type_reference) = &record.data else {
+            return Ok(None);
+        };
+        let mut name = self.reference(type_reference.type_name);
+        let text = loop {
+            match &self.node(name)?.data {
+                NodeData::Identifier(identifier) => break identifier.text.as_str(),
+                NodeData::QualifiedName(qualified) => name = self.reference(qualified.left),
+                _ => return Ok(None),
+            }
+        };
+        let mut matches = self
+            .type_import_bindings
+            .iter()
+            .filter_map(|(&symbol, binding)| (binding.local_text == text).then_some(symbol));
+        let Some(symbol) = matches.next() else {
+            return Ok(None);
+        };
+        if matches.next().is_some() {
+            return Err(SourceCheckError::Import(reference));
+        }
+        Ok(Some(symbol))
+    }
+
+    fn resolved_type_import_alias_for_reference(
+        &self,
+        reference: NodeRef,
+    ) -> Result<Option<SemanticSymbolId>, SourceCheckError> {
+        let record = self.node(reference)?;
+        let NodeData::TypeReferenceNode(type_reference) = &record.data else {
+            return Ok(None);
+        };
+        let name = self.reference(type_reference.type_name);
+        let name_record = self.node(name)?;
+        let NodeData::Identifier(identifier) = &name_record.data else {
+            return Ok(None);
+        };
+        let Some((store, host)) = self.semantic else {
+            return Ok(None);
+        };
+        let mut callback_host = host.name_resolver_host(store)?;
+        let result = CanonicalNameResolver::new(
+            self.arena,
+            self.bound,
+            store.symbol_store(),
+            &mut callback_host,
+        )
+        .map_err(DeclaredTypeError::from)?
+        .resolve(
+            Some(CanonicalResolutionLocation::Bound(name)),
+            &identifier.text,
+            SymbolFlags::TYPE,
+            None,
+            true,
+            false,
+        );
+        Ok(match result {
+            Err(ts_binder::CanonicalNameResolutionError::AliasResolutionUnavailable(alias))
+                if self.type_import_bindings.contains_key(&alias) =>
+            {
+                Some(alias)
+            }
+            _ => None,
+        })
+    }
+
+    fn is_exact_top_level_variable_type_reference(
+        &self,
+        reference: NodeRef,
+    ) -> Result<bool, SourceCheckError> {
+        let record = self.node(reference)?;
+        let NodeData::TypeReferenceNode(type_reference) = &record.data else {
+            return Ok(false);
+        };
+        let name = self.reference(type_reference.type_name);
+        let name_record = self.node(name)?;
+        if record.kind != SyntaxKind::TypeReference
+            || record.flags.0 != 0
+            || type_reference.type_arguments.is_some()
+            || name_record.kind != SyntaxKind::Identifier
+            || name_record.flags.0 != 0
+            || name_record.parent != Some(reference.node)
+            || !matches!(
+                &name_record.data,
+                NodeData::Identifier(identifier) if identifier.flow_node.is_none()
+            )
+        {
+            return Ok(false);
+        }
+        let Some(declaration) = record.parent.map(|node| self.reference(node)) else {
+            return Ok(false);
+        };
+        let declaration_record = self.node(declaration)?;
+        let NodeData::VariableDeclaration(variable) = &declaration_record.data else {
+            return Ok(false);
+        };
+        if declaration_record.kind != SyntaxKind::VariableDeclaration
+            || variable.type_ != Some(reference.node)
+        {
+            return Ok(false);
+        }
+        let Some(list) = declaration_record.parent.map(|node| self.reference(node)) else {
+            return Ok(false);
+        };
+        let list_record = self.node(list)?;
+        let Some(statement) = list_record.parent.map(|node| self.reference(node)) else {
+            return Ok(false);
+        };
+        let statement_record = self.node(statement)?;
+        Ok(list_record.kind == SyntaxKind::VariableDeclarationList
+            && statement_record.kind == SyntaxKind::VariableStatement
+            && statement_record.parent == Some(self.source.node_ref().node))
+    }
+
+    fn validate_type_import_reference_boundaries(&self) -> Result<(), SourceCheckError> {
+        if self.type_import_bindings.is_empty() {
+            return Ok(());
+        }
+        for (node, record) in self.arena.iter() {
+            if record.kind != SyntaxKind::TypeReference {
+                continue;
+            }
+            let reference = self.reference(node);
+            if self
+                .type_import_alias_for_type_reference(reference)?
+                .is_some()
+                && !self.is_exact_top_level_variable_type_reference(reference)?
+            {
+                return Err(SourceCheckError::Unsupported(
+                    UnsupportedSourceSyntax::Import(reference),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn is_direct_top_level_variable_initializer(
+        &self,
+        expression: NodeRef,
+    ) -> Result<bool, SourceCheckError> {
+        let Some(declaration) = self
+            .node(expression)?
+            .parent
+            .map(|node| self.reference(node))
+        else {
+            return Ok(false);
+        };
+        let declaration_record = self.node(declaration)?;
+        let NodeData::VariableDeclaration(variable) = &declaration_record.data else {
+            return Ok(false);
+        };
+        if declaration_record.kind != SyntaxKind::VariableDeclaration
+            || variable.initializer != Some(expression.node)
+        {
+            return Ok(false);
+        }
+        let Some(list) = declaration_record.parent.map(|node| self.reference(node)) else {
+            return Ok(false);
+        };
+        let list_record = self.node(list)?;
+        let Some(statement) = list_record.parent.map(|node| self.reference(node)) else {
+            return Ok(false);
+        };
+        let statement_record = self.node(statement)?;
+        Ok(list_record.kind == SyntaxKind::VariableDeclarationList
+            && statement_record.kind == SyntaxKind::VariableStatement
+            && statement_record.parent == Some(self.source.node_ref().node))
     }
 
     fn assignment_plan_error(error: super::assignment::AssignmentPlanError) -> SourceCheckError {
@@ -1776,6 +2038,20 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             let kind = self.node(type_node)?.kind;
             return Err(self.unsupported(type_node, kind, SourceSyntaxRole::VariableType));
         }
+        if let Some(type_node) = type_node
+            && let Some(alias_symbol) = self.resolved_type_import_alias_for_reference(type_node)?
+        {
+            if !self.is_exact_top_level_variable_type_reference(type_node)? {
+                return Err(SourceCheckError::Unsupported(
+                    UnsupportedSourceSyntax::Import(type_node),
+                ));
+            }
+            self.type_import_references
+                .push(PlannedSourceTypeImportReference {
+                    node: type_node,
+                    alias_symbol,
+                });
+        }
 
         let initializer = initializer_id.map(|node| self.reference(node)).ok_or(
             SourceCheckError::Unsupported(UnsupportedSourceSyntax::MissingVariableInitializer(
@@ -1900,12 +2176,14 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     expression,
                     &name,
                 );
-                let read = match variable_read {
-                    Ok(read) => PlannedIdentifierRead::variable(read),
+                let kind = match variable_read {
+                    Ok(read) => {
+                        PlannedExpressionKind::Identifier(PlannedIdentifierRead::variable(read))
+                    }
                     Err(VariablePlanError::Unsupported(
                         VariableUnsupported::NonVariableSymbol { flags, .. },
                     )) if flags == ts_binder::SymbolFlags::FUNCTION => {
-                        PlannedIdentifierRead::function(
+                        PlannedExpressionKind::Identifier(PlannedIdentifierRead::function(
                             plan_function_identifier_read(
                                 self.arena,
                                 self.bound,
@@ -1916,7 +2194,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                                 &name,
                             )
                             .map_err(Self::function_plan_error)?,
-                        )
+                        ))
                     }
                     Err(
                         error @ VariablePlanError::Unsupported(VariableUnsupported::AliasSymbol {
@@ -1924,24 +2202,41 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                             ..
                         }),
                     ) => {
-                        let Some(binding) = self.import_bindings.get(&symbol) else {
+                        if let Some(binding) = self.value_import_bindings.get(&symbol) {
+                            let import_read = plan_source_import_identifier_read(
+                                self.arena, self.bound, store, binding, expression, &name, symbol,
+                            )
+                            .map_err(|error| Self::import_plan_error(expression, &error))?;
+                            self.import_reads.push(import_read);
+                            PlannedExpressionKind::Identifier(PlannedIdentifierRead::import(
+                                import_read,
+                            ))
+                        } else if self.type_import_bindings.contains_key(&symbol) {
+                            if !self.is_direct_top_level_variable_initializer(expression)? {
+                                return Err(SourceCheckError::Unsupported(
+                                    UnsupportedSourceSyntax::Import(expression),
+                                ));
+                            }
+                            let read = PlannedSourceTypeImportValueUse {
+                                node: expression,
+                                alias_symbol: symbol,
+                                name,
+                            };
+                            self.type_import_value_uses.push(read.clone());
+                            PlannedExpressionKind::TypeImportValueUse(read)
+                        } else {
                             return Err(Self::variable_plan_error(error));
-                        };
-                        let import_read = plan_source_import_identifier_read(
-                            self.arena, self.bound, store, binding, expression, &name, symbol,
-                        )
-                        .map_err(|error| Self::import_plan_error(expression, &error))?;
-                        self.import_reads.push(import_read);
-                        PlannedIdentifierRead::import(import_read)
+                        }
                     }
                     Err(error) => return Err(Self::variable_plan_error(error)),
                 };
-                self.identifier_reads
-                    .push((expression, read.resolved_symbol));
-                Ok(PlannedExpression::new(
-                    expression,
-                    PlannedExpressionKind::Identifier(read),
-                ))
+                let resolved_symbol = match &kind {
+                    PlannedExpressionKind::Identifier(read) => read.resolved_symbol,
+                    PlannedExpressionKind::TypeImportValueUse(read) => read.alias_symbol,
+                    _ => unreachable!("an identifier syntax plans one identifier-family read"),
+                };
+                self.identifier_reads.push((expression, resolved_symbol));
+                Ok(PlannedExpression::new(expression, kind))
             }
             SyntaxKind::StringLiteral => {
                 let value = {
@@ -3001,6 +3296,119 @@ fn enqueue_deferred_assertion(
     Ok(())
 }
 
+fn preflight_type_import_value_use(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    resolved_type_imports: &HashMap<SemanticSymbolId, ResolvedSourceTypeImportBinding>,
+    read: &PlannedSourceTypeImportValueUse,
+) -> Result<PreparedSourceTypeImportValueUse, SourceCheckError> {
+    let resolved = resolved_type_imports
+        .get(&read.alias_symbol)
+        .ok_or(SourceCheckError::Import(read.node))?;
+    match reject_source_type_import_value_use(
+        arena,
+        bound,
+        store,
+        resolved,
+        read.node,
+        &read.name,
+        read.alias_symbol,
+    ) {
+        Err(SourceImportError::Unsupported(SourceImportUnsupported::ValueUseOfTypeOnlyImport(
+            node,
+        ))) if node == read.node => {}
+        Err(error) => return Err(SourcePlanner::import_plan_error(read.node, &error)),
+        Ok(()) => return Err(SourceCheckError::Import(read.node)),
+    }
+    let error_type = store
+        .intrinsic_bootstrap()
+        .map(|bootstrap| bootstrap.error_type)
+        .ok_or(SourceCheckError::LiteralCache(
+            SourceLiteralCacheError::BootstrapUninitialized,
+        ))?;
+    let prior_links = store.type_node_links(read.node).cloned();
+    let mut publication = prior_links.clone().unwrap_or_default();
+    if !store.contains_node_ref(read.node)
+        || store.type_payload(error_type).is_none()
+        || publication
+            .outer_type_parameters
+            .as_deref()
+            .is_some_and(|types| {
+                types
+                    .iter()
+                    .any(|type_| store.type_payload(*type_).is_none())
+            })
+        || publication
+            .resolved_type
+            .is_some_and(|cached| cached != error_type)
+    {
+        return Err(SourceCheckError::Assertion(
+            SourceAssertionError::InvalidExpressionCache {
+                node: read.node,
+                cached: publication.resolved_type,
+                expected: error_type,
+            },
+        ));
+    }
+    publication.resolved_type = Some(error_type);
+    Ok(PreparedSourceTypeImportValueUse {
+        diagnostic: CanonicalCheckerDiagnostic {
+            node: Some(read.node),
+            diagnostic: Diagnostic::with_arguments(
+                message_by_code(1361).ok_or(SourceCheckError::MissingDiagnostic(1361))?,
+                [read.name.clone()],
+            ),
+            related_information: Vec::new(),
+        },
+        error_type,
+        prior_links,
+        publication,
+    })
+}
+
+fn check_type_import_value_use(
+    store: &mut CanonicalTypeMapperStore,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    preflighted_type_import_value_uses: &HashMap<NodeRef, PreparedSourceTypeImportValueUse>,
+    read: &PlannedSourceTypeImportValueUse,
+) -> Result<CheckedExpressionTypes, SourceCheckError> {
+    let prepared = preflighted_type_import_value_uses
+        .get(&read.node)
+        .ok_or(SourceCheckError::Import(read.node))?;
+    if store.type_node_links(read.node) != prepared.prior_links.as_ref() {
+        return Err(SourceCheckError::Assertion(
+            SourceAssertionError::InvalidExpressionCache {
+                node: read.node,
+                cached: store
+                    .type_node_links(read.node)
+                    .and_then(|links| links.resolved_type),
+                expected: prepared.error_type,
+            },
+        ));
+    }
+    // Preflight proved node, error-type, and outer-type provenance. The store is
+    // append-only for all three, and the exact link comparison above prevents
+    // an intervening source statement from invalidating this prepared payload.
+    if !store.set_type_node_links(read.node, prepared.publication.clone()) {
+        return Err(SourceCheckError::Assertion(
+            SourceAssertionError::InvalidExpressionCache {
+                node: read.node,
+                cached: prepared
+                    .prior_links
+                    .as_ref()
+                    .and_then(|links| links.resolved_type),
+                expected: prepared.error_type,
+            },
+        ));
+    }
+    merge_retry_diagnostic(diagnostics, prepared.diagnostic.clone());
+    Ok(CheckedExpressionTypes::leaf(
+        prepared.error_type,
+        prepared.error_type,
+    ))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn check_expression_type(
     store: &mut CanonicalTypeMapperStore,
@@ -3010,11 +3418,18 @@ fn check_expression_type(
     options: CanonicalCheckerOptions,
     diagnostics: &mut CanonicalCheckerDiagnostics,
     current_flow_types: &HashMap<SemanticSymbolId, TypeId>,
+    preflighted_type_import_value_uses: &HashMap<NodeRef, PreparedSourceTypeImportValueUse>,
     expression: &PlannedExpression,
     contextual_type: Option<TypeId>,
     deferred: &mut Vec<DeferredAssertion>,
 ) -> Result<CheckedExpressionTypes, SourceCheckError> {
     match &expression.kind {
+        PlannedExpressionKind::TypeImportValueUse(read) => check_type_import_value_use(
+            store,
+            diagnostics,
+            preflighted_type_import_value_uses,
+            read,
+        ),
         PlannedExpressionKind::Call(call) => {
             let callee = check_expression_type(
                 store,
@@ -3024,6 +3439,7 @@ fn check_expression_type(
                 options,
                 diagnostics,
                 current_flow_types,
+                preflighted_type_import_value_uses,
                 &call.callee,
                 None,
                 deferred,
@@ -3039,6 +3455,7 @@ fn check_expression_type(
                         options,
                         diagnostics,
                         current_flow_types,
+                        preflighted_type_import_value_uses,
                         argument,
                         None,
                         deferred,
@@ -3070,6 +3487,7 @@ fn check_expression_type(
                 options,
                 diagnostics,
                 current_flow_types,
+                preflighted_type_import_value_uses,
                 inner,
                 contextual_type,
                 deferred,
@@ -3086,6 +3504,7 @@ fn check_expression_type(
                 options,
                 diagnostics,
                 current_flow_types,
+                preflighted_type_import_value_uses,
                 operand,
                 None,
                 deferred,
@@ -3277,8 +3696,10 @@ fn check_planned_assignment(
     options: CanonicalCheckerOptions,
     diagnostics: &mut CanonicalCheckerDiagnostics,
     flow_types: &HashMap<SemanticSymbolId, TypeId>,
+    preflighted_type_import_value_uses: &HashMap<NodeRef, PreparedSourceTypeImportValueUse>,
     deferred: &mut Vec<DeferredAssertion>,
     target_type_node: NodeRef,
+    type_reference_alias_targets: &[CanonicalTypeReferenceAliasTarget],
     expression: &PlannedExpression,
     fallback_node: NodeRef,
     assignment_expression: Option<NodeRef>,
@@ -3291,6 +3712,7 @@ fn check_planned_assignment(
         options,
         &mut statement_diagnostics,
     )?
+    .with_type_reference_alias_targets(type_reference_alias_targets.iter().copied())?
     .get_type_from_type_node(target_type_node);
     merge_retry_diagnostics(diagnostics, statement_diagnostics);
     let target = target?;
@@ -3305,6 +3727,7 @@ fn check_planned_assignment(
         options,
         diagnostics,
         flow_types,
+        preflighted_type_import_value_uses,
         expression,
         Some(target),
         deferred,
@@ -4264,8 +4687,11 @@ pub(super) fn check_source_file(
 
     let SourceCheckPlan {
         statements,
-        imports,
+        value_imports,
+        type_imports,
         import_reads,
+        type_import_references,
+        type_import_value_uses,
         functions,
         arrows,
         contextual_arrows,
@@ -4282,15 +4708,9 @@ pub(super) fn check_source_file(
         global_types,
     )
     .finish()?;
-    store.prepare_regular_literal_types(&strings, &numbers, &bigints)?;
-    let mut deferred = Vec::new();
-    let mut declared_types = HashMap::new();
-    let mut current_flow_types = HashMap::new();
-    let mut mutable_variables = HashSet::new();
-    let mut value_order = Vec::new();
 
     let mut resolved_imports = HashMap::<SemanticSymbolId, ResolvedSourceImportBinding>::new();
-    for import in &imports {
+    for import in &value_imports {
         for binding in &import.bindings {
             let resolved = resolve_source_import_binding(store, alias_host, binding)
                 .map_err(|error| SourcePlanner::import_plan_error(binding.declaration, &error))?;
@@ -4302,6 +4722,59 @@ pub(super) fn check_source_file(
             }
         }
     }
+
+    let mut resolved_type_imports =
+        HashMap::<SemanticSymbolId, ResolvedSourceTypeImportBinding>::new();
+    for import in &type_imports {
+        for binding in &import.bindings {
+            let resolved = resolve_source_type_import_binding(store, alias_host, host, binding)
+                .map_err(|error| SourcePlanner::import_plan_error(binding.declaration, &error))?;
+            if resolved_type_imports
+                .insert(binding.alias_symbol, resolved)
+                .is_some()
+            {
+                return Err(SourceCheckError::Import(binding.declaration));
+            }
+        }
+    }
+
+    let mut type_import_capabilities = HashMap::new();
+    for reference in &type_import_references {
+        let resolved = resolved_type_imports
+            .get(&reference.alias_symbol)
+            .ok_or(SourceCheckError::Import(reference.node))?;
+        let capability =
+            plan_source_type_import_reference(store, host, resolved, reference.node)
+                .map_err(|error| SourcePlanner::import_plan_error(reference.node, &error))?;
+        if type_import_capabilities
+            .insert(reference.node, capability)
+            .is_some()
+        {
+            return Err(SourceCheckError::Import(reference.node));
+        }
+    }
+
+    let mut preflighted_type_import_value_uses = HashMap::new();
+    for read in &type_import_value_uses {
+        if preflighted_type_import_value_uses.contains_key(&read.node) {
+            return Err(SourceCheckError::Import(read.node));
+        }
+        let prepared =
+            preflight_type_import_value_use(arena, bound, store, &resolved_type_imports, read)?;
+        if preflighted_type_import_value_uses
+            .insert(read.node, prepared)
+            .is_some()
+        {
+            return Err(SourceCheckError::Import(read.node));
+        }
+    }
+
+    store.prepare_regular_literal_types(&strings, &numbers, &bigints)?;
+    let mut deferred = Vec::new();
+    let mut declared_types = HashMap::new();
+    let mut current_flow_types = HashMap::new();
+    let mut mutable_variables = HashSet::new();
+    let mut value_order = Vec::new();
 
     let mut prepared_imports = Vec::<PreparedSourceImportValue>::new();
     let mut prepared_import_aliases = HashSet::new();
@@ -4419,8 +4892,10 @@ pub(super) fn check_source_file(
                             options,
                             diagnostics,
                             &body_flow_types,
+                            &preflighted_type_import_value_uses,
                             &mut deferred,
                             function.callable.return_type,
+                            &[],
                             expression,
                             *statement,
                             None,
@@ -4496,8 +4971,13 @@ pub(super) fn check_source_file(
                                 options,
                                 diagnostics,
                                 &current_flow_types,
+                                &preflighted_type_import_value_uses,
                                 &mut deferred,
                                 type_node,
+                                type_import_capabilities
+                                    .get(&type_node)
+                                    .map(std::slice::from_ref)
+                                    .unwrap_or(&[]),
                                 &variable.initializer,
                                 variable.name,
                                 None,
@@ -4522,6 +5002,7 @@ pub(super) fn check_source_file(
                                 options,
                                 diagnostics,
                                 &current_flow_types,
+                                &preflighted_type_import_value_uses,
                                 &variable.initializer,
                                 None,
                                 &mut deferred,
@@ -4586,8 +5067,10 @@ pub(super) fn check_source_file(
                     options,
                     diagnostics,
                     &current_flow_types,
+                    &preflighted_type_import_value_uses,
                     &mut deferred,
                     assignment.target_type_node,
+                    &[],
                     &assignment.right,
                     assignment.left,
                     Some(assignment.expression),
@@ -4655,8 +5138,10 @@ pub(super) fn check_source_file(
                     options,
                     diagnostics,
                     &body_flow_types,
+                    &preflighted_type_import_value_uses,
                     &mut deferred,
                     arrow.source.callable.return_type,
+                    &[],
                     expression,
                     *diagnostic_node,
                     None,
@@ -4711,8 +5196,12 @@ mod tests {
 
     use super::*;
     use crate::semantic::{
-        CanonicalCheckerContext, DeclaredTypeHostError, IntrinsicBootstrapOptions,
-        RelationStateSnapshot, TypeNodeUnavailable,
+        AliasTargetState, CanonicalCheckerContext, DeclaredTypeHostError,
+        IntrinsicBootstrapOptions, RelationStateSnapshot, TypeNodeUnavailable,
+        module_resolution::{
+            CanonicalModuleResolutionEntry, CanonicalModuleResolutionManifestInput,
+            CanonicalModuleResolutionMode, CanonicalResolvedModuleInput,
+        },
         object_members::{
             DeclaredPropertyObjectProof, DeclaredPropertyObjectValidation,
             validate_resolved_declared_property_object,
@@ -4799,6 +5288,54 @@ mod tests {
                 .map(|(file, parsed)| (*file, &parsed.arena))
                 .collect(),
             options,
+        )
+        .unwrap()
+    }
+
+    #[derive(Clone, Copy)]
+    struct SourceImportRoute {
+        source: usize,
+        specifier: usize,
+        target: usize,
+    }
+
+    fn source_import_specifiers(parsed: &ParseResult) -> Vec<NodeId> {
+        let mut specifiers = parsed
+            .arena
+            .iter()
+            .filter_map(|(_, record)| match &record.data {
+                NodeData::ImportDeclaration(import) => Some(import.module_specifier),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        specifiers.sort_unstable_by_key(|node| parsed.arena.get(*node).unwrap().range.start);
+        specifiers
+    }
+
+    fn external_context_with_import_routes<'arena>(
+        files: &[(FileId, &'arena ParseResult)],
+        routes: &[SourceImportRoute],
+    ) -> CanonicalCheckerContext<'arena> {
+        let entries = routes.iter().map(|route| {
+            let (source_file, source) = files[route.source];
+            let specifier = source_import_specifiers(source)[route.specifier];
+            CanonicalModuleResolutionEntry::resolved(
+                NodeRef::new(source.arena.id(), source_file, specifier),
+                CanonicalResolvedModuleInput::new(
+                    files[route.target].0,
+                    CanonicalModuleResolutionMode::Esm,
+                    CanonicalModuleResolutionMode::Esm,
+                ),
+            )
+        });
+        CanonicalCheckerContext::new_with_module_resolutions(
+            completed_bindings_with_module_state(files, CanonicalModuleState::External),
+            files
+                .iter()
+                .map(|(file, parsed)| (*file, &parsed.arena))
+                .collect(),
+            CanonicalCheckerOptions::default(),
+            CanonicalModuleResolutionManifestInput::new(entries),
         )
         .unwrap()
     }
@@ -5297,6 +5834,536 @@ mod tests {
             is_type_checked(context, file),
             context.diagnostics().len(),
         )
+    }
+
+    fn type_reference_nodes(parsed: &ParseResult, file: FileId, expected: &str) -> Vec<NodeRef> {
+        let mut references = parsed
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                let NodeData::TypeReferenceNode(reference) = &record.data else {
+                    return None;
+                };
+                let name = parsed.arena.get(reference.type_name)?;
+                matches!(
+                    &name.data,
+                    NodeData::Identifier(identifier) if identifier.text == expected
+                )
+                .then_some(NodeRef::new(parsed.arena.id(), file, node))
+            })
+            .collect::<Vec<_>>();
+        references.sort_unstable_by_key(|node| parsed.arena.get(node.node).unwrap().range.start);
+        references
+    }
+
+    fn source_import_alias_symbol(
+        context: &CanonicalCheckerContext<'_>,
+        parsed: &ParseResult,
+        file: FileId,
+        expected: &str,
+    ) -> SemanticSymbolId {
+        let binding = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::ImportSpecifier(specifier) = &record.data else {
+                    return None;
+                };
+                let name = parsed.arena.get(specifier.name)?;
+                matches!(
+                    &name.data,
+                    NodeData::Identifier(identifier) if identifier.text == expected
+                )
+                .then_some(NodeRef::new(parsed.arena.id(), file, node))
+            })
+            .unwrap_or_else(|| panic!("missing import binding {expected}"));
+        let (_, bound) = context.file(file).unwrap();
+        let symbol = bound.symbol(binding).unwrap();
+        context.store().get_merged_symbol(symbol).unwrap()
+    }
+
+    fn resolved_import_target(
+        context: &CanonicalCheckerContext<'_>,
+        alias: SemanticSymbolId,
+    ) -> SemanticSymbolId {
+        match context
+            .store()
+            .alias_symbol_links(alias)
+            .unwrap_or_else(|| panic!("missing alias links for {alias:?}"))
+            .alias_target
+        {
+            AliasTargetState::Resolved(target) => target,
+            state => panic!("import alias {alias:?} is not resolved: {state:?}"),
+        }
+    }
+
+    #[test]
+    fn type_only_import_annotations_check_direct_roots_in_both_program_orders() {
+        let importer = parsed(
+            r#"
+                import type { User as Local } from "./target";
+                const good: Local = { id: 1 };
+                const bad: Local = { id: "wrong" };
+            "#,
+        );
+        let target = parsed("export type User = { id: number };");
+        let importer_file = FileId::new(900);
+        let target_file = FileId::new(901);
+        let files = [(importer_file, &importer), (target_file, &target)];
+        let route = [SourceImportRoute {
+            source: 0,
+            specifier: 0,
+            target: 1,
+        }];
+
+        let mut importer_first = external_context_with_import_routes(&files, &route);
+        importer_first.check_source_file(importer_file).unwrap();
+        assert_eq!(
+            importer_first
+                .diagnostics()
+                .as_slice()
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.code())
+                .collect::<Vec<_>>(),
+            vec![2322]
+        );
+        assert!(is_type_checked(&importer_first, importer_file));
+        assert!(!is_type_checked(&importer_first, target_file));
+        let alias = source_import_alias_symbol(&importer_first, &importer, importer_file, "Local");
+        let target_symbol = resolved_import_target(&importer_first, alias);
+        assert!(importer_first.store().value_symbol_links(alias).is_none());
+        assert!(
+            importer_first
+                .store()
+                .value_symbol_links(target_symbol)
+                .is_none()
+        );
+        let references = type_reference_nodes(&importer, importer_file, "Local");
+        assert_eq!(references.len(), 2);
+        let declared = variable_value_type(&importer_first, &importer, importer_file, "good");
+        assert_eq!(
+            variable_value_type(&importer_first, &importer, importer_file, "bad"),
+            declared
+        );
+        for reference in &references {
+            assert_eq!(resolved_node_type(&importer_first, *reference), declared);
+            assert_eq!(
+                importer_first
+                    .store()
+                    .symbol_node_links(*reference)
+                    .and_then(|links| links.resolved_symbol),
+                Some(target_symbol)
+            );
+        }
+        let warm = observable_state(&importer_first, importer_file);
+        mark_source_unchecked(&mut importer_first, importer_file);
+        importer_first.check_source_file(importer_file).unwrap();
+        assert_eq!(observable_state(&importer_first, importer_file), warm);
+
+        let mut target_first = external_context_with_import_routes(&files, &route);
+        target_first.check_source_file(target_file).unwrap();
+        target_first.check_source_file(importer_file).unwrap();
+        assert_eq!(
+            target_first
+                .diagnostics()
+                .as_slice()
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.code())
+                .collect::<Vec<_>>(),
+            vec![2322]
+        );
+        assert!(is_type_checked(&target_first, target_file));
+        assert!(is_type_checked(&target_first, importer_file));
+    }
+
+    #[test]
+    fn unused_type_only_import_resolves_without_materializing_value_or_declared_type() {
+        let importer = parsed(
+            r#"
+                import type { User as Local } from "./target";
+                const value = 1;
+            "#,
+        );
+        let target = parsed("export type User = { id: number };");
+        let importer_file = FileId::new(902);
+        let target_file = FileId::new(903);
+        let files = [(importer_file, &importer), (target_file, &target)];
+        let mut context = external_context_with_import_routes(
+            &files,
+            &[SourceImportRoute {
+                source: 0,
+                specifier: 0,
+                target: 1,
+            }],
+        );
+
+        context.check_source_file(importer_file).unwrap();
+
+        let alias = source_import_alias_symbol(&context, &importer, importer_file, "Local");
+        let target_symbol = resolved_import_target(&context, alias);
+        assert!(context.store().value_symbol_links(alias).is_none());
+        assert!(context.store().value_symbol_links(target_symbol).is_none());
+        assert_eq!(
+            context
+                .store()
+                .type_alias_links(target_symbol)
+                .and_then(|links| links.declared_type),
+            None
+        );
+        assert_eq!(
+            context
+                .store()
+                .alias_symbol_links(alias)
+                .and_then(|links| links.type_only_declaration),
+            context
+                .store()
+                .symbol(alias)
+                .and_then(|symbol| symbol.declarations())
+                .and_then(|declarations| declarations.first())
+                .copied()
+        );
+        assert!(context.diagnostics().is_empty());
+        assert!(is_type_checked(&context, importer_file));
+        assert!(!is_type_checked(&context, target_file));
+    }
+
+    #[test]
+    fn type_only_import_value_use_reports_ts1361_and_returns_error_type_without_value_state() {
+        let importer = parsed(
+            r#"
+                import type { User as Local } from "./target";
+                const invalid = Local;
+            "#,
+        );
+        let target = parsed("export type User = { id: number };");
+        let importer_file = FileId::new(904);
+        let target_file = FileId::new(905);
+        let files = [(importer_file, &importer), (target_file, &target)];
+        let mut context = external_context_with_import_routes(
+            &files,
+            &[SourceImportRoute {
+                source: 0,
+                specifier: 0,
+                target: 1,
+            }],
+        );
+
+        context.check_source_file(importer_file).unwrap();
+
+        let [diagnostic] = context.diagnostics().as_slice() else {
+            panic!("expected one type-only value-use diagnostic")
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 1361);
+        assert_eq!(
+            diagnostic.diagnostic.render().unwrap(),
+            "'Local' cannot be used as a value because it was imported using 'import type'."
+        );
+        let alias = source_import_alias_symbol(&context, &importer, importer_file, "Local");
+        let target_symbol = resolved_import_target(&context, alias);
+        let initializer = variable_initializer(&importer, importer_file, "invalid");
+        let error_type = context.store().intrinsic_bootstrap().unwrap().error_type;
+        assert_eq!(resolved_node_type(&context, initializer), error_type);
+        assert_eq!(
+            variable_value_type(&context, &importer, importer_file, "invalid"),
+            error_type
+        );
+        assert_eq!(
+            context
+                .store()
+                .symbol_node_links(initializer)
+                .and_then(|links| links.resolved_symbol),
+            Some(alias)
+        );
+        assert!(context.store().value_symbol_links(alias).is_none());
+        assert!(context.store().value_symbol_links(target_symbol).is_none());
+        assert_eq!(
+            context
+                .store()
+                .type_alias_links(target_symbol)
+                .and_then(|links| links.declared_type),
+            None
+        );
+        let warm = observable_state(&context, importer_file);
+        mark_source_unchecked(&mut context, importer_file);
+        context.check_source_file(importer_file).unwrap();
+        assert_eq!(observable_state(&context, importer_file), warm);
+    }
+
+    #[test]
+    fn poisoned_type_only_value_use_fails_before_earlier_publications_and_retries_in_order() {
+        let importer = parsed(
+            r#"
+                import type { User as Local } from "./target";
+                const earlier: number = "wrong";
+                const invalid = Local;
+            "#,
+        );
+        let target = parsed("export type User = number;");
+        let importer_file = FileId::new(912);
+        let target_file = FileId::new(913);
+        let files = [(importer_file, &importer), (target_file, &target)];
+        let mut context = external_context_with_import_routes(
+            &files,
+            &[SourceImportRoute {
+                source: 0,
+                specifier: 0,
+                target: 1,
+            }],
+        );
+        let initializer = variable_initializer(&importer, importer_file, "invalid");
+        let earlier_symbol = variable_symbol(&context, &importer, importer_file, "earlier");
+        let (poison, error_type) = {
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            (bootstrap.number_type, bootstrap.error_type)
+        };
+        assert_ne!(poison, error_type);
+        assert!(context.store_mut_for_test().set_type_node_links(
+            initializer,
+            TypeNodeLinks {
+                resolved_type: Some(poison),
+                ..TypeNodeLinks::default()
+            }
+        ));
+
+        assert!(matches!(
+            context.check_source_file(importer_file),
+            Err(SourceCheckError::Assertion(
+                SourceAssertionError::InvalidExpressionCache {
+                    node,
+                    cached: Some(cached),
+                    expected,
+                }
+            )) if node == initializer && cached == poison && expected == error_type
+        ));
+        assert!(context.diagnostics().is_empty());
+        assert!(context.store().value_symbol_links(earlier_symbol).is_none());
+        assert!(context.store().symbol_node_links(initializer).is_none());
+        assert!(!is_type_checked(&context, importer_file));
+        assert_eq!(resolved_node_type(&context, initializer), poison);
+
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_type_node_links(initializer, TypeNodeLinks::default())
+        );
+        context.check_source_file(importer_file).unwrap();
+        assert_eq!(
+            context
+                .diagnostics()
+                .as_slice()
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.code())
+                .collect::<Vec<_>>(),
+            [2322, 1361]
+        );
+        assert!(context.store().value_symbol_links(earlier_symbol).is_some());
+        assert_eq!(resolved_node_type(&context, initializer), error_type);
+        assert!(is_type_checked(&context, importer_file));
+    }
+
+    #[test]
+    fn separate_leading_value_and_type_imports_preserve_both_routes() {
+        let importer = parsed(
+            r#"
+                import { count as localCount } from "./target";
+                import type { User as LocalUser } from "./target";
+                const copy = localCount;
+                const user: LocalUser = { id: localCount };
+            "#,
+        );
+        let target = parsed(
+            r"
+                export const count: number = 1;
+                export type User = { id: number };
+            ",
+        );
+        let importer_file = FileId::new(906);
+        let target_file = FileId::new(907);
+        let files = [(importer_file, &importer), (target_file, &target)];
+        let mut context = external_context_with_import_routes(
+            &files,
+            &[
+                SourceImportRoute {
+                    source: 0,
+                    specifier: 0,
+                    target: 1,
+                },
+                SourceImportRoute {
+                    source: 0,
+                    specifier: 1,
+                    target: 1,
+                },
+            ],
+        );
+
+        context.check_source_file(importer_file).unwrap();
+
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        assert_eq!(
+            variable_value_type(&context, &importer, importer_file, "copy"),
+            number
+        );
+        let value_alias =
+            source_import_alias_symbol(&context, &importer, importer_file, "localCount");
+        let type_alias =
+            source_import_alias_symbol(&context, &importer, importer_file, "LocalUser");
+        assert_eq!(
+            context
+                .store()
+                .value_symbol_links(value_alias)
+                .and_then(|links| links.resolved_type),
+            Some(number)
+        );
+        assert!(context.store().value_symbol_links(type_alias).is_none());
+        assert!(
+            context
+                .store()
+                .value_symbol_links(resolved_import_target(&context, type_alias))
+                .is_none()
+        );
+        assert!(context.diagnostics().is_empty());
+        assert!(is_type_checked(&context, importer_file));
+        assert!(!is_type_checked(&context, target_file));
+        context.check_source_file(target_file).unwrap();
+        assert!(is_type_checked(&context, target_file));
+    }
+
+    #[test]
+    fn nested_alias_union_and_callable_type_import_references_remain_explicit_boundaries() {
+        let target = parsed("export type User = { id: number };");
+        for (index, body) in [
+            "const value: Local | null = null;",
+            "type Wrapped = Local;",
+            "function accept(value: Local): void {}",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let importer = parsed(&format!(
+                "import type {{ User as Local }} from './target'; {body}"
+            ));
+            let importer_file = FileId::new(920 + u32::try_from(index).unwrap());
+            let target_file = FileId::new(930 + u32::try_from(index).unwrap());
+            let files = [(importer_file, &importer), (target_file, &target)];
+            let mut context = external_context_with_import_routes(
+                &files,
+                &[SourceImportRoute {
+                    source: 0,
+                    specifier: 0,
+                    target: 1,
+                }],
+            );
+
+            assert!(matches!(
+                context.check_source_file(importer_file),
+                Err(SourceCheckError::Unsupported(
+                    UnsupportedSourceSyntax::Import(_)
+                ))
+            ));
+            assert!(!is_type_checked(&context, importer_file));
+            assert!(context.diagnostics().is_empty());
+        }
+    }
+
+    #[test]
+    fn declaration_capability_is_not_reused_by_a_later_assignment() {
+        let importer = parsed(
+            r#"
+                import type { User as Local } from "./target";
+                let value: Local = { id: 1 };
+                value = { id: 2 };
+            "#,
+        );
+        let target = parsed("export type User = { id: number };");
+        let importer_file = FileId::new(910);
+        let target_file = FileId::new(911);
+        let files = [(importer_file, &importer), (target_file, &target)];
+        let mut context = external_context_with_import_routes(
+            &files,
+            &[SourceImportRoute {
+                source: 0,
+                specifier: 0,
+                target: 1,
+            }],
+        );
+        let references = type_reference_nodes(&importer, importer_file, "Local");
+        let [reference] = references.as_slice() else {
+            panic!("expected one imported type reference")
+        };
+        let alias = source_import_alias_symbol(&context, &importer, importer_file, "Local");
+
+        assert!(matches!(
+            context.check_source_file(importer_file),
+            Err(SourceCheckError::DeclaredType(
+                DeclaredTypeError::TypeNodeUnavailable(
+                    TypeNodeUnavailable::ImportAliasTypeReference {
+                        node,
+                        alias: failed_alias,
+                    }
+                )
+            )) if node == *reference && failed_alias == alias
+        ));
+        assert!(
+            context
+                .store()
+                .value_symbol_links(variable_symbol(&context, &importer, importer_file, "value"))
+                .is_none()
+        );
+        assert!(context.store().value_symbol_links(alias).is_none());
+        assert!(!is_type_checked(&context, importer_file));
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn poisoned_later_type_import_reference_fails_before_earlier_source_publications() {
+        let importer = parsed(
+            r#"
+                import type { User as Local } from "./target";
+                const first: Local = { id: 1 };
+                const second: Local = { id: 2 };
+            "#,
+        );
+        let target = parsed("export type User = { id: number };");
+        let importer_file = FileId::new(908);
+        let target_file = FileId::new(909);
+        let files = [(importer_file, &importer), (target_file, &target)];
+        let mut context = external_context_with_import_routes(
+            &files,
+            &[SourceImportRoute {
+                source: 0,
+                specifier: 0,
+                target: 1,
+            }],
+        );
+        let references = type_reference_nodes(&importer, importer_file, "Local");
+        let [first_reference, second_reference] = references.as_slice() else {
+            panic!("expected two direct imported type references")
+        };
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        assert!(context.store_mut_for_test().set_type_node_links(
+            *second_reference,
+            TypeNodeLinks {
+                resolved_type: Some(number),
+                ..TypeNodeLinks::default()
+            },
+        ));
+
+        assert_eq!(
+            context.check_source_file(importer_file),
+            Err(SourceCheckError::Import(*second_reference))
+        );
+
+        let alias = source_import_alias_symbol(&context, &importer, importer_file, "Local");
+        assert!(context.store().value_symbol_links(alias).is_none());
+        assert!(
+            context
+                .store()
+                .value_symbol_links(variable_symbol(&context, &importer, importer_file, "first"))
+                .is_none()
+        );
+        assert!(context.store().type_node_links(*first_reference).is_none());
+        assert!(!is_type_checked(&context, importer_file));
+        assert!(context.diagnostics().is_empty());
     }
 
     #[test]
