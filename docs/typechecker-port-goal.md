@@ -792,6 +792,30 @@ remains the cluster-level source of truth.
   non-nullish union projection; returning `boolean` would be a semantic cheat.
   Assignment operators, shifts/bitwise suggestion paths, updates, unions, type
   parameters, enums, objects, and flow narrowing also remain later gates.
+- The next expression/callable wave is integrated through `df297a3`,
+  `7f818a5`, `fea95fd`, `c7bffc5..0f31e7a`, `3e4cdb8`, and `37c9b99`.
+  The parser and checker now preserve the pinned left-associative `??`/`||`
+  recovery shape; source `&&`, `||`, and `??` execute their exact primitive
+  result projection, identifier flow narrowing, contextual routing, and
+  TS1345/TS2869/TS2871/TS2872/TS2873/TS5076 diagnostics. Ordered generic calls
+  infer through canonical `Array<T>` and `ReadonlyArray<T>` parameter targets,
+  while source callable metadata retains default and rest parameters and call
+  checking observes effective rest arity. Exact element access now composes
+  through source properties, strings, canonical arrays, primitive binary
+  operands, and direct call arguments, including TS7015/TS2538/TS7053 and
+  cold/warm publication. Source-declared index signatures, tuple/union access,
+  optional chains, property/element flow references, method calls, overloads,
+  and nested aggregate expression dispatch remain explicit follow-ups.
+- A fresh pinned first-50 run at
+  `/tmp/ts-rust-canonical-first50-37c9b99.json` reports two exact artifacts and
+  48 honest unsupported variants, with zero code, span, message, order, or
+  complete-artifact mismatches. This alphabetically biased smoke tranche is
+  now dominated by classes, function/body forms, module modes, JavaScript,
+  TSX, declaration emit, and advanced type nodes. The result confirms that
+  the next useful work is broad dependency closure—statements and flow,
+  compositional calls and inference, classes, advanced type instantiation, and
+  then the wider module/project surface—rather than further fixture-specific
+  patches.
 
 No percentage in this section is a whole-corpus parity claim. A score is
 publishable only when its variant manifest and complete artifact comparison are
