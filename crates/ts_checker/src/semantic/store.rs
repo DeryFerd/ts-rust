@@ -105,9 +105,6 @@ pub(super) struct SourceCallableProvenance {
     pub(super) owner_parent: Option<SemanticSymbolId>,
     pub(super) export_local: Option<SemanticSymbolId>,
     pub(super) signature: SignatureId,
-    /// Exact default-free `TypeParameterDeclaration` proved by the source
-    /// planner. `None` is required for a non-generic source signature.
-    pub(super) default_free_type_parameter: Option<NodeRef>,
     /// The annotation that contextually typed an inferred source arrow.
     ///
     /// Annotated source callables retain `None` and instead own an exact
@@ -116,6 +113,31 @@ pub(super) struct SourceCallableProvenance {
     /// identity from the arrow expression's independently inferred callable.
     pub(super) contextual_target: Option<TypeId>,
     pub(super) contextual_variable: Option<SemanticSymbolId>,
+}
+
+/// One declaration-order row for an exact source generic signature.
+///
+/// Both the binder symbol and canonical type identity are retained on purpose:
+/// warm validation must prove that an ordered signature edge still belongs to
+/// the exact `TypeParameterDeclaration`, not merely to an equal-looking node
+/// or a type parameter at the same vector position.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct SourceCallableTypeParameterProvenance {
+    pub(super) declaration: NodeRef,
+    pub(super) symbol: SemanticSymbolId,
+    pub(super) type_parameter: TypeId,
+    pub(super) constraint: Option<NodeRef>,
+    pub(super) default_type: Option<NodeRef>,
+}
+
+/// Fully resolved payload staged before publishing source generic metadata.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct ResolvedSourceCallableTypeParameter {
+    pub(super) provenance: SourceCallableTypeParameterProvenance,
+    /// The declared constraint, or the canonical `no_constraint_type`.
+    pub(super) constraint: TypeId,
+    /// The declared default, or the canonical `no_constraint_type`.
+    pub(super) default_type: TypeId,
 }
 
 /// Branded identities owned by the one canonical mutable empty tuple graph.
@@ -204,6 +226,8 @@ pub struct SemanticStore<TypePayload, MapperPayload> {
     source_callable_types_by_declaration: HashMap<NodeRef, TypeId>,
     source_callable_types_by_owner: HashMap<SemanticSymbolId, TypeId>,
     source_callable_types_by_signature: HashMap<SignatureId, TypeId>,
+    source_callable_type_parameters:
+        HashMap<SignatureId, Box<[SourceCallableTypeParameterProvenance]>>,
     /// Pinned checker `cachedSignatures`, keyed by generic target and the
     /// ordered type-argument hash.
     cached_signatures: HashMap<(SignatureId, CacheHashKey), CachedSignatureEntry>,
@@ -269,6 +293,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             source_callable_types_by_declaration: HashMap::new(),
             source_callable_types_by_owner: HashMap::new(),
             source_callable_types_by_signature: HashMap::new(),
+            source_callable_type_parameters: HashMap::new(),
             cached_signatures: HashMap::new(),
             function_signature_return_annotations: HashMap::new(),
             callable_signature_parameter_types: HashMap::new(),
@@ -686,6 +711,33 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                 .source_callable_types_by_signature
                 .try_reserve(additional)
                 .is_ok()
+            && self
+                .source_callable_type_parameters
+                .try_reserve(additional)
+                .is_ok()
+    }
+
+    pub(super) fn source_callable_type_parameters(
+        &self,
+        signature: SignatureId,
+    ) -> Option<&[SourceCallableTypeParameterProvenance]> {
+        self.source_callable_type_parameters
+            .get(&signature)
+            .map(Box::as_ref)
+    }
+
+    #[cfg(test)]
+    pub(super) fn replace_source_callable_type_parameters_for_test(
+        &mut self,
+        signature: SignatureId,
+        replacement: Option<Box<[SourceCallableTypeParameterProvenance]>>,
+    ) -> Option<Box<[SourceCallableTypeParameterProvenance]>> {
+        match replacement {
+            Some(replacement) => self
+                .source_callable_type_parameters
+                .insert(signature, replacement),
+            None => self.source_callable_type_parameters.remove(&signature),
+        }
     }
 
     pub(super) fn set_source_callable_provenance(
@@ -704,32 +756,35 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             }
             _ => false,
         };
-        let exact_type_parameter =
+        let exact_type_parameters =
             self.signatures
                 .get(provenance.signature)
                 .is_some_and(|signature| {
-                    match (
-                        provenance.default_free_type_parameter,
-                        signature.type_parameters(),
-                    ) {
-                        (None, []) => true,
-                        (Some(declaration), [type_parameter]) => {
-                            provenance.family == SourceCallableFamily::FunctionDeclaration
-                                && provenance.contextual_target.is_none()
-                                && provenance.contextual_variable.is_none()
-                                && self.types.get(*type_parameter).is_some()
-                                && self.source_node_kind(declaration)
-                                    == Some(SyntaxKind::TypeParameter)
-                                && self.source_node_parent(declaration)
-                                    == Some(SourceNodeParent::Parent(provenance.declaration))
-                        }
-                        _ => false,
+                    if signature.type_parameters().is_empty() {
+                        return !self
+                            .source_callable_type_parameters
+                            .contains_key(&provenance.signature);
                     }
+                    provenance.family == SourceCallableFamily::FunctionDeclaration
+                        && provenance.contextual_target.is_none()
+                        && provenance.contextual_variable.is_none()
+                        && self
+                            .source_callable_type_parameters
+                            .get(&provenance.signature)
+                            .is_some_and(|rows| {
+                                rows.len() == signature.type_parameters().len()
+                                    && rows.iter().zip(signature.type_parameters()).all(
+                                        |(row, type_parameter)| {
+                                            row.type_parameter == *type_parameter
+                                                && self.types.get(*type_parameter).is_some()
+                                        },
+                                    )
+                            })
                 });
         if self.types.get(type_).is_none()
             || self.source_callable_provenance.contains_key(&type_)
             || !contextual_pair
-            || !exact_type_parameter
+            || !exact_type_parameters
             || self.source_node_kind(provenance.declaration)
                 != Some(provenance.family.syntax_kind())
             || !self.symbols.contains_symbol(provenance.owner_symbol)
@@ -802,12 +857,13 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             .copied()
     }
 
-    pub(super) fn source_callable_provenance_lengths(&self) -> [usize; 4] {
+    pub(super) fn source_callable_provenance_lengths(&self) -> [usize; 5] {
         [
             self.source_callable_provenance.len(),
             self.source_callable_types_by_declaration.len(),
             self.source_callable_types_by_owner.len(),
             self.source_callable_types_by_signature.len(),
+            self.source_callable_type_parameters.len(),
         ]
     }
 
@@ -3033,6 +3089,179 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
 }
 
 impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
+    /// Publishes an exact declaration-order source type-parameter vector and
+    /// all of its resolved constraint/default caches as one logical batch.
+    ///
+    /// The complete batch is validated before the first type record is
+    /// mutated. The signature-keyed provenance entry is inserted last, so a
+    /// visible entry always denotes dependency-closed metadata. Replaying the
+    /// exact committed batch is idempotent; any partial or mismatched state is
+    /// rejected as poison.
+    pub(super) fn set_source_callable_type_parameters(
+        &mut self,
+        signature: SignatureId,
+        resolved: &[ResolvedSourceCallableTypeParameter],
+    ) -> bool {
+        let Some(signature_record) = self.signature(signature) else {
+            return false;
+        };
+        let Some(signature_declaration) = signature_record.declaration() else {
+            return false;
+        };
+        let expected_minimum = i32::try_from(signature_record.parameters().len()).ok();
+        if resolved.is_empty()
+            || signature_record.type_parameters().len() != resolved.len()
+            || signature_record.flags() != SignatureFlags::NONE
+            || signature_record.this_parameter().is_some()
+            || signature_record.target().is_some()
+            || signature_record.mapper().is_some()
+            || signature_record.resolved_return_type().is_some()
+            || signature_record.resolved_type_predicate().is_some()
+            || signature_record.isolated_signature_type().is_some()
+            || signature_record.composite().is_some()
+            || expected_minimum != Some(signature_record.min_argument_count())
+            || self.source_node_kind(signature_declaration) != Some(SyntaxKind::FunctionDeclaration)
+            || self.intrinsic_bootstrap.is_none()
+        {
+            return false;
+        }
+        let no_constraint = self
+            .intrinsic_bootstrap
+            .as_ref()
+            .expect("bootstrap presence was checked")
+            .no_constraint_type;
+        let mut declarations = HashSet::with_capacity(resolved.len());
+        let mut symbols = HashSet::with_capacity(resolved.len());
+        let mut type_parameters = HashSet::with_capacity(resolved.len());
+        let mut default_seen = false;
+        let computed_type_variable_flags = super::types::ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES
+            | super::types::ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES_COMPUTED;
+        let valid_rows = resolved.iter().enumerate().all(|(index, row)| {
+            let provenance = row.provenance;
+            let Some(record) = self.type_payload(provenance.type_parameter) else {
+                return false;
+            };
+            let Some(symbol_record) = self.symbol(provenance.symbol) else {
+                return false;
+            };
+            let TypeData::TypeParameter(data) = record.data() else {
+                return false;
+            };
+            let base_constraint_valid = match (
+                provenance.constraint,
+                data.constrained.resolved_base_constraint,
+            ) {
+                (None, None) => true,
+                (None, Some(base)) => base == no_constraint,
+                (Some(_), None) => true,
+                (Some(_), Some(_)) => false,
+            };
+            let constraint_node_valid = provenance.constraint.is_none_or(|constraint| {
+                self.source_node_parent(constraint)
+                    == Some(SourceNodeParent::Parent(provenance.declaration))
+            });
+            let default_node_valid = provenance.default_type.is_none_or(|default_type| {
+                self.source_node_parent(default_type)
+                    == Some(SourceNodeParent::Parent(provenance.declaration))
+            });
+            let trailing_default_valid = !default_seen || provenance.default_type.is_some();
+            default_seen |= provenance.default_type.is_some();
+            signature_record.type_parameters()[index] == provenance.type_parameter
+                && declarations.insert(provenance.declaration)
+                && symbols.insert(provenance.symbol)
+                && type_parameters.insert(provenance.type_parameter)
+                && record.flags() == super::types::TypeFlags::TYPE_PARAMETER
+                && (record.object_flags() == super::types::ObjectFlags::NONE
+                    || record.object_flags() == computed_type_variable_flags)
+                && record.symbol() == Some(provenance.symbol)
+                && record.alias().is_none()
+                && !data.is_this_type
+                && base_constraint_valid
+                && symbol_record.flags() == SymbolFlags::TYPE_PARAMETER
+                && symbol_record.check_flags() == CheckFlags::NONE
+                && symbol_record.declarations() == Some(&[provenance.declaration])
+                && symbol_record.value_declaration().is_none()
+                && symbol_record.members().is_none()
+                && symbol_record.exports().is_none()
+                && symbol_record.parent().is_none()
+                && symbol_record.export_symbol().is_none()
+                && self.get_merged_symbol(provenance.symbol) == Some(provenance.symbol)
+                && self
+                    .declared_type_links(provenance.symbol)
+                    .and_then(|links| links.declared_type)
+                    == Some(provenance.type_parameter)
+                && self.source_node_kind(provenance.declaration) == Some(SyntaxKind::TypeParameter)
+                && self.source_node_parent(provenance.declaration)
+                    == Some(SourceNodeParent::Parent(signature_declaration))
+                && constraint_node_valid
+                && default_node_valid
+                && trailing_default_valid
+                && self.type_payload(row.constraint).is_some()
+                && self.type_payload(row.default_type).is_some()
+                && provenance.constraint.is_some() == (row.constraint != no_constraint)
+                && provenance.default_type.is_some() == (row.default_type != no_constraint)
+        });
+        if !valid_rows {
+            return false;
+        }
+
+        let provenance = resolved
+            .iter()
+            .map(|row| row.provenance)
+            .collect::<Box<[_]>>();
+        if let Some(existing) = self.source_callable_type_parameters.get(&signature) {
+            if existing.as_ref() != provenance.as_ref() {
+                return false;
+            }
+            return resolved.iter().all(|row| {
+                self.type_payload(row.provenance.type_parameter)
+                    .is_some_and(|record| {
+                        matches!(record.data(), TypeData::TypeParameter(data)
+                            if data.constraint == Some(row.constraint)
+                                && data.target.is_none()
+                                && data.mapper.is_none()
+                                && data.resolved_default_type == Some(row.default_type))
+                    })
+            });
+        }
+        if resolved.iter().any(|row| {
+            self.type_payload(row.provenance.type_parameter)
+                .is_none_or(|record| {
+                    !matches!(record.data(), TypeData::TypeParameter(data)
+                        if record.object_flags() == super::types::ObjectFlags::NONE
+                            && data.constrained.resolved_base_constraint.is_none()
+                            && data.constraint.is_none()
+                            && data.target.is_none()
+                            && data.mapper.is_none()
+                            && data.resolved_default_type.is_none())
+                })
+        }) {
+            return false;
+        }
+
+        for row in resolved {
+            let published = self.set_type_parameter_resolution(
+                row.provenance.type_parameter,
+                Some(row.constraint),
+                None,
+                None,
+                Some(row.default_type),
+            );
+            assert!(
+                published,
+                "the entire type-parameter batch was prevalidated"
+            );
+        }
+        let previous = self
+            .source_callable_type_parameters
+            .insert(signature, provenance);
+        assert!(
+            previous.is_none(),
+            "source type-parameter provenance was prevalidated absent"
+        );
+        true
+    }
+
     /// Pushes one validated lazy-property query and probes the current owned
     /// semantic graph while scanning for cycles.
     ///

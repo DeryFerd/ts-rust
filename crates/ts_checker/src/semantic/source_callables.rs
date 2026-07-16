@@ -27,7 +27,10 @@ use super::{
         SymbolNodeLinks, TypeNodeLinks, ValueSymbolLinks,
     },
     signatures::{Signature, SignatureFlags},
-    store::{SourceCallableProvenance, SourceNodeParent},
+    store::{
+        ResolvedSourceCallableTypeParameter, SourceCallableProvenance,
+        SourceCallableTypeParameterProvenance, SourceNodeParent,
+    },
     type_records::{ConstrainedTypeData, StructuredTypeData, TypeCacheState, TypeData, TypeRecord},
     types::{ObjectFlags, TypeFlags},
 };
@@ -1046,10 +1049,6 @@ pub(super) fn source_callable_state(
         owner_parent: plan.owner_parent,
         export_local: plan.export_local,
         signature,
-        default_free_type_parameter: plan
-            .type_parameters
-            .first()
-            .map(|parameter| parameter.declaration),
         contextual_target: None,
         contextual_variable: None,
     };
@@ -1365,7 +1364,6 @@ pub(super) fn publish_contextual_source_callable(
             owner_parent: None,
             export_local: None,
             signature,
-            default_free_type_parameter: None,
             contextual_target: Some(prepared.contextual_target),
             contextual_variable: Some(prepared.variable_symbol),
         },
@@ -1433,6 +1431,7 @@ pub(super) fn begin_source_callable(
         .iter()
         .map(|type_parameter| execute_type_parameter(store, type_parameter.symbol))
         .collect::<Vec<_>>();
+    let generic_type_parameter = type_parameters.first().copied();
     let type_ = store
         .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(plan.owner_symbol))
         .ok_or_else(|| invariant(SourceCallableInvariant::Publication(plan.declaration)))?;
@@ -1451,6 +1450,32 @@ pub(super) fn begin_source_callable(
             plan.min_argument_count,
         )
         .ok_or_else(|| invariant(SourceCallableInvariant::Publication(plan.declaration)))?;
+    if let [type_parameter_plan] = plan.type_parameters.as_slice() {
+        let type_parameter =
+            generic_type_parameter.expect("one planned type parameter has one canonical identity");
+        let no_constraint = store
+            .intrinsic_bootstrap()
+            .expect("source callable capacities require bootstrap")
+            .no_constraint_type;
+        let published = store.set_source_callable_type_parameters(
+            signature,
+            &[ResolvedSourceCallableTypeParameter {
+                provenance: SourceCallableTypeParameterProvenance {
+                    declaration: type_parameter_plan.declaration,
+                    symbol: type_parameter_plan.symbol,
+                    type_parameter,
+                    constraint: None,
+                    default_type: None,
+                },
+                constraint: no_constraint,
+                default_type: no_constraint,
+            }],
+        );
+        assert!(
+            published,
+            "source type-parameter metadata was prevalidated and reserved"
+        );
+    }
     let provenance = store.set_source_callable_provenance(
         type_,
         SourceCallableProvenance {
@@ -1460,10 +1485,6 @@ pub(super) fn begin_source_callable(
             owner_parent: plan.owner_parent,
             export_local: plan.export_local,
             signature,
-            default_free_type_parameter: plan
-                .type_parameters
-                .first()
-                .map(|parameter| parameter.declaration),
             contextual_target: None,
             contextual_variable: None,
         },
@@ -1987,7 +2008,6 @@ pub(super) fn validate_stored_source_callable(
             owner_parent: provenance.owner_parent,
             export_local: provenance.export_local,
             signature: provenance.signature,
-            default_free_type_parameter: provenance.default_free_type_parameter,
             contextual_target: provenance.contextual_target,
             contextual_variable: provenance.contextual_variable,
         })
@@ -2025,7 +2045,7 @@ pub(super) fn validate_stored_source_callable(
         declaration,
         family,
         contextual.is_some(),
-        provenance.default_free_type_parameter,
+        signature,
         signature_record.type_parameters(),
     ) else {
         return StoredSourceCallableValidation::Malformed;
@@ -2303,11 +2323,14 @@ fn valid_stored_source_type_parameters(
     declaration: NodeRef,
     family: SourceCallableFamily,
     contextual: bool,
-    default_free_type_parameter: Option<NodeRef>,
+    signature: SignatureId,
     type_parameters: &[TypeId],
 ) -> Option<Vec<TypeId>> {
     if type_parameters.is_empty() {
-        return default_free_type_parameter.is_none().then(Vec::new);
+        return store
+            .source_callable_type_parameters(signature)
+            .is_none()
+            .then(Vec::new);
     }
     if contextual
         || family != SourceCallableFamily::FunctionDeclaration
@@ -2316,8 +2339,16 @@ fn valid_stored_source_type_parameters(
         return None;
     }
     let type_parameter = type_parameters[0];
+    let [provenance] = store.source_callable_type_parameters(signature)? else {
+        return None;
+    };
     let symbol = cached_ordinary_type_parameter_owner(store, type_parameter)?;
     let symbol_record = store.symbol(symbol)?;
+    let no_constraint = store.intrinsic_bootstrap()?.no_constraint_type;
+    let TypeData::TypeParameter(type_parameter_data) = store.type_payload(type_parameter)?.data()
+    else {
+        return None;
+    };
     let [type_parameter_declaration] = symbol_record.declarations()? else {
         return None;
     };
@@ -2332,7 +2363,22 @@ fn valid_stored_source_type_parameters(
         || store.source_node_kind(*type_parameter_declaration) != Some(SyntaxKind::TypeParameter)
         || store.source_node_parent(*type_parameter_declaration)
             != Some(SourceNodeParent::Parent(declaration))
-        || default_free_type_parameter != Some(*type_parameter_declaration)
+        || provenance
+            != &(SourceCallableTypeParameterProvenance {
+                declaration: *type_parameter_declaration,
+                symbol,
+                type_parameter,
+                constraint: None,
+                default_type: None,
+            })
+        || type_parameter_data.constraint != Some(no_constraint)
+        || type_parameter_data
+            .constrained
+            .resolved_base_constraint
+            .is_some_and(|base| base != no_constraint)
+        || type_parameter_data.target.is_some()
+        || type_parameter_data.mapper.is_some()
+        || type_parameter_data.resolved_default_type != Some(no_constraint)
     {
         return None;
     }
@@ -2417,6 +2463,16 @@ fn validate_signature(
         || record.resolved_min_argument_count() != -1
         || record.declaration() != Some(plan.declaration)
         || record.type_parameters() != expected_type_parameters
+        || valid_stored_source_type_parameters(
+            store,
+            plan.declaration,
+            plan.family,
+            false,
+            signature,
+            record.type_parameters(),
+        )
+        .as_deref()
+            != Some(expected_type_parameters.as_slice())
         || record.parameters() != expected_parameters
         || record.this_parameter().is_some()
         || record.resolved_type_predicate().is_some()
@@ -2935,13 +2991,109 @@ mod tests {
         (declaration, type_parameter)
     }
 
-    fn publication_state(store: &CanonicalTypeMapperStore) -> (usize, usize, [usize; 4], usize) {
+    fn publication_state(store: &CanonicalTypeMapperStore) -> (usize, usize, [usize; 5], usize) {
         (
             store.types().len(),
             store.signature_len(),
             store.source_callable_provenance_lengths(),
             store.callable_signature_parameter_types_len(),
         )
+    }
+
+    fn staged_generic_metadata(
+        source: &str,
+        file: FileId,
+    ) -> (
+        QueryFixture,
+        NodeRef,
+        SemanticSymbolId,
+        SignatureId,
+        Box<[ResolvedSourceCallableTypeParameter]>,
+    ) {
+        let mut fixture = QueryFixture::new(source, file);
+        let declaration = fixture
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::FunctionDeclaration).then_some(NodeRef::new(
+                    fixture.parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .expect("source has one function declaration");
+        let NodeData::FunctionDeclaration(function) =
+            &fixture.parsed.arena.get(declaration.node).unwrap().data
+        else {
+            unreachable!()
+        };
+        let type_parameter_declarations = function
+            .type_parameters
+            .as_ref()
+            .expect("metadata fixture is generic")
+            .nodes
+            .iter()
+            .map(|node| NodeRef::new(declaration.arena, file, *node))
+            .collect::<Vec<_>>();
+        let type_parameter_symbols = type_parameter_declarations
+            .iter()
+            .map(|declaration| fixture.bound.symbol(*declaration).unwrap())
+            .collect::<Vec<_>>();
+        let type_parameters = type_parameter_symbols
+            .iter()
+            .map(|symbol| execute_type_parameter(&mut fixture.store, *symbol))
+            .collect::<Vec<_>>();
+        let parameter_symbols = function
+            .parameters
+            .nodes
+            .iter()
+            .map(|node| {
+                fixture
+                    .bound
+                    .symbol(NodeRef::new(declaration.arena, file, *node))
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let minimum = i32::try_from(parameter_symbols.len()).unwrap();
+        let signature = fixture
+            .store
+            .alloc_signature(
+                SignatureFlags::NONE,
+                Some(declaration),
+                type_parameters.clone(),
+                None,
+                parameter_symbols,
+                None,
+                None,
+                minimum,
+            )
+            .unwrap();
+        let no_constraint = fixture
+            .store
+            .intrinsic_bootstrap()
+            .unwrap()
+            .no_constraint_type;
+        let resolved = type_parameter_declarations
+            .into_iter()
+            .zip(type_parameter_symbols)
+            .zip(type_parameters)
+            .map(
+                |((declaration, symbol), type_parameter)| ResolvedSourceCallableTypeParameter {
+                    provenance: SourceCallableTypeParameterProvenance {
+                        declaration,
+                        symbol,
+                        type_parameter,
+                        constraint: None,
+                        default_type: None,
+                    },
+                    constraint: no_constraint,
+                    default_type: no_constraint,
+                },
+            )
+            .collect::<Box<[_]>>();
+        let owner = fixture.bound.symbol(declaration).unwrap();
+        (fixture, declaration, owner, signature, resolved)
     }
 
     fn assert_exact_warm_type_parameter_annotation(
@@ -2962,6 +3114,306 @@ mod tests {
                 resolved_type: Some(type_),
                 outer_type_parameters: None,
             })
+        );
+    }
+
+    #[test]
+    fn ordered_source_type_parameter_metadata_is_atomic_idempotent_and_collision_checked() {
+        let (mut fixture, declaration, _, signature, resolved) = staged_generic_metadata(
+            "function pair<T, U>(left: T, right: U): U { return right; }",
+            FileId::new(950),
+        );
+        let before = fixture.store.source_callable_provenance_lengths();
+        assert_eq!(before[4], 0);
+        assert!(
+            fixture
+                .store
+                .set_source_callable_type_parameters(signature, &resolved)
+        );
+        let published = fixture.store.source_callable_provenance_lengths();
+        assert_eq!(published[4], 1);
+        assert_eq!(
+            fixture.store.source_callable_type_parameters(signature),
+            Some(
+                resolved
+                    .iter()
+                    .map(|row| row.provenance)
+                    .collect::<Vec<_>>()
+                    .as_slice()
+            )
+        );
+        assert!(
+            fixture
+                .store
+                .set_source_callable_type_parameters(signature, &resolved)
+        );
+        assert_eq!(
+            fixture.store.source_callable_provenance_lengths(),
+            published
+        );
+
+        let mut swapped = resolved.to_vec();
+        swapped.swap(0, 1);
+        assert!(
+            !fixture
+                .store
+                .set_source_callable_type_parameters(signature, &swapped)
+        );
+        let mut wrong_node = resolved.to_vec();
+        let string = fixture.store.intrinsic_bootstrap().unwrap().string_type;
+        wrong_node[0].provenance.constraint = Some(declaration);
+        wrong_node[0].constraint = string;
+        assert!(
+            !fixture
+                .store
+                .set_source_callable_type_parameters(signature, &wrong_node)
+        );
+
+        let (foreign, _, _, _, _) = staged_generic_metadata(
+            "function foreign<T>(value: T): T { return value; }",
+            FileId::new(949),
+        );
+        let mut foreign_type = resolved.to_vec();
+        foreign_type[0].constraint = foreign.store.intrinsic_bootstrap().unwrap().string_type;
+        foreign_type[0].provenance.constraint = Some(foreign_type[0].provenance.declaration);
+        assert!(
+            !fixture
+                .store
+                .set_source_callable_type_parameters(signature, &foreign_type)
+        );
+        assert_eq!(
+            fixture.store.source_callable_provenance_lengths(),
+            published
+        );
+    }
+
+    #[test]
+    fn partial_source_type_parameter_caches_are_not_promoted_to_provenance() {
+        let (mut constraint, _, _, signature, resolved) = staged_generic_metadata(
+            "function identity<T>(value: T): T { return value; }",
+            FileId::new(948),
+        );
+        let type_parameter = resolved[0].provenance.type_parameter;
+        let no_constraint = constraint
+            .store
+            .intrinsic_bootstrap()
+            .unwrap()
+            .no_constraint_type;
+        assert!(constraint.store.set_type_parameter_resolution(
+            type_parameter,
+            Some(no_constraint),
+            None,
+            None,
+            None,
+        ));
+        assert!(
+            !constraint
+                .store
+                .set_source_callable_type_parameters(signature, &resolved)
+        );
+        assert_eq!(constraint.store.source_callable_provenance_lengths()[4], 0);
+
+        let (mut default, _, _, signature, resolved) = staged_generic_metadata(
+            "function identity<T>(value: T): T { return value; }",
+            FileId::new(947),
+        );
+        let type_parameter = resolved[0].provenance.type_parameter;
+        let no_constraint = default
+            .store
+            .intrinsic_bootstrap()
+            .unwrap()
+            .no_constraint_type;
+        assert!(default.store.set_type_parameter_resolution(
+            type_parameter,
+            None,
+            None,
+            None,
+            Some(no_constraint),
+        ));
+        assert!(
+            !default
+                .store
+                .set_source_callable_type_parameters(signature, &resolved)
+        );
+        assert_eq!(default.store.source_callable_provenance_lengths()[4], 0);
+
+        let (mut target, _, _, signature, resolved) = staged_generic_metadata(
+            "function identity<T>(value: T): T { return value; }",
+            FileId::new(946),
+        );
+        let type_parameter = resolved[0].provenance.type_parameter;
+        let string = target.store.intrinsic_bootstrap().unwrap().string_type;
+        let mapper = target
+            .store
+            .new_simple_type_mapper(type_parameter, string)
+            .unwrap();
+        assert!(target.store.set_type_parameter_resolution(
+            type_parameter,
+            None,
+            Some(type_parameter),
+            Some(mapper),
+            None,
+        ));
+        assert!(
+            !target
+                .store
+                .set_source_callable_type_parameters(signature, &resolved)
+        );
+        assert_eq!(target.store.source_callable_provenance_lengths()[4], 0);
+
+        let (mut base, _, _, signature, resolved) = staged_generic_metadata(
+            "function identity<T>(value: T): T { return value; }",
+            FileId::new(945),
+        );
+        let type_parameter = resolved[0].provenance.type_parameter;
+        let string = base.store.intrinsic_bootstrap().unwrap().string_type;
+        assert!(
+            base.store
+                .set_resolved_base_constraint(type_parameter, Some(string))
+        );
+        assert!(
+            !base
+                .store
+                .set_source_callable_type_parameters(signature, &resolved)
+        );
+        assert_eq!(base.store.source_callable_provenance_lengths()[4], 0);
+    }
+
+    #[test]
+    fn metadata_survives_later_callable_failure_and_exact_retry() {
+        let (mut fixture, declaration, owner, signature, resolved) = staged_generic_metadata(
+            "function identity<T>(value: T): T { return value; }",
+            FileId::new(944),
+        );
+        assert!(
+            fixture
+                .store
+                .set_source_callable_type_parameters(signature, &resolved)
+        );
+        let callable = fixture
+            .store
+            .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(owner))
+            .unwrap();
+        let owner_parent = fixture.store.symbol(owner).unwrap().parent();
+        let invalid = SourceCallableProvenance {
+            family: SourceCallableFamily::FunctionDeclaration,
+            declaration,
+            owner_symbol: owner,
+            owner_parent,
+            export_local: Some(owner),
+            signature,
+            contextual_target: None,
+            contextual_variable: None,
+        };
+        assert!(
+            !fixture
+                .store
+                .set_source_callable_provenance(callable, invalid)
+        );
+        let after_failure = fixture.store.source_callable_provenance_lengths();
+        assert_eq!(after_failure, [0, 0, 0, 0, 1]);
+        assert!(
+            fixture
+                .store
+                .set_source_callable_type_parameters(signature, &resolved)
+        );
+        assert!(fixture.store.set_source_callable_provenance(
+            callable,
+            SourceCallableProvenance {
+                export_local: None,
+                ..invalid
+            },
+        ));
+        assert_eq!(
+            fixture.store.source_callable_provenance_lengths(),
+            [1, 1, 1, 1, 1]
+        );
+    }
+
+    #[test]
+    fn non_generic_source_callable_rejects_forged_type_parameter_provenance() {
+        let mut fixture = QueryFixture::new(
+            "function plain(value: string): string { return value; }",
+            FileId::new(943),
+        );
+        let declaration = fixture
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::FunctionDeclaration).then_some(NodeRef::new(
+                    fixture.parsed.arena.id(),
+                    fixture.file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let NodeData::FunctionDeclaration(function) =
+            &fixture.parsed.arena.get(declaration.node).unwrap().data
+        else {
+            unreachable!()
+        };
+        let owner = fixture.bound.symbol(declaration).unwrap();
+        let parameter = fixture
+            .bound
+            .symbol(NodeRef::new(
+                declaration.arena,
+                declaration.file,
+                function.parameters.nodes[0],
+            ))
+            .unwrap();
+        let signature = fixture
+            .store
+            .alloc_signature(
+                SignatureFlags::NONE,
+                Some(declaration),
+                Vec::new(),
+                None,
+                vec![parameter],
+                None,
+                None,
+                1,
+            )
+            .unwrap();
+        let string = fixture.store.intrinsic_bootstrap().unwrap().string_type;
+        assert!(
+            fixture
+                .store
+                .replace_source_callable_type_parameters_for_test(
+                    signature,
+                    Some(
+                        vec![SourceCallableTypeParameterProvenance {
+                            declaration,
+                            symbol: owner,
+                            type_parameter: string,
+                            constraint: None,
+                            default_type: None,
+                        }]
+                        .into_boxed_slice(),
+                    ),
+                )
+                .is_none()
+        );
+        let callable = fixture
+            .store
+            .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(owner))
+            .unwrap();
+        assert!(!fixture.store.set_source_callable_provenance(
+            callable,
+            SourceCallableProvenance {
+                family: SourceCallableFamily::FunctionDeclaration,
+                declaration,
+                owner_symbol: owner,
+                owner_parent: None,
+                export_local: None,
+                signature,
+                contextual_target: None,
+                contextual_variable: None,
+            },
+        ));
+        assert_eq!(
+            fixture.store.source_callable_provenance_lengths(),
+            [0, 0, 0, 0, 1]
         );
     }
 
@@ -2992,16 +3444,24 @@ mod tests {
             .query_callable(declaration, owner, &mut diagnostics)
             .unwrap();
         let provenance = fixture.store.source_callable_provenance(callable).unwrap();
-        assert_eq!(
-            provenance.default_free_type_parameter,
-            Some(type_parameter_declaration)
-        );
         let signature = provenance.signature;
         let type_parameter = fixture
             .store
             .signature(signature)
             .unwrap()
             .type_parameters()[0];
+        assert_eq!(
+            fixture.store.source_callable_type_parameters(signature),
+            Some(
+                &[SourceCallableTypeParameterProvenance {
+                    declaration: type_parameter_declaration,
+                    symbol: type_parameter_symbol,
+                    type_parameter,
+                    constraint: None,
+                    default_type: None,
+                }][..]
+            )
+        );
         assert_eq!(
             fixture
                 .store

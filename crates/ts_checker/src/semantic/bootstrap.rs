@@ -180,6 +180,7 @@ pub struct CheckerStateSnapshot {
     pub source_callable_declarations: usize,
     pub source_callable_owners: usize,
     pub source_callable_signatures: usize,
+    pub source_callable_type_parameters: usize,
     pub cached_signatures: usize,
     pub callable_signature_parameter_types: usize,
     pub semantic_arenas: SemanticArenaCounts,
@@ -196,6 +197,7 @@ impl CheckerStateSnapshot {
             && self.source_callable_declarations == 0
             && self.source_callable_owners == 0
             && self.source_callable_signatures == 0
+            && self.source_callable_type_parameters == 0
             && self.cached_signatures == 0
             && self.callable_signature_parameter_types == 0
             && self.semantic_arenas.is_empty()
@@ -3330,6 +3332,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             source_callable_declarations,
             source_callable_owners,
             source_callable_signatures,
+            source_callable_type_parameters,
         ] = self.source_callable_provenance_lengths();
         let state = CheckerStateSnapshot {
             checker_symbols: self.symbol_store().checker_created_symbol_len(),
@@ -3338,6 +3341,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             source_callable_declarations,
             source_callable_owners,
             source_callable_signatures,
+            source_callable_type_parameters,
             cached_signatures: self.cached_signature_len(),
             callable_signature_parameter_types: self.callable_signature_parameter_types_len(),
             semantic_arenas: SemanticArenaCounts {
@@ -4282,6 +4286,7 @@ mod tests {
             source_callable_declarations,
             source_callable_owners,
             source_callable_signatures,
+            source_callable_type_parameters,
         ] = store.source_callable_provenance_lengths();
         CheckerStateSnapshot {
             checker_symbols: store.symbol_store().checker_created_symbol_len(),
@@ -4290,6 +4295,7 @@ mod tests {
             source_callable_declarations,
             source_callable_owners,
             source_callable_signatures,
+            source_callable_type_parameters,
             cached_signatures: store.cached_signature_len(),
             callable_signature_parameter_types: store.callable_signature_parameter_types_len(),
             semantic_arenas: semantic_counts(store),

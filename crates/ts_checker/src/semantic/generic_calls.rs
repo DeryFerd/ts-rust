@@ -381,9 +381,6 @@ fn identity_type_parameter_cache_provenance(
     let Some(provenance) = store.source_callable_provenance(callee) else {
         return IdentityTypeParameterCacheProvenance::RequireResolvedCaches;
     };
-    let Some(default_free_declaration) = provenance.default_free_type_parameter else {
-        return IdentityTypeParameterCacheProvenance::RequireResolvedCaches;
-    };
     let Some(signature) = store.signature(callable.signature) else {
         return IdentityTypeParameterCacheProvenance::RequireResolvedCaches;
     };
@@ -394,12 +391,21 @@ fn identity_type_parameter_cache_provenance(
     else {
         return IdentityTypeParameterCacheProvenance::RequireResolvedCaches;
     };
+    let Some([type_parameter_provenance]) =
+        store.source_callable_type_parameters(callable.signature)
+    else {
+        return IdentityTypeParameterCacheProvenance::RequireResolvedCaches;
+    };
     if provenance.signature != callable.signature
+        || type_parameter_provenance.type_parameter != *type_parameter
+        || type_parameter_provenance.symbol != type_parameter_owner
+        || type_parameter_provenance.constraint.is_some()
+        || type_parameter_provenance.default_type.is_some()
         || store.source_callable_type_for_signature(callable.signature) != Some(callee)
         || store
             .symbol(type_parameter_owner)
             .and_then(|symbol| symbol.declarations())
-            != Some(&[default_free_declaration])
+            != Some(&[type_parameter_provenance.declaration])
     {
         return IdentityTypeParameterCacheProvenance::RequireResolvedCaches;
     }
