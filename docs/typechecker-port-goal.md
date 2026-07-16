@@ -714,6 +714,22 @@ remains the cluster-level source of truth.
   pinned TS2326/TS2322 chain only for independently proven terminal scalar
   property pairs; nested objects and callables deliberately retain the plain
   root TS2322 until recursive relation-chain reporting is ported.
+- The ordered generic-call v2 slice is integrated through
+  `0177d8f..805e1c3`. One exact stored source signature may now carry 1..N
+  ordered type parameters, fixed required naked-parameter targets, trailing
+  defaults, primitive or earlier-parameter constraints, repeated inference
+  candidates, and a mapper-supported return. Direct and imported calls share
+  globally cached checked signatures by their complete effective vector;
+  every erroneous call instead retains a distinct uncached recovery signature,
+  with TS2345 publishing its checked and recovery graphs in one reserved
+  transaction. Partial/default failure returns preserve the pinned raw-vector
+  behavior rather than recomputing from the checked signature. TS1009, TS1099,
+  TS2558, TS2554/TS6210, TS2344, and TS2345 now have exact source ranges,
+  messages, precedence, final compiler sorting, and cross-file related
+  information. The public gates cover direct/imported checked-cache sharing,
+  distinct recoveries, dependent constraints, literal candidate unions,
+  partial/full default cache identity, raw default failure returns, and warm
+  replay; two independent reviews found no P0/P1 defect.
 - Exact named `import type` consumption is integrated through
   `002e17f..70c8096`, `38e0976`, and `4017b4d`. A capability is scoped to one
   direct top-level variable annotation root and may compose through exact
@@ -731,23 +747,29 @@ remains the cluster-level source of truth.
   under the exact all-target Clippy gate and executable integration tests carry
   the public behavior checks.
 - Fresh name-filtered scorecards provide honest negative evidence rather than a
-  parity claim. `/tmp/ts-rust-generic-50-4017b4d.json` executes 50 variants with
-  zero exact and 50 explicit unsupported results; the dominant blockers are
-  general multi-parameter inference, structured candidates, contextual generic
+  parity claim. `/tmp/ts-rust-generic-50-c22851e.json` reruns 50 variants after
+  ordered source-call integration and still reports zero exact and 50 explicit
+  unsupported results, with no code/span/message/order mismatch. The selected
+  files are dominated by JavaScript, contextual generic callables, overloads,
+  classes, mapped/conditional types, declaration emit, and unsupported source
+  signatures, so none exercises the bounded annotated identifier-call cut as a
+  complete artifact. The dominant blockers remain structured multi-parameter
+  inference and candidates, contextual generic
   callables, overloads, classes, mapped/conditional types, and declaration
-  emit—not the verified identity slice. `/tmp/ts-rust-import-50-4017b4d.json`
+  emit—not the verified bounded ordered-call slice.
+  `/tmp/ts-rust-import-50-4017b4d.json`
   executes 54 variants with zero exact and 54 explicit unsupported results,
   dominated by CommonJS/Node10, NodeNext/package facts, declaration files,
   default/namespace/reexport forms, and unresolved-import diagnostics. The next
-  parallel implementation wave therefore assigns one owner to single-signature
-  generic calls v2 and a disjoint owner to primitive scalar operators; logical
+  completed parallel implementation wave assigned one owner to single-signature
+  generic calls v2 and a disjoint owner to primitive scalar operators. Logical
   operators, overload selection, element/index access, and flow joins remain
   separate later gates.
-- The generic-calls-v2 owner keeps the coupled substrate serial within one
-  worktree: first publish ordered source type-parameter metadata; then infer and
-  finalize full argument vectors; then instantiate/cache an exact full-vector
-  signature; finally expose source diagnostics and imported replay. The first
-  admitted shape is one exact stored signature with 1..N ordered type parameters,
+- The generic-calls-v2 owner kept the coupled substrate serial within one
+  worktree: ordered source type-parameter metadata, full-vector inference and
+  finalization, exact checked-signature caching, atomic recovery
+  materialization, source diagnostics, and imported replay. The admitted shape
+  is one exact stored signature with 1..N ordered type parameters,
   fixed required parameters whose inference targets are naked type parameters,
   a mapper-supported return template, repeated candidates, exact/partial
   explicit arguments, trailing defaults, and primitive or earlier-parameter
