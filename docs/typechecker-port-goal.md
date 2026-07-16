@@ -620,6 +620,34 @@ remains the cluster-level source of truth.
   requires contextual arrow extraction, optional implicit-`any` TS7006, and
   empty-tuple rest normalization. `assertionWithNoArgument.ts` remains later
   because it also requires assertion predicates and real call checking.
+- The first source-callable gate is now integrated through `96b4ebb`,
+  `be06583`, `0e5ecf7`, and `72323b1`. Exact annotated top-level
+  `FunctionDeclaration` values and direct non-contextual `const` arrows publish
+  distinct binder-owned callable identities, immutable semantic parameter
+  provenance, eager checked-return identities, strict/bivariant relations, and
+  bounded concise/block return diagnostics. Arrow bodies are planned and
+  checked after the source-order statement walk so parameter, self, and forward
+  reads retain function-expression semantics. Independent Go/Rust reviews found
+  no P0/P1 cache or retry defect; malformed arrow parser facts are rejected
+  before publication. The combined gate is 788/788 checker tests plus doctest,
+  strict checker/compiler Clippy, and rustdoc with warnings denied.
+- `97d03fa` retains `noImplicitAny` in the canonical checker and projects it
+  from compiler options. The fresh exact-artifact run at
+  `/tmp/ts-rust-canonical-first50-source-functions-20260715.json` remains one
+  exact match and 49 honest unsupported variants: all nine prior
+  function-declaration roots advanced to narrower callable/body blockers, but
+  none became a complete artifact, and the two arrow roots require contextual
+  or destructured/untyped parameters. The next callable gate is therefore a
+  reusable contextual-callable preparation layer with missing parameter/return
+  types, TS7006, optional/rest semantics, and canonical empty-tuple
+  normalization—not another syntax-only admission.
+- Dependency-adjusted clustering of the completed 536-variant scorecard ranks
+  three parallel verticals: shared value-expression/inference semantics,
+  inferred/contextual callables, and enums. Enums are the best independent
+  exact-match lane (19 first blockers, 17 no-diagnostic artifacts, and 12
+  relatively standalone fixtures); classes and relative ESM remain strategically
+  essential but consume the expression/callable kernels before they produce
+  reliable complete artifacts.
 
 No percentage in this section is a whole-corpus parity claim. A score is
 publishable only when its variant manifest and complete artifact comparison are
