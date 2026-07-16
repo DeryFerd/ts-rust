@@ -108,9 +108,12 @@ use super::{
         plan_direct_source_property_call_syntax, plan_direct_source_property_syntax,
     },
     source_statements::{
-        SourceFunctionStatementsError, SourceFunctionStatementsInvariant,
-        SourceFunctionStatementsSyntax, SourceLocalDeclarationSyntax, SourceReturnBranchSyntax,
-        plan_source_function_statements_syntax,
+        SourceFallthroughBranchSyntax, SourceFunctionStatementsError,
+        SourceFunctionStatementsInvariant, SourceFunctionStatementsSyntax,
+        SourceJoinedFunctionStatementsError, SourceJoinedFunctionStatementsInvariant,
+        SourceJoinedFunctionStatementsSyntax, SourceLocalDeclarationSyntax,
+        SourceReturnBranchSyntax, plan_source_function_statements_syntax,
+        plan_source_joined_function_statements_syntax,
     },
     type_nodes::{
         CanonicalTypeQuery, CanonicalTypeReferenceAliasTarget, normalize_bigint_literal,
@@ -659,6 +662,7 @@ enum PlannedFunctionBody {
         expression: PlannedExpression,
     },
     Statements(Box<PlannedFunctionStatements>),
+    JoinedStatements(Box<PlannedJoinedFunctionStatements>),
 }
 
 #[derive(Clone, Debug)]
@@ -676,6 +680,24 @@ struct PlannedReturnBranch {
     locals: Vec<PlannedVariable>,
     return_statement: NodeRef,
     return_expression: PlannedExpression,
+}
+
+#[derive(Clone, Debug)]
+struct PlannedJoinedFunctionStatements {
+    leading: Vec<PlannedVariable>,
+    condition: PlannedExpression,
+    condition_symbol: SemanticSymbolId,
+    then_branch: PlannedFallthroughBranch,
+    else_branch: PlannedFallthroughBranch,
+    trailing: Vec<PlannedVariable>,
+    return_statement: NodeRef,
+    return_expression: PlannedExpression,
+    flow: SourceFlowPlan,
+}
+
+#[derive(Clone, Debug)]
+struct PlannedFallthroughBranch {
+    locals: Vec<PlannedVariable>,
 }
 
 #[derive(Clone, Debug)]
@@ -1518,6 +1540,44 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         }
     }
 
+    fn joined_function_statements_plan_error(
+        callable: &SourceCallablePlan,
+        error: SourceJoinedFunctionStatementsError,
+    ) -> SourceCheckError {
+        match error {
+            SourceJoinedFunctionStatementsError::Statements(error) => {
+                Self::function_statements_plan_error(callable, error)
+            }
+            SourceJoinedFunctionStatementsError::Unsupported(_) => {
+                SourceCheckError::Unsupported(UnsupportedSourceSyntax::Function(
+                    SourceFunctionUnsupported::FunctionBody(callable.body),
+                ))
+            }
+            SourceJoinedFunctionStatementsError::Invariant(reason) => {
+                let node = match reason {
+                    SourceJoinedFunctionStatementsInvariant::InvalidCallableEdge(node)
+                    | SourceJoinedFunctionStatementsInvariant::InvalidFlowContainer {
+                        node,
+                        ..
+                    }
+                    | SourceJoinedFunctionStatementsInvariant::MissingFlowStart(node)
+                    | SourceJoinedFunctionStatementsInvariant::UnexpectedFlowEnd(node)
+                    | SourceJoinedFunctionStatementsInvariant::UnexpectedReturnFlow(node)
+                    | SourceJoinedFunctionStatementsInvariant::MissingFlowPoint(node)
+                    | SourceJoinedFunctionStatementsInvariant::FlowPointMismatch {
+                        node,
+                        ..
+                    } => node,
+                    SourceJoinedFunctionStatementsInvariant::MissingFlowNode(_)
+                    | SourceJoinedFunctionStatementsInvariant::InvalidFlowNode(_) => {
+                        callable.declaration
+                    }
+                };
+                SourceCheckError::Function(SourceFunctionInvariant::Callable(node))
+            }
+        }
+    }
+
     fn source_flow_plan_error(
         callable: &SourceCallablePlan,
         error: SourceFlowError,
@@ -2037,15 +2097,26 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 )),
             ));
         };
-        let syntax = plan_source_function_statements_syntax(
-            self.arena,
-            self.bound,
-            store,
-            callable,
-        )
-        .map_err(|error| Self::function_statements_plan_error(callable, error))?;
-        let planned = self.finish_function_statements(callable, syntax)?;
-        Ok(PlannedFunctionBody::Statements(Box::new(planned)))
+        match plan_source_function_statements_syntax(self.arena, self.bound, store, callable) {
+            Ok(syntax) => {
+                let planned = self.finish_function_statements(callable, syntax)?;
+                Ok(PlannedFunctionBody::Statements(Box::new(planned)))
+            }
+            Err(SourceFunctionStatementsError::Unsupported(_)) => {
+                let syntax = plan_source_joined_function_statements_syntax(
+                    self.arena,
+                    self.bound,
+                    store,
+                    callable,
+                )
+                .map_err(|error| {
+                    Self::joined_function_statements_plan_error(callable, error)
+                })?;
+                let planned = self.finish_joined_function_statements(callable, syntax)?;
+                Ok(PlannedFunctionBody::JoinedStatements(Box::new(planned)))
+            }
+            Err(error) => Err(Self::function_statements_plan_error(callable, error)),
+        }
     }
 
     fn finish_function_statements(
@@ -2156,6 +2227,119 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 return_statement: syntax.return_statement,
                 return_expression: self.plan_expression(syntax.return_expression)?,
             })
+        })();
+        self.prior_variables = branch_prior;
+        self.readable_variables = branch_readable;
+        result
+    }
+
+    fn finish_joined_function_statements(
+        &mut self,
+        callable: &SourceCallablePlan,
+        syntax: SourceJoinedFunctionStatementsSyntax,
+    ) -> Result<PlannedJoinedFunctionStatements, SourceCheckError> {
+        let SourceJoinedFunctionStatementsSyntax {
+            body,
+            leading: leading_syntax,
+            joined_if,
+            trailing: trailing_syntax,
+            return_statement,
+            return_expression,
+        } = syntax;
+        if body != callable.body {
+            return Err(SourceCheckError::Function(
+                SourceFunctionInvariant::Callable(callable.body),
+            ));
+        }
+
+        let mut leading = Vec::with_capacity(leading_syntax.len());
+        for local in leading_syntax {
+            leading.push(self.finish_local_declaration(local)?);
+        }
+
+        let condition = self.plan_expression(joined_if.condition)?;
+        let condition_symbol = match &condition.unparenthesized().kind {
+            PlannedExpressionKind::Identifier(read)
+                if condition.unparenthesized().node == joined_if.condition_identifier
+                    && read.kind == PlannedIdentifierReadKind::Variable =>
+            {
+                read.value_symbol
+            }
+            _ => {
+                return Err(SourceCheckError::Unsupported(
+                    UnsupportedSourceSyntax::Function(
+                        SourceFunctionUnsupported::FunctionBody(callable.body),
+                    ),
+                ));
+            }
+        };
+
+        let then_branch = self.finish_fallthrough_branch(joined_if.then_branch)?;
+        let else_branch = self.finish_fallthrough_branch(joined_if.else_branch)?;
+
+        let mut trailing = Vec::with_capacity(trailing_syntax.len());
+        for local in trailing_syntax {
+            trailing.push(self.finish_local_declaration(local)?);
+        }
+        let return_expression = self.plan_expression(return_expression)?;
+
+        let points = leading
+            .iter()
+            .map(|local| local.name)
+            .chain(std::iter::once(condition.unparenthesized().node))
+            .chain(then_branch.locals.iter().map(|local| local.name))
+            .chain(else_branch.locals.iter().map(|local| local.name))
+            .chain(trailing.iter().map(|local| local.name))
+            .chain(std::iter::once(return_statement))
+            .collect::<Vec<_>>();
+        let assignments = leading
+            .iter()
+            .chain(&then_branch.locals)
+            .chain(&else_branch.locals)
+            .chain(&trailing)
+            .map(|local| SourceFlowAssignment {
+                declaration: local.declaration,
+                symbol: local.symbol,
+            })
+            .collect::<Vec<_>>();
+        let flow = SourceFlowPlan::preflight(
+            self.bound,
+            callable.declaration,
+            None,
+            points,
+            [SourceTruthinessCondition {
+                expression: condition.node,
+                symbol: condition_symbol,
+            }],
+            assignments,
+        )
+        .map_err(|error| Self::source_flow_plan_error(callable, error))?;
+
+        Ok(PlannedJoinedFunctionStatements {
+            leading,
+            condition,
+            condition_symbol,
+            then_branch,
+            else_branch,
+            trailing,
+            return_statement,
+            return_expression,
+            flow,
+        })
+    }
+
+    fn finish_fallthrough_branch(
+        &mut self,
+        syntax: SourceFallthroughBranchSyntax,
+    ) -> Result<PlannedFallthroughBranch, SourceCheckError> {
+        let branch_prior = self.prior_variables.clone();
+        let branch_readable = self.readable_variables.clone();
+        let result = (|| {
+            let mut locals = Vec::with_capacity(syntax.locals.len());
+            for local in syntax.locals {
+                locals.push(self.finish_local_declaration(local)?);
+            }
+            Ok(PlannedFallthroughBranch { locals })
         })();
         self.prior_variables = branch_prior;
         self.readable_variables = branch_readable;
@@ -3765,7 +3949,9 @@ fn preflight_inferred_function_return_dependencies(
             PlannedFunctionBody::Return { expression, .. } => {
                 expression_is_closed(expression, &function.callable.parameters, functions)
             }
-            PlannedFunctionBody::Statements(_) => false,
+            PlannedFunctionBody::Statements(_) | PlannedFunctionBody::JoinedStatements(_) => {
+                false
+            }
         };
         if !initializers_supported || !body_supported {
             return Err(SourceCheckError::Unsupported(
@@ -5484,47 +5670,19 @@ fn check_planned_function_statements(
         value_order,
     )?;
 
-    let condition_flow = frame
-        .snapshot_at(
-            store,
-            global_types,
-            statements.condition.unparenthesized().node,
-        )
-        .map_err(|error| SourcePlanner::source_flow_plan_error(callable, error))?;
-    let condition = check_expression_type(
+    check_planned_truthiness_condition(
         store,
         host,
         global_types,
         source,
         options,
         diagnostics,
-        condition_flow.types(),
+        &mut frame,
         preflighted_type_import_value_uses,
-        &statements.condition,
-        None,
         deferred,
-    )?;
-    if condition_flow.type_of(statements.condition_symbol) != Some(condition.raw)
-        || !source_truthiness_condition_type_is_supported(
-            store,
-            condition.result,
-            statements.condition.node,
-            &mut HashSet::new(),
-        )?
-    {
-        return Err(SourceCheckError::Unsupported(
-            UnsupportedSourceSyntax::Function(SourceFunctionUnsupported::FunctionBody(
-                callable.body,
-            )),
-        ));
-    }
-    emit_truthiness_operand_diagnostics(
-        store,
-        host,
-        diagnostics,
+        callable,
         &statements.condition,
-        condition.result,
-        statements.condition.node,
+        statements.condition_symbol,
     )?;
 
     check_planned_return_branch(
@@ -5561,6 +5719,185 @@ fn check_planned_function_statements(
         staged_value_types,
         value_order,
     )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn check_planned_joined_function_statements(
+    bound: &BoundFile,
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    source: SourceFileRef,
+    options: CanonicalCheckerOptions,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    base_flow_types: HashMap<SemanticSymbolId, TypeId>,
+    preflighted_type_import_value_uses: &HashMap<NodeRef, PreparedSourceTypeImportValueUse>,
+    type_import_capabilities: &HashMap<NodeRef, Vec<CanonicalTypeReferenceAliasTarget>>,
+    deferred: &mut Vec<DeferredAssertion>,
+    callable: &SourceCallablePlan,
+    return_type: NodeRef,
+    statements: &PlannedJoinedFunctionStatements,
+    staged_value_types: &mut HashMap<SemanticSymbolId, TypeId>,
+    value_order: &mut Vec<SemanticSymbolId>,
+) -> Result<(), SourceCheckError> {
+    let mut frame = statements
+        .flow
+        .frame(bound, base_flow_types)
+        .map_err(|error| SourcePlanner::source_flow_plan_error(callable, error))?;
+    check_planned_function_locals(
+        store,
+        host,
+        global_types,
+        source,
+        options,
+        diagnostics,
+        &mut frame,
+        preflighted_type_import_value_uses,
+        type_import_capabilities,
+        deferred,
+        callable,
+        &statements.leading,
+        staged_value_types,
+        value_order,
+    )?;
+    check_planned_truthiness_condition(
+        store,
+        host,
+        global_types,
+        source,
+        options,
+        diagnostics,
+        &mut frame,
+        preflighted_type_import_value_uses,
+        deferred,
+        callable,
+        &statements.condition,
+        statements.condition_symbol,
+    )?;
+    check_planned_function_locals(
+        store,
+        host,
+        global_types,
+        source,
+        options,
+        diagnostics,
+        &mut frame,
+        preflighted_type_import_value_uses,
+        type_import_capabilities,
+        deferred,
+        callable,
+        &statements.then_branch.locals,
+        staged_value_types,
+        value_order,
+    )?;
+    check_planned_function_locals(
+        store,
+        host,
+        global_types,
+        source,
+        options,
+        diagnostics,
+        &mut frame,
+        preflighted_type_import_value_uses,
+        type_import_capabilities,
+        deferred,
+        callable,
+        &statements.else_branch.locals,
+        staged_value_types,
+        value_order,
+    )?;
+    check_planned_function_locals(
+        store,
+        host,
+        global_types,
+        source,
+        options,
+        diagnostics,
+        &mut frame,
+        preflighted_type_import_value_uses,
+        type_import_capabilities,
+        deferred,
+        callable,
+        &statements.trailing,
+        staged_value_types,
+        value_order,
+    )?;
+    let snapshot = frame
+        .snapshot_at(store, global_types, statements.return_statement)
+        .map_err(|error| SourcePlanner::source_flow_plan_error(callable, error))?;
+    check_planned_assignment(
+        store,
+        host,
+        global_types,
+        source,
+        options,
+        diagnostics,
+        snapshot.types(),
+        preflighted_type_import_value_uses,
+        deferred,
+        return_type,
+        &[],
+        &statements.return_expression,
+        statements.return_statement,
+        None,
+    )?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn check_planned_truthiness_condition(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    source: SourceFileRef,
+    options: CanonicalCheckerOptions,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    frame: &mut SourceFlowFrame<'_, '_>,
+    preflighted_type_import_value_uses: &HashMap<NodeRef, PreparedSourceTypeImportValueUse>,
+    deferred: &mut Vec<DeferredAssertion>,
+    callable: &SourceCallablePlan,
+    condition: &PlannedExpression,
+    condition_symbol: SemanticSymbolId,
+) -> Result<(), SourceCheckError> {
+    let condition_flow = frame
+        .snapshot_at(store, global_types, condition.unparenthesized().node)
+        .map_err(|error| SourcePlanner::source_flow_plan_error(callable, error))?;
+    let checked = check_expression_type(
+        store,
+        host,
+        global_types,
+        source,
+        options,
+        diagnostics,
+        condition_flow.types(),
+        preflighted_type_import_value_uses,
+        condition,
+        None,
+        deferred,
+    )?;
+    if condition_flow.type_of(condition_symbol) != Some(checked.raw)
+        || !source_truthiness_condition_type_is_supported(
+            store,
+            checked.result,
+            condition.node,
+            &mut HashSet::new(),
+        )?
+    {
+        return Err(SourceCheckError::Unsupported(
+            UnsupportedSourceSyntax::Function(SourceFunctionUnsupported::FunctionBody(
+                callable.body,
+            )),
+        ));
+    }
+    emit_truthiness_operand_diagnostics(
+        store,
+        host,
+        diagnostics,
+        condition,
+        checked.result,
+        condition.node,
+    )?;
+    Ok(())
 }
 
 fn source_truthiness_condition_type_is_supported(
@@ -6963,7 +7300,7 @@ pub(super) fn check_source_file(
         let expression = match &function.body {
             PlannedFunctionBody::Empty => None,
             PlannedFunctionBody::Return { expression, .. } => Some(expression),
-            PlannedFunctionBody::Statements(_) => {
+            PlannedFunctionBody::Statements(_) | PlannedFunctionBody::JoinedStatements(_) => {
                 return Err(SourceCheckError::Function(
                     SourceFunctionInvariant::Callable(function.callable.body),
                 ));
@@ -7082,6 +7419,26 @@ pub(super) fn check_source_file(
                     }
                     PlannedFunctionBody::Statements(statements) => {
                         check_planned_function_statements(
+                            bound,
+                            store,
+                            host,
+                            global_types,
+                            source,
+                            options,
+                            diagnostics,
+                            body_flow_types,
+                            &preflighted_type_import_value_uses,
+                            &type_import_capabilities,
+                            &mut deferred,
+                            &function.callable,
+                            return_type,
+                            statements,
+                            &mut staged_value_types,
+                            &mut value_order,
+                        )?;
+                    }
+                    PlannedFunctionBody::JoinedStatements(statements) => {
+                        check_planned_joined_function_statements(
                             bound,
                             store,
                             host,

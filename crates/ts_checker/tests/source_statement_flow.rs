@@ -663,3 +663,132 @@ fn structural_thenable_condition_remains_a_stable_semantic_boundary() {
     assert!(context.diagnostics().is_empty());
     assert!(!is_type_checked(&context, file));
 }
+
+#[test]
+fn joined_if_flow_restores_the_named_union_before_trailing_statements() {
+    let source = concat!(
+        "type Choice = \"yes\" | \"\" | undefined;\n",
+        "function joined(value: Choice): Choice {\n",
+        "  const before: Choice = value;\n",
+        "  if (((value))) {\n",
+        "    const truthy: \"yes\" = value;\n",
+        "  } else {\n",
+        "    const falsy: \"\" | undefined = value;\n",
+        "  }\n",
+        "  const after: Choice = value;\n",
+        "  return value;\n",
+        "}\n",
+    );
+    let parsed = parse_source_file(source);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(7);
+    let mut context = context(&parsed, file);
+
+    context.check_source_file(file).unwrap();
+    assert!(context.diagnostics().is_empty());
+    assert_eq!(rendered_type(&context, &parsed, file, "before"), "Choice");
+    assert_eq!(rendered_type(&context, &parsed, file, "truthy"), "\"yes\"");
+    assert_eq!(
+        rendered_type(&context, &parsed, file, "falsy"),
+        "\"\" | undefined",
+    );
+    assert_eq!(rendered_type(&context, &parsed, file, "after"), "Choice");
+    assert!(is_type_checked(&context, file));
+
+    let cold_counts = (
+        context.store().type_len(),
+        context.store().mapper_len(),
+        context.store().signature_len(),
+    );
+    let cold_diagnostics = context.diagnostics().clone();
+    context.check_source_file(file).unwrap();
+    assert_eq!(
+        (
+            context.store().type_len(),
+            context.store().mapper_len(),
+            context.store().signature_len(),
+        ),
+        cold_counts,
+    );
+    assert_eq!(context.diagnostics(), &cold_diagnostics);
+}
+
+#[test]
+fn joined_if_flow_preserves_branch_then_trailing_diagnostic_order() {
+    let source = concat!(
+        "type Choice = \"yes\" | \"\" | undefined;\n",
+        "function joinedErrors(value: Choice): Choice {\n",
+        "  if (value) {\n",
+        "    const badTruthy: \"\" = value;\n",
+        "  } else {\n",
+        "    const badFalsy: \"yes\" = value;\n",
+        "  }\n",
+        "  const badAfter: \"yes\" = value;\n",
+        "  return value;\n",
+        "}\n",
+    );
+    let parsed = parse_source_file(source);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(8);
+    let mut context = context(&parsed, file);
+
+    context.check_source_file(file).unwrap();
+    let diagnostics = context
+        .diagnostics()
+        .as_slice()
+        .iter()
+        .map(|diagnostic| {
+            let node = diagnostic.node.expect("expected node-anchored diagnostic");
+            (
+                diagnostic.diagnostic.code(),
+                parsed.arena.get(node.node).unwrap().kind,
+                node_text(source, &parsed, node),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        diagnostics,
+        [
+            (2322, SyntaxKind::Identifier, "badTruthy"),
+            (2322, SyntaxKind::Identifier, "badFalsy"),
+            (2322, SyntaxKind::Identifier, "badAfter"),
+        ],
+    );
+    assert!(is_type_checked(&context, file));
+
+    let cold_counts = (
+        context.store().type_len(),
+        context.store().mapper_len(),
+        context.store().signature_len(),
+    );
+    let cold_diagnostics = context.diagnostics().clone();
+    context.check_source_file(file).unwrap();
+    assert_eq!(
+        (
+            context.store().type_len(),
+            context.store().mapper_len(),
+            context.store().signature_len(),
+        ),
+        cold_counts,
+    );
+    assert_eq!(context.diagnostics(), &cold_diagnostics);
+}
+
+#[test]
+fn joined_if_branch_returns_remain_an_atomic_boundary() {
+    assert_final_if_boundary_is_atomic(
+        concat!(
+            "type Choice = \"yes\" | \"\" | undefined;\n",
+            "function branchReturn(value: Choice): Choice {\n",
+            "  if (value) {\n",
+            "    return value;\n",
+            "  } else {\n",
+            "    const falsy: \"\" | undefined = value;\n",
+            "  }\n",
+            "  const after: Choice = value;\n",
+            "  return value;\n",
+            "}\n",
+        ),
+        FileId::new(9),
+    );
+}

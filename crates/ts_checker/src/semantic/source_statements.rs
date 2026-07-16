@@ -1095,12 +1095,12 @@ impl SyntaxPlanner<'_> {
         let mut if_index = None;
         for (index, statement_id) in preceding.iter().copied().enumerate() {
             let statement = self.reference(statement_id);
-            if self.node(statement)?.kind == SyntaxKind::IfStatement {
-                if if_index.replace(index).is_some() {
-                    return Err(SourceJoinedFunctionStatementsError::Unsupported(
-                        SourceJoinedFunctionStatementsUnsupported::AdditionalIf(statement),
-                    ));
-                }
+            if self.node(statement)?.kind == SyntaxKind::IfStatement
+                && if_index.replace(index).is_some()
+            {
+                return Err(SourceJoinedFunctionStatementsError::Unsupported(
+                    SourceJoinedFunctionStatementsUnsupported::AdditionalIf(statement),
+                ));
             }
         }
         let Some(if_index) = if_index else {
@@ -1430,7 +1430,7 @@ impl SyntaxPlanner<'_> {
         start: FlowRef,
     ) -> Result<(), SourceJoinedFunctionStatementsError> {
         let actual = self.peel_joined_assignments(flow, assignments)?;
-        self.expect_flow_point(point, actual, start)
+        Self::expect_flow_point(point, actual, start)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1465,7 +1465,7 @@ impl SyntaxPlanner<'_> {
             );
         }
         let actual = self.peel_joined_assignments(antecedent, leading)?;
-        self.expect_flow_point(point, actual, start)
+        Self::expect_flow_point(point, actual, start)
     }
 
     fn expect_join_route(
@@ -1528,7 +1528,6 @@ impl SyntaxPlanner<'_> {
     }
 
     fn expect_flow_point(
-        &self,
         point: NodeRef,
         actual: FlowRef,
         expected: FlowRef,
