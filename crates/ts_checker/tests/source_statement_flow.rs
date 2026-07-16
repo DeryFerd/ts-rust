@@ -160,7 +160,8 @@ fn variable_initializer(parsed: &ParseResult, file: FileId, declaration: NodeRef
 }
 
 fn unique_variable_initializer(parsed: &ParseResult, file: FileId, expected: &str) -> NodeRef {
-    let [declaration] = variable_declarations(parsed, file, expected).as_slice() else {
+    let declarations = variable_declarations(parsed, file, expected);
+    let [declaration] = declarations.as_slice() else {
         panic!("expected one declaration named {expected:?}")
     };
     variable_initializer(parsed, file, *declaration)

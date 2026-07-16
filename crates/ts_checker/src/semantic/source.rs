@@ -51,7 +51,8 @@ use super::{
     },
     logical_operators::{
         LogicalBinaryError, LogicalBinaryInvariant, LogicalBinaryRequest,
-        LogicalBinaryUnsupported, check_logical_binary, narrow_logical_right_operand,
+        LogicalBinaryUnsupported, TruthinessAssumption, check_logical_binary,
+        narrow_by_truthiness, narrow_logical_right_operand,
     },
     primitive_operators::{
         PrimitiveBigIntExponentiationTarget, PrimitiveBinaryError, PrimitiveBinaryRecovery,
@@ -85,6 +86,10 @@ use super::{
         PlannedFunctionRead, SourceFunctionInvariant, SourceFunctionPlanError,
         SourceFunctionUnsupported, plan_function_identifier_read, plan_top_level_function,
     },
+    source_flow::{
+        SourceFlowAssignment, SourceFlowError, SourceFlowFrame, SourceFlowPlan,
+        SourceTruthinessCondition,
+    },
     source_imports::{
         PlannedSourceImportRead, PreparedSourceImportPublication, PreparedSourceImportValue,
         ResolvedSourceImportBinding, ResolvedSourceTypeImportBinding, SourceImportBindingPlan,
@@ -99,6 +104,11 @@ use super::{
         SourcePropertyError, SourcePropertyPlan, SourcePropertyUnsupported,
         check_direct_source_property, finish_direct_source_property_plan,
         plan_direct_source_property_call_syntax, plan_direct_source_property_syntax,
+    },
+    source_statements::{
+        SourceFunctionStatementsError, SourceFunctionStatementsInvariant,
+        SourceFunctionStatementsSyntax, SourceLocalDeclarationSyntax, SourceReturnBranchSyntax,
+        plan_source_function_statements_syntax,
     },
     type_nodes::{
         CanonicalTypeQuery, CanonicalTypeReferenceAliasTarget, normalize_bigint_literal,
@@ -597,6 +607,7 @@ impl PlannedIdentifierRead {
 
 #[derive(Clone, Debug)]
 struct PlannedVariable {
+    declaration: NodeRef,
     name: NodeRef,
     symbol: SemanticSymbolId,
     binding: VariableBindingKind,
@@ -645,6 +656,24 @@ enum PlannedFunctionBody {
         statement: NodeRef,
         expression: PlannedExpression,
     },
+    Statements(Box<PlannedFunctionStatements>),
+}
+
+#[derive(Clone, Debug)]
+struct PlannedFunctionStatements {
+    leading: Vec<PlannedVariable>,
+    condition: PlannedExpression,
+    condition_symbol: SemanticSymbolId,
+    then_branch: PlannedReturnBranch,
+    else_branch: PlannedReturnBranch,
+    flow: SourceFlowPlan,
+}
+
+#[derive(Clone, Debug)]
+struct PlannedReturnBranch {
+    locals: Vec<PlannedVariable>,
+    return_statement: NodeRef,
+    return_expression: PlannedExpression,
 }
 
 #[derive(Clone, Debug)]
@@ -1444,6 +1473,65 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         }
     }
 
+    fn function_statements_plan_error(
+        callable: &SourceCallablePlan,
+        error: SourceFunctionStatementsError,
+    ) -> SourceCheckError {
+        match error {
+            SourceFunctionStatementsError::Unsupported(_) => {
+                SourceCheckError::Unsupported(UnsupportedSourceSyntax::Function(
+                    SourceFunctionUnsupported::FunctionBody(callable.body),
+                ))
+            }
+            SourceFunctionStatementsError::Variable(error) => Self::variable_plan_error(error),
+            SourceFunctionStatementsError::Invariant(reason) => {
+                let node = match reason {
+                    SourceFunctionStatementsInvariant::BoundSourceMismatch(node)
+                    | SourceFunctionStatementsInvariant::MissingNode(node)
+                    | SourceFunctionStatementsInvariant::NodeNotBound(node)
+                    | SourceFunctionStatementsInvariant::MismatchedNodeData { node, .. }
+                    | SourceFunctionStatementsInvariant::InvalidParent { node, .. }
+                    | SourceFunctionStatementsInvariant::InvalidRange { node, .. }
+                    | SourceFunctionStatementsInvariant::InvalidListRange(node)
+                    | SourceFunctionStatementsInvariant::InvalidCallableEdge(node)
+                    | SourceFunctionStatementsInvariant::InvalidContainer { node, .. }
+                    | SourceFunctionStatementsInvariant::InvalidBlockScopeContainer {
+                        node,
+                        ..
+                    }
+                    | SourceFunctionStatementsInvariant::MissingLocals(node)
+                    | SourceFunctionStatementsInvariant::InvalidFlowContainer { node, .. }
+                    | SourceFunctionStatementsInvariant::MissingFlowStart(node)
+                    | SourceFunctionStatementsInvariant::UnexpectedFlowEnd(node)
+                    | SourceFunctionStatementsInvariant::UnexpectedReturnFlow(node)
+                    | SourceFunctionStatementsInvariant::CyclicCondition(node) => node,
+                    SourceFunctionStatementsInvariant::LocalTableMismatch {
+                        declaration,
+                        ..
+                    } => declaration,
+                    SourceFunctionStatementsInvariant::InvalidOrder { next, .. } => next,
+                };
+                SourceCheckError::Function(SourceFunctionInvariant::Callable(node))
+            }
+        }
+    }
+
+    fn source_flow_plan_error(
+        callable: &SourceCallablePlan,
+        error: SourceFlowError,
+    ) -> SourceCheckError {
+        match error {
+            SourceFlowError::Unsupported(_) | SourceFlowError::Narrowing { .. } => {
+                SourceCheckError::Unsupported(UnsupportedSourceSyntax::Function(
+                    SourceFunctionUnsupported::FunctionBody(callable.body),
+                ))
+            }
+            SourceFlowError::Invariant(_) => SourceCheckError::Function(
+                SourceFunctionInvariant::Callable(callable.declaration),
+            ),
+        }
+    }
+
     fn function_plan_error(error: SourceFunctionPlanError) -> SourceCheckError {
         match error {
             SourceFunctionPlanError::Unsupported(error) => {
@@ -1765,7 +1853,14 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         callable: &SourceCallablePlan,
     ) -> Result<(Vec<PlannedParameterInitializer>, PlannedFunctionBody), SourceCheckError> {
         let parameter_initializers = self.plan_parameter_initializers_and_enter_scope(callable)?;
+        let body_prior_variables = self.prior_variables.clone();
+        let body_readable_variables = self.readable_variables.clone();
         let result = self.plan_function_body_contents(callable);
+        // Statement planning may enter leading and branch-local scopes. Always
+        // restore the exact parameter-entry state, including on a typed
+        // unsupported boundary, before removing the parameters themselves.
+        self.prior_variables = body_prior_variables;
+        self.readable_variables = body_readable_variables;
         self.leave_callable_parameter_scope(callable)?;
         Ok((parameter_initializers, result?))
     }
@@ -1856,14 +1951,9 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             }
             block.statements.nodes.clone()
         };
-        let [] = statements.as_slice() else {
-            let [statement_id] = statements.as_slice() else {
-                return Err(SourceCheckError::Unsupported(
-                    UnsupportedSourceSyntax::Function(SourceFunctionUnsupported::FunctionBody(
-                        body,
-                    )),
-                ));
-            };
+        if let [statement_id] = statements.as_slice()
+            && self.node(self.reference(*statement_id))?.kind == SyntaxKind::ReturnStatement
+        {
             let statement = self.reference(*statement_id);
             let expression = {
                 let node = self.node(statement)?;
@@ -1901,13 +1991,198 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 statement,
                 expression: self.plan_expression(expression)?,
             });
-        };
+        }
+        if !statements.is_empty() {
+            return self.plan_function_statements(callable);
+        }
         if !self.function_empty_body_return_supported(callable.return_type)? {
             return Err(SourceCheckError::Unsupported(
                 UnsupportedSourceSyntax::Function(SourceFunctionUnsupported::FunctionBody(body)),
             ));
         }
         Ok(PlannedFunctionBody::Empty)
+    }
+
+    fn plan_function_statements(
+        &mut self,
+        callable: &SourceCallablePlan,
+    ) -> Result<PlannedFunctionBody, SourceCheckError> {
+        let Some((store, _)) = self.semantic else {
+            return Err(SourceCheckError::Unsupported(
+                UnsupportedSourceSyntax::Function(SourceFunctionUnsupported::FunctionBody(
+                    callable.body,
+                )),
+            ));
+        };
+        let syntax = plan_source_function_statements_syntax(
+            self.arena,
+            self.bound,
+            store,
+            callable,
+        )
+        .map_err(|error| Self::function_statements_plan_error(callable, error))?;
+        let planned = self.finish_function_statements(callable, syntax)?;
+        Ok(PlannedFunctionBody::Statements(Box::new(planned)))
+    }
+
+    fn finish_function_statements(
+        &mut self,
+        callable: &SourceCallablePlan,
+        syntax: SourceFunctionStatementsSyntax,
+    ) -> Result<PlannedFunctionStatements, SourceCheckError> {
+        let SourceFunctionStatementsSyntax {
+            body,
+            leading: leading_syntax,
+            final_if,
+        } = syntax;
+        if body != callable.body {
+            return Err(SourceCheckError::Function(
+                SourceFunctionInvariant::Callable(callable.body),
+            ));
+        }
+
+        let mut leading = Vec::with_capacity(leading_syntax.len());
+        for local in leading_syntax {
+            leading.push(self.finish_local_declaration(local)?);
+        }
+
+        let condition = self.plan_expression(final_if.condition)?;
+        let condition_symbol = match &condition.unparenthesized().kind {
+            PlannedExpressionKind::Identifier(read)
+                if condition.unparenthesized().node == final_if.condition_identifier
+                    && read.kind == PlannedIdentifierReadKind::Variable =>
+            {
+                read.value_symbol
+            }
+            _ => {
+                return Err(SourceCheckError::Unsupported(
+                    UnsupportedSourceSyntax::Function(
+                        SourceFunctionUnsupported::FunctionBody(callable.body),
+                    ),
+                ));
+            }
+        };
+
+        let then_branch = self.finish_return_branch(final_if.then_branch)?;
+        let else_branch = self.finish_return_branch(final_if.else_branch)?;
+
+        let points = leading
+            .iter()
+            .map(|local| local.name)
+            .chain(std::iter::once(condition.unparenthesized().node))
+            .chain(
+                then_branch
+                    .locals
+                    .iter()
+                    .map(|local| local.name),
+            )
+            .chain(std::iter::once(then_branch.return_statement))
+            .chain(
+                else_branch
+                    .locals
+                    .iter()
+                    .map(|local| local.name),
+            )
+            .chain(std::iter::once(else_branch.return_statement))
+            .collect::<Vec<_>>();
+        let assignments = leading
+            .iter()
+            .chain(&then_branch.locals)
+            .chain(&else_branch.locals)
+            .map(|local| SourceFlowAssignment {
+                declaration: local.declaration,
+                symbol: local.symbol,
+            })
+            .collect::<Vec<_>>();
+        let flow = SourceFlowPlan::preflight(
+            self.bound,
+            callable.declaration,
+            points,
+            [SourceTruthinessCondition {
+                expression: condition.node,
+                symbol: condition_symbol,
+            }],
+            assignments,
+        )
+        .map_err(|error| Self::source_flow_plan_error(callable, error))?;
+
+        Ok(PlannedFunctionStatements {
+            leading,
+            condition,
+            condition_symbol,
+            then_branch,
+            else_branch,
+            flow,
+        })
+    }
+
+    fn finish_return_branch(
+        &mut self,
+        syntax: SourceReturnBranchSyntax,
+    ) -> Result<PlannedReturnBranch, SourceCheckError> {
+        let branch_prior = self.prior_variables.clone();
+        let branch_readable = self.readable_variables.clone();
+        let result = (|| {
+            let mut locals = Vec::with_capacity(syntax.locals.len());
+            for local in syntax.locals {
+                locals.push(self.finish_local_declaration(local)?);
+            }
+            Ok(PlannedReturnBranch {
+                locals,
+                return_statement: syntax.return_statement,
+                return_expression: self.plan_expression(syntax.return_expression)?,
+            })
+        })();
+        self.prior_variables = branch_prior;
+        self.readable_variables = branch_readable;
+        result
+    }
+
+    fn finish_local_declaration(
+        &mut self,
+        syntax: SourceLocalDeclarationSyntax,
+    ) -> Result<PlannedVariable, SourceCheckError> {
+        if let Some(type_node) = syntax.type_node {
+            self.plan_type_import_annotation_root(type_node)?;
+        }
+        let initializer = self.plan_expression(syntax.initializer)?;
+        if syntax.type_node.is_none()
+            && matches!(&initializer.kind, PlannedExpressionKind::Array(elements) if elements.is_empty())
+        {
+            return Err(SourceCheckError::Unsupported(
+                UnsupportedSourceSyntax::Variable(VariableUnsupported::InferredEmptyArrayOption(
+                    syntax.declaration,
+                )),
+            ));
+        }
+        if syntax.type_node.is_none()
+            && !syntax.binding.is_const()
+            && matches!(
+                &initializer.unparenthesized().kind,
+                PlannedExpressionKind::Null | PlannedExpressionKind::GlobalUndefined
+            )
+        {
+            return Err(SourceCheckError::Unsupported(
+                UnsupportedSourceSyntax::Variable(
+                    VariableUnsupported::InferredMutableNullishOption(syntax.declaration),
+                ),
+            ));
+        }
+        if !self.prior_variables.insert(syntax.symbol)
+            || !self.readable_variables.insert(syntax.symbol)
+        {
+            return Err(SourceCheckError::Variable(
+                VariableInvariant::InvalidSymbolShape(syntax.symbol),
+            ));
+        }
+        Ok(PlannedVariable {
+            declaration: syntax.declaration,
+            name: syntax.name,
+            symbol: syntax.symbol,
+            binding: syntax.binding,
+            type_node: syntax.type_node,
+            initializer,
+        })
     }
 
     fn plan_arrow_body(
@@ -2395,6 +2670,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             ));
         }
         Ok(PlannedVariable {
+            declaration,
             name,
             symbol: variable_symbol,
             binding,
@@ -3465,6 +3741,7 @@ fn preflight_inferred_function_return_dependencies(
             PlannedFunctionBody::Return { expression, .. } => {
                 expression_is_closed(expression, &function.callable.parameters, functions)
             }
+            PlannedFunctionBody::Statements(_) => false,
         };
         if !initializers_supported || !body_supported {
             return Err(SourceCheckError::Unsupported(
@@ -4577,23 +4854,14 @@ fn emit_logical_operand_diagnostics(
 ) -> Result<(), SourceCheckError> {
     match binary.operator {
         SyntaxKind::AmpersandAmpersandToken | SyntaxKind::BarBarToken => {
-            let flags = store
-                .type_payload(left_type)
-                .map(TypeRecord::flags)
-                .ok_or(SourceCheckError::LogicalOperator(binary.node))?;
-            if flags.intersects(TypeFlags::VOID) {
-                issue_node_diagnostic(diagnostics, binary.left.node, 1345)?;
-                return Ok(());
-            }
-            match syntactic_truthiness(host, &binary.left) {
-                PredicateSemantics::Always => {
-                    issue_node_diagnostic(diagnostics, binary.left.node, 2872)?;
-                }
-                PredicateSemantics::Never => {
-                    issue_node_diagnostic(diagnostics, binary.left.node, 2873)?;
-                }
-                PredicateSemantics::Sometimes => {}
-            }
+            emit_truthiness_operand_diagnostics(
+                store,
+                host,
+                diagnostics,
+                &binary.left,
+                left_type,
+                binary.node,
+            )?;
         }
         SyntaxKind::QuestionQuestionToken => {
             let left_target = outer_expression_target(&binary.left);
@@ -4610,6 +4878,57 @@ fn emit_logical_operand_diagnostics(
         _ => return Err(SourceCheckError::LogicalOperator(binary.node)),
     }
     Ok(())
+}
+
+fn emit_truthiness_operand_diagnostics(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    expression: &PlannedExpression,
+    type_: TypeId,
+    invariant_node: NodeRef,
+) -> Result<(), SourceCheckError> {
+    if source_type_includes_void(store, type_, &mut HashSet::new())
+        .ok_or(SourceCheckError::LogicalOperator(invariant_node))?
+    {
+        issue_node_diagnostic(diagnostics, expression.node, 1345)?;
+        return Ok(());
+    }
+    match syntactic_truthiness(host, expression) {
+        PredicateSemantics::Always => {
+            issue_node_diagnostic(diagnostics, expression.node, 2872)?;
+        }
+        PredicateSemantics::Never => {
+            issue_node_diagnostic(diagnostics, expression.node, 2873)?;
+        }
+        PredicateSemantics::Sometimes => {}
+    }
+    Ok(())
+}
+
+fn source_type_includes_void(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    visiting: &mut HashSet<TypeId>,
+) -> Option<bool> {
+    let record = store.type_payload(type_)?;
+    if record.flags().intersects(TypeFlags::VOID) {
+        return Some(true);
+    }
+    let TypeData::Union(union) = record.data() else {
+        return Some(false);
+    };
+    if !visiting.insert(type_) {
+        return None;
+    }
+    for constituent in &union.union.types {
+        if source_type_includes_void(store, *constituent, visiting)? {
+            visiting.remove(&type_);
+            return Some(true);
+        }
+    }
+    visiting.remove(&type_);
+    Some(false)
 }
 
 fn outer_expression_target(mut expression: &PlannedExpression) -> &PlannedExpression {
@@ -5121,6 +5440,351 @@ fn check_callable_parameter_initializers(
         ));
     }
     Ok(flow_types)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn check_planned_function_statements(
+    bound: &BoundFile,
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    source: SourceFileRef,
+    options: CanonicalCheckerOptions,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    base_flow_types: HashMap<SemanticSymbolId, TypeId>,
+    preflighted_type_import_value_uses: &HashMap<NodeRef, PreparedSourceTypeImportValueUse>,
+    type_import_capabilities: &HashMap<NodeRef, Vec<CanonicalTypeReferenceAliasTarget>>,
+    deferred: &mut Vec<DeferredAssertion>,
+    callable: &SourceCallablePlan,
+    return_type: NodeRef,
+    statements: &PlannedFunctionStatements,
+    staged_value_types: &mut HashMap<SemanticSymbolId, TypeId>,
+    value_order: &mut Vec<SemanticSymbolId>,
+) -> Result<(), SourceCheckError> {
+    let mut frame = statements
+        .flow
+        .frame(bound, base_flow_types)
+        .map_err(|error| SourcePlanner::source_flow_plan_error(callable, error))?;
+    check_planned_function_locals(
+        store,
+        host,
+        global_types,
+        source,
+        options,
+        diagnostics,
+        &mut frame,
+        preflighted_type_import_value_uses,
+        type_import_capabilities,
+        deferred,
+        callable,
+        &statements.leading,
+        staged_value_types,
+        value_order,
+    )?;
+
+    let condition_flow = frame
+        .snapshot_at(
+            store,
+            global_types,
+            statements.condition.unparenthesized().node,
+        )
+        .map_err(|error| SourcePlanner::source_flow_plan_error(callable, error))?;
+    let condition = check_expression_type(
+        store,
+        host,
+        global_types,
+        source,
+        options,
+        diagnostics,
+        condition_flow.types(),
+        preflighted_type_import_value_uses,
+        &statements.condition,
+        None,
+        deferred,
+    )?;
+    if condition_flow.type_of(statements.condition_symbol) != Some(condition.raw)
+        || !source_truthiness_condition_type_is_supported(
+            store,
+            condition.result,
+            statements.condition.node,
+            &mut HashSet::new(),
+        )?
+    {
+        return Err(SourceCheckError::Unsupported(
+            UnsupportedSourceSyntax::Function(SourceFunctionUnsupported::FunctionBody(
+                callable.body,
+            )),
+        ));
+    }
+    let falsy = narrow_by_truthiness(
+        store,
+        Some(global_types),
+        condition.result,
+        TruthinessAssumption::Falsy,
+    )
+    .map_err(|error| {
+        SourcePlanner::source_flow_plan_error(
+            callable,
+            SourceFlowError::Narrowing {
+                condition: statements.condition.node,
+                error,
+            },
+        )
+    })?;
+    let never = store
+        .intrinsic_bootstrap()
+        .map(|bootstrap| bootstrap.never_type)
+        .ok_or(SourceCheckError::LogicalOperator(statements.condition.node))?;
+    if falsy == never {
+        return Err(SourceCheckError::Unsupported(
+            UnsupportedSourceSyntax::Function(SourceFunctionUnsupported::FunctionBody(
+                callable.body,
+            )),
+        ));
+    }
+    emit_truthiness_operand_diagnostics(
+        store,
+        host,
+        diagnostics,
+        &statements.condition,
+        condition.result,
+        statements.condition.node,
+    )?;
+
+    check_planned_return_branch(
+        store,
+        host,
+        global_types,
+        source,
+        options,
+        diagnostics,
+        &mut frame,
+        preflighted_type_import_value_uses,
+        type_import_capabilities,
+        deferred,
+        callable,
+        return_type,
+        &statements.then_branch,
+        staged_value_types,
+        value_order,
+    )?;
+    check_planned_return_branch(
+        store,
+        host,
+        global_types,
+        source,
+        options,
+        diagnostics,
+        &mut frame,
+        preflighted_type_import_value_uses,
+        type_import_capabilities,
+        deferred,
+        callable,
+        return_type,
+        &statements.else_branch,
+        staged_value_types,
+        value_order,
+    )
+}
+
+fn source_truthiness_condition_type_is_supported(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    invariant_node: NodeRef,
+    visiting: &mut HashSet<TypeId>,
+) -> Result<bool, SourceCheckError> {
+    let record = store
+        .type_payload(type_)
+        .ok_or(SourceCheckError::LogicalOperator(invariant_node))?;
+    let flags = record.flags();
+    if flags.intersects(
+        TypeFlags::UNKNOWN
+            | TypeFlags::TYPE_PARAMETER
+            | TypeFlags::INTERSECTION
+            | TypeFlags::ENUM
+            | TypeFlags::ENUM_LITERAL,
+    ) {
+        return Ok(false);
+    }
+    if !matches!(
+        validate_stored_single_callable(store, type_),
+        StoredSingleCallableValidation::NotCallable
+    ) {
+        return Ok(false);
+    }
+    let TypeData::Union(union) = record.data() else {
+        return Ok(true);
+    };
+    if !visiting.insert(type_) {
+        return Ok(false);
+    }
+    for constituent in &union.union.types {
+        if !source_truthiness_condition_type_is_supported(
+            store,
+            *constituent,
+            invariant_node,
+            visiting,
+        )? {
+            visiting.remove(&type_);
+            return Ok(false);
+        }
+    }
+    visiting.remove(&type_);
+    Ok(true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn check_planned_function_locals(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    source: SourceFileRef,
+    options: CanonicalCheckerOptions,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    frame: &mut SourceFlowFrame<'_, '_>,
+    preflighted_type_import_value_uses: &HashMap<NodeRef, PreparedSourceTypeImportValueUse>,
+    type_import_capabilities: &HashMap<NodeRef, Vec<CanonicalTypeReferenceAliasTarget>>,
+    deferred: &mut Vec<DeferredAssertion>,
+    callable: &SourceCallablePlan,
+    locals: &[PlannedVariable],
+    staged_value_types: &mut HashMap<SemanticSymbolId, TypeId>,
+    value_order: &mut Vec<SemanticSymbolId>,
+) -> Result<(), SourceCheckError> {
+    for local in locals {
+        let snapshot = frame
+            .snapshot_at(store, global_types, local.name)
+            .map_err(|error| SourcePlanner::source_flow_plan_error(callable, error))?;
+        let (declared_type, current_type) = if let Some(type_node) = local.type_node {
+            let assignment = check_planned_assignment(
+                store,
+                host,
+                global_types,
+                source,
+                options,
+                diagnostics,
+                snapshot.types(),
+                preflighted_type_import_value_uses,
+                deferred,
+                type_node,
+                type_import_capabilities
+                    .get(&type_node)
+                    .map_or(&[], Vec::as_slice),
+                &local.initializer,
+                local.name,
+                None,
+            )?;
+            (
+                assignment.declared_type,
+                current_flow_type_after_assignment(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    diagnostics,
+                    assignment,
+                )?,
+            )
+        } else {
+            let initializer = check_expression_type(
+                store,
+                host,
+                global_types,
+                source,
+                options,
+                diagnostics,
+                snapshot.types(),
+                preflighted_type_import_value_uses,
+                &local.initializer,
+                None,
+                deferred,
+            )?;
+            let declared_type = inferred_variable_type(
+                store,
+                global_types,
+                local.binding,
+                initializer.result,
+            )?;
+            let current_type = current_flow_type_after_assignment(
+                store,
+                host,
+                global_types,
+                options,
+                diagnostics,
+                CheckedAssignment {
+                    declared_type,
+                    assigned_type: initializer.result,
+                },
+            )?;
+            (declared_type, current_type)
+        };
+        stage_value_type(
+            store,
+            staged_value_types,
+            value_order,
+            local.symbol,
+            declared_type,
+        )?;
+        frame
+            .complete_assignment(local.declaration, local.symbol, current_type)
+            .map_err(|error| SourcePlanner::source_flow_plan_error(callable, error))?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn check_planned_return_branch(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    source: SourceFileRef,
+    options: CanonicalCheckerOptions,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    frame: &mut SourceFlowFrame<'_, '_>,
+    preflighted_type_import_value_uses: &HashMap<NodeRef, PreparedSourceTypeImportValueUse>,
+    type_import_capabilities: &HashMap<NodeRef, Vec<CanonicalTypeReferenceAliasTarget>>,
+    deferred: &mut Vec<DeferredAssertion>,
+    callable: &SourceCallablePlan,
+    return_type: NodeRef,
+    branch: &PlannedReturnBranch,
+    staged_value_types: &mut HashMap<SemanticSymbolId, TypeId>,
+    value_order: &mut Vec<SemanticSymbolId>,
+) -> Result<(), SourceCheckError> {
+    check_planned_function_locals(
+        store,
+        host,
+        global_types,
+        source,
+        options,
+        diagnostics,
+        frame,
+        preflighted_type_import_value_uses,
+        type_import_capabilities,
+        deferred,
+        callable,
+        &branch.locals,
+        staged_value_types,
+        value_order,
+    )?;
+    let snapshot = frame
+        .snapshot_at(store, global_types, branch.return_statement)
+        .map_err(|error| SourcePlanner::source_flow_plan_error(callable, error))?;
+    check_planned_assignment(
+        store,
+        host,
+        global_types,
+        source,
+        options,
+        diagnostics,
+        snapshot.types(),
+        preflighted_type_import_value_uses,
+        deferred,
+        return_type,
+        &[],
+        &branch.return_expression,
+        branch.return_statement,
+        None,
+    )?;
+    Ok(())
 }
 
 fn current_flow_type_after_assignment(
@@ -6194,7 +6858,11 @@ pub(super) fn check_source_file(
 
     store.prepare_regular_literal_types(&strings, &numbers, &bigints)?;
     let mut deferred = Vec::new();
-    let mut declared_types = HashMap::new();
+    // Publication owns every source value, including function-local symbols.
+    // Top-level assignment/capture semantics must remain a separate map so a
+    // local `let` can never leak into an unrelated callable's capture frame.
+    let mut staged_value_types = HashMap::new();
+    let mut top_level_declared_types = HashMap::new();
     let mut current_flow_types = HashMap::new();
     let mut mutable_variables = HashSet::new();
     let mut value_order = Vec::new();
@@ -6274,6 +6942,11 @@ pub(super) fn check_source_file(
         let expression = match &function.body {
             PlannedFunctionBody::Empty => None,
             PlannedFunctionBody::Return { expression, .. } => Some(expression),
+            PlannedFunctionBody::Statements(_) => {
+                return Err(SourceCheckError::Function(
+                    SourceFunctionInvariant::Callable(function.callable.body),
+                ));
+            }
         };
         publish_checked_source_callable_return(
             store,
@@ -6314,7 +6987,7 @@ pub(super) fn check_source_file(
                     })?;
                 stage_value_type(
                     store,
-                    &mut declared_types,
+                    &mut staged_value_types,
                     &mut value_order,
                     enumeration.owner_symbol,
                     materialized.value_type,
@@ -6382,6 +7055,26 @@ pub(super) fn check_source_file(
                             None,
                         )?;
                     }
+                    PlannedFunctionBody::Statements(statements) => {
+                        check_planned_function_statements(
+                            bound,
+                            store,
+                            host,
+                            global_types,
+                            source,
+                            options,
+                            diagnostics,
+                            body_flow_types,
+                            &preflighted_type_import_value_uses,
+                            &type_import_capabilities,
+                            &mut deferred,
+                            &function.callable,
+                            return_type,
+                            statements,
+                            &mut staged_value_types,
+                            &mut value_order,
+                        )?;
+                    }
                 }
             }
             PlannedStatement::Arrow(index) => {
@@ -6399,7 +7092,7 @@ pub(super) fn check_source_file(
                 if arrow.source.callable.return_type.is_inferred() {
                     let captured_flow_types = captured_callable_flow_types(
                         &current_flow_types,
-                        &declared_types,
+                        &top_level_declared_types,
                         &mutable_variables,
                     )?;
                     let body_flow_types = check_callable_parameter_initializers(
@@ -6436,7 +7129,7 @@ pub(super) fn check_source_file(
                 }
                 stage_value_type(
                     store,
-                    &mut declared_types,
+                    &mut staged_value_types,
                     &mut value_order,
                     arrow.source.variable_symbol,
                     materialized.type_,
@@ -6464,7 +7157,7 @@ pub(super) fn check_source_file(
                 )?;
                 stage_value_type(
                     store,
-                    &mut declared_types,
+                    &mut staged_value_types,
                     &mut value_order,
                     arrow.source.variable_symbol,
                     target,
@@ -6546,11 +7239,19 @@ pub(super) fn check_source_file(
                         };
                     stage_value_type(
                         store,
-                        &mut declared_types,
+                        &mut staged_value_types,
                         &mut value_order,
                         variable.symbol,
                         declared_type,
                     )?;
+                    if top_level_declared_types
+                        .insert(variable.symbol, declared_type)
+                        .is_some()
+                    {
+                        return Err(SourceCheckError::Variable(
+                            VariableInvariant::DuplicateStagedValueType(variable.symbol),
+                        ));
+                    }
                     if !variable.binding.is_const() && !mutable_variables.insert(variable.symbol) {
                         return Err(SourceCheckError::Variable(
                             VariableInvariant::DuplicateCurrentFlowType(variable.symbol),
@@ -6567,11 +7268,11 @@ pub(super) fn check_source_file(
                 }
             }
             PlannedStatement::Assignment(assignment) => {
-                let staged_declared_type = *declared_types.get(&assignment.target_symbol).ok_or(
-                    SourceCheckError::Variable(VariableInvariant::MissingStagedValueType(
-                        assignment.target_symbol,
-                    )),
-                )?;
+                let staged_declared_type = *top_level_declared_types
+                    .get(&assignment.target_symbol)
+                    .ok_or(SourceCheckError::Variable(
+                        VariableInvariant::MissingStagedValueType(assignment.target_symbol),
+                    ))?;
                 if !current_flow_types.contains_key(&assignment.target_symbol) {
                     return Err(SourceCheckError::Variable(
                         VariableInvariant::MissingCurrentFlowType(assignment.target_symbol),
@@ -6617,7 +7318,7 @@ pub(super) fn check_source_file(
 
     let captured_flow_types = captured_callable_flow_types(
         &current_flow_types,
-        &declared_types,
+        &top_level_declared_types,
         &mutable_variables,
     )?;
     for arrow in &arrows {
@@ -6674,7 +7375,7 @@ pub(super) fn check_source_file(
     publish_staged_variable_state(
         store,
         source.node_ref(),
-        &declared_types,
+        &staged_value_types,
         &value_order,
         &import_publications,
         &identifier_reads,

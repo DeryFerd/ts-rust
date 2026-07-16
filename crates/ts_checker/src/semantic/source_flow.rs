@@ -183,21 +183,19 @@ impl SourceFlowPlan {
         let start_payload = preflight_start_payload(graph, container, start)?;
 
         let mut planned_conditions = HashMap::new();
-        let mut condition_order = Vec::new();
         for condition in conditions {
-            validate_node_container(bound, graph, container, condition.expression)?;
+            validate_bound_node(bound, graph, condition.expression)?;
             if planned_conditions
                 .insert(condition.expression, condition)
                 .is_some()
             {
                 return Err(SourceFlowInvariant::DuplicateCondition(condition.expression).into());
             }
-            condition_order.push(condition.expression);
         }
 
         let mut planned_assignments = HashMap::new();
         for assignment in assignments {
-            validate_node_container(bound, graph, container, assignment.declaration)?;
+            validate_bound_node(bound, graph, assignment.declaration)?;
             if planned_assignments
                 .insert(assignment.declaration, assignment)
                 .is_some()
@@ -221,21 +219,6 @@ impl SourceFlowPlan {
                 true,
             )?;
         }
-        // The condition itself is always evaluated at its antecedent snapshot.
-        // Make that snapshot available even when the caller only supplied arm
-        // expression points.
-        for condition in condition_order {
-            insert_flow_point(
-                bound,
-                graph,
-                container,
-                &mut planned_points,
-                &mut point_order,
-                condition,
-                false,
-            )?;
-        }
-
         let plan = Self {
             container,
             start,
@@ -247,16 +230,6 @@ impl SourceFlowPlan {
         };
         plan.validate_flow_paths(graph)?;
         Ok(plan)
-    }
-
-    #[must_use]
-    pub(super) const fn container(&self) -> NodeRef {
-        self.container
-    }
-
-    #[must_use]
-    pub(super) const fn start(&self) -> FlowRef {
-        self.start
     }
 
     /// Starts one fresh execution frame. Flow snapshots and assignment state
@@ -550,6 +523,20 @@ fn validate_node_container(
             actual,
         }
         .into());
+    }
+    Ok(())
+}
+
+fn validate_bound_node(
+    bound: &BoundFile,
+    graph: &BoundFlowGraph,
+    node: NodeRef,
+) -> Result<(), SourceFlowError> {
+    if !node.is_for(graph.node_arena_id(), graph.file_id()) {
+        return Err(SourceFlowInvariant::ForeignNode(node).into());
+    }
+    if !bound.contains(node) {
+        return Err(SourceFlowInvariant::MissingContainer(node).into());
     }
     Ok(())
 }
