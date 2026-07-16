@@ -202,6 +202,33 @@ pub(super) enum StoredFunctionTypeValidation {
     Malformed,
 }
 
+/// Syntax-neutral display data for one parameter of a validated single-call
+/// signature. `annotation_type` deliberately retains the annotation's base
+/// identity instead of the parameter symbol's optional `T | undefined` value
+/// type.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct ValidatedSingleCallParameterDisplay {
+    pub(super) name: String,
+    pub(super) annotation_type: TypeId,
+    pub(super) optional: bool,
+}
+
+/// Syntax-neutral display projection produced by a callable-family validator.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct ValidatedSingleCallSignatureDisplay {
+    pub(super) parameters: Vec<ValidatedSingleCallParameterDisplay>,
+    pub(super) return_type: TypeId,
+}
+
+/// Why an otherwise function-shaped type cannot be projected for display.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum FunctionTypeDisplayError {
+    Unsupported(FunctionTypeUnsupported),
+    Pending,
+    UnresolvedReturn,
+    Malformed,
+}
+
 pub(super) fn plan_function_type(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -602,6 +629,117 @@ pub(super) fn function_type_state(
     }
     validate_cached_return_type(store, plan, signature)?;
     Ok(FunctionTypeState::Resolved { type_, signature })
+}
+
+/// Produces the small, immutable signature view consumed by canonical type
+/// display. Replanning against the retained AST proves parameter spelling and
+/// optionality, while [`function_type_state`] proves that the cached signature
+/// and parameter value types still describe that syntax exactly.
+pub(super) fn function_type_display_projection(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    type_: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<ValidatedSingleCallSignatureDisplay, FunctionTypeDisplayError> {
+    let record = store
+        .type_payload(type_)
+        .ok_or(FunctionTypeDisplayError::Malformed)?;
+    if !store.type_has_function_type_provenance(type_) {
+        return Err(FunctionTypeDisplayError::Malformed);
+    }
+    let symbol = record.symbol().ok_or(FunctionTypeDisplayError::Malformed)?;
+    let declaration = store
+        .symbol(symbol)
+        .and_then(|symbol| symbol.declarations())
+        .and_then(|declarations| match declarations {
+            [declaration] => Some(*declaration),
+            _ => None,
+        })
+        .ok_or(FunctionTypeDisplayError::Malformed)?;
+    let (alias_symbol, alias_is_generic) = match record.alias() {
+        None => (None, false),
+        Some(alias) => {
+            let alias = store
+                .type_alias(alias)
+                .ok_or(FunctionTypeDisplayError::Malformed)?;
+            (
+                Some(alias.symbol().ok_or(FunctionTypeDisplayError::Malformed)?),
+                alias.type_arguments().is_some(),
+            )
+        }
+    };
+    let plan = plan_function_type(
+        store,
+        host,
+        declaration,
+        alias_symbol,
+        alias_is_generic,
+        array_targets,
+    )
+    .map_err(function_type_display_error)?;
+    let signature = match function_type_state(store, &plan, true)
+        .map_err(function_type_display_error)?
+    {
+        FunctionTypeState::Resolved {
+            type_: resolved,
+            signature,
+        } if resolved == type_ => signature,
+        FunctionTypeState::ActiveBarrier { .. } | FunctionTypeState::ActiveParameters { .. } => {
+            return Err(FunctionTypeDisplayError::Pending);
+        }
+        FunctionTypeState::Cold => return Err(FunctionTypeDisplayError::Malformed),
+        FunctionTypeState::Resolved { .. } => {
+            return Err(FunctionTypeDisplayError::Malformed);
+        }
+    };
+    let signature = store
+        .signature(signature)
+        .ok_or(FunctionTypeDisplayError::Malformed)?;
+    let return_type = signature
+        .resolved_return_type()
+        .ok_or(FunctionTypeDisplayError::UnresolvedReturn)?;
+    let mut parameters = Vec::with_capacity(plan.parameters.len());
+    for parameter in &plan.parameters {
+        let annotation_type = cached_annotation_identity(
+            store,
+            parameter.identity_node,
+            parameter.null_literal_identity,
+        )
+        .ok_or(FunctionTypeDisplayError::Malformed)?;
+        let parameter_node = host
+            .node(parameter.declaration)
+            .ok_or(FunctionTypeDisplayError::Malformed)?;
+        let NodeData::ParameterDeclaration(parameter_data) = &parameter_node.data else {
+            return Err(FunctionTypeDisplayError::Malformed);
+        };
+        let name = NodeRef::new(
+            parameter.declaration.arena,
+            parameter.declaration.file,
+            parameter_data.name,
+        );
+        let name_node = host.node(name).ok_or(FunctionTypeDisplayError::Malformed)?;
+        let NodeData::Identifier(identifier) = &name_node.data else {
+            return Err(FunctionTypeDisplayError::Malformed);
+        };
+        parameters.push(ValidatedSingleCallParameterDisplay {
+            name: identifier.text.clone(),
+            annotation_type,
+            optional: parameter.optional,
+        });
+    }
+    Ok(ValidatedSingleCallSignatureDisplay {
+        parameters,
+        return_type,
+    })
+}
+
+const fn function_type_display_error(error: FunctionTypeError) -> FunctionTypeDisplayError {
+    match error {
+        FunctionTypeError::Unsupported(reason) => FunctionTypeDisplayError::Unsupported(reason),
+        FunctionTypeError::Invariant(_)
+        | FunctionTypeError::DeclaredType(_)
+        | FunctionTypeError::LiteralCache(_) => FunctionTypeDisplayError::Malformed,
+    }
 }
 
 pub(super) fn reserve_function_type_capacities(

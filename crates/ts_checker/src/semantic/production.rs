@@ -393,8 +393,15 @@ impl<'arena> CanonicalCheckerContext<'arena> {
     /// Returns [`TypeDisplayUnavailable`] when the type is foreign, malformed,
     /// or requires a display family not installed in the current checker cut.
     pub fn type_to_string(&self, type_id: TypeId) -> Result<String, TypeDisplayUnavailable> {
-        super::formatter::type_to_string_with_global_types_and_flags(
+        let host = DeclaredTypeHost::from_registry(
             &self.store,
+            &self.files,
+            GlobalMergeCompletion::new(self.options.name_resolution),
+        )
+        .map_err(TypeDisplayUnavailable::SourceHost)?;
+        super::formatter::type_to_string_with_host_global_types_and_flags(
+            &self.store,
+            &host,
             &self.global_types,
             type_id,
             self.type_format_flags(CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT),
@@ -402,9 +409,9 @@ impl<'arena> CanonicalCheckerContext<'arena> {
     }
 
     /// Flag-aware form of [`Self::type_to_string`] for the exact format flags
-    /// observable in the installed primitive/literal prefix. The retained
-    /// `no_error_truncation` compiler option takes effect even when the caller
-    /// does not supply [`CanonicalTypeFormatFlags::NO_TRUNCATION`].
+    /// observable in the installed primitive/literal/structural prefix. The
+    /// retained `no_error_truncation` compiler option takes effect even when
+    /// the caller does not supply [`CanonicalTypeFormatFlags::NO_TRUNCATION`].
     ///
     /// # Errors
     ///
@@ -415,8 +422,15 @@ impl<'arena> CanonicalCheckerContext<'arena> {
         type_id: TypeId,
         flags: CanonicalTypeFormatFlags,
     ) -> Result<String, TypeDisplayUnavailable> {
-        super::formatter::type_to_string_with_global_types_and_flags(
+        let host = DeclaredTypeHost::from_registry(
             &self.store,
+            &self.files,
+            GlobalMergeCompletion::new(self.options.name_resolution),
+        )
+        .map_err(TypeDisplayUnavailable::SourceHost)?;
+        super::formatter::type_to_string_with_host_global_types_and_flags(
+            &self.store,
+            &host,
             &self.global_types,
             type_id,
             self.type_format_flags(flags),
@@ -436,8 +450,15 @@ impl<'arena> CanonicalCheckerContext<'arena> {
         source: TypeId,
         target: TypeId,
     ) -> Result<AssignabilityErrorDisplay, TypeDisplayUnavailable> {
-        super::formatter::get_type_names_for_assignability_error_with_global_types_and_flags(
+        let host = DeclaredTypeHost::from_registry(
             &self.store,
+            &self.files,
+            GlobalMergeCompletion::new(self.options.name_resolution),
+        )
+        .map_err(TypeDisplayUnavailable::SourceHost)?;
+        super::formatter::get_type_names_for_assignability_error_with_host_global_types_and_flags(
+            &self.store,
+            &host,
             &self.global_types,
             source,
             target,

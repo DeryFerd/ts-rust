@@ -1,7 +1,7 @@
 //! Dependency-closed canonical semantic type display.
 //!
-//! This is the primitive, literal, canonical-union, global-array, and
-//! property-only object prefix of pinned
+//! This is the primitive, literal, canonical-union, global-array,
+//! property-only object, and exact annotated function-type prefix of pinned
 //! `internal/checker/printer.go::typeToString`,
 //! `internal/checker/nodebuilderimpl.go::typeToTypeNode`, and
 //! `internal/checker/relater.go::reportRelationError` at
@@ -17,9 +17,15 @@ use ts_binder::{
 };
 
 use super::{
-    ArrayTypeError, CanonicalGlobalTypes, CanonicalTypeMapperStore, DeclaredTypeHost, TypeAliasId,
-    TypeId,
+    ArrayTypeError, CanonicalGlobalTypes, CanonicalTypeMapperStore, DeclaredTypeHost,
+    DeclaredTypeHostError, TypeAliasId, TypeId,
+    array_types::CanonicalArrayTargets,
     bootstrap::LiteralTypeCacheError,
+    functions::{
+        FunctionTypeDisplayError, FunctionTypeUnsupported, StoredFunctionTypeValidation,
+        ValidatedSingleCallSignatureDisplay, function_type_display_projection,
+        validate_stored_function_type,
+    },
     links::ValueSymbolLinks,
     type_records::{
         LiteralTypeData, LiteralValue, TypeCacheState, TypeData, TypeDataKind, TypeRecord,
@@ -32,7 +38,8 @@ const NO_TRUNCATION_MAXIMUM_TRUNCATION_LENGTH: usize = 1_000_000;
 const ELLIPSIS: &str = "...";
 
 /// The pinned `TypeFormatFlags` subset observable for dependency-closed
-/// primitive, literal, canonical-union, and property-only object display.
+/// primitive, literal, canonical-union, property-only object, and exact
+/// annotated function-type display.
 ///
 /// Numeric values intentionally match typescript-go. Unsupported flag
 /// families are absent rather than silently ignored.
@@ -84,23 +91,68 @@ impl ops::BitOrAssign for CanonicalTypeFormatFlags {
     }
 }
 
+/// A function-shaped display family outside the installed exact signature
+/// cut. These cases stay distinct so callers never mistake a synthesized
+/// fallback for canonical TypeScript text.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FunctionTypeDisplayUnavailable {
+    SourceContext,
+    GenericAlias,
+    GenericSignature,
+    ThisParameter,
+    RestParameter,
+    InitializedParameter,
+    DestructuredParameter,
+    ParameterModifiers,
+    MissingParameterType,
+    MissingReturnType,
+    PendingSignature,
+    UnresolvedReturn,
+    TypePredicate,
+    Overloads,
+    ConstructSignatures,
+    IndexSignatures,
+    CallableProperties,
+    UnvalidatedCallable,
+}
+
 /// A canonical type or display dependency outside the installed formatter
 /// prefix. No variant contains substitute display text.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TypeDisplayUnavailable {
     Type(TypeId),
-    Alias { type_id: TypeId, alias: TypeAliasId },
-    UnsupportedType { type_id: TypeId, kind: TypeDataKind },
+    Alias {
+        type_id: TypeId,
+        alias: TypeAliasId,
+    },
+    UnsupportedType {
+        type_id: TypeId,
+        kind: TypeDataKind,
+    },
     MalformedType(TypeId),
     InvalidUnion(TypeId),
-    UnsupportedUnionConstituent { union: TypeId, constituent: TypeId },
+    UnsupportedUnionConstituent {
+        union: TypeId,
+        constituent: TypeId,
+    },
     CyclicType(TypeId),
     InvalidLiteralLinks(TypeId),
     UniqueSymbolName(TypeId),
     MissingBootstrap,
     ArrayType(ArrayTypeError),
-    FullyQualifiedName { source: TypeId, target: TypeId },
-    Utf8TruncationBoundary { type_id: TypeId, boundary: usize },
+    FullyQualifiedName {
+        source: TypeId,
+        target: TypeId,
+    },
+    FunctionType {
+        type_id: TypeId,
+        reason: FunctionTypeDisplayUnavailable,
+    },
+    SourceHost(DeclaredTypeHostError),
+    Utf8TruncationBoundary {
+        type_id: TypeId,
+        boundary: usize,
+    },
 }
 
 impl std::fmt::Display for TypeDisplayUnavailable {
@@ -147,6 +199,11 @@ impl std::fmt::Display for TypeDisplayUnavailable {
                 formatter,
                 "types {source:?} and {target:?} require symbol-aware fully qualified display"
             ),
+            Self::FunctionType { type_id, reason } => write!(
+                formatter,
+                "function-shaped type {type_id:?} has unavailable display dependency {reason:?}"
+            ),
+            Self::SourceHost(error) => error.fmt(formatter),
             Self::Utf8TruncationBoundary { type_id, boundary } => write!(
                 formatter,
                 "pinned byte truncation for {type_id:?} splits UTF-8 at byte {boundary}"
@@ -159,6 +216,7 @@ impl std::error::Error for TypeDisplayUnavailable {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::ArrayType(error) => Some(error),
+            Self::SourceHost(error) => Some(error),
             _ => None,
         }
     }
@@ -193,7 +251,7 @@ pub fn type_to_string(
 }
 
 /// Pinned context-free `TypeToStringEx` behavior for flags observable in the
-/// installed primitive/literal/canonical-union/property-object prefix.
+/// installed primitive/literal/canonical-union/property-object/function prefix.
 ///
 /// # Errors
 ///
@@ -455,11 +513,7 @@ fn get_type_names_for_assignability_error_with_optional_host_and_flags(
 
     if !target_record.flags().intersects(TypeFlags::NEVER)
         && is_literal_type(source_record)
-        && !type_could_have_top_level_singleton_types(
-            store,
-            target,
-            &mut HashSet::new(),
-        )?
+        && !type_could_have_top_level_singleton_types(store, target, &mut HashSet::new())?
     {
         let generalized = base_type_of_literal_type(store, source, source_record)?;
         let generalized_record = store
@@ -722,8 +776,35 @@ fn display_object_type(
         );
     }
     if let Some(alias) = record.alias() {
-        validate_property_object_alias(store, type_id, record, alias)?;
+        if let Some(provider) = single_callable_display_provider(store, type_id) {
+            if !validated_opaque_single_callable_alias(store, type_id, provider) {
+                return Err(TypeDisplayUnavailable::MalformedType(type_id));
+            }
+        } else {
+            validate_property_object_alias(store, type_id, record, alias)?;
+        }
         return display_alias_name(store, type_id, alias, state);
+    }
+
+    if let Some(projection) = validated_single_callable_display(store, host, global_types, type_id)?
+    {
+        if !visiting.insert(type_id) {
+            return Err(TypeDisplayUnavailable::CyclicType(type_id));
+        }
+        let result = display_single_call_signature(
+            store,
+            host,
+            global_types,
+            projection,
+            flags,
+            state,
+            visiting,
+        );
+        visiting.remove(&type_id);
+        return result;
+    }
+    if let Some(reason) = unsupported_callable_shape(store, type_id, record)? {
+        return Err(TypeDisplayUnavailable::FunctionType { type_id, reason });
     }
 
     let kind = record.object_flags() & ObjectFlags::OBJECT_TYPE_KIND_MASK;
@@ -756,6 +837,226 @@ fn display_object_type(
     result
 }
 
+/// Syntax-specific proof providers converge on one immutable signature
+/// projection before the formatter emits any text. Source FunctionDeclaration
+/// and ArrowFunction values can add providers here without changing display,
+/// precedence, truncation, or recursive formatting behavior.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SingleCallableDisplayProvider {
+    FunctionType,
+}
+
+fn single_callable_display_provider(
+    store: &CanonicalTypeMapperStore,
+    type_id: TypeId,
+) -> Option<SingleCallableDisplayProvider> {
+    store
+        .type_has_function_type_provenance(type_id)
+        .then_some(SingleCallableDisplayProvider::FunctionType)
+}
+
+fn validated_opaque_single_callable_alias(
+    store: &CanonicalTypeMapperStore,
+    type_id: TypeId,
+    provider: SingleCallableDisplayProvider,
+) -> bool {
+    match provider {
+        SingleCallableDisplayProvider::FunctionType => matches!(
+            validate_stored_function_type(store, type_id),
+            StoredFunctionTypeValidation::Valid(_)
+        ),
+    }
+}
+
+fn validated_single_callable_display(
+    store: &CanonicalTypeMapperStore,
+    host: Option<&DeclaredTypeHost<'_>>,
+    global_types: Option<&CanonicalGlobalTypes>,
+    type_id: TypeId,
+) -> Result<Option<ValidatedSingleCallSignatureDisplay>, TypeDisplayUnavailable> {
+    let Some(provider) = single_callable_display_provider(store, type_id) else {
+        return Ok(None);
+    };
+    match provider {
+        SingleCallableDisplayProvider::FunctionType => {
+            let host = host.ok_or(TypeDisplayUnavailable::FunctionType {
+                type_id,
+                reason: FunctionTypeDisplayUnavailable::SourceContext,
+            })?;
+            function_type_display_projection(
+                store,
+                host,
+                type_id,
+                global_types.map(CanonicalArrayTargets::from_global_types),
+            )
+            .map(Some)
+            .map_err(|error| function_display_unavailable(type_id, error))
+        }
+    }
+}
+
+const fn function_display_unavailable(
+    type_id: TypeId,
+    error: FunctionTypeDisplayError,
+) -> TypeDisplayUnavailable {
+    let reason = match error {
+        FunctionTypeDisplayError::Unsupported(reason) => match reason {
+            FunctionTypeUnsupported::GenericAlias(_) => {
+                FunctionTypeDisplayUnavailable::GenericAlias
+            }
+            FunctionTypeUnsupported::GenericSignature(_) => {
+                FunctionTypeDisplayUnavailable::GenericSignature
+            }
+            FunctionTypeUnsupported::ThisParameter(_) => {
+                FunctionTypeDisplayUnavailable::ThisParameter
+            }
+            FunctionTypeUnsupported::RestParameter(_) => {
+                FunctionTypeDisplayUnavailable::RestParameter
+            }
+            FunctionTypeUnsupported::InitializedParameter(_) => {
+                FunctionTypeDisplayUnavailable::InitializedParameter
+            }
+            FunctionTypeUnsupported::DestructuredParameter(_) => {
+                FunctionTypeDisplayUnavailable::DestructuredParameter
+            }
+            FunctionTypeUnsupported::ParameterModifiers(_) => {
+                FunctionTypeDisplayUnavailable::ParameterModifiers
+            }
+            FunctionTypeUnsupported::MissingParameterType(_) => {
+                FunctionTypeDisplayUnavailable::MissingParameterType
+            }
+            FunctionTypeUnsupported::MissingReturnType(_) => {
+                FunctionTypeDisplayUnavailable::MissingReturnType
+            }
+        },
+        FunctionTypeDisplayError::Pending => FunctionTypeDisplayUnavailable::PendingSignature,
+        FunctionTypeDisplayError::UnresolvedReturn => {
+            FunctionTypeDisplayUnavailable::UnresolvedReturn
+        }
+        FunctionTypeDisplayError::Malformed => {
+            return TypeDisplayUnavailable::MalformedType(type_id);
+        }
+    };
+    TypeDisplayUnavailable::FunctionType { type_id, reason }
+}
+
+fn unsupported_callable_shape(
+    store: &CanonicalTypeMapperStore,
+    type_id: TypeId,
+    record: &TypeRecord,
+) -> Result<Option<FunctionTypeDisplayUnavailable>, TypeDisplayUnavailable> {
+    let Some(structured) = record.data().structured() else {
+        return Ok(None);
+    };
+    let signatures = structured.signatures.as_deref().unwrap_or_default();
+    if structured.call_signature_count > signatures.len() {
+        return Err(TypeDisplayUnavailable::MalformedType(type_id));
+    }
+    let has_indexes = structured
+        .index_infos
+        .as_ref()
+        .is_some_and(|indexes| !indexes.is_empty());
+    if signatures.is_empty() && structured.call_signature_count == 0 && !has_indexes {
+        return Ok(None);
+    }
+    if structured
+        .properties
+        .as_ref()
+        .is_some_and(|properties| !properties.is_empty())
+    {
+        return Ok(Some(FunctionTypeDisplayUnavailable::CallableProperties));
+    }
+    if has_indexes {
+        return Ok(Some(FunctionTypeDisplayUnavailable::IndexSignatures));
+    }
+    if structured.call_signature_count > 1 {
+        return Ok(Some(FunctionTypeDisplayUnavailable::Overloads));
+    }
+    if signatures.len() > structured.call_signature_count {
+        return Ok(Some(FunctionTypeDisplayUnavailable::ConstructSignatures));
+    }
+    let signature_records = signatures
+        .iter()
+        .map(|signature| {
+            store
+                .signature(*signature)
+                .ok_or(TypeDisplayUnavailable::MalformedType(type_id))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if signature_records
+        .iter()
+        .any(|signature| !signature.type_parameters().is_empty())
+    {
+        return Ok(Some(FunctionTypeDisplayUnavailable::GenericSignature));
+    }
+    if signature_records
+        .iter()
+        .any(|signature| signature.this_parameter().is_some())
+    {
+        return Ok(Some(FunctionTypeDisplayUnavailable::ThisParameter));
+    }
+    if signature_records
+        .iter()
+        .any(|signature| signature.has_rest_parameter())
+    {
+        return Ok(Some(FunctionTypeDisplayUnavailable::RestParameter));
+    }
+    if signature_records
+        .iter()
+        .any(|signature| signature.resolved_type_predicate().is_some())
+    {
+        return Ok(Some(FunctionTypeDisplayUnavailable::TypePredicate));
+    }
+    Ok(Some(FunctionTypeDisplayUnavailable::UnvalidatedCallable))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn display_single_call_signature(
+    store: &CanonicalTypeMapperStore,
+    host: Option<&DeclaredTypeHost<'_>>,
+    global_types: Option<&CanonicalGlobalTypes>,
+    projection: ValidatedSingleCallSignatureDisplay,
+    flags: CanonicalTypeFormatFlags,
+    state: &mut DisplayState,
+    visiting: &mut HashSet<TypeId>,
+) -> Result<String, TypeDisplayUnavailable> {
+    // Pinned `signatureToSignatureDeclarationHelper`: three units is the
+    // minimum signature contribution, independent of the emitted punctuation.
+    state.add(3);
+    let mut result = String::from("(");
+    for (index, parameter) in projection.parameters.iter().enumerate() {
+        if index != 0 {
+            result.push_str(", ");
+        }
+        result.push_str(&parameter.name);
+        if parameter.optional {
+            result.push('?');
+        }
+        result.push_str(": ");
+        state.add(parameter.name.len().saturating_add(3));
+        result.push_str(&display_type_worker(
+            store,
+            host,
+            global_types,
+            parameter.annotation_type,
+            flags,
+            state,
+            visiting,
+        )?);
+    }
+    result.push_str(") => ");
+    result.push_str(&display_type_worker(
+        store,
+        host,
+        global_types,
+        projection.return_type,
+        flags,
+        state,
+        visiting,
+    )?);
+    Ok(result)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn display_array_type(
     store: &CanonicalTypeMapperStore,
@@ -784,9 +1085,14 @@ fn display_array_type(
             state,
             visiting,
         )?;
-        if element_record.flags().intersects(TypeFlags::UNION) && element_record.alias().is_none() {
+        let union_parentheses =
+            element_record.flags().intersects(TypeFlags::UNION) && element_record.alias().is_none();
+        let function_parentheses = is_unaliased_single_callable_type(store, element_type);
+        if union_parentheses || function_parentheses {
             element = format!("({element})");
-            state.add(2);
+            if union_parentheses {
+                state.add(2);
+            }
         }
         if readonly {
             state.add(9);
@@ -1824,8 +2130,8 @@ fn display_union_list(
     }
     if state.check_truncation(flags) && types.len() > 2 {
         let first =
-            display_type_worker(store, host, global_types, types[0], flags, state, visiting)?;
-        let last = display_type_worker(
+            display_union_constituent(store, host, global_types, types[0], flags, state, visiting)?;
+        let last = display_union_constituent(
             store,
             host,
             global_types,
@@ -1847,7 +2153,7 @@ fn display_union_list(
         let display_index = index + 1;
         if state.check_truncation(flags) && display_index + 2 < types.len() - 1 {
             displayed.push(union_elision(types.len() - display_index, flags));
-            displayed.push(display_type_worker(
+            displayed.push(display_union_constituent(
                 store,
                 host,
                 global_types,
@@ -1861,7 +2167,7 @@ fn display_union_list(
             break;
         }
         state.add(2);
-        displayed.push(display_type_worker(
+        displayed.push(display_union_constituent(
             store,
             host,
             global_types,
@@ -1872,6 +2178,32 @@ fn display_union_list(
         )?);
     }
     Ok(displayed.join(" | "))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn display_union_constituent(
+    store: &CanonicalTypeMapperStore,
+    host: Option<&DeclaredTypeHost<'_>>,
+    global_types: Option<&CanonicalGlobalTypes>,
+    type_id: TypeId,
+    flags: CanonicalTypeFormatFlags,
+    state: &mut DisplayState,
+    visiting: &mut HashSet<TypeId>,
+) -> Result<String, TypeDisplayUnavailable> {
+    let displayed =
+        display_type_worker(store, host, global_types, type_id, flags, state, visiting)?;
+    Ok(if is_unaliased_single_callable_type(store, type_id) {
+        format!("({displayed})")
+    } else {
+        displayed
+    })
+}
+
+fn is_unaliased_single_callable_type(store: &CanonicalTypeMapperStore, type_id: TypeId) -> bool {
+    single_callable_display_provider(store, type_id).is_some()
+        && store
+            .type_payload(type_id)
+            .is_some_and(|record| record.alias().is_none())
 }
 
 fn union_elision(count: usize, flags: CanonicalTypeFormatFlags) -> String {
@@ -1972,9 +2304,7 @@ const fn union_display_unavailable(
         LiteralTypeCacheError::UnsupportedUnionConstituent(constituent) => {
             TypeDisplayUnavailable::UnsupportedUnionConstituent { union, constituent }
         }
-        LiteralTypeCacheError::ArrayType { error, .. } => {
-            TypeDisplayUnavailable::ArrayType(error)
-        }
+        LiteralTypeCacheError::ArrayType { error, .. } => TypeDisplayUnavailable::ArrayType(error),
         LiteralTypeCacheError::InvalidValue
         | LiteralTypeCacheError::InvalidCachedUnion(_)
         | LiteralTypeCacheError::InvalidUnionAlias(_)
@@ -2086,10 +2416,7 @@ fn type_could_have_top_level_singleton_types(
     if record.flags().intersects(TypeFlags::BOOLEAN) {
         return Ok(false);
     }
-    if record
-        .flags()
-        .intersects(TypeFlags::UNION_OR_INTERSECTION)
-    {
+    if record.flags().intersects(TypeFlags::UNION_OR_INTERSECTION) {
         if !visiting.insert(type_) {
             return Err(TypeDisplayUnavailable::CyclicType(type_));
         }
@@ -2218,7 +2545,7 @@ mod tests {
 
     use super::*;
     use crate::semantic::{
-        CanonicalCheckerContext, CanonicalCheckerOptions, IntrinsicBootstrapOptions,
+        CanonicalCheckerContext, CanonicalCheckerOptions, IntrinsicBootstrapOptions, SignatureId,
         bootstrap::UnionReduction,
         type_records::{ConstituentMapState, LiteralValue, RegularLiteralLink},
         types::ObjectFlags,
@@ -2477,6 +2804,76 @@ mod tests {
                 (name.text == expected).then(|| NodeRef::new(parsed.arena.id(), file, alias.type_))
             })
             .expect("the test source contains the requested type alias")
+    }
+
+    fn variable_type_node(parsed: &ParseResult, file: FileId, expected: &str) -> NodeRef {
+        parsed
+            .arena
+            .iter()
+            .find_map(|(_, node)| {
+                let NodeData::VariableDeclaration(variable) = &node.data else {
+                    return None;
+                };
+                let NodeData::Identifier(name) = &parsed.arena.get(variable.name)?.data else {
+                    return None;
+                };
+                (name.text == expected).then(|| {
+                    NodeRef::new(
+                        parsed.arena.id(),
+                        file,
+                        variable.type_.expect("test variable has an annotation"),
+                    )
+                })
+            })
+            .expect("the test source contains the requested variable")
+    }
+
+    fn function_type_nodes(parsed: &ParseResult, file: FileId) -> Vec<NodeRef> {
+        parsed
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                (record.kind == SyntaxKind::FunctionType)
+                    .then(|| NodeRef::new(parsed.arena.id(), file, node))
+            })
+            .collect()
+    }
+
+    fn function_signature(
+        context: &CanonicalCheckerContext<'_>,
+        function: NodeRef,
+    ) -> Option<SignatureId> {
+        context
+            .store()
+            .signature_links(function)
+            .and_then(|links| links.resolved_signature.signature())
+    }
+
+    fn resolve_all_function_returns(
+        context: &mut CanonicalCheckerContext<'_>,
+        parsed: &ParseResult,
+        file: FileId,
+    ) {
+        let functions = function_type_nodes(parsed, file);
+        for _ in 0..=functions.len() {
+            let unresolved = functions
+                .iter()
+                .filter_map(|function| function_signature(context, *function))
+                .filter(|signature| {
+                    context
+                        .store()
+                        .signature(*signature)
+                        .is_some_and(|signature| signature.resolved_return_type().is_none())
+                })
+                .collect::<Vec<_>>();
+            if unresolved.is_empty() {
+                return;
+            }
+            for signature in unresolved {
+                context.get_return_type_of_signature(signature).unwrap();
+            }
+        }
+        panic!("nested function returns did not reach a fixed point");
     }
 
     #[test]
@@ -3941,6 +4338,267 @@ mod tests {
         assert_eq!(
             diagnostic.render().unwrap(),
             "Type 'number' is not assignable to type 'string'."
+        );
+    }
+
+    #[test]
+    fn parsed_function_display_uses_annotation_optionality_and_lazy_return_boundary() {
+        let parsed = parse_source_file(concat!(
+            "type Result = string | number; ",
+            "type Alias = (value?: number) => Result; ",
+            "let direct: (required: string, optional?: number) => Result;",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(206);
+        let mut context = parsed_context(
+            &parsed,
+            file,
+            IntrinsicBootstrapOptions {
+                strict_null_checks: true,
+                ..IntrinsicBootstrapOptions::default()
+            },
+        );
+
+        let alias_node = type_alias_body(&parsed, file, "Alias");
+        let alias_type = context.get_type_from_type_node(alias_node).unwrap();
+        assert_eq!(context.type_to_string(alias_type).unwrap(), "Alias");
+
+        let direct_node = variable_type_node(&parsed, file, "direct");
+        let direct_type = context.get_type_from_type_node(direct_node).unwrap();
+        assert_eq!(
+            context.type_to_string(direct_type),
+            Err(TypeDisplayUnavailable::FunctionType {
+                type_id: direct_type,
+                reason: FunctionTypeDisplayUnavailable::UnresolvedReturn,
+            })
+        );
+        let signature = function_signature(&context, direct_node).unwrap();
+        context.get_return_type_of_signature(signature).unwrap();
+        assert_eq!(
+            context.type_to_string(direct_type).unwrap(),
+            "(required: string, optional?: number) => Result",
+        );
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        assert_eq!(
+            context
+                .get_type_names_for_assignability_error(direct_type, string)
+                .unwrap(),
+            AssignabilityErrorDisplay {
+                source: "(required: string, optional?: number) => Result".into(),
+                target: "string".into(),
+            },
+        );
+        let optional_parameter = match &parsed.arena.get(direct_node.node).unwrap().data {
+            NodeData::FunctionTypeNode(function) => NodeRef::new(
+                direct_node.arena,
+                direct_node.file,
+                function.parameters.nodes[1],
+            ),
+            _ => unreachable!(),
+        };
+        let parameter_symbol = context
+            .file(file)
+            .unwrap()
+            .1
+            .symbol(optional_parameter)
+            .unwrap();
+        let resolved_optional = context
+            .store()
+            .value_symbol_links(parameter_symbol)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        assert!(
+            context
+                .store()
+                .type_payload(resolved_optional)
+                .is_some_and(|record| record.flags().intersects(TypeFlags::UNION)),
+            "display must use the annotation base rather than this optional value union",
+        );
+    }
+
+    #[test]
+    fn parsed_nested_function_union_and_array_display_preserve_precedence() {
+        let parsed = parse_source_file(concat!(
+            "interface Array<T> {} interface ReadonlyArray<T> {} ",
+            "type Result = string | number; ",
+            "type Callback = (value: string) => number; ",
+            "let nested: (callback: (value: string) => number) => () => Result; ",
+            "let mixed: string | ((value: string) => number); ",
+            "let list: ((value: string) => number)[]; ",
+            "let named: string | Callback;",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(207);
+        let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+        let nested = context
+            .get_type_from_type_node(variable_type_node(&parsed, file, "nested"))
+            .unwrap();
+        let mixed = context
+            .get_type_from_type_node(variable_type_node(&parsed, file, "mixed"))
+            .unwrap();
+        let list = context
+            .get_type_from_type_node(variable_type_node(&parsed, file, "list"))
+            .unwrap();
+        let named = context
+            .get_type_from_type_node(variable_type_node(&parsed, file, "named"))
+            .unwrap();
+        resolve_all_function_returns(&mut context, &parsed, file);
+
+        assert_eq!(
+            context.type_to_string(nested).unwrap(),
+            "(callback: (value: string) => number) => () => Result",
+        );
+        assert_eq!(
+            context.type_to_string(mixed).unwrap(),
+            "string | ((value: string) => number)",
+        );
+        assert_eq!(
+            context.type_to_string(list).unwrap(),
+            "((value: string) => number)[]",
+        );
+        let named = context.type_to_string(named).unwrap();
+        assert!(named.contains("Callback"));
+        assert!(!named.contains("(Callback)"));
+    }
+
+    #[test]
+    fn parsed_function_display_rejects_poisoned_parameter_value_cache() {
+        let parsed = parse_source_file("let fn: (value: string) => number;");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(208);
+        let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+        let function = variable_type_node(&parsed, file, "fn");
+        let type_ = context.get_type_from_type_node(function).unwrap();
+        resolve_all_function_returns(&mut context, &parsed, file);
+        assert_eq!(
+            context.type_to_string(type_).unwrap(),
+            "(value: string) => number"
+        );
+
+        let parameter = match &parsed.arena.get(function.node).unwrap().data {
+            NodeData::FunctionTypeNode(data) => {
+                NodeRef::new(function.arena, function.file, data.parameters.nodes[0])
+            }
+            _ => unreachable!(),
+        };
+        let parameter_symbol = context.file(file).unwrap().1.symbol(parameter).unwrap();
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        assert!(context.store_mut_for_test().set_value_symbol_links(
+            parameter_symbol,
+            ValueSymbolLinks {
+                resolved_type: Some(number),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        assert_eq!(
+            context.type_to_string(type_),
+            Err(TypeDisplayUnavailable::MalformedType(type_))
+        );
+    }
+
+    #[test]
+    fn unbranded_callable_shapes_remain_explicit_boundaries() {
+        let mut store = bootstrapped_store();
+        let number = store.intrinsic_bootstrap().unwrap().number_type;
+        let first = store
+            .alloc_signature(
+                crate::semantic::signatures::SignatureFlags::NONE,
+                None,
+                Vec::new(),
+                None,
+                Vec::new(),
+                Some(number),
+                None,
+                0,
+            )
+            .unwrap();
+        let second = store
+            .alloc_signature(
+                crate::semantic::signatures::SignatureFlags::NONE,
+                None,
+                Vec::new(),
+                None,
+                Vec::new(),
+                Some(number),
+                None,
+                0,
+            )
+            .unwrap();
+        let unvalidated = store
+            .alloc_plain_object_type(ObjectFlags::ANONYMOUS, None)
+            .unwrap();
+        assert!(store.set_structured_type_members(
+            unvalidated,
+            None,
+            Some(Vec::new()),
+            Some(vec![first]),
+            None,
+            None,
+        ));
+        assert_eq!(
+            type_to_string(&store, unvalidated),
+            Err(TypeDisplayUnavailable::FunctionType {
+                type_id: unvalidated,
+                reason: FunctionTypeDisplayUnavailable::UnvalidatedCallable,
+            })
+        );
+
+        let property = alloc_typed_property(&mut store, "value", number, false, false);
+        let callable_with_property = store
+            .alloc_plain_object_type(ObjectFlags::ANONYMOUS, None)
+            .unwrap();
+        assert!(store.set_structured_type_members(
+            callable_with_property,
+            None,
+            Some(vec![property]),
+            Some(vec![first]),
+            None,
+            None,
+        ));
+        assert_eq!(
+            type_to_string(&store, callable_with_property),
+            Err(TypeDisplayUnavailable::FunctionType {
+                type_id: callable_with_property,
+                reason: FunctionTypeDisplayUnavailable::CallableProperties,
+            })
+        );
+
+        let overloaded = store
+            .alloc_plain_object_type(ObjectFlags::ANONYMOUS, None)
+            .unwrap();
+        assert!(store.set_structured_type_members(
+            overloaded,
+            None,
+            Some(Vec::new()),
+            Some(vec![first, second]),
+            None,
+            None,
+        ));
+        assert_eq!(
+            type_to_string(&store, overloaded),
+            Err(TypeDisplayUnavailable::FunctionType {
+                type_id: overloaded,
+                reason: FunctionTypeDisplayUnavailable::Overloads,
+            })
+        );
+
+        let construct = store
+            .alloc_plain_object_type(ObjectFlags::ANONYMOUS, None)
+            .unwrap();
+        assert!(store.set_structured_type_members(
+            construct,
+            None,
+            Some(Vec::new()),
+            None,
+            Some(vec![first]),
+            None,
+        ));
+        assert_eq!(
+            type_to_string(&store, construct),
+            Err(TypeDisplayUnavailable::FunctionType {
+                type_id: construct,
+                reason: FunctionTypeDisplayUnavailable::ConstructSignatures,
+            })
         );
     }
 
