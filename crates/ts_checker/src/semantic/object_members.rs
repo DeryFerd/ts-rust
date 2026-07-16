@@ -16,6 +16,7 @@ use ts_binder::{
 use super::{
     CanonicalTypeMapperStore, DeclaredTypeHost, TypeId, ValueSymbolLinks,
     declared::preflight_node,
+    store::SourceNodeParent,
     type_records::{
         ConstrainedTypeData, InterfaceTypeData, ObjectTypeData, StructuredTypeData, TypeCacheState,
         TypeData, TypeRecord,
@@ -99,6 +100,20 @@ pub(super) enum DeclaredPropertyObjectProof {
 pub(super) enum DeclaredPropertyObjectValidation {
     Valid(DeclaredPropertyObjectProof),
     NotDeclared,
+    Malformed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DetailedDeclaredPropertyObjectValidation {
+    Valid(DeclaredPropertyObjectProof),
+    TraversableBoundary(DeclaredPropertyObjectProof),
+    NotDeclared,
+    Malformed,
+}
+
+pub(super) enum DeclaredPropertyTypeGraphValidation {
+    Traversable(Vec<TypeId>),
+    Opaque,
     Malformed,
 }
 
@@ -907,7 +922,25 @@ pub(super) fn validate_resolved_declared_property_object(
     store: &CanonicalTypeMapperStore,
     type_: TypeId,
 ) -> DeclaredPropertyObjectValidation {
-    use DeclaredPropertyObjectValidation::{Malformed, NotDeclared, Valid};
+    match validate_resolved_declared_property_object_detailed(store, type_) {
+        DetailedDeclaredPropertyObjectValidation::Valid(proof) => {
+            DeclaredPropertyObjectValidation::Valid(proof)
+        }
+        DetailedDeclaredPropertyObjectValidation::TraversableBoundary(_)
+        | DetailedDeclaredPropertyObjectValidation::NotDeclared => {
+            DeclaredPropertyObjectValidation::NotDeclared
+        }
+        DetailedDeclaredPropertyObjectValidation::Malformed => {
+            DeclaredPropertyObjectValidation::Malformed
+        }
+    }
+}
+
+fn validate_resolved_declared_property_object_detailed(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+) -> DetailedDeclaredPropertyObjectValidation {
+    use DetailedDeclaredPropertyObjectValidation::{Malformed, NotDeclared, Valid};
 
     let Some(record) = store.type_payload(type_) else {
         return NotDeclared;
@@ -968,11 +1001,7 @@ pub(super) fn validate_resolved_declared_property_object(
             {
                 return NotDeclared;
             }
-            if validate_resolved_property_interface(store, type_, record, interface) {
-                Valid(DeclaredPropertyObjectProof::Interface)
-            } else {
-                Malformed
-            }
+            validate_resolved_property_interface(store, type_, record, interface)
         }
         TypeData::Object(object) => {
             let Some(owner) = record.symbol() else {
@@ -1007,14 +1036,59 @@ pub(super) fn validate_resolved_declared_property_object(
             {
                 return NotDeclared;
             }
-            if validate_resolved_property_type_literal(store, type_, record, object) {
-                Valid(DeclaredPropertyObjectProof::TypeLiteral)
-            } else {
-                Malformed
-            }
+            validate_resolved_property_type_literal(store, type_, record, object)
         }
         _ => NotDeclared,
     }
+}
+
+/// Validates the narrower property graph needed by cache-capability scans.
+/// Legal nested/exported owner forms remain outside the admitted union domain,
+/// but their exact member/value-link shell is safe to traverse for hidden
+/// canonical-array references.
+pub(super) fn validate_resolved_declared_property_type_graph(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+) -> DeclaredPropertyTypeGraphValidation {
+    match validate_resolved_declared_property_object_detailed(store, type_) {
+        DetailedDeclaredPropertyObjectValidation::Valid(_)
+        | DetailedDeclaredPropertyObjectValidation::TraversableBoundary(_) => {
+            resolved_declared_property_types(store, type_)
+                .map_or(
+                    DeclaredPropertyTypeGraphValidation::Malformed,
+                    DeclaredPropertyTypeGraphValidation::Traversable,
+                )
+        }
+        DetailedDeclaredPropertyObjectValidation::NotDeclared => {
+            DeclaredPropertyTypeGraphValidation::Opaque
+        }
+        DetailedDeclaredPropertyObjectValidation::Malformed => {
+            DeclaredPropertyTypeGraphValidation::Malformed
+        }
+    }
+}
+
+/// Returns the store-owned property types behind an already validated
+/// declared-property object. Callers use this after
+/// [`validate_resolved_declared_property_object`] has proved the complete
+/// owner/member/link shell, so recursive property identities can be walked
+/// without retaining an AST host.
+pub(super) fn resolved_declared_property_types(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+) -> Option<Vec<TypeId>> {
+    let structured = match store.type_payload(type_)?.data() {
+        TypeData::Interface(interface) => &interface.reference.object.structured,
+        TypeData::Object(object) => &object.structured,
+        _ => return None,
+    };
+    structured
+        .properties
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .map(|property| store.value_symbol_links(*property)?.resolved_type)
+        .collect()
 }
 
 fn validate_empty_type_literal_identity(
@@ -1084,14 +1158,31 @@ fn classify_declared_owner_members(
         if property.flags().contains(SymbolFlags::PROPERTY)
             && property.flags().without(allowed_flags) == SymbolFlags::NONE
         {
-            if !matches!(
-                property
-                    .declarations()
-                    .filter(|declarations| declarations.len() == 1)
-                    .and_then(|declarations| store.source_node_kind(declarations[0])),
-                Some(SyntaxKind::PropertyDeclaration | SyntaxKind::PropertySignature)
-            ) {
-                return DeclaredOwnerMemberDomain::Malformed;
+            let declarations = property.declarations().unwrap_or_default();
+            match declarations {
+                [declaration]
+                    if matches!(
+                        store.source_node_kind(*declaration),
+                        Some(SyntaxKind::PropertyDeclaration | SyntaxKind::PropertySignature)
+                    ) => {}
+                [] => return DeclaredOwnerMemberDomain::Malformed,
+                _ => {
+                    let mut unique = HashSet::with_capacity(declarations.len());
+                    if declarations.iter().all(|declaration| {
+                        unique.insert(*declaration)
+                            && matches!(
+                                store.source_node_kind(*declaration),
+                                Some(
+                                    SyntaxKind::PropertyDeclaration
+                                        | SyntaxKind::PropertySignature
+                                )
+                            )
+                    }) {
+                        domain = DeclaredOwnerMemberDomain::Unsupported;
+                    } else {
+                        return DeclaredOwnerMemberDomain::Malformed;
+                    }
+                }
             }
         } else if property.flags().intersects(unsupported_flags) {
             domain = DeclaredOwnerMemberDomain::Unsupported;
@@ -1118,7 +1209,11 @@ fn validate_resolved_property_interface(
     type_: TypeId,
     record: &TypeRecord,
     interface: &InterfaceTypeData,
-) -> bool {
+) -> DetailedDeclaredPropertyObjectValidation {
+    use DetailedDeclaredPropertyObjectValidation::{
+        Malformed, NotDeclared, TraversableBoundary, Valid,
+    };
+
     let structured = &interface.reference.object.structured;
     if record.object_flags() != ObjectFlags::INTERFACE | ObjectFlags::MEMBERS_RESOLVED
         || record.alias().is_some()
@@ -1133,21 +1228,34 @@ fn validate_resolved_property_interface(
         || interface.declared_index_infos.is_some()
         || !valid_resolved_declared_structured_shell(&interface.reference.object)
     {
-        return false;
+        return Malformed;
     }
     let Some(owner) = record.symbol() else {
-        return false;
+        return Malformed;
     };
-    let Some(declaration) = validate_declared_property_owner(
+    let (declaration, boundary) = match validate_declared_property_owner(
         store,
         type_,
         owner,
         structured.members,
         DeclaredPropertyObjectProof::Interface,
-    ) else {
-        return false;
+    ) {
+        DeclaredPropertyOwnerValidation::Valid(declaration) => (declaration, false),
+        DeclaredPropertyOwnerValidation::TraversableBoundary(declaration) => {
+            (declaration, true)
+        }
+        DeclaredPropertyOwnerValidation::Unsupported => return NotDeclared,
+        DeclaredPropertyOwnerValidation::Malformed => return Malformed,
     };
-    validate_declared_property_members(store, owner, declaration, structured)
+    if validate_declared_property_members(store, owner, declaration, structured) {
+        if boundary {
+            TraversableBoundary(DeclaredPropertyObjectProof::Interface)
+        } else {
+            Valid(DeclaredPropertyObjectProof::Interface)
+        }
+    } else {
+        Malformed
+    }
 }
 
 fn validate_resolved_property_type_literal(
@@ -1155,28 +1263,49 @@ fn validate_resolved_property_type_literal(
     type_: TypeId,
     record: &TypeRecord,
     object: &ObjectTypeData,
-) -> bool {
+) -> DetailedDeclaredPropertyObjectValidation {
+    use DetailedDeclaredPropertyObjectValidation::{
+        Malformed, TraversableBoundary, Valid,
+    };
+
+    let alias_boundary = match validate_declared_property_alias_provenance(store, type_, record) {
+        DeclaredPropertyAliasValidation::Valid => false,
+        DeclaredPropertyAliasValidation::Unsupported => true,
+        DeclaredPropertyAliasValidation::Malformed => return Malformed,
+    };
     if record.object_flags() != ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED
         || !valid_resolved_declared_structured_shell(object)
-        || record
-            .alias()
-            .is_some_and(|alias| !valid_declared_property_alias(store, type_, alias))
     {
-        return false;
+        return Malformed;
     }
     let Some(owner) = record.symbol() else {
-        return false;
+        return Malformed;
     };
-    let Some(declaration) = validate_declared_property_owner(
+    let (declaration, owner_boundary) = match validate_declared_property_owner(
         store,
         type_,
         owner,
         object.structured.members,
         DeclaredPropertyObjectProof::TypeLiteral,
-    ) else {
-        return false;
+    ) {
+        DeclaredPropertyOwnerValidation::Valid(declaration) => (declaration, false),
+        DeclaredPropertyOwnerValidation::TraversableBoundary(declaration) => {
+            (declaration, true)
+        }
+        DeclaredPropertyOwnerValidation::Unsupported => {
+            return DetailedDeclaredPropertyObjectValidation::NotDeclared;
+        }
+        DeclaredPropertyOwnerValidation::Malformed => return Malformed,
     };
-    validate_declared_property_members(store, owner, declaration, &object.structured)
+    if validate_declared_property_members(store, owner, declaration, &object.structured) {
+        if alias_boundary || owner_boundary {
+            TraversableBoundary(DeclaredPropertyObjectProof::TypeLiteral)
+        } else {
+            Valid(DeclaredPropertyObjectProof::TypeLiteral)
+        }
+    } else {
+        Malformed
+    }
 }
 
 fn valid_resolved_declared_structured_shell(object: &ObjectTypeData) -> bool {
@@ -1191,16 +1320,27 @@ fn valid_resolved_declared_structured_shell(object: &ObjectTypeData) -> bool {
             .is_none()
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DeclaredPropertyOwnerValidation {
+    Valid(NodeRef),
+    TraversableBoundary(NodeRef),
+    Unsupported,
+    Malformed,
+}
+
 fn validate_declared_property_owner(
     store: &CanonicalTypeMapperStore,
     type_: TypeId,
     owner: SemanticSymbolId,
     members: Option<SymbolTableId>,
     proof: DeclaredPropertyObjectProof,
-) -> Option<NodeRef> {
-    let owner_record = store.symbol(owner)?;
-    let [declaration] = owner_record.declarations().unwrap_or_default() else {
-        return None;
+) -> DeclaredPropertyOwnerValidation {
+    use DeclaredPropertyOwnerValidation::{
+        Malformed, TraversableBoundary, Unsupported, Valid,
+    };
+
+    let Some(owner_record) = store.symbol(owner) else {
+        return Malformed;
     };
     let (expected_flags, expected_kind, valid_name) = match proof {
         DeclaredPropertyObjectProof::Interface => (
@@ -1214,64 +1354,175 @@ fn validate_declared_property_owner(
             owner_record.name() == InternalSymbolName::Type.as_ref(),
         ),
     };
+    let declarations = owner_record.declarations().unwrap_or_default();
+    if declarations.len() != 1 {
+        let mut unique = HashSet::with_capacity(declarations.len());
+        return if declarations.len() > 1
+            && declarations.iter().all(|declaration| {
+                unique.insert(*declaration)
+                    && store.source_node_kind(*declaration) == Some(expected_kind)
+            })
+        {
+            Unsupported
+        } else {
+            Malformed
+        };
+    }
+    let declaration = declarations[0];
     if store.get_merged_symbol(owner) != Some(owner)
         || owner_record.flags() != expected_flags
         || owner_record.check_flags() != CheckFlags::NONE
         || !valid_name
         || owner_record.value_declaration().is_some()
-        || owner_record.parent().is_some()
         || owner_record.members() != members
-        || owner_record.exports().is_some()
-        || owner_record.export_symbol().is_some()
-        || store.source_node_kind(*declaration) != Some(expected_kind)
+        || store.source_node_kind(declaration) != Some(expected_kind)
     {
-        return None;
+        return Malformed;
     }
     let valid_identity_cache = match proof {
         DeclaredPropertyObjectProof::Interface => store
             .declared_type_links(owner)
             .is_some_and(|links| links.declared_type == Some(type_)),
         DeclaredPropertyObjectProof::TypeLiteral => {
-            store.type_node_links(*declaration).is_some_and(|links| {
+            store.type_node_links(declaration).is_some_and(|links| {
                 links.resolved_type == Some(type_) && links.outer_type_parameters.is_none()
             })
         }
     };
-    valid_identity_cache.then_some(*declaration)
+    if !valid_identity_cache {
+        return Malformed;
+    }
+    let has_owner_relationship = owner_record.parent().is_some()
+        || owner_record.exports().is_some()
+        || owner_record.export_symbol().is_some();
+    if proof == DeclaredPropertyObjectProof::Interface
+        && declaration_has_external_owner_shape(store, declaration)
+    {
+        TraversableBoundary(declaration)
+    } else if has_owner_relationship {
+        Malformed
+    } else {
+        Valid(declaration)
+    }
 }
 
-fn valid_declared_property_alias(
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DeclaredPropertyAliasValidation {
+    Valid,
+    Unsupported,
+    Malformed,
+}
+
+fn validate_declared_property_alias_provenance(
     store: &CanonicalTypeMapperStore,
     type_: TypeId,
-    alias: super::TypeAliasId,
-) -> bool {
+    record: &TypeRecord,
+) -> DeclaredPropertyAliasValidation {
+    use DeclaredPropertyAliasValidation::{Malformed, Unsupported, Valid};
+
+    let Ok(expected_owner) = direct_type_literal_alias_owner(store, type_, record) else {
+        return Malformed;
+    };
+    let (alias, expected_owner) = match (record.alias(), expected_owner) {
+        (None, None) => return Valid,
+        (Some(alias), Some(expected_owner)) => (alias, expected_owner),
+        (None, Some(_)) | (Some(_), None) => return Malformed,
+    };
     let Some(alias_record) = store.type_alias(alias) else {
-        return false;
+        return Malformed;
     };
     let Some(symbol) = alias_record.symbol() else {
-        return false;
+        return Malformed;
     };
     let Some(symbol_record) = store.symbol(symbol) else {
-        return false;
+        return Malformed;
     };
     let [declaration] = symbol_record.declarations().unwrap_or_default() else {
-        return false;
+        return Malformed;
     };
-    alias_record.type_arguments().is_none()
+    let valid_core = symbol == expected_owner
+        && alias_record.type_arguments().is_none()
         && store.get_merged_symbol(symbol) == Some(symbol)
         && symbol_record.flags() == SymbolFlags::TYPE_ALIAS
         && symbol_record.check_flags() == CheckFlags::NONE
         && symbol_record.value_declaration().is_none()
-        && symbol_record.parent().is_none()
-        && symbol_record.exports().is_none()
-        && symbol_record.export_symbol().is_none()
         && store.source_node_kind(*declaration) == Some(SyntaxKind::TypeAliasDeclaration)
         && store.type_alias_links(symbol).is_some_and(|links| {
             links.declared_type == Some(type_)
                 && links.type_parameters.is_none()
                 && links.instantiations.is_none()
                 && !links.is_constructor_declared_property
+        });
+    if !valid_core {
+        return Malformed;
+    }
+    let has_owner_relationship = symbol_record.parent().is_some()
+        || symbol_record.exports().is_some()
+        || symbol_record.export_symbol().is_some();
+    if declaration_has_external_owner_shape(store, *declaration) {
+        Unsupported
+    } else if has_owner_relationship {
+        Malformed
+    } else {
+        Valid
+    }
+}
+
+fn declaration_has_external_owner_shape(
+    store: &CanonicalTypeMapperStore,
+    declaration: NodeRef,
+) -> bool {
+    if store.source_node_is_exported(declaration) == Some(true) {
+        return true;
+    }
+    match store.source_node_parent(declaration) {
+        Some(SourceNodeParent::Parent(parent)) => store
+            .source_node_kind(parent)
+            .is_some_and(|kind| kind != SyntaxKind::SourceFile),
+        Some(SourceNodeParent::Root) | None => false,
+    }
+}
+
+/// Returns the expected owner for a direct type-alias RHS or `None` for an
+/// inline type literal. The reverse declared-type index is essential here:
+/// AST parentage alone cannot prove which alias semantically owns `type_`.
+fn direct_type_literal_alias_owner(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    record: &TypeRecord,
+) -> Result<Option<SemanticSymbolId>, ()> {
+    let mut node = record
+        .symbol()
+        .and_then(|owner| store.symbol(owner))
+        .and_then(|owner| owner.declarations())
+        .and_then(|declarations| declarations.first())
+        .copied()
+        .ok_or(())?;
+    let alias_declaration = loop {
+        let SourceNodeParent::Parent(parent) = store.source_node_parent(node).ok_or(())? else {
+            return Err(());
+        };
+        match store.source_node_kind(parent).ok_or(())? {
+            SyntaxKind::ParenthesizedType => node = parent,
+            SyntaxKind::TypeAliasDeclaration => break Some(parent),
+            _ => break None,
+        }
+    };
+    let Some(alias_declaration) = alias_declaration else {
+        return Ok(None);
+    };
+    let owners = store.type_alias_declared_type_owners(type_).ok_or(())?;
+    let mut matches = owners.iter().copied().filter(|owner| {
+        store.symbol(*owner).is_some_and(|symbol| {
+            symbol.declarations() == Some(&[alias_declaration][..])
+                && symbol.flags() == SymbolFlags::TYPE_ALIAS
         })
+    });
+    let owner = matches.next().ok_or(())?;
+    if matches.next().is_some() {
+        return Err(());
+    }
+    Ok(Some(owner))
 }
 
 fn validate_declared_property_members(

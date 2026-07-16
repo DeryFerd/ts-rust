@@ -37,7 +37,7 @@ use ts_jsnum::{Number, PseudoBigInt};
 
 use super::{
     CanonicalGlobalTypes,
-    array_types::ArrayTypeError,
+    array_types::{ArrayTypeError, CanonicalArrayTargets},
     ids::{IndexInfoId, SignatureId, TypeAliasId, TypeId, TypePredicateId},
     links::ValueSymbolLinks,
     mapper::TypeMapper,
@@ -1236,6 +1236,38 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         )
     }
 
+    /// Validates every cached canonical-array edge reachable from `type_`
+    /// without granting an array capability. Unrelated semantic families are
+    /// opaque; a reference to the registered global `Array` or
+    /// `ReadonlyArray` target fails closed.
+    pub(super) fn validate_cached_array_capability(
+        &self,
+        type_: TypeId,
+    ) -> Result<(), LiteralTypeCacheError> {
+        self.validate_cached_array_capability_worker(
+            type_,
+            UnionArrayValidation::None,
+            &mut HashSet::new(),
+        )
+    }
+
+    /// Validates every cached canonical-array edge reachable from `type_`
+    /// against the explicitly installed targets. This is deliberately a
+    /// selective graph walk: generic reference arguments, union constituents,
+    /// and proven declared-property types are followed, while unrelated
+    /// leaves stay outside the array capability boundary.
+    pub(super) fn validate_cached_array_capability_with_array_targets(
+        &self,
+        targets: CanonicalArrayTargets,
+        type_: TypeId,
+    ) -> Result<(), LiteralTypeCacheError> {
+        self.validate_cached_array_capability_worker(
+            type_,
+            UnionArrayValidation::Targets(targets),
+            &mut HashSet::new(),
+        )
+    }
+
     fn validate_cached_union_result_worker(
         &self,
         type_: TypeId,
@@ -1640,6 +1672,153 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         }
     }
 
+    fn validate_cached_array_capability_worker(
+        &self,
+        type_: TypeId,
+        array_validation: UnionArrayValidation<'_>,
+        visited: &mut HashSet<TypeId>,
+    ) -> Result<(), LiteralTypeCacheError> {
+        if !visited.insert(type_) {
+            return Ok(());
+        }
+        let Some(record) = self.type_payload(type_) else {
+            return Err(LiteralTypeCacheError::UnsupportedUnionConstituent(type_));
+        };
+        match record.data() {
+            TypeData::TypeReference(reference) => self
+                .validate_cached_type_reference_array_capability(
+                    type_,
+                    record,
+                    reference,
+                    array_validation,
+                    visited,
+                ),
+            TypeData::Union(data) => {
+                self.validate_union_structure(type_)?;
+                for constituent in &data.union.types {
+                    self.validate_cached_array_capability_worker(
+                        *constituent,
+                        array_validation,
+                        visited,
+                    )?;
+                }
+                Ok(())
+            }
+            TypeData::Object(_) | TypeData::Interface(_) => {
+                match object_members::validate_resolved_declared_property_type_graph(self, type_) {
+                    object_members::DeclaredPropertyTypeGraphValidation::Traversable(
+                        property_types,
+                    ) => {
+                        for property_type in property_types {
+                            self.validate_cached_array_capability_worker(
+                                property_type,
+                                array_validation,
+                                visited,
+                            )?;
+                        }
+                        Ok(())
+                    }
+                    object_members::DeclaredPropertyTypeGraphValidation::Opaque => Ok(()),
+                    object_members::DeclaredPropertyTypeGraphValidation::Malformed => {
+                        Err(LiteralTypeCacheError::InvalidCachedUnion(type_))
+                    }
+                }
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn validate_cached_type_reference_array_capability(
+        &self,
+        type_: TypeId,
+        record: &TypeRecord,
+        reference: &super::type_records::TypeReferenceData,
+        array_validation: UnionArrayValidation<'_>,
+        visited: &mut HashSet<TypeId>,
+    ) -> Result<(), LiteralTypeCacheError> {
+        let targets = match array_validation {
+            UnionArrayValidation::None => None,
+            UnionArrayValidation::GlobalTypes(global_types) => {
+                Some(CanonicalArrayTargets::from_global_types(global_types))
+            }
+            UnionArrayValidation::Targets(targets) => Some(targets),
+        };
+        let target = reference.object.target;
+        let configured_target = targets.is_some_and(|targets| {
+            target == Some(targets.array_type()) || target == Some(targets.readonly_array_type())
+        });
+        let global_named_target = record.symbol().is_some_and(|symbol| {
+            self.symbol_is_registered_global_array(symbol)
+        }) || target
+            .and_then(|target| self.type_payload(target))
+            .and_then(TypeRecord::symbol)
+            .is_some_and(|symbol| self.symbol_is_registered_global_array(symbol));
+        let is_array_candidate = configured_target || global_named_target;
+
+        if let Some(targets) = targets {
+            if is_array_candidate {
+                let array = self
+                    .canonical_array_reference_with_targets(targets, type_)
+                    .map_err(|error| LiteralTypeCacheError::ArrayType { type_, error })?
+                    .ok_or(LiteralTypeCacheError::ArrayType {
+                        type_,
+                        error: ArrayTypeError::InvalidReference(type_),
+                    })?;
+                return self.validate_cached_array_capability_worker(
+                    array.element_type,
+                    array_validation,
+                    visited,
+                );
+            }
+        } else if is_array_candidate {
+            let target = target.ok_or(LiteralTypeCacheError::ArrayType {
+                type_,
+                error: ArrayTypeError::InvalidReference(type_),
+            })?;
+            self.canonical_array_reference_with_targets(
+                CanonicalArrayTargets::for_single_target_validation(target),
+                type_,
+            )
+            .map_err(|error| LiteralTypeCacheError::ArrayType { type_, error })?
+            .ok_or(LiteralTypeCacheError::ArrayType {
+                type_,
+                error: ArrayTypeError::InvalidReference(type_),
+            })?;
+            return Err(LiteralTypeCacheError::UnsupportedUnionConstituent(type_));
+        }
+
+        for argument in reference
+            .resolved_type_arguments
+            .as_deref()
+            .unwrap_or_default()
+        {
+            self.validate_cached_array_capability_worker(
+                *argument,
+                array_validation,
+                visited,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn symbol_is_registered_global_array(&self, symbol: SemanticSymbolId) -> bool {
+        let Some(globals) = self
+            .intrinsic_bootstrap
+            .as_ref()
+            .and_then(|bootstrap| self.symbol_table(bootstrap.globals))
+        else {
+            return false;
+        };
+        let canonical = self.get_merged_symbol(symbol);
+        ["Array", "ReadonlyArray"].into_iter().any(|name| {
+            globals.get_source(name).is_some_and(|global| {
+                global == symbol
+                    || canonical.is_some()
+                        && self.get_merged_symbol(global) == canonical
+            })
+        })
+    }
+
     fn validate_supported_canonical_array(
         &self,
         type_: TypeId,
@@ -1763,7 +1942,12 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     return Ok(());
                 }
                 match object_members::validate_resolved_declared_property_object(self, type_) {
-                    object_members::DeclaredPropertyObjectValidation::Valid(_) => Ok(()),
+                    object_members::DeclaredPropertyObjectValidation::Valid(_) => self
+                        .validate_cached_array_capability_worker(
+                            type_,
+                            array_validation,
+                            &mut HashSet::new(),
+                        ),
                     object_members::DeclaredPropertyObjectValidation::NotDeclared => self
                         .validate_supported_fresh_property_object(
                             type_,
@@ -1779,7 +1963,12 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             }
             TypeData::Interface(_) => {
                 match object_members::validate_resolved_declared_property_object(self, type_) {
-                    object_members::DeclaredPropertyObjectValidation::Valid(_) => Ok(()),
+                    object_members::DeclaredPropertyObjectValidation::Valid(_) => self
+                        .validate_cached_array_capability_worker(
+                            type_,
+                            array_validation,
+                            &mut HashSet::new(),
+                        ),
                     object_members::DeclaredPropertyObjectValidation::NotDeclared => {
                         Err(LiteralTypeCacheError::UnsupportedUnionConstituent(type_))
                     }

@@ -45,6 +45,17 @@ impl CanonicalArrayTargets {
         }
     }
 
+    /// Builds a validation-only capability for a reference whose registered
+    /// global target is already known. Treating the one target as both array
+    /// variants preserves exact target/cache validation without granting a
+    /// context-free query either array construction capability.
+    pub(super) const fn for_single_target_validation(target: TypeId) -> Self {
+        Self {
+            array_type: target,
+            readonly_array_type: target,
+        }
+    }
+
     pub(super) const fn array_type(self) -> TypeId {
         self.array_type
     }

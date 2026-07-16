@@ -763,6 +763,18 @@ impl<'store, 'host, 'arena> TypeQueryPlanner<'store, 'host, 'arena> {
         }
     }
 
+    fn validate_cached_array_capability(
+        &self,
+        cached: TypeId,
+    ) -> Result<(), LiteralTypeCacheError> {
+        match self.array_targets {
+            Some(targets) => self
+                .store
+                .validate_cached_array_capability_with_array_targets(targets, cached),
+            None => self.store.validate_cached_array_capability(cached),
+        }
+    }
+
     fn plan_array_type(
         &mut self,
         node: NodeRef,
@@ -1194,6 +1206,14 @@ impl<'store, 'host, 'arena> TypeQueryPlanner<'store, 'host, 'arena> {
         let declared_type = cached.declared_type;
         let declared_data = self.store.type_payload(declared_type).map(TypeRecord::data);
         let remains_union = matches!(declared_data, Some(TypeData::Union(_)));
+        let cached_array_capability_error = self
+            .validate_cached_array_capability(declared_type)
+            .err();
+        if let Some(error) = cached_array_capability_error
+            && !matches!(error, LiteralTypeCacheError::UnsupportedUnionConstituent(_))
+        {
+            return Err(type_construction_error(error));
+        }
         let mut current_missing_generic_metadata = cached.missing_generic_metadata;
         if union_constituent
             || matches!(
@@ -1245,8 +1265,12 @@ impl<'store, 'host, 'arena> TypeQueryPlanner<'store, 'host, 'arena> {
                 .is_some_and(|declaration| self.host.source(*declaration).is_some());
             if !has_host_declaration {
                 // Fully cached queries intentionally support an empty host.
-                // The canonical semantic identity was validated above; AST
-                // RHS provenance is enforced whenever its owner is available.
+                // The canonical semantic identity and its complete cached
+                // array-capability closure were validated above; AST RHS
+                // provenance is enforced whenever its owner is available.
+                if let Some(error) = cached_array_capability_error {
+                    return Err(type_construction_error(error));
+                }
                 return if missing_generic_metadata.is_empty() {
                     Ok(())
                 } else {
@@ -1975,12 +1999,26 @@ impl<'store, 'host, 'arena> TypeQueryPlanner<'store, 'host, 'arena> {
             }
         }
 
+        let cached_type = self
+            .store
+            .type_node_links(node)
+            .and_then(|links| links.resolved_type);
+        let cached_array_capability_missing = if let Some(cached) = cached_type {
+            match self.validate_cached_array_capability(cached) {
+                Ok(()) => false,
+                Err(LiteralTypeCacheError::UnsupportedUnionConstituent(_)) => true,
+                Err(error) => return Err(type_construction_error(error)),
+            }
+        } else {
+            false
+        };
+        let cached_syntax_contains_builtin_array = cached_type.is_some()
+            && self.type_node_contains_builtin_array_reference(node, &mut HashSet::new())?;
+
         if !union_constituent
-            && self
-                .store
-                .type_node_links(node)
-                .and_then(|links| links.resolved_type)
-                .is_some()
+            && cached_type.is_some()
+            && !cached_array_capability_missing
+            && !cached_syntax_contains_builtin_array
             && !self.cached_property_interface_reference(node)
             && !matches!(identifier.text.as_str(), "Array" | "ReadonlyArray")
         {
@@ -2688,6 +2726,12 @@ impl<'store, 'host, 'arena> TypeQueryPlanner<'store, 'host, 'arena> {
         if let Some(cached) = cached {
             self.validate_cached_type_alias_identity(symbol, cached, union_constituent)?;
         }
+        let cached_array_capability_missing = cached.is_some_and(|cached| {
+            matches!(
+                self.validate_cached_array_capability(cached.declared_type),
+                Err(LiteralTypeCacheError::UnsupportedUnionConstituent(_))
+            )
+        });
         if let Some(plan) = self.plan.aliases.get(&symbol) {
             return Ok(cached.map_or(plan.type_parameters.len(), |cached| {
                 cached.type_parameter_count
@@ -2840,6 +2884,7 @@ impl<'store, 'host, 'arena> TypeQueryPlanner<'store, 'host, 'arena> {
             },
         );
         if cached.is_none()
+            || cached_array_capability_missing
             || self.direct_type_literal_rhs(type_node)?
             || self.type_node_contains_builtin_array_reference(
                 type_node,
@@ -2868,10 +2913,7 @@ impl<'store, 'host, 'arena> TypeQueryPlanner<'store, 'host, 'arena> {
                     NodeRef::new(node.arena, node.file, parenthesized.type_),
                     visited,
                 )?,
-            NodeData::ArrayTypeNode(array) => self.type_node_contains_builtin_array_reference(
-                NodeRef::new(node.arena, node.file, array.element_type),
-                visited,
-            )?,
+            NodeData::ArrayTypeNode(_) => true,
             NodeData::TypeReferenceNode(_) => {
                 if self.builtin_array_reference_name(node)?.is_some() {
                     true
@@ -2891,6 +2933,59 @@ impl<'store, 'host, 'arena> TypeQueryPlanner<'store, 'host, 'arena> {
                         NodeRef::new(node.arena, node.file, *child),
                         visited,
                     )?;
+                }
+                contains
+            }
+            NodeData::TypeLiteralNode(literal) => {
+                if record.kind != SyntaxKind::TypeLiteral
+                    || literal.members.has_trailing_comma
+                    || literal.members.range != record.range
+                {
+                    return Err(type_node_unavailable(
+                        TypeNodeUnavailable::InvalidLiteralType(node),
+                    ));
+                }
+                let mut contains = false;
+                let mut seen = HashSet::with_capacity(literal.members.nodes.len());
+                for member in &literal.members.nodes {
+                    let member = NodeRef::new(node.arena, node.file, *member);
+                    let member_record = preflight_node(self.store, self.host, member)?;
+                    if member_record.parent != Some(node.node) || !seen.insert(member) {
+                        return Err(type_node_unavailable(
+                            TypeNodeUnavailable::InvalidLiteralType(node),
+                        ));
+                    }
+                    let type_node = match (member_record.kind, &member_record.data) {
+                        (
+                            SyntaxKind::PropertyDeclaration,
+                            NodeData::PropertyDeclaration(property),
+                        ) => property.type_,
+                        (
+                            SyntaxKind::PropertySignature,
+                            NodeData::PropertySignatureDeclaration(property),
+                        ) => Some(property.type_),
+                        _ => {
+                            return Err(type_node_unavailable(
+                                TypeNodeUnavailable::UnsupportedSyntax {
+                                    node: member,
+                                    kind: member_record.kind,
+                                },
+                            ));
+                        }
+                    }
+                    .ok_or_else(|| {
+                        type_node_unavailable(TypeNodeUnavailable::InvalidLiteralType(node))
+                    })?;
+                    let type_node = NodeRef::new(member.arena, member.file, type_node);
+                    if preflight_node(self.store, self.host, type_node)?.parent
+                        != Some(member.node)
+                    {
+                        return Err(type_node_unavailable(
+                            TypeNodeUnavailable::InvalidLiteralType(node),
+                        ));
+                    }
+                    contains |=
+                        self.type_node_contains_builtin_array_reference(type_node, visited)?;
                 }
                 contains
             }
@@ -4207,6 +4302,7 @@ mod tests {
     use crate::semantic::{
         DeclaredTypeHostError, DeclaredTypeLinks, IntrinsicBootstrapOptions, SymbolNodeLinks,
         TypeAliasLinks, TypeNodeLinks, ValueSymbolLinks,
+        bootstrap::UnionReduction,
         global_types::initialize_global_library_types,
         production::GlobalMergeCompletion,
         type_records::{LiteralValue, TypeAlias},
@@ -4719,6 +4815,38 @@ mod tests {
             &fixture.parsed.arena,
             fixture.files.get(&fixture.file).unwrap(),
         );
+        CanonicalTypeQuery::new_with_global_types(
+            &mut fixture.store,
+            &host,
+            global_types,
+            CanonicalTypeQueryOptions::default(),
+            diagnostics,
+        )?
+        .get_declared_type_of_symbol(symbol)
+    }
+
+    fn query_empty_host_declared(
+        fixture: &mut Fixture,
+        symbol: SemanticSymbolId,
+        diagnostics: &mut CanonicalCheckerDiagnostics,
+    ) -> Result<TypeId, DeclaredTypeError> {
+        let host = DeclaredTypeHost::new(std::iter::empty::<(&NodeArena, &BoundFile)>()).unwrap();
+        CanonicalTypeQuery::new(
+            &mut fixture.store,
+            &host,
+            CanonicalTypeQueryOptions::default(),
+            diagnostics,
+        )?
+        .get_declared_type_of_symbol(symbol)
+    }
+
+    fn query_empty_host_global_declared(
+        fixture: &mut Fixture,
+        global_types: &CanonicalGlobalTypes,
+        symbol: SemanticSymbolId,
+        diagnostics: &mut CanonicalCheckerDiagnostics,
+    ) -> Result<TypeId, DeclaredTypeError> {
+        let host = DeclaredTypeHost::new(std::iter::empty::<(&NodeArena, &BoundFile)>()).unwrap();
         CanonicalTypeQuery::new_with_global_types(
             &mut fixture.store,
             &host,
@@ -10150,6 +10278,841 @@ mod tests {
             ))
         );
         assert_eq!(store_state(&fixture.store), warm);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn cached_array_alias_roots_require_capability_even_with_an_empty_host() {
+        let mut fixture = global_array_fixture(concat!(
+            "type Direct = Array<number>; ",
+            "type Shorthand = number[]; ",
+            "type Through = Direct; ",
+            "type Reduced = Through | null;",
+        ));
+        let global_types = initialize_fixture_global_types(&mut fixture);
+        let aliases = ["Direct", "Shorthand", "Through", "Reduced"].map(|name| {
+            named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, name)
+        });
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        let array_type = query_global_declared(
+            &mut fixture,
+            &global_types,
+            aliases[0],
+            &mut diagnostics,
+        )
+        .unwrap();
+        for alias in aliases.iter().skip(1) {
+            assert_eq!(
+                query_global_declared(
+                    &mut fixture,
+                    &global_types,
+                    *alias,
+                    &mut diagnostics,
+                ),
+                Ok(array_type),
+                "loose null reduction and transitive aliases retain the array root",
+            );
+        }
+        let warm = store_state(&fixture.store);
+
+        for alias in aliases {
+            assert_eq!(
+                query_empty_host_declared(&mut fixture, alias, &mut diagnostics),
+                Err(DeclaredTypeError::TypeNodeUnavailable(
+                    TypeNodeUnavailable::UnsupportedUnionConstituentType(array_type),
+                )),
+            );
+            assert_eq!(store_state(&fixture.store), warm);
+            assert_eq!(
+                query_empty_host_global_declared(
+                    &mut fixture,
+                    &global_types,
+                    alias,
+                    &mut diagnostics,
+                ),
+                Ok(array_type),
+            );
+            assert_eq!(store_state(&fixture.store), warm);
+        }
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn cached_generic_wrappers_replan_only_when_their_result_contains_an_array() {
+        let mut fixture = global_array_fixture(concat!(
+            "type Box<T> = T; ",
+            "let direct: Box<Array<number>>; ",
+            "let readonly: Box<ReadonlyArray<number>>; ",
+            "let shorthand: Box<number[]>; ",
+            "let plain: Box<number>;",
+        ));
+        let global_types = initialize_fixture_global_types(&mut fixture);
+        let direct = variable_type_node(&fixture, "direct");
+        let readonly = variable_type_node(&fixture, "readonly");
+        let shorthand = variable_type_node(&fixture, "shorthand");
+        let plain = variable_type_node(&fixture, "plain");
+        let direct_array = type_reference_argument_node(&fixture, direct, 0);
+        let readonly_array = type_reference_argument_node(&fixture, readonly, 0);
+        let shorthand_array = type_reference_argument_node(&fixture, shorthand, 0);
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        let direct_type =
+            query_global_node(&mut fixture, &global_types, direct, &mut diagnostics).unwrap();
+        let readonly_type =
+            query_global_node(&mut fixture, &global_types, readonly, &mut diagnostics).unwrap();
+        let shorthand_type =
+            query_global_node(&mut fixture, &global_types, shorthand, &mut diagnostics).unwrap();
+        let plain_type =
+            query_global_node(&mut fixture, &global_types, plain, &mut diagnostics).unwrap();
+        let warm = store_state(&fixture.store);
+
+        assert!(matches!(
+            query_node(&mut fixture, direct, &mut diagnostics),
+            Err(DeclaredTypeError::TypeNodeUnavailable(
+                TypeNodeUnavailable::TypeArgumentsUnsupported(error_node)
+            )) if error_node == direct_array
+        ));
+        assert_eq!(store_state(&fixture.store), warm);
+        assert!(matches!(
+            query_node(&mut fixture, readonly, &mut diagnostics),
+            Err(DeclaredTypeError::TypeNodeUnavailable(
+                TypeNodeUnavailable::TypeArgumentsUnsupported(error_node)
+            )) if error_node == readonly_array
+        ));
+        assert_eq!(store_state(&fixture.store), warm);
+        assert_eq!(
+            query_node(&mut fixture, shorthand, &mut diagnostics),
+            Err(DeclaredTypeError::TypeNodeUnavailable(
+                TypeNodeUnavailable::UnsupportedSyntax {
+                    node: shorthand_array,
+                    kind: SyntaxKind::ArrayType,
+                },
+            )),
+        );
+        assert_eq!(store_state(&fixture.store), warm);
+        assert_eq!(
+            query_node(&mut fixture, plain, &mut diagnostics),
+            Ok(plain_type),
+            "an unrelated fully cached generic alias keeps the empty capability fast path",
+        );
+        assert_eq!(store_state(&fixture.store), warm);
+
+        for (node, expected) in [
+            (direct, direct_type),
+            (readonly, readonly_type),
+            (shorthand, shorthand_type),
+        ] {
+            assert_eq!(
+                query_global_node(
+                    &mut fixture,
+                    &global_types,
+                    node,
+                    &mut diagnostics,
+                ),
+                Ok(expected),
+            );
+            assert_eq!(store_state(&fixture.store), warm);
+        }
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn cached_erased_generic_arguments_still_close_over_array_syntax() {
+        let mut fixture = global_array_fixture(concat!(
+            "type Ignore<T> = number; ",
+            "let direct: Ignore<Array<number>>; ",
+            "let readonly: Ignore<ReadonlyArray<number>>; ",
+            "let shorthand: Ignore<number[]>; ",
+            "let plain: Ignore<string>;",
+        ));
+        let global_types = initialize_fixture_global_types(&mut fixture);
+        let direct = variable_type_node(&fixture, "direct");
+        let readonly = variable_type_node(&fixture, "readonly");
+        let shorthand = variable_type_node(&fixture, "shorthand");
+        let plain = variable_type_node(&fixture, "plain");
+        let direct_array = type_reference_argument_node(&fixture, direct, 0);
+        let readonly_array = type_reference_argument_node(&fixture, readonly, 0);
+        let shorthand_array = type_reference_argument_node(&fixture, shorthand, 0);
+        let number = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        for node in [direct, readonly, shorthand, plain] {
+            assert_eq!(
+                query_global_node(
+                    &mut fixture,
+                    &global_types,
+                    node,
+                    &mut diagnostics,
+                ),
+                Ok(number),
+            );
+        }
+        let warm = store_state(&fixture.store);
+
+        for (node, array) in [(direct, direct_array), (readonly, readonly_array)] {
+            assert!(matches!(
+                query_node(&mut fixture, node, &mut diagnostics),
+                Err(DeclaredTypeError::TypeNodeUnavailable(
+                    TypeNodeUnavailable::TypeArgumentsUnsupported(error_node)
+                )) if error_node == array
+            ));
+            assert_eq!(store_state(&fixture.store), warm);
+        }
+        assert_eq!(
+            query_node(&mut fixture, shorthand, &mut diagnostics),
+            Err(DeclaredTypeError::TypeNodeUnavailable(
+                TypeNodeUnavailable::UnsupportedSyntax {
+                    node: shorthand_array,
+                    kind: SyntaxKind::ArrayType,
+                },
+            )),
+        );
+        assert_eq!(store_state(&fixture.store), warm);
+        assert_eq!(
+            query_node(&mut fixture, plain, &mut diagnostics),
+            Ok(number),
+        );
+        assert_eq!(store_state(&fixture.store), warm);
+
+        for node in [direct, readonly, shorthand] {
+            assert_eq!(
+                query_global_node(
+                    &mut fixture,
+                    &global_types,
+                    node,
+                    &mut diagnostics,
+                ),
+                Ok(number),
+            );
+            assert_eq!(store_state(&fixture.store), warm);
+        }
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn cached_erased_type_literal_arguments_close_over_property_array_syntax() {
+        let mut fixture = global_array_fixture(concat!(
+            "type Ignore<T> = number; ",
+            "let direct: Ignore<{ values: Array<number> }>; ",
+            "let readonly: Ignore<{ values: ReadonlyArray<number> }>; ",
+            "let shorthand: Ignore<{ values: number[] }>;",
+        ));
+        let global_types = initialize_fixture_global_types(&mut fixture);
+        let direct = variable_type_node(&fixture, "direct");
+        let readonly = variable_type_node(&fixture, "readonly");
+        let shorthand = variable_type_node(&fixture, "shorthand");
+        let direct_array = property_type_literal_child(
+            &fixture,
+            type_reference_argument_node(&fixture, direct, 0),
+            0,
+        );
+        let readonly_array = property_type_literal_child(
+            &fixture,
+            type_reference_argument_node(&fixture, readonly, 0),
+            0,
+        );
+        let shorthand_array = property_type_literal_child(
+            &fixture,
+            type_reference_argument_node(&fixture, shorthand, 0),
+            0,
+        );
+        let number = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        for node in [direct, readonly, shorthand] {
+            assert_eq!(
+                query_global_node(
+                    &mut fixture,
+                    &global_types,
+                    node,
+                    &mut diagnostics,
+                ),
+                Ok(number),
+            );
+        }
+        let warm = store_state(&fixture.store);
+
+        for (node, array) in [(direct, direct_array), (readonly, readonly_array)] {
+            assert!(matches!(
+                query_node(&mut fixture, node, &mut diagnostics),
+                Err(DeclaredTypeError::TypeNodeUnavailable(
+                    TypeNodeUnavailable::TypeArgumentsUnsupported(error_node)
+                )) if error_node == array
+            ));
+            assert_eq!(store_state(&fixture.store), warm);
+        }
+        assert_eq!(
+            query_node(&mut fixture, shorthand, &mut diagnostics),
+            Err(DeclaredTypeError::TypeNodeUnavailable(
+                TypeNodeUnavailable::UnsupportedSyntax {
+                    node: shorthand_array,
+                    kind: SyntaxKind::ArrayType,
+                },
+            )),
+        );
+        assert_eq!(store_state(&fixture.store), warm);
+
+        for node in [direct, readonly, shorthand] {
+            assert_eq!(
+                query_global_node(
+                    &mut fixture,
+                    &global_types,
+                    node,
+                    &mut diagnostics,
+                ),
+                Ok(number),
+            );
+            assert_eq!(store_state(&fixture.store), warm);
+        }
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn declared_property_array_closures_are_cycle_safe_and_reject_cache_poison() {
+        let mut fixture = global_array_fixture(concat!(
+            "interface Holder { values: Array<number>; } ",
+            "interface Node { next: Node; children: Array<Node>; } ",
+            "type MaybeHolder = Holder; ",
+            "type MaybeNode = Node; ",
+            "type Item = { values: Array<number> }; ",
+            "type ThroughItem = Item;",
+        ));
+        let global_types = initialize_fixture_global_types(&mut fixture);
+        let holder_alias =
+            named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "MaybeHolder");
+        let node_alias = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "MaybeNode");
+        let through_item_alias =
+            named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "ThroughItem");
+        let item_array_node = property_type_literal_child(&fixture, alias_parts(&fixture, "Item").2, 0);
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        let holder_type = query_global_declared(
+            &mut fixture,
+            &global_types,
+            holder_alias,
+            &mut diagnostics,
+        )
+        .unwrap();
+        let node_type = query_global_declared(
+            &mut fixture,
+            &global_types,
+            node_alias,
+            &mut diagnostics,
+        )
+        .unwrap();
+        let item_type = query_global_declared(
+            &mut fixture,
+            &global_types,
+            through_item_alias,
+            &mut diagnostics,
+        )
+        .unwrap();
+        let holder_properties =
+            object_members::resolved_declared_property_types(&fixture.store, holder_type).unwrap();
+        let node_properties =
+            object_members::resolved_declared_property_types(&fixture.store, node_type).unwrap();
+        let holder_array = holder_properties[0];
+        let node_array = node_properties[1];
+        let item_array =
+            object_members::resolved_declared_property_types(&fixture.store, item_type).unwrap()[0];
+        let (number, string) = {
+            let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+            (bootstrap.number_type, bootstrap.string_type)
+        };
+
+        let node_or_array = fixture
+            .store
+            .expression_union_type_with_global_types(
+                &global_types,
+                &[node_type, node_array],
+                UnionReduction::None,
+            )
+            .unwrap();
+        assert_eq!(
+            fixture
+                .store
+                .expression_union_type_with_global_types(
+                    &global_types,
+                    &[node_array, node_type],
+                    UnionReduction::None,
+                ),
+            Ok(node_or_array),
+        );
+        let targets = CanonicalArrayTargets::from_global_types(&global_types);
+        for _ in 0..2 {
+            assert_eq!(
+                fixture
+                    .store
+                    .validate_cached_union_result_with_array_targets(
+                        targets,
+                        node_or_array,
+                        None,
+                    ),
+                Ok(()),
+                "declared-object graph visits must not poison the strict union stack",
+            );
+        }
+        let warm = store_state(&fixture.store);
+
+        assert!(matches!(
+            query_declared(
+                &mut fixture,
+                through_item_alias,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Err(DeclaredTypeError::TypeNodeUnavailable(
+                TypeNodeUnavailable::TypeArgumentsUnsupported(error_node)
+            )) if error_node == item_array_node
+        ));
+        assert_eq!(store_state(&fixture.store), warm);
+
+        for (alias, hidden_array) in [
+            (holder_alias, holder_array),
+            (node_alias, node_array),
+            (through_item_alias, item_array),
+        ] {
+            assert_eq!(
+                query_empty_host_declared(&mut fixture, alias, &mut diagnostics),
+                Err(DeclaredTypeError::TypeNodeUnavailable(
+                    TypeNodeUnavailable::UnsupportedUnionConstituentType(hidden_array),
+                )),
+            );
+            assert_eq!(store_state(&fixture.store), warm);
+            assert!(query_empty_host_global_declared(
+                &mut fixture,
+                &global_types,
+                alias,
+                &mut diagnostics,
+            )
+            .is_ok());
+            assert_eq!(store_state(&fixture.store), warm);
+        }
+
+        assert!(fixture.store.set_type_reference_resolution(
+            holder_array,
+            None,
+            Some(vec![string]),
+        ));
+        let poisoned = store_state(&fixture.store);
+        for with_globals in [false, true] {
+            let result = if with_globals {
+                query_empty_host_global_declared(
+                    &mut fixture,
+                    &global_types,
+                    holder_alias,
+                    &mut diagnostics,
+                )
+            } else {
+                query_empty_host_declared(&mut fixture, holder_alias, &mut diagnostics)
+            };
+            assert_eq!(
+                result,
+                Err(DeclaredTypeError::TypeNodeUnavailable(
+                    TypeNodeUnavailable::InvalidCachedArrayType(holder_array),
+                )),
+            );
+            assert_eq!(store_state(&fixture.store), poisoned);
+        }
+        assert!(fixture.store.set_type_reference_resolution(
+            holder_array,
+            None,
+            Some(vec![number]),
+        ));
+        assert_eq!(
+            query_empty_host_global_declared(
+                &mut fixture,
+                &global_types,
+                holder_alias,
+                &mut diagnostics,
+            ),
+            Ok(holder_type),
+        );
+        assert_eq!(store_state(&fixture.store), warm);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn declared_type_literal_alias_provenance_is_symmetric_and_repairable() {
+        let mut fixture = global_array_fixture(concat!(
+            "type Item = { value: number }; ",
+            "type Through = Item; ",
+            "type Reduced = Through;",
+        ));
+        let global_types = initialize_fixture_global_types(&mut fixture);
+        let item_alias = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Item");
+        let reduced_alias = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Reduced");
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        let item = query_global_declared(
+            &mut fixture,
+            &global_types,
+            reduced_alias,
+            &mut diagnostics,
+        )
+        .unwrap();
+        let alias = fixture
+            .store
+            .type_payload(item)
+            .and_then(TypeRecord::alias)
+            .expect("a direct alias-owned type literal retains its alias record");
+        assert!(
+            fixture
+                .store
+                .type_alias_declared_type_owners(item)
+                .is_some_and(|owners| owners.contains(&item_alias))
+        );
+        assert_eq!(
+            object_members::validate_resolved_declared_property_object(&fixture.store, item),
+            object_members::DeclaredPropertyObjectValidation::Valid(
+                object_members::DeclaredPropertyObjectProof::TypeLiteral,
+            ),
+        );
+
+        assert!(fixture.store.set_type_alias(item, None));
+        let poisoned = store_state(&fixture.store);
+        for with_globals in [false, true] {
+            let result = if with_globals {
+                query_empty_host_global_declared(
+                    &mut fixture,
+                    &global_types,
+                    reduced_alias,
+                    &mut diagnostics,
+                )
+            } else {
+                query_empty_host_declared(&mut fixture, reduced_alias, &mut diagnostics)
+            };
+            assert_eq!(
+                result,
+                Err(DeclaredTypeError::TypeNodeUnavailable(
+                    TypeNodeUnavailable::InvalidCachedUnionType(item),
+                )),
+            );
+            assert_eq!(store_state(&fixture.store), poisoned);
+        }
+        assert!(fixture.store.set_type_alias(item, Some(alias)));
+        assert_eq!(
+            query_empty_host_global_declared(
+                &mut fixture,
+                &global_types,
+                reduced_alias,
+                &mut diagnostics,
+            ),
+            Ok(item),
+        );
+        assert_eq!(
+            object_members::validate_resolved_declared_property_object(&fixture.store, item),
+            object_members::DeclaredPropertyObjectValidation::Valid(
+                object_members::DeclaredPropertyObjectProof::TypeLiteral,
+            ),
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn exported_property_alias_provenance_is_a_valid_cached_boundary() {
+        let mut fixture = fixture_with_module_state(
+            "export type Item = { value: number };",
+            CanonicalModuleState::External,
+        );
+        let item_alias = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Item");
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let item = query_declared(
+            &mut fixture,
+            item_alias,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+
+        assert_eq!(
+            object_members::validate_resolved_declared_property_object(&fixture.store, item),
+            object_members::DeclaredPropertyObjectValidation::NotDeclared,
+        );
+        let warm = store_state(&fixture.store);
+        assert_eq!(
+            query_empty_host_declared(&mut fixture, item_alias, &mut diagnostics),
+            Ok(item),
+            "a fully cached exported alias stays opaque outside the property-only proof",
+        );
+        assert_eq!(store_state(&fixture.store), warm);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn exported_property_alias_boundaries_still_scan_hidden_array_types() {
+        let mut fixture =
+            global_array_fixture("export type Item = { values: Array<number> };");
+        let global_types = initialize_fixture_global_types(&mut fixture);
+        let item_alias = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Item");
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let item = query_global_declared(
+            &mut fixture,
+            &global_types,
+            item_alias,
+            &mut diagnostics,
+        )
+        .unwrap();
+        let hidden_array =
+            object_members::resolved_declared_property_types(&fixture.store, item).unwrap()[0];
+        assert_eq!(
+            object_members::validate_resolved_declared_property_object(&fixture.store, item),
+            object_members::DeclaredPropertyObjectValidation::NotDeclared,
+        );
+        let boundary = store_state(&fixture.store);
+        assert_eq!(
+            query_empty_host_declared(&mut fixture, item_alias, &mut diagnostics),
+            Err(DeclaredTypeError::TypeNodeUnavailable(
+                TypeNodeUnavailable::UnsupportedUnionConstituentType(hidden_array),
+            )),
+        );
+        assert_eq!(store_state(&fixture.store), boundary);
+        assert_eq!(
+            query_empty_host_global_declared(
+                &mut fixture,
+                &global_types,
+                item_alias,
+                &mut diagnostics,
+            ),
+            Ok(item),
+        );
+        assert_eq!(store_state(&fixture.store), boundary);
+        assert_eq!(
+            object_members::validate_resolved_declared_property_object(&fixture.store, item),
+            object_members::DeclaredPropertyObjectValidation::NotDeclared,
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn nested_property_alias_boundaries_close_over_hidden_array_capabilities() {
+        let mut fixture = global_array_fixture(concat!(
+            "namespace Outer { ",
+            "type Item = { values: Array<number> }; ",
+            "type Through = Item; ",
+            "}",
+        ));
+        let global_types = initialize_fixture_global_types(&mut fixture);
+        let through = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Through");
+        let item_literal = alias_parts(&fixture, "Item").2;
+        let array_node = property_type_literal_child(&fixture, item_literal, 0);
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let cold = store_state(&fixture.store);
+
+        assert!(matches!(
+            query_declared(
+                &mut fixture,
+                through,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Err(DeclaredTypeError::TypeNodeUnavailable(
+                TypeNodeUnavailable::TypeArgumentsUnsupported(error_node)
+            )) if error_node == array_node
+        ));
+        assert_eq!(store_state(&fixture.store), cold);
+
+        let item = query_global_declared(
+            &mut fixture,
+            &global_types,
+            through,
+            &mut diagnostics,
+        )
+        .unwrap();
+        let hidden_array =
+            object_members::resolved_declared_property_types(&fixture.store, item).unwrap()[0];
+        assert_eq!(
+            object_members::validate_resolved_declared_property_object(&fixture.store, item),
+            object_members::DeclaredPropertyObjectValidation::NotDeclared,
+        );
+        let warm = store_state(&fixture.store);
+
+        assert_eq!(
+            query_empty_host_declared(&mut fixture, through, &mut diagnostics),
+            Err(DeclaredTypeError::TypeNodeUnavailable(
+                TypeNodeUnavailable::UnsupportedUnionConstituentType(hidden_array),
+            )),
+        );
+        assert_eq!(store_state(&fixture.store), warm);
+        assert_eq!(
+            query_empty_host_global_declared(
+                &mut fixture,
+                &global_types,
+                through,
+                &mut diagnostics,
+            ),
+            Ok(item),
+        );
+        assert_eq!(store_state(&fixture.store), warm);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn declared_owner_relationship_and_back_edge_poisons_are_repairable() {
+        let mut fixture = global_array_fixture("interface Item { value: number; }");
+        let global_types = initialize_fixture_global_types(&mut fixture);
+        let item_symbol = named_symbol(&fixture, SyntaxKind::InterfaceDeclaration, "Item");
+        let array_symbol = named_symbol(&fixture, SyntaxKind::InterfaceDeclaration, "Array");
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let item = query_global_declared(
+            &mut fixture,
+            &global_types,
+            item_symbol,
+            &mut diagnostics,
+        )
+        .unwrap();
+        assert_eq!(
+            object_members::validate_resolved_declared_property_object(&fixture.store, item),
+            object_members::DeclaredPropertyObjectValidation::Valid(
+                object_members::DeclaredPropertyObjectProof::Interface,
+            ),
+        );
+
+        let (members, exports, parent, export_symbol) = {
+            let owner = fixture.store.symbol(item_symbol).unwrap();
+            (
+                owner.members(),
+                owner.exports(),
+                owner.parent(),
+                owner.export_symbol(),
+            )
+        };
+        assert!(fixture.store.set_symbol_relationships(
+            item_symbol,
+            members,
+            exports,
+            Some(array_symbol),
+            export_symbol,
+        ));
+        assert_eq!(
+            object_members::validate_resolved_declared_property_object(&fixture.store, item),
+            object_members::DeclaredPropertyObjectValidation::Malformed,
+            "a top-level declaration cannot acquire a nested owner relationship",
+        );
+        assert!(fixture.store.set_symbol_relationships(
+            item_symbol,
+            members,
+            exports,
+            parent,
+            export_symbol,
+        ));
+        assert_eq!(
+            object_members::validate_resolved_declared_property_object(&fixture.store, item),
+            object_members::DeclaredPropertyObjectValidation::Valid(
+                object_members::DeclaredPropertyObjectProof::Interface,
+            ),
+        );
+
+        let original_links = fixture
+            .store
+            .declared_type_links(item_symbol)
+            .cloned()
+            .unwrap();
+        let number = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+        let mut poisoned_links = original_links.clone();
+        poisoned_links.declared_type = Some(number);
+        assert!(
+            fixture
+                .store
+                .set_declared_type_links(item_symbol, poisoned_links)
+        );
+        assert_eq!(
+            object_members::validate_resolved_declared_property_object(&fixture.store, item),
+            object_members::DeclaredPropertyObjectValidation::Malformed,
+            "a contradictory declared-type back edge is cache corruption",
+        );
+        assert!(
+            fixture
+                .store
+                .set_declared_type_links(item_symbol, original_links)
+        );
+        assert_eq!(
+            object_members::validate_resolved_declared_property_object(&fixture.store, item),
+            object_members::DeclaredPropertyObjectValidation::Valid(
+                object_members::DeclaredPropertyObjectProof::Interface,
+            ),
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn bound_merged_property_declarations_are_an_unsupported_declared_object_boundary() {
+        let mut fixture = global_array_fixture(concat!(
+            "interface Item { values: Array<number>; } ",
+            "interface Item { values: Array<number>; }",
+        ));
+        let global_types = initialize_fixture_global_types(&mut fixture);
+        let item_symbol = named_symbol(&fixture, SyntaxKind::InterfaceDeclaration, "Item");
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let members = fixture.store.symbol(item_symbol).unwrap().members().unwrap();
+        let item_property = fixture
+            .store
+            .symbol_table(members)
+            .unwrap()
+            .get_source("values")
+            .unwrap();
+        let declarations = fixture
+            .store
+            .symbol(item_property)
+            .unwrap()
+            .declarations()
+            .unwrap()
+            .to_vec();
+        assert_eq!(declarations.len(), 2);
+        assert_ne!(declarations[0], declarations[1]);
+        assert!(declarations.iter().all(|declaration| {
+            fixture.store.source_node_kind(*declaration)
+                == Some(SyntaxKind::PropertyDeclaration)
+        }));
+        let cold = store_state(&fixture.store);
+
+        assert!(matches!(
+            query_global_declared(
+                &mut fixture,
+                &global_types,
+                item_symbol,
+                &mut diagnostics,
+            ),
+            Err(DeclaredTypeError::Unavailable(
+                DeclaredTypeUnavailable::InvalidInterfaceDeclaration(_)
+            ))
+        ));
+        assert_eq!(store_state(&fixture.store), cold);
+
+        let flags = fixture.store.symbol(item_symbol).unwrap().flags();
+        let host = post_global_host(
+            &fixture.parsed.arena,
+            fixture.files.get(&fixture.file).unwrap(),
+        );
+        let item = get_declared_class_interface_or_type_parameter(
+            &mut fixture.store,
+            &host,
+            item_symbol,
+            flags,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            object_members::validate_resolved_declared_property_object(&fixture.store, item),
+            object_members::DeclaredPropertyObjectValidation::NotDeclared,
+            "real interface augmentation is outside the single-owner property domain",
+        );
+        assert!(matches!(
+            object_members::validate_resolved_declared_property_type_graph(&fixture.store, item),
+            object_members::DeclaredPropertyTypeGraphValidation::Opaque,
+        ));
+
+        assert!(fixture.store.set_symbol_declarations(
+            item_property,
+            Some(vec![declarations[0], declarations[0]]),
+            Some(declarations[0]),
+        ));
+        assert_eq!(
+            object_members::validate_resolved_declared_property_object(&fixture.store, item),
+            object_members::DeclaredPropertyObjectValidation::Malformed,
+            "repeated declaration identities remain cache corruption",
+        );
         assert!(diagnostics.is_empty());
     }
 

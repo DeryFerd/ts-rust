@@ -6289,8 +6289,10 @@ mod tests {
 
             assert_eq!(
                 context.check_source_file(file),
-                Err(SourceCheckError::RelationUnavailable(
-                    RelationUnavailable::InvalidStructuredMembers(target)
+                Err(SourceCheckError::DeclaredType(
+                    DeclaredTypeError::TypeNodeUnavailable(
+                        TypeNodeUnavailable::InvalidCachedUnionType(target)
+                    )
                 ))
             );
             assert_eq!(observable_state(&context, file), before);
@@ -6349,8 +6351,10 @@ mod tests {
 
         assert_eq!(
             context.check_source_file(file),
-            Err(SourceCheckError::RelationUnavailable(
-                RelationUnavailable::InvalidStructuredMembers(nested)
+            Err(SourceCheckError::DeclaredType(
+                DeclaredTypeError::TypeNodeUnavailable(
+                    TypeNodeUnavailable::InvalidCachedUnionType(nested)
+                )
             ))
         );
         assert_eq!(observable_state(&context, file), before);

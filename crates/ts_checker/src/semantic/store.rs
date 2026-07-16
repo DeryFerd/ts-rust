@@ -58,7 +58,15 @@ impl PreparedEntityName {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct SourceNodeFacts {
     kind: SyntaxKind,
+    parent: Option<NodeId>,
+    exported: bool,
     signature_links_eligible: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SourceNodeParent {
+    Root,
+    Parent(NodeRef),
 }
 
 /// A merged-symbol redirect rejected before the redirect map changes.
@@ -123,6 +131,7 @@ pub struct SemanticStore<TypePayload, MapperPayload> {
     source_files: BTreeMap<FileId, SourceFileRef>,
     source_files_by_arena: BTreeMap<NodeArenaId, SourceFileRef>,
     source_node_facts: BTreeMap<NodeArenaId, Vec<Option<SourceNodeFacts>>>,
+    type_alias_declared_type_owners: HashMap<TypeId, HashSet<SemanticSymbolId>>,
     merged_symbols: HashMap<SemanticSymbolId, SemanticSymbolId>,
     links: CheckerLinkStores,
     declared_types_in_progress: HashSet<SemanticSymbolId>,
@@ -174,6 +183,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             source_files: BTreeMap::new(),
             source_files_by_arena: BTreeMap::new(),
             source_node_facts: BTreeMap::new(),
+            type_alias_declared_type_owners: HashMap::new(),
             merged_symbols: HashMap::new(),
             links: CheckerLinkStores::default(),
             declared_types_in_progress: HashSet::new(),
@@ -948,8 +958,46 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         {
             return false;
         }
+        let previous = self
+            .links
+            .type_alias
+            .try_get(&symbol)
+            .and_then(|links| links.declared_type);
+        let declared_type = links.declared_type;
         self.links.type_alias.replace_key(symbol, links);
+        if previous != declared_type {
+            if let Some(previous) = previous {
+                let remove_entry = self
+                    .type_alias_declared_type_owners
+                    .get_mut(&previous)
+                    .is_some_and(|owners| {
+                        owners.remove(&symbol);
+                        owners.is_empty()
+                    });
+                if remove_entry {
+                    self.type_alias_declared_type_owners.remove(&previous);
+                }
+            }
+            if let Some(declared_type) = declared_type {
+                self.type_alias_declared_type_owners
+                    .entry(declared_type)
+                    .or_default()
+                    .insert(symbol);
+            }
+        }
         true
+    }
+
+    /// Returns every cached type-alias symbol whose declared-type link points
+    /// at `type_`. This reverse edge is maintained atomically with
+    /// [`Self::set_type_alias_links`] and is used to prove symmetric alias
+    /// provenance for declared type-literal identities.
+    #[must_use]
+    pub(super) fn type_alias_declared_type_owners(
+        &self,
+        type_: TypeId,
+    ) -> Option<&HashSet<SemanticSymbolId>> {
+        self.type_alias_declared_type_owners.get(&type_)
     }
 
     #[must_use]
@@ -2036,6 +2084,22 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         self.source_node_fact(node).map(|facts| facts.kind)
     }
 
+    /// Returns the registered parent of a source-reachable node. The outer
+    /// outer `Option` distinguishes an unknown node from a registered root.
+    #[must_use]
+    pub(super) fn source_node_parent(&self, node: NodeRef) -> Option<SourceNodeParent> {
+        self.source_node_fact(node).map(|facts| {
+            facts.parent.map_or(SourceNodeParent::Root, |parent| {
+                SourceNodeParent::Parent(NodeRef::new(node.arena, node.file, parent))
+            })
+        })
+    }
+
+    #[must_use]
+    pub(super) fn source_node_is_exported(&self, node: NodeRef) -> Option<bool> {
+        self.source_node_fact(node).map(|facts| facts.exported)
+    }
+
     fn source_node_fact(&self, node: NodeRef) -> Option<SourceNodeFacts> {
         if !self.contains_node_ref(node) {
             return None;
@@ -2064,6 +2128,34 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             }
             *slot = Some(SourceNodeFacts {
                 kind: node.kind,
+                parent: node.parent,
+                exported: match &node.data {
+                    NodeData::TypeAliasDeclaration(declaration) => declaration
+                        .modifiers
+                        .as_ref()
+                        .is_some_and(|modifiers| {
+                            modifiers.list.nodes.iter().any(|modifier| {
+                                arena
+                                    .get(*modifier)
+                                    .is_some_and(|modifier| {
+                                        modifier.kind == SyntaxKind::ExportKeyword
+                                    })
+                            })
+                        }),
+                    NodeData::InterfaceDeclaration(declaration) => declaration
+                        .modifiers
+                        .as_ref()
+                        .is_some_and(|modifiers| {
+                            modifiers.list.nodes.iter().any(|modifier| {
+                                arena
+                                    .get(*modifier)
+                                    .is_some_and(|modifier| {
+                                        modifier.kind == SyntaxKind::ExportKeyword
+                                    })
+                            })
+                        }),
+                    _ => false,
+                },
                 signature_links_eligible: Self::is_signature_links_eligible(arena, node),
             });
             node.for_each_child(|child| pending.push((child, Some(node_id))));
