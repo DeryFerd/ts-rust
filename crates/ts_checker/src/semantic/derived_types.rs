@@ -16,6 +16,7 @@ use ts_binder::{
 
 use super::{
     ArrayTypeError, CanonicalGlobalTypes,
+    array_types::CanonicalArrayTargets,
     ids::TypeId,
     links::ValueSymbolLinks,
     mapper::TypeMapper,
@@ -404,6 +405,37 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         &self,
         type_: TypeId,
     ) -> DerivedObjectLiteralValidation {
+        self.validate_derived_object_literal(type_, None)
+    }
+
+    /// Validates a cached regular or widened object literal while retaining
+    /// the authoritative array identities needed by nested widened arrays.
+    pub(super) fn validate_derived_object_literal_with_global_types(
+        &self,
+        type_: TypeId,
+        global_types: &CanonicalGlobalTypes,
+    ) -> DerivedObjectLiteralValidation {
+        self.validate_derived_object_literal_with_array_targets(
+            type_,
+            CanonicalArrayTargets::from_global_types(global_types),
+        )
+    }
+
+    /// Relation-facing form that retains only the exact global-array
+    /// capability installed on the relation session.
+    pub(super) fn validate_derived_object_literal_with_array_targets(
+        &self,
+        type_: TypeId,
+        array_targets: CanonicalArrayTargets,
+    ) -> DerivedObjectLiteralValidation {
+        self.validate_derived_object_literal(type_, Some(array_targets))
+    }
+
+    fn validate_derived_object_literal(
+        &self,
+        type_: TypeId,
+        array_targets: Option<CanonicalArrayTargets>,
+    ) -> DerivedObjectLiteralValidation {
         if !matches!(
             self.type_payload(type_).map(TypeRecord::data),
             Some(TypeData::Object(_))
@@ -438,7 +470,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     type_,
                     &mut visiting,
                     &mut regular_visiting,
-                    None,
+                    array_targets,
                 )
             }
         };
@@ -530,7 +562,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 cached,
                 &mut widened_visiting,
                 &mut regular_visiting,
-                global_types,
+                global_types.map(CanonicalArrayTargets::from_global_types),
             ) {
                 return Err(DerivedTypeError::InvalidWidenedTypeCache { source, cached });
             }
@@ -1053,7 +1085,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         target: TypeId,
         visiting: &mut HashSet<TypeId>,
         regular_visiting: &mut HashSet<TypeId>,
-        global_types: Option<&CanonicalGlobalTypes>,
+        array_targets: Option<CanonicalArrayTargets>,
     ) -> bool {
         let Some(source_record) = self.type_payload(source) else {
             return false;
@@ -1072,8 +1104,10 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 .intrinsic_bootstrap()
                 .is_some_and(|bootstrap| target == bootstrap.any_type);
         }
-        if let Some(global_types) = global_types {
-            let source_array = match self.canonical_array_reference(global_types, source) {
+        if let Some(array_targets) = array_targets {
+            let source_array = match self
+                .canonical_array_reference_with_targets(array_targets, source)
+            {
                 Ok(Some(source_array)) => source_array,
                 Ok(None) => {
                     return self.widened_object_cache_entry_is_valid(
@@ -1081,7 +1115,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                         target,
                         visiting,
                         regular_visiting,
-                        Some(global_types),
+                        Some(array_targets),
                     );
                 }
                 Err(_) => return false,
@@ -1091,7 +1125,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             }
             let valid = (|| {
                 let target_array = self
-                    .canonical_array_reference(global_types, target)
+                    .canonical_array_reference_with_targets(array_targets, target)
                     .ok()??;
                 if target_array.array_literal
                     || target_array.readonly != source_array.readonly
@@ -1114,7 +1148,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                         cached,
                         visiting,
                         regular_visiting,
-                        Some(global_types),
+                        Some(array_targets),
                     ) {
                         return None;
                     }
@@ -1137,7 +1171,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         target: TypeId,
         visiting: &mut HashSet<TypeId>,
         regular_visiting: &mut HashSet<TypeId>,
-        global_types: Option<&CanonicalGlobalTypes>,
+        array_targets: Option<CanonicalArrayTargets>,
     ) -> bool {
         let Some(source_record) = self.type_payload(source) else {
             return false;
@@ -1182,7 +1216,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                         cached,
                         visiting,
                         regular_visiting,
-                        global_types,
+                        array_targets,
                     ) {
                         return None;
                     }

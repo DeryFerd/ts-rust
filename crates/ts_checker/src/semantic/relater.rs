@@ -2728,10 +2728,7 @@ impl<'store> RelaterSession<'store> {
         if record.flags() != TypeFlags::OBJECT || !self.supports_property_object_alias(type_id) {
             return Err(RelationUnavailable::UnsupportedStructuredType(type_id));
         }
-        match self
-            .store
-            .validate_derived_object_literal_for_relation(type_id)
-        {
+        match self.validate_derived_object_literal(type_id) {
             DerivedObjectLiteralValidation::Valid { .. } => return Ok(()),
             DerivedObjectLiteralValidation::Invalid => {
                 return Err(RelationUnavailable::InvalidStructuredMembers(type_id));
@@ -2777,6 +2774,23 @@ impl<'store> RelaterSession<'store> {
             _ => return Err(RelationUnavailable::UnsupportedStructuredType(type_id)),
         }
         Ok(())
+    }
+
+    fn validate_derived_object_literal(
+        &self,
+        type_id: TypeId,
+    ) -> DerivedObjectLiteralValidation {
+        match self.global_types {
+            Some(global_types) => self
+                .store
+                .validate_derived_object_literal_with_array_targets(
+                    type_id,
+                    global_types.array_targets,
+                ),
+            None => self
+                .store
+                .validate_derived_object_literal_for_relation(type_id),
+        }
     }
 
     fn supports_property_object_alias(&self, type_id: TypeId) -> bool {
@@ -2977,10 +2991,7 @@ impl<'store> RelaterSession<'store> {
             .store
             .type_payload(type_id)
             .ok_or(RelationUnavailable::Type(type_id))?;
-        let property_origin = match self
-            .store
-            .validate_derived_object_literal_for_relation(type_id)
-        {
+        let property_origin = match self.validate_derived_object_literal(type_id) {
             DerivedObjectLiteralValidation::Valid { owner } => {
                 ObjectPropertyOrigin::DerivedObjectLiteral(owner)
             }

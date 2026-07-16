@@ -25,6 +25,7 @@ use super::{
         ValidatedSingleCallSignatureDisplay, single_callable_display_projection,
         single_callable_family, validate_stored_single_callable,
     },
+    derived_types::DerivedObjectLiteralValidation,
     enums,
     functions::{FunctionTypeDisplayError, FunctionTypeUnsupported},
     links::ValueSymbolLinks,
@@ -830,7 +831,7 @@ fn display_object_type(
         });
     }
 
-    let proof = validate_structural_object_shell(store, host, type_id, record)?;
+    let proof = validate_structural_object_shell(store, host, global_types, type_id, record)?;
     if !visiting.insert(type_id) {
         return Err(TypeDisplayUnavailable::CyclicType(type_id));
     }
@@ -910,7 +911,8 @@ const fn source_callable_display_unavailable(
 ) -> TypeDisplayUnavailable {
     let reason = match error {
         SourceCallableDisplayError::Unsupported(reason) => match reason {
-            SourceCallableUnsupported::GenericSignature(_) => {
+            SourceCallableUnsupported::GenericSignature(_)
+            | SourceCallableUnsupported::GenericInferredReturn(_) => {
                 FunctionTypeDisplayUnavailable::GenericSignature
             }
             SourceCallableUnsupported::ThisParameter(_) => {
@@ -932,9 +934,6 @@ const fn source_callable_display_unavailable(
             }
             SourceCallableUnsupported::MissingParameterType(_) => {
                 FunctionTypeDisplayUnavailable::MissingParameterType
-            }
-            SourceCallableUnsupported::MissingReturnType(_) => {
-                FunctionTypeDisplayUnavailable::MissingReturnType
             }
             SourceCallableUnsupported::TypePredicate(_) => {
                 FunctionTypeDisplayUnavailable::TypePredicate
@@ -1791,12 +1790,28 @@ fn valid_display_type_alias_owner(
 fn validate_structural_object_shell(
     store: &CanonicalTypeMapperStore,
     host: Option<&DeclaredTypeHost<'_>>,
+    global_types: Option<&CanonicalGlobalTypes>,
     type_id: TypeId,
     record: &TypeRecord,
 ) -> Result<StructuralObjectProof, TypeDisplayUnavailable> {
     let TypeData::Object(object) = record.data() else {
         return Err(TypeDisplayUnavailable::MalformedType(type_id));
     };
+    let derived = match global_types {
+        Some(global_types) => {
+            store.validate_derived_object_literal_with_global_types(type_id, global_types)
+        }
+        None => store.validate_derived_object_literal_for_relation(type_id),
+    };
+    match derived {
+        DerivedObjectLiteralValidation::Valid { owner } if record.symbol() == Some(owner) => {
+            return Ok(StructuralObjectProof::ObjectLiteral);
+        }
+        DerivedObjectLiteralValidation::Valid { .. } | DerivedObjectLiteralValidation::Invalid => {
+            return Err(TypeDisplayUnavailable::MalformedType(type_id));
+        }
+        DerivedObjectLiteralValidation::NotDerived => {}
+    }
     let allowed_flags = ObjectFlags::ANONYMOUS
         | ObjectFlags::OBJECT_LITERAL
         | ObjectFlags::FRESH_LITERAL

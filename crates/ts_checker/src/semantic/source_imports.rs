@@ -136,7 +136,7 @@ enum PlannedSourceImportValueTarget {
         declaration: NodeRef,
         type_node: NodeRef,
     },
-    AnnotatedFunction(SourceCallablePlan),
+    AnnotatedFunction(Box<SourceCallablePlan>),
 }
 
 /// One fully preflighted value-link payload for the source checker's combined
@@ -1681,6 +1681,7 @@ fn plan_direct_import_value_target(
             target,
             expected_name,
         )
+        .map(Box::new)
         .map(PlannedSourceImportValueTarget::AnnotatedFunction);
     }
     Err(unsupported(SourceImportUnsupported::TargetSymbol {
@@ -1730,6 +1731,13 @@ fn plan_direct_annotated_function_target(
         target,
         Some(CanonicalArrayTargets::from_global_types(global_types)),
     )?;
+    if callable.return_type.is_inferred() {
+        return Err(unsupported(SourceImportUnsupported::TargetSymbol {
+            alias,
+            target,
+            flags: target_record.flags(),
+        }));
+    }
     if callable.family != SourceCallableFamily::FunctionDeclaration
         || callable.declaration != declaration
         || callable.owner_symbol != target

@@ -4019,11 +4019,12 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             array_targets,
         )
         .map_err(|error| source_callable_error(error, family))?;
-        if let source_callables::SourceCallableState::Resolved { type_, .. } =
-            source_callables::source_callable_state(self.store, &callable, true)
-                .map_err(|error| source_callable_error(error, callable.family))?
+        match source_callables::source_callable_state(self.store, &callable, true)
+            .map_err(|error| source_callable_error(error, callable.family))?
         {
-            return Ok(type_);
+            source_callables::SourceCallableState::AwaitingInferredReturn { type_, .. }
+            | source_callables::SourceCallableState::Resolved { type_, .. } => return Ok(type_),
+            _ => {}
         }
 
         let mut planner = TypeQueryPlanner::new(
@@ -4137,7 +4138,8 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             return match source_callables::source_callable_state(self.store, &callable, false)
                 .map_err(|error| source_callable_error(error, callable.family))?
             {
-                source_callables::SourceCallableState::Resolved { type_, .. }
+                source_callables::SourceCallableState::AwaitingInferredReturn { type_, .. }
+                | source_callables::SourceCallableState::Resolved { type_, .. }
                     if type_ == pending.type_ =>
                 {
                     Ok(type_)
@@ -4401,6 +4403,15 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             self.store, &callable, signature,
         )
         .map_err(|error| source_callable_signature_error(error, callable.family, signature))?;
+        if callable.return_type.is_inferred() {
+            return source_callables::validate_inferred_source_callable_return(
+                self.store, &callable, signature,
+            )
+            .map_err(|error| source_callable_signature_error(error, callable.family, signature))?
+            .ok_or_else(|| {
+                type_node_unavailable(TypeNodeUnavailable::InvalidFunctionSignature(signature))
+            });
+        }
         if let Some(return_type) =
             source_callables::validate_lazy_source_callable_return(self.store, &callable, signature)
                 .map_err(|error| {
@@ -4410,6 +4421,9 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             return Ok(return_type);
         }
 
+        let return_type_node = callable.return_type.type_node().ok_or_else(|| {
+            type_node_unavailable(TypeNodeUnavailable::InvalidFunctionSignature(signature))
+        })?;
         let mut planner = TypeQueryPlanner::new(
             self.store,
             self.host,
@@ -4418,7 +4432,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             self.options.strict_builtin_iterator_return,
             &self.type_reference_alias_targets,
         );
-        planner.plan_type_node(callable.return_type)?;
+        planner.plan_type_node(return_type_node)?;
         let plan = planner.finish();
         let mut prepared = self.prepare_literal_types(&plan)?;
         if !self.store.try_reserve_circular_return_signatures(1) {
@@ -4446,7 +4460,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             }
             return Err(error);
         }
-        let resolved = match self.execute_type_node(callable.return_type, &plan, &mut prepared) {
+        let resolved = match self.execute_type_node(return_type_node, &plan, &mut prepared) {
             Ok(resolved) => resolved,
             Err(error) => {
                 if self.store.pop_type_resolution().is_none() {
@@ -4486,7 +4500,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             )
             .map_err(|error| source_callable_signature_error(error, callable.family, signature))?;
             self.diagnostics.add(
-                Some(callable.return_type),
+                Some(return_type_node),
                 Diagnostic::new(
                     message_by_code(2577).expect("TS2577 is in the diagnostic catalog"),
                 ),
