@@ -121,6 +121,7 @@ pub(super) enum SourceImportUnsupported {
     ImportAttributes(NodeRef),
     NonIdentifierImportName(NodeRef),
     NonIdentifierLocalName(NodeRef),
+    MergedAlias(NodeRef),
     TargetNotDirect {
         alias: SemanticSymbolId,
         immediate: Option<SemanticSymbolId>,
@@ -214,6 +215,7 @@ impl SourceImportError {
                 | SourceImportUnsupported::ImportAttributes(node)
                 | SourceImportUnsupported::NonIdentifierImportName(node)
                 | SourceImportUnsupported::NonIdentifierLocalName(node)
+                | SourceImportUnsupported::MergedAlias(node)
                 | SourceImportUnsupported::TargetDeclaration(node)
                 | SourceImportUnsupported::TargetNotExportedConst(node)
                 | SourceImportUnsupported::MissingTargetAnnotation(node)
@@ -916,6 +918,18 @@ fn validate_alias_symbol(
     let record = store
         .symbol(alias)
         .ok_or_else(|| invariant(SourceImportInvariant::InvalidAliasSymbol(alias)))?;
+    let merged = store.get_merged_symbol(alias);
+    if merged.is_some_and(|target| target != alias)
+        || (record.flags().intersects(SymbolFlags::ALIAS)
+            && record.flags() != SymbolFlags::ALIAS
+            && record
+                .declarations()
+                .is_some_and(|declarations| declarations.contains(&declaration)))
+    {
+        return Err(unsupported(SourceImportUnsupported::MergedAlias(
+            declaration,
+        )));
+    }
     if record.flags() != SymbolFlags::ALIAS
         || record.check_flags() != CheckFlags::NONE
         || record.value_declaration().is_some()
@@ -923,7 +937,7 @@ fn validate_alias_symbol(
         || record.exports().is_some()
         || record.parent().is_some()
         || record.export_symbol().is_some()
-        || store.get_merged_symbol(alias) != Some(alias)
+        || merged != Some(alias)
     {
         return Err(invariant(SourceImportInvariant::InvalidAliasSymbol(alias)));
     }

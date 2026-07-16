@@ -744,6 +744,7 @@ impl<'arena> CanonicalCheckerContext<'arena> {
             diagnostics,
             source_diagnostic_staging,
             global_types,
+            module_resolutions,
             ..
         } = self;
         let (arena, bound) = files.snapshot(file).ok_or(SourceCheckError::Provenance(
@@ -758,6 +759,9 @@ impl<'arena> CanonicalCheckerContext<'arena> {
             GlobalMergeCompletion::new(options.name_resolution),
         )
         .map_err(DeclaredTypeError::from)?;
+        let mut alias_host =
+            ProductionAliasTargetHost::from_registry(store, files, module_resolutions)
+                .map_err(|_| SourceCheckError::Import(source_file.node_ref()))?;
         let mut staged = source_diagnostic_staging
             .remove(&source_file)
             .unwrap_or_default();
@@ -766,6 +770,7 @@ impl<'arena> CanonicalCheckerContext<'arena> {
             bound,
             source_file,
             &host,
+            &mut alias_host,
             global_types,
             store,
             *options,

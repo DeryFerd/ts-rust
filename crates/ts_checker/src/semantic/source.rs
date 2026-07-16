@@ -2,6 +2,7 @@
 //!
 //! This module deliberately supports only unmodified type aliases and simple
 //! interfaces, top-level literal enums, empty external-module markers,
+//! leading direct named ESM value imports,
 //! annotated top-level function declarations, initialized identifier-named
 //! top-level variables (optionally exported), ordinary direct identifier
 //! calls, required own-property reads, and direct assignments back to
@@ -27,9 +28,9 @@ use super::{
     ArrayTypeError, AssertionLinks, AssignmentInvariant, AssignmentUnsupported,
     CanonicalCheckerDiagnostic, CanonicalCheckerDiagnostics, CanonicalCheckerOptions,
     CanonicalGlobalTypes, CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHost,
-    DerivedTypeError, RelationUnavailable, SourceFileLinks, SourceFileRef, SymbolNodeLinks,
-    TypeDisplayUnavailable, TypeId, TypeNodeLinks, ValueSymbolLinks, VariableInvariant,
-    VariableUnsupported,
+    DerivedTypeError, ProductionAliasTargetHost, RelationUnavailable, SourceFileLinks,
+    SourceFileRef, SymbolNodeLinks, TypeDisplayUnavailable, TypeId, TypeNodeLinks,
+    ValueSymbolLinks, VariableInvariant, VariableUnsupported,
     array_types::CanonicalArrayTargets,
     bootstrap::{LiteralTypeCacheError, UnionReduction},
     callables::{
@@ -62,6 +63,13 @@ use super::{
     source_functions::{
         PlannedFunctionRead, SourceFunctionInvariant, SourceFunctionPlanError,
         SourceFunctionUnsupported, plan_function_identifier_read, plan_top_level_function,
+    },
+    source_imports::{
+        PlannedSourceImportRead, PreparedSourceImportPublication, PreparedSourceImportValue,
+        ResolvedSourceImportBinding, SourceImportBindingPlan, SourceImportError, SourceImportPlan,
+        plan_source_import_identifier_read, plan_top_level_named_value_import,
+        preflight_prepared_source_import_publications, prepare_source_import_value,
+        resolve_source_import_binding,
     },
     source_properties::{
         SourcePropertyError, SourcePropertyPlan, SourcePropertyUnsupported,
@@ -142,6 +150,7 @@ pub enum UnsupportedSourceSyntax {
     Variable(VariableUnsupported),
     Call(NodeRef),
     Enum(NodeRef),
+    Import(NodeRef),
     Property(NodeRef),
 }
 
@@ -256,6 +265,7 @@ pub enum SourceCheckError {
     Variable(VariableInvariant),
     Call(NodeRef),
     Enum(NodeRef),
+    Import(NodeRef),
     Property(NodeRef),
     MissingDiagnostic(u32),
 }
@@ -281,6 +291,7 @@ impl std::fmt::Display for SourceCheckError {
             Self::Variable(error) => write!(formatter, "variable checking failed: {error:?}"),
             Self::Call(node) => write!(formatter, "call checking failed at {node:?}"),
             Self::Enum(node) => write!(formatter, "enum checking failed at {node:?}"),
+            Self::Import(node) => write!(formatter, "import checking failed at {node:?}"),
             Self::Property(node) => write!(formatter, "property checking failed at {node:?}"),
             Self::MissingDiagnostic(code) => {
                 write!(formatter, "diagnostic TS{code} is absent from the catalog")
@@ -309,6 +320,7 @@ impl std::error::Error for SourceCheckError {
             | Self::Variable(_)
             | Self::Call(_)
             | Self::Enum(_)
+            | Self::Import(_)
             | Self::Property(_)
             | Self::MissingDiagnostic(_) => None,
         }
@@ -404,6 +416,7 @@ pub(super) enum PlannedExpressionKind {
 pub(super) enum PlannedIdentifierReadKind {
     Variable,
     Function,
+    Import,
 }
 
 /// A source expression read with an explicit value-family route.
@@ -428,6 +441,14 @@ impl PlannedIdentifierRead {
             resolved_symbol: read.resolved_symbol,
             value_symbol: read.value_symbol,
             kind: PlannedIdentifierReadKind::Function,
+        }
+    }
+
+    const fn import(read: PlannedSourceImportRead) -> Self {
+        Self {
+            resolved_symbol: read.resolved_symbol,
+            value_symbol: read.value_symbol,
+            kind: PlannedIdentifierReadKind::Import,
         }
     }
 }
@@ -508,6 +529,8 @@ enum PlannedStatement {
 #[derive(Debug)]
 struct SourceCheckPlan {
     statements: Vec<PlannedStatement>,
+    imports: Vec<SourceImportPlan>,
+    import_reads: Vec<PlannedSourceImportRead>,
     functions: Vec<PlannedFunction>,
     arrows: Vec<PlannedArrow>,
     contextual_arrows: Vec<PlannedContextualArrow>,
@@ -531,6 +554,8 @@ struct SourcePlanner<'arena, 'semantic, 'sources> {
     numbers: Vec<Number>,
     bigints: Vec<PseudoBigInt>,
     identifier_reads: Vec<(NodeRef, SemanticSymbolId)>,
+    import_bindings: HashMap<SemanticSymbolId, SourceImportBindingPlan>,
+    import_reads: Vec<PlannedSourceImportRead>,
     semantic: Option<(
         &'semantic CanonicalTypeMapperStore,
         &'semantic DeclaredTypeHost<'sources>,
@@ -552,6 +577,8 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             numbers: Vec::new(),
             bigints: Vec::new(),
             identifier_reads: Vec::new(),
+            import_bindings: HashMap::new(),
+            import_reads: Vec::new(),
             semantic: None,
             array_targets: None,
             hoisted_functions: HashSet::new(),
@@ -575,6 +602,8 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             numbers: Vec::new(),
             bigints: Vec::new(),
             identifier_reads: Vec::new(),
+            import_bindings: HashMap::new(),
+            import_reads: Vec::new(),
             semantic: Some((store, host)),
             array_targets: None,
             hoisted_functions: HashSet::new(),
@@ -622,16 +651,47 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
 
         let source_statements = source_data.statements.nodes.clone();
         let mut preplanned_functions = HashMap::new();
+        let mut imports = Vec::new();
+        let mut leading_import_prefix = true;
         for statement in &source_statements {
             let statement = self.reference(*statement);
-            if self.node(statement)?.kind != SyntaxKind::FunctionDeclaration {
-                continue;
-            }
-            let callable = self.preplan_function_declaration(statement, is_external_module)?;
-            if preplanned_functions.insert(statement, callable).is_some() {
-                return Err(SourceCheckError::Function(
-                    SourceFunctionInvariant::DuplicateDeclaration(statement),
-                ));
+            match self.node(statement)?.kind {
+                SyntaxKind::ImportDeclaration if leading_import_prefix => {
+                    let Some((store, _)) = self.semantic else {
+                        return Err(SourceCheckError::Unsupported(
+                            UnsupportedSourceSyntax::Import(statement),
+                        ));
+                    };
+                    let import =
+                        plan_top_level_named_value_import(self.arena, self.bound, store, statement)
+                            .map_err(|error| Self::import_plan_error(statement, &error))?;
+                    for binding in &import.bindings {
+                        if self
+                            .import_bindings
+                            .insert(binding.alias_symbol, binding.clone())
+                            .is_some()
+                        {
+                            return Err(SourceCheckError::Import(binding.declaration));
+                        }
+                    }
+                    imports.push(import);
+                }
+                SyntaxKind::ImportDeclaration => {
+                    return Err(SourceCheckError::Unsupported(
+                        UnsupportedSourceSyntax::Import(statement),
+                    ));
+                }
+                SyntaxKind::FunctionDeclaration => {
+                    leading_import_prefix = false;
+                    let callable =
+                        self.preplan_function_declaration(statement, is_external_module)?;
+                    if preplanned_functions.insert(statement, callable).is_some() {
+                        return Err(SourceCheckError::Function(
+                            SourceFunctionInvariant::DuplicateDeclaration(statement),
+                        ));
+                    }
+                }
+                _ => leading_import_prefix = false,
             }
         }
 
@@ -642,6 +702,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         for statement in source_statements {
             let statement = self.reference(statement);
             match self.node(statement)?.kind {
+                SyntaxKind::ImportDeclaration => {}
                 SyntaxKind::TypeAliasDeclaration => {
                     let node = self.node(statement)?;
                     let NodeData::TypeAliasDeclaration(alias) = &node.data else {
@@ -831,6 +892,8 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             .collect::<Result<Vec<_>, _>>()?;
         Ok(SourceCheckPlan {
             statements,
+            imports,
+            import_reads: self.import_reads,
             functions,
             arrows,
             contextual_arrows,
@@ -883,6 +946,31 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             }
             SourceEnumError::Invariant(_) => SourceCheckError::Enum(node),
             SourceEnumError::DeclaredType(error) => SourceCheckError::DeclaredType(error),
+        }
+    }
+
+    fn import_plan_error(declaration: NodeRef, error: &SourceImportError) -> SourceCheckError {
+        let node = error.node().unwrap_or(declaration);
+        match error {
+            SourceImportError::Unsupported(_) | SourceImportError::CircularAlias { .. } => {
+                SourceCheckError::Unsupported(UnsupportedSourceSyntax::Import(node))
+            }
+            SourceImportError::Invariant(_) => SourceCheckError::Import(node),
+            SourceImportError::Alias(error) => {
+                if import_alias_error_is_unsupported(*error) {
+                    SourceCheckError::Unsupported(UnsupportedSourceSyntax::Import(node))
+                } else {
+                    SourceCheckError::Import(node)
+                }
+            }
+            SourceImportError::DeclaredType(error) => SourceCheckError::DeclaredType(*error),
+            SourceImportError::Variable(error) => match *error {
+                VariablePlanError::Unsupported(_) => {
+                    SourceCheckError::Unsupported(UnsupportedSourceSyntax::Import(node))
+                }
+                VariablePlanError::Invariant(_) => SourceCheckError::Import(node),
+                VariablePlanError::DeclaredType(error) => SourceCheckError::DeclaredType(error),
+            },
         }
     }
 
@@ -1747,6 +1835,22 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                             .map_err(Self::function_plan_error)?,
                         )
                     }
+                    Err(
+                        error @ VariablePlanError::Unsupported(VariableUnsupported::AliasSymbol {
+                            symbol,
+                            ..
+                        }),
+                    ) => {
+                        let Some(binding) = self.import_bindings.get(&symbol) else {
+                            return Err(Self::variable_plan_error(error));
+                        };
+                        let import_read = plan_source_import_identifier_read(
+                            self.arena, self.bound, store, binding, expression, &name, symbol,
+                        )
+                        .map_err(|error| Self::import_plan_error(expression, &error))?;
+                        self.import_reads.push(import_read);
+                        PlannedIdentifierRead::import(import_read)
+                    }
                     Err(error) => return Err(Self::variable_plan_error(error)),
                 };
                 self.identifier_reads
@@ -2292,6 +2396,31 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
     }
 }
 
+fn import_alias_error_is_unsupported(error: super::alias::CanonicalAliasResolutionError) -> bool {
+    use super::alias::{CanonicalAliasResolutionError, CanonicalAliasTargetUnavailable};
+
+    let CanonicalAliasResolutionError::TargetUnavailable { reason, .. } = error else {
+        return false;
+    };
+    matches!(
+        reason,
+        CanonicalAliasTargetUnavailable::UnsupportedDeclarationFamily
+            | CanonicalAliasTargetUnavailable::TargetProviderUnavailable
+            | CanonicalAliasTargetUnavailable::ModuleResolutionCapabilityUnavailable(_)
+            | CanonicalAliasTargetUnavailable::ModuleResolutionEntryAbsent(_)
+            | CanonicalAliasTargetUnavailable::ModuleResolutionUnresolved(_)
+            | CanonicalAliasTargetUnavailable::UnsupportedAliasDeclaration(_)
+            | CanonicalAliasTargetUnavailable::UnsupportedDefaultAlias(_)
+            | CanonicalAliasTargetUnavailable::UnsupportedLocalExport(_)
+            | CanonicalAliasTargetUnavailable::ExportStarResolutionUnsupported { .. }
+            | CanonicalAliasTargetUnavailable::ExportEqualsResolutionUnsupported { .. }
+            | CanonicalAliasTargetUnavailable::CommonJsModuleUnsupported { .. }
+            | CanonicalAliasTargetUnavailable::JavaScriptModuleUnsupported { .. }
+            | CanonicalAliasTargetUnavailable::SyntheticModuleResolutionUnsupported { .. }
+            | CanonicalAliasTargetUnavailable::MissingExport { .. }
+    )
+}
+
 fn valid_range(
     range: TextRange,
     parent: Option<TextRange>,
@@ -2409,6 +2538,7 @@ fn execute_expression_types(
                     PlannedIdentifierReadKind::Function => SourceCheckError::Function(
                         SourceFunctionInvariant::MissingCallableType(read.value_symbol),
                     ),
+                    PlannedIdentifierReadKind::Import => SourceCheckError::Import(expression.node),
                 })?;
             let result = identifier_expression_type(store, raw, *treatment)?;
             Ok(CheckedExpressionTypes::leaf(raw, result))
@@ -3516,15 +3646,17 @@ fn stage_value_type(
 
 fn publish_staged_variable_state(
     store: &mut CanonicalTypeMapperStore,
+    source: NodeRef,
     value_types: &HashMap<SemanticSymbolId, TypeId>,
     value_order: &[SemanticSymbolId],
+    import_publications: &[PreparedSourceImportPublication],
     identifier_reads: &[(NodeRef, SemanticSymbolId)],
 ) -> Result<(), SourceCheckError> {
     // Build and validate every eventual setter payload before the first sparse
     // variable/reference link is published. The store setters below can then
     // only reject if their validated ownership predicates change in place.
     let mut seen_values = HashSet::with_capacity(value_order.len());
-    let mut value_publications: Vec<(SemanticSymbolId, ValueSymbolLinks)> =
+    let mut local_value_publications: Vec<(SemanticSymbolId, ValueSymbolLinks)> =
         Vec::with_capacity(value_order.len());
     for &symbol in value_order {
         if !seen_values.insert(symbol) {
@@ -3570,7 +3702,7 @@ fn publish_staged_variable_state(
             ));
         }
         links.resolved_type = Some(resolved_type);
-        value_publications.push((symbol, links));
+        local_value_publications.push((symbol, links));
     }
     if value_types.len() != seen_values.len() {
         let symbol = value_types
@@ -3582,6 +3714,30 @@ fn publish_staged_variable_state(
             VariableInvariant::UnexpectedStagedValueType(symbol),
         ));
     }
+
+    let mut all_value_symbols =
+        HashSet::with_capacity(import_publications.len() + local_value_publications.len());
+    let mut value_publications =
+        Vec::with_capacity(import_publications.len() + local_value_publications.len());
+    for publication in import_publications {
+        let Some(type_) = publication.links.resolved_type else {
+            return Err(SourceCheckError::Import(source));
+        };
+        if !all_value_symbols.insert(publication.symbol)
+            || store.symbol(publication.symbol).is_none()
+            || store.type_payload(type_).is_none()
+        {
+            return Err(SourceCheckError::Import(source));
+        }
+        value_publications.push((publication.symbol, publication.links.clone()));
+    }
+    for (symbol, links) in local_value_publications {
+        if !all_value_symbols.insert(symbol) {
+            return Err(SourceCheckError::Import(source));
+        }
+        value_publications.push((symbol, links));
+    }
+    let import_publication_count = import_publications.len();
 
     let mut seen_reads = HashSet::with_capacity(identifier_reads.len());
     let mut read_publications: Vec<(NodeRef, SymbolNodeLinks)> =
@@ -3614,8 +3770,11 @@ fn publish_staged_variable_state(
         read_publications.push((node, links));
     }
 
-    for (symbol, links) in value_publications {
+    for (index, (symbol, links)) in value_publications.into_iter().enumerate() {
         if !store.set_value_symbol_links(symbol, links) {
+            if index < import_publication_count {
+                return Err(SourceCheckError::Import(source));
+            }
             return Err(SourceCheckError::Variable(
                 VariableInvariant::ValueTypePublication(symbol),
             ));
@@ -4002,6 +4161,7 @@ pub(super) fn check_source_file(
     bound: &BoundFile,
     source: SourceFileRef,
     host: &DeclaredTypeHost<'_>,
+    alias_host: &mut ProductionAliasTargetHost<'_, '_, '_>,
     global_types: &CanonicalGlobalTypes,
     store: &mut CanonicalTypeMapperStore,
     options: CanonicalCheckerOptions,
@@ -4021,6 +4181,8 @@ pub(super) fn check_source_file(
 
     let SourceCheckPlan {
         statements,
+        imports,
+        import_reads,
         functions,
         arrows,
         contextual_arrows,
@@ -4043,6 +4205,48 @@ pub(super) fn check_source_file(
     let mut current_flow_types = HashMap::new();
     let mut mutable_variables = HashSet::new();
     let mut value_order = Vec::new();
+
+    let mut resolved_imports = HashMap::<SemanticSymbolId, ResolvedSourceImportBinding>::new();
+    for import in &imports {
+        for binding in &import.bindings {
+            let resolved = resolve_source_import_binding(store, alias_host, binding)
+                .map_err(|error| SourcePlanner::import_plan_error(binding.declaration, &error))?;
+            if resolved_imports
+                .insert(binding.alias_symbol, resolved)
+                .is_some()
+            {
+                return Err(SourceCheckError::Import(binding.declaration));
+            }
+        }
+    }
+
+    let mut prepared_imports = Vec::<PreparedSourceImportValue>::new();
+    let mut prepared_import_aliases = HashSet::new();
+    for read in &import_reads {
+        if !prepared_import_aliases.insert(read.value_symbol) {
+            continue;
+        }
+        let resolved = resolved_imports
+            .get(&read.value_symbol)
+            .ok_or(SourceCheckError::Import(read.node))?;
+        let prepared = prepare_source_import_value(
+            store,
+            host,
+            global_types,
+            options,
+            diagnostics,
+            resolved,
+            read,
+        )
+        .map_err(|error| SourcePlanner::import_plan_error(read.node, &error))?;
+        if current_flow_types
+            .insert(read.value_symbol, prepared.type_)
+            .is_some()
+        {
+            return Err(SourceCheckError::Import(read.node));
+        }
+        prepared_imports.push(prepared);
+    }
 
     for function in &functions {
         let type_ = materialize_checked_source_callable(
@@ -4363,7 +4567,17 @@ pub(super) fn check_source_file(
 
     validate_deferred_assertions(store, source, &deferred)?;
     check_deferred_assertions(store, host, global_types, options, diagnostics, &deferred)?;
-    publish_staged_variable_state(store, &declared_types, &value_order, &identifier_reads)?;
+    let import_publications =
+        preflight_prepared_source_import_publications(store, &prepared_imports)
+            .map_err(|error| SourcePlanner::import_plan_error(source.node_ref(), &error))?;
+    publish_staged_variable_state(
+        store,
+        source.node_ref(),
+        &declared_types,
+        &value_order,
+        &import_publications,
+        &identifier_reads,
+    )?;
 
     Ok(())
 }

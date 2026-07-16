@@ -43,6 +43,7 @@ mod source_calls;
 mod source_callables;
 mod source_enums;
 mod source_functions;
+mod source_imports;
 mod source_properties;
 mod spelling;
 mod store;
