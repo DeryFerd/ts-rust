@@ -4,10 +4,11 @@
 //! `getTypeFromIndexedAccessTypeNode`, `getIndexedAccessTypeOrUndefined`, and
 //! `getPropertyTypeForIndexType`. The object operand is one direct, possibly
 //! parenthesized type literal admitted by [`super::object_members`]. Required
-//! own properties and its property-free string/number index-signature surface
-//! are supported. Generic or named operands, optional or missing properties,
-//! union keys, tuples, apparent types, and diagnostic recovery remain explicit
-//! boundaries.
+//! own properties and string/number index signatures are supported, including
+//! mixed surfaces: an exact literal property wins, then an applicable number
+//! index wins over a string index. Generic or named operands, optional
+//! properties, union keys, tuples, apparent types, and diagnostic recovery
+//! remain explicit boundaries.
 //!
 //! Planning chooses the exact property symbol or index-info slot before any
 //! semantic child executes. Finishing only validates the already-resolved
@@ -23,6 +24,7 @@ use super::{
     bootstrap::LiteralTypeCacheError,
     declared::preflight_node,
     object_members::{self, PropertyObjectError, PropertyObjectPlan, PropertyObjectState},
+    type_nodes::normalize_numeric_separators,
     type_records::{LiteralValue, TypeData},
     types::TypeFlags,
 };
@@ -343,12 +345,9 @@ fn classify_index(
                     if literal_record.kind == SyntaxKind::NumericLiteral
                         && data.token_flags.0 == 0 =>
                 {
-                    let value = ts_jsnum::from_string(&data.text);
-                    if value.is_nan() {
-                        Err(ConcreteIndexedAccessError::InvalidSyntax(node))
-                    } else {
-                        Ok(ConcreteIndexKey::NumberLiteral(value))
-                    }
+                    numeric_literal_value(&data.text)
+                        .map(ConcreteIndexKey::NumberLiteral)
+                        .ok_or(ConcreteIndexedAccessError::InvalidSyntax(node))
                 }
                 NodeData::PrefixUnaryExpression(prefix)
                     if literal_record.kind == SyntaxKind::PrefixUnaryExpression
@@ -366,18 +365,21 @@ fn classify_index(
                     {
                         return Err(ConcreteIndexedAccessError::InvalidSyntax(node));
                     }
-                    let value = ts_jsnum::from_string(&data.text);
-                    if value.is_nan() {
-                        Err(ConcreteIndexedAccessError::InvalidSyntax(node))
-                    } else {
-                        Ok(ConcreteIndexKey::NumberLiteral(-value))
-                    }
+                    numeric_literal_value(&data.text)
+                        .map(|value| ConcreteIndexKey::NumberLiteral(-value))
+                        .ok_or(ConcreteIndexedAccessError::InvalidSyntax(node))
                 }
                 _ => Err(ConcreteIndexedAccessError::UnsupportedIndex(node)),
             }
         }
         _ => Err(ConcreteIndexedAccessError::UnsupportedIndex(node)),
     }
+}
+
+fn numeric_literal_value(text: &str) -> Option<Number> {
+    let normalized = normalize_numeric_separators(text)?;
+    let value = ts_jsnum::from_string(&normalized);
+    (!value.is_nan()).then_some(value)
 }
 
 fn is_numeric_literal_name(name: &str) -> bool {
@@ -390,22 +392,19 @@ fn select_concrete_member(
     key: &ConcreteIndexKey,
     index: NodeRef,
 ) -> Result<ConcreteIndexedSelection, ConcreteIndexedAccessError> {
-    if !object.call_signatures.is_empty()
-        || !object.properties.is_empty() && !object.indexes.is_empty()
-    {
+    if !object.call_signatures.is_empty() {
         return Err(ConcreteIndexedAccessError::UnsupportedObjectSurface(
             object.node,
         ));
     }
-    if !object.properties.is_empty() {
-        let Some(name) = key.literal_property_name() else {
-            return Err(ConcreteIndexedAccessError::MissingIndexSignature(index));
-        };
-        let property = object
+
+    let literal_property_name = key.literal_property_name();
+    if let Some(property) = literal_property_name.as_ref().and_then(|name| {
+        object
             .properties
             .iter()
             .find(|property| name.matches(&property.name))
-            .ok_or(ConcreteIndexedAccessError::MissingProperty(index))?;
+    }) {
         if property.optional {
             return Err(ConcreteIndexedAccessError::OptionalProperty {
                 node: index,
@@ -414,10 +413,17 @@ fn select_concrete_member(
         }
         return Ok(ConcreteIndexedSelection::Property(property.symbol));
     }
+
     if object.indexes.is_empty() {
-        return Err(ConcreteIndexedAccessError::UnsupportedObjectSurface(
-            object.node,
-        ));
+        return if object.properties.is_empty() {
+            Err(ConcreteIndexedAccessError::UnsupportedObjectSurface(
+                object.node,
+            ))
+        } else if literal_property_name.is_some() {
+            Err(ConcreteIndexedAccessError::MissingProperty(index))
+        } else {
+            Err(ConcreteIndexedAccessError::MissingIndexSignature(index))
+        };
     }
 
     let mut string = None;

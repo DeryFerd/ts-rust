@@ -17,6 +17,12 @@ const SUCCESS_SOURCE: &str = concat!(
     "type NumericStringValue = { [key: number]: string }['0'];\n",
     "type NumericPrecedence = { [key: string]: string | number; [key: number]: number }['0'];\n",
     "type TextPrecedence = { [key: string]: string | number; [key: number]: number }['answer'];\n",
+    "type MixedPropertyValue = { answer: string; [key: string]: string | number; [key: number]: number }['answer'];\n",
+    "type MixedTextFallback = { answer: string; [key: string]: string | number; [key: number]: number }['missing'];\n",
+    "type MixedNumericFallback = { answer: string; [key: string]: string | number; [key: number]: number }['0'];\n",
+    "type MixedSeparatedNumberFallback = { answer: string; [key: string]: string | number; [key: number]: number }[1_000];\n",
+    "type MixedBroadString = { answer: string; [key: string]: string | number; [key: number]: number }[string];\n",
+    "type MixedBroadNumber = { answer: string; [key: string]: string | number; [key: number]: number }[number];\n",
     "const property: PropertyValue = 1;\n",
     "const parenthesized: ParenthesizedValue = 2;\n",
     "const stringValue: StringValue = true;\n",
@@ -25,6 +31,12 @@ const SUCCESS_SOURCE: &str = concat!(
     "const numericStringValue: NumericStringValue = 'numeric';\n",
     "const numericPrecedence: NumericPrecedence = 3;\n",
     "const textPrecedence: TextPrecedence = 'text';\n",
+    "const mixedPropertyValue: MixedPropertyValue = 'property';\n",
+    "const mixedTextFallback: MixedTextFallback = 4;\n",
+    "const mixedNumericFallback: MixedNumericFallback = 5;\n",
+    "const mixedSeparatedNumberFallback: MixedSeparatedNumberFallback = 1000;\n",
+    "const mixedBroadString: MixedBroadString = 'broad';\n",
+    "const mixedBroadNumber: MixedBroadNumber = 6;\n",
 );
 
 fn context<'arena>(parsed: &'arena ParseResult, file: FileId) -> CanonicalCheckerContext<'arena> {
@@ -102,6 +114,12 @@ fn concrete_inline_indexed_access_types_select_properties_and_applicable_indexes
         ("NumericStringValue", "string"),
         ("NumericPrecedence", "number"),
         ("TextPrecedence", "string | number"),
+        ("MixedPropertyValue", "string"),
+        ("MixedTextFallback", "string | number"),
+        ("MixedNumericFallback", "number"),
+        ("MixedSeparatedNumberFallback", "number"),
+        ("MixedBroadString", "string | number"),
+        ("MixedBroadNumber", "number"),
     ] {
         let alias = alias_symbol(&parsed, file, &context, name);
         assert_eq!(
@@ -133,13 +151,39 @@ fn concrete_inline_indexed_access_types_select_properties_and_applicable_indexes
 fn unsupported_concrete_indexed_access_boundaries_are_atomic_and_retryable() {
     for (index, source) in [
         "type Bad = { value?: string }['value']; const bad: Bad = 'x';",
+        concat!(
+            "type Bad = { value?: string; [key: string]: string | undefined }['value']; ",
+            "const bad: Bad = 'x';",
+        ),
         "type Bad = { value: string }['missing']; const bad: Bad = 'x';",
         "type Bad = { value: string }[string]; const bad: Bad = 'x';",
-        "type Bad = { value: string }['value' | 'missing']; const bad: Bad = 'x';",
-        "type Bad = { value: string }[boolean]; const bad: Bad = 'x';",
+        concat!(
+            "type Bad = { value: string; [key: number]: string }['missing']; ",
+            "const bad: Bad = 'x';",
+        ),
+        concat!(
+            "type Bad = { [left: string]: string; [right: string]: string }['value']; ",
+            "const bad: Bad = 'x';",
+        ),
+        concat!(
+            "type Bad = { (): string; value: string; [key: string]: string }['value']; ",
+            "const bad: Bad = 'x';",
+        ),
+        concat!(
+            "type Bad = { value: number; [key: string]: string | number }['value' | 'missing']; ",
+            "const bad: Bad = 'x';",
+        ),
+        concat!(
+            "type Bad = { value: string; [key: string]: string }[boolean]; ",
+            "const bad: Bad = 'x';",
+        ),
         concat!(
             "type Model = { value: string }; ",
             "type Bad = Model['value']; const bad: Bad = 'x';",
+        ),
+        concat!(
+            "type Bad<T> = T['value']; ",
+            "const bad: Bad<{ value: string }> = 'x';",
         ),
     ]
     .into_iter()
