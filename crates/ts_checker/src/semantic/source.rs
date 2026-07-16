@@ -5722,7 +5722,7 @@ mod tests {
         assert_eq!(diagnostics[1].diagnostic.code(), 2322);
         assert_eq!(
             diagnostics[1].diagnostic.render().unwrap(),
-            "Type 'boolean' is not assignable to type 'string | number | null'."
+            "Type 'false' is not assignable to type 'string | number | null'."
         );
         assert!(is_type_checked(&context, file));
     }
@@ -6124,7 +6124,7 @@ mod tests {
             (
                 &diagnostics[1],
                 "literalOrNumber",
-                "string",
+                "\"wrong\"",
                 "number | \"expected\"",
             ),
         ] {

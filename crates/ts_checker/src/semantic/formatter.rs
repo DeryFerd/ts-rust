@@ -455,7 +455,11 @@ fn get_type_names_for_assignability_error_with_optional_host_and_flags(
 
     if !target_record.flags().intersects(TypeFlags::NEVER)
         && is_literal_type(source_record)
-        && !type_could_have_top_level_singleton_types(target_record)
+        && !type_could_have_top_level_singleton_types(
+            store,
+            target,
+            &mut HashSet::new(),
+        )?
     {
         let generalized = base_type_of_literal_type(store, source, source_record)?;
         let generalized_record = store
@@ -2069,10 +2073,43 @@ fn is_literal_type(record: &TypeRecord) -> bool {
         .intersects(TypeFlags::BOOLEAN | TypeFlags::UNIT)
 }
 
-fn type_could_have_top_level_singleton_types(record: &TypeRecord) -> bool {
+fn type_could_have_top_level_singleton_types(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    visiting: &mut HashSet<TypeId>,
+) -> Result<bool, TypeDisplayUnavailable> {
+    let record = store
+        .type_payload(type_)
+        .ok_or(TypeDisplayUnavailable::Type(type_))?;
     // Pinned behavior intentionally treats `boolean` as non-singleton even
     // though its representation is `false | true`.
-    !record.flags().intersects(TypeFlags::BOOLEAN) && record.flags().intersects(TypeFlags::UNIT)
+    if record.flags().intersects(TypeFlags::BOOLEAN) {
+        return Ok(false);
+    }
+    if record
+        .flags()
+        .intersects(TypeFlags::UNION_OR_INTERSECTION)
+    {
+        if !visiting.insert(type_) {
+            return Err(TypeDisplayUnavailable::CyclicType(type_));
+        }
+        let result = (|| {
+            let constituents = match record.data() {
+                TypeData::Union(union) => &union.union.types,
+                TypeData::Intersection(intersection) => &intersection.intersection.types,
+                _ => return Err(TypeDisplayUnavailable::MalformedType(type_)),
+            };
+            for constituent in constituents {
+                if type_could_have_top_level_singleton_types(store, *constituent, visiting)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        })();
+        assert!(visiting.remove(&type_));
+        return result;
+    }
+    Ok(record.flags().intersects(TypeFlags::UNIT))
 }
 
 fn base_type_of_literal_type(
