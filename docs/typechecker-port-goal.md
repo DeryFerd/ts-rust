@@ -701,6 +701,75 @@ remains the cluster-level source of truth.
   unresolved-import diagnostics—not the direct Bundler/ESM named-value slice.
   This is useful negative evidence: the next module payoff is type-space and
   exported-declaration closure, not widening the current gate by guessing.
+- That type-space and generic-call seam is now integrated through
+  `8ef637e..6253984`, `a97101d`, `2a40f0b`, and `3d66eaf`. Exact exported source
+  type aliases and simple interfaces retain module/local/export ownership;
+  annotated generic source functions retain one default-free identity
+  signature; and inferred or explicit primitive identity calls execute through
+  local and imported callable values. Imported declared alias/interface objects
+  may cross the source-only inference boundary only after exact export and
+  host-graph proof. The ordinary semantic inference API remains closed, warm
+  call caches are revalidated, and importer-first checking never recursively
+  checks the target source. Failed declared-object assignments now add the
+  pinned TS2326/TS2322 chain only for independently proven terminal scalar
+  property pairs; nested objects and callables deliberately retain the plain
+  root TS2322 until recursive relation-chain reporting is ported.
+- Exact named `import type` consumption is integrated through
+  `002e17f..70c8096`, `38e0976`, and `4017b4d`. A capability is scoped to one
+  direct top-level variable annotation root and may compose through exact
+  parenthesized, array, and primitive/literal-union graphs with multiple
+  imported leaves. Every complete root is read-only preflighted before source
+  execution; warm union and both initialized/fallback array caches cannot retain
+  authority; and local aliases, callable annotations, assertions, explicit call
+  type arguments, and later assignments remain closed boundaries. Independent
+  review found and closed later-root partial publication, warm outer-cache
+  escape, wrapper-flag, nested owner, and truncated-diagnostic defects before
+  merge. The combined gate passes 10/10 public source-import tests, 3/3 imported
+  generic-call tests, 2/2 compiler Bundler/ESM tests, strict checker/compiler
+  Clippy, and rustdoc with warnings denied. The monolithic checker unit binary
+  still cannot reliably link inside the 1 GiB runner; all unit targets compile
+  under the exact all-target Clippy gate and executable integration tests carry
+  the public behavior checks.
+- Fresh name-filtered scorecards provide honest negative evidence rather than a
+  parity claim. `/tmp/ts-rust-generic-50-4017b4d.json` executes 50 variants with
+  zero exact and 50 explicit unsupported results; the dominant blockers are
+  general multi-parameter inference, structured candidates, contextual generic
+  callables, overloads, classes, mapped/conditional types, and declaration
+  emit—not the verified identity slice. `/tmp/ts-rust-import-50-4017b4d.json`
+  executes 54 variants with zero exact and 54 explicit unsupported results,
+  dominated by CommonJS/Node10, NodeNext/package facts, declaration files,
+  default/namespace/reexport forms, and unresolved-import diagnostics. The next
+  parallel implementation wave therefore assigns one owner to single-signature
+  generic calls v2 and a disjoint owner to primitive scalar operators; logical
+  operators, overload selection, element/index access, and flow joins remain
+  separate later gates.
+- The generic-calls-v2 owner keeps the coupled substrate serial within one
+  worktree: first publish ordered source type-parameter metadata; then infer and
+  finalize full argument vectors; then instantiate/cache an exact full-vector
+  signature; finally expose source diagnostics and imported replay. The first
+  admitted shape is one exact stored signature with 1..N ordered type parameters,
+  fixed required parameters whose inference targets are naked type parameters,
+  a mapper-supported return template, repeated candidates, exact/partial
+  explicit arguments, trailing defaults, and primitive or earlier-parameter
+  constraints. Candidate combination, literal widening, declaration-order
+  default/constraint instantiation, TS2558/TS2344/TS2345 recovery, exact mapper
+  endpoint order, and last-write signature-cache publication are part of this
+  gate. Structured `Array<T>` target inference is the immediate same-owner
+  follow-up. Overload sets, callbacks/context-sensitive inference, optional/rest
+  parameters, spreads, constructors, const parameters, and advanced type targets
+  are not allowed to widen this slice.
+- The parallel expression owner starts in a new `primitive_operators.rs` leaf
+  and consumes only frozen bootstrap/relation/formatting APIs. Its first oracle
+  matrix covers non-assignment primitive/literal `+`, arithmetic/exponentiation,
+  relational, and equality binary expressions, with prefix `+`, `-`, `~`, and
+  `!` only if they do not expand the shared contract. It must reproduce the
+  upstream distinction between operand diagnostics TS2362/TS2363, whole-node
+  TS2365, recovery result types, mixed number/bigint behavior, operand spans,
+  issuance order, and final source-position sorting. `&&`, `||`, and `??` are
+  explicitly deferred because their results require fact-sensitive falsy and
+  non-nullish union projection; returning `boolean` would be a semantic cheat.
+  Assignment operators, shifts/bitwise suggestion paths, updates, unions, type
+  parameters, enums, objects, and flow narrowing also remain later gates.
 
 No percentage in this section is a whole-corpus parity claim. A score is
 publishable only when its variant manifest and complete artifact comparison are
