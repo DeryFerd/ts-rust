@@ -3861,6 +3861,7 @@ mod tests {
                 owner,
                 signature,
                 parameters: vec![parameter_type],
+                rest_parameter: None,
                 min_argument_count: 1,
                 return_type: Some(return_type),
                 strict_variance_exempt: false,
