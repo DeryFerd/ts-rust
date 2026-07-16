@@ -63,6 +63,20 @@ const FLOW_SOURCE: &str = concat!(
     "    return shadow;\n",
     "  }\n",
     "}\n",
+    "function objectCondition(value: object): number {\n",
+    "  if (value) {\n",
+    "    return 1;\n",
+    "  } else {\n",
+    "    return 2;\n",
+    "  }\n",
+    "}\n",
+    "function literalCondition(value: \"yes\"): number {\n",
+    "  if (value) {\n",
+    "    return 1;\n",
+    "  } else {\n",
+    "    return 2;\n",
+    "  }\n",
+    "}\n",
 );
 
 const DIAGNOSTIC_SOURCE: &str = concat!(

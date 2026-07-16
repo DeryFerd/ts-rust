@@ -51,8 +51,7 @@ use super::{
     },
     logical_operators::{
         LogicalBinaryError, LogicalBinaryInvariant, LogicalBinaryRequest,
-        LogicalBinaryUnsupported, TruthinessAssumption, check_logical_binary,
-        narrow_by_truthiness, narrow_logical_right_operand,
+        LogicalBinaryUnsupported, check_logical_binary, narrow_logical_right_operand,
     },
     primitive_operators::{
         PrimitiveBigIntExponentiationTarget, PrimitiveBinaryError, PrimitiveBinaryRecovery,
@@ -5516,32 +5515,6 @@ fn check_planned_function_statements(
             )),
         ));
     }
-    let falsy = narrow_by_truthiness(
-        store,
-        Some(global_types),
-        condition.result,
-        TruthinessAssumption::Falsy,
-    )
-    .map_err(|error| {
-        SourcePlanner::source_flow_plan_error(
-            callable,
-            SourceFlowError::Narrowing {
-                condition: statements.condition.node,
-                error,
-            },
-        )
-    })?;
-    let never = store
-        .intrinsic_bootstrap()
-        .map(|bootstrap| bootstrap.never_type)
-        .ok_or(SourceCheckError::LogicalOperator(statements.condition.node))?;
-    if falsy == never {
-        return Err(SourceCheckError::Unsupported(
-            UnsupportedSourceSyntax::Function(SourceFunctionUnsupported::FunctionBody(
-                callable.body,
-            )),
-        ));
-    }
     emit_truthiness_operand_diagnostics(
         store,
         host,
@@ -5598,12 +5571,17 @@ fn source_truthiness_condition_type_is_supported(
         .ok_or(SourceCheckError::LogicalOperator(invariant_node))?;
     let flags = record.flags();
     if flags.intersects(
-        TypeFlags::UNKNOWN
-            | TypeFlags::TYPE_PARAMETER
-            | TypeFlags::INTERSECTION
-            | TypeFlags::ENUM
-            | TypeFlags::ENUM_LITERAL,
+        TypeFlags::UNKNOWN | TypeFlags::TYPE_PARAMETER | TypeFlags::INTERSECTION,
     ) {
+        return Ok(false);
+    }
+    if record
+        .symbol()
+        .and_then(|symbol| store.symbol(symbol))
+        .is_some_and(|symbol| {
+            matches!(symbol.name().as_bytes(), b"Promise" | b"PromiseLike")
+        })
+    {
         return Ok(false);
     }
     if !matches!(
