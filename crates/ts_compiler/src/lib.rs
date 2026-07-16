@@ -15,9 +15,9 @@ use ts_checker::semantic::formatter::FunctionTypeDisplayUnavailable;
 use ts_checker::semantic::{
     ArrayTypeError, CanonicalCheckerContext, CanonicalCheckerContextError, CanonicalCheckerOptions,
     CanonicalGlobalInitializationError, CanonicalGlobalTypeInitializationError, DeclaredTypeError,
-    DeclaredTypeUnavailable, DerivedTypeError, IntrinsicBootstrapOptions, RelationUnavailable,
-    SourceCheckError, SourceLiteralCacheError, SymbolMergeError, TypeDisplayUnavailable,
-    TypeNodeUnavailable,
+    DeclaredTypeUnavailable, DerivedTypeError, EnumTypeError, IntrinsicBootstrapOptions,
+    RelationUnavailable, SourceCheckError, SourceLiteralCacheError, SymbolMergeError,
+    TypeDisplayUnavailable, TypeNodeUnavailable,
 };
 use ts_checker::{
     CheckDiagnostic, CheckResult, CheckerOptions, EnumConstantValue as CheckerConstantValue,
@@ -409,6 +409,8 @@ fn declared_type_error_is_unsupported(error: &DeclaredTypeError) -> bool {
     match error {
         DeclaredTypeError::Unavailable(error) => declared_type_unavailable_is_unsupported(error),
         DeclaredTypeError::TypeNodeUnavailable(error) => type_node_error_is_unsupported(error),
+        DeclaredTypeError::Enum(EnumTypeError::Unsupported(_)) => true,
+        DeclaredTypeError::Enum(EnumTypeError::Invariant(_)) => false,
         DeclaredTypeError::NameResolution(error) => name_resolution_error_is_unsupported(error),
         DeclaredTypeError::Host(_)
         | DeclaredTypeError::NameResolverHost(_)
@@ -568,6 +570,7 @@ fn display_error_is_unsupported(error: &TypeDisplayUnavailable) -> bool {
         | TypeDisplayUnavailable::InvalidUnion(_)
         | TypeDisplayUnavailable::InvalidLiteralLinks(_)
         | TypeDisplayUnavailable::MissingBootstrap
+        | TypeDisplayUnavailable::EmptyTupleType(_)
         | TypeDisplayUnavailable::SourceHost(_) => false,
         TypeDisplayUnavailable::ArrayType(error) => array_type_error_is_unsupported(error),
     }
