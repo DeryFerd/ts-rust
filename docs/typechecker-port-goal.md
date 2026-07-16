@@ -806,16 +806,57 @@ remains the cluster-level source of truth.
   cold/warm publication. Source-declared index signatures, tuple/union access,
   optional chains, property/element flow references, method calls, overloads,
   and nested aggregate expression dispatch remain explicit follow-ups.
-- A fresh pinned first-50 run at
-  `/tmp/ts-rust-canonical-first50-37c9b99.json` reports two exact artifacts and
-  48 honest unsupported variants, with zero code, span, message, order, or
+- The default/index/inferred-return closure is integrated through `c732b68`,
+  `ca1c6a6`, `13d1774..e144f44`, and `ab67a9b..33105d8`. Supported source
+  functions and arrows now execute default parameter initializers in the
+  earlier-parameter scope, retain distinct optional call types and body types,
+  and infer bounded empty, single-return, and concise-arrow returns before
+  direct use. Inferred primitive, canonical array, and ordinary object results
+  widen to stable identities; nested object/array results retain the exact
+  array capability required by formatting and relation. Mutable arrow captures
+  use the declared type rather than a declaration-point narrowing, inferred
+  function diagnostics replay deterministically at the declaration slot, and
+  forced warm replay recomputes the body so valid-looking poisoned return or
+  expression caches cannot escape validation. One exact source-declared string
+  or number index signature now feeds element access with declaration and
+  readonly provenance; mixed, duplicate, interface, method, and paired index
+  families remain fail-closed until their TS2411/TS2413 checks are ported.
+  Independent review found and closed five inferred-return defects and one
+  index-owner provenance defect before integration. The combined logical,
+  generic-call, element, index, default-initializer, and inferred-return public
+  tests pass together; checker test compilation, exact checker/compiler
+  Clippy, and checker rustdoc with warnings denied are green. The monolithic
+  checker unit binary is still intentionally not retried under the 1 GiB
+  runner after repeated linker termination; its unit targets compile under the
+  all-target gates and public integration binaries carry the vertical behavior.
+- Required own-property calls are integrated through `e803a7b` and `0f2efd0`.
+  The source planner admits `api.fn(arguments)` only when the exact enclosing
+  call grants a retained callee-position capability to a direct
+  identifier-property plan. Ordinary property reads cannot be laundered into a
+  call, and the finished call cross-checks the property node, name node, parent
+  call, and callee family before execution. One required own property with one
+  exact non-generic callable now composes with the existing call kernel,
+  publishing exact property symbol/type and call signature/return links. Too
+  few arguments diagnose the property name and retain exact TS6210 related
+  information; argument and extra-argument paths retain their existing pinned
+  nodes/ranges. Optional, generic, overloaded, explicit-`this`, spread,
+  element, parenthesized, nested-receiver, apparent, union, and `any` forms stay
+  explicit boundaries. Forced warm/error replay and both property/call cache
+  poison paths are covered. Focused property/call tests, three public vertical
+  tests, checker test compilation, and exact checker Clippy pass; independent
+  review found no P0-P2 issue.
+- The current pinned first-50 run at
+  `/tmp/ts-rust-canonical-first50-41d4c5c.json`, rebuilt after inferred returns,
+  declared indexes, defaults, and property calls, remains two exact artifacts
+  and 48 honest unsupported variants, with zero code, span, message, order, or
   complete-artifact mismatches. This alphabetically biased smoke tranche is
-  now dominated by classes, function/body forms, module modes, JavaScript,
-  TSX, declaration emit, and advanced type nodes. The result confirms that
-  the next useful work is broad dependency closure—statements and flow,
-  compositional calls and inference, classes, advanced type instantiation, and
-  then the wider module/project surface—rather than further fixture-specific
-  patches.
+  dominated by classes, broader function/body forms, module modes, JavaScript,
+  TSX, declaration emit, and advanced type nodes; none is a complete artifact
+  for the newly admitted bounded cuts. The unchanged headline is therefore
+  useful negative evidence rather than a regression: the next work must close
+  broad dependencies—statements and flow, overloads and contextual calls,
+  classes, advanced types, then modules/projects—rather than add
+  fixture-specific syntax admissions.
 
 No percentage in this section is a whole-corpus parity claim. A score is
 publishable only when its variant manifest and complete artifact comparison are
@@ -1638,9 +1679,20 @@ topology changes when the semantic contracts freeze:
 
 | Active slots | Before source/signature/relation contracts freeze | After those contracts freeze | Expected useful concurrency |
 |---:|---|---|---:|
-| 4 | root/integration; one core implementer; one disjoint implementer or next-wave scout; one rotating Go/Rust reviewer | root plus three disjoint feature owners, with review rotated before merge | 2.5-3 lanes |
-| 8 | root; two core implementers; Go semantic reviewer; Rust invariant reviewer; dedicated fixer; oracle/corpus sharder; compiler/integration assistant | root; four or five feature owners; two reviewers; one corpus/integration worker | 5-6 lanes |
-| 12+ | keep at most two writers on shared contracts; add upstream-inventory, oracle, fixture-clustering, fuzz/property-test, diagnostic, and compiler workers | shard source families and corpus root causes broadly, retaining roughly one reviewer per two implementers | 8-10 lanes until integration saturates |
+| 4 | root/integration; one core implementer; one disjoint implementer or next-wave scout; one rotating Go/Rust reviewer | root, two semantic writers, and one rotating reviewer; a reviewed slot may begin the next leaf | 2.5-3 while contracts move; about 3-3.25 after freeze |
+| 8 | root; two core implementers; Go semantic reviewer; Rust invariant reviewer; dedicated fixer; oracle/corpus sharder; compiler/integration assistant | root; four or five feature owners; separate Go and Rust reviewers | about 6-7 lanes |
+| 12+ | keep at most two writers on shared contracts; add upstream-inventory, oracle, fixture-clustering, fuzz/property-test, diagnostic, and compiler workers | roughly seven feature owners; root; two reviewers; oracle and fixer roles | about 9-10.5 lanes until integration saturates |
+
+The revised post-freeze range is supported by the present module and change
+shape, not by an assumption that a checker is embarrassingly parallel. The
+checker has 52 top-level semantic modules and 40 are below 3,000 lines, so many
+families can have bounded ownership. In the most recent 120 semantic commits,
+however, `source.rs` changed in roughly one third, while `type_nodes.rs`,
+`source_calls.rs`, `store.rs`, `mod.rs`, and `relater.rs` were the next most
+frequent shared surfaces. Those dispatcher, record, and relation seams cap the
+useful population at roughly seven simultaneous semantic writers. Additional
+workers remain productive as Go-semantic reviewers, Rust cache/provenance
+reviewers, fixers, oracle/corpus sharders, and compiler-integration owners.
 
 For an eight-worker push, only two workers may write the shared type/signature,
 link, relation, or source-dispatch substrate at once. The other roles are not
@@ -1730,6 +1782,119 @@ pinned-Go comparison, targeted oracle work, and edits while the integration
 lane builds. A wave may advance when every shared contract has one owner, every
 implementation cluster has independent review capacity, and the integration
 queue contains no more than two unreviewed semantic clusters per reviewer.
+
+### Near-term parallel dependency DAG
+
+The fastest path from the current bounded checker to ordinary modern projects
+is not to finish one semantic family at a time. It is to freeze the remaining
+composition seams, then advance the independent branches below in parallel:
+
+```text
+P0: inferred returns [done] + required property calls [done] + first statement/flow slice
+|
+|-- F1 post-if joins and equality/typeof narrowing
+|    `-- F2 loops, switch, reachability and jumps
+|         `-- F3 try/finally, closure flow and definite assignment
+|
+|-- C1 callable-member and ordered overload-set construction
+|    |-- C2 overload selection and contextual callbacks
+|    |    |-- I1 structured generic inference
+|    |    |-- K1/K2 classes
+|    |    `-- J1/J2 JSX
+|    `-- T1 tuple, rest and spread call semantics ---------^
+|
+|-- A11 declared index seed [bounded slice done]
+|    `-- A1 keyof and indexed access
+|         |-- X1 intersections
+|         `-- A2 mapped types
+|              `-- A3 conditional, infer and substitution types
+|
+`-- M0 immutable ESM manifest [bounded slice done]
+     `-- M1 Bundler declaration/default/namespace/re-export closure
+          `-- M2 NodeNext and package facts
+               `-- P1 representative modern project graph
+```
+
+Before widening that graph, root/integration freezes and exclusively registers
+four interfaces:
+
+1. `SourceStatementPlan` and invocation-local `SourceFlowFrame`, with narrow
+   callbacks into the existing expression planner/checker. Leaf statement and
+   flow workers must not add private alternatives to source dispatch.
+2. A recursive type-family host for child planning, child resolution, staged
+   publication, and warm-cache validation. Advanced type workers own new leaf
+   modules; root alone registers their syntax kinds in `type_nodes.rs`.
+3. An ordered `CallableSetProjection` containing exact call and construct
+   signature IDs. Callable-member construction can then feed production sets
+   while overload selection is tested concurrently against synthetic sets.
+4. One relation-family integration owner per wave. Type constructors may
+   advance independently, but multiple workers do not add unrelated branches
+   to `relater.rs` in the same wave.
+
+`source.rs`, `type_nodes.rs`, `relater.rs`, `mod.rs`, shared store/link/signature
+records, compiler fact projection, and final diagnostic integration therefore
+remain root-owned merge surfaces. A leaf that needs a new shared field stops
+and proposes the contract instead of widening its ownership.
+
+#### Wave 1: composable declarations, calls, and straight-line bodies
+
+Goal: check ordinary strict functional and library code through Bundler imports
+and consumed declaration files.
+
+| Lane | Primary upstream seam | Rust ownership |
+|---|---|---|
+| C1 callable sets | `getSignatureFromDeclaration`, `getSignaturesOfSymbol`, anonymous member resolution | new `anonymous_signatures.rs`/`source_overloads.rs`; bounded signature/object-member adapters |
+| C2 overloads/context | `resolveCallExpression`, `resolveCall`, `chooseOverload`, applicability and contextual argument typing | new `overloads.rs`; `calls.rs`, `contextual.rs`, `inference.rs`, `source_calls.rs` |
+| T1 tuple/rest/spread | tuple type construction, rest extraction, spread argument typing, correct arity | `tuple_types.rs`, new tuple/call-arity leaves |
+| A1 indexed/keyof | indexed-access type resolution, property/index lookup and applicable index selection | new indexed/keyof leaf modules plus element/index tests |
+| F1 joins/narrowing | branch-label flow, assignment flow, equality and `typeof` narrowing | `source_flow.rs` and `source_statements.rs`; no loops yet |
+| M1 Bundler modules | import/export checking, external-module symbol and alias-target resolution | `source_imports.rs`, `alias_provider.rs`, compiler module facts |
+| O1 oracle | exact `.errors`, `.types`, and `.symbols` root-cause scorecards | `tools/ts_fixture` only |
+
+C1 and C2 may execute concurrently only after the ordered callable-set
+projection freezes. T1 joins C2 when spread/rest applicability begins. A1, F1,
+M1, and O1 are otherwise independent of that call seam.
+
+#### Wave 2: ordinary application code
+
+Goal: classes, structured inference, control statements, package declarations,
+and basic TSX.
+
+| Lane | Scope and ownership |
+|---|---|
+| K1 class graph | class/interface member resolution, bases, constructor/static/instance identities in a new class-type leaf |
+| K2 class checking | class/property/method/constructor source plans in a new source-class leaf; consumes a frozen `ClassPlan` from K1 |
+| I1 structured inference | broader inference priorities, fixing, signature and contextual candidates under one coupled inference owner |
+| X1 intersections | construction, member resolution, instantiation and one explicitly owned relation seam |
+| F2 loops/switch | flow loop labels, switch clauses, reachability, jumps, and source statement checking |
+| M2 NodeNext | package/module format facts, conditional exports, and declaration targets |
+| J1 JSX core | intrinsic tags, function components, props, children, and basic overload application |
+
+K2 may plan syntax concurrently with K1 only after the `ClassPlan` contract is
+fixed; it may not invent a second class/member representation.
+
+#### Wave 3: ecosystem closure
+
+Goal: the advanced type and flow families that dominate React, framework
+declarations, and strict multi-package projects.
+
+| Lane | Scope |
+|---|---|
+| A2 | mapped and reverse-mapped member resolution, instantiation, relation, and inference |
+| A3 | conditional/infer/substitution types, distributivity, and tail-recursion budgets |
+| A4 | template literal construction/pattern inference and intrinsic string mappings |
+| K3 | accessibility, private/protected identity, override/abstract checks, `this`/`super`, and static initialization |
+| F3 | try/finally completion, predicates/discriminants, closure flow, definite assignment, and exception reachability |
+| J2 | managed attributes, generic/class components, and JSX namespace resolution |
+| P1 | NodeNext/project references, augmentations, option closure, and exact modern-project scorecards |
+
+At four slots, root keeps two semantic writers and one rotating reviewer active.
+At eight, Wave 1 can sustain C1, C2, A1, F1, and M1 with root and separate Go
+and Rust reviewers; T1 rotates in as a lane clears. At twelve, all six Wave 1
+writers fit alongside root, two reviewers, an oracle worker, and a fixer. Waves
+2 and 3 use the same topology: staff five writers at eight slots or roughly
+seven at twelve, rather than allowing every worker to touch a shared
+dispatcher.
 
 ### Review loop for every cluster
 
