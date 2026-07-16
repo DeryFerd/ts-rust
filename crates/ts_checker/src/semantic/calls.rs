@@ -553,11 +553,11 @@ mod tests {
     fn callable(
         store: &mut CanonicalTypeMapperStore,
         flags: SignatureFlags,
-        parameters: Vec<TypeId>,
+        parameters: &[TypeId],
         minimum: i32,
         return_type: Option<TypeId>,
     ) -> ValidatedSingleCallable {
-        let mut projected_parameters = parameters.clone();
+        let mut projected_parameters = parameters.to_vec();
         let rest_parameter = if flags.contains(SignatureFlags::HAS_REST_PARAMETER) {
             projected_parameters.pop()
         } else {
@@ -660,7 +660,7 @@ mod tests {
         let callable = callable(
             &mut store,
             SignatureFlags::NONE,
-            vec![number, string],
+            &[number, string],
             1,
             Some(string),
         );
@@ -704,7 +704,7 @@ mod tests {
         let callable = callable(
             &mut store,
             SignatureFlags::NONE,
-            vec![number, string],
+            &[number, string],
             2,
             Some(string),
         );
@@ -750,7 +750,7 @@ mod tests {
         let callable = callable(
             &mut store,
             SignatureFlags::NONE,
-            vec![number, void],
+            &[number, void],
             2,
             Some(void),
         );
@@ -782,7 +782,7 @@ mod tests {
         let callable = callable(
             &mut store,
             SignatureFlags::NONE,
-            vec![number, number],
+            &[number, number],
             2,
             Some(string),
         );
@@ -815,7 +815,7 @@ mod tests {
         let mut store = initialized_store();
         let bootstrap = store.intrinsic_bootstrap().unwrap();
         let number = bootstrap.number_type;
-        let unresolved = callable(&mut store, SignatureFlags::NONE, vec![number], 1, None);
+        let unresolved = callable(&mut store, SignatureFlags::NONE, &[number], 1, None);
         assert_eq!(
             project_validated_direct_call(
                 &store,
@@ -831,7 +831,7 @@ mod tests {
         let rest = callable(
             &mut store,
             SignatureFlags::HAS_REST_PARAMETER,
-            vec![number],
+            &[number],
             0,
             Some(number),
         );
