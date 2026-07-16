@@ -14,7 +14,9 @@ use ts_binder::{
 use ts_checker::semantic::formatter::FunctionTypeDisplayUnavailable;
 use ts_checker::semantic::{
     ArrayTypeError, CanonicalCheckerContext, CanonicalCheckerContextError, CanonicalCheckerOptions,
-    CanonicalGlobalInitializationError, CanonicalGlobalTypeInitializationError, DeclaredTypeError,
+    CanonicalGlobalInitializationError, CanonicalGlobalTypeInitializationError,
+    CanonicalModuleResolutionEntry, CanonicalModuleResolutionManifestInput,
+    CanonicalModuleResolutionMode, CanonicalResolvedModuleInput, DeclaredTypeError,
     DeclaredTypeUnavailable, DerivedTypeError, EnumTypeError, IntrinsicBootstrapOptions,
     RelationUnavailable, SourceCheckError, SourceLiteralCacheError, SymbolMergeError,
     TypeDisplayUnavailable, TypeNodeUnavailable,
@@ -178,6 +180,12 @@ pub enum CanonicalProgramCheckError {
         module: ModuleKind,
         module_resolution: ModuleResolutionKind,
     },
+    PlainEsmModuleResolutionUnsupported {
+        file_name: String,
+        module: ModuleKind,
+        module_resolution: ModuleResolutionKind,
+    },
+    ModuleSpecifierResolutionModeUnsupported(NodeRef),
     DeclarationFileCheckingUnsupported {
         file_name: String,
     },
@@ -197,6 +205,17 @@ pub enum CanonicalProgramCheckError {
     MissingBoundFile {
         file_name: String,
         file: FileId,
+    },
+    InvalidModuleSourceFile(NodeRef),
+    InvalidModuleSpecifier(NodeRef),
+    ExternalModuleTargetUnsupported {
+        specifier: NodeRef,
+        target_file_name: String,
+    },
+    MissingResolvedModuleTarget {
+        containing_file: String,
+        specifier: NodeRef,
+        resolved_file_name: String,
     },
     InvalidDiagnosticNode(NodeRef),
     InvalidRelatedDiagnosticNode {
@@ -221,6 +240,9 @@ impl CanonicalProgramCheckError {
             | Self::FixedModuleFormatUnsupported { .. }
             | Self::ImportMetaModuleIndicatorUnsupported { .. }
             | Self::NodeModuleFactsUnsupported { .. }
+            | Self::PlainEsmModuleResolutionUnsupported { .. }
+            | Self::ModuleSpecifierResolutionModeUnsupported(_)
+            | Self::ExternalModuleTargetUnsupported { .. }
             | Self::DeclarationFileCheckingUnsupported { .. } => true,
             Self::DeclarationBind { error, .. } => {
                 canonical_declaration_error_is_unsupported(error)
@@ -229,6 +251,9 @@ impl CanonicalProgramCheckError {
             Self::SourceCheck { error, .. } => source_check_error_is_unsupported(error),
             Self::Bind { .. }
             | Self::MissingBoundFile { .. }
+            | Self::InvalidModuleSourceFile(_)
+            | Self::InvalidModuleSpecifier(_)
+            | Self::MissingResolvedModuleTarget { .. }
             | Self::InvalidDiagnosticNode(_)
             | Self::InvalidRelatedDiagnosticNode { .. }
             | Self::DiagnosticFormat(_) => false,
@@ -603,6 +628,7 @@ const fn function_display_error_is_unsupported(reason: FunctionTypeDisplayUnavai
 }
 
 impl std::fmt::Display for CanonicalProgramCheckError {
+    #[allow(clippy::too_many_lines)] // Exhaustive typed compiler-boundary display.
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::UnsupportedSourceKind {
@@ -627,6 +653,18 @@ impl std::fmt::Display for CanonicalProgramCheckError {
             } => write!(
                 formatter,
                 "canonical checking cannot yet derive Node module facts for '{file_name}' with module={module:?} and moduleResolution={module_resolution:?}"
+            ),
+            Self::PlainEsmModuleResolutionUnsupported {
+                file_name,
+                module,
+                module_resolution,
+            } => write!(
+                formatter,
+                "canonical module resolution for '{file_name}' requires a plain TypeScript source with ESM emit and Bundler resolution, got module={module:?} and moduleResolution={module_resolution:?}"
+            ),
+            Self::ModuleSpecifierResolutionModeUnsupported(specifier) => write!(
+                formatter,
+                "canonical module resolution cannot prove an ESM mode for module specifier {specifier:?}"
             ),
             Self::DeclarationFileCheckingUnsupported { file_name } => write!(
                 formatter,
@@ -655,6 +693,29 @@ impl std::fmt::Display for CanonicalProgramCheckError {
                 formatter,
                 "canonical binding omitted Program file {} ('{file_name}')",
                 file.index()
+            ),
+            Self::InvalidModuleSourceFile(source) => write!(
+                formatter,
+                "canonical module resolution references malformed Program source {source:?}"
+            ),
+            Self::InvalidModuleSpecifier(specifier) => write!(
+                formatter,
+                "canonical module resolution references malformed Program node {specifier:?}"
+            ),
+            Self::ExternalModuleTargetUnsupported {
+                specifier,
+                target_file_name,
+            } => write!(
+                formatter,
+                "canonical module specifier {specifier:?} resolved to script source '{target_file_name}', whose external-module diagnostic is not yet ported"
+            ),
+            Self::MissingResolvedModuleTarget {
+                containing_file,
+                specifier,
+                resolved_file_name,
+            } => write!(
+                formatter,
+                "canonical module specifier {specifier:?} in '{containing_file}' resolved to unretained Program file '{resolved_file_name}'"
             ),
             Self::InvalidDiagnosticNode(node) => write!(
                 formatter,
@@ -685,8 +746,14 @@ impl std::error::Error for CanonicalProgramCheckError {
             | Self::FixedModuleFormatUnsupported { .. }
             | Self::ImportMetaModuleIndicatorUnsupported { .. }
             | Self::NodeModuleFactsUnsupported { .. }
+            | Self::PlainEsmModuleResolutionUnsupported { .. }
+            | Self::ModuleSpecifierResolutionModeUnsupported(_)
+            | Self::ExternalModuleTargetUnsupported { .. }
             | Self::DeclarationFileCheckingUnsupported { .. }
             | Self::MissingBoundFile { .. }
+            | Self::InvalidModuleSourceFile(_)
+            | Self::InvalidModuleSpecifier(_)
+            | Self::MissingResolvedModuleTarget { .. }
             | Self::InvalidDiagnosticNode(_)
             | Self::InvalidRelatedDiagnosticNode { .. } => None,
         }
@@ -2684,6 +2751,94 @@ impl Program {
             })
     }
 
+    fn canonical_module_resolution_manifest(
+        &self,
+    ) -> Result<CanonicalModuleResolutionManifestInput, CanonicalProgramCheckError> {
+        let mut entries = Vec::new();
+        for source in &self.source_files {
+            let specifiers = canonical_static_esm_module_specifiers(source)?;
+            if specifiers.is_empty() {
+                continue;
+            }
+            self.require_plain_esm_bundler_source(source)?;
+
+            let containing = canonicalize(
+                &source.file_name,
+                &self.current_directory,
+                self.case_sensitivity,
+            );
+            for (specifier, text) in specifiers {
+                let Some(resolved_file_name) =
+                    self.resolved_modules.get(&(containing.clone(), text))
+                else {
+                    entries.push(CanonicalModuleResolutionEntry::unresolved(specifier));
+                    continue;
+                };
+                let Some(target) = self
+                    .file_index
+                    .get(resolved_file_name)
+                    .and_then(|index| self.source_files.get(*index))
+                else {
+                    return Err(CanonicalProgramCheckError::MissingResolvedModuleTarget {
+                        containing_file: source.file_name.clone(),
+                        specifier,
+                        resolved_file_name: resolved_file_name.clone(),
+                    });
+                };
+                self.require_plain_esm_bundler_source(target)?;
+                if !source_file_is_external_module(&target.parse) {
+                    return Err(CanonicalProgramCheckError::ExternalModuleTargetUnsupported {
+                        specifier,
+                        target_file_name: target.file_name.clone(),
+                    });
+                }
+                entries.push(CanonicalModuleResolutionEntry::resolved(
+                    specifier,
+                    CanonicalResolvedModuleInput::new(
+                        target.id,
+                        CanonicalModuleResolutionMode::Esm,
+                        CanonicalModuleResolutionMode::Esm,
+                    ),
+                ));
+            }
+        }
+        Ok(CanonicalModuleResolutionManifestInput::new(entries))
+    }
+
+    fn require_plain_esm_bundler_source(
+        &self,
+        source: &SourceFile,
+    ) -> Result<(), CanonicalProgramCheckError> {
+        let plain_typescript = ts_path::script_kind_from_path(&source.file_name)
+            == ts_path::ScriptKind::Ts
+            && !ts_path::is_declaration_file(&source.file_name)
+            && Path::new(&source.file_name)
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("ts"));
+        let esm_emit = matches!(
+            self.options.module,
+            ModuleKind::Es2015
+                | ModuleKind::Es2020
+                | ModuleKind::Es2022
+                | ModuleKind::EsNext
+                | ModuleKind::Preserve
+        );
+        if plain_typescript
+            && esm_emit
+            && self.options.module_resolution == ModuleResolutionKind::Bundler
+        {
+            return Ok(());
+        }
+        Err(
+            CanonicalProgramCheckError::PlainEsmModuleResolutionUnsupported {
+                file_name: source.file_name.clone(),
+                module: self.options.module,
+                module_resolution: self.options.module_resolution,
+            },
+        )
+    }
+
     #[allow(clippy::too_many_lines)]
     fn check_program_canonical(
         &self,
@@ -2769,8 +2924,14 @@ impl Program {
             no_error_truncation: false,
             name_resolution: (&self.options).into(),
         };
-        let mut context = CanonicalCheckerContext::new(binder.finish(), ordered_arenas, options)
-            .map_err(CanonicalProgramCheckError::Context)?;
+        let module_resolutions = self.canonical_module_resolution_manifest()?;
+        let mut context = CanonicalCheckerContext::new_with_module_resolutions(
+            binder.finish(),
+            ordered_arenas,
+            options,
+            module_resolutions,
+        )
+        .map_err(CanonicalProgramCheckError::Context)?;
 
         for (file, file_name, is_declaration_file) in check_files {
             if is_declaration_file {
@@ -6088,6 +6249,79 @@ fn percent_encode_source_map_url(url: &str) -> String {
     encoded
 }
 
+fn canonical_static_esm_module_specifiers(
+    source: &SourceFile,
+) -> Result<Vec<(NodeRef, String)>, CanonicalProgramCheckError> {
+    let source_ref = NodeRef::new(
+        source.parse.arena.id(),
+        source.id,
+        source.parse.source_file,
+    );
+    let Some(NodeData::SourceFile(file)) = source
+        .parse
+        .arena
+        .get(source.parse.source_file)
+        .map(|node| &node.data)
+    else {
+        return Err(CanonicalProgramCheckError::InvalidModuleSourceFile(
+            source_ref,
+        ));
+    };
+    let mut specifiers = Vec::new();
+    for statement in &file.statements.nodes {
+        let Some(node) = source.parse.arena.get(*statement) else {
+            return Err(CanonicalProgramCheckError::InvalidModuleSourceFile(
+                source_ref,
+            ));
+        };
+        let (specifier, has_attributes) = match &node.data {
+            NodeData::ImportDeclaration(import) => {
+                (Some(import.module_specifier), import.attributes.is_some())
+            }
+            NodeData::ExportDeclaration(export) => {
+                (export.module_specifier, export.attributes.is_some())
+            }
+            NodeData::ImportEqualsDeclaration(import) => {
+                let Some(NodeData::ExternalModuleReference(reference)) = source
+                    .parse
+                    .arena
+                    .get(import.module_reference)
+                    .map(|node| &node.data)
+                else {
+                    continue;
+                };
+                let specifier = NodeRef::new(
+                    source.parse.arena.id(),
+                    source.id,
+                    reference.expression,
+                );
+                return Err(
+                    CanonicalProgramCheckError::ModuleSpecifierResolutionModeUnsupported(
+                        specifier,
+                    ),
+                );
+            }
+            _ => continue,
+        };
+        let Some(specifier) = specifier else {
+            continue;
+        };
+        let specifier = NodeRef::new(source.parse.arena.id(), source.id, specifier);
+        if has_attributes {
+            return Err(
+                CanonicalProgramCheckError::ModuleSpecifierResolutionModeUnsupported(specifier),
+            );
+        }
+        let Some((text, _)) = string_literal(&source.parse.arena, specifier.node) else {
+            return Err(CanonicalProgramCheckError::InvalidModuleSpecifier(
+                specifier,
+            ));
+        };
+        specifiers.push((specifier, text));
+    }
+    Ok(specifiers)
+}
+
 fn module_specifiers(parse: &ParseResult) -> Vec<(String, TextRange, bool, bool)> {
     let mut specifiers = parse
         .arena
@@ -6542,12 +6776,12 @@ mod tests {
     use ts_checker::semantic::{
         ArrayTypeError, AssignmentInvariant, CanonicalCheckerContextError,
         CanonicalGlobalInitializationError, CanonicalGlobalTypeInitializationError,
-        CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHostError,
-        DeclaredTypeUnavailable, DerivedTypeError, IntrinsicBootstrapOptions, RelationKind,
-        RelationUnavailable, SourceAssertionError, SourceCheckError, SourceCheckProvenanceError,
-        SourceFunctionInvariant, SourceLiteralCacheError, SourceObjectLiteralError,
-        SymbolMergeError, TypeDataKind, TypeDisplayUnavailable, TypeNodeUnavailable,
-        UnsupportedSourceSyntax, VariableInvariant,
+        CanonicalModuleResolutionInput, CanonicalModuleResolutionMode, CanonicalTypeMapperStore,
+        DeclaredTypeError, DeclaredTypeHostError, DeclaredTypeUnavailable, DerivedTypeError,
+        IntrinsicBootstrapOptions, RelationKind, RelationUnavailable, SourceAssertionError,
+        SourceCheckError, SourceCheckProvenanceError, SourceFunctionInvariant,
+        SourceLiteralCacheError, SourceObjectLiteralError, SymbolMergeError, TypeDataKind,
+        TypeDisplayUnavailable, TypeNodeUnavailable, UnsupportedSourceSyntax, VariableInvariant,
     };
     use ts_diagnostics::{Category, Diagnostic, message_by_code};
     use ts_options::{
@@ -6561,6 +6795,17 @@ mod tests {
         canonical_source_file_facts, defer_export_only_bundle_imports, empty_check_result,
         parse_source_file, percent_encode_source_map_url, source_file_is_external_module,
     };
+
+    fn plain_esm_bundler_options() -> CompilerOptions {
+        CompilerOptions {
+            module: ModuleKind::EsNext,
+            module_specified: true,
+            module_resolution: ModuleResolutionKind::Bundler,
+            no_check: true,
+            no_lib: true,
+            ..CompilerOptions::default()
+        }
+    }
 
     #[test]
     fn parses_and_indexes_explicit_roots() {
@@ -6594,6 +6839,16 @@ mod tests {
             CanonicalProgramCheckError::UnsupportedSourceKind {
                 file_name: "/project/input.tsx".to_owned(),
                 script_kind: ts_path::ScriptKind::Tsx,
+            },
+            CanonicalProgramCheckError::PlainEsmModuleResolutionUnsupported {
+                file_name: "/project/input.ts".to_owned(),
+                module: ModuleKind::CommonJs,
+                module_resolution: ModuleResolutionKind::Bundler,
+            },
+            CanonicalProgramCheckError::ModuleSpecifierResolutionModeUnsupported(node),
+            CanonicalProgramCheckError::ExternalModuleTargetUnsupported {
+                specifier: node,
+                target_file_name: "/project/script.ts".to_owned(),
             },
             CanonicalProgramCheckError::DeclarationBind {
                 file_name: "/project/input.ts".to_owned(),
@@ -6845,6 +7100,13 @@ mod tests {
                 file_name: "/project/input.ts".to_owned(),
                 error: CanonicalBindError::InvalidSourceFile(node),
             },
+            CanonicalProgramCheckError::InvalidModuleSourceFile(node),
+            CanonicalProgramCheckError::InvalidModuleSpecifier(node),
+            CanonicalProgramCheckError::MissingResolvedModuleTarget {
+                containing_file: "/project/input.ts".to_owned(),
+                specifier: node,
+                resolved_file_name: "/project/missing.ts".to_owned(),
+            },
             CanonicalProgramCheckError::InvalidDiagnosticNode(node),
             CanonicalProgramCheckError::InvalidRelatedDiagnosticNode {
                 primary_code: 2451,
@@ -7056,6 +7318,262 @@ mod tests {
             }
             .is_unsupported_boundary()
         }));
+    }
+
+    #[test]
+    fn canonical_module_manifest_preserves_static_node_identity_and_unresolved_results() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file("/project/target.ts", "export const value: number = 1;")
+            .unwrap();
+        fs.write_file(
+            "/project/importer.ts",
+            concat!(
+                "import { value as first } from './target';\n",
+                "import { value as second } from './target';\n",
+                "export { value as third } from './target';\n",
+                "import './missing';\n",
+                "type Deferred = import('./target').value;\n",
+                "const deferred = import('./target');\n",
+            ),
+        )
+        .unwrap();
+        assert!(!fs.file_exists("/project/package.json"));
+
+        let program = Program::new_with_options(
+            &fs,
+            "/project",
+            &["importer.ts".to_owned()],
+            plain_esm_bundler_options(),
+        );
+        let importer = program.source_file("/project/importer.ts").unwrap();
+        let target = program.source_file("/project/target.ts").unwrap();
+        assert!(importer.id.index() < target.id.index(), "importer must load first");
+
+        let manifest = program.canonical_module_resolution_manifest().unwrap();
+        let entries = manifest.entries();
+        assert_eq!(entries.len(), 4);
+        let entry_texts = entries
+            .iter()
+            .map(|entry| match &program.node(entry.specifier()).unwrap().data {
+                NodeData::StringLiteral(literal) => literal.text.as_str(),
+                other => panic!("unexpected module specifier {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            entry_texts,
+            ["./target", "./target", "./target", "./missing"]
+        );
+
+        let resolved_specifiers = entries[..3]
+            .iter()
+            .map(|entry| entry.specifier())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(resolved_specifiers.len(), 3);
+        for entry in &entries[..3] {
+            let CanonicalModuleResolutionInput::Resolved(resolved) = entry.resolution() else {
+                panic!("static target import should resolve");
+            };
+            assert_eq!(resolved.target_file(), target.id);
+            assert_eq!(resolved.usage_mode(), CanonicalModuleResolutionMode::Esm);
+            assert_eq!(resolved.target_mode(), CanonicalModuleResolutionMode::Esm);
+        }
+        assert_eq!(
+            entries[3].resolution(),
+            CanonicalModuleResolutionInput::Unresolved
+        );
+
+        let all_target_literals = importer
+            .parse
+            .arena
+            .iter()
+            .filter(|(_, node)| {
+                matches!(
+                    &node.data,
+                    NodeData::StringLiteral(literal) if literal.text == "./target"
+                )
+            })
+            .count();
+        assert_eq!(all_target_literals, 5);
+    }
+
+    #[test]
+    fn canonical_module_manifest_ignores_detached_arena_declarations() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file("/project/target.ts", "export const value: number = 1;")
+            .unwrap();
+        fs.write_file(
+            "/project/importer.ts",
+            "import { value } from './target';",
+        )
+        .unwrap();
+        let mut program = Program::new_with_options(
+            &fs,
+            "/project",
+            &["importer.ts".to_owned()],
+            plain_esm_bundler_options(),
+        );
+        let importer_index = program
+            .source_file("/project/importer.ts")
+            .unwrap()
+            .id
+            .index();
+        let detached_import = program.source_files[importer_index]
+            .parse
+            .arena
+            .iter()
+            .find_map(|(_, node)| {
+                matches!(&node.data, NodeData::ImportDeclaration(_)).then(|| node.clone())
+            })
+            .unwrap();
+        let detached = program.source_files[importer_index]
+            .parse
+            .arena
+            .alloc(detached_import);
+        let source = &program.source_files[importer_index];
+        let NodeData::SourceFile(root) =
+            &source.parse.arena.get(source.parse.source_file).unwrap().data
+        else {
+            panic!("importer root must remain a source file");
+        };
+        assert!(!root.statements.nodes.contains(&detached));
+
+        let manifest = program.canonical_module_resolution_manifest().unwrap();
+        assert_eq!(manifest.entries().len(), 1);
+        assert!(matches!(
+            manifest.entries()[0].resolution(),
+            CanonicalModuleResolutionInput::Resolved(_)
+        ));
+    }
+
+    #[test]
+    fn canonical_module_manifest_rejects_non_bundler_or_non_esm_configuration() {
+        for (module, module_resolution) in [
+            (ModuleKind::CommonJs, ModuleResolutionKind::Bundler),
+            (ModuleKind::EsNext, ModuleResolutionKind::Node10),
+        ] {
+            let fs = MemoryFileSystem::new(true);
+            fs.write_file("/project/target.ts", "export const value: number = 1;")
+                .unwrap();
+            fs.write_file(
+                "/project/importer.ts",
+                "import { value } from './target';",
+            )
+            .unwrap();
+            let mut options = plain_esm_bundler_options();
+            options.module = module;
+            options.module_resolution = module_resolution;
+            let program = Program::new_with_options(
+                &fs,
+                "/project",
+                &["importer.ts".to_owned()],
+                options,
+            );
+
+            let error = program
+                .canonical_module_resolution_manifest()
+                .unwrap_err();
+            assert!(error.is_unsupported_boundary());
+            assert!(matches!(
+                error,
+                CanonicalProgramCheckError::PlainEsmModuleResolutionUnsupported {
+                    file_name,
+                    module: actual_module,
+                    module_resolution: actual_resolution,
+                } if file_name == "/project/importer.ts"
+                    && actual_module == module
+                    && actual_resolution == module_resolution
+            ));
+        }
+    }
+
+    #[test]
+    fn canonical_module_manifest_rejects_ambiguous_static_resolution_modes() {
+        for importer_text in [
+            "import value = require('./target');",
+            "import { value } from './target' with { type: 'json' };",
+        ] {
+            let fs = MemoryFileSystem::new(true);
+            fs.write_file("/project/target.ts", "export const value: number = 1;")
+                .unwrap();
+            fs.write_file("/project/importer.ts", importer_text)
+                .unwrap();
+            let program = Program::new_with_options(
+                &fs,
+                "/project",
+                &["importer.ts".to_owned()],
+                plain_esm_bundler_options(),
+            );
+
+            let error = program
+                .canonical_module_resolution_manifest()
+                .unwrap_err();
+            assert!(error.is_unsupported_boundary());
+            assert!(matches!(
+                error,
+                CanonicalProgramCheckError::ModuleSpecifierResolutionModeUnsupported(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn canonical_module_manifest_rejects_declaration_targets_until_mode_is_proven() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/project/target.d.ts",
+            "export declare const value: number;",
+        )
+        .unwrap();
+        fs.write_file(
+            "/project/importer.ts",
+            "import { value } from './target';",
+        )
+        .unwrap();
+        let program = Program::new_with_options(
+            &fs,
+            "/project",
+            &["importer.ts".to_owned()],
+            plain_esm_bundler_options(),
+        );
+
+        let error = program
+            .canonical_module_resolution_manifest()
+            .unwrap_err();
+        assert!(error.is_unsupported_boundary());
+        assert!(matches!(
+            error,
+            CanonicalProgramCheckError::PlainEsmModuleResolutionUnsupported { file_name, .. }
+                if file_name == "/project/target.d.ts"
+        ));
+    }
+
+    #[test]
+    fn canonical_module_manifest_rejects_resolved_script_targets_as_a_typed_boundary() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file("/project/script.ts", "const value: number = 1;")
+            .unwrap();
+        fs.write_file(
+            "/project/importer.ts",
+            "import { value } from './script';",
+        )
+        .unwrap();
+        let program = Program::new_with_options(
+            &fs,
+            "/project",
+            &["importer.ts".to_owned()],
+            plain_esm_bundler_options(),
+        );
+
+        let error = program
+            .canonical_module_resolution_manifest()
+            .unwrap_err();
+        assert!(error.is_unsupported_boundary());
+        assert!(matches!(
+            error,
+            CanonicalProgramCheckError::ExternalModuleTargetUnsupported {
+                target_file_name,
+                ..
+            } if target_file_name == "/project/script.ts"
+        ));
     }
 
     #[test]
