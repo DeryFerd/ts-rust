@@ -1,0 +1,1325 @@
+//! Canonical declared and value identities for top-level literal enums.
+//!
+//! This is the dependency-closed prefix of pinned typescript-go's
+//! `getDeclaredTypeOfEnum`, `getDeclaredTypeOfEnumMember`,
+//! `getTypeOfFuncClassEnumModule`, and `computeEnumMemberValues`. It supports
+//! one non-merged top-level enum declaration whose members have identifier
+//! names and numeric/string literal initializers (including parenthesized and
+//! unary `+`/`-` numeric literals). Numeric auto-increment, explicit ambient
+//! behavior, const-enum provenance, regular/fresh member identities, the enum
+//! declared union, and the separate enum value object are published together.
+//!
+//! Source statement dispatch is deliberately not part of this module. Its
+//! integration seam is [`get_enum_semantics`]: a source prepass can call it for
+//! every hoisted enum owner, then use [`CanonicalEnumSemantics::value_type`]
+//! for value reads and each member's fresh identity for property reads.
+//! Merged declarations, computed names, and non-literal initializers remain
+//! typed unsupported boundaries rather than approximate semantic records.
+
+use ts_ast::{NodeData, NodeList, NodeRef, SyntaxKind};
+use ts_binder::{CheckFlags, SemanticSymbolId, SymbolFlags};
+use ts_jsnum::{Number, from_string};
+
+use super::{
+    CanonicalTypeMapperStore, DeclaredTypeHost, TypeId,
+    links::{
+        DeclaredTypeLinks, EnumMemberLinks, EvaluatorResult, EvaluatorValue, NodeCheckFlags,
+        NodeLinks, ValueSymbolLinks,
+    },
+    type_records::{
+        LiteralValue, RegularLiteralLink, StructuredTypeData, TypeCacheState, TypeData,
+        UnionOrIntersectionTypeData, UnionTypeData,
+    },
+    types::{ObjectFlags, TypeFlags},
+};
+
+/// Compile-time value retained for one enum member.
+#[derive(Clone, Debug, PartialEq)]
+pub enum CanonicalEnumMemberValue {
+    Number(Number),
+    String(String),
+    /// Pinned `nil` evaluator result and `TypeFlagsEnum` identity.
+    Computed,
+}
+
+/// Published semantic identities for one enum member.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CanonicalEnumMemberSemantics {
+    pub declaration: NodeRef,
+    pub symbol: SemanticSymbolId,
+    pub regular_type: TypeId,
+    pub fresh_type: TypeId,
+    pub value: CanonicalEnumMemberValue,
+}
+
+/// Complete dependency-closed result for one top-level enum declaration.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CanonicalEnumSemantics {
+    pub declaration: NodeRef,
+    pub symbol: SemanticSymbolId,
+    /// Type-side identity (`E`).
+    pub declared_type: TypeId,
+    /// Value-side anonymous object identity (`typeof E`).
+    pub value_type: TypeId,
+    pub members: Vec<CanonicalEnumMemberSemantics>,
+    pub is_const: bool,
+    pub is_ambient: bool,
+}
+
+/// Syntax families intentionally deferred beyond the literal enum cut.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EnumTypeUnsupported {
+    MergedDeclarations(SemanticSymbolId),
+    NestedDeclaration(NodeRef),
+    Modifiers(NodeRef),
+    MemberName(NodeRef),
+    MemberModifiers(NodeRef),
+    Initializer(NodeRef),
+    MissingInitializer(NodeRef),
+}
+
+/// Malformed retained syntax, binder provenance, or semantic cache state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EnumTypeInvariant {
+    SymbolNotOwned(SemanticSymbolId),
+    MissingOrForeignFacts(NodeRef),
+    InvalidDeclaration(NodeRef),
+    InvalidOwnerSymbol(SemanticSymbolId),
+    InvalidExportRoute(NodeRef),
+    InvalidMember(NodeRef),
+    InvalidMemberSymbol(NodeRef),
+    InvalidCache(SemanticSymbolId),
+    Capacity(SemanticSymbolId),
+}
+
+/// Exact failure domain for canonical enum publication.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EnumTypeError {
+    Unsupported(EnumTypeUnsupported),
+    Invariant(EnumTypeInvariant),
+}
+
+impl std::fmt::Display for EnumTypeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unsupported(reason) => {
+                write!(formatter, "enum syntax is unsupported: {reason:?}")
+            }
+            Self::Invariant(reason) => {
+                write!(formatter, "enum semantic invariant failed: {reason:?}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for EnumTypeError {}
+
+#[derive(Clone, Debug, PartialEq)]
+struct EnumMemberPlan {
+    declaration: NodeRef,
+    symbol: SemanticSymbolId,
+    value: CanonicalEnumMemberValue,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct EnumPlan {
+    declaration: NodeRef,
+    symbol: SemanticSymbolId,
+    members: Vec<EnumMemberPlan>,
+    is_const: bool,
+    is_ambient: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EnumState {
+    Cold,
+    Resolved,
+}
+
+fn unsupported(reason: EnumTypeUnsupported) -> EnumTypeError {
+    EnumTypeError::Unsupported(reason)
+}
+
+fn invariant(reason: EnumTypeInvariant) -> EnumTypeError {
+    EnumTypeError::Invariant(reason)
+}
+
+fn preflight_node<'a>(
+    store: &CanonicalTypeMapperStore,
+    host: &'a DeclaredTypeHost<'_>,
+    node: NodeRef,
+) -> Result<&'a ts_ast::Node, EnumTypeError> {
+    if !store.contains_node_ref(node) {
+        return Err(invariant(EnumTypeInvariant::MissingOrForeignFacts(node)));
+    }
+    host.node(node)
+        .ok_or_else(|| invariant(EnumTypeInvariant::MissingOrForeignFacts(node)))
+}
+
+fn plan_enum(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    symbol: SemanticSymbolId,
+) -> Result<EnumPlan, EnumTypeError> {
+    let symbol = store
+        .get_merged_symbol(symbol)
+        .ok_or_else(|| invariant(EnumTypeInvariant::SymbolNotOwned(symbol)))?;
+    let owner = store
+        .symbol(symbol)
+        .ok_or_else(|| invariant(EnumTypeInvariant::SymbolNotOwned(symbol)))?;
+    if !matches!(owner.declarations(), Some([_])) {
+        return Err(unsupported(EnumTypeUnsupported::MergedDeclarations(symbol)));
+    }
+    let declaration = owner.declarations().expect("one declaration was checked")[0];
+    let record = preflight_node(store, host, declaration)?;
+    let NodeData::EnumDeclaration(enumeration) = &record.data else {
+        return Err(invariant(EnumTypeInvariant::InvalidDeclaration(
+            declaration,
+        )));
+    };
+    if record.kind != SyntaxKind::EnumDeclaration
+        || store.source_node_kind(declaration) != Some(SyntaxKind::EnumDeclaration)
+        || store.source_node_parent(declaration)
+            != Some(super::store::SourceNodeParent::Parent(
+                host.bound_file(declaration)
+                    .ok_or_else(|| {
+                        invariant(EnumTypeInvariant::MissingOrForeignFacts(declaration))
+                    })?
+                    .source_file()
+                    .node,
+            ))
+    {
+        return Err(unsupported(EnumTypeUnsupported::NestedDeclaration(
+            declaration,
+        )));
+    }
+    let name = NodeRef::new(declaration.arena, declaration.file, enumeration.name);
+    let name_record = preflight_node(store, host, name)?;
+    let NodeData::Identifier(identifier) = &name_record.data else {
+        return Err(invariant(EnumTypeInvariant::InvalidDeclaration(
+            declaration,
+        )));
+    };
+    let (is_const, has_declare_modifier, is_exported) = validate_modifiers(
+        store,
+        host,
+        declaration,
+        enumeration
+            .modifiers
+            .as_ref()
+            .map(|modifiers| &modifiers.list),
+    )?;
+    let expected_flags = if is_const {
+        SymbolFlags::CONST_ENUM
+    } else {
+        SymbolFlags::REGULAR_ENUM
+    };
+    let bound = host
+        .bound_file(declaration)
+        .ok_or_else(|| invariant(EnumTypeInvariant::MissingOrForeignFacts(declaration)))?;
+    let is_ambient = has_declare_modifier
+        || bound
+            .source_facts()
+            .is_some_and(ts_binder::CanonicalSourceFileFacts::is_declaration_file);
+    let bound_owner = bound
+        .symbol(declaration)
+        .and_then(|candidate| store.get_merged_symbol(candidate));
+    if name_record.kind != SyntaxKind::Identifier
+        || name_record.parent != Some(declaration.node)
+        || owner.flags() != expected_flags
+        || owner.check_flags() != CheckFlags::NONE
+        || owner.name().as_bytes() != identifier.text.as_bytes()
+        || owner.value_declaration() != Some(declaration)
+        || owner.exports().is_some()
+        || owner.export_symbol().is_some()
+        || bound_owner != Some(symbol)
+    {
+        return Err(invariant(EnumTypeInvariant::InvalidOwnerSymbol(symbol)));
+    }
+    validate_export_route(
+        store,
+        declaration,
+        symbol,
+        is_exported,
+        bound.local_symbol(declaration),
+        bound.symbol(bound.source_file()),
+    )?;
+
+    let member_table = owner
+        .members()
+        .and_then(|members| store.symbol_table(members))
+        .ok_or_else(|| invariant(EnumTypeInvariant::InvalidOwnerSymbol(symbol)))?;
+    if member_table.len() != enumeration.members.nodes.len() {
+        return Err(invariant(EnumTypeInvariant::InvalidOwnerSymbol(symbol)));
+    }
+    let mut members = Vec::with_capacity(enumeration.members.nodes.len());
+    let mut next_numeric = Some(Number::new(0.0));
+    for member_id in &enumeration.members.nodes {
+        let member = NodeRef::new(declaration.arena, declaration.file, *member_id);
+        let member_record = preflight_node(store, host, member)?;
+        let NodeData::EnumMember(member_data) = &member_record.data else {
+            return Err(invariant(EnumTypeInvariant::InvalidMember(member)));
+        };
+        if member_record.kind != SyntaxKind::EnumMember
+            || member_record.parent != Some(declaration.node)
+            || member_data.postfix_token.is_some()
+        {
+            return Err(invariant(EnumTypeInvariant::InvalidMember(member)));
+        }
+        if member_data.modifiers.is_some() {
+            return Err(unsupported(EnumTypeUnsupported::MemberModifiers(member)));
+        }
+        let member_name = NodeRef::new(member.arena, member.file, member_data.name);
+        let member_name_record = preflight_node(store, host, member_name)?;
+        let NodeData::Identifier(member_identifier) = &member_name_record.data else {
+            return Err(unsupported(EnumTypeUnsupported::MemberName(member_name)));
+        };
+        if member_name_record.kind != SyntaxKind::Identifier
+            || member_name_record.parent != Some(member.node)
+        {
+            return Err(invariant(EnumTypeInvariant::InvalidMember(member)));
+        }
+        let member_symbol = bound
+            .symbol(member)
+            .and_then(|candidate| store.get_merged_symbol(candidate))
+            .ok_or_else(|| invariant(EnumTypeInvariant::InvalidMemberSymbol(member)))?;
+        let member_symbol_record = store
+            .symbol(member_symbol)
+            .ok_or_else(|| invariant(EnumTypeInvariant::InvalidMemberSymbol(member)))?;
+        if member_table.get_source(&member_identifier.text) != Some(member_symbol)
+            || member_symbol_record.flags() != SymbolFlags::ENUM_MEMBER
+            || member_symbol_record.check_flags() != CheckFlags::NONE
+            || member_symbol_record.name().as_bytes() != member_identifier.text.as_bytes()
+            || member_symbol_record.declarations() != Some(&[member])
+            || member_symbol_record.value_declaration() != Some(member)
+            || member_symbol_record.members().is_some()
+            || member_symbol_record.exports().is_some()
+            || member_symbol_record.parent() != Some(symbol)
+            || member_symbol_record.export_symbol().is_some()
+        {
+            return Err(invariant(EnumTypeInvariant::InvalidMemberSymbol(member)));
+        }
+        let value = match member_data.initializer {
+            Some(initializer) => {
+                let initializer = NodeRef::new(member.arena, member.file, initializer);
+                let value = literal_initializer(store, host, member, initializer)?;
+                next_numeric = match &value {
+                    CanonicalEnumMemberValue::Number(value) => Some(*value + Number::new(1.0)),
+                    CanonicalEnumMemberValue::String(_) | CanonicalEnumMemberValue::Computed => {
+                        None
+                    }
+                };
+                value
+            }
+            None if is_ambient && !is_const => {
+                next_numeric = None;
+                CanonicalEnumMemberValue::Computed
+            }
+            None => {
+                let value = next_numeric.ok_or_else(|| {
+                    unsupported(EnumTypeUnsupported::MissingInitializer(member_name))
+                })?;
+                next_numeric = Some(value + Number::new(1.0));
+                CanonicalEnumMemberValue::Number(value)
+            }
+        };
+        members.push(EnumMemberPlan {
+            declaration: member,
+            symbol: member_symbol,
+            value,
+        });
+    }
+    let plan = EnumPlan {
+        declaration,
+        symbol,
+        members,
+        is_const,
+        is_ambient,
+    };
+    enum_state(store, &plan)?;
+    Ok(plan)
+}
+
+fn validate_modifiers(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    declaration: NodeRef,
+    modifiers: Option<&NodeList>,
+) -> Result<(bool, bool, bool), EnumTypeError> {
+    let mut is_const = false;
+    let mut is_ambient = false;
+    let mut is_exported = false;
+    let Some(modifiers) = modifiers else {
+        return Ok((false, false, false));
+    };
+    if modifiers.has_trailing_comma || modifiers.nodes.is_empty() {
+        return Err(unsupported(EnumTypeUnsupported::Modifiers(declaration)));
+    }
+    for modifier_id in &modifiers.nodes {
+        let modifier = NodeRef::new(declaration.arena, declaration.file, *modifier_id);
+        let record = preflight_node(store, host, modifier)?;
+        if record.parent != Some(declaration.node) || !matches!(record.data, NodeData::Token(_)) {
+            return Err(invariant(EnumTypeInvariant::InvalidDeclaration(
+                declaration,
+            )));
+        }
+        let slot = match record.kind {
+            SyntaxKind::ConstKeyword => &mut is_const,
+            SyntaxKind::DeclareKeyword => &mut is_ambient,
+            SyntaxKind::ExportKeyword => &mut is_exported,
+            _ => return Err(unsupported(EnumTypeUnsupported::Modifiers(modifier))),
+        };
+        if *slot {
+            return Err(unsupported(EnumTypeUnsupported::Modifiers(modifier)));
+        }
+        *slot = true;
+    }
+    Ok((is_const, is_ambient, is_exported))
+}
+
+fn validate_export_route(
+    store: &CanonicalTypeMapperStore,
+    declaration: NodeRef,
+    owner: SemanticSymbolId,
+    is_exported: bool,
+    local: Option<SemanticSymbolId>,
+    raw_source_owner: Option<SemanticSymbolId>,
+) -> Result<(), EnumTypeError> {
+    match (is_exported, local) {
+        (false, None)
+            if store
+                .symbol(owner)
+                .is_some_and(|symbol| symbol.parent().is_none()) =>
+        {
+            Ok(())
+        }
+        (true, Some(local)) => {
+            let source_owner = raw_source_owner
+                .and_then(|source| store.get_merged_symbol(source))
+                .ok_or_else(|| invariant(EnumTypeInvariant::InvalidExportRoute(declaration)))?;
+            let owner_record = store
+                .symbol(owner)
+                .ok_or_else(|| invariant(EnumTypeInvariant::InvalidExportRoute(declaration)))?;
+            let local_record = store
+                .symbol(local)
+                .ok_or_else(|| invariant(EnumTypeInvariant::InvalidExportRoute(declaration)))?;
+            if owner_record.parent() == Some(source_owner)
+                && local_record.flags() == SymbolFlags::EXPORT_VALUE
+                && local_record.check_flags() == CheckFlags::NONE
+                && local_record.name() == owner_record.name()
+                && local_record.declarations() == Some(&[declaration])
+                && local_record.value_declaration().is_none()
+                && local_record.members().is_none()
+                && local_record.exports().is_none()
+                && local_record.parent().is_none()
+                && local_record.export_symbol() == Some(owner)
+            {
+                Ok(())
+            } else {
+                Err(invariant(EnumTypeInvariant::InvalidExportRoute(
+                    declaration,
+                )))
+            }
+        }
+        _ => Err(invariant(EnumTypeInvariant::InvalidExportRoute(
+            declaration,
+        ))),
+    }
+}
+
+fn literal_initializer(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    member: NodeRef,
+    initializer: NodeRef,
+) -> Result<CanonicalEnumMemberValue, EnumTypeError> {
+    if preflight_node(store, host, initializer)?.parent != Some(member.node) {
+        return Err(invariant(EnumTypeInvariant::InvalidMember(member)));
+    }
+    literal_expression(store, host, initializer)
+        .ok_or_else(|| unsupported(EnumTypeUnsupported::Initializer(initializer)))
+}
+
+fn literal_expression(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    expression: NodeRef,
+) -> Option<CanonicalEnumMemberValue> {
+    let record = preflight_node(store, host, expression).ok()?;
+    match &record.data {
+        NodeData::NumericLiteral(literal) if record.kind == SyntaxKind::NumericLiteral => {
+            let value = from_string(&literal.text);
+            (!value.is_nan()).then_some(CanonicalEnumMemberValue::Number(value))
+        }
+        NodeData::StringLiteral(literal) if record.kind == SyntaxKind::StringLiteral => {
+            Some(CanonicalEnumMemberValue::String(literal.text.clone()))
+        }
+        NodeData::NoSubstitutionTemplateLiteral(literal)
+            if record.kind == SyntaxKind::NoSubstitutionTemplateLiteral =>
+        {
+            Some(CanonicalEnumMemberValue::String(literal.text.clone()))
+        }
+        NodeData::ParenthesizedExpression(parenthesized)
+            if record.kind == SyntaxKind::ParenthesizedExpression =>
+        {
+            let inner = NodeRef::new(expression.arena, expression.file, parenthesized.expression);
+            (preflight_node(store, host, inner).ok()?.parent == Some(expression.node))
+                .then(|| literal_expression(store, host, inner))?
+        }
+        NodeData::PrefixUnaryExpression(prefix)
+            if record.kind == SyntaxKind::PrefixUnaryExpression
+                && matches!(
+                    prefix.operator,
+                    SyntaxKind::PlusToken | SyntaxKind::MinusToken
+                ) =>
+        {
+            let operand = NodeRef::new(expression.arena, expression.file, prefix.operand);
+            if preflight_node(store, host, operand).ok()?.parent != Some(expression.node) {
+                return None;
+            }
+            let CanonicalEnumMemberValue::Number(value) = literal_expression(store, host, operand)?
+            else {
+                return None;
+            };
+            Some(CanonicalEnumMemberValue::Number(
+                if prefix.operator == SyntaxKind::MinusToken {
+                    -value
+                } else {
+                    value
+                },
+            ))
+        }
+        _ => None,
+    }
+}
+
+fn enum_state(
+    store: &CanonicalTypeMapperStore,
+    plan: &EnumPlan,
+) -> Result<EnumState, EnumTypeError> {
+    let owner_declared = store.declared_type_links(plan.symbol);
+    let owner_value = store.value_symbol_links(plan.symbol);
+    let node_links = store.node_links(plan.declaration);
+    let members_are_cold = plan.members.iter().all(|member| {
+        store
+            .declared_type_links(member.symbol)
+            .is_none_or(|links| links == &DeclaredTypeLinks::default())
+            && store
+                .value_symbol_links(member.symbol)
+                .is_none_or(|links| links == &ValueSymbolLinks::default())
+            && store
+                .enum_member_links(member.declaration)
+                .is_none_or(|links| links == &EnumMemberLinks::default())
+    });
+    let is_cold = owner_declared.is_none_or(|links| {
+        links.declared_type.is_none()
+            && !links.interface_checked
+            && !links.index_signatures_checked
+            && !links.type_parameters_checked
+    }) && owner_value.is_none_or(|links| links == &ValueSymbolLinks::default())
+        && node_links.is_none_or(|links| {
+            !links.flags.contains(NodeCheckFlags::ENUM_VALUES_COMPUTED)
+                && links.declaration_requires_scope_change
+                    == NodeLinks::default().declaration_requires_scope_change
+                && !links.has_reported_statement_in_ambient_context
+        })
+        && members_are_cold;
+    if is_cold {
+        return Ok(EnumState::Cold);
+    }
+    validate_resolved_enum(store, plan).map(|_| EnumState::Resolved)
+}
+
+fn validate_resolved_enum(
+    store: &CanonicalTypeMapperStore,
+    plan: &EnumPlan,
+) -> Result<CanonicalEnumSemantics, EnumTypeError> {
+    let cache_error = || invariant(EnumTypeInvariant::InvalidCache(plan.symbol));
+    let declared_type = store
+        .declared_type_links(plan.symbol)
+        .filter(|links| {
+            !links.interface_checked
+                && !links.index_signatures_checked
+                && !links.type_parameters_checked
+        })
+        .and_then(|links| links.declared_type)
+        .ok_or_else(cache_error)?;
+    let value_type = store
+        .value_symbol_links(plan.symbol)
+        .filter(|links| {
+            **links
+                == ValueSymbolLinks {
+                    resolved_type: links.resolved_type,
+                    ..ValueSymbolLinks::default()
+                }
+        })
+        .and_then(|links| links.resolved_type)
+        .ok_or_else(cache_error)?;
+    validate_value_type(store, plan.symbol, value_type).ok_or_else(cache_error)?;
+    if !store.node_links(plan.declaration).is_some_and(|links| {
+        links.flags.contains(NodeCheckFlags::ENUM_VALUES_COMPUTED)
+            && links.declaration_requires_scope_change
+                == NodeLinks::default().declaration_requires_scope_change
+            && !links.has_reported_statement_in_ambient_context
+    }) {
+        return Err(cache_error());
+    }
+    let mut members = Vec::with_capacity(plan.members.len());
+    for member in &plan.members {
+        let fresh_type = store
+            .declared_type_links(member.symbol)
+            .filter(|links| {
+                **links
+                    == DeclaredTypeLinks {
+                        declared_type: links.declared_type,
+                        ..DeclaredTypeLinks::default()
+                    }
+            })
+            .and_then(|links| links.declared_type)
+            .ok_or_else(cache_error)?;
+        if store.value_symbol_links(member.symbol)
+            != Some(&ValueSymbolLinks {
+                resolved_type: Some(fresh_type),
+                ..ValueSymbolLinks::default()
+            })
+        {
+            return Err(cache_error());
+        }
+        let expected_evaluator = evaluator_result(&member.value);
+        if store.enum_member_links(member.declaration)
+            != Some(&EnumMemberLinks {
+                value: expected_evaluator,
+            })
+        {
+            return Err(cache_error());
+        }
+        let regular_type = validate_literal_pair(store, fresh_type, member.symbol, &member.value)
+            .ok_or_else(cache_error)?;
+        members.push(CanonicalEnumMemberSemantics {
+            declaration: member.declaration,
+            symbol: member.symbol,
+            regular_type,
+            fresh_type,
+            value: member.value.clone(),
+        });
+    }
+    validate_declared_type(store, plan, declared_type, &members).ok_or_else(cache_error)?;
+    Ok(CanonicalEnumSemantics {
+        declaration: plan.declaration,
+        symbol: plan.symbol,
+        declared_type,
+        value_type,
+        members,
+        is_const: plan.is_const,
+        is_ambient: plan.is_ambient,
+    })
+}
+
+fn validate_value_type(
+    store: &CanonicalTypeMapperStore,
+    symbol: SemanticSymbolId,
+    value_type: TypeId,
+) -> Option<()> {
+    let record = store.type_payload(value_type)?;
+    let TypeData::Object(object) = record.data() else {
+        return None;
+    };
+    (record.flags() == TypeFlags::OBJECT
+        && record.object_flags() == ObjectFlags::ANONYMOUS
+        && record.symbol() == Some(symbol)
+        && record.alias().is_none()
+        && object.structured == StructuredTypeData::default()
+        && object.target.is_none()
+        && object.mapper.is_none()
+        && object.instantiations == TypeCacheState::Unallocated)
+        .then_some(())
+}
+
+fn validate_literal_pair(
+    store: &CanonicalTypeMapperStore,
+    fresh: TypeId,
+    symbol: SemanticSymbolId,
+    value: &CanonicalEnumMemberValue,
+) -> Option<TypeId> {
+    let fresh_record = store.type_payload(fresh)?;
+    let TypeData::Literal(fresh_data) = fresh_record.data() else {
+        return None;
+    };
+    let regular = fresh_data.regular_type;
+    let regular_record = store.type_payload(regular)?;
+    let TypeData::Literal(regular_data) = regular_record.data() else {
+        return None;
+    };
+    let (flags, literal) = literal_payload(value);
+    (fresh != regular
+        && fresh_record.flags() == flags
+        && regular_record.flags() == flags
+        && fresh_record.object_flags() == ObjectFlags::NONE
+        && regular_record.object_flags() == ObjectFlags::NONE
+        && fresh_record.symbol() == Some(symbol)
+        && regular_record.symbol() == Some(symbol)
+        && fresh_record.alias().is_none()
+        && regular_record.alias().is_none()
+        && fresh_data.value == literal
+        && regular_data.value == literal
+        && fresh_data.fresh_type == Some(fresh)
+        && regular_data.fresh_type == Some(fresh)
+        && regular_data.regular_type == regular)
+        .then_some(regular)
+}
+
+fn validate_declared_type(
+    store: &CanonicalTypeMapperStore,
+    plan: &EnumPlan,
+    declared_type: TypeId,
+    members: &[CanonicalEnumMemberSemantics],
+) -> Option<()> {
+    match members {
+        [] => {
+            let record = store.type_payload(declared_type)?;
+            let TypeData::Literal(data) = record.data() else {
+                return None;
+            };
+            let fresh = data.fresh_type?;
+            (validate_literal_pair(
+                store,
+                fresh,
+                plan.symbol,
+                &CanonicalEnumMemberValue::Computed,
+            )? == declared_type)
+                .then_some(())
+        }
+        [member] => (declared_type == member.regular_type).then_some(()),
+        _ => {
+            let record = store.type_payload(declared_type)?;
+            let TypeData::Union(union) = record.data() else {
+                return None;
+            };
+            let expected_types = members
+                .iter()
+                .map(|member| member.regular_type)
+                .collect::<Vec<_>>();
+            let alias = record.alias().and_then(|alias| store.type_alias(alias))?;
+            (record.flags() == TypeFlags::UNION | TypeFlags::ENUM_LITERAL
+                && record.object_flags() == ObjectFlags::PRIMITIVE_UNION
+                && record.symbol() == Some(plan.symbol)
+                && alias.symbol() == Some(plan.symbol)
+                && alias.type_arguments().is_none()
+                && union
+                    == &UnionTypeData {
+                        union: UnionOrIntersectionTypeData {
+                            types: expected_types,
+                            ..UnionOrIntersectionTypeData::default()
+                        },
+                        ..UnionTypeData::default()
+                    })
+                .then_some(())
+        }
+    }
+}
+
+fn literal_payload(value: &CanonicalEnumMemberValue) -> (TypeFlags, LiteralValue) {
+    match value {
+        CanonicalEnumMemberValue::Number(value) => (
+            TypeFlags::NUMBER_LITERAL | TypeFlags::ENUM_LITERAL,
+            LiteralValue::Number(*value),
+        ),
+        CanonicalEnumMemberValue::String(value) => (
+            TypeFlags::STRING_LITERAL | TypeFlags::ENUM_LITERAL,
+            LiteralValue::String(value.clone()),
+        ),
+        CanonicalEnumMemberValue::Computed => (TypeFlags::ENUM, LiteralValue::ComputedEnum),
+    }
+}
+
+fn evaluator_result(value: &CanonicalEnumMemberValue) -> EvaluatorResult {
+    EvaluatorResult {
+        value: match value {
+            CanonicalEnumMemberValue::Number(value) => Some(EvaluatorValue::Number(*value)),
+            CanonicalEnumMemberValue::String(value) => Some(EvaluatorValue::String(value.clone())),
+            CanonicalEnumMemberValue::Computed => None,
+        },
+        is_syntactically_string: matches!(value, CanonicalEnumMemberValue::String(_)),
+        resolved_other_files: false,
+        has_external_references: false,
+    }
+}
+
+fn alloc_literal_pair(
+    store: &mut CanonicalTypeMapperStore,
+    symbol: SemanticSymbolId,
+    value: &CanonicalEnumMemberValue,
+) -> (TypeId, TypeId) {
+    let (flags, literal) = literal_payload(value);
+    let regular = store
+        .alloc_literal_type(flags, literal.clone(), RegularLiteralLink::SelfType)
+        .expect("reserved enum regular literal capacity and validated its flags");
+    let fresh = store
+        .alloc_literal_type(flags, literal, RegularLiteralLink::Type(regular))
+        .expect("reserved enum fresh literal capacity and validated its regular type");
+    assert!(store.set_literal_links(regular, Some(fresh), regular));
+    assert!(store.set_literal_links(fresh, Some(fresh), regular));
+    assert!(store.set_type_symbol(regular, Some(symbol)));
+    assert!(store.set_type_symbol(fresh, Some(symbol)));
+    (regular, fresh)
+}
+
+fn publish_enum(
+    store: &mut CanonicalTypeMapperStore,
+    plan: &EnumPlan,
+) -> Result<CanonicalEnumSemantics, EnumTypeError> {
+    let member_type_count = plan
+        .members
+        .len()
+        .checked_mul(2)
+        .ok_or_else(|| invariant(EnumTypeInvariant::Capacity(plan.symbol)))?;
+    let declared_type_count =
+        usize::from(plan.members.is_empty()) * 2 + usize::from(plan.members.len() >= 2);
+    let type_count = member_type_count
+        .checked_add(declared_type_count)
+        .and_then(|count| count.checked_add(1))
+        .ok_or_else(|| invariant(EnumTypeInvariant::Capacity(plan.symbol)))?;
+    let alias_count = usize::from(plan.members.len() >= 2);
+    if !store.try_reserve_types(type_count) || !store.try_reserve_type_aliases(alias_count) {
+        return Err(invariant(EnumTypeInvariant::Capacity(plan.symbol)));
+    }
+
+    let mut members = Vec::with_capacity(plan.members.len());
+    for member in &plan.members {
+        let (regular_type, fresh_type) = alloc_literal_pair(store, member.symbol, &member.value);
+        members.push(CanonicalEnumMemberSemantics {
+            declaration: member.declaration,
+            symbol: member.symbol,
+            regular_type,
+            fresh_type,
+            value: member.value.clone(),
+        });
+    }
+    let declared_type = match members.as_slice() {
+        [] => alloc_literal_pair(store, plan.symbol, &CanonicalEnumMemberValue::Computed).0,
+        [member] => member.regular_type,
+        _ => {
+            let types = members
+                .iter()
+                .map(|member| member.regular_type)
+                .collect::<Vec<_>>();
+            let union = store
+                .alloc_union_type(ObjectFlags::PRIMITIVE_UNION, types)
+                .expect("reserved enum union capacity and validated member identities");
+            assert!(store.add_type_flags(union, TypeFlags::ENUM_LITERAL));
+            assert!(store.set_type_symbol(union, Some(plan.symbol)));
+            let alias = store
+                .alloc_type_alias(Some(plan.symbol))
+                .expect("reserved enum alias capacity and validated its symbol");
+            assert!(store.set_type_alias(union, Some(alias)));
+            union
+        }
+    };
+    let value_type = store
+        .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(plan.symbol))
+        .expect("reserved enum value-object capacity and validated its symbol");
+
+    let mut owner_declared_links = store
+        .declared_type_links(plan.symbol)
+        .cloned()
+        .unwrap_or_default();
+    owner_declared_links.declared_type = Some(declared_type);
+    assert!(store.set_declared_type_links(plan.symbol, owner_declared_links));
+    assert!(store.set_value_symbol_links(
+        plan.symbol,
+        ValueSymbolLinks {
+            resolved_type: Some(value_type),
+            ..ValueSymbolLinks::default()
+        }
+    ));
+    let mut node_links = store
+        .node_links(plan.declaration)
+        .cloned()
+        .unwrap_or_default();
+    node_links.flags |= NodeCheckFlags::ENUM_VALUES_COMPUTED;
+    assert!(store.set_node_links(plan.declaration, node_links));
+    for member in &members {
+        assert!(store.set_declared_type_links(
+            member.symbol,
+            DeclaredTypeLinks {
+                declared_type: Some(member.fresh_type),
+                ..DeclaredTypeLinks::default()
+            }
+        ));
+        assert!(store.set_value_symbol_links(
+            member.symbol,
+            ValueSymbolLinks {
+                resolved_type: Some(member.fresh_type),
+                ..ValueSymbolLinks::default()
+            }
+        ));
+        assert!(store.set_enum_member_links(
+            member.declaration,
+            EnumMemberLinks {
+                value: evaluator_result(&member.value),
+            }
+        ));
+    }
+    validate_resolved_enum(store, plan)
+}
+
+/// Plans, publishes, or validates one exact top-level literal enum.
+///
+/// The complete syntax/binder plan and cold/warm cache state are validated
+/// before the first write. Unsupported and poisoned-cache errors are therefore
+/// mutation-free. All fallible arena reservations precede publication.
+pub(super) fn get_enum_semantics(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    symbol: SemanticSymbolId,
+) -> Result<CanonicalEnumSemantics, EnumTypeError> {
+    let plan = plan_enum(store, host, symbol)?;
+    match enum_state(store, &plan)? {
+        EnumState::Cold => publish_enum(store, &plan),
+        EnumState::Resolved => validate_resolved_enum(store, &plan),
+    }
+}
+
+/// Declared-type dispatch seam for both enum owners and enum members.
+pub(super) fn get_declared_enum_or_member(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    symbol: SemanticSymbolId,
+) -> Result<Option<TypeId>, EnumTypeError> {
+    let symbol = store
+        .get_merged_symbol(symbol)
+        .ok_or_else(|| invariant(EnumTypeInvariant::SymbolNotOwned(symbol)))?;
+    let record = store
+        .symbol(symbol)
+        .ok_or_else(|| invariant(EnumTypeInvariant::SymbolNotOwned(symbol)))?;
+    if record.flags().intersects(SymbolFlags::ENUM) {
+        return get_enum_semantics(store, host, symbol).map(|result| Some(result.declared_type));
+    }
+    if record.flags().contains(SymbolFlags::ENUM_MEMBER) {
+        let parent = record
+            .parent()
+            .ok_or_else(|| invariant(EnumTypeInvariant::InvalidOwnerSymbol(symbol)))?;
+        let result = get_enum_semantics(store, host, parent)?;
+        return result
+            .members
+            .iter()
+            .find(|member| member.symbol == symbol)
+            .map(|member| Some(member.fresh_type))
+            .ok_or_else(|| invariant(EnumTypeInvariant::InvalidMemberSymbol(result.declaration)));
+    }
+    Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use ts_ast::{FileId, NodeArena, NodeData};
+    use ts_binder::{
+        BoundFile, CanonicalBinder, CanonicalModuleState, CanonicalSourceFileFacts,
+        CanonicalSourceLanguage, EscapedName,
+    };
+    use ts_parser::{ParseResult, parse_source_file};
+
+    use super::*;
+    use crate::semantic::{
+        IntrinsicBootstrapOptions, SemanticStore, mapper::TypeMapper, type_records::TypeRecord,
+    };
+
+    type TestStore = SemanticStore<TypeRecord, TypeMapper>;
+
+    struct Fixture {
+        parsed: ParseResult,
+        file: FileId,
+        files: BTreeMap<FileId, BoundFile>,
+        store: TestStore,
+    }
+
+    fn fixture(source: &str) -> Fixture {
+        fixture_with_module_state(source, CanonicalModuleState::Script)
+    }
+
+    fn fixture_with_module_state(source: &str, module_state: CanonicalModuleState) -> Fixture {
+        fixture_with_facts(source, module_state, false)
+    }
+
+    fn fixture_with_facts(
+        source: &str,
+        module_state: CanonicalModuleState,
+        is_declaration_file: bool,
+    ) -> Fixture {
+        let parsed = parse_source_file(source);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(43);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/enums.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    is_declaration_file,
+                    module_state,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        let (symbols, files) = binder.finish().try_into_parts().unwrap();
+        let mut store = TestStore::from_symbol_store(symbols);
+        assert!(
+            store
+                .register_source_file(&parsed.arena, parsed.source_file, file)
+                .is_some()
+        );
+        store
+            .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions::default())
+            .unwrap();
+        Fixture {
+            parsed,
+            file,
+            files,
+            store,
+        }
+    }
+
+    fn host<'a>(arena: &'a NodeArena, bound: &'a BoundFile) -> DeclaredTypeHost<'a> {
+        DeclaredTypeHost::new([(arena, bound)]).unwrap()
+    }
+
+    fn declaration_name<'a>(arena: &'a NodeArena, node: &ts_ast::Node) -> Option<&'a str> {
+        let name = match &node.data {
+            NodeData::EnumDeclaration(data) => data.name,
+            NodeData::EnumMember(data) => data.name,
+            _ => return None,
+        };
+        let NodeData::Identifier(identifier) = &arena.get(name)?.data else {
+            return None;
+        };
+        Some(&identifier.text)
+    }
+
+    fn named_node(fixture: &Fixture, kind: SyntaxKind, name: &str) -> NodeRef {
+        let node = fixture
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(id, node)| {
+                (node.kind == kind && declaration_name(&fixture.parsed.arena, node) == Some(name))
+                    .then_some(id)
+            })
+            .unwrap();
+        NodeRef::new(fixture.parsed.arena.id(), fixture.file, node)
+    }
+
+    fn symbol(fixture: &Fixture, kind: SyntaxKind, name: &str) -> SemanticSymbolId {
+        fixture.files[&fixture.file]
+            .symbol(named_node(fixture, kind, name))
+            .unwrap()
+    }
+
+    fn member<'a>(
+        result: &'a CanonicalEnumSemantics,
+        fixture: &Fixture,
+        name: &str,
+    ) -> &'a CanonicalEnumMemberSemantics {
+        let symbol = symbol(fixture, SyntaxKind::EnumMember, name);
+        result
+            .members
+            .iter()
+            .find(|member| member.symbol == symbol)
+            .unwrap()
+    }
+
+    #[test]
+    fn literal_enum_publishes_exact_type_value_member_graph_and_is_warm() {
+        let mut fixture =
+            fixture(r#"enum Mixed { Zero, Two = 2, Three, Negative = -1, Word = "word" }"#);
+        let owner = symbol(&fixture, SyntaxKind::EnumDeclaration, "Mixed");
+        let bound = &fixture.files[&fixture.file];
+        let host = host(&fixture.parsed.arena, bound);
+        let type_count = fixture.store.type_len();
+        let alias_count = fixture.store.type_alias_len();
+
+        let first = get_enum_semantics(&mut fixture.store, &host, owner).unwrap();
+        assert_eq!(fixture.store.type_len(), type_count + 12);
+        assert_eq!(fixture.store.type_alias_len(), alias_count + 1);
+        assert!(!first.is_const);
+        assert!(!first.is_ambient);
+        assert_eq!(
+            member(&first, &fixture, "Zero").value,
+            CanonicalEnumMemberValue::Number(Number::new(0.0))
+        );
+        assert_eq!(
+            member(&first, &fixture, "Two").value,
+            CanonicalEnumMemberValue::Number(Number::new(2.0))
+        );
+        assert_eq!(
+            member(&first, &fixture, "Three").value,
+            CanonicalEnumMemberValue::Number(Number::new(3.0))
+        );
+        assert_eq!(
+            member(&first, &fixture, "Negative").value,
+            CanonicalEnumMemberValue::Number(Number::new(-1.0))
+        );
+        assert_eq!(
+            member(&first, &fixture, "Word").value,
+            CanonicalEnumMemberValue::String("word".to_owned())
+        );
+        let declared = fixture.store.type_payload(first.declared_type).unwrap();
+        assert_eq!(declared.flags(), TypeFlags::UNION | TypeFlags::ENUM_LITERAL);
+        assert_eq!(declared.symbol(), Some(owner));
+        let value = fixture.store.type_payload(first.value_type).unwrap();
+        assert_eq!(value.flags(), TypeFlags::OBJECT);
+        assert_eq!(value.object_flags(), ObjectFlags::ANONYMOUS);
+        assert_eq!(value.symbol(), Some(owner));
+        for member in &first.members {
+            assert_ne!(member.regular_type, member.fresh_type);
+            assert_eq!(
+                fixture
+                    .store
+                    .type_payload(member.regular_type)
+                    .unwrap()
+                    .symbol(),
+                Some(member.symbol)
+            );
+            assert_eq!(
+                fixture
+                    .store
+                    .type_payload(member.fresh_type)
+                    .unwrap()
+                    .symbol(),
+                Some(member.symbol)
+            );
+            assert_eq!(
+                fixture
+                    .store
+                    .is_type_assignable_to(member.fresh_type, first.declared_type),
+                Ok(true)
+            );
+        }
+        let state = (
+            fixture.store.type_len(),
+            fixture.store.type_alias_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+        let mut checked_links = fixture.store.declared_type_links(owner).cloned().unwrap();
+        checked_links.enum_checked = true;
+        assert!(fixture.store.set_declared_type_links(owner, checked_links));
+        let second = get_enum_semantics(&mut fixture.store, &host, owner).unwrap();
+        assert_eq!(second, first);
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.type_alias_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            state
+        );
+        let three = member(&first, &fixture, "Three");
+        assert_eq!(
+            get_declared_enum_or_member(&mut fixture.store, &host, three.symbol),
+            Ok(Some(three.fresh_type))
+        );
+    }
+
+    #[test]
+    fn const_and_ambient_flags_control_uninitialized_member_values_exactly() {
+        let mut fixture = fixture_with_module_state(
+            r#"
+                export declare const enum Flags { A, B = "b" }
+                export declare enum Ambient { X, Y = 4, Z }
+                export declare enum Empty {}
+            "#,
+            CanonicalModuleState::External,
+        );
+        for (name, is_const) in [("Flags", true), ("Ambient", false)] {
+            let owner = symbol(&fixture, SyntaxKind::EnumDeclaration, name);
+            let bound = &fixture.files[&fixture.file];
+            let host = host(&fixture.parsed.arena, bound);
+            let result = get_enum_semantics(&mut fixture.store, &host, owner).unwrap();
+            assert_eq!(result.is_const, is_const);
+            assert!(result.is_ambient);
+        }
+        let flags_owner = symbol(&fixture, SyntaxKind::EnumDeclaration, "Flags");
+        let ambient_owner = symbol(&fixture, SyntaxKind::EnumDeclaration, "Ambient");
+        let empty_owner = symbol(&fixture, SyntaxKind::EnumDeclaration, "Empty");
+        let bound = &fixture.files[&fixture.file];
+        let host = host(&fixture.parsed.arena, bound);
+        let flags = get_enum_semantics(&mut fixture.store, &host, flags_owner).unwrap();
+        let ambient = get_enum_semantics(&mut fixture.store, &host, ambient_owner).unwrap();
+        let empty = get_enum_semantics(&mut fixture.store, &host, empty_owner).unwrap();
+        assert_eq!(
+            member(&flags, &fixture, "A").value,
+            CanonicalEnumMemberValue::Number(Number::new(0.0))
+        );
+        assert_eq!(
+            member(&flags, &fixture, "B").value,
+            CanonicalEnumMemberValue::String("b".to_owned())
+        );
+        for name in ["X", "Z"] {
+            let member = member(&ambient, &fixture, name);
+            assert_eq!(member.value, CanonicalEnumMemberValue::Computed);
+            assert_eq!(
+                fixture
+                    .store
+                    .type_payload(member.regular_type)
+                    .unwrap()
+                    .flags(),
+                TypeFlags::ENUM
+            );
+            assert_eq!(
+                fixture
+                    .store
+                    .enum_member_links(member.declaration)
+                    .unwrap()
+                    .value
+                    .value,
+                None
+            );
+        }
+        assert_eq!(
+            member(&ambient, &fixture, "Y").value,
+            CanonicalEnumMemberValue::Number(Number::new(4.0))
+        );
+        assert!(empty.members.is_empty());
+        let empty_record = fixture.store.type_payload(empty.declared_type).unwrap();
+        assert_eq!(empty_record.flags(), TypeFlags::ENUM);
+        assert_eq!(empty_record.symbol(), Some(empty_owner));
+    }
+
+    #[test]
+    fn declaration_file_enum_is_implicitly_ambient() {
+        let mut fixture = fixture_with_facts(
+            "enum Ambient { First, Second = 2 }",
+            CanonicalModuleState::External,
+            true,
+        );
+        let owner = symbol(&fixture, SyntaxKind::EnumDeclaration, "Ambient");
+        let bound = &fixture.files[&fixture.file];
+        let host = host(&fixture.parsed.arena, bound);
+        let result = get_enum_semantics(&mut fixture.store, &host, owner).unwrap();
+        assert!(result.is_ambient);
+        assert_eq!(
+            member(&result, &fixture, "First").value,
+            CanonicalEnumMemberValue::Computed
+        );
+        assert_eq!(
+            member(&result, &fixture, "Second").value,
+            CanonicalEnumMemberValue::Number(Number::new(2.0))
+        );
+    }
+
+    #[test]
+    fn unsupported_and_poisoned_enum_queries_are_atomic() {
+        let mut fixture = fixture(
+            r#"
+                enum Broken { A = "a", B }
+                enum Computed { A = runtime }
+                enum Good { A }
+            "#,
+        );
+        let broken = symbol(&fixture, SyntaxKind::EnumDeclaration, "Broken");
+        let computed = symbol(&fixture, SyntaxKind::EnumDeclaration, "Computed");
+        let good = symbol(&fixture, SyntaxKind::EnumDeclaration, "Good");
+        let bound = &fixture.files[&fixture.file];
+        let host = host(&fixture.parsed.arena, bound);
+        let initial = (
+            fixture.store.type_len(),
+            fixture.store.type_alias_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+        assert!(matches!(
+            get_enum_semantics(&mut fixture.store, &host, broken),
+            Err(EnumTypeError::Unsupported(
+                EnumTypeUnsupported::MissingInitializer(_)
+            ))
+        ));
+        assert!(matches!(
+            get_enum_semantics(&mut fixture.store, &host, computed),
+            Err(EnumTypeError::Unsupported(
+                EnumTypeUnsupported::Initializer(_)
+            ))
+        ));
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.type_alias_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            initial
+        );
+
+        let published = get_enum_semantics(&mut fixture.store, &host, good).unwrap();
+        let owner_links = fixture.store.value_symbol_links(good).cloned().unwrap();
+        let member = &published.members[0];
+        assert!(fixture.store.set_value_symbol_links(
+            member.symbol,
+            ValueSymbolLinks {
+                resolved_type: Some(published.value_type),
+                ..ValueSymbolLinks::default()
+            }
+        ));
+        let poisoned = (
+            fixture.store.type_len(),
+            fixture.store.type_alias_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+        assert_eq!(
+            get_enum_semantics(&mut fixture.store, &host, good),
+            Err(EnumTypeError::Invariant(EnumTypeInvariant::InvalidCache(
+                good
+            )))
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.type_alias_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            poisoned
+        );
+        assert!(fixture.store.set_value_symbol_links(
+            member.symbol,
+            ValueSymbolLinks {
+                resolved_type: Some(member.fresh_type),
+                ..ValueSymbolLinks::default()
+            }
+        ));
+        assert_eq!(
+            get_enum_semantics(&mut fixture.store, &host, good),
+            Ok(published)
+        );
+        assert_eq!(fixture.store.value_symbol_links(good), Some(&owner_links));
+    }
+
+    #[test]
+    fn enum_merges_stay_an_explicit_atomic_boundary() {
+        let mut fixture = fixture("enum Merged { A } enum Merged { B }");
+        let owner = symbol(&fixture, SyntaxKind::EnumDeclaration, "Merged");
+        let bound = &fixture.files[&fixture.file];
+        let host = host(&fixture.parsed.arena, bound);
+        let state = (
+            fixture.store.type_len(),
+            fixture.store.type_alias_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+        assert_eq!(
+            get_enum_semantics(&mut fixture.store, &host, owner),
+            Err(EnumTypeError::Unsupported(
+                EnumTypeUnsupported::MergedDeclarations(owner)
+            ))
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.type_alias_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            state
+        );
+    }
+}
