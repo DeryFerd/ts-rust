@@ -790,16 +790,27 @@ enum SourceCallResolutionError {
     Invariant,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct SourceCallResolutionRequest<'a> {
+    callee_form: SourceCallCalleeForm,
+    callee_type: TypeId,
+    argument_types: &'a [TypeId],
+    explicit_type_arguments: Option<&'a [TypeId]>,
+}
+
 fn resolve_source_call_once(
     store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     global_types: &CanonicalGlobalTypes,
     options: CanonicalCheckerOptions,
-    callee_form: SourceCallCalleeForm,
-    callee_type: TypeId,
-    argument_types: &[TypeId],
-    explicit_type_arguments: Option<&[TypeId]>,
+    request: SourceCallResolutionRequest<'_>,
 ) -> Result<ResolvedSourceCall, SourceCallResolutionError> {
+    let SourceCallResolutionRequest {
+        callee_form,
+        callee_type,
+        argument_types,
+        explicit_type_arguments,
+    } = request;
     if callee_form == SourceCallCalleeForm::RequiredOwnProperty
         && explicit_type_arguments.is_some()
     {
@@ -1426,10 +1437,12 @@ pub(super) fn check_direct_source_call(
             host,
             global_types,
             options,
-            plan.callee_form,
-            callee_type,
-            argument_types,
-            explicit_type_arguments.as_deref(),
+            SourceCallResolutionRequest {
+                callee_form: plan.callee_form,
+                callee_type,
+                argument_types,
+                explicit_type_arguments: explicit_type_arguments.as_deref(),
+            },
         ) {
             Ok(resolution) => break resolution,
             Err(SourceCallResolutionError::Retry(signature))
@@ -1742,6 +1755,24 @@ mod tests {
             .filter(|(_, record)| record.kind == SyntaxKind::CallExpression)
             .map(|(node, _)| NodeRef::new(parsed.arena.id(), file, node))
             .collect()
+    }
+
+    fn property_accesses(parsed: &ParseResult, file: FileId) -> Vec<NodeRef> {
+        parsed
+            .arena
+            .iter()
+            .filter(|(_, record)| record.kind == SyntaxKind::PropertyAccessExpression)
+            .map(|(node, _)| NodeRef::new(parsed.arena.id(), file, node))
+            .collect()
+    }
+
+    fn property_name(parsed: &ParseResult, file: FileId, access: NodeRef) -> NodeRef {
+        let NodeData::PropertyAccessExpression(property) =
+            &parsed.arena.get(access.node).unwrap().data
+        else {
+            panic!("expected a property access")
+        };
+        NodeRef::new(parsed.arena.id(), file, property.name)
     }
 
     fn first_function_symbol(
@@ -2089,6 +2120,219 @@ mod tests {
         ));
 
         assert_eq!(call_publication_state(&context, *call), before);
+    }
+
+    #[test]
+    fn required_own_property_calls_publish_function_and_source_callables_cold_and_warm() {
+        let parsed = parsed(concat!(
+            "type API = { fn: (value: number) => string }; ",
+            "function fromType(api: API): string { return api.fn(1); } ",
+            "function render(value: number): string { return 'ok'; } ",
+            "const holder = { fn: render }; ",
+            "const fromSource: string = holder.fn(1);",
+        ));
+        let file = FileId::new(440);
+        let mut calls = calls(&parsed, file);
+        calls.sort_by_key(|call| parsed.arena.get(call.node).unwrap().range.start);
+        let mut accesses = property_accesses(&parsed, file);
+        accesses.sort_by_key(|access| parsed.arena.get(access.node).unwrap().range.start);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(accesses.len(), 2);
+        let mut context = context(&parsed, file);
+
+        context.check_source_file(file).unwrap();
+
+        assert!(context.diagnostics().is_empty());
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        for (call, access) in calls.iter().zip(&accesses) {
+            assert_eq!(
+                context
+                    .store()
+                    .type_node_links(*call)
+                    .and_then(|links| links.resolved_type),
+                Some(string)
+            );
+            assert!(
+                context
+                    .store()
+                    .signature_links(*call)
+                    .is_some_and(|links| links.resolved_signature.signature().is_some())
+            );
+            assert!(
+                context
+                    .store()
+                    .type_node_links(*access)
+                    .and_then(|links| links.resolved_type)
+                    .is_some()
+            );
+            assert!(
+                context
+                    .store()
+                    .symbol_node_links(*access)
+                    .is_some_and(|links| links.resolved_symbol.is_some())
+            );
+        }
+
+        let cold_calls = calls
+            .iter()
+            .map(|call| call_publication_state(&context, *call))
+            .collect::<Vec<_>>();
+        let cold_properties = accesses
+            .iter()
+            .map(|access| {
+                (
+                    context.store().type_node_links(*access).cloned(),
+                    context.store().symbol_node_links(*access).cloned(),
+                )
+            })
+            .collect::<Vec<_>>();
+        mark_source_unchecked(&mut context, file);
+        context.check_source_file(file).unwrap();
+        assert_eq!(
+            calls
+                .iter()
+                .map(|call| call_publication_state(&context, *call))
+                .collect::<Vec<_>>(),
+            cold_calls
+        );
+        assert_eq!(
+            accesses
+                .iter()
+                .map(|access| {
+                    (
+                        context.store().type_node_links(*access).cloned(),
+                        context.store().symbol_node_links(*access).cloned(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            cold_properties
+        );
+    }
+
+    #[test]
+    fn property_call_diagnostics_retain_the_name_argument_and_call_nodes() {
+        let text = concat!(
+            "type API = { fn: (value: number) => string }; ",
+            "function tooFew(api: API): string { return api.fn(); } ",
+            "function wrong(api: API): string { return api.fn('bad'); } ",
+            "function tooMany(api: API): string { return api.fn(1, 2); }",
+        );
+        let parsed = parsed(text);
+        let file = FileId::new(441);
+        let mut calls = calls(&parsed, file);
+        calls.sort_by_key(|call| parsed.arena.get(call.node).unwrap().range.start);
+        let mut accesses = property_accesses(&parsed, file);
+        accesses.sort_by_key(|access| parsed.arena.get(access.node).unwrap().range.start);
+        let [too_few, _, too_many] = calls.as_slice() else {
+            panic!("expected three property calls")
+        };
+        let [too_few_access, _, _] = accesses.as_slice() else {
+            panic!("expected three property accesses")
+        };
+        let wrong_argument = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                matches!(&record.data, NodeData::StringLiteral(literal) if literal.text == "bad")
+                    .then(|| NodeRef::new(parsed.arena.id(), file, node))
+            })
+            .unwrap();
+        let mut context = context(&parsed, file);
+
+        context.check_source_file(file).unwrap();
+
+        let diagnostics = context.diagnostics().as_slice();
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.code())
+                .collect::<Vec<_>>(),
+            [2554, 2345, 2554]
+        );
+        assert_eq!(
+            diagnostics[0].node,
+            Some(property_name(&parsed, file, *too_few_access))
+        );
+        assert_eq!(diagnostics[0].range_override, None);
+        assert_eq!(diagnostics[1].node, Some(wrong_argument));
+        assert_eq!(diagnostics[1].range_override, None);
+        assert_eq!(diagnostics[2].node, Some(*too_many));
+        assert!(diagnostics[2].range_override.is_some());
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        assert!(calls.iter().all(|call| {
+            context
+                .store()
+                .type_node_links(*call)
+                .and_then(|links| links.resolved_type)
+                == Some(string)
+        }));
+        assert_ne!(diagnostics[0].node, Some(*too_few));
+    }
+
+    #[test]
+    fn property_call_poison_is_rejected_without_additional_publication() {
+        for poison_property in [true, false] {
+            let parsed = parsed(concat!(
+                "type API = { fn: (value: number) => string }; ",
+                "function use(api: API): string { return api.fn(1); }",
+            ));
+            let file = FileId::new(if poison_property { 442 } else { 443 });
+            let call_nodes = calls(&parsed, file);
+            let [call] = call_nodes.as_slice() else {
+                panic!("expected one call")
+            };
+            let call = *call;
+            let access_nodes = property_accesses(&parsed, file);
+            let [access] = access_nodes.as_slice() else {
+                panic!("expected one property access")
+            };
+            let access = *access;
+            let mut context = context(&parsed, file);
+            context.check_source_file(file).unwrap();
+            mark_source_unchecked(&mut context, file);
+
+            if poison_property {
+                assert!(context.store_mut_for_test().set_type_node_links(
+                    access,
+                    TypeNodeLinks {
+                        outer_type_parameters: Some(Vec::new()),
+                        ..TypeNodeLinks::default()
+                    },
+                ));
+            } else {
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_signature_links(call, SignatureLinks::default())
+                );
+            }
+            let poisoned_call = call_publication_state(&context, call);
+            let poisoned_property_type = context.store().type_node_links(access).cloned();
+            let poisoned_property_symbol = context.store().symbol_node_links(access).cloned();
+            let result = context.check_source_file(file);
+
+            if poison_property {
+                assert_eq!(result, Err(SourceCheckError::Property(access)));
+            } else {
+                assert_eq!(result, Err(SourceCheckError::Call(call)));
+            }
+            assert_eq!(call_publication_state(&context, call), poisoned_call);
+            assert_eq!(
+                context.store().type_node_links(access),
+                poisoned_property_type.as_ref()
+            );
+            assert_eq!(
+                context.store().symbol_node_links(access),
+                poisoned_property_symbol.as_ref()
+            );
+            let source = context.source_file(file).unwrap();
+            assert!(
+                !context
+                    .store()
+                    .source_file_links(source)
+                    .is_some_and(|links| links.type_checked)
+            );
+        }
     }
 
     #[test]
@@ -2869,10 +3113,9 @@ mod tests {
     }
 
     #[test]
-    fn nested_and_non_identifier_calls_fail_closed() {
+    fn nested_and_explicitly_instantiated_identifier_calls_fail_closed() {
         for (index, text) in [
             "function f(value: number): number { return 1; } const x = f(f(1));",
-            "const object = { f: 1 }; const x = object.f(1);",
             "function f(value: number): number { return 1; } const x = f<number>(1);",
         ]
         .into_iter()
@@ -2887,6 +3130,74 @@ mod tests {
                     UnsupportedSourceSyntax::Call(_)
                 ))
             ));
+        }
+    }
+
+    #[test]
+    fn unsupported_property_callable_families_never_publish_calls() {
+        for (index, (text, reaches_property_execution)) in [
+            (
+                concat!(
+                    "type API = { fn: <T>(value: T) => T }; ",
+                    "function use(api: API): number { return api.fn(1); }",
+                ),
+                false,
+            ),
+            (
+                concat!(
+                    "function identity<T>(value: T): T { return value; } ",
+                    "const api = { fn: identity }; const result = api.fn(1);",
+                ),
+                true,
+            ),
+            (
+                concat!(
+                    "type API = { fn: number }; ",
+                    "function use(api: API): string { return api.fn(1); }",
+                ),
+                true,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let parsed = parsed(text);
+            let file = FileId::new(444 + u32::try_from(index).unwrap());
+            let call_nodes = calls(&parsed, file);
+            let [call] = call_nodes.as_slice() else {
+                panic!("expected one property call")
+            };
+            let call = *call;
+            let access_nodes = property_accesses(&parsed, file);
+            let [access] = access_nodes.as_slice() else {
+                panic!("expected one property access")
+            };
+            let access = *access;
+            let mut context = context(&parsed, file);
+
+            let result = context.check_source_file(file);
+            if reaches_property_execution {
+                assert_eq!(result, Err(SourceCheckError::Call(call)));
+            } else {
+                assert!(result.is_err());
+            }
+            assert!(context.store().type_node_links(call).is_none());
+            assert!(context.store().signature_links(call).is_none());
+            assert_eq!(
+                context
+                    .store()
+                    .type_node_links(access)
+                    .and_then(|links| links.resolved_type)
+                    .is_some(),
+                reaches_property_execution
+            );
+            assert_eq!(
+                context
+                    .store()
+                    .symbol_node_links(access)
+                    .is_some_and(|links| links.resolved_symbol.is_some()),
+                reaches_property_execution
+            );
         }
     }
 }

@@ -615,6 +615,86 @@ mod tests {
     }
 
     #[test]
+    fn member_call_capability_retains_the_exact_call_and_name() {
+        let parsed = parsed(concat!(
+            "const first = object.value(); ",
+            "const second = object.other();",
+        ));
+        let file = FileId::new(509);
+        let mut accesses = parsed
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                (record.kind == SyntaxKind::PropertyAccessExpression).then_some((
+                    record.range.start,
+                    NodeRef::new(parsed.arena.id(), file, node),
+                ))
+            })
+            .collect::<Vec<_>>();
+        accesses.sort_by_key(|(start, _)| *start);
+        let [(_, first_access), (_, second_access)] = accesses.as_slice() else {
+            panic!("expected two property accesses")
+        };
+        let first_call = NodeRef::new(
+            parsed.arena.id(),
+            file,
+            parsed.arena.get(first_access.node).unwrap().parent.unwrap(),
+        );
+        let second_call = NodeRef::new(
+            parsed.arena.id(),
+            file,
+            parsed
+                .arena
+                .get(second_access.node)
+                .unwrap()
+                .parent
+                .unwrap(),
+        );
+        let mut store = registered_store(&parsed, file);
+        let receiver_symbol = store
+            .alloc_symbol(SymbolData::new(
+                SymbolFlags::FUNCTION_SCOPED_VARIABLE,
+                EscapedName::source("object"),
+            ))
+            .unwrap();
+
+        assert_eq!(
+            plan_direct_source_property_syntax(&parsed.arena, &store, *first_access),
+            Err(SourcePropertyError::Unsupported(
+                SourcePropertyUnsupported::MemberCall(first_call),
+            ))
+        );
+        assert_eq!(
+            plan_direct_source_property_call_syntax(
+                &parsed.arena,
+                &store,
+                *first_access,
+                second_call,
+            ),
+            Err(SourcePropertyError::Unsupported(
+                SourcePropertyUnsupported::MemberCall(second_call),
+            ))
+        );
+
+        let syntax = plan_direct_source_property_call_syntax(
+            &parsed.arena,
+            &store,
+            *first_access,
+            first_call,
+        )
+        .unwrap();
+        let name = syntax.name_node();
+        let plan = finish_direct_source_property_plan(
+            &syntax,
+            identifier_receiver(&syntax, receiver_symbol),
+        )
+        .unwrap();
+        assert!(plan.is_call_callee_for(first_call, name));
+        assert!(!plan.is_call_callee_for(second_call, name));
+        assert!(!plan.is_call_callee_for(first_call, syntax.receiver()));
+    }
+
+    #[test]
     fn union_receivers_fail_before_cache_publication() {
         let parsed = parsed("const result = object.value;");
         let file = FileId::new(508);
