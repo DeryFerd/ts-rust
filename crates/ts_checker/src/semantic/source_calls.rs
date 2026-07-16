@@ -635,6 +635,7 @@ struct ResolvedLegacySourceCall {
     return_type: TypeId,
     minimum_argument_count: usize,
     maximum_argument_count: usize,
+    has_effective_rest: bool,
     applicability: DirectCallApplicability,
 }
 
@@ -677,6 +678,7 @@ fn resolve_source_call_once(
                     return_type: resolution.projection.return_type,
                     minimum_argument_count: resolution.projection.minimum_argument_count,
                     maximum_argument_count: resolution.projection.maximum_argument_count,
+                    has_effective_rest: resolution.projection.has_effective_rest,
                     applicability: resolution.applicability,
                 }));
             }
@@ -775,6 +777,7 @@ fn resolve_source_call_once(
             return_type: resolution.projection.return_type,
             minimum_argument_count: 1,
             maximum_argument_count: 1,
+            has_effective_rest: false,
             applicability: resolution.applicability,
         })),
         Err(
@@ -985,19 +988,24 @@ fn prepare_legacy_source_call_diagnostic(
             {
                 return Err(SourceCheckError::Call(plan.node));
             }
+            let (message, expected) = if resolution.has_effective_rest {
+                (
+                    message_by_code(2555).ok_or(SourceCheckError::MissingDiagnostic(2555))?,
+                    resolution.minimum_argument_count.to_string(),
+                )
+            } else {
+                (
+                    message_by_code(2554).ok_or(SourceCheckError::MissingDiagnostic(2554))?,
+                    expected_count_text(
+                        resolution.minimum_argument_count,
+                        resolution.maximum_argument_count,
+                    ),
+                )
+            };
             CanonicalCheckerDiagnostic {
                 node: Some(plan.callee.node),
                 range_override: None,
-                diagnostic: Diagnostic::with_arguments(
-                    message_by_code(2554).ok_or(SourceCheckError::MissingDiagnostic(2554))?,
-                    [
-                        expected_count_text(
-                            resolution.minimum_argument_count,
-                            resolution.maximum_argument_count,
-                        ),
-                        actual.to_string(),
-                    ],
-                ),
+                diagnostic: Diagnostic::with_arguments(message, [expected, actual.to_string()]),
                 related_information: vec![missing_argument_related_information(
                     store,
                     host,
@@ -1011,7 +1019,8 @@ fn prepare_legacy_source_call_diagnostic(
             expected_at_most,
             actual,
         } => {
-            if expected_at_most != resolution.maximum_argument_count
+            if resolution.has_effective_rest
+                || expected_at_most != resolution.maximum_argument_count
                 || actual != plan.arguments.len()
                 || actual != argument_types.len()
             {
@@ -1465,6 +1474,47 @@ mod tests {
         CanonicalCheckerContext::new(
             binder.finish(),
             [(file, &parsed.arena)].into_iter().collect(),
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap()
+    }
+
+    fn context_with_default_library<'arena>(
+        library: &'arena ParseResult,
+        library_file: FileId,
+        source: &'arena ParseResult,
+        source_file: FileId,
+    ) -> CanonicalCheckerContext<'arena> {
+        let files = [(library_file, library), (source_file, source)];
+        let mut binder = CanonicalBinder::new();
+        for (file, parsed) in files {
+            let is_default_library = file == library_file;
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new_with_default_library(
+                        EscapedName::source(format!("\"/project/{}.ts\"", file.index())),
+                        CanonicalSourceLanguage::TypeScript,
+                        is_default_library,
+                        is_default_library,
+                        CanonicalModuleState::Script,
+                    ),
+                )
+                .unwrap();
+        }
+        for (file, parsed) in files {
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+        }
+        CanonicalCheckerContext::new(
+            binder.finish(),
+            files
+                .into_iter()
+                .map(|(file, parsed)| (file, &parsed.arena))
+                .collect(),
             CanonicalCheckerOptions::default(),
         )
         .unwrap()
@@ -2455,6 +2505,105 @@ mod tests {
                 .and_then(|links| links.resolved_type)
                 == Some(string)
         }));
+    }
+
+    #[test]
+    fn array_rest_calls_project_every_extra_argument_and_use_minimum_arity_diagnostic() {
+        let library = parsed("interface Array<T> {}");
+        let text = concat!(
+            "function take(head: string, ...values: number[]): string { return head; } ",
+            "const tooFew = take(); ",
+            "const good = take('ok', 1, 2); ",
+            "const wrong = take('ok', 1, 'bad');",
+        );
+        let parsed = parsed(text);
+        let library_file = FileId::new(402);
+        let file = FileId::new(403);
+        let mut calls = calls(&parsed, file);
+        calls.sort_by_key(|call| parsed.arena.get(call.node).unwrap().range.start);
+        let [too_few, good, wrong] = calls.as_slice() else {
+            panic!("expected too-few, applicable, and wrong-rest calls")
+        };
+        let mut context = context_with_default_library(&library, library_file, &parsed, file);
+
+        context.check_source_file(file).unwrap();
+
+        assert_eq!(
+            context
+                .diagnostics()
+                .as_slice()
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.code())
+                .collect::<Vec<_>>(),
+            vec![2555, 2345]
+        );
+        assert_eq!(
+            context.diagnostics().as_slice()[0]
+                .diagnostic
+                .render()
+                .unwrap(),
+            "Expected at least 1 arguments, but got 0."
+        );
+        assert_eq!(
+            context.diagnostics().as_slice()[1]
+                .diagnostic
+                .render()
+                .unwrap(),
+            "Argument of type 'string' is not assignable to parameter of type 'number'."
+        );
+        for call in [too_few, good, wrong] {
+            let return_type = context
+                .store()
+                .type_node_links(*call)
+                .and_then(|links| links.resolved_type)
+                .unwrap();
+            assert_eq!(
+                return_type,
+                context.store().intrinsic_bootstrap().unwrap().string_type
+            );
+        }
+    }
+
+    #[test]
+    fn initialized_parameter_is_omittable_but_keeps_its_body_value_type() {
+        let parsed = parsed(concat!(
+            "function defaulted(value: number = 1): number { return value; } ",
+            "const omitted: number = defaulted(); ",
+            "const explicitUndefined: number = defaulted(undefined); ",
+            "const wrong: number = defaulted('bad');",
+        ));
+        let file = FileId::new(404);
+        let mut context = context(&parsed, file);
+
+        context.check_source_file(file).unwrap();
+
+        let diagnostics = context.diagnostics().as_slice();
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(diagnostics[0].diagnostic.code(), 2345);
+        assert_eq!(
+            diagnostics[0].diagnostic.render().unwrap(),
+            "Argument of type '\"bad\"' is not assignable to parameter of type 'number | undefined'."
+        );
+        let owner = first_function_symbol(&parsed, &context, file);
+        let callable = context
+            .store()
+            .value_symbol_links(owner)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        let provenance = context
+            .store()
+            .source_callable_provenance(callable)
+            .unwrap();
+        let signature = context.store().signature(provenance.signature).unwrap();
+        assert_eq!(signature.min_argument_count(), 0);
+        let parameter = signature.parameters()[0];
+        assert_eq!(
+            context
+                .store()
+                .value_symbol_links(parameter)
+                .and_then(|links| links.resolved_type),
+            Some(context.store().intrinsic_bootstrap().unwrap().number_type)
+        );
     }
 
     #[test]
