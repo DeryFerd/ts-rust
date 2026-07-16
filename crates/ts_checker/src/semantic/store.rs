@@ -197,6 +197,29 @@ pub(super) struct CanonicalEmptyTupleProvenance {
     pub(super) length_symbol: SemanticSymbolId,
 }
 
+/// Exact target-cache key used by pinned `getTupleTargetType`.
+///
+/// Element types deliberately do not participate. Labels retain their arena-
+/// branded declaration identity, matching upstream's `writeNode` key segment.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(super) struct CanonicalTupleTargetKey {
+    pub(super) element_infos: Vec<TupleElementInfo>,
+    pub(super) readonly: bool,
+}
+
+/// Branded identities owned by one synthesized tuple target graph.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct CanonicalTupleTargetProvenance {
+    pub(super) target: TypeId,
+    pub(super) type_parameters: Vec<TypeId>,
+    pub(super) this_type: TypeId,
+    pub(super) declared_members: SymbolTableId,
+    pub(super) element_symbols: Vec<SemanticSymbolId>,
+    pub(super) length_symbol: SemanticSymbolId,
+    pub(super) length_type: TypeId,
+    pub(super) length_constituents: Vec<TypeId>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum SourceNodeParent {
     Root,
@@ -282,6 +305,7 @@ pub struct SemanticStore<TypePayload, MapperPayload> {
     function_signature_return_annotations: HashMap<SignatureId, (NodeRef, bool)>,
     callable_signature_parameter_types: HashMap<SignatureId, Vec<TypeId>>,
     circular_return_signatures: HashMap<SignatureId, TypeId>,
+    canonical_tuple_targets: HashMap<CanonicalTupleTargetKey, CanonicalTupleTargetProvenance>,
     canonical_empty_tuple: Option<CanonicalEmptyTupleProvenance>,
     type_resolutions: TypeResolutionStack,
     relations: RelationCaches,
@@ -346,6 +370,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             function_signature_return_annotations: HashMap::new(),
             callable_signature_parameter_types: HashMap::new(),
             circular_return_signatures: HashMap::new(),
+            canonical_tuple_targets: HashMap::new(),
             canonical_empty_tuple: None,
             type_resolutions: TypeResolutionStack::new(id),
             relations: RelationCaches::default(),
@@ -661,6 +686,83 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
     #[must_use]
     pub fn type_len(&self) -> usize {
         self.types.len()
+    }
+
+    #[must_use]
+    pub(super) fn canonical_tuple_target(
+        &self,
+        key: &CanonicalTupleTargetKey,
+    ) -> Option<&CanonicalTupleTargetProvenance> {
+        self.canonical_tuple_targets.get(key)
+    }
+
+    #[must_use]
+    pub(super) fn canonical_tuple_target_for_type(
+        &self,
+        target: TypeId,
+    ) -> Option<(&CanonicalTupleTargetKey, &CanonicalTupleTargetProvenance)> {
+        self.canonical_tuple_targets
+            .iter()
+            .find(|(_, provenance)| provenance.target == target)
+    }
+
+    #[must_use]
+    #[cfg(test)]
+    pub(super) fn canonical_tuple_target_len(&self) -> usize {
+        self.canonical_tuple_targets.len()
+    }
+
+    pub(super) fn try_reserve_canonical_tuple_targets(&mut self, additional: usize) -> bool {
+        self.canonical_tuple_targets.try_reserve(additional).is_ok()
+    }
+
+    /// Publishes a completed tuple graph without replacing an existing shape
+    /// or assigning one target identity to multiple shape keys.
+    pub(super) fn publish_canonical_tuple_target(
+        &mut self,
+        key: CanonicalTupleTargetKey,
+        provenance: CanonicalTupleTargetProvenance,
+    ) -> bool {
+        if self.canonical_tuple_targets.contains_key(&key)
+            || self
+                .canonical_tuple_targets
+                .values()
+                .any(|cached| cached.target == provenance.target)
+            || self.types.get(provenance.target).is_none()
+            || self.types.get(provenance.this_type).is_none()
+            || provenance
+                .type_parameters
+                .iter()
+                .any(|type_| self.types.get(*type_).is_none())
+            || self
+                .symbols
+                .symbol_table(provenance.declared_members)
+                .is_none()
+            || provenance
+                .element_symbols
+                .iter()
+                .any(|symbol| !self.symbols.contains_symbol(*symbol))
+            || !self.symbols.contains_symbol(provenance.length_symbol)
+            || self.types.get(provenance.length_type).is_none()
+            || provenance
+                .length_constituents
+                .iter()
+                .any(|type_| self.types.get(*type_).is_none())
+        {
+            return false;
+        }
+        self.canonical_tuple_targets.insert(key, provenance);
+        true
+    }
+
+    #[cfg(test)]
+    pub(super) fn replace_canonical_tuple_target_for_test(
+        &mut self,
+        key: &CanonicalTupleTargetKey,
+        target: TypeId,
+    ) -> Option<TypeId> {
+        let provenance = self.canonical_tuple_targets.get_mut(key)?;
+        Some(std::mem::replace(&mut provenance.target, target))
     }
 
     /// Returns the checker-owned mutable empty-tuple target, when created.

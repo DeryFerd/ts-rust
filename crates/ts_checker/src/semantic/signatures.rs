@@ -793,7 +793,7 @@ impl IndexInfoArena {
 }
 
 /// Flags and optional label declaration for one tuple element.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct TupleElementInfo {
     flags: ElementFlags,
     labeled_declaration: Option<NodeRef>,
