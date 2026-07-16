@@ -1,0 +1,825 @@
+//! Exact scalar kernel for ordinary non-assignment binary operators.
+//!
+//! The admitted domain is deliberately atomic: the canonical `string`,
+//! `number`, `bigint`, and `boolean` types plus their validated literal pairs.
+//! Every broader type family remains a typed boundary. The kernel mirrors the
+//! pinned checker's operator-specific diagnostics and recovery types without
+//! publishing expression links; source integration owns publication after the
+//! complete result and diagnostic batch have been staged.
+
+#![allow(dead_code)] // Installed one commit ahead of its source dispatch consumer.
+
+use ts_ast::{NodeRef, SyntaxKind};
+use ts_diagnostics::{Diagnostic, message_by_code};
+
+use super::{
+    CanonicalCheckerDiagnostic, CanonicalTypeMapperStore, RelationUnavailable,
+    TypeDisplayUnavailable, TypeId,
+    bootstrap::LiteralTypeCacheError,
+    formatter::type_to_string,
+    type_records::{LiteralValue, TypeData},
+    types::TypeFlags,
+};
+
+/// Target capability needed only by `bigint ** bigint`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum PrimitiveBigIntExponentiationTarget {
+    KnownAtLeastEs2016,
+    KnownBeforeEs2016,
+    Unknown,
+}
+
+/// Syntax-neutral input after both operands have been checked left-to-right.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct PrimitiveBinaryRequest {
+    pub(super) expression: NodeRef,
+    pub(super) left: NodeRef,
+    pub(super) operator: SyntaxKind,
+    pub(super) right: NodeRef,
+    pub(super) left_type: TypeId,
+    pub(super) right_type: TypeId,
+    pub(super) bigint_exponentiation_target: PrimitiveBigIntExponentiationTarget,
+}
+
+/// One complete operator result. Diagnostics retain raw checker issuance order.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct PrimitiveBinaryResolution {
+    pub(super) result_type: TypeId,
+    pub(super) diagnostics: Vec<CanonicalCheckerDiagnostic>,
+}
+
+/// Valid TypeScript behavior outside the atomic scalar kernel.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum PrimitiveBinaryUnsupported {
+    Operator(SyntaxKind),
+    Operand { node: NodeRef, type_: TypeId },
+    BigIntExponentiationTarget(NodeRef),
+}
+
+/// Malformed or foreign canonical state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum PrimitiveBinaryInvariant {
+    MissingBootstrap,
+    InvalidType(TypeId),
+    MissingDiagnostic(u32),
+}
+
+/// Capability, store, relation, or display failure without a guessed result.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum PrimitiveBinaryError {
+    Unsupported(PrimitiveBinaryUnsupported),
+    Invariant(PrimitiveBinaryInvariant),
+    Literal(LiteralTypeCacheError),
+    Relation(RelationUnavailable),
+    Display(TypeDisplayUnavailable),
+}
+
+impl From<PrimitiveBinaryUnsupported> for PrimitiveBinaryError {
+    fn from(error: PrimitiveBinaryUnsupported) -> Self {
+        Self::Unsupported(error)
+    }
+}
+
+impl From<PrimitiveBinaryInvariant> for PrimitiveBinaryError {
+    fn from(error: PrimitiveBinaryInvariant) -> Self {
+        Self::Invariant(error)
+    }
+}
+
+impl From<LiteralTypeCacheError> for PrimitiveBinaryError {
+    fn from(error: LiteralTypeCacheError) -> Self {
+        Self::Literal(error)
+    }
+}
+
+impl From<RelationUnavailable> for PrimitiveBinaryError {
+    fn from(error: RelationUnavailable) -> Self {
+        Self::Relation(error)
+    }
+}
+
+impl From<TypeDisplayUnavailable> for PrimitiveBinaryError {
+    fn from(error: TypeDisplayUnavailable) -> Self {
+        Self::Display(error)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PrimitiveScalarFamily {
+    String,
+    Number,
+    BigInt,
+    Boolean,
+}
+
+impl PrimitiveScalarFamily {
+    const fn is_numeric(self) -> bool {
+        matches!(self, Self::Number | Self::BigInt)
+    }
+
+    const fn is_bigint(self) -> bool {
+        matches!(self, Self::BigInt)
+    }
+
+    const fn is_plus_close_enough(self) -> bool {
+        !matches!(self, Self::Boolean)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PrimitiveScalar {
+    type_: TypeId,
+    base: TypeId,
+    family: PrimitiveScalarFamily,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PrimitiveBinaryOperator {
+    Plus,
+    Arithmetic(SyntaxKind),
+    Relational(SyntaxKind),
+    Equality(SyntaxKind),
+}
+
+impl PrimitiveBinaryOperator {
+    fn from_syntax(kind: SyntaxKind) -> Result<Self, PrimitiveBinaryUnsupported> {
+        Ok(match kind {
+            SyntaxKind::PlusToken => Self::Plus,
+            SyntaxKind::MinusToken
+            | SyntaxKind::AsteriskToken
+            | SyntaxKind::SlashToken
+            | SyntaxKind::PercentToken
+            | SyntaxKind::AsteriskAsteriskToken => Self::Arithmetic(kind),
+            SyntaxKind::LessThanToken
+            | SyntaxKind::LessThanEqualsToken
+            | SyntaxKind::GreaterThanToken
+            | SyntaxKind::GreaterThanEqualsToken => Self::Relational(kind),
+            SyntaxKind::EqualsEqualsToken
+            | SyntaxKind::ExclamationEqualsToken
+            | SyntaxKind::EqualsEqualsEqualsToken
+            | SyntaxKind::ExclamationEqualsEqualsToken => Self::Equality(kind),
+            _ => return Err(PrimitiveBinaryUnsupported::Operator(kind)),
+        })
+    }
+
+    const fn syntax(self) -> SyntaxKind {
+        match self {
+            Self::Plus => SyntaxKind::PlusToken,
+            Self::Arithmetic(kind) | Self::Relational(kind) | Self::Equality(kind) => kind,
+        }
+    }
+
+    fn text(self) -> &'static str {
+        match self.syntax() {
+            SyntaxKind::PlusToken => "+",
+            SyntaxKind::MinusToken => "-",
+            SyntaxKind::AsteriskToken => "*",
+            SyntaxKind::SlashToken => "/",
+            SyntaxKind::PercentToken => "%",
+            SyntaxKind::AsteriskAsteriskToken => "**",
+            SyntaxKind::LessThanToken => "<",
+            SyntaxKind::LessThanEqualsToken => "<=",
+            SyntaxKind::GreaterThanToken => ">",
+            SyntaxKind::GreaterThanEqualsToken => ">=",
+            SyntaxKind::EqualsEqualsToken => "==",
+            SyntaxKind::ExclamationEqualsToken => "!=",
+            SyntaxKind::EqualsEqualsEqualsToken => "===",
+            SyntaxKind::ExclamationEqualsEqualsToken => "!==",
+            _ => unreachable!("a primitive binary operator has canonical text"),
+        }
+    }
+}
+
+/// Checks one already-typed scalar operation without publishing source state.
+pub(super) fn check_primitive_binary(
+    store: &mut CanonicalTypeMapperStore,
+    request: PrimitiveBinaryRequest,
+) -> Result<PrimitiveBinaryResolution, PrimitiveBinaryError> {
+    let operator = PrimitiveBinaryOperator::from_syntax(request.operator)?;
+    let left = primitive_scalar(store, request.left, request.left_type)?;
+    let right = primitive_scalar(store, request.right, request.right_type)?;
+    let mut diagnostics = Vec::new();
+
+    let result_type = match operator {
+        PrimitiveBinaryOperator::Plus => check_plus(store, request, left, right, &mut diagnostics)?,
+        PrimitiveBinaryOperator::Arithmetic(kind) => {
+            check_arithmetic(store, request, kind, left, right, &mut diagnostics)?
+        }
+        PrimitiveBinaryOperator::Relational(_) => {
+            check_relational(store, request, operator, left, right, &mut diagnostics)?
+        }
+        PrimitiveBinaryOperator::Equality(_) => {
+            check_equality(store, request, operator, left, right, &mut diagnostics)?
+        }
+    };
+
+    Ok(PrimitiveBinaryResolution {
+        result_type,
+        diagnostics,
+    })
+}
+
+fn primitive_scalar(
+    store: &CanonicalTypeMapperStore,
+    node: NodeRef,
+    type_: TypeId,
+) -> Result<PrimitiveScalar, PrimitiveBinaryError> {
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or(PrimitiveBinaryInvariant::MissingBootstrap)?;
+    let bases = [
+        (bootstrap.string_type, PrimitiveScalarFamily::String),
+        (bootstrap.number_type, PrimitiveScalarFamily::Number),
+        (bootstrap.bigint_type, PrimitiveScalarFamily::BigInt),
+        (bootstrap.boolean_type, PrimitiveScalarFamily::Boolean),
+    ];
+    if let Some((base, family)) = bases.into_iter().find(|(candidate, _)| *candidate == type_) {
+        store.validate_union_constituent(type_)?;
+        return Ok(PrimitiveScalar {
+            type_,
+            base,
+            family,
+        });
+    }
+
+    let record = store
+        .type_payload(type_)
+        .ok_or(PrimitiveBinaryInvariant::InvalidType(type_))?;
+    let TypeData::Literal(literal) = record.data() else {
+        return Err(PrimitiveBinaryUnsupported::Operand { node, type_ }.into());
+    };
+    let family = match (record.flags(), &literal.value) {
+        (TypeFlags::STRING_LITERAL, LiteralValue::String(_)) => PrimitiveScalarFamily::String,
+        (TypeFlags::NUMBER_LITERAL, LiteralValue::Number(_)) => PrimitiveScalarFamily::Number,
+        (TypeFlags::BIG_INT_LITERAL, LiteralValue::BigInt(_)) => PrimitiveScalarFamily::BigInt,
+        (TypeFlags::BOOLEAN_LITERAL, LiteralValue::Boolean(_)) => PrimitiveScalarFamily::Boolean,
+        _ => return Err(PrimitiveBinaryUnsupported::Operand { node, type_ }.into()),
+    };
+    store.validate_union_constituent(type_)?;
+    let base = match family {
+        PrimitiveScalarFamily::String => bootstrap.string_type,
+        PrimitiveScalarFamily::Number => bootstrap.number_type,
+        PrimitiveScalarFamily::BigInt => bootstrap.bigint_type,
+        PrimitiveScalarFamily::Boolean => bootstrap.boolean_type,
+    };
+    Ok(PrimitiveScalar {
+        type_,
+        base,
+        family,
+    })
+}
+
+fn check_plus(
+    store: &mut CanonicalTypeMapperStore,
+    request: PrimitiveBinaryRequest,
+    left: PrimitiveScalar,
+    right: PrimitiveScalar,
+    diagnostics: &mut Vec<CanonicalCheckerDiagnostic>,
+) -> Result<TypeId, PrimitiveBinaryError> {
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or(PrimitiveBinaryInvariant::MissingBootstrap)?;
+    let result = if left.family == PrimitiveScalarFamily::Number
+        && right.family == PrimitiveScalarFamily::Number
+    {
+        bootstrap.number_type
+    } else if left.family == PrimitiveScalarFamily::BigInt
+        && right.family == PrimitiveScalarFamily::BigInt
+    {
+        bootstrap.bigint_type
+    } else if left.family == PrimitiveScalarFamily::String
+        || right.family == PrimitiveScalarFamily::String
+    {
+        bootstrap.string_type
+    } else {
+        let (display_left, display_right) =
+            if left.family.is_plus_close_enough() && right.family.is_plus_close_enough() {
+                (left.type_, right.type_)
+            } else {
+                (left.base, right.base)
+            };
+        diagnostics.push(operator_diagnostic(
+            store,
+            request.expression,
+            PrimitiveBinaryOperator::Plus,
+            display_left,
+            display_right,
+        )?);
+        bootstrap.any_type
+    };
+    Ok(result)
+}
+
+fn check_arithmetic(
+    store: &mut CanonicalTypeMapperStore,
+    request: PrimitiveBinaryRequest,
+    kind: SyntaxKind,
+    left: PrimitiveScalar,
+    right: PrimitiveScalar,
+    diagnostics: &mut Vec<CanonicalCheckerDiagnostic>,
+) -> Result<TypeId, PrimitiveBinaryError> {
+    if !left.family.is_numeric() {
+        diagnostics.push(fixed_diagnostic(request.left, 2362)?);
+    }
+    if !right.family.is_numeric() {
+        diagnostics.push(fixed_diagnostic(request.right, 2363)?);
+    }
+
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or(PrimitiveBinaryInvariant::MissingBootstrap)?;
+    if !left.family.is_bigint() && !right.family.is_bigint() {
+        return Ok(bootstrap.number_type);
+    }
+    if left.family.is_bigint() && right.family.is_bigint() {
+        if kind == SyntaxKind::AsteriskAsteriskToken {
+            match request.bigint_exponentiation_target {
+                PrimitiveBigIntExponentiationTarget::KnownAtLeastEs2016 => {}
+                PrimitiveBigIntExponentiationTarget::KnownBeforeEs2016 => {
+                    diagnostics.push(fixed_diagnostic(request.expression, 2791)?);
+                }
+                PrimitiveBigIntExponentiationTarget::Unknown => {
+                    return Err(PrimitiveBinaryUnsupported::BigIntExponentiationTarget(
+                        request.expression,
+                    )
+                    .into());
+                }
+            }
+        }
+        return Ok(bootstrap.bigint_type);
+    }
+
+    diagnostics.push(operator_diagnostic(
+        store,
+        request.expression,
+        PrimitiveBinaryOperator::Arithmetic(kind),
+        left.base,
+        right.base,
+    )?);
+    Ok(bootstrap.error_type)
+}
+
+fn check_relational(
+    store: &mut CanonicalTypeMapperStore,
+    request: PrimitiveBinaryRequest,
+    operator: PrimitiveBinaryOperator,
+    left: PrimitiveScalar,
+    right: PrimitiveScalar,
+    diagnostics: &mut Vec<CanonicalCheckerDiagnostic>,
+) -> Result<TypeId, PrimitiveBinaryError> {
+    let left_numeric = left.family.is_numeric();
+    let right_numeric = right.family.is_numeric();
+    let compatible = left_numeric && right_numeric
+        || !left_numeric && !right_numeric && store.are_types_comparable(left.base, right.base)?;
+    if !compatible {
+        diagnostics.push(operator_diagnostic(
+            store,
+            request.expression,
+            operator,
+            left.base,
+            right.base,
+        )?);
+    }
+    store
+        .intrinsic_bootstrap()
+        .map(|bootstrap| bootstrap.boolean_type)
+        .ok_or(PrimitiveBinaryInvariant::MissingBootstrap.into())
+}
+
+fn check_equality(
+    store: &mut CanonicalTypeMapperStore,
+    request: PrimitiveBinaryRequest,
+    _operator: PrimitiveBinaryOperator,
+    left: PrimitiveScalar,
+    right: PrimitiveScalar,
+    diagnostics: &mut Vec<CanonicalCheckerDiagnostic>,
+) -> Result<TypeId, PrimitiveBinaryError> {
+    // Pinned `isTypeEqualityComparableTo` adds only a nullable-target escape.
+    // Both operands have already been proven non-null atomic scalars, so its
+    // two directional calls are exactly ordinary `areTypesComparable` here.
+    if !store.are_types_comparable(left.type_, right.type_)? {
+        let (display_left, display_right) = if store.are_types_comparable(left.base, right.base)? {
+            (left.type_, right.type_)
+        } else {
+            (left.base, right.base)
+        };
+        diagnostics.push(comparison_diagnostic(
+            store,
+            request.expression,
+            display_left,
+            display_right,
+        )?);
+    }
+    store
+        .intrinsic_bootstrap()
+        .map(|bootstrap| bootstrap.boolean_type)
+        .ok_or(PrimitiveBinaryInvariant::MissingBootstrap.into())
+}
+
+fn fixed_diagnostic(
+    node: NodeRef,
+    code: u32,
+) -> Result<CanonicalCheckerDiagnostic, PrimitiveBinaryError> {
+    let message = message_by_code(code).ok_or(PrimitiveBinaryInvariant::MissingDiagnostic(code))?;
+    Ok(CanonicalCheckerDiagnostic {
+        node: Some(node),
+        diagnostic: Diagnostic::new(message),
+        related_information: Vec::new(),
+    })
+}
+
+fn operator_diagnostic(
+    store: &CanonicalTypeMapperStore,
+    node: NodeRef,
+    operator: PrimitiveBinaryOperator,
+    left: TypeId,
+    right: TypeId,
+) -> Result<CanonicalCheckerDiagnostic, PrimitiveBinaryError> {
+    let message = message_by_code(2365).ok_or(PrimitiveBinaryInvariant::MissingDiagnostic(2365))?;
+    Ok(CanonicalCheckerDiagnostic {
+        node: Some(node),
+        diagnostic: Diagnostic::with_arguments(
+            message,
+            [
+                operator.text().to_owned(),
+                type_to_string(store, left)?,
+                type_to_string(store, right)?,
+            ],
+        ),
+        related_information: Vec::new(),
+    })
+}
+
+fn comparison_diagnostic(
+    store: &CanonicalTypeMapperStore,
+    node: NodeRef,
+    left: TypeId,
+    right: TypeId,
+) -> Result<CanonicalCheckerDiagnostic, PrimitiveBinaryError> {
+    let message = message_by_code(2367).ok_or(PrimitiveBinaryInvariant::MissingDiagnostic(2367))?;
+    Ok(CanonicalCheckerDiagnostic {
+        node: Some(node),
+        diagnostic: Diagnostic::with_arguments(
+            message,
+            [type_to_string(store, left)?, type_to_string(store, right)?],
+        ),
+        related_information: Vec::new(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use ts_ast::{FileId, NodeData, NodeRef};
+    use ts_jsnum::{Number, PseudoBigInt};
+    use ts_parser::{ParseResult, parse_source_file};
+
+    use super::*;
+    use crate::semantic::{
+        IntrinsicBootstrapOptions, SemanticStore, mapper::TypeMapper, type_records::TypeRecord,
+    };
+
+    #[derive(Clone, Copy)]
+    struct BinaryNodes {
+        expression: NodeRef,
+        left: NodeRef,
+        right: NodeRef,
+    }
+
+    fn initialized_store() -> CanonicalTypeMapperStore {
+        let mut store = SemanticStore::<TypeRecord, TypeMapper>::new();
+        store
+            .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions::default())
+            .unwrap();
+        store
+    }
+
+    fn binary_nodes(parsed: &ParseResult) -> BinaryNodes {
+        let file = FileId::new(1);
+        let (expression, binary) = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::BinaryExpression(binary) = &record.data else {
+                    return None;
+                };
+                Some((node, binary))
+            })
+            .expect("fixture must contain a binary expression");
+        BinaryNodes {
+            expression: NodeRef::new(parsed.arena.id(), file, expression),
+            left: NodeRef::new(parsed.arena.id(), file, binary.left),
+            right: NodeRef::new(parsed.arena.id(), file, binary.right),
+        }
+    }
+
+    fn request(
+        nodes: BinaryNodes,
+        operator: SyntaxKind,
+        left_type: TypeId,
+        right_type: TypeId,
+    ) -> PrimitiveBinaryRequest {
+        PrimitiveBinaryRequest {
+            expression: nodes.expression,
+            left: nodes.left,
+            operator,
+            right: nodes.right,
+            left_type,
+            right_type,
+            bigint_exponentiation_target: PrimitiveBigIntExponentiationTarget::KnownAtLeastEs2016,
+        }
+    }
+
+    fn rendered(resolution: &PrimitiveBinaryResolution) -> Vec<(NodeRef, u32, String)> {
+        resolution
+            .diagnostics
+            .iter()
+            .map(|diagnostic| {
+                (
+                    diagnostic.node.unwrap(),
+                    diagnostic.diagnostic.code(),
+                    diagnostic.diagnostic.render().unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_operator_token_has_the_pinned_scalar_success_result() {
+        let parsed = parse_source_file("const value = left + right;");
+        assert!(parsed.diagnostics.is_empty());
+        let nodes = binary_nodes(&parsed);
+        let mut store = initialized_store();
+        let (string, number, bigint, boolean) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (
+                bootstrap.string_type,
+                bootstrap.number_type,
+                bootstrap.bigint_type,
+                bootstrap.boolean_type,
+            )
+        };
+
+        for (operator, left, right, expected) in [
+            (SyntaxKind::PlusToken, number, number, number),
+            (SyntaxKind::PlusToken, bigint, bigint, bigint),
+            (SyntaxKind::PlusToken, string, boolean, string),
+            (SyntaxKind::MinusToken, number, number, number),
+            (SyntaxKind::AsteriskToken, bigint, bigint, bigint),
+            (SyntaxKind::SlashToken, number, number, number),
+            (SyntaxKind::PercentToken, bigint, bigint, bigint),
+            (SyntaxKind::AsteriskAsteriskToken, number, number, number),
+            (SyntaxKind::AsteriskAsteriskToken, bigint, bigint, bigint),
+            (SyntaxKind::LessThanToken, number, bigint, boolean),
+            (SyntaxKind::LessThanEqualsToken, string, string, boolean),
+            (SyntaxKind::GreaterThanToken, boolean, boolean, boolean),
+            (SyntaxKind::GreaterThanEqualsToken, bigint, number, boolean),
+            (SyntaxKind::EqualsEqualsToken, number, number, boolean),
+            (SyntaxKind::ExclamationEqualsToken, bigint, bigint, boolean),
+            (SyntaxKind::EqualsEqualsEqualsToken, string, string, boolean),
+            (
+                SyntaxKind::ExclamationEqualsEqualsToken,
+                boolean,
+                boolean,
+                boolean,
+            ),
+        ] {
+            let resolution =
+                check_primitive_binary(&mut store, request(nodes, operator, left, right)).unwrap();
+            assert_eq!(resolution.result_type, expected, "operator {operator:?}");
+            assert!(resolution.diagnostics.is_empty(), "operator {operator:?}");
+        }
+    }
+
+    #[test]
+    fn arithmetic_preserves_operand_issuance_recovery_and_mixed_bigint_error() {
+        let parsed = parse_source_file("const value = left - right;");
+        assert!(parsed.diagnostics.is_empty());
+        let nodes = binary_nodes(&parsed);
+        let mut store = initialized_store();
+        let (string, number, bigint, boolean, error) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (
+                bootstrap.string_type,
+                bootstrap.number_type,
+                bootstrap.bigint_type,
+                bootstrap.boolean_type,
+                bootstrap.error_type,
+            )
+        };
+
+        let invalid = check_primitive_binary(
+            &mut store,
+            request(nodes, SyntaxKind::MinusToken, string, boolean),
+        )
+        .unwrap();
+        assert_eq!(invalid.result_type, number);
+        assert_eq!(
+            rendered(&invalid),
+            [
+                (
+                    nodes.left,
+                    2362,
+                    "The left-hand side of an arithmetic operation must be of type 'any', 'number', 'bigint' or an enum type.".to_owned(),
+                ),
+                (
+                    nodes.right,
+                    2363,
+                    "The right-hand side of an arithmetic operation must be of type 'any', 'number', 'bigint' or an enum type.".to_owned(),
+                ),
+            ]
+        );
+
+        let mixed = check_primitive_binary(
+            &mut store,
+            request(nodes, SyntaxKind::AsteriskToken, string, bigint),
+        )
+        .unwrap();
+        assert_eq!(mixed.result_type, error);
+        assert_eq!(
+            rendered(&mixed),
+            [
+                (
+                    nodes.left,
+                    2362,
+                    "The left-hand side of an arithmetic operation must be of type 'any', 'number', 'bigint' or an enum type.".to_owned(),
+                ),
+                (
+                    nodes.expression,
+                    2365,
+                    "Operator '*' cannot be applied to types 'string' and 'bigint'.".to_owned(),
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn plus_keeps_close_literal_names_but_widens_boolean_failures() {
+        let parsed = parse_source_file("const value = left + right;");
+        assert!(parsed.diagnostics.is_empty());
+        let nodes = binary_nodes(&parsed);
+        let mut store = initialized_store();
+        let one = store.regular_number_literal_type(Number::new(1.0)).unwrap();
+        let two_big = store
+            .regular_bigint_literal_type(PseudoBigInt::parse_valid("2n"))
+            .unwrap();
+        let (boolean, any) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (bootstrap.boolean_type, bootstrap.any_type)
+        };
+
+        let close = check_primitive_binary(
+            &mut store,
+            request(nodes, SyntaxKind::PlusToken, one, two_big),
+        )
+        .unwrap();
+        assert_eq!(close.result_type, any);
+        assert_eq!(
+            rendered(&close),
+            [(
+                nodes.expression,
+                2365,
+                "Operator '+' cannot be applied to types '1' and '2n'.".to_owned(),
+            )]
+        );
+
+        let boolean_failure = check_primitive_binary(
+            &mut store,
+            request(nodes, SyntaxKind::PlusToken, one, boolean),
+        )
+        .unwrap();
+        assert_eq!(boolean_failure.result_type, any);
+        assert_eq!(
+            rendered(&boolean_failure),
+            [(
+                nodes.expression,
+                2365,
+                "Operator '+' cannot be applied to types 'number' and 'boolean'.".to_owned(),
+            )]
+        );
+    }
+
+    #[test]
+    fn relational_and_equality_use_distinct_compatibility_and_display_rules() {
+        let parsed = parse_source_file("const value = left < right;");
+        assert!(parsed.diagnostics.is_empty());
+        let nodes = binary_nodes(&parsed);
+        let mut store = initialized_store();
+        let one = store.regular_number_literal_type(Number::new(1.0)).unwrap();
+        let two = store.regular_number_literal_type(Number::new(2.0)).unwrap();
+        let a = store.regular_string_literal_type("a".to_owned()).unwrap();
+        let boolean = store.intrinsic_bootstrap().unwrap().boolean_type;
+
+        let relational = check_primitive_binary(
+            &mut store,
+            request(nodes, SyntaxKind::LessThanToken, one, boolean),
+        )
+        .unwrap();
+        assert_eq!(relational.result_type, boolean);
+        assert_eq!(
+            rendered(&relational),
+            [(
+                nodes.expression,
+                2365,
+                "Operator '<' cannot be applied to types 'number' and 'boolean'.".to_owned(),
+            )]
+        );
+
+        let same_family = check_primitive_binary(
+            &mut store,
+            request(nodes, SyntaxKind::EqualsEqualsEqualsToken, one, two),
+        )
+        .unwrap();
+        assert_eq!(same_family.result_type, boolean);
+        assert_eq!(
+            rendered(&same_family),
+            [(
+                nodes.expression,
+                2367,
+                "This comparison appears to be unintentional because the types '1' and '2' have no overlap.".to_owned(),
+            )]
+        );
+
+        let cross_family = check_primitive_binary(
+            &mut store,
+            request(nodes, SyntaxKind::ExclamationEqualsToken, one, a),
+        )
+        .unwrap();
+        assert_eq!(cross_family.result_type, boolean);
+        assert_eq!(
+            rendered(&cross_family),
+            [(
+                nodes.expression,
+                2367,
+                "This comparison appears to be unintentional because the types 'number' and 'string' have no overlap.".to_owned(),
+            )]
+        );
+    }
+
+    #[test]
+    fn bigint_exponentiation_requires_target_capability_and_recovers_bigint() {
+        let parsed = parse_source_file("const value = left ** right;");
+        assert!(parsed.diagnostics.is_empty());
+        let nodes = binary_nodes(&parsed);
+        let mut store = initialized_store();
+        let bigint = store.intrinsic_bootstrap().unwrap().bigint_type;
+
+        let mut before = request(nodes, SyntaxKind::AsteriskAsteriskToken, bigint, bigint);
+        before.bigint_exponentiation_target =
+            PrimitiveBigIntExponentiationTarget::KnownBeforeEs2016;
+        let before = check_primitive_binary(&mut store, before).unwrap();
+        assert_eq!(before.result_type, bigint);
+        assert_eq!(
+            rendered(&before),
+            [(
+                nodes.expression,
+                2791,
+                "Exponentiation cannot be performed on 'bigint' values unless the 'target' option is set to 'es2016' or later.".to_owned(),
+            )]
+        );
+
+        let mut unknown = request(nodes, SyntaxKind::AsteriskAsteriskToken, bigint, bigint);
+        unknown.bigint_exponentiation_target = PrimitiveBigIntExponentiationTarget::Unknown;
+        assert_eq!(
+            check_primitive_binary(&mut store, unknown),
+            Err(PrimitiveBinaryError::Unsupported(
+                PrimitiveBinaryUnsupported::BigIntExponentiationTarget(nodes.expression),
+            ))
+        );
+    }
+
+    #[test]
+    fn unsupported_and_foreign_operands_never_receive_guessed_results() {
+        let parsed = parse_source_file("const value = left + right;");
+        assert!(parsed.diagnostics.is_empty());
+        let nodes = binary_nodes(&parsed);
+        let mut store = initialized_store();
+        let foreign = initialized_store();
+        let (number, any) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (bootstrap.number_type, bootstrap.any_type)
+        };
+        let foreign_number = foreign.intrinsic_bootstrap().unwrap().number_type;
+
+        assert_eq!(
+            check_primitive_binary(
+                &mut store,
+                request(nodes, SyntaxKind::PlusToken, any, number),
+            ),
+            Err(PrimitiveBinaryError::Unsupported(
+                PrimitiveBinaryUnsupported::Operand {
+                    node: nodes.left,
+                    type_: any,
+                },
+            ))
+        );
+        assert_eq!(
+            check_primitive_binary(
+                &mut store,
+                request(nodes, SyntaxKind::PlusToken, foreign_number, number),
+            ),
+            Err(PrimitiveBinaryError::Invariant(
+                PrimitiveBinaryInvariant::InvalidType(foreign_number),
+            ))
+        );
+    }
+}
