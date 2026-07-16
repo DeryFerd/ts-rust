@@ -1729,6 +1729,36 @@ mod tests {
     }
 
     #[test]
+    fn generic_call_recovery_replays_warm_without_source_writes() {
+        let parsed = parsed(concat!(
+            "function identity<T>(value: T): T { return value; } ",
+            "const bad = identity<string>(1);",
+        ));
+        let file = FileId::new(439);
+        let mut context = context(&parsed, file);
+        let call_nodes = calls(&parsed, file);
+        let [call] = call_nodes.as_slice() else {
+            panic!("expected one generic call")
+        };
+
+        context.check_source_file(file).unwrap();
+
+        assert_eq!(
+            context
+                .diagnostics()
+                .as_slice()
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.code())
+                .collect::<Vec<_>>(),
+            [2345]
+        );
+        let cold = call_publication_state(&context, *call);
+        mark_source_unchecked(&mut context, file);
+        context.check_source_file(file).unwrap();
+        assert_eq!(call_publication_state(&context, *call), cold);
+    }
+
+    #[test]
     fn finished_call_plan_rejects_a_same_shaped_forged_callee_without_publication() {
         let parsed = parsed(concat!(
             "function first(left: string, right: string): void {} ",

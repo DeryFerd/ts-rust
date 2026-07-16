@@ -35,6 +35,7 @@ fn canonical_program_emits_exact_ordered_generic_call_diagnostics() {
         "function constrained<T extends string>(value: T): T { return value; }\n",
         "const empty = pair< /* empty */ >(\"left\", 1);\n",
         "const trailing = pair< string, number , /* trailing */ >(\"left\", 1);\n",
+        "const trailingArity = pair< string , /* trailing arity */ >(\"left\", 1);\n",
         "const typeArity = pair<  string  >(\"left\", 1);\n",
         "const tooFew = pair<string, number>(\"left\");\n",
         "const tooMany = pair<string, number>(\"left\", 1, (\"extra\"), true);\n",
@@ -90,6 +91,26 @@ fn canonical_program_emits_exact_ordered_generic_call_diagnostics() {
                 Some("/project/input.ts"),
                 Some(span_within(
                     SOURCE,
+                    "pair< string , /* trailing arity */ >(\"left\", 1)",
+                    "string ,",
+                )),
+                Some(2558),
+                "Expected 2 type arguments, but got 1.",
+            ),
+            (
+                Some("/project/input.ts"),
+                Some(span_within(
+                    SOURCE,
+                    "string , /* trailing arity */",
+                    ",",
+                )),
+                Some(1009),
+                "Trailing comma not allowed.",
+            ),
+            (
+                Some("/project/input.ts"),
+                Some(span_within(
+                    SOURCE,
                     "pair<  string  >(\"left\", 1)",
                     "string",
                 )),
@@ -134,11 +155,11 @@ fn canonical_program_emits_exact_ordered_generic_call_diagnostics() {
             ),
         ]
     );
-    assert!(diagnostics[..3]
+    assert!(diagnostics[..5]
         .iter()
         .all(|diagnostic| diagnostic.related_information.is_empty()));
-    assert_eq!(diagnostics[3].related_information.len(), 1);
-    let related = &diagnostics[3].related_information[0];
+    assert_eq!(diagnostics[5].related_information.len(), 1);
+    let related = &diagnostics[5].related_information[0];
     assert_eq!(related.file_name.as_deref(), Some("/project/input.ts"));
     assert_eq!(
         related
