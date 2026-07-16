@@ -250,6 +250,7 @@ impl CanonicalTypeMapperStore {
         self.validate_tuple_request(request)?;
 
         if request.element_infos.is_empty()
+            && !request.readonly
             && let Some(cached) = self.canonical_empty_tuple_type_cache()
         {
             self.validate_canonical_empty_tuple_type(cached)
@@ -281,7 +282,7 @@ impl CanonicalTypeMapperStore {
             .map(|provenance| provenance.target)
         {
             self.validate_canonical_tuple_target(cached)?;
-            if request.element_infos.is_empty() {
+            if request.element_infos.is_empty() && !request.readonly {
                 self.validate_canonical_empty_tuple_type(cached)
                     .map_err(|_| TupleTypeError::InvalidTargetCache(cached))?;
             }
@@ -564,7 +565,7 @@ impl CanonicalTypeMapperStore {
                 length_constituents,
             },
         ));
-        if arity == 0 {
+        if arity == 0 && !request.readonly {
             assert!(
                 self.publish_canonical_empty_tuple_type(CanonicalEmptyTupleProvenance {
                     type_: target,
@@ -946,6 +947,12 @@ impl CanonicalTypeMapperStore {
         let Some(bootstrap) = self.intrinsic_bootstrap() else {
             return false;
         };
+        if self
+            .validate_cached_union_result(length_type, None)
+            .is_err()
+        {
+            return false;
+        }
         if metadata.combined_flags().intersects(ElementFlags::VARIABLE) {
             return constituents.is_empty() && length_type == bootstrap.number_type;
         }
@@ -1300,6 +1307,33 @@ mod tests {
 
         assert_eq!(store.create_canonical_empty_tuple_type(), Ok(tuple));
         assert_eq!(observable_state(&store), cold);
+    }
+
+    #[test]
+    fn readonly_and_mutable_empty_tuples_have_distinct_order_independent_targets() {
+        for readonly_first in [false, true] {
+            let mut store = initialized();
+            let readonly = || CanonicalTupleTypeRequest::new(&[], &[], true);
+            let mutable = || CanonicalTupleTypeRequest::new(&[], &[], false);
+
+            let (mutable_tuple, readonly_tuple) = if readonly_first {
+                let readonly_tuple = store.create_canonical_tuple_type(readonly()).unwrap();
+                let mutable_tuple = store.create_canonical_tuple_type(mutable()).unwrap();
+                (mutable_tuple, readonly_tuple)
+            } else {
+                let mutable_tuple = store.create_canonical_tuple_type(mutable()).unwrap();
+                let readonly_tuple = store.create_canonical_tuple_type(readonly()).unwrap();
+                (mutable_tuple, readonly_tuple)
+            };
+
+            assert_ne!(mutable_tuple, readonly_tuple);
+            assert_eq!(store.canonical_empty_tuple_type_cache(), Some(mutable_tuple));
+            assert_eq!(store.create_canonical_empty_tuple_type(), Ok(mutable_tuple));
+            assert_eq!(store.create_canonical_tuple_type(mutable()), Ok(mutable_tuple));
+            assert_eq!(store.create_canonical_tuple_type(readonly()), Ok(readonly_tuple));
+            assert_eq!(type_to_string(&store, mutable_tuple).unwrap(), "[]");
+            assert_eq!(type_to_string(&store, readonly_tuple).unwrap(), "readonly []");
+        }
     }
 
     #[test]
@@ -1804,6 +1838,36 @@ mod tests {
 
     #[test]
     fn target_instance_and_foreign_cache_poison_are_rejected_read_only() {
+        let mut length_poison = initialized();
+        let string = length_poison.intrinsic_bootstrap().unwrap().string_type;
+        let number = length_poison.intrinsic_bootstrap().unwrap().number_type;
+        let infos = [
+            element_info(&length_poison, ElementFlags::REQUIRED, None),
+            element_info(&length_poison, ElementFlags::OPTIONAL, None),
+        ];
+        let types = [string, number];
+        let instance = length_poison
+            .create_canonical_tuple_type(CanonicalTupleTypeRequest::new(&types, &infos, false))
+            .unwrap();
+        let target = length_poison
+            .canonical_tuple_shape(instance)
+            .unwrap()
+            .unwrap()
+            .target();
+        let length_type = length_poison
+            .canonical_tuple_target_for_type(target)
+            .unwrap()
+            .1
+            .length_type;
+        assert!(length_poison.add_type_flags(length_type, TypeFlags::ENUM_LITERAL));
+        let poisoned = observable_state(&length_poison);
+        assert_eq!(
+            length_poison
+                .create_canonical_tuple_type(CanonicalTupleTypeRequest::new(&types, &infos, false)),
+            Err(TupleTypeError::InvalidTargetCache(target)),
+        );
+        assert_eq!(observable_state(&length_poison), poisoned);
+
         let mut target_poison = initialized();
         let string = target_poison.intrinsic_bootstrap().unwrap().string_type;
         let number = target_poison.intrinsic_bootstrap().unwrap().number_type;
