@@ -191,6 +191,92 @@ fn imported_generic_identity_matches_oracle_and_replays_warm() {
 }
 
 #[test]
+fn imported_ordered_generics_share_checked_signatures_but_not_recoveries() {
+    let target = parse_source_file(concat!(
+        "export function pair<T, U>(left: T, right: U): U { return right; } ",
+        "export const targetGood = pair<string, number>('target', 1);",
+    ));
+    let importer = parse_source_file(concat!(
+        "import { pair } from './a'; ",
+        "export const good = pair<string, number>('imported', 1); ",
+        "export const badA = pair<string, number>('imported', 'bad'); ",
+        "export const badB = pair<string, number>('imported', 'bad'); ",
+        "export const tooFew = pair<string, number>('imported');",
+    ));
+    assert!(target.diagnostics.is_empty(), "{:?}", target.diagnostics);
+    assert!(
+        importer.diagnostics.is_empty(),
+        "{:?}",
+        importer.diagnostics
+    );
+    let importer_file = FileId::new(30);
+    let target_file = FileId::new(31);
+    let importer_calls = call_nodes(&importer, importer_file);
+    let [good, bad_a, bad_b, too_few] = importer_calls.as_slice() else {
+        panic!("expected four imported ordered-generic calls")
+    };
+    let target_calls = call_nodes(&target, target_file);
+    let [target_good] = target_calls.as_slice() else {
+        panic!("expected one target-side ordered-generic call")
+    };
+    let mut context = importer_first_context(&importer, importer_file, &target, target_file);
+
+    context.check_source_file(importer_file).unwrap();
+
+    let target_source = context.source_file(target_file).unwrap();
+    assert!(
+        !context
+            .store()
+            .source_file_links(target_source)
+            .is_some_and(|links| links.type_checked),
+        "importer-first checking must not recursively check the target source"
+    );
+    let diagnostics = context.diagnostics().as_slice();
+    assert_eq!(
+        diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.diagnostic.code())
+            .collect::<Vec<_>>(),
+        [2345, 2345, 2554]
+    );
+    assert_eq!(diagnostics[2].node.map(|node| node.file), Some(importer_file));
+    assert_eq!(diagnostics[2].related_information.len(), 1);
+    assert_eq!(
+        diagnostics[2].related_information[0]
+            .node
+            .map(|node| node.file),
+        Some(target_file)
+    );
+    assert_eq!(diagnostics[2].related_information[0].diagnostic.code(), 6210);
+    assert_eq!(
+        diagnostics[2].related_information[0]
+            .diagnostic
+            .render()
+            .unwrap(),
+        "An argument for 'right' was not provided."
+    );
+    let signature = |context: &CanonicalCheckerContext<'_>, call: NodeRef| {
+        context
+            .store()
+            .signature_links(call)
+            .and_then(|links| links.resolved_signature.signature())
+            .unwrap()
+    };
+    let good_signature = signature(&context, *good);
+    let bad_a_signature = signature(&context, *bad_a);
+    let bad_b_signature = signature(&context, *bad_b);
+    assert_ne!(bad_a_signature, bad_b_signature);
+    assert_ne!(bad_a_signature, good_signature);
+    assert_ne!(bad_b_signature, good_signature);
+    assert_ne!(signature(&context, *too_few), good_signature);
+
+    context.check_source_file(target_file).unwrap();
+
+    assert_eq!(signature(&context, *target_good), good_signature);
+    assert_eq!(context.diagnostics().len(), 3);
+}
+
+#[test]
 #[allow(clippy::too_many_lines)]
 fn imported_alias_objects_flow_through_inferred_and_explicit_identity_calls() {
     let target = parse_source_file(concat!(
