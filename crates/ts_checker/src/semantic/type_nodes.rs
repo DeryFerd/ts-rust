@@ -1399,19 +1399,24 @@ impl<'store, 'host, 'arena> TypeQueryPlanner<'store, 'host, 'arena> {
         let declared_type = cached.declared_type;
         let declared_data = self.store.type_payload(declared_type).map(TypeRecord::data);
         let remains_union = matches!(declared_data, Some(TypeData::Union(_)));
-        let cached_array_capability_error =
-            self.validate_cached_array_capability(declared_type).err();
+        let canonical_enum_owner =
+            enums::canonical_enum_type_owner(self.store, declared_type);
+        let cached_array_capability_error = canonical_enum_owner
+            .is_none()
+            .then(|| self.validate_cached_array_capability(declared_type).err())
+            .flatten();
         if let Some(error) = cached_array_capability_error
             && !matches!(error, LiteralTypeCacheError::UnsupportedUnionConstituent(_))
         {
             return Err(type_construction_error(error));
         }
         let mut current_missing_generic_metadata = cached.missing_generic_metadata;
-        if union_constituent
-            || matches!(
-                declared_data,
-                Some(TypeData::Intrinsic(_) | TypeData::Literal(_) | TypeData::Union(_))
-            )
+        if canonical_enum_owner.is_none()
+            && (union_constituent
+                || matches!(
+                    declared_data,
+                    Some(TypeData::Intrinsic(_) | TypeData::Literal(_) | TypeData::Union(_))
+                ))
         {
             self.validate_cached_union_result(declared_type, None)
                 .map_err(type_construction_error)?;
@@ -1631,6 +1636,17 @@ impl<'store, 'host, 'arena> TypeQueryPlanner<'store, 'host, 'arena> {
                         .ok_or(DeclaredTypeError::Unavailable(
                             DeclaredTypeUnavailable::SymbolNotOwned(canonical),
                         ))?;
+                    if flags.intersects(SymbolFlags::ENUM) {
+                        return if missing_generic_metadata.is_empty()
+                            && canonical_enum_owner == Some(canonical)
+                        {
+                            Ok(())
+                        } else {
+                            Err(type_node_unavailable(
+                                TypeNodeUnavailable::InvalidCachedTypeAlias(root_symbol),
+                            ))
+                        };
+                    }
                     if !flags.contains(SymbolFlags::TYPE_ALIAS) || malformed_alias_merge(flags) {
                         if !missing_generic_metadata.is_empty() {
                             return Err(type_node_unavailable(
@@ -2209,8 +2225,12 @@ impl<'store, 'host, 'arena> TypeQueryPlanner<'store, 'host, 'arena> {
             .store
             .type_node_links(node)
             .and_then(|links| links.resolved_type);
+        let cached_enum_owner = cached_type
+            .and_then(|cached| enums::canonical_enum_type_owner(self.store, cached));
         let mut cached_pending_function = false;
-        let cached_array_capability_missing = if let Some(cached) = cached_type {
+        let cached_array_capability_missing = if cached_enum_owner.is_some() {
+            false
+        } else if let Some(cached) = cached_type {
             match self.validate_cached_array_capability(cached) {
                 Ok(()) => false,
                 Err(LiteralTypeCacheError::UnsupportedUnionConstituent(_)) => true,
@@ -2232,6 +2252,7 @@ impl<'store, 'host, 'arena> TypeQueryPlanner<'store, 'host, 'arena> {
             && cached_type.is_some()
             && !cached_array_capability_missing
             && !cached_pending_function
+            && cached_enum_owner.is_none()
             && !cached_syntax_contains_builtin_array
             && !self.cached_property_interface_reference(node)
             && !matches!(identifier.text.as_str(), "Array" | "ReadonlyArray")
@@ -2381,6 +2402,11 @@ impl<'store, 'host, 'arena> TypeQueryPlanner<'store, 'host, 'arena> {
             PlannedTypeReferenceArity::Valid
         } else if flags.intersects(SymbolFlags::ENUM) {
             enums::preflight_enum(self.store, self.host, symbol)?;
+            if cached_type.is_some() && cached_enum_owner != Some(symbol) {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidTypeReference(node),
+                ));
+            }
             if type_arguments.is_empty() {
                 PlannedTypeReferenceArity::Valid
             } else {
@@ -2995,7 +3021,12 @@ impl<'store, 'host, 'arena> TypeQueryPlanner<'store, 'host, 'arena> {
             return Ok(cached_alias.type_parameter_count);
         }
 
-        let cached_array_capability_missing = if let Some(cached) = cached {
+        let cached_enum_owner = cached.and_then(|cached| {
+            enums::canonical_enum_type_owner(self.store, cached.declared_type)
+        });
+        let cached_array_capability_missing = if cached_enum_owner.is_some() {
+            false
+        } else if let Some(cached) = cached {
             match self.validate_cached_array_capability(cached.declared_type) {
                 Ok(()) => false,
                 Err(LiteralTypeCacheError::UnsupportedUnionConstituent(_)) => true,
@@ -9016,6 +9047,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(alias_type, enum_type);
+        assert_eq!(
+            enums::canonical_enum_type_owner(&fixture.store, enum_type),
+            fixture.store.get_merged_symbol(enumeration)
+        );
         assert_eq!(
             fixture
                 .store

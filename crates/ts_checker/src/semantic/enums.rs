@@ -232,7 +232,8 @@ fn plan_enum(
         || owner.check_flags() != CheckFlags::NONE
         || owner.name().as_bytes() != identifier.text.as_bytes()
         || owner.value_declaration() != Some(declaration)
-        || owner.exports().is_some()
+        || owner.members().is_some()
+        || owner.exports().is_some() == enumeration.members.nodes.is_empty()
         || owner.export_symbol().is_some()
         || bound_owner != Some(symbol)
     {
@@ -243,15 +244,17 @@ fn plan_enum(
         declaration,
         symbol,
         is_exported,
+        is_ambient,
         bound.local_symbol(declaration),
         bound.symbol(bound.source_file()),
     )?;
 
     let member_table = owner
-        .members()
-        .and_then(|members| store.symbol_table(members))
-        .ok_or_else(|| invariant(EnumTypeInvariant::InvalidOwnerSymbol(symbol)))?;
-    if member_table.len() != enumeration.members.nodes.len() {
+        .exports()
+        .and_then(|members| store.symbol_table(members));
+    if member_table.map_or(0, ts_binder::semantic::SymbolTable::len)
+        != enumeration.members.nodes.len()
+    {
         return Err(invariant(EnumTypeInvariant::InvalidOwnerSymbol(symbol)));
     }
     let mut members = Vec::with_capacity(enumeration.members.nodes.len());
@@ -288,7 +291,8 @@ fn plan_enum(
         let member_symbol_record = store
             .symbol(member_symbol)
             .ok_or_else(|| invariant(EnumTypeInvariant::InvalidMemberSymbol(member)))?;
-        if member_table.get_source(&member_identifier.text) != Some(member_symbol)
+        if member_table.and_then(|members| members.get_source(&member_identifier.text))
+            != Some(member_symbol)
             || member_symbol_record.flags() != SymbolFlags::ENUM_MEMBER
             || member_symbol_record.check_flags() != CheckFlags::NONE
             || member_symbol_record.name().as_bytes() != member_identifier.text.as_bytes()
@@ -394,6 +398,7 @@ fn validate_export_route(
     declaration: NodeRef,
     owner: SemanticSymbolId,
     is_exported: bool,
+    is_ambient: bool,
     local: Option<SemanticSymbolId>,
     raw_source_owner: Option<SemanticSymbolId>,
 ) -> Result<(), EnumTypeError> {
@@ -405,7 +410,7 @@ fn validate_export_route(
         {
             Ok(())
         }
-        (true, Some(local)) => {
+        (_, Some(local)) if is_exported || is_ambient => {
             let source_owner = raw_source_owner
                 .and_then(|source| store.get_merged_symbol(source))
                 .ok_or_else(|| invariant(EnumTypeInvariant::InvalidExportRoute(declaration)))?;
@@ -782,6 +787,7 @@ pub(super) fn enum_type_display_name(
             || alias.symbol() != Some(symbol)
             || alias.type_arguments().is_some()
             || union.union.types.len() < 2
+            || union.union.types.windows(2).any(|pair| pair[0] >= pair[1])
             || union
                 != &(UnionTypeData {
                     union: UnionOrIntersectionTypeData {
@@ -802,6 +808,30 @@ pub(super) fn enum_type_display_name(
         }
     }
     Some(symbol_record.name().as_utf8()?.to_owned())
+}
+
+/// Returns the enum owner for one exact canonical enum or enum-member type.
+pub(super) fn canonical_enum_type_owner(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+) -> Option<SemanticSymbolId> {
+    enum_type_display_name(store, type_)?;
+    let symbol = store.type_payload(type_)?.symbol()?;
+    let record = store.symbol(symbol)?;
+    if record.flags() == SymbolFlags::ENUM_MEMBER {
+        record.parent()
+    } else {
+        Some(symbol)
+    }
+}
+
+/// Whether `type_` is an exact canonical enum union accepted by relation
+/// traversal instead of the disjoint primitive-union cache validator.
+pub(super) fn is_canonical_enum_union(store: &CanonicalTypeMapperStore, type_: TypeId) -> bool {
+    store.type_payload(type_).is_some_and(|record| {
+        record.flags() == TypeFlags::UNION | TypeFlags::ENUM_LITERAL
+            && enum_type_display_name(store, type_).is_some()
+    })
 }
 
 fn validate_declared_type(

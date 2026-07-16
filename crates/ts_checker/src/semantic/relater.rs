@@ -26,6 +26,7 @@ use super::{
     },
     declared::type_list_key,
     derived_types::DerivedObjectLiteralValidation,
+    enums,
     global_types::preflight_generic_global_type_target,
     ids::{SignatureId, TypeId},
     links::{MembersOrExportsResolutionKind, ValueSymbolLinks},
@@ -927,13 +928,26 @@ impl<'store> RelaterSession<'store> {
         if let Some(types) = self.validated_unions.get(&type_id) {
             return Ok(types.clone());
         }
-        let validation = match self.global_types {
-            Some(global_types) => self
-                .store
-                .validate_union_constituent_with_array_targets(global_types.array_targets, type_id),
-            None => self.store.validate_union_constituent(type_id),
-        };
-        validation.map_err(|error| union_validation_unavailable(type_id, error))?;
+        let enum_literal = self
+            .store
+            .type_payload(type_id)
+            .ok_or(RelationUnavailable::Type(type_id))?
+            .flags()
+            .intersects(TypeFlags::ENUM_LITERAL);
+        if enum_literal {
+            if !enums::is_canonical_enum_union(self.store, type_id) {
+                return Err(RelationUnavailable::MalformedUnion(type_id));
+            }
+        } else {
+            let validation = match self.global_types {
+                Some(global_types) => self.store.validate_union_constituent_with_array_targets(
+                    global_types.array_targets,
+                    type_id,
+                ),
+                None => self.store.validate_union_constituent(type_id),
+            };
+            validation.map_err(|error| union_validation_unavailable(type_id, error))?;
+        }
         let record = self
             .store
             .type_payload(type_id)
