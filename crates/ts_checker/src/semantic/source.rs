@@ -1235,6 +1235,32 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         &mut self,
         callable: &SourceCallablePlan,
     ) -> Result<PlannedFunctionBody, SourceCheckError> {
+        for parameter in &callable.parameters {
+            if !self.prior_variables.insert(parameter.symbol)
+                || !self.readable_variables.insert(parameter.symbol)
+            {
+                return Err(SourceCheckError::Function(
+                    SourceFunctionInvariant::Callable(parameter.declaration),
+                ));
+            }
+        }
+        let result = self.plan_function_body_contents(callable);
+        for parameter in &callable.parameters {
+            if !self.prior_variables.remove(&parameter.symbol)
+                || !self.readable_variables.remove(&parameter.symbol)
+            {
+                return Err(SourceCheckError::Function(
+                    SourceFunctionInvariant::Callable(parameter.declaration),
+                ));
+            }
+        }
+        result
+    }
+
+    fn plan_function_body_contents(
+        &mut self,
+        callable: &SourceCallablePlan,
+    ) -> Result<PlannedFunctionBody, SourceCheckError> {
         let body = callable.body;
         let statements = {
             let node = self.node(body)?;
@@ -4362,6 +4388,23 @@ pub(super) fn check_source_file(
                 let function = functions.get(index).ok_or(SourceCheckError::Function(
                     SourceFunctionInvariant::InvalidStatementIndex(index),
                 ))?;
+                let mut body_flow_types = current_flow_types.clone();
+                for parameter in &function.callable.parameters {
+                    let parameter_type = store
+                        .value_symbol_links(parameter.symbol)
+                        .and_then(|links| links.resolved_type)
+                        .ok_or(SourceCheckError::Variable(
+                            VariableInvariant::MissingCurrentFlowType(parameter.symbol),
+                        ))?;
+                    if body_flow_types
+                        .insert(parameter.symbol, parameter_type)
+                        .is_some()
+                    {
+                        return Err(SourceCheckError::Variable(
+                            VariableInvariant::DuplicateCurrentFlowType(parameter.symbol),
+                        ));
+                    }
+                }
                 match &function.body {
                     PlannedFunctionBody::Empty => {}
                     PlannedFunctionBody::Return {
@@ -4375,7 +4418,7 @@ pub(super) fn check_source_file(
                             source,
                             options,
                             diagnostics,
-                            &current_flow_types,
+                            &body_flow_types,
                             &mut deferred,
                             function.callable.return_type,
                             expression,
