@@ -733,6 +733,7 @@ fn primary(
     let message = message_by_code(code).ok_or(SourceCheckError::MissingDiagnostic(code))?;
     Ok(CanonicalCheckerDiagnostic {
         node: Some(node),
+        range_override: None,
         diagnostic: Diagnostic::with_arguments(message, arguments),
         related_information: Vec::new(),
     })

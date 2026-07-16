@@ -31,10 +31,10 @@ use ts_jsnum::{Number, PseudoBigInt};
 
 use super::{
     ArrayTypeError, AssertionLinks, AssignmentInvariant, AssignmentUnsupported,
-    CanonicalCheckerDiagnostic, CanonicalCheckerDiagnostics, CanonicalCheckerOptions,
-    CanonicalGlobalTypes, CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHost,
-    DerivedTypeError, ProductionAliasTargetHost, RelationUnavailable, SourceFileLinks,
-    SourceFileRef, SymbolNodeLinks, TypeDisplayUnavailable, TypeId, TypeNodeLinks,
+    CanonicalCheckerDiagnostic, CanonicalCheckerDiagnosticRange, CanonicalCheckerDiagnostics,
+    CanonicalCheckerOptions, CanonicalGlobalTypes, CanonicalTypeMapperStore, DeclaredTypeError,
+    DeclaredTypeHost, DerivedTypeError, ProductionAliasTargetHost, RelationUnavailable,
+    SourceFileLinks, SourceFileRef, SymbolNodeLinks, TypeDisplayUnavailable, TypeId, TypeNodeLinks,
     ValueSymbolLinks, VariableInvariant, VariableUnsupported,
     array_types::CanonicalArrayTargets,
     bootstrap::{LiteralTypeCacheError, UnionReduction},
@@ -202,6 +202,10 @@ pub enum SourceCheckProvenanceError {
     },
     MissingDeclarationSymbol(NodeRef),
     InvalidDiagnosticNode(NodeRef),
+    InvalidDiagnosticRange {
+        node: Option<NodeRef>,
+        range_override: CanonicalCheckerDiagnosticRange,
+    },
     SourceLinkPublication(SourceFileRef),
 }
 
@@ -3720,6 +3724,7 @@ fn preflight_type_import_value_use(
     Ok(PreparedSourceTypeImportValueUse {
         diagnostic: CanonicalCheckerDiagnostic {
             node: Some(read.node),
+            range_override: None,
             diagnostic: Diagnostic::with_arguments(
                 message_by_code(1361).ok_or(SourceCheckError::MissingDiagnostic(1361))?,
                 [read.name.clone()],
@@ -4097,6 +4102,7 @@ fn check_deferred_assertions(
             diagnostics,
             CanonicalCheckerDiagnostic {
                 node: Some(assertion.node),
+                range_override: None,
                 diagnostic,
                 related_information: Vec::new(),
             },
@@ -4111,10 +4117,11 @@ pub(super) fn merge_retry_diagnostic(
 ) {
     let CanonicalCheckerDiagnostic {
         node,
+        range_override,
         diagnostic,
         related_information,
     } = diagnostic;
-    let entry = destination.lookup_primary_or_issue(node, diagnostic);
+    let entry = destination.lookup_primary_or_issue(node, range_override, diagnostic);
     for related in related_information {
         if !entry.related_information.contains(&related) {
             entry.append_related(related);
@@ -5068,6 +5075,7 @@ fn materialize_contextual_source_arrow(
             diagnostics,
             CanonicalCheckerDiagnostic {
                 node: Some(node),
+                range_override: None,
                 diagnostic,
                 related_information: Vec::new(),
             },
@@ -5099,6 +5107,7 @@ fn materialize_contextual_source_arrow(
             diagnostics,
             CanonicalCheckerDiagnostic {
                 node: Some(arrow.declaration),
+                range_override: None,
                 diagnostic: Diagnostic::with_arguments(
                     message_by_code(2322).ok_or(SourceCheckError::MissingDiagnostic(2322))?,
                     [display.source, display.target],

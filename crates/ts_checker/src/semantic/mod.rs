@@ -71,7 +71,8 @@ pub use declared::{
 };
 pub use derived_types::DerivedTypeError;
 pub use diagnostics::{
-    CanonicalCheckerDiagnostic, CanonicalCheckerDiagnostics, CanonicalCheckerRelatedInformation,
+    CanonicalCheckerDiagnostic, CanonicalCheckerDiagnosticRange, CanonicalCheckerDiagnostics,
+    CanonicalCheckerRelatedInformation,
 };
 pub use enums::{
     CanonicalEnumMemberSemantics, CanonicalEnumMemberValue, CanonicalEnumSemantics, EnumTypeError,

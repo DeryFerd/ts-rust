@@ -14,13 +14,13 @@ use ts_binder::{
 };
 use ts_checker::semantic::formatter::FunctionTypeDisplayUnavailable;
 use ts_checker::semantic::{
-    ArrayTypeError, CanonicalCheckerContext, CanonicalCheckerContextError, CanonicalCheckerOptions,
-    CanonicalGlobalInitializationError, CanonicalGlobalTypeInitializationError,
-    CanonicalModuleResolutionEntry, CanonicalModuleResolutionManifestInput,
-    CanonicalModuleResolutionMode, CanonicalResolvedModuleInput, DeclaredTypeError,
-    DeclaredTypeUnavailable, DerivedTypeError, EnumTypeError, IntrinsicBootstrapOptions,
-    RelationUnavailable, SourceCheckError, SourceLiteralCacheError, SymbolMergeError,
-    TypeDisplayUnavailable, TypeNodeUnavailable,
+    ArrayTypeError, CanonicalCheckerContext, CanonicalCheckerContextError,
+    CanonicalCheckerDiagnosticRange, CanonicalCheckerOptions, CanonicalGlobalInitializationError,
+    CanonicalGlobalTypeInitializationError, CanonicalModuleResolutionEntry,
+    CanonicalModuleResolutionManifestInput, CanonicalModuleResolutionMode,
+    CanonicalResolvedModuleInput, DeclaredTypeError, DeclaredTypeUnavailable, DerivedTypeError,
+    EnumTypeError, IntrinsicBootstrapOptions, RelationUnavailable, SourceCheckError,
+    SourceLiteralCacheError, SymbolMergeError, TypeDisplayUnavailable, TypeNodeUnavailable,
 };
 use ts_checker::{
     CheckDiagnostic, CheckResult, CheckerOptions, EnumConstantValue as CheckerConstantValue,
@@ -267,6 +267,10 @@ pub enum CanonicalProgramCheckError {
         resolved_file_name: String,
     },
     InvalidDiagnosticNode(NodeRef),
+    InvalidDiagnosticRange {
+        node: Option<NodeRef>,
+        range_override: CanonicalCheckerDiagnosticRange,
+    },
     InvalidRelatedDiagnosticNode {
         primary_code: u32,
         index: usize,
@@ -304,6 +308,7 @@ impl CanonicalProgramCheckError {
             | Self::InvalidModuleSpecifier(_)
             | Self::MissingResolvedModuleTarget { .. }
             | Self::InvalidDiagnosticNode(_)
+            | Self::InvalidDiagnosticRange { .. }
             | Self::InvalidRelatedDiagnosticNode { .. }
             | Self::DiagnosticFormat(_) => false,
         }
@@ -774,6 +779,13 @@ impl std::fmt::Display for CanonicalProgramCheckError {
                 formatter,
                 "canonical diagnostic references invalid Program node {node:?}"
             ),
+            Self::InvalidDiagnosticRange {
+                node,
+                range_override,
+            } => write!(
+                formatter,
+                "canonical diagnostic node {node:?} references invalid anchored range {range_override:?}"
+            ),
             Self::InvalidRelatedDiagnosticNode {
                 primary_code,
                 index,
@@ -808,6 +820,7 @@ impl std::error::Error for CanonicalProgramCheckError {
             | Self::InvalidModuleSpecifier(_)
             | Self::MissingResolvedModuleTarget { .. }
             | Self::InvalidDiagnosticNode(_)
+            | Self::InvalidDiagnosticRange { .. }
             | Self::InvalidRelatedDiagnosticNode { .. } => None,
         }
     }
@@ -2939,6 +2952,7 @@ impl Program {
                 diagnostics.push(
                     self.canonical_program_diagnostic(
                         Some(diagnostic.node),
+                        None,
                         &diagnostic.diagnostic,
                         diagnostic
                             .related_information
@@ -3004,6 +3018,7 @@ impl Program {
         for diagnostic in context.global_types().diagnostics() {
             diagnostics.push(self.canonical_program_diagnostic(
                 diagnostic.node,
+                None,
                 &diagnostic.diagnostic,
                 std::iter::empty(),
             )?);
@@ -3012,6 +3027,7 @@ impl Program {
             diagnostics.push(
                 self.canonical_program_diagnostic(
                     diagnostic.node,
+                    diagnostic.range_override,
                     &diagnostic.diagnostic,
                     diagnostic
                         .related_information
@@ -3027,16 +3043,18 @@ impl Program {
     fn canonical_program_diagnostic<'diagnostic>(
         &self,
         node: Option<NodeRef>,
+        range_override: Option<CanonicalCheckerDiagnosticRange>,
         diagnostic: &Diagnostic,
         related_information: impl IntoIterator<Item = (Option<NodeRef>, &'diagnostic Diagnostic)>,
     ) -> Result<ProgramDiagnostic, CanonicalProgramCheckError> {
-        let mut result = self.canonical_program_diagnostic_record(node, diagnostic)?;
+        let mut result =
+            self.canonical_program_diagnostic_record(node, range_override, diagnostic)?;
         let primary_code = diagnostic.code();
         result.related_information = related_information
             .into_iter()
             .enumerate()
             .map(|(index, (node, diagnostic))| {
-                self.canonical_program_diagnostic_record(node, diagnostic)
+                self.canonical_program_diagnostic_record(node, None, diagnostic)
                     .map_err(|error| match error {
                         CanonicalProgramCheckError::InvalidDiagnosticNode(node) => {
                             CanonicalProgramCheckError::InvalidRelatedDiagnosticNode {
@@ -3055,18 +3073,44 @@ impl Program {
     fn canonical_program_diagnostic_record(
         &self,
         node: Option<NodeRef>,
+        range_override: Option<CanonicalCheckerDiagnosticRange>,
         diagnostic: &Diagnostic,
     ) -> Result<ProgramDiagnostic, CanonicalProgramCheckError> {
         let (file_name, range) = if let Some(node) = node {
-            let range = self
+            let anchor = self
                 .node(node)
-                .map(|node| node.range)
                 .ok_or(CanonicalProgramCheckError::InvalidDiagnosticNode(node))?;
             let source = self
                 .source_file_by_id(node.file)
                 .ok_or(CanonicalProgramCheckError::InvalidDiagnosticNode(node))?;
+            let source_range = source
+                .parse
+                .arena
+                .get(source.parse.source_file)
+                .map(|source| source.range)
+                .ok_or(CanonicalProgramCheckError::InvalidDiagnosticNode(node))?;
+            let range = match range_override {
+                Some(range_override)
+                    if range_override.is_valid_for(node, anchor.range, source_range) =>
+                {
+                    range_override.range()
+                }
+                Some(range_override) => {
+                    return Err(CanonicalProgramCheckError::InvalidDiagnosticRange {
+                        node: Some(node),
+                        range_override,
+                    });
+                }
+                None => anchor.range,
+            };
             (Some(source.file_name.clone()), Some(range))
         } else {
+            if let Some(range_override) = range_override {
+                return Err(CanonicalProgramCheckError::InvalidDiagnosticRange {
+                    node: None,
+                    range_override,
+                });
+            }
             (None, None)
         };
         Ok(ProgramDiagnostic {
@@ -6829,14 +6873,16 @@ mod tests {
     use ts_checker::semantic::formatter::FunctionTypeDisplayUnavailable;
     use ts_checker::semantic::{
         ArrayTypeError, AssignmentInvariant, CanonicalCheckerContextError,
-        CanonicalGlobalInitializationError, CanonicalGlobalTypeInitializationError,
-        CanonicalModuleResolutionInput, CanonicalModuleResolutionMode, CanonicalTypeMapperStore,
-        DeclaredTypeError, DeclaredTypeHostError, DeclaredTypeUnavailable, DerivedTypeError,
+        CanonicalCheckerDiagnosticRange, CanonicalGlobalInitializationError,
+        CanonicalGlobalTypeInitializationError, CanonicalModuleResolutionInput,
+        CanonicalModuleResolutionMode, CanonicalTypeMapperStore, DeclaredTypeError,
+        DeclaredTypeHostError, DeclaredTypeUnavailable, DerivedTypeError,
         IntrinsicBootstrapOptions, RelationKind, RelationUnavailable, SourceAssertionError,
         SourceCheckError, SourceCheckProvenanceError, SourceFunctionInvariant,
         SourceLiteralCacheError, SourceObjectLiteralError, SymbolMergeError, TypeDataKind,
         TypeDisplayUnavailable, TypeNodeUnavailable, UnsupportedSourceSyntax, VariableInvariant,
     };
+    use ts_core::{TextPos, TextRange};
     use ts_diagnostics::{Category, Diagnostic, message_by_code};
     use ts_options::{
         CompilerOptions, ModuleDetectionKind, ModuleKind, ModuleResolutionKind, ScriptTarget,
@@ -7755,6 +7801,157 @@ mod tests {
     }
 
     #[test]
+    fn canonical_program_diagnostic_uses_exact_range_and_preserves_node_default() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file("/project/input.ts", "const target: number = 1;")
+            .unwrap();
+        let program = Program::new_with_options(
+            &fs,
+            "/project",
+            &["input.ts".to_owned()],
+            CompilerOptions {
+                no_check: true,
+                no_lib: true,
+                ..CompilerOptions::default()
+            },
+        );
+        let source = program.source_file("/project/input.ts").unwrap();
+        let (identifier, identifier_record) = source
+            .parse
+            .arena
+            .iter()
+            .find(|(_, record)| {
+                matches!(&record.data, NodeData::Identifier(identifier) if identifier.text == "target")
+            })
+            .unwrap();
+        let anchor = source.node_ref(identifier).unwrap();
+        let exact_range = TextRange::new(
+            TextPos::new(identifier_record.range.start.get() + 1),
+            TextPos::new(identifier_record.range.start.get() + 3),
+        );
+        let diagnostic = Diagnostic::with_arguments(message_by_code(2300).unwrap(), ["target"]);
+        let node_default = program
+            .canonical_program_diagnostic(Some(anchor), None, &diagnostic, std::iter::empty())
+            .unwrap();
+        let exact = program
+            .canonical_program_diagnostic(
+                Some(anchor),
+                Some(CanonicalCheckerDiagnosticRange::new(anchor, exact_range)),
+                &diagnostic,
+                std::iter::empty(),
+            )
+            .unwrap();
+
+        assert_eq!(node_default.file_name.as_deref(), Some("/project/input.ts"));
+        assert_eq!(node_default.range, Some(identifier_record.range));
+        assert_eq!(exact.range, Some(exact_range));
+        let mut normalized = exact.clone();
+        normalized.range = node_default.range;
+        assert_eq!(normalized, node_default);
+
+        let later_range = TextRange::new(
+            TextPos::new(identifier_record.range.start.get() + 3),
+            TextPos::new(identifier_record.range.start.get() + 4),
+        );
+        let later = program
+            .canonical_program_diagnostic(
+                Some(anchor),
+                Some(CanonicalCheckerDiagnosticRange::new(anchor, later_range)),
+                &diagnostic,
+                std::iter::empty(),
+            )
+            .unwrap();
+        let mut ordered = [later, exact];
+        ordered.sort_by(super::compare_program_diagnostics);
+        assert_eq!(ordered[0].range, Some(exact_range));
+        assert_eq!(ordered[1].range, Some(later_range));
+    }
+
+    #[test]
+    fn canonical_program_diagnostic_rejects_invalid_range_overrides() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file("/project/input.ts", "const target: number = 1;")
+            .unwrap();
+        let program = Program::new_with_options(
+            &fs,
+            "/project",
+            &["input.ts".to_owned()],
+            CompilerOptions {
+                no_check: true,
+                no_lib: true,
+                ..CompilerOptions::default()
+            },
+        );
+        let source = program.source_file("/project/input.ts").unwrap();
+        let (identifier, identifier_record) = source
+            .parse
+            .arena
+            .iter()
+            .find(|(_, record)| {
+                matches!(&record.data, NodeData::Identifier(identifier) if identifier.text == "target")
+            })
+            .unwrap();
+        let anchor = source.node_ref(identifier).unwrap();
+        let source_range = source
+            .parse
+            .arena
+            .get(source.parse.source_file)
+            .unwrap()
+            .range;
+        let valid_range = TextRange::new(
+            identifier_record.range.start,
+            TextPos::new(identifier_record.range.start.get() + 1),
+        );
+        let empty = CanonicalCheckerDiagnosticRange::new(
+            anchor,
+            TextRange::new(identifier_record.range.start, identifier_record.range.start),
+        );
+        let outside_anchor = CanonicalCheckerDiagnosticRange::new(
+            anchor,
+            TextRange::new(
+                TextPos::new(identifier_record.range.start.get() - 1),
+                identifier_record.range.end,
+            ),
+        );
+        let outside_source = CanonicalCheckerDiagnosticRange::new(
+            anchor,
+            TextRange::new(source_range.end, TextPos::new(source_range.end.get() + 1)),
+        );
+        let foreign = CanonicalCheckerDiagnosticRange::new(
+            ts_ast::NodeRef::new(source.parse.arena.id(), FileId::new(99), identifier),
+            valid_range,
+        );
+        let valid = CanonicalCheckerDiagnosticRange::new(anchor, valid_range);
+        let diagnostic = Diagnostic::with_arguments(message_by_code(2300).unwrap(), ["target"]);
+
+        for (node, range_override) in [
+            (Some(anchor), empty),
+            (Some(anchor), outside_anchor),
+            (Some(anchor), outside_source),
+            (Some(anchor), foreign),
+            (None, valid),
+        ] {
+            let error = program
+                .canonical_program_diagnostic(
+                    node,
+                    Some(range_override),
+                    &diagnostic,
+                    std::iter::empty(),
+                )
+                .unwrap_err();
+            assert_eq!(
+                error,
+                CanonicalProgramCheckError::InvalidDiagnosticRange {
+                    node,
+                    range_override,
+                }
+            );
+            assert!(!error.is_unsupported_boundary());
+        }
+        assert!(program.diagnostics().is_empty());
+    }
+
+    #[test]
     fn canonical_program_diagnostic_owns_same_and_cross_file_related_records_in_order() {
         let fs = MemoryFileSystem::new(true);
         fs.write_file(
@@ -7798,6 +7995,7 @@ mod tests {
         let owned = program
             .canonical_program_diagnostic(
                 Some(primary_node),
+                None,
                 &primary,
                 [
                     (Some(same_file_node), &leading),
@@ -7913,6 +8111,7 @@ mod tests {
         let error = program
             .canonical_program_diagnostic(
                 Some(identifiers[0]),
+                None,
                 &primary,
                 [
                     (Some(identifiers[1]), &leading),

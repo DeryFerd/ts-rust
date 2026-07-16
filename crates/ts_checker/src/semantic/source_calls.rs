@@ -653,6 +653,7 @@ pub(super) fn check_direct_source_call(
                 diagnostics,
                 CanonicalCheckerDiagnostic {
                     node: Some(plan.node),
+                    range_override: None,
                     diagnostic: Diagnostic::with_arguments(
                         message_by_code(2554).ok_or(SourceCheckError::MissingDiagnostic(2554))?,
                         [expected, actual.to_string()],
@@ -686,6 +687,7 @@ pub(super) fn check_direct_source_call(
                 diagnostics,
                 CanonicalCheckerDiagnostic {
                     node: Some(argument.node),
+                    range_override: None,
                     diagnostic: Diagnostic::with_arguments(
                         message_by_code(2345).ok_or(SourceCheckError::MissingDiagnostic(2345))?,
                         [display.source, display.target],

@@ -598,6 +598,7 @@ fn fixed_diagnostic(
     let message = message_by_code(code).ok_or(PrimitiveBinaryInvariant::MissingDiagnostic(code))?;
     Ok(CanonicalCheckerDiagnostic {
         node: Some(node),
+        range_override: None,
         diagnostic: Diagnostic::new(message),
         related_information: Vec::new(),
     })
@@ -613,6 +614,7 @@ fn operator_diagnostic(
     let message = message_by_code(2365).ok_or(PrimitiveBinaryInvariant::MissingDiagnostic(2365))?;
     Ok(CanonicalCheckerDiagnostic {
         node: Some(node),
+        range_override: None,
         diagnostic: Diagnostic::with_arguments(
             message,
             [
@@ -634,6 +636,7 @@ fn comparison_diagnostic(
     let message = message_by_code(2367).ok_or(PrimitiveBinaryInvariant::MissingDiagnostic(2367))?;
     Ok(CanonicalCheckerDiagnostic {
         node: Some(node),
+        range_override: None,
         diagnostic: Diagnostic::with_arguments(
             message,
             [type_to_string(store, left)?, type_to_string(store, right)?],

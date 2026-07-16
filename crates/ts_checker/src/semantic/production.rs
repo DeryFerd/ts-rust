@@ -109,16 +109,46 @@ fn diagnostic_owners(
         .iter()
         .map(|diagnostic| {
             let Some(node) = diagnostic.node else {
+                if let Some(range_override) = diagnostic.range_override {
+                    return Err(SourceCheckError::Provenance(
+                        SourceCheckProvenanceError::InvalidDiagnosticRange {
+                            node: None,
+                            range_override,
+                        },
+                    ));
+                }
                 return Ok(initiating);
             };
-            let owner = files.snapshot(node.file).filter(|(arena, bound)| {
+            let snapshot = files.snapshot(node.file).filter(|(arena, bound)| {
                 node.is_for(arena.id(), bound.file_id()) && bound.contains(node)
             });
-            owner
-                .and_then(|_| files.source_file(node.file))
+            let Some((arena, _)) = snapshot else {
+                return Err(SourceCheckError::Provenance(
+                    SourceCheckProvenanceError::InvalidDiagnosticNode(node),
+                ));
+            };
+            let owner = files
+                .source_file(node.file)
                 .ok_or(SourceCheckError::Provenance(
                     SourceCheckProvenanceError::InvalidDiagnosticNode(node),
-                ))
+                ))?;
+            if let Some(range_override) = diagnostic.range_override {
+                let valid = arena
+                    .get(node.node)
+                    .zip(arena.get(owner.node_ref().node))
+                    .is_some_and(|(anchor, source)| {
+                        range_override.is_valid_for(node, anchor.range, source.range)
+                    });
+                if !valid {
+                    return Err(SourceCheckError::Provenance(
+                        SourceCheckProvenanceError::InvalidDiagnosticRange {
+                            node: Some(node),
+                            range_override,
+                        },
+                    ));
+                }
+            }
+            Ok(owner)
         })
         .collect()
 }
@@ -1707,13 +1737,16 @@ mod tests {
         CanonicalBinder, CanonicalModuleState, CanonicalNameResolverOptions,
         CanonicalSourceFileFacts, CanonicalSourceLanguage, EscapedName, resolve_global_name,
     };
+    use ts_core::{TextPos, TextRange};
+    use ts_diagnostics::{Diagnostic, message_by_code};
     use ts_parser::{ParseResult, parse_source_file};
 
     use super::*;
     use crate::semantic::{
-        AliasTargetState, CanonicalModuleResolutionEntry, CanonicalModuleResolutionManifestInput,
-        CanonicalModuleResolutionMode, CanonicalResolvedModuleInput, DeclaredTypeUnavailable,
-        TypeData, TypeResolutionTarget, TypeResolutionTargetError, TypeSystemPropertyName,
+        AliasTargetState, CanonicalCheckerDiagnosticRange, CanonicalModuleResolutionEntry,
+        CanonicalModuleResolutionManifestInput, CanonicalModuleResolutionMode,
+        CanonicalResolvedModuleInput, DeclaredTypeUnavailable, TypeData, TypeResolutionTarget,
+        TypeResolutionTargetError, TypeSystemPropertyName,
         alias::{CanonicalAliasResolutionEvent, CanonicalAliasTargetUnavailable},
         type_records::TypeCacheState,
         types::ObjectFlags,
@@ -2087,6 +2120,80 @@ mod tests {
         assert!(!options.strict_function_types);
         assert!(!options.no_implicit_any);
         assert!(!options.no_error_truncation);
+    }
+
+    #[test]
+    fn diagnostic_ownership_accepts_exact_subranges_and_rejects_poison() {
+        let source = parsed("const target = 1;");
+        let file = FileId::new(1);
+        let context = CanonicalCheckerContext::new(
+            completed_bindings(&[(file, &source)]),
+            vec![(file, &source.arena)],
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap();
+        let (identifier, identifier_record) = source
+            .arena
+            .iter()
+            .find(|(_, record)| record.kind == SyntaxKind::Identifier)
+            .unwrap();
+        let anchor = node_ref(&source, file, identifier);
+        let source_range = source.arena.get(source.source_file).unwrap().range;
+        let valid = CanonicalCheckerDiagnosticRange::new(
+            anchor,
+            TextRange::new(
+                identifier_record.range.start,
+                TextPos::new(identifier_record.range.start.get() + 1),
+            ),
+        );
+        let owner = context.files.source_file(file).unwrap();
+        let diagnostic = Diagnostic::with_arguments(message_by_code(2300).unwrap(), ["target"]);
+        let mut accepted = CanonicalCheckerDiagnostics::default();
+        accepted.lookup_primary_or_issue(Some(anchor), Some(valid), diagnostic.clone());
+
+        assert_eq!(
+            diagnostic_owners(&context.files, owner, &accepted),
+            Ok(vec![owner])
+        );
+
+        let empty = CanonicalCheckerDiagnosticRange::new(
+            anchor,
+            TextRange::new(identifier_record.range.start, identifier_record.range.start),
+        );
+        let outside_anchor = CanonicalCheckerDiagnosticRange::new(
+            anchor,
+            TextRange::new(
+                TextPos::new(identifier_record.range.start.get() - 1),
+                identifier_record.range.end,
+            ),
+        );
+        let outside_source = CanonicalCheckerDiagnosticRange::new(
+            anchor,
+            TextRange::new(source_range.end, TextPos::new(source_range.end.get() + 1)),
+        );
+        let foreign_anchor = NodeRef::new(source.arena.id(), FileId::new(99), identifier);
+        let foreign = CanonicalCheckerDiagnosticRange::new(foreign_anchor, valid.range());
+
+        for (node, range_override) in [
+            (Some(anchor), empty),
+            (Some(anchor), outside_anchor),
+            (Some(anchor), outside_source),
+            (Some(anchor), foreign),
+            (None, valid),
+        ] {
+            let mut poisoned = CanonicalCheckerDiagnostics::default();
+            poisoned.lookup_primary_or_issue(node, Some(range_override), diagnostic.clone());
+            assert_eq!(
+                diagnostic_owners(&context.files, owner, &poisoned),
+                Err(SourceCheckError::Provenance(
+                    SourceCheckProvenanceError::InvalidDiagnosticRange {
+                        node,
+                        range_override,
+                    }
+                ))
+            );
+        }
+        assert!(context.diagnostics().is_empty());
     }
 
     #[test]
