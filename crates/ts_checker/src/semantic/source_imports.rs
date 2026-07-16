@@ -4,19 +4,21 @@
 //! `import { exported as local } from "./target"`. The import and every
 //! specifier must be value-bearing, identifier-named, modifier-free, and
 //! attribute-free. Alias discovery is delegated to the production alias host;
-//! a successful alias must point directly at one unique, initialized,
-//! annotated, explicitly exported `const` declaration in another retained
-//! TypeScript ESM source.
+//! a successful alias must point directly at one unique, explicitly exported
+//! declaration in another retained TypeScript ESM source. Value preparation
+//! currently supports initialized annotated `const` declarations and
+//! annotated `FunctionDeclaration`s.
 //!
 //! Source integration separates declaration checking from value use. Every
 //! binding is resolved through [`resolve_source_import_binding`], including
 //! unused imports, while [`prepare_source_import_value`] queries the target's
-//! annotation only for a proven later value read. Preparation returns eventual
-//! target/alias value-link payloads without publishing them. After the whole
-//! source has checked, [`preflight_prepared_source_import_publications`]
-//! validates and exposes those payloads for the source checker's one combined
-//! atomic publication batch. Importer-first Program order never recursively
-//! checks the target source: `CanonicalTypeQuery` reads its annotation lazily.
+//! annotation or callable graph only for a proven later value read. Preparation
+//! returns eventual target/alias value-link payloads without publishing the
+//! import alias. After the whole source has checked,
+//! [`preflight_prepared_source_import_publications`] validates and exposes
+//! those payloads for the source checker's one combined atomic publication
+//! batch. Importer-first Program order never recursively checks the target
+//! source: `CanonicalTypeQuery` materializes its canonical type lazily.
 //!
 //! The split follows the pinned TypeScript-Go paths in
 //! `internal/checker/checker.go`: `checkImportDeclaration` proves import
@@ -35,10 +37,15 @@ use ts_binder::{
 use super::{
     AliasTargetState, CanonicalCheckerDiagnostics, CanonicalCheckerOptions, CanonicalGlobalTypes,
     CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHost, ProductionAliasTargetHost,
-    TypeId, TypeNodeLinks, ValueSymbolLinks,
+    SignatureId, TypeId, TypeNodeLinks, ValueSymbolLinks,
     alias::{
         CanonicalAliasResolutionError, CanonicalAliasResolutionEvent, CanonicalAliasResolver,
         CanonicalAliasTargetHost, CanonicalImmediateAliasTarget,
+    },
+    array_types::CanonicalArrayTargets,
+    source_callables::{
+        SourceCallableError, SourceCallableFamily, SourceCallablePlan,
+        StoredSourceCallableValidation, plan_source_callable, validate_stored_source_callable,
     },
     type_nodes::{CanonicalTypeQuery, CanonicalTypeReferenceAliasTarget},
     variables::{VariableBindingKind, VariablePlanError, plan_top_level_variable},
@@ -105,11 +112,31 @@ pub(super) struct PreparedSourceImportValue {
     pub(super) binding: SourceImportBindingPlan,
     pub(super) target_symbol: SemanticSymbolId,
     pub(super) target_declaration: NodeRef,
-    pub(super) target_type_node: NodeRef,
     pub(super) type_: TypeId,
-    target_type_links: Option<TypeNodeLinks>,
+    target: PreparedSourceImportTarget,
     target_links: ValueSymbolLinks,
     alias_links: ValueSymbolLinks,
+}
+
+/// Target-specific cache proof retained between lazy preparation and the
+/// source checker's final alias-link publication batch.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum PreparedSourceImportTarget {
+    AnnotatedConst {
+        type_node: NodeRef,
+        type_links: Option<TypeNodeLinks>,
+    },
+    AnnotatedFunction {
+        signature: SignatureId,
+    },
+}
+
+enum PlannedSourceImportValueTarget {
+    AnnotatedConst {
+        declaration: NodeRef,
+        type_node: NodeRef,
+    },
+    AnnotatedFunction(SourceCallablePlan),
 }
 
 /// One fully preflighted value-link payload for the source checker's combined
@@ -221,6 +248,7 @@ pub(super) enum SourceImportError {
     Alias(CanonicalAliasResolutionError),
     DeclaredType(DeclaredTypeError),
     Variable(VariablePlanError),
+    Callable(SourceCallableError),
     CircularAlias {
         alias: SemanticSymbolId,
         events: Vec<CanonicalAliasResolutionEvent>,
@@ -288,6 +316,7 @@ impl SourceImportError {
                 | SourceImportInvariant::DuplicatePreparedSymbol(_)
                 | SourceImportInvariant::PreparedStateChanged(_) => None,
             },
+            Self::Callable(error) => error.node(),
             Self::Alias(_)
             | Self::DeclaredType(_)
             | Self::Variable(_)
@@ -310,6 +339,9 @@ impl std::fmt::Display for SourceImportError {
             Self::Variable(error) => {
                 write!(formatter, "target variable planning failed: {error:?}")
             }
+            Self::Callable(error) => {
+                write!(formatter, "target callable planning failed: {error:?}")
+            }
             Self::CircularAlias { alias, .. } => {
                 write!(formatter, "source import alias is circular: {alias:?}")
             }
@@ -325,6 +357,7 @@ impl std::error::Error for SourceImportError {
             Self::Unsupported(_)
             | Self::Invariant(_)
             | Self::Variable(_)
+            | Self::Callable(_)
             | Self::CircularAlias { .. } => None,
         }
     }
@@ -345,6 +378,12 @@ impl From<DeclaredTypeError> for SourceImportError {
 impl From<VariablePlanError> for SourceImportError {
     fn from(error: VariablePlanError) -> Self {
         Self::Variable(error)
+    }
+}
+
+impl From<SourceCallableError> for SourceImportError {
+    fn from(error: SourceCallableError) -> Self {
+        Self::Callable(error)
     }
 }
 
@@ -1077,28 +1116,88 @@ pub(super) fn prepare_source_import_value(
         )));
     }
 
-    let (target_declaration, target_type_node) = plan_direct_annotated_const_target(
+    let planned_target = plan_direct_import_value_target(
         store,
         declared_host,
+        global_types,
         binding.alias_symbol,
         target,
         &binding.imported_text,
     )?;
+    let target_declaration = match &planned_target {
+        PlannedSourceImportValueTarget::AnnotatedConst { declaration, .. } => *declaration,
+        PlannedSourceImportValueTarget::AnnotatedFunction(callable) => callable.declaration,
+    };
     if target_declaration.file == binding.declaration.file {
         return Err(unsupported(SourceImportUnsupported::SameSourceTarget {
             binding: binding.declaration,
             target: target_declaration,
         }));
     }
-    let type_ = CanonicalTypeQuery::new_with_global_types(
-        store,
-        declared_host,
-        global_types,
-        options,
-        diagnostics,
-    )?
-    .get_type_from_type_node(target_type_node)?;
-    let target_type_links = store.type_node_links(target_type_node).cloned();
+    let (type_, prepared_target) = match planned_target {
+        PlannedSourceImportValueTarget::AnnotatedConst { type_node, .. } => {
+            let type_ = CanonicalTypeQuery::new_with_global_types(
+                store,
+                declared_host,
+                global_types,
+                options,
+                diagnostics,
+            )?
+            .get_type_from_type_node(type_node)?;
+            let type_links = store.type_node_links(type_node).cloned();
+            (
+                type_,
+                PreparedSourceImportTarget::AnnotatedConst {
+                    type_node,
+                    type_links,
+                },
+            )
+        }
+        PlannedSourceImportValueTarget::AnnotatedFunction(callable) => {
+            let type_ = CanonicalTypeQuery::new_with_global_types(
+                store,
+                declared_host,
+                global_types,
+                options,
+                diagnostics,
+            )?
+            .get_type_of_source_callable(callable.declaration, callable.owner_symbol)?;
+            let provenance = store
+                .source_callable_provenance(type_)
+                .filter(|provenance| {
+                    provenance.family == SourceCallableFamily::FunctionDeclaration
+                        && provenance.declaration == callable.declaration
+                        && provenance.owner_symbol == callable.owner_symbol
+                })
+                .ok_or_else(|| {
+                    invariant(SourceImportInvariant::InvalidTargetLinks(
+                        callable.owner_symbol,
+                    ))
+                })?;
+            CanonicalTypeQuery::new_with_global_types(
+                store,
+                declared_host,
+                global_types,
+                options,
+                diagnostics,
+            )?
+            .get_return_type_of_signature(provenance.signature)?;
+            if !matches!(
+                validate_stored_source_callable(store, type_),
+                StoredSourceCallableValidation::Valid(_)
+            ) {
+                return Err(invariant(SourceImportInvariant::InvalidTargetLinks(
+                    callable.owner_symbol,
+                )));
+            }
+            (
+                type_,
+                PreparedSourceImportTarget::AnnotatedFunction {
+                    signature: provenance.signature,
+                },
+            )
+        }
+    };
     let target_links = prepare_value_links(store, target, type_, false)?;
     let alias_value_links = prepare_value_links(store, binding.alias_symbol, type_, true)?;
 
@@ -1106,9 +1205,8 @@ pub(super) fn prepare_source_import_value(
         binding: binding.clone(),
         target_symbol: target,
         target_declaration,
-        target_type_node,
         type_,
-        target_type_links,
+        target: prepared_target,
         target_links,
         alias_links: alias_value_links,
     })
@@ -1550,6 +1648,95 @@ fn plan_direct_exported_type_target(
     Ok(declaration)
 }
 
+fn plan_direct_import_value_target(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    alias: SemanticSymbolId,
+    target: SemanticSymbolId,
+    expected_name: &str,
+) -> Result<PlannedSourceImportValueTarget, SourceImportError> {
+    let flags = store
+        .symbol(target)
+        .ok_or_else(|| invariant(SourceImportInvariant::InvalidTargetSymbol(target)))?
+        .flags();
+    if flags == SymbolFlags::BLOCK_SCOPED_VARIABLE {
+        let (declaration, type_node) =
+            plan_direct_annotated_const_target(store, host, alias, target, expected_name)?;
+        return Ok(PlannedSourceImportValueTarget::AnnotatedConst {
+            declaration,
+            type_node,
+        });
+    }
+    if flags == SymbolFlags::FUNCTION {
+        return plan_direct_annotated_function_target(
+            store,
+            host,
+            global_types,
+            alias,
+            target,
+            expected_name,
+        )
+        .map(PlannedSourceImportValueTarget::AnnotatedFunction);
+    }
+    Err(unsupported(SourceImportUnsupported::TargetSymbol {
+        alias,
+        target,
+        flags,
+    }))
+}
+
+fn plan_direct_annotated_function_target(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    alias: SemanticSymbolId,
+    target: SemanticSymbolId,
+    expected_name: &str,
+) -> Result<SourceCallablePlan, SourceImportError> {
+    let target_record = store
+        .symbol(target)
+        .ok_or_else(|| invariant(SourceImportInvariant::InvalidTargetSymbol(target)))?;
+    if target_record.flags() != SymbolFlags::FUNCTION {
+        return Err(unsupported(SourceImportUnsupported::TargetSymbol {
+            alias,
+            target,
+            flags: target_record.flags(),
+        }));
+    }
+    let Some([declaration]) = target_record.declarations() else {
+        return Err(unsupported(SourceImportUnsupported::TargetSymbol {
+            alias,
+            target,
+            flags: target_record.flags(),
+        }));
+    };
+    let declaration = *declaration;
+    if target_record.value_declaration() != Some(declaration)
+        || target_record.name().as_bytes() != expected_name.as_bytes()
+    {
+        return Err(invariant(SourceImportInvariant::InvalidTargetSymbol(
+            target,
+        )));
+    }
+    let callable = plan_source_callable(
+        store,
+        host,
+        declaration,
+        target,
+        Some(CanonicalArrayTargets::from_global_types(global_types)),
+    )?;
+    if callable.family != SourceCallableFamily::FunctionDeclaration
+        || callable.declaration != declaration
+        || callable.owner_symbol != target
+    {
+        return Err(invariant(SourceImportInvariant::InvalidTargetSymbol(
+            target,
+        )));
+    }
+    Ok(callable)
+}
+
 fn plan_direct_annotated_const_target(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -1780,7 +1967,9 @@ fn prepare_value_links(
         })
     })?;
     if (alias && record.flags() != SymbolFlags::ALIAS)
-        || (!alias && record.flags() != SymbolFlags::BLOCK_SCOPED_VARIABLE)
+        || (!alias
+            && record.flags() != SymbolFlags::BLOCK_SCOPED_VARIABLE
+            && record.flags() != SymbolFlags::FUNCTION)
         || store.type_payload(type_).is_none()
     {
         return Err(invariant(if alias {
@@ -1837,14 +2026,43 @@ fn validate_prepared_import_value(
                 prepared.binding.alias_symbol,
             ))
         })?;
+    let target_valid = match &prepared.target {
+        PreparedSourceImportTarget::AnnotatedConst {
+            type_node,
+            type_links,
+        } => {
+            store.symbol(prepared.target_symbol).is_some_and(|target| {
+                target.flags() == SymbolFlags::BLOCK_SCOPED_VARIABLE
+                    && target.value_declaration() == Some(prepared.target_declaration)
+            }) && store.type_node_links(*type_node) == type_links.as_ref()
+        }
+        PreparedSourceImportTarget::AnnotatedFunction { signature } => {
+            store.symbol(prepared.target_symbol).is_some_and(|target| {
+                target.flags() == SymbolFlags::FUNCTION
+                    && target.value_declaration() == Some(prepared.target_declaration)
+            }) && store.source_callable_type_for_owner(prepared.target_symbol)
+                == Some(prepared.type_)
+                && store
+                    .source_callable_provenance(prepared.type_)
+                    .is_some_and(|provenance| {
+                        provenance.family == SourceCallableFamily::FunctionDeclaration
+                            && provenance.declaration == prepared.target_declaration
+                            && provenance.owner_symbol == prepared.target_symbol
+                            && provenance.signature == *signature
+                    })
+                && store
+                    .signature(*signature)
+                    .is_some_and(|signature| signature.resolved_return_type().is_some())
+                && matches!(
+                    validate_stored_source_callable(store, prepared.type_),
+                    StoredSourceCallableValidation::Valid(_)
+                )
+        }
+    };
     if alias_links.immediate_target != Some(prepared.target_symbol)
         || alias_links.alias_target != AliasTargetState::Resolved(prepared.target_symbol)
         || alias_links.type_only_declaration.is_some()
-        || store.symbol(prepared.target_symbol).is_none_or(|target| {
-            target.flags() != SymbolFlags::BLOCK_SCOPED_VARIABLE
-                || target.value_declaration() != Some(prepared.target_declaration)
-        })
-        || store.type_node_links(prepared.target_type_node) != prepared.target_type_links.as_ref()
+        || !target_valid
     {
         return Err(invariant(SourceImportInvariant::PreparedStateChanged(
             prepared.binding.alias_symbol,
@@ -3085,6 +3303,95 @@ mod tests {
     }
 
     #[test]
+    fn exported_generic_function_import_prepares_exact_callable_and_replays_warm() {
+        let mut fixture = fixture(
+            &[
+                r#"
+                    import { identity } from "./target";
+                    const imported = identity;
+                "#,
+                r"
+                    export function identity<T>(value: T): T { return value; }
+                ",
+            ],
+            &[Route {
+                source: 0,
+                specifier: 0,
+                target: Some(1),
+            }],
+        );
+        let plan = fixture.plan_import(0, 0);
+        let read = identifier_initializer(&fixture, 0, "identity");
+        let bound = fixture.bound.get(&fixture.files[0].file).unwrap();
+        let planned_read = plan_source_import_identifier_read(
+            &fixture.files[0].parsed.arena,
+            bound,
+            &fixture.store,
+            &plan.bindings[0],
+            read,
+            "identity",
+            plan.bindings[0].alias_symbol,
+        )
+        .unwrap();
+        let resolved = resolve_all(&mut fixture, &plan.bindings).unwrap();
+        let [resolved] = resolved.as_slice() else {
+            panic!("expected one import binding")
+        };
+        let target = direct_export(&fixture, 1, "identity");
+        assert_eq!(resolved.target_symbol, target);
+
+        let prepared = prepare_one(&mut fixture, resolved, &planned_read).unwrap();
+        let PreparedSourceImportTarget::AnnotatedFunction { signature } = &prepared.target else {
+            panic!("expected an annotated function target")
+        };
+        let signature = *signature;
+        let signature_record = fixture.store.signature(signature).unwrap();
+        let [type_parameter] = signature_record.type_parameters() else {
+            panic!("expected one generic type parameter")
+        };
+        assert_eq!(
+            signature_record.resolved_return_type(),
+            Some(*type_parameter)
+        );
+        assert_eq!(
+            fixture.store.source_callable_type_for_owner(target),
+            Some(prepared.type_)
+        );
+        assert_eq!(
+            fixture
+                .store
+                .value_symbol_links(target)
+                .and_then(|links| links.resolved_type),
+            Some(prepared.type_),
+            "the target callable graph is a canonical lazy-query memo"
+        );
+        assert_eq!(
+            fixture
+                .store
+                .value_symbol_links(plan.bindings[0].alias_symbol),
+            None,
+            "the importer alias remains deferred until final publication"
+        );
+
+        publish_for_test(&mut fixture.store, std::slice::from_ref(&prepared));
+        assert_eq!(
+            fixture
+                .store
+                .value_symbol_links(plan.bindings[0].alias_symbol)
+                .and_then(|links| links.resolved_type),
+            Some(prepared.type_)
+        );
+        let warm_state = store_state(&fixture.store);
+
+        let warm_resolved = resolve_all(&mut fixture, &plan.bindings).unwrap();
+        assert_eq!(warm_resolved.as_slice(), std::slice::from_ref(resolved));
+        let warm = prepare_one(&mut fixture, &warm_resolved[0], &planned_read).unwrap();
+        assert_eq!(warm, prepared);
+        assert_eq!(store_state(&fixture.store), warm_state);
+        publish_for_test(&mut fixture.store, std::slice::from_ref(&warm));
+    }
+
+    #[test]
     fn poisoned_late_binding_blocks_every_prepared_publication() {
         let mut fixture = fixture(
             &[
@@ -3322,6 +3629,56 @@ mod tests {
                 SourceImportUnsupported::MissingTargetAnnotation(_)
             ))
         ));
+
+        let mut unannotated_function = fixture(
+            &[
+                r#"
+                    import { identity } from "./target";
+                    const result = identity;
+                "#,
+                r"export function identity<T>(value: T) { return value; }",
+            ],
+            &[Route {
+                source: 0,
+                specifier: 0,
+                target: Some(1),
+            }],
+        );
+        let plan = unannotated_function.plan_import(0, 0);
+        let read_node = identifier_initializer(&unannotated_function, 0, "identity");
+        let bound = unannotated_function
+            .bound
+            .get(&unannotated_function.files[0].file)
+            .unwrap();
+        let read = plan_source_import_identifier_read(
+            &unannotated_function.files[0].parsed.arena,
+            bound,
+            &unannotated_function.store,
+            &plan.bindings[0],
+            read_node,
+            "identity",
+            plan.bindings[0].alias_symbol,
+        )
+        .unwrap();
+        let resolved = resolve_all(&mut unannotated_function, &plan.bindings).unwrap();
+        assert!(matches!(
+            prepare_one(&mut unannotated_function, &resolved[0], &read),
+            Err(SourceImportError::Callable(
+                SourceCallableError::Unsupported(_)
+            ))
+        ));
+        assert_eq!(
+            unannotated_function
+                .store
+                .value_symbol_links(plan.bindings[0].alias_symbol),
+            None
+        );
+        assert_eq!(
+            unannotated_function
+                .store
+                .value_symbol_links(resolved[0].target_symbol),
+            None
+        );
 
         for source in [
             r#"import type { value } from "./target";"#,

@@ -1249,6 +1249,14 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 VariablePlanError::Invariant(_) => SourceCheckError::Import(node),
                 VariablePlanError::DeclaredType(error) => SourceCheckError::DeclaredType(error),
             },
+            SourceImportError::Callable(error) => match *error {
+                SourceCallableError::Unsupported(_) => {
+                    SourceCheckError::Unsupported(UnsupportedSourceSyntax::Import(node))
+                }
+                SourceCallableError::Invariant(_) => SourceCheckError::Import(node),
+                SourceCallableError::DeclaredType(error) => SourceCheckError::DeclaredType(error),
+                SourceCallableError::LiteralCache(error) => error.into(),
+            },
         }
     }
 
