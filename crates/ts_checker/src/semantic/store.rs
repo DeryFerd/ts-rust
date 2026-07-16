@@ -37,6 +37,7 @@ use super::{
         CompositeSignature, IndexInfo, IndexInfoArena, Signature, SignatureArena, SignatureFlags,
         TupleElementInfo, TupleMetadata, TypePredicate, TypePredicateArena, TypePredicateKind,
     },
+    source_callables::SourceCallableTypeParameterSyntaxProof,
     type_records::{CacheHashKey, ConditionalRoot, TypeAlias, TypeData, TypeRecord, type_list_key},
 };
 
@@ -138,6 +139,34 @@ pub(super) struct ResolvedSourceCallableTypeParameter {
     pub(super) constraint: TypeId,
     /// The declared default, or the canonical `no_constraint_type`.
     pub(super) default_type: TypeId,
+}
+
+/// Dependency-closed inputs for publishing one source generic callable.
+///
+/// The opaque syntax proof is produced only by source planning. The store
+/// revalidates every semantic edge against it before allocating the callable
+/// object or signature, then commits the complete shell without fallible
+/// publication steps.
+#[derive(Debug)]
+pub(super) struct PreparedSourceGenericCallablePublication<'a> {
+    pub(super) syntax: &'a SourceCallableTypeParameterSyntaxProof,
+    pub(super) family: SourceCallableFamily,
+    pub(super) declaration: NodeRef,
+    pub(super) owner_symbol: SemanticSymbolId,
+    pub(super) owner_parent: Option<SemanticSymbolId>,
+    pub(super) export_local: Option<SemanticSymbolId>,
+    pub(super) type_parameters: Vec<ResolvedSourceCallableTypeParameter>,
+    pub(super) parameters: Vec<SemanticSymbolId>,
+    pub(super) flags: SignatureFlags,
+    pub(super) min_argument_count: i32,
+    pub(super) return_annotation: NodeRef,
+    pub(super) return_null_literal_identity: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SourceTypeParameterResolutionState {
+    Cold,
+    Warm,
 }
 
 /// Branded identities owned by the one canonical mutable empty tuple graph.
@@ -760,26 +789,10 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             self.signatures
                 .get(provenance.signature)
                 .is_some_and(|signature| {
-                    if signature.type_parameters().is_empty() {
-                        return !self
+                    signature.type_parameters().is_empty()
+                        && !self
                             .source_callable_type_parameters
-                            .contains_key(&provenance.signature);
-                    }
-                    provenance.family == SourceCallableFamily::FunctionDeclaration
-                        && provenance.contextual_target.is_none()
-                        && provenance.contextual_variable.is_none()
-                        && self
-                            .source_callable_type_parameters
-                            .get(&provenance.signature)
-                            .is_some_and(|rows| {
-                                rows.len() == signature.type_parameters().len()
-                                    && rows.iter().zip(signature.type_parameters()).all(
-                                        |(row, type_parameter)| {
-                                            row.type_parameter == *type_parameter
-                                                && self.types.get(*type_parameter).is_some()
-                                        },
-                                    )
-                            })
+                            .contains_key(&provenance.signature)
                 });
         if self.types.get(type_).is_none()
             || self.source_callable_provenance.contains_key(&type_)
@@ -833,6 +846,34 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         type_: TypeId,
     ) -> Option<SourceCallableProvenance> {
         self.source_callable_provenance.get(&type_).copied()
+    }
+
+    #[cfg(test)]
+    pub(super) fn replace_source_callable_provenance_for_test(
+        &mut self,
+        type_: TypeId,
+        replacement: Option<SourceCallableProvenance>,
+    ) -> Option<SourceCallableProvenance> {
+        match replacement {
+            Some(replacement) => self.source_callable_provenance.insert(type_, replacement),
+            None => self.source_callable_provenance.remove(&type_),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn replace_source_callable_type_for_declaration_for_test(
+        &mut self,
+        declaration: NodeRef,
+        replacement: Option<TypeId>,
+    ) -> Option<TypeId> {
+        match replacement {
+            Some(replacement) => self
+                .source_callable_types_by_declaration
+                .insert(declaration, replacement),
+            None => self
+                .source_callable_types_by_declaration
+                .remove(&declaration),
+        }
     }
 
     pub(super) fn source_callable_type_for_owner(&self, owner: SemanticSymbolId) -> Option<TypeId> {
@@ -3089,177 +3130,461 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
 }
 
 impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
-    /// Publishes an exact declaration-order source type-parameter vector and
-    /// all of its resolved constraint/default caches as one logical batch.
+    /// Publishes the type, signature, generic metadata, provenance reverse
+    /// maps, owner barrier, return annotation, and signature link as one
+    /// prevalidated transaction.
     ///
-    /// The complete batch is validated before the first type record is
-    /// mutated. The signature-keyed provenance entry is inserted last, so a
-    /// visible entry always denotes dependency-closed metadata. Replaying the
-    /// exact committed batch is idempotent; any partial or mismatched state is
-    /// rejected as poison.
-    pub(super) fn set_source_callable_type_parameters(
+    /// No semantic identity or cache is mutated until every dependency and
+    /// capacity has been checked. After the first allocation, all remaining
+    /// writes are assertions over that frozen preflight.
+    pub(super) fn publish_source_generic_callable(
         &mut self,
-        signature: SignatureId,
-        resolved: &[ResolvedSourceCallableTypeParameter],
-    ) -> bool {
-        let Some(signature_record) = self.signature(signature) else {
-            return false;
+        prepared: PreparedSourceGenericCallablePublication<'_>,
+    ) -> Option<(TypeId, SignatureId)> {
+        let resolution_states = self.validate_source_generic_type_parameters(
+            prepared.syntax,
+            prepared.declaration,
+            &prepared.type_parameters,
+        )?;
+        let owner = self.symbol(prepared.owner_symbol)?;
+        let owner_valid = owner.flags() == SymbolFlags::FUNCTION
+            && owner.check_flags() == CheckFlags::NONE
+            && owner.declarations() == Some(&[prepared.declaration])
+            && owner.value_declaration() == Some(prepared.declaration)
+            && owner.members().is_none()
+            && owner.exports().is_none()
+            && owner.parent() == prepared.owner_parent
+            && owner.export_symbol().is_none()
+            && self.get_merged_symbol(prepared.owner_symbol) == Some(prepared.owner_symbol);
+        let export_route_valid = match (prepared.owner_parent, prepared.export_local) {
+            (None, None) => owner.parent().is_none(),
+            (Some(parent), Some(local)) if owner.parent() == Some(parent) => {
+                self.symbol(parent).is_some()
+                    && self.get_merged_symbol(parent) == Some(parent)
+                    && self.symbol(local).is_some_and(|local_record| {
+                        local_record.flags() == SymbolFlags::EXPORT_VALUE
+                            && local_record.check_flags() == CheckFlags::NONE
+                            && local_record.name() == owner.name()
+                            && local_record.declarations() == Some(&[prepared.declaration])
+                            && local_record.value_declaration().is_none()
+                            && local_record.members().is_none()
+                            && local_record.exports().is_none()
+                            && local_record.parent().is_none()
+                            && local_record.export_symbol() == Some(prepared.owner_symbol)
+                            && self.get_merged_symbol(local) == Some(local)
+                    })
+            }
+            _ => false,
         };
-        let Some(signature_declaration) = signature_record.declaration() else {
-            return false;
-        };
-        let expected_minimum = i32::try_from(signature_record.parameters().len()).ok();
-        if resolved.is_empty()
-            || signature_record.type_parameters().len() != resolved.len()
-            || signature_record.flags() != SignatureFlags::NONE
-            || signature_record.this_parameter().is_some()
-            || signature_record.target().is_some()
-            || signature_record.mapper().is_some()
-            || signature_record.resolved_return_type().is_some()
-            || signature_record.resolved_type_predicate().is_some()
-            || signature_record.isolated_signature_type().is_some()
-            || signature_record.composite().is_some()
-            || expected_minimum != Some(signature_record.min_argument_count())
-            || self.source_node_kind(signature_declaration) != Some(SyntaxKind::FunctionDeclaration)
-            || self.intrinsic_bootstrap.is_none()
-        {
-            return false;
-        }
-        let no_constraint = self
-            .intrinsic_bootstrap
-            .as_ref()
-            .expect("bootstrap presence was checked")
-            .no_constraint_type;
-        let mut declarations = HashSet::with_capacity(resolved.len());
-        let mut symbols = HashSet::with_capacity(resolved.len());
-        let mut type_parameters = HashSet::with_capacity(resolved.len());
-        let mut default_seen = false;
-        let computed_type_variable_flags = super::types::ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES
-            | super::types::ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES_COMPUTED;
-        let valid_rows = resolved.iter().enumerate().all(|(index, row)| {
-            let provenance = row.provenance;
-            let Some(record) = self.type_payload(provenance.type_parameter) else {
-                return false;
-            };
-            let Some(symbol_record) = self.symbol(provenance.symbol) else {
-                return false;
-            };
-            let TypeData::TypeParameter(data) = record.data() else {
-                return false;
-            };
-            let base_constraint_valid = match (
-                provenance.constraint,
-                data.constrained.resolved_base_constraint,
-            ) {
-                (None, None) => true,
-                (None, Some(base)) => base == no_constraint,
-                (Some(_), None) => true,
-                (Some(_), Some(_)) => false,
-            };
-            let constraint_node_valid = provenance.constraint.is_none_or(|constraint| {
-                self.source_node_parent(constraint)
-                    == Some(SourceNodeParent::Parent(provenance.declaration))
-            });
-            let default_node_valid = provenance.default_type.is_none_or(|default_type| {
-                self.source_node_parent(default_type)
-                    == Some(SourceNodeParent::Parent(provenance.declaration))
-            });
-            let trailing_default_valid = !default_seen || provenance.default_type.is_some();
-            default_seen |= provenance.default_type.is_some();
-            signature_record.type_parameters()[index] == provenance.type_parameter
-                && declarations.insert(provenance.declaration)
-                && symbols.insert(provenance.symbol)
-                && type_parameters.insert(provenance.type_parameter)
-                && record.flags() == super::types::TypeFlags::TYPE_PARAMETER
-                && (record.object_flags() == super::types::ObjectFlags::NONE
-                    || record.object_flags() == computed_type_variable_flags)
-                && record.symbol() == Some(provenance.symbol)
-                && record.alias().is_none()
-                && !data.is_this_type
-                && base_constraint_valid
-                && symbol_record.flags() == SymbolFlags::TYPE_PARAMETER
-                && symbol_record.check_flags() == CheckFlags::NONE
-                && symbol_record.declarations() == Some(&[provenance.declaration])
-                && symbol_record.value_declaration().is_none()
-                && symbol_record.members().is_none()
-                && symbol_record.exports().is_none()
-                && symbol_record.parent().is_none()
-                && symbol_record.export_symbol().is_none()
-                && self.get_merged_symbol(provenance.symbol) == Some(provenance.symbol)
+        let parameters_valid = prepared.parameters.iter().enumerate().all(|(index, parameter)| {
+            *parameter != prepared.owner_symbol
+                && !prepared.parameters[..index].contains(parameter)
+                && self.symbol(*parameter).is_some_and(|symbol| {
+                    symbol.flags() == SymbolFlags::FUNCTION_SCOPED_VARIABLE
+                        && symbol.check_flags() == CheckFlags::NONE
+                        && symbol.declarations().is_some_and(|declarations| {
+                            matches!(declarations, [declaration]
+                                if self.source_node_kind(*declaration) == Some(SyntaxKind::Parameter)
+                                    && self.source_node_parent(*declaration)
+                                        == Some(SourceNodeParent::Parent(prepared.declaration)))
+                        })
+                        && symbol.value_declaration()
+                            == symbol.declarations().and_then(|declarations| declarations.first()).copied()
+                        && symbol.members().is_none()
+                        && symbol.exports().is_none()
+                        && symbol.parent().is_none()
+                        && symbol.export_symbol().is_none()
+                        && self.get_merged_symbol(*parameter) == Some(*parameter)
+                })
                 && self
-                    .declared_type_links(provenance.symbol)
-                    .and_then(|links| links.declared_type)
-                    == Some(provenance.type_parameter)
-                && self.source_node_kind(provenance.declaration) == Some(SyntaxKind::TypeParameter)
-                && self.source_node_parent(provenance.declaration)
-                    == Some(SourceNodeParent::Parent(signature_declaration))
-                && constraint_node_valid
-                && default_node_valid
-                && trailing_default_valid
-                && self.type_payload(row.constraint).is_some()
-                && self.type_payload(row.default_type).is_some()
-                && provenance.constraint.is_some() == (row.constraint != no_constraint)
-                && provenance.default_type.is_some() == (row.default_type != no_constraint)
+                    .value_symbol_links(*parameter)
+                    .is_none_or(|links| links == &ValueSymbolLinks::default())
         });
-        if !valid_rows {
-            return false;
+        let return_annotation_valid = self
+            .source_return_annotation_belongs_to(prepared.declaration, prepared.return_annotation);
+        let expected_minimum = i32::try_from(prepared.parameters.len()).ok();
+        let owner_links_cold = self
+            .value_symbol_links(prepared.owner_symbol)
+            .is_none_or(|links| links == &ValueSymbolLinks::default());
+        let signature_links_cold = self
+            .signature_links(prepared.declaration)
+            .is_none_or(|links| links == &SignatureLinks::default());
+        if prepared.type_parameters.is_empty()
+            || prepared.family != SourceCallableFamily::FunctionDeclaration
+            || prepared.syntax.declaration() != prepared.declaration
+            || self.source_node_kind(prepared.declaration) != Some(SyntaxKind::FunctionDeclaration)
+            || prepared.flags != SignatureFlags::NONE
+            || expected_minimum != Some(prepared.min_argument_count)
+            || !owner_valid
+            || !export_route_valid
+            || !parameters_valid
+            || !owner_links_cold
+            || !signature_links_cold
+            || !return_annotation_valid
+            || prepared
+                .export_local
+                .is_some_and(|local| !self.symbols.contains_symbol(local))
+            || prepared.export_local == Some(prepared.owner_symbol)
+            || self.source_callable_provenance.values().any(|provenance| {
+                provenance.declaration == prepared.declaration
+                    || provenance.owner_symbol == prepared.owner_symbol
+            })
+            || self
+                .source_callable_types_by_declaration
+                .contains_key(&prepared.declaration)
+            || self
+                .source_callable_types_by_owner
+                .contains_key(&prepared.owner_symbol)
+            || self.source_callable_type_parameters.values().any(|rows| {
+                rows.iter().any(|row| {
+                    prepared
+                        .type_parameters
+                        .iter()
+                        .any(|prepared| prepared.provenance.declaration == row.declaration)
+                })
+            })
+        {
+            return None;
         }
 
-        let provenance = resolved
+        let value_link_reservations = prepared.parameters.len().checked_add(1)?;
+        if !self.try_reserve_types(1)
+            || !self.try_reserve_signatures(1)
+            || !self.try_reserve_source_callable_provenance(1)
+            || !self.try_reserve_function_signature_return_annotations(1)
+            || !self.links.signature.try_reserve(1)
+            || !self.links.value_symbol.try_reserve(value_link_reservations)
+        {
+            return None;
+        }
+
+        let type_parameter_ids = prepared
+            .type_parameters
+            .iter()
+            .map(|row| row.provenance.type_parameter)
+            .collect::<Vec<_>>();
+        let type_ = self
+            .alloc_plain_object_type(
+                super::types::ObjectFlags::ANONYMOUS,
+                Some(prepared.owner_symbol),
+            )
+            .expect("the source generic owner was prevalidated");
+        let signature = self
+            .alloc_signature(
+                prepared.flags,
+                Some(prepared.declaration),
+                type_parameter_ids,
+                None,
+                prepared.parameters,
+                None,
+                None,
+                prepared.min_argument_count,
+            )
+            .expect("the source generic signature was prevalidated");
+
+        for (row, state) in prepared.type_parameters.iter().zip(resolution_states) {
+            if state == SourceTypeParameterResolutionState::Cold {
+                assert!(self.set_type_parameter_resolution(
+                    row.provenance.type_parameter,
+                    Some(row.constraint),
+                    None,
+                    None,
+                    Some(row.default_type),
+                ));
+            }
+        }
+        let provenance_rows = prepared
+            .type_parameters
             .iter()
             .map(|row| row.provenance)
             .collect::<Box<[_]>>();
-        if let Some(existing) = self.source_callable_type_parameters.get(&signature) {
-            if existing.as_ref() != provenance.as_ref() {
-                return false;
-            }
-            return resolved.iter().all(|row| {
-                self.type_payload(row.provenance.type_parameter)
-                    .is_some_and(|record| {
-                        matches!(record.data(), TypeData::TypeParameter(data)
-                            if data.constraint == Some(row.constraint)
-                                && data.target.is_none()
-                                && data.mapper.is_none()
-                                && data.resolved_default_type == Some(row.default_type))
-                    })
-            });
+        assert!(
+            self.source_callable_type_parameters
+                .insert(signature, provenance_rows)
+                .is_none()
+        );
+        let provenance = SourceCallableProvenance {
+            family: prepared.family,
+            declaration: prepared.declaration,
+            owner_symbol: prepared.owner_symbol,
+            owner_parent: prepared.owner_parent,
+            export_local: prepared.export_local,
+            signature,
+            contextual_target: None,
+            contextual_variable: None,
+        };
+        assert!(
+            self.source_callable_provenance
+                .insert(type_, provenance)
+                .is_none()
+        );
+        assert!(
+            self.source_callable_types_by_declaration
+                .insert(prepared.declaration, type_)
+                .is_none()
+        );
+        assert!(
+            self.source_callable_types_by_owner
+                .insert(prepared.owner_symbol, type_)
+                .is_none()
+        );
+        assert!(
+            self.source_callable_types_by_signature
+                .insert(signature, type_)
+                .is_none()
+        );
+        assert!(
+            self.function_signature_return_annotations
+                .insert(
+                    signature,
+                    (
+                        prepared.return_annotation,
+                        prepared.return_null_literal_identity,
+                    ),
+                )
+                .is_none()
+        );
+        assert!(self.set_value_symbol_links(
+            prepared.owner_symbol,
+            ValueSymbolLinks {
+                resolved_type: Some(type_),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        assert!(self.set_structured_type_members(type_, None, None, None, None, None));
+        assert!(self.set_signature_links(
+            prepared.declaration,
+            SignatureLinks {
+                resolved_signature: ResolvedSignatureState::Resolved(signature),
+                ..SignatureLinks::default()
+            },
+        ));
+        Some((type_, signature))
+    }
+
+    fn validate_source_generic_type_parameters(
+        &self,
+        syntax: &SourceCallableTypeParameterSyntaxProof,
+        declaration: NodeRef,
+        resolved: &[ResolvedSourceCallableTypeParameter],
+    ) -> Option<Vec<SourceTypeParameterResolutionState>> {
+        let no_constraint = self.intrinsic_bootstrap.as_ref()?.no_constraint_type;
+        if syntax.declaration() != declaration || syntax.rows().len() != resolved.len() {
+            return None;
         }
-        if resolved.iter().any(|row| {
-            self.type_payload(row.provenance.type_parameter)
-                .is_none_or(|record| {
-                    !matches!(record.data(), TypeData::TypeParameter(data)
-                        if record.object_flags() == super::types::ObjectFlags::NONE
-                            && data.constrained.resolved_base_constraint.is_none()
-                            && data.constraint.is_none()
-                            && data.target.is_none()
-                            && data.mapper.is_none()
-                            && data.resolved_default_type.is_none())
-                })
-        }) {
+        let mut declarations = HashSet::with_capacity(resolved.len());
+        let mut symbols = HashSet::with_capacity(resolved.len());
+        let mut type_parameters = HashSet::with_capacity(resolved.len());
+        let mut expected_bases = Vec::with_capacity(resolved.len());
+        let mut states = Vec::with_capacity(resolved.len());
+        let mut default_seen = false;
+        let computed_type_variable_flags = super::types::ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES
+            | super::types::ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES_COMPUTED;
+
+        for (index, (syntax_row, row)) in syntax.rows().iter().zip(resolved).enumerate() {
+            let provenance = row.provenance;
+            if syntax_row.declaration() != provenance.declaration
+                || syntax_row.constraint() != provenance.constraint
+                || syntax_row.default_type() != provenance.default_type
+                || !declarations.insert(provenance.declaration)
+                || !symbols.insert(provenance.symbol)
+                || !type_parameters.insert(provenance.type_parameter)
+            {
+                return None;
+            }
+            let record = self.type_payload(provenance.type_parameter)?;
+            let TypeData::TypeParameter(data) = record.data() else {
+                return None;
+            };
+            let symbol_record = self.symbol(provenance.symbol)?;
+            let exact_declared_links = self.declared_type_links(provenance.symbol)
+                == Some(&DeclaredTypeLinks {
+                    declared_type: Some(provenance.type_parameter),
+                    ..DeclaredTypeLinks::default()
+                });
+            let constraint_link_valid = match provenance.constraint {
+                Some(node) => {
+                    row.constraint != no_constraint
+                        && self.source_type_node_result_is_exact(node, row.constraint)
+                }
+                None => row.constraint == no_constraint,
+            };
+            let default_link_valid = match provenance.default_type {
+                Some(node) => {
+                    row.default_type != no_constraint
+                        && self.source_type_node_result_is_exact(node, row.default_type)
+                }
+                None => row.default_type == no_constraint,
+            };
+            let trailing_default_valid = !default_seen || provenance.default_type.is_some();
+            default_seen |= provenance.default_type.is_some();
+            if record.flags() != super::types::TypeFlags::TYPE_PARAMETER
+                || (record.object_flags() != super::types::ObjectFlags::NONE
+                    && record.object_flags() != computed_type_variable_flags)
+                || record.symbol() != Some(provenance.symbol)
+                || record.alias().is_some()
+                || data.is_this_type
+                || symbol_record.flags() != SymbolFlags::TYPE_PARAMETER
+                || symbol_record.check_flags() != CheckFlags::NONE
+                || symbol_record.declarations() != Some(&[provenance.declaration])
+                || symbol_record.value_declaration().is_some()
+                || symbol_record.members().is_some()
+                || symbol_record.exports().is_some()
+                || symbol_record.parent().is_some()
+                || symbol_record.export_symbol().is_some()
+                || self.get_merged_symbol(provenance.symbol) != Some(provenance.symbol)
+                || !exact_declared_links
+                || self.source_node_kind(provenance.declaration) != Some(SyntaxKind::TypeParameter)
+                || self.source_node_parent(provenance.declaration)
+                    != Some(SourceNodeParent::Parent(declaration))
+                || !constraint_link_valid
+                || !default_link_valid
+                || !trailing_default_valid
+                || self.type_payload(row.constraint).is_none()
+                || self.type_payload(row.default_type).is_none()
+            {
+                return None;
+            }
+
+            let expected_base = match provenance.constraint {
+                None => no_constraint,
+                Some(_) => {
+                    if let Some(earlier) = resolved[..index]
+                        .iter()
+                        .position(|candidate| candidate.provenance.type_parameter == row.constraint)
+                    {
+                        expected_bases[earlier]
+                    } else if self.source_direct_constraint_has_leaf_base(row.constraint) {
+                        row.constraint
+                    } else {
+                        return None;
+                    }
+                }
+            };
+            expected_bases.push(expected_base);
+            if data
+                .constrained
+                .resolved_base_constraint
+                .is_some_and(|base| base != expected_base)
+                || data.target.is_some()
+                || data.mapper.is_some()
+            {
+                return None;
+            }
+            let state = if data.constraint.is_none()
+                && data.resolved_default_type.is_none()
+                && data.constrained.resolved_base_constraint.is_none()
+            {
+                SourceTypeParameterResolutionState::Cold
+            } else if data.constraint == Some(row.constraint)
+                && data.resolved_default_type == Some(row.default_type)
+            {
+                SourceTypeParameterResolutionState::Warm
+            } else {
+                return None;
+            };
+            states.push(state);
+        }
+        Some(states)
+    }
+
+    fn source_direct_constraint_has_leaf_base(&self, constraint: TypeId) -> bool {
+        let Some(bootstrap) = self.intrinsic_bootstrap.as_ref() else {
+            return false;
+        };
+        [
+            bootstrap.any_type,
+            bootstrap.unknown_type,
+            bootstrap.string_type,
+            bootstrap.number_type,
+            bootstrap.bigint_type,
+            bootstrap.boolean_type,
+            bootstrap.es_symbol_type,
+            bootstrap.void_type,
+            bootstrap.undefined_type,
+            bootstrap.null_type,
+            bootstrap.never_type,
+            bootstrap.non_primitive_type,
+            bootstrap.intrinsic_marker_type,
+        ]
+        .contains(&constraint)
+            || matches!(
+                self.type_payload(constraint).map(TypeRecord::data),
+                Some(TypeData::Literal(_) | TypeData::UniqueEsSymbol(_))
+            )
+    }
+
+    fn source_type_node_result_is_exact(&self, node: NodeRef, result: TypeId) -> bool {
+        let Some(bootstrap) = self.intrinsic_bootstrap.as_ref() else {
+            return false;
+        };
+        let intrinsic = match self.source_node_kind(node) {
+            Some(SyntaxKind::AnyKeyword) => Some(bootstrap.any_type),
+            Some(SyntaxKind::UnknownKeyword) => Some(bootstrap.unknown_type),
+            Some(SyntaxKind::StringKeyword) => Some(bootstrap.string_type),
+            Some(SyntaxKind::NumberKeyword) => Some(bootstrap.number_type),
+            Some(SyntaxKind::BigIntKeyword) => Some(bootstrap.bigint_type),
+            Some(SyntaxKind::BooleanKeyword) => Some(bootstrap.boolean_type),
+            Some(SyntaxKind::SymbolKeyword) => Some(bootstrap.es_symbol_type),
+            Some(SyntaxKind::VoidKeyword) => Some(bootstrap.void_type),
+            Some(SyntaxKind::UndefinedKeyword) => Some(bootstrap.undefined_type),
+            Some(SyntaxKind::NeverKeyword) => Some(bootstrap.never_type),
+            Some(SyntaxKind::ObjectKeyword) => Some(bootstrap.non_primitive_type),
+            Some(SyntaxKind::IntrinsicKeyword) => Some(bootstrap.intrinsic_marker_type),
+            _ => None,
+        };
+        if intrinsic == Some(result) {
+            return true;
+        }
+        let exact_type_link = self.type_node_links(node)
+            == Some(&TypeNodeLinks {
+                resolved_type: Some(result),
+                outer_type_parameters: None,
+            });
+        if !exact_type_link {
             return false;
         }
+        let Some(TypeData::TypeParameter(_)) = self.type_payload(result).map(TypeRecord::data)
+        else {
+            return true;
+        };
+        self.type_payload(result)
+            .and_then(TypeRecord::symbol)
+            .is_some_and(|symbol| {
+                self.symbol_node_links(node)
+                    == Some(&SymbolNodeLinks {
+                        resolved_symbol: Some(symbol),
+                    })
+            })
+    }
 
-        for row in resolved {
-            let published = self.set_type_parameter_resolution(
-                row.provenance.type_parameter,
-                Some(row.constraint),
-                None,
-                None,
-                Some(row.default_type),
-            );
-            assert!(
-                published,
-                "the entire type-parameter batch was prevalidated"
-            );
+    fn source_return_annotation_belongs_to(
+        &self,
+        declaration: NodeRef,
+        annotation: NodeRef,
+    ) -> bool {
+        let Some(kind) = self.source_node_kind(annotation) else {
+            return false;
+        };
+        if !kind.is_keyword_type()
+            && ((kind as u16) < (SyntaxKind::FIRST_TYPE_NODE as u16)
+                || (kind as u16) > (SyntaxKind::LAST_TYPE_NODE as u16))
+        {
+            return false;
         }
-        let previous = self
-            .source_callable_type_parameters
-            .insert(signature, provenance);
-        assert!(
-            previous.is_none(),
-            "source type-parameter provenance was prevalidated absent"
-        );
-        true
+        let mut current = annotation;
+        loop {
+            let Some(SourceNodeParent::Parent(parent)) = self.source_node_parent(current) else {
+                return false;
+            };
+            if parent == declaration {
+                return true;
+            }
+            if self.source_node_kind(parent) != Some(SyntaxKind::ParenthesizedType) {
+                return false;
+            }
+            current = parent;
+        }
     }
 
     /// Pushes one validated lazy-property query and probes the current owned
