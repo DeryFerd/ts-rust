@@ -625,7 +625,14 @@ mod tests {
     use ts_parser::{ParseResult, parse_source_file};
 
     use super::*;
-    use crate::semantic::{CanonicalCheckerContext, SourceFileLinks};
+    use crate::semantic::{
+        CanonicalCheckerContext, SourceFileLinks,
+        module_resolution::{
+            CanonicalModuleResolutionEntry, CanonicalModuleResolutionManifestInput,
+            CanonicalModuleResolutionMode, CanonicalResolvedModuleInput,
+        },
+        type_records::{LiteralValue, TypeData},
+    };
 
     fn parsed(text: &str) -> ParseResult {
         let parsed = parse_source_file(text);
@@ -655,6 +662,67 @@ mod tests {
             binder.finish(),
             [(file, &parsed.arena)].into_iter().collect(),
             CanonicalCheckerOptions::default(),
+        )
+        .unwrap()
+    }
+
+    fn imported_context<'arena>(
+        importer: &'arena ParseResult,
+        importer_file: FileId,
+        target: &'arena ParseResult,
+        target_file: FileId,
+    ) -> CanonicalCheckerContext<'arena> {
+        let files = [(importer_file, importer), (target_file, target)];
+        let mut binder = CanonicalBinder::new();
+        for (file, parsed) in files {
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new(
+                        EscapedName::source(format!("\"/project/{}.ts\"", file.index())),
+                        CanonicalSourceLanguage::TypeScript,
+                        false,
+                        CanonicalModuleState::External,
+                    ),
+                )
+                .unwrap();
+        }
+        for (file, parsed) in files {
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+        }
+        let module_specifier = importer
+            .arena
+            .iter()
+            .find_map(|(_, record)| match &record.data {
+                NodeData::ImportDeclaration(import) => Some(NodeRef::new(
+                    importer.arena.id(),
+                    importer_file,
+                    import.module_specifier,
+                )),
+                _ => None,
+            })
+            .expect("fixture contains one import declaration");
+        CanonicalCheckerContext::new_with_module_resolutions(
+            binder.finish(),
+            files
+                .into_iter()
+                .map(|(file, parsed)| (file, &parsed.arena))
+                .collect(),
+            CanonicalCheckerOptions::default(),
+            CanonicalModuleResolutionManifestInput::new([
+                CanonicalModuleResolutionEntry::resolved(
+                    module_specifier,
+                    CanonicalResolvedModuleInput::new(
+                        target_file,
+                        CanonicalModuleResolutionMode::Esm,
+                        CanonicalModuleResolutionMode::Esm,
+                    ),
+                ),
+            ]),
         )
         .unwrap()
     }
@@ -804,6 +872,120 @@ mod tests {
             signatures
         );
         assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn imported_identity_calls_match_oracle_and_replay_importer_first_warm() {
+        let target = parsed("export function identity<T>(value: T): T { return value; }");
+        let importer = parsed(concat!(
+            "import { identity } from './a'; ",
+            "export const inferred = identity('inferred'); ",
+            "export const explicit = identity<number>(42); ",
+            "export const bad: string = identity<number>(42);",
+        ));
+        let importer_file = FileId::new(410);
+        let target_file = FileId::new(411);
+        let mut call_nodes = calls(&importer, importer_file);
+        call_nodes.sort_by_key(|call| importer.arena.get(call.node).unwrap().range.start);
+        let [inferred, explicit, bad] = call_nodes.as_slice() else {
+            panic!("expected inferred, explicit, and bad calls")
+        };
+        let calls = [*inferred, *explicit, *bad];
+        let mut context = imported_context(&importer, importer_file, &target, target_file);
+        let target_source = context.source_file(target_file).unwrap();
+        assert!(
+            !context
+                .store()
+                .source_file_links(target_source)
+                .is_some_and(|links| links.type_checked)
+        );
+
+        context.check_source_file(importer_file).unwrap();
+
+        assert!(
+            !context
+                .store()
+                .source_file_links(target_source)
+                .is_some_and(|links| links.type_checked),
+            "importer-first checking must lazily query, not recursively check, the target source"
+        );
+        let result_types = calls.map(|call| {
+            context
+                .store()
+                .type_node_links(call)
+                .and_then(|links| links.resolved_type)
+                .expect("every imported call caches its result type")
+        });
+        let TypeData::Literal(inferred_literal) = context
+            .store()
+            .type_payload(result_types[0])
+            .unwrap()
+            .data()
+        else {
+            panic!("inferred identity result must preserve its string literal")
+        };
+        assert_eq!(
+            inferred_literal.value,
+            LiteralValue::String("inferred".to_owned())
+        );
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        assert_eq!(result_types[1..], [number, number]);
+
+        let signatures = calls.map(|call| {
+            context
+                .store()
+                .signature_links(call)
+                .and_then(|links| links.resolved_signature.signature())
+                .expect("every imported call caches its instantiated signature")
+        });
+        assert_ne!(signatures[0], signatures[1]);
+        assert_eq!(signatures[1], signatures[2]);
+        assert_eq!(
+            context
+                .diagnostics()
+                .as_slice()
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.code())
+                .collect::<Vec<_>>(),
+            vec![2322]
+        );
+        assert_eq!(
+            context.diagnostics().as_slice()[0]
+                .diagnostic
+                .render()
+                .unwrap(),
+            "Type 'number' is not assignable to type 'string'."
+        );
+        let counts = (
+            context.store().type_len(),
+            context.store().mapper_len(),
+            context.store().signature_len(),
+            context.store().cached_signature_len(),
+        );
+
+        mark_source_unchecked(&mut context, importer_file);
+        context.check_source_file(importer_file).unwrap();
+
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().mapper_len(),
+                context.store().signature_len(),
+                context.store().cached_signature_len(),
+            ),
+            counts
+        );
+        assert_eq!(
+            calls.map(|call| {
+                context
+                    .store()
+                    .signature_links(call)
+                    .and_then(|links| links.resolved_signature.signature())
+                    .unwrap()
+            }),
+            signatures
+        );
+        assert_eq!(context.diagnostics().as_slice().len(), 1);
     }
 
     #[test]
