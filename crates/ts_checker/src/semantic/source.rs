@@ -416,6 +416,20 @@ pub(super) struct PrimitiveBinaryPlan {
     right: PlannedExpression,
 }
 
+impl PrimitiveBinaryPlan {
+    pub(super) const fn node(&self) -> NodeRef {
+        self.node
+    }
+
+    pub(super) const fn operator(&self) -> SyntaxKind {
+        self.operator
+    }
+
+    pub(super) const fn operands(&self) -> (&PlannedExpression, &PlannedExpression) {
+        (&self.left, &self.right)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(super) enum PlannedExpressionKind {
     Null,
@@ -630,6 +644,8 @@ struct SourcePlanner<'arena, 'semantic, 'sources> {
     hoisted_functions: HashSet<SemanticSymbolId>,
     prior_variables: HashSet<SemanticSymbolId>,
     readable_variables: HashSet<SemanticSymbolId>,
+    /// Exact roots minted only by assignment and direct-call syntax owners.
+    primitive_binary_position_roots: HashSet<NodeRef>,
 }
 
 impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
@@ -653,6 +669,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             hoisted_functions: HashSet::new(),
             prior_variables: HashSet::new(),
             readable_variables: HashSet::new(),
+            primitive_binary_position_roots: HashSet::new(),
         }
     }
 
@@ -681,6 +698,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             hoisted_functions: HashSet::new(),
             prior_variables: HashSet::new(),
             readable_variables: HashSet::new(),
+            primitive_binary_position_roots: HashSet::new(),
         }
     }
 
@@ -1010,6 +1028,8 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                             UnsupportedSourceSyntax::Import(assignment.target_type_node),
                         ));
                     }
+                    self.primitive_binary_position_roots
+                        .insert(assignment.right);
                     let right = self.plan_expression(assignment.right)?;
                     statements.push(PlannedStatement::Assignment(PlannedAssignment {
                         expression: assignment.expression,
@@ -2493,6 +2513,8 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 let syntax = plan_direct_source_call_syntax(self.arena, store, expression)?;
                 let callee_node = syntax.callee();
                 let argument_nodes = syntax.arguments().to_vec();
+                self.primitive_binary_position_roots
+                    .extend(argument_nodes.iter().copied());
                 let callee = self.plan_expression(callee_node)?;
                 let arguments = argument_nodes
                     .into_iter()
@@ -2621,6 +2643,9 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
     ) -> Result<bool, SourceCheckError> {
         let mut current = expression;
         loop {
+            if self.primitive_binary_position_roots.contains(&current) {
+                return Ok(true);
+            }
             let Some(parent_id) = self.node(current)?.parent else {
                 return Ok(false);
             };
@@ -3127,7 +3152,7 @@ fn primitive_binary_operand_plan_is_supported(expression: &PlannedExpression) ->
     }
 }
 
-const fn primitive_binary_operator_text(kind: SyntaxKind) -> Option<&'static str> {
+pub(super) const fn primitive_binary_operator_text(kind: SyntaxKind) -> Option<&'static str> {
     match kind {
         SyntaxKind::PlusToken => Some("+"),
         SyntaxKind::MinusToken => Some("-"),
@@ -13370,13 +13395,6 @@ mod tests {
         for (file, text) in [
             (FileId::new(402), "const value = [1 + 2];"),
             (FileId::new(403), "const value = { item: 1 + 2 };"),
-            (
-                FileId::new(404),
-                concat!(
-                    "function id(value: number): number { return value; } ",
-                    "const value = id(1 + 2);",
-                ),
-            ),
         ] {
             let source = parsed(text);
             let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
@@ -13412,27 +13430,46 @@ mod tests {
 
     #[test]
     fn primitive_binary_operator_kind_must_match_its_exact_source_spelling() {
-        let mut source = parsed("const value = 1 + 2;");
-        let file = FileId::new(409);
-        let binary = variable_initializer(&source, file, "value");
-        let operator_id = match &source.arena.get(binary.node).unwrap().data {
-            NodeData::BinaryExpression(binary) => binary.operator_token,
-            _ => unreachable!(),
-        };
-        source.arena.get_mut(operator_id).unwrap().kind = SyntaxKind::MinusToken;
-        let operator = NodeRef::new(source.arena.id(), file, operator_id);
-        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
-        let before = observable_state(&context, file);
+        for (file, text) in [
+            (FileId::new(409), "const value = 1 + 2;"),
+            (FileId::new(410), "var target: number = 0; target = 1 + 2;"),
+            (
+                FileId::new(411),
+                concat!(
+                    "function take(value: number): number { return value; } ",
+                    "const value = take(1 + 2);",
+                ),
+            ),
+        ] {
+            let mut source = parsed(text);
+            let (binary_id, operator_id) = source
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    let NodeData::BinaryExpression(binary) = &record.data else {
+                        return None;
+                    };
+                    (source.arena.get(binary.operator_token)?.kind == SyntaxKind::PlusToken)
+                        .then_some((node, binary.operator_token))
+                })
+                .expect("fixture must contain a primitive plus expression");
+            source.arena.get_mut(operator_id).unwrap().kind = SyntaxKind::MinusToken;
+            let binary = NodeRef::new(source.arena.id(), file, binary_id);
+            let operator = NodeRef::new(source.arena.id(), file, operator_id);
+            let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+            let before = observable_state(&context, file);
 
-        assert_eq!(
-            context.check_source_file(file),
-            Err(SourceCheckError::PrimitiveOperator(operator)),
-        );
+            assert_eq!(
+                context.check_source_file(file),
+                Err(SourceCheckError::PrimitiveOperator(operator)),
+                "source: {text}",
+            );
 
-        assert_eq!(observable_state(&context, file), before);
-        assert!(context.store().type_node_links(binary).is_none());
-        assert!(context.diagnostics().is_empty());
-        assert!(!is_type_checked(&context, file));
+            assert_eq!(observable_state(&context, file), before, "source: {text}");
+            assert!(context.store().type_node_links(binary).is_none());
+            assert!(context.diagnostics().is_empty());
+            assert!(!is_type_checked(&context, file));
+        }
     }
 
     #[test]

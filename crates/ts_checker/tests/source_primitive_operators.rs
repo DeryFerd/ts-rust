@@ -42,6 +42,30 @@ const RECOVERY_SOURCE: &str = concat!(
     "const errorEquality = true === (11n - 12);\n",
 );
 
+const POSITION_SOURCE: &str = concat!(
+    "function takeNumber(value: number): void {}\n",
+    "function takeString(value: string): void {}\n",
+    "function pair(left: number, right: number): void {}\n",
+    "function identity<T>(value: T): T { return value; }\n",
+    "\n",
+    "var assignedNumber: number = 0;\n",
+    "var assignedString: string = \"\";\n",
+    "\n",
+    "assignedNumber = (1 + true) - \"a\";\n",
+    "assignedString = (1n - 2) + true;\n",
+    "assignedNumber = (\"b\" - false) + true;\n",
+    "\n",
+    "const callNumber = takeNumber((3 + true) - \"c\");\n",
+    "const callError = takeString((3n - 4) + true);\n",
+    "const callAny = takeNumber((\"d\" - false) + true);\n",
+    "const callMismatch = takeString(5 + 6);\n",
+    "const callPair = pair((7 + true) - \"e\", (8n - 9) + true);\n",
+    "\n",
+    "const genericClean = identity(1 + 2);\n",
+    "const genericAny = identity((10 + true) + false);\n",
+    "const genericError = identity((11n - 12) + true);\n",
+);
+
 fn context(parsed: &ParseResult, file: FileId) -> CanonicalCheckerContext<'_> {
     let mut binder = CanonicalBinder::new();
     binder
@@ -90,6 +114,21 @@ fn variable_initializer(parsed: &ParseResult, file: FileId, expected: &str) -> N
 fn node_text<'source>(source: &'source str, parsed: &ParseResult, node: NodeRef) -> &'source str {
     let range = parsed.arena.get(node.node).unwrap().range;
     &source[usize::try_from(range.start.get()).unwrap()..usize::try_from(range.end.get()).unwrap()]
+}
+
+fn expression_by_text(source: &str, parsed: &ParseResult, file: FileId, expected: &str) -> NodeRef {
+    parsed
+        .arena
+        .iter()
+        .find_map(|(node, record)| {
+            let node = NodeRef::new(parsed.arena.id(), file, node);
+            (matches!(
+                record.kind,
+                SyntaxKind::BinaryExpression | SyntaxKind::CallExpression
+            ) && node_text(source, parsed, node) == expected)
+                .then_some(node)
+        })
+        .unwrap_or_else(|| panic!("missing expression {expected:?}"))
 }
 
 fn resolved_type(context: &CanonicalCheckerContext<'_>, node: NodeRef) -> TypeId {
@@ -330,6 +369,138 @@ fn nested_kernel_recoveries_remain_exact_and_clear_after_downstream_resolution()
 }
 
 #[test]
+fn assignment_and_call_roots_preserve_recovery_call_relations_and_warm_replay() {
+    let parsed = parse_source_file(POSITION_SOURCE);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(4);
+    let mut context = context(&parsed, file);
+
+    context.check_source_file(file).unwrap();
+
+    let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+    for (text, expected) in [
+        ("(1 + true) - \"a\"", bootstrap.number_type),
+        ("(1n - 2) + true", bootstrap.error_type),
+        ("(\"b\" - false) + true", bootstrap.any_type),
+        ("(3 + true) - \"c\"", bootstrap.number_type),
+        ("(3n - 4) + true", bootstrap.error_type),
+        ("(\"d\" - false) + true", bootstrap.any_type),
+        ("5 + 6", bootstrap.number_type),
+        ("(7 + true) - \"e\"", bootstrap.number_type),
+        ("(8n - 9) + true", bootstrap.error_type),
+    ] {
+        assert_eq!(
+            resolved_type(
+                &context,
+                expression_by_text(POSITION_SOURCE, &parsed, file, text),
+            ),
+            expected,
+            "expression {text}",
+        );
+    }
+    for (name, expected) in [
+        ("genericClean", bootstrap.number_type),
+        ("genericAny", bootstrap.any_type),
+        ("genericError", bootstrap.error_type),
+    ] {
+        assert_eq!(
+            resolved_type(&context, variable_initializer(&parsed, file, name)),
+            expected,
+            "generic call {name}",
+        );
+    }
+    for call in [
+        "takeNumber((3 + true) - \"c\")",
+        "takeString((3n - 4) + true)",
+        "takeNumber((\"d\" - false) + true)",
+        "takeString(5 + 6)",
+        "pair((7 + true) - \"e\", (8n - 9) + true)",
+    ] {
+        assert_eq!(
+            resolved_type(
+                &context,
+                expression_by_text(POSITION_SOURCE, &parsed, file, call),
+            ),
+            bootstrap.void_type,
+            "fixed call {call}",
+        );
+    }
+
+    let actual = context
+        .diagnostics()
+        .as_slice()
+        .iter()
+        .map(|diagnostic| {
+            (
+                diagnostic.diagnostic.code(),
+                node_text(POSITION_SOURCE, &parsed, diagnostic.node.unwrap()),
+                diagnostic
+                    .diagnostic
+                    .arguments
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        actual,
+        [
+            (2365, "1 + true", vec!["+", "number", "boolean"]),
+            (2363, "\"a\"", vec![]),
+            (2365, "1n - 2", vec!["-", "bigint", "number"]),
+            (2362, "\"b\"", vec![]),
+            (2363, "false", vec![]),
+            (
+                2365,
+                "(\"b\" - false) + true",
+                vec!["+", "number", "boolean"],
+            ),
+            (2365, "3 + true", vec!["+", "number", "boolean"]),
+            (2363, "\"c\"", vec![]),
+            (2365, "3n - 4", vec!["-", "bigint", "number"]),
+            (2362, "\"d\"", vec![]),
+            (2363, "false", vec![]),
+            (
+                2365,
+                "(\"d\" - false) + true",
+                vec!["+", "number", "boolean"],
+            ),
+            (2345, "5 + 6", vec!["number", "string"]),
+            (2365, "7 + true", vec!["+", "number", "boolean"]),
+            (2363, "\"e\"", vec![]),
+            (2365, "8n - 9", vec!["-", "bigint", "number"]),
+            (2365, "10 + true", vec!["+", "number", "boolean"]),
+            (2365, "11n - 12", vec!["-", "bigint", "number"]),
+        ],
+    );
+    assert!(
+        context
+            .diagnostics()
+            .as_slice()
+            .iter()
+            .all(|diagnostic| diagnostic.related_information.is_empty())
+    );
+
+    let warm = (
+        context.store().type_len(),
+        context.store().mapper_len(),
+        context.store().signature_len(),
+        context.diagnostics().as_slice().to_vec(),
+    );
+    context.check_source_file(file).unwrap();
+    assert_eq!(
+        (
+            context.store().type_len(),
+            context.store().mapper_len(),
+            context.store().signature_len(),
+            context.diagnostics().as_slice().to_vec(),
+        ),
+        warm,
+    );
+}
+
+#[test]
 fn unknown_bigint_exponentiation_target_publishes_no_root_or_source_diagnostics() {
     let parsed = parse_source_file("const value = 1n ** 2n;");
     assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
@@ -364,45 +535,111 @@ fn unknown_bigint_exponentiation_target_publishes_no_root_or_source_diagnostics(
 }
 
 #[test]
-fn unsupported_nested_binary_position_is_rejected_before_publication() {
-    let parsed = parse_source_file("const value = [1 + 2];");
-    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
-    let file = FileId::new(3);
-    let binary = parsed
-        .arena
-        .iter()
-        .find_map(|(node, record)| {
-            (record.kind == SyntaxKind::BinaryExpression)
-                .then(|| NodeRef::new(parsed.arena.id(), file, node))
-        })
-        .unwrap();
-    let mut context = context(&parsed, file);
-    let before = (
-        context.store().type_len(),
-        context.store().mapper_len(),
-        context.store().signature_len(),
-    );
-
-    assert_eq!(
-        context.check_source_file(file),
-        Err(SourceCheckError::Unsupported(
-            UnsupportedSourceSyntax::Syntax {
-                node: binary,
-                kind: SyntaxKind::BinaryExpression,
-                role: SourceSyntaxRole::BinaryExpression,
-            },
-        )),
-    );
-
-    assert_eq!(
+fn trusted_assignment_and_call_roots_fail_atomically_on_operator_spelling_poison() {
+    for (file, text) in [
+        (FileId::new(6), "var target: number = 0; target = 1 + 2;"),
         (
+            FileId::new(7),
+            concat!(
+                "function take(value: number): number { return value; } ",
+                "const result = take(1 + 2);",
+            ),
+        ),
+    ] {
+        let mut parsed = parse_source_file(text);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let (binary_id, operator_id) = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::BinaryExpression(binary) = &record.data else {
+                    return None;
+                };
+                (parsed.arena.get(binary.operator_token)?.kind == SyntaxKind::PlusToken)
+                    .then_some((node, binary.operator_token))
+            })
+            .expect("fixture must contain a primitive plus expression");
+        parsed.arena.get_mut(operator_id).unwrap().kind = SyntaxKind::MinusToken;
+        let binary = NodeRef::new(parsed.arena.id(), file, binary_id);
+        let operator = NodeRef::new(parsed.arena.id(), file, operator_id);
+        let mut context = context(&parsed, file);
+        let before = (
             context.store().type_len(),
             context.store().mapper_len(),
             context.store().signature_len(),
-        ),
-        before,
-    );
-    assert!(context.store().type_node_links(binary).is_none());
-    assert!(context.diagnostics().is_empty());
-    assert!(!is_type_checked(&context, file));
+        );
+        let expected = SourceCheckError::PrimitiveOperator(operator);
+
+        assert_eq!(context.check_source_file(file), Err(expected));
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().mapper_len(),
+                context.store().signature_len(),
+            ),
+            before,
+        );
+        assert!(context.store().type_node_links(binary).is_none());
+        assert!(context.diagnostics().is_empty());
+        assert!(!is_type_checked(&context, file));
+
+        assert_eq!(context.check_source_file(file), Err(expected));
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().mapper_len(),
+                context.store().signature_len(),
+            ),
+            before,
+        );
+        assert!(context.diagnostics().is_empty());
+    }
+}
+
+#[test]
+fn unsupported_nested_binary_position_is_rejected_before_publication() {
+    for (file, text) in [
+        (FileId::new(3), "const value = [1 + 2];"),
+        (FileId::new(5), "const value = { item: 1 + 2 };"),
+    ] {
+        let parsed = parse_source_file(text);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let binary = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::BinaryExpression)
+                    .then(|| NodeRef::new(parsed.arena.id(), file, node))
+            })
+            .unwrap();
+        let mut context = context(&parsed, file);
+        let before = (
+            context.store().type_len(),
+            context.store().mapper_len(),
+            context.store().signature_len(),
+        );
+
+        assert_eq!(
+            context.check_source_file(file),
+            Err(SourceCheckError::Unsupported(
+                UnsupportedSourceSyntax::Syntax {
+                    node: binary,
+                    kind: SyntaxKind::BinaryExpression,
+                    role: SourceSyntaxRole::BinaryExpression,
+                },
+            )),
+        );
+
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().mapper_len(),
+                context.store().signature_len(),
+            ),
+            before,
+        );
+        assert!(context.store().type_node_links(binary).is_none());
+        assert!(context.diagnostics().is_empty());
+        assert!(!is_type_checked(&context, file));
+    }
 }
