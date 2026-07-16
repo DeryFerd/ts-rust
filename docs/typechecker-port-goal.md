@@ -886,9 +886,23 @@ remains the cluster-level source of truth.
   validator preserves provider order, separates call and construct signatures,
   rejects duplicate IDs and poisoned parameter/return type caches, and checks
   minimum arity against fixed parameters after extracting a rest tail. The
-  declared interface/type-literal call-member provider and overload resolver
-  remain the next C1/C2 production consumers rather than being inferred from a
-  structured signature cache alone.
+  first production C1/C2 consumer is now integrated through
+  `ec394fd..625d062`: a call-signature-only, nongeneric interface or type
+  literal publishes fixed-arity signatures in declaration order, and direct
+  identifier or required-property calls stably move literal-specialized
+  signatures first, then select with the pinned option-aware subtype and
+  assignability passes. Multi-overload failure remains fail-closed until the
+  synthetic intersection-return recovery signature and exact TS2769/TS2575
+  reporting are ported; no declared candidate is reused as a false recovery.
+  Publication and warm replay validate declaration ownership,
+  parameter value types, explicit return annotations, signature links, set
+  order, provider provenance, and callable-interface union graph edges
+  atomically. Cross-review found and closed an admitted merged-interface
+  mismatch, literal-order and subtype-pass omissions, a callable-interface
+  union-validation hole, and incorrect declared-candidate failure recovery
+  before the public gate. Generic, optional/rest, construct, mixed-member,
+  inherited, callable-union, contextual-callback, and failed overload sets
+  remain explicit boundaries.
 - The first T1 tuple-construction seam is integrated through
   `1bc3fa1..b480547`. It ports the pinned target-key and instance-cache shape
   for required elements, trailing optional elements, a trailing rest element,
@@ -905,8 +919,9 @@ remains the cluster-level source of truth.
   indexed access, variadic tuples, and rest/spread call applicability remain
   explicit T1/A10 follow-up work.
 - The current pinned first-50 run at
-  `/tmp/ts-rust-canonical-first50-9da7475.json`, rebuilt after the first
-  post-join and callable-set slices, remains two exact artifacts and 48 honest unsupported
+  `/tmp/ts-rust-canonical-first50-a7302a7.json`, rebuilt after the first
+  post-join, tuple-construction, and production overload slices, remains two
+  exact artifacts and 48 honest unsupported
   variants, with zero code, span, message, order, or complete-artifact
   mismatches. This alphabetically biased smoke tranche is dominated by
   classes, broader function/body forms, module modes, JavaScript, TSX,
