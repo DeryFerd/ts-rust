@@ -48,6 +48,10 @@ pub(super) struct ValidatedSingleCallable {
     pub(super) owner: TypeId,
     pub(super) signature: SignatureId,
     pub(super) parameters: Vec<TypeId>,
+    /// Raw final rest parameter type, kept separate from fixed positions.
+    /// Providers may publish the canonical empty tuple to represent an
+    /// exhausted contextual rest tail.
+    pub(super) rest_parameter: Option<TypeId>,
     pub(super) min_argument_count: usize,
     pub(super) return_type: Option<TypeId>,
     pub(super) strict_variance_exempt: bool,
@@ -226,27 +230,26 @@ fn validated_single_callable(
     };
     let signature = *signature;
     let signature_record = store.signature(signature)?;
-    let mut parameters = signature_record
-        .parameters()
-        .iter()
-        .map(|parameter| {
-            store
-                .value_symbol_links(*parameter)
-                .and_then(|links| links.resolved_type)
-        })
-        .collect::<Option<Vec<_>>>()?;
-    if signature_record.has_rest_parameter() {
-        let rest = parameters.last().copied()?;
-        if store.validate_canonical_empty_tuple_type(rest).is_err() {
-            return None;
-        }
-        parameters.pop();
+    let mut parameters = store
+        .callable_signature_parameter_types(signature)?
+        .to_vec();
+    if parameters.len() != signature_record.parameters().len() {
+        return None;
+    }
+    let rest_parameter = if signature_record.has_rest_parameter() {
+        parameters.pop()
+    } else {
+        None
+    };
+    if signature_record.has_rest_parameter() && rest_parameter.is_none() {
+        return None;
     }
     let min_argument_count = usize::try_from(signature_record.min_argument_count()).ok()?;
     Some(ValidatedSingleCallable {
         owner: type_,
         signature,
         parameters,
+        rest_parameter,
         min_argument_count,
         return_type: signature_record.resolved_return_type(),
         // These exact source/type-node providers are neither methods nor constructors.

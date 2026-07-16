@@ -90,6 +90,10 @@ pub(super) enum DirectCallInvariant {
         index: usize,
         type_: TypeId,
     },
+    InvalidRestParameterType {
+        signature: SignatureId,
+        type_: TypeId,
+    },
     MalformedParameterUnion {
         signature: SignatureId,
         index: usize,
@@ -155,6 +159,7 @@ pub(super) struct DirectCallProjection {
     pub(super) signature: SignatureId,
     pub(super) minimum_argument_count: usize,
     pub(super) maximum_argument_count: usize,
+    pub(super) has_effective_rest: bool,
     pub(super) argument_targets: Vec<DirectCallArgumentTarget>,
     pub(super) return_type: TypeId,
     pub(super) return_kind: DirectCallReturnKind,
@@ -215,7 +220,8 @@ pub(super) fn resolve_direct_call(
         }
         StoredSingleCallableValidation::Valid { callable, .. } => callable,
     };
-    let mut resolution = project_validated_direct_call(store, request, &callable)?;
+    let mut resolution =
+        project_validated_direct_call(store, Some(global_types), request, &callable)?;
     if resolution.applicability != DirectCallApplicability::Applicable {
         return Ok(resolution);
     }
@@ -265,6 +271,7 @@ fn validate_argument_types(
 
 fn project_validated_direct_call(
     store: &CanonicalTypeMapperStore,
+    global_types: Option<&CanonicalGlobalTypes>,
     request: DirectCallRequest<'_>,
     callable: &ValidatedSingleCallable,
 ) -> Result<DirectCallResolution, DirectCallError> {
@@ -284,17 +291,24 @@ fn project_validated_direct_call(
     if signature.this_parameter().is_some() {
         return Err(DirectCallUnsupported::ExplicitThisParameter(callable.signature).into());
     }
-    if signature
+    let has_rest_parameter = signature
         .flags()
-        .contains(SignatureFlags::HAS_REST_PARAMETER)
-    {
-        return Err(DirectCallUnsupported::RestSignature(callable.signature).into());
-    }
-    if signature.parameters().len() != callable.parameters.len() {
+        .contains(SignatureFlags::HAS_REST_PARAMETER);
+    if has_rest_parameter != callable.rest_parameter.is_some() {
         return Err(DirectCallInvariant::SignatureParameterCountMismatch {
             signature: callable.signature,
             stored: signature.parameters().len(),
-            projected: callable.parameters.len(),
+            projected: callable.parameters.len() + usize::from(callable.rest_parameter.is_some()),
+        }
+        .into());
+    }
+    let projected_parameter_count =
+        callable.parameters.len() + usize::from(callable.rest_parameter.is_some());
+    if signature.parameters().len() != projected_parameter_count {
+        return Err(DirectCallInvariant::SignatureParameterCountMismatch {
+            signature: callable.signature,
+            stored: signature.parameters().len(),
+            projected: projected_parameter_count,
         }
         .into());
     }
@@ -325,6 +339,29 @@ fn project_validated_direct_call(
             .into());
         }
     }
+    let rest_element_type = match callable.rest_parameter {
+        None => None,
+        Some(rest) if store.validate_canonical_empty_tuple_type(rest).is_ok() => None,
+        Some(rest) => {
+            let Some(global_types) = global_types else {
+                return Err(DirectCallUnsupported::RestSignature(callable.signature).into());
+            };
+            match store.canonical_array_element_type(global_types, rest) {
+                Ok(Some(element)) => Some(element),
+                Ok(None) => {
+                    return Err(DirectCallUnsupported::RestSignature(callable.signature).into());
+                }
+                Err(_) => {
+                    return Err(DirectCallInvariant::InvalidRestParameterType {
+                        signature: callable.signature,
+                        type_: rest,
+                    }
+                    .into());
+                }
+            }
+        }
+    };
+    let has_effective_rest = rest_element_type.is_some();
 
     let Some(return_type) = callable.return_type else {
         return Err(DirectCallUnsupported::UnresolvedReturnType(callable.signature).into());
@@ -350,25 +387,31 @@ fn project_validated_direct_call(
         .arguments
         .iter()
         .copied()
-        .zip(callable.parameters.iter().copied())
         .enumerate()
-        .map(
-            |(index, (argument_type, parameter_type))| DirectCallArgumentTarget {
-                index,
-                argument_type,
-                parameter_type,
-            },
-        )
+        .filter_map(|(index, argument_type)| {
+            callable
+                .parameters
+                .get(index)
+                .copied()
+                .or(rest_element_type)
+                .map(|parameter_type| DirectCallArgumentTarget {
+                    index,
+                    argument_type,
+                    parameter_type,
+                })
+        })
         .collect();
     let applicability = match request.arguments.len() {
         actual if actual < minimum_argument_count => DirectCallApplicability::TooFewArguments {
             expected_at_least: minimum_argument_count,
             actual,
         },
-        actual if actual > maximum_argument_count => DirectCallApplicability::TooManyArguments {
-            expected_at_most: maximum_argument_count,
-            actual,
-        },
+        actual if !has_effective_rest && actual > maximum_argument_count => {
+            DirectCallApplicability::TooManyArguments {
+                expected_at_most: maximum_argument_count,
+                actual,
+            }
+        }
         _ => DirectCallApplicability::Applicable,
     };
     Ok(DirectCallResolution {
@@ -377,6 +420,7 @@ fn project_validated_direct_call(
             signature: callable.signature,
             minimum_argument_count,
             maximum_argument_count,
+            has_effective_rest,
             argument_targets,
             return_type,
             return_kind,
@@ -513,6 +557,12 @@ mod tests {
         minimum: i32,
         return_type: Option<TypeId>,
     ) -> ValidatedSingleCallable {
+        let mut projected_parameters = parameters.clone();
+        let rest_parameter = if flags.contains(SignatureFlags::HAS_REST_PARAMETER) {
+            projected_parameters.pop()
+        } else {
+            None
+        };
         let symbols = parameters
             .iter()
             .enumerate()
@@ -534,7 +584,8 @@ mod tests {
         ValidatedSingleCallable {
             owner,
             signature,
-            parameters,
+            parameters: projected_parameters,
+            rest_parameter,
             min_argument_count: usize::try_from(minimum).unwrap(),
             return_type,
             strict_variance_exempt: false,
@@ -614,9 +665,13 @@ mod tests {
             Some(string),
         );
         let arguments = [number];
-        let resolution =
-            project_validated_direct_call(&store, request(callable.owner, &arguments), &callable)
-                .unwrap();
+        let resolution = project_validated_direct_call(
+            &store,
+            None,
+            request(callable.owner, &arguments),
+            &callable,
+        )
+        .unwrap();
 
         assert_eq!(
             resolution.applicability,
@@ -654,9 +709,13 @@ mod tests {
             Some(string),
         );
 
-        let too_few =
-            project_validated_direct_call(&store, request(callable.owner, &[number]), &callable)
-                .unwrap();
+        let too_few = project_validated_direct_call(
+            &store,
+            None,
+            request(callable.owner, &[number]),
+            &callable,
+        )
+        .unwrap();
         assert_eq!(
             too_few.applicability,
             DirectCallApplicability::TooFewArguments {
@@ -667,6 +726,7 @@ mod tests {
 
         let too_many = project_validated_direct_call(
             &store,
+            None,
             request(callable.owner, &[number, string, number]),
             &callable,
         )
@@ -694,9 +754,13 @@ mod tests {
             2,
             Some(void),
         );
-        let resolution =
-            project_validated_direct_call(&store, request(callable.owner, &[number]), &callable)
-                .unwrap();
+        let resolution = project_validated_direct_call(
+            &store,
+            None,
+            request(callable.owner, &[number]),
+            &callable,
+        )
+        .unwrap();
 
         assert_eq!(resolution.projection.minimum_argument_count, 1);
         assert_eq!(
@@ -724,6 +788,7 @@ mod tests {
         );
         let resolution = project_validated_direct_call(
             &store,
+            None,
             request(callable.owner, &[number, string]),
             &callable,
         )
@@ -754,6 +819,7 @@ mod tests {
         assert_eq!(
             project_validated_direct_call(
                 &store,
+                None,
                 request(unresolved.owner, &[number]),
                 &unresolved,
             ),
@@ -770,7 +836,7 @@ mod tests {
             Some(number),
         );
         assert_eq!(
-            project_validated_direct_call(&store, request(rest.owner, &[number]), &rest,),
+            project_validated_direct_call(&store, None, request(rest.owner, &[number]), &rest,),
             Err(DirectCallError::Unsupported(
                 DirectCallUnsupported::RestSignature(rest.signature)
             ))
