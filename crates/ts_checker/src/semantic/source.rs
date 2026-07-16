@@ -1551,6 +1551,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 error: LogicalBinaryError::Literal(error),
                 ..
             } => error.into(),
+            SourceFlowError::Join { error, .. } => error.into(),
         }
     }
 
