@@ -185,6 +185,10 @@ pub enum TypeNodeUnavailable {
         element: NodeRef,
         index: usize,
     },
+    RecursiveTupleAliasUnsupported {
+        node: NodeRef,
+        symbol: SemanticSymbolId,
+    },
     InvalidCachedTupleType(TypeId),
     ResolutionStackInvariant(SemanticSymbolId),
 }
@@ -789,6 +793,7 @@ struct TypeQueryPlanner<'store, 'host, 'arena, 'aliases> {
     planning_defaults: HashSet<(SemanticSymbolId, NodeRef)>,
     planning_interfaces: HashSet<SemanticSymbolId>,
     active_structural_aliases: Vec<(SemanticSymbolId, usize)>,
+    active_tuple_aliases: Vec<SemanticSymbolId>,
     function_indirection_depth: usize,
 }
 
@@ -812,6 +817,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             planning_defaults: HashSet::new(),
             planning_interfaces: HashSet::new(),
             active_structural_aliases: Vec::new(),
+            active_tuple_aliases: Vec::new(),
             function_indirection_depth: 0,
         }
     }
@@ -1049,9 +1055,27 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         let planned =
             tuple_type_nodes::plan_tuple_type_node(self.store, self.host, node, self.array_targets)
                 .map_err(tuple_type_node_error)?;
-        for element in planned.elements() {
-            self.plan_type_node_in_context(element.type_node(), None, false)?;
+        let pushed_alias = if let Some(alias) = alias_owner {
+            if self.active_tuple_aliases.contains(&alias) {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::RecursiveTupleAliasUnsupported {
+                        node,
+                        symbol: alias,
+                    },
+                ));
+            }
+            self.active_tuple_aliases.push(alias);
+            true
+        } else {
+            false
+        };
+        let child_result = planned.elements().iter().try_for_each(|element| {
+            self.plan_type_node_in_context(element.type_node(), None, false)
+        });
+        if pushed_alias {
+            assert_eq!(self.active_tuple_aliases.pop(), alias_owner);
         }
+        child_result?;
         if planned.cached_type().is_some() {
             let mut base_types = Vec::new();
             base_types
@@ -2756,6 +2780,12 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         if malformed_alias_merge(flags) {
             return Err(DeclaredTypeError::Unavailable(
                 DeclaredTypeUnavailable::AliasMergedWithDeclaredSymbol(symbol),
+            ));
+        }
+
+        if flags.contains(SymbolFlags::TYPE_ALIAS) && self.active_tuple_aliases.contains(&symbol) {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::RecursiveTupleAliasUnsupported { node, symbol },
             ));
         }
 
@@ -5506,7 +5536,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             };
             element_types.push(type_);
         }
-        let infos = tuple_plan.element_infos();
+        let infos = tuple_plan.element_infos().map_err(tuple_type_node_error)?;
         let mut request =
             CanonicalTupleTypeRequest::new(&element_types, &infos, tuple_plan.readonly());
         if let Some(targets) = self
@@ -15694,7 +15724,7 @@ mod tests {
     #[test]
     fn tuple_aliases_preserve_labels_optionality_and_warm_identity() {
         let mut fixture = fixture_with_intrinsic(
-            "type Pair = [left: string, right?: number];",
+            "type Pair = [left: string, right?: number,];",
             IntrinsicBootstrapOptions {
                 strict_null_checks: true,
                 exact_optional_property_types: true,
@@ -15876,12 +15906,93 @@ mod tests {
     }
 
     #[test]
+    fn recursive_tuple_alias_is_an_explicit_atomic_boundary() {
+        let mut fixture = fixture("type Recursive = [Recursive];");
+        let alias = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Recursive");
+        let reference = fixture
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::TypeReference).then_some(NodeRef::new(
+                    fixture.parsed.arena.id(),
+                    fixture.file,
+                    node,
+                ))
+            })
+            .expect("recursive alias has a type-reference element");
+        let before = (
+            store_state(&fixture.store),
+            fixture.store.symbol_len(),
+            fixture.store.canonical_tuple_target_len(),
+        );
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        assert_eq!(
+            query_declared(
+                &mut fixture,
+                alias,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Err(DeclaredTypeError::TypeNodeUnavailable(
+                TypeNodeUnavailable::RecursiveTupleAliasUnsupported {
+                    node: reference,
+                    symbol: alias,
+                }
+            ))
+        );
+        assert_eq!(
+            (
+                store_state(&fixture.store),
+                fixture.store.symbol_len(),
+                fixture.store.canonical_tuple_target_len(),
+            ),
+            before
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn readonly_operator_only_warm_cache_is_rejected_atomically() {
+        let mut fixture =
+            fixture("let established: readonly [string]; let poisoned: readonly [string];");
+        let established = variable_type_node(&fixture, "established");
+        let poisoned = variable_type_node(&fixture, "poisoned");
+        let NodeData::TypeOperatorNode(poisoned_operator) =
+            &fixture.parsed.arena.get(poisoned.node).unwrap().data
+        else {
+            panic!("expected readonly tuple operator")
+        };
+        let poisoned_tuple = NodeRef::new(poisoned.arena, poisoned.file, poisoned_operator.type_);
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let established_type = query_node(&mut fixture, established, &mut diagnostics).unwrap();
+        assert!(fixture.store.set_type_node_links(
+            poisoned,
+            TypeNodeLinks {
+                resolved_type: Some(established_type),
+                ..TypeNodeLinks::default()
+            },
+        ));
+        assert!(fixture.store.type_node_links(poisoned_tuple).is_none());
+        let before = store_state(&fixture.store);
+        assert_eq!(
+            query_node(&mut fixture, poisoned, &mut diagnostics),
+            Err(DeclaredTypeError::TypeNodeUnavailable(
+                TypeNodeUnavailable::InvalidCachedTupleType(established_type)
+            ))
+        );
+        assert_eq!(store_state(&fixture.store), before);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
     fn unnamed_array_rest_requires_and_uses_authoritative_global_targets() {
         let mut fixture = global_array_fixture(
-            "let values: [string, ...number[]]; let only: readonly [...number[]];",
+            "let values: [string, ...number[]]; let wrapped: [string, ...(number[]),]; let only: readonly [...number[]];",
         );
         let global_types = initialize_fixture_global_types(&mut fixture);
         let values = variable_type_node(&fixture, "values");
+        let wrapped = variable_type_node(&fixture, "wrapped");
         let only = variable_type_node(&fixture, "only");
         let mut diagnostics = CanonicalCheckerDiagnostics::default();
         assert!(matches!(
@@ -15907,6 +16018,25 @@ mod tests {
                 .map(|info| info.flags())
                 .collect::<Vec<_>>(),
             [ElementFlags::REQUIRED, ElementFlags::REST]
+        );
+        let wrapped_type =
+            query_global_node(&mut fixture, &global_types, wrapped, &mut diagnostics).unwrap();
+        let wrapped_shape = fixture
+            .store
+            .canonical_tuple_shape(wrapped_type)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            wrapped_shape
+                .element_infos()
+                .iter()
+                .map(|info| info.flags())
+                .collect::<Vec<_>>(),
+            [ElementFlags::REQUIRED, ElementFlags::REST]
+        );
+        assert_eq!(
+            wrapped_shape.element_types()[1],
+            fixture.store.intrinsic_bootstrap().unwrap().number_type
         );
         let only_type =
             query_global_node(&mut fixture, &global_types, only, &mut diagnostics).unwrap();

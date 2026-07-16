@@ -5,6 +5,8 @@
 //! `getTupleElementInfo`. It deliberately stops before variadic tuples and
 //! named rest elements. A syntactic `...T[]` is admitted only with the
 //! authoritative global Array targets used by the canonical tuple constructor.
+//! Recursive tuple aliases remain an explicit planner boundary until deferred
+//! type references and normalized recursive tuple construction are installed.
 
 use ts_ast::{NodeData, NodeRef, SyntaxKind};
 
@@ -67,8 +69,13 @@ impl TupleTypeNodePlan {
         self.cached_type
     }
 
-    pub(super) fn element_infos(&self) -> Vec<TupleElementInfo> {
-        self.elements.iter().map(|element| element.info).collect()
+    pub(super) fn element_infos(&self) -> Result<Vec<TupleElementInfo>, TupleTypeNodeError> {
+        let mut infos = Vec::new();
+        infos
+            .try_reserve(self.elements.len())
+            .map_err(|_| TupleTypeNodeError::Capacity(self.tuple))?;
+        infos.extend(self.elements.iter().map(|element| element.info));
+        Ok(infos)
     }
 
     pub(super) fn optional_element_count(&self) -> usize {
@@ -146,9 +153,7 @@ pub(super) fn plan_tuple_type_node(
     let NodeData::TupleTypeNode(tuple_data) = &tuple_record.data else {
         return Err(TupleTypeNodeError::InvalidSyntax(tuple));
     };
-    if tuple_record.kind != SyntaxKind::TupleType
-        || tuple_data.elements.range != tuple_record.range
-        || tuple_data.elements.has_trailing_comma
+    if tuple_record.kind != SyntaxKind::TupleType || tuple_data.elements.range != tuple_record.range
     {
         return Err(TupleTypeNodeError::InvalidSyntax(tuple));
     }
@@ -206,10 +211,11 @@ pub(super) fn plan_tuple_type_node(
         elements.push(planned);
     }
 
-    let infos = elements
-        .iter()
-        .map(|element| element.info)
-        .collect::<Vec<_>>();
+    let mut infos = Vec::new();
+    infos
+        .try_reserve(elements.len())
+        .map_err(|_| TupleTypeNodeError::Capacity(tuple))?;
+    infos.extend(elements.iter().map(|element| element.info));
     validate_existing_target(store, tuple, &infos, readonly)?;
     let (cached_type, cached_element_types) = validate_warm_cache(
         store,
@@ -313,20 +319,12 @@ fn plan_tuple_element(
                 ));
             };
             let array = direct_child(store, host, element, rest.type_)?;
-            let array_record = preflight_node(store, host, array)?;
-            let NodeData::ArrayTypeNode(array_data) = &array_record.data else {
+            let Some(child) = parenthesized_array_element(store, host, array)? else {
                 return Err(TupleTypeNodeError::UnsupportedSyntax {
                     node: element,
                     kind: SyntaxKind::RestType,
                 });
             };
-            if array_record.kind != SyntaxKind::ArrayType {
-                return Err(TupleTypeNodeError::UnsupportedSyntax {
-                    node: element,
-                    kind: SyntaxKind::RestType,
-                });
-            }
-            let child = direct_child(store, host, array, array_data.element_type)?;
             (child, ElementFlags::REST, None)
         }
         (_, SyntaxKind::RestType | SyntaxKind::OptionalType | SyntaxKind::NamedTupleMember) => {
@@ -338,6 +336,25 @@ fn plan_tuple_element(
         .create_tuple_element_info(flags, label)
         .ok_or(TupleTypeNodeError::InvalidElementInfo(element))?;
     Ok(PlannedTupleElement { type_node, info })
+}
+
+fn parenthesized_array_element(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    mut node: NodeRef,
+) -> Result<Option<NodeRef>, TupleTypeNodeError> {
+    loop {
+        let record = preflight_node(store, host, node)?;
+        match (&record.data, record.kind) {
+            (NodeData::ParenthesizedTypeNode(parenthesized), SyntaxKind::ParenthesizedType) => {
+                node = direct_child(store, host, node, parenthesized.type_)?;
+            }
+            (NodeData::ArrayTypeNode(array), SyntaxKind::ArrayType) => {
+                return direct_child(store, host, node, array.element_type).map(Some);
+            }
+            _ => return Ok(None),
+        }
+    }
 }
 
 fn direct_child(
@@ -364,8 +381,13 @@ fn validate_existing_target(
     infos: &[TupleElementInfo],
     readonly: bool,
 ) -> Result<(), TupleTypeNodeError> {
+    let mut element_infos = Vec::new();
+    element_infos
+        .try_reserve(infos.len())
+        .map_err(|_| TupleTypeNodeError::Capacity(node))?;
+    element_infos.extend_from_slice(infos);
     let key = CanonicalTupleTargetKey {
-        element_infos: infos.to_vec(),
+        element_infos,
         readonly,
     };
     let Some(provenance) = store.canonical_tuple_target(&key) else {
@@ -404,6 +426,14 @@ fn validate_warm_cache(
     let operator_cached = readonly_operator
         .and_then(|operator| store.type_node_links(operator))
         .and_then(|links| links.resolved_type);
+    if tuple_cached.is_none()
+        && let (Some(operator_cached), Some(operator)) = (operator_cached, readonly_operator)
+    {
+        return Err(TupleTypeNodeError::InvalidCachedType {
+            node: operator,
+            type_: operator_cached,
+        });
+    }
     if let (Some(tuple_cached), Some(operator_cached), Some(operator)) =
         (tuple_cached, operator_cached, readonly_operator)
         && tuple_cached != operator_cached
@@ -440,7 +470,12 @@ fn validate_warm_cache(
                 type_: cached,
             });
         }
-        return Ok((Some(cached), vec![reference.element_type]));
+        let mut element_types = Vec::new();
+        element_types
+            .try_reserve(1)
+            .map_err(|_| TupleTypeNodeError::Capacity(tuple))?;
+        element_types.push(reference.element_type);
+        return Ok((Some(cached), element_types));
     }
     let shape = store
         .canonical_tuple_shape(cached)
