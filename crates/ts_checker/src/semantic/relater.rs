@@ -1391,7 +1391,7 @@ impl<'store> RelaterSession<'store> {
         if source_flags.intersects(TypeFlags::UNION) || target_flags.intersects(TypeFlags::UNION) {
             return self.union_or_intersection_related_to(source, target, intersection_state);
         }
-        if !supports_property_object_relation(self.relation)
+        if !supports_structured_object_relation(self.relation, self.strict_function_types)
             || !source_flags.intersects(TypeFlags::OBJECT)
             || !target_flags.intersects(TypeFlags::OBJECT)
         {
@@ -1700,7 +1700,7 @@ impl<'store> RelaterSession<'store> {
         target: TypeId,
     ) -> Result<bool, RelationUnavailable> {
         let allow_fresh_target = self.allows_fresh_object_target();
-        let target_members = self.resolved_object_members(target, allow_fresh_target)?;
+        let target_members = self.resolved_object_property_surface(target, allow_fresh_target)?;
         if target_members.properties.is_empty() {
             return Ok(false);
         }
@@ -1713,7 +1713,7 @@ impl<'store> RelaterSession<'store> {
                 return Ok(false);
             }
         }
-        let source_members = self.resolved_object_members(source, true)?;
+        let source_members = self.resolved_object_property_surface(source, true)?;
         if source_members.properties.is_empty() || self.is_direct_global_object_type(source)? {
             return Ok(false);
         }
@@ -1751,7 +1751,7 @@ impl<'store> RelaterSession<'store> {
         target: TypeId,
     ) -> Result<bool, RelationUnavailable> {
         let allow_fresh_target = self.allows_fresh_object_target();
-        let target_members = self.resolved_object_members(target, allow_fresh_target)?;
+        let target_members = self.resolved_object_property_surface(target, allow_fresh_target)?;
 
         // Pinned `hasExcessProperties` treats the empty object as an open
         // target and exempts the global Object target only for assignable and
@@ -1766,7 +1766,7 @@ impl<'store> RelaterSession<'store> {
         {
             return Ok(false);
         }
-        let source_members = self.resolved_object_members(source, true)?;
+        let source_members = self.resolved_object_property_surface(source, true)?;
         if target_members.properties.is_empty() {
             return Ok(!source_members.properties.is_empty());
         }
@@ -2785,6 +2785,38 @@ impl<'store> RelaterSession<'store> {
             // the shared projection in a later source-callable wave.
             strict_variance_exempt: false,
         }))
+    }
+
+    /// Property-only preflight used before recursive structural comparison.
+    ///
+    /// Pinned excess/weak checks inspect properties before
+    /// `signaturesRelatedTo`. An exact function type therefore contributes an
+    /// empty property surface here without consuming the callable capability
+    /// (or forcing a lazy return); the full projection is admitted only inside
+    /// `structured_type_related_to`, preserving source-first typed boundaries.
+    fn resolved_object_property_surface(
+        &mut self,
+        type_: TypeId,
+        allow_fresh_literal: bool,
+    ) -> Result<ResolvedObjectMembers, RelationUnavailable> {
+        match validate_stored_function_type(self.store, type_) {
+            StoredFunctionTypeValidation::NotFunctionType => {
+                self.resolved_object_members(type_, allow_fresh_literal)
+            }
+            StoredFunctionTypeValidation::Malformed => {
+                Err(RelationUnavailable::MalformedFunctionType(type_))
+            }
+            StoredFunctionTypeValidation::Pending | StoredFunctionTypeValidation::Valid(_) => {
+                self.ensure_supported_object_kind(type_, allow_fresh_literal)?;
+                Ok(ResolvedObjectMembers {
+                    members: None,
+                    properties: Vec::new(),
+                    property_origin: ObjectPropertyOrigin::Declared,
+                    call_signature: None,
+                    exact_function_type: true,
+                })
+            }
+        }
     }
 
     fn project_non_nullable_function_call_signature(
@@ -4442,7 +4474,7 @@ mod tests {
             .parsed
             .arena
             .iter()
-            .find_map(|(node, record)| {
+            .find_map(|(_node, record)| {
                 let NodeData::TypeAliasDeclaration(alias) = &record.data else {
                     return None;
                 };
