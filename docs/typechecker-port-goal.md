@@ -553,17 +553,35 @@ remains the cluster-level source of truth.
   combined main tree passes 738/738 checker library tests plus doctest, strict
   all-target checker/compiler Clippy, and rustdoc with warnings denied after an
   independent Go-semantic audit.
-- A fresh canonical first-50 scorecard on 2026-07-15 executes 50 variants with
-  one exact full diagnostic artifact (`declarationEmitBigInt.ts`) and 49 honest
-  unsupported results, with no fatal checker invariant. The first unsupported
-  syntax roots are concentrated in function declarations (9), classes (6),
-  enums (4), modules (3), interfaces and arrows (2 each), plus five JavaScript
-  and two TSX source gates. The attempted first-500 rerun hit the harness's
-  120-second cap before producing a scorecard, so the earlier completed
-  536-variant tranche remains the broad denominator. This measurement makes
-  annotated function signatures and their value-type publication the next
-  dependency kernel; after that contract freezes, functions, classes,
-  modules/imports, enums, and JS/TSX become separate source-family waves.
+- The annotated, non-generic `FunctionType` and signature kernel is integrated
+  as `b815d77`. Dependency-closed function-type annotations now publish one
+  canonical callable object, call signature, parameter value types, optional
+  unions and minimum argument count before exposing the resolved cache. The
+  implementation preserves lazy return-type resolution, function-indirected
+  recursive aliases, circular return annotation recovery, exact pending-cache
+  proofs, atomic parameter publication, and poisoned-cache retry behavior.
+  Generic signatures, `this` and rest parameters, inferred annotations,
+  constructors, signature formatting and relation, and source-level
+  `FunctionDeclaration`/`ArrowFunction` dispatch remain explicit boundaries.
+  Independent Go evaluation-order and Rust identity/transaction audits both
+  returned final GO verdicts. The integrated tree passes 744/744 checker
+  library tests plus doctest, strict all-target checker and compiler Clippy,
+  and rustdoc with warnings denied.
+- The fresh canonical first-50 scorecard at
+  `/tmp/ts-rust-canonical-first50-signatures-20260715.json` executes 50 variants
+  with one exact full diagnostic artifact (`declarationEmitBigInt.ts`) and 49
+  honest unsupported results, with no fatal checker invariant. The first
+  unsupported syntax roots are concentrated in function declarations (9),
+  classes (6), enums (4), modules (3), interfaces and arrows (2 each), plus
+  five JavaScript and two TSX source gates. The attempted first-500 rerun hit
+  the harness's 120-second cap before producing a scorecard, so the earlier
+  completed 536-variant tranche remains the broad denominator. The unchanged
+  one/49 result after `b815d77` is expected: the new kernel is not yet reachable
+  from the dominant `FunctionDeclaration` and `ArrowFunction` source roots, and
+  callable display and relation remain boundaries. The next parallel wave is
+  function-signature formatter projection and non-generic signature relation,
+  after root installs one immutable normalized `strictFunctionTypes` option;
+  source-level function dispatch follows those shared contracts.
 
 No percentage in this section is a whole-corpus parity claim. A score is
 publishable only when its variant manifest and complete artifact comparison are
@@ -1399,6 +1417,15 @@ patches from accumulating behind their original authors. Once a contract is
 frozen, those same slots can rotate into functions, classes, enums,
 modules/imports, expressions/operators, control flow, JSX/JS, or advanced-type
 clusters that consume it without editing it.
+
+The annotated non-generic signature contract subsequently passed both final
+Go-semantic and Rust-invariant reviews and integrated as `b815d77`. Its first
+consumer wave keeps option ownership at root: root first publishes one
+immutable normalized `strictFunctionTypes` value, then separate workers may
+project callable types through the semantic formatter and port non-generic
+signature relation without sharing destination modules. Source-level function
+declarations and arrows remain a later dispatch wave rather than being inferred
+from the presence of callable records.
 
 Each worktree owns one small coherent commit series. Slow Cargo and corpus-wide
 runs remain centralized and serialized; leaf workers perform static inspection,
