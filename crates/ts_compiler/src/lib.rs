@@ -476,6 +476,7 @@ fn type_node_error_is_unsupported(error: &TypeNodeUnavailable) -> bool {
         | TypeNodeUnavailable::TypeArgumentsUnsupported(_)
         | TypeNodeUnavailable::MissingTypeReference(_)
         | TypeNodeUnavailable::ImportAliasTypeReference { .. }
+        | TypeNodeUnavailable::ImportAliasCapabilityUnsupported(_)
         | TypeNodeUnavailable::UnsupportedReferenceTarget { .. }
         | TypeNodeUnavailable::GenericReferenceUnsupported { .. }
         | TypeNodeUnavailable::GenericAliasConstraintUnsupported { .. }
@@ -487,6 +488,7 @@ fn type_node_error_is_unsupported(error: &TypeNodeUnavailable) -> bool {
         | TypeNodeUnavailable::UnsupportedUnionConstituentType(_) => true,
         TypeNodeUnavailable::InvalidParenthesizedType(_)
         | TypeNodeUnavailable::InvalidTypeReference(_)
+        | TypeNodeUnavailable::InvalidImportAliasTarget { .. }
         | TypeNodeUnavailable::InvalidTypeAliasSymbol(_)
         | TypeNodeUnavailable::MissingTypeAliasDeclaration(_)
         | TypeNodeUnavailable::InvalidTypeAliasDeclaration(_)
@@ -6998,6 +7000,35 @@ mod tests {
                 .into_iter()
                 .map(source_error)
                 .all(|error| !error.is_unsupported_boundary())
+        );
+    }
+
+    #[test]
+    fn canonical_program_error_classification_separates_import_alias_capabilities() {
+        let parsed = parse_source_file("import type { T } from './target'; const value: T = 1;");
+        let file = FileId::new(7);
+        let node = ts_ast::NodeRef::new(parsed.arena.id(), file, parsed.source_file);
+        let mut store = CanonicalTypeMapperStore::new();
+        let symbol = store
+            .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions::default())
+            .unwrap()
+            .undefined_symbol;
+        let source_error = |error| CanonicalProgramCheckError::SourceCheck {
+            file_name: "/project/input.ts".to_owned(),
+            error: SourceCheckError::DeclaredType(DeclaredTypeError::TypeNodeUnavailable(error)),
+        };
+
+        assert!(
+            source_error(TypeNodeUnavailable::ImportAliasCapabilityUnsupported(node))
+                .is_unsupported_boundary()
+        );
+        assert!(
+            !source_error(TypeNodeUnavailable::InvalidImportAliasTarget {
+                node,
+                alias: symbol,
+                target: symbol,
+            })
+            .is_unsupported_boundary()
         );
     }
 
