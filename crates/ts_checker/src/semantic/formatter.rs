@@ -4818,6 +4818,37 @@ mod tests {
                 reason: FunctionTypeDisplayUnavailable::UnresolvedReturn,
             })
         );
+
+        let callback_node = context
+            .store()
+            .type_payload(callback_type)
+            .and_then(TypeRecord::symbol)
+            .and_then(|symbol| context.store().symbol(symbol))
+            .and_then(|symbol| match symbol.declarations() {
+                Some([declaration]) => Some(*declaration),
+                _ => None,
+            })
+            .unwrap();
+        let callback_signature = function_signature(&context, callback_node).unwrap();
+        context
+            .get_return_type_of_signature(callback_signature)
+            .unwrap();
+        assert_eq!(
+            context.type_to_string(outer_type),
+            Err(TypeDisplayUnavailable::FunctionType {
+                type_id: outer_type,
+                reason: FunctionTypeDisplayUnavailable::UnresolvedReturn,
+            })
+        );
+
+        let outer_signature = function_signature(&context, outer_node).unwrap();
+        context
+            .get_return_type_of_signature(outer_signature)
+            .unwrap();
+        assert_eq!(
+            context.type_to_string(outer_type).unwrap(),
+            "(callback: (value: string) => number) => boolean"
+        );
     }
 
     #[test]
