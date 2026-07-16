@@ -165,9 +165,15 @@ pub(super) fn finish_direct_source_call_plan(
     callee: PlannedExpression,
     arguments: Vec<PlannedExpression>,
 ) -> Result<SourceCallPlan, SourceCheckError> {
-    if !matches!(callee.kind, PlannedExpressionKind::Identifier(_))
+    if callee.node != syntax.callee
+        || !matches!(callee.kind, PlannedExpressionKind::Identifier(_))
         || arguments.len() != syntax.arguments.len()
-        || !arguments.iter().all(is_context_insensitive_argument_plan)
+        || !arguments
+            .iter()
+            .zip(&syntax.arguments)
+            .all(|(argument, syntax_node)| {
+                argument.node == *syntax_node && is_context_insensitive_argument_plan(argument)
+            })
     {
         return Err(SourceCheckError::Unsupported(
             UnsupportedSourceSyntax::Call(syntax.node),
@@ -753,7 +759,7 @@ mod tests {
     use ts_ast::FileId;
     use ts_binder::{
         CanonicalBinder, CanonicalModuleState, CanonicalSourceFileFacts, CanonicalSourceLanguage,
-        EscapedName,
+        EscapedName, SemanticSymbolId,
     };
     use ts_parser::{ParseResult, parse_source_file};
 
@@ -767,6 +773,7 @@ mod tests {
         object_members::{
             DeclaredPropertyTypeGraphValidation, validate_resolved_declared_property_type_graph,
         },
+        source::{PlannedIdentifierRead, PlannedIdentifierReadKind},
         type_records::{LiteralValue, TypeData},
     };
 
@@ -878,6 +885,74 @@ mod tests {
             .collect()
     }
 
+    fn first_function_symbol(
+        parsed: &ParseResult,
+        context: &CanonicalCheckerContext<'_>,
+        file: FileId,
+    ) -> SemanticSymbolId {
+        let declaration = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::FunctionDeclaration)
+                    .then(|| NodeRef::new(parsed.arena.id(), file, node))
+            })
+            .expect("fixture must contain a function declaration");
+        let (_, bound) = context.file(file).unwrap();
+        bound.symbol(declaration).unwrap()
+    }
+
+    fn identifier_plan(node: NodeRef, symbol: SemanticSymbolId) -> PlannedExpression {
+        PlannedExpression::new(
+            node,
+            PlannedExpressionKind::Identifier(PlannedIdentifierRead {
+                resolved_symbol: symbol,
+                value_symbol: symbol,
+                kind: PlannedIdentifierReadKind::Function,
+            }),
+        )
+    }
+
+    fn string_argument_plans(syntax: &DirectSourceCallSyntax) -> Vec<PlannedExpression> {
+        syntax
+            .arguments()
+            .iter()
+            .enumerate()
+            .map(|(index, node)| {
+                PlannedExpression::new(
+                    *node,
+                    PlannedExpressionKind::String(format!("argument{index}")),
+                )
+            })
+            .collect()
+    }
+
+    #[derive(Debug, Eq, PartialEq)]
+    struct CallPublicationState {
+        type_count: usize,
+        mapper_count: usize,
+        signature_count: usize,
+        cached_signature_count: usize,
+        type_links: Option<TypeNodeLinks>,
+        signature_links: Option<SignatureLinks>,
+        diagnostics: Vec<CanonicalCheckerDiagnostic>,
+    }
+
+    fn call_publication_state(
+        context: &CanonicalCheckerContext<'_>,
+        call: NodeRef,
+    ) -> CallPublicationState {
+        CallPublicationState {
+            type_count: context.store().type_len(),
+            mapper_count: context.store().mapper_len(),
+            signature_count: context.store().signature_len(),
+            cached_signature_count: context.store().cached_signature_len(),
+            type_links: context.store().type_node_links(call).cloned(),
+            signature_links: context.store().signature_links(call).cloned(),
+            diagnostics: context.diagnostics().as_slice().to_vec(),
+        }
+    }
+
     fn mark_source_unchecked(context: &mut CanonicalCheckerContext<'_>, file: FileId) {
         let source = context.source_file(file).unwrap();
         let mut links = context
@@ -891,6 +966,80 @@ mod tests {
                 .store_mut_for_test()
                 .set_source_file_links(source, links)
         );
+    }
+
+    #[test]
+    fn finished_call_plan_rejects_a_same_shaped_forged_callee_without_publication() {
+        let parsed = parsed(concat!(
+            "function first(left: string, right: string): void {} ",
+            "function second(left: string, right: string): void {} ",
+            "const one = first('left', 'right'); ",
+            "const two = second('other', 'tail');",
+        ));
+        let file = FileId::new(433);
+        let mut call_nodes = calls(&parsed, file);
+        call_nodes.sort_by_key(|call| parsed.arena.get(call.node).unwrap().range.start);
+        let [first_call, second_call] = call_nodes.as_slice() else {
+            panic!("expected two direct calls")
+        };
+        let context = context(&parsed, file);
+        let first_syntax =
+            plan_direct_source_call_syntax(&parsed.arena, context.store(), *first_call).unwrap();
+        let second_syntax =
+            plan_direct_source_call_syntax(&parsed.arena, context.store(), *second_call).unwrap();
+        let symbol = first_function_symbol(&parsed, &context, file);
+        let arguments = string_argument_plans(&first_syntax);
+        assert!(
+            finish_direct_source_call_plan(
+                &first_syntax,
+                identifier_plan(first_syntax.callee(), symbol),
+                arguments.clone(),
+            )
+            .is_ok()
+        );
+        let before = call_publication_state(&context, *first_call);
+
+        assert!(matches!(
+            finish_direct_source_call_plan(
+                &first_syntax,
+                identifier_plan(second_syntax.callee(), symbol),
+                arguments,
+            ),
+            Err(SourceCheckError::Unsupported(UnsupportedSourceSyntax::Call(node)))
+                if node == *first_call
+        ));
+
+        assert_eq!(call_publication_state(&context, *first_call), before);
+    }
+
+    #[test]
+    fn finished_call_plan_rejects_swapped_same_shaped_arguments_without_publication() {
+        let parsed = parsed(concat!(
+            "function take(left: string, right: string): void {} ",
+            "const result = take('left', 'right');",
+        ));
+        let file = FileId::new(434);
+        let call_nodes = calls(&parsed, file);
+        let [call] = call_nodes.as_slice() else {
+            panic!("expected one direct call")
+        };
+        let context = context(&parsed, file);
+        let syntax = plan_direct_source_call_syntax(&parsed.arena, context.store(), *call).unwrap();
+        let symbol = first_function_symbol(&parsed, &context, file);
+        let callee = identifier_plan(syntax.callee(), symbol);
+        let mut arguments = string_argument_plans(&syntax);
+        assert_eq!(arguments.len(), 2);
+        assert!(finish_direct_source_call_plan(&syntax, callee.clone(), arguments.clone()).is_ok());
+        arguments.swap(0, 1);
+        let before = call_publication_state(&context, *call);
+
+        assert!(matches!(
+            finish_direct_source_call_plan(&syntax, callee, arguments),
+            Err(SourceCheckError::Unsupported(UnsupportedSourceSyntax::Call(node)))
+                if node == *call
+        ));
+
+        assert_eq!(call_publication_state(&context, *call), before);
     }
 
     #[test]
