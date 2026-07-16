@@ -365,6 +365,7 @@ fn source_check_error_is_unsupported(error: &SourceCheckError) -> bool {
         | SourceCheckError::ObjectLiteral(_)
         | SourceCheckError::Assertion(_)
         | SourceCheckError::Assignment(_)
+        | SourceCheckError::Variable(_)
         | SourceCheckError::MissingDiagnostic(_) => false,
     }
 }
@@ -6499,7 +6500,7 @@ mod tests {
         IntrinsicBootstrapOptions, RelationKind, RelationUnavailable, SourceAssertionError,
         SourceCheckError, SourceCheckProvenanceError, SourceLiteralCacheError,
         SourceObjectLiteralError, SymbolMergeError, TypeDataKind, TypeDisplayUnavailable,
-        TypeNodeUnavailable, UnsupportedSourceSyntax,
+        TypeNodeUnavailable, UnsupportedSourceSyntax, VariableInvariant,
     };
     use ts_diagnostics::{Category, Diagnostic, message_by_code};
     use ts_options::{
@@ -6792,6 +6793,10 @@ mod tests {
             CanonicalProgramCheckError::SourceCheck {
                 file_name: "/project/input.ts".to_owned(),
                 error: SourceCheckError::Assignment(AssignmentInvariant::MissingNode(node)),
+            },
+            CanonicalProgramCheckError::SourceCheck {
+                file_name: "/project/input.ts".to_owned(),
+                error: SourceCheckError::Variable(VariableInvariant::InvalidSymbol(symbol)),
             },
             CanonicalProgramCheckError::SourceCheck {
                 file_name: "/project/input.ts".to_owned(),
