@@ -3475,6 +3475,20 @@ mod tests {
         materialize_validated_generic_call_vector_checked_instantiation(store, resolution, callable)
     }
 
+    fn materialize_source_vector(
+        store: &mut CanonicalTypeMapperStore,
+        callable: &ValidatedSingleCallable,
+        resolution: &GenericCallVectorResolution,
+        existing_call_signature: Option<SignatureId>,
+    ) -> Result<GenericCallVectorSourceMaterialization, GenericCallVectorError> {
+        materialize_validated_generic_call_vector_source(
+            store,
+            resolution,
+            callable,
+            existing_call_signature,
+        )
+    }
+
     #[derive(Debug, Eq, PartialEq)]
     struct VectorCacheGraphCounts {
         mappers: usize,
@@ -3513,6 +3527,51 @@ mod tests {
             .regular_number_literal_type(Number::new(value))
             .unwrap();
         store.fresh_type_of_literal_type(regular).unwrap()
+    }
+
+    fn assert_recovery_only_source_lifecycle(
+        store: &mut CanonicalTypeMapperStore,
+        callable: &ValidatedSingleCallable,
+        resolution: &GenericCallVectorResolution,
+    ) -> GenericCallVectorSourceMaterialization {
+        assert!(resolution.projection.recovery);
+        assert!(!generic_call_vector_caches_checked_instantiation(
+            resolution.applicability,
+        ));
+        let before = vector_cache_graph_counts(store);
+        let first = materialize_source_vector(store, callable, resolution, None).unwrap();
+        assert_eq!(first.checked_instantiation, None);
+        assert_eq!(store.mapper_len(), before.mappers + 1);
+        assert_eq!(store.symbol_len(), before.symbols + callable.parameters.len());
+        assert_eq!(store.signature_len(), before.signatures + 1);
+        assert_eq!(store.cached_signature_len(), before.cached_signatures);
+        assert_eq!(
+            store.cached_signatures_contain(first.call_signature),
+            Some(false),
+        );
+
+        let warm_counts = vector_cache_graph_counts(store);
+        assert_eq!(
+            materialize_source_vector(store, callable, resolution, Some(first.call_signature)),
+            Ok(first),
+        );
+        assert_eq!(vector_cache_graph_counts(store), warm_counts);
+
+        let second = materialize_source_vector(store, callable, resolution, None).unwrap();
+        assert_eq!(second.checked_instantiation, None);
+        assert_ne!(second.call_signature, first.call_signature);
+        assert_ne!(second.call_mapper, first.call_mapper);
+        assert_eq!(
+            store.cached_signatures_contain(second.call_signature),
+            Some(false),
+        );
+        let second_warm_counts = vector_cache_graph_counts(store);
+        assert_eq!(
+            materialize_source_vector(store, callable, resolution, Some(second.call_signature)),
+            Ok(second),
+        );
+        assert_eq!(vector_cache_graph_counts(store), second_warm_counts);
+        first
     }
 
     #[test]
@@ -4613,6 +4672,514 @@ mod tests {
             Err(GenericCallVectorError::Invariant(
                 GenericCallVectorInvariant::InvalidCheckedInstantiation(pair.signature)
             ))
+        );
+        assert_eq!(vector_cache_graph_counts(&store), before);
+    }
+
+    #[test]
+    fn source_materializer_shares_partial_and_full_applicable_checked_cache() {
+        let mut store = initialized_store();
+        let string = store.intrinsic_bootstrap().unwrap().string_type;
+        let (callable, _) = vector_callable(
+            &mut store,
+            &["T", "U"],
+            &[None, None],
+            &[None, Some(GenericTypeSpec::Parameter(0))],
+            &[0, 1],
+            |_, parameters| parameters[1],
+        );
+        let partial = project_vector(
+            &mut store,
+            &callable,
+            vector_request(callable.owner, Some(&[string]), &[string, string]),
+        )
+        .unwrap();
+        let before = vector_cache_graph_counts(&store);
+        let first = materialize_source_vector(&mut store, &callable, &partial, None).unwrap();
+        let checked = first.checked_instantiation.unwrap();
+        assert_eq!(first.call_signature, checked.signature);
+        assert_eq!(first.call_mapper, checked.mapper);
+        assert_eq!(store.mapper_len(), before.mappers + 1);
+        assert_eq!(store.symbol_len(), before.symbols + 2);
+        assert_eq!(store.signature_len(), before.signatures + 1);
+        assert_eq!(store.cached_signature_len(), before.cached_signatures + 1);
+        assert_eq!(
+            store.cached_signatures_contain(first.call_signature),
+            Some(true),
+        );
+
+        let full = project_vector(
+            &mut store,
+            &callable,
+            vector_request(
+                callable.owner,
+                Some(&[string, string]),
+                &[string, string],
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            partial.checked_instantiation,
+            full.checked_instantiation,
+            "partial and full explicit syntax must key the same checked vector",
+        );
+        let shared_counts = vector_cache_graph_counts(&store);
+        assert_eq!(
+            materialize_source_vector(&mut store, &callable, &full, None),
+            Ok(first),
+        );
+        assert_eq!(vector_cache_graph_counts(&store), shared_counts);
+        assert_eq!(
+            materialize_source_vector(
+                &mut store,
+                &callable,
+                &partial,
+                Some(first.call_signature),
+            ),
+            Ok(first),
+        );
+        assert_eq!(vector_cache_graph_counts(&store), shared_counts);
+
+        assert_eq!(
+            materialize_validated_generic_call_vector_source_with(
+                &mut store,
+                &partial,
+                &callable,
+                Some(first.call_signature),
+                |_, _, _, _| CachedSignatureLookup::Missing,
+                |_, _| panic!("warm cache poison must not reserve"),
+            ),
+            Err(GenericCallVectorError::Invariant(
+                GenericCallVectorInvariant::MissingCachedInstantiation(callable.signature),
+            )),
+        );
+        assert_eq!(vector_cache_graph_counts(&store), shared_counts);
+        assert_eq!(
+            materialize_source_vector(
+                &mut store,
+                &callable,
+                &partial,
+                Some(callable.signature),
+            ),
+            Err(GenericCallVectorError::Invariant(
+                GenericCallVectorInvariant::InvalidCallInstantiation {
+                    target: callable.signature,
+                    signature: callable.signature,
+                },
+            )),
+        );
+        assert_eq!(vector_cache_graph_counts(&store), shared_counts);
+
+        assert!(store.set_signature_target_and_mapper(
+            checked.signature,
+            Some(callable.signature),
+            None,
+        ));
+        let poisoned_counts = vector_cache_graph_counts(&store);
+        assert_eq!(
+            materialize_source_vector(&mut store, &callable, &partial, None),
+            Err(GenericCallVectorError::Invariant(
+                GenericCallVectorInvariant::InvalidCachedInstantiation {
+                    target: callable.signature,
+                    signature: checked.signature,
+                },
+            )),
+        );
+        assert_eq!(vector_cache_graph_counts(&store), poisoned_counts);
+    }
+
+    #[test]
+    fn source_ts2345_reserves_checked_and_raw_default_recovery_as_one_transaction() {
+        let mut store = initialized_store();
+        let (string, number) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (bootstrap.string_type, bootstrap.number_type)
+        };
+        let (callable, type_parameters) = vector_callable(
+            &mut store,
+            &["T", "U"],
+            &[None, None],
+            &[None, Some(GenericTypeSpec::Parameter(0))],
+            &[0, 1],
+            |_, parameters| parameters[1],
+        );
+        let resolution = project_vector(
+            &mut store,
+            &callable,
+            vector_request(callable.owner, Some(&[string]), &[string, number]),
+        )
+        .unwrap();
+        assert!(matches!(
+            resolution.applicability,
+            GenericCallVectorApplicability::ArgumentNotAssignable { index: 1, .. },
+        ));
+        let checked_vector = resolution.checked_instantiation.as_ref().unwrap();
+        assert_eq!(checked_vector.type_arguments, [string, string]);
+        assert_eq!(checked_vector.return_type, string);
+        assert_eq!(
+            resolution.projection.instantiation.type_arguments,
+            [string, type_parameters[0]],
+        );
+        assert_eq!(
+            resolution.projection.instantiation.return_type,
+            type_parameters[0],
+            "overload-failure default U=T remains the raw T in the call projection",
+        );
+        let before = vector_cache_graph_counts(&store);
+
+        assert_eq!(
+            materialize_validated_generic_call_vector_source_with(
+                &mut store,
+                &resolution,
+                &callable,
+                None,
+                |_, _, _, _| CachedSignatureLookup::HashCollision(callable.signature),
+                |_, _| panic!("a collision must fail before reservation"),
+            ),
+            Err(GenericCallVectorError::Invariant(
+                GenericCallVectorInvariant::InstantiationCacheHashCollision {
+                    target: callable.signature,
+                    cached: callable.signature,
+                },
+            )),
+        );
+        assert_eq!(vector_cache_graph_counts(&store), before);
+
+        let mut observed_reservation = None;
+        assert_eq!(
+            materialize_validated_generic_call_vector_source_with(
+                &mut store,
+                &resolution,
+                &callable,
+                None,
+                CanonicalTypeMapperStore::cached_signature,
+                |_, reservation| {
+                    observed_reservation = Some(reservation);
+                    false
+                },
+            ),
+            Err(GenericCallVectorError::Invariant(
+                GenericCallVectorInvariant::Capacity(callable.signature),
+            )),
+        );
+        assert_eq!(
+            observed_reservation,
+            Some(GenericCallVectorReservation {
+                mappers: 2,
+                symbols: 4,
+                value_links: 4,
+                signatures: 2,
+                cached_signatures: 1,
+            }),
+        );
+        assert_eq!(vector_cache_graph_counts(&store), before);
+
+        let first = materialize_source_vector(&mut store, &callable, &resolution, None).unwrap();
+        let checked = first.checked_instantiation.unwrap();
+        assert_ne!(first.call_signature, checked.signature);
+        assert_ne!(first.call_mapper, checked.mapper);
+        assert_eq!(store.mapper_len(), before.mappers + 2);
+        assert_eq!(store.symbol_len(), before.symbols + 4);
+        assert_eq!(store.signature_len(), before.signatures + 2);
+        assert_eq!(store.cached_signature_len(), before.cached_signatures + 1);
+        assert_eq!(
+            store.cached_signatures_contain(checked.signature),
+            Some(true),
+        );
+        assert_eq!(
+            store.cached_signatures_contain(first.call_signature),
+            Some(false),
+        );
+        assert_eq!(
+            store.type_mapper_has_exact_endpoints(
+                checked.mapper,
+                &type_parameters,
+                &[string, string],
+            ),
+            Some(true),
+        );
+        assert_eq!(
+            store.type_mapper_has_exact_endpoints(
+                first.call_mapper,
+                &type_parameters,
+                &[string, type_parameters[0]],
+            ),
+            Some(true),
+        );
+        assert_eq!(
+            store
+                .signature(checked.signature)
+                .unwrap()
+                .resolved_return_type(),
+            Some(string),
+        );
+        let original = store.signature(callable.signature).unwrap();
+        let original_parameters = original.parameters().to_vec();
+        let original_flags = original.flags();
+        let original_declaration = original.declaration();
+        let original_min_argument_count = original.min_argument_count();
+        let recovery = store.signature(first.call_signature).unwrap();
+        assert_eq!(
+            recovery.flags(),
+            original_flags & SignatureFlags::PROPAGATING_FLAGS,
+        );
+        assert_eq!(recovery.declaration(), original_declaration);
+        assert_eq!(recovery.min_argument_count(), original_min_argument_count);
+        assert_eq!(recovery.target(), Some(callable.signature));
+        assert_eq!(recovery.mapper(), Some(first.call_mapper));
+        assert_eq!(recovery.resolved_return_type(), Some(type_parameters[0]));
+        for ((parameter, target), parameter_type) in recovery
+            .parameters()
+            .iter()
+            .copied()
+            .zip(original_parameters)
+            .zip(
+                resolution
+                    .projection
+                    .instantiation
+                    .parameter_types
+                    .iter()
+                    .copied(),
+            )
+        {
+            assert!(cached_instantiated_parameter(
+                &store,
+                parameter,
+                target,
+                first.call_mapper,
+                parameter_type,
+            ));
+        }
+
+        let after_first = vector_cache_graph_counts(&store);
+        let second = materialize_source_vector(&mut store, &callable, &resolution, None).unwrap();
+        assert_eq!(second.checked_instantiation, Some(checked));
+        assert_ne!(second.call_signature, first.call_signature);
+        assert_ne!(second.call_mapper, first.call_mapper);
+        assert_eq!(store.mapper_len(), after_first.mappers + 1);
+        assert_eq!(store.symbol_len(), after_first.symbols + 2);
+        assert_eq!(store.signature_len(), after_first.signatures + 1);
+        assert_eq!(
+            store.cached_signature_len(),
+            after_first.cached_signatures,
+        );
+        let warm_counts = vector_cache_graph_counts(&store);
+        assert_eq!(
+            materialize_source_vector(
+                &mut store,
+                &callable,
+                &resolution,
+                Some(second.call_signature),
+            ),
+            Ok(second),
+        );
+        assert_eq!(vector_cache_graph_counts(&store), warm_counts);
+        assert_eq!(
+            materialize_source_vector(
+                &mut store,
+                &callable,
+                &resolution,
+                Some(checked.signature),
+            ),
+            Err(GenericCallVectorError::Invariant(
+                GenericCallVectorInvariant::InvalidCallInstantiation {
+                    target: callable.signature,
+                    signature: checked.signature,
+                },
+            )),
+        );
+        assert_eq!(vector_cache_graph_counts(&store), warm_counts);
+        assert_eq!(
+            materialize_validated_generic_call_vector_source_with(
+                &mut store,
+                &resolution,
+                &callable,
+                Some(first.call_signature),
+                |_, _, _, _| CachedSignatureLookup::Missing,
+                |_, _| panic!("warm missing cache state must not reserve"),
+            ),
+            Err(GenericCallVectorError::Invariant(
+                GenericCallVectorInvariant::MissingCachedInstantiation(callable.signature),
+            )),
+        );
+        assert_eq!(vector_cache_graph_counts(&store), warm_counts);
+
+        assert!(store.set_signature_target_and_mapper(
+            first.call_signature,
+            Some(callable.signature),
+            Some(checked.mapper),
+        ));
+        let poisoned_counts = vector_cache_graph_counts(&store);
+        assert_eq!(
+            materialize_source_vector(
+                &mut store,
+                &callable,
+                &resolution,
+                Some(first.call_signature),
+            ),
+            Err(GenericCallVectorError::Invariant(
+                GenericCallVectorInvariant::InvalidCallInstantiation {
+                    target: callable.signature,
+                    signature: first.call_signature,
+                },
+            )),
+        );
+        assert_eq!(vector_cache_graph_counts(&store), poisoned_counts);
+    }
+
+    #[test]
+    fn source_recovery_only_diagnostics_are_uncached_distinct_and_warm_stable() {
+        let mut store = initialized_store();
+        let (string, number) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (bootstrap.string_type, bootstrap.number_type)
+        };
+        let (pair, _) = vector_callable(
+            &mut store,
+            &["T", "U"],
+            &[None, None],
+            &[None, None],
+            &[0, 1],
+            |_, parameters| parameters[1],
+        );
+
+        let type_arity = project_vector(
+            &mut store,
+            &pair,
+            vector_request(pair.owner, Some(&[string]), &[string, number]),
+        )
+        .unwrap();
+        assert!(matches!(
+            type_arity.applicability,
+            GenericCallVectorApplicability::TypeArgumentArity {
+                minimum: 2,
+                maximum: 2,
+                actual: 1,
+            },
+        ));
+        assert_recovery_only_source_lifecycle(&mut store, &pair, &type_arity);
+
+        let too_few = project_vector(
+            &mut store,
+            &pair,
+            vector_request(pair.owner, None, &[string]),
+        )
+        .unwrap();
+        assert_eq!(
+            too_few.applicability,
+            GenericCallVectorApplicability::TooFewArguments {
+                expected: 2,
+                actual: 1,
+            },
+        );
+        assert_recovery_only_source_lifecycle(&mut store, &pair, &too_few);
+
+        let too_many = project_vector(
+            &mut store,
+            &pair,
+            vector_request(pair.owner, None, &[string, number, number]),
+        )
+        .unwrap();
+        assert_eq!(
+            too_many.applicability,
+            GenericCallVectorApplicability::TooManyArguments {
+                expected: 2,
+                actual: 3,
+            },
+        );
+        assert_recovery_only_source_lifecycle(&mut store, &pair, &too_many);
+
+        let (constrained, _) = vector_callable(
+            &mut store,
+            &["T"],
+            &[Some(GenericTypeSpec::Exact(string))],
+            &[None],
+            &[0],
+            |_, parameters| parameters[0],
+        );
+        let constraint = project_vector(
+            &mut store,
+            &constrained,
+            vector_request(constrained.owner, Some(&[number]), &[number]),
+        )
+        .unwrap();
+        assert!(matches!(
+            constraint.applicability,
+            GenericCallVectorApplicability::ExplicitTypeArgumentConstraint {
+                index: 0,
+                type_argument,
+                constraint,
+            } if type_argument == number && constraint == string,
+        ));
+        assert!(constraint.checked_instantiation.is_some());
+        let constraint_call =
+            assert_recovery_only_source_lifecycle(&mut store, &constrained, &constraint);
+        assert_eq!(constraint_call.checked_instantiation, None);
+
+        let exact_type_arguments = constraint
+            .projection
+            .instantiation
+            .type_arguments
+            .clone()
+            .into_boxed_slice();
+        assert!(store.set_cached_signature(
+            constrained.signature,
+            type_list_key(&exact_type_arguments),
+            exact_type_arguments,
+            constraint_call.call_signature,
+        ));
+        let poisoned_counts = vector_cache_graph_counts(&store);
+        assert_eq!(
+            materialize_source_vector(
+                &mut store,
+                &constrained,
+                &constraint,
+                Some(constraint_call.call_signature),
+            ),
+            Err(GenericCallVectorError::Invariant(
+                GenericCallVectorInvariant::InvalidCallInstantiation {
+                    target: constrained.signature,
+                    signature: constraint_call.call_signature,
+                },
+            )),
+        );
+        assert_eq!(vector_cache_graph_counts(&store), poisoned_counts);
+    }
+
+    #[test]
+    fn source_recovery_rejects_stale_raw_return_without_writes() {
+        let mut store = initialized_store();
+        let string = store.intrinsic_bootstrap().unwrap().string_type;
+        let (callable, type_parameters) = vector_callable(
+            &mut store,
+            &["T", "U"],
+            &[None, None],
+            &[None, None],
+            &[0, 1],
+            |_, parameters| parameters[1],
+        );
+        let resolution = project_vector(
+            &mut store,
+            &callable,
+            vector_request(callable.owner, None, &[string]),
+        )
+        .unwrap();
+        assert!(matches!(
+            resolution.applicability,
+            GenericCallVectorApplicability::TooFewArguments { .. },
+        ));
+        assert!(store.set_signature_resolved_return_type(
+            callable.signature,
+            Some(type_parameters[0]),
+        ));
+        let mut changed = callable.clone();
+        changed.return_type = Some(type_parameters[0]);
+        let before = vector_cache_graph_counts(&store);
+        assert_eq!(
+            materialize_source_vector(&mut store, &changed, &resolution, None),
+            Err(GenericCallVectorError::Invariant(
+                GenericCallVectorInvariant::InvalidCheckedInstantiation(callable.signature),
+            )),
         );
         assert_eq!(vector_cache_graph_counts(&store), before);
     }
