@@ -1327,12 +1327,34 @@ mod tests {
             };
 
             assert_ne!(mutable_tuple, readonly_tuple);
-            assert_eq!(store.canonical_empty_tuple_type_cache(), Some(mutable_tuple));
+            assert_eq!(
+                store.canonical_empty_tuple_type_cache(),
+                Some(mutable_tuple)
+            );
             assert_eq!(store.create_canonical_empty_tuple_type(), Ok(mutable_tuple));
-            assert_eq!(store.create_canonical_tuple_type(mutable()), Ok(mutable_tuple));
-            assert_eq!(store.create_canonical_tuple_type(readonly()), Ok(readonly_tuple));
+            assert_eq!(
+                store.create_canonical_tuple_type(mutable()),
+                Ok(mutable_tuple)
+            );
+            assert_eq!(
+                store.create_canonical_tuple_type(readonly()),
+                Ok(readonly_tuple)
+            );
             assert_eq!(type_to_string(&store, mutable_tuple).unwrap(), "[]");
-            assert_eq!(type_to_string(&store, readonly_tuple).unwrap(), "readonly []");
+            assert!(
+                !store
+                    .canonical_tuple_shape(mutable_tuple)
+                    .unwrap()
+                    .unwrap()
+                    .is_readonly()
+            );
+            assert!(
+                store
+                    .canonical_tuple_shape(readonly_tuple)
+                    .unwrap()
+                    .unwrap()
+                    .is_readonly()
+            );
         }
     }
 
