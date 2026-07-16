@@ -1378,6 +1378,35 @@ inputs, never ownership boundaries. A worker that discovers a required change
 to a shared contract stops at that boundary and returns a proposed interface
 change to the integration lane instead of editing another worker's substrate.
 
+### Scaling beyond four workers
+
+Additional workers should widen the review, oracle, and feature queues before
+they increase the number of writers touching shared checker state. The useful
+topology changes when the semantic contracts freeze:
+
+| Active slots | Before source/signature/relation contracts freeze | After those contracts freeze | Expected useful concurrency |
+|---:|---|---|---:|
+| 4 | root/integration; one core implementer; one disjoint implementer or next-wave scout; one rotating Go/Rust reviewer | root plus three disjoint feature owners, with review rotated before merge | 2.5-3 lanes |
+| 8 | root; two core implementers; Go semantic reviewer; Rust invariant reviewer; dedicated fixer; oracle/corpus sharder; compiler/integration assistant | root; four or five feature owners; two reviewers; one corpus/integration worker | 5-6 lanes |
+| 12+ | keep at most two writers on shared contracts; add upstream-inventory, oracle, fixture-clustering, fuzz/property-test, diagnostic, and compiler workers | shard source families and corpus root causes broadly, retaining roughly one reviewer per two implementers | 8-10 lanes until integration saturates |
+
+For an eight-worker push, only two workers may write the shared type/signature,
+link, relation, or source-dispatch substrate at once. The other roles are not
+standby capacity: the Go reviewer produces branch and evaluation-order defects,
+the Rust reviewer produces identity/transaction/cache defects, the oracle lane
+turns fixture failures into root-cause queues, and the fixer keeps reviewed
+patches from accumulating behind their original authors. Once a contract is
+frozen, those same slots can rotate into functions, classes, enums,
+modules/imports, expressions/operators, control flow, JSX/JS, or advanced-type
+clusters that consume it without editing it.
+
+Each worktree owns one small coherent commit series. Slow Cargo and corpus-wide
+runs remain centralized and serialized; leaf workers perform static inspection,
+pinned-Go comparison, targeted oracle work, and edits while the integration
+lane builds. A wave may advance when every shared contract has one owner, every
+implementation cluster has independent review capacity, and the integration
+queue contains no more than two unreviewed semantic clusters per reviewer.
+
 ### Review loop for every cluster
 
 1. The implementer records the exact Go functions, dependencies, and fixture
