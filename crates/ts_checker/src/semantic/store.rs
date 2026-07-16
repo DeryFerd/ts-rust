@@ -105,6 +105,9 @@ pub(super) struct SourceCallableProvenance {
     pub(super) owner_parent: Option<SemanticSymbolId>,
     pub(super) export_local: Option<SemanticSymbolId>,
     pub(super) signature: SignatureId,
+    /// Exact default-free `TypeParameterDeclaration` proved by the source
+    /// planner. `None` is required for a non-generic source signature.
+    pub(super) default_free_type_parameter: Option<NodeRef>,
     /// The annotation that contextually typed an inferred source arrow.
     ///
     /// Annotated source callables retain `None` and instead own an exact
@@ -701,9 +704,32 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             }
             _ => false,
         };
+        let exact_type_parameter =
+            self.signatures
+                .get(provenance.signature)
+                .is_some_and(|signature| {
+                    match (
+                        provenance.default_free_type_parameter,
+                        signature.type_parameters(),
+                    ) {
+                        (None, []) => true,
+                        (Some(declaration), [type_parameter]) => {
+                            provenance.family == SourceCallableFamily::FunctionDeclaration
+                                && provenance.contextual_target.is_none()
+                                && provenance.contextual_variable.is_none()
+                                && self.types.get(*type_parameter).is_some()
+                                && self.source_node_kind(declaration)
+                                    == Some(SyntaxKind::TypeParameter)
+                                && self.source_node_parent(declaration)
+                                    == Some(SourceNodeParent::Parent(provenance.declaration))
+                        }
+                        _ => false,
+                    }
+                });
         if self.types.get(type_).is_none()
             || self.source_callable_provenance.contains_key(&type_)
             || !contextual_pair
+            || !exact_type_parameter
             || self.source_node_kind(provenance.declaration)
                 != Some(provenance.family.syntax_kind())
             || !self.symbols.contains_symbol(provenance.owner_symbol)

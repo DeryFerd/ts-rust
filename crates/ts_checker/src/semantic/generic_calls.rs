@@ -177,6 +177,15 @@ struct IdentitySignatureShape {
     parameter_symbol: SemanticSymbolId,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct PreparedIdentityGenericCall {
+    callee: TypeId,
+    shape: IdentitySignatureShape,
+    argument: TypeId,
+    type_argument: TypeId,
+    return_kind: DirectCallReturnKind,
+}
+
 /// Proof carried from the exact callable provider into type-parameter cache
 /// validation. Only source syntax validation can prove that cold constraint
 /// and default caches mean "declared absent"; every other provider must have
@@ -212,18 +221,20 @@ pub(super) fn resolve_identity_generic_call(
     };
     let cache_provenance =
         identity_type_parameter_cache_provenance(store, request.callee, &callable);
-    let mut resolution =
-        project_validated_identity_call(store, request, &callable, cache_provenance)?;
-    resolution.applicability =
-        check_identity_argument_applicability(&resolution.projection, |source, target| {
+    resolve_validated_identity_call(
+        store,
+        request,
+        &callable,
+        cache_provenance,
+        |store, source, target| {
             store.is_type_assignable_to_with_global_types_and_strict_function_types(
                 source,
                 target,
                 global_types,
                 strict_function_types,
             )
-        })?;
-    Ok(resolution)
+        },
+    )
 }
 
 fn identity_type_parameter_cache_provenance(
@@ -231,13 +242,29 @@ fn identity_type_parameter_cache_provenance(
     callee: TypeId,
     callable: &ValidatedSingleCallable,
 ) -> IdentityTypeParameterCacheProvenance {
+    let Some(provenance) = store.source_callable_provenance(callee) else {
+        return IdentityTypeParameterCacheProvenance::RequireResolvedCaches;
+    };
+    let Some(default_free_declaration) = provenance.default_free_type_parameter else {
+        return IdentityTypeParameterCacheProvenance::RequireResolvedCaches;
+    };
     let Some(signature) = store.signature(callable.signature) else {
         return IdentityTypeParameterCacheProvenance::RequireResolvedCaches;
     };
     let [type_parameter] = signature.type_parameters() else {
         return IdentityTypeParameterCacheProvenance::RequireResolvedCaches;
     };
-    if store.source_callable_type_for_signature(callable.signature) != Some(callee) {
+    let Some(type_parameter_owner) = cached_ordinary_type_parameter_owner(store, *type_parameter)
+    else {
+        return IdentityTypeParameterCacheProvenance::RequireResolvedCaches;
+    };
+    if provenance.signature != callable.signature
+        || store.source_callable_type_for_signature(callable.signature) != Some(callee)
+        || store
+            .symbol(type_parameter_owner)
+            .and_then(|symbol| symbol.declarations())
+            != Some(&[default_free_declaration])
+    {
         return IdentityTypeParameterCacheProvenance::RequireResolvedCaches;
     }
     match validate_stored_source_callable(store, callee) {
@@ -305,6 +332,42 @@ fn project_validated_identity_call(
     callable: &ValidatedSingleCallable,
     cache_provenance: IdentityTypeParameterCacheProvenance,
 ) -> Result<IdentityGenericCallResolution, IdentityGenericCallError> {
+    resolve_validated_identity_call(store, request, callable, cache_provenance, |_, _, _| {
+        Ok(true)
+    })
+}
+
+fn resolve_validated_identity_call(
+    store: &mut CanonicalTypeMapperStore,
+    request: IdentityGenericCallRequest<'_>,
+    callable: &ValidatedSingleCallable,
+    cache_provenance: IdentityTypeParameterCacheProvenance,
+    mut is_assignable: impl FnMut(
+        &mut CanonicalTypeMapperStore,
+        TypeId,
+        TypeId,
+    ) -> Result<bool, RelationUnavailable>,
+) -> Result<IdentityGenericCallResolution, IdentityGenericCallError> {
+    let prepared = prepare_validated_identity_call(store, request, callable, cache_provenance)?;
+    // A poisoned existing cache is an invariant even when relation work would
+    // otherwise fail. Cache validation is read-only and must precede it.
+    let cached = cached_identity_instantiation(store, prepared.shape, prepared.type_argument)?;
+    // Relation/global-type resolution is fallible and may mutate only its own
+    // caches. Complete it before publishing a cold mapper/signature graph.
+    let applicability = check_identity_argument_applicability(
+        prepared.argument,
+        prepared.type_argument,
+        |source, target| is_assignable(store, source, target),
+    )?;
+    project_prepared_identity_call(store, prepared, cached, applicability)
+}
+
+fn prepare_validated_identity_call(
+    store: &CanonicalTypeMapperStore,
+    request: IdentityGenericCallRequest<'_>,
+    callable: &ValidatedSingleCallable,
+    cache_provenance: IdentityTypeParameterCacheProvenance,
+) -> Result<PreparedIdentityGenericCall, IdentityGenericCallError> {
     validate_request_form(store, request)?;
     let shape =
         validate_identity_signature_shape(store, request.callee, callable, cache_provenance)?;
@@ -322,13 +385,11 @@ fn project_validated_identity_call(
     validate_inference_leaf(store, argument)
         .map_err(|error| map_inference_leaf_error(error, argument, false))?;
 
-    let (signature, mapper, parameter_type, return_type) =
-        get_or_create_identity_instantiation(store, shape, type_argument)?;
-    let return_record = store.type_payload(return_type).ok_or(
+    let return_record = store.type_payload(type_argument).ok_or(
         IdentityGenericCallInvariant::InvalidInstantiation {
             source: shape.type_parameter,
             expected: type_argument,
-            actual: return_type,
+            actual: type_argument,
         },
     )?;
     let return_kind = if return_record.flags().intersects(TypeFlags::VOID) {
@@ -336,24 +397,45 @@ fn project_validated_identity_call(
     } else {
         DirectCallReturnKind::Value
     };
-    let projection = IdentityGenericCallProjection {
+    Ok(PreparedIdentityGenericCall {
         callee: request.callee,
-        generic_signature: shape.signature,
+        shape,
+        argument,
+        type_argument,
+        return_kind,
+    })
+}
+
+fn project_prepared_identity_call(
+    store: &mut CanonicalTypeMapperStore,
+    prepared: PreparedIdentityGenericCall,
+    cached: Option<(SignatureId, TypeMapperId)>,
+    applicability: DirectCallApplicability,
+) -> Result<IdentityGenericCallResolution, IdentityGenericCallError> {
+    let (signature, mapper, parameter_type, return_type) = get_or_create_identity_instantiation(
+        store,
+        prepared.shape,
+        prepared.type_argument,
+        cached,
+    )?;
+    let projection = IdentityGenericCallProjection {
+        callee: prepared.callee,
+        generic_signature: prepared.shape.signature,
         signature,
         mapper,
-        type_parameter: shape.type_parameter,
-        type_argument,
+        type_parameter: prepared.shape.type_parameter,
+        type_argument: prepared.type_argument,
         argument_target: DirectCallArgumentTarget {
             index: 0,
-            argument_type: argument,
+            argument_type: prepared.argument,
             parameter_type,
         },
         return_type,
-        return_kind,
+        return_kind: prepared.return_kind,
     };
     Ok(IdentityGenericCallResolution {
         projection,
-        applicability: DirectCallApplicability::Applicable,
+        applicability,
     })
 }
 
@@ -566,8 +648,9 @@ fn get_or_create_identity_instantiation(
     store: &mut CanonicalTypeMapperStore,
     shape: IdentitySignatureShape,
     type_argument: TypeId,
+    cached: Option<(SignatureId, TypeMapperId)>,
 ) -> Result<(SignatureId, TypeMapperId, TypeId, TypeId), IdentityGenericCallError> {
-    if let Some((signature, mapper)) = cached_identity_instantiation(store, shape, type_argument)? {
+    if let Some((signature, mapper)) = cached {
         return Ok((signature, mapper, type_argument, type_argument));
     }
 
@@ -784,6 +867,7 @@ fn cached_instantiated_parameter(
         && record.members().is_none()
         && record.exports().is_none()
         && record.export_symbol().is_none()
+        && store.get_merged_symbol(parameter) == Some(parameter)
         && store.value_symbol_links(parameter)
             == Some(&ValueSymbolLinks {
                 resolved_type: Some(type_argument),
@@ -795,17 +879,17 @@ fn cached_instantiated_parameter(
 }
 
 fn check_identity_argument_applicability(
-    projection: &IdentityGenericCallProjection,
+    argument_type: TypeId,
+    parameter_type: TypeId,
     mut is_assignable: impl FnMut(TypeId, TypeId) -> Result<bool, RelationUnavailable>,
 ) -> Result<DirectCallApplicability, RelationUnavailable> {
-    let target = projection.argument_target;
-    if is_assignable(target.argument_type, target.parameter_type)? {
+    if is_assignable(argument_type, parameter_type)? {
         Ok(DirectCallApplicability::Applicable)
     } else {
         Ok(DirectCallApplicability::ArgumentNotAssignable {
-            index: target.index,
-            argument_type: target.argument_type,
-            parameter_type: target.parameter_type,
+            index: 0,
+            argument_type,
+            parameter_type,
         })
     }
 }
@@ -930,7 +1014,7 @@ mod tests {
                 candidate
             );
             assert_eq!(
-                check_identity_argument_applicability(&resolution.projection, |source, target| {
+                check_identity_argument_applicability(candidate, candidate, |source, target| {
                     Ok(source == target)
                 }),
                 Ok(DirectCallApplicability::Applicable)
@@ -960,7 +1044,7 @@ mod tests {
         assert_eq!(resolution.projection.type_argument, string);
         assert_eq!(resolution.projection.return_type, string);
         assert_eq!(
-            check_identity_argument_applicability(&resolution.projection, |source, target| {
+            check_identity_argument_applicability(number, string, |source, target| {
                 Ok(source == target)
             }),
             Ok(DirectCallApplicability::ArgumentNotAssignable {
@@ -1255,6 +1339,114 @@ mod tests {
         .unwrap();
         assert_eq!(repaired.projection.type_argument, fresh);
         assert_eq!(store.cached_signature_len(), counts.3 + 1);
+    }
+
+    #[test]
+    fn relation_unavailable_precedes_cold_instantiation_publication() {
+        let mut store = initialized_store();
+        let (callable, _) = identity_callable(&mut store);
+        let string = store.intrinsic_bootstrap().unwrap().string_type;
+        let counts = (
+            store.mapper_len(),
+            store.symbol_len(),
+            store.signature_len(),
+            store.cached_signature_len(),
+            store.checker_link_allocated_lengths(),
+        );
+
+        assert_eq!(
+            resolve_validated_identity_call(
+                &mut store,
+                inferred_request(callable.owner, &[string]),
+                &callable,
+                EXACT_SOURCE,
+                |_, _, _| Err(RelationUnavailable::MissingBootstrap),
+            ),
+            Err(IdentityGenericCallError::Relation(
+                RelationUnavailable::MissingBootstrap
+            ))
+        );
+        assert_eq!(
+            (
+                store.mapper_len(),
+                store.symbol_len(),
+                store.signature_len(),
+                store.cached_signature_len(),
+                store.checker_link_allocated_lengths(),
+            ),
+            counts
+        );
+
+        let repaired = project_validated_identity_call(
+            &mut store,
+            inferred_request(callable.owner, &[string]),
+            &callable,
+            EXACT_SOURCE,
+        )
+        .unwrap();
+        assert_eq!(repaired.projection.type_argument, string);
+        assert_eq!(store.cached_signature_len(), counts.3 + 1);
+    }
+
+    #[test]
+    fn cached_instantiation_rejects_redirected_transient_parameter() {
+        let mut store = initialized_store();
+        let (callable, _) = identity_callable(&mut store);
+        let string = store.intrinsic_bootstrap().unwrap().string_type;
+        let first = project_validated_identity_call(
+            &mut store,
+            inferred_request(callable.owner, &[string]),
+            &callable,
+            EXACT_SOURCE,
+        )
+        .unwrap();
+        let [parameter] = store
+            .signature(first.projection.signature)
+            .unwrap()
+            .parameters()
+        else {
+            panic!("expected one instantiated parameter")
+        };
+        let target = store
+            .value_symbol_links(*parameter)
+            .and_then(|links| links.target)
+            .unwrap();
+        assert_eq!(store.record_merged_symbol(target, *parameter), Ok(None));
+        let counts = (
+            store.mapper_len(),
+            store.symbol_len(),
+            store.signature_len(),
+            store.cached_signature_len(),
+            store.merged_symbol_len(),
+            store.checker_link_allocated_lengths(),
+        );
+
+        assert_eq!(
+            project_validated_identity_call(
+                &mut store,
+                inferred_request(callable.owner, &[string]),
+                &callable,
+                EXACT_SOURCE,
+            ),
+            Err(IdentityGenericCallError::Invariant(
+                IdentityGenericCallInvariant::InvalidCachedInstantiation {
+                    target: first.projection.generic_signature,
+                    type_argument: string,
+                    signature: first.projection.signature,
+                }
+            ))
+        );
+        assert_eq!(
+            (
+                store.mapper_len(),
+                store.symbol_len(),
+                store.signature_len(),
+                store.cached_signature_len(),
+                store.merged_symbol_len(),
+                store.checker_link_allocated_lengths(),
+            ),
+            counts
+        );
     }
 
     #[test]

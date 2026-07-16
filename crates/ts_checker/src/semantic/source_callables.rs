@@ -1046,6 +1046,10 @@ pub(super) fn source_callable_state(
         owner_parent: plan.owner_parent,
         export_local: plan.export_local,
         signature,
+        default_free_type_parameter: plan
+            .type_parameters
+            .first()
+            .map(|parameter| parameter.declaration),
         contextual_target: None,
         contextual_variable: None,
     };
@@ -1361,6 +1365,7 @@ pub(super) fn publish_contextual_source_callable(
             owner_parent: None,
             export_local: None,
             signature,
+            default_free_type_parameter: None,
             contextual_target: Some(prepared.contextual_target),
             contextual_variable: Some(prepared.variable_symbol),
         },
@@ -1455,6 +1460,10 @@ pub(super) fn begin_source_callable(
             owner_parent: plan.owner_parent,
             export_local: plan.export_local,
             signature,
+            default_free_type_parameter: plan
+                .type_parameters
+                .first()
+                .map(|parameter| parameter.declaration),
             contextual_target: None,
             contextual_variable: None,
         },
@@ -1978,6 +1987,7 @@ pub(super) fn validate_stored_source_callable(
             owner_parent: provenance.owner_parent,
             export_local: provenance.export_local,
             signature: provenance.signature,
+            default_free_type_parameter: provenance.default_free_type_parameter,
             contextual_target: provenance.contextual_target,
             contextual_variable: provenance.contextual_variable,
         })
@@ -2015,6 +2025,7 @@ pub(super) fn validate_stored_source_callable(
         declaration,
         family,
         contextual.is_some(),
+        provenance.default_free_type_parameter,
         signature_record.type_parameters(),
     ) else {
         return StoredSourceCallableValidation::Malformed;
@@ -2292,10 +2303,11 @@ fn valid_stored_source_type_parameters(
     declaration: NodeRef,
     family: SourceCallableFamily,
     contextual: bool,
+    default_free_type_parameter: Option<NodeRef>,
     type_parameters: &[TypeId],
 ) -> Option<Vec<TypeId>> {
     if type_parameters.is_empty() {
-        return Some(Vec::new());
+        return default_free_type_parameter.is_none().then(Vec::new);
     }
     if contextual
         || family != SourceCallableFamily::FunctionDeclaration
@@ -2320,6 +2332,7 @@ fn valid_stored_source_type_parameters(
         || store.source_node_kind(*type_parameter_declaration) != Some(SyntaxKind::TypeParameter)
         || store.source_node_parent(*type_parameter_declaration)
             != Some(SourceNodeParent::Parent(declaration))
+        || default_free_type_parameter != Some(*type_parameter_declaration)
     {
         return None;
     }
@@ -2978,11 +2991,12 @@ mod tests {
         let callable = fixture
             .query_callable(declaration, owner, &mut diagnostics)
             .unwrap();
-        let signature = fixture
-            .store
-            .source_callable_provenance(callable)
-            .unwrap()
-            .signature;
+        let provenance = fixture.store.source_callable_provenance(callable).unwrap();
+        assert_eq!(
+            provenance.default_free_type_parameter,
+            Some(type_parameter_declaration)
+        );
+        let signature = provenance.signature;
         let type_parameter = fixture
             .store
             .signature(signature)
