@@ -4909,7 +4909,7 @@ mod tests {
     }
 
     #[test]
-    fn aliased_function_display_preserves_pending_and_malformed_cache_states() {
+    fn aliased_function_display_rejects_backtracking_and_malformed_cache_states() {
         let parsed = parse_source_file(concat!(
             "type Barrier = (value: string) => number; ",
             "type Parameters = (value: string) => number; ",
@@ -4941,10 +4941,7 @@ mod tests {
         );
         assert_eq!(
             context.type_to_string(barrier),
-            Err(TypeDisplayUnavailable::FunctionType {
-                type_id: barrier,
-                reason: FunctionTypeDisplayUnavailable::PendingSignature,
-            })
+            Err(TypeDisplayUnavailable::MalformedType(barrier))
         );
 
         let pending_parameter = function_parameter_symbol(&context, &parsed, parameters_node, 0);
@@ -4955,10 +4952,7 @@ mod tests {
         );
         assert_eq!(
             context.type_to_string(parameters),
-            Err(TypeDisplayUnavailable::FunctionType {
-                type_id: parameters,
-                reason: FunctionTypeDisplayUnavailable::PendingSignature,
-            })
+            Err(TypeDisplayUnavailable::MalformedType(parameters))
         );
 
         let poisoned_parameter = function_parameter_symbol(&context, &parsed, poisoned_node, 0);

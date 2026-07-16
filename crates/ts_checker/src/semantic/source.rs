@@ -8776,7 +8776,7 @@ mod tests {
         let source = parsed(concat!(
             "type A = A; ",
             r#"const value: string = "ok"; "#,
-            "function unsupported() {}",
+            "if (true) {}",
         ));
         let file = FileId::new(45);
         let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
