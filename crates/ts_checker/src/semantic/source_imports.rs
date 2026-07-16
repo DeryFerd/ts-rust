@@ -2181,9 +2181,9 @@ mod tests {
         plan_source_type_import_reference(&fixture.store, &declared_host, resolved, reference)
     }
 
-    fn query_imported_type(
+    fn query_type_with_import_capability(
         fixture: &mut Fixture,
-        reference: NodeRef,
+        node: NodeRef,
         capability: CanonicalTypeReferenceAliasTarget,
     ) -> Result<TypeId, DeclaredTypeError> {
         let Fixture {
@@ -2214,7 +2214,7 @@ mod tests {
             &mut CanonicalCheckerDiagnostics::default(),
         )?
         .with_type_reference_alias_targets([capability])?
-        .get_type_from_type_node(reference)
+        .get_type_from_type_node(node)
     }
 
     fn query_type_without_import_capability(
@@ -2294,6 +2294,43 @@ mod tests {
             &mut CanonicalCheckerDiagnostics::default(),
         )?
         .get_declared_type_of_symbol(symbol)
+    }
+
+    fn query_source_callable_with_import_capability(
+        fixture: &mut Fixture,
+        declaration: NodeRef,
+        owner_symbol: SemanticSymbolId,
+        capability: CanonicalTypeReferenceAliasTarget,
+    ) -> Result<TypeId, DeclaredTypeError> {
+        let Fixture {
+            files,
+            bound,
+            global_types,
+            store,
+            ..
+        } = fixture;
+        let sources = || {
+            files.iter().map(|file| {
+                (
+                    &file.parsed.arena,
+                    bound.get(&file.file).expect("fixture bound every file"),
+                )
+            })
+        };
+        let declared_host = DeclaredTypeHost::new_after_global_merge(
+            sources(),
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        CanonicalTypeQuery::new_with_global_types(
+            store,
+            &declared_host,
+            global_types,
+            CanonicalCheckerOptions::default(),
+            &mut CanonicalCheckerDiagnostics::default(),
+        )?
+        .with_type_reference_alias_targets([capability])?
+        .get_type_of_source_callable(declaration, owner_symbol)
     }
 
     fn prepare_one(
@@ -2409,7 +2446,8 @@ mod tests {
         let reference = type_reference(&fixture, 0, "LocalUser");
         let resolved = resolve_all_types(&mut fixture, &plan.bindings).unwrap();
         let capability = plan_type_reference_capability(&fixture, &resolved[0], reference);
-        let imported = query_imported_type(&mut fixture, reference, capability).unwrap();
+        let imported =
+            query_type_with_import_capability(&mut fixture, reference, capability).unwrap();
         let target = direct_export(&fixture, 1, "User");
         assert_eq!(
             fixture
@@ -2437,7 +2475,7 @@ mod tests {
         let warm_capability =
             plan_type_reference_capability(&fixture, &warm_resolved[0], reference);
         assert_eq!(
-            query_imported_type(&mut fixture, reference, warm_capability).unwrap(),
+            query_type_with_import_capability(&mut fixture, reference, warm_capability).unwrap(),
             imported
         );
     }
@@ -2462,7 +2500,7 @@ mod tests {
         let reference = type_reference(&fixture, 0, "User");
         let resolved = resolve_all_types(&mut fixture, &plan.bindings).unwrap();
         let capability = plan_type_reference_capability(&fixture, &resolved[0], reference);
-        query_imported_type(&mut fixture, reference, capability).unwrap();
+        query_type_with_import_capability(&mut fixture, reference, capability).unwrap();
 
         let before = store_state(&fixture.store);
         assert!(matches!(
@@ -2473,6 +2511,144 @@ mod tests {
                     alias,
                 }
             )) if node == reference && alias == plan.bindings[0].alias_symbol
+        ));
+        assert_eq!(store_state(&fixture.store), before);
+    }
+
+    #[test]
+    fn type_import_capability_cannot_authorize_an_enclosing_union_query() {
+        let mut fixture = fixture(
+            &[
+                r#"
+                    import type { User } from "./target";
+                    const user: User | null = null;
+                "#,
+                r"export type User = { id: number };",
+            ],
+            &[Route {
+                source: 0,
+                specifier: 0,
+                target: Some(1),
+            }],
+        );
+        let plan = fixture.plan_type_import(0, 0);
+        let reference = type_reference(&fixture, 0, "User");
+        let resolved = resolve_all_types(&mut fixture, &plan.bindings).unwrap();
+        let capability = plan_type_reference_capability(&fixture, &resolved[0], reference);
+        let union = {
+            let file = &fixture.files[0];
+            file.parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::UnionType).then_some(NodeRef::new(
+                        file.parsed.arena.id(),
+                        file.file,
+                        node,
+                    ))
+                })
+                .expect("fixture contains a union annotation")
+        };
+
+        let before = store_state(&fixture.store);
+        assert!(matches!(
+            query_type_with_import_capability(&mut fixture, union, capability),
+            Err(DeclaredTypeError::TypeNodeUnavailable(
+                super::super::type_nodes::TypeNodeUnavailable::ImportAliasCapabilityUnsupported(
+                    node
+                )
+            )) if node == reference
+        ));
+        assert_eq!(store_state(&fixture.store), before);
+    }
+
+    #[test]
+    fn type_import_capability_cannot_warm_its_enclosing_local_alias() {
+        let mut fixture = fixture(
+            &[
+                r#"
+                    import type { User } from "./target";
+                    type Local = User;
+                "#,
+                r"export type User = { id: number };",
+            ],
+            &[Route {
+                source: 0,
+                specifier: 0,
+                target: Some(1),
+            }],
+        );
+        let plan = fixture.plan_type_import(0, 0);
+        let reference = type_reference(&fixture, 0, "User");
+        let resolved = resolve_all_types(&mut fixture, &plan.bindings).unwrap();
+        let capability = plan_type_reference_capability(&fixture, &resolved[0], reference);
+
+        let before = store_state(&fixture.store);
+        assert!(matches!(
+            query_type_with_import_capability(&mut fixture, reference, capability),
+            Err(DeclaredTypeError::TypeNodeUnavailable(
+                super::super::type_nodes::TypeNodeUnavailable::ImportAliasCapabilityUnsupported(
+                    node
+                )
+            )) if node == reference
+        ));
+        assert_eq!(store_state(&fixture.store), before);
+    }
+
+    #[test]
+    fn type_import_capability_cannot_authorize_a_callable_query() {
+        let mut fixture = fixture(
+            &[
+                r#"
+                    import type { User } from "./target";
+                    function accept(value: User): void {}
+                "#,
+                r"export type User = { id: number };",
+            ],
+            &[Route {
+                source: 0,
+                specifier: 0,
+                target: Some(1),
+            }],
+        );
+        let plan = fixture.plan_type_import(0, 0);
+        let reference = type_reference(&fixture, 0, "User");
+        let resolved = resolve_all_types(&mut fixture, &plan.bindings).unwrap();
+        let capability = plan_type_reference_capability(&fixture, &resolved[0], reference);
+        let (declaration, owner_symbol) =
+            {
+                let file = &fixture.files[0];
+                let declaration =
+                    file.parsed
+                        .arena
+                        .iter()
+                        .find_map(|(node, record)| {
+                            (record.kind == SyntaxKind::FunctionDeclaration)
+                                .then_some(NodeRef::new(file.parsed.arena.id(), file.file, node))
+                        })
+                        .expect("fixture contains a function declaration");
+                let owner_symbol = fixture
+                    .bound
+                    .get(&file.file)
+                    .and_then(|bound| bound.symbol(declaration))
+                    .and_then(|symbol| fixture.store.get_merged_symbol(symbol))
+                    .expect("fixture function has one canonical owner");
+                (declaration, owner_symbol)
+            };
+
+        let before = store_state(&fixture.store);
+        assert!(matches!(
+            query_source_callable_with_import_capability(
+                &mut fixture,
+                declaration,
+                owner_symbol,
+                capability,
+            ),
+            Err(DeclaredTypeError::TypeNodeUnavailable(
+                super::super::type_nodes::TypeNodeUnavailable::ImportAliasCapabilityUnsupported(
+                    node
+                )
+            )) if node == reference
         ));
         assert_eq!(store_state(&fixture.store), before);
     }
@@ -2504,7 +2680,7 @@ mod tests {
 
         let before = store_state(&fixture.store);
         assert!(matches!(
-            query_imported_type(&mut fixture, reference, capability),
+            query_type_with_import_capability(&mut fixture, reference, capability),
             Err(DeclaredTypeError::TypeNodeUnavailable(
                 super::super::type_nodes::TypeNodeUnavailable::InvalidImportAliasTarget {
                     node,
@@ -2693,14 +2869,14 @@ mod tests {
         let resolved = resolve_all_types(&mut fixture, &plan.bindings).unwrap();
         let capability = plan_type_reference_capability(&fixture, &resolved[0], reference);
         assert_eq!(
-            query_imported_type(&mut fixture, reference, capability).unwrap(),
+            query_type_with_import_capability(&mut fixture, reference, capability).unwrap(),
             target_first
         );
         let warm_resolved = resolve_all_types(&mut fixture, &plan.bindings).unwrap();
         let warm_capability =
             plan_type_reference_capability(&fixture, &warm_resolved[0], reference);
         assert_eq!(
-            query_imported_type(&mut fixture, reference, warm_capability).unwrap(),
+            query_type_with_import_capability(&mut fixture, reference, warm_capability).unwrap(),
             target_first
         );
     }
@@ -2732,7 +2908,7 @@ mod tests {
             },
         ));
         assert!(matches!(
-            query_imported_type(&mut fixture, reference, capability),
+            query_type_with_import_capability(&mut fixture, reference, capability),
             Err(DeclaredTypeError::TypeNodeUnavailable(
                 super::super::type_nodes::TypeNodeUnavailable::InvalidCachedSymbol {
                     node,

@@ -108,6 +108,7 @@ pub enum TypeNodeUnavailable {
         alias: SemanticSymbolId,
         target: SemanticSymbolId,
     },
+    ImportAliasCapabilityUnsupported(NodeRef),
     UnsupportedReferenceTarget {
         node: NodeRef,
         symbol: SemanticSymbolId,
@@ -3662,6 +3663,39 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         Ok(query)
     }
 
+    fn reject_type_reference_alias_capabilities(&self) -> Result<(), DeclaredTypeError> {
+        if let Some(reference) = self.type_reference_alias_targets.keys().min().copied() {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::ImportAliasCapabilityUnsupported(reference),
+            ));
+        }
+        Ok(())
+    }
+
+    fn require_direct_type_reference_alias_capability(
+        &self,
+        node: NodeRef,
+    ) -> Result<(), DeclaredTypeError> {
+        if self.type_reference_alias_targets.is_empty() {
+            return Ok(());
+        }
+        if self.type_reference_alias_targets.len() == 1
+            && self.type_reference_alias_targets.contains_key(&node)
+            && preflight_node(self.store, self.host, node)?.kind == SyntaxKind::TypeReference
+        {
+            return Ok(());
+        }
+        let reference = self
+            .type_reference_alias_targets
+            .keys()
+            .min()
+            .copied()
+            .expect("a nonempty capability map has a first key");
+        Err(type_node_unavailable(
+            TypeNodeUnavailable::ImportAliasCapabilityUnsupported(reference),
+        ))
+    }
+
     /// Resolves one dependency-closed type-node query.
     ///
     /// # Errors
@@ -3672,6 +3706,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         &mut self,
         node: NodeRef,
     ) -> Result<TypeId, DeclaredTypeError> {
+        self.require_direct_type_reference_alias_capability(node)?;
         if !self.pending_function_parameters.is_empty() {
             return Err(type_node_unavailable(
                 TypeNodeUnavailable::InvalidFunctionType(node),
@@ -3688,6 +3723,9 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             &self.type_reference_alias_targets,
         );
         let direct_alias = planner.direct_type_alias_owner(node)?;
+        if direct_alias.is_some() && !self.type_reference_alias_targets.is_empty() {
+            self.reject_type_reference_alias_capabilities()?;
+        }
         planner.plan_type_node(node)?;
         let plan = planner.finish();
         let mut prepared = self.prepare_literal_types(&plan)?;
@@ -3716,6 +3754,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         declaration: NodeRef,
         owner_symbol: SemanticSymbolId,
     ) -> Result<TypeId, DeclaredTypeError> {
+        self.reject_type_reference_alias_capabilities()?;
         if !self.pending_function_parameters.is_empty() {
             return Err(type_node_unavailable(
                 TypeNodeUnavailable::InvalidFunctionType(declaration),
@@ -3850,6 +3889,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         &mut self,
         symbol: SemanticSymbolId,
     ) -> Result<CanonicalEnumSemantics, DeclaredTypeError> {
+        self.reject_type_reference_alias_capabilities()?;
         if !self.pending_function_parameters.is_empty() {
             return Err(type_node_unavailable(
                 TypeNodeUnavailable::InvalidCachedTypeAlias(symbol),
@@ -3866,6 +3906,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         &mut self,
         signature: SignatureId,
     ) -> Result<TypeId, DeclaredTypeError> {
+        self.reject_type_reference_alias_capabilities()?;
         if !self.pending_function_parameters.is_empty() {
             return Err(type_node_unavailable(
                 TypeNodeUnavailable::InvalidFunctionSignature(signature),
@@ -4167,6 +4208,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         &mut self,
         symbol: SemanticSymbolId,
     ) -> Result<TypeId, DeclaredTypeError> {
+        self.reject_type_reference_alias_capabilities()?;
         if !self.pending_function_parameters.is_empty() {
             return Err(type_node_unavailable(
                 TypeNodeUnavailable::InvalidCachedTypeAlias(symbol),
