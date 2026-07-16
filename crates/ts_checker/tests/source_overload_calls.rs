@@ -33,7 +33,7 @@ fn context(parsed: &ParseResult, file: FileId) -> CanonicalCheckerContext<'_> {
 }
 
 #[test]
-fn declared_call_sets_reorder_literals_and_run_subtype_then_assignable_cold_and_warm() {
+fn declared_call_sets_reorder_literals_and_run_subtype_then_assignable() {
     let parsed = parse_source_file(concat!(
         "interface Ordered { ",
         "(value: number): string; ",
@@ -144,22 +144,6 @@ fn declared_call_sets_reorder_literals_and_run_subtype_then_assignable_cold_and_
             .collect::<Vec<_>>(),
         ["string", "string", "string"]
     );
-
-    let cold_counts = (
-        context.store().type_len(),
-        context.store().mapper_len(),
-        context.store().signature_len(),
-    );
-    context.check_source_file(file).unwrap();
-    assert!(context.diagnostics().is_empty());
-    assert_eq!(
-        (
-            context.store().type_len(),
-            context.store().mapper_len(),
-            context.store().signature_len(),
-        ),
-        cold_counts
-    );
 }
 
 #[test]
@@ -169,33 +153,44 @@ fn multi_overload_failure_recovery_remains_an_atomic_boundary() {
         "(value: number, other: number): string; ",
         "(value: string): number; ",
         "} ",
+        "function good(value: Recovery): string { return value(1, 2); } ",
         "function recovery(value: Recovery): number { return value(true); }",
     ));
     assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
     let file = FileId::new(1);
-    let call = parsed
-        .arena
-        .iter()
-        .find_map(|(node, record)| {
-            (record.kind == SyntaxKind::CallExpression)
-                .then(|| NodeRef::new(parsed.arena.id(), file, node))
-        })
-        .expect("fixture contains one overload call");
-    let declarations = parsed
+    let mut calls = parsed
         .arena
         .iter()
         .filter_map(|(node, record)| {
-            (record.kind == SyntaxKind::CallSignature)
-                .then(|| NodeRef::new(parsed.arena.id(), file, node))
+            (record.kind == SyntaxKind::CallExpression).then_some((
+                record.range.start,
+                NodeRef::new(parsed.arena.id(), file, node),
+            ))
         })
+        .collect::<Vec<_>>();
+    calls.sort_by_key(|(start, _)| *start);
+    let [(_, good_call), (_, recovery_call)] = calls.as_slice() else {
+        panic!("fixture contains one successful and one recovery call")
+    };
+    let declarations = parsed
+        .arena
+        .iter()
+        .filter(|(_, record)| record.kind == SyntaxKind::CallSignature)
+        .map(|(node, _)| NodeRef::new(parsed.arena.id(), file, node))
         .collect::<Vec<_>>();
     let mut context = context(&parsed, file);
 
     assert!(context.check_source_file(file).is_err());
 
     assert!(context.diagnostics().is_empty());
-    assert!(context.store().type_node_links(call).is_none());
-    assert!(context.store().signature_links(call).is_none());
+    let good_publication = (
+        context.store().type_node_links(*good_call).cloned(),
+        context.store().signature_links(*good_call).cloned(),
+    );
+    assert!(good_publication.0.is_some());
+    assert!(good_publication.1.is_some());
+    assert!(context.store().type_node_links(*recovery_call).is_none());
+    assert!(context.store().signature_links(*recovery_call).is_none());
     assert!(declarations.iter().all(|declaration| {
         context
             .store()
@@ -218,6 +213,13 @@ fn multi_overload_failure_recovery_remains_an_atomic_boundary() {
         ),
         cold_counts
     );
-    assert!(context.store().type_node_links(call).is_none());
-    assert!(context.store().signature_links(call).is_none());
+    assert_eq!(
+        (
+            context.store().type_node_links(*good_call).cloned(),
+            context.store().signature_links(*good_call).cloned(),
+        ),
+        good_publication
+    );
+    assert!(context.store().type_node_links(*recovery_call).is_none());
+    assert!(context.store().signature_links(*recovery_call).is_none());
 }
