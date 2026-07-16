@@ -47,9 +47,9 @@ impl SourceFlowSnapshot {
         if self.type_of(symbol) == Some(type_) {
             return self.clone();
         }
-        let mut types = self.types().clone();
-        types.insert(symbol, type_);
-        Self::new(types)
+        let mut updated = self.types().clone();
+        updated.insert(symbol, type_);
+        Self::new(updated)
     }
 }
 

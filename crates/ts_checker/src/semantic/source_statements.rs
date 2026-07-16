@@ -903,6 +903,7 @@ impl SyntaxPlanner<'_> {
         kind: SyntaxKind,
         role: SourceFunctionStatementsRole,
     ) -> SourceFunctionStatementsError {
+        debug_assert!(node.is_for(self.arena.id(), self.bound.file_id()));
         SourceFunctionStatementsError::Unsupported(SourceFunctionStatementsUnsupported::Syntax {
             node,
             kind,
