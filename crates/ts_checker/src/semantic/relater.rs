@@ -1082,12 +1082,7 @@ impl<'store> RelaterSession<'store> {
             if let Some(arguments) = self.canonical_array_reference_arguments(source, target)? {
                 return match arguments {
                     CanonicalArrayReferenceArguments::Related { source, target } => self
-                        .is_related_to_ex(
-                            source,
-                            target,
-                            RecursionFlags::BOTH,
-                            intersection_state,
-                        ),
+                        .is_related_to_ex(source, target, RecursionFlags::BOTH, intersection_state),
                     CanonicalArrayReferenceArguments::Unrelated => Ok(Ternary::False),
                 };
             }
@@ -1190,12 +1185,7 @@ impl<'store> RelaterSession<'store> {
             if let Some(arguments) = self.canonical_array_reference_arguments(source, target)? {
                 return match arguments {
                     CanonicalArrayReferenceArguments::Related { source, target } => self
-                        .is_related_to_ex(
-                            source,
-                            target,
-                            RecursionFlags::BOTH,
-                            intersection_state,
-                        ),
+                        .is_related_to_ex(source, target, RecursionFlags::BOTH, intersection_state),
                     CanonicalArrayReferenceArguments::Unrelated => Ok(Ternary::False),
                 };
             }
@@ -2776,10 +2766,7 @@ impl<'store> RelaterSession<'store> {
         Ok(())
     }
 
-    fn validate_derived_object_literal(
-        &self,
-        type_id: TypeId,
-    ) -> DerivedObjectLiteralValidation {
+    fn validate_derived_object_literal(&self, type_id: TypeId) -> DerivedObjectLiteralValidation {
         match self.global_types {
             Some(global_types) => self
                 .store
@@ -3675,6 +3662,23 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         )
     }
 
+    /// Global-aware, option-aware subtype comparison for overload selection.
+    pub(super) fn is_type_subtype_of_with_global_types_and_strict_function_types(
+        &mut self,
+        source: TypeId,
+        target: TypeId,
+        global_types: &CanonicalGlobalTypes,
+        strict_function_types: bool,
+    ) -> Result<bool, RelationUnavailable> {
+        self.is_type_related_to_with_optional_global_types_and_options(
+            source,
+            target,
+            RelationKind::Subtype,
+            Some(RelationGlobalTypes::from_global_types(global_types)),
+            Some(strict_function_types),
+        )
+    }
+
     /// Pinned `isTypeStrictSubtypeOf`.
     ///
     /// # Errors
@@ -3914,8 +3918,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
 
         let supported_array_relation = source_flags.intersects(TypeFlags::OBJECT)
             && target_flags.intersects(TypeFlags::OBJECT)
-            && configured_array_reference_targets(self, global_types, source, target)?
-                .is_some();
+            && configured_array_reference_targets(self, global_types, source, target)?.is_some();
         let supported_apparent_primitive_relation = relation != RelationKind::Identity
             && target_flags.intersects(TypeFlags::OBJECT)
             && global_types

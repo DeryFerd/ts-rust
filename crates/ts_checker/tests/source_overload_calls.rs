@@ -4,31 +4,9 @@ use ts_binder::{
     EscapedName,
 };
 use ts_checker::semantic::{CanonicalCheckerContext, CanonicalCheckerOptions};
-use ts_parser::parse_source_file;
+use ts_parser::{ParseResult, parse_source_file};
 
-#[test]
-fn declared_call_sets_select_ordered_and_arity_compatible_overloads_cold_and_warm() {
-    let parsed = parse_source_file(concat!(
-        "interface Ordered { ",
-        "(value: number): string; ",
-        "(value: number): number; ",
-        "} ",
-        "type Branching = { ",
-        "(value: string): number; ",
-        "(value: number): string; ",
-        "}; ",
-        "interface Recovery { ",
-        "(value: number, other: number): string; ",
-        "(value: string): number; ",
-        "} ",
-        "function ordered(value: Ordered): string { return value(1); } ",
-        "function branching(value: Branching): string { return value(1); } ",
-        "type API = { fn: Branching }; ",
-        "function property(value: API): string { return value.fn(1); } ",
-        "function recovery(value: Recovery): number { return value(true); }",
-    ));
-    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
-    let file = FileId::new(0);
+fn context(parsed: &ParseResult, file: FileId) -> CanonicalCheckerContext<'_> {
     let mut binder = CanonicalBinder::new();
     binder
         .bind_source_file_with_facts(
@@ -36,7 +14,7 @@ fn declared_call_sets_select_ordered_and_arity_compatible_overloads_cold_and_war
             parsed.source_file,
             file,
             CanonicalSourceFileFacts::new(
-                EscapedName::source("\"/project/source-overload-calls.ts\""),
+                EscapedName::source(format!("\"/project/{}.ts\"", file.index())),
                 CanonicalSourceLanguage::TypeScript,
                 false,
                 CanonicalModuleState::Script,
@@ -46,24 +24,47 @@ fn declared_call_sets_select_ordered_and_arity_compatible_overloads_cold_and_war
     binder
         .bind_typescript_declaration_slice(&parsed.arena, file)
         .unwrap();
-    let mut context = CanonicalCheckerContext::new(
+    CanonicalCheckerContext::new(
         binder.finish(),
         [(file, &parsed.arena)].into_iter().collect(),
         CanonicalCheckerOptions::default(),
     )
-    .unwrap();
+    .unwrap()
+}
+
+#[test]
+fn declared_call_sets_reorder_literals_and_run_subtype_then_assignable_cold_and_warm() {
+    let parsed = parse_source_file(concat!(
+        "interface Ordered { ",
+        "(value: number): string; ",
+        "(value: number): number; ",
+        "} ",
+        "type Branching = { ",
+        "(value: string): number; ",
+        "(value: number): string; ",
+        "}; ",
+        "interface Specialized { ",
+        "(value: number): 'broad'; ",
+        "(value: 1): 'literal'; ",
+        "} ",
+        "interface AnyChoice { ",
+        "(value: string): 'string'; ",
+        "(value: any): 'any'; ",
+        "} ",
+        "function ordered(value: Ordered): string { return value(1); } ",
+        "function branching(value: Branching): string { return value(1); } ",
+        "type API = { fn: Branching }; ",
+        "function property(value: API): string { return value.fn(1); } ",
+        "function specialized(value: Specialized): 'literal' { return value(1); } ",
+        "function subtype(value: AnyChoice, input: any): 'any' { return value(input); }",
+    ));
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(0);
+    let mut context = context(&parsed, file);
 
     context.check_source_file(file).unwrap();
 
-    assert_eq!(
-        context
-            .diagnostics()
-            .as_slice()
-            .iter()
-            .map(|diagnostic| diagnostic.diagnostic.code())
-            .collect::<Vec<_>>(),
-        [2345]
-    );
+    assert!(context.diagnostics().is_empty());
     let nodes = |kind| {
         let mut nodes = parsed
             .arena
@@ -80,12 +81,28 @@ fn declared_call_sets_select_ordered_and_arity_compatible_overloads_cold_and_war
     };
     let calls = nodes(SyntaxKind::CallExpression);
     let declarations = nodes(SyntaxKind::CallSignature);
-    let [ordered_call, branching_call, property_call, recovery_call] = calls.as_slice() else {
-        panic!("expected four overload calls")
-    };
-    let [ordered_first, _, _, branching_second, _, recovery_second] = declarations.as_slice()
+    let [
+        ordered_call,
+        branching_call,
+        property_call,
+        specialized_call,
+        subtype_call,
+    ] = calls.as_slice()
     else {
-        panic!("expected six declared call signatures")
+        panic!("expected five overload calls")
+    };
+    let [
+        ordered_first,
+        _,
+        _,
+        branching_second,
+        _,
+        specialized_second,
+        _,
+        subtype_second,
+    ] = declarations.as_slice()
+    else {
+        panic!("expected eight declared call signatures")
     };
     let selected_signature = |node| {
         context
@@ -106,11 +123,15 @@ fn declared_call_sets_select_ordered_and_arity_compatible_overloads_cold_and_war
         selected_signature(*branching_second)
     );
     assert_eq!(
-        selected_signature(*recovery_call),
-        selected_signature(*recovery_second)
+        selected_signature(*specialized_call),
+        selected_signature(*specialized_second)
     );
     assert_eq!(
-        calls
+        selected_signature(*subtype_call),
+        selected_signature(*subtype_second)
+    );
+    assert_eq!(
+        calls[..3]
             .iter()
             .map(|call| {
                 let type_ = context
@@ -121,7 +142,7 @@ fn declared_call_sets_select_ordered_and_arity_compatible_overloads_cold_and_war
                 context.type_to_string(type_).unwrap()
             })
             .collect::<Vec<_>>(),
-        ["string", "string", "string", "number"]
+        ["string", "string", "string"]
     );
 
     let cold_counts = (
@@ -130,7 +151,7 @@ fn declared_call_sets_select_ordered_and_arity_compatible_overloads_cold_and_war
         context.store().signature_len(),
     );
     context.check_source_file(file).unwrap();
-    assert_eq!(context.diagnostics().len(), 1);
+    assert!(context.diagnostics().is_empty());
     assert_eq!(
         (
             context.store().type_len(),
@@ -139,4 +160,64 @@ fn declared_call_sets_select_ordered_and_arity_compatible_overloads_cold_and_war
         ),
         cold_counts
     );
+}
+
+#[test]
+fn multi_overload_failure_recovery_remains_an_atomic_boundary() {
+    let parsed = parse_source_file(concat!(
+        "interface Recovery { ",
+        "(value: number, other: number): string; ",
+        "(value: string): number; ",
+        "} ",
+        "function recovery(value: Recovery): number { return value(true); }",
+    ));
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(1);
+    let call = parsed
+        .arena
+        .iter()
+        .find_map(|(node, record)| {
+            (record.kind == SyntaxKind::CallExpression)
+                .then(|| NodeRef::new(parsed.arena.id(), file, node))
+        })
+        .expect("fixture contains one overload call");
+    let declarations = parsed
+        .arena
+        .iter()
+        .filter_map(|(node, record)| {
+            (record.kind == SyntaxKind::CallSignature)
+                .then(|| NodeRef::new(parsed.arena.id(), file, node))
+        })
+        .collect::<Vec<_>>();
+    let mut context = context(&parsed, file);
+
+    assert!(context.check_source_file(file).is_err());
+
+    assert!(context.diagnostics().is_empty());
+    assert!(context.store().type_node_links(call).is_none());
+    assert!(context.store().signature_links(call).is_none());
+    assert!(declarations.iter().all(|declaration| {
+        context
+            .store()
+            .signature_links(*declaration)
+            .is_some_and(|links| links.resolved_signature.signature().is_some())
+    }));
+    let cold_counts = (
+        context.store().type_len(),
+        context.store().mapper_len(),
+        context.store().signature_len(),
+    );
+
+    assert!(context.check_source_file(file).is_err());
+
+    assert_eq!(
+        (
+            context.store().type_len(),
+            context.store().mapper_len(),
+            context.store().signature_len(),
+        ),
+        cold_counts
+    );
+    assert!(context.store().type_node_links(call).is_none());
+    assert!(context.store().signature_links(call).is_none());
 }

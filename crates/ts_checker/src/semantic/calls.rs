@@ -53,6 +53,7 @@ pub(super) enum DirectCallUnsupported {
     ExplicitThisParameter(SignatureId),
     RestSignature(SignatureId),
     UnresolvedReturnType(SignatureId),
+    OverloadFailureRecovery(TypeId),
 }
 
 /// Malformed callable storage or foreign semantic identities.
@@ -225,9 +226,18 @@ pub(super) fn resolve_direct_call(
     {
         return Err(DirectCallUnsupported::NotExactSingleCallable(request.callee).into());
     }
-    let candidates = projection
-        .call_signatures
-        .iter()
+    let mut callables = projection.call_signatures.iter().collect::<Vec<_>>();
+    callables.sort_by_key(|callable| {
+        !store
+            .signature(callable.signature)
+            .is_some_and(|signature| {
+                signature
+                    .flags()
+                    .contains(SignatureFlags::HAS_LITERAL_TYPES)
+            })
+    });
+    let candidates = callables
+        .into_iter()
         .map(|callable| project_validated_direct_call(store, Some(global_types), request, callable))
         .collect::<Result<Vec<_>, _>>()?;
     if candidates.len() == 1 {
@@ -250,46 +260,45 @@ pub(super) fn resolve_direct_call(
         return Ok(resolution);
     }
 
-    let mut recovery: Option<DirectCallResolution> = None;
-    for mut candidate in candidates {
-        if candidate.applicability == DirectCallApplicability::Applicable {
-            candidate.applicability =
-                check_argument_applicability(&candidate.projection, |source, target| {
-                    store.is_type_assignable_to_with_global_types_and_strict_function_types(
-                        source,
-                        target,
-                        global_types,
-                        strict_function_types,
-                    )
-                })?;
-            if candidate.applicability == DirectCallApplicability::Applicable {
-                return Ok(candidate);
-            }
-        }
-        if recovery.as_ref().is_none_or(|current| {
-            overload_failure_rank(candidate.applicability)
-                < overload_failure_rank(current.applicability)
-        }) {
-            recovery = Some(candidate);
-        }
+    if let Some(candidate) = choose_applicable_overload(&candidates, |source, target| {
+        store.is_type_subtype_of_with_global_types_and_strict_function_types(
+            source,
+            target,
+            global_types,
+            strict_function_types,
+        )
+    })? {
+        return Ok(candidate);
     }
-
-    recovery.ok_or_else(|| DirectCallUnsupported::NotExactSingleCallable(request.callee).into())
+    if let Some(candidate) = choose_applicable_overload(&candidates, |source, target| {
+        store.is_type_assignable_to_with_global_types_and_strict_function_types(
+            source,
+            target,
+            global_types,
+            strict_function_types,
+        )
+    })? {
+        return Ok(candidate);
+    }
+    Err(DirectCallUnsupported::OverloadFailureRecovery(request.callee).into())
 }
 
-fn overload_failure_rank(applicability: DirectCallApplicability) -> (u8, usize) {
-    match applicability {
-        DirectCallApplicability::ArgumentNotAssignable { .. } => (0, 0),
-        DirectCallApplicability::TooFewArguments {
-            expected_at_least,
-            actual,
-        } => (1, expected_at_least.saturating_sub(actual)),
-        DirectCallApplicability::TooManyArguments {
-            expected_at_most,
-            actual,
-        } => (1, actual.saturating_sub(expected_at_most)),
-        DirectCallApplicability::Applicable => (2, 0),
+fn choose_applicable_overload(
+    candidates: &[DirectCallResolution],
+    mut is_related: impl FnMut(TypeId, TypeId) -> Result<bool, RelationUnavailable>,
+) -> Result<Option<DirectCallResolution>, DirectCallError> {
+    for candidate in candidates {
+        if candidate.applicability != DirectCallApplicability::Applicable {
+            continue;
+        }
+        let applicability = check_argument_applicability(&candidate.projection, &mut is_related)?;
+        if applicability == DirectCallApplicability::Applicable {
+            let mut selected = candidate.clone();
+            selected.applicability = applicability;
+            return Ok(Some(selected));
+        }
     }
+    Ok(None)
 }
 
 fn validate_direct_call_form(request: DirectCallRequest<'_>) -> Result<(), DirectCallError> {

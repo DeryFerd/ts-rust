@@ -1587,6 +1587,7 @@ mod tests {
     use super::*;
     use crate::semantic::{
         CanonicalCheckerContext, SourceFileLinks,
+        bootstrap::UnionReduction,
         module_resolution::{
             CanonicalModuleResolutionEntry, CanonicalModuleResolutionManifestInput,
             CanonicalModuleResolutionMode, CanonicalResolvedModuleInput,
@@ -2302,6 +2303,31 @@ mod tests {
             ),
             cold_counts,
         );
+
+        let ordered_callee =
+            plan_direct_source_call_syntax(&parsed.arena, context.store(), *ordered_call)
+                .unwrap()
+                .callee();
+        let callable = context
+            .store()
+            .type_node_links(ordered_callee)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        let undefined = context
+            .store()
+            .intrinsic_bootstrap()
+            .unwrap()
+            .undefined_type;
+        let callable_union = context
+            .store_mut_for_test()
+            .expression_union_type(&[callable, undefined], UnionReduction::Literal)
+            .unwrap();
+        assert_eq!(
+            context
+                .store()
+                .validate_cached_union_result(callable_union, None),
+            Ok(())
+        );
     }
 
     #[test]
@@ -2348,9 +2374,10 @@ mod tests {
     }
 
     #[test]
-    fn declared_call_set_failure_recovers_to_the_arity_compatible_signature() {
-        // Pinned tsgo reports TS2345 against the second overload and retains
-        // its number return type; the first declaration has the wrong arity.
+    fn declared_call_set_failure_recovery_remains_an_atomic_boundary() {
+        // Pinned tsgo synthesizes a recovery signature whose return type is
+        // `never`. That constructor is outside this overload slice, so the
+        // call must remain unpublished rather than reuse either declaration.
         let parsed = parsed(concat!(
             "interface Recovery { ",
             "(value: number, other: number): string; ",
@@ -2363,51 +2390,25 @@ mod tests {
             .into_iter()
             .next()
             .expect("fixture contains one direct call");
-        let mut declarations = parsed
+        let declarations = parsed
             .arena
             .iter()
             .filter(|(_, record)| record.kind == SyntaxKind::CallSignature)
-            .map(|(node, record)| {
-                (
-                    record.range.start,
-                    NodeRef::new(parsed.arena.id(), file, node),
-                )
-            })
+            .map(|(node, _)| NodeRef::new(parsed.arena.id(), file, node))
             .collect::<Vec<_>>();
-        declarations.sort_by_key(|(start, _)| *start);
-        let [_, (_, second)] = declarations.as_slice() else {
-            panic!("expected two declared call signatures")
-        };
         let mut context = context(&parsed, file);
 
-        context.check_source_file(file).unwrap();
+        assert!(context.check_source_file(file).is_err());
 
-        assert_eq!(
-            context
-                .diagnostics()
-                .as_slice()
-                .iter()
-                .map(|diagnostic| diagnostic.diagnostic.code())
-                .collect::<Vec<_>>(),
-            [2345]
-        );
-        assert_eq!(
+        assert!(context.diagnostics().is_empty());
+        assert!(context.store().type_node_links(call).is_none());
+        assert!(context.store().signature_links(call).is_none());
+        assert!(declarations.iter().all(|declaration| {
             context
                 .store()
-                .type_node_links(call)
-                .and_then(|links| links.resolved_type),
-            Some(context.store().intrinsic_bootstrap().unwrap().number_type)
-        );
-        assert_eq!(
-            context
-                .store()
-                .signature_links(call)
-                .and_then(|links| links.resolved_signature.signature()),
-            context
-                .store()
-                .signature_links(*second)
-                .and_then(|links| links.resolved_signature.signature())
-        );
+                .signature_links(*declaration)
+                .is_some_and(|links| links.resolved_signature.signature().is_some())
+        }));
     }
 
     #[test]

@@ -2300,7 +2300,41 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     }
                 }
             }
-            TypeData::Interface(_) => {
+            TypeData::Interface(interface) => {
+                match validate_stored_callable_set(self, type_) {
+                    StoredCallableSetValidation::Valid { edges, .. } => {
+                        if !visiting.insert(type_) {
+                            return Ok(());
+                        }
+                        for edge in edges {
+                            self.validate_cached_array_capability_worker(
+                                edge,
+                                array_validation,
+                                visiting,
+                                allowed_pending,
+                            )?;
+                        }
+                        return Ok(());
+                    }
+                    StoredCallableSetValidation::Malformed { .. } => {
+                        return Err(LiteralTypeCacheError::InvalidCachedUnion(type_));
+                    }
+                    StoredCallableSetValidation::Pending {
+                        family: CallableFamily::FunctionType,
+                    } if allowed_pending.contains(&type_) => {
+                        return Ok(());
+                    }
+                    StoredCallableSetValidation::Pending { .. } => {
+                        return Err(LiteralTypeCacheError::InvalidCachedUnion(type_));
+                    }
+                    StoredCallableSetValidation::NotCallable
+                        if interface.reference.object.structured.signatures.is_some()
+                            || interface.reference.object.structured.call_signature_count != 0 =>
+                    {
+                        return Err(LiteralTypeCacheError::InvalidCachedUnion(type_));
+                    }
+                    StoredCallableSetValidation::NotCallable => {}
+                }
                 match object_members::validate_resolved_declared_property_object(self, type_) {
                     object_members::DeclaredPropertyObjectValidation::Valid(_) => self
                         .validate_cached_array_capability_worker(
