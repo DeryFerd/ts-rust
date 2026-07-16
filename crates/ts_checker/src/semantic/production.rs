@@ -21,13 +21,13 @@ use ts_binder::{
 };
 
 use super::{
-    AssignabilityErrorDisplay, CanonicalCheckerDiagnostics, CanonicalGlobalTypeInitializationError,
-    CanonicalGlobalTypes, CanonicalModuleResolutionLookup, CanonicalModuleResolutionManifest,
-    CanonicalModuleResolutionManifestError, CanonicalModuleResolutionManifestInput,
-    CanonicalTypeFormatFlags, CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHost,
-    DeclaredTypeHostError, IntrinsicBootstrapError, IntrinsicBootstrapOptions, SignatureId,
-    RelationUnavailable, SourceCheckError, SourceCheckProvenanceError, SourceFileRef,
-    SymbolMergeError, TypeDisplayUnavailable, TypeId,
+    AssignabilityErrorDisplay, CanonicalCheckerDiagnostics, CanonicalEnumSemantics,
+    CanonicalGlobalTypeInitializationError, CanonicalGlobalTypes, CanonicalModuleResolutionLookup,
+    CanonicalModuleResolutionManifest, CanonicalModuleResolutionManifestError,
+    CanonicalModuleResolutionManifestInput, CanonicalTypeFormatFlags, CanonicalTypeMapperStore,
+    DeclaredTypeError, DeclaredTypeHost, DeclaredTypeHostError, IntrinsicBootstrapError,
+    IntrinsicBootstrapOptions, RelationUnavailable, SignatureId, SourceCheckError,
+    SourceCheckProvenanceError, SourceFileRef, SymbolMergeError, TypeDisplayUnavailable, TypeId,
     alias::{CanonicalAliasResolution, CanonicalAliasResolutionError, CanonicalAliasResolver},
     alias_flags::{
         CanonicalSymbolFlagsError, CanonicalSymbolFlagsResolution, CanonicalSymbolFlagsResolver,
@@ -622,6 +622,40 @@ impl<'arena> CanonicalCheckerContext<'arena> {
             diagnostics,
         )?
         .get_declared_type_of_symbol(symbol)
+    }
+
+    /// Publishes or validates the exact type/value/member identities for one
+    /// context-owned top-level literal enum.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed host, provenance, unsupported-syntax, or poisoned-cache
+    /// error without partially publishing an enum graph.
+    pub fn get_enum_semantics(
+        &mut self,
+        symbol: SemanticSymbolId,
+    ) -> Result<CanonicalEnumSemantics, DeclaredTypeError> {
+        let Self {
+            options,
+            files,
+            store,
+            diagnostics,
+            global_types,
+            ..
+        } = self;
+        let host = DeclaredTypeHost::from_registry(
+            store,
+            files,
+            GlobalMergeCompletion::new(options.name_resolution),
+        )?;
+        CanonicalTypeQuery::new_with_global_types(
+            store,
+            &host,
+            global_types,
+            *options,
+            diagnostics,
+        )?
+        .get_enum_semantics(symbol)
     }
 
     /// Resolves one type node through the context-owned query session.

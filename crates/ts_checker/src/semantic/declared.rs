@@ -3,10 +3,10 @@
 //! This is the dependency-closed first cut of TypeScript-Go's
 //! `getDeclaredTypeOfSymbol`, pinned to
 //! `dc37b5249ab60e2bbce936f71b883e6c8136167e`. It deliberately implements
-//! classes, interfaces whose `this` decision is dependency-closed, and ordinary
-//! type parameters. Other declared families remain explicit unavailable
-//! results, while symbols with no declared-type family retain the pinned
-//! `errorType` fallback.
+//! classes, interfaces whose `this` decision is dependency-closed, ordinary
+//! type parameters, and top-level literal enums. Other declared families
+//! remain explicit unavailable results, while symbols with no declared-type
+//! family retain the pinned `errorType` fallback.
 //!
 //! The Go checker can follow mutable AST pointers directly. The Rust port
 //! instead requires a provenance-bearing [`DeclaredTypeHost`] containing the
@@ -30,6 +30,7 @@ use xxhash_rust::xxh3::Xxh3;
 use super::{
     TypeResolutionTargetError,
     alias_provider::ProductionAliasSourceRegistry,
+    enums::{self, EnumTypeError},
     ids::TypeId,
     mapper::TypeMapper,
     name_resolution::{ProductionNameResolverHost, ProductionNameResolverHostError},
@@ -309,8 +310,6 @@ impl<'a> DeclaredTypeHost<'a> {
 /// Declared families intentionally outside this cut.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UnsupportedDeclaredTypeKind {
-    Enum,
-    EnumMember,
     Alias,
 }
 
@@ -358,6 +357,7 @@ pub enum DeclaredTypeUnavailable {
 pub enum DeclaredTypeError {
     Unavailable(DeclaredTypeUnavailable),
     TypeNodeUnavailable(TypeNodeUnavailable),
+    Enum(EnumTypeError),
     Host(DeclaredTypeHostError),
     NameResolverHost(ProductionNameResolverHostError),
     NameResolution(CanonicalNameResolutionError),
@@ -379,6 +379,7 @@ impl std::fmt::Display for DeclaredTypeError {
             Self::TypeNodeUnavailable(reason) => {
                 write!(formatter, "type node is unavailable: {reason:?}")
             }
+            Self::Enum(error) => write!(formatter, "{error}"),
             Self::Host(error) => write!(formatter, "{error}"),
             Self::NameResolverHost(error) => write!(formatter, "{error}"),
             Self::NameResolution(error) => write!(formatter, "{error}"),
@@ -391,6 +392,7 @@ impl std::error::Error for DeclaredTypeError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Unavailable(_) | Self::TypeNodeUnavailable(_) => None,
+            Self::Enum(error) => Some(error),
             Self::Host(error) => Some(error),
             Self::NameResolverHost(error) => Some(error),
             Self::NameResolution(error) => Some(error),
@@ -408,6 +410,12 @@ impl From<ProductionNameResolverHostError> for DeclaredTypeError {
 impl From<DeclaredTypeHostError> for DeclaredTypeError {
     fn from(error: DeclaredTypeHostError) -> Self {
         Self::Host(error)
+    }
+}
+
+impl From<EnumTypeError> for DeclaredTypeError {
+    fn from(error: EnumTypeError) -> Self {
+        Self::Enum(error)
     }
 }
 
@@ -1702,22 +1710,13 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             .intrinsic_bootstrap()
             .ok_or_else(|| unavailable(DeclaredTypeUnavailable::IntrinsicBootstrapNotInitialized))?
             .error_type;
+        if let Some(declared_type) = enums::get_declared_enum_or_member(self, host, symbol)? {
+            return Ok(declared_type);
+        }
         if let Some(declared_type) =
             get_declared_class_interface_or_type_parameter(self, host, symbol, flags)?
         {
             return Ok(declared_type);
-        }
-        if flags.intersects(SymbolFlags::ENUM) {
-            return Err(unavailable(
-                DeclaredTypeUnavailable::UnsupportedDeclaredType(UnsupportedDeclaredTypeKind::Enum),
-            ));
-        }
-        if flags.contains(SymbolFlags::ENUM_MEMBER) {
-            return Err(unavailable(
-                DeclaredTypeUnavailable::UnsupportedDeclaredType(
-                    UnsupportedDeclaredTypeKind::EnumMember,
-                ),
-            ));
         }
         if flags.contains(SymbolFlags::ALIAS) {
             return Err(unavailable(
@@ -3045,7 +3044,7 @@ mod tests {
     }
 
     #[test]
-    fn dispatcher_keeps_unsupported_families_unavailable_and_values_on_error_type() {
+    fn dispatcher_publishes_enums_and_keeps_aliases_unavailable_and_values_on_error_type() {
         let mut fixture = fixture_with_module_state(
             "import { remote as local } from 'm'; enum E { M } const value = 1;",
             CanonicalModuleState::External,
@@ -3057,21 +3056,33 @@ mod tests {
         let error_type = fixture.store.intrinsic_bootstrap().unwrap().error_type;
         let bound = fixture.files.get(&fixture.file).unwrap();
         let host = host(&fixture.parsed.arena, bound);
+        let enum_type = fixture
+            .store
+            .get_declared_type_of_symbol(&host, enum_symbol)
+            .unwrap();
+        let member_type = fixture
+            .store
+            .get_declared_type_of_symbol(&host, member)
+            .unwrap();
+        assert_ne!(enum_type, member_type);
+        assert_eq!(
+            fixture.store.type_payload(enum_type).unwrap().symbol(),
+            Some(member)
+        );
+        assert_eq!(
+            fixture.store.type_payload(member_type).unwrap().symbol(),
+            Some(member)
+        );
         let type_count = fixture.store.type_len();
         let link_counts = fixture.store.checker_link_allocated_lengths();
-
-        for (symbol, kind) in [
-            (enum_symbol, UnsupportedDeclaredTypeKind::Enum),
-            (member, UnsupportedDeclaredTypeKind::EnumMember),
-            (import, UnsupportedDeclaredTypeKind::Alias),
-        ] {
-            assert_eq!(
-                fixture.store.get_declared_type_of_symbol(&host, symbol),
-                Err(unavailable(
-                    DeclaredTypeUnavailable::UnsupportedDeclaredType(kind)
-                ))
-            );
-        }
+        assert_eq!(
+            fixture.store.get_declared_type_of_symbol(&host, import),
+            Err(unavailable(
+                DeclaredTypeUnavailable::UnsupportedDeclaredType(
+                    UnsupportedDeclaredTypeKind::Alias
+                )
+            ))
+        );
         assert_eq!(
             fixture.store.get_declared_type_of_symbol(&host, value),
             Ok(error_type)

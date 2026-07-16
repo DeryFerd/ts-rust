@@ -18,6 +18,7 @@ mod contextual;
 pub mod declared;
 mod derived_types;
 pub mod diagnostics;
+mod enums;
 pub mod formatter;
 mod functions;
 mod global_types;
@@ -61,6 +62,10 @@ pub use declared::{
 pub use derived_types::DerivedTypeError;
 pub use diagnostics::{
     CanonicalCheckerDiagnostic, CanonicalCheckerDiagnostics, CanonicalCheckerRelatedInformation,
+};
+pub use enums::{
+    CanonicalEnumMemberSemantics, CanonicalEnumMemberValue, CanonicalEnumSemantics, EnumTypeError,
+    EnumTypeInvariant, EnumTypeUnsupported,
 };
 pub use formatter::{
     AssignabilityErrorDisplay, CanonicalTypeFormatFlags, TypeDisplayUnavailable,

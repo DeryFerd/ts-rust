@@ -185,8 +185,7 @@ fn plan_enum(
                     .ok_or_else(|| {
                         invariant(EnumTypeInvariant::MissingOrForeignFacts(declaration))
                     })?
-                    .source_file()
-                    .node,
+                    .source_file(),
             ))
     {
         return Err(unsupported(EnumTypeUnsupported::NestedDeclaration(
@@ -338,6 +337,16 @@ fn plan_enum(
     };
     enum_state(store, &plan)?;
     Ok(plan)
+}
+
+/// Allocation-free syntax, binder, and cold/warm cache preflight for a type
+/// reference that targets an enum owner.
+pub(super) fn preflight_enum(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    symbol: SemanticSymbolId,
+) -> Result<(), EnumTypeError> {
+    plan_enum(store, host, symbol).map(drop)
 }
 
 fn validate_modifiers(
@@ -668,6 +677,98 @@ fn validate_literal_pair(
         .then_some(regular)
 }
 
+fn enum_value_from_literal(value: &LiteralValue) -> Option<CanonicalEnumMemberValue> {
+    match value {
+        LiteralValue::Number(value) => Some(CanonicalEnumMemberValue::Number(*value)),
+        LiteralValue::String(value) => Some(CanonicalEnumMemberValue::String(value.clone())),
+        LiteralValue::ComputedEnum => Some(CanonicalEnumMemberValue::Computed),
+        LiteralValue::Boolean(_) | LiteralValue::BigInt(_) => None,
+    }
+}
+
+fn validated_enum_literal_symbol(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+) -> Option<SemanticSymbolId> {
+    let record = store.type_payload(type_)?;
+    let TypeData::Literal(data) = record.data() else {
+        return None;
+    };
+    let regular = data.regular_type;
+    let TypeData::Literal(regular_data) = store.type_payload(regular)?.data() else {
+        return None;
+    };
+    let fresh = regular_data.fresh_type?;
+    let symbol = record.symbol()?;
+    let value = enum_value_from_literal(&data.value)?;
+    ((type_ == regular || type_ == fresh)
+        && validate_literal_pair(store, fresh, symbol, &value) == Some(regular))
+    .then_some(symbol)
+}
+
+/// Returns the pinned unqualified enum or enum-member display when `type_` is
+/// a complete canonical enum identity.
+pub(super) fn enum_type_display_name(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+) -> Option<String> {
+    let record = store.type_payload(type_)?;
+    if !record.flags().intersects(TypeFlags::ENUM_LIKE) {
+        return None;
+    }
+    let symbol = record.symbol()?;
+    let symbol_record = store.symbol(symbol)?;
+    if symbol_record.flags() == SymbolFlags::ENUM_MEMBER {
+        (validated_enum_literal_symbol(store, type_) == Some(symbol)).then_some(())?;
+        let parent = symbol_record.parent()?;
+        let parent_record = store.symbol(parent)?;
+        parent_record
+            .flags()
+            .intersects(SymbolFlags::ENUM)
+            .then_some(())?;
+        return Some(format!(
+            "{}.{}",
+            parent_record.name().as_utf8()?,
+            symbol_record.name().as_utf8()?
+        ));
+    }
+    if !symbol_record.flags().intersects(SymbolFlags::ENUM) {
+        return None;
+    }
+    if record.flags() == TypeFlags::ENUM {
+        (validated_enum_literal_symbol(store, type_) == Some(symbol)).then_some(())?;
+    } else {
+        let TypeData::Union(union) = record.data() else {
+            return None;
+        };
+        let alias = record.alias().and_then(|alias| store.type_alias(alias))?;
+        if record.flags() != TypeFlags::UNION | TypeFlags::ENUM_LITERAL
+            || record.object_flags() != ObjectFlags::PRIMITIVE_UNION
+            || alias.symbol() != Some(symbol)
+            || alias.type_arguments().is_some()
+            || union.union.types.len() < 2
+            || union
+                != &(UnionTypeData {
+                    union: UnionOrIntersectionTypeData {
+                        types: union.union.types.clone(),
+                        ..UnionOrIntersectionTypeData::default()
+                    },
+                    ..UnionTypeData::default()
+                })
+            || union.union.types.iter().any(|member| {
+                validated_enum_literal_symbol(store, *member).is_none_or(|member_symbol| {
+                    store
+                        .symbol(member_symbol)
+                        .is_none_or(|member| member.parent() != Some(symbol))
+                })
+            })
+        {
+            return None;
+        }
+    }
+    Some(symbol_record.name().as_utf8()?.to_owned())
+}
+
 fn validate_declared_type(
     store: &CanonicalTypeMapperStore,
     plan: &EnumPlan,
@@ -924,6 +1025,7 @@ mod tests {
     use super::*;
     use crate::semantic::{
         IntrinsicBootstrapOptions, SemanticStore, mapper::TypeMapper, type_records::TypeRecord,
+        type_to_string,
     };
 
     type TestStore = SemanticStore<TypeRecord, TypeMapper>;
@@ -1072,6 +1174,10 @@ mod tests {
         let declared = fixture.store.type_payload(first.declared_type).unwrap();
         assert_eq!(declared.flags(), TypeFlags::UNION | TypeFlags::ENUM_LITERAL);
         assert_eq!(declared.symbol(), Some(owner));
+        assert_eq!(
+            type_to_string(&fixture.store, first.declared_type),
+            Ok("Mixed".to_owned())
+        );
         let value = fixture.store.type_payload(first.value_type).unwrap();
         assert_eq!(value.flags(), TypeFlags::OBJECT);
         assert_eq!(value.object_flags(), ObjectFlags::ANONYMOUS);
@@ -1085,6 +1191,11 @@ mod tests {
                     .unwrap()
                     .symbol(),
                 Some(member.symbol)
+            );
+            let member_name = fixture.store.symbol(member.symbol).unwrap().name();
+            assert_eq!(
+                type_to_string(&fixture.store, member.fresh_type),
+                Ok(format!("Mixed.{}", member_name.as_utf8().unwrap()))
             );
             assert_eq!(
                 fixture
@@ -1189,6 +1300,10 @@ mod tests {
         let empty_record = fixture.store.type_payload(empty.declared_type).unwrap();
         assert_eq!(empty_record.flags(), TypeFlags::ENUM);
         assert_eq!(empty_record.symbol(), Some(empty_owner));
+        assert_eq!(
+            type_to_string(&fixture.store, empty.declared_type),
+            Ok("Empty".to_owned())
+        );
     }
 
     #[test]

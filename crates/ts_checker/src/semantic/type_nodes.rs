@@ -21,6 +21,7 @@ use super::{
         malformed_alias_merge, preflight_class_or_interface_reference, preflight_node,
         preflight_type_parameter_symbol, type_list_key,
     },
+    enums::{self, CanonicalEnumSemantics},
     functions::{
         self, FunctionTypeError, FunctionTypePlan, PendingFunctionTypeProof, PendingParameterTypes,
     },
@@ -2378,6 +2379,13 @@ impl<'store, 'host, 'arena> TypeQueryPlanner<'store, 'host, 'arena> {
                 self.plan_property_interface(symbol)?;
             }
             PlannedTypeReferenceArity::Valid
+        } else if flags.intersects(SymbolFlags::ENUM) {
+            enums::preflight_enum(self.store, self.host, symbol)?;
+            if type_arguments.is_empty() {
+                PlannedTypeReferenceArity::Valid
+            } else {
+                PlannedTypeReferenceArity::NotGeneric
+            }
         } else if flags.contains(SymbolFlags::TYPE_PARAMETER) {
             preflight_type_parameter_symbol(self.store, self.host, symbol, &mut HashSet::new())?;
             if type_arguments.is_empty() {
@@ -3554,6 +3562,21 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         Ok(pending.type_)
     }
 
+    /// Publishes or validates the complete type/value/member graph for one
+    /// exact top-level literal enum owner.
+    pub(super) fn get_enum_semantics(
+        &mut self,
+        symbol: SemanticSymbolId,
+    ) -> Result<CanonicalEnumSemantics, DeclaredTypeError> {
+        if !self.pending_function_parameters.is_empty() {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidCachedTypeAlias(symbol),
+            ));
+        }
+        let symbol = self.canonical_symbol(symbol)?;
+        enums::get_enum_semantics(self.store, self.host, symbol).map_err(Into::into)
+    }
+
     /// Resolves the explicitly annotated return type of an exact function-type
     /// signature. Return annotations remain lazy after the function object and
     /// its parameter value types have been published.
@@ -4154,20 +4177,13 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             }
             return Ok(declared_type);
         }
+        if let Some(declared_type) =
+            enums::get_declared_enum_or_member(self.store, self.host, symbol)?
+        {
+            return Ok(declared_type);
+        }
         if flags.contains(SymbolFlags::TYPE_ALIAS) {
             return self.execute_type_alias(symbol, plan, prepared);
-        }
-        if flags.intersects(SymbolFlags::ENUM) {
-            return Err(DeclaredTypeError::Unavailable(
-                DeclaredTypeUnavailable::UnsupportedDeclaredType(UnsupportedDeclaredTypeKind::Enum),
-            ));
-        }
-        if flags.contains(SymbolFlags::ENUM_MEMBER) {
-            return Err(DeclaredTypeError::Unavailable(
-                DeclaredTypeUnavailable::UnsupportedDeclaredType(
-                    UnsupportedDeclaredTypeKind::EnumMember,
-                ),
-            ));
         }
         if flags.contains(SymbolFlags::ALIAS) {
             return Err(DeclaredTypeError::Unavailable(
@@ -5404,6 +5420,7 @@ mod tests {
             NodeData::TypeAliasDeclaration(data) => data.name,
             NodeData::InterfaceDeclaration(data) => data.name,
             NodeData::ClassDeclaration(data) => data.name?,
+            NodeData::EnumDeclaration(data) => data.name,
             NodeData::TypeParameterDeclaration(data) => data.name,
             NodeData::VariableDeclaration(data) => data.name,
             NodeData::FunctionDeclaration(data) => data.name?,
@@ -8966,6 +8983,56 @@ mod tests {
             .unwrap();
         assert_eq!(class_alias_type, class_type);
         assert_eq!(interface_alias_type, interface_type);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn non_generic_alias_to_enum_publishes_and_preserves_the_enum_identity() {
+        let mut fixture = fixture("enum State { Idle, Busy = 4 } type StateAlias = State;");
+        let enumeration = named_symbol(&fixture, SyntaxKind::EnumDeclaration, "State");
+        let alias = named_symbol(
+            &fixture,
+            SyntaxKind::TypeAliasDeclaration,
+            "StateAlias",
+        );
+        let (_, _, reference) = alias_parts(&fixture, "StateAlias");
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        let alias_type = query_declared(
+            &mut fixture,
+            alias,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        let state_after_cold_query = store_state(&fixture.store);
+        let host = post_global_host(
+            &fixture.parsed.arena,
+            fixture.files.get(&fixture.file).unwrap(),
+        );
+        let enum_type = fixture
+            .store
+            .get_declared_type_of_symbol(&host, enumeration)
+            .unwrap();
+
+        assert_eq!(alias_type, enum_type);
+        assert_eq!(
+            fixture
+                .store
+                .type_node_links(reference)
+                .and_then(|links| links.resolved_type),
+            Some(enum_type)
+        );
+        assert_eq!(
+            query_declared(
+                &mut fixture,
+                alias,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Ok(enum_type)
+        );
+        assert_eq!(store_state(&fixture.store), state_after_cold_query);
         assert!(diagnostics.is_empty());
     }
 

@@ -25,6 +25,7 @@ use super::{
         ValidatedSingleCallSignatureDisplay, single_callable_display_projection,
         single_callable_family, validate_stored_single_callable,
     },
+    enums,
     functions::{FunctionTypeDisplayError, FunctionTypeUnsupported},
     links::ValueSymbolLinks,
     source_callables::{SourceCallableDisplayError, SourceCallableUnsupported},
@@ -561,6 +562,14 @@ fn display_type_worker(
         .ok_or(TypeDisplayUnavailable::Type(type_id))?;
     let type_flags = record.flags();
 
+    if store.canonical_empty_tuple_type_cache() == Some(type_id) {
+        store
+            .validate_canonical_empty_tuple_type(type_id)
+            .map_err(TypeDisplayUnavailable::EmptyTupleType)?;
+        state.add(2);
+        return Ok("[]".to_owned());
+    }
+
     if type_flags.intersects(TypeFlags::ANY) {
         if let Some(alias) = record.alias() {
             return Err(TypeDisplayUnavailable::Alias { type_id, alias });
@@ -604,10 +613,10 @@ fn display_type_worker(
         return Ok("boolean".to_owned());
     }
     if type_flags.intersects(TypeFlags::ENUM_LIKE) {
-        return Err(TypeDisplayUnavailable::UnsupportedType {
-            type_id,
-            kind: record.data().kind(),
-        });
+        let name = enums::enum_type_display_name(store, type_id)
+            .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+        state.add(name.len());
+        return Ok(name);
     }
     if type_flags.intersects(TypeFlags::STRING_LITERAL) {
         let literal = literal_data(type_id, record)?;
@@ -778,13 +787,6 @@ fn display_object_type(
             state,
             visiting,
         );
-    }
-    if store.canonical_empty_tuple_type_cache() == Some(type_id) {
-        store
-            .validate_canonical_empty_tuple_type(type_id)
-            .map_err(TypeDisplayUnavailable::EmptyTupleType)?;
-        state.add(2);
-        return Ok("[]".to_owned());
     }
     if let Some(alias) = record.alias() {
         if single_callable_family(store, type_id).is_some() {
