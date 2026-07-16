@@ -6,6 +6,8 @@
 //! shell/signature/parameter types, and validates the resulting store shape.
 //! Source values never borrow `FunctionType` `TypeNode` or `__call` provenance.
 
+use std::collections::HashSet;
+
 use ts_ast::{ModifierList, NodeData, NodeList, NodeRef, SyntaxKind};
 use ts_binder::{CheckFlags, InternalSymbolName, SemanticSymbolId, SymbolFlags};
 
@@ -15,7 +17,10 @@ use super::{
     array_types::CanonicalArrayTargets,
     bootstrap::{LiteralTypeCacheError, PreparedTypeQueryTypes},
     callables::{ValidatedSingleCallParameterDisplay, ValidatedSingleCallSignatureDisplay},
-    declared::preflight_node,
+    declared::{
+        cached_ordinary_type_parameter_owner, execute_type_parameter,
+        explicit_type_parameter_symbols, preflight_node,
+    },
     functions::{StoredFunctionTypeValidation, validate_stored_function_type},
     links::{
         DecoratorSignatureState, EffectsSignatureState, ResolvedSignatureState, SignatureLinks,
@@ -42,6 +47,13 @@ pub(super) struct SourceCallableParameterPlan {
     pub(super) optional: bool,
 }
 
+/// One exact declared type-parameter identity owned by a source signature.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct SourceCallableTypeParameterPlan {
+    pub(super) declaration: NodeRef,
+    pub(super) symbol: SemanticSymbolId,
+}
+
 /// Binder/syntax proof retained across source-callable publication.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct SourceCallablePlan {
@@ -50,6 +62,7 @@ pub(super) struct SourceCallablePlan {
     pub(super) owner_symbol: SemanticSymbolId,
     pub(super) owner_parent: Option<SemanticSymbolId>,
     pub(super) export_local: Option<SemanticSymbolId>,
+    pub(super) type_parameters: Vec<SourceCallableTypeParameterPlan>,
     pub(super) parameters: Vec<SourceCallableParameterPlan>,
     pub(super) return_type: NodeRef,
     return_identity_node: NodeRef,
@@ -223,7 +236,7 @@ struct SourceSyntaxView<'a> {
     family: SourceCallableFamily,
     parameters: &'a NodeList,
     modifiers: Option<&'a ModifierList>,
-    type_parameters: bool,
+    type_parameters: Option<&'a NodeList>,
     return_type: Option<ts_ast::NodeId>,
     body: Option<ts_ast::NodeId>,
     asterisk_token: Option<ts_ast::NodeId>,
@@ -249,7 +262,7 @@ pub(super) fn plan_source_callable(
                 family: SourceCallableFamily::FunctionDeclaration,
                 parameters: &function.parameters,
                 modifiers: function.modifiers.as_ref(),
-                type_parameters: function.type_parameters.is_some(),
+                type_parameters: function.type_parameters.as_ref(),
                 return_type: function.type_,
                 body: function.body,
                 asterisk_token: function.asterisk_token,
@@ -269,7 +282,7 @@ pub(super) fn plan_source_callable(
                 family: SourceCallableFamily::ArrowFunction,
                 parameters: &function.parameters,
                 modifiers: function.modifiers.as_ref(),
-                type_parameters: function.type_parameters.is_some(),
+                type_parameters: function.type_parameters.as_ref(),
                 return_type: function.type_,
                 body: Some(function.body),
                 asterisk_token: function.asterisk_token,
@@ -298,11 +311,14 @@ pub(super) fn plan_source_callable(
             declaration,
         )));
     }
-    if view.type_parameters {
-        return Err(SourceCallableError::Unsupported(
-            SourceCallableUnsupported::GenericSignature(declaration),
-        ));
-    }
+    let type_parameters = plan_exact_source_type_parameters(
+        store,
+        host,
+        declaration,
+        view.family,
+        view.type_parameters,
+        view.parameters,
+    )?;
     if let Some(asterisk) = view.asterisk_token {
         let asterisk = NodeRef::new(declaration.arena, declaration.file, asterisk);
         preflight_child(store, host, declaration, asterisk)?;
@@ -548,6 +564,7 @@ pub(super) fn plan_source_callable(
         owner_symbol,
         owner_parent: owner.parent(),
         export_local,
+        type_parameters,
         parameters,
         return_type,
         return_identity_node,
@@ -557,8 +574,193 @@ pub(super) fn plan_source_callable(
         min_argument_count,
         array_targets,
     };
+    validate_exact_generic_annotation_shape(store, host, &plan)?;
     source_callable_state(store, &plan, true)?;
     Ok(plan)
+}
+
+fn plan_exact_source_type_parameters(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    declaration: NodeRef,
+    family: SourceCallableFamily,
+    type_parameters: Option<&NodeList>,
+    parameters: &NodeList,
+) -> Result<Vec<SourceCallableTypeParameterPlan>, SourceCallableError> {
+    let Some(type_parameters) = type_parameters else {
+        return Ok(Vec::new());
+    };
+    if family != SourceCallableFamily::FunctionDeclaration
+        || type_parameters.has_trailing_comma
+        || type_parameters.nodes.len() != 1
+        || type_parameters.range.start < preflight_node(store, host, declaration)?.range.start
+        || type_parameters.range.end > parameters.range.start
+    {
+        return Err(SourceCallableError::Unsupported(
+            SourceCallableUnsupported::GenericSignature(declaration),
+        ));
+    }
+
+    let type_parameter = NodeRef::new(
+        declaration.arena,
+        declaration.file,
+        type_parameters.nodes[0],
+    );
+    let record = preflight_node(store, host, type_parameter)?;
+    let NodeData::TypeParameterDeclaration(data) = &record.data else {
+        return Err(invariant(SourceCallableInvariant::InvalidSyntax(
+            type_parameter,
+        )));
+    };
+    if record.kind != SyntaxKind::TypeParameter
+        || record.parent != Some(declaration.node)
+        || record.flags.0 & NODE_FLAG_JSDOC != 0
+        || record.range.start < type_parameters.range.start
+        || record.range.end > type_parameters.range.end
+        || data.constraint.is_some()
+        || data.default_type.is_some()
+        || data.expression.is_some()
+        || data.modifiers.is_some()
+    {
+        return Err(SourceCallableError::Unsupported(
+            SourceCallableUnsupported::GenericSignature(type_parameter),
+        ));
+    }
+    if data.symbol.is_some() {
+        return Err(invariant(SourceCallableInvariant::InvalidSyntax(
+            type_parameter,
+        )));
+    }
+    let name = NodeRef::new(type_parameter.arena, type_parameter.file, data.name);
+    let name_record = preflight_node(store, host, name)?;
+    let NodeData::Identifier(identifier) = &name_record.data else {
+        return Err(invariant(SourceCallableInvariant::InvalidSyntax(name)));
+    };
+    if name_record.kind != SyntaxKind::Identifier
+        || name_record.parent != Some(type_parameter.node)
+        || name_record.flags.0 != 0
+        || name_record.range.start < record.range.start
+        || name_record.range.end > record.range.end
+        || identifier.text.is_empty()
+        || identifier.flow_node.is_some()
+    {
+        return Err(invariant(SourceCallableInvariant::InvalidSyntax(name)));
+    }
+
+    let symbols = explicit_type_parameter_symbols(
+        store,
+        host,
+        declaration,
+        Some(type_parameters),
+        &mut HashSet::new(),
+    )?;
+    let [symbol] = symbols.as_slice() else {
+        return Err(SourceCallableError::Unsupported(
+            SourceCallableUnsupported::GenericSignature(type_parameter),
+        ));
+    };
+    let symbol_record = store
+        .symbol(*symbol)
+        .ok_or_else(|| invariant(SourceCallableInvariant::InvalidOwnerSymbol(type_parameter)))?;
+    if symbol_record.flags() != SymbolFlags::TYPE_PARAMETER
+        || symbol_record.check_flags() != CheckFlags::NONE
+        || symbol_record.declarations() != Some(&[type_parameter])
+        || symbol_record.value_declaration().is_some()
+        || symbol_record.members().is_some()
+        || symbol_record.exports().is_some()
+        || symbol_record.parent().is_some()
+        || symbol_record.export_symbol().is_some()
+    {
+        return Err(invariant(SourceCallableInvariant::InvalidOwnerSymbol(
+            type_parameter,
+        )));
+    }
+    Ok(vec![SourceCallableTypeParameterPlan {
+        declaration: type_parameter,
+        symbol: *symbol,
+    }])
+}
+
+fn validate_exact_generic_annotation_shape(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    plan: &SourceCallablePlan,
+) -> Result<(), SourceCallableError> {
+    let [] = plan.type_parameters.as_slice() else {
+        let [type_parameter] = plan.type_parameters.as_slice() else {
+            return Err(SourceCallableError::Unsupported(
+                SourceCallableUnsupported::GenericSignature(plan.declaration),
+            ));
+        };
+        let [parameter] = plan.parameters.as_slice() else {
+            return Err(SourceCallableError::Unsupported(
+                SourceCallableUnsupported::GenericSignature(plan.declaration),
+            ));
+        };
+        if parameter.optional
+            || !is_naked_source_type_parameter_annotation(
+                store,
+                host,
+                parameter.identity_node,
+                type_parameter,
+            )?
+            || !is_naked_source_type_parameter_annotation(
+                store,
+                host,
+                plan.return_identity_node,
+                type_parameter,
+            )?
+        {
+            return Err(SourceCallableError::Unsupported(
+                SourceCallableUnsupported::GenericSignature(plan.declaration),
+            ));
+        }
+        return Ok(());
+    };
+    Ok(())
+}
+
+fn is_naked_source_type_parameter_annotation(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    annotation: NodeRef,
+    type_parameter: &SourceCallableTypeParameterPlan,
+) -> Result<bool, SourceCallableError> {
+    let annotation_record = preflight_node(store, host, annotation)?;
+    let NodeData::TypeReferenceNode(reference) = &annotation_record.data else {
+        return Ok(false);
+    };
+    if annotation_record.kind != SyntaxKind::TypeReference || reference.type_arguments.is_some() {
+        return Ok(false);
+    }
+    let name = NodeRef::new(annotation.arena, annotation.file, reference.type_name);
+    let name_record = preflight_node(store, host, name)?;
+    let NodeData::Identifier(name_identifier) = &name_record.data else {
+        return Ok(false);
+    };
+    let type_parameter_record = preflight_node(store, host, type_parameter.declaration)?;
+    let NodeData::TypeParameterDeclaration(type_parameter_data) = &type_parameter_record.data
+    else {
+        return Err(invariant(SourceCallableInvariant::InvalidSyntax(
+            type_parameter.declaration,
+        )));
+    };
+    let declaration_name = NodeRef::new(
+        type_parameter.declaration.arena,
+        type_parameter.declaration.file,
+        type_parameter_data.name,
+    );
+    let declaration_name_record = preflight_node(store, host, declaration_name)?;
+    let NodeData::Identifier(declaration_identifier) = &declaration_name_record.data else {
+        return Err(invariant(SourceCallableInvariant::InvalidSyntax(
+            declaration_name,
+        )));
+    };
+    Ok(name_record.kind == SyntaxKind::Identifier
+        && name_record.parent == Some(annotation.node)
+        && name_record.flags.0 == 0
+        && name_identifier.flow_node.is_none()
+        && name_identifier.text == declaration_identifier.text)
 }
 
 fn validate_modifiers(
@@ -888,6 +1090,7 @@ pub(super) fn reserve_source_callable_capacities(
         .options
         .strict_null_checks;
     let mut cold = 0usize;
+    let mut cold_type_parameters = HashSet::new();
     let mut optional_parameter_unions = 0usize;
     for plan in plans {
         let state = source_callable_state(store, plan, true)?;
@@ -895,6 +1098,15 @@ pub(super) fn reserve_source_callable_capacities(
             cold = cold
                 .checked_add(1)
                 .ok_or_else(|| invariant(SourceCallableInvariant::Capacity(plan.declaration)))?;
+            for type_parameter in &plan.type_parameters {
+                if store
+                    .declared_type_links(type_parameter.symbol)
+                    .and_then(|links| links.declared_type)
+                    .is_none()
+                {
+                    cold_type_parameters.insert(type_parameter.symbol);
+                }
+            }
         }
         if strict
             && matches!(
@@ -923,7 +1135,10 @@ pub(super) fn reserve_source_callable_capacities(
             first.declaration,
         )));
     }
-    Ok((cold, optional_parameter_unions))
+    let source_type_allocations = cold
+        .checked_add(cold_type_parameters.len())
+        .ok_or_else(|| invariant(SourceCallableInvariant::Capacity(first.declaration)))?;
+    Ok((source_type_allocations, optional_parameter_unions))
 }
 
 /// Publishes or validates one fully prepared contextually typed arrow.
@@ -1147,6 +1362,11 @@ pub(super) fn begin_source_callable(
             return Ok(Ok(PendingSourceCallable { type_, signature }));
         }
     }
+    let type_parameters = plan
+        .type_parameters
+        .iter()
+        .map(|type_parameter| execute_type_parameter(store, type_parameter.symbol))
+        .collect::<Vec<_>>();
     let type_ = store
         .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(plan.owner_symbol))
         .ok_or_else(|| invariant(SourceCallableInvariant::Publication(plan.declaration)))?;
@@ -1154,7 +1374,7 @@ pub(super) fn begin_source_callable(
         .alloc_signature(
             plan.flags,
             Some(plan.declaration),
-            Vec::new(),
+            type_parameters,
             None,
             plan.parameters
                 .iter()
@@ -1587,6 +1807,11 @@ pub(super) fn source_callable_display_projection(
         array_targets,
     )
     .map_err(source_callable_display_error)?;
+    if !plan.type_parameters.is_empty() {
+        return Err(SourceCallableDisplayError::Unsupported(
+            SourceCallableUnsupported::GenericSignature(plan.declaration),
+        ));
+    }
     let signature =
         match source_callable_state(store, &plan, true).map_err(source_callable_display_error)? {
             SourceCallableState::Resolved {
@@ -1724,7 +1949,18 @@ pub(super) fn validate_stored_source_callable(
         return StoredSourceCallableValidation::Malformed;
     };
     let expected_parameter_types = store.callable_signature_parameter_types(signature);
-    let mut edges = Vec::with_capacity(signature_record.parameters().len() + 2);
+    let Some(type_parameter_edges) = valid_stored_source_type_parameters(
+        store,
+        declaration,
+        family,
+        contextual.is_some(),
+        signature_record.type_parameters(),
+    ) else {
+        return StoredSourceCallableValidation::Malformed;
+    };
+    let mut edges =
+        Vec::with_capacity(signature_record.parameters().len() + type_parameter_edges.len() + 2);
+    edges.extend(type_parameter_edges);
     let mut default_parameter_count = 0usize;
     let parameters_valid =
         signature_record
@@ -1828,7 +2064,6 @@ pub(super) fn validate_stored_source_callable(
         })
         || signature_record.resolved_min_argument_count() != -1
         || signature_record.declaration() != Some(declaration)
-        || !signature_record.type_parameters().is_empty()
         || signature_record.this_parameter().is_some()
         || signature_record.resolved_type_predicate().is_some()
         || signature_record.target().is_some()
@@ -1955,6 +2190,45 @@ pub(super) fn validate_stored_source_callable(
     StoredSourceCallableValidation::Valid(edges)
 }
 
+fn valid_stored_source_type_parameters(
+    store: &CanonicalTypeMapperStore,
+    declaration: NodeRef,
+    family: SourceCallableFamily,
+    contextual: bool,
+    type_parameters: &[TypeId],
+) -> Option<Vec<TypeId>> {
+    if type_parameters.is_empty() {
+        return Some(Vec::new());
+    }
+    if contextual
+        || family != SourceCallableFamily::FunctionDeclaration
+        || type_parameters.len() != 1
+    {
+        return None;
+    }
+    let type_parameter = type_parameters[0];
+    let symbol = cached_ordinary_type_parameter_owner(store, type_parameter)?;
+    let symbol_record = store.symbol(symbol)?;
+    let [type_parameter_declaration] = symbol_record.declarations()? else {
+        return None;
+    };
+    if symbol_record.flags() != SymbolFlags::TYPE_PARAMETER
+        || symbol_record.check_flags() != CheckFlags::NONE
+        || symbol_record.value_declaration().is_some()
+        || symbol_record.members().is_some()
+        || symbol_record.exports().is_some()
+        || symbol_record.parent().is_some()
+        || symbol_record.export_symbol().is_some()
+        || store.get_merged_symbol(symbol) != Some(symbol)
+        || store.source_node_kind(*type_parameter_declaration) != Some(SyntaxKind::TypeParameter)
+        || store.source_node_parent(*type_parameter_declaration)
+            != Some(SourceNodeParent::Parent(declaration))
+    {
+        return None;
+    }
+    Some(vec![type_parameter])
+}
+
 fn valid_stored_function_export_route(
     store: &CanonicalTypeMapperStore,
     owner_symbol: SemanticSymbolId,
@@ -2023,11 +2297,16 @@ fn validate_signature(
         .iter()
         .map(|parameter| parameter.symbol)
         .collect::<Vec<_>>();
+    let expected_type_parameters = planned_type_parameter_ids(store, plan).ok_or_else(|| {
+        invariant(SourceCallableInvariant::InvalidSignatureCache(
+            plan.declaration,
+        ))
+    })?;
     if record.flags() != plan.flags
         || record.min_argument_count() != plan.min_argument_count
         || record.resolved_min_argument_count() != -1
         || record.declaration() != Some(plan.declaration)
-        || !record.type_parameters().is_empty()
+        || record.type_parameters() != expected_type_parameters
         || record.parameters() != expected_parameters
         || record.this_parameter().is_some()
         || record.resolved_type_predicate().is_some()
@@ -2043,6 +2322,23 @@ fn validate_signature(
         )));
     }
     Ok(())
+}
+
+fn planned_type_parameter_ids(
+    store: &CanonicalTypeMapperStore,
+    plan: &SourceCallablePlan,
+) -> Option<Vec<TypeId>> {
+    plan.type_parameters
+        .iter()
+        .map(|type_parameter| {
+            let declared_type = store
+                .declared_type_links(type_parameter.symbol)?
+                .declared_type?;
+            (cached_ordinary_type_parameter_owner(store, declared_type)
+                == Some(type_parameter.symbol))
+            .then_some(declared_type)
+        })
+        .collect()
 }
 
 fn exact_signature_link(
@@ -2320,4 +2616,359 @@ fn valid_optional_type(
 
 const fn invariant(error: SourceCallableInvariant) -> SourceCallableError {
     SourceCallableError::Invariant(error)
+}
+
+#[cfg(test)]
+mod tests {
+    use ts_ast::{FileId, NodeData, NodeRef};
+    use ts_binder::{
+        BoundFile, CanonicalBinder, CanonicalModuleState, CanonicalNameResolverOptions,
+        CanonicalSourceFileFacts, CanonicalSourceLanguage, EscapedName,
+    };
+    use ts_parser::{ParseResult, parse_source_file};
+
+    use super::*;
+    use crate::semantic::{
+        CanonicalCheckerContext, CanonicalCheckerDiagnostics, CanonicalCheckerOptions,
+        DeclaredTypeLinks, IntrinsicBootstrapOptions,
+        production::GlobalMergeCompletion,
+        source::{SourceCheckError, UnsupportedSourceSyntax},
+        source_functions::SourceFunctionUnsupported,
+        type_nodes::{CanonicalTypeQuery, CanonicalTypeQueryOptions},
+    };
+
+    struct QueryFixture {
+        parsed: ParseResult,
+        file: FileId,
+        bound: BoundFile,
+        store: CanonicalTypeMapperStore,
+    }
+
+    impl QueryFixture {
+        fn new(source: &str, file: FileId) -> Self {
+            let parsed = parse_source_file(source);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let mut binder = CanonicalBinder::new();
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new(
+                        EscapedName::source("\"/project/source_generic_query.ts\""),
+                        CanonicalSourceLanguage::TypeScript,
+                        false,
+                        CanonicalModuleState::Script,
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+            let (symbols, mut files) = binder.finish().try_into_parts().unwrap();
+            let bound = files.remove(&file).unwrap();
+            let mut store = CanonicalTypeMapperStore::from_symbol_store(symbols);
+            assert!(
+                store
+                    .register_source_file(&parsed.arena, parsed.source_file, file)
+                    .is_some()
+            );
+            store
+                .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions::default())
+                .unwrap();
+            Self {
+                parsed,
+                file,
+                bound,
+                store,
+            }
+        }
+
+        fn declaration_and_type_parameter(&self) -> (NodeRef, NodeRef) {
+            function_and_type_parameter(&self.parsed, self.file)
+        }
+
+        fn query_callable(
+            &mut self,
+            declaration: NodeRef,
+            owner: SemanticSymbolId,
+            diagnostics: &mut CanonicalCheckerDiagnostics,
+        ) -> Result<TypeId, DeclaredTypeError> {
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&self.parsed.arena, &self.bound)],
+                GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+            )
+            .unwrap();
+            CanonicalTypeQuery::new(
+                &mut self.store,
+                &host,
+                CanonicalTypeQueryOptions::default(),
+                diagnostics,
+            )?
+            .get_type_of_source_callable(declaration, owner)
+        }
+
+        fn query_return(
+            &mut self,
+            signature: SignatureId,
+            diagnostics: &mut CanonicalCheckerDiagnostics,
+        ) -> Result<TypeId, DeclaredTypeError> {
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&self.parsed.arena, &self.bound)],
+                GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+            )
+            .unwrap();
+            CanonicalTypeQuery::new(
+                &mut self.store,
+                &host,
+                CanonicalTypeQueryOptions::default(),
+                diagnostics,
+            )?
+            .get_return_type_of_signature(signature)
+        }
+    }
+
+    fn bind_context(parsed: &ParseResult, file: FileId) -> CanonicalCheckerContext<'_> {
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/source_generic.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        CanonicalCheckerContext::new(
+            binder.finish(),
+            [(file, &parsed.arena)].into_iter().collect(),
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap()
+    }
+
+    fn function_and_type_parameter(parsed: &ParseResult, file: FileId) -> (NodeRef, NodeRef) {
+        let source = parsed.arena.get(parsed.source_file).unwrap();
+        let NodeData::SourceFile(source) = &source.data else {
+            panic!("expected source file")
+        };
+        for statement in &source.statements.nodes {
+            let record = parsed.arena.get(*statement).unwrap();
+            let NodeData::FunctionDeclaration(function) = &record.data else {
+                continue;
+            };
+            let type_parameters = function
+                .type_parameters
+                .as_ref()
+                .expect("expected generic function");
+            return (
+                NodeRef::new(parsed.arena.id(), file, *statement),
+                NodeRef::new(parsed.arena.id(), file, type_parameters.nodes[0]),
+            );
+        }
+        panic!("expected function declaration")
+    }
+
+    fn publication_state(store: &CanonicalTypeMapperStore) -> (usize, usize, [usize; 4], usize) {
+        (
+            store.types().len(),
+            store.signature_len(),
+            store.source_callable_provenance_lengths(),
+            store.callable_signature_parameter_types_len(),
+        )
+    }
+
+    #[test]
+    fn exact_generic_identity_query_publishes_and_reuses_one_declared_identity() {
+        let mut fixture = QueryFixture::new(
+            "function identity<T>(value: T): T { return value; }",
+            FileId::new(951),
+        );
+        let (declaration, type_parameter_declaration) = fixture.declaration_and_type_parameter();
+        let owner = fixture.bound.symbol(declaration).unwrap();
+        let type_parameter_symbol = fixture.bound.symbol(type_parameter_declaration).unwrap();
+        assert!(
+            fixture
+                .store
+                .declared_type_links(type_parameter_symbol)
+                .is_none()
+        );
+        assert!(
+            fixture
+                .store
+                .source_callable_type_for_owner(owner)
+                .is_none()
+        );
+
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let callable = fixture
+            .query_callable(declaration, owner, &mut diagnostics)
+            .unwrap();
+        let signature = fixture
+            .store
+            .source_callable_provenance(callable)
+            .unwrap()
+            .signature;
+        let type_parameter = fixture
+            .store
+            .signature(signature)
+            .unwrap()
+            .type_parameters()[0];
+        assert_eq!(
+            fixture
+                .store
+                .declared_type_links(type_parameter_symbol)
+                .and_then(|links| links.declared_type),
+            Some(type_parameter)
+        );
+        let [parameter] = fixture.store.signature(signature).unwrap().parameters() else {
+            panic!("expected identity parameter")
+        };
+        assert_eq!(
+            fixture
+                .store
+                .value_symbol_links(*parameter)
+                .and_then(|links| links.resolved_type),
+            Some(type_parameter)
+        );
+        assert_eq!(
+            fixture.query_return(signature, &mut diagnostics),
+            Ok(type_parameter)
+        );
+        assert!(matches!(
+            validate_stored_source_callable(&fixture.store, callable),
+            StoredSourceCallableValidation::Valid(edges) if edges.contains(&type_parameter)
+        ));
+
+        let warm = publication_state(&fixture.store);
+        assert_eq!(
+            fixture.query_callable(declaration, owner, &mut diagnostics),
+            Ok(callable)
+        );
+        assert_eq!(
+            fixture.query_return(signature, &mut diagnostics),
+            Ok(type_parameter)
+        );
+        assert_eq!(publication_state(&fixture.store), warm);
+        assert_eq!(
+            fixture
+                .store
+                .signature(signature)
+                .unwrap()
+                .type_parameters(),
+            [type_parameter]
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn unsupported_generic_signature_shapes_publish_nothing() {
+        for (index, source) in [
+            "function f<T, U>(value: T): T { return value; }",
+            "function f<T extends string>(value: T): T { return value; }",
+            "function f<T = string>(value: T): T { return value; }",
+            "function f<T>(value: T, other: T): T { return value; }",
+            "function f<T>(value: T): string { return ''; }",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let parsed = parse_source_file(source);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let file = FileId::new(960 + u32::try_from(index).unwrap());
+            let (declaration, type_parameter_declaration) =
+                function_and_type_parameter(&parsed, file);
+            let mut context = bind_context(&parsed, file);
+            let (owner, type_parameter_symbol) = {
+                let (_, bound) = context.file(file).unwrap();
+                (
+                    bound.symbol(declaration).unwrap(),
+                    bound.symbol(type_parameter_declaration).unwrap(),
+                )
+            };
+            let before = publication_state(context.store());
+            assert!(matches!(
+                context.check_source_file(file),
+                Err(SourceCheckError::Unsupported(
+                    UnsupportedSourceSyntax::Function(SourceFunctionUnsupported::Callable(_))
+                ))
+            ));
+            assert_eq!(publication_state(context.store()), before);
+            assert!(
+                context
+                    .store()
+                    .declared_type_links(type_parameter_symbol)
+                    .is_none()
+            );
+            assert!(
+                context
+                    .store()
+                    .source_callable_type_for_owner(owner)
+                    .is_none()
+            );
+            assert!(context.diagnostics().is_empty());
+        }
+    }
+
+    #[test]
+    fn poisoned_declared_or_signature_type_parameter_fails_without_new_publication() {
+        let mut cold = QueryFixture::new(
+            "function identity<T>(value: T): T { return value; }",
+            FileId::new(971),
+        );
+        let (declaration, type_parameter_declaration) = cold.declaration_and_type_parameter();
+        let owner = cold.bound.symbol(declaration).unwrap();
+        let type_parameter_symbol = cold.bound.symbol(type_parameter_declaration).unwrap();
+        let forged = cold.store.alloc_type_parameter(None).unwrap();
+        assert!(cold.store.set_declared_type_links(
+            type_parameter_symbol,
+            DeclaredTypeLinks {
+                declared_type: Some(forged),
+                ..DeclaredTypeLinks::default()
+            }
+        ));
+        let poisoned_cold = publication_state(&cold.store);
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        assert!(
+            cold.query_callable(declaration, owner, &mut diagnostics)
+                .is_err()
+        );
+        assert_eq!(publication_state(&cold.store), poisoned_cold);
+        assert!(cold.store.source_callable_type_for_owner(owner).is_none());
+
+        let mut warm = QueryFixture::new(
+            "function identity<T>(value: T): T { return value; }",
+            FileId::new(972),
+        );
+        let (declaration, _) = warm.declaration_and_type_parameter();
+        let owner = warm.bound.symbol(declaration).unwrap();
+        let callable = warm
+            .query_callable(declaration, owner, &mut diagnostics)
+            .unwrap();
+        let signature = warm
+            .store
+            .source_callable_provenance(callable)
+            .unwrap()
+            .signature;
+        let number = warm.store.intrinsic_bootstrap().unwrap().number_type;
+        assert!(
+            warm.store
+                .set_signature_type_parameters(signature, vec![number])
+        );
+        assert_eq!(
+            validate_stored_source_callable(&warm.store, callable),
+            StoredSourceCallableValidation::Malformed
+        );
+        let poisoned_warm = publication_state(&warm.store);
+        assert!(warm.query_return(signature, &mut diagnostics).is_err());
+        assert_eq!(publication_state(&warm.store), poisoned_warm);
+        assert!(diagnostics.is_empty());
+    }
 }
