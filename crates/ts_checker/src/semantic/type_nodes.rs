@@ -13175,6 +13175,13 @@ mod tests {
             .and_then(|links| links.resolved_type)
             .unwrap();
         let shell_signature = function_signature(&fixture.store, function);
+        assert!(
+            fixture
+                .store
+                .callable_signature_parameter_types(shell_signature)
+                .is_none(),
+            "pending parameter publication must not expose semantic provenance",
+        );
         let structured = fixture
             .store
             .type_payload(shell)
@@ -13210,6 +13217,16 @@ mod tests {
         assert_eq!(
             function_signature(&fixture.store, function),
             shell_signature
+        );
+        assert_eq!(
+            fixture
+                .store
+                .callable_signature_parameter_types(shell_signature),
+            fixture
+                .store
+                .value_symbol_links(node_symbol(&fixture, parameter))
+                .and_then(|links| links.resolved_type)
+                .map(std::slice::from_ref),
         );
 
         let parameter_symbol = node_symbol(&fixture, parameter);
@@ -13364,7 +13381,7 @@ mod tests {
     #[test]
     fn function_type_union_hook_rejects_barrier_and_signature_poison() {
         let mut fixture = fixture_with_intrinsic(
-            "type Fn = (value: string) => number; type Maybe = Fn | undefined;",
+            "type Fn = (value?: string) => number; type Maybe = Fn | undefined;",
             IntrinsicBootstrapOptions {
                 strict_null_checks: true,
                 ..IntrinsicBootstrapOptions::default()
@@ -13451,6 +13468,27 @@ mod tests {
             .value_symbol_links(parameter_symbol)
             .unwrap()
             .clone();
+        let string = fixture.store.intrinsic_bootstrap().unwrap().string_type;
+        assert!(fixture.store.set_value_symbol_links(
+            parameter_symbol,
+            ValueSymbolLinks {
+                resolved_type: Some(string),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        assert!(matches!(
+            functions::validate_stored_function_type(&fixture.store, function_type),
+            functions::StoredFunctionTypeValidation::Malformed
+        ));
+        assert!(
+            fixture
+                .store
+                .set_value_symbol_links(parameter_symbol, parameter_links.clone())
+        );
+        assert_eq!(
+            fixture.store.validate_union_constituent(function_type),
+            Ok(())
+        );
         assert!(
             fixture
                 .store
@@ -13709,6 +13747,44 @@ mod tests {
                 .is_type_assignable_to_with_strict_function_types(declaration_type, target, true,),
             Ok(true),
         );
+        let optional = fixture
+            .store
+            .signature(declaration_signature)
+            .unwrap()
+            .parameters()[1];
+        let expected_optional = fixture
+            .store
+            .value_symbol_links(optional)
+            .unwrap()
+            .resolved_type
+            .unwrap();
+        assert_eq!(
+            fixture
+                .store
+                .callable_signature_parameter_types(declaration_signature)
+                .and_then(|types| types.get(1))
+                .copied(),
+            Some(expected_optional),
+        );
+        let number = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+        assert_ne!(expected_optional, number);
+        assert!(fixture.store.set_value_symbol_links(
+            optional,
+            ValueSymbolLinks {
+                resolved_type: Some(number),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        assert_eq!(
+            validate_stored_source_callable(&fixture.store, declaration_type),
+            StoredSourceCallableValidation::Malformed,
+        );
+        assert!(matches!(
+            validate_stored_single_callable(&fixture.store, declaration_type),
+            StoredSingleCallableValidation::Malformed {
+                family: CallableFamily::FunctionDeclaration
+            }
+        ));
         assert!(diagnostics.is_empty());
     }
 
@@ -13768,6 +13844,52 @@ mod tests {
             validate_stored_source_callable(&fixture.store, type_),
             StoredSourceCallableValidation::Malformed,
         );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn zero_parameter_callables_publish_explicit_empty_parameter_provenance() {
+        let mut fixture = fixture_with_module_state(
+            "type EmptyType = () => string; function empty(): string { return ''; }",
+            CanonicalModuleState::External,
+        );
+        let source_declaration = named_node(&fixture, SyntaxKind::FunctionDeclaration, "empty");
+        let source_owner = node_symbol(&fixture, source_declaration);
+        let function_node = function_type_node(&fixture, "EmptyType");
+        let function_alias = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "EmptyType");
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let source_type = query_source_callable(
+            &mut fixture,
+            source_declaration,
+            source_owner,
+            &mut diagnostics,
+        )
+        .unwrap();
+        let function_type = query_declared(
+            &mut fixture,
+            function_alias,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        for signature in [
+            function_signature(&fixture.store, source_declaration),
+            function_signature(&fixture.store, function_node),
+        ] {
+            assert_eq!(
+                fixture.store.callable_signature_parameter_types(signature),
+                Some(&[][..]),
+            );
+        }
+        assert!(matches!(
+            validate_stored_source_callable(&fixture.store, source_type),
+            StoredSourceCallableValidation::Valid(_)
+        ));
+        assert!(matches!(
+            functions::validate_stored_function_type(&fixture.store, function_type),
+            functions::StoredFunctionTypeValidation::Valid(_)
+        ));
+        assert_eq!(fixture.store.callable_signature_parameter_types_len(), 2);
         assert!(diagnostics.is_empty());
     }
 }

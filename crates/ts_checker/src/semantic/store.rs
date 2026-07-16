@@ -168,6 +168,7 @@ pub struct SemanticStore<TypePayload, MapperPayload> {
     source_callable_types_by_owner: HashMap<SemanticSymbolId, TypeId>,
     source_callable_types_by_signature: HashMap<SignatureId, TypeId>,
     function_signature_return_annotations: HashMap<SignatureId, (NodeRef, bool)>,
+    callable_signature_parameter_types: HashMap<SignatureId, Vec<TypeId>>,
     circular_return_signatures: HashMap<SignatureId, TypeId>,
     type_resolutions: TypeResolutionStack,
     relations: RelationCaches,
@@ -228,6 +229,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             source_callable_types_by_owner: HashMap::new(),
             source_callable_types_by_signature: HashMap::new(),
             function_signature_return_annotations: HashMap::new(),
+            callable_signature_parameter_types: HashMap::new(),
             circular_return_signatures: HashMap::new(),
             type_resolutions: TypeResolutionStack::new(id),
             relations: RelationCaches::default(),
@@ -2202,6 +2204,60 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         id: SignatureId,
     ) -> Option<(NodeRef, bool)> {
         self.function_signature_return_annotations.get(&id).copied()
+    }
+
+    pub(super) fn try_reserve_callable_signature_parameter_types(
+        &mut self,
+        additional: usize,
+    ) -> bool {
+        self.callable_signature_parameter_types
+            .try_reserve(additional)
+            .is_ok()
+    }
+
+    /// Publishes immutable semantic parameter identities for exact callables.
+    /// The whole batch is validated before any entry is inserted.
+    pub(super) fn set_callable_signature_parameter_types_batch(
+        &mut self,
+        parameter_types: Vec<(SignatureId, Vec<TypeId>)>,
+    ) -> bool {
+        let mut signatures = HashSet::with_capacity(parameter_types.len());
+        if parameter_types.iter().any(|(signature, types)| {
+            !signatures.insert(*signature)
+                || self
+                    .callable_signature_parameter_types
+                    .contains_key(signature)
+                || !self.signature_is_callable(*signature)
+                || self
+                    .signature(*signature)
+                    .is_none_or(|record| record.parameters().len() != types.len())
+                || !self.valid_optional_types(Some(types))
+        }) {
+            return false;
+        }
+        for (signature, types) in parameter_types {
+            let previous = self
+                .callable_signature_parameter_types
+                .insert(signature, types);
+            assert!(
+                previous.is_none(),
+                "callable parameter provenance was prevalidated absent"
+            );
+        }
+        true
+    }
+
+    pub(super) fn callable_signature_parameter_types(
+        &self,
+        signature: SignatureId,
+    ) -> Option<&[TypeId]> {
+        self.callable_signature_parameter_types
+            .get(&signature)
+            .map(Vec::as_slice)
+    }
+
+    pub(super) fn callable_signature_parameter_types_len(&self) -> usize {
+        self.callable_signature_parameter_types.len()
     }
 
     #[must_use]

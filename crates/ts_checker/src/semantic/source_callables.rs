@@ -778,12 +778,14 @@ pub(super) fn source_callable_state(
         .signature(signature)
         .expect("the source signature was validated")
         .resolved_return_type();
+    let published_parameter_types = store.callable_signature_parameter_types(signature);
     let is_barrier = record.object_flags()
         == ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED
         && object.structured == StructuredTypeData::default();
     if is_barrier {
         if !allow_active_barrier
             || resolved_return_type.is_some()
+            || published_parameter_types.is_some()
             || plan
                 .parameters
                 .iter()
@@ -817,15 +819,28 @@ pub(super) fn source_callable_state(
             .iter()
             .all(|parameter| default_parameter_links(store, parameter.symbol))
     {
-        if !allow_active_barrier || resolved_return_type.is_some() {
+        if !allow_active_barrier
+            || resolved_return_type.is_some()
+            || published_parameter_types.is_some()
+        {
             return Err(invariant(SourceCallableInvariant::InvalidTypeCache(
                 plan.declaration,
             )));
         }
         return Ok(SourceCallableState::ActiveParameters { type_, signature });
     }
-    for parameter in &plan.parameters {
-        validate_parameter_links(store, plan, parameter)?;
+    let Some(published_parameter_types) = published_parameter_types else {
+        return Err(invariant(SourceCallableInvariant::InvalidParameterCache(
+            plan.declaration,
+        )));
+    };
+    if published_parameter_types.len() != plan.parameters.len() {
+        return Err(invariant(SourceCallableInvariant::InvalidParameterCache(
+            plan.declaration,
+        )));
+    }
+    for (parameter, expected) in plan.parameters.iter().zip(published_parameter_types) {
+        validate_parameter_links(store, plan, parameter, *expected)?;
     }
     validate_cached_return_type(store, plan, signature)?;
     Ok(SourceCallableState::Resolved { type_, signature })
@@ -874,6 +889,7 @@ pub(super) fn reserve_source_callable_capacities(
     if !store.try_reserve_signatures(cold)
         || !store.try_reserve_source_callable_provenance(cold)
         || !store.try_reserve_function_signature_return_annotations(cold)
+        || !store.try_reserve_callable_signature_parameter_types(plans.len())
     {
         return Err(invariant(SourceCallableInvariant::Capacity(
             first.declaration,
@@ -992,6 +1008,14 @@ pub(super) fn finalize_source_callable_structure(
             plan.declaration,
         )));
     }
+    if plan.parameters.is_empty() {
+        let published = store
+            .set_callable_signature_parameter_types_batch(vec![(pending.signature, Vec::new())]);
+        assert!(
+            published,
+            "zero-parameter source callable provenance was prevalidated and reserved"
+        );
+    }
     Ok(())
 }
 
@@ -1060,7 +1084,10 @@ pub(super) fn publish_source_callable_parameter_types(
         }
     }
     let mut resolved = Vec::with_capacity(parameter_count);
+    let mut expected_parameter_types = Vec::with_capacity(pending.len());
     for callable in pending {
+        let signature = exact_signature_link(store, callable.plan.declaration)?;
+        let mut callable_parameter_types = Vec::with_capacity(callable.plan.parameters.len());
         for (parameter, base) in callable.plan.parameters.iter().zip(&callable.base_types) {
             let type_ = if strict && parameter.optional {
                 let already_contains_undefined = *base == undefined
@@ -1099,8 +1126,15 @@ pub(super) fn publish_source_callable_parameter_types(
                 )));
             }
             resolved.push((parameter.symbol, type_));
+            callable_parameter_types.push(type_);
         }
+        expected_parameter_types.push((signature, callable_parameter_types));
     }
+    let provenance = store.set_callable_signature_parameter_types_batch(expected_parameter_types);
+    assert!(
+        provenance,
+        "prevalidated source parameter provenance publication is infallible"
+    );
     for (symbol, type_) in resolved {
         let published = store.set_value_symbol_links(
             symbol,
@@ -1398,54 +1432,64 @@ pub(super) fn validate_stored_source_callable(
     let Some(TypeData::Object(object)) = store.type_payload(type_).map(TypeRecord::data) else {
         return StoredSourceCallableValidation::Malformed;
     };
+    let expected_parameter_types = store.callable_signature_parameter_types(signature);
     let mut edges = Vec::with_capacity(signature_record.parameters().len() + 2);
     let mut default_parameter_count = 0usize;
-    let parameters_valid = signature_record.parameters().iter().all(|parameter| {
-        let Some(parameter_record) = store.symbol(*parameter) else {
-            return false;
-        };
-        let Some(parameter_declaration) = parameter_record
-            .declarations()
-            .and_then(|declarations| (declarations.len() == 1).then_some(declarations[0]))
-        else {
-            return false;
-        };
-        let links_valid = match store.value_symbol_links(*parameter) {
-            None => {
-                default_parameter_count += 1;
-                true
-            }
-            Some(links) if links == &ValueSymbolLinks::default() => {
-                default_parameter_count += 1;
-                true
-            }
-            Some(links) if links.resolved_type.is_some() => {
-                let resolved = links.resolved_type.expect("the branch checked the type");
-                let valid = links
-                    == &(ValueSymbolLinks {
-                        resolved_type: Some(resolved),
-                        ..ValueSymbolLinks::default()
-                    });
-                if valid {
-                    edges.push(resolved);
-                }
-                valid
-            }
-            Some(_) => false,
-        };
-        parameter_record.flags() == SymbolFlags::FUNCTION_SCOPED_VARIABLE
-            && parameter_record.check_flags() == CheckFlags::NONE
-            && parameter_record.value_declaration() == Some(parameter_declaration)
-            && parameter_record.members().is_none()
-            && parameter_record.exports().is_none()
-            && parameter_record.parent().is_none()
-            && parameter_record.export_symbol().is_none()
-            && store.get_merged_symbol(*parameter) == Some(*parameter)
-            && store.source_node_kind(parameter_declaration) == Some(SyntaxKind::Parameter)
-            && store.source_node_parent(parameter_declaration)
-                == Some(SourceNodeParent::Parent(declaration))
-            && links_valid
-    });
+    let parameters_valid =
+        signature_record
+            .parameters()
+            .iter()
+            .enumerate()
+            .all(|(index, parameter)| {
+                let Some(parameter_record) = store.symbol(*parameter) else {
+                    return false;
+                };
+                let Some(parameter_declaration) = parameter_record
+                    .declarations()
+                    .and_then(|declarations| (declarations.len() == 1).then_some(declarations[0]))
+                else {
+                    return false;
+                };
+                let links_valid = match store.value_symbol_links(*parameter) {
+                    None => {
+                        default_parameter_count += 1;
+                        true
+                    }
+                    Some(links) if links == &ValueSymbolLinks::default() => {
+                        default_parameter_count += 1;
+                        true
+                    }
+                    Some(links) if links.resolved_type.is_some() => {
+                        let resolved = links.resolved_type.expect("the branch checked the type");
+                        let valid = links
+                            == &(ValueSymbolLinks {
+                                resolved_type: Some(resolved),
+                                ..ValueSymbolLinks::default()
+                            })
+                            && expected_parameter_types
+                                .and_then(|types| types.get(index))
+                                .copied()
+                                == Some(resolved);
+                        if valid {
+                            edges.push(resolved);
+                        }
+                        valid
+                    }
+                    Some(_) => false,
+                };
+                parameter_record.flags() == SymbolFlags::FUNCTION_SCOPED_VARIABLE
+                    && parameter_record.check_flags() == CheckFlags::NONE
+                    && parameter_record.value_declaration() == Some(parameter_declaration)
+                    && parameter_record.members().is_none()
+                    && parameter_record.exports().is_none()
+                    && parameter_record.parent().is_none()
+                    && parameter_record.export_symbol().is_none()
+                    && store.get_merged_symbol(*parameter) == Some(*parameter)
+                    && store.source_node_kind(parameter_declaration) == Some(SyntaxKind::Parameter)
+                    && store.source_node_parent(parameter_declaration)
+                        == Some(SourceNodeParent::Parent(declaration))
+                    && links_valid
+            });
     let parameters_unique = signature_record
         .parameters()
         .iter()
@@ -1506,6 +1550,7 @@ pub(super) fn validate_stored_source_callable(
     }
     if object.structured == StructuredTypeData::default() {
         return if default_parameter_count == signature_record.parameters().len()
+            && expected_parameter_types.is_none()
             && signature_record.resolved_return_type().is_none()
             && !store.signature_has_circular_return_type(signature)
         {
@@ -1527,12 +1572,18 @@ pub(super) fn validate_stored_source_callable(
         return StoredSourceCallableValidation::Malformed;
     }
     if default_parameter_count != 0 {
-        if signature_record.resolved_return_type().is_some()
+        if expected_parameter_types.is_some()
+            || signature_record.resolved_return_type().is_some()
             || store.signature_has_circular_return_type(signature)
         {
             return StoredSourceCallableValidation::Malformed;
         }
         return StoredSourceCallableValidation::Pending;
+    }
+    if expected_parameter_types
+        .is_none_or(|types| types.len() != signature_record.parameters().len())
+    {
+        return StoredSourceCallableValidation::Malformed;
     }
     if let Some(return_type) = signature_record.resolved_return_type() {
         let annotation =
@@ -1689,6 +1740,7 @@ fn validate_parameter_links(
     store: &CanonicalTypeMapperStore,
     plan: &SourceCallablePlan,
     parameter: &SourceCallableParameterPlan,
+    expected: TypeId,
 ) -> Result<(), SourceCallableError> {
     let links = store.value_symbol_links(parameter.symbol).ok_or_else(|| {
         invariant(SourceCallableInvariant::InvalidParameterCache(
@@ -1700,11 +1752,12 @@ fn validate_parameter_links(
             parameter.declaration,
         )));
     };
-    if links
-        != &(ValueSymbolLinks {
-            resolved_type: Some(resolved),
-            ..ValueSymbolLinks::default()
-        })
+    if resolved != expected
+        || links
+            != &(ValueSymbolLinks {
+                resolved_type: Some(resolved),
+                ..ValueSymbolLinks::default()
+            })
     {
         return Err(invariant(SourceCallableInvariant::InvalidParameterCache(
             parameter.declaration,

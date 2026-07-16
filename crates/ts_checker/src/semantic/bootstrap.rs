@@ -180,6 +180,7 @@ pub struct CheckerStateSnapshot {
     pub source_callable_declarations: usize,
     pub source_callable_owners: usize,
     pub source_callable_signatures: usize,
+    pub callable_signature_parameter_types: usize,
     pub semantic_arenas: SemanticArenaCounts,
     pub links: CheckerLinkCounts,
     pub type_resolution: TypeResolutionStateSnapshot,
@@ -194,6 +195,7 @@ impl CheckerStateSnapshot {
             && self.source_callable_declarations == 0
             && self.source_callable_owners == 0
             && self.source_callable_signatures == 0
+            && self.callable_signature_parameter_types == 0
             && self.semantic_arenas.is_empty()
             && self.links.is_empty()
             && self.type_resolution.is_pristine()
@@ -3334,6 +3336,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             source_callable_declarations,
             source_callable_owners,
             source_callable_signatures,
+            callable_signature_parameter_types: self.callable_signature_parameter_types_len(),
             semantic_arenas: SemanticArenaCounts {
                 types: self.type_len(),
                 mappers: self.mapper_len(),
@@ -4284,6 +4287,7 @@ mod tests {
             source_callable_declarations,
             source_callable_owners,
             source_callable_signatures,
+            callable_signature_parameter_types: store.callable_signature_parameter_types_len(),
             semantic_arenas: semantic_counts(store),
             links: CheckerLinkCounts {
                 node,
