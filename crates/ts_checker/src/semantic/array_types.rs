@@ -221,6 +221,25 @@ impl CanonicalTypeMapperStore {
         element_type: TypeId,
         readonly: bool,
     ) -> Result<TypeId, ArrayTypeError> {
+        self.create_canonical_array_type_with_targets_and_flags(
+            targets,
+            element_type,
+            readonly,
+            ObjectFlags::NONE,
+        )
+    }
+
+    /// Target-capability form with the exact creation flags used by pinned
+    /// `createTypeReferenceEx`. The target cache remains keyed only by the
+    /// element type, so flags apply only when this call wins the first
+    /// allocation for that key.
+    pub(super) fn create_canonical_array_type_with_targets_and_flags(
+        &mut self,
+        targets: CanonicalArrayTargets,
+        element_type: TypeId,
+        readonly: bool,
+        creation_flags: ObjectFlags,
+    ) -> Result<TypeId, ArrayTypeError> {
         let target = if readonly {
             targets.readonly_array_type
         } else {
@@ -230,7 +249,7 @@ impl CanonicalTypeMapperStore {
             self,
             target,
             element_type,
-            ObjectFlags::NONE,
+            creation_flags,
         )?)
     }
 
@@ -424,6 +443,99 @@ mod tests {
         // The context retains the arena for its full test lifetime.
         let parsed = Box::leak(Box::new(parsed));
         context(parsed, file)
+    }
+
+    #[test]
+    fn array_creation_flags_follow_first_target_cache_writer() {
+        let mut context = array_context(FileId::new(916));
+        let global_types = context.global_types().clone();
+        let targets = CanonicalArrayTargets::from_global_types(&global_types);
+        let (number, string) = {
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            (bootstrap.number_type, bootstrap.string_type)
+        };
+        let store = context.store_mut_for_test();
+
+        let from_type_node = store
+            .create_canonical_array_type_with_targets_and_flags(
+                targets,
+                number,
+                false,
+                ObjectFlags::FROM_TYPE_NODE,
+            )
+            .unwrap();
+        assert_eq!(
+            store.type_payload(from_type_node).unwrap().object_flags(),
+            ObjectFlags::REFERENCE | ObjectFlags::FROM_TYPE_NODE
+        );
+        assert_eq!(
+            store
+                .create_canonical_array_type_with_targets(targets, number, false)
+                .unwrap(),
+            from_type_node
+        );
+        assert!(
+            store
+                .type_payload(from_type_node)
+                .unwrap()
+                .object_flags()
+                .contains(ObjectFlags::FROM_TYPE_NODE)
+        );
+
+        let semantic_first = store
+            .create_canonical_array_type_with_targets(targets, string, false)
+            .unwrap();
+        assert_eq!(
+            store.type_payload(semantic_first).unwrap().object_flags(),
+            ObjectFlags::REFERENCE
+        );
+        assert_eq!(
+            store
+                .create_canonical_array_type_with_targets_and_flags(
+                    targets,
+                    string,
+                    false,
+                    ObjectFlags::FROM_TYPE_NODE,
+                )
+                .unwrap(),
+            semantic_first
+        );
+        assert!(
+            !store
+                .type_payload(semantic_first)
+                .unwrap()
+                .object_flags()
+                .contains(ObjectFlags::FROM_TYPE_NODE)
+        );
+    }
+
+    #[test]
+    fn flagged_array_creation_preserves_empty_generic_fallback() {
+        let parsed = parse_source_file("");
+        let mut context = context(&parsed, FileId::new(917));
+        let global_types = context.global_types().clone();
+        let targets = CanonicalArrayTargets::from_global_types(&global_types);
+        let (number, empty_object) = {
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            (bootstrap.number_type, bootstrap.empty_object_type)
+        };
+        let store = context.store_mut_for_test();
+        let before = store.type_len();
+
+        assert_eq!(
+            store.create_canonical_array_type_with_targets_and_flags(
+                targets,
+                number,
+                false,
+                ObjectFlags::FROM_TYPE_NODE,
+            ),
+            Ok(empty_object)
+        );
+        assert_eq!(
+            store.create_canonical_array_type_with_targets(targets, number, false),
+            Ok(empty_object)
+        );
+        assert_eq!(store.type_len(), before);
     }
 
     #[test]

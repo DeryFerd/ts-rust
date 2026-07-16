@@ -42,6 +42,9 @@ pub(super) struct CanonicalTupleTypeRequest<'a> {
     pub(super) element_types: &'a [TypeId],
     pub(super) element_infos: &'a [TupleElementInfo],
     pub(super) readonly: bool,
+    /// Pinned `createTypeReferenceEx` creation flags. These participate only
+    /// when this request wins the first concrete-instance allocation.
+    pub(super) creation_flags: ObjectFlags,
     /// Authoritative Array targets are required for pinned `[...T[]] -> T[]`
     /// collapse. Source/type-node integration supplies this capability later.
     pub(super) array_targets: Option<CanonicalArrayTargets>,
@@ -57,8 +60,15 @@ impl<'a> CanonicalTupleTypeRequest<'a> {
             element_types,
             element_infos,
             readonly,
+            creation_flags: ObjectFlags::NONE,
             array_targets: None,
         }
+    }
+
+    #[allow(dead_code)] // Typed handoff for tuple type-node integration.
+    pub(super) const fn with_creation_flags(mut self, creation_flags: ObjectFlags) -> Self {
+        self.creation_flags = creation_flags;
+        self
     }
 
     #[allow(dead_code)] // Typed handoff for the next type-node integration slice.
@@ -139,6 +149,7 @@ pub(super) enum TupleTypeError {
     UnsupportedElementOrder {
         index: usize,
     },
+    UnsupportedCreationFlags(ObjectFlags),
     ArrayRestCollapseUnavailable,
     ArrayType(ArrayTypeError),
     LengthType(LiteralTypeCacheError),
@@ -180,6 +191,12 @@ impl std::fmt::Display for TupleTypeError {
                 write!(
                     formatter,
                     "tuple element {index} violates supported ordering"
+                )
+            }
+            Self::UnsupportedCreationFlags(flags) => {
+                write!(
+                    formatter,
+                    "tuple request uses unsupported creation flags {flags:?}"
                 )
             }
             Self::ArrayRestCollapseUnavailable => {
@@ -265,10 +282,11 @@ impl CanonicalTypeMapperStore {
                 return Err(TupleTypeError::ArrayRestCollapseUnavailable);
             };
             return self
-                .create_canonical_array_type_with_targets(
+                .create_canonical_array_type_with_targets_and_flags(
                     targets,
                     request.element_types[0],
                     request.readonly,
+                    request.creation_flags,
                 )
                 .map_err(Into::into);
         }
@@ -286,7 +304,11 @@ impl CanonicalTypeMapperStore {
                 self.validate_canonical_empty_tuple_type(cached)
                     .map_err(|_| TupleTypeError::InvalidTargetCache(cached))?;
             }
-            return self.create_canonical_tuple_instance(cached, request.element_types);
+            return self.create_canonical_tuple_instance(
+                cached,
+                request.element_types,
+                request.creation_flags,
+            );
         }
 
         self.create_cold_canonical_tuple_type(key, request)
@@ -298,6 +320,11 @@ impl CanonicalTypeMapperStore {
     ) -> Result<(), TupleTypeError> {
         if self.intrinsic_bootstrap().is_none() {
             return Err(TupleTypeError::BootstrapUninitialized);
+        }
+        if !(request.creation_flags & !ObjectFlags::FROM_TYPE_NODE).is_empty() {
+            return Err(TupleTypeError::UnsupportedCreationFlags(
+                request.creation_flags,
+            ));
         }
         if request.element_types.len() != request.element_infos.len() {
             return Err(TupleTypeError::ArityMismatch {
@@ -536,7 +563,7 @@ impl CanonicalTypeMapperStore {
                                 })
                     });
             let reference = self
-                .alloc_type_reference(propagating_flags, None)
+                .alloc_type_reference(propagating_flags | request.creation_flags, None)
                 .expect("preflighted tuple reference is valid");
             assert!(self.set_object_target_and_mapper(reference, Some(target), None));
             let instance_key = type_list_key(&concrete_arguments);
@@ -583,6 +610,7 @@ impl CanonicalTypeMapperStore {
         &mut self,
         target: TypeId,
         element_types: &[TypeId],
+        creation_flags: ObjectFlags,
     ) -> Result<TypeId, TupleTypeError> {
         if element_types.is_empty() {
             return Ok(target);
@@ -619,7 +647,7 @@ impl CanonicalTypeMapperStore {
                         })
             });
         let reference = self
-            .alloc_type_reference(propagating_flags, None)
+            .alloc_type_reference(propagating_flags | creation_flags, None)
             .expect("validated tuple instance arguments are valid");
         assert!(self.set_object_target_and_mapper(reference, Some(target), None));
         assert!(self.set_type_reference_resolution(reference, None, Some(arguments)));
@@ -1022,8 +1050,11 @@ impl CanonicalTypeMapperStore {
                                 record.object_flags() & ObjectFlags::PROPAGATING_FLAGS
                             })
                 });
+        let required_object_flags = ObjectFlags::REFERENCE | propagating_flags;
+        let object_flags = record.object_flags();
         if record.flags() != TypeFlags::OBJECT
-            || record.object_flags() != (ObjectFlags::REFERENCE | propagating_flags)
+            || !object_flags.contains(required_object_flags)
+            || !(object_flags & !(required_object_flags | ObjectFlags::FROM_TYPE_NODE)).is_empty()
             || record.symbol().is_some()
             || record.alias().is_some()
             || reference.object.structured != StructuredTypeData::default()
@@ -1356,6 +1387,94 @@ mod tests {
                     .is_readonly()
             );
         }
+    }
+
+    #[test]
+    fn tuple_creation_flags_follow_first_instance_cache_writer() {
+        let mut store = initialized();
+        let (string, number) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (bootstrap.string_type, bootstrap.number_type)
+        };
+        let infos = [element_info(&store, ElementFlags::REQUIRED, None)];
+
+        let syntax_first = store
+            .create_canonical_tuple_type(
+                CanonicalTupleTypeRequest::new(&[string], &infos, false)
+                    .with_creation_flags(ObjectFlags::FROM_TYPE_NODE),
+            )
+            .unwrap();
+        assert_eq!(
+            store.type_payload(syntax_first).unwrap().object_flags(),
+            ObjectFlags::REFERENCE | ObjectFlags::FROM_TYPE_NODE
+        );
+        assert_eq!(
+            store
+                .create_canonical_tuple_type(CanonicalTupleTypeRequest::new(
+                    &[string],
+                    &infos,
+                    false,
+                ))
+                .unwrap(),
+            syntax_first
+        );
+        assert!(
+            store
+                .type_payload(syntax_first)
+                .unwrap()
+                .object_flags()
+                .contains(ObjectFlags::FROM_TYPE_NODE)
+        );
+
+        let semantic_first = store
+            .create_canonical_tuple_type(CanonicalTupleTypeRequest::new(&[number], &infos, false))
+            .unwrap();
+        assert_eq!(
+            store.type_payload(semantic_first).unwrap().object_flags(),
+            ObjectFlags::REFERENCE
+        );
+        assert_eq!(
+            store
+                .create_canonical_tuple_type(
+                    CanonicalTupleTypeRequest::new(&[number], &infos, false)
+                        .with_creation_flags(ObjectFlags::FROM_TYPE_NODE),
+                )
+                .unwrap(),
+            semantic_first
+        );
+        assert!(
+            !store
+                .type_payload(semantic_first)
+                .unwrap()
+                .object_flags()
+                .contains(ObjectFlags::FROM_TYPE_NODE)
+        );
+    }
+
+    #[test]
+    fn empty_tuple_ignores_valid_reference_flags_and_rejects_unsupported_flags() {
+        let mut store = initialized();
+        let flagged = CanonicalTupleTypeRequest::new(&[], &[], false)
+            .with_creation_flags(ObjectFlags::FROM_TYPE_NODE);
+        let empty = store.create_canonical_tuple_type(flagged).unwrap();
+        assert_eq!(
+            store.type_payload(empty).unwrap().object_flags(),
+            ObjectFlags::REFERENCE | ObjectFlags::TUPLE
+        );
+        assert_eq!(
+            store.create_canonical_tuple_type(CanonicalTupleTypeRequest::new(&[], &[], false)),
+            Ok(empty)
+        );
+
+        let before = observable_state(&store);
+        let invalid_flags = ObjectFlags::FROM_TYPE_NODE | ObjectFlags::ARRAY_LITERAL;
+        assert_eq!(
+            store.create_canonical_tuple_type(
+                CanonicalTupleTypeRequest::new(&[], &[], true).with_creation_flags(invalid_flags),
+            ),
+            Err(TupleTypeError::UnsupportedCreationFlags(invalid_flags))
+        );
+        assert_eq!(observable_state(&store), before);
     }
 
     #[test]
