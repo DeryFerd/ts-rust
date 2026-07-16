@@ -404,6 +404,24 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         &self,
         type_: TypeId,
     ) -> DerivedObjectLiteralValidation {
+        self.validate_derived_object_literal(type_, None)
+    }
+
+    /// Validates a cached regular or widened object literal while retaining
+    /// the authoritative array identities needed by nested widened arrays.
+    pub(super) fn validate_derived_object_literal_with_global_types(
+        &self,
+        type_: TypeId,
+        global_types: &CanonicalGlobalTypes,
+    ) -> DerivedObjectLiteralValidation {
+        self.validate_derived_object_literal(type_, Some(global_types))
+    }
+
+    fn validate_derived_object_literal(
+        &self,
+        type_: TypeId,
+        global_types: Option<&CanonicalGlobalTypes>,
+    ) -> DerivedObjectLiteralValidation {
         if !matches!(
             self.type_payload(type_).map(TypeRecord::data),
             Some(TypeData::Object(_))
@@ -438,7 +456,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     type_,
                     &mut visiting,
                     &mut regular_visiting,
-                    None,
+                    global_types,
                 )
             }
         };

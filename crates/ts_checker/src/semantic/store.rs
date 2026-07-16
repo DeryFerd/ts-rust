@@ -14,6 +14,7 @@ use ts_binder::{
 use ts_parser::{IsolatedEntityName, parse_isolated_entity_name};
 
 use super::{
+    array_types::CanonicalArrayTargets,
     bootstrap::IntrinsicBootstrap,
     derived_types::DerivedTypeCaches,
     ids::{
@@ -88,6 +89,14 @@ pub(super) enum SourceCallableFamily {
     ArrowFunction,
 }
 
+/// Whether a source callable's return is owned by exact annotation syntax or
+/// is inferred from its checked body.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SourceCallableReturnProvenance {
+    Annotated,
+    Inferred,
+}
+
 impl SourceCallableFamily {
     pub(super) const fn syntax_kind(self) -> SyntaxKind {
         match self {
@@ -106,6 +115,11 @@ pub(super) struct SourceCallableProvenance {
     pub(super) owner_parent: Option<SemanticSymbolId>,
     pub(super) export_local: Option<SemanticSymbolId>,
     pub(super) signature: SignatureId,
+    pub(super) return_provenance: SourceCallableReturnProvenance,
+    /// Exact global-array targets installed while this callable was planned.
+    /// Store-only validation uses this retained capability for inferred
+    /// structured returns without consulting ambient checker state.
+    pub(super) array_targets: Option<CanonicalArrayTargets>,
     /// Exact declared identity named by a naked generic return annotation.
     /// Fixed keyword returns and non-generic/contextual callables retain None.
     pub(super) generic_return_type_parameter: Option<TypeId>,
@@ -165,6 +179,7 @@ pub(super) struct PreparedSourceGenericCallablePublication<'a> {
     pub(super) return_annotation: NodeRef,
     pub(super) return_null_literal_identity: bool,
     pub(super) generic_return_type_parameter: Option<TypeId>,
+    pub(super) array_targets: Option<CanonicalArrayTargets>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -782,6 +797,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             (None, None) => true,
             (Some(target), Some(variable)) => {
                 provenance.family == SourceCallableFamily::ArrowFunction
+                    && provenance.return_provenance == SourceCallableReturnProvenance::Inferred
                     && target != type_
                     && self.types.get(target).is_some()
                     && self.symbols.contains_symbol(variable)
@@ -798,10 +814,15 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                             .source_callable_type_parameters
                             .contains_key(&provenance.signature)
                 });
+        let array_targets_valid = provenance.array_targets.is_none_or(|targets| {
+            self.types.get(targets.array_type()).is_some()
+                && self.types.get(targets.readonly_array_type()).is_some()
+        });
         if self.types.get(type_).is_none()
             || self.source_callable_provenance.contains_key(&type_)
             || !contextual_pair
             || !exact_type_parameters
+            || !array_targets_valid
             || self.source_node_kind(provenance.declaration)
                 != Some(provenance.family.syntax_kind())
             || !self.symbols.contains_symbol(provenance.owner_symbol)
@@ -812,6 +833,8 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                 .export_local
                 .is_some_and(|local| !self.symbols.contains_symbol(local))
             || provenance.export_local == Some(provenance.owner_symbol)
+            || provenance.return_provenance == SourceCallableReturnProvenance::Inferred
+                && provenance.generic_return_type_parameter.is_some()
             || self.signatures.get(provenance.signature).is_none()
             || self
                 .source_callable_types_by_declaration
@@ -3345,6 +3368,8 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
             owner_parent: prepared.owner_parent,
             export_local: prepared.export_local,
             signature,
+            return_provenance: SourceCallableReturnProvenance::Annotated,
+            array_targets: prepared.array_targets,
             generic_return_type_parameter: prepared.generic_return_type_parameter,
             contextual_target: None,
             contextual_variable: None,

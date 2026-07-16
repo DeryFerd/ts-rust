@@ -34,8 +34,8 @@ use super::{
     CanonicalCheckerDiagnostic, CanonicalCheckerDiagnosticRange, CanonicalCheckerDiagnostics,
     CanonicalCheckerOptions, CanonicalGlobalTypes, CanonicalTypeMapperStore, DeclaredTypeError,
     DeclaredTypeHost, DerivedTypeError, ProductionAliasTargetHost, RelationUnavailable,
-    SourceFileLinks, SourceFileRef, SymbolNodeLinks, TypeDisplayUnavailable, TypeId, TypeNodeLinks,
-    ValueSymbolLinks, VariableInvariant, VariableUnsupported,
+    SignatureId, SourceFileLinks, SourceFileRef, SymbolNodeLinks, TypeDisplayUnavailable, TypeId,
+    TypeNodeLinks, ValueSymbolLinks, VariableInvariant, VariableUnsupported,
     array_types::CanonicalArrayTargets,
     bootstrap::{LiteralTypeCacheError, UnionReduction},
     callables::{
@@ -65,8 +65,10 @@ use super::{
     },
     source_callables::{
         ContextualSourceCallableParameter, PreparedContextualSourceCallable, SourceCallableError,
-        SourceCallableFamily, SourceCallablePlan, StoredSourceCallableValidation,
-        plan_source_callable, publish_contextual_source_callable, validate_stored_source_callable,
+        SourceCallableFamily, SourceCallableParameterPlan, SourceCallablePlan,
+        SourceCallableReturnPlan, StoredSourceCallableValidation, plan_source_callable,
+        publish_contextual_source_callable, publish_inferred_source_callable_return,
+        validate_inferred_source_callable_return, validate_stored_source_callable,
     },
     source_calls::{
         SourceCallPlan, check_direct_source_call, emit_call_type_argument_grammar_diagnostics,
@@ -1900,8 +1902,11 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
 
     fn function_empty_body_return_supported(
         &self,
-        mut type_node: NodeRef,
+        return_type: SourceCallableReturnPlan,
     ) -> Result<bool, SourceCheckError> {
+        let Some(mut type_node) = return_type.type_node() else {
+            return Ok(true);
+        };
         loop {
             let node = self.node(type_node)?;
             if matches!(
@@ -3295,6 +3300,96 @@ fn primitive_binary_operand_plan_is_supported(expression: &PlannedExpression) ->
     }
 }
 
+/// Proves that a hoisted inferred function can be checked before statement
+/// execution without observing a pending inferred callable or statement-local
+/// flow. This is deliberately a dependency gate, not a second expression
+/// planner: every admitted expression was already proven by `SourcePlanner`.
+fn preflight_inferred_function_return_dependencies(
+    functions: &[PlannedFunction],
+) -> Result<(), SourceCheckError> {
+    fn expression_is_closed(
+        expression: &PlannedExpression,
+        parameters: &[SourceCallableParameterPlan],
+        functions: &[PlannedFunction],
+    ) -> bool {
+        match &expression.kind {
+            PlannedExpressionKind::Null
+            | PlannedExpressionKind::String(_)
+            | PlannedExpressionKind::Number { .. }
+            | PlannedExpressionKind::BigInt { .. }
+            | PlannedExpressionKind::Boolean(_)
+            | PlannedExpressionKind::GlobalUndefined => true,
+            PlannedExpressionKind::Identifier(read) => {
+                read.kind == PlannedIdentifierReadKind::Variable
+                    && parameters
+                        .iter()
+                        .any(|parameter| parameter.symbol == read.value_symbol)
+            }
+            PlannedExpressionKind::TypeImportValueUse(_) => false,
+            PlannedExpressionKind::Parenthesized(inner)
+            | PlannedExpressionKind::Assertion { operand: inner, .. } => {
+                expression_is_closed(inner, parameters, functions)
+            }
+            PlannedExpressionKind::Array(elements) => elements
+                .iter()
+                .all(|element| expression_is_closed(element, parameters, functions)),
+            PlannedExpressionKind::Object { properties, .. } => properties
+                .iter()
+                .all(|property| expression_is_closed(property, parameters, functions)),
+            PlannedExpressionKind::Property(property) => {
+                expression_is_closed(&property.receiver, parameters, functions)
+            }
+            PlannedExpressionKind::Element(element) => {
+                expression_is_closed(&element.receiver, parameters, functions)
+                    && expression_is_closed(&element.index, parameters, functions)
+            }
+            PlannedExpressionKind::Call(call) => {
+                let callee = call.callee.unparenthesized();
+                let PlannedExpressionKind::Identifier(read) = &callee.kind else {
+                    return false;
+                };
+                read.kind == PlannedIdentifierReadKind::Function
+                    && functions.iter().any(|function| {
+                        function.callable.owner_symbol == read.value_symbol
+                            && !function.callable.return_type.is_inferred()
+                    })
+                    && call
+                        .arguments
+                        .iter()
+                        .all(|argument| expression_is_closed(argument, parameters, functions))
+            }
+            PlannedExpressionKind::Binary(binary) => {
+                expression_is_closed(&binary.left, parameters, functions)
+                    && expression_is_closed(&binary.right, parameters, functions)
+            }
+            PlannedExpressionKind::Logical(logical) => {
+                expression_is_closed(&logical.left, parameters, functions)
+                    && expression_is_closed(&logical.right, parameters, functions)
+            }
+        }
+    }
+
+    for function in functions {
+        if !function.callable.return_type.is_inferred() {
+            continue;
+        }
+        let supported = match &function.body {
+            PlannedFunctionBody::Empty => true,
+            PlannedFunctionBody::Return { expression, .. } => {
+                expression_is_closed(expression, &function.callable.parameters, functions)
+            }
+        };
+        if !supported {
+            return Err(SourceCheckError::Unsupported(
+                UnsupportedSourceSyntax::Function(SourceFunctionUnsupported::FunctionBody(
+                    function.callable.body,
+                )),
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub(super) const fn primitive_binary_operator_text(kind: SyntaxKind) -> Option<&'static str> {
     match kind {
         SyntaxKind::PlusToken => Some("+"),
@@ -4349,7 +4444,7 @@ fn narrow_logical_right_flow_types(
             binary.operator,
             current,
         )
-        .map_err(|error| logical_binary_check_error(host, binary, &error))?;
+                .map_err(|error| logical_binary_check_error(host, binary, &error))?;
         narrowed.insert(read.value_symbol, type_);
     }
     Ok(Some(narrowed))
@@ -5348,6 +5443,12 @@ fn publish_staged_variable_state(
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MaterializedSourceCallable {
+    type_: TypeId,
+    signature: SignatureId,
+}
+
 #[allow(clippy::too_many_arguments)] // Keeps callable source capabilities explicit.
 fn materialize_checked_source_callable(
     store: &mut CanonicalTypeMapperStore,
@@ -5356,7 +5457,7 @@ fn materialize_checked_source_callable(
     options: CanonicalCheckerOptions,
     diagnostics: &mut CanonicalCheckerDiagnostics,
     callable: &SourceCallablePlan,
-) -> Result<TypeId, SourceCheckError> {
+) -> Result<MaterializedSourceCallable, SourceCheckError> {
     let mut callable_diagnostics = CanonicalCheckerDiagnostics::default();
     let type_result = CanonicalTypeQuery::new_with_global_types(
         store,
@@ -5401,18 +5502,69 @@ fn materialize_checked_source_callable(
         .ok_or(SourceCheckError::Function(
             SourceFunctionInvariant::MissingCallableType(owner),
         ))?;
-    let mut return_diagnostics = CanonicalCheckerDiagnostics::default();
-    let return_result = CanonicalTypeQuery::new_with_global_types(
-        store,
-        host,
-        global_types,
-        options,
-        &mut return_diagnostics,
-    )
-    .and_then(|mut query| query.get_return_type_of_signature(signature));
-    merge_retry_diagnostics(diagnostics, return_diagnostics);
-    return_result?;
-    Ok(type_)
+    if !callable.return_type.is_inferred() {
+        let mut return_diagnostics = CanonicalCheckerDiagnostics::default();
+        let return_result = CanonicalTypeQuery::new_with_global_types(
+            store,
+            host,
+            global_types,
+            options,
+            &mut return_diagnostics,
+        )
+        .and_then(|mut query| query.get_return_type_of_signature(signature));
+        merge_retry_diagnostics(diagnostics, return_diagnostics);
+        return_result?;
+    }
+    Ok(MaterializedSourceCallable { type_, signature })
+}
+
+#[allow(clippy::too_many_arguments)] // Keeps body inference capabilities explicit.
+fn publish_checked_source_callable_return(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    source: SourceFileRef,
+    options: CanonicalCheckerOptions,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    flow_types: &HashMap<SemanticSymbolId, TypeId>,
+    preflighted_type_import_value_uses: &HashMap<NodeRef, PreparedSourceTypeImportValueUse>,
+    deferred: &mut Vec<DeferredAssertion>,
+    callable: &SourceCallablePlan,
+    signature: SignatureId,
+    expression: Option<&PlannedExpression>,
+) -> Result<TypeId, SourceCheckError> {
+    if let Some(existing) = validate_inferred_source_callable_return(store, callable, signature)
+        .map_err(SourcePlanner::callable_plan_error)?
+    {
+        return Ok(existing);
+    }
+    let inferred = match expression {
+        Some(expression) => {
+            let checked = check_expression_type(
+                store,
+                host,
+                global_types,
+                source,
+                options,
+                diagnostics,
+                flow_types,
+                preflighted_type_import_value_uses,
+                expression,
+                None,
+                deferred,
+            )?;
+            let widened_literal = widened_fresh_literal_type(store, checked.result)?;
+            store.get_widened_type_with_global_types(widened_literal, global_types)?
+        }
+        None => {
+            store
+                .intrinsic_bootstrap()
+                .ok_or(DerivedTypeError::BootstrapUninitialized)?
+                .void_type
+        }
+    };
+    publish_inferred_source_callable_return(store, callable, signature, inferred)
+        .map_err(SourcePlanner::callable_plan_error)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5762,6 +5914,7 @@ pub(super) fn check_source_file(
         global_types,
     )
     .finish()?;
+    preflight_inferred_function_return_dependencies(&functions)?;
 
     let mut resolved_imports = HashMap::<SemanticSymbolId, ResolvedSourceImportBinding>::new();
     for import in &value_imports {
@@ -5891,22 +6044,66 @@ pub(super) fn check_source_file(
         prepared_imports.push(prepared);
     }
 
+    let mut materialized_functions = Vec::with_capacity(functions.len());
     for function in &functions {
-        let type_ = materialize_checked_source_callable(
+        let materialized = materialize_checked_source_callable(
             store,
             host,
             global_types,
             options,
             diagnostics,
             &function.callable,
-        );
-        let type_ = type_?;
+        )?;
         let owner = function.callable.owner_symbol;
-        if current_flow_types.insert(owner, type_).is_some() {
+        if current_flow_types
+            .insert(owner, materialized.type_)
+            .is_some()
+        {
             return Err(SourceCheckError::Function(
                 SourceFunctionInvariant::DuplicateDeclaration(function.callable.declaration),
             ));
         }
+        materialized_functions.push(materialized);
+    }
+    for (function, materialized) in functions.iter().zip(&materialized_functions) {
+        if !function.callable.return_type.is_inferred() {
+            continue;
+        }
+        let mut body_flow_types = current_flow_types.clone();
+        for parameter in &function.callable.parameters {
+            let parameter_type = store
+                .value_symbol_links(parameter.symbol)
+                .and_then(|links| links.resolved_type)
+                .ok_or(SourceCheckError::Variable(
+                    VariableInvariant::MissingCurrentFlowType(parameter.symbol),
+                ))?;
+            if body_flow_types
+                .insert(parameter.symbol, parameter_type)
+                .is_some()
+            {
+                return Err(SourceCheckError::Variable(
+                    VariableInvariant::DuplicateCurrentFlowType(parameter.symbol),
+                ));
+            }
+        }
+        let expression = match &function.body {
+            PlannedFunctionBody::Empty => None,
+            PlannedFunctionBody::Return { expression, .. } => Some(expression),
+        };
+        publish_checked_source_callable_return(
+            store,
+            host,
+            global_types,
+            source,
+            options,
+            diagnostics,
+            &body_flow_types,
+            &preflighted_type_import_value_uses,
+            &mut deferred,
+            &function.callable,
+            materialized.signature,
+            expression,
+        )?;
     }
 
     for statement in statements {
@@ -5948,6 +6145,14 @@ pub(super) fn check_source_file(
                 let function = functions.get(index).ok_or(SourceCheckError::Function(
                     SourceFunctionInvariant::InvalidStatementIndex(index),
                 ))?;
+                if function.callable.return_type.is_inferred() {
+                    continue;
+                }
+                let Some(return_type) = function.callable.return_type.type_node() else {
+                    return Err(SourceCheckError::Function(
+                        SourceFunctionInvariant::Callable(function.callable.declaration),
+                    ));
+                };
                 let mut body_flow_types = current_flow_types.clone();
                 for parameter in &function.callable.parameters {
                     let parameter_type = store
@@ -5981,7 +6186,7 @@ pub(super) fn check_source_file(
                             &body_flow_types,
                             &preflighted_type_import_value_uses,
                             &mut deferred,
-                            function.callable.return_type,
+                            return_type,
                             &[],
                             expression,
                             *statement,
@@ -5994,7 +6199,7 @@ pub(super) fn check_source_file(
                 let arrow = arrows
                     .get(index)
                     .ok_or(SourceCheckError::Arrow(source.node_ref()))?;
-                let type_ = materialize_checked_source_callable(
+                let materialized = materialize_checked_source_callable(
                     store,
                     host,
                     global_types,
@@ -6002,15 +6207,52 @@ pub(super) fn check_source_file(
                     diagnostics,
                     &arrow.source.callable,
                 )?;
+                if arrow.source.callable.return_type.is_inferred() {
+                    let mut body_flow_types = current_flow_types.clone();
+                    for parameter in &arrow.source.callable.parameters {
+                        let parameter_type = store
+                            .value_symbol_links(parameter.symbol)
+                            .and_then(|links| links.resolved_type)
+                            .ok_or(SourceCheckError::Variable(
+                                VariableInvariant::MissingCurrentFlowType(parameter.symbol),
+                            ))?;
+                        if body_flow_types
+                            .insert(parameter.symbol, parameter_type)
+                            .is_some()
+                        {
+                            return Err(SourceCheckError::Variable(
+                                VariableInvariant::DuplicateCurrentFlowType(parameter.symbol),
+                            ));
+                        }
+                    }
+                    let expression = match &arrow.body {
+                        PlannedArrowBody::Empty => None,
+                        PlannedArrowBody::Return { expression, .. } => Some(expression),
+                    };
+                    publish_checked_source_callable_return(
+                        store,
+                        host,
+                        global_types,
+                        source,
+                        options,
+                        diagnostics,
+                        &body_flow_types,
+                        &preflighted_type_import_value_uses,
+                        &mut deferred,
+                        &arrow.source.callable,
+                        materialized.signature,
+                        expression,
+                    )?;
+                }
                 stage_value_type(
                     store,
                     &mut declared_types,
                     &mut value_order,
                     arrow.source.variable_symbol,
-                    type_,
+                    materialized.type_,
                 )?;
                 if current_flow_types
-                    .insert(arrow.source.variable_symbol, type_)
+                    .insert(arrow.source.variable_symbol, materialized.type_)
                     .is_some()
                 {
                     return Err(SourceCheckError::Variable(
@@ -6193,6 +6435,12 @@ pub(super) fn check_source_file(
         captured_flow_types.insert(symbol, declared_type);
     }
     for arrow in &arrows {
+        if arrow.source.callable.return_type.is_inferred() {
+            continue;
+        }
+        let Some(return_type) = arrow.source.callable.return_type.type_node() else {
+            return Err(SourceCheckError::Arrow(arrow.source.callable.declaration));
+        };
         let mut body_flow_types = captured_flow_types.clone();
         for parameter in &arrow.source.callable.parameters {
             let parameter_type = store
@@ -6226,7 +6474,7 @@ pub(super) fn check_source_file(
                     &body_flow_types,
                     &preflighted_type_import_value_uses,
                     &mut deferred,
-                    arrow.source.callable.return_type,
+                    return_type,
                     &[],
                     expression,
                     *diagnostic_node,

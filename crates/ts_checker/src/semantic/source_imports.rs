@@ -1730,6 +1730,13 @@ fn plan_direct_annotated_function_target(
         target,
         Some(CanonicalArrayTargets::from_global_types(global_types)),
     )?;
+    if callable.return_type.is_inferred() {
+        return Err(unsupported(SourceImportUnsupported::TargetSymbol {
+            alias,
+            target,
+            flags: target_record.flags(),
+        }));
+    }
     if callable.family != SourceCallableFamily::FunctionDeclaration
         || callable.declaration != declaration
         || callable.owner_symbol != target

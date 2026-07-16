@@ -1646,7 +1646,7 @@ mod tests {
             fixture
                 .parsed
                 .arena
-                .get(plan.callable.return_type.node)
+                .get(plan.callable.return_type.type_node().unwrap().node)
                 .unwrap()
                 .kind,
             SyntaxKind::StringKeyword
@@ -2051,13 +2051,15 @@ mod tests {
             ))
         ));
 
-        let missing_return_type = Fixture::new("const f = (x: number) => x;");
-        assert!(matches!(
-            missing_return_type.plan(0),
-            Err(SourceArrowError::Unsupported(
-                SourceArrowUnsupported::Callable(SourceCallableUnsupported::MissingReturnType(_))
-            ))
-        ));
+        let inferred_return = Fixture::new("const f = (x: number) => x;");
+        assert!(
+            inferred_return
+                .plan(0)
+                .unwrap()
+                .callable
+                .return_type
+                .is_inferred()
+        );
 
         let initialized = Fixture::new("const f = (x: number = 0): number => x;");
         let initialized = initialized.plan(0).unwrap();

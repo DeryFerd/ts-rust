@@ -28,7 +28,8 @@ use super::{
     signatures::{Signature, SignatureFlags},
     store::{
         PreparedSourceGenericCallablePublication, ResolvedSourceCallableTypeParameter,
-        SourceCallableProvenance, SourceCallableTypeParameterProvenance, SourceNodeParent,
+        SourceCallableProvenance, SourceCallableReturnProvenance,
+        SourceCallableTypeParameterProvenance, SourceNodeParent,
     },
     type_records::{ConstrainedTypeData, StructuredTypeData, TypeCacheState, TypeData, TypeRecord},
     types::{ObjectFlags, TypeFlags},
@@ -95,6 +96,48 @@ pub(super) struct SourceCallableTypeParameterSyntaxProof {
     generic_fixed_return_is_exact: bool,
 }
 
+/// Exact return ownership retained by source planning.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SourceCallableReturnPlan {
+    Annotated {
+        type_node: NodeRef,
+        identity_node: NodeRef,
+        null_literal_identity: bool,
+    },
+    Inferred,
+}
+
+impl SourceCallableReturnPlan {
+    pub(super) const fn type_node(self) -> Option<NodeRef> {
+        match self {
+            Self::Annotated { type_node, .. } => Some(type_node),
+            Self::Inferred => None,
+        }
+    }
+
+    const fn annotation_identity(self) -> Option<(NodeRef, bool)> {
+        match self {
+            Self::Annotated {
+                identity_node,
+                null_literal_identity,
+                ..
+            } => Some((identity_node, null_literal_identity)),
+            Self::Inferred => None,
+        }
+    }
+
+    pub(super) const fn provenance(self) -> SourceCallableReturnProvenance {
+        match self {
+            Self::Annotated { .. } => SourceCallableReturnProvenance::Annotated,
+            Self::Inferred => SourceCallableReturnProvenance::Inferred,
+        }
+    }
+
+    pub(super) const fn is_inferred(self) -> bool {
+        matches!(self, Self::Inferred)
+    }
+}
+
 impl SourceCallableTypeParameterSyntaxProof {
     pub(super) const fn declaration(&self) -> NodeRef {
         self.declaration
@@ -125,9 +168,7 @@ pub(super) struct SourceCallablePlan {
     pub(super) type_parameter_syntax: Box<SourceCallableTypeParameterSyntaxProof>,
     generic_return_type_parameter_index: Option<usize>,
     pub(super) parameters: Vec<SourceCallableParameterPlan>,
-    pub(super) return_type: NodeRef,
-    return_identity_node: NodeRef,
-    return_null_literal_identity: bool,
+    pub(super) return_type: SourceCallableReturnPlan,
     pub(super) body: NodeRef,
     pub(super) flags: SignatureFlags,
     pub(super) min_argument_count: i32,
@@ -150,7 +191,7 @@ pub(super) enum SourceCallableUnsupported {
     DestructuredParameter(NodeRef),
     ParameterModifiers(NodeRef),
     MissingParameterType(NodeRef),
-    MissingReturnType(NodeRef),
+    GenericInferredReturn(NodeRef),
     TypePredicate(NodeRef),
     RequiredAfterOptional(NodeRef),
 }
@@ -195,7 +236,7 @@ impl SourceCallableError {
                 | SourceCallableUnsupported::DestructuredParameter(node)
                 | SourceCallableUnsupported::ParameterModifiers(node)
                 | SourceCallableUnsupported::MissingParameterType(node)
-                | SourceCallableUnsupported::MissingReturnType(node)
+                | SourceCallableUnsupported::GenericInferredReturn(node)
                 | SourceCallableUnsupported::TypePredicate(node)
                 | SourceCallableUnsupported::RequiredAfterOptional(node) => node,
             }),
@@ -236,6 +277,10 @@ pub(super) enum SourceCallableState {
         signature: SignatureId,
     },
     ActiveParameters {
+        type_: TypeId,
+        signature: SignatureId,
+    },
+    AwaitingInferredReturn {
         type_: TypeId,
         signature: SignatureId,
     },
@@ -617,27 +662,42 @@ pub(super) fn plan_source_callable(
         });
     }
 
-    let Some(return_id) = view.return_type else {
-        return Err(SourceCallableError::Unsupported(
-            SourceCallableUnsupported::MissingReturnType(declaration),
-        ));
+    let (return_type, return_end) = if let Some(return_id) = view.return_type {
+        let type_node = NodeRef::new(declaration.arena, declaration.file, return_id);
+        let return_record = preflight_node(store, host, type_node)?;
+        if return_record.parent != Some(declaration.node)
+            || return_record.range.start < view.parameters.range.end
+            || return_record.range.end > record.range.end
+        {
+            return Err(invariant(SourceCallableInvariant::InvalidSyntax(
+                declaration,
+            )));
+        }
+        let identity_node = peel_parenthesized_type(store, host, type_node)?;
+        if preflight_node(store, host, identity_node)?.kind == SyntaxKind::TypePredicate {
+            return Err(SourceCallableError::Unsupported(
+                SourceCallableUnsupported::TypePredicate(type_node),
+            ));
+        }
+        (
+            SourceCallableReturnPlan::Annotated {
+                type_node,
+                identity_node,
+                null_literal_identity: is_null_literal_type(store, host, identity_node)?,
+            },
+            return_record.range.end,
+        )
+    } else {
+        if !type_parameters.is_empty() {
+            return Err(SourceCallableError::Unsupported(
+                SourceCallableUnsupported::GenericInferredReturn(declaration),
+            ));
+        }
+        (
+            SourceCallableReturnPlan::Inferred,
+            view.parameters.range.end,
+        )
     };
-    let return_type = NodeRef::new(declaration.arena, declaration.file, return_id);
-    let return_record = preflight_node(store, host, return_type)?;
-    if return_record.parent != Some(declaration.node)
-        || return_record.range.start < view.parameters.range.end
-        || return_record.range.end > record.range.end
-    {
-        return Err(invariant(SourceCallableInvariant::InvalidSyntax(
-            declaration,
-        )));
-    }
-    let return_identity_node = peel_parenthesized_type(store, host, return_type)?;
-    if preflight_node(store, host, return_identity_node)?.kind == SyntaxKind::TypePredicate {
-        return Err(SourceCallableError::Unsupported(
-            SourceCallableUnsupported::TypePredicate(return_type),
-        ));
-    }
     let Some(body_id) = view.body else {
         return Err(SourceCallableError::Unsupported(
             SourceCallableUnsupported::OverloadDeclaration(declaration),
@@ -646,7 +706,7 @@ pub(super) fn plan_source_callable(
     let body = NodeRef::new(declaration.arena, declaration.file, body_id);
     let body_record = preflight_node(store, host, body)?;
     if body_record.parent != Some(declaration.node)
-        || body_record.range.start < return_record.range.end
+        || body_record.range.start < return_end
         || body_record.range.end > record.range.end
         || view.family == SourceCallableFamily::FunctionDeclaration
             && body_record.kind != SyntaxKind::Block
@@ -660,7 +720,7 @@ pub(super) fn plan_source_callable(
         let token_record = preflight_node(store, host, token)?;
         if token_record.kind != SyntaxKind::EqualsGreaterThanToken
             || token_record.parent != Some(declaration.node)
-            || token_record.range.start < return_record.range.end
+            || token_record.range.start < return_end
             || token_record.range.end > body_record.range.start
         {
             return Err(invariant(SourceCallableInvariant::InvalidSyntax(
@@ -681,15 +741,16 @@ pub(super) fn plan_source_callable(
         generic_return_type_parameter_index: None,
         parameters,
         return_type,
-        return_identity_node,
-        return_null_literal_identity: is_null_literal_type(store, host, return_identity_node)?,
         body,
         flags,
         min_argument_count,
         array_targets,
     };
-    plan.generic_return_type_parameter_index =
-        validate_exact_generic_annotation_shape(store, host, &plan)?;
+    plan.generic_return_type_parameter_index = if plan.return_type.is_inferred() {
+        None
+    } else {
+        validate_exact_generic_annotation_shape(store, host, &plan)?
+    };
     plan.type_parameter_syntax
         .generic_return_type_parameter_declaration = plan
         .generic_return_type_parameter_index
@@ -1037,6 +1098,11 @@ fn validate_exact_generic_annotation_shape(
     if plan.type_parameters.is_empty() {
         return Ok(None);
     }
+    let Some((return_identity_node, _)) = plan.return_type.annotation_identity() else {
+        return Err(SourceCallableError::Unsupported(
+            SourceCallableUnsupported::GenericInferredReturn(plan.declaration),
+        ));
+    };
     for parameter in &plan.parameters {
         let mut exact = false;
         for type_parameter in &plan.type_parameters {
@@ -1066,7 +1132,7 @@ fn validate_exact_generic_annotation_shape(
         if is_naked_source_type_parameter_annotation(
             store,
             host,
-            plan.return_identity_node,
+            return_identity_node,
             type_parameter,
         )? {
             return_type_parameter = Some(index);
@@ -1074,11 +1140,11 @@ fn validate_exact_generic_annotation_shape(
     }
     if return_type_parameter.is_none()
         && !is_exact_source_generic_mapper_annotation(
-        store,
-        host,
-        plan.return_identity_node,
-        &plan.type_parameters,
-    )?
+            store,
+            host,
+            return_identity_node,
+            &plan.type_parameters,
+        )?
     {
         return Err(SourceCallableError::Unsupported(
             SourceCallableUnsupported::GenericSignature(plan.declaration),
@@ -1307,11 +1373,11 @@ fn source_type_parameter_annotation_links_are_cold_or_fully_warm(
         && type_links.is_none_or(|links| links == &TypeNodeLinks::default());
     cold
         || source_type_parameter_annotation_links_are_fully_warm(
-            store,
-            annotation,
-            symbol,
-            declared_type,
-        )
+        store,
+        annotation,
+        symbol,
+        declared_type,
+    )
 }
 
 fn validate_modifiers(
@@ -1554,6 +1620,8 @@ pub(super) fn source_callable_state(
         owner_parent: plan.owner_parent,
         export_local: plan.export_local,
         signature,
+        return_provenance: plan.return_type.provenance(),
+        array_targets: plan.array_targets,
         generic_return_type_parameter,
         contextual_target: None,
         contextual_variable: None,
@@ -1643,6 +1711,9 @@ pub(super) fn source_callable_state(
         validate_parameter_links(store, plan, parameter, *expected)?;
     }
     validate_cached_return_type(store, plan, signature)?;
+    if plan.return_type.is_inferred() && resolved_return_type.is_none() {
+        return Ok(SourceCallableState::AwaitingInferredReturn { type_, signature });
+    }
     Ok(SourceCallableState::Resolved { type_, signature })
 }
 
@@ -1870,6 +1941,8 @@ pub(super) fn publish_contextual_source_callable(
             owner_parent: None,
             export_local: None,
             signature,
+            return_provenance: SourceCallableReturnProvenance::Inferred,
+            array_targets: None,
             generic_return_type_parameter: None,
             contextual_target: Some(prepared.contextual_target),
             contextual_variable: Some(prepared.variable_symbol),
@@ -1927,7 +2000,8 @@ pub(super) fn begin_source_callable(
     resolved_type_parameters: &[ResolvedSourceCallableTypeParameter],
 ) -> Result<Result<PendingSourceCallable, TypeId>, SourceCallableError> {
     match source_callable_state(store, plan, true)? {
-        SourceCallableState::Resolved { type_, .. } => return Ok(Err(type_)),
+        SourceCallableState::AwaitingInferredReturn { type_, .. }
+        | SourceCallableState::Resolved { type_, .. } => return Ok(Err(type_)),
         SourceCallableState::Cold => {}
         SourceCallableState::ActiveBarrier { type_, signature }
         | SourceCallableState::ActiveParameters { type_, signature } => {
@@ -1951,6 +2025,13 @@ pub(super) fn begin_source_callable(
         )));
     }
     if !resolved_type_parameters.is_empty() {
+        let Some((return_annotation, return_null_literal_identity)) =
+            plan.return_type.annotation_identity()
+        else {
+            return Err(SourceCallableError::Unsupported(
+                SourceCallableUnsupported::GenericInferredReturn(plan.declaration),
+            ));
+        };
         let (type_, signature) = store
             .publish_source_generic_callable(PreparedSourceGenericCallablePublication {
                 syntax: &plan.type_parameter_syntax,
@@ -1967,11 +2048,12 @@ pub(super) fn begin_source_callable(
                     .collect(),
                 flags: plan.flags,
                 min_argument_count: plan.min_argument_count,
-                return_annotation: plan.return_identity_node,
-                return_null_literal_identity: plan.return_null_literal_identity,
+                return_annotation,
+                return_null_literal_identity,
                 generic_return_type_parameter: plan
                     .generic_return_type_parameter_index
                     .map(|index| resolved_type_parameters[index].provenance.type_parameter),
+                array_targets: plan.array_targets,
             })
             .ok_or_else(|| invariant(SourceCallableInvariant::Publication(plan.declaration)))?;
         return Ok(Ok(PendingSourceCallable { type_, signature }));
@@ -2003,6 +2085,8 @@ pub(super) fn begin_source_callable(
             owner_parent: plan.owner_parent,
             export_local: plan.export_local,
             signature,
+            return_provenance: plan.return_type.provenance(),
+            array_targets: plan.array_targets,
             generic_return_type_parameter: None,
             contextual_target: None,
             contextual_variable: None,
@@ -2012,15 +2096,19 @@ pub(super) fn begin_source_callable(
         provenance,
         "source callable provenance was prevalidated and reserved"
     );
-    let return_annotation = store.set_function_signature_return_annotation(
-        signature,
-        plan.return_identity_node,
-        plan.return_null_literal_identity,
-    );
-    assert!(
-        return_annotation,
-        "source callable return annotation was prevalidated and reserved"
-    );
+    if let Some((return_identity_node, return_null_literal_identity)) =
+        plan.return_type.annotation_identity()
+    {
+        let return_annotation = store.set_function_signature_return_annotation(
+            signature,
+            return_identity_node,
+            return_null_literal_identity,
+        );
+        assert!(
+            return_annotation,
+            "source callable return annotation was prevalidated and reserved"
+        );
+    }
     if !store.set_value_symbol_links(
         plan.owner_symbol,
         ValueSymbolLinks {
@@ -2224,12 +2312,26 @@ pub(super) fn publish_source_callable_parameter_types(
     for callable in pending {
         let state = source_callable_state(store, &callable.plan, false);
         assert!(
-            matches!(state, Ok(SourceCallableState::Resolved { .. })),
+            matches!(
+                state,
+                Ok(SourceCallableState::AwaitingInferredReturn { .. })
+                    | Ok(SourceCallableState::Resolved { .. })
+            ),
             "prevalidated source callable batch must publish resolved caches"
         );
-        let Ok(SourceCallableState::Resolved { type_, .. }) = state else {
-            unreachable!()
+        let (type_, awaiting_inferred_return) = match state {
+            Ok(SourceCallableState::AwaitingInferredReturn { type_, .. }) => (type_, true),
+            Ok(SourceCallableState::Resolved { type_, .. }) => (type_, false),
+            _ => unreachable!(),
         };
+        if awaiting_inferred_return {
+            assert_eq!(
+                validate_stored_source_callable(store, type_),
+                StoredSourceCallableValidation::Pending,
+                "inferred source callable must remain explicitly pending until its body is checked"
+            );
+            continue;
+        }
         let capability = match callable.plan.array_targets {
             Some(targets) => {
                 store.validate_cached_array_capability_with_array_targets(targets, type_)
@@ -2256,6 +2358,9 @@ pub(super) fn validate_source_callable_signature_identity(
         | SourceCallableState::ActiveParameters {
             signature: cached, ..
         }
+        | SourceCallableState::AwaitingInferredReturn {
+            signature: cached, ..
+        }
         | SourceCallableState::Resolved {
             signature: cached, ..
         } => cached == signature,
@@ -2274,6 +2379,11 @@ pub(super) fn validate_lazy_source_callable_return(
     plan: &SourceCallablePlan,
     signature: SignatureId,
 ) -> Result<Option<TypeId>, SourceCallableError> {
+    if plan.return_type.annotation_identity().is_none() {
+        return Err(invariant(SourceCallableInvariant::InvalidSignatureCache(
+            plan.declaration,
+        )));
+    }
     match source_callable_state(store, plan, false)? {
         SourceCallableState::Resolved {
             signature: cached, ..
@@ -2296,11 +2406,15 @@ pub(super) fn publish_lazy_source_callable_return(
     signature: SignatureId,
     return_type: TypeId,
 ) -> Result<TypeId, SourceCallableError> {
-    let annotation = cached_annotation_identity(
-        store,
-        plan.return_identity_node,
-        plan.return_null_literal_identity,
-    );
+    let Some((return_identity_node, return_null_literal_identity)) =
+        plan.return_type.annotation_identity()
+    else {
+        return Err(invariant(SourceCallableInvariant::InvalidSignatureCache(
+            plan.declaration,
+        )));
+    };
+    let annotation =
+        cached_annotation_identity(store, return_identity_node, return_null_literal_identity);
     if store.type_payload(return_type).is_none()
         || store.signature_has_circular_return_type(signature)
         || validate_lazy_source_callable_return(store, plan, signature)?.is_some()
@@ -2310,8 +2424,8 @@ pub(super) fn publish_lazy_source_callable_return(
                 valid_source_generic_mapper_type(store, return_type, &type_parameters)
                     && valid_stored_source_generic_return_annotation(
                         store,
-                        plan.return_identity_node,
-                        plan.return_null_literal_identity,
+                        return_identity_node,
+                        return_null_literal_identity,
                         return_type,
                         plan.generic_return_type_parameter_index
                             .and_then(|index| type_parameters.get(index).copied()),
@@ -2335,17 +2449,21 @@ pub(super) fn publish_circular_lazy_source_callable_return(
     signature: SignatureId,
     annotation_type: TypeId,
 ) -> Result<TypeId, SourceCallableError> {
+    let Some((return_identity_node, return_null_literal_identity)) =
+        plan.return_type.annotation_identity()
+    else {
+        return Err(invariant(SourceCallableInvariant::InvalidSignatureCache(
+            plan.declaration,
+        )));
+    };
     let Some(bootstrap) = store.intrinsic_bootstrap() else {
         return Err(invariant(SourceCallableInvariant::InvalidSignatureCache(
             plan.declaration,
         )));
     };
     let any_type = bootstrap.any_type;
-    let annotation = cached_annotation_identity(
-        store,
-        plan.return_identity_node,
-        plan.return_null_literal_identity,
-    );
+    let annotation =
+        cached_annotation_identity(store, return_identity_node, return_null_literal_identity);
     if store.type_payload(annotation_type).is_none()
         || !plan.type_parameters.is_empty()
         || store.signature_has_circular_return_type(signature)
@@ -2364,6 +2482,86 @@ pub(super) fn publish_circular_lazy_source_callable_return(
     );
     validate_cached_return_type(store, plan, signature)?;
     Ok(any_type)
+}
+
+/// Validates the final body-inferred return without consulting annotation
+/// syntax. `None` is the exact warmable state after the callable shell and
+/// parameter identities have been published.
+pub(super) fn validate_inferred_source_callable_return(
+    store: &CanonicalTypeMapperStore,
+    plan: &SourceCallablePlan,
+    signature: SignatureId,
+) -> Result<Option<TypeId>, SourceCallableError> {
+    if !plan.return_type.is_inferred() || !plan.type_parameters.is_empty() {
+        return Err(invariant(SourceCallableInvariant::InvalidSignatureCache(
+            plan.declaration,
+        )));
+    }
+    match source_callable_state(store, plan, false)? {
+        SourceCallableState::AwaitingInferredReturn {
+            signature: cached, ..
+        }
+        | SourceCallableState::Resolved {
+            signature: cached, ..
+        } if cached == signature => {}
+        _ => {
+            return Err(invariant(SourceCallableInvariant::InvalidSignatureCache(
+                plan.declaration,
+            )));
+        }
+    }
+    Ok(store
+        .signature(signature)
+        .expect("the inferred source callable cache was validated")
+        .resolved_return_type())
+}
+
+/// Atomically publishes a checked and widened inferred return. A warm replay
+/// accepts the exact existing identity and rejects every conflicting write.
+pub(super) fn publish_inferred_source_callable_return(
+    store: &mut CanonicalTypeMapperStore,
+    plan: &SourceCallablePlan,
+    signature: SignatureId,
+    return_type: TypeId,
+) -> Result<TypeId, SourceCallableError> {
+    if let Some(existing) = validate_inferred_source_callable_return(store, plan, signature)? {
+        return if existing == return_type {
+            Ok(existing)
+        } else {
+            Err(invariant(SourceCallableInvariant::InvalidSignatureCache(
+                plan.declaration,
+            )))
+        };
+    }
+    let capability_valid = match plan.array_targets {
+        Some(targets) => store
+            .validate_cached_array_capability_with_array_targets(targets, return_type)
+            .is_ok(),
+        None => store.validate_cached_array_capability(return_type).is_ok(),
+    };
+    if !capability_valid
+        || store
+            .function_signature_return_annotation(signature)
+            .is_some()
+        || store.signature_has_circular_return_type(signature)
+    {
+        return Err(invariant(SourceCallableInvariant::InvalidSignatureCache(
+            plan.declaration,
+        )));
+    }
+    let published = store.set_signature_resolved_return_type(signature, Some(return_type));
+    assert!(
+        published,
+        "inferred source return publication was prevalidated"
+    );
+    match source_callable_state(store, plan, false)? {
+        SourceCallableState::Resolved {
+            signature: cached, ..
+        } if cached == signature => Ok(return_type),
+        _ => Err(invariant(SourceCallableInvariant::InvalidSignatureCache(
+            plan.declaration,
+        ))),
+    }
 }
 
 pub(super) fn source_callable_display_projection(
@@ -2448,7 +2646,8 @@ pub(super) fn source_callable_display_projection(
                 signature,
             } if resolved == type_ && signature == provenance.signature => signature,
             SourceCallableState::ActiveBarrier { .. }
-            | SourceCallableState::ActiveParameters { .. } => {
+            | SourceCallableState::ActiveParameters { .. }
+            | SourceCallableState::AwaitingInferredReturn { .. } => {
                 return Err(SourceCallableDisplayError::Pending);
             }
             SourceCallableState::Cold | SourceCallableState::Resolved { .. } => {
@@ -2546,6 +2745,8 @@ pub(super) fn validate_stored_source_callable(
             owner_parent: provenance.owner_parent,
             export_local: provenance.export_local,
             signature: provenance.signature,
+            return_provenance: provenance.return_provenance,
+            array_targets: provenance.array_targets,
             generic_return_type_parameter: provenance.generic_return_type_parameter,
             contextual_target: provenance.contextual_target,
             contextual_variable: provenance.contextual_variable,
@@ -2595,6 +2796,18 @@ pub(super) fn validate_stored_source_callable(
         provenance.generic_return_type_parameter,
         &type_parameter_edges,
     );
+    let return_annotation = store.function_signature_return_annotation(signature);
+    let return_provenance_valid = match provenance.return_provenance {
+        SourceCallableReturnProvenance::Annotated => {
+            contextual.is_none() && return_annotation.is_some()
+        }
+        SourceCallableReturnProvenance::Inferred => {
+            return_annotation.is_none()
+                && type_parameter_edges.is_empty()
+                && provenance.generic_return_type_parameter.is_none()
+                && !store.signature_has_circular_return_type(signature)
+        }
+    };
     let mut edges =
         Vec::with_capacity(signature_record.parameters().len() + type_parameter_edges.len() + 2);
     edges.extend(type_parameter_edges.iter().copied());
@@ -2721,6 +2934,7 @@ pub(super) fn validate_stored_source_callable(
             &type_parameter_edges,
         )
         || !generic_return_provenance_valid
+        || !return_provenance_valid
         || !parameters_valid
         || default_parameter_count != 0
             && default_parameter_count != signature_record.parameters().len()
@@ -2811,9 +3025,23 @@ pub(super) fn validate_stored_source_callable(
         edges.push(return_type.expect("the contextual return was validated"));
         return StoredSourceCallableValidation::Valid(edges);
     }
-    let Some((return_identity_node, return_null_literal_identity)) =
-        store.function_signature_return_annotation(signature)
-    else {
+    if provenance.return_provenance == SourceCallableReturnProvenance::Inferred {
+        let Some(return_type) = signature_record.resolved_return_type() else {
+            return StoredSourceCallableValidation::Pending;
+        };
+        let valid_return = match provenance.array_targets {
+            Some(targets) => store
+                .validate_cached_array_capability_with_array_targets(targets, return_type)
+                .is_ok(),
+            None => store.validate_cached_array_capability(return_type).is_ok(),
+        };
+        if !valid_return {
+            return StoredSourceCallableValidation::Malformed;
+        }
+        edges.push(return_type);
+        return StoredSourceCallableValidation::Valid(edges);
+    }
+    let Some((return_identity_node, return_null_literal_identity)) = return_annotation else {
         return StoredSourceCallableValidation::Malformed;
     };
     if let Some(return_type) = signature_record.resolved_return_type() {
@@ -3227,7 +3455,7 @@ fn validate_signature(
         || record.isolated_signature_type().is_some()
         || record.composite().is_some()
         || store.function_signature_return_annotation(signature)
-            != Some((plan.return_identity_node, plan.return_null_literal_identity))
+            != plan.return_type.annotation_identity()
     {
         return Err(invariant(SourceCallableInvariant::InvalidSignatureCache(
             plan.declaration,
@@ -3361,6 +3589,31 @@ fn validate_cached_return_type(
         .signature(signature)
         .and_then(Signature::resolved_return_type);
     let circular_annotation = store.circular_return_annotation_type(signature);
+    let stored_annotation = store.function_signature_return_annotation(signature);
+    if plan.return_type.is_inferred() {
+        let resolved_valid = resolved.is_none_or(|type_| match plan.array_targets {
+            Some(targets) => store
+                .validate_cached_array_capability_with_array_targets(targets, type_)
+                .is_ok(),
+            None => store.validate_cached_array_capability(type_).is_ok(),
+        });
+        let valid = stored_annotation.is_none()
+            && circular_annotation.is_none()
+            && plan.type_parameters.is_empty()
+            && resolved_valid;
+        return if valid {
+            Ok(())
+        } else {
+            Err(invariant(SourceCallableInvariant::InvalidSignatureCache(
+                plan.declaration,
+            )))
+        };
+    }
+    let Some((return_identity_node, return_null_literal_identity)) =
+        plan.return_type.annotation_identity()
+    else {
+        unreachable!("the inferred return branch returned")
+    };
     if resolved.is_none() {
         return if circular_annotation.is_some() {
             Err(invariant(SourceCallableInvariant::InvalidSignatureCache(
@@ -3371,19 +3624,16 @@ fn validate_cached_return_type(
         };
     }
     let resolved = resolved.expect("the unresolved branch returned");
-    let annotation = cached_annotation_identity(
-        store,
-        plan.return_identity_node,
-        plan.return_null_literal_identity,
-    );
+    let annotation =
+        cached_annotation_identity(store, return_identity_node, return_null_literal_identity);
     let valid = if !plan.type_parameters.is_empty()
         && (circular_annotation.is_some()
             || !planned_type_parameter_ids(store, plan).is_some_and(|type_parameters| {
                 valid_source_generic_mapper_type(store, resolved, &type_parameters)
                     && valid_stored_source_generic_return_annotation(
                         store,
-                        plan.return_identity_node,
-                        plan.return_null_literal_identity,
+                        return_identity_node,
+                        return_null_literal_identity,
                         resolved,
                         plan.generic_return_type_parameter_index
                             .and_then(|index| type_parameters.get(index).copied()),
@@ -3820,6 +4070,7 @@ mod tests {
                     return_annotation: self.return_annotation,
                     return_null_literal_identity: false,
                     generic_return_type_parameter: self.generic_return_type_parameter,
+                    array_targets: None,
                 },
             )
         }
@@ -3843,6 +4094,7 @@ mod tests {
                     return_annotation: self.return_annotation,
                     return_null_literal_identity: false,
                     generic_return_type_parameter: self.generic_return_type_parameter,
+                    array_targets: None,
                 },
             )
         }
@@ -4422,6 +4674,8 @@ mod tests {
                         owner_parent: staged.owner_parent,
                         export_local: staged.export_local,
                         signature: poison_signature,
+                        return_provenance: SourceCallableReturnProvenance::Annotated,
+                        array_targets: None,
                         generic_return_type_parameter: staged.generic_return_type_parameter,
                         contextual_target: None,
                         contextual_variable: None,
@@ -4775,6 +5029,106 @@ mod tests {
     }
 
     #[test]
+    fn inferred_return_provenance_publishes_once_and_replays_exactly() {
+        let mut fixture = QueryFixture::new("function inferred() { return 1; }", FileId::new(989));
+        let declaration = fixture
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::FunctionDeclaration).then_some(NodeRef::new(
+                    fixture.parsed.arena.id(),
+                    fixture.file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let owner = fixture.bound.symbol(declaration).unwrap();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&fixture.parsed.arena, &fixture.bound)],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let plan = plan_source_callable(&fixture.store, &host, declaration, owner, None).unwrap();
+        assert_eq!(plan.return_type, SourceCallableReturnPlan::Inferred);
+        drop(host);
+
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let type_ = fixture
+            .query_callable(declaration, owner, &mut diagnostics)
+            .unwrap();
+        assert!(diagnostics.is_empty());
+        let provenance = fixture.store.source_callable_provenance(type_).unwrap();
+        assert_eq!(
+            provenance.return_provenance,
+            SourceCallableReturnProvenance::Inferred
+        );
+        assert!(
+            fixture
+                .store
+                .function_signature_return_annotation(provenance.signature)
+                .is_none()
+        );
+        assert!(matches!(
+            source_callable_state(&fixture.store, &plan, false),
+            Ok(SourceCallableState::AwaitingInferredReturn {
+                type_: cached,
+                signature
+            }) if cached == type_ && signature == provenance.signature
+        ));
+        assert_eq!(
+            validate_stored_source_callable(&fixture.store, type_),
+            StoredSourceCallableValidation::Pending
+        );
+
+        let number = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+        let string = fixture.store.intrinsic_bootstrap().unwrap().string_type;
+        let before = publication_state(&fixture.store);
+        assert_eq!(
+            publish_inferred_source_callable_return(
+                &mut fixture.store,
+                &plan,
+                provenance.signature,
+                number,
+            ),
+            Ok(number)
+        );
+        assert_eq!(publication_state(&fixture.store), before);
+        assert!(matches!(
+            validate_stored_source_callable(&fixture.store, type_),
+            StoredSourceCallableValidation::Valid(_)
+        ));
+        assert_eq!(
+            publish_inferred_source_callable_return(
+                &mut fixture.store,
+                &plan,
+                provenance.signature,
+                number,
+            ),
+            Ok(number)
+        );
+        assert_eq!(publication_state(&fixture.store), before);
+        assert!(
+            publish_inferred_source_callable_return(
+                &mut fixture.store,
+                &plan,
+                provenance.signature,
+                string,
+            )
+            .is_err()
+        );
+        assert_eq!(publication_state(&fixture.store), before);
+        assert_eq!(
+            fixture
+                .store
+                .signature(provenance.signature)
+                .unwrap()
+                .resolved_return_type(),
+            Some(number)
+        );
+    }
+
+    #[test]
     fn generic_array_parameter_syntax_requires_an_array_capability() {
         for (index, annotation) in ["T[]", "Array<T>"].into_iter().enumerate() {
             let fixture = QueryFixture::new(
@@ -4886,6 +5240,8 @@ mod tests {
                 owner_parent: None,
                 export_local: None,
                 signature,
+                return_provenance: SourceCallableReturnProvenance::Annotated,
+                array_targets: None,
                 generic_return_type_parameter: None,
                 contextual_target: None,
                 contextual_variable: None,
@@ -4912,12 +5268,7 @@ mod tests {
                 .declared_type_links(type_parameter_symbol)
                 .is_none()
         );
-        assert!(
-            fixture
-                .store
-                .source_callable_type_for_owner(owner)
-                .is_none()
-        );
+        assert!(fixture.store.source_callable_type_for_owner(owner).is_none());
 
         let mut diagnostics = CanonicalCheckerDiagnostics::default();
         let callable = fixture
@@ -5277,7 +5628,12 @@ mod tests {
                 .declared_type_links(type_parameter_symbol)
                 .is_none()
         );
-        assert!(fixture.store.source_callable_type_for_owner(owner).is_none());
+        assert!(
+            fixture
+                .store
+                .source_callable_type_for_owner(owner)
+                .is_none()
+        );
         assert!(diagnostics.is_empty());
     }
 
