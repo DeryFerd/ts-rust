@@ -143,6 +143,7 @@ pub struct SemanticStore<TypePayload, MapperPayload> {
     pub(super) derived_types: DerivedTypeCaches,
     pub(super) intrinsic_bootstrap: Option<IntrinsicBootstrap>,
     claimed_strict_builtin_iterator_return: Option<bool>,
+    claimed_strict_function_types: Option<bool>,
     pub(super) union_cache_needs_validation: bool,
     #[cfg(test)]
     pub(super) union_cache_validation_scans: usize,
@@ -198,6 +199,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             derived_types: DerivedTypeCaches::default(),
             intrinsic_bootstrap: None,
             claimed_strict_builtin_iterator_return: None,
+            claimed_strict_function_types: None,
             union_cache_needs_validation: false,
             #[cfg(test)]
             union_cache_validation_scans: 0,
@@ -229,6 +231,28 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
     #[cfg(test)]
     pub(super) const fn claimed_strict_builtin_iterator_return(&self) -> Option<bool> {
         self.claimed_strict_builtin_iterator_return
+    }
+
+    /// Claims the checker-global function-parameter variance mode for this
+    /// store's relation caches. Relation keys intentionally omit compiler
+    /// options, so every option-aware relation query in one store must agree
+    /// with the first claim.
+    pub(super) fn claim_strict_function_types(&mut self, requested: bool) -> Result<(), bool> {
+        match self.claimed_strict_function_types {
+            Some(established) if established != requested => Err(established),
+            Some(_) => Ok(()),
+            None => {
+                self.claimed_strict_function_types = Some(requested);
+                Ok(())
+            }
+        }
+    }
+
+    /// Returns the immutable function-variance claim without establishing it.
+    /// Legacy relation sessions use this to avoid reading option-aware cache
+    /// entries that their API did not explicitly admit.
+    pub(super) const fn claimed_strict_function_types(&self) -> Option<bool> {
+        self.claimed_strict_function_types
     }
 
     /// Registers a safe AST snapshot for semantic references.
@@ -2753,6 +2777,22 @@ mod tests {
 
     type TestStore = SemanticStore<&'static str, &'static str>;
     type CanonicalTestStore = SemanticStore<TypeRecord, &'static str>;
+
+    #[test]
+    fn strict_function_types_claim_is_immutable() {
+        let mut enabled = TestStore::new();
+        assert_eq!(enabled.claimed_strict_function_types(), None);
+        assert_eq!(enabled.claim_strict_function_types(true), Ok(()));
+        assert_eq!(enabled.claimed_strict_function_types(), Some(true));
+        assert_eq!(enabled.claim_strict_function_types(true), Ok(()));
+        assert_eq!(enabled.claim_strict_function_types(false), Err(true));
+        assert_eq!(enabled.claimed_strict_function_types(), Some(true));
+
+        let mut disabled = TestStore::new();
+        assert_eq!(disabled.claim_strict_function_types(false), Ok(()));
+        assert_eq!(disabled.claim_strict_function_types(true), Err(false));
+        assert_eq!(disabled.claimed_strict_function_types(), Some(false));
+    }
 
     fn alloc_test_symbol<TypePayload, MapperPayload>(
         store: &mut SemanticStore<TypePayload, MapperPayload>,

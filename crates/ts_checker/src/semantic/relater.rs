@@ -72,6 +72,10 @@ pub enum RelationUnavailable {
     UnresolvedFunctionType(TypeId),
     UnresolvedSignatureReturn(SignatureId),
     MalformedFunctionType(TypeId),
+    StrictFunctionTypesOptionMismatch {
+        established: bool,
+        requested: bool,
+    },
     StructuredIndexInfos(TypeId),
     UnsupportedProperty(SemanticSymbolId),
     UnresolvedPropertyType(SemanticSymbolId),
@@ -190,6 +194,13 @@ impl std::fmt::Display for RelationUnavailable {
             Self::MalformedFunctionType(type_id) => write!(
                 formatter,
                 "function type {type_id:?} has inconsistent callable caches"
+            ),
+            Self::StrictFunctionTypesOptionMismatch {
+                established,
+                requested,
+            } => write!(
+                formatter,
+                "relation store retained strictFunctionTypes={established}, but the query requested {requested}"
             ),
             Self::StructuredIndexInfos(type_id) => write!(
                 formatter,
@@ -539,7 +550,19 @@ impl<'store> RelaterSession<'store> {
     }
 
     fn cache_get(&self, key: CacheHashKey) -> RelationComparisonResult {
-        self.pending.get(self.store, self.relation, key)
+        if self.strict_function_types.is_none()
+            && self.store.claimed_strict_function_types().is_some()
+        {
+            // A legacy session cannot prove whether a retained entry depended
+            // on function variance. It may reuse only writes from this query.
+            self.pending
+                .latest
+                .get(&key)
+                .copied()
+                .unwrap_or(RelationComparisonResult::NONE)
+        } else {
+            self.pending.get(self.store, self.relation, key)
+        }
     }
 
     fn cache_set(&mut self, key: CacheHashKey, result: RelationComparisonResult) {
@@ -720,6 +743,16 @@ impl<'store> RelaterSession<'store> {
         let array_target = source_array.or(target_array).expect("one side is an Array");
         self.canonical_array_reference_argument(array, array_target)?;
         let members = self.resolved_object_members(object, true)?;
+        if object == self.bootstrap.any_function_type
+            || members.exact_function_type
+            || members.call_signature.is_some()
+        {
+            return Err(RelationUnavailable::StructuralRelation {
+                source,
+                target,
+                relation: self.relation,
+            });
+        }
         if !members.properties.is_empty() {
             return Err(RelationUnavailable::StructuralRelation {
                 source,
@@ -956,6 +989,14 @@ impl<'store> RelaterSession<'store> {
                 target: original_target,
                 relation: self.relation,
             });
+        }
+
+        self.ensure_callable_relation_admission(original_source, true)?;
+        if original_target != original_source {
+            self.ensure_callable_relation_admission(
+                original_target,
+                self.allows_fresh_object_target(),
+            )?;
         }
 
         let original_source_flags = self.store.type_flags(original_source)?;
@@ -1421,7 +1462,10 @@ impl<'store> RelaterSession<'store> {
             RelationKind::Subtype | RelationKind::StrictSubtype
         ) && self.is_fresh_object_literal(target)?
             && target_members.properties.is_empty()
-            && !source_members.properties.is_empty()
+            && (!source_members.properties.is_empty()
+                || source_members.exact_function_type
+                || source_members.call_signature.is_some()
+                || source == self.bootstrap.any_function_type)
         {
             return Ok(Ternary::False);
         }
@@ -1714,7 +1758,10 @@ impl<'store> RelaterSession<'store> {
             }
         }
         let source_members = self.resolved_object_property_surface(source, true)?;
-        if source_members.properties.is_empty() || self.is_direct_global_object_type(source)? {
+        let source_is_empty = source_members.properties.is_empty()
+            && !source_members.exact_function_type
+            && source_members.call_signature.is_none();
+        if source_is_empty || self.is_direct_global_object_type(source)? {
             return Ok(false);
         }
         let target_table = target_members
@@ -2595,6 +2642,29 @@ impl<'store> RelaterSession<'store> {
         })
     }
 
+    /// Admits branded function objects before any relation-cache read.
+    ///
+    /// Function variance is checker-option dependent while relation cache
+    /// keys are not. This boundary therefore also prevents legacy callers
+    /// without an explicit option from consuming a callable result produced
+    /// by an option-aware session. A branded object that passes the callable
+    /// validator but fails the generic object proof is one malformed function
+    /// cache, not an unsupported property-object family.
+    fn ensure_callable_relation_admission(
+        &self,
+        type_id: TypeId,
+        allow_fresh_literal: bool,
+    ) -> Result<(), RelationUnavailable> {
+        let is_function = self
+            .store
+            .admit_function_relation_type(type_id, self.strict_function_types)?;
+        if is_function {
+            self.ensure_supported_object_kind(type_id, allow_fresh_literal)
+                .map_err(|_| RelationUnavailable::MalformedFunctionType(type_id))?;
+        }
+        Ok(())
+    }
+
     fn ensure_supported_object_kind(
         &self,
         type_id: TypeId,
@@ -2799,24 +2869,21 @@ impl<'store> RelaterSession<'store> {
         type_: TypeId,
         allow_fresh_literal: bool,
     ) -> Result<ResolvedObjectMembers, RelationUnavailable> {
-        match validate_stored_function_type(self.store, type_) {
-            StoredFunctionTypeValidation::NotFunctionType => {
-                self.resolved_object_members(type_, allow_fresh_literal)
-            }
-            StoredFunctionTypeValidation::Malformed => {
-                Err(RelationUnavailable::MalformedFunctionType(type_))
-            }
-            StoredFunctionTypeValidation::Pending | StoredFunctionTypeValidation::Valid(_) => {
-                self.ensure_supported_object_kind(type_, allow_fresh_literal)?;
-                Ok(ResolvedObjectMembers {
-                    members: None,
-                    properties: Vec::new(),
-                    property_origin: ObjectPropertyOrigin::Declared,
-                    call_signature: None,
-                    exact_function_type: true,
-                })
-            }
+        if self
+            .store
+            .admit_function_relation_type(type_, self.strict_function_types)?
+        {
+            self.ensure_supported_object_kind(type_, allow_fresh_literal)
+                .map_err(|_| RelationUnavailable::MalformedFunctionType(type_))?;
+            return Ok(ResolvedObjectMembers {
+                members: None,
+                properties: Vec::new(),
+                property_origin: ObjectPropertyOrigin::Declared,
+                call_signature: None,
+                exact_function_type: true,
+            });
         }
+        self.resolved_object_members(type_, allow_fresh_literal)
     }
 
     fn project_non_nullable_function_call_signature(
@@ -2868,7 +2935,17 @@ impl<'store> RelaterSession<'store> {
         type_id: TypeId,
         allow_fresh_literal: bool,
     ) -> Result<ResolvedObjectMembers, RelationUnavailable> {
-        self.ensure_supported_object_kind(type_id, allow_fresh_literal)?;
+        let is_function = self
+            .store
+            .admit_function_relation_type(type_id, self.strict_function_types)?;
+        self.ensure_supported_object_kind(type_id, allow_fresh_literal)
+            .map_err(|error| {
+                if is_function {
+                    RelationUnavailable::MalformedFunctionType(type_id)
+                } else {
+                    error
+                }
+            })?;
         if let Some(call_signature) = self.project_exact_function_call_signature(type_id)? {
             let members = self
                 .store
@@ -3059,6 +3136,31 @@ impl<'store> RelaterSession<'store> {
 }
 
 impl SemanticStore<TypeRecord, TypeMapper> {
+    fn admit_function_relation_type(
+        &self,
+        type_: TypeId,
+        strict_function_types: Option<bool>,
+    ) -> Result<bool, RelationUnavailable> {
+        match validate_stored_function_type(self, type_) {
+            StoredFunctionTypeValidation::NotFunctionType => Ok(false),
+            StoredFunctionTypeValidation::Pending => Err(if strict_function_types.is_some() {
+                RelationUnavailable::UnresolvedFunctionType(type_)
+            } else {
+                RelationUnavailable::StructuredSignatures(type_)
+            }),
+            StoredFunctionTypeValidation::Valid(_) => {
+                if strict_function_types.is_some() {
+                    Ok(true)
+                } else {
+                    Err(RelationUnavailable::StructuredSignatures(type_))
+                }
+            }
+            StoredFunctionTypeValidation::Malformed => {
+                Err(RelationUnavailable::MalformedFunctionType(type_))
+            }
+        }
+    }
+
     /// Returns the exact ordered property view used when a declared object
     /// supplies context to an object literal.
     ///
@@ -3402,9 +3504,10 @@ impl SemanticStore<TypeRecord, TypeMapper> {
 
     /// Option-aware assignability for exact stored callable types.
     ///
-    /// `strictFunctionTypes` is checker-context state in the pinned checker,
-    /// not mutable semantic-store state. Callers that admit function
-    /// signatures must therefore supply the retained option explicitly.
+    /// `strictFunctionTypes` is checker-context state in the pinned checker.
+    /// Because relation keys omit compiler options, the first option-aware
+    /// query immutably claims that state for this store and every later query
+    /// must supply the same retained value.
     #[cfg(test)]
     pub(super) fn is_type_assignable_to_with_strict_function_types(
         &mut self,
@@ -3659,9 +3762,21 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         global_types: Option<RelationGlobalTypes>,
         strict_function_types: Option<bool>,
     ) -> Result<bool, RelationUnavailable> {
+        if let Some(requested) = strict_function_types
+            && let Err(established) = self.claim_strict_function_types(requested)
+        {
+            return Err(RelationUnavailable::StrictFunctionTypesOptionMismatch {
+                established,
+                requested,
+            });
+        }
         let bootstrap = self.relation_bootstrap_facts()?;
         let source = self.regular_type_if_fresh(source)?;
         let target = self.regular_type_if_fresh(target)?;
+        self.admit_function_relation_type(source, strict_function_types)?;
+        if target != source {
+            self.admit_function_relation_type(target, strict_function_types)?;
+        }
         if source == target {
             return Ok(true);
         }
@@ -3711,6 +3826,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         if source_flags.intersects(TypeFlags::OBJECT)
             && target_flags.intersects(TypeFlags::OBJECT)
             && !supported_array_relation
+            && (strict_function_types.is_some() || self.claimed_strict_function_types().is_none())
         {
             let key = self
                 .relation_key_if_available(
@@ -4375,7 +4491,7 @@ mod tests {
         production::GlobalMergeCompletion,
         signatures::{SignatureFlags, Ternary},
         type_nodes::{CanonicalTypeQuery, CanonicalTypeQueryOptions},
-        type_records::{LiteralValue, RegularLiteralLink, TypeData},
+        type_records::{LiteralValue, RegularLiteralLink, TypeData, TypeRecord},
         types::{ObjectFlags, TypeFlags},
     };
 
@@ -4542,22 +4658,26 @@ mod tests {
             })
             .collect::<Vec<_>>();
         for signature in signatures {
-            let mut diagnostics = CanonicalCheckerDiagnostics::default();
-            let host = relation_host(
-                &fixture.parsed.arena,
-                fixture.files.get(&fixture.file).unwrap(),
-            );
-            CanonicalTypeQuery::new(
-                &mut fixture.store,
-                &host,
-                CanonicalTypeQueryOptions::default(),
-                &mut diagnostics,
-            )
-            .unwrap()
-            .get_return_type_of_signature(signature)
-            .unwrap();
-            assert!(diagnostics.is_empty());
+            resolve_function_return(fixture, signature);
         }
+    }
+
+    fn resolve_function_return(fixture: &mut FunctionRelationFixture, signature: SignatureId) {
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let host = relation_host(
+            &fixture.parsed.arena,
+            fixture.files.get(&fixture.file).unwrap(),
+        );
+        CanonicalTypeQuery::new(
+            &mut fixture.store,
+            &host,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap()
+        .get_return_type_of_signature(signature)
+        .unwrap();
+        assert!(diagnostics.is_empty());
     }
 
     #[test]
@@ -4629,6 +4749,64 @@ mod tests {
             Err(RelationUnavailable::StructuredSignatures(left)),
             "store-only callers must opt into immutable checker option state"
         );
+    }
+
+    #[test]
+    fn strict_function_option_claim_precedes_callable_cache_access() {
+        let mut fixture =
+            function_relation_fixture("type Left = () => void; type Right = () => void;");
+        let (left, _) = query_function_alias(&mut fixture, "Left");
+        let (right, _) = query_function_alias(&mut fixture, "Right");
+        resolve_all_function_returns(&mut fixture);
+        let left_property = alloc_typed_property(&mut fixture.store, "callback", left, false);
+        let left_wrapper = alloc_property_object(&mut fixture.store, vec![left_property]);
+        let right_property = alloc_typed_property(&mut fixture.store, "callback", right, false);
+        let right_wrapper = alloc_property_object(&mut fixture.store, vec![right_property]);
+
+        assert_eq!(fixture.store.claimed_strict_function_types(), None);
+        assert_eq!(
+            fixture
+                .store
+                .is_type_assignable_to_with_strict_function_types(
+                    left_wrapper,
+                    right_wrapper,
+                    true,
+                ),
+            Ok(true)
+        );
+        assert_eq!(fixture.store.claimed_strict_function_types(), Some(true));
+        let cached = fixture.store.relation_state_snapshot();
+
+        assert_eq!(
+            fixture
+                .store
+                .is_type_assignable_to_with_strict_function_types(
+                    left_wrapper,
+                    right_wrapper,
+                    false,
+                ),
+            Err(RelationUnavailable::StrictFunctionTypesOptionMismatch {
+                established: true,
+                requested: false,
+            })
+        );
+        assert_eq!(fixture.store.relation_state_snapshot(), cached);
+        assert_eq!(fixture.store.claimed_strict_function_types(), Some(true));
+
+        assert_eq!(
+            fixture
+                .store
+                .is_type_assignable_to(left_wrapper, right_wrapper),
+            Err(RelationUnavailable::StructuredSignatures(left)),
+            "a legacy query cannot consume a wrapper cache whose nested relation was callable"
+        );
+        assert_eq!(fixture.store.relation_state_snapshot(), cached);
+        assert_eq!(
+            fixture.store.is_type_assignable_to(left, right),
+            Err(RelationUnavailable::StructuredSignatures(left)),
+            "a legacy query cannot consume the option-aware callable cache"
+        );
+        assert_eq!(fixture.store.relation_state_snapshot(), cached);
     }
 
     #[test]
@@ -4792,12 +4970,187 @@ mod tests {
     }
 
     #[test]
-    fn unresolved_signature_return_is_typed_retryable_and_cache_atomic() {
-        let mut fixture =
-            function_relation_fixture("type Left = () => string; type Right = () => string;");
-        let (left, _) = query_function_alias(&mut fixture, "Left");
-        let (right, right_signature) = query_function_alias(&mut fixture, "Right");
+    fn callable_sources_participate_in_weak_and_fresh_empty_preflights() {
+        let mut fixture = function_relation_fixture("type Callable = () => void;");
+        let (callable, _) = query_function_alias(&mut fixture, "Callable");
+        let (string, any_function) = {
+            let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+            (bootstrap.string_type, bootstrap.any_function_type)
+        };
+        let weak_property = alloc_typed_property(&mut fixture.store, "expected", string, true);
+        let weak_target = alloc_property_object(&mut fixture.store, vec![weak_property]);
+        let fresh_empty = alloc_fresh_property_object(&mut fixture.store, Vec::new());
+        let ordinary_empty = alloc_property_object(&mut fixture.store, Vec::new());
+
+        assert_eq!(
+            fixture
+                .store
+                .is_type_assignable_to_with_strict_function_types(callable, weak_target, true),
+            Ok(false),
+            "an exact call signature makes the source nonempty for weak-target overlap"
+        );
+        assert_eq!(
+            fixture
+                .store
+                .is_type_assignable_to_with_strict_function_types(any_function, weak_target, true),
+            Ok(true),
+            "the intrinsic anyFunction has no upstream signature list for the weak check"
+        );
+
+        for source in [callable, any_function] {
+            assert_eq!(
+                fixture.store.is_type_related_to_with_strict_function_types(
+                    source,
+                    fresh_empty,
+                    RelationKind::StrictSubtype,
+                    true,
+                ),
+                Ok(false),
+                "callable sources are nonempty for the fresh-empty subtype shortcut"
+            );
+        }
+        assert_eq!(
+            fixture.store.is_type_related_to_with_strict_function_types(
+                ordinary_empty,
+                fresh_empty,
+                RelationKind::StrictSubtype,
+                true,
+            ),
+            Ok(true)
+        );
+    }
+
+    #[test]
+    fn canonical_array_empty_object_shortcut_rejects_callable_surfaces() {
+        let mut fixture = function_relation_fixture("type Callable = () => void;");
+        let (callable, _) = query_function_alias(&mut fixture, "Callable");
+        let (number, empty_object, any_function) = {
+            let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+            (
+                bootstrap.number_type,
+                bootstrap.empty_object_type,
+                bootstrap.any_function_type,
+            )
+        };
+        let array = alloc_canonical_array_target(&mut fixture.store, "Array");
+        let global_types = RelationGlobalTypes {
+            array_targets: CanonicalArrayTargets::for_test(array.target, array.target),
+            string_wrapper: empty_object,
+            number_wrapper: empty_object,
+            boolean_wrapper: empty_object,
+        };
+        let array_number = canonical_array_reference(&mut fixture.store, array.target, number);
+        let signature = fixture
+            .store
+            .alloc_signature(
+                SignatureFlags::NONE,
+                None,
+                Vec::new(),
+                None,
+                Vec::new(),
+                None,
+                None,
+                0,
+            )
+            .unwrap();
+        let call_signature_object = alloc_object_shell(&mut fixture.store);
+        assert!(fixture.store.set_structured_type_members(
+            call_signature_object,
+            None,
+            None,
+            Some(vec![signature]),
+            None,
+            None,
+        ));
         let before = fixture.store.relation_state_snapshot();
+
+        for (source, target) in [
+            (array_number, callable),
+            (callable, array_number),
+            (array_number, any_function),
+            (any_function, array_number),
+        ] {
+            assert_eq!(
+                fixture
+                    .store
+                    .is_type_related_to_with_optional_global_types_and_options(
+                        source,
+                        target,
+                        RelationKind::StrictSubtype,
+                        Some(global_types),
+                        Some(true),
+                    ),
+                Err(RelationUnavailable::StructuralRelation {
+                    source,
+                    target,
+                    relation: RelationKind::StrictSubtype,
+                })
+            );
+            assert_eq!(fixture.store.relation_state_snapshot(), before);
+        }
+
+        for (source, target) in [
+            (array_number, call_signature_object),
+            (call_signature_object, array_number),
+        ] {
+            assert_eq!(
+                fixture
+                    .store
+                    .is_type_related_to_with_optional_global_types_and_options(
+                        source,
+                        target,
+                        RelationKind::StrictSubtype,
+                        Some(global_types),
+                        Some(true),
+                    ),
+                Err(RelationUnavailable::StructuredSignatures(
+                    call_signature_object
+                ))
+            );
+            assert_eq!(fixture.store.relation_state_snapshot(), before);
+        }
+    }
+
+    #[test]
+    fn unresolved_signature_return_rolls_back_nested_relation_writes() {
+        let mut fixture = function_relation_fixture(
+            r"
+                type Left = (value: { item: string }) => string;
+                type Right = (value: { item: string }) => string;
+            ",
+        );
+        let (left, left_signature) = query_function_alias(&mut fixture, "Left");
+        let (right, right_signature) = query_function_alias(&mut fixture, "Right");
+        resolve_function_return(&mut fixture, left_signature);
+        let before = fixture.store.relation_state_snapshot();
+
+        {
+            let bootstrap = fixture.store.relation_bootstrap_facts().unwrap();
+            let mut session = super::RelaterSession::new_with_global_types_and_options(
+                &mut fixture.store,
+                RelationKind::Assignable,
+                bootstrap,
+                None,
+                Some(true),
+            );
+            assert_eq!(
+                session.is_related_to_ex(
+                    left,
+                    right,
+                    super::RecursionFlags::BOTH,
+                    super::IntersectionState::NONE,
+                ),
+                Err(RelationUnavailable::UnresolvedSignatureReturn(
+                    right_signature
+                ))
+            );
+            assert!(
+                !session.pending.writes.is_empty(),
+                "the resolved object-parameter comparison must enqueue a nested result"
+            );
+        }
+        assert_eq!(fixture.store.relation_state_snapshot(), before);
+
         assert_eq!(
             fixture
                 .store
@@ -4808,7 +5161,7 @@ mod tests {
         );
         assert_eq!(fixture.store.relation_state_snapshot(), before);
 
-        resolve_all_function_returns(&mut fixture);
+        resolve_function_return(&mut fixture, right_signature);
         assert_eq!(
             fixture
                 .store
@@ -4860,6 +5213,42 @@ mod tests {
                 .store
                 .set_signature_flags(left_signature, SignatureFlags::ABSTRACT)
         );
+        let before = fixture.store.relation_state_snapshot();
+        assert_eq!(
+            fixture
+                .store
+                .is_type_assignable_to_with_strict_function_types(left, right, true),
+            Err(RelationUnavailable::MalformedFunctionType(left))
+        );
+        assert_eq!(fixture.store.relation_state_snapshot(), before);
+    }
+
+    #[test]
+    fn malformed_function_alias_is_classified_before_property_object_rejection() {
+        let mut fixture =
+            function_relation_fixture("type Left = () => string; type Right = () => string;");
+        let (left, _) = query_function_alias(&mut fixture, "Left");
+        let (right, _) = query_function_alias(&mut fixture, "Right");
+        resolve_all_function_returns(&mut fixture);
+        let alias = fixture
+            .store
+            .type_payload(left)
+            .and_then(TypeRecord::alias)
+            .expect("the named function type retains its alias record");
+        let alias_symbol = fixture
+            .store
+            .type_alias(alias)
+            .expect("the named function type retains its alias record")
+            .symbol()
+            .expect("the named function type retains its alias symbol");
+        assert!(fixture.store.set_type_alias_links(
+            alias_symbol,
+            TypeAliasLinks {
+                declared_type: Some(right),
+                ..TypeAliasLinks::default()
+            },
+        ));
+
         let before = fixture.store.relation_state_snapshot();
         assert_eq!(
             fixture
