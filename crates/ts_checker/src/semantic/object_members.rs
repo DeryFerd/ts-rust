@@ -717,7 +717,7 @@ pub(super) fn plan_interface(
             symbol,
         });
     }
-    plan_members(
+    let plan = plan_members(
         store,
         host,
         PropertyObjectKind::Interface,
@@ -726,7 +726,14 @@ pub(super) fn plan_interface(
         symbol_record.members(),
         &interface.members,
         None,
-    )
+    )?;
+    if !value_declarations.is_empty() && !plan.call_signatures.is_empty() {
+        return Err(PropertyObjectError::InvalidInterface {
+            declaration,
+            symbol,
+        });
+    }
+    Ok(plan)
 }
 
 /// Proves the only two owner shapes admitted for a named declared type:
@@ -3006,6 +3013,7 @@ pub(super) fn validate_resolved_declared_member_types(
     }
 }
 
+#[cfg(test)]
 pub(super) fn publish_property_members(
     store: &mut CanonicalTypeMapperStore,
     plan: &PropertyObjectPlan,

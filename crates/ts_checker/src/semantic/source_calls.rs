@@ -24,8 +24,8 @@ use super::{
     },
     formatter::get_type_names_for_assignability_error_with_host_global_types_and_flags,
     generic_calls::{
-        GenericCallVectorApplicability, GenericCallVectorError, GenericCallVectorResolution,
-        GenericCallVectorRequest, GenericCallVectorUnsupported, IdentityGenericCallError,
+        GenericCallVectorApplicability, GenericCallVectorError, GenericCallVectorRequest,
+        GenericCallVectorResolution, GenericCallVectorUnsupported, IdentityGenericCallError,
         IdentityGenericCallRequest, IdentityGenericCallUnsupported,
         materialize_generic_call_vector_source, resolve_generic_call_vector,
         resolve_source_identity_generic_call, source_declared_inference_candidate_is_exported,
@@ -148,10 +148,7 @@ pub(super) fn plan_direct_source_call_syntax(
         (SyntaxKind::Identifier, NodeData::Identifier(_)) => {
             (SourceCallCalleeForm::Identifier, callee)
         }
-        (
-            SyntaxKind::PropertyAccessExpression,
-            NodeData::PropertyAccessExpression(property),
-        ) => {
+        (SyntaxKind::PropertyAccessExpression, NodeData::PropertyAccessExpression(property)) => {
             let name = NodeRef::new(node.arena, node.file, property.name);
             let Some(name_record) = arena.get(property.name) else {
                 return Err(SourceCheckError::Call(node));
@@ -214,7 +211,8 @@ pub(super) fn plan_direct_source_call_syntax(
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             let mut trailing_comma_range = None;
-            let diagnostic_range = if let (Some(first), Some(last)) = (nodes.first(), nodes.last()) {
+            let diagnostic_range = if let (Some(first), Some(last)) = (nodes.first(), nodes.last())
+            {
                 let first_range = arena
                     .get(first.node)
                     .ok_or(SourceCheckError::Call(node))?
@@ -242,9 +240,8 @@ pub(super) fn plan_direct_source_call_syntax(
                 } else {
                     Some(last_range.end)
                 };
-                diagnostic_end.map(|diagnostic_end| {
-                    TextRange::new(first_range.start, diagnostic_end)
-                })
+                diagnostic_end
+                    .map(|diagnostic_end| TextRange::new(first_range.start, diagnostic_end))
             } else {
                 None
             };
@@ -311,9 +308,7 @@ fn skip_call_type_argument_trivia(text: &str) -> Option<usize> {
     loop {
         let remaining = text.get(offset..)?;
         if remaining.starts_with("//") {
-            offset += remaining
-                .find(['\r', '\n'])
-                .unwrap_or(remaining.len());
+            offset += remaining.find(['\r', '\n']).unwrap_or(remaining.len());
             continue;
         }
         if remaining.starts_with("/*") {
@@ -338,10 +333,9 @@ pub(super) fn finish_direct_source_call_plan(
 ) -> Result<SourceCallPlan, SourceCheckError> {
     let exact_callee = match (&callee.kind, syntax.callee_form) {
         (PlannedExpressionKind::Identifier(_), SourceCallCalleeForm::Identifier) => true,
-        (
-            PlannedExpressionKind::Property(property),
-            SourceCallCalleeForm::RequiredOwnProperty,
-        ) => property.is_call_callee_for(syntax.node, syntax.callee_diagnostic_node),
+        (PlannedExpressionKind::Property(property), SourceCallCalleeForm::RequiredOwnProperty) => {
+            property.is_call_callee_for(syntax.node, syntax.callee_diagnostic_node)
+        }
         _ => false,
     };
     if callee.node != syntax.callee
@@ -438,9 +432,7 @@ fn is_context_insensitive_argument_syntax(arena: &NodeArena, node: NodeRef) -> b
                         if identifier.flow_node.is_none() && !identifier.text.is_empty()
                 )
         }
-        SyntaxKind::ElementAccessExpression => {
-            is_context_insensitive_element_syntax(arena, node)
-        }
+        SyntaxKind::ElementAccessExpression => is_context_insensitive_element_syntax(arena, node),
         SyntaxKind::BinaryExpression => {
             is_context_insensitive_primitive_binary_syntax(arena, node)
                 || is_context_insensitive_logical_binary_syntax(arena, node)
@@ -644,9 +636,7 @@ fn is_context_insensitive_primitive_binary_operand_syntax(
                     )
             })
         }
-        SyntaxKind::ElementAccessExpression => {
-            is_context_insensitive_element_syntax(arena, node)
-        }
+        SyntaxKind::ElementAccessExpression => is_context_insensitive_element_syntax(arena, node),
         SyntaxKind::BinaryExpression => is_context_insensitive_primitive_binary_syntax(arena, node),
         _ => false,
     }
@@ -811,8 +801,7 @@ fn resolve_source_call_once(
         argument_types,
         explicit_type_arguments,
     } = request;
-    if callee_form == SourceCallCalleeForm::RequiredOwnProperty
-        && explicit_type_arguments.is_some()
+    if callee_form == SourceCallCalleeForm::RequiredOwnProperty && explicit_type_arguments.is_some()
     {
         return Err(SourceCallResolutionError::Unsupported);
     }
@@ -949,9 +938,9 @@ fn resolve_source_call_once(
         Err(IdentityGenericCallError::Relation(error)) => {
             Err(SourceCallResolutionError::Relation(error))
         }
-        Err(
-            IdentityGenericCallError::Unsupported(_) | IdentityGenericCallError::Inference(_),
-        ) => Err(SourceCallResolutionError::Unsupported),
+        Err(IdentityGenericCallError::Unsupported(_) | IdentityGenericCallError::Inference(_)) => {
+            Err(SourceCallResolutionError::Unsupported)
+        }
         Err(IdentityGenericCallError::Invariant(_)) => Err(SourceCallResolutionError::Invariant),
     }
 }
@@ -1086,7 +1075,9 @@ fn missing_argument_related_information(
         .signature(signature)
         .and_then(|signature| signature.parameters().get(actual))
         .ok_or(SourceCheckError::Call(call))?;
-    let symbol = store.symbol(parameter).ok_or(SourceCheckError::Call(call))?;
+    let symbol = store
+        .symbol(parameter)
+        .ok_or(SourceCheckError::Call(call))?;
     let declaration = *symbol
         .declarations()
         .and_then(|declarations| declarations.first())
@@ -1503,21 +1494,21 @@ pub(super) fn check_direct_source_call(
                 explicit_type_arguments.as_deref(),
                 &resolution,
             )?;
-            let materialized = materialize_generic_call_vector_source(
-                store,
-                &resolution,
-                existing,
-            )
-            .map_err(|error| match error {
-                GenericCallVectorError::Relation(error)
-                | GenericCallVectorError::Inference(NakedTypeCandidateError::Relation(error)) => {
-                    SourceCheckError::from(error)
-                }
-                GenericCallVectorError::Unsupported(_)
-                | GenericCallVectorError::Invariant(_)
-                | GenericCallVectorError::Inference(_)
-                | GenericCallVectorError::Instantiation(_) => SourceCheckError::Call(plan.node),
-            })?;
+            let materialized =
+                materialize_generic_call_vector_source(store, &resolution, existing).map_err(
+                    |error| match error {
+                        GenericCallVectorError::Relation(error)
+                        | GenericCallVectorError::Inference(NakedTypeCandidateError::Relation(
+                            error,
+                        )) => SourceCheckError::from(error),
+                        GenericCallVectorError::Unsupported(_)
+                        | GenericCallVectorError::Invariant(_)
+                        | GenericCallVectorError::Inference(_)
+                        | GenericCallVectorError::Instantiation(_) => {
+                            SourceCheckError::Call(plan.node)
+                        }
+                    },
+                )?;
             (materialized.call_signature, return_type, diagnostic)
         }
     };
@@ -1572,8 +1563,7 @@ fn publish_call_links(
         return Ok(());
     }
     let type_is_cold = type_links.is_none_or(|links| links == &TypeNodeLinks::default());
-    let signature_is_cold =
-        signature_links.is_none_or(|links| links == &SignatureLinks::default());
+    let signature_is_cold = signature_links.is_none_or(|links| links == &SignatureLinks::default());
     if !type_is_cold || !signature_is_cold {
         return Err(SourceCheckError::Call(node));
     }
@@ -2358,6 +2348,69 @@ mod tests {
     }
 
     #[test]
+    fn declared_call_set_failure_recovers_to_the_arity_compatible_signature() {
+        // Pinned tsgo reports TS2345 against the second overload and retains
+        // its number return type; the first declaration has the wrong arity.
+        let parsed = parsed(concat!(
+            "interface Recovery { ",
+            "(value: number, other: number): string; ",
+            "(value: string): number; ",
+            "} ",
+            "function use(callable: Recovery): number { return callable(true); }",
+        ));
+        let file = FileId::new(487);
+        let call = calls(&parsed, file)
+            .into_iter()
+            .next()
+            .expect("fixture contains one direct call");
+        let mut declarations = parsed
+            .arena
+            .iter()
+            .filter(|(_, record)| record.kind == SyntaxKind::CallSignature)
+            .map(|(node, record)| {
+                (
+                    record.range.start,
+                    NodeRef::new(parsed.arena.id(), file, node),
+                )
+            })
+            .collect::<Vec<_>>();
+        declarations.sort_by_key(|(start, _)| *start);
+        let [_, (_, second)] = declarations.as_slice() else {
+            panic!("expected two declared call signatures")
+        };
+        let mut context = context(&parsed, file);
+
+        context.check_source_file(file).unwrap();
+
+        assert_eq!(
+            context
+                .diagnostics()
+                .as_slice()
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.code())
+                .collect::<Vec<_>>(),
+            [2345]
+        );
+        assert_eq!(
+            context
+                .store()
+                .type_node_links(call)
+                .and_then(|links| links.resolved_type),
+            Some(context.store().intrinsic_bootstrap().unwrap().number_type)
+        );
+        assert_eq!(
+            context
+                .store()
+                .signature_links(call)
+                .and_then(|links| links.resolved_signature.signature()),
+            context
+                .store()
+                .signature_links(*second)
+                .and_then(|links| links.resolved_signature.signature())
+        );
+    }
+
+    #[test]
     fn unsupported_declared_call_members_reject_before_signature_publication() {
         // The pinned oracle accepts each family below. This provider's first
         // production cut intentionally rejects them as one atomic boundary.
@@ -2396,6 +2449,24 @@ mod tests {
                     .all(|declaration| context.store().signature_links(*declaration).is_none())
             );
         }
+
+        let parsed = parsed(concat!(
+            "interface Callable { (value: number): string; } ",
+            "declare var Callable: number; ",
+            "function use(callable: Callable): string { return callable(1); }",
+        ));
+        let file = FileId::new(488);
+        let declaration = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::CallSignature)
+                    .then(|| NodeRef::new(parsed.arena.id(), file, node))
+            })
+            .unwrap();
+        let mut context = context(&parsed, file);
+        assert!(context.check_source_file(file).is_err());
+        assert!(context.store().signature_links(declaration).is_none());
     }
 
     #[test]
@@ -3001,13 +3072,10 @@ mod tests {
             panic!("expected too-few, wrong-type, and too-many calls")
         };
         let mut context = context(&parsed, file);
-        let too_few_callee = plan_direct_source_call_syntax(
-            &parsed.arena,
-            context.store(),
-            *too_few,
-        )
-        .unwrap()
-        .callee();
+        let too_few_callee =
+            plan_direct_source_call_syntax(&parsed.arena, context.store(), *too_few)
+                .unwrap()
+                .callee();
         let parameter = parsed
             .arena
             .iter()
@@ -3022,8 +3090,7 @@ mod tests {
             .iter()
             .find_map(|(node, record)| {
                 (record.kind == SyntaxKind::StringLiteral
-                    && record.range.start
-                        == TextPos::new(u32::try_from(wrong_start).unwrap()))
+                    && record.range.start == TextPos::new(u32::try_from(wrong_start).unwrap()))
                 .then(|| NodeRef::new(parsed.arena.id(), file, node))
             })
             .unwrap();

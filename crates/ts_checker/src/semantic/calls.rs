@@ -250,7 +250,7 @@ pub(super) fn resolve_direct_call(
         return Ok(resolution);
     }
 
-    let mut recovery = None;
+    let mut recovery: Option<DirectCallResolution> = None;
     for mut candidate in candidates {
         if candidate.applicability == DirectCallApplicability::Applicable {
             candidate.applicability =
@@ -266,10 +266,30 @@ pub(super) fn resolve_direct_call(
                 return Ok(candidate);
             }
         }
-        recovery.get_or_insert(candidate);
+        if recovery.as_ref().is_none_or(|current| {
+            overload_failure_rank(candidate.applicability)
+                < overload_failure_rank(current.applicability)
+        }) {
+            recovery = Some(candidate);
+        }
     }
 
     recovery.ok_or_else(|| DirectCallUnsupported::NotExactSingleCallable(request.callee).into())
+}
+
+fn overload_failure_rank(applicability: DirectCallApplicability) -> (u8, usize) {
+    match applicability {
+        DirectCallApplicability::ArgumentNotAssignable { .. } => (0, 0),
+        DirectCallApplicability::TooFewArguments {
+            expected_at_least,
+            actual,
+        } => (1, expected_at_least.saturating_sub(actual)),
+        DirectCallApplicability::TooManyArguments {
+            expected_at_most,
+            actual,
+        } => (1, actual.saturating_sub(expected_at_most)),
+        DirectCallApplicability::Applicable => (2, 0),
+    }
 }
 
 fn validate_direct_call_form(request: DirectCallRequest<'_>) -> Result<(), DirectCallError> {
