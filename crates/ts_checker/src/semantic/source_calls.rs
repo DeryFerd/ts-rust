@@ -22,7 +22,7 @@ use super::{
     formatter::get_type_names_for_assignability_error_with_host_global_types_and_flags,
     generic_calls::{
         IdentityGenericCallError, IdentityGenericCallRequest, IdentityGenericCallUnsupported,
-        resolve_identity_generic_call,
+        resolve_source_identity_generic_call,
     },
     source::{
         PlannedExpression, PlannedExpressionKind, SourceCheckError, UnsupportedSourceSyntax,
@@ -328,6 +328,7 @@ enum SourceCallResolutionError {
 
 fn resolve_source_call_once(
     store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
     global_types: &CanonicalGlobalTypes,
     options: CanonicalCheckerOptions,
     callee_type: TypeId,
@@ -379,8 +380,13 @@ fn resolve_source_call_once(
         callee: callee_type,
         arguments: argument_types,
     };
-    match resolve_identity_generic_call(store, global_types, options.strict_function_types, request)
-    {
+    match resolve_source_identity_generic_call(
+        store,
+        host,
+        global_types,
+        options.strict_function_types,
+        request,
+    ) {
         Ok(resolution) => Ok(ResolvedSourceCall {
             signature: resolution.projection.signature,
             return_type: resolution.projection.return_type,
@@ -460,6 +466,7 @@ pub(super) fn check_direct_source_call(
     let resolution = loop {
         match resolve_source_call_once(
             store,
+            host,
             global_types,
             options,
             callee_type,
@@ -631,6 +638,9 @@ mod tests {
             CanonicalModuleResolutionEntry, CanonicalModuleResolutionManifestInput,
             CanonicalModuleResolutionMode, CanonicalResolvedModuleInput,
         },
+        object_members::{
+            DeclaredPropertyTypeGraphValidation, validate_resolved_declared_property_type_graph,
+        },
         type_records::{LiteralValue, TypeData},
     };
 
@@ -694,18 +704,22 @@ mod tests {
                 .bind_typescript_declaration_slice(&parsed.arena, file)
                 .unwrap();
         }
-        let module_specifier = importer
+        let mut module_specifiers = importer
             .arena
             .iter()
-            .find_map(|(_, record)| match &record.data {
-                NodeData::ImportDeclaration(import) => Some(NodeRef::new(
-                    importer.arena.id(),
-                    importer_file,
-                    import.module_specifier,
+            .filter_map(|(_, record)| match &record.data {
+                NodeData::ImportDeclaration(import) => Some((
+                    record.range.start,
+                    NodeRef::new(importer.arena.id(), importer_file, import.module_specifier),
                 )),
                 _ => None,
             })
-            .expect("fixture contains one import declaration");
+            .collect::<Vec<_>>();
+        module_specifiers.sort_by_key(|(start, _)| *start);
+        assert!(
+            !module_specifiers.is_empty(),
+            "fixture contains an import declaration"
+        );
         CanonicalCheckerContext::new_with_module_resolutions(
             binder.finish(),
             files
@@ -713,16 +727,18 @@ mod tests {
                 .map(|(file, parsed)| (file, &parsed.arena))
                 .collect(),
             CanonicalCheckerOptions::default(),
-            CanonicalModuleResolutionManifestInput::new([
-                CanonicalModuleResolutionEntry::resolved(
-                    module_specifier,
-                    CanonicalResolvedModuleInput::new(
-                        target_file,
-                        CanonicalModuleResolutionMode::Esm,
-                        CanonicalModuleResolutionMode::Esm,
-                    ),
-                ),
-            ]),
+            CanonicalModuleResolutionManifestInput::new(module_specifiers.into_iter().map(
+                |(_, module_specifier)| {
+                    CanonicalModuleResolutionEntry::resolved(
+                        module_specifier,
+                        CanonicalResolvedModuleInput::new(
+                            target_file,
+                            CanonicalModuleResolutionMode::Esm,
+                            CanonicalModuleResolutionMode::Esm,
+                        ),
+                    )
+                },
+            )),
         )
         .unwrap()
     }
@@ -986,6 +1002,230 @@ mod tests {
             signatures
         );
         assert_eq!(context.diagnostics().as_slice().len(), 1);
+    }
+
+    #[test]
+    fn imported_declared_object_identity_calls_force_warm_replay_for_aliases_and_interfaces() {
+        for (index, declaration) in [
+            "export type User = { id: number }; ",
+            "export interface User { id: number } ",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let target = parsed(&format!(
+                "{declaration}export function identity<T>(value: T): T {{ return value; }}"
+            ));
+            let importer = parsed(concat!(
+                "import type { User } from './a'; ",
+                "import { identity } from './a'; ",
+                "const user: User = { id: 1 }; ",
+                "const inferred: User = identity(user); ",
+                "const explicit = identity<string>('x');",
+            ));
+            let offset = u32::try_from(index).unwrap() * 2;
+            let importer_file = FileId::new(420 + offset);
+            let target_file = FileId::new(421 + offset);
+            let mut call_nodes = calls(&importer, importer_file);
+            call_nodes.sort_by_key(|call| importer.arena.get(call.node).unwrap().range.start);
+            let [inferred, explicit] = call_nodes.as_slice() else {
+                panic!("expected inferred declared-object and explicit primitive calls")
+            };
+            let mut context = imported_context(&importer, importer_file, &target, target_file);
+            let target_source = context.source_file(target_file).unwrap();
+
+            context.check_source_file(importer_file).unwrap();
+
+            assert!(context.diagnostics().is_empty());
+            assert!(
+                !context
+                    .store()
+                    .source_file_links(target_source)
+                    .is_some_and(|links| links.type_checked)
+            );
+            let result_types = [*inferred, *explicit].map(|call| {
+                context
+                    .store()
+                    .type_node_links(call)
+                    .and_then(|links| links.resolved_type)
+                    .unwrap()
+            });
+            assert_eq!(context.type_to_string(result_types[0]).unwrap(), "User");
+            assert_eq!(
+                result_types[1],
+                context.store().intrinsic_bootstrap().unwrap().string_type
+            );
+            let signatures = [*inferred, *explicit].map(|call| {
+                context
+                    .store()
+                    .signature_links(call)
+                    .and_then(|links| links.resolved_signature.signature())
+                    .unwrap()
+            });
+            let counts = (
+                context.store().type_len(),
+                context.store().mapper_len(),
+                context.store().signature_len(),
+                context.store().cached_signature_len(),
+            );
+
+            mark_source_unchecked(&mut context, importer_file);
+            context.check_source_file(importer_file).unwrap();
+
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().mapper_len(),
+                    context.store().signature_len(),
+                    context.store().cached_signature_len(),
+                ),
+                counts
+            );
+            assert_eq!(
+                [*inferred, *explicit].map(|call| {
+                    context
+                        .store()
+                        .signature_links(call)
+                        .and_then(|links| links.resolved_signature.signature())
+                        .unwrap()
+                }),
+                signatures
+            );
+            assert!(context.diagnostics().is_empty());
+        }
+    }
+
+    #[test]
+    fn exported_alias_owner_poison_rejects_warm_replay_without_new_call_publication() {
+        let target = parsed(concat!(
+            "export type User = { id: number }; ",
+            "export function identity<T>(value: T): T { return value; }",
+        ));
+        let importer = parsed(concat!(
+            "import type { User } from './a'; ",
+            "import { identity } from './a'; ",
+            "const user: User = { id: 1 }; ",
+            "const inferred: User = identity(user);",
+        ));
+        let importer_file = FileId::new(430);
+        let target_file = FileId::new(431);
+        let call_nodes = calls(&importer, importer_file);
+        let [call] = call_nodes.as_slice() else {
+            panic!("expected one imported identity call")
+        };
+        let call = *call;
+        let mut context = imported_context(&importer, importer_file, &target, target_file);
+        context.check_source_file(importer_file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let call_type = context.store().type_node_links(call).cloned();
+        let call_signature = context.store().signature_links(call).cloned();
+        let (module, user, identity) = {
+            let (_, bound) = context.file(target_file).unwrap();
+            let module = bound.symbol(bound.source_file()).unwrap();
+            let exports = context
+                .store()
+                .symbol(module)
+                .and_then(ts_binder::semantic::Symbol::exports)
+                .and_then(|exports| context.store().symbol_table(exports))
+                .unwrap();
+            (
+                module,
+                exports.get_source("User").unwrap(),
+                exports.get_source("identity").unwrap(),
+            )
+        };
+        let exports = context.store().symbol(module).unwrap().exports().unwrap();
+        assert_eq!(
+            context.store_mut_for_test().insert_symbol(
+                exports,
+                EscapedName::source("User"),
+                identity,
+            ),
+            Some(Some(user))
+        );
+        mark_source_unchecked(&mut context, importer_file);
+        let before = (
+            context.store().type_len(),
+            context.store().mapper_len(),
+            context.store().signature_len(),
+            context.store().cached_signature_len(),
+            context.store().relation_state_snapshot(),
+        );
+
+        let result = context.check_source_file(importer_file);
+
+        assert!(matches!(
+            result,
+            Err(SourceCheckError::Import(node)) if node.file == importer_file
+        ));
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().mapper_len(),
+                context.store().signature_len(),
+                context.store().cached_signature_len(),
+                context.store().relation_state_snapshot(),
+            ),
+            before
+        );
+        assert_eq!(context.store().type_node_links(call), call_type.as_ref());
+        assert_eq!(
+            context.store().signature_links(call),
+            call_signature.as_ref()
+        );
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn nested_declared_objects_cannot_cross_the_source_inference_export_boundary() {
+        let source = parsed(concat!(
+            "function outer() { ",
+            "type HiddenAlias = { id: number }; ",
+            "interface HiddenInterface { id: number } ",
+            "return 0; ",
+            "}",
+        ));
+        let file = FileId::new(432);
+        let mut context = context(&source, file);
+        let symbols = {
+            let (_, bound) = context.file(file).unwrap();
+            source
+                .arena
+                .iter()
+                .filter(|(_, record)| {
+                    matches!(
+                        record.kind,
+                        SyntaxKind::TypeAliasDeclaration | SyntaxKind::InterfaceDeclaration
+                    )
+                })
+                .map(|(node, _)| {
+                    let declaration = NodeRef::new(source.arena.id(), file, node);
+                    let raw = bound.symbol(declaration).unwrap();
+                    context.store().get_merged_symbol(raw).unwrap()
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(symbols.len(), 2);
+
+        for symbol in symbols {
+            let type_ = context.get_declared_type_of_symbol(symbol).unwrap();
+            assert!(matches!(
+                validate_resolved_declared_property_type_graph(context.store(), type_),
+                DeclaredPropertyTypeGraphValidation::Traversable(_)
+            ));
+            assert_eq!(
+                super::super::inference::validate_inference_leaf(context.store(), type_),
+                Err(super::super::inference::NakedTypeInferenceError::UnsupportedCandidate(type_)),
+                "a nested declaration reaches the source-only override boundary"
+            );
+            assert!(
+                !super::super::generic_calls::source_declared_inference_candidate_is_exported(
+                    context.store(),
+                    type_,
+                ),
+                "a nested modifier-free declaration must not mint export capability"
+            );
+        }
     }
 
     #[test]

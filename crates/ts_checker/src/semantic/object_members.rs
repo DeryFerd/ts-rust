@@ -368,14 +368,18 @@ pub(super) fn plan_interface(
             symbol,
         });
     };
-    let expected_parent = interface_declaration_parent(
+    let expected_parent = declared_type_declaration_parent(
         store,
         host,
         declaration,
         symbol,
         name,
         interface.modifiers.as_ref(),
-    )?;
+    )
+    .map_err(|()| PropertyObjectError::InvalidInterface {
+        declaration,
+        symbol,
+    })?;
     let expected_symbol_flags = SymbolFlags::INTERFACE
         | if value_declarations.is_empty() {
             SymbolFlags::NONE
@@ -424,18 +428,20 @@ pub(super) fn plan_interface(
     )
 }
 
-fn interface_declaration_parent(
+/// Proves the only two owner shapes admitted for a named declared type:
+/// a modifier-free local declaration or one exact top-level TypeScript ESM
+/// export. The exported form validates the source statement, export token,
+/// module symbol, binder local placeholder, and module export-table edge as
+/// one read-only capability shared by declared-type consumers.
+pub(super) fn declared_type_declaration_parent(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     declaration: NodeRef,
     symbol: SemanticSymbolId,
     name: NodeRef,
     modifiers: Option<&ts_ast::ModifierList>,
-) -> Result<Option<SemanticSymbolId>, PropertyObjectError> {
-    let invalid = || PropertyObjectError::InvalidInterface {
-        declaration,
-        symbol,
-    };
+) -> Result<Option<SemanticSymbolId>, ()> {
+    let invalid = || ();
     let Some(modifiers) = modifiers else {
         return Ok(None);
     };
@@ -443,12 +449,12 @@ fn interface_declaration_parent(
     let declaration_record = preflight_node(store, host, declaration).map_err(|_| invalid())?;
     let name_record = preflight_node(store, host, name).map_err(|_| invalid())?;
     let NodeData::Identifier(identifier) = &name_record.data else {
-        return Err(invalid());
+        return Err(());
     };
     let source = bound.source_file();
     let source_record = preflight_node(store, host, source).map_err(|_| invalid())?;
     let NodeData::SourceFile(source_data) = &source_record.data else {
-        return Err(invalid());
+        return Err(());
     };
     if declaration_record.parent != Some(source.node)
         || source_data
@@ -463,7 +469,7 @@ fn interface_declaration_parent(
             .and_then(|symbol| store.get_merged_symbol(symbol))
             != Some(symbol)
     {
-        return Err(invalid());
+        return Err(());
     }
     if !is_exact_export_modifier(
         store,
@@ -473,14 +479,15 @@ fn interface_declaration_parent(
         name_record,
         modifiers,
     ) {
-        return Err(invalid());
+        return Err(());
     }
     let facts = bound.source_facts().ok_or_else(invalid)?;
     if facts.is_javascript_file() || !facts.is_external_module() || facts.is_common_js_module() {
-        return Err(invalid());
+        return Err(());
     }
     let source_symbol = bound.symbol(source).ok_or_else(invalid)?;
     let source_symbol_record = store.symbol(source_symbol).ok_or_else(invalid)?;
+    let exported_symbol_record = store.symbol(symbol).ok_or_else(invalid)?;
     let local = bound.local_symbol(declaration).ok_or_else(invalid)?;
     let local_record = store.symbol(local).ok_or_else(invalid)?;
     if store.get_merged_symbol(source_symbol) != Some(source_symbol)
@@ -493,6 +500,7 @@ fn interface_declaration_parent(
         || source_symbol_record.exports().is_none()
         || source_symbol_record.parent().is_some()
         || source_symbol_record.export_symbol().is_some()
+        || exported_symbol_record.name().as_utf8() != Some(identifier.text.as_str())
         || local == symbol
         || store.get_merged_symbol(local) != Some(local)
         || local_record.flags() != SymbolFlags::NONE
@@ -510,7 +518,7 @@ fn interface_declaration_parent(
             .and_then(|exports| exports.get_source(&identifier.text))
             != Some(symbol)
     {
-        return Err(invalid());
+        return Err(());
     }
     Ok(Some(source_symbol))
 }
@@ -1186,11 +1194,10 @@ pub(super) fn validate_resolved_declared_property_type_graph(
     match validate_resolved_declared_property_object_detailed(store, type_) {
         DetailedDeclaredPropertyObjectValidation::Valid(_)
         | DetailedDeclaredPropertyObjectValidation::TraversableBoundary(_) => {
-            resolved_declared_property_types(store, type_)
-                .map_or(
-                    DeclaredPropertyTypeGraphValidation::Malformed,
-                    DeclaredPropertyTypeGraphValidation::Traversable,
-                )
+            resolved_declared_property_types(store, type_).map_or(
+                DeclaredPropertyTypeGraphValidation::Malformed,
+                DeclaredPropertyTypeGraphValidation::Traversable,
+            )
         }
         DetailedDeclaredPropertyObjectValidation::NotDeclared => {
             DeclaredPropertyTypeGraphValidation::Opaque
@@ -1306,8 +1313,7 @@ fn classify_declared_owner_members(
                             && matches!(
                                 store.source_node_kind(*declaration),
                                 Some(
-                                    SyntaxKind::PropertyDeclaration
-                                        | SyntaxKind::PropertySignature
+                                    SyntaxKind::PropertyDeclaration | SyntaxKind::PropertySignature
                                 )
                             )
                     }) {
@@ -1374,9 +1380,7 @@ fn validate_resolved_property_interface(
         DeclaredPropertyObjectProof::Interface,
     ) {
         DeclaredPropertyOwnerValidation::Valid(declaration) => (declaration, false),
-        DeclaredPropertyOwnerValidation::TraversableBoundary(declaration) => {
-            (declaration, true)
-        }
+        DeclaredPropertyOwnerValidation::TraversableBoundary(declaration) => (declaration, true),
         DeclaredPropertyOwnerValidation::Unsupported => return NotDeclared,
         DeclaredPropertyOwnerValidation::Malformed => return Malformed,
     };
@@ -1397,9 +1401,7 @@ fn validate_resolved_property_type_literal(
     record: &TypeRecord,
     object: &ObjectTypeData,
 ) -> DetailedDeclaredPropertyObjectValidation {
-    use DetailedDeclaredPropertyObjectValidation::{
-        Malformed, TraversableBoundary, Valid,
-    };
+    use DetailedDeclaredPropertyObjectValidation::{Malformed, TraversableBoundary, Valid};
 
     let alias_boundary = match validate_declared_property_alias_provenance(store, type_, record) {
         DeclaredPropertyAliasValidation::Valid => false,
@@ -1422,9 +1424,7 @@ fn validate_resolved_property_type_literal(
         DeclaredPropertyObjectProof::TypeLiteral,
     ) {
         DeclaredPropertyOwnerValidation::Valid(declaration) => (declaration, false),
-        DeclaredPropertyOwnerValidation::TraversableBoundary(declaration) => {
-            (declaration, true)
-        }
+        DeclaredPropertyOwnerValidation::TraversableBoundary(declaration) => (declaration, true),
         DeclaredPropertyOwnerValidation::Unsupported => {
             return DetailedDeclaredPropertyObjectValidation::NotDeclared;
         }
@@ -1468,9 +1468,7 @@ fn validate_declared_property_owner(
     members: Option<SymbolTableId>,
     proof: DeclaredPropertyObjectProof,
 ) -> DeclaredPropertyOwnerValidation {
-    use DeclaredPropertyOwnerValidation::{
-        Malformed, TraversableBoundary, Unsupported, Valid,
-    };
+    use DeclaredPropertyOwnerValidation::{Malformed, TraversableBoundary, Unsupported, Valid};
 
     let Some(owner_record) = store.symbol(owner) else {
         return Malformed;
@@ -1494,8 +1492,7 @@ fn validate_declared_property_owner(
             && declarations.iter().all(|declaration| {
                 unique.insert(*declaration)
                     && store.source_node_kind(*declaration) == Some(expected_kind)
-            })
-        {
+            }) {
             Unsupported
         } else {
             Malformed

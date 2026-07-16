@@ -11,11 +11,12 @@
 
 #![allow(dead_code)] // Installed ahead of the source-call dispatch consumer.
 
+use ts_ast::SyntaxKind;
 use ts_binder::{CheckFlags, SymbolData, SymbolFlags};
 
 use super::{
-    CanonicalGlobalTypes, CanonicalTypeMapperStore, RelationUnavailable, SemanticSymbolId,
-    SignatureId, TypeId, TypeMapperId, ValueSymbolLinks,
+    CanonicalGlobalTypes, CanonicalTypeMapperStore, DeclaredTypeHost, RelationUnavailable,
+    SemanticSymbolId, SignatureId, TypeId, TypeMapperId, ValueSymbolLinks,
     callables::{
         StoredSingleCallableValidation, ValidatedSingleCallable, validate_stored_single_callable,
     },
@@ -198,6 +199,20 @@ enum IdentityTypeParameterCacheProvenance {
     ExactDefaultFreeSource,
 }
 
+/// One host-proven exported declared-property-object root that semantic-only
+/// inference must otherwise keep opaque. The candidate is exact and the fields
+/// remain private so only the source entry point can mint this proof.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SourceDeclaredInferenceProof {
+    candidate: TypeId,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct SourceIdentityInferenceProofs {
+    argument: Option<SourceDeclaredInferenceProof>,
+    type_argument: Option<SourceDeclaredInferenceProof>,
+}
+
 /// Resolves the first generic call branch through the store's callable
 /// provider and authoritative relation context.
 pub(super) fn resolve_identity_generic_call(
@@ -237,6 +252,125 @@ pub(super) fn resolve_identity_generic_call(
             )
         },
     )
+}
+
+/// Resolves the identity slice for source syntax with one retained-host
+/// capability: an exact exported, non-generic type-alias object or simple
+/// interface may be used as the root inference candidate after host-aware
+/// property-graph validation. Semantic-only callers retain
+/// [`resolve_identity_generic_call`]'s behavior.
+pub(super) fn resolve_source_identity_generic_call(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    strict_function_types: bool,
+    request: IdentityGenericCallRequest<'_>,
+) -> Result<IdentityGenericCallResolution, IdentityGenericCallError> {
+    validate_request_form(store, request)?;
+    let callable = match validate_stored_single_callable(store, request.callee) {
+        StoredSingleCallableValidation::NotCallable => {
+            return Err(
+                IdentityGenericCallUnsupported::NotExactSingleCallable(request.callee).into(),
+            );
+        }
+        StoredSingleCallableValidation::Pending { .. } => {
+            return Err(IdentityGenericCallUnsupported::PendingCallable(request.callee).into());
+        }
+        StoredSingleCallableValidation::Malformed { .. } => {
+            return Err(IdentityGenericCallInvariant::MalformedCallable(request.callee).into());
+        }
+        StoredSingleCallableValidation::Valid { callable, .. } => callable,
+    };
+    let cache_provenance =
+        identity_type_parameter_cache_provenance(store, request.callee, &callable);
+    let argument = request.arguments[0];
+    let proofs = SourceIdentityInferenceProofs {
+        argument: source_declared_inference_proof(store, host, argument)?,
+        type_argument: request
+            .explicit_type_arguments
+            .map(|type_arguments| source_declared_inference_proof(store, host, type_arguments[0]))
+            .transpose()?
+            .flatten(),
+    };
+    resolve_validated_identity_call_with_proofs(
+        store,
+        request,
+        &callable,
+        cache_provenance,
+        proofs,
+        |store, source, target| {
+            store.is_type_assignable_to_with_global_types_and_strict_function_types(
+                source,
+                target,
+                global_types,
+                strict_function_types,
+            )
+        },
+    )
+}
+
+fn source_declared_inference_proof(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    candidate: TypeId,
+) -> Result<Option<SourceDeclaredInferenceProof>, IdentityGenericCallError> {
+    if !matches!(
+        validate_inference_leaf(store, candidate),
+        Err(NakedTypeInferenceError::UnsupportedCandidate(failed)) if failed == candidate
+    ) || store.type_payload(candidate).is_none_or(|record| {
+        !matches!(record.data(), TypeData::Interface(_))
+            && (!matches!(record.data(), TypeData::Object(_)) || record.alias().is_none())
+    }) {
+        return Ok(None);
+    }
+    if !source_declared_inference_candidate_is_exported(store, candidate) {
+        return Ok(None);
+    }
+    let Some(_) = store.resolved_declared_property_object(host, candidate)? else {
+        return Ok(None);
+    };
+    Ok(Some(SourceDeclaredInferenceProof { candidate }))
+}
+
+/// The source-only override exists solely for a cross-module boundary. Local
+/// declared roots already belong to the ordinary inference domain; requiring
+/// the exact alias/interface declaration to be exported prevents a nested
+/// modifier-free declaration from acquiring this capability.
+pub(super) fn source_declared_inference_candidate_is_exported(
+    store: &CanonicalTypeMapperStore,
+    candidate: TypeId,
+) -> bool {
+    let Some(record) = store.type_payload(candidate) else {
+        return false;
+    };
+    let (symbol, expected_kind) = match record.data() {
+        TypeData::Object(_) => {
+            let Some(symbol) = record
+                .alias()
+                .and_then(|alias| store.type_alias(alias))
+                .and_then(super::type_records::TypeAlias::symbol)
+            else {
+                return false;
+            };
+            (symbol, SyntaxKind::TypeAliasDeclaration)
+        }
+        TypeData::Interface(_) => {
+            let Some(symbol) = record.symbol() else {
+                return false;
+            };
+            (symbol, SyntaxKind::InterfaceDeclaration)
+        }
+        _ => return false,
+    };
+    let Some(symbol_record) = store.symbol(symbol) else {
+        return false;
+    };
+    let Some([declaration]) = symbol_record.declarations() else {
+        return false;
+    };
+    store.get_merged_symbol(symbol) == Some(symbol)
+        && store.source_node_kind(*declaration) == Some(expected_kind)
+        && store.source_node_is_exported(*declaration) == Some(true)
 }
 
 fn identity_type_parameter_cache_provenance(
@@ -344,13 +478,41 @@ fn resolve_validated_identity_call(
     request: IdentityGenericCallRequest<'_>,
     callable: &ValidatedSingleCallable,
     cache_provenance: IdentityTypeParameterCacheProvenance,
+    is_assignable: impl FnMut(
+        &mut CanonicalTypeMapperStore,
+        TypeId,
+        TypeId,
+    ) -> Result<bool, RelationUnavailable>,
+) -> Result<IdentityGenericCallResolution, IdentityGenericCallError> {
+    resolve_validated_identity_call_with_proofs(
+        store,
+        request,
+        callable,
+        cache_provenance,
+        SourceIdentityInferenceProofs::default(),
+        is_assignable,
+    )
+}
+
+fn resolve_validated_identity_call_with_proofs(
+    store: &mut CanonicalTypeMapperStore,
+    request: IdentityGenericCallRequest<'_>,
+    callable: &ValidatedSingleCallable,
+    cache_provenance: IdentityTypeParameterCacheProvenance,
+    proofs: SourceIdentityInferenceProofs,
     mut is_assignable: impl FnMut(
         &mut CanonicalTypeMapperStore,
         TypeId,
         TypeId,
     ) -> Result<bool, RelationUnavailable>,
 ) -> Result<IdentityGenericCallResolution, IdentityGenericCallError> {
-    let prepared = prepare_validated_identity_call(store, request, callable, cache_provenance)?;
+    let prepared = prepare_validated_identity_call_with_proofs(
+        store,
+        request,
+        callable,
+        cache_provenance,
+        proofs,
+    )?;
     // A poisoned existing cache is an invariant even when relation work would
     // otherwise fail. Cache validation is read-only and must precede it.
     let cached = cached_identity_instantiation(store, prepared.shape, prepared.type_argument)?;
@@ -370,6 +532,22 @@ fn prepare_validated_identity_call(
     callable: &ValidatedSingleCallable,
     cache_provenance: IdentityTypeParameterCacheProvenance,
 ) -> Result<PreparedIdentityGenericCall, IdentityGenericCallError> {
+    prepare_validated_identity_call_with_proofs(
+        store,
+        request,
+        callable,
+        cache_provenance,
+        SourceIdentityInferenceProofs::default(),
+    )
+}
+
+fn prepare_validated_identity_call_with_proofs(
+    store: &CanonicalTypeMapperStore,
+    request: IdentityGenericCallRequest<'_>,
+    callable: &ValidatedSingleCallable,
+    cache_provenance: IdentityTypeParameterCacheProvenance,
+    proofs: SourceIdentityInferenceProofs,
+) -> Result<PreparedIdentityGenericCall, IdentityGenericCallError> {
     validate_request_form(store, request)?;
     let shape =
         validate_identity_signature_shape(store, request.callee, callable, cache_provenance)?;
@@ -377,14 +555,21 @@ fn prepare_validated_identity_call(
     let type_argument = match request.explicit_type_arguments {
         Some(type_arguments) => {
             let type_argument = type_arguments[0];
-            validate_inference_leaf(store, type_argument)
+            validate_inference_leaf_with_source_proof(store, type_argument, proofs.type_argument)
                 .map_err(|error| map_inference_leaf_error(error, type_argument, true))?;
             type_argument
         }
-        None => infer_naked_type_parameter(store, argument)
-            .map_err(|error| map_inference_leaf_error(error, argument, false))?,
+        None => match proofs.argument {
+            Some(proof) => {
+                validate_inference_leaf_with_source_proof(store, argument, Some(proof))
+                    .map_err(|error| map_inference_leaf_error(error, argument, false))?;
+                argument
+            }
+            None => infer_naked_type_parameter(store, argument)
+                .map_err(|error| map_inference_leaf_error(error, argument, false))?,
+        },
     };
-    validate_inference_leaf(store, argument)
+    validate_inference_leaf_with_source_proof(store, argument, proofs.argument)
         .map_err(|error| map_inference_leaf_error(error, argument, false))?;
 
     let return_record = store.type_payload(type_argument).ok_or(
@@ -406,6 +591,21 @@ fn prepare_validated_identity_call(
         type_argument,
         return_kind,
     })
+}
+
+fn validate_inference_leaf_with_source_proof(
+    store: &CanonicalTypeMapperStore,
+    candidate: TypeId,
+    proof: Option<SourceDeclaredInferenceProof>,
+) -> Result<(), NakedTypeInferenceError> {
+    match validate_inference_leaf(store, candidate) {
+        Err(NakedTypeInferenceError::UnsupportedCandidate(failed))
+            if failed == candidate && proof.is_some_and(|proof| proof.candidate == candidate) =>
+        {
+            Ok(())
+        }
+        result => result,
+    }
 }
 
 fn project_prepared_identity_call(
@@ -1023,6 +1223,31 @@ mod tests {
                 Ok(DirectCallApplicability::Applicable)
             );
         }
+    }
+
+    #[test]
+    fn source_declared_inference_proof_never_waives_a_foreign_candidate() {
+        let mut store = initialized_store();
+        let proven = store
+            .alloc_plain_object_type(ObjectFlags::ANONYMOUS, None)
+            .unwrap();
+        let foreign = store
+            .alloc_plain_object_type(ObjectFlags::ANONYMOUS, None)
+            .unwrap();
+        let proof = SourceDeclaredInferenceProof { candidate: proven };
+
+        assert_eq!(
+            validate_inference_leaf(&store, foreign),
+            Err(NakedTypeInferenceError::UnsupportedCandidate(foreign))
+        );
+        assert_eq!(
+            validate_inference_leaf_with_source_proof(&store, foreign, Some(proof)),
+            Err(NakedTypeInferenceError::UnsupportedCandidate(foreign))
+        );
+        assert_eq!(
+            validate_inference_leaf_with_source_proof(&store, proven, Some(proof)),
+            Ok(())
+        );
     }
 
     #[test]

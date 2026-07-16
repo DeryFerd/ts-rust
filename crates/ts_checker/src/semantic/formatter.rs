@@ -793,7 +793,7 @@ fn display_object_type(
         if single_callable_family(store, type_id).is_some() {
             validate_opaque_single_callable_alias(store, type_id)?;
         } else {
-            validate_property_object_alias(store, type_id, record, alias)?;
+            validate_property_object_alias(store, host, type_id, record, alias)?;
         }
         return display_alias_name(store, type_id, alias, state);
     }
@@ -1662,6 +1662,7 @@ fn validate_resolved_named_interface(
 
 fn validate_property_object_alias(
     store: &CanonicalTypeMapperStore,
+    host: Option<&DeclaredTypeHost<'_>>,
     type_id: TypeId,
     record: &TypeRecord,
     alias: TypeAliasId,
@@ -1718,12 +1719,17 @@ fn validate_property_object_alias(
         || store.get_merged_symbol(alias_symbol) != Some(alias_symbol)
         || alias_symbol_record.flags() != SymbolFlags::TYPE_ALIAS
         || alias_symbol_record.check_flags() != CheckFlags::NONE
-        || alias_symbol_record.parent().is_some()
         || alias_symbol_record.value_declaration().is_some()
         || alias_symbol_record.exports().is_some()
         || alias_symbol_record.export_symbol().is_some()
         || !matches!(alias_symbol_record.declarations(), Some([declaration])
-            if store.source_node_kind(*declaration) == Some(SyntaxKind::TypeAliasDeclaration))
+        if valid_display_type_alias_owner(
+            store,
+            host,
+            alias_symbol,
+            alias_symbol_record,
+            *declaration,
+        ))
         || store.type_alias_links(alias_symbol).is_none_or(|links| {
             links.declared_type != Some(type_id)
                 || links.type_parameters.is_some()
@@ -1734,6 +1740,50 @@ fn validate_property_object_alias(
         return Err(TypeDisplayUnavailable::Alias { type_id, alias });
     }
     Ok(())
+}
+
+fn valid_display_type_alias_owner(
+    store: &CanonicalTypeMapperStore,
+    host: Option<&DeclaredTypeHost<'_>>,
+    alias_symbol: SemanticSymbolId,
+    alias_record: &ts_binder::semantic::Symbol,
+    declaration: NodeRef,
+) -> bool {
+    if store.source_node_kind(declaration) != Some(SyntaxKind::TypeAliasDeclaration) {
+        return false;
+    }
+    match (
+        store.source_node_is_exported(declaration),
+        alias_record.parent(),
+    ) {
+        (Some(false), None) => true,
+        (Some(true), Some(parent)) => host.is_some_and(|host| {
+            let Some(declaration_record) = host.node(declaration) else {
+                return false;
+            };
+            let NodeData::TypeAliasDeclaration(type_alias) = &declaration_record.data else {
+                return false;
+            };
+            if declaration_record.flags.0 != 0
+                || type_alias.flow_node.is_some()
+                || type_alias.local_symbol.is_some()
+                || type_alias.symbol.is_some()
+                || type_alias.type_parameters.is_some()
+            {
+                return false;
+            }
+            let name = NodeRef::new(declaration.arena, declaration.file, type_alias.name);
+            object_members::declared_type_declaration_parent(
+                store,
+                host,
+                declaration,
+                alias_symbol,
+                name,
+                type_alias.modifiers.as_ref(),
+            ) == Ok(Some(parent))
+        }),
+        _ => false,
+    }
 }
 
 fn validate_structural_object_shell(
@@ -3215,6 +3265,32 @@ mod tests {
         CanonicalCheckerContext::new(binder.finish(), vec![(file, &parsed.arena)], options).unwrap()
     }
 
+    fn external_parsed_context(parsed: &ParseResult, file: FileId) -> CanonicalCheckerContext<'_> {
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/formatter-external.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::External,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![(file, &parsed.arena)],
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap()
+    }
+
     fn type_alias_body(parsed: &ParseResult, file: FileId, expected: &str) -> NodeRef {
         parsed
             .arena
@@ -3577,6 +3653,76 @@ mod tests {
         assert_eq!(
             type_to_string(&interface_store, interface),
             Err(TypeDisplayUnavailable::MalformedType(interface)),
+        );
+    }
+
+    #[test]
+    fn exported_alias_display_requires_host_proof_and_rejects_export_table_poison() {
+        let parsed = parse_source_file(concat!(
+            "export type User = { id: number }; ",
+            "export type Other = { id: number };",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(194);
+        let mut context = external_parsed_context(&parsed, file);
+        let (exports, user, other) = {
+            let (_, bound) = context.file(file).unwrap();
+            let module = bound.symbol(bound.source_file()).unwrap();
+            let exports = context.store().symbol(module).unwrap().exports().unwrap();
+            let table = context.store().symbol_table(exports).unwrap();
+            (
+                exports,
+                table.get_source("User").unwrap(),
+                table.get_source("Other").unwrap(),
+            )
+        };
+        let user_type = context.get_declared_type_of_symbol(user).unwrap();
+        let alias = context
+            .store()
+            .type_payload(user_type)
+            .unwrap()
+            .alias()
+            .unwrap();
+
+        assert_eq!(context.type_to_string(user_type).unwrap(), "User");
+        assert_eq!(
+            type_to_string(context.store(), user_type),
+            Err(TypeDisplayUnavailable::Alias {
+                type_id: user_type,
+                alias,
+            }),
+            "an exported alias cannot be displayed without its retained host proof"
+        );
+        assert_eq!(
+            context
+                .store_mut_for_test()
+                .insert_symbol(exports, EscapedName::source("User"), other,),
+            Some(Some(user))
+        );
+        let before = (
+            context.store().type_len(),
+            context.store().symbol_len(),
+            context.store().type_alias_len(),
+            context.store().mapper_len(),
+            context.store().relation_state_snapshot(),
+        );
+
+        assert_eq!(
+            context.type_to_string(user_type),
+            Err(TypeDisplayUnavailable::Alias {
+                type_id: user_type,
+                alias,
+            })
+        );
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().type_alias_len(),
+                context.store().mapper_len(),
+                context.store().relation_state_snapshot(),
+            ),
+            before
         );
     }
 

@@ -12,7 +12,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use ts_ast::{NodeRef, SyntaxKind};
+use ts_ast::{NodeData, NodeRef, SyntaxKind};
 use ts_binder::{
     CheckFlags, EscapedName, InternalSymbolName, SemanticSymbolId, SymbolFlags, SymbolTableId,
 };
@@ -3276,16 +3276,33 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                                     ));
                                 }
                             };
+                            let alias_declaration_record = host
+                                .node(alias_declaration)
+                                .ok_or(RelationUnavailable::InvalidStructuredMembers(type_id))?;
+                            let NodeData::TypeAliasDeclaration(type_alias) =
+                                &alias_declaration_record.data
+                            else {
+                                return Err(RelationUnavailable::InvalidStructuredMembers(type_id));
+                            };
+                            let alias_name = NodeRef::new(
+                                alias_declaration.arena,
+                                alias_declaration.file,
+                                type_alias.name,
+                            );
                             if alias.type_arguments().is_some()
                                 || self.get_merged_symbol(alias_symbol) != Some(alias_symbol)
                                 || alias_record.flags() != SymbolFlags::TYPE_ALIAS
                                 || alias_record.check_flags() != CheckFlags::NONE
-                                || alias_record.parent().is_some()
                                 || alias_record.value_declaration().is_some()
                                 || alias_record.exports().is_some()
                                 || alias_record.export_symbol().is_some()
                                 || self.source_node_kind(alias_declaration)
                                     != Some(SyntaxKind::TypeAliasDeclaration)
+                                || alias_declaration_record.flags.0 != 0
+                                || type_alias.flow_node.is_some()
+                                || type_alias.local_symbol.is_some()
+                                || type_alias.symbol.is_some()
+                                || type_alias.type_parameters.is_some()
                                 || !host.symbol_matches(self, alias_declaration, alias_symbol)
                                 || self.type_alias_links(alias_symbol).is_none_or(|links| {
                                     links.declared_type != Some(type_id)
@@ -3293,6 +3310,14 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                                         || links.instantiations.is_some()
                                         || links.is_constructor_declared_property
                                 })
+                                || super::object_members::declared_type_declaration_parent(
+                                    self,
+                                    host,
+                                    alias_declaration,
+                                    alias_symbol,
+                                    alias_name,
+                                    type_alias.modifiers.as_ref(),
+                                ) != Ok(alias_record.parent())
                             {
                                 return Err(RelationUnavailable::InvalidStructuredMembers(type_id));
                             }
