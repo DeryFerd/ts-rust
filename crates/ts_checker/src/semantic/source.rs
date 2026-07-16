@@ -6142,7 +6142,7 @@ fn check_planned_typeof_condition(
             None,
             deferred,
         )?;
-        if identifier.raw != current || identifier.result != current {
+        if identifier.raw != current {
             return Err(SourceCheckError::Function(
                 SourceFunctionInvariant::Callable(callable.declaration),
             ));
@@ -6188,7 +6188,7 @@ fn check_planned_typeof_condition(
             None,
             deferred,
         )?;
-        if identifier.raw != current || identifier.result != current {
+        if identifier.raw != current {
             return Err(SourceCheckError::Function(
                 SourceFunctionInvariant::Callable(callable.declaration),
             ));

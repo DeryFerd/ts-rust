@@ -19,7 +19,7 @@ use super::{
     bootstrap::{LiteralTypeCacheError, UnionReduction},
     logical_operators::{LogicalBinaryError, TruthinessAssumption, narrow_by_truthiness},
     type_records::{TypeData, TypeRecord},
-    types::TypeFlags,
+    types::{ObjectFlags, TypeFlags},
 };
 
 const FLOW_DEPTH_LIMIT: usize = 2_000;
@@ -828,13 +828,21 @@ fn narrow_by_typeof(
         let record = store
             .type_payload(*leaf)
             .ok_or(SourceTypeofNarrowingError::InvalidType(*leaf))?;
-        if record.flags().intersects(TypeFlags::NEVER)
-            || source_typeof_leaf_matches(store, globals, *leaf, tag)? == require_match
-        {
+        if record.flags().intersects(TypeFlags::NEVER) {
             retained.push(*leaf);
+            continue;
+        }
+        let matches = source_typeof_leaf_matches(store, globals, *leaf, tag)?;
+        if matches == require_match {
+            retained.push(*leaf);
+        } else if require_match
+            && matches!(tag, SourceTypeofTag::Function)
+            && record.flags().intersects(TypeFlags::NON_PRIMITIVE)
+        {
+            retained.push(globals.function_type);
         }
     }
-    if retained.len() == leaves.len() {
+    if retained == leaves {
         return Ok(type_);
     }
     if retained.is_empty() {
@@ -907,6 +915,9 @@ fn source_typeof_leaf_matches(
     }
 
     let function_object = if flags.intersects(TypeFlags::OBJECT) {
+        if source_typeof_is_unbounded_empty_object(store, globals, type_, record)? {
+            return Err(SourceTypeofNarrowingError::UnsupportedType(type_));
+        }
         Some(source_typeof_object_is_function(
             store, globals, type_, record,
         )?)
@@ -942,6 +953,30 @@ fn source_typeof_leaf_matches(
         return Err(SourceTypeofNarrowingError::UnsupportedType(type_));
     }
     Ok(matched)
+}
+
+fn source_typeof_is_unbounded_empty_object(
+    store: &CanonicalTypeMapperStore,
+    globals: &CanonicalGlobalTypes,
+    type_: TypeId,
+    record: &TypeRecord,
+) -> Result<bool, SourceTypeofNarrowingError> {
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or(SourceTypeofNarrowingError::MissingBootstrap)?;
+    if type_ == globals.function_type || type_ == bootstrap.any_function_type {
+        return Ok(false);
+    }
+    if !record.object_flags().intersects(ObjectFlags::ANONYMOUS) {
+        return Ok(false);
+    }
+    let structured = record
+        .data()
+        .structured()
+        .ok_or(SourceTypeofNarrowingError::InvalidType(type_))?;
+    Ok(structured.properties.as_ref().is_none_or(Vec::is_empty)
+        && structured.signatures.as_ref().is_none_or(Vec::is_empty)
+        && structured.index_infos.as_ref().is_none_or(Vec::is_empty))
 }
 
 fn source_typeof_object_is_function(
