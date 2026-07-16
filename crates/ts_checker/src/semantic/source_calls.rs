@@ -1,8 +1,9 @@
-//! Exact source integration for one ordinary identifier call.
+//! Exact source integration for one ordinary identifier or own-property call.
 //!
-//! This deliberately admits only `identifier(arguments)` where every argument
-//! is a context-insensitive scalar, identifier, property read, or recursively
-//! proven primitive binary expression, optionally parenthesized.
+//! This deliberately admits only `identifier(arguments)` or a proven required
+//! own-property `identifier.name(arguments)` where every argument is a
+//! context-insensitive scalar, identifier, property read, or recursively proven
+//! primitive binary expression, optionally parenthesized.
 //! The semantic kernel remains in `calls`; this module owns the AST proof,
 //! lazy-return/relation retries, call caches, and source diagnostics.
 
@@ -44,8 +45,17 @@ use super::{
 pub(super) struct SourceCallPlan {
     pub(super) node: NodeRef,
     pub(super) callee: PlannedExpression,
+    callee_form: SourceCallCalleeForm,
+    callee_diagnostic_node: NodeRef,
     type_arguments: Option<SourceTypeArgumentList>,
     pub(super) arguments: Vec<PlannedExpression>,
+}
+
+/// The exact callee family proven by call syntax.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SourceCallCalleeForm {
+    Identifier,
+    RequiredOwnProperty,
 }
 
 /// Exact parser-owned type-argument list syntax retained for checker recovery.
@@ -68,6 +78,8 @@ struct SourceTypeArgumentList {
 pub(super) struct DirectSourceCallSyntax {
     node: NodeRef,
     callee: NodeRef,
+    callee_form: SourceCallCalleeForm,
+    callee_diagnostic_node: NodeRef,
     type_arguments: Option<SourceTypeArgumentList>,
     arguments: Vec<NodeRef>,
 }
@@ -75,6 +87,14 @@ pub(super) struct DirectSourceCallSyntax {
 impl DirectSourceCallSyntax {
     pub(super) fn callee(&self) -> NodeRef {
         self.callee
+    }
+
+    pub(super) fn callee_form(&self) -> SourceCallCalleeForm {
+        self.callee_form
+    }
+
+    pub(super) fn callee_diagnostic_node(&self) -> NodeRef {
+        self.callee_diagnostic_node
     }
 
     pub(super) fn arguments(&self) -> &[NodeRef] {
@@ -119,11 +139,40 @@ pub(super) fn plan_direct_source_call_syntax(
     let Some(callee_record) = arena.get(call.expression) else {
         return Err(SourceCheckError::Call(node));
     };
-    if callee_record.parent != Some(node.node) || callee_record.kind != SyntaxKind::Identifier {
+    if callee_record.parent != Some(node.node) {
         return Err(SourceCheckError::Unsupported(
             UnsupportedSourceSyntax::Call(node),
         ));
     }
+    let (callee_form, callee_diagnostic_node) = match (callee_record.kind, &callee_record.data) {
+        (SyntaxKind::Identifier, NodeData::Identifier(_)) => {
+            (SourceCallCalleeForm::Identifier, callee)
+        }
+        (
+            SyntaxKind::PropertyAccessExpression,
+            NodeData::PropertyAccessExpression(property),
+        ) => {
+            let name = NodeRef::new(node.arena, node.file, property.name);
+            let Some(name_record) = arena.get(property.name) else {
+                return Err(SourceCheckError::Call(node));
+            };
+            if name_record.parent != Some(callee.node)
+                || name_record.kind != SyntaxKind::Identifier
+                || !matches!(&name_record.data, NodeData::Identifier(_))
+                || call.type_arguments.is_some()
+            {
+                return Err(SourceCheckError::Unsupported(
+                    UnsupportedSourceSyntax::Call(node),
+                ));
+            }
+            (SourceCallCalleeForm::RequiredOwnProperty, name)
+        }
+        _ => {
+            return Err(SourceCheckError::Unsupported(
+                UnsupportedSourceSyntax::Call(node),
+            ));
+        }
+    };
 
     let type_arguments = call
         .type_arguments
@@ -232,6 +281,8 @@ pub(super) fn plan_direct_source_call_syntax(
     Ok(DirectSourceCallSyntax {
         node,
         callee,
+        callee_form,
+        callee_diagnostic_node,
         type_arguments,
         arguments,
     })
@@ -285,8 +336,16 @@ pub(super) fn finish_direct_source_call_plan(
     callee: PlannedExpression,
     arguments: Vec<PlannedExpression>,
 ) -> Result<SourceCallPlan, SourceCheckError> {
+    let exact_callee = match (&callee.kind, syntax.callee_form) {
+        (PlannedExpressionKind::Identifier(_), SourceCallCalleeForm::Identifier) => true,
+        (
+            PlannedExpressionKind::Property(property),
+            SourceCallCalleeForm::RequiredOwnProperty,
+        ) => property.is_call_callee_for(syntax.node, syntax.callee_diagnostic_node),
+        _ => false,
+    };
     if callee.node != syntax.callee
-        || !matches!(callee.kind, PlannedExpressionKind::Identifier(_))
+        || !exact_callee
         || arguments.len() != syntax.arguments.len()
         || !arguments
             .iter()
@@ -302,6 +361,8 @@ pub(super) fn finish_direct_source_call_plan(
     Ok(SourceCallPlan {
         node: syntax.node,
         callee,
+        callee_form: syntax.callee_form,
+        callee_diagnostic_node: syntax.callee_diagnostic_node,
         type_arguments: syntax.type_arguments.clone(),
         arguments,
     })
@@ -734,10 +795,16 @@ fn resolve_source_call_once(
     host: &DeclaredTypeHost<'_>,
     global_types: &CanonicalGlobalTypes,
     options: CanonicalCheckerOptions,
+    callee_form: SourceCallCalleeForm,
     callee_type: TypeId,
     argument_types: &[TypeId],
     explicit_type_arguments: Option<&[TypeId]>,
 ) -> Result<ResolvedSourceCall, SourceCallResolutionError> {
+    if callee_form == SourceCallCalleeForm::RequiredOwnProperty
+        && explicit_type_arguments.is_some()
+    {
+        return Err(SourceCallResolutionError::Unsupported);
+    }
     if explicit_type_arguments.is_none() {
         let request = DirectCallRequest {
             form: DirectCallForm::Call,
@@ -758,7 +825,11 @@ fn resolve_source_call_once(
                     applicability: resolution.applicability,
                 }));
             }
-            Err(DirectCallError::Unsupported(DirectCallUnsupported::GenericSignature(_))) => {}
+            Err(DirectCallError::Unsupported(DirectCallUnsupported::GenericSignature(_)))
+                if callee_form == SourceCallCalleeForm::Identifier => {}
+            Err(DirectCallError::Unsupported(DirectCallUnsupported::GenericSignature(_))) => {
+                return Err(SourceCallResolutionError::Unsupported);
+            }
             Err(
                 DirectCallError::Unsupported(DirectCallUnsupported::UnresolvedReturnType(
                     signature,
@@ -1079,7 +1150,7 @@ fn prepare_legacy_source_call_diagnostic(
                 )
             };
             CanonicalCheckerDiagnostic {
-                node: Some(plan.callee.node),
+                node: Some(plan.callee_diagnostic_node),
                 range_override: None,
                 diagnostic: Diagnostic::with_arguments(message, [expected, actual.to_string()]),
                 related_information: vec![missing_argument_related_information(
@@ -1209,7 +1280,7 @@ fn prepare_vector_source_call_diagnostic(
                 return Err(SourceCheckError::Call(plan.node));
             }
             CanonicalCheckerDiagnostic {
-                node: Some(plan.callee.node),
+                node: Some(plan.callee_diagnostic_node),
                 range_override: None,
                 diagnostic: Diagnostic::with_arguments(
                     message_by_code(2554).ok_or(SourceCheckError::MissingDiagnostic(2554))?,
@@ -1355,6 +1426,7 @@ pub(super) fn check_direct_source_call(
             host,
             global_types,
             options,
+            plan.callee_form,
             callee_type,
             argument_types,
             explicit_type_arguments.as_deref(),

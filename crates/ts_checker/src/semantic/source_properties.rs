@@ -1,8 +1,9 @@
-//! Exact source integration for one read-only `identifier.name` access.
+//! Exact source integration for one required own `identifier.name` access.
 //!
 //! The receiver must already have a canonical `any` type or belong to the
 //! validated own-property object domain in `relater`. Optional properties,
-//! missing/apparent/index members, chains, and member calls stay fail-closed.
+//! missing/apparent/index members, and chains stay fail-closed. A member call
+//! is admitted only when its exact enclosing call grants callee capability.
 
 use ts_ast::{NodeArena, NodeData, NodeRef, SyntaxKind};
 use ts_binder::SemanticSymbolId;
@@ -70,7 +71,19 @@ impl std::error::Error for SourcePropertyError {
 pub(super) struct SourcePropertyPlan {
     pub(super) node: NodeRef,
     pub(super) receiver: PlannedExpression,
+    name_node: NodeRef,
     name: String,
+    position: SourcePropertyPosition,
+}
+
+/// The exact source position for which a property access was proven.
+///
+/// Retaining this capability in both syntax and finished plans prevents an
+/// ordinary read plan from being repurposed as a member-call callee.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SourcePropertyPosition {
+    Read,
+    CallCallee(NodeRef),
 }
 
 /// Property-access syntax proven before recursive source planning starts.
@@ -78,12 +91,24 @@ pub(super) struct SourcePropertyPlan {
 pub(super) struct DirectSourcePropertySyntax {
     node: NodeRef,
     receiver: NodeRef,
+    name_node: NodeRef,
     name: String,
+    position: SourcePropertyPosition,
 }
 
 impl DirectSourcePropertySyntax {
     pub(super) fn receiver(&self) -> NodeRef {
         self.receiver
+    }
+
+    pub(super) fn name_node(&self) -> NodeRef {
+        self.name_node
+    }
+}
+
+impl SourcePropertyPlan {
+    pub(super) fn is_call_callee_for(&self, call: NodeRef, name: NodeRef) -> bool {
+        self.name_node == name && self.position == SourcePropertyPosition::CallCallee(call)
     }
 }
 
@@ -98,6 +123,30 @@ pub(super) fn plan_direct_source_property_syntax(
     arena: &NodeArena,
     store: &CanonicalTypeMapperStore,
     node: NodeRef,
+) -> Result<DirectSourcePropertySyntax, SourcePropertyError> {
+    plan_direct_source_property_syntax_at(arena, store, node, SourcePropertyPosition::Read)
+}
+
+/// Proves a property access specifically as the callee of `call`.
+pub(super) fn plan_direct_source_property_call_syntax(
+    arena: &NodeArena,
+    store: &CanonicalTypeMapperStore,
+    node: NodeRef,
+    call: NodeRef,
+) -> Result<DirectSourcePropertySyntax, SourcePropertyError> {
+    plan_direct_source_property_syntax_at(
+        arena,
+        store,
+        node,
+        SourcePropertyPosition::CallCallee(call),
+    )
+}
+
+fn plan_direct_source_property_syntax_at(
+    arena: &NodeArena,
+    store: &CanonicalTypeMapperStore,
+    node: NodeRef,
+    position: SourcePropertyPosition,
 ) -> Result<DirectSourcePropertySyntax, SourcePropertyError> {
     let Some(record) = arena.get(node.node) else {
         return Err(unsupported_access(node));
@@ -114,14 +163,37 @@ pub(super) fn plan_direct_source_property_syntax(
         return Err(unsupported_access(node));
     }
 
-    if let Some(parent) = record.parent
-        && let Some(parent_record) = arena.get(parent)
-        && let NodeData::CallExpression(call) = &parent_record.data
-        && call.expression == node.node
-    {
-        return Err(SourcePropertyError::Unsupported(
-            SourcePropertyUnsupported::MemberCall(NodeRef::new(node.arena, node.file, parent)),
-        ));
+    match position {
+        SourcePropertyPosition::Read => {
+            if let Some(parent) = record.parent
+                && let Some(parent_record) = arena.get(parent)
+                && let NodeData::CallExpression(call) = &parent_record.data
+                && call.expression == node.node
+            {
+                return Err(SourcePropertyError::Unsupported(
+                    SourcePropertyUnsupported::MemberCall(NodeRef::new(
+                        node.arena, node.file, parent,
+                    )),
+                ));
+            }
+        }
+        SourcePropertyPosition::CallCallee(call_node) => {
+            let exact_call = call_node.arena == node.arena
+                && call_node.file == node.file
+                && record.parent == Some(call_node.node)
+                && arena.get(call_node.node).is_some_and(|call_record| {
+                    call_record.kind == SyntaxKind::CallExpression
+                        && matches!(
+                            &call_record.data,
+                            NodeData::CallExpression(call) if call.expression == node.node
+                        )
+                });
+            if !exact_call {
+                return Err(SourcePropertyError::Unsupported(
+                    SourcePropertyUnsupported::MemberCall(call_node),
+                ));
+            }
+        }
     }
 
     let receiver = NodeRef::new(node.arena, node.file, access.expression);
@@ -141,6 +213,7 @@ pub(super) fn plan_direct_source_property_syntax(
         ));
     }
 
+    let name_node = NodeRef::new(node.arena, node.file, access.name);
     let Some(name_record) = arena.get(access.name) else {
         return Err(unsupported_access(node));
     };
@@ -160,7 +233,9 @@ pub(super) fn plan_direct_source_property_syntax(
     Ok(DirectSourcePropertySyntax {
         node,
         receiver,
+        name_node,
         name: identifier.text.clone(),
+        position,
     })
 }
 
@@ -178,7 +253,9 @@ pub(super) fn finish_direct_source_property_plan(
     Ok(SourcePropertyPlan {
         node: syntax.node,
         receiver,
+        name_node: syntax.name_node,
         name: syntax.name.clone(),
+        position: syntax.position,
     })
 }
 

@@ -70,8 +70,9 @@ use super::{
         validate_stored_source_callable,
     },
     source_calls::{
-        SourceCallPlan, check_direct_source_call, emit_call_type_argument_grammar_diagnostics,
-        finish_direct_source_call_plan, plan_direct_source_call_syntax,
+        SourceCallCalleeForm, SourceCallPlan, check_direct_source_call,
+        emit_call_type_argument_grammar_diagnostics, finish_direct_source_call_plan,
+        plan_direct_source_call_syntax,
     },
     source_elements::{
         SourceElementError, SourceElementPlan, SourceElementUnsupported,
@@ -96,7 +97,7 @@ use super::{
     source_properties::{
         SourcePropertyError, SourcePropertyPlan, SourcePropertyUnsupported,
         check_direct_source_property, finish_direct_source_property_plan,
-        plan_direct_source_property_syntax,
+        plan_direct_source_property_call_syntax, plan_direct_source_property_syntax,
     },
     type_nodes::{
         CanonicalTypeQuery, CanonicalTypeReferenceAliasTarget, normalize_bigint_literal,
@@ -2675,7 +2676,36 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 let argument_nodes = syntax.arguments().to_vec();
                 self.primitive_binary_position_roots
                     .extend(argument_nodes.iter().copied());
-                let callee = self.plan_expression(callee_node)?;
+                let callee = match syntax.callee_form() {
+                    SourceCallCalleeForm::Identifier => self.plan_expression(callee_node)?,
+                    SourceCallCalleeForm::RequiredOwnProperty => {
+                        let Some((store, _)) = self.semantic else {
+                            return Err(SourceCheckError::Unsupported(
+                                UnsupportedSourceSyntax::Property(callee_node),
+                            ));
+                        };
+                        let property_syntax = plan_direct_source_property_call_syntax(
+                            self.arena,
+                            store,
+                            callee_node,
+                            expression,
+                        )
+                        .map_err(Self::property_plan_error)?;
+                        if property_syntax.name_node() != syntax.callee_diagnostic_node() {
+                            return Err(SourceCheckError::Unsupported(
+                                UnsupportedSourceSyntax::Call(expression),
+                            ));
+                        }
+                        let receiver = self.plan_expression(property_syntax.receiver())?;
+                        let property =
+                            finish_direct_source_property_plan(&property_syntax, receiver)
+                                .map_err(Self::property_plan_error)?;
+                        PlannedExpression::new(
+                            callee_node,
+                            PlannedExpressionKind::Property(Box::new(property)),
+                        )
+                    }
+                };
                 let arguments = argument_nodes
                     .into_iter()
                     .map(|argument| self.plan_expression(argument))
