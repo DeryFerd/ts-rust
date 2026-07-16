@@ -316,6 +316,19 @@ struct ResolvedObjectMembers {
     exact_callable: bool,
 }
 
+/// One validated own property from the exact property-only object domain.
+///
+/// This projection deliberately omits apparent/global members and index
+/// signatures. Callers can therefore distinguish an absent own property from
+/// a member path that the installed semantic slice cannot answer exactly.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct ResolvedOwnProperty {
+    pub(super) symbol: SemanticSymbolId,
+    pub(super) type_: TypeId,
+    pub(super) optional: bool,
+    pub(super) readonly: bool,
+}
+
 #[derive(Clone, Copy)]
 enum ObjectPropertyOrigin {
     Declared,
@@ -3138,6 +3151,54 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         }
     }
 
+    /// Looks up one required-or-optional own property without synthesizing an
+    /// apparent member, a global `Object` augmentation, or an index result.
+    ///
+    /// The receiver must already be in the exact declared/fresh/derived
+    /// property-only object domain validated by structural relation. A valid
+    /// receiver with no such own property returns `None`; unsupported receiver
+    /// kinds and malformed warm state retain their typed relation failure.
+    pub(super) fn resolved_own_property(
+        &mut self,
+        type_id: TypeId,
+        name: &str,
+    ) -> Result<Option<ResolvedOwnProperty>, RelationUnavailable> {
+        let bootstrap = self.relation_bootstrap_facts()?;
+        let mut session = RelaterSession::new(self, RelationKind::Assignable, bootstrap);
+        let resolved = session.resolved_object_members(type_id, true)?;
+        if resolved.exact_callable || resolved.call_signature.is_some() {
+            return Err(RelationUnavailable::StructuredSignatures(type_id));
+        }
+        let Some(members) = resolved.members else {
+            return Ok(None);
+        };
+        let property = session
+            .store
+            .symbol_table(members)
+            .ok_or(RelationUnavailable::InvalidStructuredMembers(type_id))?
+            .get_source(name);
+        let Some(property) = property else {
+            return Ok(None);
+        };
+        if !resolved.properties.contains(&property) {
+            return Err(RelationUnavailable::InvalidStructuredMembers(type_id));
+        }
+        let (optional, readonly) = {
+            let record = session.property_symbol(property, resolved.property_origin)?;
+            (
+                record.flags().contains(SymbolFlags::OPTIONAL),
+                record.check_flags().contains(CheckFlags::READONLY),
+            )
+        };
+        let type_ = session.property_type(property)?;
+        Ok(Some(ResolvedOwnProperty {
+            symbol: property,
+            type_,
+            optional,
+            readonly,
+        }))
+    }
+
     /// Returns the exact ordered property view used when a declared object
     /// supplies context to an object literal.
     ///
@@ -4456,7 +4517,10 @@ mod tests {
     use ts_jsnum::{Number, PseudoBigInt};
     use ts_parser::{ParseResult, parse_source_file};
 
-    use super::{ArrayTypeError, LiteralTypeCacheError, RelationGlobalTypes, RelationUnavailable};
+    use super::{
+        ArrayTypeError, LiteralTypeCacheError, RelationGlobalTypes, RelationUnavailable,
+        ResolvedOwnProperty,
+    };
     use crate::semantic::{
         CanonicalCheckerDiagnostics, CanonicalGlobalTypeInitializationError,
         CanonicalTypeMapperStore, DeclaredTypeHost, DeclaredTypeLinks, IntrinsicBootstrapOptions,
@@ -7664,6 +7728,79 @@ mod tests {
         assert_eq!(store.relation_state_snapshot(), widened_warm);
         assert_eq!(store.is_type_comparable_to(target, widened), Ok(true));
         assert_eq!(store.is_type_comparable_to(widened, target), Ok(true));
+    }
+
+    #[test]
+    fn resolved_own_property_returns_declared_optionality_and_no_fallback() {
+        let mut store = initialized(true);
+        let string = store.intrinsic_bootstrap().unwrap().string_type;
+        let property = alloc_typed_property(&mut store, "value", string, true);
+        let object = alloc_property_object(&mut store, vec![property]);
+
+        assert_eq!(
+            store.resolved_own_property(object, "value"),
+            Ok(Some(ResolvedOwnProperty {
+                symbol: property,
+                type_: string,
+                optional: true,
+                readonly: false,
+            }))
+        );
+        assert_eq!(store.resolved_own_property(object, "missing"), Ok(None));
+    }
+
+    #[test]
+    fn resolved_own_property_accepts_validated_fresh_regular_and_widened_literals() {
+        let mut store = initialized(false);
+        let (undefined_widening, any) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (bootstrap.undefined_widening_type, bootstrap.any_type)
+        };
+        let raw_seed = alloc_typed_property(&mut store, "value", undefined_widening, false);
+        let fixture = alloc_fresh_property_object_fixture(&mut store, vec![raw_seed]);
+        let regular = store
+            .get_regular_type_of_object_literal(fixture.type_)
+            .unwrap();
+        let widened = store.get_widened_type(regular).unwrap();
+
+        let fresh = store
+            .resolved_own_property(fixture.type_, "value")
+            .unwrap()
+            .unwrap();
+        let regular_property = store
+            .resolved_own_property(regular, "value")
+            .unwrap()
+            .unwrap();
+        let widened_property = store
+            .resolved_own_property(widened, "value")
+            .unwrap()
+            .unwrap();
+        assert_eq!(fresh.symbol, fixture.properties[0]);
+        assert_eq!(fresh.type_, undefined_widening);
+        assert_eq!(regular_property.symbol, fixture.properties[0]);
+        assert_eq!(regular_property.type_, undefined_widening);
+        assert_ne!(widened_property.symbol, fixture.properties[0]);
+        assert_eq!(widened_property.type_, any);
+        assert!(!fresh.optional && !regular_property.optional && !widened_property.optional);
+    }
+
+    #[test]
+    fn resolved_own_property_rejects_union_and_primitive_receivers() {
+        let mut store = initialized(true);
+        let (string, number) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (bootstrap.string_type, bootstrap.number_type)
+        };
+        let union = canonical_union(&mut store, &[string, number]);
+
+        assert_eq!(
+            store.resolved_own_property(union, "value"),
+            Err(RelationUnavailable::UnsupportedStructuredType(union))
+        );
+        assert_eq!(
+            store.resolved_own_property(string, "length"),
+            Err(RelationUnavailable::UnsupportedStructuredType(string))
+        );
     }
 
     #[test]
