@@ -556,12 +556,14 @@ fn display_error_is_unsupported(error: &TypeDisplayUnavailable) -> bool {
         | TypeDisplayUnavailable::CyclicType(_)
         | TypeDisplayUnavailable::UniqueSymbolName(_)
         | TypeDisplayUnavailable::FullyQualifiedName { .. }
+        | TypeDisplayUnavailable::FunctionType { .. }
         | TypeDisplayUnavailable::Utf8TruncationBoundary { .. } => true,
         TypeDisplayUnavailable::Type(_)
         | TypeDisplayUnavailable::MalformedType(_)
         | TypeDisplayUnavailable::InvalidUnion(_)
         | TypeDisplayUnavailable::InvalidLiteralLinks(_)
-        | TypeDisplayUnavailable::MissingBootstrap => false,
+        | TypeDisplayUnavailable::MissingBootstrap
+        | TypeDisplayUnavailable::SourceHost(_) => false,
         TypeDisplayUnavailable::ArrayType(error) => array_type_error_is_unsupported(error),
     }
 }
@@ -6504,12 +6506,13 @@ mod tests {
     use ts_checker::semantic::{
         ArrayTypeError, AssignmentInvariant, CanonicalCheckerContextError,
         CanonicalGlobalInitializationError, CanonicalGlobalTypeInitializationError,
-        CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeUnavailable, DerivedTypeError,
-        IntrinsicBootstrapOptions, RelationKind, RelationUnavailable, SourceAssertionError,
-        SourceCheckError, SourceCheckProvenanceError, SourceLiteralCacheError,
-        SourceObjectLiteralError, SymbolMergeError, TypeDataKind, TypeDisplayUnavailable,
-        TypeNodeUnavailable, UnsupportedSourceSyntax, VariableInvariant,
+        CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHostError,
+        DeclaredTypeUnavailable, DerivedTypeError, IntrinsicBootstrapOptions, RelationKind,
+        RelationUnavailable, SourceAssertionError, SourceCheckError, SourceCheckProvenanceError,
+        SourceLiteralCacheError, SourceObjectLiteralError, SymbolMergeError, TypeDataKind,
+        TypeDisplayUnavailable, TypeNodeUnavailable, UnsupportedSourceSyntax, VariableInvariant,
     };
+    use ts_checker::semantic::formatter::FunctionTypeDisplayUnavailable;
     use ts_diagnostics::{Category, Diagnostic, message_by_code};
     use ts_options::{
         CompilerOptions, ModuleDetectionKind, ModuleKind, ModuleResolutionKind, ScriptTarget,
@@ -6539,6 +6542,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // Keeps the supported classifier matrix exhaustive.
     fn canonical_program_error_classification_accepts_capability_boundaries() {
         let parsed = parse_source_file("const value: number = 1;");
         let file = FileId::new(7);
@@ -6613,6 +6617,15 @@ mod tests {
                     TypeDisplayUnavailable::UnsupportedType {
                         type_id,
                         kind: TypeDataKind::Conditional,
+                    },
+                ),
+            },
+            CanonicalProgramCheckError::SourceCheck {
+                file_name: "/project/input.ts".to_owned(),
+                error: SourceCheckError::TypeDisplayUnavailable(
+                    TypeDisplayUnavailable::FunctionType {
+                        type_id,
+                        reason: FunctionTypeDisplayUnavailable::UnresolvedReturn,
                     },
                 ),
             },
@@ -6835,6 +6848,14 @@ mod tests {
                 file_name: "/project/input.ts".to_owned(),
                 error: SourceCheckError::TypeDisplayUnavailable(
                     TypeDisplayUnavailable::InvalidUnion(type_id),
+                ),
+            },
+            CanonicalProgramCheckError::SourceCheck {
+                file_name: "/project/input.ts".to_owned(),
+                error: SourceCheckError::TypeDisplayUnavailable(
+                    TypeDisplayUnavailable::SourceHost(
+                        DeclaredTypeHostError::DeclarationsIncomplete(file),
+                    ),
                 ),
             },
             CanonicalProgramCheckError::SourceCheck {
