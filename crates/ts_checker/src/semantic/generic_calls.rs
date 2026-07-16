@@ -2261,6 +2261,827 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy)]
+    enum GenericTypeSpec {
+        Exact(TypeId),
+        Parameter(usize),
+    }
+
+    fn generic_type_spec(spec: GenericTypeSpec, type_parameters: &[TypeId]) -> TypeId {
+        match spec {
+            GenericTypeSpec::Exact(type_) => type_,
+            GenericTypeSpec::Parameter(index) => type_parameters[index],
+        }
+    }
+
+    fn vector_callable(
+        store: &mut CanonicalTypeMapperStore,
+        names: &[&str],
+        constraints: &[Option<GenericTypeSpec>],
+        defaults: &[Option<GenericTypeSpec>],
+        parameter_indices: &[usize],
+        return_type: impl FnOnce(&mut CanonicalTypeMapperStore, &[TypeId]) -> TypeId,
+    ) -> (ValidatedSingleCallable, Vec<TypeId>) {
+        assert_eq!(constraints.len(), names.len());
+        assert_eq!(defaults.len(), names.len());
+        let no_constraint = store.intrinsic_bootstrap().unwrap().no_constraint_type;
+        let mut type_parameters = Vec::with_capacity(names.len());
+        for name in names {
+            let symbol = store
+                .alloc_symbol(SymbolData::new(
+                    SymbolFlags::TYPE_PARAMETER,
+                    EscapedName::source(*name),
+                ))
+                .unwrap();
+            let type_parameter = store.alloc_type_parameter(Some(symbol)).unwrap();
+            assert!(store.set_declared_type_links(
+                symbol,
+                DeclaredTypeLinks {
+                    declared_type: Some(type_parameter),
+                    ..DeclaredTypeLinks::default()
+                },
+            ));
+            type_parameters.push(type_parameter);
+        }
+        for (index, type_parameter) in type_parameters.iter().copied().enumerate() {
+            let constraint = constraints[index].map_or(no_constraint, |spec| {
+                generic_type_spec(spec, &type_parameters)
+            });
+            let default_type = defaults[index].map_or(no_constraint, |spec| {
+                generic_type_spec(spec, &type_parameters)
+            });
+            assert!(store.set_type_parameter_resolution(
+                type_parameter,
+                Some(constraint),
+                None,
+                None,
+                Some(default_type),
+            ));
+        }
+        let parameter_types = parameter_indices
+            .iter()
+            .map(|index| type_parameters[*index])
+            .collect::<Vec<_>>();
+        let mut parameter_symbols = Vec::with_capacity(parameter_types.len());
+        for (index, parameter_type) in parameter_types.iter().copied().enumerate() {
+            let symbol = store
+                .alloc_symbol(SymbolData::new(
+                    SymbolFlags::FUNCTION_SCOPED_VARIABLE,
+                    EscapedName::source(format!("arg{index}")),
+                ))
+                .unwrap();
+            assert!(store.set_value_symbol_links(
+                symbol,
+                ValueSymbolLinks {
+                    resolved_type: Some(parameter_type),
+                    ..ValueSymbolLinks::default()
+                },
+            ));
+            parameter_symbols.push(symbol);
+        }
+        let return_type = return_type(store, &type_parameters);
+        let signature = store
+            .alloc_signature(
+                SignatureFlags::NONE,
+                None,
+                type_parameters.clone(),
+                None,
+                parameter_symbols,
+                Some(return_type),
+                None,
+                i32::try_from(parameter_types.len()).unwrap(),
+            )
+            .unwrap();
+        let owner = store.intrinsic_bootstrap().unwrap().any_function_type;
+        (
+            ValidatedSingleCallable {
+                owner,
+                signature,
+                parameters: parameter_types,
+                min_argument_count: parameter_indices.len(),
+                return_type: Some(return_type),
+                strict_variance_exempt: false,
+            },
+            type_parameters,
+        )
+    }
+
+    fn vector_request<'a>(
+        callee: TypeId,
+        explicit_type_arguments: Option<&'a [TypeId]>,
+        arguments: &'a [TypeId],
+    ) -> GenericCallVectorRequest<'a> {
+        GenericCallVectorRequest {
+            form: DirectCallForm::Call,
+            optional_chain: false,
+            explicit_type_arguments,
+            has_spread_argument: false,
+            callee,
+            arguments,
+        }
+    }
+
+    fn scalar_assignable(store: &CanonicalTypeMapperStore, source: TypeId, target: TypeId) -> bool {
+        if source == target {
+            return true;
+        }
+        let Some(source_record) = store.type_payload(source) else {
+            return false;
+        };
+        let Some(target_record) = store.type_payload(target) else {
+            return false;
+        };
+        if let (TypeData::Literal(source), TypeData::Literal(target)) =
+            (source_record.data(), target_record.data())
+            && source.regular_type == target.regular_type
+        {
+            return true;
+        }
+        if target_record.flags().intersects(TypeFlags::ANY_OR_UNKNOWN) {
+            return true;
+        }
+        if let TypeData::Union(source_union) = source_record.data() {
+            return source_union
+                .union
+                .types
+                .iter()
+                .copied()
+                .all(|constituent| scalar_assignable(store, constituent, target));
+        }
+        if let TypeData::Union(target_union) = target_record.data() {
+            return target_union
+                .union
+                .types
+                .iter()
+                .copied()
+                .any(|constituent| scalar_assignable(store, source, constituent));
+        }
+        source_record.flags().intersects(TypeFlags::STRING_LITERAL)
+            && target_record.flags() == TypeFlags::STRING
+            || source_record.flags().intersects(TypeFlags::NUMBER_LITERAL)
+                && target_record.flags() == TypeFlags::NUMBER
+            || source_record.flags().intersects(TypeFlags::BIG_INT_LITERAL)
+                && target_record.flags() == TypeFlags::BIG_INT
+            || source_record.flags().intersects(TypeFlags::BOOLEAN_LITERAL)
+                && target_record.flags() == TypeFlags::BOOLEAN
+    }
+
+    fn project_vector(
+        store: &mut CanonicalTypeMapperStore,
+        callable: &ValidatedSingleCallable,
+        request: GenericCallVectorRequest<'_>,
+    ) -> Result<GenericCallVectorResolution, GenericCallVectorError> {
+        project_validated_generic_call_vector(
+            store,
+            request,
+            callable,
+            |store, source, target| Ok(scalar_assignable(store, source, target)),
+            CanonicalTypeMapperStore::is_type_strict_subtype_of,
+            CanonicalTypeMapperStore::is_type_subtype_of,
+        )
+    }
+
+    fn fresh_string(store: &mut CanonicalTypeMapperStore, value: &str) -> TypeId {
+        let regular = store.regular_string_literal_type(value.into()).unwrap();
+        store.fresh_type_of_literal_type(regular).unwrap()
+    }
+
+    fn fresh_number(store: &mut CanonicalTypeMapperStore, value: f64) -> TypeId {
+        let regular = store
+            .regular_number_literal_type(Number::new(value))
+            .unwrap();
+        store.fresh_type_of_literal_type(regular).unwrap()
+    }
+
+    #[test]
+    fn vector_inference_preserves_returned_literals_and_widens_other_parameters() {
+        let mut store = initialized_store();
+        let (pair, parameters) = vector_callable(
+            &mut store,
+            &["T", "U"],
+            &[None, None],
+            &[None, None],
+            &[0, 1],
+            |_, parameters| parameters[1],
+        );
+        let text = fresh_string(&mut store, "x");
+        let one = fresh_number(&mut store, 1.0);
+        let string = store.intrinsic_bootstrap().unwrap().string_type;
+        let counts = (
+            store.mapper_len(),
+            store.signature_len(),
+            store.cached_signature_len(),
+        );
+
+        let result = project_vector(
+            &mut store,
+            &pair,
+            vector_request(pair.owner, None, &[text, one]),
+        )
+        .unwrap();
+
+        assert_eq!(
+            result.applicability,
+            GenericCallVectorApplicability::Applicable
+        );
+        assert_eq!(result.projection.type_parameters, parameters);
+        assert_eq!(
+            result.projection.instantiation.type_arguments,
+            [string, one]
+        );
+        assert_eq!(
+            result.projection.instantiation.parameter_types,
+            [string, one]
+        );
+        assert_eq!(result.projection.instantiation.return_type, one);
+        assert!(!result.projection.recovery);
+        assert_eq!(
+            (
+                store.mapper_len(),
+                store.signature_len(),
+                store.cached_signature_len(),
+            ),
+            counts,
+            "pure vector projection must not publish mapper/signature cache state"
+        );
+    }
+
+    #[test]
+    fn repeated_same_base_candidates_form_the_raw_literal_union() {
+        let mut store = initialized_store();
+        let (choose, _) = vector_callable(
+            &mut store,
+            &["T"],
+            &[None],
+            &[None],
+            &[0, 0],
+            |_, parameters| parameters[0],
+        );
+        let a = fresh_string(&mut store, "a");
+        let b = fresh_string(&mut store, "b");
+
+        let result = project_vector(
+            &mut store,
+            &choose,
+            vector_request(choose.owner, None, &[a, b]),
+        )
+        .unwrap();
+
+        assert_eq!(
+            result.applicability,
+            GenericCallVectorApplicability::Applicable
+        );
+        let inferred = result.projection.instantiation.type_arguments[0];
+        assert_eq!(result.projection.instantiation.return_type, inferred);
+        let TypeData::Union(data) = store.type_payload(inferred).unwrap().data() else {
+            panic!("choose('a', 'b') must infer a literal union");
+        };
+        assert_eq!(data.union.types.len(), 2);
+        assert!(data.union.types.contains(&a));
+        assert!(data.union.types.contains(&b));
+    }
+
+    #[test]
+    fn declaration_order_defaults_and_union_returns_use_the_full_vector() {
+        let mut store = initialized_store();
+        let (fallback, parameters) = vector_callable(
+            &mut store,
+            &["T", "U"],
+            &[None, None],
+            &[None, Some(GenericTypeSpec::Parameter(0))],
+            &[0],
+            |_, parameters| parameters[1],
+        );
+        let text = fresh_string(&mut store, "x");
+        let string = store.intrinsic_bootstrap().unwrap().string_type;
+        let fallback_result = project_vector(
+            &mut store,
+            &fallback,
+            vector_request(fallback.owner, None, &[text]),
+        )
+        .unwrap();
+        assert_eq!(
+            fallback_result.projection.instantiation.type_arguments,
+            [string, string]
+        );
+        assert_eq!(fallback_result.projection.instantiation.return_type, string);
+
+        let (both, _) = vector_callable(
+            &mut store,
+            &["A", "B"],
+            &[None, None],
+            &[None, None],
+            &[0, 1],
+            |store, parameters| {
+                store
+                    .alloc_union_type(ObjectFlags::NONE, parameters.to_vec())
+                    .unwrap()
+            },
+        );
+        let one = fresh_number(&mut store, 1.0);
+        let both_result = project_vector(
+            &mut store,
+            &both,
+            vector_request(both.owner, None, &[text, one]),
+        )
+        .unwrap();
+        assert_eq!(
+            both_result.projection.instantiation.type_arguments,
+            [text, one]
+        );
+        let TypeData::Union(data) = store
+            .type_payload(both_result.projection.instantiation.return_type)
+            .unwrap()
+            .data()
+        else {
+            panic!("T | U must instantiate through the full mapper vector");
+        };
+        assert!(data.union.types.contains(&text));
+        assert!(data.union.types.contains(&one));
+        assert_ne!(parameters[0], parameters[1]);
+    }
+
+    #[test]
+    fn inferred_constraints_fallback_before_left_to_right_applicability() {
+        let mut store = initialized_store();
+        let (string, number) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (bootstrap.string_type, bootstrap.number_type)
+        };
+        let (dependent, _) = vector_callable(
+            &mut store,
+            &["T", "U"],
+            &[None, Some(GenericTypeSpec::Parameter(0))],
+            &[None, None],
+            &[0, 1],
+            |_, parameters| parameters[1],
+        );
+        let text = fresh_string(&mut store, "x");
+        let one = fresh_number(&mut store, 1.0);
+
+        let result = project_vector(
+            &mut store,
+            &dependent,
+            vector_request(dependent.owner, None, &[text, one]),
+        )
+        .unwrap();
+
+        assert_eq!(
+            result
+                .checked_instantiation
+                .as_ref()
+                .unwrap()
+                .type_arguments,
+            [string, string]
+        );
+        assert_eq!(
+            result.applicability,
+            GenericCallVectorApplicability::ArgumentNotAssignable {
+                index: 1,
+                argument_type: one,
+                parameter_type: string,
+            }
+        );
+        assert_eq!(result.applicability.diagnostic_code(), Some(2345));
+        assert_eq!(result.projection.instantiation.return_type, string);
+        assert_ne!(number, string);
+    }
+
+    #[test]
+    fn declared_constraint_shape_controls_literal_regularization() {
+        let mut store = initialized_store();
+        let string = store.intrinsic_bootstrap().unwrap().string_type;
+        let a_regular = store.regular_string_literal_type("a".into()).unwrap();
+        let b_regular = store.regular_string_literal_type("b".into()).unwrap();
+        let c_regular = store.regular_string_literal_type("c".into()).unwrap();
+        let a = store.fresh_type_of_literal_type(a_regular).unwrap();
+        let b = store.fresh_type_of_literal_type(b_regular).unwrap();
+        let c = store.fresh_type_of_literal_type(c_regular).unwrap();
+
+        let (dependent, _) = vector_callable(
+            &mut store,
+            &["T", "U"],
+            &[None, Some(GenericTypeSpec::Parameter(0))],
+            &[None, None],
+            &[0, 1, 1],
+            |_, parameters| parameters[1],
+        );
+        let dependent_result = project_vector(
+            &mut store,
+            &dependent,
+            vector_request(dependent.owner, None, &[a, b, c]),
+        )
+        .unwrap();
+        assert_eq!(
+            dependent_result.applicability,
+            GenericCallVectorApplicability::Applicable
+        );
+        assert_eq!(
+            dependent_result.projection.instantiation.type_arguments[0],
+            string
+        );
+        let dependent_inference =
+            dependent_result.projection.instantiation.type_arguments[1];
+        let TypeData::Union(data) = store
+            .type_payload(dependent_inference)
+            .unwrap()
+            .data()
+        else {
+            panic!("U extends T must preserve the fresh repeated candidates");
+        };
+        assert!(data.union.types.contains(&b));
+        assert!(data.union.types.contains(&c));
+        assert!(!data.union.types.contains(&b_regular));
+        assert!(!data.union.types.contains(&c_regular));
+
+        let (direct, _) = vector_callable(
+            &mut store,
+            &["T"],
+            &[Some(GenericTypeSpec::Exact(string))],
+            &[None],
+            &[0, 0],
+            |_, parameters| parameters[0],
+        );
+        let direct_result = project_vector(
+            &mut store,
+            &direct,
+            vector_request(direct.owner, None, &[b, c]),
+        )
+        .unwrap();
+        assert_eq!(
+            direct_result.applicability,
+            GenericCallVectorApplicability::Applicable
+        );
+        let direct_inference = direct_result.projection.instantiation.type_arguments[0];
+        let TypeData::Union(data) = store.type_payload(direct_inference).unwrap().data() else {
+            panic!("a direct primitive constraint must retain a regular literal union");
+        };
+        assert!(data.union.types.contains(&b_regular));
+        assert!(data.union.types.contains(&c_regular));
+        assert!(!data.union.types.contains(&b));
+        assert!(!data.union.types.contains(&c));
+    }
+
+    #[test]
+    fn explicit_constraint_failure_is_ts2344_and_suppresses_argument_failure() {
+        let mut store = initialized_store();
+        let (string, number) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (bootstrap.string_type, bootstrap.number_type)
+        };
+        let (constrained, _) = vector_callable(
+            &mut store,
+            &["T"],
+            &[Some(GenericTypeSpec::Exact(string))],
+            &[None],
+            &[0],
+            |_, parameters| parameters[0],
+        );
+
+        let result = project_vector(
+            &mut store,
+            &constrained,
+            vector_request(constrained.owner, Some(&[number]), &[string]),
+        )
+        .unwrap();
+
+        assert_eq!(
+            result.applicability,
+            GenericCallVectorApplicability::ExplicitTypeArgumentConstraint {
+                index: 0,
+                type_argument: number,
+                constraint: string,
+            }
+        );
+        assert_eq!(result.applicability.diagnostic_code(), Some(2344));
+        assert_eq!(result.projection.instantiation.return_type, number);
+        assert!(result.projection.recovery);
+    }
+
+    #[test]
+    fn type_arity_precedes_value_arity_and_recovers_default_constraint_unknown() {
+        let mut store = initialized_store();
+        let (string, number, boolean) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (
+                bootstrap.string_type,
+                bootstrap.number_type,
+                bootstrap.boolean_type,
+            )
+        };
+        let (pair, _) = vector_callable(
+            &mut store,
+            &["T", "U"],
+            &[None, None],
+            &[None, None],
+            &[0, 1],
+            |_, parameters| parameters[1],
+        );
+        let missing = project_vector(
+            &mut store,
+            &pair,
+            vector_request(pair.owner, Some(&[string]), &[]),
+        )
+        .unwrap();
+        let unknown = store.intrinsic_bootstrap().unwrap().unknown_type;
+        assert_eq!(
+            missing.applicability,
+            GenericCallVectorApplicability::TypeArgumentArity {
+                minimum: 2,
+                maximum: 2,
+                actual: 1,
+            }
+        );
+        assert_eq!(missing.applicability.diagnostic_code(), Some(2558));
+        assert_eq!(
+            missing.projection.instantiation.type_arguments,
+            [string, unknown]
+        );
+        assert_eq!(missing.projection.instantiation.return_type, unknown);
+
+        let (fallback, _) = vector_callable(
+            &mut store,
+            &["A", "B"],
+            &[None, None],
+            &[None, Some(GenericTypeSpec::Parameter(0))],
+            &[0],
+            |_, parameters| parameters[1],
+        );
+        let extra = project_vector(
+            &mut store,
+            &fallback,
+            vector_request(
+                fallback.owner,
+                Some(&[string, number, boolean]),
+                &[string, number],
+            ),
+        )
+        .unwrap();
+        assert_eq!(extra.applicability.diagnostic_code(), Some(2558));
+        assert_eq!(
+            extra.projection.instantiation.type_arguments,
+            [string, number]
+        );
+        assert_eq!(extra.projection.instantiation.return_type, number);
+
+        let (defaulted, _) = vector_callable(
+            &mut store,
+            &["T"],
+            &[None],
+            &[Some(GenericTypeSpec::Exact(string))],
+            &[0],
+            |_, parameters| parameters[0],
+        );
+        let empty = project_vector(
+            &mut store,
+            &defaulted,
+            vector_request(defaulted.owner, Some(&[]), &[number]),
+        )
+        .unwrap();
+        assert_eq!(
+            empty.applicability,
+            GenericCallVectorApplicability::Applicable,
+            "the parser owns TS1099 and zero type arguments trigger inference"
+        );
+        assert_eq!(empty.projection.instantiation.type_arguments, [number]);
+    }
+
+    #[test]
+    fn valid_partial_explicit_failure_exposes_raw_default_recovery_projection() {
+        let mut store = initialized_store();
+        let (string, number) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (bootstrap.string_type, bootstrap.number_type)
+        };
+        let (two, parameters) = vector_callable(
+            &mut store,
+            &["T", "U"],
+            &[None, None],
+            &[None, Some(GenericTypeSpec::Parameter(0))],
+            &[0, 1],
+            |_, parameters| parameters[1],
+        );
+        let result = project_vector(
+            &mut store,
+            &two,
+            vector_request(two.owner, Some(&[string]), &[string, number]),
+        )
+        .unwrap();
+
+        let checked = result.checked_instantiation.as_ref().unwrap();
+        assert_eq!(checked.type_arguments, [string, string]);
+        assert_eq!(
+            result.applicability,
+            GenericCallVectorApplicability::ArgumentNotAssignable {
+                index: 1,
+                argument_type: number,
+                parameter_type: string,
+            }
+        );
+        assert_eq!(
+            result.projection.instantiation.type_arguments,
+            [string, parameters[0]]
+        );
+        assert_eq!(
+            result.projection.instantiation.return_type, parameters[0],
+            "pinned overload-failure recovery maps U to the raw default T once"
+        );
+    }
+
+    #[test]
+    fn explicit_constraints_are_checked_in_declaration_order() {
+        let mut store = initialized_store();
+        let (string, number, boolean) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (
+                bootstrap.string_type,
+                bootstrap.number_type,
+                bootstrap.boolean_type,
+            )
+        };
+        let (ordered, _) = vector_callable(
+            &mut store,
+            &["T", "U"],
+            &[
+                Some(GenericTypeSpec::Exact(string)),
+                Some(GenericTypeSpec::Exact(number)),
+            ],
+            &[None, None],
+            &[0, 1],
+            |store, parameters| {
+                store
+                    .alloc_union_type(ObjectFlags::NONE, parameters.to_vec())
+                    .unwrap()
+            },
+        );
+        let first = project_vector(
+            &mut store,
+            &ordered,
+            vector_request(ordered.owner, Some(&[boolean, string]), &[boolean, string]),
+        )
+        .unwrap();
+        assert!(matches!(
+            first.applicability,
+            GenericCallVectorApplicability::ExplicitTypeArgumentConstraint { index: 0, .. }
+        ));
+        let second = project_vector(
+            &mut store,
+            &ordered,
+            vector_request(ordered.owner, Some(&[string, boolean]), &[string, boolean]),
+        )
+        .unwrap();
+        assert!(matches!(
+            second.applicability,
+            GenericCallVectorApplicability::ExplicitTypeArgumentConstraint { index: 1, .. }
+        ));
+    }
+
+    #[test]
+    fn vector_base_constraint_cache_must_be_cold_or_the_exact_eventual_base() {
+        let mut store = initialized_store();
+        let (no_constraint, string, number, boolean) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (
+                bootstrap.no_constraint_type,
+                bootstrap.string_type,
+                bootstrap.number_type,
+                bootstrap.boolean_type,
+            )
+        };
+
+        let (free, free_parameters) = vector_callable(
+            &mut store,
+            &["T"],
+            &[None],
+            &[None],
+            &[0],
+            |_, parameters| parameters[0],
+        );
+        assert!(store.set_resolved_base_constraint(free_parameters[0], Some(no_constraint)));
+        assert_eq!(
+            project_vector(
+                &mut store,
+                &free,
+                vector_request(free.owner, None, &[string]),
+            )
+            .unwrap()
+            .applicability,
+            GenericCallVectorApplicability::Applicable
+        );
+        assert!(store.set_resolved_base_constraint(free_parameters[0], Some(string)));
+        assert_eq!(
+            project_vector(
+                &mut store,
+                &free,
+                vector_request(free.owner, None, &[string]),
+            ),
+            Err(GenericCallVectorError::Invariant(
+                GenericCallVectorInvariant::InvalidTypeParameter(free_parameters[0])
+            ))
+        );
+
+        let (boolean_constrained, boolean_parameters) = vector_callable(
+            &mut store,
+            &["T"],
+            &[Some(GenericTypeSpec::Exact(boolean))],
+            &[None],
+            &[0],
+            |_, parameters| parameters[0],
+        );
+        assert!(store.set_resolved_base_constraint(boolean_parameters[0], Some(boolean)));
+        assert_eq!(
+            project_vector(
+                &mut store,
+                &boolean_constrained,
+                vector_request(boolean_constrained.owner, None, &[boolean]),
+            )
+            .unwrap()
+            .applicability,
+            GenericCallVectorApplicability::Applicable,
+            "the canonical boolean union is its own primitive base constraint"
+        );
+
+        let (dependent, dependent_parameters) = vector_callable(
+            &mut store,
+            &["T", "U"],
+            &[
+                Some(GenericTypeSpec::Exact(string)),
+                Some(GenericTypeSpec::Parameter(0)),
+            ],
+            &[None, None],
+            &[0, 1],
+            |_, parameters| parameters[1],
+        );
+        assert_eq!(
+            project_vector(
+                &mut store,
+                &dependent,
+                vector_request(dependent.owner, None, &[string, string]),
+            )
+            .unwrap()
+            .applicability,
+            GenericCallVectorApplicability::Applicable,
+            "both dependent base-constraint caches may remain cold"
+        );
+        for parameter in &dependent_parameters {
+            assert!(store.set_resolved_base_constraint(*parameter, Some(string)));
+        }
+        assert_eq!(
+            project_vector(
+                &mut store,
+                &dependent,
+                vector_request(dependent.owner, None, &[string, string]),
+            )
+            .unwrap()
+            .applicability,
+            GenericCallVectorApplicability::Applicable,
+            "U extends T has T's eventual string base"
+        );
+        assert!(store.set_resolved_base_constraint(dependent_parameters[1], Some(number)));
+        assert_eq!(
+            project_vector(
+                &mut store,
+                &dependent,
+                vector_request(dependent.owner, None, &[string, string]),
+            ),
+            Err(GenericCallVectorError::Invariant(
+                GenericCallVectorInvariant::InvalidTypeParameter(dependent_parameters[1])
+            ))
+        );
+    }
+
+    #[test]
+    fn mixed_inference_keeps_leftmost_recovery_candidate_and_reports_first_mismatch() {
+        let mut store = initialized_store();
+        let (choose, _) = vector_callable(
+            &mut store,
+            &["T"],
+            &[None],
+            &[None],
+            &[0, 0],
+            |_, parameters| parameters[0],
+        );
+        let one = fresh_number(&mut store, 1.0);
+        let text = fresh_string(&mut store, "b");
+
+        let result = project_vector(
+            &mut store,
+            &choose,
+            vector_request(choose.owner, None, &[one, text]),
+        )
+        .unwrap();
+
+        assert_eq!(result.projection.instantiation.return_type, one);
+        assert_eq!(
+            result.applicability,
+            GenericCallVectorApplicability::ArgumentNotAssignable {
+                index: 1,
+                argument_type: text,
+                parameter_type: one,
+            }
+        );
+    }
+
     #[test]
     fn inferred_identity_preserves_string_number_and_boolean_literals() {
         // Pinned oracle declaration emit:

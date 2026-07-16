@@ -368,6 +368,45 @@ mod tests {
     }
 
     #[test]
+    fn vector_instantiation_maps_many_parameters_without_allocating_a_mapper() {
+        let mut store = initialized_store();
+        let (string, number) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (bootstrap.string_type, bootstrap.number_type)
+        };
+        let first = store.alloc_type_parameter(None).unwrap();
+        let second = store.alloc_type_parameter(None).unwrap();
+        let source = store
+            .alloc_union_type(ObjectFlags::NONE, vec![first, second])
+            .unwrap();
+        let mapper_count = store.mapper_len();
+
+        let result =
+            instantiate_type_with_vector(&mut store, source, &[first, second], &[string, number])
+                .unwrap();
+
+        assert_eq!(store.mapper_len(), mapper_count);
+        let TypeData::Union(data) = store.type_payload(result).unwrap().data() else {
+            panic!("two distinct mapped leaves must remain a union");
+        };
+        assert_eq!(data.union.types, [string, number]);
+    }
+
+    #[test]
+    fn vector_instantiation_is_single_pass_for_dependent_recovery_arguments() {
+        let mut store = initialized_store();
+        let string = store.intrinsic_bootstrap().unwrap().string_type;
+        let first = store.alloc_type_parameter(None).unwrap();
+        let second = store.alloc_type_parameter(None).unwrap();
+
+        assert_eq!(
+            instantiate_type_with_vector(&mut store, second, &[first, second], &[string, first],),
+            Ok(first),
+            "newTypeMapper maps U to its raw recovery target T without remapping T"
+        );
+    }
+
+    #[test]
     fn unchanged_generic_union_fails_closed_without_identity_validator() {
         let mut store = initialized_store();
         let string = store.intrinsic_bootstrap().unwrap().string_type;
