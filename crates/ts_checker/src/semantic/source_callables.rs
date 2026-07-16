@@ -24,7 +24,7 @@ use super::{
     functions::{StoredFunctionTypeValidation, validate_stored_function_type},
     links::{
         DecoratorSignatureState, EffectsSignatureState, ResolvedSignatureState, SignatureLinks,
-        ValueSymbolLinks,
+        SymbolNodeLinks, TypeNodeLinks, ValueSymbolLinks,
     },
     signatures::{Signature, SignatureFlags},
     store::{SourceCallableProvenance, SourceNodeParent},
@@ -756,11 +756,72 @@ fn is_naked_source_type_parameter_annotation(
             declaration_name,
         )));
     };
-    Ok(name_record.kind == SyntaxKind::Identifier
+    let exact_syntax = name_record.kind == SyntaxKind::Identifier
         && name_record.parent == Some(annotation.node)
         && name_record.flags.0 == 0
         && name_identifier.flow_node.is_none()
-        && name_identifier.text == declaration_identifier.text)
+        && name_identifier.text == declaration_identifier.text;
+    if exact_syntax {
+        validate_source_type_parameter_annotation_links(store, annotation, type_parameter)?;
+    }
+    Ok(exact_syntax)
+}
+
+/// A naked source `T` annotation is either untouched or has the complete
+/// symbol/type pair produced by a canonical type-reference query. Accepting a
+/// lone warm side would let the generic callable fast path trust a type cache
+/// that was never proven to belong to its declared type parameter.
+fn validate_source_type_parameter_annotation_links(
+    store: &CanonicalTypeMapperStore,
+    annotation: NodeRef,
+    type_parameter: &SourceCallableTypeParameterPlan,
+) -> Result<(), SourceCallableError> {
+    let symbol_links = store.symbol_node_links(annotation);
+    let type_links = store.type_node_links(annotation);
+    let symbol_cold = symbol_links.is_none_or(|links| links == &SymbolNodeLinks::default());
+    let type_cold = type_links.is_none_or(|links| links == &TypeNodeLinks::default());
+    if symbol_cold && type_cold {
+        return Ok(());
+    }
+
+    let declared_type = store
+        .declared_type_links(type_parameter.symbol)
+        .and_then(|links| links.declared_type)
+        .filter(|declared_type| {
+            cached_ordinary_type_parameter_owner(store, *declared_type)
+                == Some(type_parameter.symbol)
+        });
+    let fully_warm = declared_type.is_some_and(|declared_type| {
+        source_type_parameter_annotation_links_are_fully_warm(
+            store,
+            annotation,
+            type_parameter.symbol,
+            declared_type,
+        )
+    });
+    if !fully_warm {
+        return Err(invariant(SourceCallableInvariant::InvalidTypeCache(
+            annotation,
+        )));
+    }
+    Ok(())
+}
+
+fn source_type_parameter_annotation_links_are_fully_warm(
+    store: &CanonicalTypeMapperStore,
+    annotation: NodeRef,
+    symbol: SemanticSymbolId,
+    declared_type: TypeId,
+) -> bool {
+    store.symbol_node_links(annotation)
+        == Some(&SymbolNodeLinks {
+            resolved_symbol: Some(symbol),
+        })
+        && store.type_node_links(annotation)
+            == Some(&TypeNodeLinks {
+                resolved_type: Some(declared_type),
+                outer_type_parameters: None,
+            })
 }
 
 fn validate_modifiers(
@@ -1958,6 +2019,7 @@ pub(super) fn validate_stored_source_callable(
     ) else {
         return StoredSourceCallableValidation::Malformed;
     };
+    let generic_type_parameter = type_parameter_edges.first().copied();
     let mut edges =
         Vec::with_capacity(signature_record.parameters().len() + type_parameter_edges.len() + 2);
     edges.extend(type_parameter_edges);
@@ -2070,6 +2132,11 @@ pub(super) fn validate_stored_source_callable(
         || signature_record.mapper().is_some()
         || signature_record.isolated_signature_type().is_some()
         || signature_record.composite().is_some()
+        || !valid_stored_generic_source_signature(
+            signature_record,
+            expected_parameter_types,
+            generic_type_parameter,
+        )
         || !parameters_valid
         || default_parameter_count != 0
             && default_parameter_count != signature_record.parameters().len()
@@ -2168,6 +2235,19 @@ pub(super) fn validate_stored_source_callable(
     if let Some(return_type) = signature_record.resolved_return_type() {
         let annotation =
             cached_annotation_identity(store, return_identity_node, return_null_literal_identity);
+        if let Some(type_parameter) = generic_type_parameter {
+            let Some(symbol) = cached_ordinary_type_parameter_owner(store, type_parameter) else {
+                return StoredSourceCallableValidation::Malformed;
+            };
+            if !source_type_parameter_annotation_links_are_fully_warm(
+                store,
+                return_identity_node,
+                symbol,
+                type_parameter,
+            ) {
+                return StoredSourceCallableValidation::Malformed;
+            }
+        }
         let valid_return =
             if let Some(circular_annotation) = store.circular_return_annotation_type(signature) {
                 let valid = store.intrinsic_bootstrap().is_some_and(|bootstrap| {
@@ -2188,6 +2268,23 @@ pub(super) fn validate_stored_source_callable(
         return StoredSourceCallableValidation::Malformed;
     }
     StoredSourceCallableValidation::Valid(edges)
+}
+
+fn valid_stored_generic_source_signature(
+    signature: &Signature,
+    parameter_types: Option<&[TypeId]>,
+    type_parameter: Option<TypeId>,
+) -> bool {
+    let Some(type_parameter) = type_parameter else {
+        return true;
+    };
+    signature.flags() == SignatureFlags::NONE
+        && signature.parameters().len() == 1
+        && signature.min_argument_count() == 1
+        && parameter_types.is_none_or(|types| types == [type_parameter])
+        && signature
+            .resolved_return_type()
+            .is_none_or(|return_type| return_type == type_parameter)
 }
 
 fn valid_stored_source_type_parameters(
@@ -2684,8 +2781,13 @@ mod tests {
             }
         }
 
+        fn generic_parts(&self) -> (NodeRef, NodeRef, NodeRef, NodeRef) {
+            generic_function_parts(&self.parsed, self.file)
+        }
+
         fn declaration_and_type_parameter(&self) -> (NodeRef, NodeRef) {
-            function_and_type_parameter(&self.parsed, self.file)
+            let (declaration, type_parameter, _, _) = self.generic_parts();
+            (declaration, type_parameter)
         }
 
         fn query_callable(
@@ -2726,6 +2828,25 @@ mod tests {
             )?
             .get_return_type_of_signature(signature)
         }
+
+        fn query_type_node(
+            &mut self,
+            node: NodeRef,
+            diagnostics: &mut CanonicalCheckerDiagnostics,
+        ) -> Result<TypeId, DeclaredTypeError> {
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&self.parsed.arena, &self.bound)],
+                GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+            )
+            .unwrap();
+            CanonicalTypeQuery::new(
+                &mut self.store,
+                &host,
+                CanonicalTypeQueryOptions::default(),
+                diagnostics,
+            )?
+            .get_type_from_type_node(node)
+        }
     }
 
     fn bind_context(parsed: &ParseResult, file: FileId) -> CanonicalCheckerContext<'_> {
@@ -2754,7 +2875,10 @@ mod tests {
         .unwrap()
     }
 
-    fn function_and_type_parameter(parsed: &ParseResult, file: FileId) -> (NodeRef, NodeRef) {
+    fn generic_function_parts(
+        parsed: &ParseResult,
+        file: FileId,
+    ) -> (NodeRef, NodeRef, NodeRef, NodeRef) {
         let source = parsed.arena.get(parsed.source_file).unwrap();
         let NodeData::SourceFile(source) = &source.data else {
             panic!("expected source file")
@@ -2768,12 +2892,34 @@ mod tests {
                 .type_parameters
                 .as_ref()
                 .expect("expected generic function");
+            let parameter = parsed
+                .arena
+                .get(function.parameters.nodes[0])
+                .expect("expected generic parameter");
+            let NodeData::ParameterDeclaration(parameter) = &parameter.data else {
+                panic!("expected parameter declaration")
+            };
             return (
                 NodeRef::new(parsed.arena.id(), file, *statement),
                 NodeRef::new(parsed.arena.id(), file, type_parameters.nodes[0]),
+                NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    parameter.type_.expect("expected parameter annotation"),
+                ),
+                NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    function.type_.expect("expected return annotation"),
+                ),
             );
         }
         panic!("expected function declaration")
+    }
+
+    fn function_and_type_parameter(parsed: &ParseResult, file: FileId) -> (NodeRef, NodeRef) {
+        let (declaration, type_parameter, _, _) = generic_function_parts(parsed, file);
+        (declaration, type_parameter)
     }
 
     fn publication_state(store: &CanonicalTypeMapperStore) -> (usize, usize, [usize; 4], usize) {
@@ -2783,6 +2929,27 @@ mod tests {
             store.source_callable_provenance_lengths(),
             store.callable_signature_parameter_types_len(),
         )
+    }
+
+    fn assert_exact_warm_type_parameter_annotation(
+        store: &CanonicalTypeMapperStore,
+        annotation: NodeRef,
+        symbol: SemanticSymbolId,
+        type_: TypeId,
+    ) {
+        assert_eq!(
+            store.symbol_node_links(annotation),
+            Some(&SymbolNodeLinks {
+                resolved_symbol: Some(symbol),
+            })
+        );
+        assert_eq!(
+            store.type_node_links(annotation),
+            Some(&TypeNodeLinks {
+                resolved_type: Some(type_),
+                outer_type_parameters: None,
+            })
+        );
     }
 
     #[test]
@@ -2864,6 +3031,220 @@ mod tests {
                 .unwrap()
                 .type_parameters(),
             [type_parameter]
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn generic_annotation_warm_orders_reuse_the_declared_identity() {
+        for (index, warm_return_first) in [false, true].into_iter().enumerate() {
+            let mut fixture = QueryFixture::new(
+                "function identity<T>(value: T): T { return value; }",
+                FileId::new(953 + u32::try_from(index).unwrap()),
+            );
+            let (declaration, type_parameter_declaration, parameter_type, return_type) =
+                fixture.generic_parts();
+            let owner = fixture.bound.symbol(declaration).unwrap();
+            let type_parameter_symbol = fixture.bound.symbol(type_parameter_declaration).unwrap();
+            let first = if warm_return_first {
+                return_type
+            } else {
+                parameter_type
+            };
+            let second = if warm_return_first {
+                parameter_type
+            } else {
+                return_type
+            };
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+            let type_parameter = fixture.query_type_node(first, &mut diagnostics).unwrap();
+            assert_eq!(
+                fixture
+                    .store
+                    .declared_type_links(type_parameter_symbol)
+                    .and_then(|links| links.declared_type),
+                Some(type_parameter)
+            );
+            assert_exact_warm_type_parameter_annotation(
+                &fixture.store,
+                first,
+                type_parameter_symbol,
+                type_parameter,
+            );
+            assert!(
+                fixture
+                    .store
+                    .symbol_node_links(second)
+                    .is_none_or(|links| links == &SymbolNodeLinks::default())
+            );
+            assert!(
+                fixture
+                    .store
+                    .type_node_links(second)
+                    .is_none_or(|links| links == &TypeNodeLinks::default())
+            );
+
+            let callable = fixture
+                .query_callable(declaration, owner, &mut diagnostics)
+                .unwrap();
+            let signature = fixture
+                .store
+                .source_callable_provenance(callable)
+                .unwrap()
+                .signature;
+            assert_exact_warm_type_parameter_annotation(
+                &fixture.store,
+                parameter_type,
+                type_parameter_symbol,
+                type_parameter,
+            );
+            assert_eq!(
+                fixture.query_return(signature, &mut diagnostics),
+                Ok(type_parameter)
+            );
+            assert_exact_warm_type_parameter_annotation(
+                &fixture.store,
+                return_type,
+                type_parameter_symbol,
+                type_parameter,
+            );
+            assert!(matches!(
+                validate_stored_source_callable(&fixture.store, callable),
+                StoredSourceCallableValidation::Valid(edges)
+                    if edges.iter().filter(|edge| **edge == type_parameter).count() >= 3
+            ));
+            assert!(diagnostics.is_empty());
+        }
+    }
+
+    #[test]
+    fn partial_and_poisoned_cold_generic_annotation_links_publish_nothing() {
+        let source = "function identity<T>(value: T): T { return value; }";
+
+        let mut symbol_only = QueryFixture::new(source, FileId::new(955));
+        let (declaration, type_parameter_declaration, parameter_type, _) =
+            symbol_only.generic_parts();
+        let owner = symbol_only.bound.symbol(declaration).unwrap();
+        let type_parameter_symbol = symbol_only
+            .bound
+            .symbol(type_parameter_declaration)
+            .unwrap();
+        assert!(symbol_only.store.set_symbol_node_links(
+            parameter_type,
+            SymbolNodeLinks {
+                resolved_symbol: Some(type_parameter_symbol),
+            },
+        ));
+        let before = publication_state(&symbol_only.store);
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        assert!(
+            symbol_only
+                .query_callable(declaration, owner, &mut diagnostics)
+                .is_err()
+        );
+        assert_eq!(publication_state(&symbol_only.store), before);
+        assert!(
+            symbol_only
+                .store
+                .source_callable_type_for_owner(owner)
+                .is_none()
+        );
+
+        let mut type_only = QueryFixture::new(source, FileId::new(956));
+        let (declaration, _, parameter_type, return_type) = type_only.generic_parts();
+        let owner = type_only.bound.symbol(declaration).unwrap();
+        let type_parameter = type_only
+            .query_type_node(return_type, &mut diagnostics)
+            .unwrap();
+        assert!(type_only.store.set_type_node_links(
+            parameter_type,
+            TypeNodeLinks {
+                resolved_type: Some(type_parameter),
+                outer_type_parameters: None,
+            },
+        ));
+        let before = publication_state(&type_only.store);
+        assert!(
+            type_only
+                .query_callable(declaration, owner, &mut diagnostics)
+                .is_err()
+        );
+        assert_eq!(publication_state(&type_only.store), before);
+        assert!(
+            type_only
+                .store
+                .source_callable_type_for_owner(owner)
+                .is_none()
+        );
+
+        let mut outer_poison = QueryFixture::new(source, FileId::new(957));
+        let (declaration, type_parameter_declaration, parameter_type, return_type) =
+            outer_poison.generic_parts();
+        let owner = outer_poison.bound.symbol(declaration).unwrap();
+        let type_parameter_symbol = outer_poison
+            .bound
+            .symbol(type_parameter_declaration)
+            .unwrap();
+        let type_parameter = outer_poison
+            .query_type_node(return_type, &mut diagnostics)
+            .unwrap();
+        assert!(outer_poison.store.set_symbol_node_links(
+            parameter_type,
+            SymbolNodeLinks {
+                resolved_symbol: Some(type_parameter_symbol),
+            },
+        ));
+        assert!(outer_poison.store.set_type_node_links(
+            parameter_type,
+            TypeNodeLinks {
+                resolved_type: Some(type_parameter),
+                outer_type_parameters: Some(vec![type_parameter]),
+            },
+        ));
+        let before = publication_state(&outer_poison.store);
+        assert!(
+            outer_poison
+                .query_callable(declaration, owner, &mut diagnostics)
+                .is_err()
+        );
+        assert_eq!(publication_state(&outer_poison.store), before);
+        assert!(
+            outer_poison
+                .store
+                .source_callable_type_for_owner(owner)
+                .is_none()
+        );
+
+        let mut wrong_pair = QueryFixture::new(source, FileId::new(958));
+        let (declaration, _, parameter_type, _) = wrong_pair.generic_parts();
+        let owner = wrong_pair.bound.symbol(declaration).unwrap();
+        let number = wrong_pair.store.intrinsic_bootstrap().unwrap().number_type;
+        assert!(wrong_pair.store.set_symbol_node_links(
+            parameter_type,
+            SymbolNodeLinks {
+                resolved_symbol: Some(owner),
+            },
+        ));
+        assert!(wrong_pair.store.set_type_node_links(
+            parameter_type,
+            TypeNodeLinks {
+                resolved_type: Some(number),
+                outer_type_parameters: None,
+            },
+        ));
+        let before = publication_state(&wrong_pair.store);
+        assert!(
+            wrong_pair
+                .query_callable(declaration, owner, &mut diagnostics)
+                .is_err()
+        );
+        assert_eq!(publication_state(&wrong_pair.store), before);
+        assert!(
+            wrong_pair
+                .store
+                .source_callable_type_for_owner(owner)
+                .is_none()
         );
         assert!(diagnostics.is_empty());
     }
@@ -2969,6 +3350,111 @@ mod tests {
         let poisoned_warm = publication_state(&warm.store);
         assert!(warm.query_return(signature, &mut diagnostics).is_err());
         assert_eq!(publication_state(&warm.store), poisoned_warm);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn poisoned_warm_generic_annotation_links_and_signature_shape_fail_closed() {
+        let source = "function identity<T>(value: T): T { return value; }";
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        let mut parameter_poison = QueryFixture::new(source, FileId::new(973));
+        let (declaration, _, parameter_type, _) = parameter_poison.generic_parts();
+        let owner = parameter_poison.bound.symbol(declaration).unwrap();
+        let callable = parameter_poison
+            .query_callable(declaration, owner, &mut diagnostics)
+            .unwrap();
+        let number = parameter_poison
+            .store
+            .intrinsic_bootstrap()
+            .unwrap()
+            .number_type;
+        assert!(parameter_poison.store.set_type_node_links(
+            parameter_type,
+            TypeNodeLinks {
+                resolved_type: Some(number),
+                outer_type_parameters: None,
+            },
+        ));
+        let before = publication_state(&parameter_poison.store);
+        assert!(
+            parameter_poison
+                .query_callable(declaration, owner, &mut diagnostics)
+                .is_err()
+        );
+        assert_eq!(publication_state(&parameter_poison.store), before);
+        assert_eq!(
+            parameter_poison.store.source_callable_type_for_owner(owner),
+            Some(callable)
+        );
+
+        let mut return_poison = QueryFixture::new(source, FileId::new(974));
+        let (declaration, _, _, return_type) = return_poison.generic_parts();
+        let owner = return_poison.bound.symbol(declaration).unwrap();
+        let callable = return_poison
+            .query_callable(declaration, owner, &mut diagnostics)
+            .unwrap();
+        let signature = return_poison
+            .store
+            .source_callable_provenance(callable)
+            .unwrap()
+            .signature;
+        let type_parameter = return_poison
+            .query_return(signature, &mut diagnostics)
+            .unwrap();
+        assert_eq!(
+            return_poison
+                .store
+                .signature(signature)
+                .unwrap()
+                .resolved_return_type(),
+            Some(type_parameter)
+        );
+        assert!(return_poison.store.set_symbol_node_links(
+            return_type,
+            SymbolNodeLinks {
+                resolved_symbol: Some(owner),
+            },
+        ));
+        assert_eq!(
+            validate_stored_source_callable(&return_poison.store, callable),
+            StoredSourceCallableValidation::Malformed
+        );
+        let before = publication_state(&return_poison.store);
+        assert!(
+            return_poison
+                .query_return(signature, &mut diagnostics)
+                .is_err()
+        );
+        assert_eq!(publication_state(&return_poison.store), before);
+
+        let mut shape_poison = QueryFixture::new(source, FileId::new(975));
+        let (declaration, _, _, _) = shape_poison.generic_parts();
+        let owner = shape_poison.bound.symbol(declaration).unwrap();
+        let callable = shape_poison
+            .query_callable(declaration, owner, &mut diagnostics)
+            .unwrap();
+        let signature = shape_poison
+            .store
+            .source_callable_provenance(callable)
+            .unwrap()
+            .signature;
+        assert!(
+            shape_poison
+                .store
+                .set_signature_flags(signature, SignatureFlags::HAS_LITERAL_TYPES)
+        );
+        assert_eq!(
+            validate_stored_source_callable(&shape_poison.store, callable),
+            StoredSourceCallableValidation::Malformed
+        );
+        let before = publication_state(&shape_poison.store);
+        assert!(
+            shape_poison
+                .query_callable(declaration, owner, &mut diagnostics)
+                .is_err()
+        );
+        assert_eq!(publication_state(&shape_poison.store), before);
         assert!(diagnostics.is_empty());
     }
 }
