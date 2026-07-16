@@ -661,6 +661,46 @@ remains the cluster-level source of truth.
   kernel was registered for source integration. `39f07f4` also makes the
   compiler adapter classify the new enum and empty-tuple error domains
   exhaustively instead of relying on a wildcard or fallback.
+- The follow-on source-expression and generic-kernel wave is integrated through
+  `cdba454`, `a1c04e1`, `a2c2d47`, `bbd3f8b`, and `584779d`. Ordinary direct
+  identifier calls now execute exact fixed-arity and argument checks; top-level
+  literal enums enter source execution; required own-property reads compose
+  through arrays, objects, and calls; and dependency-closed constraint and
+  instantiation kernels retain the pinned recursion/count limits rather than
+  substituting identity types. Focused gates passed 48 property tests, 34 enum
+  tests, nine constraint tests, and five instantiation tests. The checker unit
+  binary passed 853 tests before the final nested-property repair; the expanded
+  all-target Clippy build compiles all 854 unit tests, while the 1 GiB runner can
+  no longer link that monolithic unit binary reliably. The pinned enum tranche
+  at `/tmp/ts-rust-enum-50-584779d.json` executes 59 variants with seven exact
+  full artifacts, 52 honest unsupported results, and no fatal invariant.
+- Plain ESM program facts and the first exact cross-file value-import vertical
+  are integrated through `76d7709`, `81fb514`, and `a2f71b7`. The compiler
+  supplies a NodeRef-keyed Bundler/ESM resolution manifest that preserves
+  repeated equal-text specifiers and explicit unresolved results. The checker
+  accepts leading direct named value imports, resolves every binding through
+  the immutable manifest, queries a target annotation only when the alias is
+  read as a value, and never recursively source-checks an importer-first target.
+  Target, alias, local-value, and identifier links share one final preflighted
+  publication batch. Independent review caught and closed cross-batch partial
+  publication, unused-import eager typing, consistent warm-cache target poison,
+  and normal merged-alias classification defects before integration. Four
+  public checker integration scenarios and one compiler-level ESNext/Bundler
+  `string[]` scenario pass in importer-first, target-first, cold, and warm
+  orders; strict checker/compiler Clippy and rustdoc with warnings denied are
+  green.
+- The fresh first-50 scorecard at
+  `/tmp/ts-rust-canonical-first50-a2f71b7.json` advances from one to two exact
+  full artifacts: `declarationEmitBigInt.ts` and
+  `contextuallyTypedFunctionOptionalAndRest.ts`; the other 48 variants remain
+  explicit unsupported boundaries with no code/span/message/order mismatch.
+  The broad name-filtered import tranche at
+  `/tmp/ts-rust-import-50-a2f71b7.json` has zero exact results across 54
+  variants because its first blockers are predominantly CommonJS/Node10,
+  NodeNext/package facts, declaration files, default/namespace/type-only or
+  unresolved-import diagnostics—not the direct Bundler/ESM named-value slice.
+  This is useful negative evidence: the next module payoff is type-space and
+  exported-declaration closure, not widening the current gate by guessing.
 
 No percentage in this section is a whole-corpus parity claim. A score is
 publishable only when its variant manifest and complete artifact comparison are
@@ -1543,6 +1583,31 @@ plus independent Go and Rust reviewers. At twelve slots, add fixed tuples and
 cross-file reference/module work while retaining dedicated source and
 type-node/relation seam owners. Generic inference/overload selection remains a
 single coupled owner after direct calls, instantiation, and constraints land.
+
+The plain-ESM wave then exercised the same topology across files. One worker
+owned the compiler's immutable module-resolution manifest, a second owned the
+read-only named-import leaf, two short-lived reviewers separately audited Go
+alias semantics and Rust publication atomicity, and root alone changed shared
+source dispatch. That review found four integration-class defects before the
+feature merged: cross-batch partial publication, eager typing of unused
+imports, trusting consistently poisoned warm alias caches, and treating a
+valid merged alias as an internal invariant. The correction is structural,
+not fixture-specific: every binding is resolved independently, only value-read
+bindings are typed, and target/alias/local/identifier links enter one final
+preflighted publication batch.
+
+The next four-slot wave is therefore root/integration plus three disjoint
+writers: (1) generic call inference, signature instantiation, and overload
+selection under one coupled owner; (2) source-signature completion for generic
+declarations and bounded parameter/return inference; and (3) type-space ESM
+closure for named type-only imports and exported simple declarations. Root
+retains `source.rs`, production/compiler wiring, shared record changes, Cargo,
+and corpus scorecards. As each leaf finishes, its slot rotates into independent
+review before integration. About 70-80% of implementation in this phase can
+run concurrently; shared dispatch, cache/publication contracts, integration,
+and artifact scoring remain deliberately serialized. With eight slots, add a
+Go reviewer, a Rust invariant reviewer, a dedicated fixer, and an indexed/
+element-access feature owner before adding another writer to generic calls.
 
 Each worktree owns one small coherent commit series. Slow Cargo and corpus-wide
 runs remain centralized and serialized; leaf workers perform static inspection,
