@@ -561,12 +561,27 @@ remains the cluster-level source of truth.
   recursive aliases, circular return annotation recovery, exact pending-cache
   proofs, atomic parameter publication, and poisoned-cache retry behavior.
   Generic signatures, `this` and rest parameters, inferred annotations,
-  constructors, signature formatting and relation, and source-level
+  constructors, overload families, and source-level
   `FunctionDeclaration`/`ArrowFunction` dispatch remain explicit boundaries.
   Independent Go evaluation-order and Rust identity/transaction audits both
   returned final GO verdicts. The integrated tree passes 744/744 checker
   library tests plus doctest, strict all-target checker and compiler Clippy,
   and rustdoc with warnings denied.
+- The first callable consumer wave is integrated through `7de519e`,
+  `7147520..f0434fa`, and `92410e1..74cc50a`. One normalized immutable
+  `strictFunctionTypes` value now owns the relation-cache session; the
+  production context exposes option-aware assignability. Exact annotated
+  `FunctionType` values participate in non-generic signature relation,
+  including minimum arity, strict variance, callback reversal, ignored target
+  `void` returns, recursive `Maybe` state, lazy returns, and atomic cache
+  publication. The semantic formatter prints those signatures in aliases,
+  unions, arrays, and TS2322 displays while preserving optional semantic value
+  types, precedence, truncation budgets, and typed capability boundaries for
+  other callable shapes. Independent Go and Rust reviews closed cache,
+  common-property, empty-object, reserved-member, rest-arity, duplicate
+  signature, pending-state, and malformed-taxonomy defects before merge. The
+  combined tree passes 766/766 checker tests plus doctest, strict all-target
+  checker and compiler Clippy, and rustdoc with warnings denied.
 - The fresh canonical first-50 scorecard at
   `/tmp/ts-rust-canonical-first50-signatures-20260715.json` executes 50 variants
   with one exact full diagnostic artifact (`declarationEmitBigInt.ts`) and 49
@@ -576,12 +591,11 @@ remains the cluster-level source of truth.
   five JavaScript and two TSX source gates. The attempted first-500 rerun hit
   the harness's 120-second cap before producing a scorecard, so the earlier
   completed 536-variant tranche remains the broad denominator. The unchanged
-  one/49 result after `b815d77` is expected: the new kernel is not yet reachable
-  from the dominant `FunctionDeclaration` and `ArrowFunction` source roots, and
-  callable display and relation remain boundaries. The next parallel wave is
-  function-signature formatter projection and non-generic signature relation,
-  after root installs one immutable normalized `strictFunctionTypes` option;
-  source-level function dispatch follows those shared contracts.
+  one/49 result after `b815d77` is expected: neither the kernel nor its now
+  integrated formatter/relation consumers are reachable from the dominant
+  `FunctionDeclaration` and `ArrowFunction` source roots. The next parallel
+  wave is therefore source callable construction, dispatch, and bounded body
+  checking on top of the frozen signature contracts.
 
 No percentage in this section is a whole-corpus parity claim. A score is
 publishable only when its variant manifest and complete artifact comparison are
@@ -1426,6 +1440,29 @@ project callable types through the semantic formatter and port non-generic
 signature relation without sharing destination modules. Source-level function
 declarations and arrows remain a later dispatch wave rather than being inferred
 from the presence of callable records.
+
+The completed consumer wave is a concrete warning against spending every slot
+on implementation. The formatter and relation branches both passed their first
+test runs, but independent reviews still found semantic defects: optional
+parameter display, truncation accounting, pending-versus-malformed state,
+valid reserved callable members, rest-tuple arity, duplicate inherited
+signatures, weak common-property checks, empty-object shortcuts, option-blind
+relation caches, and rollback/taxonomy gaps. Separate fixers closed those
+findings, and the merged branch then passed 766 checker tests plus checker
+Clippy, compiler Clippy, and rustdoc with warnings denied. With four slots, the
+productive shape was therefore two disjoint writers, one rotating reviewer or
+fixer, and root integration—not three unchecked semantic writers.
+
+The next source-callable wave should freeze one syntax-neutral validated-callable
+projection before it widens. Root owns that shared projection, source dispatch,
+context facade, and compiler classification. Once frozen, separate workers can
+own (1) non-generic annotated `FunctionDeclaration` values, (2) fully annotated
+non-contextual arrow values, and (3) bounded body/return checking. Each owns its
+source module and upstream function range; none may independently change type,
+signature, symbol-link, or relation-cache records. With four slots, run two of
+those feature owners plus a reviewer while root integrates. With eight, all
+three can advance while Go review, Rust invariant review, a fixer, and an
+oracle/corpus worker remain continuously staffed.
 
 Each worktree owns one small coherent commit series. Slow Cargo and corpus-wide
 runs remain centralized and serialized; leaf workers perform static inspection,
