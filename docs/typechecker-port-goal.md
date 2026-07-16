@@ -889,6 +889,21 @@ remains the cluster-level source of truth.
   declared interface/type-literal call-member provider and overload resolver
   remain the next C1/C2 production consumers rather than being inferred from a
   structured signature cache alone.
+- The first T1 tuple-construction seam is integrated through
+  `1bc3fa1..b480547`. It ports the pinned target-key and instance-cache shape
+  for required elements, trailing optional elements, a trailing rest element,
+  labels, and readonly tuples. Fixed-length targets own exact numeric length
+  literals or unions; variable-length targets use `number`; and a sole rest
+  element collapses only through authoritative `Array`/`ReadonlyArray`
+  targets. The existing mutable-empty-tuple adapter remains behaviorally
+  closed while mutable `[]` and `readonly []` keep distinct target identities.
+  Warm construction validates the recursive target, instance, literal, and
+  union caches before reuse. Independent review found and closed both a
+  poisoned length-union acceptance path and the zero-arity readonly cache
+  conflation before handoff. Checker test compilation and exact checker Clippy
+  are green. Tuple type-node consumption, general tuple display and relations,
+  indexed access, variadic tuples, and rest/spread call applicability remain
+  explicit T1/A10 follow-up work.
 - The current pinned first-50 run at
   `/tmp/ts-rust-canonical-first50-9da7475.json`, rebuilt after the first
   post-join and callable-set slices, remains two exact artifacts and 48 honest unsupported
