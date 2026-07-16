@@ -23,6 +23,8 @@ fn declared_call_sets_select_ordered_and_arity_compatible_overloads_cold_and_war
         "} ",
         "function ordered(value: Ordered): string { return value(1); } ",
         "function branching(value: Branching): string { return value(1); } ",
+        "type API = { fn: Branching }; ",
+        "function property(value: API): string { return value.fn(1); } ",
         "function recovery(value: Recovery): number { return value(true); }",
     ));
     assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
@@ -78,8 +80,8 @@ fn declared_call_sets_select_ordered_and_arity_compatible_overloads_cold_and_war
     };
     let calls = nodes(SyntaxKind::CallExpression);
     let declarations = nodes(SyntaxKind::CallSignature);
-    let [ordered_call, branching_call, recovery_call] = calls.as_slice() else {
-        panic!("expected three overload calls")
+    let [ordered_call, branching_call, property_call, recovery_call] = calls.as_slice() else {
+        panic!("expected four overload calls")
     };
     let [ordered_first, _, _, branching_second, _, recovery_second] = declarations.as_slice()
     else {
@@ -100,6 +102,10 @@ fn declared_call_sets_select_ordered_and_arity_compatible_overloads_cold_and_war
         selected_signature(*branching_second)
     );
     assert_eq!(
+        selected_signature(*property_call),
+        selected_signature(*branching_second)
+    );
+    assert_eq!(
         selected_signature(*recovery_call),
         selected_signature(*recovery_second)
     );
@@ -115,7 +121,7 @@ fn declared_call_sets_select_ordered_and_arity_compatible_overloads_cold_and_war
                 context.type_to_string(type_).unwrap()
             })
             .collect::<Vec<_>>(),
-        ["string", "string", "number"]
+        ["string", "string", "string", "number"]
     );
 
     let cold_counts = (

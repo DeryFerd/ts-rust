@@ -119,10 +119,7 @@ fn required_own_property_calls_publish_public_links_and_diagnostics() {
         Some(function_type_parameter(&parsed, file, "value"))
     );
 
-    for (call, access) in [
-        (*good_call, *good_access),
-        (*too_few_call, *too_few_access),
-    ] {
+    for (call, access) in [(*good_call, *good_access), (*too_few_call, *too_few_access)] {
         let return_type = context
             .store()
             .type_node_links(call)
@@ -149,7 +146,6 @@ fn required_own_property_calls_publish_public_links_and_diagnostics() {
                 .is_some_and(|links| links.resolved_symbol.is_some())
         );
     }
-
 }
 
 #[test]
@@ -282,14 +278,6 @@ fn unsupported_property_call_families_fail_closed_without_call_publication() {
             "method signature",
             concat!(
                 "type API = { fn(value: number): string }; ",
-                "function use(api: API): string { return api.fn(1); }",
-            ),
-        ),
-        (
-            "overloaded callable",
-            concat!(
-                "interface Fn { (value: number): string; (value: string): string; } ",
-                "type API = { fn: Fn }; ",
                 "function use(api: API): string { return api.fn(1); }",
             ),
         ),
