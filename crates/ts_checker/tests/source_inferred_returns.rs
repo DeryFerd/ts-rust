@@ -4,8 +4,8 @@ use ts_binder::{
     EscapedName,
 };
 use ts_checker::semantic::{
-    CanonicalCheckerContext, CanonicalCheckerOptions, SourceCheckError, SourceFunctionUnsupported,
-    TypeId, UnsupportedSourceSyntax,
+    CanonicalCheckerContext, CanonicalCheckerOptions, IntrinsicBootstrapOptions, SourceCheckError,
+    SourceFunctionUnsupported, TypeId, UnsupportedSourceSyntax,
 };
 use ts_parser::{ParseResult, parse_source_file};
 
@@ -19,12 +19,16 @@ const SUCCESS_SOURCE: &str = concat!(
     "function annotated(value: number): string { return \"ok\"; }\n",
     "function throughAnnotated() { return annotated(1); }\n",
     "function defaulted(value: number = 1) { return value; }\n",
+    "function optionalArray(xs?: number[]) { return 1; }\n",
+    "function defaultArray(xs: number[] = [1]) { return xs; }\n",
     "function arrayValue() { return [1, 2]; }\n",
     "function objectValue() { return { value: 1 }; }\n",
     "const emptyResult = empty();\n",
     "const echoed = echo(\"value\");\n",
     "const annotatedResult = throughAnnotated();\n",
     "const defaultedResult = defaulted();\n",
+    "const optionalArrayResult = optionalArray();\n",
+    "const defaultArrayResult = defaultArray();\n",
     "const arrayResult = arrayValue();\n",
     "const objectResult = objectValue();\n",
     "const concise = (value: number) => value;\n",
@@ -96,7 +100,13 @@ fn context_with_library<'a>(
         [(library_file, &library.arena), (file, &parsed.arena)]
             .into_iter()
             .collect(),
-        CanonicalCheckerOptions::default(),
+        CanonicalCheckerOptions {
+            intrinsic: IntrinsicBootstrapOptions {
+                strict_null_checks: true,
+                ..IntrinsicBootstrapOptions::default()
+            },
+            ..CanonicalCheckerOptions::default()
+        },
     )
     .unwrap()
 }
@@ -155,6 +165,8 @@ fn inferred_functions_and_arrows_publish_before_direct_use_and_replay_warm() {
         ("echo(\"value\")", "string"),
         ("throughAnnotated()", "string"),
         ("defaulted()", "number"),
+        ("optionalArray()", "number"),
+        ("defaultArray()", "number[]"),
         ("arrayValue()", "number[]"),
         ("objectValue()", "{ value: number; }"),
         ("concise(1)", "number"),

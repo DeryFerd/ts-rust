@@ -2849,7 +2849,12 @@ pub(super) fn validate_stored_source_callable(
                             && expected.is_some_and(|expected| {
                                 store.type_payload(expected).is_some()
                                     && (expected == resolved
-                                        || valid_optional_type(store, None, resolved, expected))
+                                        || valid_optional_type(
+                                            store,
+                                            provenance.array_targets,
+                                            resolved,
+                                            expected,
+                                        ))
                             });
                         if valid {
                             edges.push(resolved);
