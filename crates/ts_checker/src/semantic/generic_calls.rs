@@ -12,7 +12,7 @@
 
 #![allow(dead_code)] // Installed ahead of the source-call dispatch consumer.
 
-use ts_ast::SyntaxKind;
+use ts_ast::{NodeRef, SyntaxKind};
 use ts_binder::{CheckFlags, SymbolData, SymbolFlags};
 
 use super::{
@@ -110,6 +110,11 @@ pub(super) enum GenericCallVectorInvariant {
     },
     InvalidCheckedInstantiation(SignatureId),
     InvalidCachedInstantiation {
+        target: SignatureId,
+        signature: SignatureId,
+    },
+    MissingCachedInstantiation(SignatureId),
+    InvalidCallInstantiation {
         target: SignatureId,
         signature: SignatureId,
     },
@@ -276,6 +281,19 @@ pub(super) enum GenericCallVectorMaterialization {
     Published(GenericCallVectorCachedInstantiation),
 }
 
+/// The signature selected for one source call, together with the globally
+/// cached checked signature when pinned overload resolution creates one.
+///
+/// Erroneous calls always select an uncached recovery signature. For TS2345,
+/// `checked_instantiation` therefore differs from `call_signature`; an
+/// applicable call exposes the same authoritative signature in both fields.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct GenericCallVectorSourceMaterialization {
+    pub(super) call_signature: SignatureId,
+    pub(super) call_mapper: TypeMapperId,
+    pub(super) checked_instantiation: Option<GenericCallVectorCachedInstantiation>,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct GenericCallTypeParameter {
     type_: TypeId,
@@ -298,6 +316,27 @@ struct GenericCallVectorParameterPlan {
     data: SymbolData,
     name_type: Option<TypeId>,
     resolved_type: TypeId,
+}
+
+#[derive(Debug)]
+struct PreparedGenericCallVectorSignature {
+    mapper_sources: Vec<TypeId>,
+    mapper_targets: Vec<TypeId>,
+    parameter_plans: Vec<GenericCallVectorParameterPlan>,
+    instantiated_parameters: Vec<SemanticSymbolId>,
+    flags: SignatureFlags,
+    declaration: Option<NodeRef>,
+    min_argument_count: i32,
+    return_type: TypeId,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct GenericCallVectorReservation {
+    mappers: usize,
+    symbols: usize,
+    value_links: usize,
+    signatures: usize,
+    cached_signatures: usize,
 }
 
 /// Resolves the bounded full-vector generic branch through the canonical
@@ -373,6 +412,41 @@ pub(super) fn materialize_generic_call_vector_checked_instantiation(
         StoredSingleCallableValidation::Valid { callable, .. } => callable,
     };
     materialize_validated_generic_call_vector_checked_instantiation(store, resolution, &callable)
+}
+
+/// Materializes the signature graph selected by one source call as a single
+/// transaction. The resolver-minted capability supplies both the checked and
+/// overload-failure vectors; `existing_call_signature` is the call node's
+/// previously published signature, if any.
+///
+/// Applicable calls use the authoritative global checked-signature cache.
+/// Every erroneous cold call receives a distinct uncached recovery signature.
+/// TS2345 additionally creates or reuses its checked signature, but never
+/// publishes that graph in a separate transaction from the recovery graph.
+pub(super) fn materialize_generic_call_vector_source(
+    store: &mut CanonicalTypeMapperStore,
+    resolution: &GenericCallVectorResolution,
+    existing_call_signature: Option<SignatureId>,
+) -> Result<GenericCallVectorSourceMaterialization, GenericCallVectorError> {
+    let callee = resolution.projection.callee;
+    let callable = match validate_stored_single_callable(store, callee) {
+        StoredSingleCallableValidation::NotCallable => {
+            return Err(GenericCallVectorUnsupported::NotExactSingleCallable(callee).into());
+        }
+        StoredSingleCallableValidation::Pending { .. } => {
+            return Err(GenericCallVectorUnsupported::PendingCallable(callee).into());
+        }
+        StoredSingleCallableValidation::Malformed { .. } => {
+            return Err(GenericCallVectorInvariant::MalformedCallable(callee).into());
+        }
+        StoredSingleCallableValidation::Valid { callable, .. } => callable,
+    };
+    materialize_validated_generic_call_vector_source(
+        store,
+        resolution,
+        &callable,
+        existing_call_signature,
+    )
 }
 
 fn generic_call_vector_resolution(
@@ -1216,6 +1290,375 @@ const fn generic_call_vector_caches_checked_instantiation(
     )
 }
 
+fn materialize_validated_generic_call_vector_source(
+    store: &mut CanonicalTypeMapperStore,
+    resolution: &GenericCallVectorResolution,
+    callable: &ValidatedSingleCallable,
+    existing_call_signature: Option<SignatureId>,
+) -> Result<GenericCallVectorSourceMaterialization, GenericCallVectorError> {
+    materialize_validated_generic_call_vector_source_with(
+        store,
+        resolution,
+        callable,
+        existing_call_signature,
+        |store, target, key, exact_type_arguments| {
+            store.cached_signature(target, key, exact_type_arguments)
+        },
+        |store, reservation| {
+            store.try_reserve_mappers(reservation.mappers)
+                && store.try_reserve_checker_symbol_allocations(reservation.symbols, 0)
+                && store.try_reserve_value_symbol_links(reservation.value_links)
+                && store.try_reserve_signatures(reservation.signatures)
+                && store.try_reserve_cached_signatures(reservation.cached_signatures)
+        },
+    )
+}
+
+fn materialize_validated_generic_call_vector_source_with(
+    store: &mut CanonicalTypeMapperStore,
+    resolution: &GenericCallVectorResolution,
+    callable: &ValidatedSingleCallable,
+    existing_call_signature: Option<SignatureId>,
+    checked_lookup: impl FnOnce(
+        &CanonicalTypeMapperStore,
+        SignatureId,
+        super::CacheHashKey,
+        &[TypeId],
+    ) -> CachedSignatureLookup,
+    reserve: impl FnOnce(&mut CanonicalTypeMapperStore, GenericCallVectorReservation) -> bool,
+) -> Result<GenericCallVectorSourceMaterialization, GenericCallVectorError> {
+    let shape =
+        validate_generic_call_signature_shape(store, resolution.projection.callee, callable)?;
+    let sources = validate_generic_call_vector_resolution(store, resolution, &shape)?;
+    let checked = if generic_call_vector_caches_checked_instantiation(resolution.applicability) {
+        Some(resolution.checked_instantiation.as_ref().ok_or(
+            GenericCallVectorInvariant::InvalidCheckedInstantiation(shape.signature),
+        )?)
+    } else {
+        None
+    };
+
+    let mut checked_key = None;
+    let checked_instantiation = if let Some(checked) = checked {
+        let key = type_list_key(&checked.type_arguments);
+        checked_key = Some(key);
+        cached_generic_call_vector_instantiation_from_lookup(
+            store,
+            &shape,
+            &sources,
+            checked,
+            checked_lookup(store, shape.signature, key, &checked.type_arguments),
+        )?
+    } else {
+        None
+    };
+
+    if resolution.applicability == GenericCallVectorApplicability::Applicable {
+        if let Some(cached) = checked_instantiation {
+            if existing_call_signature.is_some_and(|existing| existing != cached.signature) {
+                return Err(GenericCallVectorInvariant::InvalidCallInstantiation {
+                    target: shape.signature,
+                    signature: existing_call_signature
+                        .expect("the mismatching existing signature is present"),
+                }
+                .into());
+            }
+            return Ok(GenericCallVectorSourceMaterialization {
+                call_signature: cached.signature,
+                call_mapper: cached.mapper,
+                checked_instantiation: Some(cached),
+            });
+        }
+        if existing_call_signature.is_some() {
+            return Err(
+                GenericCallVectorInvariant::MissingCachedInstantiation(shape.signature).into(),
+            );
+        }
+    } else if let Some(existing) = existing_call_signature {
+        let checked_instantiation = match checked {
+            Some(_) => Some(checked_instantiation.ok_or(
+                GenericCallVectorInvariant::MissingCachedInstantiation(shape.signature),
+            )?),
+            None => None,
+        };
+        let recovery = validate_existing_generic_call_vector_recovery(
+            store,
+            &shape,
+            &sources,
+            &resolution.projection.instantiation,
+            existing,
+            checked_instantiation,
+        )?;
+        return Ok(GenericCallVectorSourceMaterialization {
+            call_signature: recovery.signature,
+            call_mapper: recovery.mapper,
+            checked_instantiation,
+        });
+    }
+
+    let publish_checked = checked.is_some() && checked_instantiation.is_none();
+    let publish_recovery = resolution.applicability != GenericCallVectorApplicability::Applicable;
+    let checked_plan = if publish_checked {
+        Some(prepare_generic_call_vector_signature(
+            store,
+            &shape,
+            &sources,
+            checked.expect("checked publication requires a checked vector"),
+        )?)
+    } else {
+        None
+    };
+    let recovery_plan = if publish_recovery {
+        Some(prepare_generic_call_vector_signature(
+            store,
+            &shape,
+            &sources,
+            &resolution.projection.instantiation,
+        )?)
+    } else {
+        None
+    };
+    let checked_exact_type_arguments = if publish_checked {
+        Some(
+            checked
+                .expect("checked publication requires a checked vector")
+                .type_arguments
+                .clone()
+                .into_boxed_slice(),
+        )
+    } else {
+        None
+    };
+    let graph_count = usize::from(publish_checked) + usize::from(publish_recovery);
+    let parameter_allocations = shape
+        .parameter_type_parameters
+        .len()
+        .checked_mul(graph_count)
+        .ok_or(GenericCallVectorInvariant::Capacity(shape.signature))?;
+    let reservation = GenericCallVectorReservation {
+        mappers: graph_count,
+        symbols: parameter_allocations,
+        value_links: parameter_allocations,
+        signatures: graph_count,
+        cached_signatures: usize::from(publish_checked),
+    };
+    if !reserve(store, reservation) {
+        return Err(GenericCallVectorInvariant::Capacity(shape.signature).into());
+    }
+
+    // All semantic validation, heap construction, and fallible reservation is
+    // complete. Build every required graph before committing the one globally
+    // authoritative checked-cache entry.
+    let published_checked = checked_plan.map(|plan| {
+        publish_prepared_generic_call_vector_signature(
+            store,
+            &shape,
+            &sources,
+            checked.expect("checked publication requires a checked vector"),
+            plan,
+        )
+    });
+    let published_recovery = recovery_plan.map(|plan| {
+        publish_prepared_generic_call_vector_signature(
+            store,
+            &shape,
+            &sources,
+            &resolution.projection.instantiation,
+            plan,
+        )
+    });
+    if let Some(published) = published_checked {
+        assert!(store.set_cached_signature(
+            shape.signature,
+            checked_key.expect("checked publication requires a cache key"),
+            checked_exact_type_arguments
+                .expect("checked publication requires exact cache arguments"),
+            published.signature,
+        ));
+    }
+
+    let checked_instantiation = published_checked.or(checked_instantiation);
+    let call = published_recovery.unwrap_or_else(|| {
+        checked_instantiation.expect("applicable publication must produce its checked signature")
+    });
+    if publish_recovery {
+        assert_eq!(
+            store.cached_signatures_contain(call.signature),
+            Some(false),
+            "recovery signatures must remain absent from the global cache"
+        );
+        if let Some(checked) = checked_instantiation {
+            assert_ne!(
+                call.signature, checked.signature,
+                "TS2345 recovery must be distinct from the checked signature"
+            );
+        }
+    }
+    Ok(GenericCallVectorSourceMaterialization {
+        call_signature: call.signature,
+        call_mapper: call.mapper,
+        checked_instantiation,
+    })
+}
+
+fn prepare_generic_call_vector_signature(
+    store: &CanonicalTypeMapperStore,
+    shape: &GenericCallSignatureShape,
+    sources: &[TypeId],
+    instantiation: &GenericCallVectorInstantiation,
+) -> Result<PreparedGenericCallVectorSignature, GenericCallVectorError> {
+    let original = store
+        .signature(shape.signature)
+        .ok_or(GenericCallVectorInvariant::InvalidSignature(shape.signature))?;
+    let original_parameters = original.parameters().to_vec();
+    let flags = original.flags() & SignatureFlags::PROPAGATING_FLAGS;
+    let declaration = original.declaration();
+    let min_argument_count = original.min_argument_count();
+    let mut parameter_plans = Vec::with_capacity(original_parameters.len());
+    for (index, (target, resolved_type)) in original_parameters
+        .iter()
+        .copied()
+        .zip(instantiation.parameter_types.iter().copied())
+        .enumerate()
+    {
+        let parameter =
+            store
+                .symbol(target)
+                .ok_or(GenericCallVectorInvariant::InvalidParameterSymbol {
+                    signature: shape.signature,
+                    index,
+                    symbol: target,
+                })?;
+        let mut data = SymbolData::new(
+            parameter.flags() | SymbolFlags::TRANSIENT,
+            parameter.name().to_owned(),
+        );
+        data.check_flags = CheckFlags::INSTANTIATED;
+        data.declarations = parameter.declarations().map(<[_]>::to_vec);
+        data.value_declaration = parameter.value_declaration();
+        data.parent = parameter.parent();
+        parameter_plans.push(GenericCallVectorParameterPlan {
+            target,
+            data,
+            name_type: store
+                .value_symbol_links(target)
+                .and_then(|links| links.name_type),
+            resolved_type,
+        });
+    }
+    Ok(PreparedGenericCallVectorSignature {
+        mapper_sources: sources.to_vec(),
+        mapper_targets: instantiation.type_arguments.clone(),
+        instantiated_parameters: Vec::with_capacity(parameter_plans.len()),
+        parameter_plans,
+        flags,
+        declaration,
+        min_argument_count,
+        return_type: instantiation.return_type,
+    })
+}
+
+fn publish_prepared_generic_call_vector_signature(
+    store: &mut CanonicalTypeMapperStore,
+    shape: &GenericCallSignatureShape,
+    sources: &[TypeId],
+    instantiation: &GenericCallVectorInstantiation,
+    plan: PreparedGenericCallVectorSignature,
+) -> GenericCallVectorCachedInstantiation {
+    let PreparedGenericCallVectorSignature {
+        mapper_sources,
+        mapper_targets,
+        parameter_plans,
+        mut instantiated_parameters,
+        flags,
+        declaration,
+        min_argument_count,
+        return_type,
+    } = plan;
+    let mapper = store
+        .new_type_mapper(mapper_sources, mapper_targets)
+        .expect("prevalidated mapper endpoints must remain owned");
+    for parameter in parameter_plans {
+        let instantiated = store
+            .alloc_symbol(parameter.data)
+            .expect("reserved transient parameter allocation must succeed");
+        assert!(store.set_value_symbol_links(
+            instantiated,
+            ValueSymbolLinks {
+                resolved_type: Some(parameter.resolved_type),
+                target: Some(parameter.target),
+                mapper: Some(mapper),
+                name_type: parameter.name_type,
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        instantiated_parameters.push(instantiated);
+    }
+    let signature = store
+        .alloc_signature(
+            flags,
+            declaration,
+            Vec::new(),
+            None,
+            instantiated_parameters,
+            Some(return_type),
+            None,
+            min_argument_count,
+        )
+        .expect("reserved instantiated signature allocation must succeed");
+    assert!(store.set_signature_target_and_mapper(
+        signature,
+        Some(shape.signature),
+        Some(mapper),
+    ));
+    assert_eq!(
+        valid_generic_call_vector_signature_instantiation(
+            store,
+            shape,
+            sources,
+            instantiation,
+            store
+                .signature(shape.signature)
+                .expect("validated generic signature must remain present"),
+            store
+                .signature(signature)
+                .expect("published instantiated signature must remain present"),
+        ),
+        Some(mapper),
+        "publication must build the exact requested instantiation graph"
+    );
+    GenericCallVectorCachedInstantiation { signature, mapper }
+}
+
+fn validate_existing_generic_call_vector_recovery(
+    store: &CanonicalTypeMapperStore,
+    shape: &GenericCallSignatureShape,
+    sources: &[TypeId],
+    recovery: &GenericCallVectorInstantiation,
+    signature: SignatureId,
+    checked: Option<GenericCallVectorCachedInstantiation>,
+) -> Result<GenericCallVectorCachedInstantiation, GenericCallVectorError> {
+    let original = store
+        .signature(shape.signature)
+        .ok_or(GenericCallVectorInvariant::InvalidSignature(shape.signature))?;
+    let existing = store.signature(signature).ok_or(
+        GenericCallVectorInvariant::InvalidCallInstantiation {
+            target: shape.signature,
+            signature,
+        },
+    )?;
+    let mapper = valid_generic_call_vector_signature_instantiation(
+        store, shape, sources, recovery, original, existing,
+    )
+    .filter(|_| store.cached_signatures_contain(signature) == Some(false))
+    .filter(|_| checked.is_none_or(|checked| checked.signature != signature))
+    .ok_or(GenericCallVectorInvariant::InvalidCallInstantiation {
+        target: shape.signature,
+        signature,
+    })?;
+    Ok(GenericCallVectorCachedInstantiation { signature, mapper })
+}
+
 fn materialize_validated_generic_call_vector_checked_instantiation(
     store: &mut CanonicalTypeMapperStore,
     resolution: &GenericCallVectorResolution,
@@ -1358,7 +1801,7 @@ fn materialize_validated_generic_call_vector_checked_instantiation_with_reservat
         .expect("reserved instantiated signature allocation must succeed");
     assert!(store.set_signature_target_and_mapper(signature, Some(shape.signature), Some(mapper),));
     assert_eq!(
-        valid_cached_generic_call_vector_instantiation(
+        valid_generic_call_vector_signature_instantiation(
             store,
             &shape,
             &sources,
@@ -1384,11 +1827,11 @@ fn materialize_validated_generic_call_vector_checked_instantiation_with_reservat
     ))
 }
 
-fn validate_generic_call_vector_checked_resolution(
+fn validate_generic_call_vector_resolution(
     store: &CanonicalTypeMapperStore,
     resolution: &GenericCallVectorResolution,
     shape: &GenericCallSignatureShape,
-) -> Result<GenericCallVectorInstantiation, GenericCallVectorError> {
+) -> Result<Vec<TypeId>, GenericCallVectorError> {
     let sources = shape
         .type_parameters
         .iter()
@@ -1402,42 +1845,100 @@ fn validate_generic_call_vector_checked_resolution(
             GenericCallVectorInvariant::InvalidCheckedInstantiation(shape.signature).into(),
         );
     }
-    let checked = resolution.checked_instantiation.clone().ok_or(
-        GenericCallVectorInvariant::InvalidCheckedInstantiation(shape.signature),
-    )?;
     if !valid_generic_call_vector_instantiation(
-        store,
-        &checked,
-        sources.len(),
-        shape.parameter_type_parameters.len(),
-    ) || !valid_generic_call_vector_instantiation(
         store,
         &resolution.projection.instantiation,
         sources.len(),
         shape.parameter_type_parameters.len(),
-    ) {
-        return Err(
-            GenericCallVectorInvariant::InvalidCheckedInstantiation(shape.signature).into(),
-        );
-    }
-    if shape
-        .parameter_type_parameters
-        .iter()
-        .zip(&checked.parameter_types)
-        .any(|(source, actual)| {
-            sources
-                .iter()
-                .position(|candidate| candidate == source)
-                .is_none_or(|index| checked.type_arguments[index] != *actual)
-        })
-    {
+    ) || !valid_generic_call_vector_parameter_row(
+        &sources,
+        &shape.parameter_type_parameters,
+        &resolution.projection.instantiation,
+    ) || resolution.checked_instantiation.as_ref().is_some_and(|checked| {
+        !valid_generic_call_vector_instantiation(
+            store,
+            checked,
+            sources.len(),
+            shape.parameter_type_parameters.len(),
+        ) || !valid_generic_call_vector_parameter_row(
+            &sources,
+            &shape.parameter_type_parameters,
+            checked,
+        )
+    }) {
         return Err(
             GenericCallVectorInvariant::InvalidCheckedInstantiation(shape.signature).into(),
         );
     }
     match resolution.applicability {
         GenericCallVectorApplicability::Applicable => {
-            if resolution.projection.recovery || resolution.projection.instantiation != checked {
+            if resolution.projection.recovery
+                || resolution.checked_instantiation.as_ref()
+                    != Some(&resolution.projection.instantiation)
+            {
+                return Err(GenericCallVectorInvariant::InvalidCheckedInstantiation(
+                    shape.signature,
+                )
+                .into());
+            }
+        }
+        GenericCallVectorApplicability::TypeArgumentArity {
+            minimum,
+            maximum,
+            actual,
+        } => {
+            if !resolution.projection.recovery
+                || resolution.checked_instantiation.is_some()
+                || minimum != minimum_type_argument_count(&shape.type_parameters)
+                || maximum != sources.len()
+                || actual >= minimum && actual <= maximum
+            {
+                return Err(GenericCallVectorInvariant::InvalidCheckedInstantiation(
+                    shape.signature,
+                )
+                .into());
+            }
+        }
+        GenericCallVectorApplicability::TooFewArguments { expected, actual } => {
+            if !resolution.projection.recovery
+                || resolution.checked_instantiation.is_some()
+                || expected != shape.parameter_type_parameters.len()
+                || actual >= expected
+            {
+                return Err(GenericCallVectorInvariant::InvalidCheckedInstantiation(
+                    shape.signature,
+                )
+                .into());
+            }
+        }
+        GenericCallVectorApplicability::TooManyArguments { expected, actual } => {
+            if !resolution.projection.recovery
+                || resolution.checked_instantiation.is_some()
+                || expected != shape.parameter_type_parameters.len()
+                || actual <= expected
+            {
+                return Err(GenericCallVectorInvariant::InvalidCheckedInstantiation(
+                    shape.signature,
+                )
+                .into());
+            }
+        }
+        GenericCallVectorApplicability::ExplicitTypeArgumentConstraint {
+            index,
+            type_argument,
+            constraint,
+        } => {
+            let Some(checked) = resolution.checked_instantiation.as_ref() else {
+                return Err(GenericCallVectorInvariant::InvalidCheckedInstantiation(
+                    shape.signature,
+                )
+                .into());
+            };
+            if !resolution.projection.recovery
+                || store.type_payload(type_argument).is_none()
+                || store.type_payload(constraint).is_none()
+                || checked.type_arguments.get(index).copied() != Some(type_argument)
+            {
                 return Err(GenericCallVectorInvariant::InvalidCheckedInstantiation(
                     shape.signature,
                 )
@@ -1449,6 +1950,12 @@ fn validate_generic_call_vector_checked_resolution(
             argument_type,
             parameter_type,
         } => {
+            let Some(checked) = resolution.checked_instantiation.as_ref() else {
+                return Err(GenericCallVectorInvariant::InvalidCheckedInstantiation(
+                    shape.signature,
+                )
+                .into());
+            };
             if !resolution.projection.recovery
                 || store.type_payload(argument_type).is_none()
                 || checked.parameter_types.get(index).copied() != Some(parameter_type)
@@ -1459,13 +1966,40 @@ fn validate_generic_call_vector_checked_resolution(
                 .into());
             }
         }
-        _ => {
-            return Err(
-                GenericCallVectorInvariant::InvalidCheckedInstantiation(shape.signature).into(),
-            );
-        }
     }
-    Ok(checked)
+    Ok(sources)
+}
+
+fn validate_generic_call_vector_checked_resolution(
+    store: &CanonicalTypeMapperStore,
+    resolution: &GenericCallVectorResolution,
+    shape: &GenericCallSignatureShape,
+) -> Result<GenericCallVectorInstantiation, GenericCallVectorError> {
+    validate_generic_call_vector_resolution(store, resolution, shape)?;
+    if !generic_call_vector_caches_checked_instantiation(resolution.applicability) {
+        return Err(
+            GenericCallVectorInvariant::InvalidCheckedInstantiation(shape.signature).into(),
+        );
+    }
+    resolution.checked_instantiation.clone().ok_or_else(|| {
+        GenericCallVectorInvariant::InvalidCheckedInstantiation(shape.signature).into()
+    })
+}
+
+fn valid_generic_call_vector_parameter_row(
+    sources: &[TypeId],
+    parameter_sources: &[TypeId],
+    instantiation: &GenericCallVectorInstantiation,
+) -> bool {
+    parameter_sources
+        .iter()
+        .zip(&instantiation.parameter_types)
+        .all(|(source, actual)| {
+            sources
+                .iter()
+                .position(|candidate| candidate == source)
+                .is_some_and(|index| instantiation.type_arguments[index] == *actual)
+        })
 }
 
 fn valid_generic_call_vector_instantiation(
@@ -1534,7 +2068,7 @@ fn cached_generic_call_vector_instantiation_from_lookup(
                 target: shape.signature,
                 signature: cached,
             })?;
-    let mapper = valid_cached_generic_call_vector_instantiation(
+    let mapper = valid_generic_call_vector_signature_instantiation(
         store, shape, sources, checked, original, signature,
     )
     .ok_or(GenericCallVectorInvariant::InvalidCachedInstantiation {
@@ -1547,7 +2081,7 @@ fn cached_generic_call_vector_instantiation_from_lookup(
     }))
 }
 
-fn valid_cached_generic_call_vector_instantiation(
+fn valid_generic_call_vector_signature_instantiation(
     store: &CanonicalTypeMapperStore,
     shape: &GenericCallSignatureShape,
     sources: &[TypeId],

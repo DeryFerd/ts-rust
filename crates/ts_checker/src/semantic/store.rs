@@ -2483,6 +2483,20 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         self.cached_signatures.len()
     }
 
+    /// Reports whether an owned signature is published by any authoritative
+    /// `cachedSignatures` entry. Recovery signatures must remain call-local,
+    /// so their validators need a reverse membership check rather than a
+    /// lookup for one already-known type-argument vector.
+    #[must_use]
+    pub(super) fn cached_signatures_contain(&self, signature: SignatureId) -> Option<bool> {
+        self.signature(signature)?;
+        Some(
+            self.cached_signatures
+                .values()
+                .any(|entry| entry.instantiated == signature),
+        )
+    }
+
     /// Reserves a transient parameter's value-link slot before publishing its
     /// symbol, mapper, and instantiated signature.
     pub(super) fn try_reserve_value_symbol_links(&mut self, additional: usize) -> bool {
