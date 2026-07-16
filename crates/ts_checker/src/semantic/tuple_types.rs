@@ -25,7 +25,7 @@ use super::{
     },
     type_records::{
         ConstrainedTypeData, LiteralValue, StructuredTypeData, TypeCacheState, TypeData,
-        TypeParameterData,
+        TypeParameterData, TypeRecord,
     },
     types::{ObjectFlags, TypeFlags},
 };
@@ -249,12 +249,12 @@ impl CanonicalTypeMapperStore {
     ) -> Result<TypeId, TupleTypeError> {
         self.validate_tuple_request(request)?;
 
-        if request.element_infos.is_empty() {
-            if let Some(cached) = self.canonical_empty_tuple_type_cache() {
-                self.validate_canonical_empty_tuple_type(cached)
-                    .map_err(|_| TupleTypeError::InvalidTargetCache(cached))?;
-                return Ok(cached);
-            }
+        if request.element_infos.is_empty()
+            && let Some(cached) = self.canonical_empty_tuple_type_cache()
+        {
+            self.validate_canonical_empty_tuple_type(cached)
+                .map_err(|_| TupleTypeError::InvalidTargetCache(cached))?;
+            return Ok(cached);
         }
 
         if request.element_infos.len() == 1
@@ -587,7 +587,7 @@ impl CanonicalTypeMapperStore {
             return Ok(target);
         }
         let key = type_list_key(element_types);
-        let existing = match self.type_payload(target).map(|record| record.data()) {
+        let existing = match self.type_payload(target).map(TypeRecord::data) {
             Some(TypeData::Tuple(tuple)) => {
                 let TypeCacheState::Allocated(instantiations) =
                     &tuple.interface.reference.object.instantiations
@@ -651,7 +651,7 @@ impl CanonicalTypeMapperStore {
                     return Ok(None);
                 };
                 if !matches!(
-                    self.type_payload(target).map(|record| record.data()),
+                    self.type_payload(target).map(TypeRecord::data),
                     Some(TypeData::Tuple(_))
                 ) {
                     return Ok(None);
@@ -885,7 +885,7 @@ impl CanonicalTypeMapperStore {
                 continue;
             }
             let Some(TypeData::TypeReference(reference)) =
-                self.type_payload(*instance).map(|record| record.data())
+                self.type_payload(*instance).map(TypeRecord::data)
             else {
                 return Err(TupleTypeError::InvalidInstantiationCache {
                     target,
@@ -960,7 +960,7 @@ impl CanonicalTypeMapperStore {
             };
             if bootstrap.cached_number_literal_type(value) != Some(constituent)
                 || !matches!(
-                    self.type_payload(constituent).map(|record| record.data()),
+                    self.type_payload(constituent).map(TypeRecord::data),
                     Some(TypeData::Literal(data))
                         if data.value == LiteralValue::Number(value)
                             && data.regular_type == constituent
@@ -973,7 +973,7 @@ impl CanonicalTypeMapperStore {
             return length_type == constituents[0];
         }
         matches!(
-            self.type_payload(length_type).map(|record| record.data()),
+            self.type_payload(length_type).map(TypeRecord::data),
             Some(TypeData::Union(data))
                 if data.union.types.len() == constituents.len()
                     && constituents
@@ -1400,9 +1400,8 @@ mod tests {
         let mut labels = parsed
             .arena
             .iter()
-            .filter_map(|(node, record)| {
-                (record.kind == SyntaxKind::NamedTupleMember).then(|| scope.node_ref(node).unwrap())
-            })
+            .filter(|(_, record)| record.kind == SyntaxKind::NamedTupleMember)
+            .map(|(node, _)| scope.node_ref(node).unwrap())
             .collect::<Vec<_>>();
         assert_eq!(labels.len(), 2);
         assert!(store.register_ast_scope(scope));
