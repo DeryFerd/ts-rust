@@ -4460,8 +4460,8 @@ mod tests {
         // versus false): direct exported mutable null/undefined infer
         // null/undefined versus any. With noImplicitAny=true, non-exported
         // mutable initializers use control-flow autoType even through
-        // parentheses. Canonical options do not retain noImplicitAny yet, so
-        // that exact syntax is fail-closed.
+        // parentheses. Canonical source-variable planning does not consume the
+        // retained noImplicitAny option yet, so that exact syntax fails closed.
         for (index, text) in [
             "const prior = 1; let blocked = null;",
             "const prior = 1; let blocked = (((null)));",
@@ -4547,8 +4547,9 @@ mod tests {
         // and non-exported `=([])` are never[] for
         // strictNullChecks=true,noImplicitAny=false, and any[] for
         // strictNullChecks=false. Non-exported direct `=[]` becomes an evolving
-        // auto[] when noImplicitAny=true, an option absent from the canonical
-        // checker contract, so only that direct syntax is rejected.
+        // auto[] when noImplicitAny=true. Canonical source-variable planning
+        // does not consume that retained option yet, so only that direct syntax
+        // is rejected.
         let blocked = parsed("const prior = 1; const blocked = [];");
         let blocked_file = FileId::new(211);
         let mut context = context(
