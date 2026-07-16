@@ -845,16 +845,42 @@ remains the cluster-level source of truth.
   poison paths are covered. Focused property/call tests, three public vertical
   tests, checker test compilation, and exact checker Clippy pass; independent
   review found no P0-P2 issue.
+- The first binder-backed source-statement flow slice is integrated through
+  `3045dd4..4b8b246`. An explicitly annotated `FunctionDeclaration` may now
+  execute sequential initialized identifier-named `let`/`const` locals and a
+  final direct or parenthesized identifier `if`/`else`; each block arm may
+  execute its own sequential locals before a direct return. The source leaf
+  proves exact AST/binder scopes, symbol tables, flow containers, payloads,
+  points, registered assignments, both condition edges, and the payload-less
+  function `START` before semantic execution. Every invocation then owns a
+  fresh flow frame, immutable snapshots, pending/resolved assignment state,
+  and monotone memoization, so retries cannot reuse branch or local state.
+  Truthiness narrowing, TS1345 and syntactic truthiness diagnostics, local and
+  return TS2322 order/anchors, branch shadowing, multi-declarator ordering,
+  parenthesized conditions, and cold/warm publication are covered. Hoisted
+  function captures start all top-level variables—including `const`—at their
+  declared types, matching the pinned checker rather than declaration-point
+  narrowing; union types that merely contain `void` do not receive TS1345.
+  Callable, named promise, exact structural-thenable, and other opaque object
+  conditions remain fail-closed until TS2774/TS2801 and general apparent or
+  inherited property lookup are ported. Missing `else`, non-final branches,
+  inferred multi-return aggregation, joins, equality/`typeof` narrowing,
+  loops, jumps, and broader statement families also remain explicit. Three
+  independent reviews found no remaining P0/P1 defect; the residual hardening
+  item is to encode the expected edge and assignment prefix per flow point
+  instead of relying on global route coverage. The 22-test expression,
+  callable, index, property-call, and statement-flow regression cluster plus
+  checker test compilation and exact checker Clippy are green.
 - The current pinned first-50 run at
-  `/tmp/ts-rust-canonical-first50-41d4c5c.json`, rebuilt after inferred returns,
-  declared indexes, defaults, and property calls, remains two exact artifacts
-  and 48 honest unsupported variants, with zero code, span, message, order, or
-  complete-artifact mismatches. This alphabetically biased smoke tranche is
-  dominated by classes, broader function/body forms, module modes, JavaScript,
-  TSX, declaration emit, and advanced type nodes; none is a complete artifact
-  for the newly admitted bounded cuts. The unchanged headline is therefore
+  `/tmp/ts-rust-canonical-first50-4b8b246.json`, rebuilt after the first
+  statement/flow slice, remains two exact artifacts and 48 honest unsupported
+  variants, with zero code, span, message, order, or complete-artifact
+  mismatches. This alphabetically biased smoke tranche is dominated by
+  classes, broader function/body forms, module modes, JavaScript, TSX,
+  declaration emit, and advanced type nodes; none is a complete artifact for
+  the newly admitted final-`if` cut. The unchanged headline is therefore
   useful negative evidence rather than a regression: the next work must close
-  broad dependencies—statements and flow, overloads and contextual calls,
+  post-branch joins and broader statements, overloads and contextual calls,
   classes, advanced types, then modules/projects—rather than add
   fixture-specific syntax admissions.
 
@@ -1790,7 +1816,7 @@ is not to finish one semantic family at a time. It is to freeze the remaining
 composition seams, then advance the independent branches below in parallel:
 
 ```text
-P0: inferred returns [done] + required property calls [done] + first statement/flow slice
+P0: inferred returns [done] + required property calls [done] + first statement/flow slice [done]
 |
 |-- F1 post-if joins and equality/typeof narrowing
 |    `-- F2 loops, switch, reachability and jumps
