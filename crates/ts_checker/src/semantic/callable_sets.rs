@@ -13,6 +13,7 @@ use super::{
         CallableFamily, StoredSingleCallableValidation, ValidatedSingleCallable,
         validate_stored_single_callable_provider,
     },
+    object_members::{StoredDeclaredCallSetValidation, validate_stored_declared_call_set},
     signatures::SignatureFlags,
 };
 
@@ -51,36 +52,57 @@ pub(super) enum StoredCallableSetValidation {
 
 /// Validates every installed callable provider and normalizes its ordered set.
 ///
-/// The initial provider registry contains the existing exact-single callable
-/// families only, so adding this boundary does not widen accepted syntax. A
-/// later declared-member provider can reuse
-/// [`validate_stored_callable_set_projection`] after proving its own source and
-/// publication provenance.
+/// Exact-single providers retain their established validation path. The
+/// declared-member provider proves its source and publication provenance first,
+/// then reuses [`validate_stored_callable_set_projection`] for the common
+/// ordered representation.
 pub(super) fn validate_stored_callable_set(
     store: &CanonicalTypeMapperStore,
     type_: TypeId,
 ) -> StoredCallableSetValidation {
     match validate_stored_single_callable_provider(store, type_) {
-        StoredSingleCallableValidation::NotCallable => StoredCallableSetValidation::NotCallable,
+        StoredSingleCallableValidation::NotCallable => {}
         StoredSingleCallableValidation::Pending { family } => {
-            StoredCallableSetValidation::Pending { family }
+            return StoredCallableSetValidation::Pending { family };
         }
         StoredSingleCallableValidation::Malformed { family } => {
-            StoredCallableSetValidation::Malformed { family }
+            return StoredCallableSetValidation::Malformed { family };
         }
         StoredSingleCallableValidation::Valid {
             family,
             callable,
             edges,
-        } => StoredCallableSetValidation::Valid {
-            family,
-            projection: CallableSetProjection {
-                owner: type_,
-                call_signatures: Box::new([callable]),
-                construct_signatures: Box::new([]),
-            },
-            edges,
-        },
+        } => {
+            return StoredCallableSetValidation::Valid {
+                family,
+                projection: CallableSetProjection {
+                    owner: type_,
+                    call_signatures: Box::new([callable]),
+                    construct_signatures: Box::new([]),
+                },
+                edges,
+            };
+        }
+    }
+    let family = CallableFamily::DeclaredCallSignatures;
+    match validate_stored_declared_call_set(store, type_) {
+        StoredDeclaredCallSetValidation::NotDeclaredCallSet => {
+            StoredCallableSetValidation::NotCallable
+        }
+        StoredDeclaredCallSetValidation::Malformed => {
+            StoredCallableSetValidation::Malformed { family }
+        }
+        StoredDeclaredCallSetValidation::Valid(edges) => {
+            let Some(projection) = validate_stored_callable_set_projection(store, type_, false)
+            else {
+                return StoredCallableSetValidation::Malformed { family };
+            };
+            StoredCallableSetValidation::Valid {
+                family,
+                projection,
+                edges,
+            }
+        }
     }
 }
 
@@ -91,7 +113,6 @@ pub(super) fn validate_stored_callable_set(
 /// Callers must first prove provider-specific source and cache provenance. It
 /// validates the common immutable suffix: a unique call prefix, a unique
 /// construct suffix, exact parameter-value caches, and store-owned type edges.
-#[allow(dead_code)] // Provider hook frozen here before declared call members are installed.
 pub(super) fn validate_stored_callable_set_projection(
     store: &CanonicalTypeMapperStore,
     owner: TypeId,
@@ -388,8 +409,7 @@ mod tests {
         ]);
         let invalid_minimum_owner = owner(&mut store, vec![invalid_minimum], Vec::new());
         let missing_rest_owner = owner(&mut store, vec![missing_rest], Vec::new());
-        let invalid_rest_minimum_owner =
-            owner(&mut store, vec![invalid_rest_minimum], Vec::new());
+        let invalid_rest_minimum_owner = owner(&mut store, vec![invalid_rest_minimum], Vec::new());
 
         assert_eq!(
             project(&store, invalid_minimum_owner, &parameter_types),

@@ -293,6 +293,8 @@ pub struct SemanticStore<TypePayload, MapperPayload> {
     links: CheckerLinkStores,
     declared_types_in_progress: HashSet<SemanticSymbolId>,
     function_type_provenance: HashSet<TypeId>,
+    declared_call_set_provenance: HashSet<TypeId>,
+    declared_call_set_types_by_signature: HashMap<SignatureId, TypeId>,
     source_callable_provenance: HashMap<TypeId, SourceCallableProvenance>,
     source_callable_types_by_declaration: HashMap<NodeRef, TypeId>,
     source_callable_types_by_owner: HashMap<SemanticSymbolId, TypeId>,
@@ -361,6 +363,8 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             links: CheckerLinkStores::default(),
             declared_types_in_progress: HashSet::new(),
             function_type_provenance: HashSet::new(),
+            declared_call_set_provenance: HashSet::new(),
+            declared_call_set_types_by_signature: HashMap::new(),
             source_callable_provenance: HashMap::new(),
             source_callable_types_by_declaration: HashMap::new(),
             source_callable_types_by_owner: HashMap::new(),
@@ -845,6 +849,67 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         self.function_type_provenance.contains(&type_)
     }
 
+    pub(super) fn try_reserve_declared_call_set_provenance(
+        &mut self,
+        additional_types: usize,
+        additional_signatures: usize,
+    ) -> bool {
+        self.declared_call_set_provenance
+            .try_reserve(additional_types)
+            .is_ok()
+            && self
+                .declared_call_set_types_by_signature
+                .try_reserve(additional_signatures)
+                .is_ok()
+    }
+
+    pub(super) fn set_declared_call_set_provenance(
+        &mut self,
+        type_: TypeId,
+        signatures: &[SignatureId],
+    ) -> bool {
+        let mut unique = HashSet::with_capacity(signatures.len());
+        if self.types.get(type_).is_none()
+            || signatures.is_empty()
+            || self.declared_call_set_provenance.contains(&type_)
+            || signatures.iter().any(|signature| {
+                !unique.insert(*signature)
+                    || self
+                        .declared_call_set_types_by_signature
+                        .contains_key(signature)
+                    || self.signature(*signature).is_none_or(|record| {
+                        record.declaration().is_none_or(|declaration| {
+                            self.source_node_kind(declaration) != Some(SyntaxKind::CallSignature)
+                        })
+                    })
+            })
+        {
+            return false;
+        }
+        assert!(self.declared_call_set_provenance.insert(type_));
+        for signature in signatures {
+            assert!(
+                self.declared_call_set_types_by_signature
+                    .insert(*signature, type_)
+                    .is_none()
+            );
+        }
+        true
+    }
+
+    pub(super) fn type_has_declared_call_set_provenance(&self, type_: TypeId) -> bool {
+        self.declared_call_set_provenance.contains(&type_)
+    }
+
+    pub(super) fn declared_call_set_type_for_signature(
+        &self,
+        signature: SignatureId,
+    ) -> Option<TypeId> {
+        self.declared_call_set_types_by_signature
+            .get(&signature)
+            .copied()
+    }
+
     pub(super) fn try_reserve_source_callable_provenance(&mut self, additional: usize) -> bool {
         self.source_callable_provenance
             .try_reserve(additional)
@@ -1038,7 +1103,14 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
     }
 
     fn has_callable_provenance(&self) -> bool {
-        !self.function_type_provenance.is_empty() || !self.source_callable_provenance.is_empty()
+        !self.function_type_provenance.is_empty()
+            || !self.declared_call_set_provenance.is_empty()
+            || !self.source_callable_provenance.is_empty()
+            || self.signatures.iter().any(|(_, signature)| {
+                signature.declaration().is_some_and(|node| {
+                    self.source_node_kind(node) == Some(SyntaxKind::CallSignature)
+                })
+            })
     }
 
     pub(super) fn mark_union_cache_validation_dirty(&mut self) {
@@ -1066,7 +1138,10 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             if !visited.insert(node) {
                 return false;
             }
-            if self.node_is_function_type(node) || self.node_is_source_callable_declaration(node) {
+            if self.node_is_function_type(node)
+                || self.node_is_source_callable_declaration(node)
+                || self.source_node_kind(node) == Some(SyntaxKind::CallSignature)
+            {
                 return true;
             }
             let Some(SourceNodeParent::Parent(parent)) = self.source_node_parent(node) else {
@@ -1086,6 +1161,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                 Some(SourceNodeParent::Parent(parent))
                     if self.node_is_function_type(parent)
                         || self.node_is_source_callable_declaration(parent)
+                        || self.source_node_kind(parent) == Some(SyntaxKind::CallSignature)
             )
     }
 
@@ -1098,6 +1174,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             .and_then(Signature::declaration)
             .is_some_and(|declaration| {
                 self.node_is_function_type(declaration)
+                    || self.source_node_kind(declaration) == Some(SyntaxKind::CallSignature)
                     || self
                         .source_callable_type_for_signature(signature)
                         .and_then(|type_| self.source_callable_provenance(type_))
@@ -1118,6 +1195,11 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             self.type_node_links(declaration)
                 .and_then(|links| links.resolved_type)
                 .filter(|type_| self.type_has_function_type_provenance(*type_))
+        } else if self.source_node_kind(declaration) == Some(SyntaxKind::CallSignature) {
+            self.declared_call_set_types_by_signature
+                .get(&signature)
+                .copied()
+                .filter(|type_| self.type_has_declared_call_set_provenance(*type_))
         } else {
             self.source_callable_type_for_signature(signature)
                 .filter(|type_| {
@@ -1489,6 +1571,8 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         }
         let dirty = (self.node_is_function_type(node)
             || self.node_is_source_callable_declaration(node))
+            || self.source_node_kind(node) == Some(SyntaxKind::CallSignature);
+        let dirty = dirty
             && self
                 .signature_links(node)
                 .is_some_and(|current| current != &SignatureLinks::default() && current != &links);
@@ -2647,6 +2731,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             return false;
         };
         let valid_callable = self.node_is_function_type(declaration)
+            || self.source_node_kind(declaration) == Some(SyntaxKind::CallSignature)
             || self
                 .source_callable_type_for_signature(id)
                 .and_then(|type_| self.source_callable_provenance(type_))

@@ -1,19 +1,18 @@
 //! Exact semantic kernel for one ordinary, direct call expression.
 //!
-//! This is the dependency-closed single-candidate branch of pinned
+//! This is the dependency-closed fixed-signature branch of pinned
 //! typescript-go `checkCallExpression`, `resolveCallExpression`, `resolveCall`,
 //! `chooseOverload`, and `hasCorrectArity`. Syntax planning and expression
 //! typing remain with the source checker. This module accepts an already-typed
-//! callee and arguments, proves that the callee is one stored non-generic call
-//! signature, checks fixed arity and argument assignability, and projects the
-//! resolved return type. It never substitutes `any` for an unsupported or
-//! malformed call.
+//! callee and arguments, proves an ordered set of stored non-generic call
+//! signatures, selects the first applicable fixed-arity candidate, and
+//! projects its resolved return type. It never substitutes `any` for an
+//! unsupported or malformed call.
 
 use super::{
     CanonicalGlobalTypes, CanonicalTypeMapperStore, RelationUnavailable, SignatureId, TypeId,
-    callables::{
-        StoredSingleCallableValidation, ValidatedSingleCallable, validate_stored_single_callable,
-    },
+    callable_sets::{StoredCallableSetValidation, validate_stored_callable_set},
+    callables::ValidatedSingleCallable,
     signatures::SignatureFlags,
     type_records::TypeData,
     types::TypeFlags,
@@ -191,7 +190,7 @@ pub(super) struct DirectCallResolution {
     pub(super) applicability: DirectCallApplicability,
 }
 
-/// Resolves the dependency-closed single-non-generic-candidate call branch.
+/// Resolves the dependency-closed non-generic direct-call branch.
 ///
 /// The source caller must pass the context's immutable `strictFunctionTypes`
 /// option and authoritative global identities. Relation caches may be written;
@@ -208,34 +207,69 @@ pub(super) fn resolve_direct_call(
     }
     validate_argument_types(store, request.arguments)?;
 
-    let callable = match validate_stored_single_callable(store, request.callee) {
-        StoredSingleCallableValidation::NotCallable => {
+    let projection = match validate_stored_callable_set(store, request.callee) {
+        StoredCallableSetValidation::NotCallable => {
             return Err(DirectCallUnsupported::NotExactSingleCallable(request.callee).into());
         }
-        StoredSingleCallableValidation::Pending { .. } => {
+        StoredCallableSetValidation::Pending { .. } => {
             return Err(DirectCallUnsupported::PendingCallable(request.callee).into());
         }
-        StoredSingleCallableValidation::Malformed { .. } => {
+        StoredCallableSetValidation::Malformed { .. } => {
             return Err(DirectCallInvariant::MalformedCallable(request.callee).into());
         }
-        StoredSingleCallableValidation::Valid { callable, .. } => callable,
+        StoredCallableSetValidation::Valid { projection, .. } => projection,
     };
-    let mut resolution =
-        project_validated_direct_call(store, Some(global_types), request, &callable)?;
-    if resolution.applicability != DirectCallApplicability::Applicable {
+    if projection.owner != request.callee
+        || !projection.construct_signatures.is_empty()
+        || projection.call_signatures.is_empty()
+    {
+        return Err(DirectCallUnsupported::NotExactSingleCallable(request.callee).into());
+    }
+    let candidates = projection
+        .call_signatures
+        .iter()
+        .map(|callable| project_validated_direct_call(store, Some(global_types), request, callable))
+        .collect::<Result<Vec<_>, _>>()?;
+    if candidates.len() == 1 {
+        let mut resolution = candidates
+            .into_iter()
+            .next()
+            .expect("the exact-single candidate count was checked");
+        if resolution.applicability != DirectCallApplicability::Applicable {
+            return Ok(resolution);
+        }
+        resolution.applicability =
+            check_argument_applicability(&resolution.projection, |source, target| {
+                store.is_type_assignable_to_with_global_types_and_strict_function_types(
+                    source,
+                    target,
+                    global_types,
+                    strict_function_types,
+                )
+            })?;
         return Ok(resolution);
     }
 
-    resolution.applicability =
-        check_argument_applicability(&resolution.projection, |source, target| {
-            store.is_type_assignable_to_with_global_types_and_strict_function_types(
-                source,
-                target,
-                global_types,
-                strict_function_types,
-            )
-        })?;
-    Ok(resolution)
+    let mut recovery = None;
+    for mut candidate in candidates {
+        if candidate.applicability == DirectCallApplicability::Applicable {
+            candidate.applicability =
+                check_argument_applicability(&candidate.projection, |source, target| {
+                    store.is_type_assignable_to_with_global_types_and_strict_function_types(
+                        source,
+                        target,
+                        global_types,
+                        strict_function_types,
+                    )
+                })?;
+            if candidate.applicability == DirectCallApplicability::Applicable {
+                return Ok(candidate);
+            }
+        }
+        recovery.get_or_insert(candidate);
+    }
+
+    recovery.ok_or_else(|| DirectCallUnsupported::NotExactSingleCallable(request.callee).into())
 }
 
 fn validate_direct_call_form(request: DirectCallRequest<'_>) -> Result<(), DirectCallError> {

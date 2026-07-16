@@ -1222,6 +1222,9 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 self.plan_type_node_in_context(key_type, None, false)?;
                 self.plan_type_node_in_context(value_type, None, false)?;
             }
+            for annotation in planned.call_type_nodes() {
+                self.plan_type_node_in_context(annotation, None, false)?;
+            }
             Ok(())
         })();
         if pushed_alias {
@@ -1324,6 +1327,9 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         let result = (|| {
             for property in planned.property_type_nodes() {
                 self.plan_type_node_in_context(property, None, false)?;
+            }
+            for annotation in planned.call_type_nodes() {
+                self.plan_type_node_in_context(annotation, None, false)?;
             }
             debug_assert!(planned.indexes.is_empty());
             Ok(())
@@ -4877,13 +4883,42 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             for property in interface.property_type_nodes() {
                 types.push(self.execute_type_node(property, plan, prepared)?);
             }
+            let mut call_types = Vec::with_capacity(interface.call_signatures.len());
+            for signature in &interface.call_signatures {
+                let mut parameter_types = Vec::with_capacity(signature.parameters.len());
+                for parameter in &signature.parameters {
+                    parameter_types.push(self.execute_type_node(
+                        parameter.type_node,
+                        plan,
+                        prepared,
+                    )?);
+                }
+                let return_type = self.execute_type_node(signature.return_type, plan, prepared)?;
+                call_types.push(object_members::ResolvedCallSignatureTypes {
+                    parameter_types,
+                    return_type,
+                });
+            }
             if state.is_resolved() {
-                object_members::validate_resolved_property_types(self.store, &interface, &types)
-                    .map_err(property_object_error)?;
+                object_members::validate_resolved_declared_member_types(
+                    self.store,
+                    &interface,
+                    &types,
+                    &[],
+                    &call_types,
+                )
+                .map_err(property_object_error)?;
                 Ok(declared_type)
             } else {
-                object_members::publish_property_members(self.store, &interface, state, &types)
-                    .map_err(property_object_error)
+                object_members::publish_declared_members(
+                    self.store,
+                    &interface,
+                    state,
+                    &types,
+                    &[],
+                    &call_types,
+                )
+                .map_err(property_object_error)
             }
         })();
         assert!(self.resolving_property_interfaces.remove(&symbol));
@@ -5232,12 +5267,29 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             let value_type = self.execute_type_node(value_node, plan, prepared)?;
             index_types.push((key_type, value_type));
         }
+        let mut call_types = Vec::with_capacity(literal.call_signatures.len());
+        for signature in &literal.call_signatures {
+            let mut parameter_types = Vec::with_capacity(signature.parameters.len());
+            for parameter in &signature.parameters {
+                parameter_types.push(self.execute_type_node(
+                    parameter.type_node,
+                    plan,
+                    prepared,
+                )?);
+            }
+            let return_type = self.execute_type_node(signature.return_type, plan, prepared)?;
+            call_types.push(object_members::ResolvedCallSignatureTypes {
+                parameter_types,
+                return_type,
+            });
+        }
         if state.is_resolved() {
             object_members::validate_resolved_declared_member_types(
                 self.store,
                 &literal,
                 &types,
                 &index_types,
+                &call_types,
             )
             .map_err(property_object_error)?;
             Ok(state.type_id())
@@ -5248,6 +5300,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 state,
                 &types,
                 &index_types,
+                &call_types,
             )
             .map_err(property_object_error)
         }

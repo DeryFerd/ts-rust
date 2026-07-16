@@ -28,6 +28,7 @@ pub(super) enum CallableFamily {
     FunctionType,
     FunctionDeclaration,
     ArrowFunction,
+    DeclaredCallSignatures,
 }
 
 impl From<SourceCallableFamily> for CallableFamily {
@@ -261,6 +262,7 @@ pub(super) fn single_callable_display_projection(
             .map(Some)
             .map_err(SingleCallableDisplayError::SourceCallable)
         }
+        CallableFamily::DeclaredCallSignatures => Ok(None),
     }
 }
 

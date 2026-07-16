@@ -2210,6 +2210,195 @@ mod tests {
     }
 
     #[test]
+    fn declared_call_sets_match_the_pinned_oracle_and_preserve_overload_order() {
+        // Pinned tsgo oracle: the first applicable overload wins. `ordered(1)`
+        // therefore returns string even though the following overload has the
+        // same parameter list, while `branching(1)` skips its string overload.
+        let parsed = parsed(concat!(
+            "interface Ordered { ",
+            "(value: number): string; ",
+            "(value: number): number; ",
+            "} ",
+            "type Branching = { ",
+            "(value: string): number; ",
+            "(value: number): string; ",
+            "}; ",
+            "type Unary = { (value: boolean): number; }; ",
+            "function fromInterface(ordered: Ordered): string { return ordered(1); } ",
+            "function fromTypeLiteral(branching: Branching): string { return branching(1); } ",
+            "function exactSingle(unary: Unary): number { return unary(true); }",
+        ));
+        let file = FileId::new(480);
+        let mut calls = calls(&parsed, file);
+        calls.sort_by_key(|call| parsed.arena.get(call.node).unwrap().range.start);
+        let [ordered_call, branching_call, exact_call] = calls.as_slice() else {
+            panic!("expected the ordered, branching, and exact-single calls")
+        };
+        let mut declarations = parsed
+            .arena
+            .iter()
+            .filter(|(_, record)| record.kind == SyntaxKind::CallSignature)
+            .map(|(node, record)| {
+                (
+                    record.range.start,
+                    NodeRef::new(parsed.arena.id(), file, node),
+                )
+            })
+            .collect::<Vec<_>>();
+        declarations.sort_by_key(|(start, _)| *start);
+        let [ordered_first, _, _, branching_second, exact_declaration] = declarations.as_slice()
+        else {
+            panic!("expected five declared call signatures")
+        };
+        let mut context = context(&parsed, file);
+
+        context.check_source_file(file).unwrap();
+
+        assert!(context.diagnostics().is_empty());
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        assert_eq!(
+            [*ordered_call, *branching_call, *exact_call].map(|call| {
+                context
+                    .store()
+                    .type_node_links(call)
+                    .and_then(|links| links.resolved_type)
+            }),
+            [
+                Some(string),
+                Some(string),
+                Some(context.store().intrinsic_bootstrap().unwrap().number_type),
+            ],
+        );
+        let declared_signature = |declaration: NodeRef| {
+            context
+                .store()
+                .signature_links(declaration)
+                .and_then(|links| links.resolved_signature.signature())
+        };
+        assert_eq!(
+            context
+                .store()
+                .signature_links(*ordered_call)
+                .and_then(|links| links.resolved_signature.signature()),
+            declared_signature(ordered_first.1),
+        );
+        assert_eq!(
+            context
+                .store()
+                .signature_links(*branching_call)
+                .and_then(|links| links.resolved_signature.signature()),
+            declared_signature(branching_second.1),
+        );
+        assert_eq!(
+            context
+                .store()
+                .signature_links(*exact_call)
+                .and_then(|links| links.resolved_signature.signature()),
+            declared_signature(exact_declaration.1),
+        );
+
+        let cold_counts = (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.store().callable_signature_parameter_types_len(),
+        );
+        mark_source_unchecked(&mut context, file);
+        context.check_source_file(file).unwrap();
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().callable_signature_parameter_types_len(),
+            ),
+            cold_counts,
+        );
+    }
+
+    #[test]
+    fn declared_call_set_poison_fails_closed_without_republishing_the_call() {
+        let parsed = parsed(concat!(
+            "interface Callable { ",
+            "(value: number): string; ",
+            "(value: string): number; ",
+            "} ",
+            "function use(callable: Callable): string { return callable(1); }",
+        ));
+        let file = FileId::new(481);
+        let call_nodes = calls(&parsed, file);
+        let [call] = call_nodes.as_slice() else {
+            panic!("expected one call")
+        };
+        let call = *call;
+        let declaration = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::CallSignature)
+                    .then(|| NodeRef::new(parsed.arena.id(), file, node))
+            })
+            .unwrap();
+        let mut context = context(&parsed, file);
+        context.check_source_file(file).unwrap();
+        mark_source_unchecked(&mut context, file);
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_signature_links(declaration, SignatureLinks::default())
+        );
+        let poisoned_call = call_publication_state(&context, call);
+
+        assert!(context.check_source_file(file).is_err());
+        assert_eq!(call_publication_state(&context, call), poisoned_call);
+        assert!(
+            context
+                .store()
+                .signature_links(declaration)
+                .is_some_and(|links| links == &SignatureLinks::default())
+        );
+    }
+
+    #[test]
+    fn unsupported_declared_call_members_reject_before_signature_publication() {
+        // The pinned oracle accepts each family below. This provider's first
+        // production cut intentionally rejects them as one atomic boundary.
+        for (index, member) in [
+            "<T>(value: T): T;",
+            "(value?: number): string;",
+            "(...values: number[]): string;",
+            "new (value: number): string; (value: number): string;",
+            "value: number; (value: number): string;",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let parsed = parsed(&format!(
+                "interface Callable {{ {member} }} function use(callable: Callable): string {{ return callable(1); }}"
+            ));
+            let file = FileId::new(482 + u32::try_from(index).unwrap());
+            let call = calls(&parsed, file)
+                .into_iter()
+                .next()
+                .expect("fixture contains one direct call");
+            let declarations = parsed
+                .arena
+                .iter()
+                .filter(|(_, record)| record.kind == SyntaxKind::CallSignature)
+                .map(|(node, _)| NodeRef::new(parsed.arena.id(), file, node))
+                .collect::<Vec<_>>();
+            let mut context = context(&parsed, file);
+
+            assert!(context.check_source_file(file).is_err());
+            assert!(context.store().type_node_links(call).is_none());
+            assert!(context.store().signature_links(call).is_none());
+            assert!(
+                declarations
+                    .iter()
+                    .all(|declaration| context.store().signature_links(*declaration).is_none())
+            );
+        }
+    }
+
+    #[test]
     fn property_call_diagnostics_retain_the_name_argument_and_call_nodes() {
         let text = concat!(
             "type API = { fn: (value: number) => string }; ",
