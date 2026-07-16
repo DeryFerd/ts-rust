@@ -328,6 +328,7 @@ pub(super) enum SourceContextualArrowError {
 }
 
 impl SourceContextualArrowError {
+    #[allow(dead_code)] // Consumed by the next source-execution integration slice.
     pub(super) const fn node(self) -> Option<NodeRef> {
         match self {
             Self::Unsupported(reason) => match reason {
