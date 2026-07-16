@@ -713,11 +713,27 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                             },
                         ));
                     };
-                    if node.flags.0 != 0 || alias.modifiers.is_some() {
+                    if node.flags.0 != 0 {
                         return Err(self.unsupported(
                             statement,
                             node.kind,
                             SourceSyntaxRole::TypeAliasDeclaration,
+                        ));
+                    }
+                    let export_modifier = self.validate_type_alias_modifiers(
+                        statement,
+                        node.range,
+                        alias.name,
+                        alias.modifiers.as_ref(),
+                    )?;
+                    if let Some(export_modifier) = export_modifier
+                        && !is_external_module
+                    {
+                        return Err(SourceCheckError::Unsupported(
+                            UnsupportedSourceSyntax::MissingExternalModuleFact {
+                                node: export_modifier,
+                                role: SourceSyntaxRole::TypeAliasDeclaration,
+                            },
                         ));
                     }
                     let symbol =
@@ -1136,6 +1152,47 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             ));
         }
         Ok(callable)
+    }
+
+    fn validate_type_alias_modifiers(
+        &self,
+        declaration: NodeRef,
+        declaration_range: TextRange,
+        name: NodeId,
+        modifiers: Option<&ModifierList>,
+    ) -> Result<Option<NodeRef>, SourceCheckError> {
+        let Some(modifiers) = modifiers else {
+            return Ok(None);
+        };
+        let [modifier_id] = modifiers.list.nodes.as_slice() else {
+            return Err(self.unsupported(
+                declaration,
+                SyntaxKind::TypeAliasDeclaration,
+                SourceSyntaxRole::TypeAliasDeclaration,
+            ));
+        };
+        let modifier = self.reference(*modifier_id);
+        let modifier_node = self.node(modifier)?;
+        let name_start = self.node(self.reference(name))?.range.start.get();
+        if modifiers.flags.0 != 0
+            || modifiers.list.has_trailing_comma
+            || modifiers.list.range.start != declaration_range.start
+            || modifiers.list.range.end.get() > name_start
+            || modifier_node.kind != SyntaxKind::ExportKeyword
+            || !matches!(modifier_node.data, NodeData::Token(_))
+            || modifier_node.flags.0 != 0
+            || modifier_node.parent != Some(declaration.node)
+            || modifier_node.range.start != declaration_range.start
+            || modifier_node.range.end.get() > modifiers.list.range.end.get()
+            || !self.source_spelling_matches(modifier, "export")
+        {
+            return Err(self.unsupported(
+                modifier,
+                modifier_node.kind,
+                SourceSyntaxRole::TypeAliasDeclaration,
+            ));
+        }
+        Ok(Some(modifier))
     }
 
     fn validate_function_modifiers(
@@ -8356,6 +8413,29 @@ mod tests {
     }
 
     #[test]
+    fn exported_type_aliases_check_idempotently() {
+        let source = parsed(concat!(
+            "export type Label = string; ",
+            "export type Model = { value: number }; ",
+            r#"export const label: Label = "ok";"#,
+        ));
+        let file = FileId::new(5_600);
+        let mut context = context_with_module_state(
+            &[(file, &source)],
+            CanonicalModuleState::External,
+            CanonicalCheckerOptions::default(),
+        );
+
+        context.check_source_file(file).unwrap();
+        let after_first = observable_state(&context, file);
+
+        assert!(context.diagnostics().is_empty());
+        assert!(is_type_checked(&context, file));
+        context.check_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), after_first);
+    }
+
+    #[test]
     fn export_near_misses_reject_the_whole_plan_without_writes() {
         let near_misses = [
             ("export { A };", SourceSyntaxRole::ExportClause),
@@ -8369,8 +8449,8 @@ mod tests {
                 SourceSyntaxRole::VariableStatement,
             ),
             (
-                "export type Alias = string;",
-                SourceSyntaxRole::TypeAliasDeclaration,
+                "export default interface Model {}",
+                SourceSyntaxRole::InterfaceDeclaration,
             ),
         ];
 
@@ -8406,6 +8486,10 @@ mod tests {
             (
                 r#"type A = A; export const value: string = "ok";"#,
                 SourceSyntaxRole::VariableModifier,
+            ),
+            (
+                "type A = A; export type Alias = string;",
+                SourceSyntaxRole::TypeAliasDeclaration,
             ),
         ];
 
