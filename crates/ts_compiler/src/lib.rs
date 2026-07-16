@@ -1,6 +1,7 @@
 //! Compiler Program and source-file graph foundations.
 
 use std::{
+    cmp::Ordering,
     collections::{BTreeMap, BTreeSet, HashSet},
     path::Path,
 };
@@ -156,6 +157,54 @@ pub struct ProgramDiagnostic {
     /// top-level diagnostic stream. Canonical conversion validates every
     /// located record against this Program before publishing the primary.
     pub related_information: Vec<ProgramDiagnostic>,
+}
+
+/// Pinned `ast.CompareDiagnostics` order adapted to the owned Program record.
+///
+/// `ProgramDiagnostic::message` is already the rendered ownership boundary, so
+/// it supplies the deterministic message-argument/chain tie-break after the
+/// exact path, location, and code keys. Related records retain the pinned
+/// longer-first ordering and recurse through the same comparator.
+fn compare_program_diagnostics(
+    left: &ProgramDiagnostic,
+    right: &ProgramDiagnostic,
+) -> Ordering {
+    left.file_name
+        .as_deref()
+        .unwrap_or("")
+        .cmp(right.file_name.as_deref().unwrap_or(""))
+        .then_with(|| compare_program_diagnostic_ranges(left.range, right.range))
+        .then_with(|| left.code.cmp(&right.code))
+        .then_with(|| left.message.cmp(&right.message))
+        .then_with(|| {
+            right
+                .related_information
+                .len()
+                .cmp(&left.related_information.len())
+        })
+        .then_with(|| {
+            left.related_information
+                .iter()
+                .zip(&right.related_information)
+                .map(|(left, right)| compare_program_diagnostics(left, right))
+                .find(|ordering| !ordering.is_eq())
+                .unwrap_or(Ordering::Equal)
+        })
+}
+
+fn compare_program_diagnostic_ranges(
+    left: Option<TextRange>,
+    right: Option<TextRange>,
+) -> Ordering {
+    match (left, right) {
+        (Some(left), Some(right)) => left
+            .start
+            .cmp(&right.start)
+            .then_with(|| left.end.cmp(&right.end)),
+        (None, Some(_)) => Ordering::Less,
+        (Some(_), None) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
 }
 
 /// A typed failure from the experimental canonical diagnostics pipeline.
@@ -1210,9 +1259,9 @@ impl Program {
     /// the duration of checking, and only owned diagnostics are committed after
     /// every eligible source succeeds. The legacy checker is never invoked and
     /// there is no fallback on an unsupported canonical boundary.
-    /// Diagnostics and their validated, owned related records retain canonical
-    /// issuance order in this first slice; Program-level sorting and
-    /// deduplication remain explicit follow-up work.
+    /// Diagnostics and their validated, owned related records are source-sorted
+    /// by the pinned Program comparator after canonical checking. Program-level
+    /// deduplication remains explicit follow-up work.
     /// Bundled default declarations participate in binding and global-type
     /// initialization but are not source-checked: they are immutable pinned
     /// compiler inputs, while declaration-file source checking is not installed.
@@ -1242,6 +1291,7 @@ impl Program {
             let diagnostics = program.check_program_canonical()?;
             program.diagnostics.extend(diagnostics);
         }
+        program.diagnostics.sort_by(compare_program_diagnostics);
         Ok(program)
     }
 
