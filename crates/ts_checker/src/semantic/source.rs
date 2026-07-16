@@ -65,8 +65,9 @@ use super::{
     },
     source_callables::{
         ContextualSourceCallableParameter, PreparedContextualSourceCallable, SourceCallableError,
-        SourceCallableFamily, SourceCallablePlan, StoredSourceCallableValidation,
-        plan_source_callable, publish_contextual_source_callable, validate_stored_source_callable,
+        SourceCallableFamily, SourceCallableParameterPlan, SourceCallablePlan,
+        StoredSourceCallableValidation, plan_source_callable, publish_contextual_source_callable,
+        validate_stored_source_callable,
     },
     source_calls::{
         SourceCallPlan, check_direct_source_call, emit_call_type_argument_grammar_diagnostics,
@@ -604,13 +605,21 @@ struct PlannedVariable {
 #[derive(Clone, Debug)]
 struct PlannedFunction {
     callable: SourceCallablePlan,
+    parameter_initializers: Vec<PlannedParameterInitializer>,
     body: PlannedFunctionBody,
 }
 
 #[derive(Clone, Debug)]
 struct PlannedArrow {
     source: SourceArrowPlan,
+    parameter_initializers: Vec<PlannedParameterInitializer>,
     body: PlannedArrowBody,
+}
+
+#[derive(Clone, Debug)]
+struct PlannedParameterInitializer {
+    parameter: SourceCallableParameterPlan,
+    expression: PlannedExpression,
 }
 
 #[derive(Clone, Debug)]
@@ -1004,9 +1013,13 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                             statement,
                         )),
                     )?;
-                    let body = self.plan_function_body(&callable)?;
+                    let (parameter_initializers, body) = self.plan_function_body(&callable)?;
                     let index = functions.len();
-                    functions.push(PlannedFunction { callable, body });
+                    functions.push(PlannedFunction {
+                        callable,
+                        parameter_initializers,
+                        body,
+                    });
                     statements.push(PlannedStatement::Function(index));
                 }
                 SyntaxKind::VariableStatement => {
@@ -1748,27 +1761,75 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
     fn plan_function_body(
         &mut self,
         callable: &SourceCallablePlan,
-    ) -> Result<PlannedFunctionBody, SourceCheckError> {
-        for parameter in &callable.parameters {
-            if !self.prior_variables.insert(parameter.symbol)
-                || !self.readable_variables.insert(parameter.symbol)
-            {
-                return Err(SourceCheckError::Function(
-                    SourceFunctionInvariant::Callable(parameter.declaration),
-                ));
-            }
-        }
+    ) -> Result<(Vec<PlannedParameterInitializer>, PlannedFunctionBody), SourceCheckError> {
+        let parameter_initializers = self.plan_parameter_initializers_and_enter_scope(callable)?;
         let result = self.plan_function_body_contents(callable);
-        for parameter in &callable.parameters {
-            if !self.prior_variables.remove(&parameter.symbol)
-                || !self.readable_variables.remove(&parameter.symbol)
-            {
-                return Err(SourceCheckError::Function(
-                    SourceFunctionInvariant::Callable(parameter.declaration),
+        self.leave_callable_parameter_scope(callable)?;
+        Ok((parameter_initializers, result?))
+    }
+
+    fn plan_parameter_initializers_and_enter_scope(
+        &mut self,
+        callable: &SourceCallablePlan,
+    ) -> Result<Vec<PlannedParameterInitializer>, SourceCheckError> {
+        let mut initializers = Vec::new();
+        for (entered, parameter) in callable.parameters.iter().enumerate() {
+            if let Some(initializer) = parameter.initializer {
+                self.primitive_binary_position_roots.insert(initializer);
+                let expression = match self.plan_expression(initializer) {
+                    Ok(expression) => expression,
+                    Err(error) => {
+                        self.leave_callable_parameter_prefix_scope(callable, entered)?;
+                        return Err(error);
+                    }
+                };
+                initializers.push(PlannedParameterInitializer {
+                    parameter: *parameter,
+                    expression,
+                });
+            }
+            let inserted_prior = self.prior_variables.insert(parameter.symbol);
+            let inserted_readable = self.readable_variables.insert(parameter.symbol);
+            if !inserted_prior || !inserted_readable {
+                if inserted_prior {
+                    self.prior_variables.remove(&parameter.symbol);
+                }
+                if inserted_readable {
+                    self.readable_variables.remove(&parameter.symbol);
+                }
+                self.leave_callable_parameter_prefix_scope(callable, entered)?;
+                return Err(callable_parameter_execution_error(
+                    callable,
+                    parameter.declaration,
                 ));
             }
         }
-        result
+        Ok(initializers)
+    }
+
+    fn leave_callable_parameter_scope(
+        &mut self,
+        callable: &SourceCallablePlan,
+    ) -> Result<(), SourceCheckError> {
+        self.leave_callable_parameter_prefix_scope(callable, callable.parameters.len())
+    }
+
+    fn leave_callable_parameter_prefix_scope(
+        &mut self,
+        callable: &SourceCallablePlan,
+        entered: usize,
+    ) -> Result<(), SourceCheckError> {
+        let mut invalid = None;
+        for parameter in callable.parameters.iter().take(entered) {
+            let removed_prior = self.prior_variables.remove(&parameter.symbol);
+            let removed_readable = self.readable_variables.remove(&parameter.symbol);
+            if (!removed_prior || !removed_readable) && invalid.is_none() {
+                invalid = Some(parameter.declaration);
+            }
+        }
+        invalid.map_or(Ok(()), |parameter| {
+            Err(callable_parameter_execution_error(callable, parameter))
+        })
     }
 
     fn plan_function_body_contents(
@@ -1851,21 +1912,16 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         &mut self,
         source: SourceArrowPlan,
     ) -> Result<PlannedArrow, SourceCheckError> {
-        for parameter in &source.callable.parameters {
-            if !self.prior_variables.insert(parameter.symbol)
-                || !self.readable_variables.insert(parameter.symbol)
-            {
-                return Err(SourceCheckError::Arrow(parameter.declaration));
-            }
-        }
+        let parameter_initializers =
+            self.plan_parameter_initializers_and_enter_scope(&source.callable)?;
         let body = match source.body {
             SourceArrowBodyPlan::EmptyBlock { block } => {
-                if self.function_empty_body_return_supported(source.callable.return_type)? {
-                    Ok(PlannedArrowBody::Empty)
-                } else {
-                    Err(SourceCheckError::Unsupported(
+                match self.function_empty_body_return_supported(source.callable.return_type) {
+                    Ok(true) => Ok(PlannedArrowBody::Empty),
+                    Ok(false) => Err(SourceCheckError::Unsupported(
                         UnsupportedSourceSyntax::Arrow(block),
-                    ))
+                    )),
+                    Err(error) => Err(error),
                 }
             }
             SourceArrowBodyPlan::ReturnExpression {
@@ -1885,15 +1941,10 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     expression,
                 }),
         };
-        for parameter in &source.callable.parameters {
-            if !self.prior_variables.remove(&parameter.symbol)
-                || !self.readable_variables.remove(&parameter.symbol)
-            {
-                return Err(SourceCheckError::Arrow(parameter.declaration));
-            }
-        }
+        self.leave_callable_parameter_scope(&source.callable)?;
         Ok(PlannedArrow {
             source,
+            parameter_initializers,
             body: body?,
         })
     }
@@ -4857,6 +4908,90 @@ fn source_type_is_assignable_to(
     }
 }
 
+fn callable_parameter_execution_error(
+    callable: &SourceCallablePlan,
+    parameter: NodeRef,
+) -> SourceCheckError {
+    match callable.family {
+        SourceCallableFamily::FunctionDeclaration => {
+            SourceCheckError::Function(SourceFunctionInvariant::Callable(parameter))
+        }
+        SourceCallableFamily::ArrowFunction => SourceCheckError::Arrow(parameter),
+    }
+}
+
+#[allow(clippy::too_many_arguments)] // Mirrors expression execution with an explicit flow scope.
+fn check_callable_parameter_initializers(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    source: SourceFileRef,
+    options: CanonicalCheckerOptions,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    outer_flow_types: &HashMap<SemanticSymbolId, TypeId>,
+    preflighted_type_import_value_uses: &HashMap<NodeRef, PreparedSourceTypeImportValueUse>,
+    deferred: &mut Vec<DeferredAssertion>,
+    callable: &SourceCallablePlan,
+    initializers: &[PlannedParameterInitializer],
+) -> Result<HashMap<SemanticSymbolId, TypeId>, SourceCheckError> {
+    let mut flow_types = outer_flow_types.clone();
+    let mut initializer_index = 0usize;
+    for parameter in &callable.parameters {
+        let body_type = store
+            .value_symbol_links(parameter.symbol)
+            .and_then(|links| links.resolved_type)
+            .ok_or(SourceCheckError::Variable(
+                VariableInvariant::MissingCurrentFlowType(parameter.symbol),
+            ))?;
+        if let Some(initializer) = parameter.initializer {
+            let planned = initializers.get(initializer_index).ok_or_else(|| {
+                callable_parameter_execution_error(callable, parameter.declaration)
+            })?;
+            if planned.parameter != *parameter || planned.expression.node != initializer {
+                return Err(callable_parameter_execution_error(
+                    callable,
+                    parameter.declaration,
+                ));
+            }
+            let assignment = check_planned_assignment(
+                store,
+                host,
+                global_types,
+                source,
+                options,
+                diagnostics,
+                &flow_types,
+                preflighted_type_import_value_uses,
+                deferred,
+                parameter.type_node,
+                &[],
+                &planned.expression,
+                parameter.declaration,
+                None,
+            )?;
+            if assignment.declared_type != body_type {
+                return Err(callable_parameter_execution_error(
+                    callable,
+                    parameter.declaration,
+                ));
+            }
+            initializer_index += 1;
+        }
+        if flow_types.insert(parameter.symbol, body_type).is_some() {
+            return Err(SourceCheckError::Variable(
+                VariableInvariant::DuplicateCurrentFlowType(parameter.symbol),
+            ));
+        }
+    }
+    if initializer_index != initializers.len() {
+        return Err(callable_parameter_execution_error(
+            callable,
+            callable.declaration,
+        ));
+    }
+    Ok(flow_types)
+}
+
 fn current_flow_type_after_assignment(
     store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -5948,23 +6083,19 @@ pub(super) fn check_source_file(
                 let function = functions.get(index).ok_or(SourceCheckError::Function(
                     SourceFunctionInvariant::InvalidStatementIndex(index),
                 ))?;
-                let mut body_flow_types = current_flow_types.clone();
-                for parameter in &function.callable.parameters {
-                    let parameter_type = store
-                        .value_symbol_links(parameter.symbol)
-                        .and_then(|links| links.resolved_type)
-                        .ok_or(SourceCheckError::Variable(
-                            VariableInvariant::MissingCurrentFlowType(parameter.symbol),
-                        ))?;
-                    if body_flow_types
-                        .insert(parameter.symbol, parameter_type)
-                        .is_some()
-                    {
-                        return Err(SourceCheckError::Variable(
-                            VariableInvariant::DuplicateCurrentFlowType(parameter.symbol),
-                        ));
-                    }
-                }
+                let body_flow_types = check_callable_parameter_initializers(
+                    store,
+                    host,
+                    global_types,
+                    source,
+                    options,
+                    diagnostics,
+                    &current_flow_types,
+                    &preflighted_type_import_value_uses,
+                    &mut deferred,
+                    &function.callable,
+                    &function.parameter_initializers,
+                )?;
                 match &function.body {
                     PlannedFunctionBody::Empty => {}
                     PlannedFunctionBody::Return {
@@ -6193,23 +6324,19 @@ pub(super) fn check_source_file(
         captured_flow_types.insert(symbol, declared_type);
     }
     for arrow in &arrows {
-        let mut body_flow_types = captured_flow_types.clone();
-        for parameter in &arrow.source.callable.parameters {
-            let parameter_type = store
-                .value_symbol_links(parameter.symbol)
-                .and_then(|links| links.resolved_type)
-                .ok_or(SourceCheckError::Variable(
-                    VariableInvariant::MissingCurrentFlowType(parameter.symbol),
-                ))?;
-            if body_flow_types
-                .insert(parameter.symbol, parameter_type)
-                .is_some()
-            {
-                return Err(SourceCheckError::Variable(
-                    VariableInvariant::DuplicateCurrentFlowType(parameter.symbol),
-                ));
-            }
-        }
+        let body_flow_types = check_callable_parameter_initializers(
+            store,
+            host,
+            global_types,
+            source,
+            options,
+            diagnostics,
+            &captured_flow_types,
+            &preflighted_type_import_value_uses,
+            &mut deferred,
+            &arrow.source.callable,
+            &arrow.parameter_initializers,
+        )?;
         match &arrow.body {
             PlannedArrowBody::Empty => {}
             PlannedArrowBody::Return {
