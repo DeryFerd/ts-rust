@@ -1261,13 +1261,13 @@ fn validate_reserved_index_member(
     Ok(())
 }
 
-fn validate_reserved_callable_symbol<'a>(
-    store: &'a CanonicalTypeMapperStore,
+fn validate_reserved_callable_symbol(
+    store: &CanonicalTypeMapperStore,
     type_id: TypeId,
     owner: Option<SemanticSymbolId>,
     name: InternalSymbolName,
     symbol: SemanticSymbolId,
-) -> Result<&'a ts_binder::semantic::Symbol, TypeDisplayUnavailable> {
+) -> Result<&ts_binder::semantic::Symbol, TypeDisplayUnavailable> {
     let record = store
         .symbol(symbol)
         .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
