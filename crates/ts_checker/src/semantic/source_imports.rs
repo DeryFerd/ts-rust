@@ -136,7 +136,7 @@ enum PlannedSourceImportValueTarget {
         declaration: NodeRef,
         type_node: NodeRef,
     },
-    AnnotatedFunction(SourceCallablePlan),
+    AnnotatedFunction(Box<SourceCallablePlan>),
 }
 
 /// One fully preflighted value-link payload for the source checker's combined
@@ -1681,6 +1681,7 @@ fn plan_direct_import_value_target(
             target,
             expected_name,
         )
+        .map(Box::new)
         .map(PlannedSourceImportValueTarget::AnnotatedFunction);
     }
     Err(unsupported(SourceImportUnsupported::TargetSymbol {

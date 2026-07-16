@@ -2314,8 +2314,8 @@ pub(super) fn publish_source_callable_parameter_types(
         assert!(
             matches!(
                 state,
-                Ok(SourceCallableState::AwaitingInferredReturn { .. })
-                    | Ok(SourceCallableState::Resolved { .. })
+                Ok(SourceCallableState::AwaitingInferredReturn { .. }
+                    | SourceCallableState::Resolved { .. })
             ),
             "prevalidated source callable batch must publish resolved caches"
         );
