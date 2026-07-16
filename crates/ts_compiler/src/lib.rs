@@ -2758,6 +2758,7 @@ impl Program {
             strict_bind_call_apply: self.options.strict_bind_call_apply,
             strict_builtin_iterator_return: self.options.strict_builtin_iterator_return,
             strict_function_types: self.options.strict_function_types,
+            no_implicit_any: self.options.no_implicit_any,
             no_error_truncation: false,
             name_resolution: (&self.options).into(),
         };
