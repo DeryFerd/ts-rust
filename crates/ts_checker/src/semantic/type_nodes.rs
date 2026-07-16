@@ -1069,14 +1069,18 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         } else {
             false
         };
-        let child_result = planned.elements().iter().try_for_each(|element| {
-            self.plan_type_node_in_context(element.type_node(), None, false)
-        });
+        let child_result = if planned.requires_element_resolution() {
+            planned.elements().iter().try_for_each(|element| {
+                self.plan_type_node_in_context(element.type_node(), None, false)
+            })
+        } else {
+            Ok(())
+        };
         if pushed_alias {
             assert_eq!(self.active_tuple_aliases.pop(), alias_owner);
         }
         child_result?;
-        if planned.cached_type().is_some() {
+        if planned.cached_type().is_some() && planned.requires_element_resolution() {
             let mut base_types = Vec::new();
             base_types
                 .try_reserve(planned.elements().len())
@@ -5510,9 +5514,22 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         let tuple_plan = plan.tuples.get(&tuple).cloned().ok_or_else(|| {
             type_node_unavailable(TypeNodeUnavailable::MissingPlannedTupleType(node))
         })?;
-        if let Some(cached) = tuple_plan.cached_type() {
+        if let Some(cached) = tuple_plan.cached_type().or_else(|| {
+            self.store
+                .type_node_links(tuple)
+                .and_then(|links| links.resolved_type)
+        }) {
             self.publish_tuple_type_node_links(&tuple_plan, cached)?;
             return Ok(cached);
+        }
+
+        if let tuple_type_nodes::TupleTypeNodeDestination::Array {
+            fallback: Some(fallback),
+            ..
+        } = tuple_plan.destination()
+        {
+            self.publish_tuple_type_node_links(&tuple_plan, *fallback)?;
+            return Ok(*fallback);
         }
 
         let bootstrap = self
@@ -5536,9 +5553,12 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             };
             element_types.push(type_);
         }
-        let infos = tuple_plan.element_infos().map_err(tuple_type_node_error)?;
-        let mut request =
-            CanonicalTupleTypeRequest::new(&element_types, &infos, tuple_plan.readonly());
+        let mut request = CanonicalTupleTypeRequest::new(
+            &element_types,
+            tuple_plan.element_infos(),
+            tuple_plan.readonly(),
+        )
+        .with_creation_flags(ObjectFlags::FROM_TYPE_NODE);
         if let Some(targets) = self
             .global_types
             .as_ref()
@@ -16056,6 +16076,128 @@ mod tests {
         assert_eq!(
             only_array.element_type,
             fixture.store.intrinsic_bootstrap().unwrap().number_type
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn sole_rest_tuple_uses_exact_global_fallback_without_resolving_its_element() {
+        let mut fixture = global_array_fixture("let skipped: readonly [...(() => string)[]];");
+        let mut global_types = initialize_fixture_global_types(&mut fixture);
+        let skipped = variable_type_node(&fixture, "skipped");
+        let NodeData::TypeOperatorNode(operator) =
+            &fixture.parsed.arena.get(skipped.node).unwrap().data
+        else {
+            panic!("expected readonly tuple operator")
+        };
+        let tuple = NodeRef::new(skipped.arena, skipped.file, operator.type_);
+        let NodeData::TupleTypeNode(tuple_data) =
+            &fixture.parsed.arena.get(tuple.node).unwrap().data
+        else {
+            panic!("expected tuple")
+        };
+        let rest = NodeRef::new(tuple.arena, tuple.file, tuple_data.elements.nodes[0]);
+        let NodeData::RestTypeNode(rest_data) = &fixture.parsed.arena.get(rest.node).unwrap().data
+        else {
+            panic!("expected rest element")
+        };
+        let array = NodeRef::new(rest.arena, rest.file, rest_data.type_);
+        let NodeData::ArrayTypeNode(array_data) =
+            &fixture.parsed.arena.get(array.node).unwrap().data
+        else {
+            panic!("expected rest array")
+        };
+        let element = NodeRef::new(array.arena, array.file, array_data.element_type);
+        let (empty_generic, empty_object) = {
+            let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+            (bootstrap.empty_generic_type, bootstrap.empty_object_type)
+        };
+        global_types.readonly_array_type = empty_generic;
+
+        let before = store_state(&fixture.store);
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        assert_eq!(
+            query_global_node(&mut fixture, &global_types, skipped, &mut diagnostics),
+            Ok(empty_object),
+        );
+        assert_eq!(fixture.store.type_len(), before.0);
+        assert_eq!(fixture.store.type_node_links(element), None);
+        for node in [skipped, tuple] {
+            assert_eq!(
+                fixture
+                    .store
+                    .type_node_links(node)
+                    .and_then(|links| links.resolved_type),
+                Some(empty_object),
+            );
+        }
+        assert_eq!(
+            query_global_node(&mut fixture, &global_types, skipped, &mut diagnostics),
+            Ok(empty_object),
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn readonly_and_mutable_sole_rest_tuples_share_an_aliased_array_target() {
+        let mut fixture =
+            global_array_fixture("let frozen: readonly [...number[]]; let mutable: [...number[]];");
+        let mut global_types = initialize_fixture_global_types(&mut fixture);
+        global_types.readonly_array_type = global_types.array_type;
+        let frozen = variable_type_node(&fixture, "frozen");
+        let mutable = variable_type_node(&fixture, "mutable");
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        let frozen_type =
+            query_global_node(&mut fixture, &global_types, frozen, &mut diagnostics).unwrap();
+        let mutable_type =
+            query_global_node(&mut fixture, &global_types, mutable, &mut diagnostics).unwrap();
+        assert_eq!(frozen_type, mutable_type);
+        assert_eq!(
+            query_global_node(&mut fixture, &global_types, frozen, &mut diagnostics),
+            Ok(frozen_type),
+        );
+        let TypeData::TypeReference(reference) =
+            fixture.store.type_payload(frozen_type).unwrap().data()
+        else {
+            panic!("sole rest tuple must collapse to an array reference")
+        };
+        assert_eq!(reference.object.target, Some(global_types.array_type));
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn readonly_tuple_repairs_a_tuple_only_warm_cache() {
+        let mut fixture =
+            fixture("let established: readonly [string]; let repair: readonly [string];");
+        let established = variable_type_node(&fixture, "established");
+        let repair = variable_type_node(&fixture, "repair");
+        let NodeData::TypeOperatorNode(operator) =
+            &fixture.parsed.arena.get(repair.node).unwrap().data
+        else {
+            panic!("expected readonly tuple operator")
+        };
+        let tuple = NodeRef::new(repair.arena, repair.file, operator.type_);
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let established_type = query_node(&mut fixture, established, &mut diagnostics).unwrap();
+        assert!(fixture.store.set_type_node_links(
+            tuple,
+            TypeNodeLinks {
+                resolved_type: Some(established_type),
+                ..TypeNodeLinks::default()
+            },
+        ));
+
+        assert_eq!(
+            query_node(&mut fixture, repair, &mut diagnostics),
+            Ok(established_type),
+        );
+        assert_eq!(
+            fixture
+                .store
+                .type_node_links(repair)
+                .and_then(|links| links.resolved_type),
+            Some(established_type),
         );
         assert!(diagnostics.is_empty());
     }

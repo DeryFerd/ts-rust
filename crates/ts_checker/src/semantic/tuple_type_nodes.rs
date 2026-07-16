@@ -14,10 +14,13 @@ use super::{
     CanonicalTypeMapperStore, DeclaredTypeHost, TypeId,
     array_types::CanonicalArrayTargets,
     declared::{DeclaredTypeError, preflight_node},
+    global_types::{
+        preflight_generic_global_type_target, validate_generic_global_type_instantiation,
+    },
     signatures::{ElementFlags, TupleElementInfo},
     store::CanonicalTupleTargetKey,
     type_records::{TypeData, TypeRecord},
-    types::TypeFlags,
+    types::{ObjectFlags, TypeFlags},
 };
 
 /// One tuple element after wrappers have been validated and stripped.
@@ -43,9 +46,24 @@ pub(super) struct TupleTypeNodePlan {
     tuple: NodeRef,
     readonly_operator: Option<NodeRef>,
     elements: Vec<PlannedTupleElement>,
+    element_infos: Vec<TupleElementInfo>,
+    destination: TupleTypeNodeDestination,
     readonly: bool,
     cached_type: Option<TypeId>,
     cached_element_types: Vec<TypeId>,
+}
+
+/// Exact canonical destination selected before any element dependency runs.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum TupleTypeNodeDestination {
+    Tuple {
+        key: CanonicalTupleTargetKey,
+        existing_target: Option<TypeId>,
+    },
+    Array {
+        target: TypeId,
+        fallback: Option<TypeId>,
+    },
 }
 
 impl TupleTypeNodePlan {
@@ -65,17 +83,28 @@ impl TupleTypeNodePlan {
         self.readonly
     }
 
+    pub(super) const fn destination(&self) -> &TupleTypeNodeDestination {
+        &self.destination
+    }
+
     pub(super) const fn cached_type(&self) -> Option<TypeId> {
         self.cached_type
     }
 
-    pub(super) fn element_infos(&self) -> Result<Vec<TupleElementInfo>, TupleTypeNodeError> {
-        let mut infos = Vec::new();
-        infos
-            .try_reserve(self.elements.len())
-            .map_err(|_| TupleTypeNodeError::Capacity(self.tuple))?;
-        infos.extend(self.elements.iter().map(|element| element.info));
-        Ok(infos)
+    pub(super) fn element_infos(&self) -> &[TupleElementInfo] {
+        &self.element_infos
+    }
+
+    /// A malformed/missing generic global returns its canonical fallback
+    /// before the sole rest element is consulted upstream.
+    pub(super) fn requires_element_resolution(&self) -> bool {
+        !matches!(
+            &self.destination,
+            TupleTypeNodeDestination::Array {
+                fallback: Some(_),
+                ..
+            }
+        )
     }
 
     pub(super) fn optional_element_count(&self) -> usize {
@@ -216,19 +245,46 @@ pub(super) fn plan_tuple_type_node(
         .try_reserve(elements.len())
         .map_err(|_| TupleTypeNodeError::Capacity(tuple))?;
     infos.extend(elements.iter().map(|element| element.info));
-    validate_existing_target(store, tuple, &infos, readonly)?;
-    let (cached_type, cached_element_types) = validate_warm_cache(
-        store,
-        tuple,
-        readonly_operator,
-        &infos,
-        readonly,
-        array_targets,
-    )?;
+    let destination = if infos.len() == 1 && infos[0].flags() == ElementFlags::REST {
+        let Some(targets) = array_targets else {
+            return Err(TupleTypeNodeError::AuthoritativeArrayTargetsRequired(tuple));
+        };
+        let target = if readonly {
+            targets.readonly_array_type()
+        } else {
+            targets.array_type()
+        };
+        let fallback = preflight_generic_global_type_target(store, target).map_err(|_| {
+            TupleTypeNodeError::InvalidCachedType {
+                node: tuple,
+                type_: target,
+            }
+        })?;
+        TupleTypeNodeDestination::Array { target, fallback }
+    } else {
+        let mut key_infos = Vec::new();
+        key_infos
+            .try_reserve(infos.len())
+            .map_err(|_| TupleTypeNodeError::Capacity(tuple))?;
+        key_infos.extend_from_slice(&infos);
+        let key = CanonicalTupleTargetKey {
+            element_infos: key_infos,
+            readonly,
+        };
+        let existing_target = validate_existing_target(store, tuple, &key)?;
+        TupleTypeNodeDestination::Tuple {
+            key,
+            existing_target,
+        }
+    };
+    let (cached_type, cached_element_types) =
+        validate_warm_cache(store, tuple, readonly_operator, &infos, &destination)?;
     Ok(TupleTypeNodePlan {
         tuple,
         readonly_operator,
         elements,
+        element_infos: infos,
+        destination,
         readonly,
         cached_type,
         cached_element_types,
@@ -378,20 +434,10 @@ fn direct_child(
 fn validate_existing_target(
     store: &CanonicalTypeMapperStore,
     node: NodeRef,
-    infos: &[TupleElementInfo],
-    readonly: bool,
-) -> Result<(), TupleTypeNodeError> {
-    let mut element_infos = Vec::new();
-    element_infos
-        .try_reserve(infos.len())
-        .map_err(|_| TupleTypeNodeError::Capacity(node))?;
-    element_infos.extend_from_slice(infos);
-    let key = CanonicalTupleTargetKey {
-        element_infos,
-        readonly,
-    };
-    let Some(provenance) = store.canonical_tuple_target(&key) else {
-        return Ok(());
+    key: &CanonicalTupleTargetKey,
+) -> Result<Option<TypeId>, TupleTypeNodeError> {
+    let Some(provenance) = store.canonical_tuple_target(key) else {
+        return Ok(None);
     };
     let shape = store
         .canonical_tuple_shape(provenance.target)
@@ -403,13 +449,14 @@ fn validate_existing_target(
             node,
             type_: provenance.target,
         })?;
-    if shape.element_infos() != infos || shape.is_readonly() != readonly {
+    if shape.element_infos() != key.element_infos.as_slice() || shape.is_readonly() != key.readonly
+    {
         return Err(TupleTypeNodeError::InvalidCachedType {
             node,
             type_: provenance.target,
         });
     }
-    Ok(())
+    Ok(Some(provenance.target))
 }
 
 fn validate_warm_cache(
@@ -417,8 +464,7 @@ fn validate_warm_cache(
     tuple: NodeRef,
     readonly_operator: Option<NodeRef>,
     infos: &[TupleElementInfo],
-    readonly: bool,
-    array_targets: Option<CanonicalArrayTargets>,
+    destination: &TupleTypeNodeDestination,
 ) -> Result<(Option<TypeId>, Vec<TypeId>), TupleTypeNodeError> {
     let tuple_cached = store
         .type_node_links(tuple)
@@ -447,23 +493,42 @@ fn validate_warm_cache(
     let Some(cached) = cached else {
         return Ok((None, Vec::new()));
     };
-    if infos.len() == 1 && infos[0].flags() == ElementFlags::REST {
-        let Some(targets) = array_targets else {
-            return Err(TupleTypeNodeError::AuthoritativeArrayTargetsRequired(tuple));
+    if let TupleTypeNodeDestination::Array { target, fallback } = destination {
+        validate_generic_global_type_instantiation(store, *target, cached).map_err(|_| {
+            TupleTypeNodeError::InvalidCachedType {
+                node: tuple,
+                type_: cached,
+            }
+        })?;
+        if let Some(fallback) = fallback {
+            if cached != *fallback {
+                return Err(TupleTypeNodeError::InvalidCachedType {
+                    node: tuple,
+                    type_: cached,
+                });
+            }
+            return Ok((Some(cached), Vec::new()));
+        }
+        let Some(record) = store.type_payload(cached) else {
+            return Err(TupleTypeNodeError::InvalidCachedType {
+                node: tuple,
+                type_: cached,
+            });
         };
-        let reference = store
-            .canonical_array_reference_with_targets(targets, cached)
-            .map_err(|_| TupleTypeNodeError::InvalidCachedType {
+        let TypeData::TypeReference(reference) = record.data() else {
+            return Err(TupleTypeNodeError::InvalidCachedType {
                 node: tuple,
                 type_: cached,
-            })?
-            .ok_or(TupleTypeNodeError::InvalidCachedType {
+            });
+        };
+        let Some([element_type]) = reference.resolved_type_arguments.as_deref() else {
+            return Err(TupleTypeNodeError::InvalidCachedType {
                 node: tuple,
                 type_: cached,
-            })?;
-        if reference.readonly != readonly
-            || reference.array_literal
-            || reference.base_type != cached
+            });
+        };
+        if reference.object.target != Some(*target)
+            || record.object_flags().contains(ObjectFlags::ARRAY_LITERAL)
         {
             return Err(TupleTypeNodeError::InvalidCachedType {
                 node: tuple,
@@ -474,9 +539,16 @@ fn validate_warm_cache(
         element_types
             .try_reserve(1)
             .map_err(|_| TupleTypeNodeError::Capacity(tuple))?;
-        element_types.push(reference.element_type);
+        element_types.push(*element_type);
         return Ok((Some(cached), element_types));
     }
+    let TupleTypeNodeDestination::Tuple {
+        key,
+        existing_target,
+    } = destination
+    else {
+        unreachable!("array destinations return above")
+    };
     let shape = store
         .canonical_tuple_shape(cached)
         .map_err(|_| TupleTypeNodeError::InvalidCachedType {
@@ -487,7 +559,10 @@ fn validate_warm_cache(
             node: tuple,
             type_: cached,
         })?;
-    if shape.element_infos() != infos || shape.is_readonly() != readonly {
+    if shape.element_infos() != infos
+        || shape.is_readonly() != key.readonly
+        || existing_target.is_some_and(|target| target != shape.target())
+    {
         return Err(TupleTypeNodeError::InvalidCachedType {
             node: tuple,
             type_: cached,
@@ -510,6 +585,16 @@ pub(super) fn validate_warm_tuple_elements(
 ) -> Result<(), TupleTypeNodeError> {
     if plan.cached_type.is_none() {
         return Ok(());
+    }
+    if !plan.requires_element_resolution() {
+        return if base_types.is_empty() && plan.cached_element_types.is_empty() {
+            Ok(())
+        } else {
+            Err(TupleTypeNodeError::InvalidCachedType {
+                node: plan.tuple,
+                type_: plan.cached_type.expect("warm plan has a cache"),
+            })
+        };
     }
     if base_types.len() != plan.elements.len()
         || plan.cached_element_types.len() != plan.elements.len()
