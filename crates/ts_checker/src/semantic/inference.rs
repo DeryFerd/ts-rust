@@ -3,8 +3,10 @@
 //! This is the first exact branch of pinned `inferTypes` used by generic call
 //! resolution. When the target is the inference context's type parameter,
 //! upstream records the source type itself as a covariant candidate. The
-//! bounded Rust branch accepts only primitive, literal, unique-symbol, and
-//! anonymous primitive-union candidates. It preserves candidates that do not
+//! bounded Rust branch accepts primitive, literal, unique-symbol, anonymous
+//! primitive-union, and exact resolved nongeneric declared-property-object
+//! candidates. Declared objects are admitted only as the root candidate, not
+//! recursively inside a union. The branch preserves candidates that do not
 //! require widening, including fresh literals. Widening sentinels remain a
 //! typed boundary until the exact final `getWidenedType` step is available.
 
@@ -16,6 +18,9 @@ use super::{
     TypeId,
     bootstrap::LiteralTypeCacheError,
     mapper::CanonicalTypeMapperStore,
+    object_members::{
+        DeclaredPropertyObjectValidation, validate_resolved_declared_property_object,
+    },
     type_records::TypeData,
     types::{ObjectFlags, TypeFlags},
 };
@@ -28,6 +33,7 @@ pub(super) enum NakedTypeInferenceError {
         candidate: TypeId,
         error: LiteralTypeCacheError,
     },
+    MalformedDeclaredPropertyObject(TypeId),
     UnsupportedCandidate(TypeId),
     RequiresWidening(TypeId),
     AliasedUnion(TypeId),
@@ -60,9 +66,35 @@ pub(super) fn validate_inference_leaf(
     store: &CanonicalTypeMapperStore,
     candidate: TypeId,
 ) -> Result<(), NakedTypeInferenceError> {
+    validate_inference_candidate(store, candidate, true)
+}
+
+fn validate_inference_candidate(
+    store: &CanonicalTypeMapperStore,
+    candidate: TypeId,
+    allow_declared_object: bool,
+) -> Result<(), NakedTypeInferenceError> {
     let record = store
         .type_payload(candidate)
         .ok_or(NakedTypeInferenceError::InvalidCandidate(candidate))?;
+    if record
+        .object_flags()
+        .intersects(ObjectFlags::REQUIRES_WIDENING)
+    {
+        return Err(NakedTypeInferenceError::RequiresWidening(candidate));
+    }
+    match validate_resolved_declared_property_object(store, candidate) {
+        DeclaredPropertyObjectValidation::Valid(_) if allow_declared_object => return Ok(()),
+        DeclaredPropertyObjectValidation::Valid(_) => {
+            return Err(NakedTypeInferenceError::UnsupportedCandidate(candidate));
+        }
+        DeclaredPropertyObjectValidation::Malformed => {
+            return Err(NakedTypeInferenceError::MalformedDeclaredPropertyObject(
+                candidate,
+            ));
+        }
+        DeclaredPropertyObjectValidation::NotDeclared => {}
+    }
     match store.validate_union_constituent(candidate) {
         Ok(()) => {}
         Err(LiteralTypeCacheError::UnsupportedUnionConstituent(_)) => {
@@ -71,12 +103,6 @@ pub(super) fn validate_inference_leaf(
         Err(error) => {
             return Err(NakedTypeInferenceError::InvalidCanonicalCandidate { candidate, error });
         }
-    }
-    if record
-        .object_flags()
-        .intersects(ObjectFlags::REQUIRES_WIDENING)
-    {
-        return Err(NakedTypeInferenceError::RequiresWidening(candidate));
     }
     match record.data() {
         TypeData::Intrinsic(_) if intrinsic_leaf_flags(record.flags()) => Ok(()),
@@ -109,7 +135,7 @@ pub(super) fn validate_inference_leaf(
                         constituent: *constituent,
                     });
                 }
-                validate_inference_leaf(store, *constituent)?;
+                validate_inference_candidate(store, *constituent, false)?;
             }
             Ok(())
         }

@@ -2,10 +2,12 @@
 //!
 //! The admitted signature is exactly `<T>(value: T): T`: one stored call
 //! signature, one naked unconstrained/default-free type parameter, one required
-//! parameter, and a naked return. Calls may infer `T` from one leaf argument or
-//! supply one explicit leaf type argument. Overloads, missing/extra value or
-//! type arguments, constraints, defaults, contextual/structured inference,
-//! spreads, `this`, and rest signatures remain typed boundaries.
+//! parameter, and a naked return. Calls may infer `T` from one admitted scalar,
+//! primitive-union, or resolved declared-property-object argument, or supply
+//! one explicit argument from the same domain. Overloads, missing/extra value
+//! or type arguments, constraints, defaults, contextual inference, broader
+//! structured types, spreads, `this`, and rest signatures remain typed
+//! boundaries.
 
 #![allow(dead_code)] // Installed ahead of the source-call dispatch consumer.
 
@@ -448,6 +450,7 @@ fn map_inference_leaf_error(
         error,
         NakedTypeInferenceError::InvalidCandidate(_)
             | NakedTypeInferenceError::InvalidCanonicalCandidate { .. }
+            | NakedTypeInferenceError::MalformedDeclaredPropertyObject(_)
     ) {
         return IdentityGenericCallError::Inference(error);
     }

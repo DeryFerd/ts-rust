@@ -9,7 +9,10 @@ use ts_parser::parse_source_file;
 #[test]
 fn identity_generic_calls_infer_and_apply_explicit_type_arguments() {
     let parsed = parse_source_file(concat!(
+        "type User = { id: number }; ",
         "function identity<T>(value: T): T { return value; } ",
+        "const user: User = { id: 1 }; ",
+        "const copied: User = identity(user); ",
         "const inferred: 'x' = identity('x'); ",
         "const explicit: string = identity<string>('x'); ",
         "const bad = identity<string>(1);",
@@ -62,8 +65,8 @@ fn identity_generic_calls_infer_and_apply_explicit_type_arguments() {
         })
         .collect::<Vec<_>>();
     calls.sort_by_key(|(start, _)| *start);
-    let [(_, inferred), (_, explicit), (_, bad)] = calls.as_slice() else {
-        panic!("expected three generic calls")
+    let [(_, structured), (_, inferred), (_, explicit), (_, bad)] = calls.as_slice() else {
+        panic!("expected four generic calls")
     };
     let store = context.store();
     let string = store.intrinsic_bootstrap().unwrap().string_type;
@@ -88,10 +91,16 @@ fn identity_generic_calls_infer_and_apply_explicit_type_arguments() {
         .signature_links(*inferred)
         .and_then(|links| links.resolved_signature.signature())
         .unwrap();
+    let structured_signature = store
+        .signature_links(*structured)
+        .and_then(|links| links.resolved_signature.signature())
+        .unwrap();
     let explicit_signature = store
         .signature_links(*explicit)
         .and_then(|links| links.resolved_signature.signature())
         .unwrap();
+    assert_ne!(structured_signature, inferred_signature);
+    assert_ne!(structured_signature, explicit_signature);
     assert_ne!(inferred_signature, explicit_signature);
     assert_eq!(
         store
