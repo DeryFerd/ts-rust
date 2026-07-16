@@ -25,9 +25,13 @@ use super::{
     CanonicalCheckerDiagnostic, CanonicalCheckerDiagnostics, CanonicalCheckerOptions,
     CanonicalGlobalTypes, CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHost,
     DerivedTypeError, RelationUnavailable, SourceFileLinks, SourceFileRef, SymbolNodeLinks,
-    TypeDisplayUnavailable, TypeId, ValueSymbolLinks, VariableInvariant, VariableUnsupported,
+    TypeDisplayUnavailable, TypeId, TypeNodeLinks, ValueSymbolLinks, VariableInvariant,
+    VariableUnsupported,
     array_types::CanonicalArrayTargets,
     bootstrap::{LiteralTypeCacheError, UnionReduction},
+    callables::{
+        StoredSingleCallableValidation, ValidatedSingleCallable, validate_stored_single_callable,
+    },
     contextual::{
         LiteralTreatment, PreparedExpression, prepare_expression_context_with_global_types,
         prepare_expression_without_context_with_global_types,
@@ -36,8 +40,17 @@ use super::{
         CanonicalTypeFormatFlags,
         get_type_names_for_assignability_error_with_host_global_types_and_flags,
     },
-    source_arrows::{SourceArrowBodyPlan, SourceArrowError, SourceArrowPlan, plan_source_arrow},
-    source_callables::{SourceCallableError, SourceCallablePlan, plan_source_callable},
+    source_arrows::{
+        ResolvedSourceContextualArrowPlan, SourceArrowBodyPlan, SourceArrowError, SourceArrowPlan,
+        SourceContextualArrowError, SourceContextualArrowPlan, SourceContextualParameterOrigin,
+        SourceContextualSignatureShape, plan_contextual_source_arrow, plan_source_arrow,
+        resolve_contextual_arrow_parameter_origins,
+    },
+    source_callables::{
+        ContextualSourceCallableParameter, PreparedContextualSourceCallable, SourceCallableError,
+        SourceCallableFamily, SourceCallablePlan, StoredSourceCallableValidation,
+        plan_source_callable, publish_contextual_source_callable, validate_stored_source_callable,
+    },
     source_functions::{
         PlannedFunctionRead, SourceFunctionInvariant, SourceFunctionPlanError,
         SourceFunctionUnsupported, plan_function_identifier_read, plan_top_level_function,
@@ -414,6 +427,11 @@ struct PlannedArrow {
 }
 
 #[derive(Clone, Debug)]
+struct PlannedContextualArrow {
+    source: SourceContextualArrowPlan,
+}
+
+#[derive(Clone, Debug)]
 enum PlannedArrowBody {
     Empty,
     Return {
@@ -454,6 +472,7 @@ enum PlannedStatement {
     ExternalModuleMarker,
     Function(usize),
     Arrow(usize),
+    ContextualArrow(usize),
     Variables(Vec<PlannedVariable>),
     Assignment(PlannedAssignment),
 }
@@ -463,6 +482,7 @@ struct SourceCheckPlan {
     statements: Vec<PlannedStatement>,
     functions: Vec<PlannedFunction>,
     arrows: Vec<PlannedArrow>,
+    contextual_arrows: Vec<PlannedContextualArrow>,
     identifier_reads: Vec<(NodeRef, SemanticSymbolId)>,
     strings: Vec<String>,
     numbers: Vec<Number>,
@@ -471,6 +491,7 @@ struct SourceCheckPlan {
 
 enum PlannedVariableStatement {
     Arrow(Box<SourceArrowPlan>),
+    ContextualArrow(Box<SourceContextualArrowPlan>),
     Variables(Vec<PlannedVariable>),
 }
 
@@ -589,6 +610,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         let mut statements = Vec::with_capacity(source_statements.len());
         let mut functions = Vec::with_capacity(preplanned_functions.len());
         let mut arrows = Vec::new();
+        let mut contextual_arrows = Vec::new();
         for statement in source_statements {
             let statement = self.reference(statement);
             match self.node(statement)?.kind {
@@ -717,6 +739,11 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                             arrows.push(*arrow);
                             statements.push(PlannedStatement::Arrow(index));
                         }
+                        PlannedVariableStatement::ContextualArrow(arrow) => {
+                            let index = contextual_arrows.len();
+                            contextual_arrows.push(PlannedContextualArrow { source: *arrow });
+                            statements.push(PlannedStatement::ContextualArrow(index));
+                        }
                         PlannedVariableStatement::Variables(variables) => {
                             statements.push(PlannedStatement::Variables(variables));
                         }
@@ -766,6 +793,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             statements,
             functions,
             arrows,
+            contextual_arrows,
             identifier_reads: self.identifier_reads,
             strings: self.strings,
             numbers: self.numbers,
@@ -838,6 +866,24 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             ),
             SourceArrowError::DeclaredType(error) => SourceCheckError::DeclaredType(error),
             SourceArrowError::LiteralCache(error) => error.into(),
+        }
+    }
+
+    fn contextual_arrow_plan_error(error: SourceContextualArrowError) -> SourceCheckError {
+        let node = error.node();
+        match error {
+            SourceContextualArrowError::Unsupported(_) => {
+                SourceCheckError::Unsupported(UnsupportedSourceSyntax::Arrow(
+                    node.expect("contextual arrow unsupported errors retain their syntax node"),
+                ))
+            }
+            SourceContextualArrowError::Invariant(_) => SourceCheckError::Arrow(
+                node.expect("contextual arrow invariant errors retain their syntax node"),
+            ),
+            SourceContextualArrowError::DeclaredType(error) => {
+                SourceCheckError::DeclaredType(error)
+            }
+            SourceContextualArrowError::LiteralCache(error) => error.into(),
         }
     }
 
@@ -1358,16 +1404,32 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     SourceSyntaxRole::VariableInitializer,
                 ));
             };
-            let arrow = plan_source_arrow(store, host, declaration, self.array_targets)
-                .map_err(Self::arrow_plan_error)?;
-            if !self.prior_variables.insert(arrow.variable_symbol)
-                || !self.readable_variables.insert(arrow.variable_symbol)
+            let contextual = variable.type_.is_some();
+            let (variable_symbol, planned) = if contextual {
+                let arrow =
+                    plan_contextual_source_arrow(store, host, declaration, self.array_targets)
+                        .map_err(Self::contextual_arrow_plan_error)?;
+                preflight_contextual_source_publication(store, &arrow, None)?;
+                (
+                    arrow.variable_symbol,
+                    PlannedVariableStatement::ContextualArrow(Box::new(arrow)),
+                )
+            } else {
+                let arrow = plan_source_arrow(store, host, declaration, self.array_targets)
+                    .map_err(Self::arrow_plan_error)?;
+                (
+                    arrow.variable_symbol,
+                    PlannedVariableStatement::Arrow(Box::new(arrow)),
+                )
+            };
+            if !self.prior_variables.insert(variable_symbol)
+                || !self.readable_variables.insert(variable_symbol)
             {
                 return Err(SourceCheckError::Variable(
-                    VariableInvariant::InvalidSymbolShape(arrow.variable_symbol),
+                    VariableInvariant::InvalidSymbolShape(variable_symbol),
                 ));
             }
-            return Ok(PlannedVariableStatement::Arrow(Box::new(arrow)));
+            return Ok(planned);
         }
 
         let mut variables = Vec::with_capacity(declarations.len());
@@ -2234,17 +2296,16 @@ fn execute_expression_types(
                 SourceLiteralCacheError::BootstrapUninitialized,
             )),
         (PlannedExpressionKind::Identifier(read), PreparedExpression::Identifier(treatment)) => {
-            let raw =
-                *current_flow_types
-                    .get(&read.value_symbol)
-                    .ok_or(match read.kind {
-                        PlannedIdentifierReadKind::Variable => SourceCheckError::Variable(
-                            VariableInvariant::MissingCurrentFlowType(read.value_symbol),
-                        ),
-                        PlannedIdentifierReadKind::Function => SourceCheckError::Function(
-                            SourceFunctionInvariant::MissingCallableType(read.value_symbol),
-                        ),
-                    })?;
+            let raw = *current_flow_types
+                .get(&read.value_symbol)
+                .ok_or(match read.kind {
+                    PlannedIdentifierReadKind::Variable => SourceCheckError::Variable(
+                        VariableInvariant::MissingCurrentFlowType(read.value_symbol),
+                    ),
+                    PlannedIdentifierReadKind::Function => SourceCheckError::Function(
+                        SourceFunctionInvariant::MissingCallableType(read.value_symbol),
+                    ),
+                })?;
             let result = identifier_expression_type(store, raw, *treatment)?;
             Ok(CheckedExpressionTypes::leaf(raw, result))
         }
@@ -3472,6 +3533,303 @@ fn materialize_checked_source_callable(
     Ok(type_)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn resolve_contextual_callable_target(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    arrow: &SourceContextualArrowPlan,
+) -> Result<(TypeId, ValidatedSingleCallable), SourceCheckError> {
+    let mut target_diagnostics = CanonicalCheckerDiagnostics::default();
+    let target = CanonicalTypeQuery::new_with_global_types(
+        store,
+        host,
+        global_types,
+        options,
+        &mut target_diagnostics,
+    )?
+    .get_type_from_type_node(arrow.contextual_type.type_node);
+    merge_retry_diagnostics(diagnostics, target_diagnostics);
+    let target = target?;
+
+    let mut resolved_return = false;
+    loop {
+        match validate_stored_single_callable(store, target) {
+            StoredSingleCallableValidation::Valid { callable, .. }
+                if callable.return_type.is_some() =>
+            {
+                return Ok((target, callable));
+            }
+            StoredSingleCallableValidation::Valid { callable, .. } if !resolved_return => {
+                let mut return_diagnostics = CanonicalCheckerDiagnostics::default();
+                let result = CanonicalTypeQuery::new_with_global_types(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    &mut return_diagnostics,
+                )?
+                .get_return_type_of_signature(callable.signature);
+                merge_retry_diagnostics(diagnostics, return_diagnostics);
+                result?;
+                resolved_return = true;
+            }
+            StoredSingleCallableValidation::NotCallable
+            | StoredSingleCallableValidation::Pending { .. }
+            | StoredSingleCallableValidation::Malformed { .. }
+            | StoredSingleCallableValidation::Valid { .. } => {
+                return Err(SourceCheckError::Unsupported(
+                    UnsupportedSourceSyntax::Arrow(arrow.contextual_type.type_node),
+                ));
+            }
+        }
+    }
+}
+
+fn contextual_parameter_name(
+    host: &DeclaredTypeHost<'_>,
+    parameter: &super::source_arrows::ResolvedSourceContextualParameter,
+) -> Result<String, SourceCheckError> {
+    let node = host
+        .node(parameter.name)
+        .ok_or(SourceCheckError::Arrow(parameter.name))?;
+    let NodeData::Identifier(identifier) = &node.data else {
+        return Err(SourceCheckError::Arrow(parameter.name));
+    };
+    Ok(identifier.text.clone())
+}
+
+fn preflight_contextual_source_publication(
+    store: &CanonicalTypeMapperStore,
+    arrow: &SourceContextualArrowPlan,
+    resolved_target: Option<TypeId>,
+) -> Result<(), SourceCheckError> {
+    let existing_callable = store.source_callable_type_for_owner(arrow.owner_symbol);
+    let Some(existing_callable) = existing_callable else {
+        if store
+            .value_symbol_links(arrow.variable_symbol)
+            .is_some_and(|links| links != &ValueSymbolLinks::default())
+        {
+            return Err(SourceCheckError::Variable(
+                VariableInvariant::InvalidValueLinks(arrow.variable_symbol),
+            ));
+        }
+        if store
+            .value_symbol_links(arrow.owner_symbol)
+            .is_some_and(|links| links != &ValueSymbolLinks::default())
+            || store
+                .signature_links(arrow.declaration)
+                .is_some_and(|links| links != &super::links::SignatureLinks::default())
+            || arrow.parameters.iter().any(|parameter| {
+                store
+                    .value_symbol_links(parameter.symbol)
+                    .is_some_and(|links| links != &ValueSymbolLinks::default())
+            })
+            || store
+                .type_node_links(arrow.declaration)
+                .is_some_and(|links| links != &TypeNodeLinks::default())
+            || store
+                .source_callable_type_for_declaration(arrow.declaration)
+                .is_some()
+        {
+            return Err(SourceCheckError::Arrow(arrow.declaration));
+        }
+        return Ok(());
+    };
+
+    let Some(provenance) = store.source_callable_provenance(existing_callable) else {
+        return Err(SourceCheckError::Arrow(arrow.declaration));
+    };
+    let expected_parameter_symbols = arrow
+        .parameters
+        .iter()
+        .map(|parameter| parameter.symbol)
+        .collect::<Vec<_>>();
+    let contextual_target = provenance.contextual_target;
+    let expected_variable_links = contextual_target.map(|target| ValueSymbolLinks {
+        resolved_type: Some(target),
+        ..ValueSymbolLinks::default()
+    });
+    let variable_links_are_admissible = match store.value_symbol_links(arrow.variable_symbol) {
+        None => true,
+        Some(links) if links == &ValueSymbolLinks::default() => true,
+        Some(links) => expected_variable_links.as_ref() == Some(links),
+    };
+    let warm_source_is_exact = matches!(
+        validate_stored_source_callable(store, existing_callable),
+        StoredSourceCallableValidation::Valid(_)
+    ) && provenance.family == SourceCallableFamily::ArrowFunction
+        && provenance.declaration == arrow.declaration
+        && provenance.owner_symbol == arrow.owner_symbol
+        && provenance.owner_parent.is_none()
+        && provenance.export_local.is_none()
+        && provenance.contextual_variable == Some(arrow.variable_symbol)
+        && provenance.contextual_target.is_some()
+        && resolved_target.is_none_or(|target| provenance.contextual_target == Some(target))
+        && store
+            .signature(provenance.signature)
+            .is_some_and(|signature| {
+                signature.parameters() == expected_parameter_symbols
+                    && signature.flags() == arrow.flags
+                    && signature.min_argument_count() == arrow.min_argument_count
+            })
+        && store.source_callable_type_for_declaration(arrow.declaration) == Some(existing_callable)
+        && store.type_node_links(arrow.declaration)
+            == Some(&TypeNodeLinks {
+                resolved_type: Some(existing_callable),
+                ..TypeNodeLinks::default()
+            })
+        && variable_links_are_admissible;
+    if !warm_source_is_exact {
+        return Err(SourceCheckError::Arrow(arrow.declaration));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn materialize_contextual_source_arrow(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    arrow: &SourceContextualArrowPlan,
+) -> Result<(TypeId, TypeId), SourceCheckError> {
+    let (target, target_callable) =
+        resolve_contextual_callable_target(store, host, global_types, options, diagnostics, arrow)?;
+    preflight_contextual_source_publication(store, arrow, Some(target))?;
+    let target_signature = store
+        .signature(target_callable.signature)
+        .ok_or(SourceCheckError::Arrow(arrow.contextual_type.type_node))?;
+    let resolved_shape = SourceContextualSignatureShape {
+        call_signature_count: 1,
+        type_parameter_count: target_signature.type_parameters().len(),
+        parameter_count: target_callable.parameters.len(),
+        has_effective_rest: target_signature.has_rest_parameter(),
+    };
+    if resolved_shape != arrow.contextual_signature_shape {
+        return Err(SourceCheckError::Arrow(arrow.contextual_type.type_node));
+    }
+    let resolved = resolve_contextual_arrow_parameter_origins(arrow, resolved_shape)
+        .map_err(SourcePlanner::contextual_arrow_plan_error)?;
+    let implicit_any_nodes = resolved.implicit_any_diagnostic_nodes(options.no_implicit_any);
+    let ResolvedSourceContextualArrowPlan {
+        parameters,
+        flags,
+        min_argument_count,
+        ..
+    } = resolved;
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or(SourceCheckError::Arrow(arrow.declaration))?;
+    let any = bootstrap.any_type;
+    let undefined = bootstrap.undefined_type;
+    let void = bootstrap.void_type;
+    let strict_null_checks = bootstrap.options.strict_null_checks;
+    let mut prepared_parameters = Vec::with_capacity(parameters.len());
+    for parameter in &parameters {
+        let base = match parameter.origin {
+            SourceContextualParameterOrigin::ContextualPosition { index } => target_callable
+                .parameters
+                .get(index)
+                .copied()
+                .ok_or(SourceCheckError::Arrow(parameter.declaration))?,
+            SourceContextualParameterOrigin::ImplicitAny { .. } => any,
+            SourceContextualParameterOrigin::ContextualEmptyRestTail { .. } => store
+                .create_canonical_empty_tuple_type()
+                .map_err(|_| SourceCheckError::Arrow(parameter.declaration))?,
+        };
+        let type_ = if strict_null_checks && parameter.optional && base != any {
+            store.expression_union_type_with_global_types(
+                global_types,
+                &[base, undefined],
+                UnionReduction::Literal,
+            )?
+        } else {
+            base
+        };
+        prepared_parameters.push(ContextualSourceCallableParameter {
+            declaration: parameter.declaration,
+            symbol: parameter.symbol,
+            type_,
+        });
+    }
+    let callable = publish_contextual_source_callable(
+        store,
+        &PreparedContextualSourceCallable {
+            declaration: arrow.declaration,
+            owner_symbol: arrow.owner_symbol,
+            variable_symbol: arrow.variable_symbol,
+            contextual_target: target,
+            parameters: prepared_parameters,
+            flags,
+            min_argument_count,
+            return_type: void,
+        },
+    )
+    .map_err(SourcePlanner::callable_plan_error)?;
+    publish_expression_type(store, arrow.declaration, callable)?;
+
+    for node in implicit_any_nodes {
+        let parameter = parameters
+            .iter()
+            .find(|parameter| parameter.declaration == node)
+            .ok_or(SourceCheckError::Arrow(node))?;
+        let diagnostic = Diagnostic::with_arguments(
+            message_by_code(7006).ok_or(SourceCheckError::MissingDiagnostic(7006))?,
+            [
+                contextual_parameter_name(host, parameter)?,
+                "any".to_owned(),
+            ],
+        );
+        merge_retry_diagnostic(
+            diagnostics,
+            CanonicalCheckerDiagnostic {
+                node: Some(node),
+                diagnostic,
+                related_information: Vec::new(),
+            },
+        );
+    }
+
+    if !source_type_is_assignable_to(
+        store,
+        host,
+        global_types,
+        options,
+        diagnostics,
+        callable,
+        target,
+    )? {
+        let mut flags = CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT;
+        if options.no_error_truncation {
+            flags |= CanonicalTypeFormatFlags::NO_TRUNCATION;
+        }
+        let display = get_type_names_for_assignability_error_with_host_global_types_and_flags(
+            store,
+            host,
+            global_types,
+            callable,
+            target,
+            flags,
+        )?;
+        merge_retry_diagnostic(
+            diagnostics,
+            CanonicalCheckerDiagnostic {
+                node: Some(arrow.declaration),
+                diagnostic: Diagnostic::with_arguments(
+                    message_by_code(2322).ok_or(SourceCheckError::MissingDiagnostic(2322))?,
+                    [display.source, display.target],
+                ),
+                related_information: Vec::new(),
+            },
+        );
+    }
+    Ok((target, callable))
+}
+
 /// Checks one already-retained source into context-owned private staging.
 #[allow(clippy::too_many_arguments)] // Mirrors the context-owned source execution boundary.
 pub(super) fn check_source_file(
@@ -3500,6 +3858,7 @@ pub(super) fn check_source_file(
         statements,
         functions,
         arrows,
+        contextual_arrows,
         identifier_reads,
         strings,
         numbers,
@@ -3602,6 +3961,34 @@ pub(super) fn check_source_file(
                 )?;
                 if current_flow_types
                     .insert(arrow.source.variable_symbol, type_)
+                    .is_some()
+                {
+                    return Err(SourceCheckError::Variable(
+                        VariableInvariant::DuplicateCurrentFlowType(arrow.source.variable_symbol),
+                    ));
+                }
+            }
+            PlannedStatement::ContextualArrow(index) => {
+                let arrow = contextual_arrows
+                    .get(index)
+                    .ok_or(SourceCheckError::Arrow(source.node_ref()))?;
+                let (target, _) = materialize_contextual_source_arrow(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    diagnostics,
+                    &arrow.source,
+                )?;
+                stage_value_type(
+                    store,
+                    &mut declared_types,
+                    &mut value_order,
+                    arrow.source.variable_symbol,
+                    target,
+                )?;
+                if current_flow_types
+                    .insert(arrow.source.variable_symbol, target)
                     .is_some()
                 {
                     return Err(SourceCheckError::Variable(
@@ -9672,6 +10059,406 @@ mod tests {
         assert_eq!(observable_state(&context, file), warm);
         assert_eq!(variable_value_type(&context, &source, file, "f"), callable);
         assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn contextual_optional_and_exhausted_rest_arrow_matches_the_pinned_oracle() {
+        let source = parsed("const f: () => void = (a?, ...b) => {};");
+        let file = FileId::new(315);
+        let mut context = context(
+            &[(file, &source)],
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    exact_optional_property_types: false,
+                },
+                no_implicit_any: true,
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+
+        context.check_source_file(file).unwrap();
+
+        let arrow = variable_initializer(&source, file, "f");
+        let NodeData::ArrowFunction(arrow_data) = &source.arena.get(arrow.node).unwrap().data
+        else {
+            panic!("expected arrow initializer")
+        };
+        let [a_id, b_id] = arrow_data.parameters.nodes.as_slice() else {
+            panic!("expected optional and rest parameters")
+        };
+        let a = NodeRef::new(source.arena.id(), file, *a_id);
+        let b = NodeRef::new(source.arena.id(), file, *b_id);
+        let (_, bound) = context.file(file).unwrap();
+        let owner = bound.symbol(arrow).unwrap();
+        let variable = variable_symbol(&context, &source, file, "f");
+        assert_ne!(owner, variable);
+
+        let target = variable_value_type(&context, &source, file, "f");
+        let callable = context
+            .store()
+            .source_callable_type_for_owner(owner)
+            .unwrap();
+        assert_ne!(target, callable);
+        assert_eq!(resolved_node_type(&context, arrow), callable);
+        assert_eq!(context.type_to_string(target).unwrap(), "() => void");
+        assert_eq!(
+            context.type_to_string(callable).unwrap(),
+            "(a?: any) => void"
+        );
+
+        let provenance = context
+            .store()
+            .source_callable_provenance(callable)
+            .unwrap();
+        assert_eq!(provenance.contextual_target, Some(target));
+        assert_eq!(provenance.contextual_variable, Some(variable));
+        let signature = context.store().signature(provenance.signature).unwrap();
+        assert_eq!(signature.min_argument_count(), 0);
+        assert!(signature.has_rest_parameter());
+        assert_eq!(
+            signature.resolved_return_type(),
+            Some(context.store().intrinsic_bootstrap().unwrap().void_type)
+        );
+        let [a_symbol, b_symbol] = signature.parameters() else {
+            panic!("expected retained optional and rest parameter symbols")
+        };
+        assert_eq!(bound.symbol(a), Some(*a_symbol));
+        assert_eq!(bound.symbol(b), Some(*b_symbol));
+        assert_eq!(
+            context
+                .store()
+                .value_symbol_links(*a_symbol)
+                .and_then(|links| links.resolved_type),
+            Some(context.store().intrinsic_bootstrap().unwrap().any_type)
+        );
+        let empty_tuple = context
+            .store()
+            .value_symbol_links(*b_symbol)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        assert_eq!(context.type_to_string(empty_tuple).unwrap(), "[]");
+        assert_eq!(
+            context
+                .store()
+                .validate_canonical_empty_tuple_type(empty_tuple),
+            Ok(())
+        );
+
+        let [diagnostic] = context.diagnostics().as_slice() else {
+            panic!("expected only TS7006 for the non-contextual optional parameter")
+        };
+        assert_eq!(diagnostic.node, Some(a));
+        assert_eq!(diagnostic.diagnostic.code(), 7006);
+        assert_eq!(
+            diagnostic.diagnostic.render().unwrap(),
+            "Parameter 'a' implicitly has an 'any' type."
+        );
+        assert!(is_type_checked(&context, file));
+
+        let warm = observable_state(&context, file);
+        mark_source_unchecked(&mut context, file);
+        context.check_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+        assert_eq!(context.diagnostics().len(), 1);
+        assert_eq!(variable_value_type(&context, &source, file, "f"), target);
+        assert_eq!(resolved_node_type(&context, arrow), callable);
+    }
+
+    #[test]
+    fn contextual_parameter_origins_control_implicit_any_diagnostics() {
+        for (file, text, no_implicit_any, expected_diagnostics) in [
+            (
+                FileId::new(316),
+                "const f: () => void = (a?) => {};",
+                false,
+                0,
+            ),
+            (
+                FileId::new(317),
+                "const f: (a?: any) => void = (a) => {};",
+                true,
+                0,
+            ),
+            (
+                FileId::new(318),
+                "const f: (a: number) => void = (a) => {};",
+                true,
+                0,
+            ),
+        ] {
+            let source = parsed(text);
+            let mut context = context(
+                &[(file, &source)],
+                CanonicalCheckerOptions {
+                    intrinsic: IntrinsicBootstrapOptions {
+                        strict_null_checks: true,
+                        exact_optional_property_types: false,
+                    },
+                    no_implicit_any,
+                    ..CanonicalCheckerOptions::default()
+                },
+            );
+
+            context.check_source_file(file).unwrap();
+
+            assert_eq!(context.diagnostics().len(), expected_diagnostics);
+            let arrow = variable_initializer(&source, file, "f");
+            let (_, bound) = context.file(file).unwrap();
+            let owner = bound.symbol(arrow).unwrap();
+            let callable = context
+                .store()
+                .source_callable_type_for_owner(owner)
+                .unwrap();
+            assert!(context.type_to_string(callable).unwrap().contains('a'));
+            assert!(is_type_checked(&context, file));
+        }
+    }
+
+    #[test]
+    fn contextual_optional_array_target_replays_from_warm_caches() {
+        let library = parsed("interface Array<T> {}");
+        let source = parsed("const f: (a?: string[]) => void = (a) => {};");
+        let library_file = FileId::new(330);
+        let file = FileId::new(325);
+        let mut context = context(
+            &[(library_file, &library), (file, &source)],
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    exact_optional_property_types: false,
+                },
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let warm = observable_state(&context, file);
+
+        mark_source_unchecked(&mut context, file);
+        context.check_source_file(file).unwrap();
+
+        assert_eq!(observable_state(&context, file), warm);
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn contextual_arrow_shape_failures_preflight_the_whole_file_atomically() {
+        for (file, text) in [
+            (
+                FileId::new(319),
+                concat!(
+                    "const ready: () => void = () => {}; ",
+                    "const bad: () => void = (required) => {};",
+                ),
+            ),
+            (
+                FileId::new(320),
+                concat!(
+                    "const ready: () => void = () => {}; ",
+                    "const bad: () => undefined = () => {};",
+                ),
+            ),
+            (
+                FileId::new(323),
+                concat!(
+                    "const ready: () => void = () => {}; ",
+                    "const bad: (this: unknown) => void = () => {};",
+                ),
+            ),
+            (
+                FileId::new(324),
+                concat!(
+                    "const ready: () => void = () => {}; ",
+                    "const bad: (value) => void = () => {};",
+                ),
+            ),
+        ] {
+            let source = parsed(text);
+            let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+            let ready = variable_initializer(&source, file, "ready");
+            let (_, bound) = context.file(file).unwrap();
+            let ready_owner = bound.symbol(ready).unwrap();
+            let before = observable_state(&context, file);
+
+            assert!(matches!(
+                context.check_source_file(file),
+                Err(SourceCheckError::Unsupported(
+                    UnsupportedSourceSyntax::Arrow(_)
+                ))
+            ));
+            assert_eq!(observable_state(&context, file), before);
+            assert!(
+                context
+                    .store()
+                    .source_callable_type_for_owner(ready_owner)
+                    .is_none()
+            );
+            assert!(!is_type_checked(&context, file));
+        }
+    }
+
+    #[test]
+    fn contextual_arrow_sparse_cache_poison_precedes_source_publication() {
+        let expression_poison = parsed("const f: () => void = (a?) => {};");
+        let expression_file = FileId::new(321);
+        let mut expression_context = context(
+            &[(expression_file, &expression_poison)],
+            CanonicalCheckerOptions::default(),
+        );
+        let arrow = variable_initializer(&expression_poison, expression_file, "f");
+        let (_, bound) = expression_context.file(expression_file).unwrap();
+        let owner = bound.symbol(arrow).unwrap();
+        let number = expression_context
+            .store()
+            .intrinsic_bootstrap()
+            .unwrap()
+            .number_type;
+        assert!(expression_context.store_mut_for_test().set_type_node_links(
+            arrow,
+            TypeNodeLinks {
+                outer_type_parameters: Some(vec![number]),
+                ..TypeNodeLinks::default()
+            },
+        ));
+
+        assert_eq!(
+            expression_context.check_source_file(expression_file),
+            Err(SourceCheckError::Arrow(arrow)),
+        );
+        assert!(
+            expression_context
+                .store()
+                .source_callable_type_for_owner(owner)
+                .is_none()
+        );
+        assert!(
+            expression_context
+                .store()
+                .value_symbol_links(owner)
+                .is_none()
+        );
+        assert!(expression_context.store().signature_links(arrow).is_none());
+        assert!(!is_type_checked(&expression_context, expression_file));
+
+        let variable_poison = parsed("const f: () => void = (a?) => {};");
+        let variable_file = FileId::new(322);
+        let mut variable_context = context(
+            &[(variable_file, &variable_poison)],
+            CanonicalCheckerOptions::default(),
+        );
+        let arrow = variable_initializer(&variable_poison, variable_file, "f");
+        let variable = variable_symbol(&variable_context, &variable_poison, variable_file, "f");
+        let (_, bound) = variable_context.file(variable_file).unwrap();
+        let owner = bound.symbol(arrow).unwrap();
+        let number = variable_context
+            .store()
+            .intrinsic_bootstrap()
+            .unwrap()
+            .number_type;
+        assert!(
+            variable_context
+                .store_mut_for_test()
+                .set_value_symbol_links(
+                    variable,
+                    ValueSymbolLinks {
+                        resolved_type: Some(number),
+                        ..ValueSymbolLinks::default()
+                    },
+                )
+        );
+
+        assert!(matches!(
+            variable_context.check_source_file(variable_file),
+            Err(SourceCheckError::Variable(_))
+        ));
+        assert!(
+            variable_context
+                .store()
+                .source_callable_type_for_owner(owner)
+                .is_none()
+        );
+        assert!(variable_context.store().value_symbol_links(owner).is_none());
+        assert!(variable_context.store().signature_links(arrow).is_none());
+        assert!(!is_type_checked(&variable_context, variable_file));
+    }
+
+    #[test]
+    fn later_contextual_arrow_cache_poison_preflights_before_earlier_publication() {
+        for (file, poison) in [
+            (FileId::new(326), 0_u8),
+            (FileId::new(327), 1_u8),
+            (FileId::new(328), 2_u8),
+            (FileId::new(329), 3_u8),
+        ] {
+            let source = parsed(concat!(
+                "const ready: () => void = () => {}; ",
+                "const bad: () => void = (value?) => {};",
+            ));
+            let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+            let ready = variable_initializer(&source, file, "ready");
+            let bad = variable_initializer(&source, file, "bad");
+            let NodeData::ArrowFunction(bad_data) = &source.arena.get(bad.node).unwrap().data
+            else {
+                panic!("expected bad arrow")
+            };
+            let [parameter_id] = bad_data.parameters.nodes.as_slice() else {
+                panic!("expected one bad parameter")
+            };
+            let parameter = NodeRef::new(source.arena.id(), file, *parameter_id);
+            let (_, bound) = context.file(file).unwrap();
+            let ready_owner = bound.symbol(ready).unwrap();
+            let bad_owner = bound.symbol(bad).unwrap();
+            let bad_parameter = bound.symbol(parameter).unwrap();
+            let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+
+            match poison {
+                0 => assert!(context.store_mut_for_test().set_type_node_links(
+                    bad,
+                    TypeNodeLinks {
+                        outer_type_parameters: Some(vec![number]),
+                        ..TypeNodeLinks::default()
+                    },
+                )),
+                1 => assert!(context.store_mut_for_test().set_value_symbol_links(
+                    bad_owner,
+                    ValueSymbolLinks {
+                        resolved_type: Some(number),
+                        ..ValueSymbolLinks::default()
+                    },
+                )),
+                2 => assert!(context.store_mut_for_test().set_value_symbol_links(
+                    bad_parameter,
+                    ValueSymbolLinks {
+                        resolved_type: Some(number),
+                        ..ValueSymbolLinks::default()
+                    },
+                )),
+                3 => assert!(context.store_mut_for_test().set_signature_links(
+                    bad,
+                    crate::semantic::links::SignatureLinks {
+                        resolved_signature:
+                            crate::semantic::links::ResolvedSignatureState::Resolving,
+                        ..crate::semantic::links::SignatureLinks::default()
+                    },
+                )),
+                _ => unreachable!(),
+            }
+            let before = observable_state(&context, file);
+
+            assert!(context.check_source_file(file).is_err());
+
+            assert_eq!(observable_state(&context, file), before);
+            assert!(
+                context
+                    .store()
+                    .source_callable_type_for_owner(ready_owner)
+                    .is_none()
+            );
+            assert!(context.store().value_symbol_links(ready_owner).is_none());
+            assert!(!is_type_checked(&context, file));
+        }
     }
 
     #[test]

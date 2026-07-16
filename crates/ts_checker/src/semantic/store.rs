@@ -88,6 +88,23 @@ pub(super) struct SourceCallableProvenance {
     pub(super) owner_parent: Option<SemanticSymbolId>,
     pub(super) export_local: Option<SemanticSymbolId>,
     pub(super) signature: SignatureId,
+    /// The annotation that contextually typed an inferred source arrow.
+    ///
+    /// Annotated source callables retain `None` and instead own an exact
+    /// return-annotation edge. Contextual arrows retain both this target and
+    /// `contextual_variable` so warm validation can distinguish the target
+    /// identity from the arrow expression's independently inferred callable.
+    pub(super) contextual_target: Option<TypeId>,
+    pub(super) contextual_variable: Option<SemanticSymbolId>,
+}
+
+/// Branded identities owned by the one canonical mutable empty tuple graph.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct CanonicalEmptyTupleProvenance {
+    pub(super) type_: TypeId,
+    pub(super) this_type: TypeId,
+    pub(super) declared_members: SymbolTableId,
+    pub(super) length_symbol: SemanticSymbolId,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -170,7 +187,7 @@ pub struct SemanticStore<TypePayload, MapperPayload> {
     function_signature_return_annotations: HashMap<SignatureId, (NodeRef, bool)>,
     callable_signature_parameter_types: HashMap<SignatureId, Vec<TypeId>>,
     circular_return_signatures: HashMap<SignatureId, TypeId>,
-    canonical_empty_tuple_type: Option<TypeId>,
+    canonical_empty_tuple: Option<CanonicalEmptyTupleProvenance>,
     type_resolutions: TypeResolutionStack,
     relations: RelationCaches,
     pub(super) derived_types: DerivedTypeCaches,
@@ -232,7 +249,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             function_signature_return_annotations: HashMap::new(),
             callable_signature_parameter_types: HashMap::new(),
             circular_return_signatures: HashMap::new(),
-            canonical_empty_tuple_type: None,
+            canonical_empty_tuple: None,
             type_resolutions: TypeResolutionStack::new(id),
             relations: RelationCaches::default(),
             derived_types: DerivedTypeCaches::default(),
@@ -555,17 +572,35 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
     /// complete recursive graph has been initialized.
     #[must_use]
     pub(super) const fn canonical_empty_tuple_type_cache(&self) -> Option<TypeId> {
-        self.canonical_empty_tuple_type
+        match self.canonical_empty_tuple {
+            Some(provenance) => Some(provenance.type_),
+            None => None,
+        }
     }
 
-    pub(super) fn publish_canonical_empty_tuple_type(&mut self, type_: TypeId) -> bool {
+    pub(super) const fn canonical_empty_tuple_provenance(
+        &self,
+    ) -> Option<CanonicalEmptyTupleProvenance> {
+        self.canonical_empty_tuple
+    }
+
+    pub(super) fn publish_canonical_empty_tuple_type(
+        &mut self,
+        provenance: CanonicalEmptyTupleProvenance,
+    ) -> bool {
         if self.intrinsic_bootstrap.is_none()
-            || self.types.get(type_).is_none()
-            || self.canonical_empty_tuple_type.is_some()
+            || self.types.get(provenance.type_).is_none()
+            || self.types.get(provenance.this_type).is_none()
+            || self
+                .symbols
+                .symbol_table(provenance.declared_members)
+                .is_none()
+            || !self.symbols.contains_symbol(provenance.length_symbol)
+            || self.canonical_empty_tuple.is_some()
         {
             return false;
         }
-        self.canonical_empty_tuple_type = Some(type_);
+        self.canonical_empty_tuple = Some(provenance);
         true
     }
 
@@ -574,7 +609,16 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         &mut self,
         type_: Option<TypeId>,
     ) -> Option<TypeId> {
-        std::mem::replace(&mut self.canonical_empty_tuple_type, type_)
+        let previous = self.canonical_empty_tuple_type_cache();
+        self.canonical_empty_tuple = match (self.canonical_empty_tuple, type_) {
+            (_, None) => None,
+            (Some(mut provenance), Some(type_)) => {
+                provenance.type_ = type_;
+                Some(provenance)
+            }
+            (None, Some(_)) => return previous,
+        };
+        previous
     }
 
     pub(super) fn try_reserve_types(&mut self, additional: usize) -> bool {
@@ -625,8 +669,20 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         type_: TypeId,
         provenance: SourceCallableProvenance,
     ) -> bool {
+        let contextual_pair = match (provenance.contextual_target, provenance.contextual_variable) {
+            (None, None) => true,
+            (Some(target), Some(variable)) => {
+                provenance.family == SourceCallableFamily::ArrowFunction
+                    && target != type_
+                    && self.types.get(target).is_some()
+                    && self.symbols.contains_symbol(variable)
+                    && variable != provenance.owner_symbol
+            }
+            _ => false,
+        };
         if self.types.get(type_).is_none()
             || self.source_callable_provenance.contains_key(&type_)
+            || !contextual_pair
             || self.source_node_kind(provenance.declaration)
                 != Some(provenance.family.syntax_kind())
             || !self.symbols.contains_symbol(provenance.owner_symbol)

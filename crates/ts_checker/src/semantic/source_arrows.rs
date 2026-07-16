@@ -15,6 +15,7 @@ use super::{
     array_types::CanonicalArrayTargets,
     bootstrap::LiteralTypeCacheError,
     declared::preflight_node,
+    functions::{FunctionTypeError, plan_function_type},
     signatures::SignatureFlags,
     source_callables::{
         SourceCallableError, SourceCallableFamily, SourceCallableInvariant, SourceCallablePlan,
@@ -77,6 +78,7 @@ pub(super) struct SourceContextualArrowPlan {
     pub(super) variable_name: NodeRef,
     pub(super) variable_symbol: SemanticSymbolId,
     pub(super) contextual_type: SourceContextualTypeRequest,
+    pub(super) contextual_signature_shape: SourceContextualSignatureShape,
     pub(super) declaration: NodeRef,
     pub(super) owner_symbol: SemanticSymbolId,
     pub(super) parameters: Vec<SourceContextualParameterPlan>,
@@ -298,6 +300,7 @@ pub(super) enum SourceContextualArrowUnsupported {
     ContextualEffectiveRest(NodeRef),
     ContextualArity(NodeRef),
     ContextualNonEmptyRestTail(NodeRef),
+    ContextualTargetSyntax(NodeRef),
     Variable(VariableUnsupported),
 }
 
@@ -325,6 +328,7 @@ pub(super) enum SourceContextualArrowError {
     Unsupported(SourceContextualArrowUnsupported),
     Invariant(SourceContextualArrowInvariant),
     DeclaredType(DeclaredTypeError),
+    LiteralCache(LiteralTypeCacheError),
 }
 
 impl SourceContextualArrowError {
@@ -356,7 +360,8 @@ impl SourceContextualArrowError {
                 | SourceContextualArrowUnsupported::ContextualGenericSignature(node)
                 | SourceContextualArrowUnsupported::ContextualEffectiveRest(node)
                 | SourceContextualArrowUnsupported::ContextualArity(node)
-                | SourceContextualArrowUnsupported::ContextualNonEmptyRestTail(node) => Some(node),
+                | SourceContextualArrowUnsupported::ContextualNonEmptyRestTail(node)
+                | SourceContextualArrowUnsupported::ContextualTargetSyntax(node) => Some(node),
                 SourceContextualArrowUnsupported::Variable(_) => None,
             },
             Self::Invariant(reason) => match reason {
@@ -374,7 +379,7 @@ impl SourceContextualArrowError {
                 | SourceContextualArrowInvariant::Capacity(node) => Some(node),
                 SourceContextualArrowInvariant::Variable(_) => None,
             },
-            Self::DeclaredType(_) => None,
+            Self::DeclaredType(_) | Self::LiteralCache(_) => None,
         }
     }
 }
@@ -385,6 +390,52 @@ impl From<DeclaredTypeError> for SourceContextualArrowError {
     }
 }
 
+impl From<LiteralTypeCacheError> for SourceContextualArrowError {
+    fn from(error: LiteralTypeCacheError) -> Self {
+        Self::LiteralCache(error)
+    }
+}
+
+fn contextual_target_plan_error(
+    error: FunctionTypeError,
+    fallback: NodeRef,
+) -> SourceContextualArrowError {
+    let node = error.node().unwrap_or(fallback);
+    match error {
+        FunctionTypeError::Unsupported(_) => contextual_unsupported(
+            SourceContextualArrowUnsupported::ContextualTargetSyntax(node),
+        ),
+        FunctionTypeError::Invariant(_) => {
+            contextual_invariant(SourceContextualArrowInvariant::InvalidVariableType(node))
+        }
+        FunctionTypeError::DeclaredType(error) => SourceContextualArrowError::DeclaredType(error),
+        FunctionTypeError::LiteralCache(error) => SourceContextualArrowError::LiteralCache(error),
+    }
+}
+
+fn plan_contextual_target_syntax_shape(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    type_node: NodeRef,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<SourceContextualSignatureShape, SourceContextualArrowError> {
+    let plan = plan_function_type(store, host, type_node, None, false, array_targets)
+        .map_err(|error| contextual_target_plan_error(error, type_node))?;
+    let return_type = plan.return_type;
+    let return_record = preflight_node(store, host, return_type)?;
+    if return_record.kind != SyntaxKind::VoidKeyword {
+        return Err(contextual_unsupported(
+            SourceContextualArrowUnsupported::ContextualTargetSyntax(return_type),
+        ));
+    }
+    Ok(SourceContextualSignatureShape {
+        call_signature_count: 1,
+        type_parameter_count: 0,
+        parameter_count: plan.parameters.len(),
+        has_effective_rest: false,
+    })
+}
+
 /// Proves one direct context-sensitive arrow without resolving its annotation
 /// or mutating semantic state.
 #[allow(clippy::too_many_lines)] // One atomic syntax and binder provenance proof.
@@ -392,6 +443,7 @@ pub(super) fn plan_contextual_source_arrow(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     variable_declaration: NodeRef,
+    array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<SourceContextualArrowPlan, SourceContextualArrowError> {
     let declaration_record = preflight_node(store, host, variable_declaration)?;
     let NodeData::VariableDeclaration(declaration) = &declaration_record.data else {
@@ -557,6 +609,8 @@ pub(super) fn plan_contextual_source_arrow(
             SourceContextualArrowInvariant::InvalidVariableType(type_node),
         ));
     }
+    let contextual_signature_shape =
+        plan_contextual_target_syntax_shape(store, host, type_node, array_targets)?;
 
     let Some(initializer_id) = declaration.initializer else {
         return Err(contextual_unsupported(
@@ -915,7 +969,7 @@ pub(super) fn plan_contextual_source_arrow(
 
     let min_argument_count = i32::try_from(leading_required_parameter_count)
         .map_err(|_| contextual_invariant(SourceContextualArrowInvariant::Capacity(initializer)))?;
-    Ok(SourceContextualArrowPlan {
+    let plan = SourceContextualArrowPlan {
         variable_declaration,
         variable_name,
         variable_symbol,
@@ -923,6 +977,7 @@ pub(super) fn plan_contextual_source_arrow(
             type_node,
             requirement: SourceContextualSignatureRequirement::SingleNonGenericCallSignature,
         },
+        contextual_signature_shape,
         declaration: initializer,
         owner_symbol,
         parameters,
@@ -930,7 +985,9 @@ pub(super) fn plan_contextual_source_arrow(
         flags,
         min_argument_count,
         return_origin: SourceContextualReturnOrigin::InferredEmptyBody { block: body },
-    })
+    };
+    resolve_contextual_arrow_parameter_origins(&plan, contextual_signature_shape)?;
+    Ok(plan)
 }
 
 /// Applies pinned contextual-signature eligibility and records why each
@@ -1521,7 +1578,7 @@ mod tests {
             index: usize,
         ) -> Result<SourceContextualArrowPlan, SourceContextualArrowError> {
             let host = self.host();
-            plan_contextual_source_arrow(&self.store, &host, self.declarations()[index])
+            plan_contextual_source_arrow(&self.store, &host, self.declarations()[index], None)
         }
     }
 
@@ -1762,17 +1819,8 @@ mod tests {
         ));
 
         let required = Fixture::new("const f: () => void = (a) => {};");
-        let required_plan = required.contextual_plan(0).unwrap();
         assert!(matches!(
-            resolve_contextual_arrow_parameter_origins(
-                &required_plan,
-                SourceContextualSignatureShape {
-                    call_signature_count: 1,
-                    type_parameter_count: 0,
-                    parameter_count: 0,
-                    has_effective_rest: false,
-                }
-            ),
+            required.contextual_plan(0),
             Err(SourceContextualArrowError::Unsupported(
                 SourceContextualArrowUnsupported::ContextualArity(_)
             ))

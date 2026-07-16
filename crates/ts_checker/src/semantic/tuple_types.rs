@@ -16,6 +16,7 @@ use super::{
     declared::type_list_key,
     links::ValueSymbolLinks,
     signatures::ElementFlags,
+    store::CanonicalEmptyTupleProvenance,
     type_records::{
         ConstrainedTypeData, StructuredTypeData, TypeCacheState, TypeData, TypeParameterData,
     },
@@ -107,7 +108,14 @@ impl CanonicalTypeMapperStore {
             declared_members,
             type_list_key(&[]),
         ));
-        assert!(self.publish_canonical_empty_tuple_type(tuple));
+        assert!(
+            self.publish_canonical_empty_tuple_type(CanonicalEmptyTupleProvenance {
+                type_: tuple,
+                this_type,
+                declared_members,
+                length_symbol: length,
+            })
+        );
         debug_assert_eq!(self.validate_canonical_empty_tuple_type(tuple), Ok(()));
         Ok(tuple)
     }
@@ -122,7 +130,10 @@ impl CanonicalTypeMapperStore {
         type_: TypeId,
     ) -> Result<(), EmptyTupleTypeError> {
         let invalid = || EmptyTupleTypeError::InvalidCache(type_);
-        if self.canonical_empty_tuple_type_cache() != Some(type_) {
+        let Some(provenance) = self.canonical_empty_tuple_provenance() else {
+            return Err(invalid());
+        };
+        if provenance.type_ != type_ {
             return Err(invalid());
         }
         let zero_type = self
@@ -165,7 +176,7 @@ impl CanonicalTypeMapperStore {
         let Some([this_type]) = interface.all_type_parameters.as_deref() else {
             return Err(invalid());
         };
-        if interface.this_type != Some(*this_type) {
+        if interface.this_type != Some(*this_type) || provenance.this_type != *this_type {
             return Err(invalid());
         }
         let TypeCacheState::Allocated(instantiations) = &object.instantiations else {
@@ -196,9 +207,12 @@ impl CanonicalTypeMapperStore {
         }
 
         let declared_members = interface.declared_members.ok_or_else(invalid)?;
+        if declared_members != provenance.declared_members {
+            return Err(invalid());
+        }
         let members = self.symbol_table(declared_members).ok_or_else(invalid)?;
         let length = members.get_source(LENGTH).ok_or_else(invalid)?;
-        if members.len() != 1 {
+        if members.len() != 1 || length != provenance.length_symbol {
             return Err(invalid());
         }
         let length_symbol = self.symbol(length).ok_or_else(invalid)?;
@@ -285,6 +299,43 @@ mod tests {
             Err(EmptyTupleTypeError::BootstrapUninitialized),
         );
         assert_eq!(observable_state(&pristine), pristine_state);
+
+        let mut replaced = initialized();
+        let replaced_tuple = replaced.create_canonical_empty_tuple_type().unwrap();
+        let zero = replaced.intrinsic_bootstrap().unwrap().zero_type;
+        let replacement_members = replaced.alloc_symbol_table();
+        let replacement_length = replaced.alloc_transient_symbol(
+            SymbolFlags::PROPERTY,
+            EscapedName::source(LENGTH),
+            CheckFlags::NONE,
+        );
+        assert!(replaced.set_value_symbol_links(
+            replacement_length,
+            ValueSymbolLinks {
+                resolved_type: Some(zero),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        assert_eq!(
+            replaced.insert_symbol(
+                replacement_members,
+                EscapedName::source(LENGTH),
+                replacement_length,
+            ),
+            Some(None),
+        );
+        assert!(replaced.set_interface_declared_members(
+            replaced_tuple,
+            true,
+            Some(replacement_members),
+            None,
+            None,
+            None,
+        ));
+        assert_eq!(
+            replaced.validate_canonical_empty_tuple_type(replaced_tuple),
+            Err(EmptyTupleTypeError::InvalidCache(replaced_tuple)),
+        );
 
         let mut store = initialized();
         let tuple = store.create_canonical_empty_tuple_type().unwrap();

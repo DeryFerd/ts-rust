@@ -226,7 +226,7 @@ fn validated_single_callable(
     };
     let signature = *signature;
     let signature_record = store.signature(signature)?;
-    let parameters = signature_record
+    let mut parameters = signature_record
         .parameters()
         .iter()
         .map(|parameter| {
@@ -235,6 +235,13 @@ fn validated_single_callable(
                 .and_then(|links| links.resolved_type)
         })
         .collect::<Option<Vec<_>>>()?;
+    if signature_record.has_rest_parameter() {
+        let rest = parameters.last().copied()?;
+        if store.validate_canonical_empty_tuple_type(rest).is_err() {
+            return None;
+        }
+        parameters.pop();
+    }
     let min_argument_count = usize::try_from(signature_record.min_argument_count()).ok()?;
     Some(ValidatedSingleCallable {
         owner: type_,

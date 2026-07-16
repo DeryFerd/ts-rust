@@ -16,6 +16,7 @@ use super::{
     bootstrap::{LiteralTypeCacheError, PreparedTypeQueryTypes},
     callables::{ValidatedSingleCallParameterDisplay, ValidatedSingleCallSignatureDisplay},
     declared::preflight_node,
+    functions::{StoredFunctionTypeValidation, validate_stored_function_type},
     links::{
         DecoratorSignatureState, EffectsSignatureState, ResolvedSignatureState, SignatureLinks,
         ValueSymbolLinks,
@@ -176,6 +177,31 @@ pub(super) struct PendingSourceCallable {
 pub(super) struct PendingSourceCallableParameterTypes {
     pub(super) plan: SourceCallablePlan,
     pub(super) base_types: Vec<TypeId>,
+}
+
+/// One already-resolved parameter of a contextually typed source arrow.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct ContextualSourceCallableParameter {
+    pub(super) declaration: NodeRef,
+    pub(super) symbol: SemanticSymbolId,
+    pub(super) type_: TypeId,
+}
+
+/// Fully prepared semantic values for the bounded inferred contextual arrow.
+///
+/// Syntax and contextual-origin planning happen before this boundary. Every
+/// `TypeId` here is final, so publication never fabricates an annotation node
+/// or conflates the variable's contextual target with the arrow expression.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct PreparedContextualSourceCallable {
+    pub(super) declaration: NodeRef,
+    pub(super) owner_symbol: SemanticSymbolId,
+    pub(super) variable_symbol: SemanticSymbolId,
+    pub(super) contextual_target: TypeId,
+    pub(super) parameters: Vec<ContextualSourceCallableParameter>,
+    pub(super) flags: SignatureFlags,
+    pub(super) min_argument_count: i32,
+    pub(super) return_type: TypeId,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -757,6 +783,8 @@ pub(super) fn source_callable_state(
         owner_parent: plan.owner_parent,
         export_local: plan.export_local,
         signature,
+        contextual_target: None,
+        contextual_variable: None,
     };
     if record.flags() != TypeFlags::OBJECT
         || record.symbol() != Some(plan.owner_symbol)
@@ -898,6 +926,214 @@ pub(super) fn reserve_source_callable_capacities(
     Ok((cold, optional_parameter_unions))
 }
 
+/// Publishes or validates one fully prepared contextually typed arrow.
+///
+/// Unlike annotated source callables, this path has no synthetic type-node
+/// annotations to resolve lazily. The contextual target, final parameter
+/// value types, and inferred `void` return are all known before the first
+/// write, and the arrow expression receives an identity distinct from the
+/// variable's retained target type.
+pub(super) fn publish_contextual_source_callable(
+    store: &mut CanonicalTypeMapperStore,
+    prepared: &PreparedContextualSourceCallable,
+) -> Result<TypeId, SourceCallableError> {
+    if let Some(existing) = store.source_callable_type_for_owner(prepared.owner_symbol) {
+        let provenance = store.source_callable_provenance(existing);
+        let signature = provenance.and_then(|provenance| store.signature(provenance.signature));
+        let parameter_types = provenance
+            .and_then(|provenance| store.callable_signature_parameter_types(provenance.signature));
+        let expected_symbols = prepared
+            .parameters
+            .iter()
+            .map(|parameter| parameter.symbol)
+            .collect::<Vec<_>>();
+        let expected_types = prepared
+            .parameters
+            .iter()
+            .map(|parameter| parameter.type_)
+            .collect::<Vec<_>>();
+        if matches!(
+            validate_stored_source_callable(store, existing),
+            StoredSourceCallableValidation::Valid(_)
+        ) && provenance.is_some_and(|provenance| {
+            provenance.family == SourceCallableFamily::ArrowFunction
+                && provenance.declaration == prepared.declaration
+                && provenance.owner_symbol == prepared.owner_symbol
+                && provenance.owner_parent.is_none()
+                && provenance.export_local.is_none()
+                && provenance.contextual_target == Some(prepared.contextual_target)
+                && provenance.contextual_variable == Some(prepared.variable_symbol)
+        }) && signature.is_some_and(|signature| {
+            signature.flags() == prepared.flags
+                && signature.parameters() == expected_symbols
+                && signature.min_argument_count() == prepared.min_argument_count
+                && signature.resolved_return_type() == Some(prepared.return_type)
+        }) && parameter_types == Some(expected_types.as_slice())
+        {
+            return Ok(existing);
+        }
+        return Err(invariant(SourceCallableInvariant::InvalidTypeCache(
+            prepared.declaration,
+        )));
+    }
+
+    let parameter_count = prepared.parameters.len();
+    let minimum = usize::try_from(prepared.min_argument_count).ok();
+    let allowed_flags = SignatureFlags::HAS_REST_PARAMETER;
+    let owner = store.symbol(prepared.owner_symbol);
+    let owner_valid = owner.is_some_and(|owner| {
+        owner.flags() == SymbolFlags::FUNCTION
+            && owner.check_flags() == CheckFlags::NONE
+            && owner.name() == InternalSymbolName::Function.as_ref()
+            && owner.declarations() == Some(&[prepared.declaration])
+            && owner.value_declaration() == Some(prepared.declaration)
+            && owner.members().is_none()
+            && owner.exports().is_none()
+            && owner.parent().is_none()
+            && owner.export_symbol().is_none()
+            && store.get_merged_symbol(prepared.owner_symbol) == Some(prepared.owner_symbol)
+            && default_parameter_links(store, prepared.owner_symbol)
+    });
+    let parameters_valid = prepared
+        .parameters
+        .iter()
+        .enumerate()
+        .all(|(index, parameter)| {
+            !prepared.parameters[..index]
+                .iter()
+                .any(|previous| previous.symbol == parameter.symbol)
+                && parameter.symbol != prepared.owner_symbol
+                && store.type_payload(parameter.type_).is_some()
+                && store.symbol(parameter.symbol).is_some_and(|symbol| {
+                    symbol.flags() == SymbolFlags::FUNCTION_SCOPED_VARIABLE
+                        && symbol.check_flags() == CheckFlags::NONE
+                        && symbol.declarations() == Some(&[parameter.declaration])
+                        && symbol.value_declaration() == Some(parameter.declaration)
+                        && symbol.members().is_none()
+                        && symbol.exports().is_none()
+                        && symbol.parent().is_none()
+                        && symbol.export_symbol().is_none()
+                        && store.get_merged_symbol(parameter.symbol) == Some(parameter.symbol)
+                })
+                && default_parameter_links(store, parameter.symbol)
+        });
+    let signature_links_cold = store
+        .signature_links(prepared.declaration)
+        .is_none_or(|links| links == &SignatureLinks::default());
+    if !owner_valid
+        || !parameters_valid
+        || prepared.flags.bits() & !allowed_flags.bits() != 0
+        || minimum.is_none_or(|minimum| minimum > parameter_count)
+        || store.type_payload(prepared.contextual_target).is_none()
+        || store.type_payload(prepared.return_type).is_none()
+        || store
+            .source_callable_type_for_declaration(prepared.declaration)
+            .is_some()
+        || !signature_links_cold
+    {
+        return Err(invariant(SourceCallableInvariant::Publication(
+            prepared.declaration,
+        )));
+    }
+    let Some(bootstrap) = store.intrinsic_bootstrap() else {
+        return Err(invariant(SourceCallableInvariant::Publication(
+            prepared.declaration,
+        )));
+    };
+    if prepared.return_type != bootstrap.void_type
+        || !store.try_reserve_types(1)
+        || !store.try_reserve_signatures(1)
+        || !store.try_reserve_source_callable_provenance(1)
+        || !store.try_reserve_callable_signature_parameter_types(1)
+    {
+        return Err(invariant(SourceCallableInvariant::Capacity(
+            prepared.declaration,
+        )));
+    }
+
+    let type_ = store
+        .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(prepared.owner_symbol))
+        .ok_or_else(|| invariant(SourceCallableInvariant::Publication(prepared.declaration)))?;
+    let parameter_symbols = prepared
+        .parameters
+        .iter()
+        .map(|parameter| parameter.symbol)
+        .collect::<Vec<_>>();
+    let parameter_types = prepared
+        .parameters
+        .iter()
+        .map(|parameter| parameter.type_)
+        .collect::<Vec<_>>();
+    let signature = store
+        .alloc_signature(
+            prepared.flags,
+            Some(prepared.declaration),
+            Vec::new(),
+            None,
+            parameter_symbols,
+            Some(prepared.return_type),
+            None,
+            prepared.min_argument_count,
+        )
+        .ok_or_else(|| invariant(SourceCallableInvariant::Publication(prepared.declaration)))?;
+    assert!(store.set_source_callable_provenance(
+        type_,
+        SourceCallableProvenance {
+            family: SourceCallableFamily::ArrowFunction,
+            declaration: prepared.declaration,
+            owner_symbol: prepared.owner_symbol,
+            owner_parent: None,
+            export_local: None,
+            signature,
+            contextual_target: Some(prepared.contextual_target),
+            contextual_variable: Some(prepared.variable_symbol),
+        },
+    ));
+    assert!(store.set_value_symbol_links(
+        prepared.owner_symbol,
+        ValueSymbolLinks {
+            resolved_type: Some(type_),
+            ..ValueSymbolLinks::default()
+        },
+    ));
+    assert!(store.set_structured_type_members(
+        type_,
+        None,
+        None,
+        Some(vec![signature]),
+        None,
+        None,
+    ));
+    assert!(store.set_signature_links(
+        prepared.declaration,
+        SignatureLinks {
+            resolved_signature: ResolvedSignatureState::Resolved(signature),
+            ..SignatureLinks::default()
+        },
+    ));
+    assert!(
+        store.set_callable_signature_parameter_types_batch(vec![(signature, parameter_types,)])
+    );
+    for parameter in &prepared.parameters {
+        assert!(store.set_value_symbol_links(
+            parameter.symbol,
+            ValueSymbolLinks {
+                resolved_type: Some(parameter.type_),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+    }
+    if !matches!(
+        validate_stored_source_callable(store, type_),
+        StoredSourceCallableValidation::Valid(_)
+    ) {
+        return Err(invariant(SourceCallableInvariant::Publication(
+            prepared.declaration,
+        )));
+    }
+    Ok(type_)
+}
+
 /// Publishes the recursive owner cache and structured empty-member barrier.
 pub(super) fn begin_source_callable(
     store: &mut CanonicalTypeMapperStore,
@@ -938,6 +1174,8 @@ pub(super) fn begin_source_callable(
             owner_parent: plan.owner_parent,
             export_local: plan.export_local,
             signature,
+            contextual_target: None,
+            contextual_variable: None,
         },
     );
     assert!(
@@ -1288,6 +1526,59 @@ pub(super) fn source_callable_display_projection(
     let provenance = store
         .source_callable_provenance(type_)
         .ok_or(SourceCallableDisplayError::Malformed)?;
+    if provenance.contextual_target.is_some() {
+        if !matches!(
+            validate_stored_source_callable(store, type_),
+            StoredSourceCallableValidation::Valid(_)
+        ) {
+            return Err(SourceCallableDisplayError::Malformed);
+        }
+        let signature = store
+            .signature(provenance.signature)
+            .ok_or(SourceCallableDisplayError::Malformed)?;
+        let expected_types = store
+            .callable_signature_parameter_types(provenance.signature)
+            .ok_or(SourceCallableDisplayError::Malformed)?;
+        if expected_types.len() != signature.parameters().len() {
+            return Err(SourceCallableDisplayError::Malformed);
+        }
+        let mut parameters = Vec::with_capacity(signature.parameters().len());
+        for (parameter, value_type) in signature.parameters().iter().zip(expected_types) {
+            let declaration = store
+                .symbol(*parameter)
+                .and_then(ts_binder::semantic::Symbol::value_declaration)
+                .ok_or(SourceCallableDisplayError::Malformed)?;
+            let parameter_node = host
+                .node(declaration)
+                .ok_or(SourceCallableDisplayError::Malformed)?;
+            let NodeData::ParameterDeclaration(parameter_data) = &parameter_node.data else {
+                return Err(SourceCallableDisplayError::Malformed);
+            };
+            if parameter_data.dot_dot_dot_token.is_some() {
+                store
+                    .validate_canonical_empty_tuple_type(*value_type)
+                    .map_err(|_| SourceCallableDisplayError::Malformed)?;
+                continue;
+            }
+            let name = NodeRef::new(declaration.arena, declaration.file, parameter_data.name);
+            let name_node = host
+                .node(name)
+                .ok_or(SourceCallableDisplayError::Malformed)?;
+            let NodeData::Identifier(identifier) = &name_node.data else {
+                return Err(SourceCallableDisplayError::Malformed);
+            };
+            parameters.push(ValidatedSingleCallParameterDisplay {
+                name: identifier.text.clone(),
+                value_type: *value_type,
+                optional: parameter_data.question_token.is_some(),
+            });
+        }
+        return Ok(ValidatedSingleCallSignatureDisplay {
+            owner: type_,
+            parameters,
+            return_type: signature.resolved_return_type(),
+        });
+    }
     let plan = plan_source_callable(
         store,
         host,
@@ -1401,6 +1692,8 @@ pub(super) fn validate_stored_source_callable(
             owner_parent: provenance.owner_parent,
             export_local: provenance.export_local,
             signature: provenance.signature,
+            contextual_target: provenance.contextual_target,
+            contextual_variable: provenance.contextual_variable,
         })
         || store.source_callable_type_for_owner(owner_symbol) != Some(type_)
         || store.source_callable_type_for_signature(provenance.signature) != Some(type_)
@@ -1424,11 +1717,9 @@ pub(super) fn validate_stored_source_callable(
     let Some(signature_record) = store.signature(signature) else {
         return StoredSourceCallableValidation::Malformed;
     };
-    let Some((return_identity_node, return_null_literal_identity)) =
-        store.function_signature_return_annotation(signature)
-    else {
-        return StoredSourceCallableValidation::Malformed;
-    };
+    let contextual = provenance
+        .contextual_target
+        .zip(provenance.contextual_variable);
     let Some(TypeData::Object(object)) = store.type_payload(type_).map(TypeRecord::data) else {
         return StoredSourceCallableValidation::Malformed;
     };
@@ -1523,7 +1814,14 @@ pub(super) fn validate_stored_source_callable(
             )
         || store.get_merged_symbol(owner_symbol) != Some(owner_symbol)
         || store.value_symbol_links(owner_symbol) != Some(&owner_links)
-        || signature_record.flags().bits() & !SignatureFlags::HAS_LITERAL_TYPES.bits() != 0
+        || signature_record.flags().bits()
+            & !(if contextual.is_some() {
+                SignatureFlags::HAS_REST_PARAMETER
+            } else {
+                SignatureFlags::HAS_LITERAL_TYPES
+            })
+            .bits()
+            != 0
         || signature_record.min_argument_count() < 0
         || usize::try_from(signature_record.min_argument_count()).map_or(true, |minimum| {
             minimum > signature_record.parameters().len()
@@ -1541,6 +1839,7 @@ pub(super) fn validate_stored_source_callable(
         || default_parameter_count != 0
             && default_parameter_count != signature_record.parameters().len()
         || !parameters_unique
+        || contextual.is_some() && default_parameter_count != 0
         || object.structured.constrained != ConstrainedTypeData::default()
         || object.target.is_some()
         || object.mapper.is_some()
@@ -1585,6 +1884,52 @@ pub(super) fn validate_stored_source_callable(
     {
         return StoredSourceCallableValidation::Malformed;
     }
+    if let Some((target, variable)) = contextual {
+        let variable_valid = store.symbol(variable).is_some_and(|symbol| {
+            symbol.flags() == SymbolFlags::BLOCK_SCOPED_VARIABLE
+                && symbol.check_flags() == CheckFlags::NONE
+                && symbol.members().is_none()
+                && symbol.exports().is_none()
+                && symbol.parent().is_none()
+                && symbol.export_symbol().is_none()
+                && store.get_merged_symbol(variable) == Some(variable)
+        });
+        let return_type = signature_record.resolved_return_type();
+        let return_valid = store.intrinsic_bootstrap().is_some_and(|bootstrap| {
+            return_type == Some(bootstrap.void_type)
+                && store
+                    .function_signature_return_annotation(signature)
+                    .is_none()
+                && !store.signature_has_circular_return_type(signature)
+        });
+        let target_valid = target != type_
+            && matches!(
+                validate_stored_function_type(store, target),
+                StoredFunctionTypeValidation::Valid(_)
+            );
+        let rest_valid = if signature_record
+            .flags()
+            .contains(SignatureFlags::HAS_REST_PARAMETER)
+        {
+            expected_parameter_types
+                .and_then(|types| types.last())
+                .copied()
+                .is_some_and(|rest| store.validate_canonical_empty_tuple_type(rest).is_ok())
+        } else {
+            true
+        };
+        if !variable_valid || !return_valid || !target_valid || !rest_valid {
+            return StoredSourceCallableValidation::Malformed;
+        }
+        edges.push(target);
+        edges.push(return_type.expect("the contextual return was validated"));
+        return StoredSourceCallableValidation::Valid(edges);
+    }
+    let Some((return_identity_node, return_null_literal_identity)) =
+        store.function_signature_return_annotation(signature)
+    else {
+        return StoredSourceCallableValidation::Malformed;
+    };
     if let Some(return_type) = signature_record.resolved_return_type() {
         let annotation =
             cached_annotation_identity(store, return_identity_node, return_null_literal_identity);
