@@ -260,7 +260,8 @@ fn context_error_is_unsupported(error: &CanonicalCheckerContextError) -> bool {
         | CanonicalCheckerContextError::Bootstrap(_)
         | CanonicalCheckerContextError::ModuleResolutions(_)
         | CanonicalCheckerContextError::AliasTargetHost(_)
-        | CanonicalCheckerContextError::StrictBuiltinIteratorReturnClaim { .. } => false,
+        | CanonicalCheckerContextError::StrictBuiltinIteratorReturnClaim { .. }
+        | CanonicalCheckerContextError::StrictFunctionTypesClaim { .. } => false,
     }
 }
 
@@ -539,7 +540,11 @@ fn relation_error_is_unsupported(error: &RelationUnavailable) -> bool {
         | RelationUnavailable::InvalidUnknownLikeUnionState(_)
         | RelationUnavailable::InvalidStructuredMembers(_)
         | RelationUnavailable::UnavailableCanonicalArrayTarget(_)
-        | RelationUnavailable::MalformedCanonicalArrayReference(_) => false,
+        | RelationUnavailable::MalformedCanonicalArrayReference(_)
+        | RelationUnavailable::UnresolvedFunctionType(_)
+        | RelationUnavailable::UnresolvedSignatureReturn(_)
+        | RelationUnavailable::MalformedFunctionType(_)
+        | RelationUnavailable::StrictFunctionTypesOptionMismatch { .. } => false,
     }
 }
 
@@ -6683,6 +6688,36 @@ mod tests {
             TypeNodeUnavailable::MissingGenericAliasMetadata(symbol),
             TypeNodeUnavailable::InvalidGenericAliasInstantiationCache(symbol),
         ];
+        assert!(
+            invariant
+                .into_iter()
+                .map(source_error)
+                .all(|error| !error.is_unsupported_boundary())
+        );
+    }
+
+    #[test]
+    fn canonical_program_error_classification_rejects_function_relation_state_failures() {
+        let mut store = CanonicalTypeMapperStore::new();
+        let bootstrap = store
+            .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions::default())
+            .unwrap();
+        let type_id = bootstrap.any_type;
+        let signature = bootstrap.any_signature;
+        let source_error = |error| CanonicalProgramCheckError::SourceCheck {
+            file_name: "/project/input.ts".to_owned(),
+            error: SourceCheckError::RelationUnavailable(error),
+        };
+        let invariant = [
+            RelationUnavailable::UnresolvedFunctionType(type_id),
+            RelationUnavailable::UnresolvedSignatureReturn(signature),
+            RelationUnavailable::MalformedFunctionType(type_id),
+            RelationUnavailable::StrictFunctionTypesOptionMismatch {
+                established: true,
+                requested: false,
+            },
+        ];
+
         assert!(
             invariant
                 .into_iter()

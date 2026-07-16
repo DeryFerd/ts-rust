@@ -26,8 +26,8 @@ use super::{
     CanonicalModuleResolutionManifestError, CanonicalModuleResolutionManifestInput,
     CanonicalTypeFormatFlags, CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHost,
     DeclaredTypeHostError, IntrinsicBootstrapError, IntrinsicBootstrapOptions, SignatureId,
-    SourceCheckError, SourceCheckProvenanceError, SourceFileRef, SymbolMergeError,
-    TypeDisplayUnavailable, TypeId,
+    RelationUnavailable, SourceCheckError, SourceCheckProvenanceError, SourceFileRef,
+    SymbolMergeError, TypeDisplayUnavailable, TypeId,
     alias::{CanonicalAliasResolution, CanonicalAliasResolutionError, CanonicalAliasResolver},
     alias_flags::{
         CanonicalSymbolFlagsError, CanonicalSymbolFlagsResolution, CanonicalSymbolFlagsResolver,
@@ -303,6 +303,14 @@ impl<'arena> CanonicalCheckerContext<'arena> {
                 },
             );
         }
+        if let Err(established_strict_function_types) =
+            store.claim_strict_function_types(options.strict_function_types)
+        {
+            return Err(CanonicalCheckerContextError::StrictFunctionTypesClaim {
+                established_strict_function_types,
+                requested_strict_function_types: options.strict_function_types,
+            });
+        }
 
         let mut retained_files = Vec::with_capacity(registered.len());
         for (file, arena, source_file) in registered {
@@ -434,6 +442,32 @@ impl<'arena> CanonicalCheckerContext<'arena> {
             source,
             target,
             self.type_format_flags(CanonicalTypeFormatFlags::NONE),
+        )
+    }
+
+    /// Tests assignability using the context's authoritative global identities
+    /// and immutable `strictFunctionTypes` option.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RelationUnavailable`] when either type is malformed or the
+    /// relation requires a semantic family outside the installed checker cut.
+    pub fn is_type_assignable_to(
+        &mut self,
+        source: TypeId,
+        target: TypeId,
+    ) -> Result<bool, RelationUnavailable> {
+        let Self {
+            options,
+            store,
+            global_types,
+            ..
+        } = self;
+        store.is_type_assignable_to_with_global_types_and_strict_function_types(
+            source,
+            target,
+            global_types,
+            options.strict_function_types,
         )
     }
 
@@ -1434,6 +1468,11 @@ pub enum CanonicalCheckerContextError {
         established_strict_builtin_iterator_return: bool,
         requested_strict_builtin_iterator_return: bool,
     },
+    /// The checker store already retained a conflicting function-variance mode.
+    StrictFunctionTypesClaim {
+        established_strict_function_types: bool,
+        requested_strict_function_types: bool,
+    },
     /// The supported `initializeChecker` global prefix could not complete.
     GlobalInitialization(CanonicalGlobalInitializationError),
 }
@@ -1541,6 +1580,13 @@ impl std::fmt::Display for CanonicalCheckerContextError {
             } => write!(
                 formatter,
                 "checker store retained strictBuiltinIteratorReturn={established_strict_builtin_iterator_return}, not the requested {requested_strict_builtin_iterator_return}"
+            ),
+            Self::StrictFunctionTypesClaim {
+                established_strict_function_types,
+                requested_strict_function_types,
+            } => write!(
+                formatter,
+                "checker store retained strictFunctionTypes={established_strict_function_types}, not the requested {requested_strict_function_types}"
             ),
             Self::GlobalInitialization(error) => {
                 write!(formatter, "checker global initialization failed: {error}")
@@ -2038,8 +2084,52 @@ mod tests {
             context.store().claimed_strict_builtin_iterator_return(),
             Some(true)
         );
+        assert_eq!(context.store().claimed_strict_function_types(), Some(true));
         assert!(context.options().strict_function_types);
         assert_eq!(context.diagnostics().len(), 2);
+    }
+
+    #[test]
+    fn context_assignability_uses_one_immutable_function_variance_mode() {
+        let source = parsed(concat!(
+            "type Narrow = (value: string) => void; ",
+            "type Wide = (value: string | number) => void;",
+        ));
+        let file = FileId::new(805);
+        let narrow_node = type_alias_body(&source, file, "Narrow");
+        let wide_node = type_alias_body(&source, file, "Wide");
+
+        for (strict_function_types, narrow_to_wide) in [(true, false), (false, true)] {
+            let mut context = CanonicalCheckerContext::new(
+                completed_bindings(&[(file, &source)]),
+                vec![(file, &source.arena)],
+                CanonicalCheckerOptions {
+                    strict_function_types,
+                    ..CanonicalCheckerOptions::default()
+                },
+            )
+            .unwrap();
+            let narrow = context.get_type_from_type_node(narrow_node).unwrap();
+            let wide = context.get_type_from_type_node(wide_node).unwrap();
+            for node in [narrow_node, wide_node] {
+                let signature = context
+                    .store()
+                    .signature_links(node)
+                    .and_then(|links| links.resolved_signature.signature())
+                    .unwrap();
+                context.get_return_type_of_signature(signature).unwrap();
+            }
+
+            assert_eq!(
+                context.store().claimed_strict_function_types(),
+                Some(strict_function_types)
+            );
+            assert_eq!(
+                context.is_type_assignable_to(narrow, wide),
+                Ok(narrow_to_wide)
+            );
+            assert_eq!(context.is_type_assignable_to(wide, narrow), Ok(true));
+        }
     }
 
     #[test]
