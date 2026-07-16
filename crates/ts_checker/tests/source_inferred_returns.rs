@@ -37,7 +37,7 @@ const SUCCESS_SOURCE: &str = concat!(
     "const emptyArrowResult = emptyArrow();\n",
 );
 
-fn context<'a>(parsed: &'a ParseResult, file: FileId) -> CanonicalCheckerContext<'a> {
+fn context(parsed: &ParseResult, file: FileId) -> CanonicalCheckerContext<'_> {
     let mut binder = CanonicalBinder::new();
     binder
         .bind_source_file_with_facts(
