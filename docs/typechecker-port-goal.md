@@ -648,6 +648,19 @@ remains the cluster-level source of truth.
   relatively standalone fixtures); classes and relative ESM remain strategically
   essential but consume the expression/callable kernels before they produce
   reliable complete artifacts.
+- The first three-way feature wave is integrated through `a789acf..ca65708`,
+  `1bf491c..fdde968`, and `87fcad1`. Root owned contextual-arrow source dispatch
+  and the shared callable/tuple seams; one leaf worker owned canonical enum
+  declared/value/member identity and relation admission; another leaf worker
+  produced the syntax-neutral direct-call kernel; and a read-only reviewer
+  attacked contextual-arrow and empty-tuple cache atomicity. That review found
+  whole-file publication, optional-array capability, warm-retry, effective
+  empty-rest, and tuple-provenance defects before merge. The resulting bounded
+  contextual-arrow cut passes 23 focused tests, enum coverage passes 29 focused
+  tests, and the combined checker library passed 812/812 tests before the call
+  kernel was registered for source integration. `39f07f4` also makes the
+  compiler adapter classify the new enum and empty-tuple error domains
+  exhaustively instead of relying on a wildcard or fallback.
 
 No percentage in this section is a whole-corpus parity claim. A score is
 publishable only when its variant manifest and complete artifact comparison are
@@ -1515,6 +1528,21 @@ signature, symbol-link, or relation-cache records. With four slots, run two of
 those feature owners plus a reviewer while root integrates. With eight, all
 three can advance while Go review, Rust invariant review, a fixer, and an
 oracle/corpus worker remain continuously staffed.
+
+That source-callable wave is now complete, and the contextual/enum/call wave
+confirmed the next ownership boundary. At four slots, root can integrate one
+shared source-dispatch change while two workers build non-overlapping semantic
+leaves and the fourth slot performs adversarial review or starts the next leaf.
+The current wave assigns direct-call source integration to one worker,
+top-level enum source planning to a second worker without granting it
+`source.rs`, and dependency-closed instantiation/constraint work to a third;
+root alone owns compiler classification, serialized Cargo, corpus runs, and
+changes to shared dispatch. This is the stable 2.5-3-lane shape in practice.
+At eight slots, add property/member access and inferred-callable completion
+plus independent Go and Rust reviewers. At twelve slots, add fixed tuples and
+cross-file reference/module work while retaining dedicated source and
+type-node/relation seam owners. Generic inference/overload selection remains a
+single coupled owner after direct calls, instantiation, and constraints land.
 
 Each worktree owns one small coherent commit series. Slow Cargo and corpus-wide
 runs remain centralized and serialized; leaf workers perform static inspection,
