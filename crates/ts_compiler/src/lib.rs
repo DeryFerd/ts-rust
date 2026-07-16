@@ -367,6 +367,7 @@ fn source_check_error_is_unsupported(error: &SourceCheckError) -> bool {
         | SourceCheckError::ObjectLiteral(_)
         | SourceCheckError::Assertion(_)
         | SourceCheckError::Assignment(_)
+        | SourceCheckError::Arrow(_)
         | SourceCheckError::Function(_)
         | SourceCheckError::Variable(_)
         | SourceCheckError::MissingDiagnostic(_) => false,
@@ -6956,6 +6957,10 @@ mod tests {
                 error: SourceCheckError::Function(SourceFunctionInvariant::MissingCallableType(
                     symbol,
                 )),
+            },
+            CanonicalProgramCheckError::SourceCheck {
+                file_name: "/project/input.ts".to_owned(),
+                error: SourceCheckError::Arrow(node),
             },
             CanonicalProgramCheckError::SourceCheck {
                 file_name: "/project/input.ts".to_owned(),
