@@ -3237,16 +3237,35 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
                 .contains_key(&prepared.owner_symbol)
             || self.source_callable_type_parameters.values().any(|rows| {
                 rows.iter().any(|row| {
-                    prepared
-                        .type_parameters
-                        .iter()
-                        .any(|prepared| prepared.provenance.declaration == row.declaration)
+                    prepared.type_parameters.iter().any(|prepared| {
+                        let provenance = prepared.provenance;
+                        // Each retained dimension is a unique ownership edge.
+                        // Reusing only a symbol or TypeId under a different
+                        // declaration would still let two signatures claim
+                        // one canonical type-parameter identity.
+                        provenance.declaration == row.declaration
+                            || provenance.symbol == row.symbol
+                            || provenance.type_parameter == row.type_parameter
+                    })
                 })
             })
         {
             return None;
         }
 
+        // These heap allocations are deliberately completed before the first
+        // callable TypeId or SignatureId is allocated. Everything after that
+        // identity boundary is a reserved, infallible publication step.
+        let provenance_rows = prepared
+            .type_parameters
+            .iter()
+            .map(|row| row.provenance)
+            .collect::<Box<[_]>>();
+        let type_parameter_ids = prepared
+            .type_parameters
+            .iter()
+            .map(|row| row.provenance.type_parameter)
+            .collect::<Vec<_>>();
         let value_link_reservations = prepared.parameters.len().checked_add(1)?;
         if !self.try_reserve_types(1)
             || !self.try_reserve_signatures(1)
@@ -3258,11 +3277,6 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
             return None;
         }
 
-        let type_parameter_ids = prepared
-            .type_parameters
-            .iter()
-            .map(|row| row.provenance.type_parameter)
-            .collect::<Vec<_>>();
         let type_ = self
             .alloc_plain_object_type(
                 super::types::ObjectFlags::ANONYMOUS,
@@ -3293,11 +3307,6 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
                 ));
             }
         }
-        let provenance_rows = prepared
-            .type_parameters
-            .iter()
-            .map(|row| row.provenance)
-            .collect::<Box<[_]>>();
         assert!(
             self.source_callable_type_parameters
                 .insert(signature, provenance_rows)
@@ -3405,14 +3414,22 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
             let constraint_link_valid = match provenance.constraint {
                 Some(node) => {
                     row.constraint != no_constraint
-                        && self.source_type_node_result_is_exact(node, row.constraint)
+                        && self.source_type_node_result_is_exact(
+                            node,
+                            row.constraint,
+                            &resolved[..index],
+                        )
                 }
                 None => row.constraint == no_constraint,
             };
             let default_link_valid = match provenance.default_type {
                 Some(node) => {
                     row.default_type != no_constraint
-                        && self.source_type_node_result_is_exact(node, row.default_type)
+                        && self.source_type_node_result_is_exact(
+                            node,
+                            row.default_type,
+                            &resolved[..index],
+                        )
                 }
                 None => row.default_type == no_constraint,
             };
@@ -3514,11 +3531,17 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
             )
     }
 
-    fn source_type_node_result_is_exact(&self, node: NodeRef, result: TypeId) -> bool {
+    fn source_type_node_result_is_exact(
+        &self,
+        node: NodeRef,
+        result: TypeId,
+        earlier: &[ResolvedSourceCallableTypeParameter],
+    ) -> bool {
         let Some(bootstrap) = self.intrinsic_bootstrap.as_ref() else {
             return false;
         };
-        let intrinsic = match self.source_node_kind(node) {
+        let kind = self.source_node_kind(node);
+        let intrinsic = match kind {
             Some(SyntaxKind::AnyKeyword) => Some(bootstrap.any_type),
             Some(SyntaxKind::UnknownKeyword) => Some(bootstrap.unknown_type),
             Some(SyntaxKind::StringKeyword) => Some(bootstrap.string_type),
@@ -3528,34 +3551,49 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
             Some(SyntaxKind::SymbolKeyword) => Some(bootstrap.es_symbol_type),
             Some(SyntaxKind::VoidKeyword) => Some(bootstrap.void_type),
             Some(SyntaxKind::UndefinedKeyword) => Some(bootstrap.undefined_type),
+            Some(SyntaxKind::NullKeyword) => Some(bootstrap.null_type),
             Some(SyntaxKind::NeverKeyword) => Some(bootstrap.never_type),
             Some(SyntaxKind::ObjectKeyword) => Some(bootstrap.non_primitive_type),
             Some(SyntaxKind::IntrinsicKeyword) => Some(bootstrap.intrinsic_marker_type),
             _ => None,
         };
-        if intrinsic == Some(result) {
-            return true;
+        if let Some(intrinsic) = intrinsic {
+            let type_links_valid = self.type_node_links(node).is_none_or(|links| {
+                links == &TypeNodeLinks::default()
+                    || links
+                        == &TypeNodeLinks {
+                            resolved_type: Some(result),
+                            outer_type_parameters: None,
+                        }
+            });
+            let symbol_links_valid = self
+                .symbol_node_links(node)
+                .is_none_or(|links| links == &SymbolNodeLinks::default());
+            return result == intrinsic && type_links_valid && symbol_links_valid;
         }
-        let exact_type_link = self.type_node_links(node)
+
+        // The opaque source proof does not yet retain enough structure to
+        // authenticate aliases or composite type syntax. The one supported
+        // non-keyword result is an exact reference to an earlier prepared
+        // type parameter, proven by both canonical query links.
+        if kind != Some(SyntaxKind::TypeReference) {
+            return false;
+        }
+        let Some(earlier) = earlier
+            .iter()
+            .find(|row| row.provenance.type_parameter == result)
+        else {
+            return false;
+        };
+        self.type_node_links(node)
             == Some(&TypeNodeLinks {
                 resolved_type: Some(result),
                 outer_type_parameters: None,
-            });
-        if !exact_type_link {
-            return false;
-        }
-        let Some(TypeData::TypeParameter(_)) = self.type_payload(result).map(TypeRecord::data)
-        else {
-            return true;
-        };
-        self.type_payload(result)
-            .and_then(TypeRecord::symbol)
-            .is_some_and(|symbol| {
-                self.symbol_node_links(node)
-                    == Some(&SymbolNodeLinks {
-                        resolved_symbol: Some(symbol),
-                    })
             })
+            && self.symbol_node_links(node)
+                == Some(&SymbolNodeLinks {
+                    resolved_symbol: Some(earlier.provenance.symbol),
+                })
     }
 
     fn source_return_annotation_belongs_to(
@@ -3779,16 +3817,17 @@ mod tests {
     use super::{AstScope, CachedSignatureLookup, SemanticStore, type_list_key};
     use crate::semantic::{
         AccessibleChainCacheKey, AliasSymbolLinks, AliasTargetState, ArrayLiteralLinks,
-        AssertionLinks, CacheHashKey, ContainingSymbolLinks, DeclaredTypeLinks,
-        DecoratorSignatureState, DeferredSymbolLinks, EffectsSignatureState, EntityNameNode,
-        EnumMemberLinks, EvaluatorResult, EvaluatorValue, ExhaustiveState, ExportTypeLinks,
-        ExtendedContainersState, ExternalEmitHelpers, JsxElementLinks, JsxFlags, LateBoundLinks,
-        MappedSymbolLinks, MarkedAssignmentSymbolLinks, MembersAndExportsLinks, ModuleSymbolLinks,
-        NodeCheckFlags, NodeLinks, OptionalSymbolSequence, OrderedNodeSet,
-        RelationComparisonResult, RelationKind, ResolvedSignatureState, ReverseMappedSymbolLinks,
-        SignatureLinks, SourceFileLinks, SpreadLinks, SwitchStatementLinks, SymbolNodeLinks,
-        SymbolReferenceLinks, TypeAliasLinks, TypeNodeLinks, TypeRecord, TypeResolutionTarget,
-        TypeSystemPropertyName, ValueSymbolLinks, VarianceFlags, VarianceLinks,
+        AssertionLinks, CacheHashKey, CanonicalTypeMapperStore, ContainingSymbolLinks,
+        DeclaredTypeLinks, DecoratorSignatureState, DeferredSymbolLinks, EffectsSignatureState,
+        EntityNameNode, EnumMemberLinks, EvaluatorResult, EvaluatorValue, ExhaustiveState,
+        ExportTypeLinks, ExtendedContainersState, ExternalEmitHelpers, IntrinsicBootstrapOptions,
+        JsxElementLinks, JsxFlags, LateBoundLinks, MappedSymbolLinks, MarkedAssignmentSymbolLinks,
+        MembersAndExportsLinks, ModuleSymbolLinks, NodeCheckFlags, NodeLinks,
+        OptionalSymbolSequence, OrderedNodeSet, RelationComparisonResult, RelationKind,
+        ResolvedSignatureState, ReverseMappedSymbolLinks, SignatureLinks, SourceFileLinks,
+        SpreadLinks, SwitchStatementLinks, SymbolNodeLinks, SymbolReferenceLinks, TypeAliasLinks,
+        TypeNodeLinks, TypeRecord, TypeResolutionTarget, TypeSystemPropertyName, ValueSymbolLinks,
+        VarianceFlags, VarianceLinks,
         signatures::{ElementFlags, SignatureFlags, TypePredicateKind},
         types::{ObjectFlags, TypeFlags},
     };
@@ -3796,6 +3835,60 @@ mod tests {
 
     type TestStore = SemanticStore<&'static str, &'static str>;
     type CanonicalTestStore = SemanticStore<TypeRecord, &'static str>;
+
+    #[test]
+    fn source_keyword_result_requires_exact_null_identity_and_unpoisoned_links() {
+        let parsed = parse_source_file("type Nullish = null;");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(90_001);
+        let mut store = CanonicalTypeMapperStore::new();
+        assert!(
+            store
+                .register_source_file(&parsed.arena, parsed.source_file, file)
+                .is_some()
+        );
+        store
+            .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions::default())
+            .unwrap();
+        let null_node = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::NullKeyword).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .expect("fixture has a null keyword");
+        let literal_wrapper = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::LiteralType).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .expect("the parser wraps null in a literal type");
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        let null = bootstrap.null_type;
+        let number = bootstrap.number_type;
+
+        assert!(store.source_type_node_result_is_exact(null_node, null, &[]));
+        assert!(!store.source_type_node_result_is_exact(null_node, number, &[]));
+        assert!(!store.source_type_node_result_is_exact(literal_wrapper, null, &[]));
+
+        assert!(store.set_type_node_links(
+            null_node,
+            TypeNodeLinks {
+                resolved_type: Some(number),
+                outer_type_parameters: None,
+            },
+        ));
+        assert!(!store.source_type_node_result_is_exact(null_node, null, &[]));
+    }
 
     #[test]
     fn strict_function_types_claim_is_immutable() {

@@ -3150,6 +3150,31 @@ mod tests {
         )
     }
 
+    #[derive(Debug, Eq, PartialEq)]
+    struct GenericTransactionState {
+        types: usize,
+        signatures: usize,
+        symbols: usize,
+        mappers: usize,
+        cached_signatures: usize,
+        source_callable_provenance: [usize; 5],
+        callable_parameter_types: usize,
+        checker_links: [usize; 26],
+    }
+
+    fn generic_transaction_state(store: &CanonicalTypeMapperStore) -> GenericTransactionState {
+        GenericTransactionState {
+            types: store.type_len(),
+            signatures: store.signature_len(),
+            symbols: store.symbol_len(),
+            mappers: store.mapper_len(),
+            cached_signatures: store.cached_signature_len(),
+            source_callable_provenance: store.source_callable_provenance_lengths(),
+            callable_parameter_types: store.callable_signature_parameter_types_len(),
+            checker_links: store.checker_link_allocated_lengths(),
+        }
+    }
+
     struct StagedGenericPublication {
         fixture: QueryFixture,
         declaration: NodeRef,
@@ -3502,6 +3527,233 @@ mod tests {
                 .source_callable_type_for_declaration(staged.declaration),
             Some(callable)
         );
+    }
+
+    #[test]
+    fn keyword_type_parameter_results_reject_poisoned_semantic_links() {
+        let source = "function identity<T extends string>(value: T): T { return value; }";
+
+        let mut wrong_result = staged_generic_publication(source, FileId::new(931));
+        let constraint = wrong_result.resolved[0]
+            .provenance
+            .constraint
+            .expect("fixture has a constraint");
+        let number = wrong_result
+            .fixture
+            .store
+            .intrinsic_bootstrap()
+            .unwrap()
+            .number_type;
+        wrong_result.resolved[0].constraint = number;
+        assert!(wrong_result.fixture.store.set_type_node_links(
+            constraint,
+            TypeNodeLinks {
+                resolved_type: Some(number),
+                outer_type_parameters: None,
+            },
+        ));
+        let before = generic_transaction_state(&wrong_result.fixture.store);
+        assert_eq!(wrong_result.publish(), None);
+        assert_eq!(
+            generic_transaction_state(&wrong_result.fixture.store),
+            before
+        );
+
+        let mut wrong_link = staged_generic_publication(source, FileId::new(932));
+        let constraint = wrong_link.resolved[0]
+            .provenance
+            .constraint
+            .expect("fixture has a constraint");
+        let number = wrong_link
+            .fixture
+            .store
+            .intrinsic_bootstrap()
+            .unwrap()
+            .number_type;
+        assert!(wrong_link.fixture.store.set_type_node_links(
+            constraint,
+            TypeNodeLinks {
+                resolved_type: Some(number),
+                outer_type_parameters: None,
+            },
+        ));
+        let before = generic_transaction_state(&wrong_link.fixture.store);
+        assert_eq!(wrong_link.publish(), None);
+        assert_eq!(generic_transaction_state(&wrong_link.fixture.store), before);
+
+        let mut symbol_poison = staged_generic_publication(source, FileId::new(933));
+        let constraint = symbol_poison.resolved[0]
+            .provenance
+            .constraint
+            .expect("fixture has a constraint");
+        assert!(symbol_poison.fixture.store.set_symbol_node_links(
+            constraint,
+            SymbolNodeLinks {
+                resolved_symbol: Some(symbol_poison.owner),
+            },
+        ));
+        let before = generic_transaction_state(&symbol_poison.fixture.store);
+        assert_eq!(symbol_poison.publish(), None);
+        assert_eq!(
+            generic_transaction_state(&symbol_poison.fixture.store),
+            before
+        );
+
+        let mut exact_link = staged_generic_publication(source, FileId::new(934));
+        let constraint = exact_link.resolved[0]
+            .provenance
+            .constraint
+            .expect("fixture has a constraint");
+        let string = exact_link.resolved[0].constraint;
+        assert!(exact_link.fixture.store.set_type_node_links(
+            constraint,
+            TypeNodeLinks {
+                resolved_type: Some(string),
+                outer_type_parameters: None,
+            },
+        ));
+        assert!(exact_link.publish().is_some());
+    }
+
+    #[test]
+    fn dependent_type_parameter_results_require_the_exact_earlier_symbol_link() {
+        let source =
+            "function pair<T extends string, U extends T>(left: T, right: U): U { return right; }";
+
+        let mut missing = staged_generic_publication(source, FileId::new(935));
+        let constraint = missing.resolved[1]
+            .provenance
+            .constraint
+            .expect("second parameter has a dependent constraint");
+        assert!(
+            missing
+                .fixture
+                .store
+                .set_symbol_node_links(constraint, SymbolNodeLinks::default())
+        );
+        let before = generic_transaction_state(&missing.fixture.store);
+        assert_eq!(missing.publish(), None);
+        assert_eq!(generic_transaction_state(&missing.fixture.store), before);
+
+        let mut wrong = staged_generic_publication(source, FileId::new(943));
+        let constraint = wrong.resolved[1]
+            .provenance
+            .constraint
+            .expect("second parameter has a dependent constraint");
+        let wrong_symbol = wrong.resolved[1].provenance.symbol;
+        assert!(wrong.fixture.store.set_symbol_node_links(
+            constraint,
+            SymbolNodeLinks {
+                resolved_symbol: Some(wrong_symbol),
+            },
+        ));
+        let before = generic_transaction_state(&wrong.fixture.store);
+        assert_eq!(wrong.publish(), None);
+        assert_eq!(generic_transaction_state(&wrong.fixture.store), before);
+    }
+
+    #[test]
+    fn unproven_alias_and_composite_default_results_fail_closed() {
+        for (index, source) in [
+            "type Alias = string; function identity<T extends Alias>(value: T): T { return value; }",
+            "type Alias = string; function identity<T = Alias>(value: T): T { return value; }",
+            "function identity<T = string | number>(value: T): T { return value; }",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut staged = staged_generic_publication(
+                source,
+                FileId::new(976 + u32::try_from(index).unwrap()),
+            );
+            let before = generic_transaction_state(&staged.fixture.store);
+            assert_eq!(staged.publish(), None, "{source}");
+            assert_eq!(generic_transaction_state(&staged.fixture.store), before);
+        }
+    }
+
+    #[test]
+    fn existing_type_parameter_symbol_metadata_collision_is_atomic() {
+        let mut staged = staged_generic_publication(
+            "function identity<T>(value: T): T { return value; }",
+            FileId::new(979),
+        );
+        let prepared = staged.resolved[0].provenance;
+        let poison_signature = staged
+            .fixture
+            .store
+            .intrinsic_bootstrap()
+            .unwrap()
+            .unknown_signature;
+        let distinct_type = staged
+            .fixture
+            .store
+            .intrinsic_bootstrap()
+            .unwrap()
+            .string_type;
+        assert_ne!(prepared.declaration, staged.declaration);
+        assert_ne!(prepared.type_parameter, distinct_type);
+        assert_eq!(
+            staged
+                .fixture
+                .store
+                .replace_source_callable_type_parameters_for_test(
+                    poison_signature,
+                    Some(
+                        vec![SourceCallableTypeParameterProvenance {
+                            declaration: staged.declaration,
+                            symbol: prepared.symbol,
+                            type_parameter: distinct_type,
+                            constraint: None,
+                            default_type: None,
+                        }]
+                        .into_boxed_slice(),
+                    ),
+                ),
+            None
+        );
+        let before = generic_transaction_state(&staged.fixture.store);
+        assert_eq!(staged.publish(), None);
+        assert_eq!(generic_transaction_state(&staged.fixture.store), before);
+    }
+
+    #[test]
+    fn existing_type_parameter_identity_metadata_collision_is_atomic() {
+        let mut staged = staged_generic_publication(
+            "function identity<T>(value: T): T { return value; }",
+            FileId::new(980),
+        );
+        let prepared = staged.resolved[0].provenance;
+        let poison_signature = staged
+            .fixture
+            .store
+            .intrinsic_bootstrap()
+            .unwrap()
+            .unknown_signature;
+        assert_ne!(prepared.declaration, staged.declaration);
+        assert_ne!(prepared.symbol, staged.owner);
+        assert_eq!(
+            staged
+                .fixture
+                .store
+                .replace_source_callable_type_parameters_for_test(
+                    poison_signature,
+                    Some(
+                        vec![SourceCallableTypeParameterProvenance {
+                            declaration: staged.declaration,
+                            symbol: staged.owner,
+                            type_parameter: prepared.type_parameter,
+                            constraint: None,
+                            default_type: None,
+                        }]
+                        .into_boxed_slice(),
+                    ),
+                ),
+            None
+        );
+        let before = generic_transaction_state(&staged.fixture.store);
+        assert_eq!(staged.publish(), None);
+        assert_eq!(generic_transaction_state(&staged.fixture.store), before);
     }
 
     #[test]
