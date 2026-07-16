@@ -2723,6 +2723,7 @@ impl Program {
             },
             strict_bind_call_apply: self.options.strict_bind_call_apply,
             strict_builtin_iterator_return: self.options.strict_builtin_iterator_return,
+            strict_function_types: self.options.strict_function_types,
             no_error_truncation: false,
             name_resolution: (&self.options).into(),
         };
@@ -11121,6 +11122,53 @@ export function create() { return new M.Value(); }"#,
             elapsed < Duration::from_secs(2),
             "cold debug default-library check took {elapsed:?}"
         );
+    }
+
+    #[test]
+    fn retains_strict_function_types_configuration_for_checker_construction() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file("/project/main.ts", "const value = 1;")
+            .unwrap();
+
+        fs.write_file(
+            "/project/tsconfig.json",
+            r#"{
+                "files": ["main.ts"],
+                "compilerOptions": { "noLib": true }
+            }"#,
+        )
+        .unwrap();
+        let defaults = Program::from_config(&fs, "/project/tsconfig.json");
+        assert!(defaults.options().strict_function_types);
+        assert!(!defaults.options().strict_function_types_specified);
+
+        fs.write_file(
+            "/project/tsconfig.json",
+            r#"{
+                "files": ["main.ts"],
+                "compilerOptions": { "noLib": true, "strict": false }
+            }"#,
+        )
+        .unwrap();
+        let inherited = Program::from_config(&fs, "/project/tsconfig.json");
+        assert!(!inherited.options().strict_function_types);
+        assert!(!inherited.options().strict_function_types_specified);
+
+        fs.write_file(
+            "/project/tsconfig.json",
+            r#"{
+                "files": ["main.ts"],
+                "compilerOptions": {
+                    "noLib": true,
+                    "strict": false,
+                    "strictFunctionTypes": true
+                }
+            }"#,
+        )
+        .unwrap();
+        let overridden = Program::from_config(&fs, "/project/tsconfig.json");
+        assert!(overridden.options().strict_function_types);
+        assert!(overridden.options().strict_function_types_specified);
     }
 
     #[test]

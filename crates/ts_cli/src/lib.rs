@@ -191,6 +191,7 @@ fn compiler_boolean_name(argument: &str) -> Option<&'static str> {
         "--strict" => "strict",
         "--strictbindcallapply" => "strictbindcallapply",
         "--strictbuiltiniteratorreturn" => "strictbuiltiniteratorreturn",
+        "--strictfunctiontypes" => "strictfunctiontypes",
         "--strictnullchecks" => "strictnullchecks",
         "--strictpropertyinitialization" => "strictpropertyinitialization",
         "--useunknownincatchvariables" => "useunknownincatchvariables",
@@ -427,6 +428,8 @@ mod tests {
             "false",
             "--StrictBuiltinIteratorReturn",
             "false",
+            "--StrictFunctionTypes",
+            "false",
             "main.ts",
         ])
         .unwrap() else {
@@ -441,6 +444,8 @@ mod tests {
                 .compiler_options
                 .strict_builtin_iterator_return_specified
         );
+        assert!(!disabled.compiler_options.strict_function_types);
+        assert!(disabled.compiler_options.strict_function_types_specified);
         assert_eq!(
             disabled
                 .specified_options
@@ -450,7 +455,8 @@ mod tests {
             [
                 "strict",
                 "strictbindcallapply",
-                "strictbuiltiniteratorreturn"
+                "strictbuiltiniteratorreturn",
+                "strictfunctiontypes"
             ]
         );
 
@@ -460,6 +466,8 @@ mod tests {
             "--strictBindCallApply",
             "true",
             "--STRICTBUILTINITERATORRETURN",
+            "true",
+            "--STRICTFUNCTIONTYPES",
             "true",
             "main.ts",
         ])
@@ -475,6 +483,8 @@ mod tests {
                 .compiler_options
                 .strict_builtin_iterator_return_specified
         );
+        assert!(enabled.compiler_options.strict_function_types);
+        assert!(enabled.compiler_options.strict_function_types_specified);
         assert_eq!(
             enabled
                 .specified_options
@@ -484,7 +494,8 @@ mod tests {
             [
                 "strict",
                 "strictbindcallapply",
-                "strictbuiltiniteratorreturn"
+                "strictbuiltiniteratorreturn",
+                "strictfunctiontypes"
             ]
         );
     }

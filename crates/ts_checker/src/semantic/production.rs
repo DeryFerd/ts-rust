@@ -47,13 +47,16 @@ use super::{
 /// The intrinsic pair controls bootstrap identity. `strict_bind_call_apply`
 /// selects the pinned `CallableFunction`/`NewableFunction` globals instead of
 /// aliasing both fields to `Function`. `strict_builtin_iterator_return` is
-/// retained for declared type-alias construction. `no_error_truncation`
-/// raises semantic type display to the pinned hard output cutoff.
+/// retained for declared type-alias construction. `strict_function_types` is
+/// retained as immutable context state for signature relation queries.
+/// `no_error_truncation` raises semantic type display to the pinned hard output
+/// cutoff.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CanonicalCheckerOptions {
     pub intrinsic: IntrinsicBootstrapOptions,
     pub strict_bind_call_apply: bool,
     pub strict_builtin_iterator_return: bool,
+    pub strict_function_types: bool,
     pub no_error_truncation: bool,
     pub name_resolution: CanonicalNameResolverOptions,
 }
@@ -64,6 +67,7 @@ impl From<IntrinsicBootstrapOptions> for CanonicalCheckerOptions {
             intrinsic,
             strict_bind_call_apply: false,
             strict_builtin_iterator_return: false,
+            strict_function_types: false,
             no_error_truncation: false,
             name_resolution: CanonicalNameResolverOptions::default(),
         }
@@ -1955,9 +1959,10 @@ mod tests {
     }
 
     #[test]
-    fn checker_option_defaults_leave_strict_builtin_iterator_return_disabled() {
+    fn checker_option_defaults_leave_retained_strict_options_disabled() {
         let defaults = CanonicalCheckerOptions::default();
         assert!(!defaults.strict_builtin_iterator_return);
+        assert!(!defaults.strict_function_types);
         assert!(!defaults.no_error_truncation);
 
         let intrinsic = IntrinsicBootstrapOptions {
@@ -1967,6 +1972,7 @@ mod tests {
         let options = CanonicalCheckerOptions::from(intrinsic);
         assert_eq!(options.intrinsic, intrinsic);
         assert!(!options.strict_builtin_iterator_return);
+        assert!(!options.strict_function_types);
         assert!(!options.no_error_truncation);
     }
 
@@ -1981,6 +1987,7 @@ mod tests {
         let wrapper_body = type_alias_body(&source, file, "Wrapper");
         let options = CanonicalCheckerOptions {
             strict_builtin_iterator_return: true,
+            strict_function_types: true,
             ..CanonicalCheckerOptions::default()
         };
         let mut context = CanonicalCheckerContext::new(
@@ -2030,6 +2037,7 @@ mod tests {
             context.store().claimed_strict_builtin_iterator_return(),
             Some(true)
         );
+        assert!(context.options().strict_function_types);
         assert_eq!(context.diagnostics().len(), 2);
     }
 
@@ -2602,6 +2610,7 @@ mod tests {
                 exact_optional_property_types: true,
             },
             strict_builtin_iterator_return: true,
+            strict_function_types: true,
             ..CanonicalCheckerOptions::default()
         };
 
