@@ -582,6 +582,20 @@ remains the cluster-level source of truth.
   signature, pending-state, and malformed-taxonomy defects before merge. The
   combined tree passes 766/766 checker tests plus doctest, strict all-target
   checker and compiler Clippy, and rustdoc with warnings denied.
+- The source-callable integration boundary is frozen through `a1ba91a`,
+  `b652b3a`, `579ec46`, and `6fd8fba`. Source assignment and current-flow
+  relations now consume the retained `strictFunctionTypes` option and retry
+  provider-owned lazy returns only when the relation or diagnostic formatter
+  demands them. The retry path covers every union-flow constituent and stages
+  circular-return diagnostics transactionally. A syntax-neutral callable
+  dispatcher now owns cache classification, graph edges, relation projection,
+  and display projection while the existing `FunctionType` implementation
+  remains its only installed provider. Formatter traversal emits parameter
+  types before demanding the outer return, including the complete nested
+  inner-return, outer-return, successful-display retry sequence. Two
+  independent semantic/invariant reviews found no P0/P1 defect after the
+  union-flow repair. The combined tree passes 769/769 checker tests plus the
+  doctest and strict all-target checker Clippy.
 - The fresh canonical first-50 scorecard at
   `/tmp/ts-rust-canonical-first50-signatures-20260715.json` executes 50 variants
   with one exact full diagnostic artifact (`declarationEmitBigInt.ts`) and 49
@@ -596,6 +610,16 @@ remains the cluster-level source of truth.
   `FunctionDeclaration` and `ArrowFunction` source roots. The next parallel
   wave is therefore source callable construction, dispatch, and bounded body
   checking on top of the frozen signature contracts.
+- The pinned source-callable oracle selects two separate gates. The first
+  implementation gate is an annotated source function or fully annotated
+  non-contextual arrow with required/optional identifier parameters, an
+  explicit return annotation, exact source-function symbol ownership, lazy
+  return resolution, formatter/relation participation, and one bounded return
+  body. The first likely first-50 payoff after that substrate is
+  `contextuallyTypedFunctionOptionalAndRest.ts`; exact parity additionally
+  requires contextual arrow extraction, optional implicit-`any` TS7006, and
+  empty-tuple rest normalization. `assertionWithNoArgument.ts` remains later
+  because it also requires assertion predicates and real call checking.
 
 No percentage in this section is a whole-corpus parity claim. A score is
 publishable only when its variant manifest and complete artifact comparison are
