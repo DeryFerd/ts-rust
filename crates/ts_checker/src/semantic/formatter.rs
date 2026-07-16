@@ -1,6 +1,6 @@
 //! Dependency-closed canonical semantic type display.
 //!
-//! This is the primitive, literal, canonical-union, global-array,
+//! This is the primitive, literal, canonical-union, global-array, empty-tuple,
 //! property-only object, and exact annotated function-type prefix of pinned
 //! `internal/checker/printer.go::typeToString`,
 //! `internal/checker/nodebuilderimpl.go::typeToTypeNode`, and
@@ -18,7 +18,7 @@ use ts_binder::{
 
 use super::{
     ArrayTypeError, CanonicalGlobalTypes, CanonicalTypeMapperStore, DeclaredTypeHost,
-    DeclaredTypeHostError, IndexInfoId, SignatureId, TypeAliasId, TypeId,
+    DeclaredTypeHostError, EmptyTupleTypeError, IndexInfoId, SignatureId, TypeAliasId, TypeId,
     bootstrap::LiteralTypeCacheError,
     callables::{
         CallableFamily, SingleCallableDisplayError, StoredSingleCallableValidation,
@@ -141,6 +141,7 @@ pub enum TypeDisplayUnavailable {
     UniqueSymbolName(TypeId),
     MissingBootstrap,
     ArrayType(ArrayTypeError),
+    EmptyTupleType(EmptyTupleTypeError),
     FullyQualifiedName {
         source: TypeId,
         target: TypeId,
@@ -196,6 +197,7 @@ impl std::fmt::Display for TypeDisplayUnavailable {
                 formatter.write_str("literal relation display requires intrinsic checker bootstrap")
             }
             Self::ArrayType(error) => error.fmt(formatter),
+            Self::EmptyTupleType(error) => error.fmt(formatter),
             Self::FullyQualifiedName { source, target } => write!(
                 formatter,
                 "types {source:?} and {target:?} require symbol-aware fully qualified display"
@@ -217,6 +219,7 @@ impl std::error::Error for TypeDisplayUnavailable {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::ArrayType(error) => Some(error),
+            Self::EmptyTupleType(error) => Some(error),
             Self::SourceHost(error) => Some(error),
             _ => None,
         }
@@ -775,6 +778,13 @@ fn display_object_type(
             state,
             visiting,
         );
+    }
+    if store.canonical_empty_tuple_type_cache() == Some(type_id) {
+        store
+            .validate_canonical_empty_tuple_type(type_id)
+            .map_err(TypeDisplayUnavailable::EmptyTupleType)?;
+        state.add(2);
+        return Ok("[]".to_owned());
     }
     if let Some(alias) = record.alias() {
         if single_callable_family(store, type_id).is_some() {

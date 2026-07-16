@@ -39,6 +39,7 @@ mod source_callables;
 mod source_functions;
 mod spelling;
 mod store;
+mod tuple_types;
 pub mod type_nodes;
 pub mod type_records;
 pub mod types;
@@ -115,8 +116,9 @@ pub use source::{
     SourceObjectLiteralError, SourceSyntaxRole, UnsupportedSourceSyntax,
 };
 pub use source_functions::{SourceFunctionInvariant, SourceFunctionUnsupported};
-pub use variables::{VariableInvariant, VariableUnsupported};
 pub use store::SemanticStore;
+pub use tuple_types::EmptyTupleTypeError;
 pub use type_nodes::TypeNodeUnavailable;
 pub use type_records::{CacheHashKey, CanonicalSemanticStore, TypeData, TypeDataKind, TypeRecord};
 pub use types::VarianceFlags;
+pub use variables::{VariableInvariant, VariableUnsupported};

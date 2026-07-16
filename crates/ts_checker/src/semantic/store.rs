@@ -170,6 +170,7 @@ pub struct SemanticStore<TypePayload, MapperPayload> {
     function_signature_return_annotations: HashMap<SignatureId, (NodeRef, bool)>,
     callable_signature_parameter_types: HashMap<SignatureId, Vec<TypeId>>,
     circular_return_signatures: HashMap<SignatureId, TypeId>,
+    canonical_empty_tuple_type: Option<TypeId>,
     type_resolutions: TypeResolutionStack,
     relations: RelationCaches,
     pub(super) derived_types: DerivedTypeCaches,
@@ -231,6 +232,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             function_signature_return_annotations: HashMap::new(),
             callable_signature_parameter_types: HashMap::new(),
             circular_return_signatures: HashMap::new(),
+            canonical_empty_tuple_type: None,
             type_resolutions: TypeResolutionStack::new(id),
             relations: RelationCaches::default(),
             derived_types: DerivedTypeCaches::default(),
@@ -545,6 +547,34 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
     #[must_use]
     pub fn type_len(&self) -> usize {
         self.types.len()
+    }
+
+    /// Returns the checker-owned mutable empty-tuple target, when created.
+    ///
+    /// Publication is deliberately one-shot and occurs only after the tuple's
+    /// complete recursive graph has been initialized.
+    #[must_use]
+    pub(super) const fn canonical_empty_tuple_type_cache(&self) -> Option<TypeId> {
+        self.canonical_empty_tuple_type
+    }
+
+    pub(super) fn publish_canonical_empty_tuple_type(&mut self, type_: TypeId) -> bool {
+        if self.intrinsic_bootstrap.is_none()
+            || self.types.get(type_).is_none()
+            || self.canonical_empty_tuple_type.is_some()
+        {
+            return false;
+        }
+        self.canonical_empty_tuple_type = Some(type_);
+        true
+    }
+
+    #[cfg(test)]
+    pub(super) fn replace_canonical_empty_tuple_type_for_test(
+        &mut self,
+        type_: Option<TypeId>,
+    ) -> Option<TypeId> {
+        std::mem::replace(&mut self.canonical_empty_tuple_type, type_)
     }
 
     pub(super) fn try_reserve_types(&mut self, additional: usize) -> bool {

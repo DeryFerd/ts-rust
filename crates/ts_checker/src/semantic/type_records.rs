@@ -1617,6 +1617,78 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         true
     }
 
+    /// Publishes the complete recursive target graph for the mutable empty
+    /// tuple created by pinned `createTupleTargetType`.
+    ///
+    /// This is narrower than [`Self::initialize_interface_type_parameters`]:
+    /// it admits only a pristine, zero-arity tuple shell and initializes the
+    /// target/self edges and declared `length` member as one record transition.
+    pub(super) fn initialize_empty_tuple_target(
+        &mut self,
+        id: TypeId,
+        this_type: TypeId,
+        declared_members: SymbolTableId,
+        self_instantiation_key: CacheHashKey,
+    ) -> bool {
+        let Some(record) = self.type_payload(id) else {
+            return false;
+        };
+        let TypeData::Tuple(tuple) = record.data() else {
+            return false;
+        };
+        if record.flags() != TypeFlags::OBJECT
+            || record.object_flags() != (ObjectFlags::REFERENCE | ObjectFlags::TUPLE)
+            || record.symbol().is_some()
+            || record.alias().is_some()
+            || tuple.interface != InterfaceTypeData::default()
+            || !tuple.metadata.element_infos().is_empty()
+            || tuple.metadata.min_length() != 0
+            || tuple.metadata.fixed_length() != 0
+            || !tuple.metadata.combined_flags().is_empty()
+            || tuple.metadata.is_readonly()
+            || self.symbol_table(declared_members).is_none()
+        {
+            return false;
+        }
+        let Some(this_record) = self.type_payload(this_type) else {
+            return false;
+        };
+        if this_record.flags() != TypeFlags::TYPE_PARAMETER
+            || !this_record.object_flags().is_empty()
+            || this_record.symbol().is_some()
+            || this_record.alias().is_some()
+            || !matches!(
+                this_record.data(),
+                TypeData::TypeParameter(data) if data == &TypeParameterData::default()
+            )
+        {
+            return false;
+        }
+
+        let Some(TypeData::TypeParameter(this_data)) = self
+            .type_payload_mut(this_type)
+            .map(|record| &mut record.data)
+        else {
+            unreachable!("validated empty-tuple this type disappeared")
+        };
+        this_data.constraint = Some(id);
+        this_data.is_this_type = true;
+
+        let Some(TypeData::Tuple(tuple)) = self.type_payload_mut(id).map(|record| &mut record.data)
+        else {
+            unreachable!("validated empty-tuple target disappeared")
+        };
+        tuple.interface.all_type_parameters = Some(vec![this_type]);
+        tuple.interface.this_type = Some(this_type);
+        tuple.interface.reference.object.target = Some(id);
+        tuple.interface.reference.object.instantiations =
+            TypeCacheState::Allocated(HashMap::from([(self_instantiation_key, id)]));
+        tuple.interface.reference.resolved_type_arguments = Some(Vec::new());
+        tuple.interface.declared_members_resolved = true;
+        tuple.interface.declared_members = Some(declared_members);
+        true
+    }
+
     pub fn set_interface_base_resolution(
         &mut self,
         id: TypeId,
