@@ -19,6 +19,7 @@ use ts_binder::{BoundFile, SemanticSymbolId};
 use super::{
     CanonicalTypeMapperStore,
     source_callables::{SourceCallableFamily, SourceCallablePlan},
+    source_flow::{SourceTypeofComparison, SourceTypeofTag},
     variables::{VariableBindingKind, VariablePlanError, plan_top_level_variable},
 };
 
@@ -163,8 +164,21 @@ pub(super) struct SourceFinalIfSyntax {
     pub(super) statement: NodeRef,
     pub(super) condition: NodeRef,
     pub(super) condition_identifier: NodeRef,
+    pub(super) typeof_condition: Option<SourceTypeofConditionSyntax>,
     pub(super) then_branch: SourceReturnBranchSyntax,
     pub(super) else_branch: SourceReturnBranchSyntax,
+}
+
+/// Exact source nodes retained for one direct `typeof` identifier comparison.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct SourceTypeofConditionSyntax {
+    pub(super) type_of_expression: NodeRef,
+    pub(super) identifier: NodeRef,
+    pub(super) operator: NodeRef,
+    pub(super) literal: NodeRef,
+    pub(super) tag: SourceTypeofTag,
+    pub(super) comparison: SourceTypeofComparison,
+    pub(super) type_of_on_left: bool,
 }
 
 /// Complete source-ordered syntax for the first closed function-body vertical.
@@ -188,8 +202,15 @@ pub(super) struct SourceJoinedIfSyntax {
     pub(super) statement: NodeRef,
     pub(super) condition: NodeRef,
     pub(super) condition_identifier: NodeRef,
+    pub(super) typeof_condition: Option<SourceTypeofConditionSyntax>,
     pub(super) then_branch: SourceFallthroughBranchSyntax,
     pub(super) else_branch: SourceFallthroughBranchSyntax,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PlannedConditionSyntax {
+    identifier: NodeRef,
+    typeof_condition: Option<SourceTypeofConditionSyntax>,
 }
 
 /// Complete source-ordered syntax for the first post-`if` join vertical.
@@ -665,7 +686,7 @@ impl SyntaxPlanner<'_> {
             SourceFunctionStatementsRole::Condition,
         )?;
         self.validate_range(condition, statement)?;
-        let condition_identifier = self.plan_condition(condition, callable)?;
+        let condition_syntax = self.plan_condition(condition, callable)?;
 
         let then_block = self.reference(if_statement.then_statement);
         let else_block = if_statement
@@ -684,7 +705,8 @@ impl SyntaxPlanner<'_> {
         Ok(SourceFinalIfSyntax {
             statement,
             condition,
-            condition_identifier,
+            condition_identifier: condition_syntax.identifier,
+            typeof_condition: condition_syntax.typeof_condition,
             then_branch,
             else_branch,
         })
@@ -694,7 +716,10 @@ impl SyntaxPlanner<'_> {
         &self,
         condition: NodeRef,
         callable: NodeRef,
-    ) -> Result<NodeRef, SourceFunctionStatementsError> {
+    ) -> Result<PlannedConditionSyntax, SourceFunctionStatementsError> {
+        if self.node(condition)?.kind == SyntaxKind::BinaryExpression {
+            return self.plan_typeof_condition(condition, callable);
+        }
         let mut current = condition;
         let mut seen = HashSet::new();
         loop {
@@ -710,7 +735,10 @@ impl SyntaxPlanner<'_> {
                 {
                     self.validate_container(current, callable)?;
                     self.validate_block_scope_container(current, callable)?;
-                    return Ok(current);
+                    return Ok(PlannedConditionSyntax {
+                        identifier: current,
+                        typeof_condition: None,
+                    });
                 }
                 NodeData::ParenthesizedExpression(parenthesized)
                     if record.kind == SyntaxKind::ParenthesizedExpression
@@ -736,6 +764,189 @@ impl SyntaxPlanner<'_> {
                 }
             }
         }
+    }
+
+    fn plan_typeof_condition(
+        &self,
+        condition: NodeRef,
+        callable: NodeRef,
+    ) -> Result<PlannedConditionSyntax, SourceFunctionStatementsError> {
+        let record = self.node(condition)?;
+        let NodeData::BinaryExpression(binary) = &record.data else {
+            return Err(self.unsupported(
+                condition,
+                record.kind,
+                SourceFunctionStatementsRole::Condition,
+            ));
+        };
+        if record.kind != SyntaxKind::BinaryExpression
+            || record.flags.0 != 0
+            || binary.symbol.is_some()
+            || binary.type_.is_some()
+            || binary.facts != 0
+            || binary.modifiers.is_some()
+        {
+            return Err(self.unsupported(
+                condition,
+                record.kind,
+                SourceFunctionStatementsRole::Condition,
+            ));
+        }
+        self.validate_container(condition, callable)?;
+        self.validate_block_scope_container(condition, callable)?;
+
+        let left = self.reference(binary.left);
+        let operator = self.reference(binary.operator_token);
+        let right = self.reference(binary.right);
+        self.validate_parent(
+            left,
+            Some(condition.node),
+            SourceFunctionStatementsRole::Condition,
+        )?;
+        self.validate_parent(
+            operator,
+            Some(condition.node),
+            SourceFunctionStatementsRole::Condition,
+        )?;
+        self.validate_parent(
+            right,
+            Some(condition.node),
+            SourceFunctionStatementsRole::Condition,
+        )?;
+        self.validate_range(left, condition)?;
+        self.validate_range(operator, condition)?;
+        self.validate_range(right, condition)?;
+        self.validate_order(left, operator)?;
+        self.validate_order(operator, right)?;
+
+        let operator_record = self.node(operator)?;
+        if operator_record.flags.0 != 0 || !matches!(operator_record.data, NodeData::Token(_)) {
+            return Err(self.unsupported(
+                operator,
+                operator_record.kind,
+                SourceFunctionStatementsRole::Condition,
+            ));
+        }
+        let comparison = match operator_record.kind {
+            SyntaxKind::EqualsEqualsEqualsToken => SourceTypeofComparison::Equal,
+            SyntaxKind::ExclamationEqualsEqualsToken => SourceTypeofComparison::NotEqual,
+            _ => {
+                return Err(self.unsupported(
+                    operator,
+                    operator_record.kind,
+                    SourceFunctionStatementsRole::Condition,
+                ));
+            }
+        };
+
+        let (type_of_expression, literal, type_of_on_left) =
+            match (self.node(left)?.kind, self.node(right)?.kind) {
+                (SyntaxKind::TypeOfExpression, SyntaxKind::StringLiteral) => (left, right, true),
+                (SyntaxKind::StringLiteral, SyntaxKind::TypeOfExpression) => (right, left, false),
+                _ => {
+                    return Err(self.unsupported(
+                        condition,
+                        record.kind,
+                        SourceFunctionStatementsRole::Condition,
+                    ));
+                }
+            };
+
+        let type_of_record = self.node(type_of_expression)?;
+        let NodeData::TypeOfExpression(type_of) = &type_of_record.data else {
+            return Err(self.unsupported(
+                type_of_expression,
+                type_of_record.kind,
+                SourceFunctionStatementsRole::Condition,
+            ));
+        };
+        if type_of_record.kind != SyntaxKind::TypeOfExpression || type_of_record.flags.0 != 0 {
+            return Err(self.unsupported(
+                type_of_expression,
+                type_of_record.kind,
+                SourceFunctionStatementsRole::Condition,
+            ));
+        }
+        self.validate_container(type_of_expression, callable)?;
+        self.validate_block_scope_container(type_of_expression, callable)?;
+        let identifier = self.reference(type_of.expression);
+        self.validate_parent(
+            identifier,
+            Some(type_of_expression.node),
+            SourceFunctionStatementsRole::Condition,
+        )?;
+        self.validate_range(identifier, type_of_expression)?;
+        let identifier_record = self.node(identifier)?;
+        let NodeData::Identifier(identifier_data) = &identifier_record.data else {
+            return Err(self.unsupported(
+                identifier,
+                identifier_record.kind,
+                SourceFunctionStatementsRole::Condition,
+            ));
+        };
+        if identifier_record.kind != SyntaxKind::Identifier
+            || identifier_record.flags.0 != 0
+            || identifier_data.flow_node.is_some()
+        {
+            return Err(self.unsupported(
+                identifier,
+                identifier_record.kind,
+                SourceFunctionStatementsRole::Condition,
+            ));
+        }
+        self.validate_container(identifier, callable)?;
+        self.validate_block_scope_container(identifier, callable)?;
+
+        let literal_record = self.node(literal)?;
+        let NodeData::StringLiteral(literal_data) = &literal_record.data else {
+            return Err(self.unsupported(
+                literal,
+                literal_record.kind,
+                SourceFunctionStatementsRole::Condition,
+            ));
+        };
+        if literal_record.kind != SyntaxKind::StringLiteral
+            || literal_record.flags.0 != 0
+            || literal_data.token_flags.0 != 0
+        {
+            return Err(self.unsupported(
+                literal,
+                literal_record.kind,
+                SourceFunctionStatementsRole::Condition,
+            ));
+        }
+        self.validate_container(literal, callable)?;
+        self.validate_block_scope_container(literal, callable)?;
+        let tag = match literal_data.text.as_str() {
+            "string" => SourceTypeofTag::String,
+            "number" => SourceTypeofTag::Number,
+            "boolean" => SourceTypeofTag::Boolean,
+            "bigint" => SourceTypeofTag::BigInt,
+            "symbol" => SourceTypeofTag::Symbol,
+            "undefined" => SourceTypeofTag::Undefined,
+            "object" => SourceTypeofTag::Object,
+            "function" => SourceTypeofTag::Function,
+            _ => {
+                return Err(self.unsupported(
+                    literal,
+                    literal_record.kind,
+                    SourceFunctionStatementsRole::Condition,
+                ));
+            }
+        };
+
+        Ok(PlannedConditionSyntax {
+            identifier,
+            typeof_condition: Some(SourceTypeofConditionSyntax {
+                type_of_expression,
+                identifier,
+                operator,
+                literal,
+                tag,
+                comparison,
+                type_of_on_left,
+            }),
+        })
     }
 
     fn plan_branch(
@@ -1178,7 +1389,7 @@ impl SyntaxPlanner<'_> {
             SourceFunctionStatementsRole::Condition,
         )?;
         self.validate_range(condition, statement)?;
-        let condition_identifier = self.plan_condition(condition, callable)?;
+        let condition_syntax = self.plan_condition(condition, callable)?;
 
         let then_block = self.reference(if_statement.then_statement);
         let else_block = if_statement
@@ -1195,7 +1406,8 @@ impl SyntaxPlanner<'_> {
         Ok(SourceJoinedIfSyntax {
             statement,
             condition,
-            condition_identifier,
+            condition_identifier: condition_syntax.identifier,
+            typeof_condition: condition_syntax.typeof_condition,
             then_branch: self.plan_fallthrough_branch(then_block, statement, callable)?,
             else_branch: self.plan_fallthrough_branch(else_block, statement, callable)?,
         })
@@ -1714,6 +1926,73 @@ mod joined_tests {
                 syntax.joined_if.else_branch.locals[0].declaration,
             )),
         );
+    }
+
+    #[test]
+    fn joined_typeof_syntax_retains_strict_comparison_and_binder_payload() {
+        for (file, condition, comparison, type_of_on_left) in [
+            (
+                FileId::new(1_205),
+                "typeof value === \"string\"",
+                SourceTypeofComparison::Equal,
+                true,
+            ),
+            (
+                FileId::new(1_206),
+                "\"number\" !== typeof value",
+                SourceTypeofComparison::NotEqual,
+                false,
+            ),
+        ] {
+            let source = format!(
+                "function narrowed(value: string | number): string | number {{\n  if ({condition}) {{\n    const selected: string | number = value;\n  }} else {{\n    const rejected: string | number = value;\n  }}\n  return value;\n}}\n"
+            );
+            let fixture = JoinedFixture::new(&source, file);
+            let syntax = fixture.plan().unwrap();
+            let typeof_condition = syntax
+                .joined_if
+                .typeof_condition
+                .expect("expected a retained typeof condition");
+            assert_eq!(typeof_condition.identifier, syntax.joined_if.condition_identifier);
+            assert_eq!(typeof_condition.comparison, comparison);
+            assert_eq!(typeof_condition.type_of_on_left, type_of_on_left);
+
+            for branch in [
+                &syntax.joined_if.then_branch,
+                &syntax.joined_if.else_branch,
+            ] {
+                let flow = fixture.bound.flow_at(branch.locals[0].name).unwrap();
+                let flow = fixture.bound.flow_graph().nodes().get(flow).unwrap();
+                assert_eq!(
+                    flow.payload,
+                    Some(FlowNodePayload::Ast(syntax.joined_if.condition)),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn joined_typeof_syntax_rejects_loose_comparisons_and_unknown_tags() {
+        for (file, condition) in [
+            (FileId::new(1_207), "typeof value == \"string\""),
+            (FileId::new(1_208), "typeof value === \"decimal\""),
+        ] {
+            let source = format!(
+                "function narrowed(value: string | number): string | number {{ if ({condition}) {{}} else {{}} return value; }}"
+            );
+            let fixture = JoinedFixture::new(&source, file);
+            assert!(matches!(
+                fixture.plan(),
+                Err(SourceJoinedFunctionStatementsError::Statements(
+                    SourceFunctionStatementsError::Unsupported(
+                        SourceFunctionStatementsUnsupported::Syntax {
+                            role: SourceFunctionStatementsRole::Condition,
+                            ..
+                        },
+                    ),
+                )),
+            ));
+        }
     }
 
     #[test]

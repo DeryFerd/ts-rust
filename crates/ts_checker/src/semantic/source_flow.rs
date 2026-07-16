@@ -18,7 +18,8 @@ use super::{
     CanonicalGlobalTypes, CanonicalTypeMapperStore, TypeId,
     bootstrap::{LiteralTypeCacheError, UnionReduction},
     logical_operators::{LogicalBinaryError, TruthinessAssumption, narrow_by_truthiness},
-    type_records::TypeData,
+    type_records::{TypeData, TypeRecord},
+    types::TypeFlags,
 };
 
 const FLOW_DEPTH_LIMIT: usize = 2_000;
@@ -63,6 +64,65 @@ pub(super) struct SourceTruthinessCondition {
     pub(super) symbol: SemanticSymbolId,
 }
 
+/// One JavaScript `typeof` result admitted by the bounded source-flow slice.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SourceTypeofTag {
+    String,
+    Number,
+    Boolean,
+    BigInt,
+    Symbol,
+    Undefined,
+    Object,
+    Function,
+}
+
+/// Whether the source condition compares equal or not equal to its tag.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SourceTypeofComparison {
+    Equal,
+    NotEqual,
+}
+
+/// A direct identifier narrowed by an exact `typeof` comparison.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct SourceTypeofCondition {
+    /// The exact AST payload carried by both binder condition nodes.
+    pub(super) expression: NodeRef,
+    pub(super) symbol: SemanticSymbolId,
+    pub(super) tag: SourceTypeofTag,
+    pub(super) comparison: SourceTypeofComparison,
+}
+
+/// One cold-proven condition executable by the invocation-local flow frame.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SourceFlowCondition {
+    Truthiness(SourceTruthinessCondition),
+    Typeof(SourceTypeofCondition),
+}
+
+impl SourceFlowCondition {
+    const fn expression(self) -> NodeRef {
+        match self {
+            Self::Truthiness(condition) => condition.expression,
+            Self::Typeof(condition) => condition.expression,
+        }
+    }
+
+    const fn symbol(self) -> SemanticSymbolId {
+        match self {
+            Self::Truthiness(condition) => condition.symbol,
+            Self::Typeof(condition) => condition.symbol,
+        }
+    }
+}
+
+impl From<SourceTruthinessCondition> for SourceFlowCondition {
+    fn from(condition: SourceTruthinessCondition) -> Self {
+        Self::Truthiness(condition)
+    }
+}
+
 /// One initialized local represented by a binder assignment node.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct SourceFlowAssignment {
@@ -79,7 +139,7 @@ pub(super) struct SourceFlowPlan {
     start_payload: Option<NodeRef>,
     points: HashMap<NodeRef, FlowRef>,
     point_order: Vec<NodeRef>,
-    conditions: HashMap<NodeRef, SourceTruthinessCondition>,
+    conditions: HashMap<NodeRef, SourceFlowCondition>,
     assignments: HashMap<NodeRef, SourceFlowAssignment>,
     assignment_order: Vec<NodeRef>,
 }
@@ -135,6 +195,7 @@ pub(super) enum SourceFlowInvariant {
     },
     AssignmentAlreadyCompleted(NodeRef),
     MissingCurrentType(SemanticSymbolId),
+    TypeofNarrowing(SourceTypeofNarrowingError),
     Cycle(FlowRef),
     DepthLimit(FlowRef),
 }
@@ -151,6 +212,18 @@ pub(super) enum SourceFlowError {
         flow: FlowRef,
         error: LiteralTypeCacheError,
     },
+}
+
+/// A malformed type graph or unavailable union cache while applying a
+/// preflighted `typeof` flow fact.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SourceTypeofNarrowingError {
+    MissingBootstrap,
+    InvalidType(TypeId),
+    InvalidUnion(TypeId),
+    CyclicUnion(TypeId),
+    UnsupportedType(TypeId),
+    Union(LiteralTypeCacheError),
 }
 
 impl From<SourceFlowUnsupported> for SourceFlowError {
@@ -201,6 +274,26 @@ impl SourceFlowPlan {
         conditions: impl IntoIterator<Item = SourceTruthinessCondition>,
         assignments: impl IntoIterator<Item = SourceFlowAssignment>,
     ) -> Result<Self, SourceFlowError> {
+        Self::preflight_conditions(
+            bound,
+            container,
+            expected_start_payload,
+            points,
+            conditions.into_iter().map(SourceFlowCondition::from),
+            assignments,
+        )
+    }
+
+    /// General typed-condition entry used once a statement syntax leaf has
+    /// proved more than direct identifier truthiness.
+    pub(super) fn preflight_conditions(
+        bound: &BoundFile,
+        container: NodeRef,
+        expected_start_payload: Option<NodeRef>,
+        points: impl IntoIterator<Item = NodeRef>,
+        conditions: impl IntoIterator<Item = SourceFlowCondition>,
+        assignments: impl IntoIterator<Item = SourceFlowAssignment>,
+    ) -> Result<Self, SourceFlowError> {
         let graph = bound.flow_graph();
         validate_container(graph, container)?;
         let start = graph
@@ -213,12 +306,10 @@ impl SourceFlowPlan {
 
         let mut planned_conditions = HashMap::new();
         for condition in conditions {
-            validate_bound_node(bound, graph, condition.expression)?;
-            if planned_conditions
-                .insert(condition.expression, condition)
-                .is_some()
-            {
-                return Err(SourceFlowInvariant::DuplicateCondition(condition.expression).into());
+            let expression = condition.expression();
+            validate_bound_node(bound, graph, expression)?;
+            if planned_conditions.insert(expression, condition).is_some() {
+                return Err(SourceFlowInvariant::DuplicateCondition(expression).into());
             }
         }
 
@@ -578,21 +669,48 @@ impl SourceFlowFrame<'_, '_> {
                     .ok_or(SourceFlowInvariant::UnknownCondition(condition_node))?;
                 let prior = self.resolve_flow(store, globals, antecedent, depth + 1)?;
                 let current = prior
-                    .type_of(condition.symbol)
-                    .ok_or(SourceFlowInvariant::MissingCurrentType(condition.symbol))?;
-                let assumption = match kind {
-                    SourceFlowKind::TrueCondition => TruthinessAssumption::Truthy,
-                    SourceFlowKind::FalseCondition => TruthinessAssumption::Falsy,
+                    .type_of(condition.symbol())
+                    .ok_or(SourceFlowInvariant::MissingCurrentType(condition.symbol()))?;
+                let assume_true = match kind {
+                    SourceFlowKind::TrueCondition => true,
+                    SourceFlowKind::FalseCondition => false,
                     SourceFlowKind::Start
                     | SourceFlowKind::Assignment
                     | SourceFlowKind::BranchLabel => unreachable!(),
                 };
-                let narrowed = narrow_by_truthiness(store, Some(globals), current, assumption)
+                let narrowed = match condition {
+                    SourceFlowCondition::Truthiness(_) => narrow_by_truthiness(
+                        store,
+                        Some(globals),
+                        current,
+                        if assume_true {
+                            TruthinessAssumption::Truthy
+                        } else {
+                            TruthinessAssumption::Falsy
+                        },
+                    )
                     .map_err(|error| SourceFlowError::Narrowing {
                         condition: condition_node,
                         error,
-                    })?;
-                Ok(prior.with_type(condition.symbol, narrowed))
+                    })?,
+                    SourceFlowCondition::Typeof(condition) => narrow_by_typeof(
+                        store,
+                        globals,
+                        current,
+                        condition.tag,
+                        assume_true
+                            == matches!(condition.comparison, SourceTypeofComparison::Equal),
+                    )
+                    .map_err(|error| match error {
+                        SourceTypeofNarrowingError::Union(error) => {
+                            SourceFlowError::Join { flow, error }
+                        }
+                        error => SourceFlowError::Invariant(
+                            SourceFlowInvariant::TypeofNarrowing(error),
+                        ),
+                    })?,
+                };
+                Ok(prior.with_type(condition.symbol(), narrowed))
             }
             SourceFlowKind::BranchLabel => {
                 let [then_flow, else_flow] = branch_antecedents(flow, &node)?;
@@ -675,6 +793,178 @@ impl SourceFlowFrame<'_, '_> {
             .find(|candidate| union_constituents(store, *candidate) == Some(anonymous_types))
             .unwrap_or(anonymous)
     }
+}
+
+/// Confirms that `typeof` filtering can classify every union leaf without
+/// invoking general relation, intersection, or type-parameter machinery.
+pub(super) fn source_typeof_narrowing_type_is_supported(
+    store: &CanonicalTypeMapperStore,
+    globals: &CanonicalGlobalTypes,
+    type_: TypeId,
+) -> Result<bool, SourceTypeofNarrowingError> {
+    let mut leaves = Vec::new();
+    collect_source_typeof_leaves(store, type_, &mut leaves, &mut HashSet::new())?;
+    for leaf in leaves {
+        match source_typeof_leaf_matches(store, globals, leaf, SourceTypeofTag::String) {
+            Ok(_) => {}
+            Err(SourceTypeofNarrowingError::UnsupportedType(_)) => return Ok(false),
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(true)
+}
+
+fn narrow_by_typeof(
+    store: &mut CanonicalTypeMapperStore,
+    globals: &CanonicalGlobalTypes,
+    type_: TypeId,
+    tag: SourceTypeofTag,
+    require_match: bool,
+) -> Result<TypeId, SourceTypeofNarrowingError> {
+    let mut leaves = Vec::new();
+    collect_source_typeof_leaves(store, type_, &mut leaves, &mut HashSet::new())?;
+    let mut retained = Vec::with_capacity(leaves.len());
+    for leaf in &leaves {
+        let record = store
+            .type_payload(*leaf)
+            .ok_or(SourceTypeofNarrowingError::InvalidType(*leaf))?;
+        if record.flags().intersects(TypeFlags::NEVER)
+            || source_typeof_leaf_matches(store, globals, *leaf, tag)? == require_match
+        {
+            retained.push(*leaf);
+        }
+    }
+    if retained.len() == leaves.len() {
+        return Ok(type_);
+    }
+    if retained.is_empty() {
+        return store
+            .intrinsic_bootstrap()
+            .map(|bootstrap| bootstrap.never_type)
+            .ok_or(SourceTypeofNarrowingError::MissingBootstrap);
+    }
+    if let [only] = retained.as_slice() {
+        return Ok(*only);
+    }
+    store
+        .expression_union_type_with_global_types(globals, &retained, UnionReduction::Literal)
+        .map_err(SourceTypeofNarrowingError::Union)
+}
+
+fn collect_source_typeof_leaves(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    leaves: &mut Vec<TypeId>,
+    visiting: &mut HashSet<TypeId>,
+) -> Result<(), SourceTypeofNarrowingError> {
+    let record = store
+        .type_payload(type_)
+        .ok_or(SourceTypeofNarrowingError::InvalidType(type_))?;
+    if !record.flags().intersects(TypeFlags::UNION) {
+        if matches!(record.data(), TypeData::Union(_)) {
+            return Err(SourceTypeofNarrowingError::InvalidUnion(type_));
+        }
+        leaves.push(type_);
+        return Ok(());
+    }
+    if !visiting.insert(type_) {
+        return Err(SourceTypeofNarrowingError::CyclicUnion(type_));
+    }
+    let TypeData::Union(union) = record.data() else {
+        return Err(SourceTypeofNarrowingError::InvalidUnion(type_));
+    };
+    for constituent in &union.union.types {
+        collect_source_typeof_leaves(store, *constituent, leaves, visiting)?;
+    }
+    visiting.remove(&type_);
+    Ok(())
+}
+
+fn source_typeof_leaf_matches(
+    store: &CanonicalTypeMapperStore,
+    globals: &CanonicalGlobalTypes,
+    type_: TypeId,
+    tag: SourceTypeofTag,
+) -> Result<bool, SourceTypeofNarrowingError> {
+    let record = store
+        .type_payload(type_)
+        .ok_or(SourceTypeofNarrowingError::InvalidType(type_))?;
+    let flags = record.flags();
+    if flags.intersects(
+        TypeFlags::ANY
+            | TypeFlags::UNKNOWN
+            | TypeFlags::TYPE_PARAMETER
+            | TypeFlags::INTERSECTION
+            | TypeFlags::INDEX
+            | TypeFlags::INDEXED_ACCESS
+            | TypeFlags::CONDITIONAL
+            | TypeFlags::SUBSTITUTION,
+    ) {
+        return Err(SourceTypeofNarrowingError::UnsupportedType(type_));
+    }
+    if flags.intersects(TypeFlags::UNION) {
+        return Err(SourceTypeofNarrowingError::InvalidUnion(type_));
+    }
+
+    let function_object = if flags.intersects(TypeFlags::OBJECT) {
+        Some(source_typeof_object_is_function(
+            store, globals, type_, record,
+        )?)
+    } else {
+        None
+    };
+    let matched = match tag {
+        SourceTypeofTag::String => flags.intersects(TypeFlags::STRING_LIKE),
+        SourceTypeofTag::Number => flags.intersects(TypeFlags::NUMBER_LIKE),
+        SourceTypeofTag::Boolean => flags.intersects(TypeFlags::BOOLEAN_LIKE),
+        SourceTypeofTag::BigInt => flags.intersects(TypeFlags::BIG_INT_LIKE),
+        SourceTypeofTag::Symbol => flags.intersects(TypeFlags::ES_SYMBOL_LIKE),
+        SourceTypeofTag::Undefined => flags.intersects(TypeFlags::VOID_LIKE),
+        SourceTypeofTag::Object => {
+            flags.intersects(TypeFlags::NULL | TypeFlags::NON_PRIMITIVE)
+                || function_object == Some(false)
+        }
+        SourceTypeofTag::Function => function_object == Some(true),
+    };
+    let classifiable = flags.intersects(
+        TypeFlags::NEVER
+            | TypeFlags::STRING_LIKE
+            | TypeFlags::NUMBER_LIKE
+            | TypeFlags::BIG_INT_LIKE
+            | TypeFlags::BOOLEAN_LIKE
+            | TypeFlags::ES_SYMBOL_LIKE
+            | TypeFlags::VOID_LIKE
+            | TypeFlags::NULL
+            | TypeFlags::NON_PRIMITIVE
+            | TypeFlags::OBJECT,
+    );
+    if !classifiable {
+        return Err(SourceTypeofNarrowingError::UnsupportedType(type_));
+    }
+    Ok(matched)
+}
+
+fn source_typeof_object_is_function(
+    store: &CanonicalTypeMapperStore,
+    globals: &CanonicalGlobalTypes,
+    type_: TypeId,
+    record: &TypeRecord,
+) -> Result<bool, SourceTypeofNarrowingError> {
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or(SourceTypeofNarrowingError::MissingBootstrap)?;
+    if type_ == globals.function_type || type_ == bootstrap.any_function_type {
+        return Ok(true);
+    }
+    let structured = record
+        .data()
+        .structured()
+        .ok_or(SourceTypeofNarrowingError::InvalidType(type_))?;
+    let signature_count = structured.signatures.as_ref().map_or(0, Vec::len);
+    if structured.call_signature_count > signature_count {
+        return Err(SourceTypeofNarrowingError::InvalidType(type_));
+    }
+    Ok(signature_count != 0)
 }
 
 fn validate_container(graph: &BoundFlowGraph, container: NodeRef) -> Result<(), SourceFlowError> {
