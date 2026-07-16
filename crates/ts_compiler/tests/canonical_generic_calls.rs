@@ -28,6 +28,7 @@ fn canonical_options() -> CompilerOptions {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn canonical_program_emits_exact_ordered_generic_call_diagnostics() {
     const SOURCE: &str = concat!(
         "function pair<T, U>(left: T, right: U): U { return right; }\n",
