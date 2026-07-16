@@ -2933,6 +2933,42 @@ mod tests {
         )
     }
 
+    fn materialize_vector(
+        store: &mut CanonicalTypeMapperStore,
+        callable: &ValidatedSingleCallable,
+        resolution: &GenericCallVectorResolution,
+    ) -> Result<GenericCallVectorMaterialization, GenericCallVectorError> {
+        materialize_validated_generic_call_vector_checked_instantiation(store, resolution, callable)
+    }
+
+    #[derive(Debug, Eq, PartialEq)]
+    struct VectorCacheGraphCounts {
+        mappers: usize,
+        symbols: usize,
+        signatures: usize,
+        cached_signatures: usize,
+        links: [usize; 26],
+        types: usize,
+        unions: usize,
+        unions_of_unions: usize,
+        union_validation_scans: usize,
+    }
+
+    fn vector_cache_graph_counts(store: &CanonicalTypeMapperStore) -> VectorCacheGraphCounts {
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        VectorCacheGraphCounts {
+            mappers: store.mapper_len(),
+            symbols: store.symbol_len(),
+            signatures: store.signature_len(),
+            cached_signatures: store.cached_signature_len(),
+            links: store.checker_link_allocated_lengths(),
+            types: store.type_len(),
+            unions: bootstrap.union_cache_len(),
+            unions_of_unions: bootstrap.union_of_union_cache_len(),
+            union_validation_scans: store.union_cache_validation_scan_count(),
+        }
+    }
+
     fn fresh_string(store: &mut CanonicalTypeMapperStore, value: &str) -> TypeId {
         let regular = store.regular_string_literal_type(value.into()).unwrap();
         store.fresh_type_of_literal_type(regular).unwrap()
@@ -3333,7 +3369,7 @@ mod tests {
         assert_eq!(
             empty.applicability,
             GenericCallVectorApplicability::Applicable,
-            "the parser owns TS1099 and zero type arguments trigger inference"
+            "the source grammar consumer owns TS1099 and zero type arguments trigger inference"
         );
         assert_eq!(empty.projection.instantiation.type_arguments, [number]);
     }
@@ -3572,6 +3608,479 @@ mod tests {
                 parameter_type: one,
             }
         );
+    }
+
+    #[test]
+    fn vector_checked_materialization_publishes_exact_ordered_cache_and_reuses_it() {
+        let mut store = initialized_store();
+        let (string, number) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (bootstrap.string_type, bootstrap.number_type)
+        };
+        let (pair, type_parameters) = vector_callable(
+            &mut store,
+            &["T", "U"],
+            &[None, None],
+            &[None, None],
+            &[0, 1],
+            |_, parameters| parameters[1],
+        );
+        let resolution = project_vector(
+            &mut store,
+            &pair,
+            vector_request(pair.owner, Some(&[string, number]), &[string, number]),
+        )
+        .unwrap();
+        let checked = resolution.checked_instantiation.as_ref().unwrap().clone();
+        let before = vector_cache_graph_counts(&store);
+
+        let first = materialize_vector(&mut store, &pair, &resolution).unwrap();
+        let GenericCallVectorMaterialization::Published(cached) = first else {
+            panic!("cold checked vector must publish its global cache entry");
+        };
+
+        assert_eq!(store.mapper_len(), before.mappers + 1);
+        assert_eq!(store.symbol_len(), before.symbols + 2);
+        assert_eq!(store.signature_len(), before.signatures + 1);
+        assert_eq!(store.cached_signature_len(), before.cached_signatures + 1);
+        assert_ne!(store.checker_link_allocated_lengths(), before.links);
+        assert_eq!(
+            store.type_mapper_has_exact_endpoints(
+                cached.mapper,
+                &type_parameters,
+                &[string, number],
+            ),
+            Some(true)
+        );
+        let original = store.signature(pair.signature).unwrap();
+        let original_parameters = original.parameters().to_vec();
+        let original_flags = original.flags();
+        let original_declaration = original.declaration();
+        let original_min_argument_count = original.min_argument_count();
+        let instantiated = store.signature(cached.signature).unwrap();
+        assert_eq!(
+            instantiated.flags(),
+            original_flags & SignatureFlags::PROPAGATING_FLAGS
+        );
+        assert_eq!(instantiated.declaration(), original_declaration);
+        assert!(instantiated.type_parameters().is_empty());
+        assert_eq!(instantiated.this_parameter(), None);
+        assert_eq!(instantiated.resolved_return_type(), Some(number));
+        assert_eq!(instantiated.resolved_type_predicate(), None);
+        assert_eq!(
+            instantiated.min_argument_count(),
+            original_min_argument_count
+        );
+        assert_eq!(instantiated.resolved_min_argument_count(), -1);
+        assert_eq!(instantiated.target(), Some(pair.signature));
+        assert_eq!(instantiated.mapper(), Some(cached.mapper));
+        assert_eq!(instantiated.isolated_signature_type(), None);
+        assert_eq!(instantiated.composite(), None);
+        assert_eq!(instantiated.parameters().len(), 2);
+        for ((parameter, target), parameter_type) in instantiated
+            .parameters()
+            .iter()
+            .copied()
+            .zip(original_parameters)
+            .zip(checked.parameter_types.iter().copied())
+        {
+            assert!(cached_instantiated_parameter(
+                &store,
+                parameter,
+                target,
+                cached.mapper,
+                parameter_type,
+            ));
+        }
+        assert_eq!(
+            store.cached_signature(
+                pair.signature,
+                type_list_key(&checked.type_arguments),
+                &checked.type_arguments,
+            ),
+            CachedSignatureLookup::Hit(cached.signature)
+        );
+
+        let warm_counts = vector_cache_graph_counts(&store);
+        assert_eq!(
+            materialize_vector(&mut store, &pair, &resolution),
+            Ok(GenericCallVectorMaterialization::Reused(cached))
+        );
+        assert_eq!(vector_cache_graph_counts(&store), warm_counts);
+    }
+
+    #[test]
+    fn ts2345_materializes_checked_inferred_and_explicit_vectors_not_recovery_vectors() {
+        let mut store = initialized_store();
+        let (string, number) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (bootstrap.string_type, bootstrap.number_type)
+        };
+
+        let (choose, choose_parameters) = vector_callable(
+            &mut store,
+            &["T"],
+            &[None],
+            &[None],
+            &[0, 0],
+            |_, parameters| parameters[0],
+        );
+        let inferred_number = fresh_number(&mut store, 1.0);
+        let inferred_string = fresh_string(&mut store, "mixed");
+        let inferred = project_vector(
+            &mut store,
+            &choose,
+            vector_request(choose.owner, None, &[inferred_number, inferred_string]),
+        )
+        .unwrap();
+        assert!(matches!(
+            inferred.applicability,
+            GenericCallVectorApplicability::ArgumentNotAssignable { .. }
+        ));
+        let inferred_checked = inferred.checked_instantiation.as_ref().unwrap();
+        let GenericCallVectorMaterialization::Published(inferred_cached) =
+            materialize_vector(&mut store, &choose, &inferred).unwrap()
+        else {
+            panic!("an inferred TS2345 candidate must cache its checked signature");
+        };
+        assert_eq!(
+            store.type_mapper_has_exact_endpoints(
+                inferred_cached.mapper,
+                &choose_parameters,
+                &inferred_checked.type_arguments,
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            store
+                .signature(inferred_cached.signature)
+                .unwrap()
+                .resolved_return_type(),
+            Some(inferred_checked.return_type)
+        );
+
+        let (two, type_parameters) = vector_callable(
+            &mut store,
+            &["T", "U"],
+            &[None, None],
+            &[None, Some(GenericTypeSpec::Parameter(0))],
+            &[0, 1],
+            |_, parameters| parameters[1],
+        );
+        let explicit = project_vector(
+            &mut store,
+            &two,
+            vector_request(two.owner, Some(&[string]), &[string, number]),
+        )
+        .unwrap();
+        let explicit_checked = explicit.checked_instantiation.as_ref().unwrap();
+        assert_eq!(explicit_checked.type_arguments, [string, string]);
+        assert_eq!(
+            explicit.projection.instantiation.return_type,
+            type_parameters[0]
+        );
+        assert_ne!(
+            explicit_checked.return_type,
+            explicit.projection.instantiation.return_type
+        );
+        let GenericCallVectorMaterialization::Published(explicit_cached) =
+            materialize_vector(&mut store, &two, &explicit).unwrap()
+        else {
+            panic!("an explicit TS2345 candidate must cache its checked signature");
+        };
+        assert_eq!(
+            store.type_mapper_has_exact_endpoints(
+                explicit_cached.mapper,
+                &type_parameters,
+                &[string, string],
+            ),
+            Some(true),
+            "raw default recovery must not leak into the global mapper"
+        );
+        let explicit_signature = store.signature(explicit_cached.signature).unwrap();
+        assert_eq!(explicit_signature.resolved_return_type(), Some(string));
+        for parameter in explicit_signature.parameters() {
+            assert_eq!(
+                store
+                    .value_symbol_links(*parameter)
+                    .and_then(|links| links.resolved_type),
+                Some(string)
+            );
+        }
+    }
+
+    #[test]
+    fn recovery_only_vector_diagnostics_are_explicitly_unmaterialized_without_writes() {
+        let mut store = initialized_store();
+        let (string, number) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (bootstrap.string_type, bootstrap.number_type)
+        };
+        let (pair, _) = vector_callable(
+            &mut store,
+            &["T", "U"],
+            &[None, None],
+            &[None, None],
+            &[0, 1],
+            |_, parameters| parameters[1],
+        );
+
+        let type_arity = project_vector(
+            &mut store,
+            &pair,
+            vector_request(pair.owner, Some(&[string]), &[string, number]),
+        )
+        .unwrap();
+        assert_eq!(type_arity.applicability.diagnostic_code(), Some(2558));
+        let before = vector_cache_graph_counts(&store);
+        assert_eq!(
+            materialize_vector(&mut store, &pair, &type_arity),
+            Ok(GenericCallVectorMaterialization::Unmaterialized {
+                applicability: type_arity.applicability,
+            })
+        );
+        assert_eq!(vector_cache_graph_counts(&store), before);
+
+        let value_arity = project_vector(
+            &mut store,
+            &pair,
+            vector_request(pair.owner, None, &[string]),
+        )
+        .unwrap();
+        assert_eq!(value_arity.applicability.diagnostic_code(), Some(2554));
+        let before = vector_cache_graph_counts(&store);
+        assert_eq!(
+            materialize_vector(&mut store, &pair, &value_arity),
+            Ok(GenericCallVectorMaterialization::Unmaterialized {
+                applicability: value_arity.applicability,
+            })
+        );
+        assert_eq!(vector_cache_graph_counts(&store), before);
+
+        let (constrained, _) = vector_callable(
+            &mut store,
+            &["T"],
+            &[Some(GenericTypeSpec::Exact(string))],
+            &[None],
+            &[0],
+            |_, parameters| parameters[0],
+        );
+        let constraint = project_vector(
+            &mut store,
+            &constrained,
+            vector_request(constrained.owner, Some(&[number]), &[number]),
+        )
+        .unwrap();
+        assert_eq!(constraint.applicability.diagnostic_code(), Some(2344));
+        let before = vector_cache_graph_counts(&store);
+        assert_eq!(
+            materialize_vector(&mut store, &constrained, &constraint),
+            Ok(GenericCallVectorMaterialization::Unmaterialized {
+                applicability: constraint.applicability,
+            })
+        );
+        assert_eq!(vector_cache_graph_counts(&store), before);
+    }
+
+    #[test]
+    fn vector_cache_failures_are_atomic_and_capacity_failure_is_retryable() {
+        let mut store = initialized_store();
+        let (string, number) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (bootstrap.string_type, bootstrap.number_type)
+        };
+        let (pair, type_parameters) = vector_callable(
+            &mut store,
+            &["T", "U"],
+            &[None, None],
+            &[None, None],
+            &[0, 1],
+            |_, parameters| parameters[1],
+        );
+        let resolution = project_vector(
+            &mut store,
+            &pair,
+            vector_request(pair.owner, Some(&[string, number]), &[string, number]),
+        )
+        .unwrap();
+        let before = vector_cache_graph_counts(&store);
+
+        assert_eq!(
+            materialize_validated_generic_call_vector_checked_instantiation_with_reservation(
+                &mut store,
+                &resolution,
+                &pair,
+                |_, _| false,
+            ),
+            Err(GenericCallVectorError::Invariant(
+                GenericCallVectorInvariant::Capacity(pair.signature)
+            ))
+        );
+        assert_eq!(vector_cache_graph_counts(&store), before);
+
+        let shape = validate_generic_call_signature_shape(&store, pair.owner, &pair).unwrap();
+        let checked = resolution.checked_instantiation.as_ref().unwrap();
+        assert_eq!(
+            cached_generic_call_vector_instantiation_from_lookup(
+                &store,
+                &shape,
+                &type_parameters,
+                checked,
+                CachedSignatureLookup::HashCollision(pair.signature),
+            ),
+            Err(GenericCallVectorError::Invariant(
+                GenericCallVectorInvariant::InstantiationCacheHashCollision {
+                    target: pair.signature,
+                    cached: pair.signature,
+                }
+            ))
+        );
+        assert_eq!(vector_cache_graph_counts(&store), before);
+
+        let GenericCallVectorMaterialization::Published(cached) =
+            materialize_vector(&mut store, &pair, &resolution).unwrap()
+        else {
+            panic!("retry after a capacity failure must publish exactly once");
+        };
+        let wrong_mapper = store
+            .new_type_mapper(type_parameters, vec![number, string])
+            .unwrap();
+        assert!(store.set_signature_target_and_mapper(
+            cached.signature,
+            Some(pair.signature),
+            Some(wrong_mapper),
+        ));
+        let poisoned_counts = vector_cache_graph_counts(&store);
+        assert_eq!(
+            materialize_vector(&mut store, &pair, &resolution),
+            Err(GenericCallVectorError::Invariant(
+                GenericCallVectorInvariant::InvalidCachedInstantiation {
+                    target: pair.signature,
+                    signature: cached.signature,
+                }
+            ))
+        );
+        assert_eq!(vector_cache_graph_counts(&store), poisoned_counts);
+
+        assert!(store.set_signature_target_and_mapper(
+            cached.signature,
+            Some(pair.signature),
+            Some(cached.mapper),
+        ));
+        assert_eq!(
+            materialize_vector(&mut store, &pair, &resolution),
+            Ok(GenericCallVectorMaterialization::Reused(cached))
+        );
+        let parameter = store.signature(cached.signature).unwrap().parameters()[0];
+        let target = store
+            .value_symbol_links(parameter)
+            .and_then(|links| links.target)
+            .unwrap();
+        assert!(store.set_value_symbol_links(
+            parameter,
+            ValueSymbolLinks {
+                resolved_type: Some(number),
+                target: Some(target),
+                mapper: Some(cached.mapper),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        let poisoned_counts = vector_cache_graph_counts(&store);
+        assert_eq!(
+            materialize_vector(&mut store, &pair, &resolution),
+            Err(GenericCallVectorError::Invariant(
+                GenericCallVectorInvariant::InvalidCachedInstantiation {
+                    target: pair.signature,
+                    signature: cached.signature,
+                }
+            ))
+        );
+        assert_eq!(vector_cache_graph_counts(&store), poisoned_counts);
+    }
+
+    #[test]
+    fn forged_checked_union_vector_is_rejected_read_only_before_cache_lookup() {
+        let mut store = initialized_store();
+        let (string, number) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (bootstrap.string_type, bootstrap.number_type)
+        };
+        let (both, _) = vector_callable(
+            &mut store,
+            &["T", "U"],
+            &[None, None],
+            &[None, None],
+            &[0, 1],
+            |store, parameters| {
+                store
+                    .alloc_union_type(ObjectFlags::NONE, parameters.to_vec())
+                    .unwrap()
+            },
+        );
+        let resolution = project_vector(
+            &mut store,
+            &both,
+            vector_request(both.owner, Some(&[string, number]), &[string, number]),
+        )
+        .unwrap();
+        let forged_argument = fresh_string(&mut store, "forged");
+        let mut forged = resolution.clone();
+        let forged_checked = forged.checked_instantiation.as_mut().unwrap();
+        forged_checked.type_arguments[0] = forged_argument;
+        let before = vector_cache_graph_counts(&store);
+
+        assert_eq!(
+            materialize_vector(&mut store, &both, &forged),
+            Err(GenericCallVectorError::Invariant(
+                GenericCallVectorInvariant::InvalidCheckedInstantiation(both.signature)
+            ))
+        );
+        assert_eq!(
+            vector_cache_graph_counts(&store),
+            before,
+            "read-only vector validation must reject malformed internal state without interning its union"
+        );
+    }
+
+    #[test]
+    fn stale_ts2345_checked_return_source_is_rejected_read_only() {
+        let mut store = initialized_store();
+        let (string, number) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (bootstrap.string_type, bootstrap.number_type)
+        };
+        let (pair, type_parameters) = vector_callable(
+            &mut store,
+            &["T", "U"],
+            &[None, None],
+            &[None, None],
+            &[0, 1],
+            |_, parameters| parameters[1],
+        );
+        let resolution = project_vector(
+            &mut store,
+            &pair,
+            vector_request(pair.owner, Some(&[string, number]), &[string, string]),
+        )
+        .unwrap();
+        assert!(matches!(
+            resolution.applicability,
+            GenericCallVectorApplicability::ArgumentNotAssignable { .. }
+        ));
+
+        assert!(
+            store.set_signature_resolved_return_type(pair.signature, Some(type_parameters[0]),)
+        );
+        let mut changed_pair = pair.clone();
+        changed_pair.return_type = Some(type_parameters[0]);
+        let before = vector_cache_graph_counts(&store);
+        assert_eq!(
+            materialize_vector(&mut store, &changed_pair, &resolution),
+            Err(GenericCallVectorError::Invariant(
+                GenericCallVectorInvariant::InvalidCheckedInstantiation(pair.signature)
+            ))
+        );
+        assert_eq!(vector_cache_graph_counts(&store), before);
     }
 
     #[test]

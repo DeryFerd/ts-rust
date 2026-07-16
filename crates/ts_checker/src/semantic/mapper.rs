@@ -387,11 +387,25 @@ mod tests {
         let empty = store.new_type_mapper(vec![], vec![]).unwrap();
         assert_eq!(store.mapper_kind(empty), Some(TypeMapperKind::Array));
         assert_eq!(store.map_type(empty, a), Some(a));
+        assert_eq!(
+            store.type_mapper_has_exact_endpoints(empty, &[], &[]),
+            Some(true)
+        );
 
         let one = store.new_type_mapper(vec![a], vec![b]).unwrap();
         assert_eq!(store.mapper_kind(one), Some(TypeMapperKind::Simple));
         assert_eq!(store.map_type(one, a), Some(b));
         assert_eq!(store.map_type(one, c), Some(c));
+        assert_eq!(
+            store.type_mapper_has_exact_endpoints(one, &[a], &[b]),
+            Some(true)
+        );
+        let wrong_one_representation = store.new_array_type_mapper(vec![a], vec![b]).unwrap();
+        assert_eq!(
+            store.type_mapper_has_exact_endpoints(wrong_one_representation, &[a], &[b]),
+            Some(false),
+            "one-row newTypeMapper caches must use the simple representation"
+        );
 
         let many = store
             .new_array_type_mapper(vec![a, a, c], vec![b, d, d])
@@ -399,6 +413,15 @@ mod tests {
         assert_eq!(store.map_type(many, a), Some(b));
         assert_eq!(store.map_type(many, c), Some(d));
         assert_eq!(store.map_type(many, d), Some(d));
+        assert_eq!(
+            store.type_mapper_has_exact_endpoints(many, &[a, a, c], &[b, d, d]),
+            Some(true)
+        );
+        assert_eq!(
+            store.type_mapper_has_exact_endpoints(many, &[a, c, a], &[b, d, d]),
+            Some(false),
+            "ordered source rows are part of the cache identity"
+        );
 
         let to_single = store
             .new_array_to_single_type_mapper(vec![a, c], d)
@@ -406,6 +429,10 @@ mod tests {
         assert_eq!(store.map_type(to_single, a), Some(d));
         assert_eq!(store.map_type(to_single, c), Some(d));
         assert_eq!(store.map_type(to_single, b), Some(b));
+        assert_eq!(
+            store.type_mapper_has_exact_endpoints(to_single, &[a, c], &[d, d]),
+            Some(false)
+        );
     }
 
     #[test]
