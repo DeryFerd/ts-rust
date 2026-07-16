@@ -1,14 +1,16 @@
 //! Dependency-closed type instantiation.
 //!
 //! This is the first exact slice of pinned `instantiateTypeWorker`. It covers
-//! primitive and literal leaves, direct type-parameter mapping, and anonymous
-//! origin-free unions whose constituents remain inside the installed canonical
-//! union domain. Object, signature, alias, and origin instantiation need their
-//! owning caches and are rejected instead of being treated as identities.
+//! primitive and literal leaves, direct type-parameter mapping, canonical
+//! Array/ReadonlyArray references under an explicit target capability, and
+//! anonymous origin-free unions whose constituents remain inside the installed
+//! canonical union domain. Other object, signature, alias, and origin
+//! instantiation needs its owning caches and is rejected instead of identity.
 
 use super::{
-    TypeId, TypeMapperId, bootstrap::LiteralTypeCacheError, mapper::CanonicalTypeMapperStore,
-    type_records::TypeData,
+    TypeId, TypeMapperId,
+    array_types::{ArrayTypeError, CanonicalArrayTargets},
+    bootstrap::LiteralTypeCacheError, mapper::CanonicalTypeMapperStore, type_records::TypeData,
 };
 
 /// Pinned checker limits for one instantiation query.
@@ -54,6 +56,7 @@ pub(super) enum InstantiationError {
     /// Needs a read-only canonical union identity validator that admits type
     /// parameters; the installed literal-union validator intentionally does not.
     UnvalidatedUnchangedUnion(TypeId),
+    Array(ArrayTypeError),
     Union(LiteralTypeCacheError),
 }
 
@@ -99,6 +102,7 @@ impl std::fmt::Display for InstantiationError {
                 formatter,
                 "unchanged generic union {type_:?} requires canonical identity validation"
             ),
+            Self::Array(error) => error.fmt(formatter),
             Self::Union(error) => error.fmt(formatter),
         }
     }
@@ -107,6 +111,7 @@ impl std::fmt::Display for InstantiationError {
 impl std::error::Error for InstantiationError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::Array(error) => Some(error),
             Self::Union(error) => Some(error),
             _ => None,
         }
@@ -116,6 +121,12 @@ impl std::error::Error for InstantiationError {
 impl From<LiteralTypeCacheError> for InstantiationError {
     fn from(error: LiteralTypeCacheError) -> Self {
         Self::Union(error)
+    }
+}
+
+impl From<ArrayTypeError> for InstantiationError {
+    fn from(error: ArrayTypeError) -> Self {
+        Self::Array(error)
     }
 }
 
@@ -169,6 +180,7 @@ pub(super) fn instantiate_type_with_limits(
         store,
         type_,
         InstantiationMapping::Stored(mapper),
+        None,
         0,
         &mut state,
     )
@@ -187,6 +199,33 @@ pub(super) fn instantiate_type_with_vector(
     sources: &[TypeId],
     targets: &[TypeId],
 ) -> Result<TypeId, InstantiationError> {
+    instantiate_type_with_vector_and_optional_array_targets(store, type_, sources, targets, None)
+}
+
+/// Vector instantiation with retained canonical `Array` targets.
+pub(super) fn instantiate_type_with_vector_and_array_targets(
+    store: &mut CanonicalTypeMapperStore,
+    type_: TypeId,
+    sources: &[TypeId],
+    targets: &[TypeId],
+    array_targets: CanonicalArrayTargets,
+) -> Result<TypeId, InstantiationError> {
+    instantiate_type_with_vector_and_optional_array_targets(
+        store,
+        type_,
+        sources,
+        targets,
+        Some(array_targets),
+    )
+}
+
+fn instantiate_type_with_vector_and_optional_array_targets(
+    store: &mut CanonicalTypeMapperStore,
+    type_: TypeId,
+    sources: &[TypeId],
+    targets: &[TypeId],
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<TypeId, InstantiationError> {
     if sources.len() != targets.len() {
         return Err(InstantiationError::InvalidType(type_));
     }
@@ -203,6 +242,7 @@ pub(super) fn instantiate_type_with_vector(
         store,
         type_,
         InstantiationMapping::Vector { sources, targets },
+        array_targets,
         0,
         &mut state,
     )
@@ -238,6 +278,7 @@ fn instantiate_type_worker(
     store: &mut CanonicalTypeMapperStore,
     type_: TypeId,
     mapping: InstantiationMapping<'_>,
+    array_targets: Option<CanonicalArrayTargets>,
     depth: usize,
     state: &mut InstantiationState,
 ) -> Result<TypeId, InstantiationError> {
@@ -260,10 +301,46 @@ fn instantiate_type_worker(
                 return Err(InstantiationError::UnsupportedUnionOrigin(type_));
             }
             let constituents = data.union.types.clone();
-            instantiate_union(store, type_, &constituents, mapping, depth, state)
+            instantiate_union(store, type_, &constituents, mapping, array_targets, depth, state)
         }
+        TypeData::TypeReference(_) => instantiate_array_reference(
+            store,
+            type_,
+            mapping,
+            array_targets.ok_or(InstantiationError::UnsupportedType(type_))?,
+            depth,
+            state,
+        ),
         _ => Err(InstantiationError::UnsupportedType(type_)),
     }
+}
+
+fn instantiate_array_reference(
+    store: &mut CanonicalTypeMapperStore,
+    source: TypeId,
+    mapping: InstantiationMapping<'_>,
+    array_targets: CanonicalArrayTargets,
+    depth: usize,
+    state: &mut InstantiationState,
+) -> Result<TypeId, InstantiationError> {
+    let Some(reference) = store.canonical_array_reference_with_targets(array_targets, source)? else {
+        return Err(InstantiationError::UnsupportedType(source));
+    };
+    state.enter(depth)?;
+    let element = instantiate_type_worker(
+        store,
+        reference.element_type,
+        mapping,
+        Some(array_targets),
+        depth + 1,
+        state,
+    )?;
+    if element == reference.element_type {
+        return Ok(source);
+    }
+    store
+        .create_canonical_array_type_with_targets(array_targets, element, reference.readonly)
+        .map_err(Into::into)
 }
 
 fn instantiate_union(
@@ -271,6 +348,7 @@ fn instantiate_union(
     source: TypeId,
     constituents: &[TypeId],
     mapping: InstantiationMapping<'_>,
+    array_targets: Option<CanonicalArrayTargets>,
     depth: usize,
     state: &mut InstantiationState,
 ) -> Result<TypeId, InstantiationError> {
@@ -299,7 +377,14 @@ fn instantiate_union(
     }
     state.enter(depth)?;
     for constituent in constituents {
-        let instantiated = instantiate_type_worker(store, *constituent, mapping, depth + 1, state)?;
+        let instantiated = instantiate_type_worker(
+            store,
+            *constituent,
+            mapping,
+            array_targets,
+            depth + 1,
+            state,
+        )?;
         changed |= instantiated != *constituent;
         mapped_types.push(instantiated);
     }

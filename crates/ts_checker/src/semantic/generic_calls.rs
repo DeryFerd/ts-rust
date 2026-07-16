@@ -2,7 +2,8 @@
 //!
 //! The full-vector branch admits one stored signature with ordered type
 //! parameters, fixed required parameters whose targets are naked type
-//! parameters, and a mapper-supported return. It owns declaration-order
+//! parameters or canonical nested Array wrappers, and a mapper-supported
+//! return. It owns declaration-order
 //! inference/default/constraint finalization, overload-failure projection, and
 //! exact checked-instantiation cache publication. Recovery signatures remain a
 //! separate call-node concern and never enter the global signature cache. The
@@ -18,6 +19,7 @@ use ts_binder::{CheckFlags, SymbolData, SymbolFlags};
 use super::{
     CanonicalGlobalTypes, CanonicalTypeMapperStore, DeclaredTypeHost, RelationUnavailable,
     SemanticSymbolId, SignatureId, TypeId, TypeMapperId, ValueSymbolLinks,
+    array_types::{ArrayTypeError, CanonicalArrayTargets},
     callables::{
         StoredSingleCallableValidation, ValidatedSingleCallable, validate_stored_single_callable,
     },
@@ -27,9 +29,14 @@ use super::{
     declared::{cached_ordinary_type_parameter_owner, type_list_key},
     inference::{
         InferenceLiteralTreatment, NakedTypeCandidateError, NakedTypeInferenceError,
-        infer_naked_type_parameter, infer_naked_type_parameter_candidates, validate_inference_leaf,
+        infer_naked_type_parameter, infer_naked_type_parameter_candidates,
+        infer_naked_type_parameter_candidates_with_array_targets, validate_inference_leaf,
+        validate_inference_leaf_with_array_targets,
     },
-    instantiate::{InstantiationError, instantiate_type_with_vector},
+    instantiate::{
+        InstantiationError, instantiate_type_with_vector,
+        instantiate_type_with_vector_and_array_targets,
+    },
     signatures::SignatureFlags,
     source_callables::{StoredSourceCallableValidation, validate_stored_source_callable},
     store::CachedSignatureLookup,
@@ -124,6 +131,11 @@ pub(super) enum GenericCallVectorInvariant {
     },
     Capacity(SignatureId),
     MissingBootstrap,
+    InvalidArrayType {
+        signature: SignatureId,
+        type_: TypeId,
+        error: ArrayTypeError,
+    },
 }
 
 /// Capability, inference, instantiation, or relation failure. Ordinary call
@@ -236,15 +248,20 @@ impl GenericCallVectorApplicability {
 /// overload-failure vector used for the call expression's final return type.
 /// Fields are private so sibling consumers receive an immutable resolver-minted
 /// capability; cache publication never needs to recompute and potentially
-/// intern a forged union merely to validate it. `checked_return_source` also
-/// proves that the callable's current raw return source is the one from which
-/// the checked return was minted.
+/// intern a forged union merely to validate it. The boxed capability keeps the
+/// resolver compact while proving both the raw return and retained Array targets.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct GenericCallVectorResolution {
     projection: GenericCallVectorProjection,
     checked_instantiation: Option<GenericCallVectorInstantiation>,
     applicability: GenericCallVectorApplicability,
+    capability: Box<GenericCallVectorCapability>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GenericCallVectorCapability {
     checked_return_source: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
 }
 
 impl GenericCallVectorResolution {
@@ -306,8 +323,9 @@ struct GenericCallTypeParameter {
 struct GenericCallSignatureShape {
     signature: SignatureId,
     type_parameters: Vec<GenericCallTypeParameter>,
-    parameter_type_parameters: Vec<TypeId>,
+    parameter_templates: Vec<TypeId>,
     return_type: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
 }
 
 #[derive(Debug)]
@@ -369,6 +387,7 @@ pub(super) fn resolve_generic_call_vector(
         store,
         request,
         &callable,
+        Some(CanonicalArrayTargets::from_global_types(global_types)),
         |store, source, target| {
             store.is_type_assignable_to_with_global_types_and_strict_function_types(
                 source,
@@ -454,12 +473,16 @@ fn generic_call_vector_resolution(
     checked_instantiation: Option<GenericCallVectorInstantiation>,
     applicability: GenericCallVectorApplicability,
     checked_return_source: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
 ) -> GenericCallVectorResolution {
     GenericCallVectorResolution {
         projection,
         checked_instantiation,
         applicability,
-        checked_return_source,
+        capability: Box::new(GenericCallVectorCapability {
+            checked_return_source,
+            array_targets,
+        }),
     }
 }
 
@@ -467,6 +490,7 @@ fn project_validated_generic_call_vector(
     store: &mut CanonicalTypeMapperStore,
     request: GenericCallVectorRequest<'_>,
     callable: &ValidatedSingleCallable,
+    array_targets: Option<CanonicalArrayTargets>,
     mut is_assignable: impl FnMut(
         &mut CanonicalTypeMapperStore,
         TypeId,
@@ -490,7 +514,8 @@ fn project_validated_generic_call_vector(
             .filter(|arguments| !arguments.is_empty()),
         ..request
     };
-    let shape = validate_generic_call_signature_shape(store, request.callee, callable)?;
+    let shape =
+        validate_generic_call_signature_shape(store, request.callee, callable, array_targets)?;
     let minimum_type_arguments = minimum_type_argument_count(&shape.type_parameters);
     if let Some(explicit) = request.explicit_type_arguments
         && (explicit.len() < minimum_type_arguments || explicit.len() > shape.type_parameters.len())
@@ -506,10 +531,11 @@ fn project_validated_generic_call_vector(
                 actual: explicit.len(),
             },
             shape.return_type,
+            shape.array_targets,
         ));
     }
 
-    let expected_arguments = shape.parameter_type_parameters.len();
+    let expected_arguments = shape.parameter_templates.len();
     if request.arguments.len() != expected_arguments {
         let recovery = failure_type_arguments(
             store,
@@ -536,6 +562,7 @@ fn project_validated_generic_call_vector(
             None,
             applicability,
             shape.return_type,
+            shape.array_targets,
         ));
     }
 
@@ -570,6 +597,7 @@ fn project_validated_generic_call_vector(
             Some(checked),
             applicability,
             shape.return_type,
+            shape.array_targets,
         ));
     }
 
@@ -589,6 +617,7 @@ fn project_validated_generic_call_vector(
             Some(checked),
             applicability,
             shape.return_type,
+            shape.array_targets,
         ));
     }
 
@@ -607,6 +636,7 @@ fn project_validated_generic_call_vector(
         Some(checked),
         GenericCallVectorApplicability::Applicable,
         shape.return_type,
+        shape.array_targets,
     ))
 }
 
@@ -649,6 +679,7 @@ fn validate_generic_call_signature_shape(
     store: &CanonicalTypeMapperStore,
     callee: TypeId,
     callable: &ValidatedSingleCallable,
+    array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<GenericCallSignatureShape, GenericCallVectorError> {
     if callable.owner != callee {
         return Err(GenericCallVectorInvariant::CallableOwnerMismatch {
@@ -742,7 +773,14 @@ fn validate_generic_call_signature_shape(
         .zip(callable.parameters.iter().copied())
         .enumerate()
     {
-        if !type_parameter_ids.contains(&projected) {
+        if !validate_generic_parameter_template(
+            store,
+            projected,
+            &type_parameter_ids,
+            array_targets,
+            callable.signature,
+            &mut Vec::new(),
+        )? {
             return Err(GenericCallVectorUnsupported::NonNakedParameter {
                 signature: callable.signature,
                 index,
@@ -767,13 +805,66 @@ fn validate_generic_call_signature_shape(
             .into());
         }
     }
-    validate_generic_mapper_type(store, return_type, &type_parameter_ids, callable.signature)?;
+    validate_generic_mapper_type(
+        store,
+        return_type,
+        &type_parameter_ids,
+        array_targets,
+        callable.signature,
+        &mut Vec::new(),
+    )?;
     Ok(GenericCallSignatureShape {
         signature: callable.signature,
         type_parameters,
-        parameter_type_parameters: callable.parameters.clone(),
+        parameter_templates: callable.parameters.clone(),
         return_type,
+        array_targets,
     })
+}
+
+fn validate_generic_parameter_template(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    type_parameters: &[TypeId],
+    array_targets: Option<CanonicalArrayTargets>,
+    signature: SignatureId,
+    active_arrays: &mut Vec<TypeId>,
+) -> Result<bool, GenericCallVectorError> {
+    if type_parameters.contains(&type_) {
+        return Ok(true);
+    }
+    let Some(array_targets) = array_targets else {
+        return Ok(false);
+    };
+    let reference = store
+        .canonical_array_reference_with_targets(array_targets, type_)
+        .map_err(|error| GenericCallVectorInvariant::InvalidArrayType {
+            signature,
+            type_,
+            error,
+        })?;
+    let Some(reference) = reference else {
+        return Ok(false);
+    };
+    if reference.array_literal || active_arrays.contains(&type_) {
+        return Err(GenericCallVectorInvariant::InvalidArrayType {
+            signature,
+            type_,
+            error: ArrayTypeError::InvalidReference(type_),
+        }
+        .into());
+    }
+    active_arrays.push(type_);
+    let contains_type_parameter = validate_generic_parameter_template(
+        store,
+        reference.element_type,
+        type_parameters,
+        Some(array_targets),
+        signature,
+        active_arrays,
+    )?;
+    active_arrays.pop();
+    Ok(contains_type_parameter)
 }
 
 fn validate_generic_call_type_parameter(
@@ -928,7 +1019,9 @@ fn validate_generic_mapper_type(
     store: &CanonicalTypeMapperStore,
     type_: TypeId,
     type_parameters: &[TypeId],
+    array_targets: Option<CanonicalArrayTargets>,
     signature: SignatureId,
+    active_arrays: &mut Vec<TypeId>,
 ) -> Result<(), GenericCallVectorError> {
     let record = store
         .type_payload(type_)
@@ -938,8 +1031,53 @@ fn validate_generic_mapper_type(
         TypeData::TypeParameter(_) if type_parameters.contains(&type_) => Ok(()),
         TypeData::Union(union) if record.alias().is_none() && union.origin.is_none() => {
             for constituent in &union.union.types {
-                validate_generic_mapper_type(store, *constituent, type_parameters, signature)?;
+                validate_generic_mapper_type(
+                    store,
+                    *constituent,
+                    type_parameters,
+                    None,
+                    signature,
+                    active_arrays,
+                )?;
             }
+            Ok(())
+        }
+        TypeData::TypeReference(_) => {
+            let Some(array_targets) = array_targets else {
+                return Err(
+                    GenericCallVectorUnsupported::InstantiationType { signature, type_ }.into(),
+                );
+            };
+            let reference = store
+                .canonical_array_reference_with_targets(array_targets, type_)
+                .map_err(|error| GenericCallVectorInvariant::InvalidArrayType {
+                    signature,
+                    type_,
+                    error,
+                })?;
+            let Some(reference) = reference else {
+                return Err(
+                    GenericCallVectorUnsupported::InstantiationType { signature, type_ }.into(),
+                );
+            };
+            if reference.array_literal || active_arrays.contains(&type_) {
+                return Err(GenericCallVectorInvariant::InvalidArrayType {
+                    signature,
+                    type_,
+                    error: ArrayTypeError::InvalidReference(type_),
+                }
+                .into());
+            }
+            active_arrays.push(type_);
+            validate_generic_mapper_type(
+                store,
+                reference.element_type,
+                type_parameters,
+                Some(array_targets),
+                signature,
+                active_arrays,
+            )?;
+            active_arrays.pop();
             Ok(())
         }
         _ => Err(GenericCallVectorUnsupported::InstantiationType { signature, type_ }.into()),
@@ -970,8 +1108,13 @@ fn explicit_checked_type_arguments(
         let default_type = shape.type_parameters[index].default_type.expect(
             "valid partial explicit arity guarantees every omitted parameter has a default",
         );
-        let instantiated =
-            instantiate_type_with_vector(store, default_type, &sources[..index], &result[..index])?;
+        let instantiated = instantiate_generic_call_type(
+            store,
+            default_type,
+            &sources[..index],
+            &result[..index],
+            shape.array_targets,
+        )?;
         result.push(instantiated);
     }
     Ok(result)
@@ -1064,17 +1207,18 @@ fn infer_generic_call_type_arguments(
     for (argument, parameter) in arguments
         .iter()
         .copied()
-        .zip(shape.parameter_type_parameters.iter().copied())
+        .zip(shape.parameter_templates.iter().copied())
     {
-        let index = type_parameters
-            .iter()
-            .position(|type_parameter| *type_parameter == parameter)
-            .expect("signature validation proved every parameter is a naked type parameter");
-        validate_inference_leaf(store, argument)
-            .map_err(|error| GenericCallVectorError::Inference(error.into()))?;
-        if !buckets[index].contains(&argument) {
-            buckets[index].push(argument);
-        }
+        collect_generic_call_inferences(
+            store,
+            shape.array_targets,
+            argument,
+            parameter,
+            &type_parameters,
+            &mut buckets,
+            shape.signature,
+            &mut Vec::new(),
+        )?;
     }
 
     let unknown = store
@@ -1086,11 +1230,12 @@ fn infer_generic_call_type_arguments(
         let instantiated_constraint = parameter
             .constraint
             .map(|constraint| {
-                instantiate_type_with_vector(
+                instantiate_generic_call_type(
                     store,
                     constraint,
                     &type_parameters[..index],
                     &inferred[..index],
+                    shape.array_targets,
                 )
             })
             .transpose()?;
@@ -1104,23 +1249,34 @@ fn infer_generic_call_type_arguments(
         } else {
             InferenceLiteralTreatment::Widen
         };
-        let candidate = infer_naked_type_parameter_candidates(
-            store,
-            &buckets[index],
-            treatment,
-            |store, source, target| is_strict_subtype(store, source, target),
-            |store, source, target| is_subtype(store, source, target),
-        )?;
+        let candidate = match shape.array_targets {
+            Some(array_targets) => infer_naked_type_parameter_candidates_with_array_targets(
+                store,
+                &buckets[index],
+                treatment,
+                array_targets,
+                |store, source, target| is_strict_subtype(store, source, target),
+                |store, source, target| is_subtype(store, source, target),
+            )?,
+            None => infer_naked_type_parameter_candidates(
+                store,
+                &buckets[index],
+                treatment,
+                |store, source, target| is_strict_subtype(store, source, target),
+                |store, source, target| is_subtype(store, source, target),
+            )?,
+        };
         let mut argument = match candidate {
             Some(candidate) => candidate,
             None => parameter
                 .default_type
                 .map(|default_type| {
-                    instantiate_type_with_vector(
+                    instantiate_generic_call_type(
                         store,
                         default_type,
                         &type_parameters[..index],
                         &inferred[..index],
+                        shape.array_targets,
                     )
                 })
                 .transpose()?
@@ -1134,6 +1290,79 @@ fn infer_generic_call_type_arguments(
         inferred.push(argument);
     }
     Ok(inferred)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_generic_call_inferences(
+    store: &CanonicalTypeMapperStore,
+    array_targets: Option<CanonicalArrayTargets>,
+    source: TypeId,
+    target: TypeId,
+    type_parameters: &[TypeId],
+    buckets: &mut [Vec<TypeId>],
+    signature: SignatureId,
+    active_targets: &mut Vec<TypeId>,
+) -> Result<(), GenericCallVectorError> {
+    if let Some(index) = type_parameters
+        .iter()
+        .position(|type_parameter| *type_parameter == target)
+    {
+        match array_targets {
+            Some(array_targets) => {
+                validate_inference_leaf_with_array_targets(store, source, array_targets)
+            }
+            None => validate_inference_leaf(store, source),
+        }
+        .map_err(|error| GenericCallVectorError::Inference(error.into()))?;
+        if !buckets[index].contains(&source) {
+            buckets[index].push(source);
+        }
+        return Ok(());
+    }
+
+    let Some(array_targets) = array_targets else {
+        unreachable!("validated parameter templates are naked without Array targets")
+    };
+    if active_targets.contains(&target) {
+        return Err(GenericCallVectorError::Inference(
+            NakedTypeInferenceError::RecursiveArrayCandidate(target).into(),
+        ));
+    }
+    let target_reference = store
+        .canonical_array_reference_with_targets(array_targets, target)
+        .map_err(|error| GenericCallVectorInvariant::InvalidArrayType {
+            signature,
+            type_: target,
+            error,
+        })?
+        .expect("signature validation admitted a canonical Array target");
+    let source_reference = store
+        .canonical_array_reference_with_targets(array_targets, source)
+        .map_err(|error| {
+            GenericCallVectorError::Inference(
+                NakedTypeInferenceError::InvalidCanonicalArrayCandidate {
+                    candidate: source,
+                    error,
+                }
+                .into(),
+            )
+        })?;
+    let Some(source_reference) = source_reference else {
+        return Ok(());
+    };
+    active_targets.push(target);
+    let result = collect_generic_call_inferences(
+        store,
+        Some(array_targets),
+        source_reference.element_type,
+        target_reference.element_type,
+        type_parameters,
+        buckets,
+        signature,
+        active_targets,
+    );
+    active_targets.pop();
+    result
 }
 
 fn type_maybe_primitive(store: &CanonicalTypeMapperStore, type_: TypeId) -> bool {
@@ -1180,7 +1409,13 @@ fn check_explicit_type_argument_constraints(
         let Some(constraint) = shape.type_parameters[index].constraint else {
             continue;
         };
-        let constraint = instantiate_type_with_vector(store, constraint, &sources, checked)?;
+        let constraint = instantiate_generic_call_type(
+            store,
+            constraint,
+            &sources,
+            checked,
+            shape.array_targets,
+        )?;
         if !is_assignable(store, type_argument, constraint)? {
             return Ok(Some(
                 GenericCallVectorApplicability::ExplicitTypeArgumentConstraint {
@@ -1233,17 +1468,23 @@ fn instantiate_generic_call_shape(
         .iter()
         .map(|parameter| parameter.type_)
         .collect::<Vec<_>>();
-    let mut parameter_types = Vec::with_capacity(shape.parameter_type_parameters.len());
-    for parameter in &shape.parameter_type_parameters {
-        parameter_types.push(instantiate_type_with_vector(
+    let mut parameter_types = Vec::with_capacity(shape.parameter_templates.len());
+    for parameter in &shape.parameter_templates {
+        parameter_types.push(instantiate_generic_call_type(
             store,
             *parameter,
             &sources,
             &type_arguments,
+            shape.array_targets,
         )?);
     }
-    let return_type =
-        instantiate_type_with_vector(store, shape.return_type, &sources, &type_arguments)?;
+    let return_type = instantiate_generic_call_type(
+        store,
+        shape.return_type,
+        &sources,
+        &type_arguments,
+        shape.array_targets,
+    )?;
     let return_kind = if store
         .type_payload(return_type)
         .is_some_and(|record| record.flags().intersects(TypeFlags::VOID))
@@ -1258,6 +1499,25 @@ fn instantiate_generic_call_shape(
         return_type,
         return_kind,
     })
+}
+
+fn instantiate_generic_call_type(
+    store: &mut CanonicalTypeMapperStore,
+    type_: TypeId,
+    sources: &[TypeId],
+    targets: &[TypeId],
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<TypeId, InstantiationError> {
+    match array_targets {
+        Some(array_targets) => instantiate_type_with_vector_and_array_targets(
+            store,
+            type_,
+            sources,
+            targets,
+            array_targets,
+        ),
+        None => instantiate_type_with_vector(store, type_, sources, targets),
+    }
 }
 
 fn generic_call_projection(
@@ -1327,8 +1587,12 @@ fn materialize_validated_generic_call_vector_source_with(
     ) -> CachedSignatureLookup,
     reserve: impl FnOnce(&mut CanonicalTypeMapperStore, GenericCallVectorReservation) -> bool,
 ) -> Result<GenericCallVectorSourceMaterialization, GenericCallVectorError> {
-    let shape =
-        validate_generic_call_signature_shape(store, resolution.projection.callee, callable)?;
+    let shape = validate_generic_call_signature_shape(
+        store,
+        resolution.projection.callee,
+        callable,
+        resolution.capability.array_targets,
+    )?;
     let sources = validate_generic_call_vector_resolution(store, resolution, &shape)?;
     let checked = if generic_call_vector_caches_checked_instantiation(resolution.applicability) {
         Some(resolution.checked_instantiation.as_ref().ok_or(
@@ -1431,7 +1695,7 @@ fn materialize_validated_generic_call_vector_source_with(
     };
     let graph_count = usize::from(publish_checked) + usize::from(publish_recovery);
     let parameter_allocations = shape
-        .parameter_type_parameters
+        .parameter_templates
         .len()
         .checked_mul(graph_count)
         .ok_or(GenericCallVectorInvariant::Capacity(shape.signature))?;
@@ -1690,8 +1954,12 @@ fn materialize_validated_generic_call_vector_checked_instantiation_with_reservat
         });
     }
 
-    let shape =
-        validate_generic_call_signature_shape(store, resolution.projection.callee, callable)?;
+    let shape = validate_generic_call_signature_shape(
+        store,
+        resolution.projection.callee,
+        callable,
+        resolution.capability.array_targets,
+    )?;
     let checked = validate_generic_call_vector_checked_resolution(store, resolution, &shape)?;
     let sources = shape
         .type_parameters
@@ -1837,7 +2105,8 @@ fn validate_generic_call_vector_resolution(
         .iter()
         .map(|parameter| parameter.type_)
         .collect::<Vec<_>>();
-    if resolution.checked_return_source != shape.return_type
+    if resolution.capability.checked_return_source != shape.return_type
+        || resolution.capability.array_targets != shape.array_targets
         || resolution.projection.generic_signature != shape.signature
         || resolution.projection.type_parameters != sources
     {
@@ -1849,20 +2118,24 @@ fn validate_generic_call_vector_resolution(
         store,
         &resolution.projection.instantiation,
         sources.len(),
-        shape.parameter_type_parameters.len(),
+        shape.parameter_templates.len(),
     ) || !valid_generic_call_vector_parameter_row(
+        store,
+        shape.array_targets,
         &sources,
-        &shape.parameter_type_parameters,
+        &shape.parameter_templates,
         &resolution.projection.instantiation,
     ) || resolution.checked_instantiation.as_ref().is_some_and(|checked| {
         !valid_generic_call_vector_instantiation(
             store,
             checked,
             sources.len(),
-            shape.parameter_type_parameters.len(),
+            shape.parameter_templates.len(),
         ) || !valid_generic_call_vector_parameter_row(
+            store,
+            shape.array_targets,
             &sources,
-            &shape.parameter_type_parameters,
+            &shape.parameter_templates,
             checked,
         )
     }) {
@@ -1902,7 +2175,7 @@ fn validate_generic_call_vector_resolution(
         GenericCallVectorApplicability::TooFewArguments { expected, actual } => {
             if !resolution.projection.recovery
                 || resolution.checked_instantiation.is_some()
-                || expected != shape.parameter_type_parameters.len()
+                || expected != shape.parameter_templates.len()
                 || actual >= expected
             {
                 return Err(GenericCallVectorInvariant::InvalidCheckedInstantiation(
@@ -1914,7 +2187,7 @@ fn validate_generic_call_vector_resolution(
         GenericCallVectorApplicability::TooManyArguments { expected, actual } => {
             if !resolution.projection.recovery
                 || resolution.checked_instantiation.is_some()
-                || expected != shape.parameter_type_parameters.len()
+                || expected != shape.parameter_templates.len()
                 || actual <= expected
             {
                 return Err(GenericCallVectorInvariant::InvalidCheckedInstantiation(
@@ -1987,19 +2260,71 @@ fn validate_generic_call_vector_checked_resolution(
 }
 
 fn valid_generic_call_vector_parameter_row(
+    store: &CanonicalTypeMapperStore,
+    array_targets: Option<CanonicalArrayTargets>,
     sources: &[TypeId],
-    parameter_sources: &[TypeId],
+    parameter_templates: &[TypeId],
     instantiation: &GenericCallVectorInstantiation,
 ) -> bool {
-    parameter_sources
+    parameter_templates
         .iter()
         .zip(&instantiation.parameter_types)
-        .all(|(source, actual)| {
-            sources
-                .iter()
-                .position(|candidate| candidate == source)
-                .is_some_and(|index| instantiation.type_arguments[index] == *actual)
+        .all(|(template, actual)| {
+            generic_call_type_instantiation_matches(
+                store,
+                array_targets,
+                *template,
+                *actual,
+                sources,
+                &instantiation.type_arguments,
+                &mut Vec::new(),
+            )
         })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn generic_call_type_instantiation_matches(
+    store: &CanonicalTypeMapperStore,
+    array_targets: Option<CanonicalArrayTargets>,
+    template: TypeId,
+    actual: TypeId,
+    sources: &[TypeId],
+    targets: &[TypeId],
+    active_templates: &mut Vec<TypeId>,
+) -> bool {
+    if let Some(index) = sources.iter().position(|source| *source == template) {
+        return targets.get(index).copied() == Some(actual);
+    }
+    let Some(array_targets) = array_targets else {
+        return false;
+    };
+    if active_templates.contains(&template) {
+        return false;
+    }
+    let (Ok(Some(template_reference)), Ok(Some(actual_reference))) = (
+        store.canonical_array_reference_with_targets(array_targets, template),
+        store.canonical_array_reference_with_targets(array_targets, actual),
+    ) else {
+        return false;
+    };
+    if template_reference.array_literal
+        || actual_reference.array_literal
+        || template_reference.readonly != actual_reference.readonly
+    {
+        return false;
+    }
+    active_templates.push(template);
+    let matches = generic_call_type_instantiation_matches(
+        store,
+        Some(array_targets),
+        template_reference.element_type,
+        actual_reference.element_type,
+        sources,
+        targets,
+        active_templates,
+    );
+    active_templates.pop();
+    matches
 }
 
 fn valid_generic_call_vector_instantiation(
@@ -3392,6 +3717,156 @@ mod tests {
         )
     }
 
+    fn canonical_array_target(store: &mut CanonicalTypeMapperStore, name: &str) -> TypeId {
+        let symbol = store
+            .alloc_symbol(SymbolData::new(
+                SymbolFlags::INTERFACE,
+                EscapedName::source(name),
+            ))
+            .unwrap();
+        let parameter_symbol = store
+            .alloc_symbol(SymbolData::new(
+                SymbolFlags::TYPE_PARAMETER,
+                EscapedName::source("T"),
+            ))
+            .unwrap();
+        let parameter = store.alloc_type_parameter(Some(parameter_symbol)).unwrap();
+        assert!(store.set_declared_type_links(
+            parameter_symbol,
+            DeclaredTypeLinks {
+                declared_type: Some(parameter),
+                ..DeclaredTypeLinks::default()
+            },
+        ));
+        let target = store
+            .alloc_interface_type(ObjectFlags::INTERFACE, Some(symbol))
+            .unwrap();
+        let this_type = store.alloc_type_parameter(Some(symbol)).unwrap();
+        assert!(store.initialize_interface_type_parameters(
+            target,
+            vec![parameter, this_type],
+            0,
+            this_type,
+            type_list_key(&[parameter]),
+        ));
+        target
+    }
+
+    fn canonical_array_targets(store: &mut CanonicalTypeMapperStore) -> CanonicalArrayTargets {
+        CanonicalArrayTargets::for_test(
+            canonical_array_target(store, "Array"),
+            canonical_array_target(store, "ReadonlyArray"),
+        )
+    }
+
+    fn canonical_array_type(
+        store: &mut CanonicalTypeMapperStore,
+        targets: CanonicalArrayTargets,
+        element: TypeId,
+        readonly: bool,
+    ) -> TypeId {
+        store
+            .create_canonical_array_type_with_targets(targets, element, readonly)
+            .unwrap()
+    }
+
+    fn array_literal_clone(
+        store: &mut CanonicalTypeMapperStore,
+        targets: CanonicalArrayTargets,
+        element: TypeId,
+    ) -> TypeId {
+        let base = canonical_array_type(store, targets, element, false);
+        let base_record = store.type_payload(base).unwrap();
+        let flags = base_record.object_flags() & !ObjectFlags::MEMBERS_RESOLVED
+            | ObjectFlags::ARRAY_LITERAL
+            | ObjectFlags::CONTAINS_OBJECT_OR_ARRAY_LITERAL;
+        let symbol = base_record.symbol();
+        let TypeData::TypeReference(reference) = base_record.data() else {
+            panic!("canonical Array instantiations are direct references")
+        };
+        let target = reference.object.target;
+        let arguments = reference.resolved_type_arguments.clone();
+        let clone = store.alloc_type_reference(flags, symbol).unwrap();
+        assert!(store.set_type_object_flags(clone, flags));
+        assert!(store.set_object_target_and_mapper(clone, target, None));
+        assert!(store.set_type_reference_resolution(clone, None, arguments));
+        assert_eq!(
+            store.derived_types.array_literal_types.insert(base, clone),
+            None
+        );
+        clone
+    }
+
+    fn structured_vector_callable(
+        store: &mut CanonicalTypeMapperStore,
+        parameter_type: impl FnOnce(&mut CanonicalTypeMapperStore, TypeId) -> TypeId,
+        return_type: impl FnOnce(&mut CanonicalTypeMapperStore, TypeId) -> TypeId,
+    ) -> (ValidatedSingleCallable, TypeId) {
+        let type_parameter_symbol = store
+            .alloc_symbol(SymbolData::new(
+                SymbolFlags::TYPE_PARAMETER,
+                EscapedName::source("T"),
+            ))
+            .unwrap();
+        let type_parameter = store
+            .alloc_type_parameter(Some(type_parameter_symbol))
+            .unwrap();
+        assert!(store.set_declared_type_links(
+            type_parameter_symbol,
+            DeclaredTypeLinks {
+                declared_type: Some(type_parameter),
+                ..DeclaredTypeLinks::default()
+            },
+        ));
+        let no_constraint = store.intrinsic_bootstrap().unwrap().no_constraint_type;
+        assert!(store.set_type_parameter_resolution(
+            type_parameter,
+            Some(no_constraint),
+            None,
+            None,
+            Some(no_constraint),
+        ));
+        let parameter_type = parameter_type(store, type_parameter);
+        let return_type = return_type(store, type_parameter);
+        let parameter = store
+            .alloc_symbol(SymbolData::new(
+                SymbolFlags::FUNCTION_SCOPED_VARIABLE,
+                EscapedName::source("value"),
+            ))
+            .unwrap();
+        assert!(store.set_value_symbol_links(
+            parameter,
+            ValueSymbolLinks {
+                resolved_type: Some(parameter_type),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        let signature = store
+            .alloc_signature(
+                SignatureFlags::NONE,
+                None,
+                vec![type_parameter],
+                None,
+                vec![parameter],
+                Some(return_type),
+                None,
+                1,
+            )
+            .unwrap();
+        let owner = store.intrinsic_bootstrap().unwrap().any_function_type;
+        (
+            ValidatedSingleCallable {
+                owner,
+                signature,
+                parameters: vec![parameter_type],
+                min_argument_count: 1,
+                return_type: Some(return_type),
+                strict_variance_exempt: false,
+            },
+            type_parameter,
+        )
+    }
+
     fn vector_request<'a>(
         callee: TypeId,
         explicit_type_arguments: Option<&'a [TypeId]>,
@@ -3452,6 +3927,25 @@ mod tests {
                 && target_record.flags() == TypeFlags::BOOLEAN
     }
 
+    fn scalar_or_array_assignable(
+        store: &CanonicalTypeMapperStore,
+        targets: CanonicalArrayTargets,
+        source: TypeId,
+        target: TypeId,
+    ) -> bool {
+        if scalar_assignable(store, source, target) {
+            return true;
+        }
+        let (Ok(Some(source)), Ok(Some(target))) = (
+            store.canonical_array_reference_with_targets(targets, source),
+            store.canonical_array_reference_with_targets(targets, target),
+        ) else {
+            return false;
+        };
+        (!source.readonly || target.readonly)
+            && scalar_or_array_assignable(store, targets, source.element_type, target.element_type)
+    }
+
     fn project_vector(
         store: &mut CanonicalTypeMapperStore,
         callable: &ValidatedSingleCallable,
@@ -3461,9 +3955,30 @@ mod tests {
             store,
             request,
             callable,
+            None,
             |store, source, target| Ok(scalar_assignable(store, source, target)),
             CanonicalTypeMapperStore::is_type_strict_subtype_of,
             CanonicalTypeMapperStore::is_type_subtype_of,
+        )
+    }
+
+    fn project_array_vector(
+        store: &mut CanonicalTypeMapperStore,
+        targets: CanonicalArrayTargets,
+        callable: &ValidatedSingleCallable,
+        request: GenericCallVectorRequest<'_>,
+    ) -> Result<GenericCallVectorResolution, GenericCallVectorError> {
+        project_validated_generic_call_vector(
+            store,
+            request,
+            callable,
+            Some(targets),
+            |store, source, target| Ok(scalar_or_array_assignable(store, targets, source, target)),
+            |store, source, target| {
+                Ok(source != target
+                    && scalar_or_array_assignable(store, targets, source, target))
+            },
+            |store, source, target| Ok(scalar_or_array_assignable(store, targets, source, target)),
         )
     }
 
@@ -3572,6 +4087,264 @@ mod tests {
         );
         assert_eq!(vector_cache_graph_counts(store), second_warm_counts);
         first
+    }
+
+    #[test]
+    fn canonical_array_target_inference_reuses_checked_cache_on_warm_calls() {
+        let mut store = initialized_store();
+        let targets = canonical_array_targets(&mut store);
+        let (first, type_parameter) = structured_vector_callable(
+            &mut store,
+            |store, type_parameter| {
+                canonical_array_type(store, targets, type_parameter, false)
+            },
+            |_, type_parameter| type_parameter,
+        );
+        let number = store.intrinsic_bootstrap().unwrap().number_type;
+        let ordinary_argument = canonical_array_type(&mut store, targets, number, false);
+        let argument = array_literal_clone(&mut store, targets, number);
+        let before_projection = vector_cache_graph_counts(&store);
+
+        let resolution = project_array_vector(
+            &mut store,
+            targets,
+            &first,
+            vector_request(first.owner, None, &[argument]),
+        )
+        .unwrap();
+
+        assert_eq!(resolution.applicability, GenericCallVectorApplicability::Applicable);
+        assert_eq!(resolution.projection.type_parameters, [type_parameter]);
+        assert_eq!(resolution.projection.instantiation.type_arguments, [number]);
+        assert_eq!(
+            resolution.projection.instantiation.parameter_types,
+            [ordinary_argument]
+        );
+        assert_eq!(resolution.projection.instantiation.return_type, number);
+        assert_eq!(vector_cache_graph_counts(&store), before_projection);
+
+        let published = materialize_vector(&mut store, &first, &resolution).unwrap();
+        let GenericCallVectorMaterialization::Published(published) = published else {
+            panic!("the first checked Array instantiation must publish")
+        };
+        let warm_counts = vector_cache_graph_counts(&store);
+        assert_eq!(
+            materialize_vector(&mut store, &first, &resolution),
+            Ok(GenericCallVectorMaterialization::Reused(published))
+        );
+        assert_eq!(vector_cache_graph_counts(&store), warm_counts);
+
+        let replay = project_array_vector(
+            &mut store,
+            targets,
+            &first,
+            vector_request(first.owner, None, &[argument]),
+        )
+        .unwrap();
+        assert_eq!(replay, resolution);
+        assert_eq!(vector_cache_graph_counts(&store), warm_counts);
+    }
+
+    #[test]
+    fn canonical_array_returns_instantiate_nested_mutable_and_readonly_targets() {
+        let mut store = initialized_store();
+        let targets = canonical_array_targets(&mut store);
+        let (wrap, _) = structured_vector_callable(
+            &mut store,
+            |_, type_parameter| type_parameter,
+            |store, type_parameter| {
+                canonical_array_type(store, targets, type_parameter, true)
+            },
+        );
+        let text = fresh_string(&mut store, "x");
+        let string = store.intrinsic_bootstrap().unwrap().string_type;
+        let before = store.type_len();
+        let wrapped = project_array_vector(
+            &mut store,
+            targets,
+            &wrap,
+            vector_request(wrap.owner, None, &[text]),
+        )
+        .unwrap();
+        let readonly_string = canonical_array_type(&mut store, targets, string, true);
+        assert_eq!(wrapped.projection.instantiation.type_arguments, [string]);
+        assert_eq!(wrapped.projection.instantiation.parameter_types, [string]);
+        assert_eq!(wrapped.projection.instantiation.return_type, readonly_string);
+        assert_eq!(store.type_len(), before + 1);
+
+        let (nested, _) = structured_vector_callable(
+            &mut store,
+            |store, type_parameter| {
+                let inner = canonical_array_type(store, targets, type_parameter, false);
+                canonical_array_type(store, targets, inner, true)
+            },
+            |store, type_parameter| {
+                let inner = canonical_array_type(store, targets, type_parameter, true);
+                canonical_array_type(store, targets, inner, false)
+            },
+        );
+        let number = store.intrinsic_bootstrap().unwrap().number_type;
+        let inner_source = canonical_array_type(&mut store, targets, number, false);
+        let source = canonical_array_type(&mut store, targets, inner_source, false);
+        let result = project_array_vector(
+            &mut store,
+            targets,
+            &nested,
+            vector_request(nested.owner, None, &[source]),
+        )
+        .unwrap();
+        let expected_parameter = canonical_array_type(&mut store, targets, inner_source, true);
+        let readonly_number = canonical_array_type(&mut store, targets, number, true);
+        let expected_return = canonical_array_type(&mut store, targets, readonly_number, false);
+        assert_eq!(result.applicability, GenericCallVectorApplicability::Applicable);
+        assert_eq!(result.projection.instantiation.type_arguments, [number]);
+        assert_eq!(result.projection.instantiation.parameter_types, [expected_parameter]);
+        assert_eq!(result.projection.instantiation.return_type, expected_return);
+    }
+
+    #[test]
+    fn naked_inference_accepts_canonical_array_candidates_with_retained_targets() {
+        let mut store = initialized_store();
+        let targets = canonical_array_targets(&mut store);
+        let (identity, _) = structured_vector_callable(
+            &mut store,
+            |_, type_parameter| type_parameter,
+            |_, type_parameter| type_parameter,
+        );
+        let number = store.intrinsic_bootstrap().unwrap().number_type;
+        let array = canonical_array_type(&mut store, targets, number, false);
+        let resolution = project_array_vector(
+            &mut store,
+            targets,
+            &identity,
+            vector_request(identity.owner, None, &[array]),
+        )
+        .unwrap();
+
+        assert_eq!(resolution.applicability, GenericCallVectorApplicability::Applicable);
+        assert_eq!(resolution.projection.instantiation.type_arguments, [array]);
+        assert_eq!(resolution.projection.instantiation.parameter_types, [array]);
+        assert_eq!(resolution.projection.instantiation.return_type, array);
+    }
+
+    #[test]
+    fn structured_array_mismatch_caches_checked_signature_and_replays_distinct_recoveries() {
+        let mut store = initialized_store();
+        let targets = canonical_array_targets(&mut store);
+        let (first, _) = structured_vector_callable(
+            &mut store,
+            |store, type_parameter| {
+                canonical_array_type(store, targets, type_parameter, false)
+            },
+            |_, type_parameter| type_parameter,
+        );
+        let (number, unknown) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (bootstrap.number_type, bootstrap.unknown_type)
+        };
+        let array_unknown = canonical_array_type(&mut store, targets, unknown, false);
+        let resolution = project_array_vector(
+            &mut store,
+            targets,
+            &first,
+            vector_request(first.owner, None, &[number]),
+        )
+        .unwrap();
+        assert_eq!(resolution.projection.instantiation.type_arguments, [unknown]);
+        assert_eq!(resolution.projection.instantiation.parameter_types, [array_unknown]);
+        assert_eq!(
+            resolution.applicability,
+            GenericCallVectorApplicability::ArgumentNotAssignable {
+                index: 0,
+                argument_type: number,
+                parameter_type: array_unknown,
+            }
+        );
+
+        let before = vector_cache_graph_counts(&store);
+        let first_call =
+            materialize_source_vector(&mut store, &first, &resolution, None).unwrap();
+        let checked = first_call.checked_instantiation.unwrap();
+        assert_ne!(first_call.call_signature, checked.signature);
+        assert_eq!(store.cached_signature_len(), before.cached_signatures + 1);
+        assert_eq!(store.mapper_len(), before.mappers + 2);
+        assert_eq!(store.signature_len(), before.signatures + 2);
+        let warm_counts = vector_cache_graph_counts(&store);
+        assert_eq!(
+            materialize_source_vector(
+                &mut store,
+                &first,
+                &resolution,
+                Some(first_call.call_signature),
+            ),
+            Ok(first_call)
+        );
+        assert_eq!(vector_cache_graph_counts(&store), warm_counts);
+
+        let second_call =
+            materialize_source_vector(&mut store, &first, &resolution, None).unwrap();
+        assert_eq!(second_call.checked_instantiation, Some(checked));
+        assert_ne!(second_call.call_signature, first_call.call_signature);
+        assert_eq!(store.cached_signature_len(), before.cached_signatures + 1);
+        let second_warm_counts = vector_cache_graph_counts(&store);
+        assert_eq!(
+            materialize_source_vector(
+                &mut store,
+                &first,
+                &resolution,
+                Some(second_call.call_signature),
+            ),
+            Ok(second_call)
+        );
+        assert_eq!(vector_cache_graph_counts(&store), second_warm_counts);
+    }
+
+    #[test]
+    fn forged_array_parameter_is_rejected_before_projection_writes() {
+        let mut store = initialized_store();
+        let targets = canonical_array_targets(&mut store);
+        let mut forged = None;
+        let (callable, _) = structured_vector_callable(
+            &mut store,
+            |store, type_parameter| {
+                let canonical = canonical_array_type(store, targets, type_parameter, false);
+                let symbol = store.type_payload(canonical).unwrap().symbol();
+                let duplicate = store.alloc_type_reference(ObjectFlags::NONE, symbol).unwrap();
+                assert!(store.set_object_target_and_mapper(
+                    duplicate,
+                    Some(targets.array_type()),
+                    None,
+                ));
+                assert!(store.set_type_reference_resolution(
+                    duplicate,
+                    None,
+                    Some(vec![type_parameter]),
+                ));
+                forged = Some(duplicate);
+                duplicate
+            },
+            |_, type_parameter| type_parameter,
+        );
+        let forged = forged.unwrap();
+        let number = store.intrinsic_bootstrap().unwrap().number_type;
+        let before = vector_cache_graph_counts(&store);
+
+        assert_eq!(
+            project_array_vector(
+                &mut store,
+                targets,
+                &callable,
+                vector_request(callable.owner, None, &[number]),
+            ),
+            Err(GenericCallVectorError::Invariant(
+                GenericCallVectorInvariant::InvalidArrayType {
+                    signature: callable.signature,
+                    type_: forged,
+                    error: ArrayTypeError::InvalidReference(forged),
+                }
+            ))
+        );
+        assert_eq!(vector_cache_graph_counts(&store), before);
     }
 
     #[test]
@@ -4511,7 +5284,8 @@ mod tests {
         );
         assert_eq!(vector_cache_graph_counts(&store), before);
 
-        let shape = validate_generic_call_signature_shape(&store, pair.owner, &pair).unwrap();
+        let shape =
+            validate_generic_call_signature_shape(&store, pair.owner, &pair, None).unwrap();
         let checked = resolution.checked_instantiation.as_ref().unwrap();
         assert_eq!(
             cached_generic_call_vector_instantiation_from_lookup(

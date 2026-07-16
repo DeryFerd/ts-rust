@@ -5,10 +5,12 @@
 //! upstream records the source type itself as a covariant candidate. The
 //! bounded Rust branch accepts primitive, literal, unique-symbol, anonymous
 //! primitive-union, and exact resolved nongeneric declared-property-object
-//! candidates. Declared objects are admitted only as the root candidate, not
-//! recursively inside a union. The branch preserves candidates that do not
-//! require widening, including fresh literals. Widening sentinels remain a
-//! typed boundary until the exact final `getWidenedType` step is available.
+//! candidates, plus canonical Array/ReadonlyArray references when the caller
+//! retains the authoritative global targets. Declared objects are admitted
+//! only as the root candidate, not recursively inside a union. The branch
+//! preserves candidates that do not require widening, including fresh
+//! literals. Widening sentinels remain a typed boundary until the exact final
+//! `getWidenedType` step is available.
 
 #![allow(dead_code)] // Installed ahead of the generic-call dispatch consumer.
 
@@ -16,6 +18,7 @@ use std::collections::HashSet;
 
 use super::{
     RelationUnavailable, TypeId,
+    array_types::{ArrayTypeError, CanonicalArrayTargets},
     bootstrap::LiteralTypeCacheError,
     instantiate::canonical_anonymous_union,
     mapper::CanonicalTypeMapperStore,
@@ -72,6 +75,11 @@ pub(super) enum NakedTypeInferenceError {
         candidate: TypeId,
         error: LiteralTypeCacheError,
     },
+    InvalidCanonicalArrayCandidate {
+        candidate: TypeId,
+        error: ArrayTypeError,
+    },
+    RecursiveArrayCandidate(TypeId),
     MalformedDeclaredPropertyObject(TypeId),
     UnsupportedCandidate(TypeId),
     RequiresWidening(TypeId),
@@ -113,6 +121,58 @@ pub(super) fn infer_naked_type_parameter_candidates(
     store: &mut CanonicalTypeMapperStore,
     candidates: &[TypeId],
     treatment: InferenceLiteralTreatment,
+    is_strict_subtype: impl FnMut(
+        &mut CanonicalTypeMapperStore,
+        TypeId,
+        TypeId,
+    ) -> Result<bool, RelationUnavailable>,
+    is_subtype: impl FnMut(
+        &mut CanonicalTypeMapperStore,
+        TypeId,
+        TypeId,
+    ) -> Result<bool, RelationUnavailable>,
+) -> Result<Option<TypeId>, NakedTypeCandidateError> {
+    infer_naked_type_parameter_candidates_with_optional_array_targets(
+        store,
+        candidates,
+        treatment,
+        None,
+        is_strict_subtype,
+        is_subtype,
+    )
+}
+
+pub(super) fn infer_naked_type_parameter_candidates_with_array_targets(
+    store: &mut CanonicalTypeMapperStore,
+    candidates: &[TypeId],
+    treatment: InferenceLiteralTreatment,
+    array_targets: CanonicalArrayTargets,
+    is_strict_subtype: impl FnMut(
+        &mut CanonicalTypeMapperStore,
+        TypeId,
+        TypeId,
+    ) -> Result<bool, RelationUnavailable>,
+    is_subtype: impl FnMut(
+        &mut CanonicalTypeMapperStore,
+        TypeId,
+        TypeId,
+    ) -> Result<bool, RelationUnavailable>,
+) -> Result<Option<TypeId>, NakedTypeCandidateError> {
+    infer_naked_type_parameter_candidates_with_optional_array_targets(
+        store,
+        candidates,
+        treatment,
+        Some(array_targets),
+        is_strict_subtype,
+        is_subtype,
+    )
+}
+
+fn infer_naked_type_parameter_candidates_with_optional_array_targets(
+    store: &mut CanonicalTypeMapperStore,
+    candidates: &[TypeId],
+    treatment: InferenceLiteralTreatment,
+    array_targets: Option<CanonicalArrayTargets>,
     mut is_strict_subtype: impl FnMut(
         &mut CanonicalTypeMapperStore,
         TypeId,
@@ -126,7 +186,7 @@ pub(super) fn infer_naked_type_parameter_candidates(
 ) -> Result<Option<TypeId>, NakedTypeCandidateError> {
     let mut prepared = Vec::with_capacity(candidates.len());
     for candidate in candidates {
-        validate_inference_leaf(store, *candidate)?;
+        validate_inference_leaf_with_optional_array_targets(store, *candidate, array_targets)?;
         let candidate = inference_candidate_literal_treatment(store, *candidate, treatment)?;
         if !prepared.contains(&candidate) {
             prepared.push(candidate);
@@ -406,13 +466,37 @@ pub(super) fn validate_inference_leaf(
     store: &CanonicalTypeMapperStore,
     candidate: TypeId,
 ) -> Result<(), NakedTypeInferenceError> {
-    validate_inference_candidate(store, candidate, true)
+    validate_inference_leaf_with_optional_array_targets(store, candidate, None)
+}
+
+pub(super) fn validate_inference_leaf_with_array_targets(
+    store: &CanonicalTypeMapperStore,
+    candidate: TypeId,
+    array_targets: CanonicalArrayTargets,
+) -> Result<(), NakedTypeInferenceError> {
+    validate_inference_leaf_with_optional_array_targets(store, candidate, Some(array_targets))
+}
+
+fn validate_inference_leaf_with_optional_array_targets(
+    store: &CanonicalTypeMapperStore,
+    candidate: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<(), NakedTypeInferenceError> {
+    validate_inference_candidate(
+        store,
+        candidate,
+        true,
+        array_targets,
+        &mut HashSet::new(),
+    )
 }
 
 fn validate_inference_candidate(
     store: &CanonicalTypeMapperStore,
     candidate: TypeId,
     allow_declared_object: bool,
+    array_targets: Option<CanonicalArrayTargets>,
+    active_arrays: &mut HashSet<TypeId>,
 ) -> Result<(), NakedTypeInferenceError> {
     let record = store
         .type_payload(candidate)
@@ -422,6 +506,31 @@ fn validate_inference_candidate(
         .intersects(ObjectFlags::REQUIRES_WIDENING)
     {
         return Err(NakedTypeInferenceError::RequiresWidening(candidate));
+    }
+    if let Some(array_targets) = array_targets {
+        match store.canonical_array_reference_with_targets(array_targets, candidate) {
+            Ok(Some(reference)) => {
+                if !active_arrays.insert(candidate) {
+                    return Err(NakedTypeInferenceError::RecursiveArrayCandidate(candidate));
+                }
+                let result = validate_inference_candidate(
+                    store,
+                    reference.element_type,
+                    true,
+                    Some(array_targets),
+                    active_arrays,
+                );
+                active_arrays.remove(&candidate);
+                return result;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return Err(NakedTypeInferenceError::InvalidCanonicalArrayCandidate {
+                    candidate,
+                    error,
+                });
+            }
+        }
     }
     match validate_resolved_declared_property_object(store, candidate) {
         DeclaredPropertyObjectValidation::Valid(_) if allow_declared_object => return Ok(()),
@@ -475,7 +584,13 @@ fn validate_inference_candidate(
                         constituent: *constituent,
                     });
                 }
-                validate_inference_candidate(store, *constituent, false)?;
+                validate_inference_candidate(
+                    store,
+                    *constituent,
+                    false,
+                    None,
+                    active_arrays,
+                )?;
             }
             Ok(())
         }

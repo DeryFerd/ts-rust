@@ -316,6 +316,12 @@ struct ResolvedObjectMembers {
     exact_callable: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CanonicalArrayReferenceArguments {
+    Related { source: TypeId, target: TypeId },
+    Unrelated,
+}
+
 /// One validated own property from the exact property-only object domain.
 ///
 /// This projection deliberately omits apparent/global members and index
@@ -581,12 +587,12 @@ impl<'store> RelaterSession<'store> {
         )
     }
 
-    fn matching_array_reference_target(
+    fn configured_array_reference_targets(
         &self,
         source: TypeId,
         target: TypeId,
-    ) -> Result<Option<TypeId>, RelationUnavailable> {
-        matching_configured_array_reference_target(self.store, self.global_types, source, target)
+    ) -> Result<Option<(TypeId, TypeId)>, RelationUnavailable> {
+        configured_array_reference_targets(self.store, self.global_types, source, target)
     }
 
     fn configured_array_reference_target(
@@ -708,13 +714,27 @@ impl<'store> RelaterSession<'store> {
         &mut self,
         source: TypeId,
         target: TypeId,
-    ) -> Result<Option<(TypeId, TypeId)>, RelationUnavailable> {
-        let Some(array_target) = self.matching_array_reference_target(source, target)? else {
+    ) -> Result<Option<CanonicalArrayReferenceArguments>, RelationUnavailable> {
+        let Some((source_target, target_target)) =
+            self.configured_array_reference_targets(source, target)?
+        else {
             return Ok(None);
         };
-        let source_argument = self.canonical_array_reference_argument(source, array_target)?;
-        let target_argument = self.canonical_array_reference_argument(target, array_target)?;
-        Ok(Some((source_argument, target_argument)))
+        let same_target = source_target == target_target;
+        let mutable_to_readonly = self.relation != RelationKind::Identity
+            && self.global_types.is_some_and(|global_types| {
+                source_target == global_types.array_targets.array_type()
+                    && target_target == global_types.array_targets.readonly_array_type()
+            });
+        let source_argument = self.canonical_array_reference_argument(source, source_target)?;
+        let target_argument = self.canonical_array_reference_argument(target, target_target)?;
+        if !same_target && !mutable_to_readonly {
+            return Ok(Some(CanonicalArrayReferenceArguments::Unrelated));
+        }
+        Ok(Some(CanonicalArrayReferenceArguments::Related {
+            source: source_argument,
+            target: target_argument,
+        }))
     }
 
     /// The only mixed Array/property-object relation that is independent of
@@ -1059,15 +1079,17 @@ impl<'store> RelaterSession<'store> {
                     recursion_flags,
                 );
             }
-            if let Some((source_argument, target_argument)) =
-                self.canonical_array_reference_arguments(source, target)?
-            {
-                return self.is_related_to_ex(
-                    source_argument,
-                    target_argument,
-                    RecursionFlags::BOTH,
-                    intersection_state,
-                );
+            if let Some(arguments) = self.canonical_array_reference_arguments(source, target)? {
+                return match arguments {
+                    CanonicalArrayReferenceArguments::Related { source, target } => self
+                        .is_related_to_ex(
+                            source,
+                            target,
+                            RecursionFlags::BOTH,
+                            intersection_state,
+                        ),
+                    CanonicalArrayReferenceArguments::Unrelated => Ok(Ternary::False),
+                };
             }
             if self.strict_function_types.is_some()
                 && source_flags.intersects(TypeFlags::OBJECT)
@@ -1165,15 +1187,17 @@ impl<'store> RelaterSession<'store> {
                     intersection_state,
                 );
             }
-            if let Some((source_argument, target_argument)) =
-                self.canonical_array_reference_arguments(source, target)?
-            {
-                return self.is_related_to_ex(
-                    source_argument,
-                    target_argument,
-                    RecursionFlags::BOTH,
-                    intersection_state,
-                );
+            if let Some(arguments) = self.canonical_array_reference_arguments(source, target)? {
+                return match arguments {
+                    CanonicalArrayReferenceArguments::Related { source, target } => self
+                        .is_related_to_ex(
+                            source,
+                            target,
+                            RecursionFlags::BOTH,
+                            intersection_state,
+                        ),
+                    CanonicalArrayReferenceArguments::Unrelated => Ok(Ternary::False),
+                };
             }
             if source_flags.intersects(TypeFlags::OBJECT)
                 && target_flags.intersects(TypeFlags::OBJECT)
@@ -3879,7 +3903,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
 
         let supported_array_relation = source_flags.intersects(TypeFlags::OBJECT)
             && target_flags.intersects(TypeFlags::OBJECT)
-            && matching_configured_array_reference_target(self, global_types, source, target)?
+            && configured_array_reference_targets(self, global_types, source, target)?
                 .is_some();
         let supported_apparent_primitive_relation = relation != RelationKind::Identity
             && target_flags.intersects(TypeFlags::OBJECT)
@@ -4358,12 +4382,12 @@ impl SemanticStore<TypeRecord, TypeMapper> {
     }
 }
 
-fn matching_configured_array_reference_target(
+fn configured_array_reference_targets(
     store: &SemanticStore<TypeRecord, TypeMapper>,
     global_types: Option<RelationGlobalTypes>,
     source: TypeId,
     target: TypeId,
-) -> Result<Option<TypeId>, RelationUnavailable> {
+) -> Result<Option<(TypeId, TypeId)>, RelationUnavailable> {
     let Some(global_types) = global_types else {
         return Ok(None);
     };
@@ -4378,12 +4402,15 @@ fn matching_configured_array_reference_target(
     else {
         return Ok(None);
     };
-    let Some(reference_target) = source_reference.object.target else {
+    let Some(source_target) = source_reference.object.target else {
         return Ok(None);
     };
-    Ok((target_reference.object.target == Some(reference_target)
-        && global_types.contains_array_target(reference_target))
-    .then_some(reference_target))
+    let Some(target_target) = target_reference.object.target else {
+        return Ok(None);
+    };
+    Ok((global_types.contains_array_target(source_target)
+        && global_types.contains_array_target(target_target))
+    .then_some((source_target, target_target)))
 }
 
 const fn array_relation_preflight_error(
@@ -7039,10 +7066,28 @@ mod tests {
                 RelationKind::Assignable,
                 Some(global_types),
             ),
-            Err(RelationUnavailable::UnsupportedStructuredType(
-                readonly_union
-            )),
-            "different generic targets do not acquire inferred variance"
+            Ok(true),
+            "mutable Array is covariant to the canonical ReadonlyArray target"
+        );
+        assert_eq!(
+            store.is_type_related_to_with_optional_global_types(
+                readonly_number,
+                array_union,
+                RelationKind::Assignable,
+                Some(global_types),
+            ),
+            Ok(false),
+            "ReadonlyArray is not assignable to mutable Array"
+        );
+        assert_eq!(
+            store.is_type_related_to_with_optional_global_types(
+                array_number,
+                readonly_number,
+                RelationKind::Identity,
+                Some(global_types),
+            ),
+            Ok(false),
+            "different canonical array targets are never identical"
         );
     }
 

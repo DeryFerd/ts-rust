@@ -206,10 +206,25 @@ impl CanonicalTypeMapperStore {
         element_type: TypeId,
         readonly: bool,
     ) -> Result<TypeId, ArrayTypeError> {
+        self.create_canonical_array_type_with_targets(
+            CanonicalArrayTargets::from_global_types(global_types),
+            element_type,
+            readonly,
+        )
+    }
+
+    /// Target-capability form used by semantic operations that retain only
+    /// the authoritative canonical Array identities.
+    pub(super) fn create_canonical_array_type_with_targets(
+        &mut self,
+        targets: CanonicalArrayTargets,
+        element_type: TypeId,
+        readonly: bool,
+    ) -> Result<TypeId, ArrayTypeError> {
         let target = if readonly {
-            global_types.readonly_array_type
+            targets.readonly_array_type
         } else {
-            global_types.array_type
+            targets.array_type
         };
         Ok(create_type_from_generic_global_type(
             self,
