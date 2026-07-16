@@ -1,15 +1,19 @@
 //! Exact syntax and binder proof for the first function-statement vertical.
 //!
-//! This leaf admits one annotated function declaration whose block contains
+//! This leaf admits two additive annotated-function shapes. The first contains
 //! initialized identifier-named `let`/`const` declarations followed by one
-//! final two-arm `if`. Each arm is a block containing optional declarations
-//! followed by exactly one value-returning `return`. It deliberately stops
-//! before expression planning, lexical admission-set mutation, flow narrowing,
-//! or checking. Those operations remain source-dispatch responsibilities.
+//! final two-arm `if`, with a value return in each arm. The second contains one
+//! two-arm fallthrough `if` between leading and trailing declarations, followed
+//! by one final value return. It deliberately stops before expression planning,
+//! lexical admission-set mutation, flow narrowing, or checking. Those
+//! operations remain source-dispatch responsibilities.
 
 use std::collections::HashSet;
 
-use ts_ast::{Node, NodeArena, NodeData, NodeId, NodeRef, SyntaxKind};
+use ts_ast::{
+    FlowFlags, FlowNode, FlowNodePayload, FlowRef, Node, NodeArena, NodeData, NodeId, NodeRef,
+    SyntaxKind,
+};
 use ts_binder::{BoundFile, SemanticSymbolId};
 
 use super::{
@@ -171,6 +175,93 @@ pub(super) struct SourceFunctionStatementsSyntax {
     pub(super) final_if: SourceFinalIfSyntax,
 }
 
+/// One fallthrough block arm containing initialized locals only.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct SourceFallthroughBranchSyntax {
+    pub(super) block: NodeRef,
+    pub(super) locals: Vec<SourceLocalDeclarationSyntax>,
+}
+
+/// The exact joined `if` and its unwrapped direct identifier condition.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct SourceJoinedIfSyntax {
+    pub(super) statement: NodeRef,
+    pub(super) condition: NodeRef,
+    pub(super) condition_identifier: NodeRef,
+    pub(super) then_branch: SourceFallthroughBranchSyntax,
+    pub(super) else_branch: SourceFallthroughBranchSyntax,
+}
+
+/// Complete source-ordered syntax for the first post-`if` join vertical.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct SourceJoinedFunctionStatementsSyntax {
+    pub(super) body: NodeRef,
+    pub(super) leading: Vec<SourceLocalDeclarationSyntax>,
+    pub(super) joined_if: SourceJoinedIfSyntax,
+    pub(super) trailing: Vec<SourceLocalDeclarationSyntax>,
+    pub(super) return_statement: NodeRef,
+    pub(super) return_expression: NodeRef,
+}
+
+/// Valid source forms intentionally outside the first post-`if` join slice.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SourceJoinedFunctionStatementsUnsupported {
+    InferredCallable(NodeRef),
+    MissingIf(NodeRef),
+    AdditionalIf(NodeRef),
+    MissingElse(NodeRef),
+    MissingReturn(NodeRef),
+    IncompleteFlow(NodeRef),
+}
+
+/// Malformed binder flow in an otherwise admitted joined body.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SourceJoinedFunctionStatementsInvariant {
+    InvalidCallableEdge(NodeRef),
+    InvalidFlowContainer {
+        node: NodeRef,
+        expected: NodeRef,
+        actual: Option<NodeRef>,
+    },
+    MissingFlowStart(NodeRef),
+    UnexpectedFlowEnd(NodeRef),
+    UnexpectedReturnFlow(NodeRef),
+    MissingFlowPoint(NodeRef),
+    MissingFlowNode(FlowRef),
+    InvalidFlowNode(FlowRef),
+    FlowPointMismatch {
+        node: NodeRef,
+        expected: FlowRef,
+        actual: FlowRef,
+    },
+}
+
+/// Read-only failure from the additive joined-body syntax/provenance leaf.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SourceJoinedFunctionStatementsError {
+    Statements(SourceFunctionStatementsError),
+    Unsupported(SourceJoinedFunctionStatementsUnsupported),
+    Invariant(SourceJoinedFunctionStatementsInvariant),
+}
+
+impl From<SourceFunctionStatementsError> for SourceJoinedFunctionStatementsError {
+    fn from(error: SourceFunctionStatementsError) -> Self {
+        Self::Statements(error)
+    }
+}
+
+impl From<SourceFunctionStatementsInvariant> for SourceJoinedFunctionStatementsError {
+    fn from(error: SourceFunctionStatementsInvariant) -> Self {
+        Self::Statements(error.into())
+    }
+}
+
+impl From<SourceJoinedFunctionStatementsInvariant> for SourceJoinedFunctionStatementsError {
+    fn from(error: SourceJoinedFunctionStatementsInvariant) -> Self {
+        Self::Invariant(error)
+    }
+}
+
 /// Proves the complete local-plus-final-`if` syntax and immutable binder route.
 ///
 /// The returned vectors retain parser statement/declaration order. No checker
@@ -188,6 +279,27 @@ pub(super) fn plan_source_function_statements_syntax(
         callable,
     }
     .plan()
+}
+
+/// Proves one local-plus-fallthrough-`if`-plus-return body and its binder join.
+///
+/// This is intentionally separate from [`plan_source_function_statements_syntax`]
+/// so the existing final-`if` capability and all of its callers remain stable.
+/// Returned vectors retain parser declaration order and no checker state is
+/// mutated.
+pub(super) fn plan_source_joined_function_statements_syntax(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    callable: &SourceCallablePlan,
+) -> Result<SourceJoinedFunctionStatementsSyntax, SourceJoinedFunctionStatementsError> {
+    SyntaxPlanner {
+        arena,
+        bound,
+        store,
+        callable,
+    }
+    .plan_joined()
 }
 
 struct SyntaxPlanner<'a> {
@@ -912,9 +1024,754 @@ impl SyntaxPlanner<'_> {
     }
 }
 
+const JOIN_FLOW_METADATA_BITS: u32 = FlowFlags::REFERENCED.bits() | FlowFlags::SHARED.bits();
+
+impl SyntaxPlanner<'_> {
+    #[allow(clippy::too_many_lines)]
+    fn plan_joined(
+        &self,
+    ) -> Result<SourceJoinedFunctionStatementsSyntax, SourceJoinedFunctionStatementsError> {
+        let declaration = self.callable.declaration;
+        if !declaration.is_for(self.arena.id(), self.bound.file_id())
+            || self.bound.node_arena_id() != self.arena.id()
+            || self.bound.node_arena_revision() != self.arena.revision()
+        {
+            return Err(SourceFunctionStatementsInvariant::BoundSourceMismatch(declaration).into());
+        }
+        if self.callable.family != SourceCallableFamily::FunctionDeclaration {
+            return Err(self
+                .unsupported(
+                    declaration,
+                    self.node(declaration)?.kind,
+                    SourceFunctionStatementsRole::Callable,
+                )
+                .into());
+        }
+        if self.callable.return_type.is_inferred() {
+            return Err(SourceJoinedFunctionStatementsError::Unsupported(
+                SourceJoinedFunctionStatementsUnsupported::InferredCallable(declaration),
+            ));
+        }
+
+        let declaration_record = self.node(declaration)?;
+        let NodeData::FunctionDeclaration(function) = &declaration_record.data else {
+            return Err(self
+                .unsupported(
+                    declaration,
+                    declaration_record.kind,
+                    SourceFunctionStatementsRole::Callable,
+                )
+                .into());
+        };
+        if declaration_record.kind != SyntaxKind::FunctionDeclaration
+            || function.body != Some(self.callable.body.node)
+            || function.type_
+                != self
+                    .callable
+                    .return_type
+                    .type_node()
+                    .map(|type_node| type_node.node)
+        {
+            return Err(
+                SourceJoinedFunctionStatementsInvariant::InvalidCallableEdge(declaration).into(),
+            );
+        }
+
+        let body = self.callable.body;
+        self.validate_range(body, declaration)?;
+        let statements = self.plan_body(body, declaration)?;
+        let Some((&return_id, preceding)) = statements.split_last() else {
+            return Err(SourceJoinedFunctionStatementsError::Unsupported(
+                SourceJoinedFunctionStatementsUnsupported::MissingIf(body),
+            ));
+        };
+        let return_statement = self.reference(return_id);
+        if self.node(return_statement)?.kind != SyntaxKind::ReturnStatement {
+            return Err(SourceJoinedFunctionStatementsError::Unsupported(
+                SourceJoinedFunctionStatementsUnsupported::MissingReturn(return_statement),
+            ));
+        }
+
+        let mut if_index = None;
+        for (index, statement_id) in preceding.iter().copied().enumerate() {
+            let statement = self.reference(statement_id);
+            if self.node(statement)?.kind == SyntaxKind::IfStatement {
+                if if_index.replace(index).is_some() {
+                    return Err(SourceJoinedFunctionStatementsError::Unsupported(
+                        SourceJoinedFunctionStatementsUnsupported::AdditionalIf(statement),
+                    ));
+                }
+            }
+        }
+        let Some(if_index) = if_index else {
+            return Err(SourceJoinedFunctionStatementsError::Unsupported(
+                SourceJoinedFunctionStatementsUnsupported::MissingIf(body),
+            ));
+        };
+
+        let mut leading = Vec::new();
+        for &statement_id in &preceding[..if_index] {
+            leading.extend(self.plan_local_statement(
+                self.reference(statement_id),
+                body,
+                declaration,
+            )?);
+        }
+        let joined_if =
+            self.plan_joined_if(self.reference(preceding[if_index]), body, declaration)?;
+        let mut trailing = Vec::new();
+        for &statement_id in &preceding[if_index + 1..] {
+            trailing.extend(self.plan_local_statement(
+                self.reference(statement_id),
+                body,
+                declaration,
+            )?);
+        }
+        let return_expression = self.plan_joined_return(return_statement, body, declaration)?;
+
+        let syntax = SourceJoinedFunctionStatementsSyntax {
+            body,
+            leading,
+            joined_if,
+            trailing,
+            return_statement,
+            return_expression,
+        };
+        self.validate_joined_flow(&syntax)?;
+        Ok(syntax)
+    }
+
+    fn plan_joined_if(
+        &self,
+        statement: NodeRef,
+        body: NodeRef,
+        callable: NodeRef,
+    ) -> Result<SourceJoinedIfSyntax, SourceJoinedFunctionStatementsError> {
+        let record = self.node(statement)?;
+        let NodeData::IfStatement(if_statement) = &record.data else {
+            return Err(SourceJoinedFunctionStatementsError::Unsupported(
+                SourceJoinedFunctionStatementsUnsupported::MissingIf(statement),
+            ));
+        };
+        if record.kind != SyntaxKind::IfStatement
+            || record.flags.0 != 0
+            || record.parent != Some(body.node)
+            || if_statement.flow_node.is_some()
+            || if_statement.facts != 0
+        {
+            return Err(self
+                .unsupported(
+                    statement,
+                    record.kind,
+                    SourceFunctionStatementsRole::IfStatement,
+                )
+                .into());
+        }
+        self.validate_range(statement, body)?;
+        self.validate_container(statement, callable)?;
+        self.validate_block_scope_container(statement, callable)?;
+
+        let condition = self.reference(if_statement.expression);
+        self.validate_parent(
+            condition,
+            Some(statement.node),
+            SourceFunctionStatementsRole::Condition,
+        )?;
+        self.validate_range(condition, statement)?;
+        let condition_identifier = self.plan_condition(condition, callable)?;
+
+        let then_block = self.reference(if_statement.then_statement);
+        let else_block = if_statement
+            .else_statement
+            .map(|node| self.reference(node))
+            .ok_or(SourceJoinedFunctionStatementsError::Unsupported(
+                SourceJoinedFunctionStatementsUnsupported::MissingElse(statement),
+            ))?;
+        self.validate_range(then_block, statement)?;
+        self.validate_range(else_block, statement)?;
+        self.validate_order(condition, then_block)?;
+        self.validate_order(then_block, else_block)?;
+
+        Ok(SourceJoinedIfSyntax {
+            statement,
+            condition,
+            condition_identifier,
+            then_branch: self.plan_fallthrough_branch(then_block, statement, callable)?,
+            else_branch: self.plan_fallthrough_branch(else_block, statement, callable)?,
+        })
+    }
+
+    fn plan_fallthrough_branch(
+        &self,
+        block: NodeRef,
+        if_statement: NodeRef,
+        callable: NodeRef,
+    ) -> Result<SourceFallthroughBranchSyntax, SourceJoinedFunctionStatementsError> {
+        let record = self.node(block)?;
+        let NodeData::Block(block_data) = &record.data else {
+            return Err(self
+                .unsupported(
+                    block,
+                    record.kind,
+                    SourceFunctionStatementsRole::BranchBlock,
+                )
+                .into());
+        };
+        if record.kind != SyntaxKind::Block
+            || record.flags.0 != 0
+            || record.parent != Some(if_statement.node)
+            || block_data.flow_node.is_some()
+            || block_data.next_container.is_some()
+            || block_data.statements.has_trailing_comma
+            || block_data.facts != 0
+        {
+            return Err(self
+                .unsupported(
+                    block,
+                    record.kind,
+                    SourceFunctionStatementsRole::BranchBlock,
+                )
+                .into());
+        }
+        self.validate_range(block, if_statement)?;
+        self.validate_container(block, callable)?;
+        self.validate_block_scope_container(block, callable)?;
+        self.validate_node_list(
+            block,
+            block_data.statements.range,
+            &block_data.statements.nodes,
+        )?;
+
+        let mut locals = Vec::new();
+        for &statement_id in &block_data.statements.nodes {
+            locals.extend(self.plan_local_statement(
+                self.reference(statement_id),
+                block,
+                callable,
+            )?);
+        }
+        Ok(SourceFallthroughBranchSyntax { block, locals })
+    }
+
+    fn plan_joined_return(
+        &self,
+        statement: NodeRef,
+        body: NodeRef,
+        callable: NodeRef,
+    ) -> Result<NodeRef, SourceJoinedFunctionStatementsError> {
+        let record = self.node(statement)?;
+        let NodeData::ReturnStatement(return_data) = &record.data else {
+            return Err(SourceJoinedFunctionStatementsError::Unsupported(
+                SourceJoinedFunctionStatementsUnsupported::MissingReturn(statement),
+            ));
+        };
+        if record.kind != SyntaxKind::ReturnStatement
+            || record.flags.0 != 0
+            || record.parent != Some(body.node)
+            || return_data.flow_node.is_some()
+            || return_data.facts != 0
+        {
+            return Err(self
+                .unsupported(
+                    statement,
+                    record.kind,
+                    SourceFunctionStatementsRole::ReturnStatement,
+                )
+                .into());
+        }
+        self.validate_range(statement, body)?;
+        self.validate_container(statement, callable)?;
+        self.validate_block_scope_container(statement, callable)?;
+
+        let expression = return_data
+            .expression
+            .map(|node| self.reference(node))
+            .ok_or(SourceJoinedFunctionStatementsError::Unsupported(
+                SourceJoinedFunctionStatementsUnsupported::MissingReturn(statement),
+            ))?;
+        self.validate_parent(
+            expression,
+            Some(statement.node),
+            SourceFunctionStatementsRole::ReturnExpression,
+        )?;
+        self.validate_range(expression, statement)?;
+        self.validate_container(expression, callable)?;
+        self.validate_block_scope_container(expression, callable)?;
+        Ok(expression)
+    }
+
+    fn validate_joined_flow(
+        &self,
+        syntax: &SourceJoinedFunctionStatementsSyntax,
+    ) -> Result<(), SourceJoinedFunctionStatementsError> {
+        let declaration = self.callable.declaration;
+        let graph = self.bound.flow_graph();
+        if graph.container_is_complete(declaration) != Some(true) {
+            return Err(SourceJoinedFunctionStatementsError::Unsupported(
+                SourceJoinedFunctionStatementsUnsupported::IncompleteFlow(declaration),
+            ));
+        }
+        let start = graph.container_start(declaration).ok_or(
+            SourceJoinedFunctionStatementsInvariant::MissingFlowStart(declaration),
+        )?;
+        self.expect_start_flow(start)?;
+        if graph.container_end(declaration).is_some() {
+            return Err(
+                SourceJoinedFunctionStatementsInvariant::UnexpectedFlowEnd(declaration).into(),
+            );
+        }
+        if graph.container_return(declaration).is_some() {
+            return Err(
+                SourceJoinedFunctionStatementsInvariant::UnexpectedReturnFlow(declaration).into(),
+            );
+        }
+        let actual = graph.flow_container(syntax.joined_if.statement);
+        if actual != Some(declaration) {
+            return Err(
+                SourceJoinedFunctionStatementsInvariant::InvalidFlowContainer {
+                    node: syntax.joined_if.statement,
+                    expected: declaration,
+                    actual,
+                }
+                .into(),
+            );
+        }
+
+        for (index, local) in syntax.leading.iter().enumerate() {
+            let flow = self.joined_flow_at(local.name)?;
+            self.expect_start_route(local.name, flow, &syntax.leading[..index], start)?;
+        }
+        let if_flow = self.joined_flow_at(syntax.joined_if.statement)?;
+        self.expect_start_route(syntax.joined_if.statement, if_flow, &syntax.leading, start)?;
+        let condition_flow = self.joined_flow_at(syntax.joined_if.condition_identifier)?;
+        self.expect_start_route(
+            syntax.joined_if.condition_identifier,
+            condition_flow,
+            &syntax.leading,
+            start,
+        )?;
+
+        for (index, local) in syntax.joined_if.then_branch.locals.iter().enumerate() {
+            let flow = self.joined_flow_at(local.name)?;
+            self.expect_condition_route(
+                local.name,
+                flow,
+                &syntax.joined_if.then_branch.locals[..index],
+                true,
+                &syntax.joined_if,
+                &syntax.leading,
+                start,
+            )?;
+        }
+        for (index, local) in syntax.joined_if.else_branch.locals.iter().enumerate() {
+            let flow = self.joined_flow_at(local.name)?;
+            self.expect_condition_route(
+                local.name,
+                flow,
+                &syntax.joined_if.else_branch.locals[..index],
+                false,
+                &syntax.joined_if,
+                &syntax.leading,
+                start,
+            )?;
+        }
+        for (index, local) in syntax.trailing.iter().enumerate() {
+            let flow = self.joined_flow_at(local.name)?;
+            self.expect_join_route(local.name, flow, &syntax.trailing[..index], syntax, start)?;
+        }
+        let return_flow = self.joined_flow_at(syntax.return_statement)?;
+        self.expect_join_route(
+            syntax.return_statement,
+            return_flow,
+            &syntax.trailing,
+            syntax,
+            start,
+        )?;
+        Ok(())
+    }
+
+    fn joined_flow_at(
+        &self,
+        node: NodeRef,
+    ) -> Result<FlowRef, SourceJoinedFunctionStatementsError> {
+        self.bound
+            .flow_at(node)
+            .ok_or_else(|| SourceJoinedFunctionStatementsInvariant::MissingFlowPoint(node).into())
+    }
+
+    fn joined_flow_node(
+        &self,
+        flow: FlowRef,
+    ) -> Result<&FlowNode, SourceJoinedFunctionStatementsError> {
+        self.bound
+            .flow_graph()
+            .nodes()
+            .get(flow)
+            .ok_or_else(|| SourceJoinedFunctionStatementsInvariant::MissingFlowNode(flow).into())
+    }
+
+    fn expect_start_flow(&self, flow: FlowRef) -> Result<(), SourceJoinedFunctionStatementsError> {
+        let node = self.joined_flow_node(flow)?;
+        if joined_semantic_flow_flags(node.flags) != FlowFlags::START.bits()
+            || node.payload.is_some()
+            || node.antecedent.is_some()
+            || !node.antecedents.is_empty()
+        {
+            return Err(SourceJoinedFunctionStatementsInvariant::InvalidFlowNode(flow).into());
+        }
+        Ok(())
+    }
+
+    fn expect_start_route(
+        &self,
+        point: NodeRef,
+        flow: FlowRef,
+        assignments: &[SourceLocalDeclarationSyntax],
+        start: FlowRef,
+    ) -> Result<(), SourceJoinedFunctionStatementsError> {
+        let actual = self.peel_joined_assignments(flow, assignments)?;
+        self.expect_flow_point(point, actual, start)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn expect_condition_route(
+        &self,
+        point: NodeRef,
+        flow: FlowRef,
+        branch_assignments: &[SourceLocalDeclarationSyntax],
+        assume_true: bool,
+        joined_if: &SourceJoinedIfSyntax,
+        leading: &[SourceLocalDeclarationSyntax],
+        start: FlowRef,
+    ) -> Result<(), SourceJoinedFunctionStatementsError> {
+        let condition_flow = self.peel_joined_assignments(flow, branch_assignments)?;
+        let condition = self.joined_flow_node(condition_flow)?;
+        let expected_flags = if assume_true {
+            FlowFlags::TRUE_CONDITION
+        } else {
+            FlowFlags::FALSE_CONDITION
+        };
+        let Some(antecedent) = condition.antecedent else {
+            return Err(
+                SourceJoinedFunctionStatementsInvariant::InvalidFlowNode(condition_flow).into(),
+            );
+        };
+        if joined_semantic_flow_flags(condition.flags) != expected_flags.bits()
+            || condition.payload != Some(FlowNodePayload::Ast(joined_if.condition))
+            || !condition.antecedents.is_empty()
+        {
+            return Err(
+                SourceJoinedFunctionStatementsInvariant::InvalidFlowNode(condition_flow).into(),
+            );
+        }
+        let actual = self.peel_joined_assignments(antecedent, leading)?;
+        self.expect_flow_point(point, actual, start)
+    }
+
+    fn expect_join_route(
+        &self,
+        point: NodeRef,
+        flow: FlowRef,
+        trailing_assignments: &[SourceLocalDeclarationSyntax],
+        syntax: &SourceJoinedFunctionStatementsSyntax,
+        start: FlowRef,
+    ) -> Result<(), SourceJoinedFunctionStatementsError> {
+        let join_flow = self.peel_joined_assignments(flow, trailing_assignments)?;
+        let join = self.joined_flow_node(join_flow)?;
+        if joined_semantic_flow_flags(join.flags) != FlowFlags::BRANCH_LABEL.bits()
+            || join.payload.is_some()
+            || join.antecedent.is_some()
+            || join.antecedents.len() != 2
+            || join.antecedents[0] == join.antecedents[1]
+        {
+            return Err(SourceJoinedFunctionStatementsInvariant::InvalidFlowNode(join_flow).into());
+        }
+        self.expect_condition_route(
+            point,
+            join.antecedents[0],
+            &syntax.joined_if.then_branch.locals,
+            true,
+            &syntax.joined_if,
+            &syntax.leading,
+            start,
+        )?;
+        self.expect_condition_route(
+            point,
+            join.antecedents[1],
+            &syntax.joined_if.else_branch.locals,
+            false,
+            &syntax.joined_if,
+            &syntax.leading,
+            start,
+        )
+    }
+
+    fn peel_joined_assignments(
+        &self,
+        mut flow: FlowRef,
+        assignments: &[SourceLocalDeclarationSyntax],
+    ) -> Result<FlowRef, SourceJoinedFunctionStatementsError> {
+        for assignment in assignments.iter().rev() {
+            let node = self.joined_flow_node(flow)?;
+            let Some(antecedent) = node.antecedent else {
+                return Err(SourceJoinedFunctionStatementsInvariant::InvalidFlowNode(flow).into());
+            };
+            if joined_semantic_flow_flags(node.flags) != FlowFlags::ASSIGNMENT.bits()
+                || node.payload != Some(FlowNodePayload::Ast(assignment.declaration))
+                || !node.antecedents.is_empty()
+            {
+                return Err(SourceJoinedFunctionStatementsInvariant::InvalidFlowNode(flow).into());
+            }
+            flow = antecedent;
+        }
+        Ok(flow)
+    }
+
+    fn expect_flow_point(
+        &self,
+        point: NodeRef,
+        actual: FlowRef,
+        expected: FlowRef,
+    ) -> Result<(), SourceJoinedFunctionStatementsError> {
+        if actual != expected {
+            return Err(SourceJoinedFunctionStatementsInvariant::FlowPointMismatch {
+                node: point,
+                expected,
+                actual,
+            }
+            .into());
+        }
+        Ok(())
+    }
+}
+
+const fn joined_semantic_flow_flags(flags: FlowFlags) -> u32 {
+    flags.bits() & !JOIN_FLOW_METADATA_BITS
+}
+
 fn range_contains(parent: ts_core::TextRange, child: ts_core::TextRange) -> bool {
     parent.start <= parent.end
         && child.start <= child.end
         && child.start >= parent.start
         && child.end <= parent.end
+}
+
+#[cfg(test)]
+mod joined_tests {
+    use ts_ast::{FileId, NodeData};
+    use ts_binder::{
+        CanonicalBinder, CanonicalModuleState, CanonicalNameResolverOptions,
+        CanonicalSourceFileFacts, CanonicalSourceLanguage, EscapedName,
+    };
+    use ts_parser::{ParseResult, parse_source_file};
+
+    use super::*;
+    use crate::semantic::{
+        DeclaredTypeHost, IntrinsicBootstrapOptions,
+        production::GlobalMergeCompletion,
+        source_callables::{SourceCallablePlan, plan_source_callable},
+    };
+
+    const JOINED_SOURCE: &str = concat!(
+        "type Choice = \"yes\" | \"\" | undefined;\n",
+        "function joined(value: Choice): Choice {\n",
+        "  const before: Choice = value;\n",
+        "  if (((value))) {\n",
+        "    const truthy: \"yes\" = value;\n",
+        "  } else {\n",
+        "    const falsy: \"\" | undefined = value;\n",
+        "  }\n",
+        "  const after: Choice = value;\n",
+        "  return value;\n",
+        "}\n",
+    );
+
+    struct JoinedFixture {
+        parsed: ParseResult,
+        file: FileId,
+        bound: BoundFile,
+        store: CanonicalTypeMapperStore,
+    }
+
+    impl JoinedFixture {
+        fn new(source: &str, file: FileId) -> Self {
+            let parsed = parse_source_file(source);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let mut binder = CanonicalBinder::new();
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new(
+                        EscapedName::source("\"/project/source_joined_statements.ts\""),
+                        CanonicalSourceLanguage::TypeScript,
+                        false,
+                        CanonicalModuleState::Script,
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+            let (symbols, mut files) = binder.finish().try_into_parts().unwrap();
+            let bound = files.remove(&file).unwrap();
+            let mut store = CanonicalTypeMapperStore::from_symbol_store(symbols);
+            assert!(
+                store
+                    .register_source_file(&parsed.arena, parsed.source_file, file)
+                    .is_some()
+            );
+            store
+                .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    ..IntrinsicBootstrapOptions::default()
+                })
+                .unwrap();
+            Self {
+                parsed,
+                file,
+                bound,
+                store,
+            }
+        }
+
+        fn declaration(&self) -> NodeRef {
+            let source = self.parsed.arena.get(self.parsed.source_file).unwrap();
+            let NodeData::SourceFile(source) = &source.data else {
+                panic!("expected source file")
+            };
+            source
+                .statements
+                .nodes
+                .iter()
+                .copied()
+                .find(|statement| {
+                    self.parsed
+                        .arena
+                        .get(*statement)
+                        .is_some_and(|node| node.kind == SyntaxKind::FunctionDeclaration)
+                })
+                .map(|node| NodeRef::new(self.parsed.arena.id(), self.file, node))
+                .expect("expected function declaration")
+        }
+
+        fn callable(&self) -> SourceCallablePlan {
+            let declaration = self.declaration();
+            let owner = self.bound.symbol(declaration).unwrap();
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&self.parsed.arena, &self.bound)],
+                GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+            )
+            .unwrap();
+            plan_source_callable(&self.store, &host, declaration, owner, None).unwrap()
+        }
+
+        fn plan(
+            &self,
+        ) -> Result<SourceJoinedFunctionStatementsSyntax, SourceJoinedFunctionStatementsError>
+        {
+            let callable = self.callable();
+            plan_source_joined_function_statements_syntax(
+                &self.parsed.arena,
+                &self.bound,
+                &self.store,
+                &callable,
+            )
+        }
+    }
+
+    #[test]
+    fn joined_named_union_syntax_retains_exact_ordered_label_routes() {
+        let fixture = JoinedFixture::new(JOINED_SOURCE, FileId::new(1_201));
+        let syntax = fixture.plan().unwrap();
+        assert_eq!(syntax.leading.len(), 1);
+        assert_eq!(syntax.joined_if.then_branch.locals.len(), 1);
+        assert_eq!(syntax.joined_if.else_branch.locals.len(), 1);
+        assert_eq!(syntax.trailing.len(), 1);
+
+        let join_flow = fixture.bound.flow_at(syntax.trailing[0].name).unwrap();
+        let join = fixture.bound.flow_graph().nodes().get(join_flow).unwrap();
+        assert_eq!(
+            joined_semantic_flow_flags(join.flags),
+            FlowFlags::BRANCH_LABEL.bits(),
+        );
+        assert!(join.payload.is_none());
+        assert!(join.antecedent.is_none());
+        let [then_flow, else_flow] = join.antecedents.as_slice() else {
+            panic!("expected ordered then/else join antecedents")
+        };
+        let then_assignment = fixture.bound.flow_graph().nodes().get(*then_flow).unwrap();
+        let else_assignment = fixture.bound.flow_graph().nodes().get(*else_flow).unwrap();
+        assert_eq!(
+            then_assignment.payload,
+            Some(FlowNodePayload::Ast(
+                syntax.joined_if.then_branch.locals[0].declaration,
+            )),
+        );
+        assert_eq!(
+            else_assignment.payload,
+            Some(FlowNodePayload::Ast(
+                syntax.joined_if.else_branch.locals[0].declaration,
+            )),
+        );
+    }
+
+    #[test]
+    fn joined_shape_rejects_missing_else_returns_and_nested_control() {
+        let no_else = JoinedFixture::new(
+            "function f(value: boolean): boolean { if (value) {} return value; }",
+            FileId::new(1_210),
+        );
+        assert!(matches!(
+            no_else.plan(),
+            Err(SourceJoinedFunctionStatementsError::Unsupported(
+                SourceJoinedFunctionStatementsUnsupported::MissingElse(_),
+            )),
+        ));
+
+        for (file, source) in [
+            (
+                FileId::new(1_211),
+                "function f(value: boolean): boolean { if (value) { return value; } else {} return value; }",
+            ),
+            (
+                FileId::new(1_212),
+                "function f(value: boolean): boolean { if (value) { if (value) {} } else {} return value; }",
+            ),
+        ] {
+            let fixture = JoinedFixture::new(source, file);
+            assert!(matches!(
+                fixture.plan(),
+                Err(SourceJoinedFunctionStatementsError::Statements(
+                    SourceFunctionStatementsError::Unsupported(
+                        SourceFunctionStatementsUnsupported::Syntax {
+                            role: SourceFunctionStatementsRole::BranchStatement,
+                            ..
+                        },
+                    ),
+                )),
+            ));
+        }
+    }
+
+    #[test]
+    fn joined_shape_rejects_foreign_callable_provenance() {
+        let first = JoinedFixture::new(JOINED_SOURCE, FileId::new(1_220));
+        let second = JoinedFixture::new(JOINED_SOURCE, FileId::new(1_220));
+        let callable = first.callable();
+        assert!(matches!(
+            plan_source_joined_function_statements_syntax(
+                &second.parsed.arena,
+                &second.bound,
+                &second.store,
+                &callable,
+            ),
+            Err(SourceJoinedFunctionStatementsError::Statements(
+                SourceFunctionStatementsError::Invariant(
+                    SourceFunctionStatementsInvariant::BoundSourceMismatch(_),
+                ),
+            )),
+        ));
+    }
 }
