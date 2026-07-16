@@ -1,13 +1,13 @@
-//! Exact semantic kernel for the first generic direct-call vertical.
+//! Exact semantic kernels for bounded generic direct-call verticals.
 //!
-//! The admitted signature is exactly `<T>(value: T): T`: one stored call
-//! signature, one naked unconstrained/default-free type parameter, one required
-//! parameter, and a naked return. Calls may infer `T` from one admitted scalar,
-//! primitive-union, or resolved declared-property-object argument, or supply
-//! one explicit argument from the same domain. Overloads, missing/extra value
-//! or type arguments, constraints, defaults, contextual inference, broader
-//! structured types, spreads, `this`, and rest signatures remain typed
-//! boundaries.
+//! The full-vector branch admits one stored signature with ordered type
+//! parameters, fixed required parameters whose targets are naked type
+//! parameters, and a mapper-supported return. It owns declaration-order
+//! inference/default/constraint finalization and overload-failure projection,
+//! but deliberately leaves instantiated-signature cache publication to its
+//! eventual source consumer. The original exact `<T>(value: T): T` entry points
+//! remain available for compatibility with the installed identity-call source
+//! path and its one-row cache protocol.
 
 #![allow(dead_code)] // Installed ahead of the source-call dispatch consumer.
 
@@ -24,13 +24,1080 @@ use super::{
         DirectCallApplicability, DirectCallArgumentTarget, DirectCallForm, DirectCallReturnKind,
     },
     declared::{cached_ordinary_type_parameter_owner, type_list_key},
-    inference::{NakedTypeInferenceError, infer_naked_type_parameter, validate_inference_leaf},
+    inference::{
+        InferenceLiteralTreatment, NakedTypeCandidateError, NakedTypeInferenceError,
+        infer_naked_type_parameter, infer_naked_type_parameter_candidates, validate_inference_leaf,
+    },
+    instantiate::{InstantiationError, instantiate_type_with_vector},
     signatures::SignatureFlags,
     source_callables::{StoredSourceCallableValidation, validate_stored_source_callable},
     store::CachedSignatureLookup,
     type_records::TypeData,
     types::{ObjectFlags, TypeFlags},
 };
+
+/// Syntax-neutral input for the declaration-order generic-call kernel.
+///
+/// `Some` preserves the distinction between explicit syntax and inference.
+/// An empty explicit list is normalized back to inference because the parser
+/// owns TS1099 while pinned overload resolution observes zero type arguments.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct GenericCallVectorRequest<'a> {
+    pub(super) form: DirectCallForm,
+    pub(super) optional_chain: bool,
+    pub(super) explicit_type_arguments: Option<&'a [TypeId]>,
+    pub(super) has_spread_argument: bool,
+    pub(super) callee: TypeId,
+    pub(super) arguments: &'a [TypeId],
+}
+
+/// Valid semantics intentionally outside this first full-vector cut.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum GenericCallVectorUnsupported {
+    Form(DirectCallForm),
+    OptionalChain,
+    SpreadArgument,
+    NotExactSingleCallable(TypeId),
+    PendingCallable(TypeId),
+    SignatureTypeParameterCount(SignatureId),
+    SignatureFlags(SignatureId),
+    ExplicitThisParameter(SignatureId),
+    RestSignature(SignatureId),
+    NonRequiredParameter(SignatureId),
+    NonNakedParameter {
+        signature: SignatureId,
+        index: usize,
+        type_: TypeId,
+    },
+    UnresolvedReturnType(SignatureId),
+    InstantiationType {
+        signature: SignatureId,
+        type_: TypeId,
+    },
+    TypeParameterDependency {
+        type_parameter: TypeId,
+        dependency: TypeId,
+    },
+}
+
+/// Malformed stored callable state or foreign semantic identities.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum GenericCallVectorInvariant {
+    InvalidCalleeType(TypeId),
+    MalformedCallable(TypeId),
+    CallableOwnerMismatch {
+        callee: TypeId,
+        owner: TypeId,
+    },
+    InvalidSignature(SignatureId),
+    CallableSignatureMismatch(SignatureId),
+    InvalidTypeParameter(TypeId),
+    DuplicateTypeParameter(TypeId),
+    InvalidParameterSymbol {
+        signature: SignatureId,
+        index: usize,
+        symbol: SemanticSymbolId,
+    },
+    InvalidArgumentType {
+        index: usize,
+        type_: TypeId,
+    },
+    InvalidTypeArgument {
+        index: usize,
+        type_: TypeId,
+    },
+    MissingBootstrap,
+}
+
+/// Capability, inference, instantiation, or relation failure. Ordinary call
+/// diagnostics are represented by [`GenericCallVectorApplicability`].
+#[derive(Debug, PartialEq)]
+pub(super) enum GenericCallVectorError {
+    Unsupported(GenericCallVectorUnsupported),
+    Invariant(GenericCallVectorInvariant),
+    Inference(NakedTypeCandidateError),
+    Instantiation(InstantiationError),
+    Relation(RelationUnavailable),
+}
+
+impl From<GenericCallVectorUnsupported> for GenericCallVectorError {
+    fn from(error: GenericCallVectorUnsupported) -> Self {
+        Self::Unsupported(error)
+    }
+}
+
+impl From<GenericCallVectorInvariant> for GenericCallVectorError {
+    fn from(error: GenericCallVectorInvariant) -> Self {
+        Self::Invariant(error)
+    }
+}
+
+impl From<NakedTypeCandidateError> for GenericCallVectorError {
+    fn from(error: NakedTypeCandidateError) -> Self {
+        Self::Inference(error)
+    }
+}
+
+impl From<InstantiationError> for GenericCallVectorError {
+    fn from(error: InstantiationError) -> Self {
+        Self::Instantiation(error)
+    }
+}
+
+impl From<RelationUnavailable> for GenericCallVectorError {
+    fn from(error: RelationUnavailable) -> Self {
+        Self::Relation(error)
+    }
+}
+
+/// One mapper-equivalent projection with no mapper/signature cache published.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct GenericCallVectorInstantiation {
+    pub(super) type_arguments: Vec<TypeId>,
+    pub(super) parameter_types: Vec<TypeId>,
+    pub(super) return_type: TypeId,
+    pub(super) return_kind: DirectCallReturnKind,
+}
+
+/// Final selected signature view. On an erroneous sole-candidate call this is
+/// the exact overload-failure recovery projection exposed by TypeScript-Go.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct GenericCallVectorProjection {
+    pub(super) callee: TypeId,
+    pub(super) generic_signature: SignatureId,
+    pub(super) type_parameters: Vec<TypeId>,
+    pub(super) instantiation: GenericCallVectorInstantiation,
+    pub(super) recovery: bool,
+}
+
+/// Single diagnostic class produced by the bounded one-candidate resolver.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum GenericCallVectorApplicability {
+    Applicable,
+    TypeArgumentArity {
+        minimum: usize,
+        maximum: usize,
+        actual: usize,
+    },
+    TooFewArguments {
+        expected: usize,
+        actual: usize,
+    },
+    TooManyArguments {
+        expected: usize,
+        actual: usize,
+    },
+    ExplicitTypeArgumentConstraint {
+        index: usize,
+        type_argument: TypeId,
+        constraint: TypeId,
+    },
+    ArgumentNotAssignable {
+        index: usize,
+        argument_type: TypeId,
+        parameter_type: TypeId,
+    },
+}
+
+impl GenericCallVectorApplicability {
+    /// Stable TypeScript diagnostic category for source-dispatch integration.
+    pub(super) const fn diagnostic_code(self) -> Option<u32> {
+        match self {
+            Self::Applicable => None,
+            Self::TypeArgumentArity { .. } => Some(2558),
+            Self::TooFewArguments { .. } | Self::TooManyArguments { .. } => Some(2554),
+            Self::ExplicitTypeArgumentConstraint { .. } => Some(2344),
+            Self::ArgumentNotAssignable { .. } => Some(2345),
+        }
+    }
+}
+
+/// Complete pure-resolution result.
+///
+/// `checked_instantiation` retains the normal inference/default vector used to
+/// classify TS2344/TS2345. `projection` may instead contain the raw
+/// overload-failure vector used for the call expression's final return type.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct GenericCallVectorResolution {
+    pub(super) projection: GenericCallVectorProjection,
+    pub(super) checked_instantiation: Option<GenericCallVectorInstantiation>,
+    pub(super) applicability: GenericCallVectorApplicability,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct GenericCallTypeParameter {
+    type_: TypeId,
+    constraint: Option<TypeId>,
+    default_type: Option<TypeId>,
+    base_constraint: TypeId,
+}
+
+#[derive(Clone, Debug)]
+struct GenericCallSignatureShape {
+    signature: SignatureId,
+    type_parameters: Vec<GenericCallTypeParameter>,
+    parameter_type_parameters: Vec<TypeId>,
+    return_type: TypeId,
+}
+
+/// Resolves the bounded full-vector generic branch through the canonical
+/// callable provider. It deliberately does not allocate a mapper, transient
+/// parameter symbol, instantiated signature, or cached-signature entry. The
+/// source provider must reject `const` type-parameter declarations before
+/// publication because stored type-parameter records do not retain that bit.
+pub(super) fn resolve_generic_call_vector(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
+    strict_function_types: bool,
+    request: GenericCallVectorRequest<'_>,
+) -> Result<GenericCallVectorResolution, GenericCallVectorError> {
+    validate_generic_call_vector_request(store, request)?;
+    let callable = match validate_stored_single_callable(store, request.callee) {
+        StoredSingleCallableValidation::NotCallable => {
+            return Err(
+                GenericCallVectorUnsupported::NotExactSingleCallable(request.callee).into(),
+            );
+        }
+        StoredSingleCallableValidation::Pending { .. } => {
+            return Err(GenericCallVectorUnsupported::PendingCallable(request.callee).into());
+        }
+        StoredSingleCallableValidation::Malformed { .. } => {
+            return Err(GenericCallVectorInvariant::MalformedCallable(request.callee).into());
+        }
+        StoredSingleCallableValidation::Valid { callable, .. } => callable,
+    };
+    project_validated_generic_call_vector(
+        store,
+        request,
+        &callable,
+        |store, source, target| {
+            store.is_type_assignable_to_with_global_types_and_strict_function_types(
+                source,
+                target,
+                global_types,
+                strict_function_types,
+            )
+        },
+        |store, source, target| {
+            store.is_type_strict_subtype_of_with_global_types(source, target, global_types)
+        },
+        |store, source, target| {
+            store.is_type_subtype_of_with_global_types(source, target, global_types)
+        },
+    )
+}
+
+fn project_validated_generic_call_vector(
+    store: &mut CanonicalTypeMapperStore,
+    request: GenericCallVectorRequest<'_>,
+    callable: &ValidatedSingleCallable,
+    mut is_assignable: impl FnMut(
+        &mut CanonicalTypeMapperStore,
+        TypeId,
+        TypeId,
+    ) -> Result<bool, RelationUnavailable>,
+    mut is_strict_subtype: impl FnMut(
+        &mut CanonicalTypeMapperStore,
+        TypeId,
+        TypeId,
+    ) -> Result<bool, RelationUnavailable>,
+    mut is_subtype: impl FnMut(
+        &mut CanonicalTypeMapperStore,
+        TypeId,
+        TypeId,
+    ) -> Result<bool, RelationUnavailable>,
+) -> Result<GenericCallVectorResolution, GenericCallVectorError> {
+    validate_generic_call_vector_request(store, request)?;
+    let request = GenericCallVectorRequest {
+        explicit_type_arguments: request
+            .explicit_type_arguments
+            .filter(|arguments| !arguments.is_empty()),
+        ..request
+    };
+    let shape = validate_generic_call_signature_shape(store, request.callee, callable)?;
+    let minimum_type_arguments = minimum_type_argument_count(&shape.type_parameters);
+    if let Some(explicit) = request.explicit_type_arguments
+        && (explicit.len() < minimum_type_arguments || explicit.len() > shape.type_parameters.len())
+    {
+        let recovery = explicit_recovery_type_arguments(store, &shape, explicit)?;
+        let projection = generic_call_projection(store, request.callee, &shape, recovery, true)?;
+        return Ok(GenericCallVectorResolution {
+            projection,
+            checked_instantiation: None,
+            applicability: GenericCallVectorApplicability::TypeArgumentArity {
+                minimum: minimum_type_arguments,
+                maximum: shape.type_parameters.len(),
+                actual: explicit.len(),
+            },
+        });
+    }
+
+    let expected_arguments = shape.parameter_type_parameters.len();
+    if request.arguments.len() != expected_arguments {
+        let recovery = failure_type_arguments(
+            store,
+            &shape,
+            request,
+            &mut is_assignable,
+            &mut is_strict_subtype,
+            &mut is_subtype,
+        )?;
+        let projection = generic_call_projection(store, request.callee, &shape, recovery, true)?;
+        let applicability = if request.arguments.len() < expected_arguments {
+            GenericCallVectorApplicability::TooFewArguments {
+                expected: expected_arguments,
+                actual: request.arguments.len(),
+            }
+        } else {
+            GenericCallVectorApplicability::TooManyArguments {
+                expected: expected_arguments,
+                actual: request.arguments.len(),
+            }
+        };
+        return Ok(GenericCallVectorResolution {
+            projection,
+            checked_instantiation: None,
+            applicability,
+        });
+    }
+
+    let selected_type_arguments = match request.explicit_type_arguments {
+        Some(explicit) => explicit_checked_type_arguments(store, &shape, explicit)?,
+        None => {
+            infer_generic_call_type_arguments(
+                store,
+                &shape,
+                request.arguments,
+                &mut is_assignable,
+                &mut is_strict_subtype,
+                &mut is_subtype,
+            )?
+        }
+    };
+    let checked = instantiate_generic_call_shape(store, &shape, selected_type_arguments.clone())?;
+
+    if let Some(explicit) = request.explicit_type_arguments
+        && let Some(applicability) = check_explicit_type_argument_constraints(
+            store,
+            &shape,
+            explicit,
+            &selected_type_arguments,
+            &mut is_assignable,
+        )?
+    {
+        let recovery = explicit_recovery_type_arguments(store, &shape, explicit)?;
+        let projection = generic_call_projection(store, request.callee, &shape, recovery, true)?;
+        return Ok(GenericCallVectorResolution {
+            projection,
+            checked_instantiation: Some(checked),
+            applicability,
+        });
+    }
+
+    if let Some(applicability) = check_generic_call_arguments(
+        store,
+        request.arguments,
+        &checked.parameter_types,
+        &mut is_assignable,
+    )? {
+        let recovery = match request.explicit_type_arguments {
+            Some(explicit) => explicit_recovery_type_arguments(store, &shape, explicit)?,
+            None => selected_type_arguments,
+        };
+        let projection = generic_call_projection(store, request.callee, &shape, recovery, true)?;
+        return Ok(GenericCallVectorResolution {
+            projection,
+            checked_instantiation: Some(checked),
+            applicability,
+        });
+    }
+
+    Ok(GenericCallVectorResolution {
+        projection: GenericCallVectorProjection {
+            callee: request.callee,
+            generic_signature: shape.signature,
+            type_parameters: shape
+                .type_parameters
+                .iter()
+                .map(|parameter| parameter.type_)
+                .collect(),
+            instantiation: checked.clone(),
+            recovery: false,
+        },
+        checked_instantiation: Some(checked),
+        applicability: GenericCallVectorApplicability::Applicable,
+    })
+}
+
+fn validate_generic_call_vector_request(
+    store: &CanonicalTypeMapperStore,
+    request: GenericCallVectorRequest<'_>,
+) -> Result<(), GenericCallVectorError> {
+    if request.form != DirectCallForm::Call {
+        return Err(GenericCallVectorUnsupported::Form(request.form).into());
+    }
+    if request.optional_chain {
+        return Err(GenericCallVectorUnsupported::OptionalChain.into());
+    }
+    if request.has_spread_argument {
+        return Err(GenericCallVectorUnsupported::SpreadArgument.into());
+    }
+    if store.type_payload(request.callee).is_none() {
+        return Err(GenericCallVectorInvariant::InvalidCalleeType(request.callee).into());
+    }
+    for (index, type_) in request.arguments.iter().copied().enumerate() {
+        if store.type_payload(type_).is_none() {
+            return Err(GenericCallVectorInvariant::InvalidArgumentType { index, type_ }.into());
+        }
+    }
+    for (index, type_) in request
+        .explicit_type_arguments
+        .unwrap_or_default()
+        .iter()
+        .copied()
+        .enumerate()
+    {
+        if store.type_payload(type_).is_none() {
+            return Err(GenericCallVectorInvariant::InvalidTypeArgument { index, type_ }.into());
+        }
+    }
+    Ok(())
+}
+
+fn validate_generic_call_signature_shape(
+    store: &CanonicalTypeMapperStore,
+    callee: TypeId,
+    callable: &ValidatedSingleCallable,
+) -> Result<GenericCallSignatureShape, GenericCallVectorError> {
+    if callable.owner != callee {
+        return Err(GenericCallVectorInvariant::CallableOwnerMismatch {
+            callee,
+            owner: callable.owner,
+        }
+        .into());
+    }
+    let signature =
+        store
+            .signature(callable.signature)
+            .ok_or(GenericCallVectorInvariant::InvalidSignature(
+                callable.signature,
+            ))?;
+    if signature.type_parameters().is_empty() {
+        return Err(
+            GenericCallVectorUnsupported::SignatureTypeParameterCount(callable.signature).into(),
+        );
+    }
+    if signature.flags() != SignatureFlags::NONE {
+        return Err(GenericCallVectorUnsupported::SignatureFlags(callable.signature).into());
+    }
+    if signature.this_parameter().is_some() {
+        return Err(GenericCallVectorUnsupported::ExplicitThisParameter(callable.signature).into());
+    }
+    if signature.has_rest_parameter() {
+        return Err(GenericCallVectorUnsupported::RestSignature(callable.signature).into());
+    }
+    let parameter_count = signature.parameters().len();
+    if signature.min_argument_count() != i32::try_from(parameter_count).unwrap_or(-1)
+        || callable.min_argument_count != parameter_count
+    {
+        return Err(GenericCallVectorUnsupported::NonRequiredParameter(callable.signature).into());
+    }
+    if callable.parameters.len() != parameter_count
+        || signature.resolved_min_argument_count() != -1
+        || signature.resolved_type_predicate().is_some()
+        || signature.target().is_some()
+        || signature.mapper().is_some()
+        || signature.isolated_signature_type().is_some()
+        || signature.composite().is_some()
+        || callable.strict_variance_exempt
+    {
+        return Err(
+            GenericCallVectorInvariant::CallableSignatureMismatch(callable.signature).into(),
+        );
+    }
+    let Some(return_type) = callable.return_type else {
+        return Err(GenericCallVectorUnsupported::UnresolvedReturnType(callable.signature).into());
+    };
+    if signature.resolved_return_type() != Some(return_type) {
+        return Err(
+            GenericCallVectorInvariant::CallableSignatureMismatch(callable.signature).into(),
+        );
+    }
+
+    let no_constraint = store
+        .intrinsic_bootstrap()
+        .map(|bootstrap| bootstrap.no_constraint_type)
+        .ok_or(GenericCallVectorInvariant::MissingBootstrap)?;
+    let mut type_parameters = Vec::with_capacity(signature.type_parameters().len());
+    for type_parameter in signature.type_parameters().iter().copied() {
+        if type_parameters
+            .iter()
+            .any(|parameter: &GenericCallTypeParameter| parameter.type_ == type_parameter)
+        {
+            return Err(GenericCallVectorInvariant::DuplicateTypeParameter(type_parameter).into());
+        }
+        let (constraint, default_type, base_constraint) =
+            validate_generic_call_type_parameter(
+                store,
+                type_parameter,
+                &type_parameters,
+                no_constraint,
+            )?;
+        type_parameters.push(GenericCallTypeParameter {
+            type_: type_parameter,
+            constraint,
+            default_type,
+            base_constraint,
+        });
+    }
+    let type_parameter_ids = type_parameters
+        .iter()
+        .map(|parameter| parameter.type_)
+        .collect::<Vec<_>>();
+    for (index, (symbol, projected)) in signature
+        .parameters()
+        .iter()
+        .copied()
+        .zip(callable.parameters.iter().copied())
+        .enumerate()
+    {
+        if !type_parameter_ids.contains(&projected) {
+            return Err(GenericCallVectorUnsupported::NonNakedParameter {
+                signature: callable.signature,
+                index,
+                type_: projected,
+            }
+            .into());
+        }
+        let valid_symbol = store.symbol(symbol).is_some_and(|record| {
+            record.flags() == SymbolFlags::FUNCTION_SCOPED_VARIABLE
+                && record.check_flags() == CheckFlags::NONE
+        }) && store.value_symbol_links(symbol)
+            == Some(&ValueSymbolLinks {
+                resolved_type: Some(projected),
+                ..ValueSymbolLinks::default()
+            });
+        if !valid_symbol {
+            return Err(GenericCallVectorInvariant::InvalidParameterSymbol {
+                signature: callable.signature,
+                index,
+                symbol,
+            }
+            .into());
+        }
+    }
+    validate_generic_mapper_type(store, return_type, &type_parameter_ids, callable.signature)?;
+    Ok(GenericCallSignatureShape {
+        signature: callable.signature,
+        type_parameters,
+        parameter_type_parameters: callable.parameters.clone(),
+        return_type,
+    })
+}
+
+fn validate_generic_call_type_parameter(
+    store: &CanonicalTypeMapperStore,
+    type_parameter: TypeId,
+    earlier: &[GenericCallTypeParameter],
+    no_constraint: TypeId,
+) -> Result<(Option<TypeId>, Option<TypeId>, TypeId), GenericCallVectorError> {
+    let record = store.type_payload(type_parameter).ok_or(
+        GenericCallVectorInvariant::InvalidTypeParameter(type_parameter),
+    )?;
+    let TypeData::TypeParameter(data) = record.data() else {
+        return Err(GenericCallVectorInvariant::InvalidTypeParameter(type_parameter).into());
+    };
+    let symbol = record
+        .symbol()
+        .ok_or(GenericCallVectorInvariant::InvalidTypeParameter(
+            type_parameter,
+        ))?;
+    let computed = ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES
+        | ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES_COMPUTED;
+    let valid_symbol = store.symbol(symbol).is_some_and(|symbol_record| {
+        symbol_record.flags() == SymbolFlags::TYPE_PARAMETER
+            && symbol_record.check_flags() == CheckFlags::NONE
+    });
+    if record.flags() != TypeFlags::TYPE_PARAMETER
+        || (record.object_flags() != ObjectFlags::NONE && record.object_flags() != computed)
+        || record.alias().is_some()
+        || !valid_symbol
+        || store.get_merged_symbol(symbol) != Some(symbol)
+        || cached_ordinary_type_parameter_owner(store, type_parameter) != Some(symbol)
+        || data.target.is_some()
+        || data.mapper.is_some()
+        || data.is_this_type
+    {
+        return Err(GenericCallVectorInvariant::InvalidTypeParameter(type_parameter).into());
+    }
+    let constraint = data
+        .constraint
+        .ok_or(GenericCallVectorInvariant::InvalidTypeParameter(
+            type_parameter,
+        ))?;
+    let default_type =
+        data.resolved_default_type
+            .ok_or(GenericCallVectorInvariant::InvalidTypeParameter(
+                type_parameter,
+            ))?;
+    let base_constraint = if constraint == no_constraint {
+        no_constraint
+    } else {
+        validate_generic_constraint_dependency(store, constraint, earlier, type_parameter)?
+    };
+    if data
+        .constrained
+        .resolved_base_constraint
+        .is_some_and(|cached| cached != base_constraint)
+    {
+        return Err(GenericCallVectorInvariant::InvalidTypeParameter(type_parameter).into());
+    }
+    let constraint = (constraint != no_constraint).then_some(constraint);
+    let default_type = (default_type != no_constraint).then_some(default_type);
+    if let Some(default_type) = default_type {
+        validate_generic_type_parameter_dependency(store, default_type, earlier, type_parameter)?;
+    }
+    Ok((constraint, default_type, base_constraint))
+}
+
+fn validate_generic_constraint_dependency(
+    store: &CanonicalTypeMapperStore,
+    constraint: TypeId,
+    earlier: &[GenericCallTypeParameter],
+    owner: TypeId,
+) -> Result<TypeId, GenericCallVectorError> {
+    if let Some(parameter) = earlier
+        .iter()
+        .find(|parameter| parameter.type_ == constraint)
+    {
+        return Ok(parameter.base_constraint);
+    }
+    let record = store.type_payload(constraint).ok_or(
+        GenericCallVectorUnsupported::TypeParameterDependency {
+            type_parameter: owner,
+            dependency: constraint,
+        },
+    )?;
+    match record.data() {
+        TypeData::Intrinsic(_) | TypeData::Literal(_) | TypeData::UniqueEsSymbol(_) => {
+            Ok(constraint)
+        }
+        TypeData::Union(union) if record.alias().is_none() && union.origin.is_none() => {
+            for constituent in &union.union.types {
+                let base = validate_generic_constraint_dependency(
+                    store,
+                    *constituent,
+                    earlier,
+                    owner,
+                )?;
+                if base != *constituent {
+                    return Err(GenericCallVectorUnsupported::TypeParameterDependency {
+                        type_parameter: owner,
+                        dependency: constraint,
+                    }
+                    .into());
+                }
+            }
+            Ok(constraint)
+        }
+        _ => Err(GenericCallVectorUnsupported::TypeParameterDependency {
+            type_parameter: owner,
+            dependency: constraint,
+        }
+        .into()),
+    }
+}
+
+fn validate_generic_type_parameter_dependency(
+    store: &CanonicalTypeMapperStore,
+    dependency: TypeId,
+    earlier: &[GenericCallTypeParameter],
+    owner: TypeId,
+) -> Result<(), GenericCallVectorError> {
+    let record = store.type_payload(dependency).ok_or(
+        GenericCallVectorUnsupported::TypeParameterDependency {
+            type_parameter: owner,
+            dependency,
+        },
+    )?;
+    match record.data() {
+        TypeData::Intrinsic(_) | TypeData::Literal(_) | TypeData::UniqueEsSymbol(_) => Ok(()),
+        TypeData::TypeParameter(_)
+            if earlier
+                .iter()
+                .any(|parameter| parameter.type_ == dependency) =>
+        {
+            Ok(())
+        }
+        TypeData::Union(union) if record.alias().is_none() && union.origin.is_none() => {
+            for constituent in &union.union.types {
+                validate_generic_type_parameter_dependency(store, *constituent, earlier, owner)?;
+            }
+            Ok(())
+        }
+        _ => Err(GenericCallVectorUnsupported::TypeParameterDependency {
+            type_parameter: owner,
+            dependency,
+        }
+        .into()),
+    }
+}
+
+fn validate_generic_mapper_type(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    type_parameters: &[TypeId],
+    signature: SignatureId,
+) -> Result<(), GenericCallVectorError> {
+    let record = store
+        .type_payload(type_)
+        .ok_or(GenericCallVectorUnsupported::InstantiationType { signature, type_ })?;
+    match record.data() {
+        TypeData::Intrinsic(_) | TypeData::Literal(_) | TypeData::UniqueEsSymbol(_) => Ok(()),
+        TypeData::TypeParameter(_) if type_parameters.contains(&type_) => Ok(()),
+        TypeData::Union(union) if record.alias().is_none() && union.origin.is_none() => {
+            for constituent in &union.union.types {
+                validate_generic_mapper_type(store, *constituent, type_parameters, signature)?;
+            }
+            Ok(())
+        }
+        _ => Err(GenericCallVectorUnsupported::InstantiationType { signature, type_ }.into()),
+    }
+}
+
+fn minimum_type_argument_count(parameters: &[GenericCallTypeParameter]) -> usize {
+    parameters
+        .iter()
+        .enumerate()
+        .filter_map(|(index, parameter)| parameter.default_type.is_none().then_some(index + 1))
+        .max()
+        .unwrap_or_default()
+}
+
+fn explicit_checked_type_arguments(
+    store: &mut CanonicalTypeMapperStore,
+    shape: &GenericCallSignatureShape,
+    explicit: &[TypeId],
+) -> Result<Vec<TypeId>, GenericCallVectorError> {
+    let sources = shape
+        .type_parameters
+        .iter()
+        .map(|parameter| parameter.type_)
+        .collect::<Vec<_>>();
+    let mut result = explicit.to_vec();
+    for index in explicit.len()..shape.type_parameters.len() {
+        let default_type = shape.type_parameters[index].default_type.expect(
+            "valid partial explicit arity guarantees every omitted parameter has a default",
+        );
+        let instantiated =
+            instantiate_type_with_vector(store, default_type, &sources[..index], &result[..index])?;
+        result.push(instantiated);
+    }
+    Ok(result)
+}
+
+fn explicit_recovery_type_arguments(
+    store: &CanonicalTypeMapperStore,
+    shape: &GenericCallSignatureShape,
+    explicit: &[TypeId],
+) -> Result<Vec<TypeId>, GenericCallVectorError> {
+    let unknown = store
+        .intrinsic_bootstrap()
+        .map(|bootstrap| bootstrap.unknown_type)
+        .ok_or(GenericCallVectorInvariant::MissingBootstrap)?;
+    let mut result = explicit
+        .iter()
+        .copied()
+        .take(shape.type_parameters.len())
+        .collect::<Vec<_>>();
+    for parameter in shape.type_parameters.iter().skip(result.len()) {
+        result.push(
+            parameter
+                .default_type
+                .or(parameter.constraint)
+                .unwrap_or(unknown),
+        );
+    }
+    Ok(result)
+}
+
+fn failure_type_arguments(
+    store: &mut CanonicalTypeMapperStore,
+    shape: &GenericCallSignatureShape,
+    request: GenericCallVectorRequest<'_>,
+    is_assignable: &mut impl FnMut(
+        &mut CanonicalTypeMapperStore,
+        TypeId,
+        TypeId,
+    ) -> Result<bool, RelationUnavailable>,
+    is_strict_subtype: &mut impl FnMut(
+        &mut CanonicalTypeMapperStore,
+        TypeId,
+        TypeId,
+    ) -> Result<bool, RelationUnavailable>,
+    is_subtype: &mut impl FnMut(
+        &mut CanonicalTypeMapperStore,
+        TypeId,
+        TypeId,
+    ) -> Result<bool, RelationUnavailable>,
+) -> Result<Vec<TypeId>, GenericCallVectorError> {
+    match request.explicit_type_arguments {
+        Some(explicit) => explicit_recovery_type_arguments(store, shape, explicit),
+        None => infer_generic_call_type_arguments(
+            store,
+            shape,
+            request.arguments,
+            is_assignable,
+            is_strict_subtype,
+            is_subtype,
+        ),
+    }
+}
+
+fn infer_generic_call_type_arguments(
+    store: &mut CanonicalTypeMapperStore,
+    shape: &GenericCallSignatureShape,
+    arguments: &[TypeId],
+    is_assignable: &mut impl FnMut(
+        &mut CanonicalTypeMapperStore,
+        TypeId,
+        TypeId,
+    ) -> Result<bool, RelationUnavailable>,
+    is_strict_subtype: &mut impl FnMut(
+        &mut CanonicalTypeMapperStore,
+        TypeId,
+        TypeId,
+    ) -> Result<bool, RelationUnavailable>,
+    is_subtype: &mut impl FnMut(
+        &mut CanonicalTypeMapperStore,
+        TypeId,
+        TypeId,
+    ) -> Result<bool, RelationUnavailable>,
+) -> Result<Vec<TypeId>, GenericCallVectorError> {
+    let type_parameters = shape
+        .type_parameters
+        .iter()
+        .map(|parameter| parameter.type_)
+        .collect::<Vec<_>>();
+    let mut buckets = vec![Vec::new(); type_parameters.len()];
+    for (argument, parameter) in arguments
+        .iter()
+        .copied()
+        .zip(shape.parameter_type_parameters.iter().copied())
+    {
+        let index = type_parameters
+            .iter()
+            .position(|type_parameter| *type_parameter == parameter)
+            .expect("signature validation proved every parameter is a naked type parameter");
+        validate_inference_leaf(store, argument)
+            .map_err(|error| GenericCallVectorError::Inference(error.into()))?;
+        if !buckets[index].contains(&argument) {
+            buckets[index].push(argument);
+        }
+    }
+
+    let unknown = store
+        .intrinsic_bootstrap()
+        .map(|bootstrap| bootstrap.unknown_type)
+        .ok_or(GenericCallVectorInvariant::MissingBootstrap)?;
+    let mut inferred = Vec::with_capacity(type_parameters.len());
+    for (index, parameter) in shape.type_parameters.iter().enumerate() {
+        let instantiated_constraint = parameter
+            .constraint
+            .map(|constraint| {
+                instantiate_type_with_vector(
+                    store,
+                    constraint,
+                    &type_parameters[..index],
+                    &inferred[..index],
+                )
+            })
+            .transpose()?;
+        let treatment = if parameter
+            .constraint
+            .is_some_and(|constraint| type_maybe_primitive(store, constraint))
+        {
+            InferenceLiteralTreatment::Regularize
+        } else if type_parameter_is_top_level_in_return(store, shape.return_type, parameter.type_) {
+            InferenceLiteralTreatment::Preserve
+        } else {
+            InferenceLiteralTreatment::Widen
+        };
+        let candidate = infer_naked_type_parameter_candidates(
+            store,
+            &buckets[index],
+            treatment,
+            |store, source, target| is_strict_subtype(store, source, target),
+            |store, source, target| is_subtype(store, source, target),
+        )?;
+        let mut argument = match candidate {
+            Some(candidate) => candidate,
+            None => parameter
+                .default_type
+                .map(|default_type| {
+                    instantiate_type_with_vector(
+                        store,
+                        default_type,
+                        &type_parameters[..index],
+                        &inferred[..index],
+                    )
+                })
+                .transpose()?
+                .unwrap_or(unknown),
+        };
+        if let Some(constraint) = instantiated_constraint
+            && !is_assignable(store, argument, constraint)?
+        {
+            argument = constraint;
+        }
+        inferred.push(argument);
+    }
+    Ok(inferred)
+}
+
+fn type_maybe_primitive(store: &CanonicalTypeMapperStore, type_: TypeId) -> bool {
+    let Some(record) = store.type_payload(type_) else {
+        return false;
+    };
+    record.flags().intersects(TypeFlags::PRIMITIVE)
+        || matches!(record.data(), TypeData::Union(union)
+            if union.union.types.iter().copied().any(|type_| type_maybe_primitive(store, type_)))
+}
+
+fn type_parameter_is_top_level_in_return(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    type_parameter: TypeId,
+) -> bool {
+    if type_ == type_parameter {
+        return true;
+    }
+    matches!(store.type_payload(type_).map(super::type_records::TypeRecord::data),
+    Some(TypeData::Union(union))
+        if union.union.types.iter().copied().any(|constituent| {
+            type_parameter_is_top_level_in_return(store, constituent, type_parameter)
+        }))
+}
+
+fn check_explicit_type_argument_constraints(
+    store: &mut CanonicalTypeMapperStore,
+    shape: &GenericCallSignatureShape,
+    explicit: &[TypeId],
+    checked: &[TypeId],
+    is_assignable: &mut impl FnMut(
+        &mut CanonicalTypeMapperStore,
+        TypeId,
+        TypeId,
+    ) -> Result<bool, RelationUnavailable>,
+) -> Result<Option<GenericCallVectorApplicability>, GenericCallVectorError> {
+    let sources = shape
+        .type_parameters
+        .iter()
+        .map(|parameter| parameter.type_)
+        .collect::<Vec<_>>();
+    for (index, type_argument) in explicit.iter().copied().enumerate() {
+        let Some(constraint) = shape.type_parameters[index].constraint else {
+            continue;
+        };
+        let constraint = instantiate_type_with_vector(store, constraint, &sources, checked)?;
+        if !is_assignable(store, type_argument, constraint)? {
+            return Ok(Some(
+                GenericCallVectorApplicability::ExplicitTypeArgumentConstraint {
+                    index,
+                    type_argument,
+                    constraint,
+                },
+            ));
+        }
+    }
+    Ok(None)
+}
+
+fn check_generic_call_arguments(
+    store: &mut CanonicalTypeMapperStore,
+    arguments: &[TypeId],
+    parameters: &[TypeId],
+    is_assignable: &mut impl FnMut(
+        &mut CanonicalTypeMapperStore,
+        TypeId,
+        TypeId,
+    ) -> Result<bool, RelationUnavailable>,
+) -> Result<Option<GenericCallVectorApplicability>, GenericCallVectorError> {
+    for (index, (argument_type, parameter_type)) in arguments
+        .iter()
+        .copied()
+        .zip(parameters.iter().copied())
+        .enumerate()
+    {
+        if !is_assignable(store, argument_type, parameter_type)? {
+            return Ok(Some(
+                GenericCallVectorApplicability::ArgumentNotAssignable {
+                    index,
+                    argument_type,
+                    parameter_type,
+                },
+            ));
+        }
+    }
+    Ok(None)
+}
+
+fn instantiate_generic_call_shape(
+    store: &mut CanonicalTypeMapperStore,
+    shape: &GenericCallSignatureShape,
+    type_arguments: Vec<TypeId>,
+) -> Result<GenericCallVectorInstantiation, GenericCallVectorError> {
+    let sources = shape
+        .type_parameters
+        .iter()
+        .map(|parameter| parameter.type_)
+        .collect::<Vec<_>>();
+    let mut parameter_types = Vec::with_capacity(shape.parameter_type_parameters.len());
+    for parameter in &shape.parameter_type_parameters {
+        parameter_types.push(instantiate_type_with_vector(
+            store,
+            *parameter,
+            &sources,
+            &type_arguments,
+        )?);
+    }
+    let return_type =
+        instantiate_type_with_vector(store, shape.return_type, &sources, &type_arguments)?;
+    let return_kind = if store
+        .type_payload(return_type)
+        .is_some_and(|record| record.flags().intersects(TypeFlags::VOID))
+    {
+        DirectCallReturnKind::Void
+    } else {
+        DirectCallReturnKind::Value
+    };
+    Ok(GenericCallVectorInstantiation {
+        type_arguments,
+        parameter_types,
+        return_type,
+        return_kind,
+    })
+}
+
+fn generic_call_projection(
+    store: &mut CanonicalTypeMapperStore,
+    callee: TypeId,
+    shape: &GenericCallSignatureShape,
+    type_arguments: Vec<TypeId>,
+    recovery: bool,
+) -> Result<GenericCallVectorProjection, GenericCallVectorError> {
+    Ok(GenericCallVectorProjection {
+        callee,
+        generic_signature: shape.signature,
+        type_parameters: shape
+            .type_parameters
+            .iter()
+            .map(|parameter| parameter.type_)
+            .collect(),
+        instantiation: instantiate_generic_call_shape(store, shape, type_arguments)?,
+        recovery,
+    })
+}
 
 /// Syntax-neutral input after the source checker has typed the callee,
 /// explicit type argument (if any), and sole value argument.

@@ -165,13 +165,79 @@ pub(super) fn instantiate_type_with_limits(
         return Err(InstantiationError::InvalidMapper(mapper));
     }
     let mut state = InstantiationState { limits, count: 0 };
-    instantiate_type_worker(store, type_, mapper, 0, &mut state)
+    instantiate_type_worker(
+        store,
+        type_,
+        InstantiationMapping::Stored(mapper),
+        0,
+        &mut state,
+    )
+}
+
+/// Instantiates through the exact parallel vectors used by `newTypeMapper`
+/// without publishing a mapper record.
+///
+/// Generic-call inference needs to project parameter and return types before
+/// the owning signature cache is ready to commit. Keeping this representation
+/// borrowed makes that resolution phase independent of mapper/signature cache
+/// publication while preserving the pinned mapper's first-match behavior.
+pub(super) fn instantiate_type_with_vector(
+    store: &mut CanonicalTypeMapperStore,
+    type_: TypeId,
+    sources: &[TypeId],
+    targets: &[TypeId],
+) -> Result<TypeId, InstantiationError> {
+    if sources.len() != targets.len() {
+        return Err(InstantiationError::InvalidType(type_));
+    }
+    for endpoint in sources.iter().chain(targets) {
+        if store.type_payload(*endpoint).is_none() {
+            return Err(InstantiationError::InvalidType(*endpoint));
+        }
+    }
+    let mut state = InstantiationState {
+        limits: InstantiationLimits::default(),
+        count: 0,
+    };
+    instantiate_type_worker(
+        store,
+        type_,
+        InstantiationMapping::Vector { sources, targets },
+        0,
+        &mut state,
+    )
+}
+
+#[derive(Clone, Copy, Debug)]
+enum InstantiationMapping<'a> {
+    Stored(TypeMapperId),
+    Vector {
+        sources: &'a [TypeId],
+        targets: &'a [TypeId],
+    },
+}
+
+impl InstantiationMapping<'_> {
+    fn map(self, store: &CanonicalTypeMapperStore, type_: TypeId) -> Option<TypeId> {
+        match self {
+            Self::Stored(mapper) => store.map_type(mapper, type_),
+            Self::Vector { sources, targets } => {
+                store.type_payload(type_)?;
+                Some(
+                    sources
+                        .iter()
+                        .position(|source| *source == type_)
+                        .map_or(type_, |index| targets[index]),
+                )
+            }
+        }
+    }
 }
 
 fn instantiate_type_worker(
     store: &mut CanonicalTypeMapperStore,
     type_: TypeId,
-    mapper: TypeMapperId,
+    mapping: InstantiationMapping<'_>,
     depth: usize,
     state: &mut InstantiationState,
 ) -> Result<TypeId, InstantiationError> {
@@ -181,9 +247,9 @@ fn instantiate_type_worker(
     match record.data() {
         TypeData::TypeParameter(_) => {
             state.enter(depth)?;
-            store
-                .map_type(mapper, type_)
-                .ok_or(InstantiationError::InvalidMapper(mapper))
+            mapping
+                .map(store, type_)
+                .ok_or(InstantiationError::InvalidType(type_))
         }
         TypeData::Intrinsic(_) | TypeData::Literal(_) | TypeData::UniqueEsSymbol(_) => Ok(type_),
         TypeData::Union(data) => {
@@ -194,7 +260,7 @@ fn instantiate_type_worker(
                 return Err(InstantiationError::UnsupportedUnionOrigin(type_));
             }
             let constituents = data.union.types.clone();
-            instantiate_union(store, type_, &constituents, mapper, depth, state)
+            instantiate_union(store, type_, &constituents, mapping, depth, state)
         }
         _ => Err(InstantiationError::UnsupportedType(type_)),
     }
@@ -204,7 +270,7 @@ fn instantiate_union(
     store: &mut CanonicalTypeMapperStore,
     source: TypeId,
     constituents: &[TypeId],
-    mapper: TypeMapperId,
+    mapping: InstantiationMapping<'_>,
     depth: usize,
     state: &mut InstantiationState,
 ) -> Result<TypeId, InstantiationError> {
@@ -233,7 +299,7 @@ fn instantiate_union(
     }
     state.enter(depth)?;
     for constituent in constituents {
-        let instantiated = instantiate_type_worker(store, *constituent, mapper, depth + 1, state)?;
+        let instantiated = instantiate_type_worker(store, *constituent, mapping, depth + 1, state)?;
         changed |= instantiated != *constituent;
         mapped_types.push(instantiated);
     }

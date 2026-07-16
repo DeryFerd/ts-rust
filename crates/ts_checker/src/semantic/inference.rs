@@ -15,8 +15,9 @@
 use std::collections::HashSet;
 
 use super::{
-    TypeId,
+    RelationUnavailable, TypeId,
     bootstrap::LiteralTypeCacheError,
+    instantiate::canonical_anonymous_union,
     mapper::CanonicalTypeMapperStore,
     object_members::{
         DeclaredPropertyObjectValidation, validate_resolved_declared_property_object,
@@ -24,6 +25,44 @@ use super::{
     type_records::TypeData,
     types::{ObjectFlags, TypeFlags},
 };
+
+/// Literal handling selected by pinned `getCovariantInference` for one naked
+/// type parameter's candidate bucket.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum InferenceLiteralTreatment {
+    /// The type parameter occurs at top level in the return type.
+    Preserve,
+    /// A primitive constraint converts fresh literals to their regular peers.
+    Regularize,
+    /// A top-level parameter that is not returned widens fresh literals.
+    Widen,
+}
+
+/// Failure while finalizing one declaration-order inference bucket.
+#[derive(Debug, PartialEq)]
+pub(super) enum NakedTypeCandidateError {
+    Candidate(NakedTypeInferenceError),
+    Union(LiteralTypeCacheError),
+    Relation(RelationUnavailable),
+}
+
+impl From<NakedTypeInferenceError> for NakedTypeCandidateError {
+    fn from(error: NakedTypeInferenceError) -> Self {
+        Self::Candidate(error)
+    }
+}
+
+impl From<LiteralTypeCacheError> for NakedTypeCandidateError {
+    fn from(error: LiteralTypeCacheError) -> Self {
+        Self::Union(error)
+    }
+}
+
+impl From<RelationUnavailable> for NakedTypeCandidateError {
+    fn from(error: RelationUnavailable) -> Self {
+        Self::Relation(error)
+    }
+}
 
 /// A missing dependency or shape outside naked leaf inference.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -59,6 +98,307 @@ pub(super) fn infer_naked_type_parameter(
 ) -> Result<TypeId, NakedTypeInferenceError> {
     validate_inference_leaf(store, candidate)?;
     Ok(candidate)
+}
+
+/// Finalizes all covariant candidates collected for one naked type parameter.
+///
+/// Candidate identity is de-duplicated in encounter order. Same-base literal
+/// candidates form a canonical literal union; otherwise the exact two-pass
+/// strict-subtype/subtype selection chooses the single common supertype.
+/// Strict-null inference removes nullable constituents before selection and
+/// adds the combined nullable flags back afterward. `None` means no inference
+/// was made and leaves default/constraint/unknown fallback to the owning call
+/// context.
+pub(super) fn infer_naked_type_parameter_candidates(
+    store: &mut CanonicalTypeMapperStore,
+    candidates: &[TypeId],
+    treatment: InferenceLiteralTreatment,
+    mut is_strict_subtype: impl FnMut(
+        &mut CanonicalTypeMapperStore,
+        TypeId,
+        TypeId,
+    ) -> Result<bool, RelationUnavailable>,
+    mut is_subtype: impl FnMut(
+        &mut CanonicalTypeMapperStore,
+        TypeId,
+        TypeId,
+    ) -> Result<bool, RelationUnavailable>,
+) -> Result<Option<TypeId>, NakedTypeCandidateError> {
+    let mut prepared = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        validate_inference_leaf(store, *candidate)?;
+        let candidate = inference_candidate_literal_treatment(store, *candidate, treatment)?;
+        if !prepared.contains(&candidate) {
+            prepared.push(candidate);
+        }
+    }
+    if prepared.is_empty() {
+        return Ok(None);
+    }
+    let strict_null_checks = store
+        .intrinsic_bootstrap()
+        .ok_or(LiteralTypeCacheError::BootstrapUninitialized)?
+        .options
+        .strict_null_checks;
+    let nullable = combined_nullable_flags(store, &prepared)?;
+    let primary = if strict_null_checks {
+        let mut primary = Vec::with_capacity(prepared.len());
+        for candidate in &prepared {
+            primary.push(remove_nullable_from_candidate(store, *candidate)?);
+        }
+        primary
+    } else {
+        prepared
+    };
+    let common = if primary.len() == 1 {
+        primary[0]
+    } else if literal_candidates_have_same_base(store, &primary) {
+        canonical_anonymous_union(store, &primary)?
+    } else {
+        single_common_supertype(
+            store,
+            &primary,
+            &mut is_strict_subtype,
+            &mut is_subtype,
+        )?
+    };
+    if strict_null_checks && nullable != TypeFlags::NONE {
+        add_nullable_to_candidate(store, common, nullable).map(Some)
+    } else {
+        Ok(Some(common))
+    }
+}
+
+fn single_common_supertype(
+    store: &mut CanonicalTypeMapperStore,
+    types: &[TypeId],
+    is_strict_subtype: &mut impl FnMut(
+        &mut CanonicalTypeMapperStore,
+        TypeId,
+        TypeId,
+    ) -> Result<bool, RelationUnavailable>,
+    is_subtype: &mut impl FnMut(
+        &mut CanonicalTypeMapperStore,
+        TypeId,
+        TypeId,
+    ) -> Result<bool, RelationUnavailable>,
+) -> Result<TypeId, NakedTypeCandidateError> {
+    let strict_candidate = find_leftmost_type(store, types, is_strict_subtype)?;
+    let mut strict_supertype = true;
+    for type_ in types {
+        if *type_ != strict_candidate && !is_strict_subtype(store, *type_, strict_candidate)? {
+            strict_supertype = false;
+            break;
+        }
+    }
+    if strict_supertype {
+        return Ok(strict_candidate);
+    }
+    find_leftmost_type(store, types, is_subtype)
+}
+
+fn find_leftmost_type(
+    store: &mut CanonicalTypeMapperStore,
+    types: &[TypeId],
+    relation: &mut impl FnMut(
+        &mut CanonicalTypeMapperStore,
+        TypeId,
+        TypeId,
+    ) -> Result<bool, RelationUnavailable>,
+) -> Result<TypeId, NakedTypeCandidateError> {
+    let mut candidate = None;
+    for type_ in types {
+        if candidate.is_none() || relation(store, candidate.unwrap(), *type_)? {
+            candidate = Some(*type_);
+        }
+    }
+    Ok(candidate.expect("candidate finalization proved a nonempty bucket"))
+}
+
+fn combined_nullable_flags(
+    store: &CanonicalTypeMapperStore,
+    candidates: &[TypeId],
+) -> Result<TypeFlags, NakedTypeCandidateError> {
+    let mut flags = TypeFlags::NONE;
+    for candidate in candidates {
+        let record = store.type_payload(*candidate).ok_or(
+            LiteralTypeCacheError::UnsupportedUnionConstituent(*candidate),
+        )?;
+        match record.data() {
+            TypeData::Union(union) => {
+                flags |= combined_nullable_flags(store, &union.union.types)?;
+            }
+            _ => flags |= record.flags() & TypeFlags::NULLABLE,
+        }
+    }
+    Ok(flags)
+}
+
+fn remove_nullable_from_candidate(
+    store: &mut CanonicalTypeMapperStore,
+    candidate: TypeId,
+) -> Result<TypeId, NakedTypeCandidateError> {
+    let record = store.type_payload(candidate).ok_or(
+        LiteralTypeCacheError::UnsupportedUnionConstituent(candidate),
+    )?;
+    if record.flags().intersects(TypeFlags::NULLABLE) {
+        return store
+            .intrinsic_bootstrap()
+            .map(|bootstrap| bootstrap.never_type)
+            .ok_or(LiteralTypeCacheError::BootstrapUninitialized.into());
+    }
+    let TypeData::Union(union) = record.data() else {
+        return Ok(candidate);
+    };
+    let constituents = union.union.types.clone();
+    let mut filtered = Vec::with_capacity(constituents.len());
+    let mut changed = false;
+    for constituent in constituents {
+        let primary = remove_nullable_from_candidate(store, constituent)?;
+        changed |= primary != constituent;
+        filtered.push(primary);
+    }
+    if changed {
+        canonical_anonymous_union(store, &filtered).map_err(Into::into)
+    } else {
+        Ok(candidate)
+    }
+}
+
+fn add_nullable_to_candidate(
+    store: &mut CanonicalTypeMapperStore,
+    candidate: TypeId,
+    nullable: TypeFlags,
+) -> Result<TypeId, NakedTypeCandidateError> {
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or(LiteralTypeCacheError::BootstrapUninitialized)?;
+    let undefined = bootstrap.undefined_type;
+    let null = bootstrap.null_type;
+    let mut types = Vec::with_capacity(3);
+    types.push(candidate);
+    if nullable.intersects(TypeFlags::UNDEFINED) {
+        types.push(undefined);
+    }
+    if nullable.intersects(TypeFlags::NULL) {
+        types.push(null);
+    }
+    canonical_anonymous_union(store, &types).map_err(Into::into)
+}
+
+fn inference_candidate_literal_treatment(
+    store: &mut CanonicalTypeMapperStore,
+    candidate: TypeId,
+    treatment: InferenceLiteralTreatment,
+) -> Result<TypeId, LiteralTypeCacheError> {
+    if treatment == InferenceLiteralTreatment::Preserve {
+        return Ok(candidate);
+    }
+    let record =
+        store
+            .type_payload(candidate)
+            .ok_or(LiteralTypeCacheError::UnsupportedUnionConstituent(
+                candidate,
+            ))?;
+    match record.data() {
+        TypeData::Literal(data) => {
+            let regular = data.regular_type;
+            let fresh = data.fresh_type == Some(candidate) && regular != candidate;
+            if treatment == InferenceLiteralTreatment::Regularize {
+                return Ok(regular);
+            }
+            if !fresh {
+                return Ok(candidate);
+            }
+            let bootstrap = store
+                .intrinsic_bootstrap()
+                .ok_or(LiteralTypeCacheError::BootstrapUninitialized)?;
+            if record.flags() == TypeFlags::STRING_LITERAL {
+                Ok(bootstrap.string_type)
+            } else if record.flags() == TypeFlags::NUMBER_LITERAL {
+                Ok(bootstrap.number_type)
+            } else if record.flags() == TypeFlags::BIG_INT_LITERAL {
+                Ok(bootstrap.bigint_type)
+            } else if record.flags() == TypeFlags::BOOLEAN_LITERAL {
+                Ok(bootstrap.boolean_type)
+            } else {
+                Err(LiteralTypeCacheError::UnsupportedUnionConstituent(
+                    candidate,
+                ))
+            }
+        }
+        TypeData::Union(data) => {
+            let constituents = data.union.types.clone();
+            let mut treated = Vec::with_capacity(constituents.len());
+            let mut changed = false;
+            for constituent in constituents {
+                let mapped = inference_candidate_literal_treatment(store, constituent, treatment)?;
+                changed |= mapped != constituent;
+                treated.push(mapped);
+            }
+            if changed {
+                canonical_anonymous_union(store, &treated)
+            } else {
+                Ok(candidate)
+            }
+        }
+        _ => Ok(candidate),
+    }
+}
+
+fn literal_candidates_have_same_base(
+    store: &CanonicalTypeMapperStore,
+    candidates: &[TypeId],
+) -> bool {
+    let mut base = None;
+    for candidate in candidates {
+        let Some(record) = store.type_payload(*candidate) else {
+            return false;
+        };
+        if record.flags().intersects(TypeFlags::NEVER) {
+            continue;
+        }
+        let Some(candidate_base) = literal_candidate_base(store, *candidate) else {
+            return false;
+        };
+        if base
+            .replace(candidate_base)
+            .is_some_and(|base| base != candidate_base)
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn literal_candidate_base(
+    store: &CanonicalTypeMapperStore,
+    candidate: TypeId,
+) -> Option<TypeFlags> {
+    let record = store.type_payload(candidate)?;
+    if record.flags() == TypeFlags::STRING_LITERAL {
+        return Some(TypeFlags::STRING);
+    }
+    if record.flags() == TypeFlags::NUMBER_LITERAL {
+        return Some(TypeFlags::NUMBER);
+    }
+    if record.flags() == TypeFlags::BIG_INT_LITERAL {
+        return Some(TypeFlags::BIG_INT);
+    }
+    if record.flags() == TypeFlags::BOOLEAN_LITERAL {
+        return Some(TypeFlags::BOOLEAN);
+    }
+    if record.flags() != TypeFlags::UNION {
+        return None;
+    }
+    let TypeData::Union(union) = record.data() else {
+        return None;
+    };
+    let mut base = TypeFlags::NONE;
+    for constituent in &union.union.types {
+        base |= literal_candidate_base(store, *constituent)?;
+    }
+    (base != TypeFlags::NONE).then_some(base)
 }
 
 /// Proves that a type is inside the first explicit/inferred argument domain.
