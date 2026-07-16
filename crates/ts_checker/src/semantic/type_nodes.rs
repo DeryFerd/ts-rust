@@ -1214,9 +1214,16 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         } else {
             false
         };
-        let result = planned
-            .property_type_nodes()
-            .try_for_each(|property| self.plan_type_node_in_context(property, None, false));
+        let result = (|| {
+            for property in planned.property_type_nodes() {
+                self.plan_type_node_in_context(property, None, false)?;
+            }
+            for (key_type, value_type) in planned.index_type_nodes() {
+                self.plan_type_node_in_context(key_type, None, false)?;
+                self.plan_type_node_in_context(value_type, None, false)?;
+            }
+            Ok(())
+        })();
         if pushed_alias {
             assert_eq!(
                 self.active_structural_aliases.pop().map(|(alias, _)| alias),
@@ -1314,9 +1321,13 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         if !self.planning_interfaces.insert(symbol) {
             return Ok(());
         }
-        let result = planned
-            .property_type_nodes()
-            .try_for_each(|property| self.plan_type_node_in_context(property, None, false));
+        let result = (|| {
+            for property in planned.property_type_nodes() {
+                self.plan_type_node_in_context(property, None, false)?;
+            }
+            debug_assert!(planned.indexes.is_empty());
+            Ok(())
+        })();
         assert!(self.planning_interfaces.remove(&symbol));
         result
     }
@@ -4728,7 +4739,23 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             .and_then(|count| count.checked_add(cold_function_types))
             .and_then(|count| count.checked_add(additional_source_types))
             .ok_or_else(|| Self::literal_cache_error(LiteralTypeCacheError::Capacity))?;
-        if !self.store.try_reserve_types(additional_types) {
+        let index_infos = plan
+            .type_literals
+            .values()
+            .try_fold(0usize, |count, literal| {
+                let state = object_members::type_literal_state(self.store, literal)
+                    .map_err(property_object_error)?;
+                if state.is_some_and(PropertyObjectState::is_resolved) {
+                    Ok(count)
+                } else {
+                    count
+                        .checked_add(literal.indexes.len())
+                        .ok_or_else(|| Self::literal_cache_error(LiteralTypeCacheError::Capacity))
+                }
+            })?;
+        if !self.store.try_reserve_index_infos(index_infos)
+            || !self.store.try_reserve_types(additional_types)
+        {
             return Err(Self::literal_cache_error(LiteralTypeCacheError::Capacity));
         }
         for (target, (count, node)) in array_references_by_target {
@@ -5199,13 +5226,30 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         for property in literal.property_type_nodes() {
             types.push(self.execute_type_node(property, plan, prepared)?);
         }
+        let mut index_types = Vec::with_capacity(literal.indexes.len());
+        for (key_node, value_node) in literal.index_type_nodes() {
+            let key_type = self.execute_type_node(key_node, plan, prepared)?;
+            let value_type = self.execute_type_node(value_node, plan, prepared)?;
+            index_types.push((key_type, value_type));
+        }
         if state.is_resolved() {
-            object_members::validate_resolved_property_types(self.store, &literal, &types)
-                .map_err(property_object_error)?;
+            object_members::validate_resolved_declared_member_types(
+                self.store,
+                &literal,
+                &types,
+                &index_types,
+            )
+            .map_err(property_object_error)?;
             Ok(state.type_id())
         } else {
-            object_members::publish_property_members(self.store, &literal, state, &types)
-                .map_err(property_object_error)
+            object_members::publish_declared_members(
+                self.store,
+                &literal,
+                state,
+                &types,
+                &index_types,
+            )
+            .map_err(property_object_error)
         }
     }
 
@@ -5849,6 +5893,7 @@ mod tests {
     use ts_binder::{
         BoundFile, CanonicalBinder, CanonicalModuleState, CanonicalNameResolverOptions,
         CanonicalSourceFileFacts, CanonicalSourceLanguage, CheckFlags, EscapedName,
+        InternalSymbolName,
     };
     use ts_core::TextRange;
     use ts_parser::{ParseResult, parse_source_file};
@@ -10521,6 +10566,289 @@ mod tests {
             Ok(shape_type)
         );
         assert_eq!(store_state(&fixture.store), warm_state);
+    }
+
+    #[test]
+    fn type_literal_index_signature_publishes_exact_record_cold_and_warm() {
+        let mut fixture = fixture(concat!(
+            "type Value = { nested: boolean }; ",
+            "type Table = { readonly [key: string]: Value };",
+        ));
+        let value = canonical_fixture_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Value");
+        let table = canonical_fixture_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Table");
+        let (_, _, literal) = alias_parts(&fixture, "Table");
+        let plan = {
+            let host = post_global_host(
+                &fixture.parsed.arena,
+                fixture.files.get(&fixture.file).unwrap(),
+            );
+            object_members::plan_type_literal(&fixture.store, &host, literal, Some(table)).unwrap()
+        };
+        let [planned] = plan.indexes.as_slice() else {
+            panic!("the exact type literal has one planned index")
+        };
+        assert!(plan.properties.is_empty());
+        assert!(planned.readonly);
+        assert_eq!(
+            fixture.store.source_node_kind(planned.key_type_node),
+            Some(SyntaxKind::StringKeyword)
+        );
+        assert_eq!(
+            fixture.store.source_node_kind(planned.value_type_node),
+            Some(SyntaxKind::TypeReference)
+        );
+        let before_indexes = fixture.store.index_info_len();
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let table_type = query_declared(
+            &mut fixture,
+            table,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        assert!(diagnostics.is_empty());
+        assert_eq!(fixture.store.index_info_len(), before_indexes + 1);
+        assert_eq!(
+            object_members::type_literal_state(&fixture.store, &plan),
+            Ok(Some(PropertyObjectState::Resolved(table_type)))
+        );
+        let TypeData::Object(object) = fixture.store.type_payload(table_type).unwrap().data()
+        else {
+            panic!("type literal indexes retain anonymous object identity")
+        };
+        assert_eq!(object.structured.properties, None);
+        assert_eq!(object.structured.signatures, None);
+        let [index] = object.structured.index_infos.as_deref().unwrap() else {
+            panic!("one index info is attached")
+        };
+        let info = fixture.store.index_info(*index).unwrap();
+        let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+        let value_type = fixture
+            .store
+            .type_alias_links(value)
+            .and_then(|links| links.declared_type)
+            .expect("the index annotation dependency resolves first");
+        assert_eq!(info.key_type(), bootstrap.string_type);
+        assert_eq!(info.value_type(), value_type);
+        assert_eq!(
+            fixture
+                .store
+                .type_node_links(planned.value_type_node)
+                .and_then(|links| links.resolved_type),
+            Some(value_type)
+        );
+        assert!(info.is_readonly());
+        assert_eq!(info.declaration(), Some(planned.declaration));
+        assert_eq!(info.index_symbol(), None);
+        assert!(info.components().is_empty());
+        let members = object.structured.members.unwrap();
+        let member_table = fixture.store.symbol_table(members).unwrap();
+        assert_eq!(member_table.len(), 1);
+        assert_eq!(
+            member_table.get(InternalSymbolName::Index.as_ref()),
+            Some(planned.symbol)
+        );
+        let bound_index = fixture.store.symbol(planned.symbol).unwrap();
+        assert_eq!(bound_index.flags(), SymbolFlags::SIGNATURE);
+        assert_eq!(bound_index.check_flags(), CheckFlags::NONE);
+        assert_eq!(bound_index.declarations(), Some(&[planned.declaration][..]));
+        assert_eq!(bound_index.value_declaration(), None);
+        assert_eq!(bound_index.parent(), Some(plan.symbol));
+
+        let warm_state = (store_state(&fixture.store), fixture.store.index_info_len());
+        assert_eq!(
+            query_declared(
+                &mut fixture,
+                table,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Ok(table_type)
+        );
+        assert_eq!(
+            (store_state(&fixture.store), fixture.store.index_info_len()),
+            warm_state
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn type_literal_index_boundaries_fail_before_publication() {
+        for (source, alias, expected_kind) in [
+            (
+                "type Duplicate = { [left: string]: number; [right: string]: number };",
+                "Duplicate",
+                SyntaxKind::IndexSignature,
+            ),
+            (
+                "type Paired = { [key: string]: number; [position: number]: number };",
+                "Paired",
+                SyntaxKind::IndexSignature,
+            ),
+            (
+                "type Mixed = { known: string; [key: string]: number };",
+                "Mixed",
+                SyntaxKind::IndexSignature,
+            ),
+            (
+                "type Multiple = { [left: string, right: number]: boolean };",
+                "Multiple",
+                SyntaxKind::IndexSignature,
+            ),
+            (
+                "type Missing = { [key]: boolean };",
+                "Missing",
+                SyntaxKind::IndexSignature,
+            ),
+            (
+                "type InvalidKey = { [key: boolean]: number };",
+                "InvalidKey",
+                SyntaxKind::IndexSignature,
+            ),
+            (
+                "type Method = { method(): void };",
+                "Method",
+                SyntaxKind::MethodSignature,
+            ),
+            (
+                "type NestedMethod = { [key: string]: { method(): void } };",
+                "NestedMethod",
+                SyntaxKind::MethodSignature,
+            ),
+        ] {
+            let mut fixture = fixture(source);
+            let symbol =
+                canonical_fixture_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, alias);
+            let before = (store_state(&fixture.store), fixture.store.index_info_len());
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            for _ in 0..2 {
+                assert!(matches!(
+                    query_declared(
+                        &mut fixture,
+                        symbol,
+                        CanonicalTypeQueryOptions::default(),
+                        &mut diagnostics,
+                    ),
+                    Err(DeclaredTypeError::TypeNodeUnavailable(
+                        TypeNodeUnavailable::UnsupportedSyntax { kind, .. }
+                    )) if kind == expected_kind
+                ));
+                assert_eq!(
+                    (store_state(&fixture.store), fixture.store.index_info_len()),
+                    before,
+                    "unsupported boundary mutated {alias}"
+                );
+                assert!(diagnostics.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Exercises independent warm-cache poison dimensions.
+    fn warm_type_literal_index_poison_fails_without_further_publication() {
+        #[derive(Clone, Copy, Debug)]
+        enum Poison {
+            Value,
+            Readonly,
+            Declaration,
+            Components,
+            IndexSymbol,
+        }
+
+        for poison in [
+            Poison::Value,
+            Poison::Readonly,
+            Poison::Declaration,
+            Poison::Components,
+            Poison::IndexSymbol,
+        ] {
+            let mut fixture = fixture("type Table = { [key: string]: boolean };");
+            let table =
+                canonical_fixture_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Table");
+            let (_, _, literal) = alias_parts(&fixture, "Table");
+            let plan = {
+                let host = post_global_host(
+                    &fixture.parsed.arena,
+                    fixture.files.get(&fixture.file).unwrap(),
+                );
+                object_members::plan_type_literal(&fixture.store, &host, literal, Some(table))
+                    .unwrap()
+            };
+            let declaration = plan.indexes[0].declaration;
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            let table_type = query_declared(
+                &mut fixture,
+                table,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap();
+            let TypeData::Object(object) = fixture.store.type_payload(table_type).unwrap().data()
+            else {
+                panic!("expected anonymous object")
+            };
+            let members = object.structured.members;
+            let properties = object.structured.properties.clone();
+            let (string_type, number_type, boolean_type) = {
+                let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+                (
+                    bootstrap.string_type,
+                    bootstrap.number_type,
+                    bootstrap.boolean_type,
+                )
+            };
+            let forged = fixture
+                .store
+                .alloc_index_info(
+                    string_type,
+                    if matches!(poison, Poison::Value) {
+                        number_type
+                    } else {
+                        boolean_type
+                    },
+                    matches!(poison, Poison::Readonly),
+                    (!matches!(poison, Poison::Declaration)).then_some(declaration),
+                    if matches!(poison, Poison::Components) {
+                        vec![declaration]
+                    } else {
+                        Vec::new()
+                    },
+                )
+                .unwrap();
+            if matches!(poison, Poison::IndexSymbol) {
+                assert!(
+                    fixture
+                        .store
+                        .set_index_info_symbol(forged, Some(plan.indexes[0].symbol))
+                );
+            }
+            assert!(fixture.store.set_structured_type_members(
+                table_type,
+                members,
+                properties,
+                None,
+                None,
+                Some(vec![forged]),
+            ));
+            let poisoned_state = (store_state(&fixture.store), fixture.store.index_info_len());
+            assert_eq!(
+                query_declared(
+                    &mut fixture,
+                    table,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut diagnostics,
+                ),
+                Err(DeclaredTypeError::TypeNodeUnavailable(
+                    TypeNodeUnavailable::InvalidLiteralType(literal)
+                )),
+                "poison {poison:?} must fail closed",
+            );
+            assert_eq!(
+                (store_state(&fixture.store), fixture.store.index_info_len()),
+                poisoned_state
+            );
+            assert!(diagnostics.is_empty());
+        }
     }
 
     #[test]

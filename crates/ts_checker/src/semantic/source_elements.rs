@@ -11,7 +11,7 @@
 use std::collections::HashSet;
 
 use ts_ast::{NodeArena, NodeData, NodeRef, SyntaxKind};
-use ts_binder::{InternalSymbolName, SemanticSymbolId};
+use ts_binder::{CheckFlags, InternalSymbolName, SemanticSymbolId, SymbolFlags, SymbolTableId};
 use ts_diagnostics::{Diagnostic, message_by_code};
 
 use super::{
@@ -24,6 +24,7 @@ use super::{
         type_to_string_with_host_and_flags, type_to_string_with_host_global_types_and_flags,
     },
     source::{PlannedExpression, PlannedExpressionKind},
+    store::SourceNodeParent,
     type_records::{LiteralValue, TypeCacheState, TypeData},
     types::{ObjectFlags, TypeFlags},
 };
@@ -683,6 +684,8 @@ fn resolved_index_signature_surface(
 
     match (object.structured.members, index_symbol.flatten()) {
         (None, None) => {}
+        (Some(members), None)
+            if valid_bound_declared_index_member(store, record.symbol(), members, index_infos) => {}
         (Some(members), Some(symbol)) => {
             let table = store
                 .symbol_table(members)
@@ -705,6 +708,70 @@ fn resolved_index_signature_surface(
         }
     }
     Ok(Some(resolved))
+}
+
+fn valid_bound_declared_index_member(
+    store: &CanonicalTypeMapperStore,
+    owner: Option<SemanticSymbolId>,
+    members: SymbolTableId,
+    index_infos: &[super::IndexInfoId],
+) -> bool {
+    let Some(owner) = owner else {
+        return false;
+    };
+    let Some(owner_record) = store.symbol(owner) else {
+        return false;
+    };
+    let Some([owner_declaration]) = owner_record.declarations() else {
+        return false;
+    };
+    let Some(table) = store.symbol_table(members) else {
+        return false;
+    };
+    let Some(symbol) = table.get(InternalSymbolName::Index.as_ref()) else {
+        return false;
+    };
+    let Some(record) = store.symbol(symbol) else {
+        return false;
+    };
+    let declarations = index_infos
+        .iter()
+        .map(|index| {
+            let info = store.index_info(*index)?;
+            let declaration = info.declaration()?;
+            (info.index_symbol().is_none()
+                && info.components().is_empty()
+                && store.source_node_kind(declaration) == Some(SyntaxKind::IndexSignature))
+            .then_some(declaration)
+        })
+        .collect::<Option<Vec<_>>>();
+    table.len() == 1
+        && store.get_merged_symbol(owner) == Some(owner)
+        && owner_record.flags() == SymbolFlags::TYPE_LITERAL
+        && owner_record.check_flags() == CheckFlags::NONE
+        && owner_record.name() == InternalSymbolName::Type.as_ref()
+        && owner_record.value_declaration().is_none()
+        && owner_record.members() == Some(members)
+        && owner_record.exports().is_none()
+        && owner_record.parent().is_none()
+        && owner_record.export_symbol().is_none()
+        && store.source_node_kind(*owner_declaration) == Some(SyntaxKind::TypeLiteral)
+        && store.get_merged_symbol(symbol) == Some(symbol)
+        && record.flags() == SymbolFlags::SIGNATURE
+        && record.check_flags() == CheckFlags::NONE
+        && record.name() == InternalSymbolName::Index.as_ref()
+        && declarations.as_deref().is_some_and(|declarations| {
+            record.declarations() == Some(declarations)
+                && declarations.iter().all(|declaration| {
+                    store.source_node_parent(*declaration)
+                        == Some(SourceNodeParent::Parent(*owner_declaration))
+                })
+        })
+        && record.value_declaration().is_none()
+        && record.members().is_none()
+        && record.exports().is_none()
+        && record.parent() == Some(owner)
+        && record.export_symbol().is_none()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1046,6 +1113,87 @@ mod tests {
             no_implicit_any: true,
             ..CanonicalCheckerOptions::default()
         }
+    }
+
+    #[test]
+    fn bound_declared_index_member_rejects_cloned_nonowner_table() {
+        let parsed = parse_fixture("type Table = { [key: string]: number };");
+        let file = FileId::new(600);
+        let mut store = registered_store(&parsed, file);
+        let literal = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::TypeLiteral).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let declaration = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::IndexSignature).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let members = store.alloc_symbol_table();
+        let owner = store
+            .alloc_symbol(SymbolData::new(
+                SymbolFlags::TYPE_LITERAL,
+                EscapedName::internal(InternalSymbolName::Type),
+            ))
+            .unwrap();
+        assert!(store.set_symbol_declarations(owner, Some(vec![literal]), None));
+        assert!(store.set_symbol_relationships(owner, Some(members), None, None, None));
+        let symbol = store
+            .alloc_symbol(SymbolData::new(
+                SymbolFlags::SIGNATURE,
+                EscapedName::internal(InternalSymbolName::Index),
+            ))
+            .unwrap();
+        assert!(store.set_symbol_declarations(symbol, Some(vec![declaration]), None));
+        assert!(store.set_symbol_relationships(symbol, None, None, Some(owner), None));
+        assert_eq!(
+            store.insert_symbol(
+                members,
+                EscapedName::internal(InternalSymbolName::Index),
+                symbol,
+            ),
+            Some(None)
+        );
+        let (string, number) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (bootstrap.string_type, bootstrap.number_type)
+        };
+        let index = store
+            .alloc_index_info(string, number, false, Some(declaration), Vec::new())
+            .unwrap();
+        assert!(valid_bound_declared_index_member(
+            &store,
+            Some(owner),
+            members,
+            &[index],
+        ));
+
+        let replacement = store.clone_symbol_table(members).unwrap();
+        assert_eq!(
+            store
+                .symbol_table(replacement)
+                .and_then(|table| table.get(InternalSymbolName::Index.as_ref())),
+            Some(symbol)
+        );
+        assert!(!valid_bound_declared_index_member(
+            &store,
+            Some(owner),
+            replacement,
+            &[index],
+        ));
     }
 
     #[test]

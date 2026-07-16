@@ -1,9 +1,11 @@
-//! Property-only object construction for the first canonical checker slice.
+//! Declared object-member construction for the canonical checker.
 //!
 //! This module owns the exact syntax-to-member-table boundary.  It deliberately
 //! does not recurse through property annotations: [`super::type_nodes`] plans
-//! and executes those nodes so one query retains a single dependency graph and
-//! resolution stack.
+//! and executes property and index annotations so one query retains a single
+//! dependency graph and resolution stack. The A11 prefix admits one pure
+//! string or number index signature on a type literal; combinations that need
+//! TS2411/TS2413 remain explicit boundaries.
 
 use std::collections::HashSet;
 
@@ -47,6 +49,20 @@ pub(super) struct PlannedProperty {
     pub name: String,
 }
 
+/// One exact source-declared index signature admitted by the first A11 cut.
+///
+/// The bound `__index` symbol is a signature-container member. It is not the
+/// synthetic property cached later in [`super::signatures::IndexInfo`], so
+/// publication deliberately leaves `IndexInfo::index_symbol` empty.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct PlannedIndexSignature {
+    pub declaration: NodeRef,
+    pub symbol: SemanticSymbolId,
+    pub key_type_node: NodeRef,
+    pub value_type_node: NodeRef,
+    pub readonly: bool,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct PropertyObjectPlan {
     pub kind: PropertyObjectKind,
@@ -54,12 +70,21 @@ pub(super) struct PropertyObjectPlan {
     pub symbol: SemanticSymbolId,
     pub members: Option<SymbolTableId>,
     pub properties: Vec<PlannedProperty>,
+    pub indexes: Vec<PlannedIndexSignature>,
     pub alias_symbol: Option<SemanticSymbolId>,
 }
 
 impl PropertyObjectPlan {
     pub(super) fn property_type_nodes(&self) -> impl ExactSizeIterator<Item = NodeRef> + '_ {
         self.properties.iter().map(|property| property.type_node)
+    }
+
+    pub(super) fn index_type_nodes(
+        &self,
+    ) -> impl ExactSizeIterator<Item = (NodeRef, NodeRef)> + '_ {
+        self.indexes
+            .iter()
+            .map(|index| (index.key_type_node, index.value_type_node))
     }
 
     fn property_symbols(&self) -> Vec<SemanticSymbolId> {
@@ -585,6 +610,7 @@ fn plan_members(
         symbol,
         members,
         properties: Vec::new(),
+        indexes: Vec::new(),
         alias_symbol,
     };
     if kind != PropertyObjectKind::ObjectLiteral && member_nodes.has_trailing_comma
@@ -593,9 +619,7 @@ fn plan_members(
         return Err(invalid_plan(&provisional));
     }
     let table = members.and_then(|members| store.symbol_table(members));
-    if members.is_some() != table.is_some()
-        || table.is_some_and(|table| table.len() != member_nodes.nodes.len())
-    {
+    if members.is_some() != table.is_some() {
         return Err(invalid_plan(&provisional));
     }
 
@@ -605,6 +629,7 @@ fn plan_members(
     let mut seen_symbols = HashSet::new();
     let mut seen_names = HashSet::new();
     let mut properties = Vec::with_capacity(member_nodes.nodes.len());
+    let mut indexes = Vec::with_capacity(1);
     for member in &member_nodes.nodes {
         let member = NodeRef::new(node.arena, node.file, *member);
         let member_record =
@@ -613,7 +638,13 @@ fn plan_members(
             PropertyObjectKind::ObjectLiteral => {
                 member_record.kind == SyntaxKind::PropertyAssignment
             }
-            PropertyObjectKind::TypeLiteral | PropertyObjectKind::Interface => matches!(
+            PropertyObjectKind::TypeLiteral => matches!(
+                member_record.kind,
+                SyntaxKind::PropertyDeclaration
+                    | SyntaxKind::PropertySignature
+                    | SyntaxKind::IndexSignature
+            ),
+            PropertyObjectKind::Interface => matches!(
                 member_record.kind,
                 SyntaxKind::PropertyDeclaration | SyntaxKind::PropertySignature
             ),
@@ -624,6 +655,31 @@ fn plan_members(
                 kind: member_record.kind,
             });
         }
+        if member_record.parent != Some(node.node)
+            || member_record.flags.0 & NODE_FLAG_JSDOC != 0
+            || member_record.range.start < previous_end
+            || member_record.range.start < member_nodes.range.start
+            || member_record.range.end > member_nodes.range.end
+            || member_record.range.start < owner_record.range.start
+            || member_record.range.end > owner_record.range.end
+            || !seen_nodes.insert(member)
+        {
+            return Err(invalid_plan(&provisional));
+        }
+        previous_end = member_record.range.end;
+
+        if member_record.kind == SyntaxKind::IndexSignature {
+            let index = plan_index_signature(store, host, node, symbol, member)?;
+            if !indexes.is_empty() {
+                return Err(PropertyObjectError::UnsupportedMember {
+                    node: member,
+                    kind: SyntaxKind::IndexSignature,
+                });
+            }
+            indexes.push(index);
+            continue;
+        }
+
         let (name_id, value_id, postfix_token, modifiers, signature_initializer, valid_payload) =
             match &member_record.data {
                 NodeData::PropertyDeclaration(property)
@@ -671,16 +727,7 @@ fn plan_members(
                 }
                 _ => return Err(invalid_plan(&provisional)),
             };
-        if member_record.parent != Some(node.node)
-            || member_record.flags.0 & NODE_FLAG_JSDOC != 0
-            || member_record.range.start < previous_end
-            || member_record.range.start < member_nodes.range.start
-            || member_record.range.end > member_nodes.range.end
-            || member_record.range.start < owner_record.range.start
-            || member_record.range.end > owner_record.range.end
-            || !seen_nodes.insert(member)
-            || !valid_payload
-        {
+        if !valid_payload {
             return Err(invalid_plan(&provisional));
         }
         if let Some(initializer) = signature_initializer
@@ -688,8 +735,6 @@ fn plan_members(
         {
             return Err(invalid_plan(&provisional));
         }
-        previous_end = member_record.range.end;
-
         let name = NodeRef::new(member.arena, member.file, name_id);
         let name_record =
             preflight_node(store, host, name).map_err(|_| invalid_plan(&provisional))?;
@@ -779,9 +824,188 @@ fn plan_members(
         });
     }
 
+    let reserved_index_count = usize::from(!indexes.is_empty());
+    if table.is_some_and(|table| {
+        table.len() != properties.len().saturating_add(reserved_index_count)
+            || match indexes.first() {
+                Some(index) => table.get(InternalSymbolName::Index.as_ref()) != Some(index.symbol),
+                None => table.get(InternalSymbolName::Index.as_ref()).is_some(),
+            }
+    }) {
+        return Err(invalid_plan(&provisional));
+    }
+    if let Some(index) = indexes.first() {
+        let declarations = indexes
+            .iter()
+            .map(|index| index.declaration)
+            .collect::<Vec<_>>();
+        let Some(record) = store.symbol(index.symbol) else {
+            return Err(invalid_plan(&provisional));
+        };
+        if record.declarations() != Some(declarations.as_slice()) {
+            return Err(invalid_plan(&provisional));
+        }
+    }
+    if !indexes.is_empty() && !properties.is_empty() {
+        return Err(PropertyObjectError::UnsupportedMember {
+            node: indexes[0].declaration,
+            kind: SyntaxKind::IndexSignature,
+        });
+    }
+
     Ok(PropertyObjectPlan {
         properties,
+        indexes,
         ..provisional
+    })
+}
+
+fn plan_index_signature(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    owner: NodeRef,
+    owner_symbol: SemanticSymbolId,
+    declaration: NodeRef,
+) -> Result<PlannedIndexSignature, PropertyObjectError> {
+    let unsupported = || PropertyObjectError::UnsupportedMember {
+        node: declaration,
+        kind: SyntaxKind::IndexSignature,
+    };
+    let record = preflight_node(store, host, declaration).map_err(|_| unsupported())?;
+    let NodeData::IndexSignatureDeclaration(index) = &record.data else {
+        return Err(unsupported());
+    };
+    if record.kind != SyntaxKind::IndexSignature
+        || record.parent != Some(owner.node)
+        || record.flags.0 != 0
+        || index.full_signature.is_some()
+        || index.next_container.is_some()
+        || index.symbol.is_some()
+        || index.type_parameters.is_some()
+        || index.parameters.has_trailing_comma
+        || index.parameters.nodes.len() != 1
+        || index.parameters.range.start < record.range.start
+        || index.parameters.range.end > record.range.end
+    {
+        return Err(unsupported());
+    }
+    let readonly = preflight_readonly_modifier(store, host, declaration, index.modifiers.as_ref())
+        .ok_or_else(unsupported)?;
+
+    let parameter = NodeRef::new(
+        declaration.arena,
+        declaration.file,
+        index.parameters.nodes[0],
+    );
+    let parameter_record = preflight_node(store, host, parameter).map_err(|_| unsupported())?;
+    let NodeData::ParameterDeclaration(parameter_data) = &parameter_record.data else {
+        return Err(unsupported());
+    };
+    if parameter_record.kind != SyntaxKind::Parameter
+        || parameter_record.parent != Some(declaration.node)
+        || parameter_record.flags.0 != 0
+        || parameter_record.range.start < index.parameters.range.start
+        || parameter_record.range.end > index.parameters.range.end
+        || parameter_data.dot_dot_dot_token.is_some()
+        || parameter_data.initializer.is_some()
+        || parameter_data.question_token.is_some()
+        || parameter_data.symbol.is_some()
+        || parameter_data.facts != 0
+        || parameter_data.modifiers.is_some()
+    {
+        return Err(unsupported());
+    }
+    let name = NodeRef::new(parameter.arena, parameter.file, parameter_data.name);
+    let name_record = preflight_node(store, host, name).map_err(|_| unsupported())?;
+    let NodeData::Identifier(identifier) = &name_record.data else {
+        return Err(unsupported());
+    };
+    if name_record.kind != SyntaxKind::Identifier
+        || name_record.parent != Some(parameter.node)
+        || name_record.range.start < parameter_record.range.start
+        || name_record.range.end > parameter_record.range.end
+        || identifier.text.is_empty()
+        || identifier.text == "this"
+    {
+        return Err(unsupported());
+    }
+    let Some(key_type_id) = parameter_data.type_ else {
+        return Err(unsupported());
+    };
+    let key_type_node = NodeRef::new(parameter.arena, parameter.file, key_type_id);
+    let key_record = preflight_node(store, host, key_type_node).map_err(|_| unsupported())?;
+    if !matches!(
+        key_record.kind,
+        SyntaxKind::StringKeyword | SyntaxKind::NumberKeyword
+    ) || key_record.parent != Some(parameter.node)
+        || key_record.range.start < name_record.range.end
+        || key_record.range.end > parameter_record.range.end
+    {
+        return Err(unsupported());
+    }
+
+    let value_type_node = NodeRef::new(declaration.arena, declaration.file, index.type_);
+    let value_record = preflight_node(store, host, value_type_node).map_err(|_| unsupported())?;
+    if value_record.parent != Some(declaration.node)
+        || value_record.range.start < index.parameters.range.end
+        || value_record.range.end > record.range.end
+    {
+        return Err(unsupported());
+    }
+
+    let Some(bound) = host.bound_file(declaration) else {
+        return Err(unsupported());
+    };
+    let raw_index_symbol = bound.symbol(declaration).ok_or_else(unsupported)?;
+    let index_symbol = store
+        .get_merged_symbol(raw_index_symbol)
+        .ok_or_else(unsupported)?;
+    let index_record = store.symbol(index_symbol).ok_or_else(unsupported)?;
+    if index_symbol != raw_index_symbol
+        || index_record.flags() != SymbolFlags::SIGNATURE
+        || index_record.check_flags() != CheckFlags::NONE
+        || index_record.name() != InternalSymbolName::Index.as_ref()
+        || index_record
+            .declarations()
+            .is_none_or(|declarations| !declarations.contains(&declaration))
+        || index_record.value_declaration().is_some()
+        || index_record.members().is_some()
+        || index_record.exports().is_some()
+        || index_record.parent() != Some(owner_symbol)
+        || index_record.export_symbol().is_some()
+    {
+        return Err(unsupported());
+    }
+
+    let raw_parameter_symbol = bound.symbol(parameter).ok_or_else(unsupported)?;
+    let parameter_symbol = store
+        .get_merged_symbol(raw_parameter_symbol)
+        .ok_or_else(unsupported)?;
+    let parameter_symbol_record = store.symbol(parameter_symbol).ok_or_else(unsupported)?;
+    let locals = bound.locals(declaration).ok_or_else(unsupported)?;
+    let locals = store.symbol_table(locals).ok_or_else(unsupported)?;
+    if parameter_symbol != raw_parameter_symbol
+        || parameter_symbol_record.flags() != SymbolFlags::FUNCTION_SCOPED_VARIABLE
+        || parameter_symbol_record.check_flags() != CheckFlags::NONE
+        || parameter_symbol_record.name().as_utf8() != Some(identifier.text.as_str())
+        || parameter_symbol_record.declarations() != Some(&[parameter])
+        || parameter_symbol_record.value_declaration() != Some(parameter)
+        || parameter_symbol_record.members().is_some()
+        || parameter_symbol_record.exports().is_some()
+        || parameter_symbol_record.parent().is_some()
+        || parameter_symbol_record.export_symbol().is_some()
+        || locals.len() != 1
+        || locals.get_source(&identifier.text) != Some(parameter_symbol)
+    {
+        return Err(unsupported());
+    }
+
+    Ok(PlannedIndexSignature {
+        declaration,
+        symbol: index_symbol,
+        key_type_node,
+        value_type_node,
+        readonly,
     })
 }
 
@@ -854,7 +1078,7 @@ pub(super) fn type_literal_state(
     let Some(type_) = links.resolved_type else {
         return Ok(None);
     };
-    if plan.properties.is_empty() && plan.alias_symbol.is_none() {
+    if plan.properties.is_empty() && plan.indexes.is_empty() && plan.alias_symbol.is_none() {
         let expected = store
             .intrinsic_bootstrap()
             .ok_or(PropertyObjectError::InvalidCachedTypeLiteral {
@@ -910,7 +1134,7 @@ pub(super) fn ensure_type_literal_shell(
     if let Some(state) = type_literal_state(store, plan)? {
         return Ok(state);
     }
-    if plan.properties.is_empty() && plan.alias_symbol.is_none() {
+    if plan.properties.is_empty() && plan.indexes.is_empty() && plan.alias_symbol.is_none() {
         let type_ = store
             .intrinsic_bootstrap()
             .ok_or(PropertyObjectError::InvalidTypeLiteral(plan.node))?
@@ -981,7 +1205,7 @@ fn validate_object_record(
                 return Some(PropertyObjectState::Shell(type_));
             }
             if record.object_flags() == ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED
-                && valid_declared_structured_members(object, plan)
+                && valid_declared_structured_members(store, object, plan)
                 && resolved_property_links(store, plan)
             {
                 return Some(PropertyObjectState::Resolved(type_));
@@ -1045,7 +1269,7 @@ fn validate_interface_record(
         && interface.declared_call_signatures.is_none()
         && interface.declared_construct_signatures.is_none()
         && interface.declared_index_infos.is_none()
-        && valid_declared_structured_members(&interface.reference.object, plan)
+        && valid_declared_structured_members(store, &interface.reference.object, plan)
         && resolved_property_links(store, plan)
     {
         return Some(PropertyObjectState::Resolved(type_));
@@ -1786,18 +2010,80 @@ fn valid_unresolved_interface_members(interface: &InterfaceTypeData) -> bool {
         && interface.declared_index_infos.is_none()
 }
 
-fn valid_declared_structured_members(object: &ObjectTypeData, plan: &PropertyObjectPlan) -> bool {
+fn valid_declared_structured_members(
+    store: &CanonicalTypeMapperStore,
+    object: &ObjectTypeData,
+    plan: &PropertyObjectPlan,
+) -> bool {
     valid_object_tail(object)
         && object.structured.constrained == ConstrainedTypeData::default()
         && object.structured.members == plan.members
         && object.structured.properties == plan.expected_properties()
         && object.structured.signatures.is_none()
         && object.structured.call_signature_count == 0
-        && object.structured.index_infos.is_none()
+        && valid_declared_index_infos(store, object.structured.index_infos.as_deref(), plan)
         && object
             .structured
             .object_type_without_abstract_construct_signatures
             .is_none()
+}
+
+fn valid_declared_index_infos(
+    store: &CanonicalTypeMapperStore,
+    index_infos: Option<&[super::IndexInfoId]>,
+    plan: &PropertyObjectPlan,
+) -> bool {
+    let indexes = index_infos.unwrap_or_default();
+    if indexes.len() != plan.indexes.len() || plan.indexes.is_empty() != index_infos.is_none() {
+        return false;
+    }
+    let Some(bootstrap) = store.intrinsic_bootstrap() else {
+        return false;
+    };
+    let mut seen = HashSet::with_capacity(indexes.len());
+    indexes.iter().zip(&plan.indexes).all(|(id, planned)| {
+        if !seen.insert(*id) {
+            return false;
+        }
+        let expected_key = match store.source_node_kind(planned.key_type_node) {
+            Some(SyntaxKind::StringKeyword) => bootstrap.string_type,
+            Some(SyntaxKind::NumberKeyword) => bootstrap.number_type,
+            _ => return false,
+        };
+        store.index_info(*id).is_some_and(|info| {
+            info.key_type() == expected_key
+                && store.type_payload(info.key_type()).is_some()
+                && store.type_payload(info.value_type()).is_some()
+                && cached_planned_type_identity(store, planned.value_type_node)
+                    .is_none_or(|value_type| info.value_type() == value_type)
+                && info.is_readonly() == planned.readonly
+                && info.declaration() == Some(planned.declaration)
+                && info.index_symbol().is_none()
+                && info.components().is_empty()
+        })
+    })
+}
+
+fn cached_planned_type_identity(store: &CanonicalTypeMapperStore, node: NodeRef) -> Option<TypeId> {
+    let bootstrap = store.intrinsic_bootstrap()?;
+    match store.source_node_kind(node)? {
+        SyntaxKind::AnyKeyword => Some(bootstrap.any_type),
+        SyntaxKind::UnknownKeyword => Some(bootstrap.unknown_type),
+        SyntaxKind::StringKeyword => Some(bootstrap.string_type),
+        SyntaxKind::NumberKeyword => Some(bootstrap.number_type),
+        SyntaxKind::BigIntKeyword => Some(bootstrap.bigint_type),
+        SyntaxKind::BooleanKeyword => Some(bootstrap.boolean_type),
+        SyntaxKind::SymbolKeyword => Some(bootstrap.es_symbol_type),
+        SyntaxKind::VoidKeyword => Some(bootstrap.void_type),
+        SyntaxKind::UndefinedKeyword => Some(bootstrap.undefined_type),
+        SyntaxKind::NullKeyword => Some(bootstrap.null_type),
+        SyntaxKind::NeverKeyword => Some(bootstrap.never_type),
+        SyntaxKind::ObjectKeyword => Some(bootstrap.non_primitive_type),
+        SyntaxKind::IntrinsicKeyword => Some(bootstrap.intrinsic_marker_type),
+        _ => store
+            .type_node_links(node)
+            .and_then(|links| links.resolved_type),
+    }
 }
 
 fn object_literal_property_types(
@@ -1959,28 +2245,125 @@ pub(super) fn validate_resolved_property_types(
     Ok(())
 }
 
+pub(super) fn validate_resolved_declared_member_types(
+    store: &CanonicalTypeMapperStore,
+    plan: &PropertyObjectPlan,
+    property_types: &[TypeId],
+    index_types: &[(TypeId, TypeId)],
+) -> Result<(), PropertyObjectError> {
+    validate_resolved_property_types(store, plan, property_types)?;
+    let type_ = match plan.kind {
+        PropertyObjectKind::TypeLiteral => store
+            .type_node_links(plan.node)
+            .and_then(|links| links.resolved_type),
+        PropertyObjectKind::Interface => store
+            .declared_type_links(plan.symbol)
+            .and_then(|links| links.declared_type),
+        PropertyObjectKind::ObjectLiteral => None,
+    }
+    .ok_or_else(|| invalid_plan(plan))?;
+    let index_infos = store
+        .type_payload(type_)
+        .and_then(|record| record.data().structured())
+        .and_then(|structured| structured.index_infos.as_deref())
+        .unwrap_or_default();
+    let valid = index_types.len() == plan.indexes.len()
+        && index_infos.len() == index_types.len()
+        && index_infos
+            .iter()
+            .zip(index_types)
+            .all(|(id, (key_type, value_type))| {
+                store.index_info(*id).is_some_and(|info| {
+                    info.key_type() == *key_type && info.value_type() == *value_type
+                })
+            });
+    if valid {
+        Ok(())
+    } else {
+        Err(invalid_cache(plan, type_))
+    }
+}
+
 pub(super) fn publish_property_members(
     store: &mut CanonicalTypeMapperStore,
     plan: &PropertyObjectPlan,
     state: PropertyObjectState,
     property_types: &[TypeId],
 ) -> Result<TypeId, PropertyObjectError> {
+    if !plan.indexes.is_empty() {
+        return Err(invalid_cache(plan, state.type_id()));
+    }
+    publish_declared_members(store, plan, state, property_types, &[])
+}
+
+pub(super) fn publish_declared_members(
+    store: &mut CanonicalTypeMapperStore,
+    plan: &PropertyObjectPlan,
+    state: PropertyObjectState,
+    property_types: &[TypeId],
+    index_types: &[(TypeId, TypeId)],
+) -> Result<TypeId, PropertyObjectError> {
     if plan.kind == PropertyObjectKind::ObjectLiteral {
         return Err(PropertyObjectError::InvalidObjectLiteral(plan.node));
     }
     let type_ = state.type_id();
     if state.is_resolved() {
-        validate_resolved_property_types(store, plan, property_types)?;
+        validate_resolved_declared_member_types(store, plan, property_types, index_types)?;
         return Ok(type_);
     }
     if property_types.len() != plan.properties.len()
+        || index_types.len() != plan.indexes.len()
         || property_types
             .iter()
             .any(|type_| store.type_payload(*type_).is_none())
+        || index_types.iter().any(|(key_type, value_type)| {
+            store.type_payload(*key_type).is_none() || store.type_payload(*value_type).is_none()
+        })
         || !unresolved_property_links(store, plan)
     {
         return Err(invalid_cache(plan, type_));
     }
+
+    let Some(bootstrap) = store.intrinsic_bootstrap() else {
+        return Err(invalid_cache(plan, type_));
+    };
+    let mut seen_keys = HashSet::with_capacity(index_types.len());
+    let valid_indexes = plan
+        .indexes
+        .iter()
+        .zip(index_types)
+        .all(|(planned, (key_type, _))| {
+            let expected = match store.source_node_kind(planned.key_type_node) {
+                Some(SyntaxKind::StringKeyword) => bootstrap.string_type,
+                Some(SyntaxKind::NumberKeyword) => bootstrap.number_type,
+                _ => return false,
+            };
+            *key_type == expected && seen_keys.insert(*key_type)
+        });
+    if !valid_indexes {
+        return Err(invalid_cache(plan, type_));
+    }
+    if !store.try_reserve_index_infos(plan.indexes.len()) {
+        return Err(PropertyObjectError::Capacity(plan.node));
+    }
+
+    let index_infos = plan
+        .indexes
+        .iter()
+        .zip(index_types)
+        .map(|(planned, (key_type, value_type))| {
+            store
+                .alloc_index_info(
+                    *key_type,
+                    *value_type,
+                    planned.readonly,
+                    Some(planned.declaration),
+                    Vec::new(),
+                )
+                .expect("the declared-index plan and reservation validated every identity")
+        })
+        .collect::<Vec<_>>();
+    let published_index_infos = (!index_infos.is_empty()).then_some(index_infos);
 
     // All fallible checks precede publication.  The store setters below can
     // only reject foreign identities, all of which were validated above.
@@ -1999,17 +2382,18 @@ pub(super) fn publish_property_members(
                 plan.expected_properties(),
                 None,
                 None,
-                None,
+                published_index_infos,
             ));
         }
         PropertyObjectKind::Interface => {
+            debug_assert!(plan.indexes.is_empty());
             assert!(store.set_interface_declared_members(
                 type_,
                 true,
                 plan.members,
                 None,
                 None,
-                None,
+                published_index_infos.clone(),
             ));
             assert!(store.set_interface_base_resolution(type_, true, None, None));
             assert!(store.set_structured_type_members(
@@ -2018,7 +2402,7 @@ pub(super) fn publish_property_members(
                 plan.expected_properties(),
                 None,
                 None,
-                None,
+                published_index_infos,
             ));
         }
         PropertyObjectKind::ObjectLiteral => {

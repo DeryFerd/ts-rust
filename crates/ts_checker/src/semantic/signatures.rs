@@ -737,6 +737,11 @@ impl IndexInfoArena {
         }
     }
 
+    #[must_use]
+    pub(super) fn try_reserve(&mut self, additional: usize) -> bool {
+        self.infos.try_reserve(additional)
+    }
+
     /// Implements the record initialization performed by
     /// typescript-go `checker.go::newIndexInfo`.
     ///
