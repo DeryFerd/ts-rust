@@ -6,10 +6,13 @@
 //! checker state, so a malformed target cannot leave a partially constructed
 //! source object behind.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+
+use ts_binder::SemanticSymbolId;
 
 use super::{
     CanonicalGlobalTypes, CanonicalTypeMapperStore, DeclaredTypeHost, RelationUnavailable, TypeId,
+    VariableInvariant,
     source::{PlannedExpression, PlannedExpressionKind, SourceCheckError, UnsupportedSourceSyntax},
     type_records::{TypeData, TypeRecord},
     types::TypeFlags,
@@ -34,6 +37,7 @@ pub(super) enum LiteralTreatment {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum PreparedExpression {
     Literal(LiteralTreatment),
+    Identifier(LiteralTreatment),
     Parenthesized(Box<PreparedExpression>),
     Array(Vec<PreparedExpression>),
     Object(Vec<PreparedExpression>),
@@ -57,7 +61,14 @@ pub(super) fn prepare_expression_context(
     expression: &PlannedExpression,
     contextual_type: TypeId,
 ) -> Result<PreparedExpression, SourceCheckError> {
-    prepare_expression_context_worker(store, host, None, expression, contextual_type)
+    prepare_expression_context_worker(
+        store,
+        host,
+        None,
+        &HashMap::new(),
+        expression,
+        contextual_type,
+    )
 }
 
 /// Prepares a contextual expression with authoritative generic-global identities.
@@ -65,16 +76,25 @@ pub(super) fn prepare_expression_context_with_global_types(
     store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     global_types: &CanonicalGlobalTypes,
+    value_types: &HashMap<SemanticSymbolId, TypeId>,
     expression: &PlannedExpression,
     contextual_type: TypeId,
 ) -> Result<PreparedExpression, SourceCheckError> {
-    prepare_expression_context_worker(store, host, Some(global_types), expression, contextual_type)
+    prepare_expression_context_worker(
+        store,
+        host,
+        Some(global_types),
+        value_types,
+        expression,
+        contextual_type,
+    )
 }
 
 fn prepare_expression_context_worker(
     store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     global_types: Option<&CanonicalGlobalTypes>,
+    value_types: &HashMap<SemanticSymbolId, TypeId>,
     expression: &PlannedExpression,
     contextual_type: TypeId,
 ) -> Result<PreparedExpression, SourceCheckError> {
@@ -92,6 +112,7 @@ fn prepare_expression_context_worker(
         store,
         host,
         global_types,
+        value_types,
         expression,
         Some(contextual_type),
         ExpressionLocation::Cached,
@@ -103,21 +124,30 @@ pub(super) fn prepare_expression_without_context_with_global_types(
     store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     global_types: &CanonicalGlobalTypes,
+    value_types: &HashMap<SemanticSymbolId, TypeId>,
     expression: &PlannedExpression,
 ) -> Result<PreparedExpression, SourceCheckError> {
-    prepare_expression_without_context_worker(store, host, Some(global_types), expression)
+    prepare_expression_without_context_worker(
+        store,
+        host,
+        Some(global_types),
+        value_types,
+        expression,
+    )
 }
 
 fn prepare_expression_without_context_worker(
     store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     global_types: Option<&CanonicalGlobalTypes>,
+    value_types: &HashMap<SemanticSymbolId, TypeId>,
     expression: &PlannedExpression,
 ) -> Result<PreparedExpression, SourceCheckError> {
     prepare_expression(
         store,
         host,
         global_types,
+        value_types,
         expression,
         None,
         ExpressionLocation::Cached,
@@ -197,6 +227,7 @@ fn prepare_expression(
     store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     global_types: Option<&CanonicalGlobalTypes>,
+    value_types: &HashMap<SemanticSymbolId, TypeId>,
     expression: &PlannedExpression,
     contextual_type: Option<TypeId>,
     location: ExpressionLocation,
@@ -204,6 +235,19 @@ fn prepare_expression(
     let prepared = match &expression.kind {
         PlannedExpressionKind::Null | PlannedExpressionKind::GlobalUndefined => {
             PreparedExpression::Literal(LiteralTreatment::Identity)
+        }
+        PlannedExpressionKind::Identifier(read) => {
+            PreparedExpression::Identifier(identifier_treatment(
+                store,
+                global_types,
+                *value_types
+                    .get(&read.value_symbol)
+                    .ok_or(SourceCheckError::Variable(
+                        VariableInvariant::MissingStagedValueType(read.value_symbol),
+                    ))?,
+                contextual_type,
+                location,
+            )?)
         }
         PlannedExpressionKind::String(_) => PreparedExpression::Literal(literal_treatment(
             store,
@@ -233,9 +277,17 @@ fn prepare_expression(
             contextual_type,
             location,
         )?),
-        PlannedExpressionKind::Parenthesized(inner) => PreparedExpression::Parenthesized(Box::new(
-            prepare_expression(store, host, global_types, inner, contextual_type, location)?,
-        )),
+        PlannedExpressionKind::Parenthesized(inner) => {
+            PreparedExpression::Parenthesized(Box::new(prepare_expression(
+                store,
+                host,
+                global_types,
+                value_types,
+                inner,
+                contextual_type,
+                location,
+            )?))
+        }
         PlannedExpressionKind::Assertion { .. } => {
             return Err(SourceCheckError::Unsupported(
                 UnsupportedSourceSyntax::NestedAssertion(expression.node),
@@ -254,6 +306,7 @@ fn prepare_expression(
                     store,
                     host,
                     global_types,
+                    value_types,
                     element,
                     element_context,
                     ExpressionLocation::Mutable,
@@ -274,6 +327,7 @@ fn prepare_expression(
                     store,
                     host,
                     global_types,
+                    value_types,
                     expression,
                     property_context,
                     ExpressionLocation::Mutable,
@@ -326,6 +380,50 @@ fn literal_treatment(
     if location == ExpressionLocation::Cached {
         return Ok(LiteralTreatment::Fresh);
     }
+    if is_literal_of_contextual_type(
+        store,
+        global_types,
+        kind,
+        contextual_type,
+        &mut HashSet::new(),
+    )? {
+        Ok(LiteralTreatment::Regular)
+    } else {
+        Ok(LiteralTreatment::WidenedPrimitive)
+    }
+}
+
+fn identifier_treatment(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: Option<&CanonicalGlobalTypes>,
+    type_: TypeId,
+    contextual_type: Option<TypeId>,
+    location: ExpressionLocation,
+) -> Result<LiteralTreatment, SourceCheckError> {
+    if location == ExpressionLocation::Cached {
+        return Ok(LiteralTreatment::Identity);
+    }
+    let record = store
+        .type_payload(type_)
+        .ok_or(RelationUnavailable::Type(type_))?;
+    let TypeData::Literal(literal) = record.data() else {
+        return Ok(LiteralTreatment::Identity);
+    };
+    store.validate_union_constituent(type_)?;
+    if literal.fresh_type != Some(type_) || literal.regular_type == type_ {
+        return Ok(LiteralTreatment::Identity);
+    }
+    let kind = if record.flags().intersects(TypeFlags::STRING_LITERAL) {
+        LiteralKind::String
+    } else if record.flags().intersects(TypeFlags::NUMBER_LITERAL) {
+        LiteralKind::Number
+    } else if record.flags().intersects(TypeFlags::BIG_INT_LITERAL) {
+        LiteralKind::BigInt
+    } else if record.flags().intersects(TypeFlags::BOOLEAN_LITERAL) {
+        LiteralKind::Boolean
+    } else {
+        return Err(RelationUnavailable::UnsupportedStructuredType(type_).into());
+    };
     if is_literal_of_contextual_type(
         store,
         global_types,

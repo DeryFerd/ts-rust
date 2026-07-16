@@ -1,9 +1,9 @@
 //! Atomic canonical checking for the first source-statement slice.
 //!
 //! This module deliberately supports only unmodified type aliases and simple
-//! interfaces, empty external-module markers, explicitly typed ordinary
-//! variable declarations (optionally exported), and direct assignments back
-//! to supported `var` declarations. The complete source tree and the complete
+//! interfaces, empty external-module markers, initialized identifier-named
+//! top-level variables (optionally exported), and direct assignments back to
+//! supported `var` declarations. The complete source tree and the complete
 //! supported-statement plan are validated before checker state is touched.
 //! Unsupported syntax is therefore
 //! a typed boundary, never a request to fall back to the legacy checker or to
@@ -11,7 +11,7 @@
 //! semantic failure; diagnostics coupled to those caches remain in private
 //! source staging until a retry completes and publishes them atomically.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use ts_ast::{FileId, ModifierList, Node, NodeArena, NodeData, NodeId, NodeRef, SyntaxKind};
 use ts_binder::{BoundFile, SemanticSymbolId};
@@ -23,8 +23,8 @@ use super::{
     ArrayTypeError, AssertionLinks, AssignmentInvariant, AssignmentUnsupported,
     CanonicalCheckerDiagnostic, CanonicalCheckerDiagnostics, CanonicalCheckerOptions,
     CanonicalGlobalTypes, CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHost,
-    DerivedTypeError, RelationUnavailable, SourceFileLinks, SourceFileRef, TypeDisplayUnavailable,
-    TypeId,
+    DerivedTypeError, RelationUnavailable, SourceFileLinks, SourceFileRef, SymbolNodeLinks,
+    TypeDisplayUnavailable, TypeId, ValueSymbolLinks, VariableInvariant, VariableUnsupported,
     bootstrap::{LiteralTypeCacheError, UnionReduction},
     contextual::{
         LiteralTreatment, PreparedExpression, prepare_expression_context_with_global_types,
@@ -35,8 +35,12 @@ use super::{
         get_type_names_for_assignability_error_with_host_global_types_and_flags,
     },
     type_nodes::{CanonicalTypeQuery, normalize_bigint_literal, normalize_numeric_separators},
-    type_records::TypeRecord,
+    type_records::{TypeData, TypeRecord},
     types::TypeFlags,
+    variables::{
+        PlannedIdentifierRead, VariableBindingKind, VariablePlanError, plan_identifier_read,
+        plan_top_level_variable,
+    },
 };
 
 const NODE_FLAG_JSDOC: u32 = 1 << 22;
@@ -94,6 +98,7 @@ pub enum UnsupportedSourceSyntax {
     ConstAssertion(NodeRef),
     NestedAssertion(NodeRef),
     Assignment(AssignmentUnsupported),
+    Variable(VariableUnsupported),
 }
 
 /// Source and AST identity rejected before semantic execution.
@@ -202,6 +207,7 @@ pub enum SourceCheckError {
     DerivedType(DerivedTypeError),
     Assertion(SourceAssertionError),
     Assignment(AssignmentInvariant),
+    Variable(VariableInvariant),
     MissingDiagnostic(u32),
 }
 
@@ -221,6 +227,7 @@ impl std::fmt::Display for SourceCheckError {
             Self::DerivedType(error) => write!(formatter, "{error}"),
             Self::Assertion(error) => write!(formatter, "assertion checking failed: {error:?}"),
             Self::Assignment(error) => write!(formatter, "assignment planning failed: {error:?}"),
+            Self::Variable(error) => write!(formatter, "variable checking failed: {error:?}"),
             Self::MissingDiagnostic(code) => {
                 write!(formatter, "diagnostic TS{code} is absent from the catalog")
             }
@@ -243,6 +250,7 @@ impl std::error::Error for SourceCheckError {
             | Self::ObjectLiteral(_)
             | Self::Assertion(_)
             | Self::Assignment(_)
+            | Self::Variable(_)
             | Self::MissingDiagnostic(_) => None,
         }
     }
@@ -318,6 +326,7 @@ pub(super) enum PlannedExpressionKind {
     },
     Boolean(bool),
     GlobalUndefined,
+    Identifier(PlannedIdentifierRead),
     Parenthesized(Box<PlannedExpression>),
     Assertion {
         type_node: NodeRef,
@@ -333,7 +342,9 @@ pub(super) enum PlannedExpressionKind {
 #[derive(Clone, Debug)]
 struct PlannedVariable {
     name: NodeRef,
-    type_node: NodeRef,
+    symbol: SemanticSymbolId,
+    binding: VariableBindingKind,
+    type_node: Option<NodeRef>,
     initializer: PlannedExpression,
 }
 
@@ -364,6 +375,7 @@ enum PlannedStatement {
 #[derive(Debug)]
 struct SourceCheckPlan {
     statements: Vec<PlannedStatement>,
+    identifier_reads: Vec<(NodeRef, SemanticSymbolId)>,
     strings: Vec<String>,
     numbers: Vec<Number>,
     bigints: Vec<PseudoBigInt>,
@@ -376,10 +388,13 @@ struct SourcePlanner<'arena, 'semantic, 'sources> {
     strings: Vec<String>,
     numbers: Vec<Number>,
     bigints: Vec<PseudoBigInt>,
+    identifier_reads: Vec<(NodeRef, SemanticSymbolId)>,
     semantic: Option<(
         &'semantic CanonicalTypeMapperStore,
         &'semantic DeclaredTypeHost<'sources>,
     )>,
+    prior_variables: HashSet<SemanticSymbolId>,
+    readable_variables: HashSet<SemanticSymbolId>,
 }
 
 impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
@@ -392,7 +407,10 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             strings: Vec::new(),
             numbers: Vec::new(),
             bigints: Vec::new(),
+            identifier_reads: Vec::new(),
             semantic: None,
+            prior_variables: HashSet::new(),
+            readable_variables: HashSet::new(),
         }
     }
 
@@ -410,7 +428,10 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             strings: Vec::new(),
             numbers: Vec::new(),
             bigints: Vec::new(),
+            identifier_reads: Vec::new(),
             semantic: Some((store, host)),
+            prior_variables: HashSet::new(),
+            readable_variables: HashSet::new(),
         }
     }
 
@@ -515,7 +536,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     statements.push(PlannedStatement::ExternalModuleMarker);
                 }
                 SyntaxKind::VariableStatement => {
-                    let declaration_list = {
+                    let (declaration_list, exported) = {
                         let node = self.node(statement)?;
                         let NodeData::VariableStatement(variable) = &node.data else {
                             return Err(SourceCheckError::Provenance(
@@ -549,10 +570,10 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                                 },
                             ));
                         }
-                        variable.declaration_list
+                        (variable.declaration_list, export_modifier.is_some())
                     };
                     statements.push(PlannedStatement::Variables(
-                        self.plan_variable_statement(statement, declaration_list)?,
+                        self.plan_variable_statement(statement, declaration_list, exported)?,
                     ));
                 }
                 SyntaxKind::ExpressionStatement => {
@@ -582,6 +603,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         }
         Ok(SourceCheckPlan {
             statements,
+            identifier_reads: self.identifier_reads,
             strings: self.strings,
             numbers: self.numbers,
             bigints: self.bigints,
@@ -599,6 +621,16 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             super::assignment::AssignmentPlanError::DeclaredType(error) => {
                 SourceCheckError::DeclaredType(error)
             }
+        }
+    }
+
+    fn variable_plan_error(error: VariablePlanError) -> SourceCheckError {
+        match error {
+            VariablePlanError::Unsupported(error) => {
+                SourceCheckError::Unsupported(UnsupportedSourceSyntax::Variable(error))
+            }
+            VariablePlanError::Invariant(error) => SourceCheckError::Variable(error),
+            VariablePlanError::DeclaredType(error) => SourceCheckError::DeclaredType(error),
         }
     }
 
@@ -772,6 +804,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         &mut self,
         statement: NodeRef,
         declaration_list: NodeId,
+        exported: bool,
     ) -> Result<Vec<PlannedVariable>, SourceCheckError> {
         let list = self.reference(declaration_list);
         let (kind, parent, flags, range, declarations, declaration_range, trailing_comma, facts) = {
@@ -808,10 +841,21 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 UnsupportedSourceSyntax::EmptyVariableDeclarationList(list),
             ));
         }
+        let binding = match flags {
+            0 => VariableBindingKind::Var,
+            NODE_FLAG_LET => VariableBindingKind::Let,
+            NODE_FLAG_CONST => VariableBindingKind::Const,
+            _ => unreachable!("the declaration-list flag gate accepted one exact binding kind"),
+        };
 
         let mut variables = Vec::with_capacity(declarations.len());
         for declaration in declarations {
-            variables.push(self.plan_variable_declaration(list, self.reference(declaration))?);
+            variables.push(self.plan_variable_declaration(
+                list,
+                self.reference(declaration),
+                binding,
+                exported,
+            )?);
         }
         Ok(variables)
     }
@@ -820,6 +864,8 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         &mut self,
         list: NodeRef,
         declaration: NodeRef,
+        binding: VariableBindingKind,
+        exported: bool,
     ) -> Result<PlannedVariable, SourceCheckError> {
         let (
             declaration_kind,
@@ -871,20 +917,39 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
 
         let name = self.reference(name_id);
         let name_node = self.node(name)?;
+        let NodeData::Identifier(identifier) = &name_node.data else {
+            return Err(self.unsupported(name, name_node.kind, SourceSyntaxRole::VariableName));
+        };
         if name_node.kind != SyntaxKind::Identifier
-            || !matches!(name_node.data, NodeData::Identifier(_))
+            || name_node.flags.0 != 0
             || name_node.parent != Some(declaration.node)
+            || identifier.flow_node.is_some()
         {
             return Err(self.unsupported(name, name_node.kind, SourceSyntaxRole::VariableName));
         }
+        let name_text = identifier.text.clone();
+        let Some((store, _)) = self.semantic else {
+            return Err(self.unsupported(
+                declaration,
+                declaration_kind,
+                SourceSyntaxRole::VariableDeclaration,
+            ));
+        };
+        let variable_symbol = plan_top_level_variable(
+            self.bound,
+            store,
+            declaration,
+            name,
+            &name_text,
+            binding,
+            exported,
+        )
+        .map_err(Self::variable_plan_error)?;
 
-        let type_node =
-            type_id
-                .map(|node| self.reference(node))
-                .ok_or(SourceCheckError::Unsupported(
-                    UnsupportedSourceSyntax::MissingVariableType(declaration),
-                ))?;
-        if self.node(type_node)?.parent != Some(declaration.node) {
+        let type_node = type_id.map(|node| self.reference(node));
+        if let Some(type_node) = type_node
+            && self.node(type_node)?.parent != Some(declaration.node)
+        {
             let kind = self.node(type_node)?.kind;
             return Err(self.unsupported(type_node, kind, SourceSyntaxRole::VariableType));
         }
@@ -899,8 +964,47 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             return Err(self.unsupported(initializer, kind, SourceSyntaxRole::VariableInitializer));
         }
         let initializer = self.plan_expression(initializer)?;
+        if type_node.is_none()
+            && !exported
+            && matches!(&initializer.kind, PlannedExpressionKind::Array(elements) if elements.is_empty())
+        {
+            return Err(SourceCheckError::Unsupported(
+                UnsupportedSourceSyntax::Variable(
+                    VariableUnsupported::InferredEmptyArrayOption(declaration),
+                ),
+            ));
+        }
+        if type_node.is_none()
+            && !exported
+            && !binding.is_const()
+            && matches!(
+                &initializer.unparenthesized().kind,
+                PlannedExpressionKind::Null | PlannedExpressionKind::GlobalUndefined
+            )
+        {
+            return Err(SourceCheckError::Unsupported(
+                UnsupportedSourceSyntax::Variable(
+                    VariableUnsupported::InferredMutableNullishOption(declaration),
+                ),
+            ));
+        }
+        if !self.prior_variables.insert(variable_symbol) {
+            return Err(SourceCheckError::Variable(
+                VariableInvariant::InvalidSymbolShape(variable_symbol),
+            ));
+        }
+        if binding.is_const()
+            && type_node.is_none()
+            && !self.readable_variables.insert(variable_symbol)
+        {
+            return Err(SourceCheckError::Variable(
+                VariableInvariant::InvalidSymbolShape(variable_symbol),
+            ));
+        }
         Ok(PlannedVariable {
             name,
+            symbol: variable_symbol,
+            binding,
             type_node,
             initializer,
         })
@@ -945,16 +1049,43 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         SourceSyntaxRole::VariableInitializer,
                     ));
                 };
-                if identifier.text != "undefined" || !self.is_global_undefined() {
+                if node.flags.0 != 0 || identifier.flow_node.is_some() {
                     return Err(self.unsupported(
                         expression,
                         node.kind,
                         SourceSyntaxRole::VariableInitializer,
                     ));
                 }
+                let name = identifier.text.clone();
+                if name == "undefined" && self.is_global_undefined() {
+                    return Ok(PlannedExpression::new(
+                        expression,
+                        PlannedExpressionKind::GlobalUndefined,
+                    ));
+                }
+                let Some((store, host)) = self.semantic else {
+                    return Err(self.unsupported(
+                        expression,
+                        node.kind,
+                        SourceSyntaxRole::VariableInitializer,
+                    ));
+                };
+                let read = plan_identifier_read(
+                    self.arena,
+                    self.bound,
+                    store,
+                    host,
+                    &self.prior_variables,
+                    &self.readable_variables,
+                    expression,
+                    &name,
+                )
+                .map_err(Self::variable_plan_error)?;
+                self.identifier_reads
+                    .push((expression, read.resolved_symbol));
                 Ok(PlannedExpression::new(
                     expression,
-                    PlannedExpressionKind::GlobalUndefined,
+                    PlannedExpressionKind::Identifier(read),
                 ))
             }
             SyntaxKind::StringLiteral => {
@@ -1484,7 +1615,7 @@ fn expression_type(
     expression: &PlannedExpression,
     prepared: &PreparedExpression,
 ) -> Result<TypeId, SourceCheckError> {
-    Ok(execute_expression_types(store, None, expression, prepared)?.result)
+    Ok(execute_expression_types(store, None, &HashMap::new(), expression, prepared)?.result)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1514,6 +1645,7 @@ impl CheckedExpressionTypes {
 fn execute_expression_types(
     store: &mut CanonicalTypeMapperStore,
     global_types: Option<&CanonicalGlobalTypes>,
+    value_types: &HashMap<SemanticSymbolId, TypeId>,
     expression: &PlannedExpression,
     prepared: &PreparedExpression,
 ) -> Result<CheckedExpressionTypes, SourceCheckError> {
@@ -1563,6 +1695,18 @@ fn execute_expression_types(
             .ok_or(SourceCheckError::LiteralCache(
                 SourceLiteralCacheError::BootstrapUninitialized,
             )),
+        (
+            PlannedExpressionKind::Identifier(read),
+            PreparedExpression::Identifier(treatment),
+        ) => {
+            let raw = *value_types.get(&read.value_symbol).ok_or(
+                SourceCheckError::Variable(VariableInvariant::MissingStagedValueType(
+                    read.value_symbol,
+                )),
+            )?;
+            let result = identifier_expression_type(store, raw, *treatment)?;
+            Ok(CheckedExpressionTypes::leaf(raw, result))
+        }
         (PlannedExpressionKind::String(value), PreparedExpression::Literal(treatment)) => {
             let regular = store.regular_string_literal_type(value.clone())?;
             let widened = store
@@ -1614,7 +1758,7 @@ fn execute_expression_types(
         (
             PlannedExpressionKind::Parenthesized(inner),
             PreparedExpression::Parenthesized(prepared),
-        ) => execute_expression_types(store, global_types, inner, prepared),
+        ) => execute_expression_types(store, global_types, value_types, inner, prepared),
         (PlannedExpressionKind::Array(elements), PreparedExpression::Array(prepared_elements)) => {
             debug_assert_eq!(elements.len(), prepared_elements.len());
             let global_types = global_types.ok_or(SourceCheckError::Unsupported(
@@ -1627,8 +1771,13 @@ fn execute_expression_types(
             let mut checked_elements = Vec::with_capacity(elements.len());
             let mut element_types = Vec::with_capacity(elements.len());
             for (element, prepared) in elements.iter().zip(prepared_elements) {
-                let checked =
-                    execute_expression_types(store, Some(global_types), element, prepared)?;
+                let checked = execute_expression_types(
+                    store,
+                    Some(global_types),
+                    value_types,
+                    element,
+                    prepared,
+                )?;
                 element_types.push(checked.result);
                 checked_elements.push(checked);
             }
@@ -1670,7 +1819,13 @@ fn execute_expression_types(
             let mut checked_properties = Vec::with_capacity(properties.len());
             let mut property_types = Vec::with_capacity(properties.len());
             for (property, prepared) in properties.iter().zip(prepared_properties) {
-                let checked = execute_expression_types(store, global_types, property, prepared)?;
+                let checked = execute_expression_types(
+                    store,
+                    global_types,
+                    value_types,
+                    property,
+                    prepared,
+                )?;
                 property_types.push(checked.result);
                 checked_properties.push(checked);
             }
@@ -1715,6 +1870,68 @@ fn prepared_literal_type(
         LiteralTreatment::Identity => {
             unreachable!("null and undefined do not use literal-pair treatment")
         }
+    }
+}
+
+fn identifier_expression_type(
+    store: &CanonicalTypeMapperStore,
+    raw: TypeId,
+    treatment: LiteralTreatment,
+) -> Result<TypeId, SourceCheckError> {
+    match treatment {
+        LiteralTreatment::Identity | LiteralTreatment::Fresh => Ok(raw),
+        LiteralTreatment::Regular => {
+            store.validate_union_constituent(raw)?;
+            let TypeData::Literal(literal) = store
+                .type_payload(raw)
+                .ok_or(SourceCheckError::LiteralCache(
+                    SourceLiteralCacheError::InvalidCachedLiteral(raw),
+                ))?
+                .data()
+            else {
+                return Err(SourceCheckError::LiteralCache(
+                    SourceLiteralCacheError::InvalidCachedLiteral(raw),
+                ));
+            };
+            Ok(literal.regular_type)
+        }
+        LiteralTreatment::WidenedPrimitive => widened_fresh_literal_type(store, raw),
+    }
+}
+
+fn widened_fresh_literal_type(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+) -> Result<TypeId, SourceCheckError> {
+    let Some(record) = store.type_payload(type_) else {
+        return Err(SourceCheckError::LiteralCache(
+            SourceLiteralCacheError::InvalidCachedLiteral(type_),
+        ));
+    };
+    let TypeData::Literal(literal) = record.data() else {
+        return Ok(type_);
+    };
+    store.validate_union_constituent(type_)?;
+    if literal.fresh_type != Some(type_) || literal.regular_type == type_ {
+        return Ok(type_);
+    }
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or(SourceCheckError::LiteralCache(
+            SourceLiteralCacheError::BootstrapUninitialized,
+        ))?;
+    if record.flags().intersects(TypeFlags::STRING_LITERAL) {
+        Ok(bootstrap.string_type)
+    } else if record.flags().intersects(TypeFlags::NUMBER_LITERAL) {
+        Ok(bootstrap.number_type)
+    } else if record.flags().intersects(TypeFlags::BIG_INT_LITERAL) {
+        Ok(bootstrap.bigint_type)
+    } else if record.flags().intersects(TypeFlags::BOOLEAN_LITERAL) {
+        Ok(bootstrap.boolean_type)
+    } else {
+        Err(SourceCheckError::LiteralCache(
+            SourceLiteralCacheError::InvalidCachedLiteral(type_),
+        ))
     }
 }
 
@@ -1858,6 +2075,7 @@ fn check_expression_type(
     source: SourceFileRef,
     options: CanonicalCheckerOptions,
     diagnostics: &mut CanonicalCheckerDiagnostics,
+    value_types: &HashMap<SemanticSymbolId, TypeId>,
     expression: &PlannedExpression,
     contextual_type: Option<TypeId>,
     deferred: &mut Vec<DeferredAssertion>,
@@ -1871,6 +2089,7 @@ fn check_expression_type(
                 source,
                 options,
                 diagnostics,
+                value_types,
                 inner,
                 contextual_type,
                 deferred,
@@ -1886,6 +2105,7 @@ fn check_expression_type(
                 source,
                 options,
                 diagnostics,
+                value_types,
                 operand,
                 None,
                 deferred,
@@ -1917,6 +2137,7 @@ fn check_expression_type(
                     store,
                     host,
                     global_types,
+                    value_types,
                     expression,
                     contextual_type,
                 )?
@@ -1925,10 +2146,17 @@ fn check_expression_type(
                     store,
                     host,
                     global_types,
+                    value_types,
                     expression,
                 )?
             };
-            execute_expression_types(store, Some(global_types), expression, &prepared)
+            execute_expression_types(
+                store,
+                Some(global_types),
+                value_types,
+                expression,
+                &prepared,
+            )
         }
     }
 }
@@ -2062,12 +2290,13 @@ fn check_planned_assignment(
     source: SourceFileRef,
     options: CanonicalCheckerOptions,
     diagnostics: &mut CanonicalCheckerDiagnostics,
+    value_types: &HashMap<SemanticSymbolId, TypeId>,
     deferred: &mut Vec<DeferredAssertion>,
     target_type_node: NodeRef,
     expression: &PlannedExpression,
     fallback_node: NodeRef,
     assignment_expression: Option<NodeRef>,
-) -> Result<(), SourceCheckError> {
+) -> Result<TypeId, SourceCheckError> {
     let mut statement_diagnostics = CanonicalCheckerDiagnostics::default();
     let target = CanonicalTypeQuery::new_with_global_types(
         store,
@@ -2089,6 +2318,7 @@ fn check_planned_assignment(
         source,
         options,
         diagnostics,
+        value_types,
         expression,
         Some(target),
         deferred,
@@ -2110,6 +2340,165 @@ fn check_planned_assignment(
         )?;
         for diagnostic in staged {
             merge_retry_diagnostic(diagnostics, diagnostic);
+        }
+    }
+    Ok(target)
+}
+
+fn inferred_variable_type(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
+    binding: VariableBindingKind,
+    initializer_type: TypeId,
+) -> Result<TypeId, SourceCheckError> {
+    let initializer_type = if binding.is_const() {
+        initializer_type
+    } else {
+        widened_fresh_literal_type(store, initializer_type)?
+    };
+    store
+        .get_widened_type_with_global_types(initializer_type, global_types)
+        .map_err(Into::into)
+}
+
+fn stage_value_type(
+    store: &CanonicalTypeMapperStore,
+    value_types: &mut HashMap<SemanticSymbolId, TypeId>,
+    value_order: &mut Vec<SemanticSymbolId>,
+    symbol: SemanticSymbolId,
+    expected: TypeId,
+) -> Result<(), SourceCheckError> {
+    if let Some(cached) = store
+        .value_symbol_links(symbol)
+        .and_then(|links| links.resolved_type)
+        && cached != expected
+    {
+        return Err(SourceCheckError::Variable(
+            VariableInvariant::CachedValueTypeMismatch {
+                symbol,
+                cached,
+                expected,
+            },
+        ));
+    }
+    if value_types.insert(symbol, expected).is_some() {
+        return Err(SourceCheckError::Variable(
+            VariableInvariant::DuplicateStagedValueType(symbol),
+        ));
+    }
+    value_order.push(symbol);
+    Ok(())
+}
+
+fn publish_staged_variable_state(
+    store: &mut CanonicalTypeMapperStore,
+    value_types: &HashMap<SemanticSymbolId, TypeId>,
+    value_order: &[SemanticSymbolId],
+    identifier_reads: &[(NodeRef, SemanticSymbolId)],
+) -> Result<(), SourceCheckError> {
+    // Build and validate every eventual setter payload before the first sparse
+    // variable/reference link is published. The store setters below can then
+    // only reject if their validated ownership predicates change in place.
+    let mut seen_values = HashSet::with_capacity(value_order.len());
+    let mut value_publications: Vec<(SemanticSymbolId, ValueSymbolLinks)> =
+        Vec::with_capacity(value_order.len());
+    for &symbol in value_order {
+        if !seen_values.insert(symbol) {
+            return Err(SourceCheckError::Variable(
+                VariableInvariant::DuplicateStagedValueType(symbol),
+            ));
+        }
+        let resolved_type = *value_types.get(&symbol).ok_or(SourceCheckError::Variable(
+            VariableInvariant::MissingStagedValueType(symbol),
+        ))?;
+        if store.symbol(symbol).is_none() || store.type_payload(resolved_type).is_none() {
+            return Err(SourceCheckError::Variable(
+                VariableInvariant::InvalidStagedValueType {
+                    symbol,
+                    type_: resolved_type,
+                },
+            ));
+        }
+        let mut links = store.value_symbol_links(symbol).cloned().unwrap_or_default();
+        if links.write_type.is_some()
+            || links.target.is_some()
+            || links.mapper.is_some()
+            || links.name_type.is_some()
+            || links.containing_type.is_some()
+            || links.function_or_constructor_checked
+        {
+            return Err(SourceCheckError::Variable(
+                VariableInvariant::InvalidValueLinks(symbol),
+            ));
+        }
+        if let Some(cached) = links.resolved_type
+            && cached != resolved_type
+        {
+            return Err(SourceCheckError::Variable(
+                VariableInvariant::CachedValueTypeMismatch {
+                    symbol,
+                    cached,
+                    expected: resolved_type,
+                },
+            ));
+        }
+        links.resolved_type = Some(resolved_type);
+        value_publications.push((symbol, links));
+    }
+    if value_types.len() != seen_values.len() {
+        let symbol = value_types
+            .keys()
+            .copied()
+            .find(|symbol| !seen_values.contains(symbol))
+            .expect("different staged value-map and order lengths imply an extra map key");
+        return Err(SourceCheckError::Variable(
+            VariableInvariant::UnexpectedStagedValueType(symbol),
+        ));
+    }
+
+    let mut seen_reads = HashSet::with_capacity(identifier_reads.len());
+    let mut read_publications: Vec<(NodeRef, SymbolNodeLinks)> =
+        Vec::with_capacity(identifier_reads.len());
+    for &(node, resolved_symbol) in identifier_reads {
+        if !seen_reads.insert(node) {
+            return Err(SourceCheckError::Variable(
+                VariableInvariant::DuplicateIdentifierRead(node),
+            ));
+        }
+        if !store.contains_node_ref(node) || store.symbol(resolved_symbol).is_none() {
+            return Err(SourceCheckError::Variable(
+                VariableInvariant::SymbolNodePublication(node),
+            ));
+        }
+        let mut links = store.symbol_node_links(node).cloned().unwrap_or_default();
+        if links
+            .resolved_symbol
+            .is_some_and(|cached| cached != resolved_symbol)
+        {
+            return Err(SourceCheckError::Variable(
+                VariableInvariant::InvalidSymbolNodeCache {
+                    node,
+                    cached: links.resolved_symbol,
+                    expected: resolved_symbol,
+                },
+            ));
+        }
+        links.resolved_symbol = Some(resolved_symbol);
+        read_publications.push((node, links));
+    }
+
+    for (symbol, links) in value_publications {
+        if !store.set_value_symbol_links(symbol, links) {
+            return Err(SourceCheckError::Variable(
+                VariableInvariant::ValueTypePublication(symbol),
+            ));
+        }
+    }
+    for (node, links) in read_publications {
+        if !store.set_symbol_node_links(node, links) {
+            return Err(SourceCheckError::Variable(
+                VariableInvariant::SymbolNodePublication(node),
+            ));
         }
     }
     Ok(())
@@ -2139,11 +2528,19 @@ pub(super) fn check_source_file(
         return Ok(());
     }
 
-    let plan = SourcePlanner::new_semantic(arena, bound, source, store, host).finish()?;
-    store.prepare_regular_literal_types(&plan.strings, &plan.numbers, &plan.bigints)?;
+    let SourceCheckPlan {
+        statements,
+        identifier_reads,
+        strings,
+        numbers,
+        bigints,
+    } = SourcePlanner::new_semantic(arena, bound, source, store, host).finish()?;
+    store.prepare_regular_literal_types(&strings, &numbers, &bigints)?;
     let mut deferred = Vec::new();
+    let mut value_types = HashMap::new();
+    let mut value_order = Vec::new();
 
-    for statement in plan.statements {
+    for statement in statements {
         match statement {
             PlannedStatement::TypeAlias(symbol) | PlannedStatement::Interface(symbol) => {
                 let mut statement_diagnostics = CanonicalCheckerDiagnostics::default();
@@ -2161,39 +2558,72 @@ pub(super) fn check_source_file(
             PlannedStatement::ExternalModuleMarker => {}
             PlannedStatement::Variables(variables) => {
                 for variable in variables {
-                    check_planned_assignment(
+                    let resolved_type = if let Some(type_node) = variable.type_node {
+                        check_planned_assignment(
+                            store,
+                            host,
+                            global_types,
+                            source,
+                            options,
+                            diagnostics,
+                            &value_types,
+                            &mut deferred,
+                            type_node,
+                            &variable.initializer,
+                            variable.name,
+                            None,
+                        )?
+                    } else {
+                        let initializer = check_expression_type(
+                            store,
+                            host,
+                            global_types,
+                            source,
+                            options,
+                            diagnostics,
+                            &value_types,
+                            &variable.initializer,
+                            None,
+                            &mut deferred,
+                        )?;
+                        inferred_variable_type(
+                            store,
+                            global_types,
+                            variable.binding,
+                            initializer.result,
+                        )?
+                    };
+                    stage_value_type(
                         store,
-                        host,
-                        global_types,
-                        source,
-                        options,
-                        diagnostics,
-                        &mut deferred,
-                        variable.type_node,
-                        &variable.initializer,
-                        variable.name,
-                        None,
+                        &mut value_types,
+                        &mut value_order,
+                        variable.symbol,
+                        resolved_type,
                     )?;
                 }
             }
-            PlannedStatement::Assignment(assignment) => check_planned_assignment(
-                store,
-                host,
-                global_types,
-                source,
-                options,
-                diagnostics,
-                &mut deferred,
-                assignment.target_type_node,
-                &assignment.right,
-                assignment.left,
-                Some(assignment.expression),
-            )?,
+            PlannedStatement::Assignment(assignment) => {
+                check_planned_assignment(
+                    store,
+                    host,
+                    global_types,
+                    source,
+                    options,
+                    diagnostics,
+                    &value_types,
+                    &mut deferred,
+                    assignment.target_type_node,
+                    &assignment.right,
+                    assignment.left,
+                    Some(assignment.expression),
+                )?;
+            }
         }
     }
 
     validate_deferred_assertions(store, source, &deferred)?;
     check_deferred_assertions(store, host, global_types, options, diagnostics, &deferred)?;
+    publish_staged_variable_state(store, &value_types, &value_order, &identifier_reads)?;
 
     Ok(())
 }
@@ -2228,7 +2658,7 @@ mod tests {
     use super::*;
     use crate::semantic::{
         CanonicalCheckerContext, DeclaredTypeHostError, IntrinsicBootstrapOptions,
-        RelationStateSnapshot, TypeNodeUnavailable, ValueSymbolLinks,
+        RelationStateSnapshot, TypeNodeUnavailable,
         object_members::{
             DeclaredPropertyObjectProof, DeclaredPropertyObjectValidation,
             validate_resolved_declared_property_object,
@@ -2319,6 +2749,37 @@ mod tests {
         .unwrap()
     }
 
+    fn context_with_file_module_states<'arena>(
+        files: &[(FileId, &'arena ParseResult, CanonicalModuleState)],
+        options: CanonicalCheckerOptions,
+    ) -> CanonicalCheckerContext<'arena> {
+        let mut binder = CanonicalBinder::new();
+        for &(file, parsed, module_state) in files {
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    source_facts_with_module_state(file, module_state),
+                )
+                .unwrap();
+        }
+        for &(file, parsed, _) in files {
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+        }
+        CanonicalCheckerContext::new(
+            binder.finish(),
+            files
+                .iter()
+                .map(|(file, parsed, _)| (*file, &parsed.arena))
+                .collect(),
+            options,
+        )
+        .unwrap()
+    }
+
     fn context_with_default_library_files<'arena>(
         files: &[(FileId, &'arena ParseResult)],
         default_library_files: &[FileId],
@@ -2376,6 +2837,38 @@ mod tests {
         NodeRef::new(parsed.arena.id(), file, name)
     }
 
+    fn variable_declaration(parsed: &ParseResult, file: FileId, expected: &str) -> NodeRef {
+        let name = variable_name(parsed, file, expected);
+        let declaration = parsed.arena.get(name.node).unwrap().parent.unwrap();
+        NodeRef::new(parsed.arena.id(), file, declaration)
+    }
+
+    fn variable_symbol(
+        context: &CanonicalCheckerContext<'_>,
+        parsed: &ParseResult,
+        file: FileId,
+        expected: &str,
+    ) -> SemanticSymbolId {
+        let declaration = variable_declaration(parsed, file, expected);
+        let (_, bound) = context.file(file).unwrap();
+        let raw = bound.symbol(declaration).unwrap();
+        context.store().get_merged_symbol(raw).unwrap()
+    }
+
+    fn variable_value_type(
+        context: &CanonicalCheckerContext<'_>,
+        parsed: &ParseResult,
+        file: FileId,
+        expected: &str,
+    ) -> TypeId {
+        let symbol = variable_symbol(context, parsed, file, expected);
+        context
+            .store()
+            .value_symbol_links(symbol)
+            .and_then(|links| links.resolved_type)
+            .unwrap_or_else(|| panic!("missing value type for {expected}"))
+    }
+
     fn variable_initializer(parsed: &ParseResult, file: FileId, expected: &str) -> NodeRef {
         let initializer = parsed
             .arena
@@ -2394,6 +2887,35 @@ mod tests {
             })
             .unwrap_or_else(|| panic!("missing initializer for variable {expected}"));
         NodeRef::new(parsed.arena.id(), file, initializer)
+    }
+
+    fn identifier_expressions(
+        parsed: &ParseResult,
+        file: FileId,
+        expected: &str,
+    ) -> Vec<NodeRef> {
+        parsed
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                let NodeData::Identifier(identifier) = &record.data else {
+                    return None;
+                };
+                if identifier.text != expected {
+                    return None;
+                }
+                let is_declaration_name = record
+                    .parent
+                    .and_then(|parent| parsed.arena.get(parent))
+                    .is_some_and(|parent| {
+                        matches!(
+                            &parent.data,
+                            NodeData::VariableDeclaration(variable) if variable.name == node
+                        )
+                    });
+                (!is_declaration_name).then(|| NodeRef::new(parsed.arena.id(), file, node))
+            })
+            .collect()
     }
 
     fn variable_type_node(parsed: &ParseResult, file: FileId, expected: &str) -> NodeRef {
@@ -2615,6 +3137,21 @@ mod tests {
             .is_some_and(|links| links.type_checked)
     }
 
+    fn mark_source_unchecked(context: &mut CanonicalCheckerContext<'_>, file: FileId) {
+        let source = context.source_file(file).unwrap();
+        let mut links = context
+            .store()
+            .source_file_links(source)
+            .cloned()
+            .unwrap();
+        links.type_checked = false;
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_source_file_links(source, links)
+        );
+    }
+
     fn observable_state(
         context: &CanonicalCheckerContext<'_>,
         file: FileId,
@@ -2638,6 +3175,737 @@ mod tests {
             is_type_checked(context, file),
             context.diagnostics().len(),
         )
+    }
+
+    #[test]
+    fn inferred_primitive_variables_publish_const_and_mutable_identities() {
+        let source = parsed(concat!(
+            "const first = 1, sameList = first; ",
+            "let mutableNumber = 2; var varNumber = 3; ",
+            "const text = \"text\"; let mutableText = \"mutable\"; ",
+            "const bigint = 1n; var mutableBigint = 2n; ",
+            "const truth = true; let mutableTruth = false; ",
+            "const constAlias = first; let letAlias = first; var varAlias = first; ",
+            "const annotated: number = 4;",
+        ));
+        let file = FileId::new(200);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let (number, string, bigint, boolean) = {
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            (
+                bootstrap.number_type,
+                bootstrap.string_type,
+                bootstrap.bigint_type,
+                bootstrap.boolean_type,
+            )
+        };
+        let first = variable_value_type(&context, &source, file, "first");
+        assert_eq!(
+            first,
+            resolved_node_type(&context, variable_initializer(&source, file, "first"))
+        );
+        assert_ne!(first, number);
+        assert_eq!(
+            variable_value_type(&context, &source, file, "sameList"),
+            first
+        );
+        assert_eq!(
+            variable_value_type(&context, &source, file, "constAlias"),
+            first
+        );
+        for name in ["mutableNumber", "varNumber", "letAlias", "varAlias", "annotated"] {
+            assert_eq!(variable_value_type(&context, &source, file, name), number);
+        }
+        assert_ne!(
+            resolved_node_type(&context, variable_initializer(&source, file, "annotated")),
+            number
+        );
+        assert_eq!(
+            variable_value_type(&context, &source, file, "text"),
+            resolved_node_type(&context, variable_initializer(&source, file, "text"))
+        );
+        assert_eq!(
+            variable_value_type(&context, &source, file, "mutableText"),
+            string
+        );
+        assert_eq!(
+            variable_value_type(&context, &source, file, "bigint"),
+            resolved_node_type(&context, variable_initializer(&source, file, "bigint"))
+        );
+        assert_eq!(
+            variable_value_type(&context, &source, file, "mutableBigint"),
+            bigint
+        );
+        assert_eq!(
+            variable_value_type(&context, &source, file, "truth"),
+            resolved_node_type(&context, variable_initializer(&source, file, "truth"))
+        );
+        assert_eq!(
+            variable_value_type(&context, &source, file, "mutableTruth"),
+            boolean
+        );
+
+        let first_symbol = variable_symbol(&context, &source, file, "first");
+        let reads = identifier_expressions(&source, file, "first");
+        assert_eq!(reads.len(), 4);
+        for read in reads {
+            assert_eq!(resolved_node_type(&context, read), first);
+            assert_eq!(
+                context
+                    .store()
+                    .symbol_node_links(read)
+                    .and_then(|links| links.resolved_symbol),
+                Some(first_symbol)
+            );
+        }
+        assert!(context.diagnostics().is_empty());
+        assert!(is_type_checked(&context, file));
+
+        let warm = observable_state(&context, file);
+        mark_source_unchecked(&mut context, file);
+        context.check_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn inferred_object_and_array_variables_widen_nested_mutable_locations() {
+        let library = parsed("interface Array<T> {}");
+        let source = parsed(concat!(
+            "interface Exact { value: 1 } const seed = 1; ",
+            "const values = [seed]; const matrix = [[seed]]; ",
+            "const object = { value: seed, nested: { label: \"x\" }, values: [seed] }; ",
+            "let mutableObject = { value: 2 }; ",
+            "const exact: Exact = { value: seed }; ",
+            "const undefined = \"shadow\"; const shadowed = { missing: undefined };",
+        ));
+        let library_file = FileId::new(201);
+        let file = FileId::new(202);
+        let mut context = context_with_file_module_states(
+            &[
+                (library_file, &library, CanonicalModuleState::Script),
+                (file, &source, CanonicalModuleState::External),
+            ],
+            CanonicalCheckerOptions::default(),
+        );
+
+        context.check_source_file(file).unwrap();
+
+        let seed = variable_value_type(&context, &source, file, "seed");
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        let values = variable_initializer(&source, file, "values");
+        let matrix = variable_initializer(&source, file, "matrix");
+        let object = variable_initializer(&source, file, "object");
+        let mutable_object = variable_initializer(&source, file, "mutableObject");
+        let exact = variable_initializer(&source, file, "exact");
+        let shadowed = variable_initializer(&source, file, "shadowed");
+        assert_eq!(
+            context
+                .type_to_string(variable_value_type(&context, &source, file, "values"))
+                .unwrap(),
+            "number[]"
+        );
+        assert_eq!(
+            context
+                .type_to_string(variable_value_type(&context, &source, file, "matrix"))
+                .unwrap(),
+            "number[][]"
+        );
+        assert_ne!(
+            variable_value_type(&context, &source, file, "values"),
+            resolved_node_type(&context, values)
+        );
+        assert_ne!(
+            variable_value_type(&context, &source, file, "matrix"),
+            resolved_node_type(&context, matrix)
+        );
+        assert_ne!(
+            variable_value_type(&context, &source, file, "object"),
+            resolved_node_type(&context, object)
+        );
+        assert_ne!(
+            variable_value_type(&context, &source, file, "mutableObject"),
+            resolved_node_type(&context, mutable_object)
+        );
+        assert_eq!(object_property_type(&context, object, "value"), number);
+        let nested = object_property_initializer(&source, file, object, "nested");
+        assert_eq!(
+            context
+                .type_to_string(object_property_type(&context, nested, "label"))
+                .unwrap(),
+            "string"
+        );
+        assert_eq!(
+            context
+                .type_to_string(object_property_type(&context, object, "values"))
+                .unwrap(),
+            "number[]"
+        );
+        assert_eq!(object_property_type(&context, mutable_object, "value"), number);
+        let TypeData::Literal(seed_literal) = context.store().type_payload(seed).unwrap().data()
+        else {
+            panic!("expected a fresh seed literal")
+        };
+        assert_eq!(
+            object_property_type(&context, exact, "value"),
+            seed_literal.regular_type
+        );
+        assert_eq!(
+            context
+                .type_to_string(object_property_type(&context, shadowed, "missing"))
+                .unwrap(),
+            "string"
+        );
+        for read in identifier_expressions(&source, file, "seed") {
+            assert_eq!(resolved_node_type(&context, read), seed);
+        }
+        assert!(context.diagnostics().is_empty());
+        assert!(is_type_checked(&context, file));
+    }
+
+    #[test]
+    fn exported_inferred_variables_route_reads_through_local_export_symbols() {
+        let source = parsed(concat!(
+            "export const exposed = 1; ",
+            "const localAlias = exposed; export let widened = exposed;",
+        ));
+        let file = FileId::new(203);
+        let mut context = context_with_module_state(
+            &[(file, &source)],
+            CanonicalModuleState::External,
+            CanonicalCheckerOptions::default(),
+        );
+        let exposed_declaration = variable_declaration(&source, file, "exposed");
+        let exposed_local = {
+            let (_, bound) = context.file(file).unwrap();
+            bound.local_symbol(exposed_declaration).unwrap()
+        };
+
+        context.check_source_file(file).unwrap();
+
+        let exposed = variable_symbol(&context, &source, file, "exposed");
+        let exposed_type = variable_value_type(&context, &source, file, "exposed");
+        assert_ne!(exposed_local, exposed);
+        assert_eq!(
+            context
+                .store()
+                .value_symbol_links(exposed_local)
+                .and_then(|links| links.resolved_type),
+            None
+        );
+        assert_eq!(
+            variable_value_type(&context, &source, file, "localAlias"),
+            exposed_type
+        );
+        assert_eq!(
+            variable_value_type(&context, &source, file, "widened"),
+            context.store().intrinsic_bootstrap().unwrap().number_type
+        );
+        let reads = identifier_expressions(&source, file, "exposed");
+        assert_eq!(reads.len(), 2);
+        for read in reads {
+            assert_eq!(resolved_node_type(&context, read), exposed_type);
+            assert_eq!(
+                context
+                    .store()
+                    .symbol_node_links(read)
+                    .and_then(|links| links.resolved_symbol),
+                Some(exposed_local)
+            );
+        }
+        assert!(context.diagnostics().is_empty());
+        assert!(is_type_checked(&context, file));
+    }
+
+    #[test]
+    fn inferred_nullish_variables_follow_strictness_and_exact_auto_type_boundary() {
+        let source = parsed(concat!(
+            "const nil = null; const missing = undefined; ",
+            "let nilAlias = nil; var missingAlias = missing; ",
+            "export let exportedNil = null; export var exportedMissing = undefined;",
+        ));
+        let file = FileId::new(204);
+        let strict_options = CanonicalCheckerOptions {
+            intrinsic: IntrinsicBootstrapOptions {
+                strict_null_checks: true,
+                exact_optional_property_types: false,
+            },
+            ..CanonicalCheckerOptions::default()
+        };
+        let mut strict = context_with_module_state(
+            &[(file, &source)],
+            CanonicalModuleState::External,
+            strict_options,
+        );
+        let mut loose = context_with_module_state(
+            &[(file, &source)],
+            CanonicalModuleState::External,
+            CanonicalCheckerOptions::default(),
+        );
+
+        strict.check_source_file(file).unwrap();
+        loose.check_source_file(file).unwrap();
+
+        let (null, undefined) = {
+            let bootstrap = strict.store().intrinsic_bootstrap().unwrap();
+            (bootstrap.null_type, bootstrap.undefined_type)
+        };
+        for name in ["nil", "nilAlias", "exportedNil"] {
+            assert_eq!(variable_value_type(&strict, &source, file, name), null);
+        }
+        for name in ["missing", "missingAlias", "exportedMissing"] {
+            assert_eq!(
+                variable_value_type(&strict, &source, file, name),
+                undefined
+            );
+        }
+        let any = loose.store().intrinsic_bootstrap().unwrap().any_type;
+        for name in [
+            "nil",
+            "missing",
+            "nilAlias",
+            "missingAlias",
+            "exportedNil",
+            "exportedMissing",
+        ] {
+            assert_eq!(variable_value_type(&loose, &source, file, name), any);
+        }
+
+        // Pinned tsgo-oracle (`typescript-go@dc37b524`, strictNullChecks=true
+        // versus false): direct exported mutable null/undefined infer
+        // null/undefined versus any. With noImplicitAny=true, non-exported
+        // mutable initializers use control-flow autoType even through
+        // parentheses. Canonical options do not retain noImplicitAny yet, so
+        // that exact syntax is fail-closed.
+        for (index, text) in [
+            "const prior = 1; let blocked = null;",
+            "const prior = 1; let blocked = (((null)));",
+            "const prior = 1; var blocked = undefined;",
+            "const prior = 1; var blocked = (((undefined)));",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let blocked = parsed(text);
+            let blocked_file = FileId::new(205 + u32::try_from(index).unwrap());
+            let mut context = context(&[(blocked_file, &blocked)], strict_options);
+            let before = observable_state(&context, blocked_file);
+            assert!(matches!(
+                context.check_source_file(blocked_file),
+                Err(SourceCheckError::Unsupported(
+                    UnsupportedSourceSyntax::Variable(
+                        VariableUnsupported::InferredMutableNullishOption(node)
+                    )
+                )) if node == variable_declaration(&blocked, blocked_file, "blocked")
+            ));
+            assert_eq!(observable_state(&context, blocked_file), before);
+            assert!(
+                context
+                    .store()
+                    .value_symbol_links(variable_symbol(
+                        &context,
+                        &blocked,
+                        blocked_file,
+                        "prior"
+                    ))
+                    .and_then(|links| links.resolved_type)
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn inferred_empty_arrays_follow_strictness_and_exact_evolving_array_boundary() {
+        let library = parsed("interface Array<T> {}");
+        let source = parsed("export const direct = []; const wrapped = ([]);");
+        let library_file = FileId::new(209);
+        let file = FileId::new(210);
+        let strict_options = CanonicalCheckerOptions {
+            intrinsic: IntrinsicBootstrapOptions {
+                strict_null_checks: true,
+                exact_optional_property_types: false,
+            },
+            ..CanonicalCheckerOptions::default()
+        };
+        let files = [
+            (library_file, &library, CanonicalModuleState::Script),
+            (file, &source, CanonicalModuleState::External),
+        ];
+        let mut strict = context_with_file_module_states(
+            &files,
+            strict_options,
+        );
+        let mut loose = context_with_file_module_states(
+            &files,
+            CanonicalCheckerOptions::default(),
+        );
+
+        strict.check_source_file(file).unwrap();
+        loose.check_source_file(file).unwrap();
+
+        for name in ["direct", "wrapped"] {
+            assert_eq!(
+                strict
+                    .type_to_string(variable_value_type(&strict, &source, file, name))
+                    .unwrap(),
+                "never[]"
+            );
+            assert_eq!(
+                loose
+                    .type_to_string(variable_value_type(&loose, &source, file, name))
+                    .unwrap(),
+                "any[]"
+            );
+        }
+
+        // Pinned tsgo-oracle (`typescript-go@dc37b524`): exported direct `=[]`
+        // and non-exported `=([])` are never[] for
+        // strictNullChecks=true,noImplicitAny=false, and any[] for
+        // strictNullChecks=false. Non-exported direct `=[]` becomes an evolving
+        // auto[] when noImplicitAny=true, an option absent from the canonical
+        // checker contract, so only that direct syntax is rejected.
+        let blocked = parsed("const prior = 1; const blocked = [];");
+        let blocked_file = FileId::new(211);
+        let mut context = context(
+            &[(library_file, &library), (blocked_file, &blocked)],
+            strict_options,
+        );
+        let before = observable_state(&context, blocked_file);
+        assert!(matches!(
+            context.check_source_file(blocked_file),
+            Err(SourceCheckError::Unsupported(
+                UnsupportedSourceSyntax::Variable(
+                    VariableUnsupported::InferredEmptyArrayOption(node)
+                )
+            )) if node == variable_declaration(&blocked, blocked_file, "blocked")
+        ));
+        assert_eq!(observable_state(&context, blocked_file), before);
+        assert!(
+            context
+                .store()
+                .value_symbol_links(variable_symbol(
+                    &context,
+                    &blocked,
+                    blocked_file,
+                    "prior"
+                ))
+                .and_then(|links| links.resolved_type)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn inferred_identifier_reads_reject_self_forward_and_cross_file_dependencies() {
+        for (index, (text, name)) in [
+            ("const self = self;", "self"),
+            ("const value = later; const later = 1;", "value"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let source = parsed(text);
+            let file = FileId::new(212 + u32::try_from(index).unwrap());
+            let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+            let read = variable_initializer(&source, file, name);
+            let before = observable_state(&context, file);
+            assert!(matches!(
+                context.check_source_file(file),
+                Err(SourceCheckError::Unsupported(
+                    UnsupportedSourceSyntax::Variable(
+                        VariableUnsupported::IdentifierNotPrior { node, .. }
+                    )
+                )) if node == read
+            ));
+            assert_eq!(observable_state(&context, file), before);
+            assert!(!is_type_checked(&context, file));
+        }
+
+        let dependency = parsed("const shared = 1;");
+        let source = parsed("const value = shared;");
+        let dependency_file = FileId::new(214);
+        let file = FileId::new(215);
+        let mut context = context(
+            &[(dependency_file, &dependency), (file, &source)],
+            CanonicalCheckerOptions::default(),
+        );
+        let read = variable_initializer(&source, file, "value");
+        let declaration = variable_declaration(&dependency, dependency_file, "shared");
+        let before = observable_state(&context, file);
+        assert_eq!(
+            context.check_source_file(file),
+            Err(SourceCheckError::Unsupported(
+                UnsupportedSourceSyntax::Variable(
+                    VariableUnsupported::CrossFileDeclaration {
+                        node: read,
+                        declaration,
+                    }
+                )
+            ))
+        );
+        assert_eq!(observable_state(&context, file), before);
+        assert!(!is_type_checked(&context, file));
+    }
+
+    #[test]
+    fn identifier_reads_requiring_current_flow_types_fail_closed() {
+        // Pinned tsgo-oracle (`typescript-go@dc37b524`) observes the current
+        // flow type, not the declaration/symbol type: fixed and the initial v
+        // read are 1, b is false, and the post-assignment v read is 2. Until
+        // canonical CFA is installed, only unannotated inferred const reads are
+        // admitted by this source slice.
+        let cases = [
+            (
+                "export const fixed: 1 | 2 = 1; export const observed = fixed;",
+                "fixed",
+                "observed",
+            ),
+            (
+                "export let b = false; export const observed = b;",
+                "b",
+                "observed",
+            ),
+            (
+                "export const b: boolean = false; export const observed = b;",
+                "b",
+                "observed",
+            ),
+            (
+                "export var v: 1 | 2 = 1; export const before = v;",
+                "v",
+                "before",
+            ),
+            (
+                "export var v: 1 | 2 = 1; v = 2; export const after = v;",
+                "v",
+                "after",
+            ),
+        ];
+        for (index, (text, target, observer)) in cases.into_iter().enumerate() {
+            let source = parsed(text);
+            let file = FileId::new(217 + u32::try_from(index).unwrap());
+            let mut context = context_with_module_state(
+                &[(file, &source)],
+                CanonicalModuleState::External,
+                CanonicalCheckerOptions::default(),
+            );
+            let node = variable_initializer(&source, file, observer);
+            let symbol = variable_symbol(&context, &source, file, target);
+            let declaration = variable_declaration(&source, file, target);
+            let before = observable_state(&context, file);
+
+            assert_eq!(
+                context.check_source_file(file),
+                Err(SourceCheckError::Unsupported(
+                    UnsupportedSourceSyntax::Variable(
+                        VariableUnsupported::IdentifierRequiresFlowType {
+                            node,
+                            symbol,
+                            declaration,
+                        }
+                    )
+                ))
+            );
+            assert_eq!(observable_state(&context, file), before);
+            assert!(
+                context
+                    .store()
+                    .value_symbol_links(symbol)
+                    .and_then(|links| links.resolved_type)
+                    .is_none()
+            );
+            assert!(!is_type_checked(&context, file));
+        }
+    }
+
+    #[test]
+    fn variable_and_identifier_sparse_links_preflight_atomically_and_retry() {
+        let source = parsed("const first = 1; const second = first; const third = second;");
+        let file = FileId::new(216);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        let first_symbol = variable_symbol(&context, &source, file, "first");
+        let second_symbol = variable_symbol(&context, &source, file, "second");
+        let third_symbol = variable_symbol(&context, &source, file, "third");
+        let first_read = variable_initializer(&source, file, "second");
+        let second_read = variable_initializer(&source, file, "third");
+        let (number, string) = {
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            (bootstrap.number_type, bootstrap.string_type)
+        };
+
+        assert!(context.store_mut_for_test().set_symbol_node_links(
+            second_read,
+            SymbolNodeLinks {
+                resolved_symbol: Some(first_symbol),
+            },
+        ));
+        let poisoned = observable_state(&context, file);
+        assert_eq!(
+            context.check_source_file(file),
+            Err(SourceCheckError::Variable(
+                VariableInvariant::InvalidSymbolNodeCache {
+                    node: second_read,
+                    cached: Some(first_symbol),
+                    expected: second_symbol,
+                }
+            ))
+        );
+        assert_eq!(observable_state(&context, file), poisoned);
+        for symbol in [first_symbol, second_symbol, third_symbol] {
+            assert!(
+                context
+                    .store()
+                    .value_symbol_links(symbol)
+                    .and_then(|links| links.resolved_type)
+                    .is_none()
+            );
+        }
+        assert!(context.store_mut_for_test().set_symbol_node_links(
+            second_read,
+            SymbolNodeLinks::default(),
+        ));
+
+        assert!(context.store_mut_for_test().set_value_symbol_links(
+            third_symbol,
+            ValueSymbolLinks {
+                write_type: Some(number),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        let poisoned = observable_state(&context, file);
+        assert_eq!(
+            context.check_source_file(file),
+            Err(SourceCheckError::Variable(
+                VariableInvariant::InvalidValueLinks(third_symbol)
+            ))
+        );
+        assert_eq!(observable_state(&context, file), poisoned);
+        assert!(context.store_mut_for_test().set_value_symbol_links(
+            third_symbol,
+            ValueSymbolLinks::default(),
+        ));
+
+        assert!(context.store_mut_for_test().set_value_symbol_links(
+            second_symbol,
+            ValueSymbolLinks {
+                resolved_type: Some(string),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        let result = context.check_source_file(file);
+        let expected_second = resolved_node_type(
+            &context,
+            variable_initializer(&source, file, "first"),
+        );
+        assert_eq!(
+            result,
+            Err(SourceCheckError::Variable(
+                VariableInvariant::CachedValueTypeMismatch {
+                    symbol: second_symbol,
+                    cached: string,
+                    expected: expected_second,
+                }
+            ))
+        );
+        assert!(
+            context
+                .store()
+                .value_symbol_links(first_symbol)
+                .and_then(|links| links.resolved_type)
+                .is_none()
+        );
+        assert_eq!(context.store().symbol_node_links(first_read), None);
+        assert_eq!(
+            context
+                .store()
+                .symbol_node_links(second_read)
+                .and_then(|links| links.resolved_symbol),
+            None
+        );
+        assert!(context.store_mut_for_test().set_value_symbol_links(
+            second_symbol,
+            ValueSymbolLinks::default(),
+        ));
+
+        context.check_source_file(file).unwrap();
+        assert_eq!(
+            variable_value_type(&context, &source, file, "second"),
+            expected_second
+        );
+        assert_eq!(
+            context
+                .store()
+                .symbol_node_links(first_read)
+                .and_then(|links| links.resolved_symbol),
+            Some(first_symbol)
+        );
+        assert_eq!(
+            context
+                .store()
+                .symbol_node_links(second_read)
+                .and_then(|links| links.resolved_symbol),
+            Some(second_symbol)
+        );
+
+        let warm = observable_state(&context, file);
+        mark_source_unchecked(&mut context, file);
+        context.check_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+
+        let expected_third_links = context
+            .store()
+            .value_symbol_links(third_symbol)
+            .cloned()
+            .unwrap();
+        mark_source_unchecked(&mut context, file);
+        let mut poisoned_third_links = expected_third_links.clone();
+        poisoned_third_links.write_type = Some(number);
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_value_symbol_links(third_symbol, poisoned_third_links)
+        );
+        let poisoned = observable_state(&context, file);
+        assert_eq!(
+            context.check_source_file(file),
+            Err(SourceCheckError::Variable(
+                VariableInvariant::InvalidValueLinks(third_symbol)
+            ))
+        );
+        assert_eq!(observable_state(&context, file), poisoned);
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_value_symbol_links(third_symbol, expected_third_links)
+        );
+
+        assert!(context.store_mut_for_test().set_symbol_node_links(
+            second_read,
+            SymbolNodeLinks {
+                resolved_symbol: Some(first_symbol),
+            },
+        ));
+        let poisoned = observable_state(&context, file);
+        assert_eq!(
+            context.check_source_file(file),
+            Err(SourceCheckError::Variable(
+                VariableInvariant::InvalidSymbolNodeCache {
+                    node: second_read,
+                    cached: Some(first_symbol),
+                    expected: second_symbol,
+                }
+            ))
+        );
+        assert_eq!(observable_state(&context, file), poisoned);
+        assert!(context.store_mut_for_test().set_symbol_node_links(
+            second_read,
+            SymbolNodeLinks {
+                resolved_symbol: Some(second_symbol),
+            },
+        ));
+        context.check_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
     }
 
     #[test]
@@ -6072,7 +7340,7 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_object_forms_and_shadowed_undefined_fail_before_writes() {
+    fn unsupported_object_forms_fail_before_writes() {
         let cases = [
             (
                 r#"const property: string = "ok"; const value: any = { property };"#,
@@ -6089,10 +7357,6 @@ mod tests {
             (
                 "const value: any = { ['property']: 1 };",
                 SourceSyntaxRole::ObjectProperty,
-            ),
-            (
-                r#"const undefined: string = "shadow"; const value: any = { missing: undefined };"#,
-                SourceSyntaxRole::VariableInitializer,
             ),
         ];
         for (index, (text, role)) in cases.into_iter().enumerate() {

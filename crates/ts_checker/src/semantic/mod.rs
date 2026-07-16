@@ -37,6 +37,7 @@ mod store;
 pub mod type_nodes;
 pub mod type_records;
 pub mod types;
+mod variables;
 
 pub use ts_binder::{AstScope, SemanticStoreId, SemanticSymbolId, SymbolTableId};
 
@@ -108,6 +109,7 @@ pub use source::{
     SourceAssertionError, SourceCheckError, SourceCheckProvenanceError, SourceLiteralCacheError,
     SourceObjectLiteralError, SourceSyntaxRole, UnsupportedSourceSyntax,
 };
+pub use variables::{VariableInvariant, VariableUnsupported};
 pub use store::SemanticStore;
 pub use type_nodes::TypeNodeUnavailable;
 pub use type_records::{CacheHashKey, CanonicalSemanticStore, TypeData, TypeDataKind, TypeRecord};
