@@ -51,6 +51,7 @@ pub(super) struct CanonicalTypeQueryOptions {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct CanonicalTypeReferenceAliasTarget {
     reference: NodeRef,
+    binding_declaration: NodeRef,
     alias: SemanticSymbolId,
     target: SemanticSymbolId,
 }
@@ -59,11 +60,13 @@ impl CanonicalTypeReferenceAliasTarget {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(super) const fn new(
         reference: NodeRef,
+        binding_declaration: NodeRef,
         alias: SemanticSymbolId,
         target: SemanticSymbolId,
     ) -> Self {
         Self {
             reference,
+            binding_declaration,
             alias,
             target,
         }
@@ -2282,6 +2285,14 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         let cached_syntax_contains_builtin_array = cached_type.is_some()
             && self.type_node_contains_builtin_array_reference(node, &mut HashSet::new())?;
         let exact_import = self.type_reference_alias_targets.get(&node).copied();
+        let cached_symbol = self
+            .store
+            .symbol_node_links(node)
+            .and_then(|links| links.resolved_symbol);
+
+        if exact_import.is_none() && (cached_type.is_some() || cached_symbol.is_some()) {
+            self.reject_cached_import_alias_without_capability(node, name, &identifier.text)?;
+        }
 
         if !union_constituent
             && exact_import.is_none()
@@ -2296,10 +2307,6 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             return Ok(());
         }
 
-        let cached_symbol = self
-            .store
-            .symbol_node_links(node)
-            .and_then(|links| links.resolved_symbol);
         let possible_global_array_name = self.array_targets.is_some()
             && matches!(identifier.text.as_str(), "Array" | "ReadonlyArray");
         let symbol = if let Some(capability) = exact_import {
@@ -2907,6 +2914,17 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         if capability.reference != node {
             return Err(invalid());
         }
+        let alias_record = self.store.symbol(capability.alias).ok_or_else(&invalid)?;
+        if !capability
+            .binding_declaration
+            .is_for(capability.reference.arena, capability.reference.file)
+            || !self.store.contains_node_ref(capability.binding_declaration)
+            || alias_record.flags() != SymbolFlags::ALIAS
+            || alias_record.declarations() != Some(&[capability.binding_declaration])
+            || self.store.get_merged_symbol(capability.alias) != Some(capability.alias)
+        {
+            return Err(invalid());
+        }
         let (arena, bound) = self.host.source(node).ok_or({
             DeclaredTypeError::Unavailable(DeclaredTypeUnavailable::MissingOrForeignFacts(node))
         })?;
@@ -2942,11 +2960,11 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             .alias_symbol_links(capability.alias)
             .ok_or_else(&invalid)?;
         if target != capability.target
-            || !target_flags.intersects(SymbolFlags::TYPE_ALIAS | SymbolFlags::INTERFACE)
-            || target_flags.intersects(SymbolFlags::ALIAS)
+            || (target_flags != SymbolFlags::TYPE_ALIAS
+                && target_flags != SymbolFlags::INTERFACE)
             || alias_links.immediate_target != Some(target)
             || alias_links.alias_target != super::AliasTargetState::Resolved(target)
-            || alias_links.type_only_declaration.is_none()
+            || alias_links.type_only_declaration != Some(capability.binding_declaration)
         {
             return Err(invalid());
         }
@@ -2967,6 +2985,42 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             }
         }
         Ok(target)
+    }
+
+    fn reject_cached_import_alias_without_capability(
+        &self,
+        node: NodeRef,
+        name: NodeRef,
+        name_text: &str,
+    ) -> Result<(), DeclaredTypeError> {
+        let (arena, bound) = self.host.source(node).ok_or({
+            DeclaredTypeError::Unavailable(DeclaredTypeUnavailable::MissingOrForeignFacts(node))
+        })?;
+        let mut callback_host = self.host.name_resolver_host(self.store)?;
+        let resolved = CanonicalNameResolver::new(
+            arena,
+            bound,
+            self.store.symbol_store(),
+            &mut callback_host,
+        )?
+        .resolve(
+            Some(CanonicalResolutionLocation::Bound(name)),
+            name_text,
+            SymbolFlags::TYPE,
+            None,
+            true,
+            false,
+        );
+        match resolved {
+            Err(CanonicalNameResolutionError::AliasResolutionUnavailable(alias)) => {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::ImportAliasTypeReference { node, alias },
+                ));
+            }
+            Err(error) => return Err(error.into()),
+            Ok(_) => {}
+        }
+        Ok(())
     }
 
     fn resolve_uncached_type_reference_symbol(
@@ -3539,6 +3593,10 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
     ) -> Result<Self, DeclaredTypeError> {
         for capability in targets {
             let alias_flags = self.symbol_flags(capability.alias)?;
+            let alias_declarations = self
+                .store
+                .symbol(capability.alias)
+                .and_then(|symbol| symbol.declarations());
             let target = self.canonical_symbol(capability.target)?;
             let target_flags = self.symbol_flags(target)?;
             let links = self
@@ -3552,13 +3610,19 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                     })
                 })?;
             if !self.store.contains_node_ref(capability.reference)
+                || !capability
+                    .binding_declaration
+                    .is_for(capability.reference.arena, capability.reference.file)
+                || !self.store.contains_node_ref(capability.binding_declaration)
                 || alias_flags != SymbolFlags::ALIAS
+                || alias_declarations != Some(&[capability.binding_declaration])
+                || self.store.get_merged_symbol(capability.alias) != Some(capability.alias)
                 || target != capability.target
-                || !target_flags.intersects(SymbolFlags::TYPE_ALIAS | SymbolFlags::INTERFACE)
-                || target_flags.intersects(SymbolFlags::ALIAS)
+                || (target_flags != SymbolFlags::TYPE_ALIAS
+                    && target_flags != SymbolFlags::INTERFACE)
                 || links.immediate_target != Some(target)
                 || links.alias_target != super::AliasTargetState::Resolved(target)
-                || links.type_only_declaration.is_none()
+                || links.type_only_declaration != Some(capability.binding_declaration)
             {
                 return Err(type_node_unavailable(
                     TypeNodeUnavailable::InvalidImportAliasTarget {

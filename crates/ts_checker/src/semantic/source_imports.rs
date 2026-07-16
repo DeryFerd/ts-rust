@@ -195,6 +195,7 @@ pub(super) enum SourceImportInvariant {
     },
     InvalidAliasLinks(SemanticSymbolId),
     InvalidIdentifierCache(NodeRef),
+    InvalidTypeReferenceCache(NodeRef),
     ReadBindingMismatch(NodeRef),
     InvalidTargetSymbol(SemanticSymbolId),
     TargetNameMismatch {
@@ -272,6 +273,7 @@ impl SourceImportError {
                 | SourceImportInvariant::AliasNameMismatch { name: node, .. }
                 | SourceImportInvariant::TargetNameMismatch { name: node, .. }
                 | SourceImportInvariant::InvalidIdentifierCache(node)
+                | SourceImportInvariant::InvalidTypeReferenceCache(node)
                 | SourceImportInvariant::ReadBindingMismatch(node) => Some(node),
                 SourceImportInvariant::AliasDeclarationMismatch { declaration, .. } => {
                     Some(declaration)
@@ -585,20 +587,23 @@ fn plan_top_level_named_import(
         let alias_symbol = bound
             .symbol(binding)
             .ok_or_else(|| invariant(SourceImportInvariant::MissingAliasSymbol(binding)))?;
-        validate_alias_symbol(store, alias_symbol, binding, local_name, &local_text)?;
-        if !aliases.insert(alias_symbol) {
-            return Err(invariant(SourceImportInvariant::DuplicateAlias(
-                alias_symbol,
-            )));
-        }
-        if !local_names.insert(local_text.clone()) {
-            return Err(invariant(SourceImportInvariant::DuplicateLocalName(
-                local_name,
-            )));
-        }
-        match phase {
-            SourceImportPhase::Value => preflight_alias_value_links(store, alias_symbol)?,
-            SourceImportPhase::Type => preflight_type_import_value_links(store, alias_symbol)?,
+        if phase == SourceImportPhase::Type {
+            if !local_names.insert(local_text.clone()) || !aliases.insert(alias_symbol) {
+                return Err(unsupported(SourceImportUnsupported::Binding(binding)));
+            }
+        } else {
+            validate_alias_symbol(store, alias_symbol, binding, local_name, &local_text)?;
+            if !aliases.insert(alias_symbol) {
+                return Err(invariant(SourceImportInvariant::DuplicateAlias(
+                    alias_symbol,
+                )));
+            }
+            if !local_names.insert(local_text.clone()) {
+                return Err(invariant(SourceImportInvariant::DuplicateLocalName(
+                    local_name,
+                )));
+            }
+            preflight_alias_value_links(store, alias_symbol)?;
         }
         bindings.push(SourceImportBindingPlan {
             declaration: binding,
@@ -608,6 +613,19 @@ fn plan_top_level_named_import(
             local_text,
             alias_symbol,
         });
+    }
+
+    if phase == SourceImportPhase::Type {
+        for binding in &bindings {
+            validate_alias_symbol(
+                store,
+                binding.alias_symbol,
+                binding.declaration,
+                binding.local_name,
+                &binding.local_text,
+            )?;
+            preflight_type_import_value_links(store, binding.alias_symbol)?;
+        }
     }
 
     Ok(SourceImportPlan {
@@ -722,7 +740,7 @@ fn resolve_source_import_binding_phase(
         binding.local_name,
         &binding.local_text,
     )?;
-    if !store.ensure_alias_symbol_links(binding.alias_symbol) {
+    if phase == SourceImportPhase::Type && !store.ensure_alias_symbol_links(binding.alias_symbol) {
         return Err(invariant(SourceImportInvariant::InvalidAliasLinks(
             binding.alias_symbol,
         )));
@@ -864,6 +882,11 @@ pub(super) fn plan_source_type_import_reference(
     reference: NodeRef,
 ) -> Result<CanonicalTypeReferenceAliasTarget, SourceImportError> {
     let binding = &resolved.binding;
+    if !reference.is_for(binding.declaration.arena, binding.declaration.file) {
+        return Err(unsupported(SourceImportUnsupported::TypeReference(
+            reference,
+        )));
+    }
     validate_resolved_type_import(store, host, resolved)?;
     let (arena, bound) = host
         .source(reference)
@@ -915,7 +938,7 @@ pub(super) fn plan_source_type_import_reference(
         Err(CanonicalNameResolutionError::AliasResolutionUnavailable(alias))
             if alias == binding.alias_symbol
     ) {
-        return Err(invariant(SourceImportInvariant::ReadBindingMismatch(
+        return Err(unsupported(SourceImportUnsupported::TypeReference(
             reference,
         )));
     }
@@ -928,9 +951,42 @@ pub(super) fn plan_source_type_import_reference(
             reference,
         )));
     }
+    if let Some(links) = store.type_node_links(reference) {
+        let target_type = match store
+            .symbol(resolved.target_symbol)
+            .ok_or_else(|| {
+                invariant(SourceImportInvariant::InvalidTargetSymbol(
+                    resolved.target_symbol,
+                ))
+            })?
+            .flags()
+        {
+            SymbolFlags::TYPE_ALIAS => store
+                .type_alias_links(resolved.target_symbol)
+                .and_then(|links| links.declared_type),
+            SymbolFlags::INTERFACE => store
+                .declared_type_links(resolved.target_symbol)
+                .and_then(|links| links.declared_type),
+            _ => {
+                return Err(invariant(SourceImportInvariant::InvalidTargetSymbol(
+                    resolved.target_symbol,
+                )));
+            }
+        };
+        if links.outer_type_parameters.is_some()
+            || links
+                .resolved_type
+                .is_some_and(|cached| target_type != Some(cached))
+        {
+            return Err(invariant(SourceImportInvariant::InvalidTypeReferenceCache(
+                reference,
+            )));
+        }
+    }
 
     Ok(CanonicalTypeReferenceAliasTarget::new(
         reference,
+        binding.declaration,
         binding.alias_symbol,
         resolved.target_symbol,
     ))
@@ -2098,6 +2154,14 @@ mod tests {
         resolved: &ResolvedSourceTypeImportBinding,
         reference: NodeRef,
     ) -> CanonicalTypeReferenceAliasTarget {
+        try_plan_type_reference_capability(fixture, resolved, reference).unwrap()
+    }
+
+    fn try_plan_type_reference_capability(
+        fixture: &Fixture,
+        resolved: &ResolvedSourceTypeImportBinding,
+        reference: NodeRef,
+    ) -> Result<CanonicalTypeReferenceAliasTarget, SourceImportError> {
         let sources = || {
             fixture.files.iter().map(|file| {
                 (
@@ -2115,7 +2179,6 @@ mod tests {
         )
         .unwrap();
         plan_source_type_import_reference(&fixture.store, &declared_host, resolved, reference)
-            .unwrap()
     }
 
     fn query_imported_type(
@@ -2152,6 +2215,51 @@ mod tests {
         )?
         .with_type_reference_alias_targets([capability])?
         .get_type_from_type_node(reference)
+    }
+
+    fn query_type_without_import_capability(
+        fixture: &mut Fixture,
+        reference: NodeRef,
+    ) -> Result<TypeId, DeclaredTypeError> {
+        let Fixture {
+            files,
+            bound,
+            global_types,
+            store,
+            ..
+        } = fixture;
+        let sources = || {
+            files.iter().map(|file| {
+                (
+                    &file.parsed.arena,
+                    bound.get(&file.file).expect("fixture bound every file"),
+                )
+            })
+        };
+        let declared_host = DeclaredTypeHost::new_after_global_merge(
+            sources(),
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        CanonicalTypeQuery::new_with_global_types(
+            store,
+            &declared_host,
+            global_types,
+            CanonicalCheckerOptions::default(),
+            &mut CanonicalCheckerDiagnostics::default(),
+        )?
+        .get_type_from_type_node(reference)
+    }
+
+    fn store_state(
+        store: &CanonicalTypeMapperStore,
+    ) -> (usize, usize, [usize; 26], (usize, usize, usize, u64)) {
+        (
+            store.type_len(),
+            store.mapper_len(),
+            store.checker_link_allocated_lengths(),
+            store.type_resolution_internal_state(),
+        )
     }
 
     fn query_declared_type(
@@ -2332,6 +2440,234 @@ mod tests {
             query_imported_type(&mut fixture, reference, warm_capability).unwrap(),
             imported
         );
+    }
+
+    #[test]
+    fn warmed_imported_type_still_requires_its_exact_capability() {
+        let mut fixture = fixture(
+            &[
+                r#"
+                    import type { User } from "./target";
+                    const user: User = { id: 1 };
+                "#,
+                r"export type User = { id: number };",
+            ],
+            &[Route {
+                source: 0,
+                specifier: 0,
+                target: Some(1),
+            }],
+        );
+        let plan = fixture.plan_type_import(0, 0);
+        let reference = type_reference(&fixture, 0, "User");
+        let resolved = resolve_all_types(&mut fixture, &plan.bindings).unwrap();
+        let capability = plan_type_reference_capability(&fixture, &resolved[0], reference);
+        query_imported_type(&mut fixture, reference, capability).unwrap();
+
+        let before = store_state(&fixture.store);
+        assert!(matches!(
+            query_type_without_import_capability(&mut fixture, reference),
+            Err(DeclaredTypeError::TypeNodeUnavailable(
+                super::super::type_nodes::TypeNodeUnavailable::ImportAliasTypeReference {
+                    node,
+                    alias,
+                }
+            )) if node == reference && alias == plan.bindings[0].alias_symbol
+        ));
+        assert_eq!(store_state(&fixture.store), before);
+    }
+
+    #[test]
+    fn minted_type_import_capability_rejects_a_foreign_type_only_marker() {
+        let mut fixture = fixture(
+            &[
+                r#"
+                    import type { User } from "./target";
+                    const user: User = { id: 1 };
+                "#,
+                r"export type User = { id: number };",
+            ],
+            &[Route {
+                source: 0,
+                specifier: 0,
+                target: Some(1),
+            }],
+        );
+        let plan = fixture.plan_type_import(0, 0);
+        let reference = type_reference(&fixture, 0, "User");
+        let resolved = resolve_all_types(&mut fixture, &plan.bindings).unwrap();
+        let capability = plan_type_reference_capability(&fixture, &resolved[0], reference);
+        let alias = plan.bindings[0].alias_symbol;
+        let mut links = fixture.store.alias_symbol_links(alias).unwrap().clone();
+        links.type_only_declaration = Some(resolved[0].target_declaration);
+        assert!(fixture.store.set_alias_symbol_links(alias, links));
+
+        let before = store_state(&fixture.store);
+        assert!(matches!(
+            query_imported_type(&mut fixture, reference, capability),
+            Err(DeclaredTypeError::TypeNodeUnavailable(
+                super::super::type_nodes::TypeNodeUnavailable::InvalidImportAliasTarget {
+                    node,
+                    alias: failed_alias,
+                    target,
+                }
+            )) if node == reference
+                && failed_alias == alias
+                && target == resolved[0].target_symbol
+        ));
+        assert_eq!(store_state(&fixture.store), before);
+    }
+
+    #[test]
+    fn warm_reference_requires_an_equal_preexisting_target_cache_before_query() {
+        let mut fixture = fixture(
+            &[
+                r#"
+                    import type { User } from "./target";
+                    const user: User = { id: 1 };
+                "#,
+                r"export type User = { id: number };",
+            ],
+            &[Route {
+                source: 0,
+                specifier: 0,
+                target: Some(1),
+            }],
+        );
+        let plan = fixture.plan_type_import(0, 0);
+        let reference = type_reference(&fixture, 0, "User");
+        let resolved = resolve_all_types(&mut fixture, &plan.bindings).unwrap();
+        let target = resolved[0].target_symbol;
+        let (number_type, string_type) = {
+            let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+            (bootstrap.number_type, bootstrap.string_type)
+        };
+        assert_eq!(
+            fixture
+                .store
+                .type_alias_links(target)
+                .and_then(|links| links.declared_type),
+            None
+        );
+        assert!(fixture.store.set_type_node_links(
+            reference,
+            TypeNodeLinks {
+                resolved_type: Some(number_type),
+                outer_type_parameters: None,
+            },
+        ));
+
+        let before = store_state(&fixture.store);
+        let alias_links = fixture
+            .store
+            .alias_symbol_links(plan.bindings[0].alias_symbol)
+            .cloned();
+        let reference_links = fixture.store.type_node_links(reference).cloned();
+        let reference_symbol_links = fixture.store.symbol_node_links(reference).cloned();
+        assert_eq!(
+            try_plan_type_reference_capability(&fixture, &resolved[0], reference),
+            Err(SourceImportError::Invariant(
+                SourceImportInvariant::InvalidTypeReferenceCache(reference)
+            ))
+        );
+        assert_eq!(store_state(&fixture.store), before);
+        assert_eq!(
+            fixture
+                .store
+                .alias_symbol_links(plan.bindings[0].alias_symbol),
+            alias_links.as_ref()
+        );
+        assert_eq!(
+            fixture.store.type_node_links(reference),
+            reference_links.as_ref()
+        );
+        assert_eq!(
+            fixture.store.symbol_node_links(reference),
+            reference_symbol_links.as_ref()
+        );
+        assert_eq!(fixture.store.type_alias_links(target), None);
+
+        let mut target_links = fixture
+            .store
+            .type_alias_links(target)
+            .cloned()
+            .unwrap_or_default();
+        target_links.declared_type = Some(string_type);
+        assert!(fixture.store.set_type_alias_links(target, target_links));
+        let before_mismatch = store_state(&fixture.store);
+        assert_eq!(
+            try_plan_type_reference_capability(&fixture, &resolved[0], reference),
+            Err(SourceImportError::Invariant(
+                SourceImportInvariant::InvalidTypeReferenceCache(reference)
+            ))
+        );
+        assert_eq!(store_state(&fixture.store), before_mismatch);
+        assert_eq!(
+            fixture
+                .store
+                .type_alias_links(target)
+                .and_then(|links| links.declared_type),
+            Some(string_type)
+        );
+    }
+
+    #[test]
+    fn shadowed_same_text_type_reference_is_an_unsupported_import_use() {
+        let mut fixture = fixture(
+            &[
+                r#"
+                    import type { User } from "./target";
+                    function shadow<User>(value: User): void {}
+                "#,
+                r"export type User = { id: number };",
+            ],
+            &[Route {
+                source: 0,
+                specifier: 0,
+                target: Some(1),
+            }],
+        );
+        let plan = fixture.plan_type_import(0, 0);
+        let reference = type_reference(&fixture, 0, "User");
+        let resolved = resolve_all_types(&mut fixture, &plan.bindings).unwrap();
+        assert_eq!(
+            try_plan_type_reference_capability(&fixture, &resolved[0], reference),
+            Err(SourceImportError::Unsupported(
+                SourceImportUnsupported::TypeReference(reference)
+            ))
+        );
+    }
+
+    #[test]
+    fn duplicate_local_named_type_import_is_a_typed_unsupported_boundary() {
+        let fixture = fixture(
+            &[
+                r#"import type { User as Local, User as Local } from "./target";"#,
+                r"export type User = { id: number };",
+            ],
+            &[],
+        );
+        let file = &fixture.files[0];
+        let bound = fixture.bound.get(&file.file).unwrap();
+        let declaration = file
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ImportDeclaration).then_some(node)
+            })
+            .unwrap();
+        assert!(matches!(
+            plan_top_level_named_type_import(
+                &file.parsed.arena,
+                bound,
+                &fixture.store,
+                NodeRef::new(file.parsed.arena.id(), file.file, declaration),
+            ),
+            Err(SourceImportError::Unsupported(
+                SourceImportUnsupported::Binding(_)
+            ))
+        ));
     }
 
     #[test]
@@ -2659,6 +2995,8 @@ mod tests {
         );
         let plan = fixture.plan_import(0, 0);
         let alias = plan.bindings[0].alias_symbol;
+        assert_eq!(fixture.store.alias_symbol_links(alias), None);
+        let before = store_state(&fixture.store);
         let error = resolve_all(&mut fixture, &plan.bindings).unwrap_err();
         assert!(matches!(
             error,
@@ -2667,7 +3005,9 @@ mod tests {
                 reason: super::super::alias::CanonicalAliasTargetUnavailable::ModuleResolutionUnresolved(_),
             }) if failed == alias
         ));
+        assert_eq!(fixture.store.alias_symbol_links(alias), None);
         assert_eq!(fixture.store.value_symbol_links(alias), None);
+        assert_eq!(store_state(&fixture.store), before);
     }
 
     #[test]
