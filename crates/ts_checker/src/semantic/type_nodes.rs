@@ -29,6 +29,10 @@ use super::{
         create_type_from_generic_global_type, preflight_generic_global_type_target,
         validate_generic_global_type_instantiation,
     },
+    indexed_access_types::{
+        ConcreteIndexedAccessError, ConcreteIndexedAccessPlan, finish_concrete_indexed_access,
+        plan_concrete_indexed_access,
+    },
     object_members::{self, PropertyObjectError, PropertyObjectPlan, PropertyObjectState},
     signatures::Signature,
     source_callables::{
@@ -165,6 +169,8 @@ pub enum TypeNodeUnavailable {
     UnsupportedUnionConstituentType(TypeId),
     InvalidCachedUnionType(TypeId),
     InvalidCachedArrayType(TypeId),
+    InvalidIndexedAccessType(NodeRef),
+    MissingPlannedIndexedAccessType(NodeRef),
     InvalidFunctionType(NodeRef),
     InvalidFunctionSignature(SignatureId),
     InvalidUnionAlias(SemanticSymbolId),
@@ -222,6 +228,7 @@ enum PlannedLiteralType {
 #[derive(Debug, Default)]
 struct TypeQueryPlan {
     arrays: BTreeMap<NodeRef, PlannedArrayType>,
+    indexed_accesses: BTreeMap<NodeRef, ConcreteIndexedAccessPlan>,
     aliases: BTreeMap<SemanticSymbolId, TypeAliasPlan>,
     references: BTreeMap<NodeRef, PlannedTypeReference>,
     literals: BTreeMap<NodeRef, PlannedLiteralType>,
@@ -284,6 +291,7 @@ enum CachedTypeAliasRhs {
     TypeReference(NodeRef),
     TypeLiteral(NodeRef),
     FunctionType(NodeRef),
+    IndexedAccess(NodeRef),
     NonUnion,
 }
 
@@ -317,6 +325,32 @@ fn property_object_error(error: PropertyObjectError) -> DeclaredTypeError {
         }
         PropertyObjectError::Capacity(_) => {
             type_node_unavailable(TypeNodeUnavailable::LiteralTypeCapacity)
+        }
+    }
+}
+
+fn indexed_access_error(error: ConcreteIndexedAccessError, root: NodeRef) -> DeclaredTypeError {
+    match error {
+        ConcreteIndexedAccessError::DeclaredType(error) => error,
+        ConcreteIndexedAccessError::PropertyObject(error) => property_object_error(error),
+        ConcreteIndexedAccessError::LiteralCache(error) => type_construction_error(error),
+        ConcreteIndexedAccessError::InvalidSyntax(node)
+        | ConcreteIndexedAccessError::InvalidCache(node) => {
+            type_node_unavailable(TypeNodeUnavailable::InvalidIndexedAccessType(node))
+        }
+        ConcreteIndexedAccessError::InvalidType(_) => {
+            type_node_unavailable(TypeNodeUnavailable::InvalidIndexedAccessType(root))
+        }
+        ConcreteIndexedAccessError::UnsupportedObject(_)
+        | ConcreteIndexedAccessError::UnsupportedIndex(_)
+        | ConcreteIndexedAccessError::UnsupportedObjectSurface(_)
+        | ConcreteIndexedAccessError::OptionalProperty { .. }
+        | ConcreteIndexedAccessError::MissingProperty(_)
+        | ConcreteIndexedAccessError::MissingIndexSignature(_) => {
+            type_node_unavailable(TypeNodeUnavailable::UnsupportedSyntax {
+                node: root,
+                kind: SyntaxKind::IndexedAccessType,
+            })
         }
     }
 }
@@ -887,9 +921,15 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             SyntaxKind::TypeLiteral if union_constituent => Err(type_node_unavailable(
                 TypeNodeUnavailable::UnsupportedUnionConstituent(node),
             )),
+            SyntaxKind::IndexedAccessType if union_constituent => Err(type_node_unavailable(
+                TypeNodeUnavailable::UnsupportedUnionConstituent(node),
+            )),
             SyntaxKind::ArrayType => self.plan_array_type(node, alias_owner),
             SyntaxKind::TypeLiteral => self.plan_property_type_literal(node, alias_owner),
             SyntaxKind::FunctionType => self.plan_function_type(node, alias_owner),
+            SyntaxKind::IndexedAccessType => {
+                self.plan_concrete_indexed_access_type(node, alias_owner)
+            }
             SyntaxKind::TypeReference => {
                 self.plan_type_reference(node, alias_owner, union_constituent)
             }
@@ -1182,8 +1222,17 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 },
             ));
         }
-        let planned = object_members::plan_type_literal(self.store, self.host, node, alias_owner)
-            .map_err(property_object_error)?;
+        let indexed_object_plan = self
+            .plan
+            .indexed_accesses
+            .values()
+            .find(|indexed| indexed.object_literal() == node)
+            .map(|indexed| indexed.object_plan().clone());
+        let planned = match indexed_object_plan {
+            Some(planned) if alias_owner.is_none() => planned,
+            _ => object_members::plan_type_literal(self.store, self.host, node, alias_owner)
+                .map_err(property_object_error)?,
+        };
         if let Some(existing) = self.plan.type_literals.get(&node) {
             return if existing == &planned {
                 Ok(())
@@ -1234,6 +1283,41 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             );
         }
         result
+    }
+
+    fn plan_concrete_indexed_access_type(
+        &mut self,
+        node: NodeRef,
+        alias_owner: Option<SemanticSymbolId>,
+    ) -> Result<(), DeclaredTypeError> {
+        if let Some(alias) = alias_owner
+            && self
+                .plan
+                .aliases
+                .get(&alias)
+                .is_some_and(|plan| !plan.type_parameters.is_empty())
+        {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::GenericReferenceUnsupported {
+                    node,
+                    symbol: alias,
+                },
+            ));
+        }
+        let planned = plan_concrete_indexed_access(self.store, self.host, node)
+            .map_err(|error| indexed_access_error(error, node))?;
+        if let Some(existing) = self.plan.indexed_accesses.get(&node) {
+            return if existing == &planned {
+                Ok(())
+            } else {
+                Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidIndexedAccessType(node),
+                ))
+            };
+        }
+        self.plan.indexed_accesses.insert(node, planned.clone());
+        self.plan_type_node_in_context(planned.object(), None, false)?;
+        self.plan_type_node_in_context(planned.index(), None, false)
     }
 
     fn plan_function_type(
@@ -1518,6 +1602,9 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                     SyntaxKind::TypeReference => CachedTypeAliasRhs::TypeReference(type_node),
                     SyntaxKind::TypeLiteral => CachedTypeAliasRhs::TypeLiteral(type_node),
                     SyntaxKind::FunctionType => CachedTypeAliasRhs::FunctionType(type_node),
+                    SyntaxKind::IndexedAccessType => {
+                        CachedTypeAliasRhs::IndexedAccess(type_node)
+                    }
                     _ => CachedTypeAliasRhs::NonUnion,
                 });
             }
@@ -1678,6 +1765,20 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                             .and_then(|links| links.resolved_type)
                             != Some(declared_type)
                         || !matches!(declared_data, Some(TypeData::Object(_)))
+                    {
+                        return Err(type_node_unavailable(
+                            TypeNodeUnavailable::InvalidCachedTypeAlias(root_symbol),
+                        ));
+                    }
+                    return Ok(());
+                }
+                CachedTypeAliasRhs::IndexedAccess(indexed_access) => {
+                    if !missing_generic_metadata.is_empty()
+                        || self
+                            .store
+                            .type_node_links(indexed_access)
+                            .and_then(|links| links.resolved_type)
+                            != Some(declared_type)
                     {
                         return Err(type_node_unavailable(
                             TypeNodeUnavailable::InvalidCachedTypeAlias(root_symbol),
@@ -3451,6 +3552,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             || cached_pending_function
             || self.direct_type_literal_rhs(type_node)?
             || self.direct_function_type_rhs(type_node)?
+            || self.direct_indexed_access_rhs(type_node)?
             || self.type_node_contains_builtin_array_reference(type_node, &mut HashSet::new())?
         {
             self.plan_type_node_in_context(type_node, Some(symbol), union_constituent)?;
@@ -3500,6 +3602,27 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                     )?;
                 }
                 contains
+            }
+            NodeData::IndexedAccessTypeNode(indexed) => {
+                if record.kind != SyntaxKind::IndexedAccessType {
+                    return Err(type_node_unavailable(
+                        TypeNodeUnavailable::InvalidIndexedAccessType(node),
+                    ));
+                }
+                let object = NodeRef::new(node.arena, node.file, indexed.object_type);
+                let index = NodeRef::new(node.arena, node.file, indexed.index_type);
+                if preflight_node(self.store, self.host, object)?.parent != Some(node.node)
+                    || preflight_node(self.store, self.host, index)?.parent != Some(node.node)
+                {
+                    return Err(type_node_unavailable(
+                        TypeNodeUnavailable::InvalidIndexedAccessType(node),
+                    ));
+                }
+                // A cached outer array must replay the complete indexed leaf.
+                // Its dedicated planner owns the widened member-surface proof;
+                // descending here would route its type literal through the
+                // deliberately narrower general object-member capability.
+                true
             }
             NodeData::TypeLiteralNode(literal) => {
                 if record.kind != SyntaxKind::TypeLiteral
@@ -3613,6 +3736,19 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         loop {
             let record = preflight_node(self.store, self.host, node)?;
             if record.kind == SyntaxKind::FunctionType {
+                return Ok(true);
+            }
+            let NodeData::ParenthesizedTypeNode(parenthesized) = &record.data else {
+                return Ok(false);
+            };
+            node = NodeRef::new(node.arena, node.file, parenthesized.type_);
+        }
+    }
+
+    fn direct_indexed_access_rhs(&self, mut node: NodeRef) -> Result<bool, DeclaredTypeError> {
+        loop {
+            let record = preflight_node(self.store, self.host, node)?;
+            if record.kind == SyntaxKind::IndexedAccessType {
                 return Ok(true);
             }
             let NodeData::ParenthesizedTypeNode(parenthesized) = &record.data else {
@@ -4941,6 +5077,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 && let Some(structural_node) = self
                     .direct_type_literal_plan_node(alias.type_node, plan)
                     .or_else(|| self.direct_function_type_plan_node(alias.type_node, plan))
+                    .or_else(|| self.direct_indexed_access_plan_node(alias.type_node, plan))
                 && !self
                     .pending_function_parameters
                     .iter()
@@ -5084,12 +5221,43 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             SyntaxKind::ArrayType => self.execute_array_type(node, plan, prepared),
             SyntaxKind::TypeLiteral => self.execute_property_type_literal(node, plan, prepared),
             SyntaxKind::FunctionType => self.execute_function_type(node, plan, prepared),
+            SyntaxKind::IndexedAccessType => {
+                self.execute_concrete_indexed_access_type(node, plan, prepared)
+            }
             SyntaxKind::TypeReference => self.execute_type_reference(node, plan, prepared),
             SyntaxKind::UnionType => self.execute_union_type(node, plan, prepared),
             kind => Err(type_node_unavailable(
                 TypeNodeUnavailable::UnsupportedSyntax { node, kind },
             )),
         }
+    }
+
+    fn execute_concrete_indexed_access_type(
+        &mut self,
+        node: NodeRef,
+        plan: &TypeQueryPlan,
+        prepared: &mut PreparedTypeQueryTypes,
+    ) -> Result<TypeId, DeclaredTypeError> {
+        let indexed = plan.indexed_accesses.get(&node).cloned().ok_or_else(|| {
+            type_node_unavailable(TypeNodeUnavailable::MissingPlannedIndexedAccessType(node))
+        })?;
+        let object_type = self.execute_type_node(indexed.object(), plan, prepared)?;
+        let index_type = self.execute_type_node(indexed.index(), plan, prepared)?;
+        let resolved =
+            finish_concrete_indexed_access(self.store, &indexed, object_type, index_type)
+                .map_err(|error| indexed_access_error(error, node))?;
+        let mut links = self
+            .store
+            .type_node_links(node)
+            .cloned()
+            .unwrap_or_default();
+        links.resolved_type = Some(resolved);
+        if !self.store.set_type_node_links(node, links) {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidIndexedAccessType(node),
+            ));
+        }
+        Ok(resolved)
     }
 
     fn execute_function_type(
@@ -5233,6 +5401,22 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
     ) -> Option<NodeRef> {
         loop {
             if plan.functions.contains_key(&node) {
+                return Some(node);
+            }
+            let NodeData::ParenthesizedTypeNode(parenthesized) = &self.host.node(node)?.data else {
+                return None;
+            };
+            node = NodeRef::new(node.arena, node.file, parenthesized.type_);
+        }
+    }
+
+    fn direct_indexed_access_plan_node(
+        &self,
+        mut node: NodeRef,
+        plan: &TypeQueryPlan,
+    ) -> Option<NodeRef> {
+        loop {
+            if plan.indexed_accesses.contains_key(&node) {
                 return Some(node);
             }
             let NodeData::ParenthesizedTypeNode(parenthesized) = &self.host.node(node)?.data else {
@@ -6194,6 +6378,20 @@ mod tests {
             declaration,
             NodeRef::new(declaration.arena, declaration.file, alias.name),
             NodeRef::new(declaration.arena, declaration.file, alias.type_),
+        )
+    }
+
+    fn indexed_access_parts(fixture: &Fixture, name: &str) -> (NodeRef, NodeRef, NodeRef) {
+        let indexed = alias_parts(fixture, name).2;
+        let NodeData::IndexedAccessTypeNode(data) =
+            &fixture.parsed.arena.get(indexed.node).unwrap().data
+        else {
+            panic!("type alias {name} must have a direct indexed-access RHS")
+        };
+        (
+            indexed,
+            NodeRef::new(indexed.arena, indexed.file, data.object_type),
+            NodeRef::new(indexed.arena, indexed.file, data.index_type),
         )
     }
 
@@ -10734,12 +10932,12 @@ mod tests {
                 SyntaxKind::IndexSignature,
             ),
             (
-                "type Paired = { [key: string]: number; [position: number]: number };",
+                "type Paired = { [text: string]: string | number; [numeric: number]: number };",
                 "Paired",
                 SyntaxKind::IndexSignature,
             ),
             (
-                "type Mixed = { known: string; [key: string]: number };",
+                "type Mixed = { known: string; [text: string]: string };",
                 "Mixed",
                 SyntaxKind::IndexSignature,
             ),
@@ -10793,6 +10991,79 @@ mod tests {
                 );
                 assert!(diagnostics.is_empty());
             }
+        }
+    }
+
+    #[test]
+    fn cold_indexed_access_rejects_poisoned_literal_key_before_publication() {
+        let mut fixture = fixture("type Bad = { value: string }['value'];");
+        let bad = canonical_fixture_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Bad");
+        let (indexed, object, index) = indexed_access_parts(&fixture, "Bad");
+        let object_plan = {
+            let host = post_global_host(
+                &fixture.parsed.arena,
+                fixture.files.get(&fixture.file).unwrap(),
+            );
+            object_members::plan_concrete_indexed_access_type_literal(
+                &fixture.store,
+                &host,
+                object,
+            )
+            .unwrap()
+        };
+        let property = object_plan.properties[0].symbol;
+        let poison = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+        assert!(fixture.store.set_type_node_links(
+            index,
+            TypeNodeLinks {
+                resolved_type: Some(poison),
+                ..TypeNodeLinks::default()
+            },
+        ));
+
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let before = (
+            literal_state(&fixture.store),
+            fixture.store.type_alias_len(),
+            fixture.store.index_info_len(),
+            fixture.store.signature_len(),
+            object_members::type_literal_state(&fixture.store, &object_plan),
+            fixture.store.type_node_links(indexed).cloned(),
+            fixture.store.type_node_links(object).cloned(),
+            fixture.store.type_node_links(index).cloned(),
+            fixture.store.value_symbol_links(property).cloned(),
+            fixture.store.type_alias_links(bad).cloned(),
+            diagnostics.clone(),
+        );
+
+        for _ in 0..2 {
+            assert!(matches!(
+                query_declared(
+                    &mut fixture,
+                    bad,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut diagnostics,
+                ),
+                Err(DeclaredTypeError::TypeNodeUnavailable(
+                    TypeNodeUnavailable::InvalidIndexedAccessType(node)
+                )) if node == index
+            ));
+            assert_eq!(
+                (
+                    literal_state(&fixture.store),
+                    fixture.store.type_alias_len(),
+                    fixture.store.index_info_len(),
+                    fixture.store.signature_len(),
+                    object_members::type_literal_state(&fixture.store, &object_plan),
+                    fixture.store.type_node_links(indexed).cloned(),
+                    fixture.store.type_node_links(object).cloned(),
+                    fixture.store.type_node_links(index).cloned(),
+                    fixture.store.value_symbol_links(property).cloned(),
+                    fixture.store.type_alias_links(bad).cloned(),
+                    diagnostics.clone(),
+                ),
+                before,
+            );
         }
     }
 

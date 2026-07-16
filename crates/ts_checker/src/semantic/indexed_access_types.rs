@@ -103,20 +103,20 @@ pub(super) struct ConcreteIndexedAccessPlan {
 }
 
 impl ConcreteIndexedAccessPlan {
-    pub(super) const fn node(&self) -> NodeRef {
-        self.node
-    }
-
     pub(super) const fn object(&self) -> NodeRef {
         self.object
     }
 
-    pub(super) const fn index(&self) -> NodeRef {
-        self.index
+    pub(super) const fn object_literal(&self) -> NodeRef {
+        self.object_literal
     }
 
-    pub(super) const fn cached_type(&self) -> Option<TypeId> {
-        self.cached_type
+    pub(super) const fn object_plan(&self) -> &PropertyObjectPlan {
+        &self.object_plan
+    }
+
+    pub(super) const fn index(&self) -> NodeRef {
+        self.index
     }
 }
 
@@ -211,11 +211,14 @@ pub(super) fn plan_concrete_indexed_access(
                 ConcreteIndexedAccessError::UnsupportedObject(node)
             }
         })?;
-    let object_plan = object_members::plan_type_literal(store, host, object_literal, None)?;
+    let object_plan =
+        object_members::plan_concrete_indexed_access_type_literal(store, host, object_literal)?;
+    validate_member_domains(store, host, &object_plan)?;
     let key = classify_index(store, host, index)?;
     let selection = select_concrete_member(store, &object_plan, &key, index)?;
 
     validate_transparent_object_links(store, &object_wrappers)?;
+    validate_existing_index_links(store, index, &key)?;
     let cached_type = validate_parent_links(store, node)?;
     let plan = ConcreteIndexedAccessPlan {
         node,
@@ -241,6 +244,143 @@ pub(super) fn plan_concrete_indexed_access(
         validate_index_type(store, &plan.key, index_type)?;
     }
     Ok(plan)
+}
+
+#[derive(Clone, Copy)]
+struct PrimitiveDomain(u8);
+
+impl PrimitiveDomain {
+    const STRING: Self = Self(1 << 0);
+    const NUMBER: Self = Self(1 << 1);
+    const BOOLEAN: Self = Self(1 << 2);
+    const BIGINT: Self = Self(1 << 3);
+    const SYMBOL: Self = Self(1 << 4);
+    const NEVER: Self = Self(0);
+
+    const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    const fn is_subset_of(self, other: Self) -> bool {
+        self.0 & !other.0 == 0
+    }
+}
+
+/// Proves the TS2411/TS2413 obligations for the narrow mixed/paired surface.
+///
+/// General source checking does not yet run `checkIndexConstraints`, so this
+/// leaf may only publish a mixed type literal when primitive syntax proves
+/// every property is assignable to the string index and the number index is
+/// assignable to the string index. Single-index, property-free literals have
+/// no cross-member obligation and retain the broader annotation capability.
+fn validate_member_domains(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    object: &PropertyObjectPlan,
+) -> Result<(), ConcreteIndexedAccessError> {
+    if object.indexes.is_empty()
+        || object.indexes.len() == 1 && object.properties.is_empty()
+    {
+        return Ok(());
+    }
+
+    let string_index = object.indexes.iter().find(|index| {
+        store.source_node_kind(index.key_type_node) == Some(SyntaxKind::StringKeyword)
+    });
+    let number_index = object.indexes.iter().find(|index| {
+        store.source_node_kind(index.key_type_node) == Some(SyntaxKind::NumberKeyword)
+    });
+    let Some(string_index) = string_index else {
+        return Err(ConcreteIndexedAccessError::UnsupportedObjectSurface(
+            object.node,
+        ));
+    };
+    let string_domain = primitive_domain(store, host, string_index.value_type_node)
+        .ok_or(ConcreteIndexedAccessError::UnsupportedObjectSurface(
+            object.node,
+        ))?;
+
+    let number_domain = number_index
+        .and_then(|index| primitive_domain(store, host, index.value_type_node));
+    if number_index.is_some()
+        && !number_domain.is_some_and(|domain| domain.is_subset_of(string_domain))
+    {
+        return Err(ConcreteIndexedAccessError::UnsupportedObjectSurface(
+            object.node,
+        ));
+    }
+    for property in &object.properties {
+        let Some(domain) = (!property.optional)
+            .then(|| primitive_domain(store, host, property.type_node))
+            .flatten()
+        else {
+            return Err(ConcreteIndexedAccessError::UnsupportedObjectSurface(
+                object.node,
+            ));
+        };
+        if !domain.is_subset_of(string_domain)
+            || is_numeric_literal_name(&property.name)
+                && !number_domain.is_none_or(|number| domain.is_subset_of(number))
+        {
+            return Err(ConcreteIndexedAccessError::UnsupportedObjectSurface(
+                object.node,
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn primitive_domain(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    node: NodeRef,
+) -> Option<PrimitiveDomain> {
+    let record = preflight_node(store, host, node).ok()?;
+    match (&record.data, record.kind) {
+        (_, SyntaxKind::StringKeyword) => Some(PrimitiveDomain::STRING),
+        (_, SyntaxKind::NumberKeyword) => Some(PrimitiveDomain::NUMBER),
+        (_, SyntaxKind::BooleanKeyword) => Some(PrimitiveDomain::BOOLEAN),
+        (_, SyntaxKind::BigIntKeyword) => Some(PrimitiveDomain::BIGINT),
+        (_, SyntaxKind::SymbolKeyword) => Some(PrimitiveDomain::SYMBOL),
+        (_, SyntaxKind::NeverKeyword) => Some(PrimitiveDomain::NEVER),
+        (NodeData::ParenthesizedTypeNode(parenthesized), SyntaxKind::ParenthesizedType) => {
+            let child = NodeRef::new(node.arena, node.file, parenthesized.type_);
+            let child_record = preflight_node(store, host, child).ok()?;
+            (child != node
+                && child_record.parent == Some(node.node)
+                && child_record.range.start >= record.range.start
+                && child_record.range.end <= record.range.end)
+                .then(|| primitive_domain(store, host, child))
+                .flatten()
+        }
+        (NodeData::UnionTypeNode(union), SyntaxKind::UnionType)
+            if union.types.nodes.len() >= 2
+                && !union.types.has_trailing_comma
+                && union.types.range == record.range =>
+        {
+            let mut domain = PrimitiveDomain::NEVER;
+            let mut previous_end = record.range.start;
+            let mut seen = Vec::with_capacity(union.types.nodes.len());
+            for child in &union.types.nodes {
+                let child = NodeRef::new(node.arena, node.file, *child);
+                let child_record = preflight_node(store, host, child).ok()?;
+                if child == node
+                    || child_record.parent != Some(node.node)
+                    || child_record.range.start < previous_end
+                    || child_record.range.start < record.range.start
+                    || child_record.range.end > record.range.end
+                    || seen.contains(&child)
+                {
+                    return None;
+                }
+                previous_end = child_record.range.end;
+                seen.push(child);
+                domain = domain.union(primitive_domain(store, host, child)?);
+            }
+            Some(domain)
+        }
+        _ => None,
+    }
 }
 
 /// Validates the recursively resolved children and returns the existing value
@@ -527,6 +667,31 @@ fn validate_keyword_index_links(
         return Err(ConcreteIndexedAccessError::InvalidCache(node));
     }
     Ok(())
+}
+
+fn validate_existing_index_links(
+    store: &CanonicalTypeMapperStore,
+    node: NodeRef,
+    key: &ConcreteIndexKey,
+) -> Result<(), ConcreteIndexedAccessError> {
+    match key {
+        ConcreteIndexKey::String | ConcreteIndexKey::Number => {
+            validate_keyword_index_links(store, node)
+        }
+        ConcreteIndexKey::StringLiteral { .. } | ConcreteIndexKey::NumberLiteral(_) => {
+            let Some(links) = store.type_node_links(node) else {
+                return Ok(());
+            };
+            if links.outer_type_parameters.is_some() {
+                return Err(ConcreteIndexedAccessError::InvalidCache(node));
+            }
+            if let Some(type_) = links.resolved_type {
+                validate_index_type(store, key, type_)
+                    .map_err(|_| ConcreteIndexedAccessError::InvalidCache(node))?;
+            }
+            Ok(())
+        }
+    }
 }
 
 fn validate_index_type(

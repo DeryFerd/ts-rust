@@ -38,6 +38,12 @@ pub(super) enum PropertyObjectKind {
     ObjectLiteral,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TypeLiteralMemberPolicy {
+    General,
+    ConcreteIndexedAccess,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct PlannedProperty {
     pub declaration: NodeRef,
@@ -523,6 +529,7 @@ pub(super) fn plan_object_literal(
         symbol_record.members(),
         &object.properties,
         None,
+        TypeLiteralMemberPolicy::General,
     )
 }
 
@@ -531,6 +538,36 @@ pub(super) fn plan_type_literal(
     host: &DeclaredTypeHost<'_>,
     node: NodeRef,
     alias_symbol: Option<SemanticSymbolId>,
+) -> Result<PropertyObjectPlan, PropertyObjectError> {
+    plan_type_literal_with_policy(
+        store,
+        host,
+        node,
+        alias_symbol,
+        TypeLiteralMemberPolicy::General,
+    )
+}
+
+pub(super) fn plan_concrete_indexed_access_type_literal(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    node: NodeRef,
+) -> Result<PropertyObjectPlan, PropertyObjectError> {
+    plan_type_literal_with_policy(
+        store,
+        host,
+        node,
+        None,
+        TypeLiteralMemberPolicy::ConcreteIndexedAccess,
+    )
+}
+
+fn plan_type_literal_with_policy(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    node: NodeRef,
+    alias_symbol: Option<SemanticSymbolId>,
+    policy: TypeLiteralMemberPolicy,
 ) -> Result<PropertyObjectPlan, PropertyObjectError> {
     let record = preflight_node(store, host, node)
         .map_err(|_| PropertyObjectError::InvalidTypeLiteral(node))?;
@@ -579,6 +616,7 @@ pub(super) fn plan_type_literal(
         symbol_record.members(),
         &literal.members,
         alias_symbol,
+        policy,
     )
 }
 
@@ -726,6 +764,7 @@ pub(super) fn plan_interface(
         symbol_record.members(),
         &interface.members,
         None,
+        TypeLiteralMemberPolicy::General,
     )?;
     if !value_declarations.is_empty() && !plan.call_signatures.is_empty() {
         return Err(PropertyObjectError::InvalidInterface {
@@ -886,6 +925,7 @@ fn plan_members(
     members: Option<SymbolTableId>,
     member_nodes: &NodeList,
     alias_symbol: Option<SemanticSymbolId>,
+    policy: TypeLiteralMemberPolicy,
 ) -> Result<PropertyObjectPlan, PropertyObjectError> {
     let provisional = PropertyObjectPlan {
         kind,
@@ -963,7 +1003,7 @@ fn plan_members(
 
         if member_record.kind == SyntaxKind::IndexSignature {
             let index = plan_index_signature(store, host, node, symbol, member)?;
-            if !indexes.is_empty() {
+            if policy == TypeLiteralMemberPolicy::General && !indexes.is_empty() {
                 return Err(PropertyObjectError::UnsupportedMember {
                     node: member,
                     kind: SyntaxKind::IndexSignature,
@@ -1117,6 +1157,21 @@ fn plan_members(
         });
     }
 
+    let mut seen_index_kinds = HashSet::with_capacity(indexes.len());
+    for index in &indexes {
+        let Some(kind @ (SyntaxKind::StringKeyword | SyntaxKind::NumberKeyword)) =
+            store.source_node_kind(index.key_type_node)
+        else {
+            return Err(invalid_plan(&provisional));
+        };
+        if !seen_index_kinds.insert(kind) {
+            return Err(PropertyObjectError::UnsupportedMember {
+                node: index.declaration,
+                kind: SyntaxKind::IndexSignature,
+            });
+        }
+    }
+
     let reserved_index_count = usize::from(!indexes.is_empty());
     let reserved_call_count = usize::from(!call_signatures.is_empty());
     if table.is_some_and(|table| {
@@ -1146,11 +1201,18 @@ fn plan_members(
         let Some(record) = store.symbol(index.symbol) else {
             return Err(invalid_plan(&provisional));
         };
-        if record.declarations() != Some(declarations.as_slice()) {
+        if indexes
+            .iter()
+            .any(|candidate| candidate.symbol != index.symbol)
+            || record.declarations() != Some(declarations.as_slice())
+        {
             return Err(invalid_plan(&provisional));
         }
     }
-    if !indexes.is_empty() && !properties.is_empty() {
+    if policy == TypeLiteralMemberPolicy::General
+        && !indexes.is_empty()
+        && !properties.is_empty()
+    {
         return Err(PropertyObjectError::UnsupportedMember {
             node: indexes[0].declaration,
             kind: SyntaxKind::IndexSignature,

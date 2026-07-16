@@ -27,6 +27,7 @@ mod functions;
 mod generic_calls;
 mod global_types;
 pub mod ids;
+mod indexed_access_types;
 mod inference;
 mod instantiate;
 pub mod links;

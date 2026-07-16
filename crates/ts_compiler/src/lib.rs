@@ -565,6 +565,8 @@ fn type_node_error_is_unsupported(error: &TypeNodeUnavailable) -> bool {
         | TypeNodeUnavailable::MissingPlannedUnionType(_)
         | TypeNodeUnavailable::InvalidCachedUnionType(_)
         | TypeNodeUnavailable::InvalidCachedArrayType(_)
+        | TypeNodeUnavailable::InvalidIndexedAccessType(_)
+        | TypeNodeUnavailable::MissingPlannedIndexedAccessType(_)
         | TypeNodeUnavailable::InvalidFunctionType(_)
         | TypeNodeUnavailable::InvalidFunctionSignature(_)
         | TypeNodeUnavailable::InvalidUnionAlias(_)

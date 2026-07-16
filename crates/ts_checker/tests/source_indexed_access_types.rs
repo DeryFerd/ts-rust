@@ -16,6 +16,7 @@ const SUCCESS_SOURCE: &str = concat!(
     "type NumberValue = { [key: number]: string }[number];\n",
     "type NumericStringValue = { [key: number]: string }['0'];\n",
     "type NumericPrecedence = { [key: string]: string | number; [key: number]: number }['0'];\n",
+    "type ReversedNumericPrecedence = { [key: number]: number; [key: string]: string | number }['0'];\n",
     "type TextPrecedence = { [key: string]: string | number; [key: number]: number }['answer'];\n",
     "type MixedPropertyValue = { answer: string; [key: string]: string | number; [key: number]: number }['answer'];\n",
     "type MixedTextFallback = { answer: string; [key: string]: string | number; [key: number]: number }['missing'];\n",
@@ -23,6 +24,7 @@ const SUCCESS_SOURCE: &str = concat!(
     "type MixedSeparatedNumberFallback = { answer: string; [key: string]: string | number; [key: number]: number }[1_000];\n",
     "type MixedBroadString = { answer: string; [key: string]: string | number; [key: number]: number }[string];\n",
     "type MixedBroadNumber = { answer: string; [key: string]: string | number; [key: number]: number }[number];\n",
+    "type NestedArrayValue = ({ [key: string]: number }[string])[];\n",
     "const property: PropertyValue = 1;\n",
     "const parenthesized: ParenthesizedValue = 2;\n",
     "const stringValue: StringValue = true;\n",
@@ -30,6 +32,7 @@ const SUCCESS_SOURCE: &str = concat!(
     "const numberValue: NumberValue = 'number';\n",
     "const numericStringValue: NumericStringValue = 'numeric';\n",
     "const numericPrecedence: NumericPrecedence = 3;\n",
+    "const reversedNumericPrecedence: ReversedNumericPrecedence = 7;\n",
     "const textPrecedence: TextPrecedence = 'text';\n",
     "const mixedPropertyValue: MixedPropertyValue = 'property';\n",
     "const mixedTextFallback: MixedTextFallback = 4;\n",
@@ -39,7 +42,7 @@ const SUCCESS_SOURCE: &str = concat!(
     "const mixedBroadNumber: MixedBroadNumber = 6;\n",
 );
 
-fn context<'arena>(parsed: &'arena ParseResult, file: FileId) -> CanonicalCheckerContext<'arena> {
+fn context(parsed: &ParseResult, file: FileId) -> CanonicalCheckerContext<'_> {
     let mut binder = CanonicalBinder::new();
     binder
         .bind_source_file_with_facts(
@@ -113,6 +116,7 @@ fn concrete_inline_indexed_access_types_select_properties_and_applicable_indexes
         ("NumberValue", "string"),
         ("NumericStringValue", "string"),
         ("NumericPrecedence", "number"),
+        ("ReversedNumericPrecedence", "number"),
         ("TextPrecedence", "string | number"),
         ("MixedPropertyValue", "string"),
         ("MixedTextFallback", "string | number"),
@@ -120,6 +124,7 @@ fn concrete_inline_indexed_access_types_select_properties_and_applicable_indexes
         ("MixedSeparatedNumberFallback", "number"),
         ("MixedBroadString", "string | number"),
         ("MixedBroadNumber", "number"),
+        ("NestedArrayValue", "{}"),
     ] {
         let alias = alias_symbol(&parsed, file, &context, name);
         assert_eq!(
@@ -178,8 +183,16 @@ fn unsupported_concrete_indexed_access_boundaries_are_atomic_and_retryable() {
             "const bad: Bad = 'x';",
         ),
         concat!(
-            "type Model = { value: string }; ",
-            "type Bad = Model['value']; const bad: Bad = 'x';",
+            "type Bad = { value: boolean; [key: string]: number }['value']; ",
+            "const bad: Bad = true;",
+        ),
+        concat!(
+            "type Bad = { [key: string]: string; [key: number]: number }[number]; ",
+            "const bad: Bad = 1;",
+        ),
+        concat!(
+            "type Bad = { [key: string]: string | number | boolean | bigint | symbol; ",
+            "[key: number]: unknown }[number]; const bad: Bad = 1;",
         ),
         concat!(
             "type Bad<T> = T['value']; ",
@@ -227,4 +240,41 @@ fn unsupported_concrete_indexed_access_boundaries_are_atomic_and_retryable() {
         );
         assert!(context.store().type_alias_links(bad).is_none());
     }
+}
+
+#[test]
+fn named_indexed_access_boundary_preserves_and_reuses_the_valid_source_prefix() {
+    let parsed = parse_source_file(concat!(
+        "type Model = { value: string }; ",
+        "type Bad = Model['value']; const bad: Bad = 'x';",
+    ));
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(100);
+    let mut context = context(&parsed, file);
+    let model = alias_symbol(&parsed, file, &context, "Model");
+    let bad = alias_symbol(&parsed, file, &context, "Bad");
+
+    let first = context.check_source_file(file).unwrap_err();
+    assert!(matches!(first, SourceCheckError::DeclaredType(_)));
+    assert!(context.store().type_alias_links(model).is_some());
+    assert!(context.store().type_alias_links(bad).is_none());
+    let stable_prefix = (
+        context.store().type_len(),
+        context.store().index_info_len(),
+        context.store().signature_len(),
+        context.diagnostics().clone(),
+    );
+
+    assert_eq!(context.check_source_file(file), Err(first));
+    assert_eq!(
+        (
+            context.store().type_len(),
+            context.store().index_info_len(),
+            context.store().signature_len(),
+            context.diagnostics().clone(),
+        ),
+        stable_prefix,
+    );
+    assert!(context.store().type_alias_links(model).is_some());
+    assert!(context.store().type_alias_links(bad).is_none());
 }
