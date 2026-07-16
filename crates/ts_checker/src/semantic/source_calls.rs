@@ -377,9 +377,80 @@ fn is_context_insensitive_argument_syntax(arena: &NodeArena, node: NodeRef) -> b
                         if identifier.flow_node.is_none() && !identifier.text.is_empty()
                 )
         }
+        SyntaxKind::ElementAccessExpression => {
+            is_context_insensitive_element_syntax(arena, node)
+        }
         SyntaxKind::BinaryExpression => {
             is_context_insensitive_primitive_binary_syntax(arena, node)
                 || is_context_insensitive_logical_binary_syntax(arena, node)
+        }
+        _ => false,
+    }
+}
+
+fn is_context_insensitive_element_syntax(arena: &NodeArena, node: NodeRef) -> bool {
+    let Some(record) = arena.get(node.node) else {
+        return false;
+    };
+    let NodeData::ElementAccessExpression(access) = &record.data else {
+        return false;
+    };
+    if record.kind != SyntaxKind::ElementAccessExpression
+        || record.flags.0 != 0
+        || access.flow_node.is_some()
+        || access.question_dot_token.is_some()
+        || access.facts != 0
+    {
+        return false;
+    }
+    let Some(receiver) = arena.get(access.expression) else {
+        return false;
+    };
+    let Some(index) = arena.get(access.argument_expression) else {
+        return false;
+    };
+    receiver.parent == Some(node.node)
+        && receiver.kind == SyntaxKind::Identifier
+        && receiver.flags.0 == 0
+        && matches!(
+            &receiver.data,
+            NodeData::Identifier(identifier) if identifier.flow_node.is_none()
+        )
+        && index.parent == Some(node.node)
+        && receiver.range.end <= index.range.start
+        && is_context_insensitive_element_index_syntax(arena, access.argument_expression)
+}
+
+fn is_context_insensitive_element_index_syntax(arena: &NodeArena, node: ts_ast::NodeId) -> bool {
+    let Some(record) = arena.get(node) else {
+        return false;
+    };
+    match record.kind {
+        SyntaxKind::Identifier => {
+            record.flags.0 == 0
+                && matches!(
+                    &record.data,
+                    NodeData::Identifier(identifier) if identifier.flow_node.is_none()
+                )
+        }
+        SyntaxKind::NullKeyword
+        | SyntaxKind::TrueKeyword
+        | SyntaxKind::FalseKeyword
+        | SyntaxKind::StringLiteral
+        | SyntaxKind::NoSubstitutionTemplateLiteral
+        | SyntaxKind::NumericLiteral
+        | SyntaxKind::BigIntLiteral => true,
+        SyntaxKind::PrefixUnaryExpression => {
+            let NodeData::PrefixUnaryExpression(prefix) = &record.data else {
+                return false;
+            };
+            arena.get(prefix.operand).is_some_and(|operand| {
+                operand.parent == Some(node)
+                    && matches!(
+                        operand.kind,
+                        SyntaxKind::NumericLiteral | SyntaxKind::BigIntLiteral
+                    )
+            })
         }
         _ => false,
     }
@@ -512,6 +583,9 @@ fn is_context_insensitive_primitive_binary_operand_syntax(
                     )
             })
         }
+        SyntaxKind::ElementAccessExpression => {
+            is_context_insensitive_element_syntax(arena, node)
+        }
         SyntaxKind::BinaryExpression => is_context_insensitive_primitive_binary_syntax(arena, node),
         _ => false,
     }
@@ -526,7 +600,8 @@ fn is_context_insensitive_argument_plan(expression: &PlannedExpression) -> bool 
         | PlannedExpressionKind::Boolean(_)
         | PlannedExpressionKind::GlobalUndefined
         | PlannedExpressionKind::Identifier(_)
-        | PlannedExpressionKind::Property(_) => true,
+        | PlannedExpressionKind::Property(_)
+        | PlannedExpressionKind::Element(_) => true,
         PlannedExpressionKind::Parenthesized(inner) => is_context_insensitive_argument_plan(inner),
         PlannedExpressionKind::Binary(binary) => {
             let (left, right) = binary.operands();
@@ -556,7 +631,8 @@ fn is_context_insensitive_primitive_binary_operand_plan(expression: &PlannedExpr
         | PlannedExpressionKind::Number { .. }
         | PlannedExpressionKind::BigInt { .. }
         | PlannedExpressionKind::Boolean(_)
-        | PlannedExpressionKind::Identifier(_) => true,
+        | PlannedExpressionKind::Identifier(_)
+        | PlannedExpressionKind::Element(_) => true,
         PlannedExpressionKind::Parenthesized(inner) => {
             is_context_insensitive_primitive_binary_operand_plan(inner)
         }

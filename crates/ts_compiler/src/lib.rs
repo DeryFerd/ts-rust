@@ -453,6 +453,7 @@ fn source_check_error_is_unsupported(error: &SourceCheckError) -> bool {
         | SourceCheckError::Enum(_)
         | SourceCheckError::Import(_)
         | SourceCheckError::Property(_)
+        | SourceCheckError::Element(_)
         | SourceCheckError::PrimitiveOperator(_)
         | SourceCheckError::LogicalOperator(_)
         | SourceCheckError::MissingDiagnostic(_) => false,
@@ -7378,7 +7379,15 @@ mod tests {
             },
             CanonicalProgramCheckError::SourceCheck {
                 file_name: "/project/input.ts".to_owned(),
+                error: SourceCheckError::Element(node),
+            },
+            CanonicalProgramCheckError::SourceCheck {
+                file_name: "/project/input.ts".to_owned(),
                 error: SourceCheckError::PrimitiveOperator(node),
+            },
+            CanonicalProgramCheckError::SourceCheck {
+                file_name: "/project/input.ts".to_owned(),
+                error: SourceCheckError::LogicalOperator(node),
             },
             CanonicalProgramCheckError::SourceCheck {
                 file_name: "/project/input.ts".to_owned(),

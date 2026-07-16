@@ -8,8 +8,8 @@
 //! annotated top-level function declarations, initialized identifier-named
 //! top-level variables (optionally exported), ordinary direct identifier
 //! calls, atomic primitive/literal scalar binary operators, required
-//! own-property reads, and direct assignments back to supported `var`
-//! declarations.
+//! own-property reads, direct indexed reads over supported objects, arrays,
+//! and strings, and direct assignments back to supported `var` declarations.
 //! The complete source tree and complete supported-statement plan are validated
 //! before semantic execution begins. Execution may retain safe canonical memo
 //! caches while discovering a type-dependent capability boundary.
@@ -71,6 +71,11 @@ use super::{
     source_calls::{
         SourceCallPlan, check_direct_source_call, emit_call_type_argument_grammar_diagnostics,
         finish_direct_source_call_plan, plan_direct_source_call_syntax,
+    },
+    source_elements::{
+        SourceElementError, SourceElementPlan, SourceElementUnsupported,
+        check_direct_source_element, finish_direct_source_element_plan,
+        plan_direct_source_element_syntax,
     },
     source_enums::{SourceEnumError, SourceEnumPlan, execute_top_level_enum, plan_top_level_enum},
     source_functions::{
@@ -175,6 +180,7 @@ pub enum UnsupportedSourceSyntax {
     Enum(NodeRef),
     Import(NodeRef),
     Property(NodeRef),
+    Element(NodeRef),
 }
 
 /// Source and AST identity rejected before semantic execution.
@@ -294,6 +300,7 @@ pub enum SourceCheckError {
     Enum(NodeRef),
     Import(NodeRef),
     Property(NodeRef),
+    Element(NodeRef),
     PrimitiveOperator(NodeRef),
     LogicalOperator(NodeRef),
     MissingDiagnostic(u32),
@@ -322,6 +329,7 @@ impl std::fmt::Display for SourceCheckError {
             Self::Enum(node) => write!(formatter, "enum checking failed at {node:?}"),
             Self::Import(node) => write!(formatter, "import checking failed at {node:?}"),
             Self::Property(node) => write!(formatter, "property checking failed at {node:?}"),
+            Self::Element(node) => write!(formatter, "element checking failed at {node:?}"),
             Self::PrimitiveOperator(node) => {
                 write!(formatter, "primitive operator checking failed at {node:?}")
             }
@@ -357,6 +365,7 @@ impl std::error::Error for SourceCheckError {
             | Self::Enum(_)
             | Self::Import(_)
             | Self::Property(_)
+            | Self::Element(_)
             | Self::PrimitiveOperator(_)
             | Self::LogicalOperator(_)
             | Self::MissingDiagnostic(_) => None,
@@ -511,6 +520,7 @@ pub(super) enum PlannedExpressionKind {
         properties: Vec<PlannedExpression>,
     },
     Property(Box<SourcePropertyPlan>),
+    Element(Box<SourceElementPlan>),
     Call(Box<SourceCallPlan>),
     Binary(Box<PrimitiveBinaryPlan>),
     Logical(Box<LogicalBinaryPlan>),
@@ -1487,6 +1497,33 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             }
             SourcePropertyError::InvalidCache(node) => SourceCheckError::Property(node),
             SourcePropertyError::Relation(error) => SourceCheckError::RelationUnavailable(error),
+        }
+    }
+
+    fn element_plan_error(access: NodeRef, error: SourceElementError) -> SourceCheckError {
+        match error {
+            SourceElementError::Unsupported(reason) => {
+                let node = match reason {
+                    SourceElementUnsupported::Access(node)
+                    | SourceElementUnsupported::Receiver(node)
+                    | SourceElementUnsupported::Index(node)
+                    | SourceElementUnsupported::MemberCall(node)
+                    | SourceElementUnsupported::Write(node) => node,
+                    SourceElementUnsupported::OptionalProperty { node, .. } => node,
+                    SourceElementUnsupported::IndexType(_)
+                    | SourceElementUnsupported::IndexSignatureSurface(_) => access,
+                };
+                SourceCheckError::Unsupported(UnsupportedSourceSyntax::Element(node))
+            }
+            SourceElementError::InvalidCache(node) => SourceCheckError::Element(node),
+            SourceElementError::InvalidType(_) => SourceCheckError::Element(access),
+            SourceElementError::Relation(error) => SourceCheckError::RelationUnavailable(error),
+            SourceElementError::Array(error) => SourceCheckError::ArrayType(error),
+            SourceElementError::Literal(error) => error.into(),
+            SourceElementError::Display(error) => SourceCheckError::TypeDisplayUnavailable(error),
+            SourceElementError::MissingDiagnostic(code) => {
+                SourceCheckError::MissingDiagnostic(code)
+            }
         }
     }
 
@@ -2559,6 +2596,23 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     PlannedExpressionKind::Property(Box::new(property)),
                 ))
             }
+            SyntaxKind::ElementAccessExpression => {
+                let Some((store, _)) = self.semantic else {
+                    return Err(SourceCheckError::Unsupported(
+                        UnsupportedSourceSyntax::Element(expression),
+                    ));
+                };
+                let syntax = plan_direct_source_element_syntax(self.arena, store, expression)
+                    .map_err(|error| Self::element_plan_error(expression, error))?;
+                let receiver = self.plan_expression(syntax.receiver())?;
+                let index = self.plan_expression(syntax.index())?;
+                let element = finish_direct_source_element_plan(syntax, receiver, index)
+                    .map_err(|error| Self::element_plan_error(expression, error))?;
+                Ok(PlannedExpression::new(
+                    expression,
+                    PlannedExpressionKind::Element(Box::new(element)),
+                ))
+            }
             SyntaxKind::CallExpression => {
                 let Some((store, _)) = self.semantic else {
                     return Err(SourceCheckError::Unsupported(
@@ -3216,7 +3270,8 @@ fn primitive_binary_operand_plan_is_supported(expression: &PlannedExpression) ->
         | PlannedExpressionKind::BigInt { .. }
         | PlannedExpressionKind::Boolean(_)
         | PlannedExpressionKind::Identifier(_)
-        | PlannedExpressionKind::Call(_) => true,
+        | PlannedExpressionKind::Call(_)
+        | PlannedExpressionKind::Element(_) => true,
         PlannedExpressionKind::Parenthesized(inner) => {
             primitive_binary_operand_plan_is_supported(inner)
         }
@@ -3949,6 +4004,48 @@ fn check_expression_type(
             preflighted_type_import_value_uses,
             read,
         ),
+        PlannedExpressionKind::Element(element) => {
+            let receiver = check_expression_type(
+                store,
+                host,
+                global_types,
+                source,
+                options,
+                diagnostics,
+                current_flow_types,
+                preflighted_type_import_value_uses,
+                &element.receiver,
+                None,
+                deferred,
+            )?;
+            let index = check_expression_type(
+                store,
+                host,
+                global_types,
+                source,
+                options,
+                diagnostics,
+                current_flow_types,
+                preflighted_type_import_value_uses,
+                &element.index,
+                None,
+                deferred,
+            )?;
+            let checked = check_direct_source_element(
+                store,
+                host,
+                global_types,
+                options,
+                element,
+                receiver.result,
+                index.result,
+            )
+            .map_err(|error| SourcePlanner::element_plan_error(element.node, error))?;
+            if let Some(diagnostic) = checked.diagnostic {
+                merge_retry_diagnostic(diagnostics, diagnostic);
+            }
+            Ok(CheckedExpressionTypes::leaf(checked.type_, checked.type_))
+        }
         PlannedExpressionKind::Logical(binary) => {
             let left_contextual_type = match binary.operator {
                 SyntaxKind::BarBarToken | SyntaxKind::QuestionQuestionToken => contextual_type,
@@ -4405,6 +4502,7 @@ fn syntactic_truthiness(
         | PlannedExpressionKind::Identifier(_)
         | PlannedExpressionKind::TypeImportValueUse(_)
         | PlannedExpressionKind::Property(_)
+        | PlannedExpressionKind::Element(_)
         | PlannedExpressionKind::Call(_)
         | PlannedExpressionKind::Binary(_)
         | PlannedExpressionKind::Logical(_)
@@ -4424,6 +4522,7 @@ fn syntactic_nullishness(expression: &PlannedExpression) -> PredicateSemantics {
         PlannedExpressionKind::Identifier(_)
         | PlannedExpressionKind::TypeImportValueUse(_)
         | PlannedExpressionKind::Property(_)
+        | PlannedExpressionKind::Element(_)
         | PlannedExpressionKind::Call(_) => PredicateSemantics::Sometimes,
         PlannedExpressionKind::Logical(binary) => match binary.operator {
             SyntaxKind::AmpersandAmpersandToken | SyntaxKind::BarBarToken => {
