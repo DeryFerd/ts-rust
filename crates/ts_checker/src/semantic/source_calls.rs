@@ -9,6 +9,7 @@
 use std::collections::HashSet;
 
 use ts_ast::{NodeArena, NodeData, NodeRef, SyntaxKind};
+use ts_core::{TextPos, TextRange};
 use ts_diagnostics::{Diagnostic, message_by_code};
 
 use super::{
@@ -37,15 +38,32 @@ use super::{
 pub(super) struct SourceCallPlan {
     pub(super) node: NodeRef,
     pub(super) callee: PlannedExpression,
-    pub(super) type_arguments: Option<Vec<NodeRef>>,
+    type_arguments: Option<SourceTypeArgumentList>,
     pub(super) arguments: Vec<PlannedExpression>,
+}
+
+/// Exact parser-owned type-argument list syntax retained for checker recovery.
+///
+/// The local parser stores the surrounding angle brackets in `NodeList.range`,
+/// while pinned TypeScript-Go stores the list range after `<` and before `>`.
+/// `syntax_range` retains the complete bracketed list for grammar TS1099.
+/// `diagnostic_range` retains the first type token through the last type token
+/// or trailing comma for TS2558, excluding outer trivia and angle brackets. An
+/// empty list remains present because call resolution treats it as inference.
+#[derive(Clone, Debug)]
+#[allow(dead_code)] // Exact ranges are consumed by the next generic diagnostic slice.
+struct SourceTypeArgumentList {
+    nodes: Vec<NodeRef>,
+    syntax_range: TextRange,
+    diagnostic_range: Option<TextRange>,
+    trailing_comma_range: Option<TextRange>,
 }
 
 #[derive(Clone, Debug)]
 pub(super) struct DirectSourceCallSyntax {
     node: NodeRef,
     callee: NodeRef,
-    type_arguments: Option<Vec<NodeRef>>,
+    type_arguments: Option<SourceTypeArgumentList>,
     arguments: Vec<NodeRef>,
 }
 
@@ -106,15 +124,23 @@ pub(super) fn plan_direct_source_call_syntax(
         .type_arguments
         .as_ref()
         .map(|type_arguments| {
-            if type_arguments.nodes.is_empty()
-                || type_arguments.range.start < record.range.start
+            let start = type_arguments.range.start.get();
+            let end = type_arguments.range.end.get();
+            if type_arguments.range.start < record.range.start
                 || type_arguments.range.end > record.range.end
+                || end < start.saturating_add(2)
+                || arena.source_text().is_some_and(|source| {
+                    let start = usize::try_from(start).ok();
+                    let close = usize::try_from(end.saturating_sub(1)).ok();
+                    start.is_none_or(|start| source.as_bytes().get(start) != Some(&b'<'))
+                        || close.is_none_or(|close| source.as_bytes().get(close) != Some(&b'>'))
+                })
             {
                 return Err(SourceCheckError::Unsupported(
                     UnsupportedSourceSyntax::Call(node),
                 ));
             }
-            type_arguments
+            let nodes = type_arguments
                 .nodes
                 .iter()
                 .map(|type_argument| {
@@ -132,7 +158,53 @@ pub(super) fn plan_direct_source_call_syntax(
                     }
                     Ok(type_argument)
                 })
-                .collect::<Result<Vec<_>, _>>()
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut trailing_comma_range = None;
+            let diagnostic_range = if let (Some(first), Some(last)) = (nodes.first(), nodes.last()) {
+                let first_range = arena
+                    .get(first.node)
+                    .ok_or(SourceCheckError::Call(node))?
+                    .range;
+                let last_range = arena
+                    .get(last.node)
+                    .ok_or(SourceCheckError::Call(node))?
+                    .range;
+                if first_range.start < TextPos::new(start.saturating_add(1))
+                    || last_range.end > TextPos::new(end.saturating_sub(1))
+                {
+                    return Err(SourceCheckError::Unsupported(
+                        UnsupportedSourceSyntax::Call(node),
+                    ));
+                }
+                let diagnostic_end = if type_arguments.has_trailing_comma {
+                    trailing_comma_range = arena.source_text().and_then(|source| {
+                        trailing_type_argument_comma_range(
+                            source,
+                            last_range.end,
+                            TextPos::new(end.saturating_sub(1)),
+                        )
+                    });
+                    trailing_comma_range.map(|range| range.end)
+                } else {
+                    Some(last_range.end)
+                };
+                diagnostic_end.map(|diagnostic_end| {
+                    TextRange::new(first_range.start, diagnostic_end)
+                })
+            } else {
+                None
+            };
+            if type_arguments.has_trailing_comma && trailing_comma_range.is_none() {
+                return Err(SourceCheckError::Unsupported(
+                    UnsupportedSourceSyntax::Call(node),
+                ));
+            }
+            Ok(SourceTypeArgumentList {
+                nodes,
+                syntax_range: type_arguments.range,
+                diagnostic_range,
+                trailing_comma_range,
+            })
         })
         .transpose()?;
 
@@ -158,6 +230,49 @@ pub(super) fn plan_direct_source_call_syntax(
         type_arguments,
         arguments,
     })
+}
+
+fn trailing_type_argument_comma_range(
+    source: &str,
+    start: TextPos,
+    closing_bracket: TextPos,
+) -> Option<TextRange> {
+    let start = usize::try_from(start.get()).ok()?;
+    let closing_bracket = usize::try_from(closing_bracket.get()).ok()?;
+    let before_close = source.get(start..closing_bracket)?;
+    let comma = skip_call_type_argument_trivia(before_close)?;
+    if before_close.as_bytes().get(comma) != Some(&b',') {
+        return None;
+    }
+    Some(TextRange::new(
+        TextPos::new(u32::try_from(start + comma).ok()?),
+        TextPos::new(u32::try_from(start + comma + 1).ok()?),
+    ))
+}
+
+fn skip_call_type_argument_trivia(text: &str) -> Option<usize> {
+    let mut offset = 0;
+    loop {
+        let remaining = text.get(offset..)?;
+        if remaining.starts_with("//") {
+            offset += remaining
+                .find(['\r', '\n'])
+                .unwrap_or(remaining.len());
+            continue;
+        }
+        if remaining.starts_with("/*") {
+            offset += remaining.find("*/")?.checked_add(2)?;
+            continue;
+        }
+        let Some(character) = remaining.chars().next() else {
+            return Some(offset);
+        };
+        if character.is_whitespace() || character == '\u{feff}' {
+            offset = offset.checked_add(character.len_utf8())?;
+            continue;
+        }
+        return Some(offset);
+    }
 }
 
 pub(super) fn finish_direct_source_call_plan(
@@ -557,6 +672,9 @@ fn resolve_explicit_source_type_arguments(
     let Some(type_arguments) = type_arguments else {
         return Ok(None);
     };
+    if type_arguments.is_empty() {
+        return Ok(None);
+    }
     let mut type_argument_diagnostics = CanonicalCheckerDiagnostics::default();
     let result = (|| {
         let mut query = CanonicalTypeQuery::new_with_global_types(
@@ -592,7 +710,9 @@ pub(super) fn check_direct_source_call(
         global_types,
         options,
         diagnostics,
-        plan.type_arguments.as_deref(),
+        plan.type_arguments
+            .as_ref()
+            .map(|type_arguments| type_arguments.nodes.as_slice()),
     )?;
     let mut retried_signatures = HashSet::new();
     let resolution = loop {
@@ -967,6 +1087,86 @@ mod tests {
             context
                 .store_mut_for_test()
                 .set_source_file_links(source, links)
+        );
+    }
+
+    #[test]
+    fn call_plan_retains_go_style_type_argument_list_interior() {
+        let text = concat!(
+            "function pair<T, U>(left: T, right: U): U { return right; } ",
+            "const spaced = pair< string, number >(\"left\", 1); ",
+            "const empty = pair<>(\"left\", 1); ",
+            "const trailing = pair< string, number ,   >(\"left\", 1);",
+        );
+        let parsed = parsed(text);
+        let file = FileId::new(435);
+        let context = context(&parsed, file);
+        let call_nodes = calls(&parsed, file);
+        let [spaced, empty, trailing] = call_nodes.as_slice() else {
+            panic!("expected spaced, empty, and trailing-comma generic calls")
+        };
+
+        let spaced = plan_direct_source_call_syntax(&parsed.arena, context.store(), *spaced)
+            .unwrap()
+            .type_arguments
+            .unwrap();
+        let spaced_start = text.find("string, number").unwrap();
+        let spaced_end = spaced_start + "string, number".len();
+        assert_eq!(spaced.nodes.len(), 2);
+        assert_eq!(spaced.trailing_comma_range, None);
+        let spaced_syntax_start = text.find("< string, number >").unwrap();
+        let spaced_syntax_end = spaced_syntax_start + "< string, number >".len();
+        assert_eq!(
+            spaced.syntax_range,
+            TextRange::new(
+                TextPos::new(u32::try_from(spaced_syntax_start).unwrap()),
+                TextPos::new(u32::try_from(spaced_syntax_end).unwrap()),
+            )
+        );
+        assert_eq!(
+            spaced.diagnostic_range,
+            Some(TextRange::new(
+                TextPos::new(u32::try_from(spaced_start).unwrap()),
+                TextPos::new(u32::try_from(spaced_end).unwrap()),
+            ))
+        );
+
+        let empty = plan_direct_source_call_syntax(&parsed.arena, context.store(), *empty)
+            .unwrap()
+            .type_arguments
+            .unwrap();
+        assert!(empty.nodes.is_empty());
+        assert_eq!(empty.trailing_comma_range, None);
+        let empty_syntax_start = text.find("<>").unwrap();
+        assert_eq!(
+            empty.syntax_range,
+            TextRange::new(
+                TextPos::new(u32::try_from(empty_syntax_start).unwrap()),
+                TextPos::new(u32::try_from(empty_syntax_start + 2).unwrap()),
+            )
+        );
+        assert_eq!(empty.diagnostic_range, None);
+
+        let trailing = plan_direct_source_call_syntax(&parsed.arena, context.store(), *trailing)
+            .unwrap()
+            .type_arguments
+            .unwrap();
+        let trailing_start = text.rfind("string, number ,").unwrap();
+        let trailing_end = trailing_start + "string, number ,".len();
+        assert_eq!(trailing.nodes.len(), 2);
+        assert_eq!(
+            trailing.trailing_comma_range,
+            Some(TextRange::new(
+                TextPos::new(u32::try_from(trailing_end - 1).unwrap()),
+                TextPos::new(u32::try_from(trailing_end).unwrap()),
+            ))
+        );
+        assert_eq!(
+            trailing.diagnostic_range,
+            Some(TextRange::new(
+                TextPos::new(u32::try_from(trailing_start).unwrap()),
+                TextPos::new(u32::try_from(trailing_end).unwrap()),
+            ))
         );
     }
 
