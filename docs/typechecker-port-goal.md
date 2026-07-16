@@ -523,6 +523,47 @@ remains the cluster-level source of truth.
   Array-to-ReadonlyArray relations remain explicit follow-ups. The combined
   checker passes 705/705 library tests, doctest, strict all-target checker and
   compiler Clippy, and rustdoc with warnings denied.
+- The canonical array surface now extends through direct global
+  `Array<T>`/`ReadonlyArray<T>` references, declared property-object elements,
+  mixed array/property-object relation reduction, and dependency-closed cache
+  validation in `41b5eb7`, `ab36630`, `5b382a9..21468be`, and `af2b51a`.
+  Direct references share the authoritative target-local instantiation cache
+  with shorthand arrays, preserve exact arity diagnostics, and reject local
+  aliases that merely spell `Array`. Declared interface/type-literal elements
+  participate in contextual arrays and unions without descriptor shortcuts.
+  Cached capability validation closes through aliases, generic wrappers,
+  unions, and declared property graphs, including exported and nested legal
+  boundaries, while actual repeated merged properties remain an explicit
+  unsupported family rather than a malformed cache. Array/object mixed
+  reductions retain the pinned empty-object ordering and validate both source
+  and target graphs before relation publication.
+- Top-level initialized variable inference and exact straight-line current-flow
+  types are integrated through `6821c5d`, `65487d4`, `889cd7a`, and the
+  compiler invariant classification in `18987e5`. The source checker keeps the
+  published declaration type separate from the source-ordered current-flow
+  type used by identifier reads. Within the completely preflighted straight-line
+  tree, annotated and inferred declarations, same-list reads, and direct
+  assignments to already declared supported `var` symbols follow the pinned
+  union-only assignment reduction, including `never`, `void`, fresh boolean
+  literals, denormalized named-union origins, and the final invalid-reduction
+  assignability safeguard. Non-union declarations retain their declared type;
+  invalid assignments diagnose then reset flow to it. Self/forward reads,
+  assignment before declaration, block-scoped assignment, chained/nested
+  targets, cross-file flow, and control-flow joins still fail closed. The
+  combined main tree passes 738/738 checker library tests plus doctest, strict
+  all-target checker/compiler Clippy, and rustdoc with warnings denied after an
+  independent Go-semantic audit.
+- A fresh canonical first-50 scorecard on 2026-07-15 executes 50 variants with
+  one exact full diagnostic artifact (`declarationEmitBigInt.ts`) and 49 honest
+  unsupported results, with no fatal checker invariant. The first unsupported
+  syntax roots are concentrated in function declarations (9), classes (6),
+  enums (4), modules (3), interfaces and arrows (2 each), plus five JavaScript
+  and two TSX source gates. The attempted first-500 rerun hit the harness's
+  120-second cap before producing a scorecard, so the earlier completed
+  536-variant tranche remains the broad denominator. This measurement makes
+  annotated function signatures and their value-type publication the next
+  dependency kernel; after that contract freezes, functions, classes,
+  modules/imports, enums, and JS/TSX become separate source-family waves.
 
 No percentage in this section is a whole-corpus parity claim. A score is
 publishable only when its variant manifest and complete artifact comparison are
@@ -1312,6 +1353,21 @@ patches. With four slots this pattern yields roughly 2.5-3 useful worker lanes;
 additional workers become valuable only after dispatch and shared cache
 contracts are frozen, at which point 6-10 disjoint feature clusters are
 plausible but reviewer/integration throughput becomes the limiting resource.
+
+The subsequent array/flow/signature wave confirmed the same ceiling from the
+opposite direction. One implementation lane completed array capability-graph
+closure while another implemented current-flow types; a read-only Go reviewer
+caught the union-only caller guard, non-union `never` behavior, `void` relation
+edge, and fresh-literal mapping details before merge. Root serialized Cargo,
+integrated the two slices, and kept the next FunctionType kernel in static
+development. Two independent signature reviews then split Go evaluation-order
+semantics from Rust retry/atomicity and found different shell-state defects
+before that slice reached integration. With four slots, this is the stable
+default: root/integration, one active core implementer, one next-wave
+implementer or disjoint feature owner, and one rotating reviewer. A fifth and
+sixth worker are best spent on a second review dimension and corpus/oracle
+shards until source dispatch, signature records, and relation cache contracts
+freeze; only then should they become additional core writers.
 
 Work is assigned by an exclusive tuple of upstream functions, Rust destination
 modules, and semantic records it may mutate. Fixture buckets are validation
