@@ -28,8 +28,8 @@ use super::{
         CanonicalEmptyTupleProvenance, CanonicalTupleTargetKey, CanonicalTupleTargetProvenance,
     },
     type_records::{
-        CacheHashKey, InterfaceTypeData, LiteralValue, StructuredTypeData, TypeCacheState, TypeData,
-        TypeRecord,
+        CacheHashKey, InterfaceTypeData, LiteralValue, StructuredTypeData, TypeCacheState,
+        TypeData, TypeRecord,
     },
     types::{ObjectFlags, TypeFlags},
 };
@@ -42,12 +42,9 @@ fn valid_canonical_reference_object_flags(
     allow_from_type_node: bool,
 ) -> bool {
     let allowed = required
-        | ObjectFlags::PROPAGATING_FLAGS
         | ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES_COMPUTED
         | ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES
         | ObjectFlags::MEMBERS_RESOLVED
-        | ObjectFlags::CONTAINS_SPREAD
-        | ObjectFlags::OBJECT_REST_TYPE
         | ObjectFlags::IDENTICAL_BASE_TYPE_CALCULATED
         | ObjectFlags::IDENTICAL_BASE_TYPE_EXISTS
         | ObjectFlags::UNRESOLVED_MEMBERS
@@ -56,7 +53,14 @@ fn valid_canonical_reference_object_flags(
         } else {
             ObjectFlags::NONE
         };
-    flags.contains(required) && (flags & !allowed).is_empty()
+    flags.contains(required)
+        && (flags & !allowed).is_empty()
+        && (!flags.contains(ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES)
+            || flags.contains(ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES_COMPUTED))
+        && (!flags.contains(ObjectFlags::IDENTICAL_BASE_TYPE_EXISTS)
+            || flags.contains(ObjectFlags::IDENTICAL_BASE_TYPE_CALCULATED))
+        && (!flags.contains(ObjectFlags::UNRESOLVED_MEMBERS)
+            || flags.contains(ObjectFlags::MEMBERS_RESOLVED))
 }
 
 /// Dependency-closed request for one supported tuple identity.
@@ -1808,9 +1812,12 @@ impl CanonicalTypeMapperStore {
     }
 
     fn valid_canonical_tuple_base_cache(&self, interface: &InterfaceTypeData) -> bool {
-        interface
-            .resolved_base_constructor_type
-            .is_none_or(|type_| self.type_payload(type_).is_some())
+        (interface.base_types_resolved
+            || interface.resolved_base_constructor_type.is_none()
+                && interface.resolved_base_types.is_none())
+            && interface
+                .resolved_base_constructor_type
+                .is_none_or(|type_| self.type_payload(type_).is_some())
             && interface
                 .resolved_base_types
                 .as_deref()
@@ -2583,8 +2590,6 @@ mod tests {
         );
         let lazy_flags = ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES_COMPUTED
             | ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES
-            | ObjectFlags::CONTAINS_SPREAD
-            | ObjectFlags::OBJECT_REST_TYPE
             | ObjectFlags::IDENTICAL_BASE_TYPE_CALCULATED
             | ObjectFlags::IDENTICAL_BASE_TYPE_EXISTS
             | ObjectFlags::UNRESOLVED_MEMBERS;
@@ -2637,6 +2642,82 @@ mod tests {
             ),
             Ok(empty)
         );
+    }
+
+    #[test]
+    fn tuple_reference_cache_rejects_extra_propagating_construction_and_implied_flags() {
+        fn assert_instance_poison(poison: ObjectFlags) {
+            let mut store = initialized();
+            let string = store.intrinsic_bootstrap().unwrap().string_type;
+            let infos = [element_info(&store, ElementFlags::REQUIRED, None)];
+            let instance = store
+                .create_canonical_tuple_type(CanonicalTupleTypeRequest::new(
+                    &[string],
+                    &infos,
+                    false,
+                ))
+                .unwrap();
+            let target = match store.type_payload(instance).unwrap().data() {
+                TypeData::TypeReference(reference) => reference.object.target.unwrap(),
+                _ => panic!("nonempty tuple must be a concrete reference"),
+            };
+            assert!(store.add_type_object_flags(instance, poison));
+            assert_eq!(
+                store.create_canonical_tuple_type(CanonicalTupleTypeRequest::new(
+                    &[string],
+                    &infos,
+                    false,
+                )),
+                Err(TupleTypeError::InvalidInstantiationCache { target, instance }),
+                "poison={poison:?}",
+            );
+        }
+
+        for poison in [
+            ObjectFlags::NON_INFERRABLE_TYPE,
+            ObjectFlags::CONTAINS_SPREAD,
+            ObjectFlags::OBJECT_REST_TYPE,
+            ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES,
+            ObjectFlags::IDENTICAL_BASE_TYPE_EXISTS,
+            ObjectFlags::UNRESOLVED_MEMBERS,
+        ] {
+            assert_instance_poison(poison);
+        }
+
+        for poison in [
+            ObjectFlags::FROM_TYPE_NODE,
+            ObjectFlags::NON_INFERRABLE_TYPE,
+            ObjectFlags::CONTAINS_SPREAD,
+            ObjectFlags::OBJECT_REST_TYPE,
+        ] {
+            let mut store = initialized();
+            let empty = store.create_canonical_empty_tuple_type().unwrap();
+            assert!(store.add_type_object_flags(empty, poison));
+            assert_eq!(
+                store.create_canonical_empty_tuple_type(),
+                Err(EmptyTupleTypeError::InvalidCache(empty)),
+                "target poison={poison:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn unresolved_tuple_target_rejects_published_base_cache_payloads() {
+        for resolved_base_types in [false, true] {
+            let mut store = initialized();
+            let string = store.intrinsic_bootstrap().unwrap().string_type;
+            let empty = store.create_canonical_empty_tuple_type().unwrap();
+            assert!(store.set_interface_base_resolution(
+                empty,
+                false,
+                (!resolved_base_types).then_some(string),
+                resolved_base_types.then(|| vec![string]),
+            ));
+            assert_eq!(
+                store.create_canonical_empty_tuple_type(),
+                Err(EmptyTupleTypeError::InvalidCache(empty)),
+            );
+        }
     }
 
     #[test]
