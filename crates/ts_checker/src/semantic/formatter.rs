@@ -795,7 +795,7 @@ fn display_object_type(
             store,
             host,
             global_types,
-            projection,
+            &projection,
             flags,
             state,
             visiting,
@@ -838,8 +838,8 @@ fn display_object_type(
 }
 
 /// Syntax-specific proof providers converge on one immutable signature
-/// projection before the formatter emits any text. Source FunctionDeclaration
-/// and ArrowFunction values can add providers here without changing display,
+/// projection before the formatter emits any text. Source `FunctionDeclaration`
+/// and `ArrowFunction` values can add providers here without changing display,
 /// precedence, truncation, or recursive formatting behavior.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SingleCallableDisplayProvider {
@@ -1015,7 +1015,7 @@ fn display_single_call_signature(
     store: &CanonicalTypeMapperStore,
     host: Option<&DeclaredTypeHost<'_>>,
     global_types: Option<&CanonicalGlobalTypes>,
-    projection: ValidatedSingleCallSignatureDisplay,
+    projection: &ValidatedSingleCallSignatureDisplay,
     flags: CanonicalTypeFormatFlags,
     state: &mut DisplayState,
     visiting: &mut HashSet<TypeId>,
@@ -2832,10 +2832,8 @@ mod tests {
         parsed
             .arena
             .iter()
-            .filter_map(|(node, record)| {
-                (record.kind == SyntaxKind::FunctionType)
-                    .then(|| NodeRef::new(parsed.arena.id(), file, node))
-            })
+            .filter(|(_, record)| record.kind == SyntaxKind::FunctionType)
+            .map(|(node, _)| NodeRef::new(parsed.arena.id(), file, node))
             .collect()
     }
 
