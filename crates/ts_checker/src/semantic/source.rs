@@ -3517,6 +3517,7 @@ pub(super) fn check_source_file(
     let mut deferred = Vec::new();
     let mut declared_types = HashMap::new();
     let mut current_flow_types = HashMap::new();
+    let mut mutable_variables = HashSet::new();
     let mut value_order = Vec::new();
 
     for function in &functions {
@@ -3607,22 +3608,6 @@ pub(super) fn check_source_file(
                         VariableInvariant::DuplicateCurrentFlowType(arrow.source.variable_symbol),
                     ));
                 }
-                for parameter in &arrow.source.callable.parameters {
-                    let parameter_type = store
-                        .value_symbol_links(parameter.symbol)
-                        .and_then(|links| links.resolved_type)
-                        .ok_or(SourceCheckError::Variable(
-                            VariableInvariant::MissingCurrentFlowType(parameter.symbol),
-                        ))?;
-                    if current_flow_types
-                        .insert(parameter.symbol, parameter_type)
-                        .is_some()
-                    {
-                        return Err(SourceCheckError::Variable(
-                            VariableInvariant::DuplicateCurrentFlowType(parameter.symbol),
-                        ));
-                    }
-                }
             }
             PlannedStatement::Variables(variables) => {
                 for variable in variables {
@@ -3692,6 +3677,11 @@ pub(super) fn check_source_file(
                         variable.symbol,
                         declared_type,
                     )?;
+                    if !variable.binding.is_const() && !mutable_variables.insert(variable.symbol) {
+                        return Err(SourceCheckError::Variable(
+                            VariableInvariant::DuplicateCurrentFlowType(variable.symbol),
+                        ));
+                    }
                     if current_flow_types
                         .insert(variable.symbol, current_flow_type)
                         .is_some()
@@ -3749,7 +3739,33 @@ pub(super) fn check_source_file(
         }
     }
 
+    let mut captured_flow_types = current_flow_types.clone();
+    for symbol in mutable_variables {
+        let declared_type = *declared_types
+            .get(&symbol)
+            .ok_or(SourceCheckError::Variable(
+                VariableInvariant::MissingStagedValueType(symbol),
+            ))?;
+        captured_flow_types.insert(symbol, declared_type);
+    }
     for arrow in &arrows {
+        let mut body_flow_types = captured_flow_types.clone();
+        for parameter in &arrow.source.callable.parameters {
+            let parameter_type = store
+                .value_symbol_links(parameter.symbol)
+                .and_then(|links| links.resolved_type)
+                .ok_or(SourceCheckError::Variable(
+                    VariableInvariant::MissingCurrentFlowType(parameter.symbol),
+                ))?;
+            if body_flow_types
+                .insert(parameter.symbol, parameter_type)
+                .is_some()
+            {
+                return Err(SourceCheckError::Variable(
+                    VariableInvariant::DuplicateCurrentFlowType(parameter.symbol),
+                ));
+            }
+        }
         match &arrow.body {
             PlannedArrowBody::Empty => {}
             PlannedArrowBody::Return {
@@ -3763,7 +3779,7 @@ pub(super) fn check_source_file(
                     source,
                     options,
                     diagnostics,
-                    &current_flow_types,
+                    &body_flow_types,
                     &mut deferred,
                     arrow.source.callable.return_type,
                     expression,
@@ -4055,6 +4071,15 @@ mod tests {
             panic!("arrow {expected} does not have one statement")
         };
         NodeRef::new(parsed.arena.id(), file, *statement)
+    }
+
+    fn arrow_body(parsed: &ParseResult, file: FileId, expected: &str) -> NodeRef {
+        let initializer = variable_initializer(parsed, file, expected);
+        let NodeData::ArrowFunction(arrow) = &parsed.arena.get(initializer.node).unwrap().data
+        else {
+            panic!("variable {expected} does not have an arrow initializer")
+        };
+        NodeRef::new(parsed.arena.id(), file, arrow.body)
     }
 
     fn variable_symbol(
@@ -9647,6 +9672,82 @@ mod tests {
         assert_eq!(observable_state(&context, file), warm);
         assert_eq!(variable_value_type(&context, &source, file, "f"), callable);
         assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn source_arrow_mutable_captures_use_their_declared_entry_types() {
+        for (file, text) in [
+            (
+                FileId::new(312),
+                "let x: string | number = 1; const f = (): string => x;",
+            ),
+            (
+                FileId::new(313),
+                concat!(
+                    "var x: string | number = 1; ",
+                    "const f = (): string => x; ",
+                    "x = 'ok';",
+                ),
+            ),
+        ] {
+            let source = parsed(text);
+            let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+            context.check_source_file(file).unwrap();
+
+            let [diagnostic] = context.diagnostics().as_slice() else {
+                panic!("expected one mutable capture diagnostic")
+            };
+            assert_eq!(diagnostic.node, Some(arrow_body(&source, file, "f")));
+            assert_eq!(diagnostic.diagnostic.code(), 2322);
+            assert_eq!(
+                diagnostic.diagnostic.render().unwrap(),
+                "Type 'string | number' is not assignable to type 'string'."
+            );
+            assert!(is_type_checked(&context, file));
+        }
+    }
+
+    #[test]
+    fn deferred_arrow_parameters_remain_body_local() {
+        let source = parsed(concat!(
+            "const text = (value: string): string => value; ",
+            "const numeric = (value: number): number => value;",
+        ));
+        let file = FileId::new(314);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let (_, bound) = context.file(file).unwrap();
+        let mut parameters = Vec::new();
+        for name in ["text", "numeric"] {
+            let arrow = variable_initializer(&source, file, name);
+            let owner = bound.symbol(arrow).unwrap();
+            let callable = context
+                .store()
+                .source_callable_type_for_owner(owner)
+                .unwrap();
+            let provenance = context
+                .store()
+                .source_callable_provenance(callable)
+                .unwrap();
+            let signature = context.store().signature(provenance.signature).unwrap();
+            let [parameter] = signature.parameters() else {
+                panic!("expected one parameter for {name}")
+            };
+            assert_eq!(
+                context
+                    .store()
+                    .symbol_node_links(arrow_body(&source, file, name))
+                    .and_then(|links| links.resolved_symbol),
+                Some(*parameter)
+            );
+            parameters.push(*parameter);
+        }
+        assert_ne!(parameters[0], parameters[1]);
+        assert!(context.diagnostics().is_empty());
+        assert!(is_type_checked(&context, file));
     }
 
     #[test]
