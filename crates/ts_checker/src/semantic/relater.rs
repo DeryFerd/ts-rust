@@ -2013,16 +2013,16 @@ impl<'store> RelaterSession<'store> {
             }
 
             let (source_callback, source_nullable_facts) =
-                if !check_mode.intersects(SignatureCheckMode::CALLBACK) {
-                    self.project_non_nullable_function_call_signature(source_type)?
-                } else {
+                if check_mode.intersects(SignatureCheckMode::CALLBACK) {
                     (None, 0)
+                } else {
+                    self.project_non_nullable_function_call_signature(source_type)?
                 };
             let (target_callback, target_nullable_facts) =
-                if !check_mode.intersects(SignatureCheckMode::CALLBACK) {
-                    self.project_non_nullable_function_call_signature(target_type)?
-                } else {
+                if check_mode.intersects(SignatureCheckMode::CALLBACK) {
                     (None, 0)
+                } else {
+                    self.project_non_nullable_function_call_signature(target_type)?
                 };
             let mut related = if let (Some(source_callback), Some(target_callback)) =
                 (source_callback.as_ref(), target_callback.as_ref())
