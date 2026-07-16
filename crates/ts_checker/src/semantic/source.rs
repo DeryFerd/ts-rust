@@ -65,8 +65,8 @@ use super::{
         plan_source_callable, publish_contextual_source_callable, validate_stored_source_callable,
     },
     source_calls::{
-        SourceCallPlan, check_direct_source_call, finish_direct_source_call_plan,
-        plan_direct_source_call_syntax,
+        SourceCallPlan, check_direct_source_call, emit_call_type_argument_grammar_diagnostics,
+        finish_direct_source_call_plan, plan_direct_source_call_syntax,
     },
     source_enums::{SourceEnumError, SourceEnumPlan, execute_top_level_enum, plan_top_level_enum},
     source_functions::{
@@ -3852,6 +3852,7 @@ fn check_expression_type(
             ))
         }
         PlannedExpressionKind::Call(call) => {
+            emit_call_type_argument_grammar_diagnostics(diagnostics, call)?;
             let callee = check_expression_type(
                 store,
                 host,

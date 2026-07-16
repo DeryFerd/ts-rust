@@ -13,10 +13,10 @@ use ts_core::{TextPos, TextRange};
 use ts_diagnostics::{Diagnostic, message_by_code};
 
 use super::{
-    CanonicalCheckerDiagnostic, CanonicalCheckerDiagnostics, CanonicalCheckerOptions,
-    CanonicalGlobalTypes, CanonicalTypeFormatFlags, CanonicalTypeMapperStore, DeclaredTypeHost,
-    RelationUnavailable, ResolvedSignatureState, SignatureId, SignatureLinks, TypeId,
-    TypeNodeLinks,
+    CanonicalCheckerDiagnostic, CanonicalCheckerDiagnosticRange, CanonicalCheckerDiagnostics,
+    CanonicalCheckerOptions, CanonicalCheckerRelatedInformation, CanonicalGlobalTypes,
+    CanonicalTypeFormatFlags, CanonicalTypeMapperStore, DeclaredTypeHost, RelationUnavailable,
+    ResolvedSignatureState, SignatureId, SignatureLinks, TypeId, TypeNodeLinks,
     calls::{
         DirectCallApplicability, DirectCallError, DirectCallForm, DirectCallRequest,
         DirectCallUnsupported, resolve_direct_call,
@@ -51,10 +51,10 @@ pub(super) struct SourceCallPlan {
 /// or trailing comma for TS2558, excluding outer trivia and angle brackets. An
 /// empty list remains present because call resolution treats it as inference.
 #[derive(Clone, Debug)]
-#[allow(dead_code)] // Exact ranges are consumed by the next generic diagnostic slice.
 struct SourceTypeArgumentList {
     nodes: Vec<NodeRef>,
     syntax_range: TextRange,
+    #[allow(dead_code)] // Consumed when TS2558 is routed through the vector kernel.
     diagnostic_range: Option<TextRange>,
     trailing_comma_range: Option<TextRange>,
 }
@@ -693,6 +693,106 @@ fn resolve_explicit_source_type_arguments(
     Ok(Some(result?))
 }
 
+pub(super) fn emit_call_type_argument_grammar_diagnostics(
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    plan: &SourceCallPlan,
+) -> Result<(), SourceCheckError> {
+    let Some(type_arguments) = &plan.type_arguments else {
+        return Ok(());
+    };
+    if let Some(range) = type_arguments.trailing_comma_range {
+        merge_retry_diagnostic(
+            diagnostics,
+            CanonicalCheckerDiagnostic {
+                node: Some(plan.node),
+                range_override: Some(CanonicalCheckerDiagnosticRange::new(plan.node, range)),
+                diagnostic: Diagnostic::new(
+                    message_by_code(1009).ok_or(SourceCheckError::MissingDiagnostic(1009))?,
+                ),
+                related_information: Vec::new(),
+            },
+        );
+        return Ok(());
+    }
+    if type_arguments.nodes.is_empty() {
+        merge_retry_diagnostic(
+            diagnostics,
+            CanonicalCheckerDiagnostic {
+                node: Some(plan.node),
+                range_override: Some(CanonicalCheckerDiagnosticRange::new(
+                    plan.node,
+                    type_arguments.syntax_range,
+                )),
+                diagnostic: Diagnostic::new(
+                    message_by_code(1099).ok_or(SourceCheckError::MissingDiagnostic(1099))?,
+                ),
+                related_information: Vec::new(),
+            },
+        );
+    }
+    Ok(())
+}
+
+fn extra_argument_diagnostic_range(
+    host: &DeclaredTypeHost<'_>,
+    plan: &SourceCallPlan,
+    first_extra: usize,
+) -> Result<CanonicalCheckerDiagnosticRange, SourceCheckError> {
+    let first = plan
+        .arguments
+        .get(first_extra)
+        .ok_or(SourceCheckError::Call(plan.node))?;
+    let last = plan
+        .arguments
+        .last()
+        .ok_or(SourceCheckError::Call(plan.node))?;
+    let first_range = host
+        .node(first.node)
+        .ok_or(SourceCheckError::Call(plan.node))?
+        .range;
+    let last_range = host
+        .node(last.node)
+        .ok_or(SourceCheckError::Call(plan.node))?
+        .range;
+    Ok(CanonicalCheckerDiagnosticRange::new(
+        plan.node,
+        TextRange::new(first_range.start, last_range.end),
+    ))
+}
+
+fn missing_argument_related_information(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    call: NodeRef,
+    signature: SignatureId,
+    actual: usize,
+) -> Result<CanonicalCheckerRelatedInformation, SourceCheckError> {
+    let parameter = *store
+        .signature(signature)
+        .and_then(|signature| signature.parameters().get(actual))
+        .ok_or(SourceCheckError::Call(call))?;
+    let symbol = store.symbol(parameter).ok_or(SourceCheckError::Call(call))?;
+    let declaration = *symbol
+        .declarations()
+        .and_then(|declarations| declarations.first())
+        .ok_or(SourceCheckError::Call(call))?;
+    if host.node(declaration).is_none() {
+        return Err(SourceCheckError::Call(call));
+    }
+    let name = symbol
+        .name()
+        .as_utf8()
+        .ok_or(SourceCheckError::Call(call))?
+        .to_owned();
+    Ok(CanonicalCheckerRelatedInformation {
+        node: Some(declaration),
+        diagnostic: Diagnostic::with_arguments(
+            message_by_code(6210).ok_or(SourceCheckError::MissingDiagnostic(6210))?,
+            [name],
+        ),
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn check_direct_source_call(
     store: &mut CanonicalTypeMapperStore,
@@ -758,8 +858,52 @@ pub(super) fn check_direct_source_call(
     )?;
     match resolution.applicability {
         DirectCallApplicability::Applicable => {}
-        DirectCallApplicability::TooFewArguments { actual, .. }
-        | DirectCallApplicability::TooManyArguments { actual, .. } => {
+        DirectCallApplicability::TooFewArguments {
+            expected_at_least,
+            actual,
+        } => {
+            if expected_at_least != resolution.minimum_argument_count
+                || actual != plan.arguments.len()
+            {
+                return Err(SourceCheckError::Call(plan.node));
+            }
+            let expected = if resolution.minimum_argument_count == resolution.maximum_argument_count
+            {
+                resolution.minimum_argument_count.to_string()
+            } else {
+                format!(
+                    "{}-{}",
+                    resolution.minimum_argument_count, resolution.maximum_argument_count
+                )
+            };
+            merge_retry_diagnostic(
+                diagnostics,
+                CanonicalCheckerDiagnostic {
+                    node: Some(plan.callee.node),
+                    range_override: None,
+                    diagnostic: Diagnostic::with_arguments(
+                        message_by_code(2554).ok_or(SourceCheckError::MissingDiagnostic(2554))?,
+                        [expected, actual.to_string()],
+                    ),
+                    related_information: vec![missing_argument_related_information(
+                        store,
+                        host,
+                        plan.node,
+                        resolution.signature,
+                        actual,
+                    )?],
+                },
+            );
+        }
+        DirectCallApplicability::TooManyArguments {
+            expected_at_most,
+            actual,
+        } => {
+            if expected_at_most != resolution.maximum_argument_count
+                || actual != plan.arguments.len()
+            {
+                return Err(SourceCheckError::Call(plan.node));
+            }
             let expected = if resolution.minimum_argument_count == resolution.maximum_argument_count
             {
                 resolution.minimum_argument_count.to_string()
@@ -773,7 +917,11 @@ pub(super) fn check_direct_source_call(
                 diagnostics,
                 CanonicalCheckerDiagnostic {
                     node: Some(plan.node),
-                    range_override: None,
+                    range_override: Some(extra_argument_diagnostic_range(
+                        host,
+                        plan,
+                        expected_at_most,
+                    )?),
                     diagnostic: Diagnostic::with_arguments(
                         message_by_code(2554).ok_or(SourceCheckError::MissingDiagnostic(2554))?,
                         [expected, actual.to_string()],
@@ -806,7 +954,7 @@ pub(super) fn check_direct_source_call(
             merge_retry_diagnostic(
                 diagnostics,
                 CanonicalCheckerDiagnostic {
-                    node: Some(argument.node),
+                    node: Some(argument.unparenthesized().node),
                     range_override: None,
                     diagnostic: Diagnostic::with_arguments(
                         message_by_code(2345).ok_or(SourceCheckError::MissingDiagnostic(2345))?,
@@ -1167,6 +1315,86 @@ mod tests {
                 TextPos::new(u32::try_from(trailing_start).unwrap()),
                 TextPos::new(u32::try_from(trailing_end).unwrap()),
             ))
+        );
+    }
+
+    #[test]
+    fn generic_call_grammar_diagnostics_use_exact_bracket_and_comma_ranges() {
+        let text = concat!(
+            "function identity<T>(value: T): T { return value; } ",
+            "const empty = identity<>(1 + true); ",
+            "const trailing = identity< string , /* trivia */ >(\"trailing\");",
+        );
+        let parsed = parsed(text);
+        let file = FileId::new(436);
+        let mut context = context(&parsed, file);
+
+        context.check_source_file(file).unwrap();
+
+        let diagnostics = context.diagnostics().as_slice();
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.code())
+                .collect::<Vec<_>>(),
+            vec![1099, 2365, 1009]
+        );
+        let mut call_nodes = calls(&parsed, file);
+        call_nodes.sort_by_key(|call| parsed.arena.get(call.node).unwrap().range.start);
+        let [empty, trailing] = call_nodes.as_slice() else {
+            panic!("expected empty and trailing-comma generic calls")
+        };
+        let empty_start = text.find("<>").unwrap();
+        assert_eq!(diagnostics[0].node, Some(*empty));
+        assert_eq!(
+            diagnostics[0].range_override,
+            Some(CanonicalCheckerDiagnosticRange::new(
+                *empty,
+                TextRange::new(
+                    TextPos::new(u32::try_from(empty_start).unwrap()),
+                    TextPos::new(u32::try_from(empty_start + 2).unwrap()),
+                ),
+            ))
+        );
+        assert_eq!(
+            diagnostics[0].diagnostic.render().unwrap(),
+            "Type argument list cannot be empty."
+        );
+        let trailing_start = text.find(", /* trivia */").unwrap();
+        assert_eq!(diagnostics[2].node, Some(*trailing));
+        assert_eq!(
+            diagnostics[2].range_override,
+            Some(CanonicalCheckerDiagnosticRange::new(
+                *trailing,
+                TextRange::new(
+                    TextPos::new(u32::try_from(trailing_start).unwrap()),
+                    TextPos::new(u32::try_from(trailing_start + 1).unwrap()),
+                ),
+            ))
+        );
+        assert_eq!(
+            diagnostics[2].diagnostic.render().unwrap(),
+            "Trailing comma not allowed."
+        );
+
+        let cold_diagnostics = context.diagnostics().as_slice().to_vec();
+        let cold_counts = (
+            context.store().type_len(),
+            context.store().mapper_len(),
+            context.store().signature_len(),
+            context.store().cached_signature_len(),
+        );
+        mark_source_unchecked(&mut context, file);
+        context.check_source_file(file).unwrap();
+        assert_eq!(context.diagnostics().as_slice(), cold_diagnostics);
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().mapper_len(),
+                context.store().signature_len(),
+                context.store().cached_signature_len(),
+            ),
+            cold_counts
         );
     }
 
@@ -1707,14 +1935,46 @@ mod tests {
 
     #[test]
     fn direct_calls_issue_exact_arity_and_argument_diagnostics_but_keep_return_type() {
-        let parsed = parsed(concat!(
+        let text = concat!(
             "function take(value: number): string { return 'ok'; } ",
             "const tooFew = take(); ",
-            "const wrong = take('x');",
-        ));
+            "const wrong = take((('x'))); ",
+            "const tooMany = take(1, ('extra'), true);",
+        );
+        let parsed = parsed(text);
         let file = FileId::new(402);
-        let calls = calls(&parsed, file);
+        let mut calls = calls(&parsed, file);
+        calls.sort_by_key(|call| parsed.arena.get(call.node).unwrap().range.start);
+        let [too_few, _, _] = calls.as_slice() else {
+            panic!("expected too-few, wrong-type, and too-many calls")
+        };
         let mut context = context(&parsed, file);
+        let too_few_callee = plan_direct_source_call_syntax(
+            &parsed.arena,
+            context.store(),
+            *too_few,
+        )
+        .unwrap()
+        .callee();
+        let parameter = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::Parameter)
+                    .then(|| NodeRef::new(parsed.arena.id(), file, node))
+            })
+            .unwrap();
+        let wrong_start = text.find("'x'").unwrap();
+        let wrong_argument = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::StringLiteral
+                    && record.range.start
+                        == TextPos::new(u32::try_from(wrong_start).unwrap()))
+                .then(|| NodeRef::new(parsed.arena.id(), file, node))
+            })
+            .unwrap();
 
         context.check_source_file(file).unwrap();
 
@@ -1725,21 +1985,46 @@ mod tests {
                 .iter()
                 .map(|diagnostic| diagnostic.diagnostic.code())
                 .collect::<Vec<_>>(),
-            vec![2554, 2345]
+            vec![2554, 2345, 2554]
         );
+        let diagnostics = context.diagnostics().as_slice();
+        assert_eq!(diagnostics[0].node, Some(too_few_callee));
+        assert_eq!(diagnostics[0].range_override, None);
         assert_eq!(
-            context.diagnostics().as_slice()[0]
-                .diagnostic
-                .render()
-                .unwrap(),
+            diagnostics[0].diagnostic.render().unwrap(),
             "Expected 1 arguments, but got 0."
         );
+        assert_eq!(diagnostics[0].related_information.len(), 1);
+        assert_eq!(diagnostics[0].related_information[0].node, Some(parameter));
         assert_eq!(
-            context.diagnostics().as_slice()[1]
+            diagnostics[0].related_information[0]
                 .diagnostic
                 .render()
                 .unwrap(),
+            "An argument for 'value' was not provided."
+        );
+        assert_eq!(diagnostics[1].node, Some(wrong_argument));
+        assert_eq!(diagnostics[1].range_override, None);
+        assert_eq!(
+            diagnostics[1].diagnostic.render().unwrap(),
             "Argument of type 'string' is not assignable to parameter of type 'number'."
+        );
+        let too_many_start = text.find("('extra'), true").unwrap();
+        let too_many_end = too_many_start + "('extra'), true".len();
+        assert_eq!(diagnostics[2].node, Some(calls[2]));
+        assert_eq!(
+            diagnostics[2].range_override,
+            Some(CanonicalCheckerDiagnosticRange::new(
+                calls[2],
+                TextRange::new(
+                    TextPos::new(u32::try_from(too_many_start).unwrap()),
+                    TextPos::new(u32::try_from(too_many_end).unwrap()),
+                ),
+            ))
+        );
+        assert_eq!(
+            diagnostics[2].diagnostic.render().unwrap(),
+            "Expected 1 arguments, but got 3."
         );
         let string = context.store().intrinsic_bootstrap().unwrap().string_type;
         assert!(calls.iter().all(|call| {
