@@ -51,6 +51,7 @@ use super::{
 /// retained as immutable context state for signature relation queries.
 /// `no_error_truncation` raises semantic type display to the pinned hard output
 /// cutoff.
+#[allow(clippy::struct_excessive_bools)] // Flat immutable compiler-option projection.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CanonicalCheckerOptions {
     pub intrinsic: IntrinsicBootstrapOptions,
