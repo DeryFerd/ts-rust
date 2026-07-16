@@ -28,13 +28,36 @@ use super::{
         CanonicalEmptyTupleProvenance, CanonicalTupleTargetKey, CanonicalTupleTargetProvenance,
     },
     type_records::{
-        CacheHashKey, ConstrainedTypeData, LiteralValue, StructuredTypeData, TypeCacheState,
-        TypeData, TypeParameterData, TypeRecord,
+        CacheHashKey, InterfaceTypeData, LiteralValue, StructuredTypeData, TypeCacheState, TypeData,
+        TypeRecord,
     },
     types::{ObjectFlags, TypeFlags},
 };
 
 const LENGTH: &str = "length";
+
+fn valid_canonical_reference_object_flags(
+    flags: ObjectFlags,
+    required: ObjectFlags,
+    allow_from_type_node: bool,
+) -> bool {
+    let allowed = required
+        | ObjectFlags::PROPAGATING_FLAGS
+        | ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES_COMPUTED
+        | ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES
+        | ObjectFlags::MEMBERS_RESOLVED
+        | ObjectFlags::CONTAINS_SPREAD
+        | ObjectFlags::OBJECT_REST_TYPE
+        | ObjectFlags::IDENTICAL_BASE_TYPE_CALCULATED
+        | ObjectFlags::IDENTICAL_BASE_TYPE_EXISTS
+        | ObjectFlags::UNRESOLVED_MEMBERS
+        | if allow_from_type_node {
+            ObjectFlags::FROM_TYPE_NODE
+        } else {
+            ObjectFlags::NONE
+        };
+    flags.contains(required) && (flags & !allowed).is_empty()
+}
 
 /// Dependency-closed request for one supported tuple identity.
 ///
@@ -1755,6 +1778,78 @@ impl CanonicalTypeMapperStore {
 }
 
 impl CanonicalTypeMapperStore {
+    fn valid_canonical_reference_structured_cache(&self, structured: &StructuredTypeData) -> bool {
+        structured
+            .constrained
+            .resolved_base_constraint
+            .is_none_or(|type_| self.type_payload(type_).is_some())
+            && structured
+                .members
+                .is_none_or(|members| self.symbol_table(members).is_some())
+            && structured.properties.as_deref().is_none_or(|properties| {
+                properties
+                    .iter()
+                    .all(|property| self.symbol(*property).is_some())
+            })
+            && structured.signatures.as_deref().is_none_or(|signatures| {
+                signatures
+                    .iter()
+                    .all(|signature| self.signature(*signature).is_some())
+            })
+            && structured.call_signature_count <= structured.signatures.as_ref().map_or(0, Vec::len)
+            && structured.index_infos.as_deref().is_none_or(|index_infos| {
+                index_infos
+                    .iter()
+                    .all(|index_info| self.index_info(*index_info).is_some())
+            })
+            && structured
+                .object_type_without_abstract_construct_signatures
+                .is_none_or(|type_| self.type_payload(type_).is_some())
+    }
+
+    fn valid_canonical_tuple_base_cache(&self, interface: &InterfaceTypeData) -> bool {
+        interface
+            .resolved_base_constructor_type
+            .is_none_or(|type_| self.type_payload(type_).is_some())
+            && interface
+                .resolved_base_types
+                .as_deref()
+                .is_none_or(|types| {
+                    types
+                        .iter()
+                        .all(|type_| self.type_payload(*type_).is_some())
+                })
+    }
+
+    fn valid_canonical_tuple_type_parameter(
+        &self,
+        record: &TypeRecord,
+        constraint: Option<TypeId>,
+        is_this_type: bool,
+    ) -> bool {
+        let resolved_flags = ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES_COMPUTED
+            | ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES;
+        let TypeData::TypeParameter(data) = record.data() else {
+            return false;
+        };
+        record.flags() == TypeFlags::TYPE_PARAMETER
+            && (record.object_flags() == ObjectFlags::NONE
+                || record.object_flags() == resolved_flags)
+            && record.symbol().is_none()
+            && record.alias().is_none()
+            && data.constraint == constraint
+            && data.target.is_none()
+            && data.mapper.is_none()
+            && data.is_this_type == is_this_type
+            && data
+                .constrained
+                .resolved_base_constraint
+                .is_none_or(|type_| self.type_payload(type_).is_some())
+            && data
+                .resolved_default_type
+                .is_none_or(|type_| self.type_payload(type_).is_some())
+    }
+
     #[allow(clippy::too_many_lines)]
     fn validate_canonical_tuple_target(&self, target: TypeId) -> Result<(), TupleTypeError> {
         let invalid = || TupleTypeError::InvalidTargetCache(target);
@@ -1795,19 +1890,21 @@ impl CanonicalTypeMapperStore {
         }
 
         if record.flags() != TypeFlags::OBJECT
-            || record.object_flags() != (ObjectFlags::REFERENCE | ObjectFlags::TUPLE)
+            || !valid_canonical_reference_object_flags(
+                record.object_flags(),
+                ObjectFlags::REFERENCE | ObjectFlags::TUPLE,
+                false,
+            )
             || record.symbol().is_some()
             || record.alias().is_some()
-            || object.structured != StructuredTypeData::default()
+            || !self.valid_canonical_reference_structured_cache(&object.structured)
             || object.target != Some(target)
             || object.mapper.is_some()
             || reference.node.is_some()
             || reference.resolved_type_arguments.as_deref()
                 != Some(provenance.type_parameters.as_slice())
             || interface.outer_type_parameter_count != 0
-            || interface.base_types_resolved
-            || interface.resolved_base_constructor_type.is_some()
-            || interface.resolved_base_types.is_some()
+            || !self.valid_canonical_tuple_base_cache(interface)
             || !interface.declared_members_resolved
             || interface.declared_members != Some(provenance.declared_members)
             || interface.declared_call_signatures.is_some()
@@ -1839,38 +1936,14 @@ impl CanonicalTypeMapperStore {
             let Some(parameter_record) = self.type_payload(*parameter) else {
                 return Err(invalid());
             };
-            if parameter_record.flags() != TypeFlags::TYPE_PARAMETER
-                || !parameter_record.object_flags().is_empty()
-                || parameter_record.symbol().is_some()
-                || parameter_record.alias().is_some()
-                || !matches!(
-                    parameter_record.data(),
-                    TypeData::TypeParameter(data) if data == &TypeParameterData::default()
-                )
-            {
+            if !self.valid_canonical_tuple_type_parameter(parameter_record, None, false) {
                 return Err(invalid());
             }
         }
         let this_record = self
             .type_payload(provenance.this_type)
             .ok_or_else(invalid)?;
-        if this_record.flags() != TypeFlags::TYPE_PARAMETER
-            || !this_record.object_flags().is_empty()
-            || this_record.symbol().is_some()
-            || this_record.alias().is_some()
-            || !matches!(
-                this_record.data(),
-                TypeData::TypeParameter(data)
-                    if data == &(TypeParameterData {
-                        constrained: ConstrainedTypeData::default(),
-                        constraint: Some(target),
-                        target: None,
-                        mapper: None,
-                        is_this_type: true,
-                        resolved_default_type: None,
-                    })
-            )
-        {
+        if !self.valid_canonical_tuple_type_parameter(this_record, Some(target), true) {
             return Err(invalid());
         }
 
@@ -2078,11 +2151,10 @@ impl CanonicalTypeMapperStore {
         let required_object_flags = ObjectFlags::REFERENCE | propagating_flags;
         let object_flags = record.object_flags();
         if record.flags() != TypeFlags::OBJECT
-            || !object_flags.contains(required_object_flags)
-            || !(object_flags & !(required_object_flags | ObjectFlags::FROM_TYPE_NODE)).is_empty()
+            || !valid_canonical_reference_object_flags(object_flags, required_object_flags, true)
             || record.symbol().is_some()
             || record.alias().is_some()
-            || reference.object.structured != StructuredTypeData::default()
+            || !self.valid_canonical_reference_structured_cache(&reference.object.structured)
             || reference.object.target != Some(target)
             || reference.object.mapper.is_some()
             || reference.object.instantiations != TypeCacheState::Unallocated
@@ -2216,18 +2288,20 @@ impl CanonicalTypeMapperStore {
         let reference = &interface.reference;
         let object = &reference.object;
         if record.flags() != TypeFlags::OBJECT
-            || record.object_flags() != (ObjectFlags::REFERENCE | ObjectFlags::TUPLE)
+            || !valid_canonical_reference_object_flags(
+                record.object_flags(),
+                ObjectFlags::REFERENCE | ObjectFlags::TUPLE,
+                false,
+            )
             || record.symbol().is_some()
             || record.alias().is_some()
-            || object.structured != StructuredTypeData::default()
+            || !self.valid_canonical_reference_structured_cache(&object.structured)
             || object.target != Some(type_)
             || object.mapper.is_some()
             || reference.node.is_some()
             || reference.resolved_type_arguments.as_deref() != Some(&[])
             || interface.outer_type_parameter_count != 0
-            || interface.base_types_resolved
-            || interface.resolved_base_constructor_type.is_some()
-            || interface.resolved_base_types.is_some()
+            || !self.valid_canonical_tuple_base_cache(interface)
             || !interface.declared_members_resolved
             || interface.declared_call_signatures.is_some()
             || interface.declared_construct_signatures.is_some()
@@ -2254,23 +2328,7 @@ impl CanonicalTypeMapperStore {
             return Err(invalid());
         }
         let this_record = self.type_payload(*this_type).ok_or_else(invalid)?;
-        let TypeData::TypeParameter(this_data) = this_record.data() else {
-            return Err(invalid());
-        };
-        if this_record.flags() != TypeFlags::TYPE_PARAMETER
-            || !this_record.object_flags().is_empty()
-            || this_record.symbol().is_some()
-            || this_record.alias().is_some()
-            || this_data
-                != &(TypeParameterData {
-                    constrained: ConstrainedTypeData::default(),
-                    constraint: Some(type_),
-                    target: None,
-                    mapper: None,
-                    is_this_type: true,
-                    resolved_default_type: None,
-                })
-        {
+        if !self.valid_canonical_tuple_type_parameter(this_record, Some(type_), true) {
             return Err(invalid());
         }
 
@@ -2416,64 +2474,67 @@ mod tests {
 
     #[test]
     fn tuple_creation_flags_follow_first_instance_cache_writer() {
-        let mut store = initialized();
-        let (string, number) = {
-            let bootstrap = store.intrinsic_bootstrap().unwrap();
-            (bootstrap.string_type, bootstrap.number_type)
-        };
-        let infos = [element_info(&store, ElementFlags::REQUIRED, None)];
-
-        let syntax_first = store
-            .create_canonical_tuple_type(
-                CanonicalTupleTypeRequest::new(&[string], &infos, false)
-                    .with_creation_flags(ObjectFlags::FROM_TYPE_NODE),
-            )
-            .unwrap();
-        assert_eq!(
-            store.type_payload(syntax_first).unwrap().object_flags(),
-            ObjectFlags::REFERENCE | ObjectFlags::FROM_TYPE_NODE
-        );
-        assert_eq!(
-            store
-                .create_canonical_tuple_type(CanonicalTupleTypeRequest::new(
-                    &[string],
-                    &infos,
-                    false,
-                ))
-                .unwrap(),
-            syntax_first
-        );
-        assert!(
-            store
-                .type_payload(syntax_first)
-                .unwrap()
-                .object_flags()
-                .contains(ObjectFlags::FROM_TYPE_NODE)
-        );
-
-        let semantic_first = store
-            .create_canonical_tuple_type(CanonicalTupleTypeRequest::new(&[number], &infos, false))
-            .unwrap();
-        assert_eq!(
-            store.type_payload(semantic_first).unwrap().object_flags(),
-            ObjectFlags::REFERENCE
-        );
-        assert_eq!(
-            store
-                .create_canonical_tuple_type(
-                    CanonicalTupleTypeRequest::new(&[number], &infos, false)
-                        .with_creation_flags(ObjectFlags::FROM_TYPE_NODE),
+        fn assert_order(existing_target: bool, syntax_first: bool) {
+            let mut store = initialized();
+            let string = store.intrinsic_bootstrap().unwrap().string_type;
+            let argument = store
+                .alloc_plain_object_type(
+                    ObjectFlags::ANONYMOUS | ObjectFlags::NON_INFERRABLE_TYPE,
+                    None,
                 )
-                .unwrap(),
-            semantic_first
-        );
-        assert!(
-            !store
-                .type_payload(semantic_first)
-                .unwrap()
-                .object_flags()
-                .contains(ObjectFlags::FROM_TYPE_NODE)
-        );
+                .unwrap();
+            let infos = [element_info(&store, ElementFlags::REQUIRED, None)];
+            if existing_target {
+                store
+                    .create_canonical_tuple_type(CanonicalTupleTypeRequest::new(
+                        &[string],
+                        &infos,
+                        false,
+                    ))
+                    .unwrap();
+            }
+
+            let first_request = CanonicalTupleTypeRequest::new(&[argument], &infos, false);
+            let first_request = if syntax_first {
+                first_request.with_creation_flags(ObjectFlags::FROM_TYPE_NODE)
+            } else {
+                first_request
+            };
+            let first = store.create_canonical_tuple_type(first_request).unwrap();
+            let expected_flags = ObjectFlags::REFERENCE
+                | ObjectFlags::NON_INFERRABLE_TYPE
+                | if syntax_first {
+                    ObjectFlags::FROM_TYPE_NODE
+                } else {
+                    ObjectFlags::NONE
+                };
+            assert_eq!(
+                store.type_payload(first).unwrap().object_flags(),
+                expected_flags
+            );
+
+            let second_request = CanonicalTupleTypeRequest::new(&[argument], &infos, false);
+            let second_request = if syntax_first {
+                second_request
+            } else {
+                second_request.with_creation_flags(ObjectFlags::FROM_TYPE_NODE)
+            };
+            assert_eq!(
+                store.create_canonical_tuple_type(second_request),
+                Ok(first),
+                "existing_target={existing_target}, syntax_first={syntax_first}",
+            );
+            assert_eq!(
+                store.type_payload(first).unwrap().object_flags(),
+                expected_flags
+            );
+        }
+
+        for existing_target in [false, true] {
+            for syntax_first in [false, true] {
+                assert_order(existing_target, syntax_first);
+            }
+        }
     }
 
     #[test]
@@ -2500,6 +2561,82 @@ mod tests {
             Err(TupleTypeError::UnsupportedCreationFlags(invalid_flags))
         );
         assert_eq!(observable_state(&store), before);
+    }
+
+    #[test]
+    fn warm_nonempty_tuple_admits_resolved_member_and_lazy_reference_caches() {
+        let mut store = initialized();
+        let string = store.intrinsic_bootstrap().unwrap().string_type;
+        let infos = [element_info(&store, ElementFlags::REQUIRED, None)];
+        let instance = store
+            .create_canonical_tuple_type(CanonicalTupleTypeRequest::new(&[string], &infos, false))
+            .unwrap();
+        let target = match store.type_payload(instance).unwrap().data() {
+            TypeData::TypeReference(reference) => reference.object.target.unwrap(),
+            _ => panic!("nonempty tuple must be a concrete reference"),
+        };
+
+        assert!(store.set_structured_type_members(instance, None, None, None, None, None));
+        assert!(store.set_resolved_base_constraint(instance, Some(string)));
+        assert!(
+            store.set_object_type_without_abstract_construct_signatures(instance, Some(instance),)
+        );
+        let lazy_flags = ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES_COMPUTED
+            | ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES
+            | ObjectFlags::CONTAINS_SPREAD
+            | ObjectFlags::OBJECT_REST_TYPE
+            | ObjectFlags::IDENTICAL_BASE_TYPE_CALCULATED
+            | ObjectFlags::IDENTICAL_BASE_TYPE_EXISTS
+            | ObjectFlags::UNRESOLVED_MEMBERS;
+        assert!(store.add_type_object_flags(instance, lazy_flags));
+        assert_eq!(
+            store.create_canonical_tuple_type(CanonicalTupleTypeRequest::new(
+                &[string],
+                &infos,
+                false,
+            )),
+            Ok(instance)
+        );
+
+        assert!(store.add_type_object_flags(instance, ObjectFlags::ARRAY_LITERAL));
+        assert_eq!(
+            store.create_canonical_tuple_type(CanonicalTupleTypeRequest::new(
+                &[string],
+                &infos,
+                false,
+            )),
+            Err(TupleTypeError::InvalidInstantiationCache { target, instance })
+        );
+    }
+
+    #[test]
+    fn warm_empty_tuple_admits_resolved_target_and_type_parameter_caches() {
+        let mut store = initialized();
+        let string = store.intrinsic_bootstrap().unwrap().string_type;
+        let empty = store.create_canonical_empty_tuple_type().unwrap();
+        let this_type = match store.type_payload(empty).unwrap().data() {
+            TypeData::Tuple(tuple) => tuple.interface.this_type.unwrap(),
+            _ => panic!("empty tuple must be its canonical target"),
+        };
+
+        assert!(store.set_structured_type_members(empty, None, None, None, None, None));
+        assert!(store.set_resolved_base_constraint(empty, Some(string)));
+        assert!(store.set_object_type_without_abstract_construct_signatures(empty, Some(empty),));
+        assert!(store.set_interface_base_resolution(empty, true, None, Some(Vec::new()),));
+        let resolved_type_variable_flags = ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES_COMPUTED
+            | ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES;
+        assert!(store.add_type_object_flags(empty, resolved_type_variable_flags));
+        assert!(store.add_type_object_flags(this_type, resolved_type_variable_flags));
+
+        assert_eq!(store.validate_canonical_empty_tuple_type(empty), Ok(()));
+        assert_eq!(store.create_canonical_empty_tuple_type(), Ok(empty));
+        assert_eq!(
+            store.create_canonical_tuple_type(
+                CanonicalTupleTypeRequest::new(&[], &[], false)
+                    .with_creation_flags(ObjectFlags::FROM_TYPE_NODE),
+            ),
+            Ok(empty)
+        );
     }
 
     #[test]

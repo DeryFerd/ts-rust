@@ -4527,6 +4527,9 @@ pub(super) const fn union_validation_unavailable(
             | ArrayTypeError::InvalidArrayLiteralCache {
                 cached: type_id, ..
             } => RelationUnavailable::MalformedCanonicalArrayReference(type_id),
+            ArrayTypeError::UnsupportedCreationFlags(_) => {
+                RelationUnavailable::InvalidUnionPreparation(union)
+            }
             ArrayTypeError::Capacity(_) => RelationUnavailable::UnionValidationCapacity(union),
         },
         LiteralTypeCacheError::InvalidUnionAlias(symbol) => {

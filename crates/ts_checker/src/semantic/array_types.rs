@@ -69,6 +69,7 @@ impl CanonicalArrayTargets {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ArrayTypeError {
     GlobalType(CanonicalGlobalTypeInitializationError),
+    UnsupportedCreationFlags(ObjectFlags),
     InvalidReference(TypeId),
     InvalidArrayLiteralCache { base: TypeId, cached: TypeId },
     Capacity(TypeId),
@@ -78,6 +79,12 @@ impl std::fmt::Display for ArrayTypeError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::GlobalType(error) => error.fmt(formatter),
+            Self::UnsupportedCreationFlags(flags) => {
+                write!(
+                    formatter,
+                    "array request uses unsupported creation flags {flags:?}"
+                )
+            }
             Self::InvalidReference(type_id) => {
                 write!(
                     formatter,
@@ -100,7 +107,8 @@ impl std::error::Error for ArrayTypeError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::GlobalType(error) => Some(error),
-            Self::InvalidReference(_)
+            Self::UnsupportedCreationFlags(_)
+            | Self::InvalidReference(_)
             | Self::InvalidArrayLiteralCache { .. }
             | Self::Capacity(_) => None,
         }
@@ -240,6 +248,9 @@ impl CanonicalTypeMapperStore {
         readonly: bool,
         creation_flags: ObjectFlags,
     ) -> Result<TypeId, ArrayTypeError> {
+        if !(creation_flags & !ObjectFlags::FROM_TYPE_NODE).is_empty() {
+            return Err(ArrayTypeError::UnsupportedCreationFlags(creation_flags));
+        }
         let target = if readonly {
             targets.readonly_array_type
         } else {
@@ -536,6 +547,79 @@ mod tests {
             Ok(empty_object)
         );
         assert_eq!(store.type_len(), before);
+    }
+
+    #[test]
+    fn unsupported_array_creation_flags_are_rejected_before_caches_and_fallbacks() {
+        let invalid_flags = ObjectFlags::FROM_TYPE_NODE | ObjectFlags::ARRAY_LITERAL;
+        let mut initialized = array_context(FileId::new(918));
+        let global_types = initialized.global_types().clone();
+        let targets = CanonicalArrayTargets::from_global_types(&global_types);
+        let (number, string) = {
+            let bootstrap = initialized.store().intrinsic_bootstrap().unwrap();
+            (bootstrap.number_type, bootstrap.string_type)
+        };
+        let store = initialized.store_mut_for_test();
+
+        let cold_before = store.type_len();
+        assert_eq!(
+            store.create_canonical_array_type_with_targets_and_flags(
+                targets,
+                number,
+                false,
+                invalid_flags,
+            ),
+            Err(ArrayTypeError::UnsupportedCreationFlags(invalid_flags))
+        );
+        assert_eq!(store.type_len(), cold_before);
+
+        let warm = store
+            .create_canonical_array_type_with_targets(targets, string, false)
+            .unwrap();
+        let warm_before = store.type_len();
+        assert_eq!(
+            store.create_canonical_array_type_with_targets_and_flags(
+                targets,
+                string,
+                false,
+                invalid_flags,
+            ),
+            Err(ArrayTypeError::UnsupportedCreationFlags(invalid_flags))
+        );
+        assert_eq!(store.type_len(), warm_before);
+        assert_eq!(
+            store.create_canonical_array_type_with_targets(targets, string, false),
+            Ok(warm)
+        );
+
+        let parsed = parse_source_file("");
+        let mut fallback_context = context(&parsed, FileId::new(919));
+        let fallback_globals = fallback_context.global_types().clone();
+        let fallback_targets = CanonicalArrayTargets::from_global_types(&fallback_globals);
+        let (number, empty_object) = {
+            let bootstrap = fallback_context.store().intrinsic_bootstrap().unwrap();
+            (bootstrap.number_type, bootstrap.empty_object_type)
+        };
+        let fallback_store = fallback_context.store_mut_for_test();
+        let fallback_before = fallback_store.type_len();
+        assert_eq!(
+            fallback_store.create_canonical_array_type_with_targets_and_flags(
+                fallback_targets,
+                number,
+                false,
+                invalid_flags,
+            ),
+            Err(ArrayTypeError::UnsupportedCreationFlags(invalid_flags))
+        );
+        assert_eq!(fallback_store.type_len(), fallback_before);
+        assert_eq!(
+            fallback_store.create_canonical_array_type_with_targets(
+                fallback_targets,
+                number,
+                false,
+            ),
+            Ok(empty_object)
+        );
     }
 
     #[test]
