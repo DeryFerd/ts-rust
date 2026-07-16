@@ -1,10 +1,10 @@
 //! Exact annotated callable values owned by source function symbols.
 //!
 //! This provider deliberately stops before statement/expression dispatch and
-//! function-body semantics. It proves one retained FunctionDeclaration or
-//! ArrowFunction and its binder-owned FUNCTION symbol, publishes the callable
+//! function-body semantics. It proves one retained `FunctionDeclaration` or
+//! `ArrowFunction` and its binder-owned FUNCTION symbol, publishes the callable
 //! shell/signature/parameter types, and validates the resulting store shape.
-//! Source values never borrow FunctionType TypeNode or `__call` provenance.
+//! Source values never borrow `FunctionType` `TypeNode` or `__call` provenance.
 
 use ts_ast::{ModifierList, NodeData, NodeList, NodeRef, SyntaxKind};
 use ts_binder::{CheckFlags, InternalSymbolName, SemanticSymbolId, SymbolFlags};

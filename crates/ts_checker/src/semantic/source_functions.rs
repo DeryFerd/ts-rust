@@ -27,7 +27,7 @@ pub(super) struct PlannedTopLevelFunction {
 pub(super) struct PlannedFunctionRead {
     /// The symbol cached by upstream before direct-export routing.
     pub(super) resolved_symbol: SemanticSymbolId,
-    /// The `FUNCTION` symbol whose value links own the callable TypeId.
+    /// The `FUNCTION` symbol whose value links own the callable `TypeId`.
     pub(super) value_symbol: SemanticSymbolId,
 }
 

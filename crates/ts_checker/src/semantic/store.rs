@@ -79,7 +79,7 @@ impl SourceCallableFamily {
     }
 }
 
-/// Immutable owner tuple distinguishing source values from FunctionType nodes.
+/// Immutable owner tuple distinguishing source values from `FunctionType` nodes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct SourceCallableProvenance {
     pub(super) family: SourceCallableFamily,

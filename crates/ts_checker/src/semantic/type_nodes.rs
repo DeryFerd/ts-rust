@@ -3420,7 +3420,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         self.complete_type_query(result, &plan, &mut prepared)
     }
 
-    /// Resolves one exact annotated FunctionDeclaration or ArrowFunction into
+    /// Resolves one exact annotated `FunctionDeclaration` or `ArrowFunction` into
     /// the callable value owned by its binder FUNCTION symbol.
     pub(super) fn get_type_of_source_callable(
         &mut self,

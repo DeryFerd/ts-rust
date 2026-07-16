@@ -470,7 +470,7 @@ struct SourceCheckPlan {
 }
 
 enum PlannedVariableStatement {
-    Arrow(SourceArrowPlan),
+    Arrow(Box<SourceArrowPlan>),
     Variables(Vec<PlannedVariable>),
 }
 
@@ -714,7 +714,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     match self.plan_variable_statement(statement, declaration_list, exported)? {
                         PlannedVariableStatement::Arrow(arrow) => {
                             let index = arrows.len();
-                            arrows.push(arrow);
+                            arrows.push(*arrow);
                             statements.push(PlannedStatement::Arrow(index));
                         }
                         PlannedVariableStatement::Variables(variables) => {
@@ -1367,7 +1367,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     VariableInvariant::InvalidSymbolShape(arrow.variable_symbol),
                 ));
             }
-            return Ok(PlannedVariableStatement::Arrow(arrow));
+            return Ok(PlannedVariableStatement::Arrow(Box::new(arrow)));
         }
 
         let mut variables = Vec::with_capacity(declarations.len());
@@ -2237,7 +2237,7 @@ fn execute_expression_types(
             let raw =
                 *current_flow_types
                     .get(&read.value_symbol)
-                    .ok_or_else(|| match read.kind {
+                    .ok_or(match read.kind {
                         PlannedIdentifierReadKind::Variable => SourceCheckError::Variable(
                             VariableInvariant::MissingCurrentFlowType(read.value_symbol),
                         ),
@@ -3445,7 +3445,7 @@ fn materialize_checked_source_callable(
             SourceFunctionInvariant::CallableTypeMismatch {
                 symbol: owner,
                 expected: type_,
-                actual: if linked != type_ { linked } else { registered },
+                actual: if linked == type_ { registered } else { linked },
             },
         ));
     }
