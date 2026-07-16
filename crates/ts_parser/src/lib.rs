@@ -9653,8 +9653,11 @@ fn binary_precedence(kind: SyntaxKind) -> Option<(u8, bool)> {
         | SyntaxKind::BarBarEqualsToken
         | SyntaxKind::AmpersandAmpersandEqualsToken
         | SyntaxKind::QuestionQuestionEqualsToken => (2, true),
-        SyntaxKind::QuestionQuestionToken => (3, false),
-        SyntaxKind::BarBarToken => (4, false),
+        // `??` and `||` share the ShortCircuitExpression precedence. Keeping
+        // them equal is also important for error recovery: invalid unparenthesized
+        // mixtures are parsed left-associatively before the checker reports
+        // TS5076.
+        SyntaxKind::QuestionQuestionToken | SyntaxKind::BarBarToken => (4, false),
         SyntaxKind::AmpersandAmpersandToken => (5, false),
         SyntaxKind::BarToken => (6, false),
         SyntaxKind::CaretToken => (7, false),
@@ -9908,6 +9911,46 @@ mod tests {
             SyntaxKind::ParenthesizedExpression
         );
         assert_eq!(first_statement, statements[0]);
+    }
+
+    #[test]
+    fn parses_nullish_and_logical_or_with_shared_left_associative_precedence() {
+        let result = parse_source_file(
+            "const first: number = 1 ?? 2 || 3; const second: number = 1 || 2 ?? 3;",
+        );
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+
+        for (statement, root_operator, left_operator) in [
+            (
+                source_statements(&result)[0],
+                SyntaxKind::BarBarToken,
+                SyntaxKind::QuestionQuestionToken,
+            ),
+            (
+                source_statements(&result)[1],
+                SyntaxKind::QuestionQuestionToken,
+                SyntaxKind::BarBarToken,
+            ),
+        ] {
+            let (list, _) = variable_list(&result, statement);
+            let declaration = declaration_nodes(&result, list)[0];
+            let (_, initializer) = declaration_type_and_initializer(&result, declaration);
+            let NodeData::BinaryExpression(root) = &result.arena.get(initializer).unwrap().data
+            else {
+                panic!("expected a mixed short-circuit expression");
+            };
+            assert_eq!(
+                result.arena.get(root.operator_token).unwrap().kind,
+                root_operator
+            );
+            let NodeData::BinaryExpression(left) = &result.arena.get(root.left).unwrap().data else {
+                panic!("expected a left-associative mixed operand");
+            };
+            assert_eq!(
+                result.arena.get(left.operator_token).unwrap().kind,
+                left_operator
+            );
+        }
     }
 
     #[test]
