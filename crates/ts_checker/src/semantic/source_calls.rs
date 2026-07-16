@@ -13,12 +13,17 @@ use ts_diagnostics::{Diagnostic, message_by_code};
 use super::{
     CanonicalCheckerDiagnostic, CanonicalCheckerDiagnostics, CanonicalCheckerOptions,
     CanonicalGlobalTypes, CanonicalTypeFormatFlags, CanonicalTypeMapperStore, DeclaredTypeHost,
-    ResolvedSignatureState, SignatureLinks, TypeId, TypeNodeLinks,
+    RelationUnavailable, ResolvedSignatureState, SignatureId, SignatureLinks, TypeId,
+    TypeNodeLinks,
     calls::{
         DirectCallApplicability, DirectCallError, DirectCallForm, DirectCallRequest,
         DirectCallUnsupported, resolve_direct_call,
     },
     formatter::get_type_names_for_assignability_error_with_host_global_types_and_flags,
+    generic_calls::{
+        IdentityGenericCallError, IdentityGenericCallRequest, IdentityGenericCallUnsupported,
+        resolve_identity_generic_call,
+    },
     source::{
         PlannedExpression, PlannedExpressionKind, SourceCheckError, UnsupportedSourceSyntax,
         merge_retry_diagnostic, merge_retry_diagnostics,
@@ -31,6 +36,7 @@ use super::{
 pub(super) struct SourceCallPlan {
     pub(super) node: NodeRef,
     pub(super) callee: PlannedExpression,
+    pub(super) type_arguments: Option<Vec<NodeRef>>,
     pub(super) arguments: Vec<PlannedExpression>,
 }
 
@@ -38,6 +44,7 @@ pub(super) struct SourceCallPlan {
 pub(super) struct DirectSourceCallSyntax {
     node: NodeRef,
     callee: NodeRef,
+    type_arguments: Option<Vec<NodeRef>>,
     arguments: Vec<NodeRef>,
 }
 
@@ -76,7 +83,6 @@ pub(super) fn plan_direct_source_call_syntax(
     if record.kind != SyntaxKind::CallExpression
         || record.flags.0 != 0
         || call.question_dot_token.is_some()
-        || call.type_arguments.is_some()
         || call.symbol.is_some()
         || call.facts != 0
     {
@@ -94,6 +100,40 @@ pub(super) fn plan_direct_source_call_syntax(
             UnsupportedSourceSyntax::Call(node),
         ));
     }
+
+    let type_arguments = call
+        .type_arguments
+        .as_ref()
+        .map(|type_arguments| {
+            if type_arguments.nodes.is_empty()
+                || type_arguments.range.start < record.range.start
+                || type_arguments.range.end > record.range.end
+            {
+                return Err(SourceCheckError::Unsupported(
+                    UnsupportedSourceSyntax::Call(node),
+                ));
+            }
+            type_arguments
+                .nodes
+                .iter()
+                .map(|type_argument| {
+                    let type_argument = NodeRef::new(node.arena, node.file, *type_argument);
+                    let Some(type_argument_record) = arena.get(type_argument.node) else {
+                        return Err(SourceCheckError::Call(node));
+                    };
+                    if type_argument_record.parent != Some(node.node)
+                        || type_argument_record.range.start < type_arguments.range.start
+                        || type_argument_record.range.end > type_arguments.range.end
+                    {
+                        return Err(SourceCheckError::Unsupported(
+                            UnsupportedSourceSyntax::Call(node),
+                        ));
+                    }
+                    Ok(type_argument)
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .transpose()?;
 
     let mut arguments = Vec::with_capacity(call.arguments.nodes.len());
     for argument_id in &call.arguments.nodes {
@@ -114,6 +154,7 @@ pub(super) fn plan_direct_source_call_syntax(
     Ok(DirectSourceCallSyntax {
         node,
         callee,
+        type_arguments,
         arguments,
     })
 }
@@ -134,6 +175,7 @@ pub(super) fn finish_direct_source_call_plan(
     Ok(SourceCallPlan {
         node: syntax.node,
         callee,
+        type_arguments: syntax.type_arguments.clone(),
         arguments,
     })
 }
@@ -267,6 +309,133 @@ fn preflight_call_links(
 
 /// Resolves one already-typed source call, retrying the two lazy semantic
 /// boundaries before publishing its exact signature/return caches.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ResolvedSourceCall {
+    signature: SignatureId,
+    return_type: TypeId,
+    minimum_argument_count: usize,
+    maximum_argument_count: usize,
+    applicability: DirectCallApplicability,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SourceCallResolutionError {
+    Retry(SignatureId),
+    Relation(RelationUnavailable),
+    Unsupported,
+}
+
+fn resolve_source_call_once(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    callee_type: TypeId,
+    argument_types: &[TypeId],
+    explicit_type_arguments: Option<&[TypeId]>,
+) -> Result<ResolvedSourceCall, SourceCallResolutionError> {
+    if explicit_type_arguments.is_none() {
+        let request = DirectCallRequest {
+            form: DirectCallForm::Call,
+            optional_chain: false,
+            type_argument_count: 0,
+            has_spread_argument: false,
+            callee: callee_type,
+            arguments: argument_types,
+        };
+        match resolve_direct_call(store, global_types, options.strict_function_types, request) {
+            Ok(resolution) => {
+                return Ok(ResolvedSourceCall {
+                    signature: resolution.projection.signature,
+                    return_type: resolution.projection.return_type,
+                    minimum_argument_count: resolution.projection.minimum_argument_count,
+                    maximum_argument_count: resolution.projection.maximum_argument_count,
+                    applicability: resolution.applicability,
+                });
+            }
+            Err(DirectCallError::Unsupported(DirectCallUnsupported::GenericSignature(_))) => {}
+            Err(
+                DirectCallError::Unsupported(DirectCallUnsupported::UnresolvedReturnType(
+                    signature,
+                ))
+                | DirectCallError::Relation(RelationUnavailable::UnresolvedSignatureReturn(
+                    signature,
+                )),
+            ) => return Err(SourceCallResolutionError::Retry(signature)),
+            Err(DirectCallError::Relation(error)) => {
+                return Err(SourceCallResolutionError::Relation(error));
+            }
+            Err(DirectCallError::Unsupported(_) | DirectCallError::Invariant(_)) => {
+                return Err(SourceCallResolutionError::Unsupported);
+            }
+        }
+    }
+
+    let request = IdentityGenericCallRequest {
+        form: DirectCallForm::Call,
+        optional_chain: false,
+        explicit_type_arguments,
+        has_spread_argument: false,
+        callee: callee_type,
+        arguments: argument_types,
+    };
+    match resolve_identity_generic_call(store, global_types, options.strict_function_types, request)
+    {
+        Ok(resolution) => Ok(ResolvedSourceCall {
+            signature: resolution.projection.signature,
+            return_type: resolution.projection.return_type,
+            minimum_argument_count: 1,
+            maximum_argument_count: 1,
+            applicability: resolution.applicability,
+        }),
+        Err(
+            IdentityGenericCallError::Unsupported(
+                IdentityGenericCallUnsupported::UnresolvedReturnType(signature),
+            )
+            | IdentityGenericCallError::Relation(RelationUnavailable::UnresolvedSignatureReturn(
+                signature,
+            )),
+        ) => Err(SourceCallResolutionError::Retry(signature)),
+        Err(IdentityGenericCallError::Relation(error)) => {
+            Err(SourceCallResolutionError::Relation(error))
+        }
+        Err(
+            IdentityGenericCallError::Unsupported(_)
+            | IdentityGenericCallError::Invariant(_)
+            | IdentityGenericCallError::Inference(_),
+        ) => Err(SourceCallResolutionError::Unsupported),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_explicit_source_type_arguments(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    type_arguments: Option<&[NodeRef]>,
+) -> Result<Option<Vec<TypeId>>, SourceCheckError> {
+    let Some(type_arguments) = type_arguments else {
+        return Ok(None);
+    };
+    let mut type_argument_diagnostics = CanonicalCheckerDiagnostics::default();
+    let result = (|| {
+        let mut query = CanonicalTypeQuery::new_with_global_types(
+            store,
+            host,
+            global_types,
+            options,
+            &mut type_argument_diagnostics,
+        )?;
+        type_arguments
+            .iter()
+            .map(|type_argument| query.get_type_from_type_node(*type_argument))
+            .collect::<Result<Vec<_>, _>>()
+    })();
+    merge_retry_diagnostics(diagnostics, type_argument_diagnostics);
+    Ok(Some(result?))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn check_direct_source_call(
     store: &mut CanonicalTypeMapperStore,
@@ -278,26 +447,28 @@ pub(super) fn check_direct_source_call(
     callee_type: TypeId,
     argument_types: &[TypeId],
 ) -> Result<CheckedSourceCall, SourceCheckError> {
-    let request = DirectCallRequest {
-        form: DirectCallForm::Call,
-        optional_chain: false,
-        type_argument_count: 0,
-        has_spread_argument: false,
-        callee: callee_type,
-        arguments: argument_types,
-    };
+    let explicit_type_arguments = resolve_explicit_source_type_arguments(
+        store,
+        host,
+        global_types,
+        options,
+        diagnostics,
+        plan.type_arguments.as_deref(),
+    )?;
     let mut retried_signatures = HashSet::new();
     let resolution = loop {
-        match resolve_direct_call(store, global_types, options.strict_function_types, request) {
+        match resolve_source_call_once(
+            store,
+            global_types,
+            options,
+            callee_type,
+            argument_types,
+            explicit_type_arguments.as_deref(),
+        ) {
             Ok(resolution) => break resolution,
-            Err(
-                DirectCallError::Unsupported(DirectCallUnsupported::UnresolvedReturnType(
-                    signature,
-                ))
-                | DirectCallError::Relation(super::RelationUnavailable::UnresolvedSignatureReturn(
-                    signature,
-                )),
-            ) if retried_signatures.insert(signature) => {
+            Err(SourceCallResolutionError::Retry(signature))
+                if retried_signatures.insert(signature) =>
+            {
                 resolve_signature_return(
                     store,
                     host,
@@ -307,8 +478,13 @@ pub(super) fn check_direct_source_call(
                     signature,
                 )?;
             }
-            Err(DirectCallError::Relation(error)) => return Err(error.into()),
-            Err(DirectCallError::Unsupported(_) | DirectCallError::Invariant(_)) => {
+            Err(SourceCallResolutionError::Relation(error)) => return Err(error.into()),
+            Err(SourceCallResolutionError::Unsupported) if plan.type_arguments.is_some() => {
+                return Err(SourceCheckError::Unsupported(
+                    UnsupportedSourceSyntax::Call(plan.node),
+                ));
+            }
+            Err(SourceCallResolutionError::Retry(_) | SourceCallResolutionError::Unsupported) => {
                 return Err(SourceCheckError::Call(plan.node));
             }
         }
@@ -317,22 +493,20 @@ pub(super) fn check_direct_source_call(
     publish_call_links(
         store,
         plan.node,
-        resolution.projection.signature,
-        resolution.projection.return_type,
+        resolution.signature,
+        resolution.return_type,
     )?;
     match resolution.applicability {
         DirectCallApplicability::Applicable => {}
         DirectCallApplicability::TooFewArguments { actual, .. }
         | DirectCallApplicability::TooManyArguments { actual, .. } => {
-            let expected = if resolution.projection.minimum_argument_count
-                == resolution.projection.maximum_argument_count
+            let expected = if resolution.minimum_argument_count == resolution.maximum_argument_count
             {
-                resolution.projection.minimum_argument_count.to_string()
+                resolution.minimum_argument_count.to_string()
             } else {
                 format!(
                     "{}-{}",
-                    resolution.projection.minimum_argument_count,
-                    resolution.projection.maximum_argument_count
+                    resolution.minimum_argument_count, resolution.maximum_argument_count
                 )
             };
             merge_retry_diagnostic(
@@ -382,7 +556,7 @@ pub(super) fn check_direct_source_call(
         }
     }
     Ok(CheckedSourceCall {
-        return_type: resolution.projection.return_type,
+        return_type: resolution.return_type,
     })
 }
 
@@ -557,6 +731,76 @@ mod tests {
                 .signature_links(call)
                 .and_then(|links| links.resolved_signature.signature()),
             Some(signature)
+        );
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn inferred_and_explicit_identity_calls_reuse_instantiated_signatures_warm() {
+        let parsed = parsed(concat!(
+            "function identity<T>(value: T): T { return value; } ",
+            "const inferred: 'x' = identity('x'); ",
+            "const explicit = identity<string>('x');",
+        ));
+        let file = FileId::new(404);
+        let mut call_nodes = calls(&parsed, file);
+        call_nodes.sort_by_key(|call| parsed.arena.get(call.node).unwrap().range.start);
+        let [inferred, explicit] = call_nodes.as_slice() else {
+            panic!("expected inferred and explicit calls")
+        };
+        let mut context = context(&parsed, file);
+
+        context.check_source_file(file).unwrap();
+
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        let inferred_type = context
+            .store()
+            .type_node_links(*inferred)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        assert_ne!(inferred_type, string);
+        assert_eq!(
+            context
+                .store()
+                .type_node_links(*explicit)
+                .and_then(|links| links.resolved_type),
+            Some(string)
+        );
+        let signatures = [inferred, explicit].map(|call| {
+            context
+                .store()
+                .signature_links(*call)
+                .and_then(|links| links.resolved_signature.signature())
+                .unwrap()
+        });
+        assert_ne!(signatures[0], signatures[1]);
+        let counts = (
+            context.store().type_len(),
+            context.store().mapper_len(),
+            context.store().signature_len(),
+        );
+        assert!(context.diagnostics().is_empty());
+
+        mark_source_unchecked(&mut context, file);
+        context.check_source_file(file).unwrap();
+
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().mapper_len(),
+                context.store().signature_len(),
+            ),
+            counts
+        );
+        assert_eq!(
+            [inferred, explicit].map(|call| {
+                context
+                    .store()
+                    .signature_links(*call)
+                    .and_then(|links| links.resolved_signature.signature())
+                    .unwrap()
+            }),
+            signatures
         );
         assert!(context.diagnostics().is_empty());
     }
