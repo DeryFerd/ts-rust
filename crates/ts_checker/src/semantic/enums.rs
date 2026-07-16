@@ -8,6 +8,9 @@
 //! unary `+`/`-` numeric literals). Numeric auto-increment, explicit ambient
 //! behavior, const-enum provenance, regular/fresh member identities, the enum
 //! declared union, and the separate enum value object are published together.
+//! Numeric and string identities use the pinned `(enum owner, literal value)`
+//! cache key, so later duplicate-valued members route to the first member's
+//! regular/fresh pair.
 //!
 //! Source statement dispatch is deliberately not part of this module. Its
 //! integration seam is [`get_enum_semantics`]: a source prepass can call it for
@@ -573,8 +576,8 @@ fn validate_resolved_enum(
     }) {
         return Err(cache_error());
     }
-    let mut members = Vec::with_capacity(plan.members.len());
-    for member in &plan.members {
+    let mut members = Vec::<CanonicalEnumMemberSemantics>::with_capacity(plan.members.len());
+    for (index, member) in plan.members.iter().enumerate() {
         let fresh_type = store
             .declared_type_links(member.symbol)
             .filter(|links| {
@@ -602,8 +605,16 @@ fn validate_resolved_enum(
         {
             return Err(cache_error());
         }
-        let regular_type = validate_literal_pair(store, fresh_type, member.symbol, &member.value)
+        let identity_index = first_member_identity_index(&plan.members, index);
+        let identity_symbol = plan.members[identity_index].symbol;
+        let regular_type = validate_literal_pair(store, fresh_type, identity_symbol, &member.value)
             .ok_or_else(cache_error)?;
+        if identity_index != index {
+            let identity = &members[identity_index];
+            if regular_type != identity.regular_type || fresh_type != identity.fresh_type {
+                return Err(cache_error());
+            }
+        }
         members.push(CanonicalEnumMemberSemantics {
             declaration: member.declaration,
             symbol: member.symbol,
@@ -684,6 +695,30 @@ fn enum_value_from_literal(value: &LiteralValue) -> Option<CanonicalEnumMemberVa
         LiteralValue::ComputedEnum => Some(CanonicalEnumMemberValue::Computed),
         LiteralValue::Boolean(_) | LiteralValue::BigInt(_) => None,
     }
+}
+
+fn enum_literal_values_share_cache_key(
+    left: &CanonicalEnumMemberValue,
+    right: &CanonicalEnumMemberValue,
+) -> bool {
+    match (left, right) {
+        (CanonicalEnumMemberValue::Number(left), CanonicalEnumMemberValue::Number(right)) => {
+            left == right
+        }
+        (CanonicalEnumMemberValue::String(left), CanonicalEnumMemberValue::String(right)) => {
+            left == right
+        }
+        _ => false,
+    }
+}
+
+fn first_member_identity_index(members: &[EnumMemberPlan], index: usize) -> usize {
+    members[..index]
+        .iter()
+        .position(|member| {
+            enum_literal_values_share_cache_key(&member.value, &members[index].value)
+        })
+        .unwrap_or(index)
 }
 
 fn validated_enum_literal_symbol(
@@ -775,7 +810,15 @@ fn validate_declared_type(
     declared_type: TypeId,
     members: &[CanonicalEnumMemberSemantics],
 ) -> Option<()> {
-    match members {
+    let expected_types = members
+        .iter()
+        .enumerate()
+        .filter_map(|(index, member)| {
+            (first_member_identity_index(&plan.members, index) == index)
+                .then_some(member.regular_type)
+        })
+        .collect::<Vec<_>>();
+    match expected_types.as_slice() {
         [] => {
             let record = store.type_payload(declared_type)?;
             let TypeData::Literal(data) = record.data() else {
@@ -790,16 +833,12 @@ fn validate_declared_type(
             )? == declared_type)
                 .then_some(())
         }
-        [member] => (declared_type == member.regular_type).then_some(()),
+        [member] => (declared_type == *member).then_some(()),
         _ => {
             let record = store.type_payload(declared_type)?;
             let TypeData::Union(union) = record.data() else {
                 return None;
             };
-            let expected_types = members
-                .iter()
-                .map(|member| member.regular_type)
-                .collect::<Vec<_>>();
             let alias = record.alias().and_then(|alias| store.type_alias(alias))?;
             (record.flags() == TypeFlags::UNION | TypeFlags::ENUM_LITERAL
                 && record.object_flags() == ObjectFlags::PRIMITIVE_UNION
@@ -869,25 +908,35 @@ fn publish_enum(
     store: &mut CanonicalTypeMapperStore,
     plan: &EnumPlan,
 ) -> Result<CanonicalEnumSemantics, EnumTypeError> {
-    let member_type_count = plan
+    let member_identity_count = plan
         .members
-        .len()
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| first_member_identity_index(&plan.members, *index) == *index)
+        .count();
+    let member_type_count = member_identity_count
         .checked_mul(2)
         .ok_or_else(|| invariant(EnumTypeInvariant::Capacity(plan.symbol)))?;
     let declared_type_count =
-        usize::from(plan.members.is_empty()) * 2 + usize::from(plan.members.len() >= 2);
+        usize::from(plan.members.is_empty()) * 2 + usize::from(member_identity_count >= 2);
     let type_count = member_type_count
         .checked_add(declared_type_count)
         .and_then(|count| count.checked_add(1))
         .ok_or_else(|| invariant(EnumTypeInvariant::Capacity(plan.symbol)))?;
-    let alias_count = usize::from(plan.members.len() >= 2);
+    let alias_count = usize::from(member_identity_count >= 2);
     if !store.try_reserve_types(type_count) || !store.try_reserve_type_aliases(alias_count) {
         return Err(invariant(EnumTypeInvariant::Capacity(plan.symbol)));
     }
 
-    let mut members = Vec::with_capacity(plan.members.len());
-    for member in &plan.members {
-        let (regular_type, fresh_type) = alloc_literal_pair(store, member.symbol, &member.value);
+    let mut members = Vec::<CanonicalEnumMemberSemantics>::with_capacity(plan.members.len());
+    for (index, member) in plan.members.iter().enumerate() {
+        let identity_index = first_member_identity_index(&plan.members, index);
+        let (regular_type, fresh_type) = if identity_index == index {
+            alloc_literal_pair(store, member.symbol, &member.value)
+        } else {
+            let identity = &members[identity_index];
+            (identity.regular_type, identity.fresh_type)
+        };
         members.push(CanonicalEnumMemberSemantics {
             declaration: member.declaration,
             symbol: member.symbol,
@@ -896,16 +945,20 @@ fn publish_enum(
             value: member.value.clone(),
         });
     }
-    let declared_type = match members.as_slice() {
+    let member_types = members
+        .iter()
+        .enumerate()
+        .filter_map(|(index, member)| {
+            (first_member_identity_index(&plan.members, index) == index)
+                .then_some(member.regular_type)
+        })
+        .collect::<Vec<_>>();
+    let declared_type = match member_types.as_slice() {
         [] => alloc_literal_pair(store, plan.symbol, &CanonicalEnumMemberValue::Computed).0,
-        [member] => member.regular_type,
+        [member] => *member,
         _ => {
-            let types = members
-                .iter()
-                .map(|member| member.regular_type)
-                .collect::<Vec<_>>();
             let union = store
-                .alloc_union_type(ObjectFlags::PRIMITIVE_UNION, types)
+                .alloc_union_type(ObjectFlags::PRIMITIVE_UNION, member_types)
                 .expect("reserved enum union capacity and validated member identities");
             assert!(store.add_type_flags(union, TypeFlags::ENUM_LITERAL));
             assert!(store.set_type_symbol(union, Some(plan.symbol)));
@@ -1234,6 +1287,221 @@ mod tests {
         assert_eq!(
             get_declared_enum_or_member(&mut fixture.store, &host, three.symbol),
             Ok(Some(three.fresh_type))
+        );
+    }
+
+    #[test]
+    fn duplicate_literal_values_share_first_identity_in_source_order_and_are_warm() {
+        let mut fixture = fixture(
+            r#"
+                enum Aliased {
+                    First = 7,
+                    Second = 7,
+                    Word = "word",
+                    WordAgain = "word",
+                    AutoTarget = 9,
+                    AutoBase = 8,
+                    AutoDuplicate,
+                }
+            "#,
+        );
+        let owner = symbol(&fixture, SyntaxKind::EnumDeclaration, "Aliased");
+        let bound = &fixture.files[&fixture.file];
+        let host = host(&fixture.parsed.arena, bound);
+        let type_count = fixture.store.type_len();
+        let alias_count = fixture.store.type_alias_len();
+
+        let cold = get_enum_semantics(&mut fixture.store, &host, owner).unwrap();
+        assert_eq!(fixture.store.type_len(), type_count + 10);
+        assert_eq!(fixture.store.type_alias_len(), alias_count + 1);
+        let first = member(&cold, &fixture, "First");
+        let second = member(&cold, &fixture, "Second");
+        let word = member(&cold, &fixture, "Word");
+        let word_again = member(&cold, &fixture, "WordAgain");
+        let auto_target = member(&cold, &fixture, "AutoTarget");
+        let auto_base = member(&cold, &fixture, "AutoBase");
+        let auto_duplicate = member(&cold, &fixture, "AutoDuplicate");
+
+        for (identity, duplicate) in [
+            (first, second),
+            (word, word_again),
+            (auto_target, auto_duplicate),
+        ] {
+            assert_eq!(duplicate.regular_type, identity.regular_type);
+            assert_eq!(duplicate.fresh_type, identity.fresh_type);
+            assert_ne!(duplicate.symbol, identity.symbol);
+            assert_eq!(
+                fixture
+                    .store
+                    .type_payload(duplicate.regular_type)
+                    .unwrap()
+                    .symbol(),
+                Some(identity.symbol)
+            );
+            assert_eq!(
+                fixture
+                    .store
+                    .declared_type_links(duplicate.symbol)
+                    .and_then(|links| links.declared_type),
+                Some(identity.fresh_type)
+            );
+            assert_eq!(
+                fixture
+                    .store
+                    .value_symbol_links(duplicate.symbol)
+                    .and_then(|links| links.resolved_type),
+                Some(identity.fresh_type)
+            );
+            assert_eq!(
+                fixture
+                    .store
+                    .enum_member_links(duplicate.declaration)
+                    .unwrap()
+                    .value,
+                evaluator_result(&duplicate.value)
+            );
+            assert_eq!(
+                get_declared_enum_or_member(&mut fixture.store, &host, duplicate.symbol),
+                Ok(Some(identity.fresh_type))
+            );
+        }
+        assert_eq!(
+            type_to_string(&fixture.store, second.fresh_type),
+            Ok("Aliased.First".to_owned())
+        );
+        assert_eq!(
+            type_to_string(&fixture.store, word_again.fresh_type),
+            Ok("Aliased.Word".to_owned())
+        );
+        assert_eq!(
+            type_to_string(&fixture.store, auto_duplicate.fresh_type),
+            Ok("Aliased.AutoTarget".to_owned())
+        );
+
+        let TypeData::Union(union) = fixture
+            .store
+            .type_payload(cold.declared_type)
+            .unwrap()
+            .data()
+        else {
+            panic!("four first-occurrence identities must form an enum union")
+        };
+        assert_eq!(
+            union.union.types,
+            vec![
+                first.regular_type,
+                word.regular_type,
+                auto_target.regular_type,
+                auto_base.regular_type,
+            ]
+        );
+
+        let warm_state = (
+            fixture.store.type_len(),
+            fixture.store.type_alias_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+        assert_eq!(
+            get_enum_semantics(&mut fixture.store, &host, owner),
+            Ok(cold)
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.type_alias_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            warm_state
+        );
+    }
+
+    #[test]
+    fn duplicate_only_enum_collapses_to_the_first_member_without_an_alias() {
+        let mut fixture = fixture(r#"enum Same { First = "same", Second = "same" }"#);
+        let owner = symbol(&fixture, SyntaxKind::EnumDeclaration, "Same");
+        let bound = &fixture.files[&fixture.file];
+        let host = host(&fixture.parsed.arena, bound);
+        let type_count = fixture.store.type_len();
+        let alias_count = fixture.store.type_alias_len();
+
+        let result = get_enum_semantics(&mut fixture.store, &host, owner).unwrap();
+        let first = member(&result, &fixture, "First");
+        let second = member(&result, &fixture, "Second");
+        assert_eq!(fixture.store.type_len(), type_count + 3);
+        assert_eq!(fixture.store.type_alias_len(), alias_count);
+        assert_eq!(result.declared_type, first.regular_type);
+        assert_eq!(second.regular_type, first.regular_type);
+        assert_eq!(second.fresh_type, first.fresh_type);
+        assert_eq!(
+            type_to_string(&fixture.store, result.declared_type),
+            Ok("Same.First".to_owned())
+        );
+    }
+
+    #[test]
+    fn warm_duplicate_cache_rejects_a_separate_valid_pair_atomically() {
+        let mut fixture = fixture("enum Reused { First = 1, Second = 1, Other = 2 }");
+        let owner = symbol(&fixture, SyntaxKind::EnumDeclaration, "Reused");
+        let bound = &fixture.files[&fixture.file];
+        let host = host(&fixture.parsed.arena, bound);
+        let published = get_enum_semantics(&mut fixture.store, &host, owner).unwrap();
+        let first = member(&published, &fixture, "First").clone();
+        let second = member(&published, &fixture, "Second").clone();
+        assert!(fixture.store.try_reserve_types(2));
+        let (_, separate_fresh) =
+            alloc_literal_pair(&mut fixture.store, second.symbol, &second.value);
+        assert!(fixture.store.set_declared_type_links(
+            second.symbol,
+            DeclaredTypeLinks {
+                declared_type: Some(separate_fresh),
+                ..DeclaredTypeLinks::default()
+            }
+        ));
+        assert!(fixture.store.set_value_symbol_links(
+            second.symbol,
+            ValueSymbolLinks {
+                resolved_type: Some(separate_fresh),
+                ..ValueSymbolLinks::default()
+            }
+        ));
+        let poisoned_state = (
+            fixture.store.type_len(),
+            fixture.store.type_alias_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+
+        assert_eq!(
+            get_enum_semantics(&mut fixture.store, &host, owner),
+            Err(EnumTypeError::Invariant(EnumTypeInvariant::InvalidCache(
+                owner
+            )))
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.type_alias_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            poisoned_state
+        );
+
+        assert!(fixture.store.set_declared_type_links(
+            second.symbol,
+            DeclaredTypeLinks {
+                declared_type: Some(first.fresh_type),
+                ..DeclaredTypeLinks::default()
+            }
+        ));
+        assert!(fixture.store.set_value_symbol_links(
+            second.symbol,
+            ValueSymbolLinks {
+                resolved_type: Some(first.fresh_type),
+                ..ValueSymbolLinks::default()
+            }
+        ));
+        assert_eq!(
+            get_enum_semantics(&mut fixture.store, &host, owner),
+            Ok(published)
         );
     }
 
