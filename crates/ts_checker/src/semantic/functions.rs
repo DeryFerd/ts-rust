@@ -203,13 +203,12 @@ pub(super) enum StoredFunctionTypeValidation {
 }
 
 /// Syntax-neutral display data for one parameter of a validated single-call
-/// signature. `annotation_type` deliberately retains the annotation's base
-/// identity instead of the parameter symbol's optional `T | undefined` value
-/// type.
+/// signature. TypeScript serializes the parameter symbol's semantic value type,
+/// including optional `undefined`, while retaining syntactic `?` separately.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct ValidatedSingleCallParameterDisplay {
     pub(super) name: String,
-    pub(super) annotation_type: TypeId,
+    pub(super) value_type: TypeId,
     pub(super) optional: bool,
 }
 
@@ -700,12 +699,10 @@ pub(super) fn function_type_display_projection(
         .ok_or(FunctionTypeDisplayError::UnresolvedReturn)?;
     let mut parameters = Vec::with_capacity(plan.parameters.len());
     for parameter in &plan.parameters {
-        let annotation_type = cached_annotation_identity(
-            store,
-            parameter.identity_node,
-            parameter.null_literal_identity,
-        )
-        .ok_or(FunctionTypeDisplayError::Malformed)?;
+        let value_type = store
+            .value_symbol_links(parameter.symbol)
+            .and_then(|links| links.resolved_type)
+            .ok_or(FunctionTypeDisplayError::Malformed)?;
         let parameter_node = host
             .node(parameter.declaration)
             .ok_or(FunctionTypeDisplayError::Malformed)?;
@@ -723,7 +720,7 @@ pub(super) fn function_type_display_projection(
         };
         parameters.push(ValidatedSingleCallParameterDisplay {
             name: identifier.text.clone(),
-            annotation_type,
+            value_type,
             optional: parameter.optional,
         });
     }

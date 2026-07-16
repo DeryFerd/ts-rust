@@ -11,6 +11,7 @@ use ts_binder::{
     CanonicalModuleState, CanonicalNameResolutionError, CanonicalSourceFileFacts,
     CanonicalSourceLanguage, EscapedName, SymbolFlags, bind_source_file_in_file,
 };
+use ts_checker::semantic::formatter::FunctionTypeDisplayUnavailable;
 use ts_checker::semantic::{
     ArrayTypeError, CanonicalCheckerContext, CanonicalCheckerContextError, CanonicalCheckerOptions,
     CanonicalGlobalInitializationError, CanonicalGlobalTypeInitializationError, DeclaredTypeError,
@@ -556,8 +557,10 @@ fn display_error_is_unsupported(error: &TypeDisplayUnavailable) -> bool {
         | TypeDisplayUnavailable::CyclicType(_)
         | TypeDisplayUnavailable::UniqueSymbolName(_)
         | TypeDisplayUnavailable::FullyQualifiedName { .. }
-        | TypeDisplayUnavailable::FunctionType { .. }
         | TypeDisplayUnavailable::Utf8TruncationBoundary { .. } => true,
+        TypeDisplayUnavailable::FunctionType { reason, .. } => {
+            function_display_error_is_unsupported(*reason)
+        }
         TypeDisplayUnavailable::Type(_)
         | TypeDisplayUnavailable::MalformedType(_)
         | TypeDisplayUnavailable::InvalidUnion(_)
@@ -565,6 +568,29 @@ fn display_error_is_unsupported(error: &TypeDisplayUnavailable) -> bool {
         | TypeDisplayUnavailable::MissingBootstrap
         | TypeDisplayUnavailable::SourceHost(_) => false,
         TypeDisplayUnavailable::ArrayType(error) => array_type_error_is_unsupported(error),
+    }
+}
+
+const fn function_display_error_is_unsupported(reason: FunctionTypeDisplayUnavailable) -> bool {
+    match reason {
+        FunctionTypeDisplayUnavailable::SourceContext
+        | FunctionTypeDisplayUnavailable::GenericAlias
+        | FunctionTypeDisplayUnavailable::GenericSignature
+        | FunctionTypeDisplayUnavailable::ThisParameter
+        | FunctionTypeDisplayUnavailable::RestParameter
+        | FunctionTypeDisplayUnavailable::InitializedParameter
+        | FunctionTypeDisplayUnavailable::DestructuredParameter
+        | FunctionTypeDisplayUnavailable::ParameterModifiers
+        | FunctionTypeDisplayUnavailable::MissingParameterType
+        | FunctionTypeDisplayUnavailable::MissingReturnType
+        | FunctionTypeDisplayUnavailable::TypePredicate
+        | FunctionTypeDisplayUnavailable::Overloads
+        | FunctionTypeDisplayUnavailable::ConstructSignatures
+        | FunctionTypeDisplayUnavailable::IndexSignatures
+        | FunctionTypeDisplayUnavailable::CallableProperties
+        | FunctionTypeDisplayUnavailable::UnvalidatedCallable => true,
+        FunctionTypeDisplayUnavailable::PendingSignature
+        | FunctionTypeDisplayUnavailable::UnresolvedReturn => false,
     }
 }
 
@@ -6512,7 +6538,6 @@ mod tests {
         SourceLiteralCacheError, SourceObjectLiteralError, SymbolMergeError, TypeDataKind,
         TypeDisplayUnavailable, TypeNodeUnavailable, UnsupportedSourceSyntax, VariableInvariant,
     };
-    use ts_checker::semantic::formatter::FunctionTypeDisplayUnavailable;
     use ts_diagnostics::{Category, Diagnostic, message_by_code};
     use ts_options::{
         CompilerOptions, ModuleDetectionKind, ModuleKind, ModuleResolutionKind, ScriptTarget,
@@ -6625,7 +6650,7 @@ mod tests {
                 error: SourceCheckError::TypeDisplayUnavailable(
                     TypeDisplayUnavailable::FunctionType {
                         type_id,
-                        reason: FunctionTypeDisplayUnavailable::UnresolvedReturn,
+                        reason: FunctionTypeDisplayUnavailable::SourceContext,
                     },
                 ),
             },
@@ -6700,6 +6725,58 @@ mod tests {
         let invariant = [
             TypeNodeUnavailable::MissingGenericAliasMetadata(symbol),
             TypeNodeUnavailable::InvalidGenericAliasInstantiationCache(symbol),
+        ];
+        assert!(
+            invariant
+                .into_iter()
+                .map(source_error)
+                .all(|error| !error.is_unsupported_boundary())
+        );
+    }
+
+    #[test]
+    fn canonical_program_error_classification_exhausts_function_display_boundaries() {
+        let mut store = CanonicalTypeMapperStore::new();
+        let type_id = store
+            .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions::default())
+            .unwrap()
+            .any_type;
+        let source_error = |reason| CanonicalProgramCheckError::SourceCheck {
+            file_name: "/project/input.ts".to_owned(),
+            error: SourceCheckError::TypeDisplayUnavailable(TypeDisplayUnavailable::FunctionType {
+                type_id,
+                reason,
+            }),
+        };
+
+        let capability = [
+            FunctionTypeDisplayUnavailable::SourceContext,
+            FunctionTypeDisplayUnavailable::GenericAlias,
+            FunctionTypeDisplayUnavailable::GenericSignature,
+            FunctionTypeDisplayUnavailable::ThisParameter,
+            FunctionTypeDisplayUnavailable::RestParameter,
+            FunctionTypeDisplayUnavailable::InitializedParameter,
+            FunctionTypeDisplayUnavailable::DestructuredParameter,
+            FunctionTypeDisplayUnavailable::ParameterModifiers,
+            FunctionTypeDisplayUnavailable::MissingParameterType,
+            FunctionTypeDisplayUnavailable::MissingReturnType,
+            FunctionTypeDisplayUnavailable::TypePredicate,
+            FunctionTypeDisplayUnavailable::Overloads,
+            FunctionTypeDisplayUnavailable::ConstructSignatures,
+            FunctionTypeDisplayUnavailable::IndexSignatures,
+            FunctionTypeDisplayUnavailable::CallableProperties,
+            FunctionTypeDisplayUnavailable::UnvalidatedCallable,
+        ];
+        assert!(
+            capability
+                .into_iter()
+                .map(source_error)
+                .all(|error| error.is_unsupported_boundary())
+        );
+
+        let invariant = [
+            FunctionTypeDisplayUnavailable::PendingSignature,
+            FunctionTypeDisplayUnavailable::UnresolvedReturn,
         ];
         assert!(
             invariant

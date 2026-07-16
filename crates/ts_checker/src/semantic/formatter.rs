@@ -18,7 +18,7 @@ use ts_binder::{
 
 use super::{
     ArrayTypeError, CanonicalGlobalTypes, CanonicalTypeMapperStore, DeclaredTypeHost,
-    DeclaredTypeHostError, TypeAliasId, TypeId,
+    DeclaredTypeHostError, SignatureId, TypeAliasId, TypeId,
     array_types::CanonicalArrayTargets,
     bootstrap::LiteralTypeCacheError,
     functions::{
@@ -777,9 +777,7 @@ fn display_object_type(
     }
     if let Some(alias) = record.alias() {
         if let Some(provider) = single_callable_display_provider(store, type_id) {
-            if !validated_opaque_single_callable_alias(store, type_id, provider) {
-                return Err(TypeDisplayUnavailable::MalformedType(type_id));
-            }
+            validate_opaque_single_callable_alias(store, type_id, provider)?;
         } else {
             validate_property_object_alias(store, type_id, record, alias)?;
         }
@@ -838,9 +836,10 @@ fn display_object_type(
 }
 
 /// Syntax-specific proof providers converge on one immutable signature
-/// projection before the formatter emits any text. Source `FunctionDeclaration`
-/// and `ArrowFunction` values can add providers here without changing display,
-/// precedence, truncation, or recursive formatting behavior.
+/// projection before the formatter emits any text. Bounded source-callable
+/// providers can reuse emission and precedence; source diagnostic integration
+/// must additionally supply each side's enclosing declaration once qualified
+/// names enter the installed display cut.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SingleCallableDisplayProvider {
     FunctionType,
@@ -855,16 +854,27 @@ fn single_callable_display_provider(
         .then_some(SingleCallableDisplayProvider::FunctionType)
 }
 
-fn validated_opaque_single_callable_alias(
+fn validate_opaque_single_callable_alias(
     store: &CanonicalTypeMapperStore,
     type_id: TypeId,
     provider: SingleCallableDisplayProvider,
-) -> bool {
+) -> Result<(), TypeDisplayUnavailable> {
     match provider {
-        SingleCallableDisplayProvider::FunctionType => matches!(
-            validate_stored_function_type(store, type_id),
-            StoredFunctionTypeValidation::Valid(_)
-        ),
+        SingleCallableDisplayProvider::FunctionType => {
+            match validate_stored_function_type(store, type_id) {
+                StoredFunctionTypeValidation::Valid(_) => Ok(()),
+                StoredFunctionTypeValidation::Pending => {
+                    Err(TypeDisplayUnavailable::FunctionType {
+                        type_id,
+                        reason: FunctionTypeDisplayUnavailable::PendingSignature,
+                    })
+                }
+                StoredFunctionTypeValidation::NotFunctionType
+                | StoredFunctionTypeValidation::Malformed => {
+                    Err(TypeDisplayUnavailable::MalformedType(type_id))
+                }
+            }
+        }
     }
 }
 
@@ -959,6 +969,7 @@ fn unsupported_callable_shape(
     if signatures.is_empty() && structured.call_signature_count == 0 && !has_indexes {
         return Ok(None);
     }
+    validate_unbranded_callable_cache(store, type_id, record, signatures)?;
     if structured
         .properties
         .as_ref()
@@ -1010,6 +1021,151 @@ fn unsupported_callable_shape(
     Ok(Some(FunctionTypeDisplayUnavailable::UnvalidatedCallable))
 }
 
+fn validate_unbranded_callable_cache(
+    store: &CanonicalTypeMapperStore,
+    type_id: TypeId,
+    record: &TypeRecord,
+    signatures: &[SignatureId],
+) -> Result<(), TypeDisplayUnavailable> {
+    let structured = record
+        .data()
+        .structured()
+        .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+    if record.flags() != TypeFlags::OBJECT
+        || !record
+            .object_flags()
+            .intersects(ObjectFlags::MEMBERS_RESOLVED)
+        || structured.call_signature_count > signatures.len()
+        || structured
+            .constrained
+            .resolved_base_constraint
+            .is_some_and(|constraint| store.type_payload(constraint).is_none())
+        || structured
+            .object_type_without_abstract_construct_signatures
+            .is_some_and(|cached| store.type_payload(cached).is_none())
+    {
+        return Err(TypeDisplayUnavailable::MalformedType(type_id));
+    }
+
+    let properties = structured.properties.as_deref().unwrap_or_default();
+    validate_structured_member_table(store, type_id, structured.members, properties)?;
+
+    let mut unique_signatures = HashSet::with_capacity(signatures.len());
+    for signature in signatures {
+        if !unique_signatures.insert(*signature) {
+            return Err(TypeDisplayUnavailable::MalformedType(type_id));
+        }
+        validate_unbranded_signature_record(store, type_id, *signature)?;
+    }
+
+    let indexes = structured.index_infos.as_deref().unwrap_or_default();
+    let mut unique_indexes = HashSet::with_capacity(indexes.len());
+    for index in indexes {
+        if !unique_indexes.insert(*index) {
+            return Err(TypeDisplayUnavailable::MalformedType(type_id));
+        }
+        let record = store
+            .index_info(*index)
+            .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+        if store.type_payload(record.key_type()).is_none()
+            || store.type_payload(record.value_type()).is_none()
+            || record
+                .declaration()
+                .is_some_and(|declaration| !store.contains_node_ref(declaration))
+            || record
+                .index_symbol()
+                .is_some_and(|symbol| store.symbol(symbol).is_none())
+            || record
+                .components()
+                .iter()
+                .any(|component| !store.contains_node_ref(*component))
+        {
+            return Err(TypeDisplayUnavailable::MalformedType(type_id));
+        }
+    }
+    Ok(())
+}
+
+fn validate_unbranded_signature_record(
+    store: &CanonicalTypeMapperStore,
+    type_id: TypeId,
+    signature: SignatureId,
+) -> Result<(), TypeDisplayUnavailable> {
+    let signature = store
+        .signature(signature)
+        .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+    let parameter_count = signature.parameters().len();
+    let minimum = usize::try_from(signature.min_argument_count())
+        .ok()
+        .filter(|minimum| *minimum <= parameter_count);
+    let resolved_minimum = signature.resolved_min_argument_count();
+    let allowed_flags = super::signatures::SignatureFlags::HAS_REST_PARAMETER
+        | super::signatures::SignatureFlags::HAS_LITERAL_TYPES
+        | super::signatures::SignatureFlags::CONSTRUCT
+        | super::signatures::SignatureFlags::ABSTRACT
+        | super::signatures::SignatureFlags::IS_INNER_CALL_CHAIN
+        | super::signatures::SignatureFlags::IS_OUTER_CALL_CHAIN
+        | super::signatures::SignatureFlags::IS_UNTYPED_SIGNATURE_IN_JS_FILE
+        | super::signatures::SignatureFlags::IS_NON_INFERRABLE
+        | super::signatures::SignatureFlags::IS_SIGNATURE_CANDIDATE_FOR_OVERLOAD_FAILURE;
+    let parameters_unique = signature
+        .parameters()
+        .iter()
+        .enumerate()
+        .all(|(index, parameter)| !signature.parameters()[..index].contains(parameter));
+    let type_parameters_unique = signature
+        .type_parameters()
+        .iter()
+        .enumerate()
+        .all(|(index, parameter)| !signature.type_parameters()[..index].contains(parameter));
+    let composite_valid = signature.composite().is_none_or(|composite| {
+        composite
+            .signatures()
+            .iter()
+            .all(|constituent| store.signature(*constituent).is_some())
+    });
+    if signature.flags().bits() & !allowed_flags.bits() != 0
+        || minimum.is_none()
+        || resolved_minimum < -1
+        || usize::try_from(resolved_minimum).is_ok_and(|minimum| minimum > parameter_count)
+        || !parameters_unique
+        || !type_parameters_unique
+        || signature
+            .declaration()
+            .is_some_and(|declaration| !store.contains_node_ref(declaration))
+        || signature
+            .parameters()
+            .iter()
+            .any(|parameter| store.symbol(*parameter).is_none())
+        || signature
+            .type_parameters()
+            .iter()
+            .any(|parameter| store.type_payload(*parameter).is_none())
+        || signature
+            .this_parameter()
+            .is_some_and(|parameter| store.symbol(parameter).is_none())
+        || signature
+            .resolved_return_type()
+            .is_some_and(|return_type| store.type_payload(return_type).is_none())
+        || signature
+            .resolved_type_predicate()
+            .is_some_and(|predicate| store.type_predicate(predicate).is_none())
+        || signature
+            .target()
+            .is_some_and(|target| store.signature(target).is_none())
+        || signature
+            .mapper()
+            .is_some_and(|mapper| store.mapper_payload(mapper).is_none())
+        || signature
+            .isolated_signature_type()
+            .is_some_and(|isolated| store.type_payload(isolated).is_none())
+        || !composite_valid
+    {
+        return Err(TypeDisplayUnavailable::MalformedType(type_id));
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn display_single_call_signature(
     store: &CanonicalTypeMapperStore,
@@ -1038,7 +1194,7 @@ fn display_single_call_signature(
             store,
             host,
             global_types,
-            parameter.annotation_type,
+            parameter.value_type,
             flags,
             state,
             visiting,
@@ -1090,15 +1246,10 @@ fn display_array_type(
         let function_parentheses = is_unaliased_single_callable_type(store, element_type);
         if union_parentheses || function_parentheses {
             element = format!("({element})");
-            if union_parentheses {
-                state.add(2);
-            }
         }
         if readonly {
-            state.add(9);
             element.insert_str(0, "readonly ");
         }
-        state.add(2);
         element.push_str("[]");
         Ok(element)
     })();
@@ -2847,6 +2998,26 @@ mod tests {
             .and_then(|links| links.resolved_signature.signature())
     }
 
+    fn function_parameter_symbol(
+        context: &CanonicalCheckerContext<'_>,
+        parsed: &ParseResult,
+        function: NodeRef,
+        index: usize,
+    ) -> SemanticSymbolId {
+        let parameter = match &parsed.arena.get(function.node).unwrap().data {
+            NodeData::FunctionTypeNode(data) => {
+                NodeRef::new(function.arena, function.file, data.parameters.nodes[index])
+            }
+            _ => unreachable!(),
+        };
+        context
+            .file(function.file)
+            .unwrap()
+            .1
+            .symbol(parameter)
+            .unwrap()
+    }
+
     fn resolve_all_function_returns(
         context: &mut CanonicalCheckerContext<'_>,
         parsed: &ParseResult,
@@ -4340,7 +4511,7 @@ mod tests {
     }
 
     #[test]
-    fn parsed_function_display_uses_annotation_optionality_and_lazy_return_boundary() {
+    fn parsed_function_display_uses_semantic_parameter_types_and_syntactic_optionality() {
         let parsed = parse_source_file(concat!(
             "type Result = string | number; ",
             "type Alias = (value?: number) => Result; ",
@@ -4374,7 +4545,7 @@ mod tests {
         context.get_return_type_of_signature(signature).unwrap();
         assert_eq!(
             context.type_to_string(direct_type).unwrap(),
-            "(required: string, optional?: number) => Result",
+            "(required: string, optional?: number | undefined) => Result",
         );
         let string = context.store().intrinsic_bootstrap().unwrap().string_type;
         assert_eq!(
@@ -4382,7 +4553,7 @@ mod tests {
                 .get_type_names_for_assignability_error(direct_type, string)
                 .unwrap(),
             AssignabilityErrorDisplay {
-                source: "(required: string, optional?: number) => Result".into(),
+                source: "(required: string, optional?: number | undefined) => Result".into(),
                 target: "string".into(),
             },
         );
@@ -4410,7 +4581,76 @@ mod tests {
                 .store()
                 .type_payload(resolved_optional)
                 .is_some_and(|record| record.flags().intersects(TypeFlags::UNION)),
-            "display must use the annotation base rather than this optional value union",
+            "display must use this optional value union together with syntactic `?`",
+        );
+    }
+
+    #[test]
+    fn aliased_function_display_preserves_pending_and_malformed_cache_states() {
+        let parsed = parse_source_file(concat!(
+            "type Barrier = (value: string) => number; ",
+            "type Parameters = (value: string) => number; ",
+            "type Poisoned = (value: string) => number;",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(209);
+        let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+        let barrier_node = type_alias_body(&parsed, file, "Barrier");
+        let parameters_node = type_alias_body(&parsed, file, "Parameters");
+        let poisoned_node = type_alias_body(&parsed, file, "Poisoned");
+        let barrier = context.get_type_from_type_node(barrier_node).unwrap();
+        let parameters = context.get_type_from_type_node(parameters_node).unwrap();
+        let poisoned = context.get_type_from_type_node(poisoned_node).unwrap();
+        assert_eq!(context.type_to_string(barrier).unwrap(), "Barrier");
+        assert_eq!(context.type_to_string(parameters).unwrap(), "Parameters");
+        assert_eq!(context.type_to_string(poisoned).unwrap(), "Poisoned");
+
+        let barrier_parameter = function_parameter_symbol(&context, &parsed, barrier_node, 0);
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_value_symbol_links(barrier_parameter, ValueSymbolLinks::default(),)
+        );
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_structured_type_members(barrier, None, None, None, None, None,)
+        );
+        assert_eq!(
+            context.type_to_string(barrier),
+            Err(TypeDisplayUnavailable::FunctionType {
+                type_id: barrier,
+                reason: FunctionTypeDisplayUnavailable::PendingSignature,
+            })
+        );
+
+        let pending_parameter = function_parameter_symbol(&context, &parsed, parameters_node, 0);
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_value_symbol_links(pending_parameter, ValueSymbolLinks::default(),)
+        );
+        assert_eq!(
+            context.type_to_string(parameters),
+            Err(TypeDisplayUnavailable::FunctionType {
+                type_id: parameters,
+                reason: FunctionTypeDisplayUnavailable::PendingSignature,
+            })
+        );
+
+        let poisoned_parameter = function_parameter_symbol(&context, &parsed, poisoned_node, 0);
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        assert!(context.store_mut_for_test().set_value_symbol_links(
+            poisoned_parameter,
+            ValueSymbolLinks {
+                resolved_type: Some(number),
+                target: Some(poisoned_parameter),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        assert_eq!(
+            context.type_to_string(poisoned),
+            Err(TypeDisplayUnavailable::MalformedType(poisoned))
         );
     }
 
@@ -4545,9 +4785,14 @@ mod tests {
         let callable_with_property = store
             .alloc_plain_object_type(ObjectFlags::ANONYMOUS, None)
             .unwrap();
+        let property_members = store.alloc_symbol_table();
+        assert_eq!(
+            store.insert_symbol(property_members, EscapedName::source("value"), property,),
+            Some(None),
+        );
         assert!(store.set_structured_type_members(
             callable_with_property,
-            None,
+            Some(property_members),
             Some(vec![property]),
             Some(vec![first]),
             None,
@@ -4597,6 +4842,136 @@ mod tests {
                 type_id: construct,
                 reason: FunctionTypeDisplayUnavailable::ConstructSignatures,
             })
+        );
+
+        let index = store
+            .alloc_index_info(number, number, false, None, Vec::new())
+            .unwrap();
+        let indexed = store
+            .alloc_plain_object_type(ObjectFlags::ANONYMOUS, None)
+            .unwrap();
+        assert!(store.set_structured_type_members(
+            indexed,
+            None,
+            Some(Vec::new()),
+            None,
+            None,
+            Some(vec![index]),
+        ));
+        assert_eq!(
+            type_to_string(&store, indexed),
+            Err(TypeDisplayUnavailable::FunctionType {
+                type_id: indexed,
+                reason: FunctionTypeDisplayUnavailable::IndexSignatures,
+            })
+        );
+    }
+
+    #[test]
+    fn malformed_unbranded_callable_caches_fail_before_capability_classification() {
+        let mut store = bootstrapped_store();
+        let number = store.intrinsic_bootstrap().unwrap().number_type;
+        let signature = store
+            .alloc_signature(
+                crate::semantic::signatures::SignatureFlags::NONE,
+                None,
+                Vec::new(),
+                None,
+                Vec::new(),
+                Some(number),
+                None,
+                0,
+            )
+            .unwrap();
+
+        let property = alloc_typed_property(&mut store, "value", number, false, false);
+        let malformed_members = store.alloc_symbol_table();
+        assert_eq!(
+            store.insert_symbol(malformed_members, EscapedName::source("notValue"), property,),
+            Some(None),
+        );
+        let malformed_properties = store
+            .alloc_plain_object_type(ObjectFlags::ANONYMOUS, None)
+            .unwrap();
+        assert!(store.set_structured_type_members(
+            malformed_properties,
+            Some(malformed_members),
+            Some(vec![property]),
+            Some(vec![signature]),
+            None,
+            None,
+        ));
+        assert_eq!(
+            type_to_string(&store, malformed_properties),
+            Err(TypeDisplayUnavailable::MalformedType(malformed_properties,))
+        );
+
+        let duplicate_properties = store
+            .alloc_plain_object_type(ObjectFlags::ANONYMOUS, None)
+            .unwrap();
+        let duplicate_members = store.alloc_symbol_table();
+        assert_eq!(
+            store.insert_symbol(duplicate_members, EscapedName::source("value"), property,),
+            Some(None),
+        );
+        assert!(store.set_structured_type_members(
+            duplicate_properties,
+            Some(duplicate_members),
+            Some(vec![property, property]),
+            Some(vec![signature]),
+            None,
+            None,
+        ));
+        assert_eq!(
+            type_to_string(&store, duplicate_properties),
+            Err(TypeDisplayUnavailable::MalformedType(duplicate_properties,))
+        );
+
+        let malformed_signature = store
+            .alloc_signature(
+                crate::semantic::signatures::SignatureFlags::NONE,
+                None,
+                Vec::new(),
+                None,
+                Vec::new(),
+                Some(number),
+                None,
+                -1,
+            )
+            .unwrap();
+        let malformed_overload = store
+            .alloc_plain_object_type(ObjectFlags::ANONYMOUS, None)
+            .unwrap();
+        assert!(store.set_structured_type_members(
+            malformed_overload,
+            None,
+            Some(Vec::new()),
+            Some(vec![signature, malformed_signature]),
+            None,
+            None,
+        ));
+        assert_eq!(
+            type_to_string(&store, malformed_overload),
+            Err(TypeDisplayUnavailable::MalformedType(malformed_overload))
+        );
+
+        let index = store
+            .alloc_index_info(number, number, false, None, Vec::new())
+            .unwrap();
+        let malformed_indexes = store
+            .alloc_plain_object_type(ObjectFlags::ANONYMOUS, None)
+            .unwrap();
+        assert!(store.set_structured_type_members(
+            malformed_indexes,
+            None,
+            Some(Vec::new()),
+            None,
+            None,
+            Some(vec![index, index]),
+        ));
+        assert_eq!(
+            type_to_string(&store, malformed_indexes),
+            Err(TypeDisplayUnavailable::MalformedType(malformed_indexes))
         );
     }
 
