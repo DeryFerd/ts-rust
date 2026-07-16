@@ -370,6 +370,9 @@ fn source_check_error_is_unsupported(error: &SourceCheckError) -> bool {
         | SourceCheckError::Arrow(_)
         | SourceCheckError::Function(_)
         | SourceCheckError::Variable(_)
+        | SourceCheckError::Call(_)
+        | SourceCheckError::Enum(_)
+        | SourceCheckError::Property(_)
         | SourceCheckError::MissingDiagnostic(_) => false,
     }
 }
@@ -410,9 +413,9 @@ fn declared_type_error_is_unsupported(error: &DeclaredTypeError) -> bool {
         DeclaredTypeError::Unavailable(error) => declared_type_unavailable_is_unsupported(error),
         DeclaredTypeError::TypeNodeUnavailable(error) => type_node_error_is_unsupported(error),
         DeclaredTypeError::Enum(EnumTypeError::Unsupported(_)) => true,
-        DeclaredTypeError::Enum(EnumTypeError::Invariant(_)) => false,
         DeclaredTypeError::NameResolution(error) => name_resolution_error_is_unsupported(error),
-        DeclaredTypeError::Host(_)
+        DeclaredTypeError::Enum(EnumTypeError::Invariant(_))
+        | DeclaredTypeError::Host(_)
         | DeclaredTypeError::NameResolverHost(_)
         | DeclaredTypeError::TypeResolutionTarget(_) => false,
     }
@@ -6964,6 +6967,18 @@ mod tests {
             CanonicalProgramCheckError::SourceCheck {
                 file_name: "/project/input.ts".to_owned(),
                 error: SourceCheckError::Arrow(node),
+            },
+            CanonicalProgramCheckError::SourceCheck {
+                file_name: "/project/input.ts".to_owned(),
+                error: SourceCheckError::Call(node),
+            },
+            CanonicalProgramCheckError::SourceCheck {
+                file_name: "/project/input.ts".to_owned(),
+                error: SourceCheckError::Enum(node),
+            },
+            CanonicalProgramCheckError::SourceCheck {
+                file_name: "/project/input.ts".to_owned(),
+                error: SourceCheckError::Property(node),
             },
             CanonicalProgramCheckError::SourceCheck {
                 file_name: "/project/input.ts".to_owned(),

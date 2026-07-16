@@ -175,6 +175,39 @@ fn is_context_insensitive_argument_syntax(arena: &NodeArena, node: NodeRef) -> b
                     )
             })
         }
+        SyntaxKind::PropertyAccessExpression => {
+            let NodeData::PropertyAccessExpression(access) = &record.data else {
+                return false;
+            };
+            if record.flags.0 != 0
+                || access.flow_node.is_some()
+                || access.question_dot_token.is_some()
+                || access.facts != 0
+            {
+                return false;
+            }
+            let Some(receiver) = arena.get(access.expression) else {
+                return false;
+            };
+            let Some(name) = arena.get(access.name) else {
+                return false;
+            };
+            receiver.parent == Some(node.node)
+                && receiver.kind == SyntaxKind::Identifier
+                && receiver.flags.0 == 0
+                && matches!(
+                    &receiver.data,
+                    NodeData::Identifier(identifier) if identifier.flow_node.is_none()
+                )
+                && name.parent == Some(node.node)
+                && name.kind == SyntaxKind::Identifier
+                && name.flags.0 == 0
+                && matches!(
+                    &name.data,
+                    NodeData::Identifier(identifier)
+                        if identifier.flow_node.is_none() && !identifier.text.is_empty()
+                )
+        }
         _ => false,
     }
 }
@@ -187,7 +220,8 @@ fn is_context_insensitive_argument_plan(expression: &PlannedExpression) -> bool 
         | PlannedExpressionKind::BigInt { .. }
         | PlannedExpressionKind::Boolean(_)
         | PlannedExpressionKind::GlobalUndefined
-        | PlannedExpressionKind::Identifier(_) => true,
+        | PlannedExpressionKind::Identifier(_)
+        | PlannedExpressionKind::Property(_) => true,
         PlannedExpressionKind::Parenthesized(inner) => is_context_insensitive_argument_plan(inner),
         PlannedExpressionKind::Assertion { .. }
         | PlannedExpressionKind::Array(_)

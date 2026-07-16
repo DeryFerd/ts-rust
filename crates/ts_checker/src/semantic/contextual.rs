@@ -41,6 +41,7 @@ pub(super) enum PreparedExpression {
     Parenthesized(Box<PreparedExpression>),
     Array(Vec<PreparedExpression>),
     Object(Vec<PreparedExpression>),
+    Property(Box<PreparedExpression>),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -334,6 +335,17 @@ fn prepare_expression(
                 )?);
             }
             PreparedExpression::Object(prepared)
+        }
+        PlannedExpressionKind::Property(property) => {
+            PreparedExpression::Property(Box::new(prepare_expression(
+                store,
+                host,
+                global_types,
+                current_flow_types,
+                &property.receiver,
+                None,
+                ExpressionLocation::Cached,
+            )?))
         }
         PlannedExpressionKind::Call(_) => {
             return Err(SourceCheckError::Unsupported(

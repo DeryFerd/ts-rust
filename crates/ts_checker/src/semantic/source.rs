@@ -1,11 +1,14 @@
 //! Atomic canonical checking for the first source-statement slice.
 //!
 //! This module deliberately supports only unmodified type aliases and simple
-//! interfaces, empty external-module markers, annotated top-level function
-//! declarations, initialized identifier-named top-level variables (optionally
-//! exported), and direct assignments back to supported `var` declarations.
+//! interfaces, top-level literal enums, empty external-module markers,
+//! annotated top-level function declarations, initialized identifier-named
+//! top-level variables (optionally exported), ordinary direct identifier
+//! calls, required own-property reads, and direct assignments back to
+//! supported `var` declarations.
 //! The complete source tree and complete supported-statement plan are validated
-//! before checker state is touched.
+//! before semantic execution begins. Execution may retain safe canonical memo
+//! caches while discovering a type-dependent capability boundary.
 //! Unsupported syntax is therefore
 //! a typed boundary, never a request to fall back to the legacy checker or to
 //! synthesize `any`. Canonical memo caches are not rolled back after a later
@@ -55,9 +58,15 @@ use super::{
         SourceCallPlan, check_direct_source_call, finish_direct_source_call_plan,
         plan_direct_source_call_syntax,
     },
+    source_enums::{SourceEnumError, SourceEnumPlan, execute_top_level_enum, plan_top_level_enum},
     source_functions::{
         PlannedFunctionRead, SourceFunctionInvariant, SourceFunctionPlanError,
         SourceFunctionUnsupported, plan_function_identifier_read, plan_top_level_function,
+    },
+    source_properties::{
+        SourcePropertyError, SourcePropertyPlan, SourcePropertyUnsupported,
+        check_direct_source_property, finish_direct_source_property_plan,
+        plan_direct_source_property_syntax,
     },
     type_nodes::{CanonicalTypeQuery, normalize_bigint_literal, normalize_numeric_separators},
     type_records::{TypeData, TypeRecord},
@@ -132,6 +141,8 @@ pub enum UnsupportedSourceSyntax {
     Function(SourceFunctionUnsupported),
     Variable(VariableUnsupported),
     Call(NodeRef),
+    Enum(NodeRef),
+    Property(NodeRef),
 }
 
 /// Source and AST identity rejected before semantic execution.
@@ -244,6 +255,8 @@ pub enum SourceCheckError {
     Function(SourceFunctionInvariant),
     Variable(VariableInvariant),
     Call(NodeRef),
+    Enum(NodeRef),
+    Property(NodeRef),
     MissingDiagnostic(u32),
 }
 
@@ -267,6 +280,8 @@ impl std::fmt::Display for SourceCheckError {
             Self::Function(error) => write!(formatter, "function checking failed: {error:?}"),
             Self::Variable(error) => write!(formatter, "variable checking failed: {error:?}"),
             Self::Call(node) => write!(formatter, "call checking failed at {node:?}"),
+            Self::Enum(node) => write!(formatter, "enum checking failed at {node:?}"),
+            Self::Property(node) => write!(formatter, "property checking failed at {node:?}"),
             Self::MissingDiagnostic(code) => {
                 write!(formatter, "diagnostic TS{code} is absent from the catalog")
             }
@@ -293,6 +308,8 @@ impl std::error::Error for SourceCheckError {
             | Self::Function(_)
             | Self::Variable(_)
             | Self::Call(_)
+            | Self::Enum(_)
+            | Self::Property(_)
             | Self::MissingDiagnostic(_) => None,
         }
     }
@@ -379,6 +396,7 @@ pub(super) enum PlannedExpressionKind {
         plan: super::object_members::PropertyObjectPlan,
         properties: Vec<PlannedExpression>,
     },
+    Property(Box<SourcePropertyPlan>),
     Call(Box<SourceCallPlan>),
 }
 
@@ -478,6 +496,7 @@ struct DeferredAssertion {
 enum PlannedStatement {
     TypeAlias(SemanticSymbolId),
     Interface(SemanticSymbolId),
+    Enum(SourceEnumPlan),
     ExternalModuleMarker,
     Function(usize),
     Arrow(usize),
@@ -682,6 +701,18 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     }
                     statements.push(PlannedStatement::Interface(symbol));
                 }
+                SyntaxKind::EnumDeclaration => {
+                    let Some((store, host)) = self.semantic else {
+                        return Err(self.unsupported(
+                            statement,
+                            SyntaxKind::EnumDeclaration,
+                            SourceSyntaxRole::Statement,
+                        ));
+                    };
+                    let enumeration = plan_top_level_enum(store, host, statement)
+                        .map_err(|error| Self::enum_plan_error(statement, error))?;
+                    statements.push(PlannedStatement::Enum(enumeration));
+                }
                 SyntaxKind::ExportDeclaration => {
                     if !is_external_module {
                         return Err(SourceCheckError::Unsupported(
@@ -841,6 +872,34 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             }
             SourceFunctionPlanError::Invariant(error) => SourceCheckError::Function(error),
             SourceFunctionPlanError::DeclaredType(error) => SourceCheckError::DeclaredType(error),
+        }
+    }
+
+    fn enum_plan_error(declaration: NodeRef, error: SourceEnumError) -> SourceCheckError {
+        let node = error.node().unwrap_or(declaration);
+        match error {
+            SourceEnumError::Unsupported(_) => {
+                SourceCheckError::Unsupported(UnsupportedSourceSyntax::Enum(node))
+            }
+            SourceEnumError::Invariant(_) => SourceCheckError::Enum(node),
+            SourceEnumError::DeclaredType(error) => SourceCheckError::DeclaredType(error),
+        }
+    }
+
+    fn property_plan_error(error: SourcePropertyError) -> SourceCheckError {
+        match error {
+            SourcePropertyError::Unsupported(reason) => {
+                let node = match reason {
+                    SourcePropertyUnsupported::Access(node)
+                    | SourcePropertyUnsupported::Receiver(node)
+                    | SourcePropertyUnsupported::MemberCall(node) => node,
+                    SourcePropertyUnsupported::MissingOwnProperty { node, .. }
+                    | SourcePropertyUnsupported::OptionalProperty { node, .. } => node,
+                };
+                SourceCheckError::Unsupported(UnsupportedSourceSyntax::Property(node))
+            }
+            SourcePropertyError::InvalidCache(node) => SourceCheckError::Property(node),
+            SourcePropertyError::Relation(error) => SourceCheckError::RelationUnavailable(error),
         }
     }
 
@@ -1797,6 +1856,22 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             }
             SyntaxKind::ArrayLiteralExpression => self.plan_array_literal(expression),
             SyntaxKind::ObjectLiteralExpression => self.plan_object_literal(expression),
+            SyntaxKind::PropertyAccessExpression => {
+                let Some((store, _)) = self.semantic else {
+                    return Err(SourceCheckError::Unsupported(
+                        UnsupportedSourceSyntax::Property(expression),
+                    ));
+                };
+                let syntax = plan_direct_source_property_syntax(self.arena, store, expression)
+                    .map_err(Self::property_plan_error)?;
+                let receiver = self.plan_expression(syntax.receiver())?;
+                let property = finish_direct_source_property_plan(&syntax, receiver)
+                    .map_err(Self::property_plan_error)?;
+                Ok(PlannedExpression::new(
+                    expression,
+                    PlannedExpressionKind::Property(Box::new(property)),
+                ))
+            }
             SyntaxKind::CallExpression => {
                 let Some((store, _)) = self.semantic else {
                     return Err(SourceCheckError::Unsupported(
@@ -2468,6 +2543,21 @@ fn execute_expression_types(
                 result: object,
                 shape: CheckedExpressionShape::Object(checked_properties),
             })
+        }
+        (
+            PlannedExpressionKind::Property(property),
+            PreparedExpression::Property(prepared_receiver),
+        ) => {
+            let receiver = execute_expression_types(
+                store,
+                global_types,
+                current_flow_types,
+                &property.receiver,
+                prepared_receiver,
+            )?;
+            let checked = check_direct_source_property(store, property, receiver.result)
+                .map_err(SourcePlanner::property_plan_error)?;
+            Ok(CheckedExpressionTypes::leaf(checked.type_, checked.type_))
         }
         _ => unreachable!("a prepared expression must retain its planned expression shape"),
     }?;
@@ -3987,6 +4077,25 @@ pub(super) fn check_source_file(
                 merge_retry_diagnostics(diagnostics, statement_diagnostics);
                 result?;
             }
+            PlannedStatement::Enum(enumeration) => {
+                let materialized =
+                    execute_top_level_enum(store, host, &enumeration).map_err(|error| {
+                        SourcePlanner::enum_plan_error(enumeration.declaration, error)
+                    })?;
+                stage_value_type(
+                    store,
+                    &mut declared_types,
+                    &mut value_order,
+                    enumeration.owner_symbol,
+                    materialized.value_type,
+                )?;
+                if current_flow_types
+                    .insert(enumeration.owner_symbol, materialized.value_type)
+                    .is_some()
+                {
+                    return Err(SourceCheckError::Enum(enumeration.declaration));
+                }
+            }
             PlannedStatement::ExternalModuleMarker => {}
             PlannedStatement::Function(index) => {
                 let function = functions.get(index).ok_or(SourceCheckError::Function(
@@ -4874,6 +4983,239 @@ mod tests {
             is_type_checked(context, file),
             context.diagnostics().len(),
         )
+    }
+
+    #[test]
+    fn top_level_enum_materializes_value_and_declared_identities_and_replays_warm() {
+        let source = parsed(r#"enum Status { Ready, Running = 3, Label = "label" }"#);
+        let file = FileId::new(410);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        let owner = global_symbol(&context, "Status");
+
+        context.check_source_file(file).unwrap();
+
+        let declared = context
+            .store()
+            .declared_type_links(owner)
+            .and_then(|links| links.declared_type)
+            .expect("enum declared type must be published");
+        let value = context
+            .store()
+            .value_symbol_links(owner)
+            .and_then(|links| links.resolved_type)
+            .expect("enum value type must be published");
+        assert_ne!(declared, value);
+        assert!(context.store().type_payload(declared).is_some());
+        assert!(context.store().type_payload(value).is_some());
+        assert!(context.diagnostics().is_empty());
+        assert!(is_type_checked(&context, file));
+
+        let warm = observable_state(&context, file);
+        mark_source_unchecked(&mut context, file);
+        context.check_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+        assert_eq!(
+            context
+                .store()
+                .value_symbol_links(owner)
+                .and_then(|links| links.resolved_type),
+            Some(value)
+        );
+    }
+
+    #[test]
+    fn unsupported_later_enum_prevents_earlier_enum_publication() {
+        let source = parsed("enum Good { A } enum Bad { A = runtime }");
+        let file = FileId::new(411);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        let good = global_symbol(&context, "Good");
+        let bad = source
+            .arena
+            .iter()
+            .filter(|(_, record)| record.kind == SyntaxKind::EnumDeclaration)
+            .map(|(node, _)| NodeRef::new(source.arena.id(), file, node))
+            .nth(1)
+            .expect("second enum declaration must exist");
+        let before = observable_state(&context, file);
+
+        assert_eq!(
+            context.check_source_file(file),
+            Err(SourceCheckError::Unsupported(
+                UnsupportedSourceSyntax::Enum(bad)
+            ))
+        );
+        assert_eq!(observable_state(&context, file), before);
+        assert!(context.store().declared_type_links(good).is_none());
+        assert!(context.store().value_symbol_links(good).is_none());
+        assert!(context.diagnostics().is_empty());
+        assert!(!is_type_checked(&context, file));
+    }
+
+    #[test]
+    fn inferred_object_property_read_publishes_exact_type_and_symbol_and_replays_warm() {
+        let source = parsed("const object = { value: 1 }; const result = object.value;");
+        let file = FileId::new(412);
+        let access = variable_initializer(&source, file, "result");
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        assert_eq!(
+            variable_value_type(&context, &source, file, "result"),
+            number
+        );
+        assert_eq!(resolved_node_type(&context, access), number);
+        let property = context
+            .store()
+            .symbol_node_links(access)
+            .and_then(|links| links.resolved_symbol)
+            .expect("property symbol must be retained");
+        assert!(context.store().symbol(property).is_some());
+        assert!(context.diagnostics().is_empty());
+
+        let warm = observable_state(&context, file);
+        mark_source_unchecked(&mut context, file);
+        context.check_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+        assert_eq!(
+            context
+                .store()
+                .symbol_node_links(access)
+                .and_then(|links| links.resolved_symbol),
+            Some(property)
+        );
+    }
+
+    #[test]
+    fn property_read_keeps_its_type_for_assignment_diagnostics() {
+        let source = parsed(concat!(
+            "interface Model { value: string } ",
+            "const object: Model = { value: 'ok' }; ",
+            "const result: number = object.value;",
+        ));
+        let file = FileId::new(413);
+        let access = variable_initializer(&source, file, "result");
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let (string, number) = {
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            (bootstrap.string_type, bootstrap.number_type)
+        };
+        assert_eq!(resolved_node_type(&context, access), string);
+        assert_eq!(
+            variable_value_type(&context, &source, file, "result"),
+            number
+        );
+        let [diagnostic] = context.diagnostics().as_slice() else {
+            panic!("expected one property assignment diagnostic")
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 2322);
+        assert_eq!(
+            diagnostic.diagnostic.render().unwrap(),
+            "Type 'string' is not assignable to type 'number'."
+        );
+    }
+
+    #[test]
+    fn arrow_capture_reads_a_prior_object_property() {
+        let source =
+            parsed("const object = { value: 1 }; const read = (): number => object.value;");
+        let file = FileId::new(414);
+        let access = arrow_body(&source, file, "read");
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        assert_eq!(resolved_node_type(&context, access), number);
+        assert!(
+            context
+                .store()
+                .symbol_node_links(access)
+                .and_then(|links| links.resolved_symbol)
+                .is_some()
+        );
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn property_reads_remain_context_insensitive_in_arrays_objects_and_calls() {
+        let source = parsed(concat!(
+            "const object = { value: 1 }; ",
+            "function take(value: number): number { return 1; } ",
+            "const array = [object.value]; ",
+            "const copy = { value: object.value }; ",
+            "const called = take(object.value);",
+        ));
+        let file = FileId::new(416);
+        let array = variable_initializer(&source, file, "array");
+        let array_elements = array_elements(&source, file, array);
+        let [array_access] = array_elements.as_slice() else {
+            panic!("array must contain one property read")
+        };
+        let copy = variable_initializer(&source, file, "copy");
+        let object_access = object_property_initializer(&source, file, copy, "value");
+        let call = variable_initializer(&source, file, "called");
+        let NodeData::CallExpression(call_data) = &source.arena.get(call.node).unwrap().data else {
+            panic!("called must have a call initializer")
+        };
+        let [call_access] = call_data.arguments.nodes.as_slice() else {
+            panic!("call must contain one property argument")
+        };
+        let call_access = NodeRef::new(source.arena.id(), file, *call_access);
+        let accesses = [*array_access, object_access, call_access];
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        for access in accesses {
+            assert_eq!(resolved_node_type(&context, access), number);
+            assert!(
+                context
+                    .store()
+                    .symbol_node_links(access)
+                    .and_then(|links| links.resolved_symbol)
+                    .is_some()
+            );
+        }
+        assert_eq!(object_property_type(&context, copy, "value"), number);
+        assert_eq!(
+            variable_value_type(&context, &source, file, "called"),
+            number
+        );
+        assert!(context.diagnostics().is_empty());
+
+        let warm = observable_state(&context, file);
+        mark_source_unchecked(&mut context, file);
+        context.check_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn optional_property_read_remains_an_atomic_capability_boundary() {
+        let source = parsed(concat!(
+            "interface Model { value?: string } ",
+            "const object: Model = {}; ",
+            "const result = object.value;",
+        ));
+        let file = FileId::new(415);
+        let access = variable_initializer(&source, file, "result");
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        assert_eq!(
+            context.check_source_file(file),
+            Err(SourceCheckError::Unsupported(
+                UnsupportedSourceSyntax::Property(access)
+            ))
+        );
+        assert!(context.store().type_node_links(access).is_none());
+        assert!(context.store().symbol_node_links(access).is_none());
+        assert!(context.diagnostics().is_empty());
+        assert!(!is_type_checked(&context, file));
     }
 
     #[test]
