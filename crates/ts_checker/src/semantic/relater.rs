@@ -21,9 +21,12 @@ use super::{
     CanonicalGlobalTypeInitializationError, CanonicalGlobalTypes, DeclaredTypeHost,
     array_types::{ArrayTypeError, CanonicalArrayTargets},
     bootstrap::LiteralTypeCacheError,
+    callables::{
+        CallableFamily, StoredSingleCallableValidation, ValidatedSingleCallable,
+        validate_stored_single_callable,
+    },
     declared::type_list_key,
     derived_types::DerivedObjectLiteralValidation,
-    functions::{StoredFunctionTypeValidation, validate_stored_function_type},
     global_types::preflight_generic_global_type_target,
     ids::{SignatureId, TypeId},
     links::{MembersOrExportsResolutionKind, ValueSymbolLinks},
@@ -309,22 +312,8 @@ struct ResolvedObjectMembers {
     members: Option<SymbolTableId>,
     properties: Vec<SemanticSymbolId>,
     property_origin: ObjectPropertyOrigin,
-    call_signature: Option<ResolvedCallSignature>,
-    exact_function_type: bool,
-}
-
-/// Read-only projection consumed by signature relation after a callable
-/// family has proved its own storage invariants. Keeping comparison detached
-/// from `FunctionTypeNode` layout lets source functions feed the same worker
-/// once their distinct symbol/object proof is installed.
-#[derive(Clone, Debug)]
-struct ResolvedCallSignature {
-    owner: TypeId,
-    id: SignatureId,
-    parameters: Vec<TypeId>,
-    min_argument_count: usize,
-    return_type: Option<TypeId>,
-    strict_variance_exempt: bool,
+    call_signature: Option<ValidatedSingleCallable>,
+    exact_callable: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -744,7 +733,7 @@ impl<'store> RelaterSession<'store> {
         self.canonical_array_reference_argument(array, array_target)?;
         let members = self.resolved_object_members(object, true)?;
         if object == self.bootstrap.any_function_type
-            || members.exact_function_type
+            || members.exact_callable
             || members.call_signature.is_some()
         {
             return Err(RelationUnavailable::StructuralRelation {
@@ -1446,8 +1435,8 @@ impl<'store> RelaterSession<'store> {
         let allow_fresh_target = self.allows_fresh_object_target();
         let target_members = self.resolved_object_members(target, allow_fresh_target)?;
         if self.relation.is_identity()
-            && !source_members.exact_function_type
-            && !target_members.exact_function_type
+            && !source_members.exact_callable
+            && !target_members.exact_callable
             && source != self.bootstrap.any_function_type
             && target != self.bootstrap.any_function_type
         {
@@ -1463,7 +1452,7 @@ impl<'store> RelaterSession<'store> {
         ) && self.is_fresh_object_literal(target)?
             && target_members.properties.is_empty()
             && (!source_members.properties.is_empty()
-                || source_members.exact_function_type
+                || source_members.exact_callable
                 || source_members.call_signature.is_some()
                 || source == self.bootstrap.any_function_type)
         {
@@ -1759,7 +1748,7 @@ impl<'store> RelaterSession<'store> {
         }
         let source_members = self.resolved_object_property_surface(source, true)?;
         let source_is_empty = source_members.properties.is_empty()
-            && !source_members.exact_function_type
+            && !source_members.exact_callable
             && source_members.call_signature.is_none();
         if source_is_empty || self.is_direct_global_object_type(source)? {
             return Ok(false);
@@ -1912,8 +1901,8 @@ impl<'store> RelaterSession<'store> {
         &mut self,
         source: TypeId,
         target: TypeId,
-        source_signature: Option<&ResolvedCallSignature>,
-        target_signature: Option<&ResolvedCallSignature>,
+        source_signature: Option<&ValidatedSingleCallable>,
+        target_signature: Option<&ValidatedSingleCallable>,
         intersection_state: IntersectionState,
     ) -> Result<Ternary, RelationUnavailable> {
         if self.relation.is_identity() {
@@ -1952,11 +1941,11 @@ impl<'store> RelaterSession<'store> {
 
     fn compare_signatures_identical(
         &mut self,
-        source: &ResolvedCallSignature,
-        target: &ResolvedCallSignature,
+        source: &ValidatedSingleCallable,
+        target: &ValidatedSingleCallable,
         intersection_state: IntersectionState,
     ) -> Result<Ternary, RelationUnavailable> {
-        if source.id == target.id {
+        if source.signature == target.signature {
             return Ok(Ternary::True);
         }
         if source.parameters.len() != target.parameters.len()
@@ -1964,7 +1953,7 @@ impl<'store> RelaterSession<'store> {
         {
             return Ok(Ternary::False);
         }
-        let key = (source.id, target.id, u32::MAX);
+        let key = (source.signature, target.signature, u32::MAX);
         if !self.active_signature_pairs.insert(key) {
             return Ok(Ternary::Maybe);
         }
@@ -1982,12 +1971,18 @@ impl<'store> RelaterSession<'store> {
                 }
                 result &= related;
             }
-            let source_return = source
-                .return_type
-                .ok_or(RelationUnavailable::UnresolvedSignatureReturn(source.id))?;
-            let target_return = target
-                .return_type
-                .ok_or(RelationUnavailable::UnresolvedSignatureReturn(target.id))?;
+            let source_return =
+                source
+                    .return_type
+                    .ok_or(RelationUnavailable::UnresolvedSignatureReturn(
+                        source.signature,
+                    ))?;
+            let target_return =
+                target
+                    .return_type
+                    .ok_or(RelationUnavailable::UnresolvedSignatureReturn(
+                        target.signature,
+                    ))?;
             let returns = self.is_related_to_ex(
                 source_return,
                 target_return,
@@ -2003,15 +1998,15 @@ impl<'store> RelaterSession<'store> {
     #[allow(clippy::too_many_lines)] // Mirrors pinned compareSignaturesRelated branch order.
     fn compare_signatures_related(
         &mut self,
-        source: &ResolvedCallSignature,
-        target: &ResolvedCallSignature,
+        source: &ValidatedSingleCallable,
+        target: &ValidatedSingleCallable,
         check_mode: SignatureCheckMode,
         intersection_state: IntersectionState,
     ) -> Result<Ternary, RelationUnavailable> {
-        if source.id == target.id {
+        if source.signature == target.signature {
             return Ok(Ternary::True);
         }
-        let key = (source.id, target.id, check_mode.bits());
+        let key = (source.signature, target.signature, check_mode.bits());
         if !self.active_signature_pairs.insert(key) {
             return Ok(Ternary::Maybe);
         }
@@ -2023,8 +2018,8 @@ impl<'store> RelaterSession<'store> {
 
     fn compare_signatures_related_worker(
         &mut self,
-        source: &ResolvedCallSignature,
-        target: &ResolvedCallSignature,
+        source: &ValidatedSingleCallable,
+        target: &ValidatedSingleCallable,
         check_mode: SignatureCheckMode,
         intersection_state: IntersectionState,
     ) -> Result<Ternary, RelationUnavailable> {
@@ -2063,13 +2058,13 @@ impl<'store> RelaterSession<'store> {
                 if check_mode.intersects(SignatureCheckMode::CALLBACK) {
                     (None, 0)
                 } else {
-                    self.project_non_nullable_function_call_signature(source_type)?
+                    self.project_non_nullable_callable_signature(source_type)?
                 };
             let (target_callback, target_nullable_facts) =
                 if check_mode.intersects(SignatureCheckMode::CALLBACK) {
                     (None, 0)
                 } else {
-                    self.project_non_nullable_function_call_signature(target_type)?
+                    self.project_non_nullable_callable_signature(target_type)?
                 };
             let mut related = if let (Some(source_callback), Some(target_callback)) =
                 (source_callback.as_ref(), target_callback.as_ref())
@@ -2133,15 +2128,21 @@ impl<'store> RelaterSession<'store> {
         if check_mode.intersects(SignatureCheckMode::IGNORE_RETURN_TYPES) {
             return Ok(result);
         }
-        let target_return = target
-            .return_type
-            .ok_or(RelationUnavailable::UnresolvedSignatureReturn(target.id))?;
+        let target_return =
+            target
+                .return_type
+                .ok_or(RelationUnavailable::UnresolvedSignatureReturn(
+                    target.signature,
+                ))?;
         if target_return == self.bootstrap.void_type || target_return == self.bootstrap.any_type {
             return Ok(result);
         }
-        let source_return = source
-            .return_type
-            .ok_or(RelationUnavailable::UnresolvedSignatureReturn(source.id))?;
+        let source_return =
+            source
+                .return_type
+                .ok_or(RelationUnavailable::UnresolvedSignatureReturn(
+                    source.signature,
+                ))?;
         let mut related = Ternary::False;
         if check_mode.intersects(SignatureCheckMode::BIVARIANT_CALLBACK) {
             related = self.is_related_to_ex(
@@ -2657,7 +2658,7 @@ impl<'store> RelaterSession<'store> {
     ) -> Result<(), RelationUnavailable> {
         let is_function = self
             .store
-            .admit_function_relation_type(type_id, self.strict_function_types)?;
+            .admit_callable_relation_type(type_id, self.strict_function_types)?;
         if is_function {
             self.ensure_supported_object_kind(type_id, allow_fresh_literal)
                 .map_err(|_| RelationUnavailable::MalformedFunctionType(type_id))?;
@@ -2789,72 +2790,41 @@ impl<'store> RelaterSession<'store> {
             })
     }
 
-    fn project_exact_function_call_signature(
+    fn project_exact_callable_signature(
         &mut self,
         type_: TypeId,
-    ) -> Result<Option<ResolvedCallSignature>, RelationUnavailable> {
-        match validate_stored_function_type(self.store, type_) {
-            StoredFunctionTypeValidation::NotFunctionType => return Ok(None),
-            StoredFunctionTypeValidation::Pending => {
+    ) -> Result<Option<ValidatedSingleCallable>, RelationUnavailable> {
+        let mut callable = match validate_stored_single_callable(self.store, type_) {
+            StoredSingleCallableValidation::NotCallable => return Ok(None),
+            StoredSingleCallableValidation::Pending {
+                family: CallableFamily::FunctionType,
+            } => {
                 return Err(if self.strict_function_types.is_some() {
                     RelationUnavailable::UnresolvedFunctionType(type_)
                 } else {
                     RelationUnavailable::StructuredSignatures(type_)
                 });
             }
-            StoredFunctionTypeValidation::Malformed => {
+            StoredSingleCallableValidation::Malformed {
+                family: CallableFamily::FunctionType,
+            } => {
                 return Err(RelationUnavailable::MalformedFunctionType(type_));
             }
-            StoredFunctionTypeValidation::Valid(_) => {}
-        }
+            StoredSingleCallableValidation::Valid {
+                family: CallableFamily::FunctionType,
+                callable,
+                ..
+            } => callable,
+        };
         if self.strict_function_types.is_none() {
             return Err(RelationUnavailable::StructuredSignatures(type_));
         }
-        let record = self
-            .store
-            .type_payload(type_)
-            .ok_or(RelationUnavailable::Type(type_))?;
-        let structured = record
-            .data()
-            .structured()
-            .ok_or(RelationUnavailable::MalformedFunctionType(type_))?;
-        let Some([signature]) = structured.signatures.as_deref() else {
-            return Err(RelationUnavailable::MalformedFunctionType(type_));
-        };
-        let signature = *signature;
-        let signature_record = self
-            .store
-            .signature(signature)
-            .ok_or(RelationUnavailable::MalformedFunctionType(type_))?;
-        let parameter_symbols = signature_record.parameters().to_vec();
-        let mut min_argument_count = usize::try_from(signature_record.min_argument_count())
-            .map_err(|_| RelationUnavailable::MalformedFunctionType(type_))?;
-        let return_type = signature_record.resolved_return_type();
-        let mut parameters = Vec::with_capacity(parameter_symbols.len());
-        for parameter in parameter_symbols {
-            let parameter_type = self
-                .store
-                .value_symbol_links(parameter)
-                .and_then(|links| links.resolved_type)
-                .ok_or(RelationUnavailable::MalformedFunctionType(type_))?;
-            parameters.push(parameter_type);
-        }
-        while min_argument_count != 0
-            && self.type_contains_void(parameters[min_argument_count - 1])?
+        while callable.min_argument_count != 0
+            && self.type_contains_void(callable.parameters[callable.min_argument_count - 1])?
         {
-            min_argument_count -= 1;
+            callable.min_argument_count -= 1;
         }
-        Ok(Some(ResolvedCallSignature {
-            owner: type_,
-            id: signature,
-            parameters,
-            min_argument_count,
-            return_type,
-            // This admission path contains only FunctionTypeNode signatures.
-            // Method/constructor validators can set this bit when they feed
-            // the shared projection in a later source-callable wave.
-            strict_variance_exempt: false,
-        }))
+        Ok(Some(callable))
     }
 
     /// Property-only preflight used before recursive structural comparison.
@@ -2871,7 +2841,7 @@ impl<'store> RelaterSession<'store> {
     ) -> Result<ResolvedObjectMembers, RelationUnavailable> {
         if self
             .store
-            .admit_function_relation_type(type_, self.strict_function_types)?
+            .admit_callable_relation_type(type_, self.strict_function_types)?
         {
             self.ensure_supported_object_kind(type_, allow_fresh_literal)
                 .map_err(|_| RelationUnavailable::MalformedFunctionType(type_))?;
@@ -2880,19 +2850,19 @@ impl<'store> RelaterSession<'store> {
                 properties: Vec::new(),
                 property_origin: ObjectPropertyOrigin::Declared,
                 call_signature: None,
-                exact_function_type: true,
+                exact_callable: true,
             });
         }
         self.resolved_object_members(type_, allow_fresh_literal)
     }
 
-    fn project_non_nullable_function_call_signature(
+    fn project_non_nullable_callable_signature(
         &mut self,
         type_: TypeId,
-    ) -> Result<(Option<ResolvedCallSignature>, u8), RelationUnavailable> {
+    ) -> Result<(Option<ValidatedSingleCallable>, u8), RelationUnavailable> {
         let flags = self.store.type_flags(type_)?;
         if !flags.intersects(TypeFlags::UNION) {
-            return Ok((self.project_exact_function_call_signature(type_)?, 0));
+            return Ok((self.project_exact_callable_signature(type_)?, 0));
         }
         let mut nullable_facts = 0u8;
         let mut non_nullable = Vec::new();
@@ -2910,7 +2880,7 @@ impl<'store> RelaterSession<'store> {
             return Ok((None, nullable_facts));
         };
         Ok((
-            self.project_exact_function_call_signature(*non_nullable)?,
+            self.project_exact_callable_signature(*non_nullable)?,
             nullable_facts,
         ))
     }
@@ -2937,7 +2907,7 @@ impl<'store> RelaterSession<'store> {
     ) -> Result<ResolvedObjectMembers, RelationUnavailable> {
         let is_function = self
             .store
-            .admit_function_relation_type(type_id, self.strict_function_types)?;
+            .admit_callable_relation_type(type_id, self.strict_function_types)?;
         self.ensure_supported_object_kind(type_id, allow_fresh_literal)
             .map_err(|error| {
                 if is_function {
@@ -2946,7 +2916,7 @@ impl<'store> RelaterSession<'store> {
                     error
                 }
             })?;
-        if let Some(call_signature) = self.project_exact_function_call_signature(type_id)? {
+        if let Some(call_signature) = self.project_exact_callable_signature(type_id)? {
             let members = self
                 .store
                 .type_payload(type_id)
@@ -2958,7 +2928,7 @@ impl<'store> RelaterSession<'store> {
                 properties: Vec::new(),
                 property_origin: ObjectPropertyOrigin::Declared,
                 call_signature: Some(call_signature),
-                exact_function_type: true,
+                exact_callable: true,
             });
         }
         let record = self
@@ -3130,34 +3100,39 @@ impl<'store> RelaterSession<'store> {
             properties,
             property_origin,
             call_signature: None,
-            exact_function_type: false,
+            exact_callable: false,
         })
     }
 }
 
 impl SemanticStore<TypeRecord, TypeMapper> {
-    fn admit_function_relation_type(
+    fn admit_callable_relation_type(
         &self,
         type_: TypeId,
         strict_function_types: Option<bool>,
     ) -> Result<bool, RelationUnavailable> {
-        match validate_stored_function_type(self, type_) {
-            StoredFunctionTypeValidation::NotFunctionType => Ok(false),
-            StoredFunctionTypeValidation::Pending => Err(if strict_function_types.is_some() {
+        match validate_stored_single_callable(self, type_) {
+            StoredSingleCallableValidation::NotCallable => Ok(false),
+            StoredSingleCallableValidation::Pending {
+                family: CallableFamily::FunctionType,
+            } => Err(if strict_function_types.is_some() {
                 RelationUnavailable::UnresolvedFunctionType(type_)
             } else {
                 RelationUnavailable::StructuredSignatures(type_)
             }),
-            StoredFunctionTypeValidation::Valid(_) => {
+            StoredSingleCallableValidation::Valid {
+                family: CallableFamily::FunctionType,
+                ..
+            } => {
                 if strict_function_types.is_some() {
                     Ok(true)
                 } else {
                     Err(RelationUnavailable::StructuredSignatures(type_))
                 }
             }
-            StoredFunctionTypeValidation::Malformed => {
-                Err(RelationUnavailable::MalformedFunctionType(type_))
-            }
+            StoredSingleCallableValidation::Malformed {
+                family: CallableFamily::FunctionType,
+            } => Err(RelationUnavailable::MalformedFunctionType(type_)),
         }
     }
 
@@ -3773,9 +3748,9 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         let bootstrap = self.relation_bootstrap_facts()?;
         let source = self.regular_type_if_fresh(source)?;
         let target = self.regular_type_if_fresh(target)?;
-        self.admit_function_relation_type(source, strict_function_types)?;
+        self.admit_callable_relation_type(source, strict_function_types)?;
         if target != source {
-            self.admit_function_relation_type(target, strict_function_types)?;
+            self.admit_callable_relation_type(target, strict_function_types)?;
         }
         if source == target {
             return Ok(true);

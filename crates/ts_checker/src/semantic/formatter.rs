@@ -19,13 +19,13 @@ use ts_binder::{
 use super::{
     ArrayTypeError, CanonicalGlobalTypes, CanonicalTypeMapperStore, DeclaredTypeHost,
     DeclaredTypeHostError, IndexInfoId, SignatureId, TypeAliasId, TypeId,
-    array_types::CanonicalArrayTargets,
     bootstrap::LiteralTypeCacheError,
-    functions::{
-        FunctionTypeDisplayError, FunctionTypeUnsupported, StoredFunctionTypeValidation,
-        ValidatedSingleCallSignatureDisplay, function_type_display_projection,
-        validate_stored_function_type,
+    callables::{
+        CallableFamily, SingleCallableDisplayError, StoredSingleCallableValidation,
+        ValidatedSingleCallSignatureDisplay, single_callable_display_projection,
+        single_callable_family, validate_stored_single_callable,
     },
+    functions::{FunctionTypeDisplayError, FunctionTypeUnsupported},
     links::ValueSymbolLinks,
     type_records::{
         LiteralTypeData, LiteralValue, TypeCacheState, TypeData, TypeDataKind, TypeRecord,
@@ -776,8 +776,8 @@ fn display_object_type(
         );
     }
     if let Some(alias) = record.alias() {
-        if let Some(provider) = single_callable_display_provider(store, type_id) {
-            validate_opaque_single_callable_alias(store, type_id, provider)?;
+        if single_callable_family(store, type_id).is_some() {
+            validate_opaque_single_callable_alias(store, type_id)?;
         } else {
             validate_property_object_alias(store, type_id, record, alias)?;
         }
@@ -835,46 +835,25 @@ fn display_object_type(
     result
 }
 
-/// Syntax-specific proof providers converge on one immutable signature
-/// projection before the formatter emits any text. Bounded source-callable
-/// providers can reuse emission and precedence; source diagnostic integration
-/// must additionally supply each side's enclosing declaration once qualified
-/// names enter the installed display cut.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SingleCallableDisplayProvider {
-    FunctionType,
-}
-
-fn single_callable_display_provider(
-    store: &CanonicalTypeMapperStore,
-    type_id: TypeId,
-) -> Option<SingleCallableDisplayProvider> {
-    store
-        .type_has_function_type_provenance(type_id)
-        .then_some(SingleCallableDisplayProvider::FunctionType)
-}
-
 fn validate_opaque_single_callable_alias(
     store: &CanonicalTypeMapperStore,
     type_id: TypeId,
-    provider: SingleCallableDisplayProvider,
 ) -> Result<(), TypeDisplayUnavailable> {
-    match provider {
-        SingleCallableDisplayProvider::FunctionType => {
-            match validate_stored_function_type(store, type_id) {
-                StoredFunctionTypeValidation::Valid(_) => Ok(()),
-                StoredFunctionTypeValidation::Pending => {
-                    Err(TypeDisplayUnavailable::FunctionType {
-                        type_id,
-                        reason: FunctionTypeDisplayUnavailable::PendingSignature,
-                    })
-                }
-                StoredFunctionTypeValidation::NotFunctionType
-                | StoredFunctionTypeValidation::Malformed => {
-                    Err(TypeDisplayUnavailable::MalformedType(type_id))
-                }
-            }
-        }
+    match validate_stored_single_callable(store, type_id) {
+        StoredSingleCallableValidation::Valid {
+            family: CallableFamily::FunctionType,
+            ..
+        } => Ok(()),
+        StoredSingleCallableValidation::Pending {
+            family: CallableFamily::FunctionType,
+        } => Err(TypeDisplayUnavailable::FunctionType {
+            type_id,
+            reason: FunctionTypeDisplayUnavailable::PendingSignature,
+        }),
+        StoredSingleCallableValidation::NotCallable
+        | StoredSingleCallableValidation::Malformed {
+            family: CallableFamily::FunctionType,
+        } => Err(TypeDisplayUnavailable::MalformedType(type_id)),
     }
 }
 
@@ -884,23 +863,24 @@ fn validated_single_callable_display(
     global_types: Option<&CanonicalGlobalTypes>,
     type_id: TypeId,
 ) -> Result<Option<ValidatedSingleCallSignatureDisplay>, TypeDisplayUnavailable> {
-    let Some(provider) = single_callable_display_provider(store, type_id) else {
+    if single_callable_family(store, type_id).is_none() {
         return Ok(None);
-    };
-    match provider {
-        SingleCallableDisplayProvider::FunctionType => {
-            let host = host.ok_or(TypeDisplayUnavailable::FunctionType {
-                type_id,
-                reason: FunctionTypeDisplayUnavailable::SourceContext,
-            })?;
-            function_type_display_projection(
-                store,
-                host,
-                type_id,
-                global_types.map(CanonicalArrayTargets::from_global_types),
-            )
-            .map(Some)
-            .map_err(|error| function_display_unavailable(type_id, error))
+    }
+    let host = host.ok_or(TypeDisplayUnavailable::FunctionType {
+        type_id,
+        reason: FunctionTypeDisplayUnavailable::SourceContext,
+    })?;
+    single_callable_display_projection(store, host, type_id, global_types)
+        .map_err(|error| callable_display_unavailable(type_id, error))
+}
+
+const fn callable_display_unavailable(
+    type_id: TypeId,
+    error: SingleCallableDisplayError,
+) -> TypeDisplayUnavailable {
+    match error {
+        SingleCallableDisplayError::FunctionType(error) => {
+            function_display_unavailable(type_id, error)
         }
     }
 }
@@ -940,9 +920,6 @@ const fn function_display_unavailable(
             }
         },
         FunctionTypeDisplayError::Pending => FunctionTypeDisplayUnavailable::PendingSignature,
-        FunctionTypeDisplayError::UnresolvedReturn => {
-            FunctionTypeDisplayUnavailable::UnresolvedReturn
-        }
         FunctionTypeDisplayError::Malformed => {
             return TypeDisplayUnavailable::MalformedType(type_id);
         }
@@ -1402,11 +1379,17 @@ fn display_single_call_signature(
         )?);
     }
     result.push_str(") => ");
+    let return_type = projection
+        .return_type
+        .ok_or(TypeDisplayUnavailable::FunctionType {
+            type_id: projection.owner,
+            reason: FunctionTypeDisplayUnavailable::UnresolvedReturn,
+        })?;
     result.push_str(&display_type_worker(
         store,
         host,
         global_types,
-        projection.return_type,
+        return_type,
         flags,
         state,
         visiting,
@@ -2552,7 +2535,7 @@ fn display_union_constituent(
 }
 
 fn is_unaliased_single_callable_type(store: &CanonicalTypeMapperStore, type_id: TypeId) -> bool {
-    single_callable_display_provider(store, type_id).is_some()
+    single_callable_family(store, type_id).is_some()
         && store
             .type_payload(type_id)
             .is_some_and(|record| record.alias().is_none())
@@ -4808,6 +4791,32 @@ mod tests {
                 .type_payload(resolved_optional)
                 .is_some_and(|record| record.flags().intersects(TypeFlags::UNION)),
             "display must use this optional value union together with syntactic `?`",
+        );
+    }
+
+    #[test]
+    fn function_display_traverses_parameters_before_demanding_the_outer_return() {
+        let parsed =
+            parse_source_file("let outer: (callback: (value: string) => number) => boolean;");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(213);
+        let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+        let outer_node = variable_type_node(&parsed, file, "outer");
+        let outer_type = context.get_type_from_type_node(outer_node).unwrap();
+        let callback_symbol = function_parameter_symbol(&context, &parsed, outer_node, 0);
+        let callback_type = context
+            .store()
+            .value_symbol_links(callback_symbol)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        assert_ne!(callback_type, outer_type);
+
+        assert_eq!(
+            context.type_to_string(outer_type),
+            Err(TypeDisplayUnavailable::FunctionType {
+                type_id: callback_type,
+                reason: FunctionTypeDisplayUnavailable::UnresolvedReturn,
+            })
         );
     }
 

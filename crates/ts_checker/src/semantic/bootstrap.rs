@@ -38,7 +38,8 @@ use ts_jsnum::{Number, PseudoBigInt};
 use super::{
     CanonicalGlobalTypes, CanonicalTypeMapperStore,
     array_types::{ArrayTypeError, CanonicalArrayTargets},
-    functions::{self, PendingFunctionTypeProof, StoredFunctionTypeValidation},
+    callables::{CallableFamily, StoredSingleCallableValidation, validate_stored_single_callable},
+    functions::{self, PendingFunctionTypeProof},
     ids::{IndexInfoId, SignatureId, TypeAliasId, TypeId, TypePredicateId},
     links::ValueSymbolLinks,
     mapper::TypeMapper,
@@ -1957,8 +1958,12 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                         if object.structured.signatures.is_some()
                             || object.structured.call_signature_count != 0
                 );
-                match functions::validate_stored_function_type(self, type_) {
-                    StoredFunctionTypeValidation::Valid(edges) => {
+                match validate_stored_single_callable(self, type_) {
+                    StoredSingleCallableValidation::Valid {
+                        family: CallableFamily::FunctionType,
+                        edges,
+                        ..
+                    } => {
                         for edge in edges {
                             self.validate_cached_array_capability_worker(
                                 edge,
@@ -1969,19 +1974,25 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                         }
                         return Ok(());
                     }
-                    StoredFunctionTypeValidation::Malformed => {
+                    StoredSingleCallableValidation::Malformed {
+                        family: CallableFamily::FunctionType,
+                    } => {
                         return Err(LiteralTypeCacheError::InvalidCachedUnion(type_));
                     }
-                    StoredFunctionTypeValidation::Pending if allowed_pending.contains(&type_) => {
+                    StoredSingleCallableValidation::Pending {
+                        family: CallableFamily::FunctionType,
+                    } if allowed_pending.contains(&type_) => {
                         return Ok(());
                     }
-                    StoredFunctionTypeValidation::Pending => {
+                    StoredSingleCallableValidation::Pending {
+                        family: CallableFamily::FunctionType,
+                    } => {
                         return Err(LiteralTypeCacheError::InvalidCachedUnion(type_));
                     }
-                    StoredFunctionTypeValidation::NotFunctionType if unsupported_callable => {
+                    StoredSingleCallableValidation::NotCallable if unsupported_callable => {
                         return Err(LiteralTypeCacheError::InvalidCachedUnion(type_));
                     }
-                    StoredFunctionTypeValidation::NotFunctionType => {}
+                    StoredSingleCallableValidation::NotCallable => {}
                 }
                 match object_members::validate_resolved_declared_property_type_graph(self, type_) {
                     object_members::DeclaredPropertyTypeGraphValidation::Traversable(
@@ -2226,8 +2237,12 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 if self.validate_supported_unknown_empty_object(type_, record, object) {
                     return Ok(());
                 }
-                match functions::validate_stored_function_type(self, type_) {
-                    StoredFunctionTypeValidation::Valid(edges) => {
+                match validate_stored_single_callable(self, type_) {
+                    StoredSingleCallableValidation::Valid {
+                        family: CallableFamily::FunctionType,
+                        edges,
+                        ..
+                    } => {
                         if !visiting.insert(type_) {
                             return Ok(());
                         }
@@ -2241,22 +2256,28 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                         }
                         return Ok(());
                     }
-                    StoredFunctionTypeValidation::Malformed => {
+                    StoredSingleCallableValidation::Malformed {
+                        family: CallableFamily::FunctionType,
+                    } => {
                         return Err(LiteralTypeCacheError::InvalidCachedUnion(type_));
                     }
-                    StoredFunctionTypeValidation::Pending if allowed_pending.contains(&type_) => {
+                    StoredSingleCallableValidation::Pending {
+                        family: CallableFamily::FunctionType,
+                    } if allowed_pending.contains(&type_) => {
                         return Ok(());
                     }
-                    StoredFunctionTypeValidation::Pending => {
+                    StoredSingleCallableValidation::Pending {
+                        family: CallableFamily::FunctionType,
+                    } => {
                         return Err(LiteralTypeCacheError::InvalidCachedUnion(type_));
                     }
-                    StoredFunctionTypeValidation::NotFunctionType
+                    StoredSingleCallableValidation::NotCallable
                         if object.structured.signatures.is_some()
                             || object.structured.call_signature_count != 0 =>
                     {
                         return Err(LiteralTypeCacheError::InvalidCachedUnion(type_));
                     }
-                    StoredFunctionTypeValidation::NotFunctionType => {}
+                    StoredSingleCallableValidation::NotCallable => {}
                 }
                 match object_members::validate_resolved_declared_property_object(self, type_) {
                     object_members::DeclaredPropertyObjectValidation::Valid(_) => self

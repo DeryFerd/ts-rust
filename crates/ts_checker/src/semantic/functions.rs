@@ -15,6 +15,7 @@ use super::{
     SignatureId, TypeId,
     array_types::CanonicalArrayTargets,
     bootstrap::{LiteralTypeCacheError, PreparedTypeQueryTypes},
+    callables::{ValidatedSingleCallParameterDisplay, ValidatedSingleCallSignatureDisplay},
     declared::preflight_node,
     links::{
         DecoratorSignatureState, EffectsSignatureState, ResolvedSignatureState, SignatureLinks,
@@ -202,29 +203,11 @@ pub(super) enum StoredFunctionTypeValidation {
     Malformed,
 }
 
-/// Syntax-neutral display data for one parameter of a validated single-call
-/// signature. TypeScript serializes the parameter symbol's semantic value type,
-/// including optional `undefined`, while retaining syntactic `?` separately.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct ValidatedSingleCallParameterDisplay {
-    pub(super) name: String,
-    pub(super) value_type: TypeId,
-    pub(super) optional: bool,
-}
-
-/// Syntax-neutral display projection produced by a callable-family validator.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct ValidatedSingleCallSignatureDisplay {
-    pub(super) parameters: Vec<ValidatedSingleCallParameterDisplay>,
-    pub(super) return_type: TypeId,
-}
-
 /// Why an otherwise function-shaped type cannot be projected for display.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum FunctionTypeDisplayError {
     Unsupported(FunctionTypeUnsupported),
     Pending,
-    UnresolvedReturn,
     Malformed,
 }
 
@@ -694,9 +677,7 @@ pub(super) fn function_type_display_projection(
     let signature = store
         .signature(signature)
         .ok_or(FunctionTypeDisplayError::Malformed)?;
-    let return_type = signature
-        .resolved_return_type()
-        .ok_or(FunctionTypeDisplayError::UnresolvedReturn)?;
+    let return_type = signature.resolved_return_type();
     let mut parameters = Vec::with_capacity(plan.parameters.len());
     for parameter in &plan.parameters {
         let value_type = store
@@ -725,6 +706,7 @@ pub(super) fn function_type_display_projection(
         });
     }
     Ok(ValidatedSingleCallSignatureDisplay {
+        owner: type_,
         parameters,
         return_type,
     })
