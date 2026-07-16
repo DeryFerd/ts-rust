@@ -5,7 +5,7 @@
 //! publication and normalizes the immutable views consumed by union/array
 //! validation, type display, and signature relation. Keeping this boundary
 //! free of `FunctionTypeNode` storage details lets later source-callable
-//! providers participate without borrowing FunctionType provenance.
+//! providers participate without borrowing `FunctionType` provenance.
 
 use super::{
     CanonicalGlobalTypes, CanonicalTypeMapperStore, DeclaredTypeHost, SignatureId, TypeId,
