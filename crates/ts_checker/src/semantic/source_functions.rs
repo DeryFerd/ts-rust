@@ -13,7 +13,7 @@ use ts_binder::{
     CheckFlags, SemanticSymbolId, SymbolFlags,
 };
 
-use super::{CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHost};
+use super::{CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHost, TypeId};
 
 /// Binder identities retained for one exact top-level function declaration.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -71,6 +71,8 @@ pub enum SourceFunctionUnsupported {
         symbol: SemanticSymbolId,
         declaration: NodeRef,
     },
+    Callable(NodeRef),
+    FunctionBody(NodeRef),
 }
 
 /// Malformed binder, resolver, or sparse-link provenance for source functions.
@@ -117,6 +119,16 @@ pub enum SourceFunctionInvariant {
         node: NodeRef,
         cached: Option<SemanticSymbolId>,
         expected: SemanticSymbolId,
+    },
+    DuplicateDeclaration(NodeRef),
+    MissingDeclaration(NodeRef),
+    InvalidStatementIndex(usize),
+    Callable(NodeRef),
+    MissingCallableType(SemanticSymbolId),
+    CallableTypeMismatch {
+        symbol: SemanticSymbolId,
+        expected: TypeId,
+        actual: TypeId,
     },
     NameResolution(CanonicalNameResolutionError),
 }
@@ -195,9 +207,11 @@ pub(super) fn plan_top_level_function(
 
 /// Resolves one identifier as a precollected, hoisted source function.
 ///
-/// `Ok(None)` means the resolver reached a non-function value and lets the
-/// caller try its independent variable route. Once a `FUNCTION` symbol is
-/// observed, every source-function invariant is fail-closed here.
+/// The caller invokes this only after the independent variable planner has
+/// resolved the same identifier and rejected its routed target specifically as
+/// a `FUNCTION`. Repeating resolution here therefore cannot swallow or
+/// reclassify unresolved-name, alias, or callback-host failures from the
+/// established variable path. Every function-specific invariant is fail-closed.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn plan_function_identifier_read(
     arena: &ts_ast::NodeArena,
@@ -207,7 +221,7 @@ pub(super) fn plan_function_identifier_read(
     hoisted_functions: &HashSet<SemanticSymbolId>,
     node: NodeRef,
     name: &str,
-) -> Result<Option<PlannedFunctionRead>, SourceFunctionPlanError> {
+) -> Result<PlannedFunctionRead, SourceFunctionPlanError> {
     let mut callback_host = host
         .name_resolver_host(store)
         .map_err(SourceFunctionPlanError::DeclaredType)?;
@@ -248,7 +262,13 @@ pub(super) fn plan_function_identifier_read(
         ));
     }
     if record.flags() != SymbolFlags::FUNCTION {
-        return Ok(None);
+        return Err(SourceFunctionPlanError::Unsupported(
+            SourceFunctionUnsupported::NonFunctionSymbol {
+                node,
+                symbol: routed.target,
+                flags: record.flags(),
+            },
+        ));
     }
     let declarations = record
         .declarations()
@@ -321,10 +341,10 @@ pub(super) fn plan_function_identifier_read(
         }
         .into());
     }
-    Ok(Some(PlannedFunctionRead {
+    Ok(PlannedFunctionRead {
         resolved_symbol: routed.resolved,
         value_symbol: routed.target,
-    }))
+    })
 }
 
 fn route_value_symbol(

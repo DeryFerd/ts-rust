@@ -36,6 +36,7 @@ pub mod signatures;
 pub mod source;
 mod source_arrows;
 mod source_callables;
+mod source_functions;
 mod spelling;
 mod store;
 pub mod type_nodes;
@@ -113,6 +114,7 @@ pub use source::{
     SourceAssertionError, SourceCheckError, SourceCheckProvenanceError, SourceLiteralCacheError,
     SourceObjectLiteralError, SourceSyntaxRole, UnsupportedSourceSyntax,
 };
+pub use source_functions::{SourceFunctionInvariant, SourceFunctionUnsupported};
 pub use variables::{VariableInvariant, VariableUnsupported};
 pub use store::SemanticStore;
 pub use type_nodes::TypeNodeUnavailable;

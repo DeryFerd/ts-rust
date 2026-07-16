@@ -1,10 +1,11 @@
 //! Atomic canonical checking for the first source-statement slice.
 //!
 //! This module deliberately supports only unmodified type aliases and simple
-//! interfaces, empty external-module markers, initialized identifier-named
-//! top-level variables (optionally exported), and direct assignments back to
-//! supported `var` declarations. The complete source tree and the complete
-//! supported-statement plan are validated before checker state is touched.
+//! interfaces, empty external-module markers, annotated top-level function
+//! declarations, initialized identifier-named top-level variables (optionally
+//! exported), and direct assignments back to supported `var` declarations.
+//! The complete source tree and complete supported-statement plan are validated
+//! before checker state is touched.
 //! Unsupported syntax is therefore
 //! a typed boundary, never a request to fall back to the legacy checker or to
 //! synthesize `any`. Canonical memo caches are not rolled back after a later
@@ -25,6 +26,7 @@ use super::{
     CanonicalGlobalTypes, CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHost,
     DerivedTypeError, RelationUnavailable, SourceFileLinks, SourceFileRef, SymbolNodeLinks,
     TypeDisplayUnavailable, TypeId, ValueSymbolLinks, VariableInvariant, VariableUnsupported,
+    array_types::CanonicalArrayTargets,
     bootstrap::{LiteralTypeCacheError, UnionReduction},
     contextual::{
         LiteralTreatment, PreparedExpression, prepare_expression_context_with_global_types,
@@ -37,9 +39,14 @@ use super::{
     type_nodes::{CanonicalTypeQuery, normalize_bigint_literal, normalize_numeric_separators},
     type_records::{TypeData, TypeRecord},
     types::TypeFlags,
+    source_callables::{SourceCallableError, SourceCallablePlan, plan_source_callable},
+    source_functions::{
+        PlannedFunctionRead, SourceFunctionInvariant, SourceFunctionPlanError,
+        SourceFunctionUnsupported, plan_function_identifier_read, plan_top_level_function,
+    },
     variables::{
-        PlannedIdentifierRead, VariableBindingKind, VariablePlanError, plan_identifier_read,
-        plan_top_level_variable,
+        PlannedIdentifierRead as PlannedVariableRead, VariableBindingKind, VariablePlanError,
+        plan_identifier_read, plan_top_level_variable,
     },
 };
 
@@ -54,6 +61,11 @@ pub enum SourceSyntaxRole {
     Statement,
     TypeAliasDeclaration,
     InterfaceDeclaration,
+    FunctionDeclaration,
+    FunctionModifier,
+    FunctionName,
+    FunctionBody,
+    ReturnStatement,
     ExportDeclaration,
     ExportClause,
     VariableStatement,
@@ -98,6 +110,7 @@ pub enum UnsupportedSourceSyntax {
     ConstAssertion(NodeRef),
     NestedAssertion(NodeRef),
     Assignment(AssignmentUnsupported),
+    Function(SourceFunctionUnsupported),
     Variable(VariableUnsupported),
 }
 
@@ -207,6 +220,7 @@ pub enum SourceCheckError {
     DerivedType(DerivedTypeError),
     Assertion(SourceAssertionError),
     Assignment(AssignmentInvariant),
+    Function(SourceFunctionInvariant),
     Variable(VariableInvariant),
     MissingDiagnostic(u32),
 }
@@ -227,6 +241,7 @@ impl std::fmt::Display for SourceCheckError {
             Self::DerivedType(error) => write!(formatter, "{error}"),
             Self::Assertion(error) => write!(formatter, "assertion checking failed: {error:?}"),
             Self::Assignment(error) => write!(formatter, "assignment planning failed: {error:?}"),
+            Self::Function(error) => write!(formatter, "function checking failed: {error:?}"),
             Self::Variable(error) => write!(formatter, "variable checking failed: {error:?}"),
             Self::MissingDiagnostic(code) => {
                 write!(formatter, "diagnostic TS{code} is absent from the catalog")
@@ -250,6 +265,7 @@ impl std::error::Error for SourceCheckError {
             | Self::ObjectLiteral(_)
             | Self::Assertion(_)
             | Self::Assignment(_)
+            | Self::Function(_)
             | Self::Variable(_)
             | Self::MissingDiagnostic(_) => None,
         }
@@ -339,6 +355,38 @@ pub(super) enum PlannedExpressionKind {
     },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum PlannedIdentifierReadKind {
+    Variable,
+    Function,
+}
+
+/// A source expression read with an explicit value-family route.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct PlannedIdentifierRead {
+    pub(super) resolved_symbol: SemanticSymbolId,
+    pub(super) value_symbol: SemanticSymbolId,
+    pub(super) kind: PlannedIdentifierReadKind,
+}
+
+impl PlannedIdentifierRead {
+    const fn variable(read: PlannedVariableRead) -> Self {
+        Self {
+            resolved_symbol: read.resolved_symbol,
+            value_symbol: read.value_symbol,
+            kind: PlannedIdentifierReadKind::Variable,
+        }
+    }
+
+    const fn function(read: PlannedFunctionRead) -> Self {
+        Self {
+            resolved_symbol: read.resolved_symbol,
+            value_symbol: read.value_symbol,
+            kind: PlannedIdentifierReadKind::Function,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct PlannedVariable {
     name: NodeRef,
@@ -346,6 +394,21 @@ struct PlannedVariable {
     binding: VariableBindingKind,
     type_node: Option<NodeRef>,
     initializer: PlannedExpression,
+}
+
+#[derive(Clone, Debug)]
+struct PlannedFunction {
+    callable: SourceCallablePlan,
+    body: PlannedFunctionBody,
+}
+
+#[derive(Clone, Debug)]
+enum PlannedFunctionBody {
+    Empty,
+    Return {
+        statement: NodeRef,
+        expression: PlannedExpression,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -369,6 +432,7 @@ enum PlannedStatement {
     TypeAlias(SemanticSymbolId),
     Interface(SemanticSymbolId),
     ExternalModuleMarker,
+    Function(usize),
     Variables(Vec<PlannedVariable>),
     Assignment(PlannedAssignment),
 }
@@ -376,6 +440,7 @@ enum PlannedStatement {
 #[derive(Debug)]
 struct SourceCheckPlan {
     statements: Vec<PlannedStatement>,
+    functions: Vec<PlannedFunction>,
     identifier_reads: Vec<(NodeRef, SemanticSymbolId)>,
     strings: Vec<String>,
     numbers: Vec<Number>,
@@ -394,6 +459,8 @@ struct SourcePlanner<'arena, 'semantic, 'sources> {
         &'semantic CanonicalTypeMapperStore,
         &'semantic DeclaredTypeHost<'sources>,
     )>,
+    array_targets: Option<CanonicalArrayTargets>,
+    hoisted_functions: HashSet<SemanticSymbolId>,
     prior_variables: HashSet<SemanticSymbolId>,
     readable_variables: HashSet<SemanticSymbolId>,
 }
@@ -410,6 +477,8 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             bigints: Vec::new(),
             identifier_reads: Vec::new(),
             semantic: None,
+            array_targets: None,
+            hoisted_functions: HashSet::new(),
             prior_variables: HashSet::new(),
             readable_variables: HashSet::new(),
         }
@@ -431,9 +500,24 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             bigints: Vec::new(),
             identifier_reads: Vec::new(),
             semantic: Some((store, host)),
+            array_targets: None,
+            hoisted_functions: HashSet::new(),
             prior_variables: HashSet::new(),
             readable_variables: HashSet::new(),
         }
+    }
+
+    fn new_semantic_with_global_types(
+        arena: &'arena NodeArena,
+        bound: &'arena BoundFile,
+        source: SourceFileRef,
+        store: &'semantic CanonicalTypeMapperStore,
+        host: &'semantic DeclaredTypeHost<'sources>,
+        global_types: &CanonicalGlobalTypes,
+    ) -> Self {
+        let mut planner = Self::new_semantic(arena, bound, source, store, host);
+        planner.array_targets = Some(CanonicalArrayTargets::from_global_types(global_types));
+        planner
     }
 
     fn finish(mut self) -> Result<SourceCheckPlan, SourceCheckError> {
@@ -461,7 +545,22 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         }
 
         let source_statements = source_data.statements.nodes.clone();
+        let mut preplanned_functions = HashMap::new();
+        for statement in &source_statements {
+            let statement = self.reference(*statement);
+            if self.node(statement)?.kind != SyntaxKind::FunctionDeclaration {
+                continue;
+            }
+            let callable = self.preplan_function_declaration(statement, is_external_module)?;
+            if preplanned_functions.insert(statement, callable).is_some() {
+                return Err(SourceCheckError::Function(
+                    SourceFunctionInvariant::DuplicateDeclaration(statement),
+                ));
+            }
+        }
+
         let mut statements = Vec::with_capacity(source_statements.len());
+        let mut functions = Vec::with_capacity(preplanned_functions.len());
         for statement in source_statements {
             let statement = self.reference(statement);
             match self.node(statement)?.kind {
@@ -535,6 +634,17 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     }
                     self.plan_external_module_marker(statement)?;
                     statements.push(PlannedStatement::ExternalModuleMarker);
+                }
+                SyntaxKind::FunctionDeclaration => {
+                    let callable = preplanned_functions.remove(&statement).ok_or(
+                        SourceCheckError::Function(SourceFunctionInvariant::MissingDeclaration(
+                            statement,
+                        )),
+                    )?;
+                    let body = self.plan_function_body(&callable)?;
+                    let index = functions.len();
+                    functions.push(PlannedFunction { callable, body });
+                    statements.push(PlannedStatement::Function(index));
                 }
                 SyntaxKind::VariableStatement => {
                     let (declaration_list, exported) = {
@@ -615,6 +725,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         }
         Ok(SourceCheckPlan {
             statements,
+            functions,
             identifier_reads: self.identifier_reads,
             strings: self.strings,
             numbers: self.numbers,
@@ -643,6 +754,276 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             }
             VariablePlanError::Invariant(error) => SourceCheckError::Variable(error),
             VariablePlanError::DeclaredType(error) => SourceCheckError::DeclaredType(error),
+        }
+    }
+
+    fn function_plan_error(error: SourceFunctionPlanError) -> SourceCheckError {
+        match error {
+            SourceFunctionPlanError::Unsupported(error) => {
+                SourceCheckError::Unsupported(UnsupportedSourceSyntax::Function(error))
+            }
+            SourceFunctionPlanError::Invariant(error) => SourceCheckError::Function(error),
+            SourceFunctionPlanError::DeclaredType(error) => SourceCheckError::DeclaredType(error),
+        }
+    }
+
+    fn callable_plan_error(error: SourceCallableError) -> SourceCheckError {
+        let node = error.node();
+        match error {
+            SourceCallableError::Unsupported(_) => SourceCheckError::Unsupported(
+                UnsupportedSourceSyntax::Function(SourceFunctionUnsupported::Callable(
+                    node.expect("source callable unsupported errors retain their syntax node"),
+                )),
+            ),
+            SourceCallableError::Invariant(_) => {
+                SourceCheckError::Function(SourceFunctionInvariant::Callable(
+                    node.expect("source callable invariant errors retain their syntax node"),
+                ))
+            }
+            SourceCallableError::DeclaredType(error) => SourceCheckError::DeclaredType(error),
+            SourceCallableError::LiteralCache(error) => error.into(),
+        }
+    }
+
+    fn preplan_function_declaration(
+        &mut self,
+        declaration: NodeRef,
+        is_external_module: bool,
+    ) -> Result<SourceCallablePlan, SourceCheckError> {
+        let (range, flags, facts, modifiers, name_id) = {
+            let node = self.node(declaration)?;
+            let NodeData::FunctionDeclaration(function) = &node.data else {
+                return Err(SourceCheckError::Provenance(
+                    SourceCheckProvenanceError::MismatchedNodeData {
+                        node: declaration,
+                        kind: node.kind,
+                    },
+                ));
+            };
+            (
+                node.range,
+                node.flags.0,
+                function.facts,
+                function.modifiers.clone(),
+                function.name,
+            )
+        };
+        if flags != 0 || facts != 0 {
+            return Err(self.unsupported(
+                declaration,
+                SyntaxKind::FunctionDeclaration,
+                SourceSyntaxRole::FunctionDeclaration,
+            ));
+        }
+        let name = name_id.map(|name| self.reference(name)).ok_or_else(|| {
+            self.unsupported(
+                declaration,
+                SyntaxKind::FunctionDeclaration,
+                SourceSyntaxRole::FunctionName,
+            )
+        })?;
+        let (name_text, name_start) = {
+            let node = self.node(name)?;
+            let NodeData::Identifier(identifier) = &node.data else {
+                return Err(self.unsupported(name, node.kind, SourceSyntaxRole::FunctionName));
+            };
+            if node.kind != SyntaxKind::Identifier
+                || node.flags.0 != 0
+                || node.parent != Some(declaration.node)
+                || identifier.flow_node.is_some()
+            {
+                return Err(self.unsupported(name, node.kind, SourceSyntaxRole::FunctionName));
+            }
+            (identifier.text.clone(), node.range.start.get())
+        };
+        let export_modifier = self.validate_function_modifiers(
+            declaration,
+            range,
+            name_start,
+            modifiers.as_ref(),
+        )?;
+        if let Some(export_modifier) = export_modifier
+            && !is_external_module
+        {
+            return Err(SourceCheckError::Unsupported(
+                UnsupportedSourceSyntax::MissingExternalModuleFact {
+                    node: export_modifier,
+                    role: SourceSyntaxRole::FunctionModifier,
+                },
+            ));
+        }
+        let Some((store, host)) = self.semantic else {
+            return Err(self.unsupported(
+                declaration,
+                SyntaxKind::FunctionDeclaration,
+                SourceSyntaxRole::FunctionDeclaration,
+            ));
+        };
+        let function = plan_top_level_function(
+            self.bound,
+            store,
+            declaration,
+            name,
+            &name_text,
+            export_modifier.is_some(),
+        )
+        .map_err(Self::function_plan_error)?;
+        let callable = plan_source_callable(
+            store,
+            host,
+            declaration,
+            function.owner_symbol,
+            self.array_targets,
+        )
+        .map_err(Self::callable_plan_error)?;
+        if !self.hoisted_functions.insert(function.owner_symbol) {
+            return Err(SourceCheckError::Function(
+                SourceFunctionInvariant::DuplicateDeclaration(declaration),
+            ));
+        }
+        Ok(callable)
+    }
+
+    fn validate_function_modifiers(
+        &self,
+        declaration: NodeRef,
+        declaration_range: TextRange,
+        name_start: u32,
+        modifiers: Option<&ModifierList>,
+    ) -> Result<Option<NodeRef>, SourceCheckError> {
+        let Some(modifiers) = modifiers else {
+            return Ok(None);
+        };
+        let [modifier_id] = modifiers.list.nodes.as_slice() else {
+            return Err(self.unsupported(
+                declaration,
+                SyntaxKind::FunctionDeclaration,
+                SourceSyntaxRole::FunctionModifier,
+            ));
+        };
+        let modifier = self.reference(*modifier_id);
+        let node = self.node(modifier)?;
+        if modifiers.flags.0 != 0
+            || modifiers.list.has_trailing_comma
+            || modifiers.list.range.start != declaration_range.start
+            || modifiers.list.range.end.get() > name_start
+            || node.kind != SyntaxKind::ExportKeyword
+            || !matches!(node.data, NodeData::Token(_))
+            || node.flags.0 != 0
+            || node.parent != Some(declaration.node)
+            || node.range.start != declaration_range.start
+            || node.range.end.get() > modifiers.list.range.end.get()
+            || !self.source_spelling_matches(modifier, "export")
+        {
+            return Err(self.unsupported(
+                modifier,
+                node.kind,
+                SourceSyntaxRole::FunctionModifier,
+            ));
+        }
+        Ok(Some(modifier))
+    }
+
+    fn plan_function_body(
+        &mut self,
+        callable: &SourceCallablePlan,
+    ) -> Result<PlannedFunctionBody, SourceCheckError> {
+        let body = callable.body;
+        let statements = {
+            let node = self.node(body)?;
+            let NodeData::Block(block) = &node.data else {
+                return Err(self.unsupported(body, node.kind, SourceSyntaxRole::FunctionBody));
+            };
+            if node.kind != SyntaxKind::Block
+                || node.flags.0 != 0
+                || node.parent != Some(callable.declaration.node)
+                || block.flow_node.is_some()
+                || block.next_container.is_some()
+                || block.statements.has_trailing_comma
+                || block.facts != 0
+            {
+                return Err(self.unsupported(body, node.kind, SourceSyntaxRole::FunctionBody));
+            }
+            block.statements.nodes.clone()
+        };
+        let [] = statements.as_slice() else {
+            let [statement_id] = statements.as_slice() else {
+                return Err(SourceCheckError::Unsupported(
+                    UnsupportedSourceSyntax::Function(
+                        SourceFunctionUnsupported::FunctionBody(body),
+                    ),
+                ));
+            };
+            let statement = self.reference(*statement_id);
+            let expression = {
+                let node = self.node(statement)?;
+                let NodeData::ReturnStatement(return_statement) = &node.data else {
+                    return Err(self.unsupported(
+                        statement,
+                        node.kind,
+                        SourceSyntaxRole::ReturnStatement,
+                    ));
+                };
+                if node.kind != SyntaxKind::ReturnStatement
+                    || node.flags.0 != 0
+                    || node.parent != Some(body.node)
+                    || return_statement.flow_node.is_some()
+                    || return_statement.facts != 0
+                {
+                    return Err(self.unsupported(
+                        statement,
+                        node.kind,
+                        SourceSyntaxRole::ReturnStatement,
+                    ));
+                }
+                return_statement.expression.map(|node| self.reference(node)).ok_or_else(|| {
+                    self.unsupported(statement, node.kind, SourceSyntaxRole::ReturnStatement)
+                })?
+            };
+            if self.node(expression)?.parent != Some(statement.node) {
+                let kind = self.node(expression)?.kind;
+                return Err(self.unsupported(
+                    expression,
+                    kind,
+                    SourceSyntaxRole::ReturnStatement,
+                ));
+            }
+            return Ok(PlannedFunctionBody::Return {
+                statement,
+                expression: self.plan_expression(expression)?,
+            });
+        };
+        if !self.function_empty_body_return_supported(callable.return_type)? {
+            return Err(SourceCheckError::Unsupported(
+                UnsupportedSourceSyntax::Function(SourceFunctionUnsupported::FunctionBody(body)),
+            ));
+        }
+        Ok(PlannedFunctionBody::Empty)
+    }
+
+    fn function_empty_body_return_supported(
+        &self,
+        mut type_node: NodeRef,
+    ) -> Result<bool, SourceCheckError> {
+        loop {
+            let node = self.node(type_node)?;
+            if matches!(
+                node.kind,
+                SyntaxKind::AnyKeyword | SyntaxKind::VoidKeyword | SyntaxKind::UndefinedKeyword
+            ) {
+                return Ok(true);
+            }
+            let NodeData::ParenthesizedTypeNode(parenthesized) = &node.data else {
+                return Ok(false);
+            };
+            if node.kind != SyntaxKind::ParenthesizedType {
+                return Ok(false);
+            }
+            let inner = self.reference(parenthesized.type_);
+            if self.node(inner)?.parent != Some(type_node.node) {
+                return Ok(false);
+            }
+            type_node = inner;
         }
     }
 
@@ -1079,7 +1460,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         SourceSyntaxRole::VariableInitializer,
                     ));
                 };
-                let read = plan_identifier_read(
+                let variable_read = plan_identifier_read(
                     self.arena,
                     self.bound,
                     store,
@@ -1088,8 +1469,27 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     &self.readable_variables,
                     expression,
                     &name,
-                )
-                .map_err(Self::variable_plan_error)?;
+                );
+                let read = match variable_read {
+                    Ok(read) => PlannedIdentifierRead::variable(read),
+                    Err(VariablePlanError::Unsupported(
+                        VariableUnsupported::NonVariableSymbol { flags, .. },
+                    )) if flags == ts_binder::SymbolFlags::FUNCTION => {
+                        PlannedIdentifierRead::function(
+                            plan_function_identifier_read(
+                                self.arena,
+                                self.bound,
+                                store,
+                                host,
+                                &self.hoisted_functions,
+                                expression,
+                                &name,
+                            )
+                            .map_err(Self::function_plan_error)?,
+                        )
+                    }
+                    Err(error) => return Err(Self::variable_plan_error(error)),
+                };
                 self.identifier_reads
                     .push((expression, read.resolved_symbol));
                 Ok(PlannedExpression::new(
@@ -1708,11 +2108,14 @@ fn execute_expression_types(
             PlannedExpressionKind::Identifier(read),
             PreparedExpression::Identifier(treatment),
         ) => {
-            let raw = *current_flow_types.get(&read.value_symbol).ok_or(
-                SourceCheckError::Variable(VariableInvariant::MissingCurrentFlowType(
-                    read.value_symbol,
-                )),
-            )?;
+            let raw = *current_flow_types.get(&read.value_symbol).ok_or_else(|| match read.kind {
+                PlannedIdentifierReadKind::Variable => SourceCheckError::Variable(
+                    VariableInvariant::MissingCurrentFlowType(read.value_symbol),
+                ),
+                PlannedIdentifierReadKind::Function => SourceCheckError::Function(
+                    SourceFunctionInvariant::MissingCallableType(read.value_symbol),
+                ),
+            })?;
             let result = identifier_expression_type(store, raw, *treatment)?;
             Ok(CheckedExpressionTypes::leaf(raw, result))
         }
@@ -2898,16 +3301,66 @@ pub(super) fn check_source_file(
 
     let SourceCheckPlan {
         statements,
+        functions,
         identifier_reads,
         strings,
         numbers,
         bigints,
-    } = SourcePlanner::new_semantic(arena, bound, source, store, host).finish()?;
+    } = SourcePlanner::new_semantic_with_global_types(
+        arena,
+        bound,
+        source,
+        store,
+        host,
+        global_types,
+    )
+    .finish()?;
     store.prepare_regular_literal_types(&strings, &numbers, &bigints)?;
     let mut deferred = Vec::new();
     let mut declared_types = HashMap::new();
     let mut current_flow_types = HashMap::new();
     let mut value_order = Vec::new();
+
+    for function in &functions {
+        let mut statement_diagnostics = CanonicalCheckerDiagnostics::default();
+        let type_ = CanonicalTypeQuery::new_with_global_types(
+            store,
+            host,
+            global_types,
+            options,
+            &mut statement_diagnostics,
+        )?
+        .get_type_of_source_callable(
+            function.callable.declaration,
+            function.callable.owner_symbol,
+        );
+        merge_retry_diagnostics(diagnostics, statement_diagnostics);
+        let type_ = type_?;
+        let owner = function.callable.owner_symbol;
+        let linked = store
+            .value_symbol_links(owner)
+            .and_then(|links| links.resolved_type)
+            .ok_or(SourceCheckError::Function(
+                SourceFunctionInvariant::MissingCallableType(owner),
+            ))?;
+        let registered = store.source_callable_type_for_owner(owner).ok_or(
+            SourceCheckError::Function(SourceFunctionInvariant::MissingCallableType(owner)),
+        )?;
+        if linked != type_ || registered != type_ {
+            return Err(SourceCheckError::Function(
+                SourceFunctionInvariant::CallableTypeMismatch {
+                    symbol: owner,
+                    expected: type_,
+                    actual: if linked != type_ { linked } else { registered },
+                },
+            ));
+        }
+        if current_flow_types.insert(owner, type_).is_some() {
+            return Err(SourceCheckError::Function(
+                SourceFunctionInvariant::DuplicateDeclaration(function.callable.declaration),
+            ));
+        }
+    }
 
     for statement in statements {
         match statement {
@@ -2925,6 +3378,33 @@ pub(super) fn check_source_file(
                 result?;
             }
             PlannedStatement::ExternalModuleMarker => {}
+            PlannedStatement::Function(index) => {
+                let function = functions.get(index).ok_or(SourceCheckError::Function(
+                    SourceFunctionInvariant::InvalidStatementIndex(index),
+                ))?;
+                match &function.body {
+                    PlannedFunctionBody::Empty => {}
+                    PlannedFunctionBody::Return {
+                        statement,
+                        expression,
+                    } => {
+                        check_planned_assignment(
+                            store,
+                            host,
+                            global_types,
+                            source,
+                            options,
+                            diagnostics,
+                            &current_flow_types,
+                            &mut deferred,
+                            function.callable.return_type,
+                            expression,
+                            *statement,
+                            None,
+                        )?;
+                    }
+                }
+            }
             PlannedStatement::Variables(variables) => {
                 for variable in variables {
                     let (declared_type, current_flow_type) = if let Some(type_node) = variable.type_node {
@@ -3271,6 +3751,57 @@ mod tests {
         NodeRef::new(parsed.arena.id(), file, declaration)
     }
 
+    fn function_declaration(parsed: &ParseResult, file: FileId, expected: &str) -> NodeRef {
+        parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::FunctionDeclaration(function) = &record.data else {
+                    return None;
+                };
+                let name = parsed.arena.get(function.name?)?;
+                let NodeData::Identifier(identifier) = &name.data else {
+                    return None;
+                };
+                (identifier.text == expected)
+                    .then(|| NodeRef::new(parsed.arena.id(), file, node))
+            })
+            .unwrap_or_else(|| panic!("missing function {expected}"))
+    }
+
+    fn function_symbol(
+        context: &CanonicalCheckerContext<'_>,
+        parsed: &ParseResult,
+        file: FileId,
+        expected: &str,
+    ) -> SemanticSymbolId {
+        let declaration = function_declaration(parsed, file, expected);
+        let (_, bound) = context.file(file).unwrap();
+        let raw = bound.symbol(declaration).unwrap();
+        context.store().get_merged_symbol(raw).unwrap()
+    }
+
+    fn function_return_statement(
+        parsed: &ParseResult,
+        file: FileId,
+        expected: &str,
+    ) -> NodeRef {
+        let declaration = function_declaration(parsed, file, expected);
+        let NodeData::FunctionDeclaration(function) =
+            &parsed.arena.get(declaration.node).unwrap().data
+        else {
+            unreachable!()
+        };
+        let body = function.body.unwrap();
+        let NodeData::Block(block) = &parsed.arena.get(body).unwrap().data else {
+            unreachable!()
+        };
+        let [statement] = block.statements.nodes.as_slice() else {
+            panic!("function {expected} does not have one statement")
+        };
+        NodeRef::new(parsed.arena.id(), file, *statement)
+    }
+
     fn variable_symbol(
         context: &CanonicalCheckerContext<'_>,
         parsed: &ParseResult,
@@ -3339,6 +3870,9 @@ mod tests {
                         matches!(
                             &parent.data,
                             NodeData::VariableDeclaration(variable) if variable.name == node
+                        ) || matches!(
+                            &parent.data,
+                            NodeData::FunctionDeclaration(function) if function.name == Some(node)
                         )
                     });
                 (!is_declaration_name).then(|| NodeRef::new(parsed.arena.id(), file, node))
@@ -8502,6 +9036,270 @@ mod tests {
         bivariant.check_source_file(file).unwrap();
         assert_eq!(strict.diagnostics().len(), 1);
         assert!(bivariant.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn source_functions_are_hoisted_and_reuse_their_cold_identity_on_retry() {
+        let source = parsed(concat!(
+            "const before: (input: string) => number = fn; ",
+            "function fn(input: string): number { return 1; } ",
+            "const after = fn;",
+        ));
+        let file = FileId::new(301);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let owner = function_symbol(&context, &source, file, "fn");
+        let callable = context
+            .store()
+            .source_callable_type_for_owner(owner)
+            .unwrap();
+        assert_eq!(
+            context
+                .store()
+                .value_symbol_links(owner)
+                .and_then(|links| links.resolved_type),
+            Some(callable)
+        );
+        assert_eq!(
+            variable_value_type(&context, &source, file, "before"),
+            callable
+        );
+        assert_eq!(
+            variable_value_type(&context, &source, file, "after"),
+            callable
+        );
+        let reads = identifier_expressions(&source, file, "fn");
+        assert_eq!(reads.len(), 2);
+        assert!(reads.iter().all(|read| {
+            context
+                .store()
+                .symbol_node_links(*read)
+                .and_then(|links| links.resolved_symbol)
+                == Some(owner)
+        }));
+        assert!(context.diagnostics().is_empty());
+        assert!(is_type_checked(&context, file));
+
+        let warm = observable_state(&context, file);
+        mark_source_unchecked(&mut context, file);
+        context.check_source_file(file).unwrap();
+        assert_eq!(
+            context.store().source_callable_type_for_owner(owner),
+            Some(callable)
+        );
+        assert_eq!(observable_state(&context, file), warm);
+        context.check_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn exported_source_functions_keep_local_and_owner_symbols_distinct() {
+        let source = parsed("export function fn(value: string): void {} const copy = fn;");
+        let file = FileId::new(302);
+        let mut context = context_with_module_state(
+            &[(file, &source)],
+            CanonicalModuleState::External,
+            CanonicalCheckerOptions::default(),
+        );
+
+        context.check_source_file(file).unwrap();
+
+        let declaration = function_declaration(&source, file, "fn");
+        let (_, bound) = context.file(file).unwrap();
+        let owner = bound.symbol(declaration).unwrap();
+        let local = bound.local_symbol(declaration).unwrap();
+        let owner_record = context.store().symbol(owner).unwrap();
+        let local_record = context.store().symbol(local).unwrap();
+        assert_eq!(owner_record.flags(), SymbolFlags::FUNCTION);
+        assert_eq!(local_record.flags(), SymbolFlags::EXPORT_VALUE);
+        assert_eq!(local_record.declarations(), Some(&[declaration][..]));
+        assert_eq!(local_record.value_declaration(), None);
+        assert_eq!(local_record.export_symbol(), Some(owner));
+        assert!(owner_record.parent().is_some());
+        let callable = context
+            .store()
+            .source_callable_type_for_owner(owner)
+            .unwrap();
+        assert_eq!(
+            context
+                .store()
+                .value_symbol_links(owner)
+                .and_then(|links| links.resolved_type),
+            Some(callable)
+        );
+        assert!(context.store().value_symbol_links(local).is_none());
+        assert_eq!(
+            variable_value_type(&context, &source, file, "copy"),
+            callable
+        );
+        let [read] = identifier_expressions(&source, file, "fn").as_slice() else {
+            panic!("expected one exported function read")
+        };
+        assert_eq!(
+            context
+                .store()
+                .symbol_node_links(*read)
+                .and_then(|links| links.resolved_symbol),
+            Some(local)
+        );
+        assert!(context.diagnostics().is_empty());
+        assert!(is_type_checked(&context, file));
+    }
+
+    #[test]
+    fn optional_source_function_parameters_publish_strict_value_types() {
+        let source = parsed("function maybe(value?: string): void {}");
+        let file = FileId::new(303);
+        let mut context = context(
+            &[(file, &source)],
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    exact_optional_property_types: false,
+                },
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+
+        context.check_source_file(file).unwrap();
+
+        let owner = function_symbol(&context, &source, file, "maybe");
+        let callable = context
+            .store()
+            .source_callable_type_for_owner(owner)
+            .unwrap();
+        let provenance = context
+            .store()
+            .source_callable_provenance(callable)
+            .unwrap();
+        let signature = context.store().signature(provenance.signature).unwrap();
+        assert_eq!(signature.min_argument_count(), 0);
+        let [parameter] = signature.parameters() else {
+            panic!("expected one optional parameter")
+        };
+        let parameter_type = context
+            .store()
+            .value_symbol_links(*parameter)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        let TypeData::Union(union) = context.store().type_payload(parameter_type).unwrap().data()
+        else {
+            panic!("strict optional parameter must include undefined")
+        };
+        assert!(union
+            .union
+            .types
+            .contains(&context.store().intrinsic_bootstrap().unwrap().undefined_type));
+        assert!(context.diagnostics().is_empty());
+        assert!(is_type_checked(&context, file));
+    }
+
+    #[test]
+    fn unsupported_source_function_plans_are_atomic_and_preserve_variable_errors() {
+        let source = parsed(concat!(
+            "function ready(): void {} ",
+            "function generic<T>(value: T): T { return value; }",
+        ));
+        let file = FileId::new(304);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        let ready = function_symbol(&context, &source, file, "ready");
+        let before = observable_state(&context, file);
+
+        assert!(matches!(
+            context.check_source_file(file),
+            Err(SourceCheckError::Unsupported(
+                UnsupportedSourceSyntax::Function(SourceFunctionUnsupported::Callable(_))
+            ))
+        ));
+        assert_eq!(observable_state(&context, file), before);
+        assert!(context.store().value_symbol_links(ready).is_none());
+        assert!(context
+            .store()
+            .source_callable_type_for_owner(ready)
+            .is_none());
+        assert!(!is_type_checked(&context, file));
+
+        let unresolved = parsed("const value = missing;");
+        let unresolved_file = FileId::new(305);
+        let mut unresolved_context = context(
+            &[(unresolved_file, &unresolved)],
+            CanonicalCheckerOptions::default(),
+        );
+        let read = variable_initializer(&unresolved, unresolved_file, "value");
+        assert_eq!(
+            unresolved_context.check_source_file(unresolved_file),
+            Err(SourceCheckError::Unsupported(
+                UnsupportedSourceSyntax::Variable(
+                    VariableUnsupported::UnresolvedIdentifier(read)
+                )
+            ))
+        );
+    }
+
+    #[test]
+    fn source_function_returns_and_strict_relations_use_callable_semantics() {
+        let bad_return = parsed("function bad(): string { return 1; }");
+        let return_file = FileId::new(306);
+        let mut return_context = context(
+            &[(return_file, &bad_return)],
+            CanonicalCheckerOptions::default(),
+        );
+
+        return_context.check_source_file(return_file).unwrap();
+
+        let [diagnostic] = return_context.diagnostics().as_slice() else {
+            panic!("expected one return diagnostic")
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 2322);
+        assert_eq!(
+            diagnostic.node,
+            Some(function_return_statement(&bad_return, return_file, "bad"))
+        );
+        assert_eq!(
+            diagnostic.diagnostic.render().unwrap(),
+            "Type 'number' is not assignable to type 'string'."
+        );
+        assert!(is_type_checked(&return_context, return_file));
+        return_context.check_source_file(return_file).unwrap();
+        assert_eq!(return_context.diagnostics().len(), 1);
+
+        let relation = parsed(concat!(
+            "function narrow(input: 'only'): void {} ",
+            "const value: (input: string) => void = narrow;",
+        ));
+        let relation_file = FileId::new(307);
+        let mut strict = context(
+            &[(relation_file, &relation)],
+            CanonicalCheckerOptions {
+                strict_function_types: true,
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+        let mut bivariant = context(
+            &[(relation_file, &relation)],
+            CanonicalCheckerOptions {
+                strict_function_types: false,
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+
+        strict.check_source_file(relation_file).unwrap();
+        bivariant.check_source_file(relation_file).unwrap();
+
+        assert_eq!(strict.diagnostics().len(), 1);
+        assert_eq!(strict.diagnostics().as_slice()[0].diagnostic.code(), 2322);
+        assert_eq!(
+            strict.diagnostics().as_slice()[0]
+                .diagnostic
+                .render()
+                .unwrap(),
+            "Type '(input: \"only\") => void' is not assignable to type '(input: string) => void'."
+        );
+        assert!(bivariant.diagnostics().is_empty());
+        assert!(is_type_checked(&strict, relation_file));
+        assert!(is_type_checked(&bivariant, relation_file));
     }
 
     #[test]
