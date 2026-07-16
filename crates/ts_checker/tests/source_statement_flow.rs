@@ -216,6 +216,16 @@ fn function_declaration(parsed: &ParseResult, file: FileId) -> NodeRef {
         .expect("expected function declaration")
 }
 
+fn node_of_kind(parsed: &ParseResult, file: FileId, kind: SyntaxKind) -> NodeRef {
+    parsed
+        .arena
+        .iter()
+        .find_map(|(node, record)| {
+            (record.kind == kind).then_some(NodeRef::new(parsed.arena.id(), file, node))
+        })
+        .unwrap_or_else(|| panic!("expected one {kind:?} node"))
+}
+
 fn is_type_checked(context: &CanonicalCheckerContext<'_>, file: FileId) -> bool {
     context
         .source_file(file)
@@ -456,4 +466,71 @@ fn missing_else_and_inferred_final_if_remain_explicit_atomic_boundaries() {
         ),
         FileId::new(3),
     );
+}
+
+#[test]
+fn final_if_flow_recreates_invocation_state_after_a_later_semantic_failure() {
+    let source = concat!(
+        "type Broken = { fn: number };\n",
+        "function replay(flag: boolean): number {\n",
+        "  let value: number = 1;\n",
+        "  if (flag) {\n",
+        "    const branch: number = value;\n",
+        "    return branch;\n",
+        "  } else {\n",
+        "    const branch: number = value;\n",
+        "    return branch;\n",
+        "  }\n",
+        "}\n",
+        "const api: Broken = { fn: 1 };\n",
+        "const stopped = api.fn();\n",
+    );
+    let parsed = parse_source_file(source);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(4);
+    let call = node_of_kind(&parsed, file, SyntaxKind::CallExpression);
+    let local_declarations = ["value", "branch"]
+        .into_iter()
+        .flat_map(|name| variable_declarations(&parsed, file, name))
+        .collect::<Vec<_>>();
+    let mut context = context(&parsed, file);
+
+    assert_eq!(
+        context.check_source_file(file),
+        Err(SourceCheckError::Call(call)),
+    );
+    assert!(context.diagnostics().is_empty());
+    assert!(!is_type_checked(&context, file));
+    let (_, bound) = context.file(file).unwrap();
+    for declaration in &local_declarations {
+        let symbol = bound.symbol(*declaration).unwrap();
+        assert!(context.store().value_symbol_links(symbol).is_none());
+        let initializer = variable_initializer(&parsed, file, *declaration);
+        assert!(context.store().type_node_links(initializer).is_some());
+    }
+    let first_counts = (
+        context.store().type_len(),
+        context.store().mapper_len(),
+        context.store().signature_len(),
+    );
+
+    assert_eq!(
+        context.check_source_file(file),
+        Err(SourceCheckError::Call(call)),
+    );
+    assert_eq!(
+        (
+            context.store().type_len(),
+            context.store().mapper_len(),
+            context.store().signature_len(),
+        ),
+        first_counts,
+    );
+    assert!(context.diagnostics().is_empty());
+    assert!(!is_type_checked(&context, file));
+    let (_, bound) = context.file(file).unwrap();
+    for declaration in local_declarations {
+        let symbol = bound.symbol(declaration).unwrap();
+        assert!(context.store().value_symbol_links(symbol).is_none());
+    }
 }
