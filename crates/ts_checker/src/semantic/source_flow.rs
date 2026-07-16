@@ -117,6 +117,13 @@ pub(super) enum SourceFlowInvariant {
     DuplicateAssignment(NodeRef),
     UnknownCondition(NodeRef),
     UnknownAssignment(NodeRef),
+    UnreachedCondition(NodeRef),
+    MissingConditionEdge {
+        condition: NodeRef,
+        true_edge: bool,
+        false_edge: bool,
+    },
+    UnreachedAssignment(NodeRef),
     PendingAssignment(NodeRef),
     AssignmentSymbolMismatch {
         declaration: NodeRef,
@@ -165,12 +172,23 @@ enum SourceFlowAssignmentState {
     Resolved(TypeId),
 }
 
+#[derive(Default)]
+struct SourceFlowCoverage {
+    assignments: HashSet<NodeRef>,
+    condition_edges: HashMap<NodeRef, u8>,
+}
+
+const TRUE_CONDITION_EDGE: u8 = 1 << 0;
+const FALSE_CONDITION_EDGE: u8 = 1 << 1;
+const BOTH_CONDITION_EDGES: u8 = TRUE_CONDITION_EDGE | FALSE_CONDITION_EDGE;
+
 impl SourceFlowPlan {
     /// Freezes and validates every flow chain that the source executor may
     /// request. No semantic store state is read or written during preflight.
     pub(super) fn preflight(
         bound: &BoundFile,
         container: NodeRef,
+        expected_start_payload: Option<NodeRef>,
         points: impl IntoIterator<Item = NodeRef>,
         conditions: impl IntoIterator<Item = SourceTruthinessCondition>,
         assignments: impl IntoIterator<Item = SourceFlowAssignment>,
@@ -181,6 +199,9 @@ impl SourceFlowPlan {
             .container_start(container)
             .ok_or(SourceFlowInvariant::MissingStart(container))?;
         let start_payload = preflight_start_payload(graph, container, start)?;
+        if start_payload != expected_start_payload {
+            return Err(SourceFlowInvariant::InvalidStart(start).into());
+        }
 
         let mut planned_conditions = HashMap::new();
         for condition in conditions {
@@ -275,12 +296,38 @@ impl SourceFlowPlan {
     fn validate_flow_paths(&self, graph: &BoundFlowGraph) -> Result<(), SourceFlowError> {
         let mut validated = HashSet::new();
         let mut visiting = HashSet::new();
+        let mut coverage = SourceFlowCoverage::default();
         for point in &self.point_order {
             let flow = *self
                 .points
                 .get(point)
                 .ok_or(SourceFlowInvariant::MissingFlowPoint(*point))?;
-            self.validate_flow(graph, flow, 0, &mut validated, &mut visiting)?;
+            self.validate_flow(
+                graph,
+                flow,
+                0,
+                &mut validated,
+                &mut visiting,
+                &mut coverage,
+            )?;
+        }
+        for declaration in self.assignments.keys() {
+            if !coverage.assignments.contains(declaration) {
+                return Err(SourceFlowInvariant::UnreachedAssignment(*declaration).into());
+            }
+        }
+        for condition in self.conditions.keys() {
+            let Some(edges) = coverage.condition_edges.get(condition).copied() else {
+                return Err(SourceFlowInvariant::UnreachedCondition(*condition).into());
+            };
+            if edges != BOTH_CONDITION_EDGES {
+                return Err(SourceFlowInvariant::MissingConditionEdge {
+                    condition: *condition,
+                    true_edge: edges & TRUE_CONDITION_EDGE != 0,
+                    false_edge: edges & FALSE_CONDITION_EDGE != 0,
+                }
+                .into());
+            }
         }
         Ok(())
     }
@@ -292,6 +339,7 @@ impl SourceFlowPlan {
         depth: usize,
         validated: &mut HashSet<FlowRef>,
         visiting: &mut HashSet<FlowRef>,
+        coverage: &mut SourceFlowCoverage,
     ) -> Result<(), SourceFlowError> {
         if validated.contains(&flow) {
             return Ok(());
@@ -302,7 +350,8 @@ impl SourceFlowPlan {
         if !visiting.insert(flow) {
             return Err(SourceFlowInvariant::Cycle(flow).into());
         }
-        let result = self.validate_flow_uncached(graph, flow, depth, validated, visiting);
+        let result =
+            self.validate_flow_uncached(graph, flow, depth, validated, visiting, coverage);
         let removed = visiting.remove(&flow);
         debug_assert!(removed);
         if result.is_ok() {
@@ -318,6 +367,7 @@ impl SourceFlowPlan {
         depth: usize,
         validated: &mut HashSet<FlowRef>,
         visiting: &mut HashSet<FlowRef>,
+        coverage: &mut SourceFlowCoverage,
     ) -> Result<(), SourceFlowError> {
         let node = flow_node(graph, flow)?;
         match source_flow_kind(flow, node.flags)? {
@@ -328,15 +378,36 @@ impl SourceFlowPlan {
                 if !self.assignments.contains_key(&declaration) {
                     return Err(SourceFlowInvariant::UnknownAssignment(declaration).into());
                 }
-                self.validate_flow(graph, antecedent, depth + 1, validated, visiting)
+                coverage.assignments.insert(declaration);
+                self.validate_flow(
+                    graph,
+                    antecedent,
+                    depth + 1,
+                    validated,
+                    visiting,
+                    coverage,
+                )
             }
-            SourceFlowKind::TrueCondition | SourceFlowKind::FalseCondition => {
+            kind @ (SourceFlowKind::TrueCondition | SourceFlowKind::FalseCondition) => {
                 let antecedent = linear_antecedent(flow, &node)?;
                 let condition = ast_payload(flow, &node)?;
                 if !self.conditions.contains_key(&condition) {
                     return Err(SourceFlowInvariant::UnknownCondition(condition).into());
                 }
-                self.validate_flow(graph, antecedent, depth + 1, validated, visiting)
+                let edge = match kind {
+                    SourceFlowKind::TrueCondition => TRUE_CONDITION_EDGE,
+                    SourceFlowKind::FalseCondition => FALSE_CONDITION_EDGE,
+                    SourceFlowKind::Start | SourceFlowKind::Assignment => unreachable!(),
+                };
+                *coverage.condition_edges.entry(condition).or_default() |= edge;
+                self.validate_flow(
+                    graph,
+                    antecedent,
+                    depth + 1,
+                    validated,
+                    visiting,
+                    coverage,
+                )
             }
         }
     }

@@ -77,6 +77,13 @@ const FLOW_SOURCE: &str = concat!(
     "    return 2;\n",
     "  }\n",
     "}\n",
+    "function voidUnionCondition(value: void | boolean): number {\n",
+    "  if (value) {\n",
+    "    return 1;\n",
+    "  } else {\n",
+    "    return 2;\n",
+    "  }\n",
+    "}\n",
 );
 
 const DIAGNOSTIC_SOURCE: &str = concat!(
@@ -547,4 +554,112 @@ fn final_if_flow_recreates_invocation_state_after_a_later_semantic_failure() {
         let symbol = bound.symbol(declaration).unwrap();
         assert!(context.store().value_symbol_links(symbol).is_none());
     }
+}
+
+#[test]
+fn function_declaration_flow_starts_captured_variables_at_their_declared_types() {
+    let source = concat!(
+        "const fixed: string | number = \"fixed\";\n",
+        "let mutable: string | number = \"mutable\";\n",
+        "function capture(flag: boolean): string {\n",
+        "  const fromConst: string = fixed;\n",
+        "  const fromLet: string = mutable;\n",
+        "  if (flag) {\n",
+        "    return \"ok\";\n",
+        "  } else {\n",
+        "    return mutable;\n",
+        "  }\n",
+        "}\n",
+    );
+    let parsed = parse_source_file(source);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(5);
+    let mut context = context(&parsed, file);
+
+    context.check_source_file(file).unwrap();
+
+    let diagnostics = context
+        .diagnostics()
+        .as_slice()
+        .iter()
+        .map(|diagnostic| {
+            let node = diagnostic.node.expect("expected node-anchored diagnostic");
+            (
+                diagnostic.diagnostic.code(),
+                parsed.arena.get(node.node).unwrap().kind,
+                node_text(source, &parsed, node),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        diagnostics,
+        [
+            (2322, SyntaxKind::Identifier, "fromConst"),
+            (2322, SyntaxKind::Identifier, "fromLet"),
+            (2322, SyntaxKind::ReturnStatement, "return mutable;"),
+        ],
+    );
+    assert!(is_type_checked(&context, file));
+
+    let cold_counts = (
+        context.store().type_len(),
+        context.store().mapper_len(),
+        context.store().signature_len(),
+    );
+    let cold_diagnostics = context.diagnostics().clone();
+    context.check_source_file(file).unwrap();
+    assert_eq!(
+        (
+            context.store().type_len(),
+            context.store().mapper_len(),
+            context.store().signature_len(),
+        ),
+        cold_counts,
+    );
+    assert_eq!(context.diagnostics(), &cold_diagnostics);
+}
+
+#[test]
+fn structural_thenable_condition_remains_a_stable_semantic_boundary() {
+    let source = concat!(
+        "type Thenable = { then: (onfulfilled: (value: number) => unknown) => unknown };\n",
+        "function structural(value: Thenable): number {\n",
+        "  if (value) {\n",
+        "    return 1;\n",
+        "  } else {\n",
+        "    return 2;\n",
+        "  }\n",
+        "}\n",
+    );
+    let parsed = parse_source_file(source);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(6);
+    let mut context = context(&parsed, file);
+
+    let first = context.check_source_file(file).unwrap_err();
+    assert!(matches!(
+        first,
+        SourceCheckError::Unsupported(UnsupportedSourceSyntax::Function(
+            SourceFunctionUnsupported::FunctionBody(_)
+        ))
+    ));
+    assert!(context.diagnostics().is_empty());
+    assert!(!is_type_checked(&context, file));
+    let first_counts = (
+        context.store().type_len(),
+        context.store().mapper_len(),
+        context.store().signature_len(),
+    );
+
+    assert_eq!(context.check_source_file(file), Err(first));
+    assert_eq!(
+        (
+            context.store().type_len(),
+            context.store().mapper_len(),
+            context.store().signature_len(),
+        ),
+        first_counts,
+    );
+    assert!(context.diagnostics().is_empty());
+    assert!(!is_type_checked(&context, file));
 }

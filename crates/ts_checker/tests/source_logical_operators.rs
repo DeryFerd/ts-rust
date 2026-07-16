@@ -17,6 +17,7 @@ const SOURCE: &str = concat!(
     "function unknownNullish(unknownValue: unknown): unknown { return unknownValue ?? 1; }\n",
     "function narrowedAnd(narrowedValue: number | null): unknown { return narrowedValue && narrowedValue + 1; }\n",
     "function narrowedChain(chainValue: number | null, gate: boolean): unknown { return chainValue && gate && chainValue + 1; }\n",
+    "function voidUnion(value: void | boolean): unknown { return value && 13; }\n",
     "function contextualAnd(): LogicalObject { return true && { kind: \"a\" }; }\n",
     "function accept(value: unknown): void {}\n",
     "function nothing(): void {}\n",

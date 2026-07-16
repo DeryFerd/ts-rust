@@ -53,6 +53,9 @@ use super::{
         LogicalBinaryError, LogicalBinaryInvariant, LogicalBinaryRequest,
         LogicalBinaryUnsupported, check_logical_binary, narrow_logical_right_operand,
     },
+    object_members::{
+        DeclaredPropertyObjectValidation, validate_resolved_declared_property_object,
+    },
     primitive_operators::{
         PrimitiveBigIntExponentiationTarget, PrimitiveBinaryError, PrimitiveBinaryRecovery,
         PrimitiveBinaryRequest, PrimitiveBinaryUnsupported, check_primitive_binary,
@@ -1520,7 +1523,11 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         error: SourceFlowError,
     ) -> SourceCheckError {
         match error {
-            SourceFlowError::Unsupported(_) | SourceFlowError::Narrowing { .. } => {
+            SourceFlowError::Unsupported(_)
+            | SourceFlowError::Narrowing {
+                error: LogicalBinaryError::Unsupported(LogicalBinaryUnsupported::Type(_)),
+                ..
+            } => {
                 SourceCheckError::Unsupported(UnsupportedSourceSyntax::Function(
                     SourceFunctionUnsupported::FunctionBody(callable.body),
                 ))
@@ -1528,6 +1535,22 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             SourceFlowError::Invariant(_) => SourceCheckError::Function(
                 SourceFunctionInvariant::Callable(callable.declaration),
             ),
+            SourceFlowError::Narrowing {
+                condition,
+                error:
+                    LogicalBinaryError::Unsupported(LogicalBinaryUnsupported::Operator(_))
+                    | LogicalBinaryError::Invariant(_),
+            } => SourceCheckError::LogicalOperator(condition),
+            #[cfg(not(test))]
+            SourceFlowError::Narrowing {
+                condition,
+                error:
+                    LogicalBinaryError::Unsupported(LogicalBinaryUnsupported::MissingGlobalTypes),
+            } => SourceCheckError::LogicalOperator(condition),
+            SourceFlowError::Narrowing {
+                error: LogicalBinaryError::Literal(error),
+                ..
+            } => error.into(),
         }
     }
 
@@ -2096,6 +2119,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         let flow = SourceFlowPlan::preflight(
             self.bound,
             callable.declaration,
+            None,
             points,
             [SourceTruthinessCondition {
                 expression: condition.node,
@@ -4887,8 +4911,11 @@ fn emit_truthiness_operand_diagnostics(
     type_: TypeId,
     invariant_node: NodeRef,
 ) -> Result<(), SourceCheckError> {
-    if source_type_includes_void(store, type_, &mut HashSet::new())
+    if store
+        .type_payload(type_)
         .ok_or(SourceCheckError::LogicalOperator(invariant_node))?
+        .flags()
+        .intersects(TypeFlags::VOID)
     {
         issue_node_diagnostic(diagnostics, expression.node, 1345)?;
         return Ok(());
@@ -4903,31 +4930,6 @@ fn emit_truthiness_operand_diagnostics(
         PredicateSemantics::Sometimes => {}
     }
     Ok(())
-}
-
-fn source_type_includes_void(
-    store: &CanonicalTypeMapperStore,
-    type_: TypeId,
-    visiting: &mut HashSet<TypeId>,
-) -> Option<bool> {
-    let record = store.type_payload(type_)?;
-    if record.flags().intersects(TypeFlags::VOID) {
-        return Some(true);
-    }
-    let TypeData::Union(union) = record.data() else {
-        return Some(false);
-    };
-    if !visiting.insert(type_) {
-        return None;
-    }
-    for constituent in &union.union.types {
-        if source_type_includes_void(store, *constituent, visiting)? {
-            visiting.remove(&type_);
-            return Some(true);
-        }
-    }
-    visiting.remove(&type_);
-    Some(false)
 }
 
 fn outer_expression_target(mut expression: &PlannedExpression) -> &PlannedExpression {
@@ -5561,27 +5563,33 @@ fn check_planned_function_statements(
 }
 
 fn source_truthiness_condition_type_is_supported(
-    store: &CanonicalTypeMapperStore,
+    store: &mut CanonicalTypeMapperStore,
     type_: TypeId,
     invariant_node: NodeRef,
     visiting: &mut HashSet<TypeId>,
 ) -> Result<bool, SourceCheckError> {
-    let record = store
-        .type_payload(type_)
-        .ok_or(SourceCheckError::LogicalOperator(invariant_node))?;
-    let flags = record.flags();
+    let (flags, named_promise, union_types) = {
+        let record = store
+            .type_payload(type_)
+            .ok_or(SourceCheckError::LogicalOperator(invariant_node))?;
+        let named_promise = record
+            .symbol()
+            .and_then(|symbol| store.symbol(symbol))
+            .is_some_and(|symbol| {
+                matches!(symbol.name().as_bytes(), b"Promise" | b"PromiseLike")
+            });
+        let union_types = match record.data() {
+            TypeData::Union(union) => Some(union.union.types.clone()),
+            _ => None,
+        };
+        (record.flags(), named_promise, union_types)
+    };
     if flags.intersects(
         TypeFlags::UNKNOWN | TypeFlags::TYPE_PARAMETER | TypeFlags::INTERSECTION,
     ) {
         return Ok(false);
     }
-    if record
-        .symbol()
-        .and_then(|symbol| store.symbol(symbol))
-        .is_some_and(|symbol| {
-            matches!(symbol.name().as_bytes(), b"Promise" | b"PromiseLike")
-        })
-    {
+    if named_promise {
         return Ok(false);
     }
     if !matches!(
@@ -5590,16 +5598,41 @@ fn source_truthiness_condition_type_is_supported(
     ) {
         return Ok(false);
     }
-    let TypeData::Union(union) = record.data() else {
+    match validate_resolved_declared_property_object(store, type_) {
+        DeclaredPropertyObjectValidation::Valid(_) => {
+            if store.resolved_own_property(type_, "then")?.is_some() {
+                // The pinned checker diagnoses promise-shaped structural
+                // values with TS2801. Until that diagnostic path is ported,
+                // keep exact own `then` properties outside this condition
+                // slice rather than accepting a thenable as an ordinary
+                // known-truthy object.
+                return Ok(false);
+            }
+        }
+        DeclaredPropertyObjectValidation::NotDeclared => {
+            // Other structured objects can expose inherited or apparent
+            // callable `then` members. General property lookup is not yet in
+            // the canonical source condition path, so accepting them here
+            // would fail open for structural promises. Intrinsic `object` is
+            // NON_PRIMITIVE rather than OBJECT and remains supported.
+            if flags.intersects(TypeFlags::OBJECT) {
+                return Ok(false);
+            }
+        }
+        DeclaredPropertyObjectValidation::Malformed => {
+            return Err(SourceCheckError::LogicalOperator(invariant_node));
+        }
+    }
+    let Some(union_types) = union_types else {
         return Ok(true);
     };
     if !visiting.insert(type_) {
         return Ok(false);
     }
-    for constituent in &union.union.types {
+    for constituent in union_types {
         if !source_truthiness_condition_type_is_supported(
             store,
-            *constituent,
+            constituent,
             invariant_node,
             visiting,
         )? {
@@ -6392,6 +6425,15 @@ fn captured_callable_flow_types(
     Ok(captured)
 }
 
+fn function_declaration_flow_types(
+    current_flow_types: &HashMap<SemanticSymbolId, TypeId>,
+    declared_types: &HashMap<SemanticSymbolId, TypeId>,
+) -> HashMap<SemanticSymbolId, TypeId> {
+    let mut captured = current_flow_types.clone();
+    captured.extend(declared_types.iter().map(|(symbol, type_)| (*symbol, *type_)));
+    captured
+}
+
 #[allow(clippy::too_many_arguments)]
 fn resolve_contextual_callable_target(
     store: &mut CanonicalTypeMapperStore,
@@ -6997,6 +7039,10 @@ pub(super) fn check_source_file(
                         SourceFunctionInvariant::Callable(function.callable.declaration),
                     ));
                 };
+                let captured_flow_types = function_declaration_flow_types(
+                    &current_flow_types,
+                    &top_level_declared_types,
+                );
                 let body_flow_types = check_callable_parameter_initializers(
                     store,
                     host,
@@ -7004,7 +7050,7 @@ pub(super) fn check_source_file(
                     source,
                     options,
                     diagnostics,
-                    &current_flow_types,
+                    &captured_flow_types,
                     &preflighted_type_import_value_uses,
                     &mut deferred,
                     &function.callable,
