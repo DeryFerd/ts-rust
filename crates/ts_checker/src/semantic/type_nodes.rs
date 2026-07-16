@@ -34,10 +34,12 @@ use super::{
         plan_concrete_indexed_access,
     },
     object_members::{self, PropertyObjectError, PropertyObjectPlan, PropertyObjectState},
-    signatures::Signature,
+    signatures::{ElementFlags, Signature},
     source_callables::{
         self, PendingSourceCallableParameterTypes, SourceCallableError, SourceCallableFamily,
     },
+    tuple_type_nodes::{self, TupleTypeNodeError, TupleTypeNodePlan, validate_warm_tuple_elements},
+    tuple_types::{CanonicalTupleTypeRequest, TupleTypeError},
     type_records::{CacheHashKey, TypeData, TypeRecord},
     types::ObjectFlags,
 };
@@ -176,6 +178,14 @@ pub enum TypeNodeUnavailable {
     InvalidUnionAlias(SemanticSymbolId),
     InvalidPreparedTypeQuery,
     LiteralTypeCapacity,
+    InvalidTupleType(NodeRef),
+    MissingPlannedTupleType(NodeRef),
+    UnsupportedTupleElementOrder {
+        tuple: NodeRef,
+        element: NodeRef,
+        index: usize,
+    },
+    InvalidCachedTupleType(TypeId),
     ResolutionStackInvariant(SemanticSymbolId),
 }
 
@@ -236,6 +246,7 @@ struct TypeQueryPlan {
     type_literals: BTreeMap<NodeRef, PropertyObjectPlan>,
     interfaces: BTreeMap<SemanticSymbolId, PropertyObjectPlan>,
     functions: BTreeMap<NodeRef, FunctionTypePlan>,
+    tuples: BTreeMap<NodeRef, TupleTypeNodePlan>,
     pending_function_proofs: Vec<PendingFunctionTypeProof>,
 }
 
@@ -292,6 +303,7 @@ enum CachedTypeAliasRhs {
     TypeLiteral(NodeRef),
     FunctionType(NodeRef),
     IndexedAccess(NodeRef),
+    TupleType(NodeRef),
     NonUnion,
 }
 
@@ -425,6 +437,53 @@ fn source_callable_signature_error(
         SourceCallableError::Invariant(_) => {
             type_node_unavailable(TypeNodeUnavailable::InvalidFunctionSignature(signature))
         }
+    }
+}
+
+fn tuple_type_node_error(error: TupleTypeNodeError) -> DeclaredTypeError {
+    match error {
+        TupleTypeNodeError::DeclaredType(error) => error,
+        TupleTypeNodeError::InvalidSyntax(node) | TupleTypeNodeError::InvalidElementInfo(node) => {
+            type_node_unavailable(TypeNodeUnavailable::InvalidTupleType(node))
+        }
+        TupleTypeNodeError::UnsupportedSyntax { node, kind } => {
+            type_node_unavailable(TypeNodeUnavailable::UnsupportedSyntax { node, kind })
+        }
+        TupleTypeNodeError::UnsupportedElementOrder {
+            tuple,
+            element,
+            index,
+        } => type_node_unavailable(TypeNodeUnavailable::UnsupportedTupleElementOrder {
+            tuple,
+            element,
+            index,
+        }),
+        TupleTypeNodeError::AuthoritativeArrayTargetsRequired(node) => {
+            type_node_unavailable(TypeNodeUnavailable::UnsupportedSyntax {
+                node,
+                kind: SyntaxKind::RestType,
+            })
+        }
+        TupleTypeNodeError::InvalidCachedType { type_, .. } => {
+            type_node_unavailable(TypeNodeUnavailable::InvalidCachedTupleType(type_))
+        }
+        TupleTypeNodeError::Capacity(_) => {
+            type_node_unavailable(TypeNodeUnavailable::LiteralTypeCapacity)
+        }
+    }
+}
+
+fn tuple_type_error(error: TupleTypeError, node: NodeRef) -> DeclaredTypeError {
+    match error {
+        TupleTypeError::BootstrapUninitialized => DeclaredTypeError::Unavailable(
+            DeclaredTypeUnavailable::IntrinsicBootstrapNotInitialized,
+        ),
+        TupleTypeError::Capacity => type_node_unavailable(TypeNodeUnavailable::LiteralTypeCapacity),
+        TupleTypeError::InvalidTargetCache(type_)
+        | TupleTypeError::InvalidInstantiationCache {
+            instance: type_, ..
+        } => type_node_unavailable(TypeNodeUnavailable::InvalidCachedTupleType(type_)),
+        _ => type_node_unavailable(TypeNodeUnavailable::InvalidTupleType(node)),
     }
 }
 
@@ -918,17 +977,24 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             SyntaxKind::ArrayType if union_constituent && self.array_targets.is_none() => Err(
                 type_node_unavailable(TypeNodeUnavailable::UnsupportedUnionConstituent(node)),
             ),
-            SyntaxKind::TypeLiteral if union_constituent => Err(type_node_unavailable(
-                TypeNodeUnavailable::UnsupportedUnionConstituent(node),
-            )),
-            SyntaxKind::IndexedAccessType if union_constituent => Err(type_node_unavailable(
-                TypeNodeUnavailable::UnsupportedUnionConstituent(node),
-            )),
+            SyntaxKind::TypeLiteral
+            | SyntaxKind::IndexedAccessType
+            | SyntaxKind::TupleType
+            | SyntaxKind::TypeOperator
+                if union_constituent =>
+            {
+                Err(type_node_unavailable(
+                    TypeNodeUnavailable::UnsupportedUnionConstituent(node),
+                ))
+            }
             SyntaxKind::ArrayType => self.plan_array_type(node, alias_owner),
             SyntaxKind::TypeLiteral => self.plan_property_type_literal(node, alias_owner),
             SyntaxKind::FunctionType => self.plan_function_type(node, alias_owner),
             SyntaxKind::IndexedAccessType => {
                 self.plan_concrete_indexed_access_type(node, alias_owner)
+            }
+            SyntaxKind::TupleType | SyntaxKind::TypeOperator => {
+                self.plan_tuple_type(node, alias_owner)
             }
             SyntaxKind::TypeReference => {
                 self.plan_type_reference(node, alias_owner, union_constituent)
@@ -957,6 +1023,64 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 self.validate_cached_union_result(cached, None)
                     .map_err(type_construction_error)?;
             }
+        }
+        Ok(())
+    }
+
+    fn plan_tuple_type(
+        &mut self,
+        node: NodeRef,
+        alias_owner: Option<SemanticSymbolId>,
+    ) -> Result<(), DeclaredTypeError> {
+        if let Some(alias) = alias_owner
+            && self
+                .plan
+                .aliases
+                .get(&alias)
+                .is_some_and(|plan| !plan.type_parameters.is_empty())
+        {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::GenericReferenceUnsupported {
+                    node,
+                    symbol: alias,
+                },
+            ));
+        }
+        let planned =
+            tuple_type_nodes::plan_tuple_type_node(self.store, self.host, node, self.array_targets)
+                .map_err(tuple_type_node_error)?;
+        for element in planned.elements() {
+            self.plan_type_node_in_context(element.type_node(), None, false)?;
+        }
+        if planned.cached_type().is_some() {
+            let mut base_types = Vec::new();
+            base_types
+                .try_reserve(planned.elements().len())
+                .map_err(|_| type_node_unavailable(TypeNodeUnavailable::LiteralTypeCapacity))?;
+            for element in planned.elements() {
+                base_types.push(
+                    self.cached_array_element_identity(element.type_node())
+                        .map_err(|_| {
+                            type_node_unavailable(TypeNodeUnavailable::InvalidTupleType(
+                                planned.tuple(),
+                            ))
+                        })?
+                        .ok_or_else(|| {
+                            type_node_unavailable(TypeNodeUnavailable::InvalidCachedTupleType(
+                                planned.cached_type().expect("checked as warm"),
+                            ))
+                        })?,
+                );
+            }
+            validate_warm_tuple_elements(self.store, self.array_targets, &planned, &base_types)
+                .map_err(tuple_type_node_error)?;
+        }
+        if let Some(existing) = self.plan.tuples.insert(planned.tuple(), planned.clone())
+            && existing != planned
+        {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidTupleType(node),
+            ));
         }
         Ok(())
     }
@@ -1605,6 +1729,16 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                     SyntaxKind::IndexedAccessType => {
                         CachedTypeAliasRhs::IndexedAccess(type_node)
                     }
+                    SyntaxKind::TupleType => CachedTypeAliasRhs::TupleType(type_node),
+                    SyntaxKind::TypeOperator
+                        if matches!(
+                            &record.data,
+                            NodeData::TypeOperatorNode(operator)
+                                if operator.operator == SyntaxKind::ReadonlyKeyword
+                        ) =>
+                    {
+                        CachedTypeAliasRhs::TupleType(type_node)
+                    }
                     _ => CachedTypeAliasRhs::NonUnion,
                 });
             }
@@ -1777,6 +1911,21 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                         || self
                             .store
                             .type_node_links(indexed_access)
+                            .and_then(|links| links.resolved_type)
+                            != Some(declared_type)
+                    {
+                        return Err(type_node_unavailable(
+                            TypeNodeUnavailable::InvalidCachedTypeAlias(root_symbol),
+                        ));
+                    }
+                    return Ok(());
+                }
+                CachedTypeAliasRhs::TupleType(tuple_type) => {
+                    if !missing_generic_metadata.is_empty()
+                        || remains_union
+                        || self
+                            .store
+                            .type_node_links(tuple_type)
                             .and_then(|links| links.resolved_type)
                             != Some(declared_type)
                     {
@@ -3553,6 +3702,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             || self.direct_type_literal_rhs(type_node)?
             || self.direct_function_type_rhs(type_node)?
             || self.direct_indexed_access_rhs(type_node)?
+            || self.direct_tuple_type_rhs(type_node)?
             || self.type_node_contains_builtin_array_reference(type_node, &mut HashSet::new())?
         {
             self.plan_type_node_in_context(type_node, Some(symbol), union_constituent)?;
@@ -3755,6 +3905,29 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 return Ok(false);
             };
             node = NodeRef::new(node.arena, node.file, parenthesized.type_);
+        }
+    }
+
+    fn direct_tuple_type_rhs(&self, mut node: NodeRef) -> Result<bool, DeclaredTypeError> {
+        loop {
+            let record = preflight_node(self.store, self.host, node)?;
+            if record.kind == SyntaxKind::TupleType {
+                return Ok(true);
+            }
+            match &record.data {
+                NodeData::ParenthesizedTypeNode(parenthesized)
+                    if record.kind == SyntaxKind::ParenthesizedType =>
+                {
+                    node = NodeRef::new(node.arena, node.file, parenthesized.type_);
+                }
+                NodeData::TypeOperatorNode(operator)
+                    if record.kind == SyntaxKind::TypeOperator
+                        && operator.operator == SyntaxKind::ReadonlyKeyword =>
+                {
+                    node = NodeRef::new(node.arena, node.file, operator.type_);
+                }
+                _ => return Ok(false),
+            }
         }
     }
 }
@@ -4819,9 +4992,26 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         let (cold_function_types, function_type_aliases, optional_parameter_unions) =
             functions::reserve_function_type_capacities(self.store, &function_plans)
                 .map_err(function_type_error)?;
+        let optional_tuple_unions = if self
+            .store
+            .intrinsic_bootstrap()
+            .is_some_and(|bootstrap| bootstrap.options.strict_null_checks)
+        {
+            plan.tuples
+                .values()
+                .filter(|tuple| tuple.cached_type().is_none())
+                .try_fold(0usize, |count, tuple| {
+                    count
+                        .checked_add(tuple.optional_element_count())
+                        .ok_or_else(|| Self::literal_cache_error(LiteralTypeCacheError::Capacity))
+                })?
+        } else {
+            0
+        };
         let union_operation_count = unions
             .len()
             .checked_add(optional_parameter_unions)
+            .and_then(|count| count.checked_add(optional_tuple_unions))
             .and_then(|count| count.checked_add(additional_union_operations))
             .ok_or_else(|| Self::literal_cache_error(LiteralTypeCacheError::Capacity))?;
         let named_unions = unions
@@ -5078,6 +5268,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                     .direct_type_literal_plan_node(alias.type_node, plan)
                     .or_else(|| self.direct_function_type_plan_node(alias.type_node, plan))
                     .or_else(|| self.direct_indexed_access_plan_node(alias.type_node, plan))
+                    .or_else(|| self.direct_tuple_type_plan_node(alias.type_node, plan))
                 && !self
                     .pending_function_parameters
                     .iter()
@@ -5224,6 +5415,9 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             SyntaxKind::IndexedAccessType => {
                 self.execute_concrete_indexed_access_type(node, plan, prepared)
             }
+            SyntaxKind::TupleType | SyntaxKind::TypeOperator => {
+                self.execute_tuple_type(node, plan, prepared)
+            }
             SyntaxKind::TypeReference => self.execute_type_reference(node, plan, prepared),
             SyntaxKind::UnionType => self.execute_union_type(node, plan, prepared),
             kind => Err(type_node_unavailable(
@@ -5258,6 +5452,146 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             ));
         }
         Ok(resolved)
+    }
+
+    fn execute_tuple_type(
+        &mut self,
+        node: NodeRef,
+        plan: &TypeQueryPlan,
+        prepared: &mut PreparedTypeQueryTypes,
+    ) -> Result<TypeId, DeclaredTypeError> {
+        let record = preflight_node(self.store, self.host, node)?;
+        let tuple = match (&record.data, record.kind) {
+            (NodeData::TupleTypeNode(_), SyntaxKind::TupleType) => node,
+            (NodeData::TypeOperatorNode(operator), SyntaxKind::TypeOperator)
+                if operator.operator == SyntaxKind::ReadonlyKeyword =>
+            {
+                NodeRef::new(node.arena, node.file, operator.type_)
+            }
+            _ => {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::UnsupportedSyntax {
+                        node,
+                        kind: record.kind,
+                    },
+                ));
+            }
+        };
+        let tuple_plan = plan.tuples.get(&tuple).cloned().ok_or_else(|| {
+            type_node_unavailable(TypeNodeUnavailable::MissingPlannedTupleType(node))
+        })?;
+        if let Some(cached) = tuple_plan.cached_type() {
+            self.publish_tuple_type_node_links(&tuple_plan, cached)?;
+            return Ok(cached);
+        }
+
+        let bootstrap = self
+            .store
+            .intrinsic_bootstrap()
+            .ok_or(DeclaredTypeError::Unavailable(
+                DeclaredTypeUnavailable::IntrinsicBootstrapNotInitialized,
+            ))?;
+        let strict_null_checks = bootstrap.options.strict_null_checks;
+        let optional_sentinel = bootstrap.undefined_or_missing_type;
+        let mut element_types = Vec::new();
+        element_types
+            .try_reserve(tuple_plan.elements().len())
+            .map_err(|_| type_node_unavailable(TypeNodeUnavailable::LiteralTypeCapacity))?;
+        for element in tuple_plan.elements() {
+            let base = self.execute_type_node(element.type_node(), plan, prepared)?;
+            let type_ = if strict_null_checks && element.info().flags() == ElementFlags::OPTIONAL {
+                self.optional_tuple_element_type(base, optional_sentinel, prepared)?
+            } else {
+                base
+            };
+            element_types.push(type_);
+        }
+        let infos = tuple_plan.element_infos();
+        let mut request =
+            CanonicalTupleTypeRequest::new(&element_types, &infos, tuple_plan.readonly());
+        if let Some(targets) = self
+            .global_types
+            .as_ref()
+            .map(CanonicalArrayTargets::from_global_types)
+        {
+            request = request.with_array_targets(targets);
+        }
+        let resolved = self
+            .store
+            .create_canonical_tuple_type(request)
+            .map_err(|error| tuple_type_error(error, tuple))?;
+        self.publish_tuple_type_node_links(&tuple_plan, resolved)?;
+        Ok(resolved)
+    }
+
+    fn optional_tuple_element_type(
+        &mut self,
+        base: TypeId,
+        sentinel: TypeId,
+        prepared: &mut PreparedTypeQueryTypes,
+    ) -> Result<TypeId, DeclaredTypeError> {
+        let record = self.store.type_payload(base).ok_or_else(|| {
+            type_node_unavailable(TypeNodeUnavailable::InvalidCachedTupleType(base))
+        })?;
+        if base == sentinel
+            || record
+                .flags()
+                .intersects(super::types::TypeFlags::ANY | super::types::TypeFlags::UNKNOWN)
+            || matches!(
+                record.data(),
+                TypeData::Union(union) if union.union.types.contains(&sentinel)
+            )
+        {
+            return Ok(base);
+        }
+        match self.global_types.as_ref() {
+            Some(global_types) => self.store.literal_union_type_prepared_with_global_types(
+                global_types,
+                &[base, sentinel],
+                None,
+                prepared,
+            ),
+            None => self
+                .store
+                .literal_union_type_prepared(&[base, sentinel], None, prepared),
+        }
+        .map_err(Self::literal_cache_error)
+    }
+
+    fn publish_tuple_type_node_links(
+        &mut self,
+        plan: &TupleTypeNodePlan,
+        resolved: TypeId,
+    ) -> Result<(), DeclaredTypeError> {
+        let mut nodes = vec![plan.tuple()];
+        if let Some(operator) = plan.readonly_operator() {
+            nodes.push(operator);
+        }
+        for node in &nodes {
+            if let Some(cached) = self
+                .store
+                .type_node_links(*node)
+                .and_then(|links| links.resolved_type)
+                && cached != resolved
+            {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidCachedTupleType(cached),
+                ));
+            }
+        }
+        for node in nodes {
+            let mut links = self
+                .store
+                .type_node_links(node)
+                .cloned()
+                .unwrap_or_default();
+            links.resolved_type = Some(resolved);
+            assert!(
+                self.store.set_type_node_links(node, links),
+                "preflighted tuple type-node publication is infallible"
+            );
+        }
+        Ok(())
     }
 
     fn execute_function_type(
@@ -5423,6 +5757,29 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 return None;
             };
             node = NodeRef::new(node.arena, node.file, parenthesized.type_);
+        }
+    }
+
+    fn direct_tuple_type_plan_node(
+        &self,
+        mut node: NodeRef,
+        plan: &TypeQueryPlan,
+    ) -> Option<NodeRef> {
+        loop {
+            if plan.tuples.contains_key(&node) {
+                return Some(node);
+            }
+            match &self.host.node(node)?.data {
+                NodeData::ParenthesizedTypeNode(parenthesized) => {
+                    node = NodeRef::new(node.arena, node.file, parenthesized.type_);
+                }
+                NodeData::TypeOperatorNode(operator)
+                    if operator.operator == SyntaxKind::ReadonlyKeyword =>
+                {
+                    node = NodeRef::new(node.arena, node.file, operator.type_);
+                }
+                _ => return None,
+            }
         }
     }
 
@@ -15331,6 +15688,245 @@ mod tests {
             functions::StoredFunctionTypeValidation::Valid(_)
         ));
         assert_eq!(fixture.store.callable_signature_parameter_types_len(), 2);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn tuple_aliases_preserve_labels_optionality_and_warm_identity() {
+        let mut fixture = fixture_with_intrinsic(
+            "type Pair = [left: string, right?: number];",
+            IntrinsicBootstrapOptions {
+                strict_null_checks: true,
+                exact_optional_property_types: true,
+            },
+        );
+        let alias = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Pair");
+        let tuple = alias_parts(&fixture, "Pair").2;
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let first = query_declared(
+            &mut fixture,
+            alias,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+        let string = bootstrap.string_type;
+        let missing = bootstrap.missing_type;
+        let (element_types, infos) = {
+            let shape = fixture.store.canonical_tuple_shape(first).unwrap().unwrap();
+            assert!(!shape.is_readonly());
+            (
+                shape.element_types().to_vec(),
+                shape.element_infos().to_vec(),
+            )
+        };
+        assert_eq!(element_types[0], string);
+        let TypeData::Union(optional) =
+            fixture.store.type_payload(element_types[1]).unwrap().data()
+        else {
+            panic!("strict optional tuple element must include the missing sentinel")
+        };
+        assert!(optional.union.types.contains(&missing));
+        assert_eq!(
+            infos.iter().map(|info| info.flags()).collect::<Vec<_>>(),
+            [ElementFlags::REQUIRED, ElementFlags::OPTIONAL]
+        );
+        assert!(infos.iter().all(|info| {
+            info.labeled_declaration().is_some_and(|label| {
+                fixture.parsed.arena.get(label.node).unwrap().kind == SyntaxKind::NamedTupleMember
+            })
+        }));
+        assert_eq!(
+            fixture
+                .store
+                .type_node_links(tuple)
+                .and_then(|links| links.resolved_type),
+            Some(first)
+        );
+        let warm = store_state(&fixture.store);
+        assert_eq!(
+            query_declared(
+                &mut fixture,
+                alias,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Ok(first)
+        );
+        assert_eq!(store_state(&fixture.store), warm);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn readonly_tuple_alias_publishes_operator_and_inner_identity() {
+        let mut fixture = fixture_with_intrinsic(
+            "type Frozen = readonly [name: string, count?: number];",
+            IntrinsicBootstrapOptions {
+                strict_null_checks: true,
+                exact_optional_property_types: false,
+            },
+        );
+        let alias = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Frozen");
+        let operator = alias_parts(&fixture, "Frozen").2;
+        let NodeData::TypeOperatorNode(operator_data) =
+            &fixture.parsed.arena.get(operator.node).unwrap().data
+        else {
+            panic!("expected readonly type operator")
+        };
+        let tuple = NodeRef::new(operator.arena, operator.file, operator_data.type_);
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let resolved = query_declared(
+            &mut fixture,
+            alias,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        let shape = fixture
+            .store
+            .canonical_tuple_shape(resolved)
+            .unwrap()
+            .unwrap();
+        assert!(shape.is_readonly());
+        assert_eq!(shape.element_infos()[1].flags(), ElementFlags::OPTIONAL);
+        for node in [operator, tuple] {
+            assert_eq!(
+                fixture
+                    .store
+                    .type_node_links(node)
+                    .and_then(|links| links.resolved_type),
+                Some(resolved)
+            );
+        }
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn tuple_warm_cache_mismatch_is_rejected_atomically() {
+        let mut fixture = fixture("let text: [string]; let count: [number];");
+        let text = variable_type_node(&fixture, "text");
+        let count = variable_type_node(&fixture, "count");
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let text_type = query_node(&mut fixture, text, &mut diagnostics).unwrap();
+        assert!(fixture.store.set_type_node_links(
+            count,
+            TypeNodeLinks {
+                resolved_type: Some(text_type),
+                ..TypeNodeLinks::default()
+            },
+        ));
+        let before = (
+            store_state(&fixture.store),
+            fixture.store.symbol_len(),
+            fixture.store.canonical_tuple_target_len(),
+        );
+        assert_eq!(
+            query_node(&mut fixture, count, &mut diagnostics),
+            Err(DeclaredTypeError::TypeNodeUnavailable(
+                TypeNodeUnavailable::InvalidCachedTupleType(text_type)
+            ))
+        );
+        assert_eq!(
+            (
+                store_state(&fixture.store),
+                fixture.store.symbol_len(),
+                fixture.store.canonical_tuple_target_len(),
+            ),
+            before
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn tuple_required_after_optional_is_an_atomic_order_boundary() {
+        let mut fixture = fixture("let invalid: [first?: string, second: number];");
+        let tuple = variable_type_node(&fixture, "invalid");
+        let NodeData::TupleTypeNode(tuple_data) =
+            &fixture.parsed.arena.get(tuple.node).unwrap().data
+        else {
+            panic!("expected tuple type")
+        };
+        let second = NodeRef::new(tuple.arena, tuple.file, tuple_data.elements.nodes[1]);
+        let before = (
+            store_state(&fixture.store),
+            fixture.store.symbol_len(),
+            fixture.store.canonical_tuple_target_len(),
+        );
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        assert_eq!(
+            query_node(&mut fixture, tuple, &mut diagnostics),
+            Err(DeclaredTypeError::TypeNodeUnavailable(
+                TypeNodeUnavailable::UnsupportedTupleElementOrder {
+                    tuple,
+                    element: second,
+                    index: 1,
+                }
+            ))
+        );
+        assert_eq!(
+            (
+                store_state(&fixture.store),
+                fixture.store.symbol_len(),
+                fixture.store.canonical_tuple_target_len(),
+            ),
+            before
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn unnamed_array_rest_requires_and_uses_authoritative_global_targets() {
+        let mut fixture = global_array_fixture(
+            "let values: [string, ...number[]]; let only: readonly [...number[]];",
+        );
+        let global_types = initialize_fixture_global_types(&mut fixture);
+        let values = variable_type_node(&fixture, "values");
+        let only = variable_type_node(&fixture, "only");
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        assert!(matches!(
+            query_node(&mut fixture, values, &mut diagnostics),
+            Err(DeclaredTypeError::TypeNodeUnavailable(
+                TypeNodeUnavailable::UnsupportedSyntax {
+                    kind: SyntaxKind::RestType,
+                    ..
+                }
+            ))
+        ));
+        let values_type =
+            query_global_node(&mut fixture, &global_types, values, &mut diagnostics).unwrap();
+        let values_shape = fixture
+            .store
+            .canonical_tuple_shape(values_type)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            values_shape
+                .element_infos()
+                .iter()
+                .map(|info| info.flags())
+                .collect::<Vec<_>>(),
+            [ElementFlags::REQUIRED, ElementFlags::REST]
+        );
+        let only_type =
+            query_global_node(&mut fixture, &global_types, only, &mut diagnostics).unwrap();
+        assert!(
+            fixture
+                .store
+                .canonical_tuple_shape(only_type)
+                .unwrap()
+                .is_none()
+        );
+        let only_array = fixture
+            .store
+            .canonical_array_reference(&global_types, only_type)
+            .unwrap()
+            .unwrap();
+        assert!(only_array.readonly);
+        assert_eq!(
+            only_array.element_type,
+            fixture.store.intrinsic_bootstrap().unwrap().number_type
+        );
         assert!(diagnostics.is_empty());
     }
 }

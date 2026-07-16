@@ -56,6 +56,7 @@ mod source_properties;
 mod source_statements;
 mod spelling;
 mod store;
+mod tuple_type_nodes;
 mod tuple_types;
 pub mod type_nodes;
 pub mod type_records;
