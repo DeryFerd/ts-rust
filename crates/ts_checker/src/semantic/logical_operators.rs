@@ -11,11 +11,11 @@ use ts_ast::SyntaxKind;
 use ts_jsnum::Number;
 
 use super::{
+    CanonicalGlobalTypes, CanonicalTypeMapperStore, TypeId,
     bootstrap::{LiteralTypeCacheError, UnionReduction},
     enums::canonical_enum_type_owner,
     type_records::{LiteralValue, TypeData, TypeRecord},
     types::TypeFlags,
-    CanonicalGlobalTypes, CanonicalTypeMapperStore, TypeId,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -51,6 +51,13 @@ pub(super) enum LogicalBinaryError {
     Unsupported(LogicalBinaryUnsupported),
     Invariant(LogicalBinaryInvariant),
     Literal(LiteralTypeCacheError),
+}
+
+/// The truthiness fact assumed while evaluating one control-flow branch.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum TruthinessAssumption {
+    Truthy,
+    Falsy,
 }
 
 impl From<LogicalBinaryInvariant> for LogicalBinaryError {
@@ -191,17 +198,19 @@ pub(super) fn narrow_logical_right_operand(
         .options
         .strict_null_checks;
     match operator {
-        SyntaxKind::AmpersandAmpersandToken => {
-            let truthy =
-                remove_definitely_falsy_types(store, global_types, left_type, strict_null_checks)?;
-            get_non_nullable_type(store, global_types, truthy, strict_null_checks)
-        }
-        SyntaxKind::BarBarToken => filter_union_leaves(
+        SyntaxKind::AmpersandAmpersandToken => narrow_by_truthiness_with_strict_null_checks(
             store,
             global_types,
             left_type,
-            UnionReduction::Literal,
-            |store, leaf| Ok(logical_type_facts(store, leaf, strict_null_checks)?.falsy),
+            TruthinessAssumption::Truthy,
+            strict_null_checks,
+        ),
+        SyntaxKind::BarBarToken => narrow_by_truthiness_with_strict_null_checks(
+            store,
+            global_types,
+            left_type,
+            TruthinessAssumption::Falsy,
+            strict_null_checks,
         ),
         SyntaxKind::QuestionQuestionToken => {
             narrow_nullish_right(store, global_types, left_type, strict_null_checks)
@@ -209,6 +218,50 @@ pub(super) fn narrow_logical_right_operand(
         operator => Err(LogicalBinaryError::Unsupported(
             LogicalBinaryUnsupported::Operator(operator),
         )),
+    }
+}
+
+/// Narrows a type by the truthiness fact established on a control-flow edge.
+pub(super) fn narrow_by_truthiness(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: Option<&CanonicalGlobalTypes>,
+    type_: TypeId,
+    assumption: TruthinessAssumption,
+) -> Result<TypeId, LogicalBinaryError> {
+    let strict_null_checks = store
+        .intrinsic_bootstrap()
+        .ok_or(LogicalBinaryInvariant::MissingBootstrap)?
+        .options
+        .strict_null_checks;
+    narrow_by_truthiness_with_strict_null_checks(
+        store,
+        global_types,
+        type_,
+        assumption,
+        strict_null_checks,
+    )
+}
+
+fn narrow_by_truthiness_with_strict_null_checks(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: Option<&CanonicalGlobalTypes>,
+    type_: TypeId,
+    assumption: TruthinessAssumption,
+    strict_null_checks: bool,
+) -> Result<TypeId, LogicalBinaryError> {
+    match assumption {
+        TruthinessAssumption::Truthy => {
+            let truthy =
+                remove_definitely_falsy_types(store, global_types, type_, strict_null_checks)?;
+            get_non_nullable_type(store, global_types, truthy, strict_null_checks)
+        }
+        TruthinessAssumption::Falsy => filter_union_leaves(
+            store,
+            global_types,
+            type_,
+            UnionReduction::Literal,
+            |store, leaf| Ok(logical_type_facts(store, leaf, strict_null_checks)?.falsy),
+        ),
     }
 }
 
@@ -621,7 +674,7 @@ mod tests {
 
     use super::*;
     use crate::semantic::{
-        mapper::TypeMapper, type_records::TypeRecord, IntrinsicBootstrapOptions, SemanticStore,
+        IntrinsicBootstrapOptions, SemanticStore, mapper::TypeMapper, type_records::TypeRecord,
     };
 
     fn initialized_store(strict_null_checks: bool) -> CanonicalTypeMapperStore {
@@ -767,6 +820,45 @@ mod tests {
     }
 
     #[test]
+    fn logical_rhs_narrowing_delegates_to_shared_truthiness_facts() {
+        let mut store = initialized_store(true);
+        let empty = store.regular_string_literal_type(String::new()).unwrap();
+        let present = store
+            .regular_string_literal_type("present".to_owned())
+            .unwrap();
+        let undefined = store.intrinsic_bootstrap().unwrap().undefined_type;
+        let input = store
+            .literal_union_type(&[empty, present, undefined], None)
+            .unwrap();
+
+        let truthy =
+            narrow_by_truthiness(&mut store, None, input, TruthinessAssumption::Truthy).unwrap();
+        assert_eq!(truthy, present);
+        assert_eq!(
+            narrow_logical_right_operand(
+                &mut store,
+                None,
+                SyntaxKind::AmpersandAmpersandToken,
+                input,
+            )
+            .unwrap(),
+            truthy,
+        );
+
+        let falsy =
+            narrow_by_truthiness(&mut store, None, input, TruthinessAssumption::Falsy).unwrap();
+        let falsy_types = union_types(&store, falsy);
+        assert_eq!(falsy_types.len(), 2);
+        assert!(falsy_types.contains(&empty));
+        assert!(falsy_types.contains(&undefined));
+        assert_eq!(
+            narrow_logical_right_operand(&mut store, None, SyntaxKind::BarBarToken, input,)
+                .unwrap(),
+            falsy,
+        );
+    }
+
+    #[test]
     fn non_strict_and_uses_the_right_base_literal_falsy_projection() {
         let mut store = initialized_store(false);
         let right = store
@@ -822,6 +914,19 @@ mod tests {
             ),
             Err(LogicalBinaryError::Unsupported(
                 LogicalBinaryUnsupported::Operator(SyntaxKind::PlusToken),
+            )),
+        );
+    }
+
+    #[test]
+    fn logical_rhs_narrowing_preserves_bootstrap_error_precedence() {
+        let initialized = initialized_store(true);
+        let type_ = initialized.intrinsic_bootstrap().unwrap().string_type;
+        let mut uninitialized = SemanticStore::<TypeRecord, TypeMapper>::new();
+        assert_eq!(
+            narrow_logical_right_operand(&mut uninitialized, None, SyntaxKind::PlusToken, type_,),
+            Err(LogicalBinaryError::Invariant(
+                LogicalBinaryInvariant::MissingBootstrap,
             )),
         );
     }
