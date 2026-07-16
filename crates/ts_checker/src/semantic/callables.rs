@@ -10,6 +10,7 @@
 use super::{
     CanonicalGlobalTypes, CanonicalTypeMapperStore, DeclaredTypeHost, SignatureId, TypeId,
     array_types::CanonicalArrayTargets,
+    callable_sets::{StoredCallableSetValidation, validate_stored_callable_set},
     functions::{
         FunctionTypeDisplayError, StoredFunctionTypeValidation, function_type_display_projection,
         validate_stored_function_type,
@@ -125,6 +126,49 @@ pub(super) fn single_callable_family(
 
 /// Validates an exact callable using only retained semantic-store state.
 pub(super) fn validate_stored_single_callable(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+) -> StoredSingleCallableValidation {
+    match validate_stored_callable_set(store, type_) {
+        StoredCallableSetValidation::NotCallable => StoredSingleCallableValidation::NotCallable,
+        StoredCallableSetValidation::Pending { family } => {
+            StoredSingleCallableValidation::Pending { family }
+        }
+        StoredCallableSetValidation::Malformed { family } => {
+            StoredSingleCallableValidation::Malformed { family }
+        }
+        StoredCallableSetValidation::Valid {
+            family,
+            projection,
+            edges,
+        } => {
+            if projection.owner != type_ {
+                return StoredSingleCallableValidation::Malformed { family };
+            }
+            if !projection.construct_signatures.is_empty() || projection.call_signatures.len() != 1
+            {
+                return StoredSingleCallableValidation::NotCallable;
+            }
+            let mut call_signatures = projection.call_signatures.into_vec();
+            let callable = call_signatures
+                .pop()
+                .expect("the exact-one callable shape was checked above");
+            StoredSingleCallableValidation::Valid {
+                family,
+                callable,
+                edges,
+            }
+        }
+    }
+}
+
+/// Provider dispatch used by the ordered callable-set boundary.
+///
+/// This remains separate from [`validate_stored_single_callable`] so the
+/// single-call compatibility adapter can consume a set without recursively
+/// dispatching back into itself. New callable families join the set dispatcher
+/// only after their own syntax, provenance, and publication caches are proven.
+pub(super) fn validate_stored_single_callable_provider(
     store: &CanonicalTypeMapperStore,
     type_: TypeId,
 ) -> StoredSingleCallableValidation {

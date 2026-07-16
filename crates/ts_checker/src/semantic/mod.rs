@@ -13,6 +13,7 @@ mod array_diagnostics;
 mod array_types;
 mod assignment;
 pub mod bootstrap;
+mod callable_sets;
 mod callables;
 mod calls;
 mod constraints;
