@@ -49,6 +49,10 @@ use super::{
         CanonicalTypeFormatFlags,
         get_type_names_for_assignability_error_with_host_global_types_and_flags,
     },
+    logical_operators::{
+        LogicalBinaryError, LogicalBinaryInvariant, LogicalBinaryRequest,
+        LogicalBinaryUnsupported, check_logical_binary, narrow_logical_right_operand,
+    },
     primitive_operators::{
         PrimitiveBigIntExponentiationTarget, PrimitiveBinaryError, PrimitiveBinaryRecovery,
         PrimitiveBinaryRequest, PrimitiveBinaryUnsupported, check_primitive_binary,
@@ -291,6 +295,7 @@ pub enum SourceCheckError {
     Import(NodeRef),
     Property(NodeRef),
     PrimitiveOperator(NodeRef),
+    LogicalOperator(NodeRef),
     MissingDiagnostic(u32),
 }
 
@@ -319,6 +324,9 @@ impl std::fmt::Display for SourceCheckError {
             Self::Property(node) => write!(formatter, "property checking failed at {node:?}"),
             Self::PrimitiveOperator(node) => {
                 write!(formatter, "primitive operator checking failed at {node:?}")
+            }
+            Self::LogicalOperator(node) => {
+                write!(formatter, "logical operator checking failed at {node:?}")
             }
             Self::MissingDiagnostic(code) => {
                 write!(formatter, "diagnostic TS{code} is absent from the catalog")
@@ -350,6 +358,7 @@ impl std::error::Error for SourceCheckError {
             | Self::Import(_)
             | Self::Property(_)
             | Self::PrimitiveOperator(_)
+            | Self::LogicalOperator(_)
             | Self::MissingDiagnostic(_) => None,
         }
     }
@@ -420,7 +429,48 @@ pub(super) struct PrimitiveBinaryPlan {
     right: PlannedExpression,
 }
 
+/// Fully preflighted logical/coalescing source shape with recursive operands.
+#[derive(Clone, Debug)]
+pub(super) struct LogicalBinaryPlan {
+    node: NodeRef,
+    left: PlannedExpression,
+    operator: SyntaxKind,
+    right: PlannedExpression,
+    parent: Option<DirectBinaryParent>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct LogicalGrammarDiagnostic {
+    node: NodeRef,
+    first: SyntaxKind,
+    second: SyntaxKind,
+}
+
+/// The direct, unparenthesized binary parent of one planned logical
+/// expression. TypeScript owns TS5076 on the `??` node, but selecting its
+/// diagnostic requires the surrounding binary operator and left operand.
+#[derive(Clone, Copy, Debug)]
+struct DirectBinaryParent {
+    left: NodeRef,
+    left_is_binary: bool,
+    operator: SyntaxKind,
+}
+
 impl PrimitiveBinaryPlan {
+    pub(super) const fn node(&self) -> NodeRef {
+        self.node
+    }
+
+    pub(super) const fn operator(&self) -> SyntaxKind {
+        self.operator
+    }
+
+    pub(super) const fn operands(&self) -> (&PlannedExpression, &PlannedExpression) {
+        (&self.left, &self.right)
+    }
+}
+
+impl LogicalBinaryPlan {
     pub(super) const fn node(&self) -> NodeRef {
         self.node
     }
@@ -463,6 +513,7 @@ pub(super) enum PlannedExpressionKind {
     Property(Box<SourcePropertyPlan>),
     Call(Box<SourceCallPlan>),
     Binary(Box<PrimitiveBinaryPlan>),
+    Logical(Box<LogicalBinaryPlan>),
 }
 
 /// A direct expression read of one clause-level type-only import. It remains
@@ -2485,7 +2536,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     PlannedExpressionKind::Parenthesized(Box::new(self.plan_expression(inner)?)),
                 ))
             }
-            SyntaxKind::BinaryExpression => self.plan_primitive_binary(expression),
+            SyntaxKind::BinaryExpression => self.plan_binary(expression),
             SyntaxKind::PrefixUnaryExpression => self.plan_prefix_unary(expression),
             SyntaxKind::TypeAssertionExpression | SyntaxKind::AsExpression => {
                 self.plan_assertion(expression)
@@ -2534,7 +2585,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         }
     }
 
-    fn plan_primitive_binary(
+    fn plan_binary(
         &mut self,
         expression: NodeRef,
     ) -> Result<PlannedExpression, SourceCheckError> {
@@ -2611,7 +2662,13 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             return Err(SourceCheckError::PrimitiveOperator(operator));
         }
         let operator_kind = operator_record.kind;
-        let Some(operator_text) = primitive_binary_operator_text(operator_kind) else {
+        let logical = matches!(
+            operator_kind,
+            SyntaxKind::AmpersandAmpersandToken
+                | SyntaxKind::BarBarToken
+                | SyntaxKind::QuestionQuestionToken
+        );
+        let Some(operator_text) = binary_operator_text(operator_kind) else {
             return Err(self.unsupported(
                 operator,
                 operator_kind,
@@ -2619,26 +2676,48 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             ));
         };
         if !self.source_spelling_matches(operator, operator_text) {
-            return Err(SourceCheckError::PrimitiveOperator(operator));
+            return Err(if logical {
+                SourceCheckError::LogicalOperator(operator)
+            } else {
+                SourceCheckError::PrimitiveOperator(operator)
+            });
         }
 
-        let left_plan = self.plan_expression(left)?;
-        if !primitive_binary_operand_plan_is_supported(&left_plan) {
+        let mut left_plan = self.plan_expression(left)?;
+        if !logical && !primitive_binary_operand_plan_is_supported(&left_plan) {
             return Err(self.unsupported(left, left_kind, SourceSyntaxRole::BinaryOperand));
         }
-        let right_plan = self.plan_expression(right)?;
-        if !primitive_binary_operand_plan_is_supported(&right_plan) {
+        let mut right_plan = self.plan_expression(right)?;
+        if !logical && !primitive_binary_operand_plan_is_supported(&right_plan) {
             return Err(self.unsupported(right, right_kind, SourceSyntaxRole::BinaryOperand));
         }
-        Ok(PlannedExpression::new(
-            expression,
+        let parent = DirectBinaryParent {
+            left: left_plan.node,
+            left_is_binary: matches!(
+                &left_plan.kind,
+                PlannedExpressionKind::Binary(_) | PlannedExpressionKind::Logical(_)
+            ),
+            operator: operator_kind,
+        };
+        set_direct_binary_parent(&mut left_plan, parent);
+        set_direct_binary_parent(&mut right_plan, parent);
+        let kind = if logical {
+            PlannedExpressionKind::Logical(Box::new(LogicalBinaryPlan {
+                node: expression,
+                left: left_plan,
+                operator: operator_kind,
+                right: right_plan,
+                parent: None,
+            }))
+        } else {
             PlannedExpressionKind::Binary(Box::new(PrimitiveBinaryPlan {
                 node: expression,
                 left: left_plan,
                 operator: operator_kind,
                 right: right_plan,
-            })),
-        ))
+            }))
+        };
+        Ok(PlannedExpression::new(expression, kind))
     }
 
     fn primitive_binary_position_is_supported(
@@ -3146,6 +3225,11 @@ fn primitive_binary_operand_plan_is_supported(expression: &PlannedExpression) ->
                 && primitive_binary_operand_plan_is_supported(&binary.left)
                 && primitive_binary_operand_plan_is_supported(&binary.right)
         }
+        PlannedExpressionKind::Logical(logical) => {
+            logical.node == expression.node
+                && primitive_binary_operand_plan_is_supported(&logical.left)
+                && primitive_binary_operand_plan_is_supported(&logical.right)
+        }
         PlannedExpressionKind::Null
         | PlannedExpressionKind::GlobalUndefined
         | PlannedExpressionKind::TypeImportValueUse(_)
@@ -3174,6 +3258,71 @@ pub(super) const fn primitive_binary_operator_text(kind: SyntaxKind) -> Option<&
         SyntaxKind::ExclamationEqualsEqualsToken => Some("!=="),
         _ => None,
     }
+}
+
+pub(super) const fn logical_binary_operator_text(kind: SyntaxKind) -> Option<&'static str> {
+    match kind {
+        SyntaxKind::AmpersandAmpersandToken => Some("&&"),
+        SyntaxKind::BarBarToken => Some("||"),
+        SyntaxKind::QuestionQuestionToken => Some("??"),
+        _ => None,
+    }
+}
+
+const fn binary_operator_text(kind: SyntaxKind) -> Option<&'static str> {
+    match logical_binary_operator_text(kind) {
+        Some(text) => Some(text),
+        None => primitive_binary_operator_text(kind),
+    }
+}
+
+fn set_direct_binary_parent(expression: &mut PlannedExpression, parent: DirectBinaryParent) {
+    if let PlannedExpressionKind::Logical(binary) = &mut expression.kind {
+        binary.parent = Some(parent);
+    }
+}
+
+fn logical_mix_grammar_diagnostic(
+    binary: &LogicalBinaryPlan,
+) -> Option<LogicalGrammarDiagnostic> {
+    fn direct_logical(expression: &PlannedExpression) -> Option<&LogicalBinaryPlan> {
+        let PlannedExpressionKind::Logical(binary) = &expression.kind else {
+            return None;
+        };
+        Some(binary)
+    }
+
+    if binary.operator != SyntaxKind::QuestionQuestionToken {
+        return None;
+    }
+    if let Some(parent) = binary.parent {
+        return (parent.left_is_binary && parent.operator == SyntaxKind::BarBarToken).then_some(
+            LogicalGrammarDiagnostic {
+                node: parent.left,
+                first: binary.operator,
+                second: parent.operator,
+            },
+        );
+    }
+    if let Some(left) = direct_logical(&binary.left).filter(|left| {
+        matches!(
+            left.operator,
+            SyntaxKind::AmpersandAmpersandToken | SyntaxKind::BarBarToken
+        )
+    }) {
+        return Some(LogicalGrammarDiagnostic {
+            node: left.node,
+            first: left.operator,
+            second: binary.operator,
+        });
+    }
+    direct_logical(&binary.right)
+        .filter(|right| right.operator == SyntaxKind::AmpersandAmpersandToken)
+        .map(|right| LogicalGrammarDiagnostic {
+            node: right.node,
+            first: binary.operator,
+            second: right.operator,
+        })
 }
 
 #[cfg(test)]
@@ -3800,6 +3949,78 @@ fn check_expression_type(
             preflighted_type_import_value_uses,
             read,
         ),
+        PlannedExpressionKind::Logical(binary) => {
+            let left_contextual_type = match binary.operator {
+                SyntaxKind::BarBarToken | SyntaxKind::QuestionQuestionToken => contextual_type,
+                SyntaxKind::AmpersandAmpersandToken => None,
+                _ => return Err(SourceCheckError::LogicalOperator(binary.node)),
+            };
+            let left = check_expression_type(
+                store,
+                host,
+                global_types,
+                source,
+                options,
+                diagnostics,
+                current_flow_types,
+                preflighted_type_import_value_uses,
+                &binary.left,
+                left_contextual_type,
+                deferred,
+            )?;
+            let narrowed_flow_types = narrow_logical_right_flow_types(
+                store,
+                host,
+                global_types,
+                binary,
+                current_flow_types,
+            )?;
+            let right_contextual_type = match binary.operator {
+                SyntaxKind::AmpersandAmpersandToken => contextual_type,
+                SyntaxKind::BarBarToken | SyntaxKind::QuestionQuestionToken => {
+                    contextual_type.or(Some(left.result))
+                }
+                _ => return Err(SourceCheckError::LogicalOperator(binary.node)),
+            };
+            let right = check_expression_type(
+                store,
+                host,
+                global_types,
+                source,
+                options,
+                diagnostics,
+                narrowed_flow_types
+                    .as_ref()
+                    .unwrap_or(current_flow_types),
+                preflighted_type_import_value_uses,
+                &binary.right,
+                right_contextual_type,
+                deferred,
+            )?;
+            emit_logical_grammar_diagnostic(diagnostics, binary)?;
+            emit_logical_operand_diagnostics(
+                store,
+                host,
+                diagnostics,
+                binary,
+                left.result,
+            )?;
+            let resolution = check_logical_binary(
+                store,
+                Some(global_types),
+                LogicalBinaryRequest {
+                    operator: binary.operator,
+                    left_type: left.result,
+                    right_type: right.result,
+                },
+            )
+            .map_err(|error| logical_binary_check_error(host, binary, &error))?;
+            publish_expression_type(store, binary.node, resolution.result_type)?;
+            Ok(CheckedExpressionTypes::leaf(
+                resolution.result_type,
+                resolution.result_type,
+            ))
+        }
         PlannedExpressionKind::Binary(binary) => {
             let left = check_expression_type(
                 store,
@@ -3979,6 +4200,280 @@ fn check_expression_type(
                 &prepared,
             )
         }
+    }
+}
+
+fn narrow_logical_right_flow_types(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    binary: &LogicalBinaryPlan,
+    current_flow_types: &HashMap<SemanticSymbolId, TypeId>,
+) -> Result<Option<HashMap<SemanticSymbolId, TypeId>>, SourceCheckError> {
+    fn collect<'a>(
+        expression: &'a PlannedExpression,
+        operator: SyntaxKind,
+        reads: &mut Vec<&'a PlannedIdentifierRead>,
+    ) {
+        let expression = expression.unparenthesized();
+        match &expression.kind {
+            PlannedExpressionKind::Identifier(read)
+                if read.kind == PlannedIdentifierReadKind::Variable =>
+            {
+                reads.push(read);
+            }
+            PlannedExpressionKind::Logical(logical) if logical.operator == operator => {
+                collect(&logical.left, operator, reads);
+                collect(&logical.right, operator, reads);
+            }
+            _ => {}
+        }
+    }
+
+    let mut reads = Vec::new();
+    collect(&binary.left, binary.operator, &mut reads);
+    if reads.is_empty() {
+        return Ok(None);
+    }
+    let mut narrowed = current_flow_types.clone();
+    let mut seen = HashSet::new();
+    for read in reads {
+        if !seen.insert(read.value_symbol) {
+            continue;
+        }
+        let current = *current_flow_types.get(&read.value_symbol).ok_or(
+            SourceCheckError::Variable(VariableInvariant::MissingCurrentFlowType(
+                read.value_symbol,
+            )),
+        )?;
+        let type_ = narrow_logical_right_operand(
+            store,
+            Some(global_types),
+            binary.operator,
+            current,
+        )
+        .map_err(|error| logical_binary_check_error(host, binary, &error))?;
+        narrowed.insert(read.value_symbol, type_);
+    }
+    Ok(Some(narrowed))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PredicateSemantics {
+    Always,
+    Never,
+    Sometimes,
+}
+
+fn emit_logical_grammar_diagnostic(
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    binary: &LogicalBinaryPlan,
+) -> Result<(), SourceCheckError> {
+    let Some(grammar) = logical_mix_grammar_diagnostic(binary) else {
+        return Ok(());
+    };
+    let first = logical_binary_operator_text(grammar.first)
+        .ok_or(SourceCheckError::LogicalOperator(binary.node))?;
+    let second = logical_binary_operator_text(grammar.second)
+        .ok_or(SourceCheckError::LogicalOperator(binary.node))?;
+    let message = message_by_code(5076).ok_or(SourceCheckError::MissingDiagnostic(5076))?;
+    merge_retry_diagnostic(
+        diagnostics,
+        CanonicalCheckerDiagnostic {
+            node: Some(grammar.node),
+            range_override: None,
+            diagnostic: Diagnostic::with_arguments(message, [first, second]),
+            related_information: Vec::new(),
+        },
+    );
+    Ok(())
+}
+
+fn emit_logical_operand_diagnostics(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    binary: &LogicalBinaryPlan,
+    left_type: TypeId,
+) -> Result<(), SourceCheckError> {
+    match binary.operator {
+        SyntaxKind::AmpersandAmpersandToken | SyntaxKind::BarBarToken => {
+            let flags = store
+                .type_payload(left_type)
+                .map(TypeRecord::flags)
+                .ok_or(SourceCheckError::LogicalOperator(binary.node))?;
+            if flags.intersects(TypeFlags::VOID) {
+                issue_node_diagnostic(diagnostics, binary.left.node, 1345)?;
+                return Ok(());
+            }
+            match syntactic_truthiness(host, &binary.left) {
+                PredicateSemantics::Always => {
+                    issue_node_diagnostic(diagnostics, binary.left.node, 2872)?;
+                }
+                PredicateSemantics::Never => {
+                    issue_node_diagnostic(diagnostics, binary.left.node, 2873)?;
+                }
+                PredicateSemantics::Sometimes => {}
+            }
+        }
+        SyntaxKind::QuestionQuestionToken => {
+            let left_target = outer_expression_target(&binary.left);
+            match syntactic_nullishness(left_target) {
+                PredicateSemantics::Always => {
+                    issue_node_diagnostic(diagnostics, left_target.node, 2871)?;
+                }
+                PredicateSemantics::Never => {
+                    issue_node_diagnostic(diagnostics, left_target.node, 2869)?;
+                }
+                PredicateSemantics::Sometimes => {}
+            }
+        }
+        _ => return Err(SourceCheckError::LogicalOperator(binary.node)),
+    }
+    Ok(())
+}
+
+fn outer_expression_target(mut expression: &PlannedExpression) -> &PlannedExpression {
+    loop {
+        expression = match &expression.kind {
+            PlannedExpressionKind::Parenthesized(inner)
+            | PlannedExpressionKind::Assertion { operand: inner, .. } => inner,
+            _ => return expression,
+        };
+    }
+}
+
+fn issue_node_diagnostic(
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    node: NodeRef,
+    code: u32,
+) -> Result<(), SourceCheckError> {
+    let message = message_by_code(code).ok_or(SourceCheckError::MissingDiagnostic(code))?;
+    merge_retry_diagnostic(
+        diagnostics,
+        CanonicalCheckerDiagnostic {
+            node: Some(node),
+            range_override: None,
+            diagnostic: Diagnostic::new(message),
+            related_information: Vec::new(),
+        },
+    );
+    Ok(())
+}
+
+fn syntactic_truthiness(
+    host: &DeclaredTypeHost<'_>,
+    expression: &PlannedExpression,
+) -> PredicateSemantics {
+    match &expression.kind {
+        PlannedExpressionKind::Parenthesized(inner)
+        | PlannedExpressionKind::Assertion { operand: inner, .. } => {
+            syntactic_truthiness(host, inner)
+        }
+        PlannedExpressionKind::Number { .. }
+            if host.node(expression.node).is_some_and(|node| {
+                matches!(
+                    &node.data,
+                    NodeData::NumericLiteral(literal)
+                        if literal.text == "0" || literal.text == "1"
+                )
+            }) =>
+        {
+            PredicateSemantics::Sometimes
+        }
+        PlannedExpressionKind::Number { .. }
+            if host
+                .node(expression.node)
+                .is_some_and(|node| node.kind == SyntaxKind::NumericLiteral) =>
+        {
+            PredicateSemantics::Always
+        }
+        PlannedExpressionKind::Array(_)
+        | PlannedExpressionKind::Object { .. }
+        | PlannedExpressionKind::BigInt { .. } => PredicateSemantics::Always,
+        PlannedExpressionKind::Null | PlannedExpressionKind::GlobalUndefined => {
+            PredicateSemantics::Never
+        }
+        PlannedExpressionKind::String(value) => {
+            if value.is_empty() {
+                PredicateSemantics::Never
+            } else {
+                PredicateSemantics::Always
+            }
+        }
+        PlannedExpressionKind::Boolean(_)
+        | PlannedExpressionKind::Identifier(_)
+        | PlannedExpressionKind::TypeImportValueUse(_)
+        | PlannedExpressionKind::Property(_)
+        | PlannedExpressionKind::Call(_)
+        | PlannedExpressionKind::Binary(_)
+        | PlannedExpressionKind::Logical(_)
+        | PlannedExpressionKind::Number { .. } => PredicateSemantics::Sometimes,
+    }
+}
+
+fn syntactic_nullishness(expression: &PlannedExpression) -> PredicateSemantics {
+    match &expression.kind {
+        PlannedExpressionKind::Parenthesized(inner)
+        | PlannedExpressionKind::Assertion { operand: inner, .. } => {
+            syntactic_nullishness(inner)
+        }
+        PlannedExpressionKind::Null | PlannedExpressionKind::GlobalUndefined => {
+            PredicateSemantics::Always
+        }
+        PlannedExpressionKind::Identifier(_)
+        | PlannedExpressionKind::TypeImportValueUse(_)
+        | PlannedExpressionKind::Property(_)
+        | PlannedExpressionKind::Call(_) => PredicateSemantics::Sometimes,
+        PlannedExpressionKind::Logical(binary) => match binary.operator {
+            SyntaxKind::AmpersandAmpersandToken | SyntaxKind::BarBarToken => {
+                PredicateSemantics::Sometimes
+            }
+            SyntaxKind::QuestionQuestionToken => syntactic_nullishness(&binary.right),
+            _ => PredicateSemantics::Never,
+        },
+        PlannedExpressionKind::String(_)
+        | PlannedExpressionKind::Number { .. }
+        | PlannedExpressionKind::BigInt { .. }
+        | PlannedExpressionKind::Boolean(_)
+        | PlannedExpressionKind::Array(_)
+        | PlannedExpressionKind::Object { .. }
+        | PlannedExpressionKind::Binary(_) => PredicateSemantics::Never,
+    }
+}
+
+fn logical_binary_check_error(
+    host: &DeclaredTypeHost<'_>,
+    binary: &LogicalBinaryPlan,
+    error: &LogicalBinaryError,
+) -> SourceCheckError {
+    match error {
+        LogicalBinaryError::Unsupported(LogicalBinaryUnsupported::Operator(kind)) => {
+            SourceCheckError::Unsupported(UnsupportedSourceSyntax::Syntax {
+                node: binary.node,
+                kind: *kind,
+                role: SourceSyntaxRole::BinaryOperator,
+            })
+        }
+        LogicalBinaryError::Unsupported(LogicalBinaryUnsupported::Type(_)) => {
+            let node = binary.left.node;
+            SourceCheckError::Unsupported(UnsupportedSourceSyntax::Syntax {
+                node,
+                kind: host.node(node).map_or(SyntaxKind::Unknown, |record| record.kind),
+                role: SourceSyntaxRole::BinaryOperand,
+            })
+        }
+        #[cfg(not(test))]
+        LogicalBinaryError::Unsupported(LogicalBinaryUnsupported::MissingGlobalTypes) => {
+            SourceCheckError::LogicalOperator(binary.node)
+        }
+        LogicalBinaryError::Invariant(
+            LogicalBinaryInvariant::MissingBootstrap
+            | LogicalBinaryInvariant::InvalidType(_)
+            | LogicalBinaryInvariant::CyclicUnion(_)
+            | LogicalBinaryInvariant::InvalidUnion(_),
+        ) => SourceCheckError::LogicalOperator(binary.node),
+        LogicalBinaryError::Literal(error) => (*error).into(),
     }
 }
 

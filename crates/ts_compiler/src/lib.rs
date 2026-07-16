@@ -454,6 +454,7 @@ fn source_check_error_is_unsupported(error: &SourceCheckError) -> bool {
         | SourceCheckError::Import(_)
         | SourceCheckError::Property(_)
         | SourceCheckError::PrimitiveOperator(_)
+        | SourceCheckError::LogicalOperator(_)
         | SourceCheckError::MissingDiagnostic(_) => false,
     }
 }

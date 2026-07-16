@@ -29,6 +29,7 @@ pub mod ids;
 mod inference;
 mod instantiate;
 pub mod links;
+mod logical_operators;
 pub mod mapper;
 mod merge;
 pub mod module_resolution;

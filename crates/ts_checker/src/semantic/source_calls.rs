@@ -32,7 +32,8 @@ use super::{
     inference::{NakedTypeCandidateError, NakedTypeInferenceError},
     source::{
         PlannedExpression, PlannedExpressionKind, SourceCheckError, UnsupportedSourceSyntax,
-        merge_retry_diagnostic, merge_retry_diagnostics, primitive_binary_operator_text,
+        logical_binary_operator_text, merge_retry_diagnostic, merge_retry_diagnostics,
+        primitive_binary_operator_text,
     },
     source_callables::{StoredSourceCallableValidation, validate_stored_source_callable},
     type_nodes::CanonicalTypeQuery,
@@ -376,9 +377,55 @@ fn is_context_insensitive_argument_syntax(arena: &NodeArena, node: NodeRef) -> b
                         if identifier.flow_node.is_none() && !identifier.text.is_empty()
                 )
         }
-        SyntaxKind::BinaryExpression => is_context_insensitive_primitive_binary_syntax(arena, node),
+        SyntaxKind::BinaryExpression => {
+            is_context_insensitive_primitive_binary_syntax(arena, node)
+                || is_context_insensitive_logical_binary_syntax(arena, node)
+        }
         _ => false,
     }
+}
+
+fn is_context_insensitive_logical_binary_syntax(arena: &NodeArena, node: NodeRef) -> bool {
+    let Some(record) = arena.get(node.node) else {
+        return false;
+    };
+    let NodeData::BinaryExpression(binary) = &record.data else {
+        return false;
+    };
+    if record.kind != SyntaxKind::BinaryExpression
+        || record.flags.0 != 0
+        || binary.symbol.is_some()
+        || binary.type_.is_some()
+        || binary.facts != 0
+        || binary.modifiers.is_some()
+    {
+        return false;
+    }
+    let Some(left) = arena.get(binary.left) else {
+        return false;
+    };
+    let Some(operator) = arena.get(binary.operator_token) else {
+        return false;
+    };
+    let Some(right) = arena.get(binary.right) else {
+        return false;
+    };
+    left.parent == Some(node.node)
+        && operator.parent == Some(node.node)
+        && right.parent == Some(node.node)
+        && left.range.end <= operator.range.start
+        && operator.range.end <= right.range.start
+        && operator.flags.0 == 0
+        && matches!(operator.data, NodeData::Token(_))
+        && logical_binary_operator_text(operator.kind).is_some()
+        && is_context_insensitive_argument_syntax(
+            arena,
+            NodeRef::new(node.arena, node.file, binary.left),
+        )
+        && is_context_insensitive_argument_syntax(
+            arena,
+            NodeRef::new(node.arena, node.file, binary.right),
+        )
 }
 
 fn is_context_insensitive_primitive_binary_syntax(arena: &NodeArena, node: NodeRef) -> bool {
@@ -488,6 +535,13 @@ fn is_context_insensitive_argument_plan(expression: &PlannedExpression) -> bool 
                 && is_context_insensitive_primitive_binary_operand_plan(left)
                 && is_context_insensitive_primitive_binary_operand_plan(right)
         }
+        PlannedExpressionKind::Logical(binary) => {
+            let (left, right) = binary.operands();
+            binary.node() == expression.node
+                && logical_binary_operator_text(binary.operator()).is_some()
+                && is_context_insensitive_argument_plan(left)
+                && is_context_insensitive_argument_plan(right)
+        }
         PlannedExpressionKind::Assertion { .. }
         | PlannedExpressionKind::TypeImportValueUse(_)
         | PlannedExpressionKind::Array(_)
@@ -510,6 +564,13 @@ fn is_context_insensitive_primitive_binary_operand_plan(expression: &PlannedExpr
             let (left, right) = binary.operands();
             binary.node() == expression.node
                 && primitive_binary_operator_text(binary.operator()).is_some()
+                && is_context_insensitive_primitive_binary_operand_plan(left)
+                && is_context_insensitive_primitive_binary_operand_plan(right)
+        }
+        PlannedExpressionKind::Logical(binary) => {
+            let (left, right) = binary.operands();
+            binary.node() == expression.node
+                && logical_binary_operator_text(binary.operator()).is_some()
                 && is_context_insensitive_primitive_binary_operand_plan(left)
                 && is_context_insensitive_primitive_binary_operand_plan(right)
         }
