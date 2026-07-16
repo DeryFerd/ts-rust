@@ -13218,15 +13218,16 @@ mod tests {
             function_signature(&fixture.store, function),
             shell_signature
         );
+        let published_parameter_type = fixture
+            .store
+            .value_symbol_links(node_symbol(&fixture, parameter))
+            .and_then(|links| links.resolved_type)
+            .unwrap();
         assert_eq!(
             fixture
                 .store
                 .callable_signature_parameter_types(shell_signature),
-            fixture
-                .store
-                .value_symbol_links(node_symbol(&fixture, parameter))
-                .and_then(|links| links.resolved_type)
-                .map(std::slice::from_ref),
+            Some(std::slice::from_ref(&published_parameter_type)),
         );
 
         let parameter_symbol = node_symbol(&fixture, parameter);
@@ -13243,17 +13244,17 @@ mod tests {
             },
         ));
         let warm_poison = function_store_state(&fixture.store);
+        assert_eq!(
+            functions::validate_stored_function_type(&fixture.store, shell),
+            functions::StoredFunctionTypeValidation::Malformed,
+        );
+        let poisoned_result = query_node(&mut fixture, function, &mut diagnostics);
         assert!(matches!(
-            query_declared(
-                &mut fixture,
-                alias,
-                CanonicalTypeQueryOptions::default(),
-                &mut diagnostics,
-            ),
+            poisoned_result,
             Err(DeclaredTypeError::TypeNodeUnavailable(
-                TypeNodeUnavailable::InvalidFunctionType(node)
-            )) if node == parameter
-        ));
+                TypeNodeUnavailable::InvalidCachedUnionType(type_)
+            )) if type_ == shell
+        ), "unexpected poisoned function result: {poisoned_result:?}");
         assert_eq!(function_store_state(&fixture.store), warm_poison);
         assert!(
             fixture
@@ -13261,12 +13262,7 @@ mod tests {
                 .set_value_symbol_links(parameter_symbol, correct_links)
         );
         assert_eq!(
-            query_declared(
-                &mut fixture,
-                alias,
-                CanonicalTypeQueryOptions::default(),
-                &mut diagnostics,
-            ),
+            query_node(&mut fixture, function, &mut diagnostics),
             Ok(shell)
         );
         assert!(diagnostics.is_empty());
