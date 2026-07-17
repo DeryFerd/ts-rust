@@ -24,6 +24,7 @@ use super::{
     callables::{
         StoredSingleCallableValidation, ValidatedSingleCallable, validate_stored_single_callable,
     },
+    classes::{ClassHeritageMembersValidation, validate_class_heritage_members},
     derived_types::DerivedObjectLiteralValidation,
     enums,
     ids::{SignatureId, TypeId},
@@ -268,6 +269,18 @@ fn validate_direct_interface_heritage_relation_endpoint(
     Ok(())
 }
 
+fn validate_class_members_relation_endpoint(
+    store: &SemanticStore<TypeRecord, TypeMapper>,
+    type_: TypeId,
+) -> Result<(), RelationUnavailable> {
+    if validate_class_heritage_members(store, type_)
+        == ClassHeritageMembersValidation::Malformed
+    {
+        return Err(RelationUnavailable::InvalidStructuredMembers(type_));
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy)]
 struct RelationBootstrapFacts {
     strict_null_checks: bool,
@@ -353,13 +366,14 @@ pub(super) struct ResolvedOwnProperty {
 #[derive(Clone, Copy)]
 enum ObjectPropertyOrigin {
     Declared,
+    ValidatedClass,
     FreshObjectLiteral(SemanticSymbolId),
     DerivedObjectLiteral(SemanticSymbolId),
 }
 
 impl ObjectPropertyOrigin {
     fn is_declared(self) -> bool {
-        matches!(self, Self::Declared)
+        matches!(self, Self::Declared | Self::ValidatedClass)
     }
 }
 
@@ -1047,8 +1061,10 @@ impl<'store> RelaterSession<'store> {
             self.observe_type_surface(original_target);
         }
         validate_direct_interface_heritage_relation_endpoint(self.store, original_source)?;
+        validate_class_members_relation_endpoint(self.store, original_source)?;
         if original_target != original_source {
             validate_direct_interface_heritage_relation_endpoint(self.store, original_target)?;
+            validate_class_members_relation_endpoint(self.store, original_target)?;
         }
         if original_source == original_target {
             return Ok(Ternary::True);
@@ -2585,7 +2601,7 @@ impl<'store> RelaterSession<'store> {
                     Err(RelationUnavailable::UnsupportedProperty(symbol))
                 };
             }
-            ObjectPropertyOrigin::Declared => {}
+            ObjectPropertyOrigin::Declared | ObjectPropertyOrigin::ValidatedClass => {}
         }
         let allowed_flags = SymbolFlags::PROPERTY | SymbolFlags::OPTIONAL;
         let allowed_checks = CheckFlags::READONLY.bits();
@@ -2603,7 +2619,16 @@ impl<'store> RelaterSession<'store> {
                 .store
                 .symbol(parent)
                 .ok_or(RelationUnavailable::Symbol(parent))?;
-            let allowed_parent_flags = SymbolFlags::INTERFACE | SymbolFlags::TYPE_LITERAL;
+            let allowed_parent_flags = match origin {
+                ObjectPropertyOrigin::ValidatedClass => SymbolFlags::CLASS,
+                ObjectPropertyOrigin::Declared => {
+                    SymbolFlags::INTERFACE | SymbolFlags::TYPE_LITERAL
+                }
+                ObjectPropertyOrigin::FreshObjectLiteral(_)
+                | ObjectPropertyOrigin::DerivedObjectLiteral(_) => {
+                    unreachable!("literal property origins return before declared validation")
+                }
+            };
             if !parent.flags().intersects(allowed_parent_flags) {
                 return Err(RelationUnavailable::UnsupportedProperty(symbol));
             }
@@ -2788,6 +2813,13 @@ impl<'store> RelaterSession<'store> {
             .ok_or(RelationUnavailable::Type(type_id))?;
         if record.flags() != TypeFlags::OBJECT || !self.supports_property_object_alias(type_id) {
             return Err(RelationUnavailable::UnsupportedStructuredType(type_id));
+        }
+        match validate_class_heritage_members(self.store, type_id) {
+            ClassHeritageMembersValidation::Valid => return Ok(()),
+            ClassHeritageMembersValidation::Malformed => {
+                return Err(RelationUnavailable::InvalidStructuredMembers(type_id));
+            }
+            ClassHeritageMembersValidation::NotClass => {}
         }
         match self.validate_derived_object_literal(type_id) {
             DerivedObjectLiteralValidation::Valid { .. } => return Ok(()),
@@ -3060,7 +3092,7 @@ impl<'store> RelaterSession<'store> {
                 )
             })
             .ok_or(RelationUnavailable::Type(type_id))?;
-        let property_origin = match self.validate_derived_object_literal(type_id) {
+        let mut property_origin = match self.validate_derived_object_literal(type_id) {
             DerivedObjectLiteralValidation::Valid { owner, .. } => {
                 ObjectPropertyOrigin::DerivedObjectLiteral(owner)
             }
@@ -3097,7 +3129,20 @@ impl<'store> RelaterSession<'store> {
             return Err(RelationUnavailable::StructuredIndexInfos(type_id));
         }
         let properties = structured.properties.clone().unwrap_or_default();
-        let heritage_members = if property_origin.is_declared() {
+        let class_members = if property_origin.is_declared() {
+            validate_class_heritage_members(self.store, type_id)
+        } else {
+            ClassHeritageMembersValidation::NotClass
+        };
+        if class_members == ClassHeritageMembersValidation::Malformed {
+            return Err(RelationUnavailable::InvalidStructuredMembers(type_id));
+        }
+        if class_members == ClassHeritageMembersValidation::Valid {
+            property_origin = ObjectPropertyOrigin::ValidatedClass;
+        }
+        let heritage_members = if property_origin.is_declared()
+            && class_members == ClassHeritageMembersValidation::NotClass
+        {
             validate_interface_heritage_members(self.store, type_id)
         } else {
             InterfaceHeritageMembersValidation::NotHeritage
@@ -3115,6 +3160,7 @@ impl<'store> RelaterSession<'store> {
             if property_origin.is_declared()
                 && property_record.parent() != record_symbol
                 && heritage_members != InterfaceHeritageMembersValidation::Valid
+                && class_members != ClassHeritageMembersValidation::Valid
             {
                 return Err(RelationUnavailable::InvalidStructuredMembers(type_id));
             }
@@ -4017,8 +4063,10 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         let source = self.regular_type_if_fresh(source)?;
         let target = self.regular_type_if_fresh(target)?;
         validate_direct_interface_heritage_relation_endpoint(self, source)?;
+        validate_class_members_relation_endpoint(self, source)?;
         if target != source {
             validate_direct_interface_heritage_relation_endpoint(self, target)?;
+            validate_class_members_relation_endpoint(self, target)?;
         }
         self.admit_callable_relation_type(source, strict_function_types)?;
         if target != source {

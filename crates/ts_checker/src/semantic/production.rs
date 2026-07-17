@@ -38,8 +38,8 @@ use super::{
         ProductionAliasSourceRegistry, ProductionAliasTargetHost, ProductionAliasTargetHostError,
     },
     classes::{
-        execute_nongeneric_class_members, execute_nongeneric_class_shells,
-        plan_nongeneric_class, plan_nongeneric_class_members,
+        execute_nongeneric_class_member_query, execute_nongeneric_class_shells,
+        plan_nongeneric_class, plan_nongeneric_class_member_query,
     },
     global_types::initialize_global_library_types,
     instantiate::{InstantiationLimits, InstantiationSession},
@@ -734,9 +734,11 @@ impl<'arena> CanonicalCheckerContext<'arena> {
     /// Materializes exact primitive annotated members and the default
     /// construct signature for one local nongeneric class declaration.
     ///
-    /// The admitted class has no heritage, executable members, initializers,
-    /// or non-keyword property annotations. The operation preflights and
-    /// reserves the entire graph before publishing a cold shell.
+    /// The admitted class has either no heritage or one direct local,
+    /// nongeneric, property-only base. It has no executable members,
+    /// initializers, or non-keyword property annotations. The operation
+    /// preflights and reserves the entire graph before publishing a cold
+    /// dependency or derived shell.
     ///
     /// # Errors
     ///
@@ -758,8 +760,8 @@ impl<'arena> CanonicalCheckerContext<'arena> {
             GlobalMergeCompletion::new(options.name_resolution),
         )
         .map_err(DeclaredTypeError::from)?;
-        let plan = plan_nongeneric_class_members(store, &host, symbol)?;
-        execute_nongeneric_class_members(store, &host, &plan)
+        let plan = plan_nongeneric_class_member_query(store, &host, symbol)?;
+        execute_nongeneric_class_member_query(store, &host, &plan)
     }
 
     /// Publishes or validates the exact type/value/member identities for one

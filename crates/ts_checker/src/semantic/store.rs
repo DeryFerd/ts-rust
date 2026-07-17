@@ -208,6 +208,21 @@ pub(super) struct DirectInterfaceHeritageProvenance {
     pub(super) base_type: TypeId,
 }
 
+/// Immutable source-plan edge for one direct local class base.
+///
+/// Classes retain two distinct base identities: the constructor value cached
+/// on the derived instance and the declared instance cached in
+/// `resolved_base_types`. Keeping both edges separate prevents a coherent but
+/// source-wrong class graph from reaching relation through a poisoned cache.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct DirectClassHeritageProvenance {
+    pub(super) owner_symbol: SemanticSymbolId,
+    pub(super) owner_value_type: TypeId,
+    pub(super) base_symbol: SemanticSymbolId,
+    pub(super) base_instance_type: TypeId,
+    pub(super) base_value_type: TypeId,
+}
+
 /// One declaration-order row for an exact source generic signature.
 ///
 /// Both the binder symbol and canonical type identity are retained on purpose:
@@ -371,6 +386,7 @@ pub struct SemanticStore<TypePayload, MapperPayload> {
     declared_call_set_provenance: HashSet<TypeId>,
     declared_call_set_types_by_signature: HashMap<SignatureId, TypeId>,
     direct_interface_heritage_provenance: HashMap<TypeId, DirectInterfaceHeritageProvenance>,
+    direct_class_heritage_provenance: HashMap<TypeId, DirectClassHeritageProvenance>,
     source_callable_provenance: HashMap<TypeId, SourceCallableProvenance>,
     source_callable_types_by_declaration: HashMap<NodeRef, TypeId>,
     source_callable_types_by_owner: HashMap<SemanticSymbolId, TypeId>,
@@ -461,6 +477,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             declared_call_set_provenance: HashSet::new(),
             declared_call_set_types_by_signature: HashMap::new(),
             direct_interface_heritage_provenance: HashMap::new(),
+            direct_class_heritage_provenance: HashMap::new(),
             source_callable_provenance: HashMap::new(),
             source_callable_types_by_declaration: HashMap::new(),
             source_callable_types_by_owner: HashMap::new(),
@@ -2079,6 +2096,10 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             self.mark_relation_inputs_dirty();
         }
         true
+    }
+
+    pub(super) fn try_reserve_declared_type_links(&mut self, additional: usize) -> bool {
+        self.links.declared_type.try_reserve(additional)
     }
 
     /// Marks the narrow interval in which a recursive class shell is visible
@@ -4186,6 +4207,94 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         };
         entry.insert(provenance);
         if self.relation_type_is_observable(type_) {
+            self.mark_relation_inputs_dirty();
+        }
+        true
+    }
+
+    pub(super) fn try_reserve_direct_class_heritage_provenance(
+        &mut self,
+        additional: usize,
+    ) -> bool {
+        self.direct_class_heritage_provenance
+            .try_reserve(additional)
+            .is_ok()
+    }
+
+    pub(super) fn direct_class_heritage_provenance(
+        &self,
+        instance_type: TypeId,
+    ) -> Option<DirectClassHeritageProvenance> {
+        self.observe_relation_type_read(instance_type);
+        self.direct_class_heritage_provenance
+            .get(&instance_type)
+            .copied()
+    }
+
+    /// Publishes the exact instance/value split selected by one direct class
+    /// heritage plan. All five identities must already be authoritative.
+    pub(super) fn publish_direct_class_heritage_provenance(
+        &mut self,
+        instance_type: TypeId,
+        provenance: DirectClassHeritageProvenance,
+    ) -> bool {
+        let exact_class_instance =
+            |store: &Self, type_: TypeId, symbol: SemanticSymbolId| {
+                store.type_payload(type_).is_some_and(|record| {
+                    matches!(record.data(), TypeData::Interface(_))
+                        && record
+                            .object_flags()
+                            .contains(super::types::ObjectFlags::CLASS)
+                        && record
+                            .object_flags()
+                            .contains(super::types::ObjectFlags::REFERENCE)
+                        && record.symbol() == Some(symbol)
+                }) && store.get_merged_symbol(symbol) == Some(symbol)
+                    && store
+                        .declared_type_links(symbol)
+                        .is_some_and(|links| links.declared_type == Some(type_))
+            };
+        let exact_class_value =
+            |store: &Self, type_: TypeId, symbol: SemanticSymbolId| {
+                store.type_payload(type_).is_some_and(|record| {
+                    matches!(record.data(), TypeData::Object(_))
+                        && record
+                            .object_flags()
+                            .contains(super::types::ObjectFlags::ANONYMOUS)
+                        && record.symbol() == Some(symbol)
+                }) && store
+                    .value_symbol_links(symbol)
+                    .is_some_and(|links| {
+                        links
+                            == &(ValueSymbolLinks {
+                                resolved_type: Some(type_),
+                                ..ValueSymbolLinks::default()
+                            })
+                    })
+            };
+        if provenance.owner_symbol == provenance.base_symbol
+            || !exact_class_instance(self, instance_type, provenance.owner_symbol)
+            || !exact_class_value(
+                self,
+                provenance.owner_value_type,
+                provenance.owner_symbol,
+            )
+            || !exact_class_instance(
+                self,
+                provenance.base_instance_type,
+                provenance.base_symbol,
+            )
+            || !exact_class_value(self, provenance.base_value_type, provenance.base_symbol)
+        {
+            return false;
+        }
+        let std::collections::hash_map::Entry::Vacant(entry) =
+            self.direct_class_heritage_provenance.entry(instance_type)
+        else {
+            return false;
+        };
+        entry.insert(provenance);
+        if self.relation_type_is_observable(instance_type) {
             self.mark_relation_inputs_dirty();
         }
         true
