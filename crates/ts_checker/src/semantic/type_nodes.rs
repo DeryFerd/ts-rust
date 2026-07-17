@@ -3013,6 +3013,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         if union_constituent
             && global_array_target.is_none()
             && !flags.contains(SymbolFlags::TYPE_ALIAS)
+            && !flags.intersects(SymbolFlags::CLASS | SymbolFlags::INTERFACE)
         {
             return Err(type_node_unavailable(
                 TypeNodeUnavailable::UnsupportedUnionConstituent(node),
@@ -3039,6 +3040,13 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         } else if flags.intersects(SymbolFlags::CLASS | SymbolFlags::INTERFACE) {
             let local_count =
                 preflight_class_or_interface_reference(self.store, self.host, symbol, flags)?;
+            if union_constituent
+                && (flags.contains(SymbolFlags::CLASS) || local_count != 0)
+            {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::UnsupportedUnionConstituent(node),
+                ));
+            }
             if local_count == 0 {
                 if flags.contains(SymbolFlags::INTERFACE)
                     && !flags.contains(SymbolFlags::CLASS)
