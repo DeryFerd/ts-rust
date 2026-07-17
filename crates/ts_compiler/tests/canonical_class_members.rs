@@ -40,6 +40,55 @@ fn canonical_program_checks_primitive_class_members() {
 }
 
 #[test]
+fn canonical_program_checks_default_class_construction() {
+    let fs = MemoryFileSystem::new(true);
+    fs.write_file(
+        "/project/main.ts",
+        concat!(
+            "class Model { value!: string; }\n",
+            "const model = new Model();\n",
+            "const value = model.value;\n",
+        ),
+    )
+    .unwrap();
+
+    let program = Program::try_new_with_canonical_checker(
+        &fs,
+        "/project",
+        &["main.ts".to_owned()],
+        canonical_options(),
+    )
+    .unwrap();
+
+    assert!(program.diagnostics().is_empty());
+}
+
+#[test]
+fn canonical_program_rejects_unsupported_class_construction_as_a_typed_boundary() {
+    let fs = MemoryFileSystem::new(true);
+    fs.write_file(
+        "/project/main.ts",
+        "class Model { value!: string; }\nconst model = new Model(1);\n",
+    )
+    .unwrap();
+
+    let error = Program::try_new_with_canonical_checker(
+        &fs,
+        "/project",
+        &["main.ts".to_owned()],
+        canonical_options(),
+    )
+    .unwrap_err();
+
+    assert_eq!(
+        error.failure_class(),
+        CanonicalProgramCheckFailureClass::Unsupported {
+            capability_code: "E00.SOURCE_SYNTAX",
+        }
+    );
+}
+
+#[test]
 fn canonical_program_rejects_uninitialized_instance_field_as_a_typed_boundary() {
     let fs = MemoryFileSystem::new(true);
     fs.write_file(
