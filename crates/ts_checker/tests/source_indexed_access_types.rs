@@ -11,6 +11,8 @@ use ts_parser::{ParseResult, parse_source_file};
 const SUCCESS_SOURCE: &str = concat!(
     "type PropertyValue = { answer: number }['answer'];\n",
     "type ParenthesizedValue = ({ answer: number })['answer'];\n",
+    "type ParenthesizedMemberValue = { answer: (string) }['answer'];\n",
+    "type NullMemberValue = { answer: null }['answer'];\n",
     "type StringValue = { [key: string]: boolean }[string];\n",
     "type StringNumberValue = { [key: string]: boolean }[number];\n",
     "type NumberValue = { [key: number]: string }[number];\n",
@@ -27,6 +29,8 @@ const SUCCESS_SOURCE: &str = concat!(
     "type NestedArrayValue = ({ [key: string]: number }[string])[];\n",
     "const property: PropertyValue = 1;\n",
     "const parenthesized: ParenthesizedValue = 2;\n",
+    "const parenthesizedMember: ParenthesizedMemberValue = 'member';\n",
+    "const nullMember: NullMemberValue = null;\n",
     "const stringValue: StringValue = true;\n",
     "const stringNumberValue: StringNumberValue = false;\n",
     "const numberValue: NumberValue = 'number';\n",
@@ -111,6 +115,8 @@ fn concrete_inline_indexed_access_types_select_properties_and_applicable_indexes
     for (name, expected) in [
         ("PropertyValue", "number"),
         ("ParenthesizedValue", "number"),
+        ("ParenthesizedMemberValue", "string"),
+        ("NullMemberValue", "null"),
         ("StringValue", "boolean"),
         ("StringNumberValue", "boolean"),
         ("NumberValue", "string"),

@@ -470,7 +470,8 @@ fn literal_cache_error_is_unsupported(error: &SourceLiteralCacheError) -> bool {
 fn array_type_error_is_unsupported(error: &ArrayTypeError) -> bool {
     match error {
         ArrayTypeError::GlobalType(error) => global_type_initialization_error_is_unsupported(error),
-        ArrayTypeError::InvalidReference(_)
+        ArrayTypeError::UnsupportedCreationFlags(_)
+        | ArrayTypeError::InvalidReference(_)
         | ArrayTypeError::InvalidArrayLiteralCache { .. }
         | ArrayTypeError::Capacity(_) => false,
     }
@@ -542,7 +543,9 @@ fn type_node_error_is_unsupported(error: &TypeNodeUnavailable) -> bool {
         | TypeNodeUnavailable::CircularGenericAliasDefault { .. }
         | TypeNodeUnavailable::JsDocTypeAlias(_)
         | TypeNodeUnavailable::UnsupportedUnionConstituent(_)
-        | TypeNodeUnavailable::UnsupportedUnionConstituentType(_) => true,
+        | TypeNodeUnavailable::UnsupportedUnionConstituentType(_)
+        | TypeNodeUnavailable::UnsupportedTupleElementOrder { .. }
+        | TypeNodeUnavailable::RecursiveTupleAliasUnsupported { .. } => true,
         TypeNodeUnavailable::InvalidParenthesizedType(_)
         | TypeNodeUnavailable::InvalidTypeReference(_)
         | TypeNodeUnavailable::InvalidImportAliasTarget { .. }
@@ -572,6 +575,9 @@ fn type_node_error_is_unsupported(error: &TypeNodeUnavailable) -> bool {
         | TypeNodeUnavailable::InvalidUnionAlias(_)
         | TypeNodeUnavailable::InvalidPreparedTypeQuery
         | TypeNodeUnavailable::LiteralTypeCapacity
+        | TypeNodeUnavailable::InvalidTupleType(_)
+        | TypeNodeUnavailable::MissingPlannedTupleType(_)
+        | TypeNodeUnavailable::InvalidCachedTupleType(_)
         | TypeNodeUnavailable::ResolutionStackInvariant(_) => false,
     }
 }

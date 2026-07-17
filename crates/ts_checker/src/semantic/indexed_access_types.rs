@@ -23,9 +23,10 @@ use super::{
     CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHost, TypeId,
     bootstrap::LiteralTypeCacheError,
     declared::preflight_node,
+    links::ValueSymbolLinks,
     object_members::{self, PropertyObjectError, PropertyObjectPlan, PropertyObjectState},
     type_nodes::normalize_numeric_separators,
-    type_records::{LiteralValue, TypeData},
+    type_records::{LiteralValue, TypeData, TypeRecord},
     types::TypeFlags,
 };
 
@@ -214,6 +215,7 @@ pub(super) fn plan_concrete_indexed_access(
     let object_plan =
         object_members::plan_concrete_indexed_access_type_literal(store, host, object_literal)?;
     validate_member_domains(store, host, &object_plan)?;
+    validate_member_annotation_cache(store, host, &object_plan)?;
     let key = classify_index(store, host, index)?;
     let selection = select_concrete_member(store, &object_plan, &key, index)?;
 
@@ -328,6 +330,199 @@ fn validate_member_domains(
         }
     }
     Ok(())
+}
+
+/// Keeps the leaf's object publication dependency-closed in the presence of
+/// pre-existing checker links.
+///
+/// A cold inline object accepts only a cold/default annotation subtree. This
+/// intentionally leaves independently pre-resolved child annotations as a
+/// fail-closed boundary for this first leaf. A resolved object instead
+/// requires every property and index annotation to reproduce its published
+/// member identity without executing a child first.
+fn validate_member_annotation_cache(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    object: &PropertyObjectPlan,
+) -> Result<(), ConcreteIndexedAccessError> {
+    let state = object_members::type_literal_state(store, object)?;
+    let Some(PropertyObjectState::Resolved(object_type)) = state else {
+        if state.is_none()
+            && object.properties.iter().any(|property| {
+                store
+                    .value_symbol_links(property.symbol)
+                    .is_some_and(|links| links != &ValueSymbolLinks::default())
+            })
+        {
+            return Err(ConcreteIndexedAccessError::InvalidCache(object.node));
+        }
+        for property in &object.properties {
+            validate_cold_annotation_subtree(store, host, property.type_node)?;
+        }
+        for index in &object.indexes {
+            validate_cold_annotation_subtree(store, host, index.key_type_node)?;
+            validate_cold_annotation_subtree(store, host, index.value_type_node)?;
+        }
+        return Ok(());
+    };
+
+    for property in &object.properties {
+        let published = store
+            .value_symbol_links(property.symbol)
+            .and_then(|links| links.resolved_type)
+            .ok_or(ConcreteIndexedAccessError::InvalidCache(
+                property.type_node,
+            ))?;
+        if cached_annotation_identity(store, host, property.type_node)? != published {
+            return Err(ConcreteIndexedAccessError::InvalidCache(
+                property.type_node,
+            ));
+        }
+    }
+
+    let infos = match store.type_payload(object_type).map(TypeRecord::data) {
+        Some(TypeData::Object(object)) => object.structured.index_infos.as_deref(),
+        _ => None,
+    }
+    .unwrap_or_default();
+    if infos.len() != object.indexes.len() {
+        return Err(ConcreteIndexedAccessError::InvalidCache(object.node));
+    }
+    for (planned, info) in object.indexes.iter().zip(infos) {
+        let info = store
+            .index_info(*info)
+            .ok_or(ConcreteIndexedAccessError::InvalidCache(
+                planned.declaration,
+            ))?;
+        if cached_annotation_identity(store, host, planned.key_type_node)? != info.key_type()
+            || cached_annotation_identity(store, host, planned.value_type_node)?
+                != info.value_type()
+        {
+            return Err(ConcreteIndexedAccessError::InvalidCache(
+                planned.value_type_node,
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_cold_annotation_subtree(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    root: NodeRef,
+) -> Result<(), ConcreteIndexedAccessError> {
+    let mut pending = vec![(root, None)];
+    let mut seen = Vec::new();
+    while let Some((node, expected_parent)) = pending.pop() {
+        if seen.contains(&node) {
+            return Err(ConcreteIndexedAccessError::InvalidCache(node));
+        }
+        let record = preflight_node(store, host, node)?;
+        if expected_parent.is_some() && record.parent != expected_parent {
+            return Err(ConcreteIndexedAccessError::InvalidCache(node));
+        }
+        if store.type_node_links(node).is_some_and(|links| {
+            links.resolved_type.is_some() || links.outer_type_parameters.is_some()
+        }) {
+            return Err(ConcreteIndexedAccessError::InvalidCache(node));
+        }
+        seen.push(node);
+        record.for_each_child(|child| {
+            pending.push((
+                NodeRef::new(node.arena, node.file, child),
+                Some(node.node),
+            ));
+        });
+    }
+    Ok(())
+}
+
+fn cached_annotation_identity(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    node: NodeRef,
+) -> Result<TypeId, ConcreteIndexedAccessError> {
+    let record = preflight_node(store, host, node)?;
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or(ConcreteIndexedAccessError::InvalidCache(node))?;
+    let keyword = match record.kind {
+        SyntaxKind::AnyKeyword => Some(bootstrap.any_type),
+        SyntaxKind::UnknownKeyword => Some(bootstrap.unknown_type),
+        SyntaxKind::StringKeyword => Some(bootstrap.string_type),
+        SyntaxKind::NumberKeyword => Some(bootstrap.number_type),
+        SyntaxKind::BigIntKeyword => Some(bootstrap.bigint_type),
+        SyntaxKind::BooleanKeyword => Some(bootstrap.boolean_type),
+        SyntaxKind::SymbolKeyword => Some(bootstrap.es_symbol_type),
+        SyntaxKind::VoidKeyword => Some(bootstrap.void_type),
+        SyntaxKind::UndefinedKeyword => Some(bootstrap.undefined_type),
+        SyntaxKind::NullKeyword => Some(bootstrap.null_type),
+        SyntaxKind::NeverKeyword => Some(bootstrap.never_type),
+        SyntaxKind::ObjectKeyword => Some(bootstrap.non_primitive_type),
+        SyntaxKind::IntrinsicKeyword => Some(bootstrap.intrinsic_marker_type),
+        _ => None,
+    };
+    if let Some(keyword) = keyword {
+        validate_empty_annotation_links(store, node)?;
+        return Ok(keyword);
+    }
+
+    if let NodeData::ParenthesizedTypeNode(parenthesized) = &record.data {
+        if record.kind != SyntaxKind::ParenthesizedType {
+            return Err(ConcreteIndexedAccessError::InvalidCache(node));
+        }
+        validate_empty_annotation_links(store, node)?;
+        let child = NodeRef::new(node.arena, node.file, parenthesized.type_);
+        let child_record = preflight_node(store, host, child)?;
+        if child_record.parent != Some(node.node)
+            || child_record.range.start < record.range.start
+            || child_record.range.end > record.range.end
+        {
+            return Err(ConcreteIndexedAccessError::InvalidCache(node));
+        }
+        return cached_annotation_identity(store, host, child);
+    }
+
+    if let NodeData::LiteralTypeNode(literal) = &record.data {
+        let literal = NodeRef::new(node.arena, node.file, literal.literal);
+        let literal_record = preflight_node(store, host, literal)?;
+        if literal_record.parent != Some(node.node) || literal_record.range != record.range {
+            return Err(ConcreteIndexedAccessError::InvalidCache(node));
+        }
+        if literal_record.kind == SyntaxKind::NullKeyword
+            && matches!(literal_record.data, NodeData::KeywordExpression(_))
+        {
+            validate_empty_annotation_links(store, node)?;
+            return Ok(bootstrap.null_type);
+        }
+    }
+
+    let links = store
+        .type_node_links(node)
+        .ok_or(ConcreteIndexedAccessError::InvalidCache(node))?;
+    if links.outer_type_parameters.is_some() {
+        return Err(ConcreteIndexedAccessError::InvalidCache(node));
+    }
+    let type_ = links
+        .resolved_type
+        .ok_or(ConcreteIndexedAccessError::InvalidCache(node))?;
+    store
+        .type_payload(type_)
+        .map(|_| type_)
+        .ok_or(ConcreteIndexedAccessError::InvalidCache(node))
+}
+
+fn validate_empty_annotation_links(
+    store: &CanonicalTypeMapperStore,
+    node: NodeRef,
+) -> Result<(), ConcreteIndexedAccessError> {
+    if store.type_node_links(node).is_some_and(|links| {
+        links.resolved_type.is_some() || links.outer_type_parameters.is_some()
+    }) {
+        Err(ConcreteIndexedAccessError::InvalidCache(node))
+    } else {
+        Ok(())
+    }
 }
 
 fn primitive_domain(

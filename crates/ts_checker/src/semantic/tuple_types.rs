@@ -165,7 +165,7 @@ pub(super) enum PreparedCanonicalTupleType {
         key: CanonicalTupleTargetKey,
         target_at_preflight: Option<TypeId>,
         arguments: Vec<TypeId>,
-        cold: Option<PreparedColdCanonicalTupleType>,
+        cold: Option<Box<PreparedColdCanonicalTupleType>>,
     },
     Array {
         target: TypeId,
@@ -832,7 +832,7 @@ impl CanonicalTypeMapperStore {
                 let cold = if group.existing_target.is_none() {
                     let infos = clone_with_capacity(&group.key.element_infos)
                         .map_err(|error| preparation_error(node, error))?;
-                    Some(
+                    Some(Box::new(
                         stage_cold_tuple_type(
                             &group.key,
                             TupleMetadata::new(infos, group.key.readonly),
@@ -840,7 +840,7 @@ impl CanonicalTypeMapperStore {
                             length_count,
                         )
                         .map_err(|error| preparation_error(node, error))?,
-                    )
+                    ))
                 } else {
                     None
                 };
@@ -942,7 +942,7 @@ impl CanonicalTypeMapperStore {
                 else {
                     continue;
                 };
-                if &*key != &length.key {
+                if *key != length.key {
                     continue;
                 }
                 cold.length_type = Some(length_type);
@@ -954,12 +954,9 @@ impl CanonicalTypeMapperStore {
             matches!(
                 token,
                 PreparedCanonicalTupleType::Tuple {
-                    cold: Some(PreparedColdCanonicalTupleType {
-                        length_type: None,
-                        ..
-                    }),
+                    cold: Some(cold),
                     ..
-                }
+                } if cold.length_type.is_none()
             )
         }) {
             return Err(preparation_error(
@@ -1098,7 +1095,7 @@ impl CanonicalTypeMapperStore {
                     ));
                 }
                 let cold = cold.ok_or(TupleTypeError::InvalidPreparedQuery)?;
-                self.create_prepared_cold_canonical_tuple_type(key, request, arguments, cold)
+                self.create_prepared_cold_canonical_tuple_type(key, request, arguments, *cold)
             }
         }
     }
@@ -2501,7 +2498,8 @@ mod tests {
                     .unwrap();
             }
 
-            let first_request = CanonicalTupleTypeRequest::new(&[argument], &infos, false);
+            let arguments = [argument];
+            let first_request = CanonicalTupleTypeRequest::new(&arguments, &infos, false);
             let first_request = if syntax_first {
                 first_request.with_creation_flags(ObjectFlags::FROM_TYPE_NODE)
             } else {
@@ -2520,7 +2518,7 @@ mod tests {
                 expected_flags
             );
 
-            let second_request = CanonicalTupleTypeRequest::new(&[argument], &infos, false);
+            let second_request = CanonicalTupleTypeRequest::new(&arguments, &infos, false);
             let second_request = if syntax_first {
                 second_request
             } else {

@@ -1939,12 +1939,20 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                     return Ok(());
                 }
                 CachedTypeAliasRhs::IndexedAccess(indexed_access) => {
+                    let identity_seed = self
+                        .store
+                        .type_node_links(indexed_access)
+                        .and_then(|links| links.resolved_type);
                     if !missing_generic_metadata.is_empty()
-                        || self
-                            .store
-                            .type_node_links(indexed_access)
-                            .and_then(|links| links.resolved_type)
-                            != Some(declared_type)
+                        || !identity_seed.is_some_and(|identity_seed| {
+                            valid_type_alias_identity_seed(
+                                self.store,
+                                symbol,
+                                declared_type,
+                                identity_seed,
+                                self.strict_builtin_iterator_return,
+                            )
+                        })
                     {
                         return Err(type_node_unavailable(
                             TypeNodeUnavailable::InvalidCachedTypeAlias(root_symbol),
@@ -4981,7 +4989,8 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         let capacity = plan
             .arrays
             .len()
-            .checked_add(plan.references.len())
+            .checked_add(plan.indexed_accesses.len())
+            .and_then(|count| count.checked_add(plan.references.len()))
             .and_then(|count| count.checked_add(plan.literals.len()))
             .and_then(|count| count.checked_add(plan.unions.len()))
             .and_then(|count| count.checked_add(plan.type_literals.len()))
@@ -5000,6 +5009,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         for node in plan
             .arrays
             .keys()
+            .chain(plan.indexed_accesses.keys())
             .chain(plan.references.keys())
             .chain(plan.literals.keys())
             .chain(plan.unions.keys())
@@ -5400,7 +5410,13 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                     .any(|pending| pending.node == structural_node)
             {
                 let resolved = self.execute_type_node(alias.type_node, plan, prepared)?;
-                if resolved != cached.declared_type {
+                if !valid_type_alias_identity_seed(
+                    self.store,
+                    symbol,
+                    cached.declared_type,
+                    resolved,
+                    self.options.strict_builtin_iterator_return,
+                ) {
                     return Err(type_node_unavailable(
                         TypeNodeUnavailable::InvalidCachedTypeAlias(symbol),
                     ));
@@ -10630,6 +10646,56 @@ mod tests {
     }
 
     #[test]
+    fn indexed_builtin_iterator_return_replays_its_intrinsic_identity_seed() {
+        for strict in [false, true] {
+            let mut fixture = fixture(concat!(
+                "type BuiltinIteratorReturn = { marker: intrinsic }['marker']; ",
+                "type Wrapper = BuiltinIteratorReturn;",
+            ));
+            let alias = named_symbol(
+                &fixture,
+                SyntaxKind::TypeAliasDeclaration,
+                "BuiltinIteratorReturn",
+            );
+            let wrapper = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Wrapper");
+            let indexed = indexed_access_parts(&fixture, "BuiltinIteratorReturn").0;
+            let (expected, marker) = {
+                let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+                (
+                    if strict {
+                        bootstrap.undefined_type
+                    } else {
+                        bootstrap.any_type
+                    },
+                    bootstrap.intrinsic_marker_type,
+                )
+            };
+            let options = CanonicalTypeQueryOptions {
+                strict_builtin_iterator_return: strict,
+            };
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            for _ in 0..2 {
+                assert_eq!(
+                    query_declared(&mut fixture, wrapper, options, &mut diagnostics),
+                    Ok(expected),
+                );
+                assert_eq!(
+                    query_declared(&mut fixture, alias, options, &mut diagnostics),
+                    Ok(expected),
+                );
+                assert_eq!(
+                    fixture
+                        .store
+                        .type_node_links(indexed)
+                        .and_then(|links| links.resolved_type),
+                    Some(marker),
+                );
+            }
+            assert!(diagnostics.is_empty());
+        }
+    }
+
+    #[test]
     fn iterator_return_option_is_store_global_for_transitive_aliases_in_both_orders() {
         for (established, requested) in [(false, true), (true, false)] {
             let mut fixture = fixture(concat!(
@@ -10938,9 +11004,9 @@ mod tests {
     fn every_remaining_deferred_type_node_family_and_recursive_array_fail_atomically() {
         let source = concat!(
             "declare const value: string; ",
-            "type ArrayAlias = string[]; type TupleAlias = [string]; ",
+            "type ArrayAlias = string[]; ",
             "type IntersectionAlias = object & {}; ",
-            "type OperatorAlias = keyof object; type IndexedAlias = { a: string }['a']; ",
+            "type OperatorAlias = keyof object; ",
             "type MappedAlias<T> = { [K in keyof T]: T[K] }; ",
             "type ConditionalAlias<T> = T extends string ? string : number; ",
             "type InferAlias<T> = T extends infer U ? U : never; ",
@@ -10949,10 +11015,8 @@ mod tests {
         );
         let aliases = [
             "ArrayAlias",
-            "TupleAlias",
             "IntersectionAlias",
             "OperatorAlias",
-            "IndexedAlias",
             "MappedAlias",
             "ConditionalAlias",
             "InferAlias",
@@ -11560,6 +11624,313 @@ mod tests {
                 before,
             );
         }
+    }
+
+    #[test]
+    fn cold_indexed_access_rejects_poisoned_member_annotations_before_publication() {
+        for (source, property_annotation) in [
+            ("type Bad = { value: 'expected' }['value'];", true),
+            ("type Bad = { [key: string]: 'expected' }[string];", false),
+        ] {
+            let mut fixture = fixture(source);
+            let bad = canonical_fixture_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Bad");
+            let (indexed, object, _) = indexed_access_parts(&fixture, "Bad");
+            let object_plan = {
+                let host = post_global_host(
+                    &fixture.parsed.arena,
+                    fixture.files.get(&fixture.file).unwrap(),
+                );
+                object_members::plan_concrete_indexed_access_type_literal(
+                    &fixture.store,
+                    &host,
+                    object,
+                )
+                .unwrap()
+            };
+            let annotation = if property_annotation {
+                object_plan.properties[0].type_node
+            } else {
+                object_plan.indexes[0].value_type_node
+            };
+            let property = object_plan.properties.first().map(|property| property.symbol);
+            let poison = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+            assert!(fixture.store.set_type_node_links(
+                annotation,
+                TypeNodeLinks {
+                    resolved_type: Some(poison),
+                    ..TypeNodeLinks::default()
+                },
+            ));
+
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            let before = (
+                literal_state(&fixture.store),
+                fixture.store.type_alias_len(),
+                fixture.store.index_info_len(),
+                fixture.store.signature_len(),
+                object_members::type_literal_state(&fixture.store, &object_plan),
+                fixture.store.type_node_links(indexed).cloned(),
+                fixture.store.type_node_links(object).cloned(),
+                fixture.store.type_node_links(annotation).cloned(),
+                property.and_then(|property| fixture.store.value_symbol_links(property).cloned()),
+                fixture.store.type_alias_links(bad).cloned(),
+                diagnostics.clone(),
+            );
+            for _ in 0..2 {
+                assert!(matches!(
+                    query_declared(
+                        &mut fixture,
+                        bad,
+                        CanonicalTypeQueryOptions::default(),
+                        &mut diagnostics,
+                    ),
+                    Err(DeclaredTypeError::TypeNodeUnavailable(
+                        TypeNodeUnavailable::InvalidIndexedAccessType(node)
+                    )) if node == annotation
+                ));
+                assert_eq!(
+                    (
+                        literal_state(&fixture.store),
+                        fixture.store.type_alias_len(),
+                        fixture.store.index_info_len(),
+                        fixture.store.signature_len(),
+                        object_members::type_literal_state(&fixture.store, &object_plan),
+                        fixture.store.type_node_links(indexed).cloned(),
+                        fixture.store.type_node_links(object).cloned(),
+                        fixture.store.type_node_links(annotation).cloned(),
+                        property.and_then(|property| {
+                            fixture.store.value_symbol_links(property).cloned()
+                        }),
+                        fixture.store.type_alias_links(bad).cloned(),
+                        diagnostics.clone(),
+                    ),
+                    before,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cold_indexed_access_rejects_prepublished_property_links_before_shell_creation() {
+        let mut fixture = fixture("type Bad = { value: string }['value'];");
+        let bad = canonical_fixture_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Bad");
+        let (indexed, object, _) = indexed_access_parts(&fixture, "Bad");
+        let object_plan = {
+            let host = post_global_host(
+                &fixture.parsed.arena,
+                fixture.files.get(&fixture.file).unwrap(),
+            );
+            object_members::plan_concrete_indexed_access_type_literal(
+                &fixture.store,
+                &host,
+                object,
+            )
+            .unwrap()
+        };
+        let property = object_plan.properties[0].symbol;
+        let poison = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+        assert!(fixture.store.set_value_symbol_links(
+            property,
+            ValueSymbolLinks {
+                resolved_type: Some(poison),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let before = (
+            literal_state(&fixture.store),
+            fixture.store.type_alias_len(),
+            fixture.store.index_info_len(),
+            fixture.store.signature_len(),
+            fixture.store.type_node_links(indexed).cloned(),
+            fixture.store.type_node_links(object).cloned(),
+            fixture.store.value_symbol_links(property).cloned(),
+            fixture.store.type_alias_links(bad).cloned(),
+            diagnostics.clone(),
+        );
+        for _ in 0..2 {
+            assert!(matches!(
+                query_declared(
+                    &mut fixture,
+                    bad,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut diagnostics,
+                ),
+                Err(DeclaredTypeError::TypeNodeUnavailable(
+                    TypeNodeUnavailable::InvalidIndexedAccessType(node)
+                )) if node == object
+            ));
+            assert_eq!(
+                (
+                    literal_state(&fixture.store),
+                    fixture.store.type_alias_len(),
+                    fixture.store.index_info_len(),
+                    fixture.store.signature_len(),
+                    fixture.store.type_node_links(indexed).cloned(),
+                    fixture.store.type_node_links(object).cloned(),
+                    fixture.store.value_symbol_links(property).cloned(),
+                    fixture.store.type_alias_links(bad).cloned(),
+                    diagnostics.clone(),
+                ),
+                before,
+            );
+        }
+    }
+
+    #[test]
+    fn warm_indexed_access_rejects_wrong_or_missing_member_annotation_identity() {
+        for (source, property_annotation) in [
+            ("type Bad = { value: 'expected' }['value'];", true),
+            ("type Bad = { [key: string]: 'expected' }[string];", false),
+        ] {
+            let mut fixture = fixture(source);
+            let bad = canonical_fixture_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Bad");
+            let (indexed, object, _) = indexed_access_parts(&fixture, "Bad");
+            let object_plan = {
+                let host = post_global_host(
+                    &fixture.parsed.arena,
+                    fixture.files.get(&fixture.file).unwrap(),
+                );
+                object_members::plan_concrete_indexed_access_type_literal(
+                    &fixture.store,
+                    &host,
+                    object,
+                )
+                .unwrap()
+            };
+            let annotation = if property_annotation {
+                object_plan.properties[0].type_node
+            } else {
+                object_plan.indexes[0].value_type_node
+            };
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            query_declared(
+                &mut fixture,
+                bad,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap();
+            assert!(matches!(
+                object_members::type_literal_state(&fixture.store, &object_plan),
+                Ok(Some(PropertyObjectState::Resolved(_)))
+            ));
+
+            let links = if property_annotation {
+                TypeNodeLinks {
+                    resolved_type: Some(
+                        fixture.store.intrinsic_bootstrap().unwrap().number_type,
+                    ),
+                    ..TypeNodeLinks::default()
+                }
+            } else {
+                TypeNodeLinks::default()
+            };
+            assert!(fixture.store.set_type_node_links(annotation, links));
+            let before = (
+                literal_state(&fixture.store),
+                fixture.store.type_alias_len(),
+                fixture.store.index_info_len(),
+                fixture.store.signature_len(),
+                fixture.store.type_node_links(indexed).cloned(),
+                fixture.store.type_node_links(object).cloned(),
+                fixture.store.type_node_links(annotation).cloned(),
+                fixture.store.type_alias_links(bad).cloned(),
+                diagnostics.clone(),
+            );
+            for _ in 0..2 {
+                assert!(matches!(
+                    query_declared(
+                        &mut fixture,
+                        bad,
+                        CanonicalTypeQueryOptions::default(),
+                        &mut diagnostics,
+                    ),
+                    Err(DeclaredTypeError::TypeNodeUnavailable(
+                        TypeNodeUnavailable::InvalidIndexedAccessType(node)
+                    )) if node == annotation
+                ));
+                assert_eq!(
+                    (
+                        literal_state(&fixture.store),
+                        fixture.store.type_alias_len(),
+                        fixture.store.index_info_len(),
+                        fixture.store.signature_len(),
+                        fixture.store.type_node_links(indexed).cloned(),
+                        fixture.store.type_node_links(object).cloned(),
+                        fixture.store.type_node_links(annotation).cloned(),
+                        fixture.store.type_alias_links(bad).cloned(),
+                        diagnostics.clone(),
+                    ),
+                    before,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn global_array_replays_nested_indexed_access_cold_and_warm() {
+        let mut fixture = global_array_fixture(
+            "type Nested = ({ [key: string]: number }[string])[];",
+        );
+        let global_types = initialize_fixture_global_types(&mut fixture);
+        let nested = canonical_fixture_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Nested");
+        let indexed = fixture
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::IndexedAccessType).then_some(NodeRef::new(
+                    fixture.parsed.arena.id(),
+                    fixture.file,
+                    node,
+                ))
+            })
+            .expect("the nested alias contains one indexed-access node");
+        let number = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        let resolved = query_global_declared(
+            &mut fixture,
+            &global_types,
+            nested,
+            &mut diagnostics,
+        )
+        .unwrap();
+        assert_eq!(type_reference_arguments(&fixture.store, resolved), [number]);
+        assert_eq!(
+            fixture
+                .store
+                .type_node_links(indexed)
+                .and_then(|links| links.resolved_type),
+            Some(number),
+        );
+        let warm = (
+            store_state(&fixture.store),
+            fixture.store.index_info_len(),
+            fixture.store.type_alias_links(nested).cloned(),
+            fixture.store.type_node_links(indexed).cloned(),
+            diagnostics.clone(),
+        );
+        assert_eq!(
+            query_global_declared(
+                &mut fixture,
+                &global_types,
+                nested,
+                &mut diagnostics,
+            ),
+            Ok(resolved),
+        );
+        assert_eq!(
+            (
+                store_state(&fixture.store),
+                fixture.store.index_info_len(),
+                fixture.store.type_alias_links(nested).cloned(),
+                fixture.store.type_node_links(indexed).cloned(),
+                diagnostics.clone(),
+            ),
+            warm,
+        );
     }
 
     #[test]
