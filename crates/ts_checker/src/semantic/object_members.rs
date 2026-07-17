@@ -18,6 +18,9 @@ use ts_binder::{
 use super::{
     CanonicalTypeMapperStore, DeclaredTypeHost, SignatureId, TypeId,
     declared::preflight_node,
+    interface_heritage::{
+        DirectInterfaceHeritageError, DirectInterfaceHeritagePlan, plan_direct_interface_heritage,
+    },
     links::{ResolvedSignatureState, SignatureLinks, ValueSymbolLinks},
     signatures::SignatureFlags,
     store::SourceNodeParent,
@@ -108,6 +111,7 @@ pub(super) struct PropertyObjectPlan {
     pub indexes: Vec<PlannedIndexSignature>,
     pub call_signatures: Vec<PlannedCallSignature>,
     pub alias_symbol: Option<SemanticSymbolId>,
+    pub heritage: Option<DirectInterfaceHeritagePlan>,
 }
 
 impl PropertyObjectPlan {
@@ -131,6 +135,16 @@ impl PropertyObjectPlan {
                 .map(|parameter| parameter.type_node)
                 .chain(std::iter::once(signature.return_type))
         })
+    }
+
+    pub(super) fn heritage_base_symbols(
+        &self,
+    ) -> impl ExactSizeIterator<Item = SemanticSymbolId> + '_ {
+        let bases = self
+            .heritage
+            .as_ref()
+            .map_or(&[][..], |heritage| heritage.bases.as_slice());
+        bases.iter().map(|base| base.symbol)
     }
 
     fn property_symbols(&self) -> Vec<SemanticSymbolId> {
@@ -745,7 +759,6 @@ pub(super) fn plan_interface(
         || interface.local_symbol.is_some()
         || interface.symbol.is_some()
         || interface.type_parameters.is_some()
-        || interface.heritage_clauses.is_some()
         || interface.members.has_trailing_comma
         || interface.members.range.start < record.range.start
         || interface.members.range.end != record.range.end
@@ -755,7 +768,26 @@ pub(super) fn plan_interface(
             symbol,
         });
     }
-    let plan = plan_members(
+    let heritage = interface
+        .heritage_clauses
+        .as_ref()
+        .map(|clauses| {
+            plan_direct_interface_heritage(store, host, declaration, symbol, clauses).map_err(
+                |error| match error {
+                    DirectInterfaceHeritageError::Invalid => {
+                        PropertyObjectError::InvalidInterface {
+                            declaration,
+                            symbol,
+                        }
+                    }
+                    DirectInterfaceHeritageError::Unsupported { node, kind } => {
+                        PropertyObjectError::UnsupportedMember { node, kind }
+                    }
+                },
+            )
+        })
+        .transpose()?;
+    let mut plan = plan_members(
         store,
         host,
         PropertyObjectKind::Interface,
@@ -766,6 +798,21 @@ pub(super) fn plan_interface(
         None,
         TypeLiteralMemberPolicy::General,
     )?;
+    plan.heritage = heritage;
+    if let Some(heritage) = plan.heritage.as_ref() {
+        if let Some(call) = plan.call_signatures.first() {
+            return Err(PropertyObjectError::UnsupportedMember {
+                node: call.declaration,
+                kind: SyntaxKind::CallSignature,
+            });
+        }
+        if !value_declarations.is_empty() {
+            return Err(PropertyObjectError::UnsupportedMember {
+                node: heritage.clause,
+                kind: SyntaxKind::HeritageClause,
+            });
+        }
+    }
     if !value_declarations.is_empty() && !plan.call_signatures.is_empty() {
         return Err(PropertyObjectError::InvalidInterface {
             declaration,
@@ -936,6 +983,7 @@ fn plan_members(
         indexes: Vec::new(),
         call_signatures: Vec::new(),
         alias_symbol,
+        heritage: None,
     };
     if kind != PropertyObjectKind::ObjectLiteral && member_nodes.has_trailing_comma
         || members.is_some() == member_nodes.nodes.is_empty()
@@ -1751,6 +1799,105 @@ pub(super) fn interface_state(
 ) -> Result<PropertyObjectState, PropertyObjectError> {
     debug_assert_eq!(plan.kind, PropertyObjectKind::Interface);
     validate_interface_record(store, plan, type_).ok_or_else(|| invalid_cache(plan, type_))
+}
+
+/// Read-only proof for the declared-own half of a direct heritage result.
+///
+/// The final structured cache is owned by [`super::structured_members`]. This
+/// proof deliberately validates only the interface shell, its declared table,
+/// and the exact property-type links so inherited publication can remain one
+/// atomic transaction.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum DirectInterfaceDeclaredState {
+    Unresolved,
+    Resolved,
+}
+
+pub(super) fn prepare_direct_interface_declared_properties(
+    store: &CanonicalTypeMapperStore,
+    plan: &PropertyObjectPlan,
+    type_: TypeId,
+    property_types: &[TypeId],
+) -> Result<DirectInterfaceDeclaredState, PropertyObjectError> {
+    if plan.kind != PropertyObjectKind::Interface
+        || plan.heritage.is_none()
+        || !plan.indexes.is_empty()
+        || !plan.call_signatures.is_empty()
+        || property_types.len() != plan.properties.len()
+        || property_types
+            .iter()
+            .any(|type_| store.type_payload(*type_).is_none())
+    {
+        return Err(invalid_cache(plan, type_));
+    }
+    let Some(record) = store.type_payload(type_) else {
+        return Err(invalid_cache(plan, type_));
+    };
+    let TypeData::Interface(interface) = record.data() else {
+        return Err(invalid_cache(plan, type_));
+    };
+    if record.flags() != TypeFlags::OBJECT
+        || record.symbol() != Some(plan.symbol)
+        || record.alias().is_some()
+        || !valid_thisless_interface_identity(interface)
+    {
+        return Err(invalid_cache(plan, type_));
+    }
+    if record.object_flags() == ObjectFlags::INTERFACE
+        && valid_unresolved_interface_members(interface)
+        && unresolved_property_links(store, plan)
+    {
+        return Ok(DirectInterfaceDeclaredState::Unresolved);
+    }
+    let exact_property_types =
+        plan.properties
+            .iter()
+            .zip(property_types)
+            .all(|(property, type_)| {
+                store.value_symbol_links(property.symbol)
+                    == Some(&ValueSymbolLinks {
+                        resolved_type: Some(*type_),
+                        ..ValueSymbolLinks::default()
+                    })
+            });
+    if record.object_flags() == ObjectFlags::INTERFACE | ObjectFlags::MEMBERS_RESOLVED
+        && interface.declared_members_resolved
+        && interface.declared_members == plan.members
+        && interface.declared_call_signatures.is_none()
+        && interface.declared_construct_signatures.is_none()
+        && interface.declared_index_infos.is_none()
+        && exact_property_types
+    {
+        return Ok(DirectInterfaceDeclaredState::Resolved);
+    }
+    Err(invalid_cache(plan, type_))
+}
+
+/// Publishes a previously validated declared-own property result.
+///
+/// Every identity and cache precondition was checked by
+/// [`prepare_direct_interface_declared_properties`]; these setters can now
+/// reject only a programming error in this module's caller.
+pub(super) fn publish_prepared_direct_interface_declared_properties(
+    store: &mut CanonicalTypeMapperStore,
+    plan: &PropertyObjectPlan,
+    type_: TypeId,
+    property_types: &[TypeId],
+    state: DirectInterfaceDeclaredState,
+) {
+    if state == DirectInterfaceDeclaredState::Resolved {
+        return;
+    }
+    for (property, property_type) in plan.properties.iter().zip(property_types) {
+        assert!(store.set_value_symbol_links(
+            property.symbol,
+            ValueSymbolLinks {
+                resolved_type: Some(*property_type),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+    }
+    assert!(store.set_interface_declared_members(type_, true, plan.members, None, None, None));
 }
 
 fn validate_object_record(

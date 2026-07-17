@@ -37,6 +37,7 @@ use super::{
     },
     signatures::Ternary,
     store::SemanticStore,
+    structured_members::{InterfaceHeritageMembersValidation, validate_interface_heritage_members},
     type_records::{CacheHashKey, ConstrainedTypeData, TypeCacheState, TypeData, TypeRecord},
     types::{ObjectFlags, TypeFlags},
 };
@@ -3024,16 +3025,24 @@ impl<'store> RelaterSession<'store> {
             return Err(RelationUnavailable::StructuredIndexInfos(type_id));
         }
         let properties = structured.properties.clone().unwrap_or_default();
+        let heritage_members = if property_origin.is_declared() {
+            validate_interface_heritage_members(self.store, type_id)
+        } else {
+            InterfaceHeritageMembersValidation::NotHeritage
+        };
+        if heritage_members == InterfaceHeritageMembersValidation::Malformed {
+            return Err(RelationUnavailable::InvalidStructuredMembers(type_id));
+        }
         let mut property_set = HashSet::with_capacity(properties.len());
         for property in &properties {
             if !property_set.insert(*property) {
                 return Err(RelationUnavailable::InvalidStructuredMembers(type_id));
             }
             let property_record = self.property_symbol(*property, property_origin)?;
-            // This dependency-closed slice admits no interface heritage, so
-            // every ordinary member is owned directly by this type's symbol.
-            // Revisit this equality when inherited members become supported.
-            if property_origin.is_declared() && property_record.parent() != record.symbol() {
+            if property_origin.is_declared()
+                && property_record.parent() != record.symbol()
+                && heritage_members != InterfaceHeritageMembersValidation::Valid
+            {
                 return Err(RelationUnavailable::InvalidStructuredMembers(type_id));
             }
         }
@@ -3257,14 +3266,22 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                         .ok_or(RelationUnavailable::InvalidStructuredMembers(type_id))?;
                     let plan = super::object_members::plan_interface(self, host, owner)
                         .map_err(|_| RelationUnavailable::InvalidStructuredMembers(type_id))?;
-                    let state = super::object_members::interface_state(self, &plan, type_id)
-                        .map_err(|_| RelationUnavailable::InvalidStructuredMembers(type_id))?;
-                    if !matches!(
-                        state,
-                        super::object_members::PropertyObjectState::Resolved(resolved)
-                            if resolved == type_id
-                    ) {
-                        return Err(RelationUnavailable::InvalidStructuredMembers(type_id));
+                    if plan.heritage.is_some() {
+                        if validate_interface_heritage_members(self, type_id)
+                            != InterfaceHeritageMembersValidation::Valid
+                        {
+                            return Err(RelationUnavailable::InvalidStructuredMembers(type_id));
+                        }
+                    } else {
+                        let state = super::object_members::interface_state(self, &plan, type_id)
+                            .map_err(|_| RelationUnavailable::InvalidStructuredMembers(type_id))?;
+                        if !matches!(
+                            state,
+                            super::object_members::PropertyObjectState::Resolved(resolved)
+                                if resolved == type_id
+                        ) {
+                            return Err(RelationUnavailable::InvalidStructuredMembers(type_id));
+                        }
                     }
                     plan
                 }
@@ -3386,6 +3403,41 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         let mut session = RelaterSession::new(self, RelationKind::Assignable, bootstrap);
         let resolved = session.resolved_object_members(type_id, false)?;
         if let Some((plan, property_types)) = plan {
+            if plan.heritage.is_some() {
+                if !resolved.property_origin.is_declared()
+                    || resolved.call_signature.is_some()
+                    || resolved.exact_callable
+                {
+                    return Err(RelationUnavailable::InvalidStructuredMembers(type_id));
+                }
+                let mut properties = Vec::with_capacity(resolved.properties.len());
+                let mut by_name = HashMap::with_capacity(resolved.properties.len());
+                for property in resolved.properties {
+                    let record = session.property_symbol(property, resolved.property_origin)?;
+                    let Some([declaration]) = record.declarations() else {
+                        return Err(RelationUnavailable::InvalidStructuredMembers(type_id));
+                    };
+                    let name = record.name().to_owned();
+                    let optional = record.flags().contains(SymbolFlags::OPTIONAL);
+                    let declaration = *declaration;
+                    let type_ = session.property_type(property)?;
+                    let index = properties.len();
+                    if by_name.insert(name.clone(), index).is_some() {
+                        return Err(RelationUnavailable::InvalidStructuredMembers(type_id));
+                    }
+                    properties.push(ResolvedDeclaredProperty {
+                        symbol: property,
+                        name,
+                        type_,
+                        optional,
+                        declaration,
+                    });
+                }
+                return Ok(Some(ResolvedDeclaredPropertyObject {
+                    properties,
+                    by_name,
+                }));
+            }
             if resolved.members != plan.members
                 || !resolved.property_origin.is_declared()
                 || resolved.properties
