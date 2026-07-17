@@ -5,7 +5,7 @@
 - Upstream epoch: `dc37b5249ab60e2bbce936f71b883e6c8136167e`
 - Wave branch baseline: `cdbf749`
 - Integration branch: `july-ultra`
-- Current integrated semantic stack: through `d443d1b`
+- Current integrated semantic stack: through `1ad5689`
 
 This is the live execution record for Wave 0 of
 [`typechecker-completion-goal.md`](typechecker-completion-goal.md). The port
@@ -15,7 +15,7 @@ map remains authoritative for cluster state.
 
 | Lane | Branch/worktree | Current task | State |
 |---|---|---|---|
-| Root/integration | `july-ultra`; repository root | contract adapters, review, serial verification | M0, S1b named reexports, S2a including readonly directionality, recovering/lazy S3, and the first S5/S6 Wave 1 sub-wave are integrated; root is the sole Cargo/build and fixed-shard owner |
+| Root/integration | `july-ultra`; repository root | contract adapters, review, serial verification | the declared-union source bridge and first executable class-declaration slice are integrated; root is the sole Cargo/build and fixed-shard owner |
 | M0 | `july-ultra`; repository root | deterministic checker scoring | schema-5 provenance, retained fatal outcomes, exact fixed-manifest execution, and selected-case preparation integrated through `174eebf` |
 | S2a | `july-ultra`; repository root | exact single-base interface heritage and relation-cache observation | integrated through `14ae6ce`; two exact-tip reviews found no P0/P1 issue, all five public heritage tests pass, and the fixed shard advances one interface fixture without an exact loss |
 | S2 readonly follow-up | `july-ultra`; repository root | readonly property retention and strict-subtype directionality | integrated through `d4719b3`; two independent reviews found no P0/P1 issue, the public production target passes, focused strict Clippy is green, and the fixed shard is semantically unchanged |
@@ -23,10 +23,13 @@ map remains authoritative for cluster state.
 | S1b | `july-ultra`; repository root | named ESM imports and two-hop renamed/type-only reexports | integrated through `6c3bf97`; 17 focused import/reexport public tests pass, sparse immediate-link timing matches pinned `resolveAlias`, warm alias/type-only/value poison is rejected, and independent review approved the slice |
 | W1 S5 | `july-ultra`; repository root | nongeneric `keyof`/property-key algebra | integrated through `c5c3cf9` plus cache hardening `7d97c9a`; direct and parenthesized property/index literals, nongeneric interfaces, exact `propertiesTypes` timing, eager Index origins, symbolic display, interface index publication, and cold/warm source identity pass independent review |
 | W1 S6 | `july-ultra`; repository root | direct explicit generic class/interface reference shells | integrated through `8132af9` with compiler classification `a478f13`; local full-arity class/interface references reuse target caches mapper-free/session-free, publish exact node/symbol links, and recover with pinned TS2314/TS2315 diagnostics |
-| W1 S2b | `july-ultra`; repository root | exact two-way union property synthesis and declared source adapter | integrated through `e497d84`, with direct nongeneric interface-union admission in `d443d1b`; raw and declared type-literal modes stay disjoint, synthetic source provenance and cache identity are exact, interfaces/mixed modes reject before writes, and independent oracle review found no P0/P1 issue |
+| W1 S2b | `july-ultra`; repository root | exact two-way union property synthesis and declared source reads | integrated through `26346f5` plus cleanup `6974fb4`; direct reads over two declared type-literal unions reuse exact synthetic members, emit pinned TS2339/TS2551 details and spelling suggestions, preserve first-missing provenance, reject apparent-Object/comparator-dependent cases before publication, and pass independent review |
 | W1 S4b | `july-ultra`; repository root | direct scalar conditional initializers | integrated through `afb36f8`; boolean and ordinary scalar truthiness, branch-order joins, fixed/bootstrap and freshly allocated union identities, whole-source preflight, poison rejection, and forced warm replay pass the focused production gate and independent oracle review |
-| W1 S11a | `july-ultra`; repository root | first nongeneric class instance/value shells | integrated through `09c57b9`; local top-level nongeneric/no-heritage class declarations install exact instance, synthetic `this`, static value, and no-base constructor-cache identities with allocation-free warm reuse; annotated member materialization is active |
-| W1 review/oracle | rotating read-only lanes | pinned behavior, cache timing, and adversarial fixtures | S5/S6, scalar conditionals, declared union members, and direct interface-union admission are approved with no remaining P0/P1 issue; review rotates with each integrated leaf |
+| W1 S11a | `july-ultra`; repository root | primitive class declarations through source/compiler | integrated through `b909237` with classifier repair `1ad5689`; local named nongeneric/no-heritage classes install exact instance/static member graphs and a default construct signature at lexical source positions, whole-file preflight rejects unsafe or poisoned later classes before earlier publication, exported/anonymous classes remain typed boundaries, and independent review found no remaining P0/P1 issue |
+| W1 S11a heritage | isolated worker worktree | one exact direct local nongeneric base class plus class relations | active; pinned owner/base instance/value provenance, own-first instance/static composition, derived default construction, exact relation admission, and poison/cache-masking gates are the frozen contract |
+| W1 S11b default construction | isolated worker worktree | direct zero-argument `new Model()` and optional-property read adjacency | active; source execution will consume the canonical class construct signature without widening constructors, class bodies, or unsupported new-expression forms |
+| W1 A16 oracle | read-only worker lane | first direct nongeneric intersection contract | active inventory; no implementation lease has been granted yet |
+| W1 review/oracle | rotating read-only lanes | pinned behavior, cache timing, and adversarial fixtures | declared union reads and primitive class source execution are approved with no remaining P0/P1 issue; the fixed shard additionally caught and closed one anonymous-class fatal classifier regression |
 
 The completed S5/S6 sub-wave validates the intended four-slot steady state:
 root integrates and builds, two isolated semantic workers own non-overlapping
@@ -78,8 +81,23 @@ The integrated S2b/S4b/S11a-shell stack through `d443d1b` has raw fixed-shard
 digest `514c967f1737901d80dbdd5af119cfb0`. Removing the Rust provenance object and
 invocation provenance produces `353dddd39af6749db775683da54d7c9a` again. The
 96 variants remain four exact, 90 typed capability boundaries, two supported
-mismatches, and zero fatal invariants. The focused public checker surface is
-now 81 tests across 29 independently runnable targets.
+mismatches, and zero fatal invariants. At that checkpoint, the focused public
+checker surface was 81 tests across 29 independently runnable targets.
+
+The declared-union read and primitive-class source stack through `1ad5689` has
+raw fixed-shard digest `b9bd4de812f8b438af1baa9c7aae15d9`. The first run
+at `b909237` exposed one honest integration bug: an anonymous decorated class
+was classified as `INV.SOURCE.CLASS`. `1ad5689` moves the missing-name check
+ahead of semantic class planning, adds checker/compiler regressions, and the
+rerun returns to zero fatal invariants. The headline remains four exact
+variants, 90 typed capability boundaries, and two supported mismatches. Its
+provenance-normalized digest is `c3dd4beaec5aae1377c60e50e7871d6f`:
+15 fixed-shard frontier records changed from `d443d1b`, all retaining the same
+typed capability code and comparison status. One fixture,
+`checkInheritedProperty.ts`, now advances past its first class declaration to
+the next unsupported `declare` modifier; the other 14 expose a more specific
+class-family boundary. There are no exact losses. The focused public checker
+surface is now 94 tests across 31 independently runnable targets.
 
 The current frontier is four exact variants, 90 typed capability boundaries,
 and two supported mismatches. The run discovers 12,750 upstream configurations,

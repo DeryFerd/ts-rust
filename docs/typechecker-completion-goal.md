@@ -136,7 +136,7 @@ inline indexed access, property objects in unions, all eight strict `typeof`
 tags, reversed comparisons, object/function classification, `void` projection,
 and base/local join identity restoration.
 
-### Execution checkpoint: 2026-07-16
+### Execution checkpoint: 2026-07-17
 
 The fixed 96-variant smoke lane is integrated and reproducible. The current
 frontier remains four exact variants, 90 typed capability boundaries, two
@@ -190,6 +190,24 @@ review found no P0/P1 issue in the union and conditional cuts. The frozen
 supported mismatches, and zero fatal invariants; its provenance-normalized
 digest is still `353dddd39af6749db775683da54d7c9a`.
 
+The following source-facing cut is integrated through `1ad5689`. Direct
+property reads over exact two-member declared type-literal unions now execute
+through the ordinary source dispatcher with pinned synthetic-member identity,
+TS2339/TS2551 diagnostics, first-missing constituent detail, spelling
+suggestions, warm replay, and fail-closed apparent-Object/comparator handling.
+Nongeneric/no-heritage classes with primitive annotated fields now execute at
+their lexical source positions, publish exact instance/static member graphs
+and the canonical default construct signature, and are admitted through the
+compiler adapter. Whole-file planning validates every later class before an
+earlier class can publish; exported, anonymous, unsafe-initialization, and
+unsupported member families remain typed capability boundaries. Independent
+review found no remaining P0/P1 issue. A fixed-shard run caught one anonymous
+class invariant classification after initial integration; `1ad5689` repairs it
+and the full rerun has four exact variants, 90 typed capability boundaries, two
+supported mismatches, and zero fatal invariants. The normalized digest changes
+to `c3dd4beaec5aae1377c60e50e7871d6f` solely because 15 frontier details move
+within the same capability/status classes; there are no exact losses.
+
 The four-slot topology has rotated from the completed S5/S6 leaf pair into
 S2b/S4b/S11a cuts while root retains shared type-node, store, compiler,
 formatter, build, and scoring ownership. The live commit/worktree ledger is
@@ -202,7 +220,7 @@ At the planning baseline:
 | Evidence | Current value | Interpretation |
 |---|---:|---|
 | Semantic unit tests compiled | 923 | Broad invariant coverage; the monolithic binary cannot link in the current memory envelope |
-| Public checker integration tests | 81 across 29 targets | Executable production-path evidence and the mandatory home for new verticals |
+| Public checker integration tests | 94 across 31 targets | Executable production-path evidence and the mandatory home for new verticals |
 | Semantic modules | 58 | Enough leaf surfaces for bounded ownership |
 | `type_nodes.rs` | 16,820 lines | Shared type-family dispatch hotspot |
 | `source.rs` | 16,162 lines | Shared source-plan/execution hotspot |
