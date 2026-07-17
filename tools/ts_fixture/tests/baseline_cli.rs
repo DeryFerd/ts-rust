@@ -431,7 +431,7 @@ impl FixedCliFixture {
         assert_eq!(
             output.status.code(),
             Some(2),
-            "stdout:\n{}\nstderr:\n{}",
+            "manifest={name}\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );

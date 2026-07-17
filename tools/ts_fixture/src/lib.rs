@@ -16,7 +16,7 @@ use std::{
     sync::Arc,
 };
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use ts_core::{SourceText, TextRange};
 use ts_vfs::{FileSystem, MemoryFileSystem, decode_utf16_bom};
 use xxhash_rust::xxh3::xxh3_128;
@@ -556,6 +556,7 @@ struct FixedVariantManifestEntry {
     family: String,
     case: String,
     options: BTreeMap<String, String>,
+    #[serde(default)]
     expected_baseline: FixedExpectedBaseline,
     expected_diagnostics: FixedExpectedDiagnostics,
     file_shape: FixedFileShape,
@@ -563,18 +564,32 @@ struct FixedVariantManifestEntry {
     tags: Vec<String>,
 }
 
-/// A nullable value whose containing object must still include the field.
-///
-/// Serde treats a bare `Option<T>` field as optional during derived
-/// deserialization. The transparent wrapper preserves JSON `null` while
-/// making an omitted `expectedBaseline` a schema error.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
-#[serde(transparent)]
-struct FixedExpectedBaseline(Option<String>);
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+enum FixedExpectedBaseline {
+    #[default]
+    Missing,
+    Present(Option<String>),
+}
 
 impl FixedExpectedBaseline {
+    const fn is_missing(&self) -> bool {
+        matches!(self, Self::Missing)
+    }
+
     fn as_deref(&self) -> Option<&str> {
-        self.0.as_deref()
+        match self {
+            Self::Missing | Self::Present(None) => None,
+            Self::Present(Some(value)) => Some(value),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for FixedExpectedBaseline {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Option::<String>::deserialize(deserializer).map(Self::Present)
     }
 }
 
@@ -758,6 +773,12 @@ fn validate_fixed_variant_manifest_structure(manifest: &FixedVariantManifest) ->
         if !is_lower_hex(digest, 32) || !keys.insert(entry.variant_key.as_str()) {
             return Err(invalid_fixed_manifest(format!(
                 "variant key {:?} is malformed or duplicated",
+                entry.variant_key
+            )));
+        }
+        if entry.expected_baseline.is_missing() {
+            return Err(invalid_fixed_manifest(format!(
+                "variant {} must explicitly include expectedBaseline",
                 entry.variant_key
             )));
         }
@@ -1196,6 +1217,7 @@ impl fmt::Display for RunnerSummary {
 /// # Errors
 ///
 /// Returns an error when a case, baseline, or fixture compilation cannot be read.
+#[allow(clippy::too_many_lines)] // Keep emitted-output selection and accounting visibly linear.
 pub fn run_upstream_baselines(
     repository: &Path,
     options: &RunnerOptions,
@@ -1564,6 +1586,7 @@ fn resolve_fixed_variant_plans(
         .collect())
 }
 
+#[allow(clippy::too_many_lines)] // One shared execution path keeps ordinary and fixed runs exact.
 fn execute_diagnostic_variant(
     mut plan: DiagnosticVariantPlan,
     repository: &Path,
