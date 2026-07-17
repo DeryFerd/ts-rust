@@ -43,6 +43,7 @@ use super::{
         resolve_nongeneric_keyof_type,
     },
     object_members::{self, PropertyObjectError, PropertyObjectPlan, PropertyObjectState},
+    reference_types::{create_direct_generic_reference, validate_direct_generic_reference},
     signatures::{ElementFlags, Signature},
     source_callables::{
         self, PendingSourceCallableParameterTypes, SourceCallableError, SourceCallableFamily,
@@ -230,6 +231,7 @@ struct PlannedTypeReference {
     alias_owner: Option<SemanticSymbolId>,
     arity: PlannedTypeReferenceArity,
     global_array_target: Option<TypeId>,
+    direct_generic: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1018,9 +1020,9 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 self.plan_type_node_in_context(inner, alias_owner, union_constituent)
             }
             SyntaxKind::LiteralType => self.plan_literal_type(node),
-            // Global-aware shorthand `T[]` is the installed array-reference
-            // syntax. Direct `Array<T>`/`ReadonlyArray<T>` references still
-            // wait on generic interface type-argument instantiation.
+            // Global-aware shorthand `T[]` and named global arrays retain
+            // their specialized target capability; ordinary direct generic
+            // class/interface references are planned below.
             SyntaxKind::ArrayType if union_constituent && self.array_targets.is_none() => Err(
                 type_node_unavailable(TypeNodeUnavailable::UnsupportedUnionConstituent(node)),
             ),
@@ -2256,7 +2258,25 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                             ))
                         };
                     }
-                    if !flags.contains(SymbolFlags::TYPE_ALIAS) || malformed_alias_merge(flags) {
+                    if malformed_alias_merge(flags) {
+                        return Err(type_node_unavailable(
+                            TypeNodeUnavailable::InvalidCachedTypeAlias(root_symbol),
+                        ));
+                    }
+                    if flags.intersects(SymbolFlags::CLASS | SymbolFlags::INTERFACE) {
+                        if !missing_generic_metadata.is_empty() || remains_union {
+                            return Err(type_node_unavailable(
+                                TypeNodeUnavailable::InvalidCachedTypeAlias(root_symbol),
+                            ));
+                        }
+                        return self.validate_cached_class_or_interface_reference(
+                            root_symbol,
+                            reference,
+                            canonical,
+                            declared_type,
+                        );
+                    }
+                    if !flags.contains(SymbolFlags::TYPE_ALIAS) {
                         if !missing_generic_metadata.is_empty() {
                             return Err(type_node_unavailable(
                                 TypeNodeUnavailable::InvalidCachedTypeAlias(root_symbol),
@@ -2873,7 +2893,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             && !cached_pending_function
             && cached_enum_owner.is_none()
             && !cached_syntax_contains_builtin_array
-            && !self.cached_property_interface_reference(node)
+            && !self.cached_class_or_interface_reference(node)
             && !matches!(identifier.text.as_str(), "Array" | "ReadonlyArray")
         {
             return Ok(());
@@ -3006,6 +3026,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         }
 
         let mut effective_alias_owner = alias_owner;
+        let mut direct_generic = false;
         let arity = if global_array_target.is_some() {
             if type_arguments.len() == 1 {
                 PlannedTypeReferenceArity::Valid
@@ -3018,17 +3039,35 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         } else if flags.intersects(SymbolFlags::CLASS | SymbolFlags::INTERFACE) {
             let local_count =
                 preflight_class_or_interface_reference(self.store, self.host, symbol, flags)?;
-            if local_count != 0 || !type_arguments.is_empty() {
-                return Err(type_node_unavailable(if type_arguments.is_empty() {
-                    TypeNodeUnavailable::GenericReferenceUnsupported { node, symbol }
+            if local_count == 0 {
+                if flags.contains(SymbolFlags::INTERFACE)
+                    && !flags.contains(SymbolFlags::CLASS)
+                    && type_arguments.is_empty()
+                {
+                    self.plan_property_interface(symbol)?;
+                }
+                if type_arguments.is_empty() {
+                    PlannedTypeReferenceArity::Valid
                 } else {
-                    TypeNodeUnavailable::TypeArgumentsUnsupported(node)
-                }));
+                    PlannedTypeReferenceArity::NotGeneric
+                }
+            } else {
+                if exact_import.is_some() {
+                    return Err(type_node_unavailable(
+                        TypeNodeUnavailable::TypeArgumentsUnsupported(node),
+                    ));
+                }
+                self.preflight_direct_generic_reference_target(node, symbol, local_count)?;
+                direct_generic = true;
+                if type_arguments.len() == local_count {
+                    PlannedTypeReferenceArity::Valid
+                } else {
+                    PlannedTypeReferenceArity::InvalidGeneric {
+                        minimum: local_count,
+                        maximum: local_count,
+                    }
+                }
             }
-            if flags.contains(SymbolFlags::INTERFACE) && !flags.contains(SymbolFlags::CLASS) {
-                self.plan_property_interface(symbol)?;
-            }
-            PlannedTypeReferenceArity::Valid
         } else if flags.intersects(SymbolFlags::ENUM) {
             enums::preflight_enum(self.store, self.host, symbol)?;
             if cached_type.is_some() && cached_enum_owner != Some(symbol) {
@@ -3191,6 +3230,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             alias_owner: effective_alias_owner,
             arity,
             global_array_target,
+            direct_generic,
         };
         if let Some(existing) = self.plan.references.insert(node, planned.clone()) {
             assert_eq!(existing, planned, "one type-reference node has one plan");
@@ -3271,28 +3311,182 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             == Some(symbol)
     }
 
-    fn cached_property_interface_reference(&self, node: NodeRef) -> bool {
-        let cached_type_is_interface = self
+    fn cached_class_or_interface_reference(&self, node: NodeRef) -> bool {
+        let cached_type_is_class_or_interface = self
             .store
             .type_node_links(node)
             .and_then(|links| links.resolved_type)
             .and_then(|type_| self.store.type_payload(type_))
             .is_some_and(|record| {
-                matches!(record.data(), TypeData::Interface(_))
-                    && record.object_flags().contains(ObjectFlags::INTERFACE)
-                    && !record.object_flags().contains(ObjectFlags::CLASS)
+                record
+                    .symbol()
+                    .and_then(|symbol| self.store.get_merged_symbol(symbol))
+                    .and_then(|symbol| self.store.symbol(symbol))
+                    .is_some_and(|symbol| {
+                        symbol
+                            .flags()
+                            .intersects(SymbolFlags::CLASS | SymbolFlags::INTERFACE)
+                    })
             });
-        let cached_symbol_is_interface = self
+        let cached_symbol_is_class_or_interface = self
             .store
             .symbol_node_links(node)
             .and_then(|links| links.resolved_symbol)
             .and_then(|symbol| self.store.get_merged_symbol(symbol))
             .and_then(|symbol| self.store.symbol(symbol))
             .is_some_and(|record| {
-                record.flags().contains(SymbolFlags::INTERFACE)
-                    && !record.flags().contains(SymbolFlags::CLASS)
+                record
+                    .flags()
+                    .intersects(SymbolFlags::CLASS | SymbolFlags::INTERFACE)
             });
-        cached_type_is_interface || cached_symbol_is_interface
+        cached_type_is_class_or_interface || cached_symbol_is_class_or_interface
+    }
+
+    fn preflight_direct_generic_reference_target(
+        &self,
+        node: NodeRef,
+        symbol: SemanticSymbolId,
+        local_type_parameter_count: usize,
+    ) -> Result<(), DeclaredTypeError> {
+        let unsupported = || {
+            type_node_unavailable(TypeNodeUnavailable::GenericReferenceUnsupported { node, symbol })
+        };
+        let declarations = self
+            .store
+            .symbol(symbol)
+            .and_then(|symbol| symbol.declarations())
+            .filter(|declarations| declarations.len() == 1)
+            .ok_or_else(unsupported)?;
+        let declaration = declarations[0];
+        if declaration.arena != node.arena || declaration.file != node.file {
+            return Err(unsupported());
+        }
+        let declaration_node = preflight_node(self.store, self.host, declaration)?;
+        if declaration_node.flags.0 & NODE_FLAG_JSDOC != 0 {
+            return Err(unsupported());
+        }
+        let parameters = match &declaration_node.data {
+            NodeData::ClassDeclaration(class) => class.type_parameters.as_ref(),
+            NodeData::InterfaceDeclaration(interface) => interface.type_parameters.as_ref(),
+            _ => return Err(unsupported()),
+        }
+        .filter(|parameters| {
+            parameters.nodes.len() == local_type_parameter_count && !parameters.nodes.is_empty()
+        })
+        .ok_or_else(unsupported)?;
+        let parent = declaration_node
+            .parent
+            .map(|parent| NodeRef::new(declaration.arena, declaration.file, parent))
+            .ok_or_else(unsupported)?;
+        if preflight_node(self.store, self.host, parent)?.kind != SyntaxKind::SourceFile {
+            return Err(unsupported());
+        }
+        for parameter in &parameters.nodes {
+            let parameter = NodeRef::new(declaration.arena, declaration.file, *parameter);
+            let parameter_node = preflight_node(self.store, self.host, parameter)?;
+            let NodeData::TypeParameterDeclaration(parameter_data) = &parameter_node.data else {
+                return Err(unsupported());
+            };
+            if parameter_node.parent != Some(declaration.node)
+                || parameter_node.flags.0 & NODE_FLAG_JSDOC != 0
+                || parameter_data.constraint.is_some()
+                || parameter_data.default_type.is_some()
+                || parameter_data.expression.is_some()
+                || parameter_data.modifiers.is_some()
+            {
+                return Err(unsupported());
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_cached_class_or_interface_reference(
+        &self,
+        root_symbol: SemanticSymbolId,
+        reference: NodeRef,
+        target_symbol: SemanticSymbolId,
+        declared_type: TypeId,
+    ) -> Result<(), DeclaredTypeError> {
+        let flags = self
+            .store
+            .symbol(target_symbol)
+            .map(ts_binder::semantic::Symbol::flags)
+            .ok_or(DeclaredTypeError::Unavailable(
+                DeclaredTypeUnavailable::SymbolNotOwned(target_symbol),
+            ))?;
+        let local_type_parameter_count =
+            preflight_class_or_interface_reference(self.store, self.host, target_symbol, flags)?;
+        let argument_nodes = self.type_reference_argument_nodes(reference)?;
+        let is_error = self
+            .store
+            .intrinsic_bootstrap()
+            .is_some_and(|bootstrap| declared_type == bootstrap.error_type);
+        if local_type_parameter_count == 0 {
+            if !argument_nodes.is_empty() {
+                return if is_error {
+                    Ok(())
+                } else {
+                    Err(type_node_unavailable(
+                        TypeNodeUnavailable::InvalidCachedTypeAlias(root_symbol),
+                    ))
+                };
+            }
+            let target = self
+                .store
+                .declared_type_links(target_symbol)
+                .and_then(|links| links.declared_type);
+            return if target == Some(declared_type) {
+                Ok(())
+            } else {
+                Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidCachedTypeAlias(root_symbol),
+                ))
+            };
+        }
+
+        self.preflight_direct_generic_reference_target(
+            reference,
+            target_symbol,
+            local_type_parameter_count,
+        )?;
+        if argument_nodes.len() != local_type_parameter_count {
+            return if is_error {
+                Ok(())
+            } else {
+                Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidCachedTypeAlias(root_symbol),
+                ))
+            };
+        }
+        let target = self
+            .store
+            .declared_type_links(target_symbol)
+            .and_then(|links| links.declared_type)
+            .ok_or_else(|| {
+                type_node_unavailable(TypeNodeUnavailable::InvalidCachedTypeAlias(root_symbol))
+            })?;
+        let cached_reference = validate_direct_generic_reference(self.store, declared_type)
+            .map_err(|_| {
+                type_node_unavailable(TypeNodeUnavailable::InvalidCachedTypeAlias(root_symbol))
+            })?;
+        if cached_reference.target != target
+            || cached_reference.type_arguments.len() != argument_nodes.len()
+        {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidCachedTypeAlias(root_symbol),
+            ));
+        }
+        for (node, cached) in argument_nodes
+            .into_iter()
+            .zip(cached_reference.type_arguments)
+        {
+            if self.cached_type_node_identity(root_symbol, node)? != cached {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidCachedTypeAlias(root_symbol),
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn validate_generic_alias_default_references(
@@ -6647,6 +6841,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             && !planned_reference.is_some_and(|reference| {
                 reference.import_alias.is_some()
                     || reference.global_array_target.is_some()
+                    || reference.direct_generic
                     || plan.interfaces.contains_key(&reference.symbol)
             })
         {
@@ -6727,36 +6922,52 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             let declared_type = self.execute_declared_type(symbol, plan, prepared)?;
             match reference.arity {
                 PlannedTypeReferenceArity::Valid => {
-                    let alias_parameter_count = self
-                        .store
-                        .type_alias_links(symbol)
-                        .and_then(|links| links.type_parameters.as_ref())
-                        .map(Vec::len);
-                    let is_type_alias =
-                        self.symbol_flags(symbol)?.contains(SymbolFlags::TYPE_ALIAS);
-                    if is_type_alias
-                        && !reference.type_arguments.is_empty()
-                        && alias_parameter_count.is_none()
-                    {
-                        self.issue_type_reference_arity_diagnostic(
-                            node,
-                            symbol,
-                            PlannedTypeReferenceArity::NotGeneric,
-                            None,
-                        )?;
-                        self.error_type()?
-                    } else if is_type_alias
-                        && (!reference.type_arguments.is_empty()
-                            || alias_parameter_count.is_some_and(|count| count != 0))
-                    {
-                        self.execute_generic_alias_instantiation(
-                            &reference,
+                    if reference.direct_generic {
+                        let mut type_arguments = Vec::with_capacity(reference.type_arguments.len());
+                        for argument in &reference.type_arguments {
+                            type_arguments.push(self.execute_type_node(*argument, plan, prepared)?);
+                        }
+                        create_direct_generic_reference(
+                            self.store,
                             declared_type,
-                            plan,
-                            prepared,
-                        )?
+                            &type_arguments,
+                            ObjectFlags::FROM_TYPE_NODE,
+                        )
+                        .map_err(|_| {
+                            type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node))
+                        })?
                     } else {
-                        declared_type
+                        let alias_parameter_count = self
+                            .store
+                            .type_alias_links(symbol)
+                            .and_then(|links| links.type_parameters.as_ref())
+                            .map(Vec::len);
+                        let is_type_alias =
+                            self.symbol_flags(symbol)?.contains(SymbolFlags::TYPE_ALIAS);
+                        if is_type_alias
+                            && !reference.type_arguments.is_empty()
+                            && alias_parameter_count.is_none()
+                        {
+                            self.issue_type_reference_arity_diagnostic(
+                                node,
+                                symbol,
+                                PlannedTypeReferenceArity::NotGeneric,
+                                None,
+                            )?;
+                            self.error_type()?
+                        } else if is_type_alias
+                            && (!reference.type_arguments.is_empty()
+                                || alias_parameter_count.is_some_and(|count| count != 0))
+                        {
+                            self.execute_generic_alias_instantiation(
+                                &reference,
+                                declared_type,
+                                plan,
+                                prepared,
+                            )?
+                        } else {
+                            declared_type
+                        }
                     }
                 }
                 PlannedTypeReferenceArity::NotGeneric
@@ -7015,7 +7226,8 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         let name = if let Some(target) = generic_global_target {
             self.generic_global_type_display_name(node, symbol, target, &symbol_name)?
         } else {
-            symbol_name
+            self.direct_generic_reference_display_name(symbol, &symbol_name)
+                .unwrap_or(symbol_name)
         };
         let (code, arguments) = match arity {
             PlannedTypeReferenceArity::NotGeneric => (2315, vec![name]),
@@ -7037,6 +7249,34 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             ),
         );
         Ok(())
+    }
+
+    fn direct_generic_reference_display_name(
+        &self,
+        symbol: SemanticSymbolId,
+        symbol_name: &str,
+    ) -> Option<String> {
+        let declared_type = self.store.declared_type_links(symbol)?.declared_type?;
+        let TypeData::Interface(interface) = self.store.type_payload(declared_type)?.data() else {
+            return None;
+        };
+        let parameters = interface.reference.resolved_type_arguments.as_deref()?;
+        if parameters.is_empty() || interface.outer_type_parameter_count != 0 {
+            return None;
+        }
+        let names = parameters
+            .iter()
+            .map(|parameter| {
+                let parameter = cached_ordinary_type_parameter_owner(self.store, *parameter)?;
+                self.store
+                    .symbol(parameter)?
+                    .name()
+                    .as_utf8()
+                    .filter(|name| !name.is_empty())
+                    .map(str::to_owned)
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some(format!("{symbol_name}<{}>", names.join(", ")))
     }
 
     fn generic_global_type_display_name(
@@ -11401,8 +11641,11 @@ mod tests {
         let cases = [
             ("namespace N { export interface X {} } type Bad = N.X;", 0),
             ("type Bad = Missing;", 1),
-            ("interface Box<T> {} type Bad = Box<string>;", 2),
-            ("class Box<T> {} type Bad = Box;", 3),
+            (
+                "interface Box<T extends string> {} type Bad = Box<string>;",
+                2,
+            ),
+            ("class Box<T = string> {} type Bad = Box<string>;", 3),
         ];
 
         for (source, expected) in cases {
@@ -11431,12 +11674,7 @@ mod tests {
                             TypeNodeUnavailable::MissingTypeReference(_)
                         )
                     ) | (
-                        2,
-                        DeclaredTypeError::TypeNodeUnavailable(
-                            TypeNodeUnavailable::TypeArgumentsUnsupported(_)
-                        )
-                    ) | (
-                        3,
+                        2 | 3,
                         DeclaredTypeError::TypeNodeUnavailable(
                             TypeNodeUnavailable::GenericReferenceUnsupported { .. }
                         )
