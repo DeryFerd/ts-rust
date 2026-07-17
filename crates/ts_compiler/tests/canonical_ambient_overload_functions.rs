@@ -32,6 +32,14 @@ fn pinned_strict_false_options() -> CompilerOptions {
     }
 }
 
+fn pinned_strict_property_options() -> CompilerOptions {
+    CompilerOptions {
+        strict_null_checks: true,
+        strict_property_initialization: true,
+        ..pinned_strict_false_options()
+    }
+}
+
 #[test]
 fn canonical_program_checks_local_ambient_overload_order_and_hoisting() {
     let fs = MemoryFileSystem::new(true);
@@ -62,14 +70,13 @@ fn canonical_program_checks_local_ambient_overload_order_and_hoisting() {
 }
 
 #[test]
-fn pinned_ambiguous_overload_fixture_remains_at_uninitialized_class_field_boundary() {
+fn pinned_strict_false_fixture_advances_to_uninitialized_variable() {
     // Pinned typescript-go dc37b524:
     // `_submodules/TypeScript/tests/cases/compiler/ambiguousOverloadResolution.ts`.
     //
-    // Direct class heritage is supported here, but this narrow source adapter
-    // still requires every instance field to carry `?` or `!`, independently
-    // of strictPropertyInitialization. The original fixture therefore stops
-    // at B's uninitialized field before the later top-level variable.
+    // Direct class heritage and the bare instance field are both admitted
+    // when strictNullChecks and strictPropertyInitialization are disabled.
+    // The original fixture therefore reaches the later top-level variable.
     let fs = MemoryFileSystem::new(true);
     fs.write_file(
         "/project/ambiguousOverloadResolution.ts",
@@ -103,6 +110,52 @@ fn pinned_ambiguous_overload_fixture_remains_at_uninitialized_class_field_bounda
         matches!(
             &error,
             CanonicalProgramCheckError::SourceCheck {
+                error: SourceCheckError::Unsupported(
+                    UnsupportedSourceSyntax::MissingVariableInitializer(_)
+                ),
+                ..
+            }
+        ),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn both_strict_property_options_stop_at_the_uninitialized_class_field() {
+    let fs = MemoryFileSystem::new(true);
+    fs.write_file(
+        "/project/ambiguousOverloadResolution.ts",
+        concat!(
+            "class A { }\n",
+            "class B extends A { x: number; }\n",
+            "\n",
+            "declare function f(p: A, q: B): number;\n",
+            "declare function f(p: B, q: A): string;\n",
+            "\n",
+            "var x: B;\n",
+            "var t: number = f(x, x);\n",
+        ),
+    )
+    .unwrap();
+
+    let error = Program::try_new_with_canonical_checker(
+        &fs,
+        "/project",
+        &["ambiguousOverloadResolution.ts".to_owned()],
+        pinned_strict_property_options(),
+    )
+    .unwrap_err();
+
+    assert_eq!(
+        error.failure_class(),
+        CanonicalProgramCheckFailureClass::Unsupported {
+            capability_code: "E00.SOURCE_SYNTAX",
+        }
+    );
+    assert!(
+        matches!(
+            &error,
+            CanonicalProgramCheckError::SourceCheck {
                 error: SourceCheckError::Unsupported(UnsupportedSourceSyntax::Class(_)),
                 ..
             }
@@ -112,7 +165,7 @@ fn pinned_ambiguous_overload_fixture_remains_at_uninitialized_class_field_bounda
 }
 
 #[test]
-fn definite_field_variant_advances_through_heritage_to_uninitialized_variable() {
+fn definite_field_variant_advances_under_both_options_to_uninitialized_variable() {
     let fs = MemoryFileSystem::new(true);
     fs.write_file(
         "/project/ambiguousOverloadResolution.ts",
@@ -133,7 +186,7 @@ fn definite_field_variant_advances_through_heritage_to_uninitialized_variable() 
         &fs,
         "/project",
         &["ambiguousOverloadResolution.ts".to_owned()],
-        pinned_strict_false_options(),
+        pinned_strict_property_options(),
     )
     .unwrap_err();
 

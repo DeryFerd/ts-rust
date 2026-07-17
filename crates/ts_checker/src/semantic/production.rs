@@ -56,6 +56,8 @@ use super::{
 /// aliasing both fields to `Function`. `strict_builtin_iterator_return` is
 /// retained for declared type-alias construction. `strict_function_types` is
 /// retained as immutable context state for signature relation queries.
+/// `strict_property_initialization` controls the narrow source class-field
+/// admission check when intrinsic strict-null identity is also enabled.
 /// `no_implicit_any` controls diagnostics and evolving inference for
 /// unannotated declarations.
 /// `no_error_truncation` raises semantic type display to the pinned hard output
@@ -67,6 +69,7 @@ pub struct CanonicalCheckerOptions {
     pub strict_bind_call_apply: bool,
     pub strict_builtin_iterator_return: bool,
     pub strict_function_types: bool,
+    pub strict_property_initialization: bool,
     pub no_implicit_any: bool,
     pub no_error_truncation: bool,
     pub name_resolution: CanonicalNameResolverOptions,
@@ -79,6 +82,7 @@ impl From<IntrinsicBootstrapOptions> for CanonicalCheckerOptions {
             strict_bind_call_apply: false,
             strict_builtin_iterator_return: false,
             strict_function_types: false,
+            strict_property_initialization: false,
             no_implicit_any: false,
             no_error_truncation: false,
             name_resolution: CanonicalNameResolverOptions::default(),
@@ -2290,6 +2294,7 @@ mod tests {
         let defaults = CanonicalCheckerOptions::default();
         assert!(!defaults.strict_builtin_iterator_return);
         assert!(!defaults.strict_function_types);
+        assert!(!defaults.strict_property_initialization);
         assert!(!defaults.no_implicit_any);
         assert!(!defaults.no_error_truncation);
 
@@ -2301,6 +2306,7 @@ mod tests {
         assert_eq!(options.intrinsic, intrinsic);
         assert!(!options.strict_builtin_iterator_return);
         assert!(!options.strict_function_types);
+        assert!(!options.strict_property_initialization);
         assert!(!options.no_implicit_any);
         assert!(!options.no_error_truncation);
     }

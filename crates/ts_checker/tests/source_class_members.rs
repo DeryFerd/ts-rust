@@ -4,8 +4,8 @@ use ts_binder::{
     CheckFlags, EscapedName, SemanticSymbolId, SymbolFlags,
 };
 use ts_checker::semantic::{
-    CanonicalCheckerContext, CanonicalCheckerOptions, SourceCheckError, TypeData, TypeNodeLinks,
-    UnsupportedSourceSyntax, ValueSymbolLinks,
+    CanonicalCheckerContext, CanonicalCheckerOptions, IntrinsicBootstrapOptions, SourceCheckError,
+    TypeData, TypeNodeLinks, UnsupportedSourceSyntax, ValueSymbolLinks,
     signatures::SignatureFlags,
     type_records::TypeCacheState,
     types::{ObjectFlags, TypeFlags},
@@ -29,6 +29,20 @@ fn checker_context_with_module_state(
     file: FileId,
     module_state: CanonicalModuleState,
 ) -> CanonicalCheckerContext<'_> {
+    checker_context_with_options(
+        parsed,
+        file,
+        module_state,
+        CanonicalCheckerOptions::default(),
+    )
+}
+
+fn checker_context_with_options(
+    parsed: &ParseResult,
+    file: FileId,
+    module_state: CanonicalModuleState,
+    options: CanonicalCheckerOptions,
+) -> CanonicalCheckerContext<'_> {
     let mut binder = CanonicalBinder::new();
     binder
         .bind_source_file_with_facts(
@@ -49,9 +63,20 @@ fn checker_context_with_module_state(
     CanonicalCheckerContext::new(
         binder.finish(),
         [(file, &parsed.arena)].into_iter().collect(),
-        CanonicalCheckerOptions::default(),
+        options,
     )
     .unwrap()
+}
+
+fn strict_property_options() -> CanonicalCheckerOptions {
+    CanonicalCheckerOptions {
+        intrinsic: IntrinsicBootstrapOptions {
+            strict_null_checks: true,
+            ..IntrinsicBootstrapOptions::default()
+        },
+        strict_property_initialization: true,
+        ..CanonicalCheckerOptions::default()
+    }
 }
 
 fn class_declaration(parsed: &ParseResult, file: FileId, expected: &str) -> NodeRef {
@@ -80,6 +105,22 @@ fn class_symbol(
     let declaration = class_declaration(parsed, file, expected);
     let raw = context.file(file).unwrap().1.symbol(declaration).unwrap();
     context.store().get_merged_symbol(raw).unwrap()
+}
+
+fn variable_declaration(parsed: &ParseResult, file: FileId, expected: &str) -> NodeRef {
+    parsed
+        .arena
+        .iter()
+        .find_map(|(node, record)| {
+            let NodeData::VariableDeclaration(variable) = &record.data else {
+                return None;
+            };
+            let NodeData::Identifier(name) = &parsed.arena.get(variable.name)?.data else {
+                return None;
+            };
+            (name.text == expected).then_some(NodeRef::new(parsed.arena.id(), file, node))
+        })
+        .unwrap_or_else(|| panic!("missing variable {expected}"))
 }
 
 fn type_alias_symbol(
@@ -126,6 +167,13 @@ fn property_type_node(parsed: &ParseResult, file: FileId, expected: &str) -> Nod
             })
         })
         .unwrap_or_else(|| panic!("missing property {expected}"))
+}
+
+fn is_type_checked(context: &CanonicalCheckerContext<'_>, file: FileId) -> bool {
+    context
+        .source_file(file)
+        .and_then(|source| context.store().source_file_links(source))
+        .is_some_and(|links| links.type_checked)
 }
 
 #[test]
@@ -213,41 +261,165 @@ fn supported_classes_execute_at_their_lexical_statement_positions() {
 }
 
 #[test]
-fn later_unsafe_instance_field_preflights_before_earlier_class_publication() {
+fn loose_options_admit_bare_instance_fields_and_replay_without_growth() {
+    let parsed = parse_source_file(concat!(
+        "class Loose {\n",
+        "  bare: string;\n",
+        "  optional?: number;\n",
+        "  definite!: boolean;\n",
+        "  static count: number;\n",
+        "}\n",
+    ));
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+
+    for (index, options) in [
+        CanonicalCheckerOptions::default(),
+        CanonicalCheckerOptions {
+            strict_property_initialization: true,
+            ..CanonicalCheckerOptions::default()
+        },
+        CanonicalCheckerOptions {
+            intrinsic: IntrinsicBootstrapOptions {
+                strict_null_checks: true,
+                ..IntrinsicBootstrapOptions::default()
+            },
+            ..CanonicalCheckerOptions::default()
+        },
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let file = FileId::new(10 + u32::try_from(index).unwrap());
+        let mut context =
+            checker_context_with_options(&parsed, file, CanonicalModuleState::Script, options);
+        let symbol = class_symbol(&parsed, file, &context, "Loose");
+
+        context.check_source_file(file).unwrap();
+
+        let members = context.get_nongeneric_class_members(symbol).unwrap();
+        assert_eq!(members.instance_properties().len(), 3);
+        assert_eq!(members.static_properties().len(), 1);
+        assert!(is_type_checked(&context, file));
+        assert!(context.diagnostics().is_empty());
+        let warm = (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.store().symbol_len(),
+            context.store().symbol_store().symbol_table_len(),
+            context.store().relation_state_snapshot(),
+            members.clone(),
+        );
+
+        context.recheck_source_file(file).unwrap();
+        let replayed = context.get_nongeneric_class_members(symbol).unwrap();
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().symbol_len(),
+                context.store().symbol_store().symbol_table_len(),
+                context.store().relation_state_snapshot(),
+                replayed,
+            ),
+            warm
+        );
+        assert!(is_type_checked(&context, file));
+        assert!(context.diagnostics().is_empty());
+    }
+}
+
+#[test]
+fn strict_property_options_reject_later_unsafe_field_before_earlier_publication() {
     let parsed = parse_source_file(concat!(
         "class Early { value?: string; }\n",
         "class Later { value: string; static count: number; }\n",
     ));
     assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
     let file = FileId::new(0);
-    let mut context = checker_context(&parsed, file);
+    let mut context = checker_context_with_options(
+        &parsed,
+        file,
+        CanonicalModuleState::Script,
+        strict_property_options(),
+    );
     let early = class_symbol(&parsed, file, &context, "Early");
     let later = class_declaration(&parsed, file, "Later");
+    let later_symbol = class_symbol(&parsed, file, &context, "Later");
     let before = (
         context.store().type_len(),
         context.store().signature_len(),
+        context.store().symbol_len(),
         context.store().symbol_store().symbol_table_len(),
         context.store().relation_state_snapshot(),
     );
 
-    assert_eq!(
-        context.check_source_file(file),
-        Err(SourceCheckError::Unsupported(
-            UnsupportedSourceSyntax::Class(later)
-        ))
+    for _ in 0..2 {
+        assert_eq!(
+            context.check_source_file(file),
+            Err(SourceCheckError::Unsupported(
+                UnsupportedSourceSyntax::Class(later)
+            ))
+        );
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().symbol_len(),
+                context.store().symbol_store().symbol_table_len(),
+                context.store().relation_state_snapshot(),
+            ),
+            before
+        );
+        for symbol in [early, later_symbol] {
+            assert!(context.store().declared_type_links(symbol).is_none());
+            assert!(context.store().value_symbol_links(symbol).is_none());
+        }
+        assert!(!is_type_checked(&context, file));
+        assert!(context.diagnostics().is_empty());
+    }
+}
+
+#[test]
+fn later_uninitialized_variable_keeps_an_admitted_loose_class_cold_across_retries() {
+    let parsed = parse_source_file(concat!(
+        "class Loose { bare: string; optional?: number; static count: number; }\n",
+        "var missing: Loose;\n",
+    ));
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(13);
+    let mut context = checker_context(&parsed, file);
+    let class = class_symbol(&parsed, file, &context, "Loose");
+    let missing = variable_declaration(&parsed, file, "missing");
+    let cold = (
+        context.store().type_len(),
+        context.store().signature_len(),
+        context.store().symbol_len(),
+        context.store().symbol_store().symbol_table_len(),
+        context.store().relation_state_snapshot(),
     );
-    assert_eq!(
-        (
-            context.store().type_len(),
-            context.store().signature_len(),
-            context.store().symbol_store().symbol_table_len(),
-            context.store().relation_state_snapshot(),
-        ),
-        before
-    );
-    assert!(context.store().declared_type_links(early).is_none());
-    assert!(context.store().value_symbol_links(early).is_none());
-    assert!(context.diagnostics().is_empty());
+
+    for _ in 0..2 {
+        assert_eq!(
+            context.check_source_file(file),
+            Err(SourceCheckError::Unsupported(
+                UnsupportedSourceSyntax::MissingVariableInitializer(missing)
+            ))
+        );
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().symbol_len(),
+                context.store().symbol_store().symbol_table_len(),
+                context.store().relation_state_snapshot(),
+            ),
+            cold
+        );
+        assert!(context.store().declared_type_links(class).is_none());
+        assert!(context.store().value_symbol_links(class).is_none());
+        assert!(!is_type_checked(&context, file));
+        assert!(context.diagnostics().is_empty());
+    }
 }
 
 #[test]

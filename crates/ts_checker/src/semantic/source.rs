@@ -917,6 +917,7 @@ struct SourcePlanner<'arena, 'semantic, 'sources> {
         &'semantic DeclaredTypeHost<'sources>,
     )>,
     array_targets: Option<CanonicalArrayTargets>,
+    enforce_property_initialization: bool,
     hoisted_functions: HashSet<SemanticSymbolId>,
     prior_variables: HashSet<SemanticSymbolId>,
     readable_variables: HashSet<SemanticSymbolId>,
@@ -947,6 +948,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             type_import_value_uses: Vec::new(),
             semantic: None,
             array_targets: None,
+            enforce_property_initialization: false,
             hoisted_functions: HashSet::new(),
             prior_variables: HashSet::new(),
             readable_variables: HashSet::new(),
@@ -964,6 +966,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         source: SourceFileRef,
         store: &'semantic CanonicalTypeMapperStore,
         host: &'semantic DeclaredTypeHost<'sources>,
+        enforce_property_initialization: bool,
     ) -> Self {
         Self {
             arena,
@@ -981,6 +984,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             type_import_value_uses: Vec::new(),
             semantic: Some((store, host)),
             array_targets: None,
+            enforce_property_initialization,
             hoisted_functions: HashSet::new(),
             prior_variables: HashSet::new(),
             readable_variables: HashSet::new(),
@@ -999,8 +1003,16 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         store: &'semantic CanonicalTypeMapperStore,
         host: &'semantic DeclaredTypeHost<'sources>,
         global_types: &CanonicalGlobalTypes,
+        enforce_property_initialization: bool,
     ) -> Self {
-        let mut planner = Self::new_semantic(arena, bound, source, store, host);
+        let mut planner = Self::new_semantic(
+            arena,
+            bound,
+            source,
+            store,
+            host,
+            enforce_property_initialization,
+        );
         planner.array_targets = Some(CanonicalArrayTargets::from_global_types(global_types));
         planner
     }
@@ -1316,7 +1328,9 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                             UnsupportedSourceSyntax::Class(statement),
                         ));
                     }
-                    if !class.instance_properties_are_initialization_safe() {
+                    if self.enforce_property_initialization
+                        && !class.instance_properties_are_initialization_safe()
+                    {
                         return Err(SourceCheckError::Unsupported(
                             UnsupportedSourceSyntax::Class(statement),
                         ));
@@ -9304,6 +9318,7 @@ pub(super) fn check_source_file(
         store,
         host,
         global_types,
+        options.intrinsic.strict_null_checks && options.strict_property_initialization,
     )
     .finish()?;
     preflight_inferred_function_return_dependencies(&functions)?;
@@ -14159,9 +14174,16 @@ mod tests {
             let source = nested_context.source_file(nested_file).unwrap();
             let host = DeclaredTypeHost::new([(arena, bound)]).unwrap();
             let plan =
-                SourcePlanner::new_semantic(arena, bound, source, nested_context.store(), &host)
-                    .finish()
-                    .unwrap();
+                SourcePlanner::new_semantic(
+                    arena,
+                    bound,
+                    source,
+                    nested_context.store(),
+                    &host,
+                    false,
+                )
+                .finish()
+                .unwrap();
             let [PlannedStatement::Variables(variables)] = plan.statements.as_slice() else {
                 panic!("expected one variable statement")
             };
