@@ -2023,12 +2023,31 @@ mod tests {
     #[test]
     fn classifies_bound_expando_properties_as_deferred_source_semantics() {
         let direct = Fixture::new("const foo = () => {}; foo.bar = 42; export {};");
+        let direct_declaration = direct.declarations()[0];
+        let NodeData::VariableDeclaration(direct_variable) =
+            &direct.parsed.arena.get(direct_declaration.node).unwrap().data
+        else {
+            panic!("expected variable declaration")
+        };
+        let direct_arrow = NodeRef::new(
+            direct.parsed.arena.id(),
+            direct.file,
+            direct_variable.initializer.unwrap(),
+        );
+        let direct_owner = direct.bound.symbol(direct_arrow).unwrap();
+        assert!(direct.store.symbol(direct_owner).unwrap().exports().is_some());
         assert!(matches!(
             direct.plan(0),
             Err(SourceArrowError::Unsupported(
                 SourceArrowUnsupported::Callable(SourceCallableUnsupported::ExpandoProperties(_))
             ))
         ));
+        assert!(
+            direct
+                .store
+                .source_callable_type_for_owner(direct_owner)
+                .is_none()
+        );
 
         let contextual = Fixture::new("const foo: () => void = () => {}; foo.bar = 42; export {};");
         assert!(matches!(
