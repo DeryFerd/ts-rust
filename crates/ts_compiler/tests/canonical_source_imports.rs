@@ -122,6 +122,10 @@ fn canonical_program_consumes_declaration_exports_in_both_program_orders() {
             // A declaration-file source check would try to resolve this name.
             // The importer never reads it, so skipLibCheck must leave it alone.
             "export declare const unchecked: MissingGlobal;",
+            // Binder diagnostics are skipped too, while all declaration
+            // symbols remain available to the two importers.
+            "declare const duplicate: number; ",
+            "declare const duplicate: string;",
         ),
     )
     .unwrap();
