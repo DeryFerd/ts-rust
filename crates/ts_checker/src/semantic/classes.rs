@@ -1675,7 +1675,7 @@ pub(super) fn execute_nongeneric_class_members(
         None,
     ));
 
-    completed_class_members(
+    Ok(completed_class_members(
         store,
         plan,
         shells.instance_type,
@@ -1685,7 +1685,7 @@ pub(super) fn execute_nongeneric_class_members(
         panic!(
             "the fully preflighted class-member transaction published an invalid final graph"
         )
-    })
+    }))
 }
 
 #[cfg(test)]

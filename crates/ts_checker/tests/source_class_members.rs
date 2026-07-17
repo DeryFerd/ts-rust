@@ -77,7 +77,7 @@ fn property_type_node(parsed: &ParseResult, file: FileId, expected: &str) -> Nod
     parsed
         .arena
         .iter()
-        .find_map(|(node, record)| {
+        .find_map(|(_node, record)| {
             let NodeData::PropertyDeclaration(property) = &record.data else {
                 return None;
             };
