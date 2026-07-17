@@ -3029,7 +3029,7 @@ impl Program {
                         resolved_file_name: resolved_file_name.clone(),
                     });
                 };
-                self.require_plain_esm_bundler_source(target)?;
+                self.require_plain_esm_bundler_target(target)?;
                 if !source_file_is_external_module(&target.parse) {
                     return Err(CanonicalProgramCheckError::ExternalModuleTargetUnsupported {
                         specifier,
@@ -3053,9 +3053,24 @@ impl Program {
         &self,
         source: &SourceFile,
     ) -> Result<(), CanonicalProgramCheckError> {
+        self.require_plain_esm_bundler_file(source, false)
+    }
+
+    fn require_plain_esm_bundler_target(
+        &self,
+        source: &SourceFile,
+    ) -> Result<(), CanonicalProgramCheckError> {
+        self.require_plain_esm_bundler_file(source, true)
+    }
+
+    fn require_plain_esm_bundler_file(
+        &self,
+        source: &SourceFile,
+        allow_declaration_file: bool,
+    ) -> Result<(), CanonicalProgramCheckError> {
         let plain_typescript = ts_path::script_kind_from_path(&source.file_name)
             == ts_path::ScriptKind::Ts
-            && !ts_path::is_declaration_file(&source.file_name)
+            && (allow_declaration_file || !ts_path::is_declaration_file(&source.file_name))
             && Path::new(&source.file_name)
                 .extension()
                 .and_then(|extension| extension.to_str())
@@ -7868,7 +7883,7 @@ mod tests {
     }
 
     #[test]
-    fn canonical_module_manifest_rejects_declaration_targets_until_mode_is_proven() {
+    fn canonical_module_manifest_admits_plain_declaration_targets() {
         let fs = MemoryFileSystem::new(true);
         fs.write_file(
             "/project/target.d.ts",
@@ -7887,15 +7902,25 @@ mod tests {
             plain_esm_bundler_options(),
         );
 
-        let error = program
-            .canonical_module_resolution_manifest()
-            .unwrap_err();
-        assert!(error.is_unsupported_boundary());
-        assert!(matches!(
-            error,
-            CanonicalProgramCheckError::PlainEsmModuleResolutionUnsupported { file_name, .. }
-                if file_name == "/project/target.d.ts"
-        ));
+        let target = program.source_file("/project/target.d.ts").unwrap();
+        let manifest = program.canonical_module_resolution_manifest().unwrap();
+        let [entry] = manifest.entries() else {
+            panic!("expected one declaration-target resolution entry");
+        };
+        let ts_checker::semantic::CanonicalModuleResolutionInput::Resolved(resolution) =
+            entry.resolution()
+        else {
+            panic!("expected the declaration target to resolve");
+        };
+        assert_eq!(resolution.target_file(), target.id);
+        assert_eq!(
+            resolution.usage_mode(),
+            CanonicalModuleResolutionMode::Esm
+        );
+        assert_eq!(
+            resolution.target_mode(),
+            CanonicalModuleResolutionMode::Esm
+        );
     }
 
     #[test]
