@@ -21,7 +21,7 @@ use super::{
         prepare_direct_interface_declared_properties,
         publish_prepared_direct_interface_declared_properties,
     },
-    store::SourceNodeParent,
+    store::{DirectInterfaceHeritageProvenance, SourceNodeParent},
     type_records::{ConstrainedTypeData, InterfaceTypeData, TypeCacheState, TypeData},
     types::{ObjectFlags, TypeFlags},
 };
@@ -196,19 +196,29 @@ pub(super) fn resolve_direct_interface_members(
         .count();
     if !store.try_reserve_checker_symbol_allocations(0, usize::from(prepared_members.is_some()))
         || !store.try_reserve_value_symbol_links(missing_value_links)
+        || !store.try_reserve_direct_interface_heritage_provenance(1)
     {
         return Err(capacity(plan));
     }
 
     // Every allocation and fallible semantic check precedes this point. The
-    // prepared table owns entry capacity, the table arena and sparse value-link
-    // map are reserved, and the base/property vectors are already staged.
+    // prepared table owns entry capacity, the table arena, sparse value-link
+    // map, and heritage-provenance map are reserved, and the base/property
+    // vectors are already staged.
     let members = prepared_members.map(|prepared| store.alloc_prepared_symbol_table(prepared));
     if let Some(members) = members {
         for (name, property) in expected_entries {
             assert_eq!(store.insert_symbol(members, name, property), Some(None));
         }
     }
+    assert!(store.publish_direct_interface_heritage_provenance(
+        type_,
+        DirectInterfaceHeritageProvenance {
+            owner_symbol: plan.symbol,
+            base_symbol: planned_base.symbol,
+            base_type: *base_type,
+        },
+    ));
     publish_prepared_direct_interface_declared_properties(
         store,
         plan,
@@ -253,8 +263,14 @@ pub(super) fn validate_planned_interface_heritage_members(
     let Some([base_type]) = interface.resolved_base_types.as_deref() else {
         return false;
     };
+    let expected_provenance = DirectInterfaceHeritageProvenance {
+        owner_symbol: plan.symbol,
+        base_symbol: planned_base.symbol,
+        base_type: *base_type,
+    };
     if record.symbol() != Some(plan.symbol)
         || interface.declared_members != plan.members
+        || store.direct_interface_heritage_provenance(type_) != Some(expected_provenance)
         || store
             .type_payload(*base_type)
             .and_then(|base| base.symbol())
@@ -317,6 +333,19 @@ fn validate_property_interface(
         return None;
     };
     let owner = record.symbol()?;
+    let heritage_provenance = if requires_direct_base {
+        let provenance = store.direct_interface_heritage_provenance(type_)?;
+        (provenance.owner_symbol == owner).then_some(provenance)?
+    } else {
+        if store.direct_interface_heritage_provenance(type_).is_some() {
+            return None;
+        }
+        DirectInterfaceHeritageProvenance {
+            owner_symbol: owner,
+            base_symbol: owner,
+            base_type: type_,
+        }
+    };
     let owner_record = store.symbol(owner)?;
     let [owner_declaration] = owner_record.declarations()? else {
         return None;
@@ -364,8 +393,13 @@ fn validate_property_interface(
         interface.resolved_base_types.as_deref(),
     ) {
         (false, None) => Vec::new(),
-        (true, Some([base_type])) if *base_type != type_ => {
+        (true, Some([base_type]))
+            if *base_type != type_ && *base_type == heritage_provenance.base_type =>
+        {
             let base = validate_no_heritage_property_interface(store, *base_type)?;
+            if base.owner != heritage_provenance.base_symbol {
+                return None;
+            }
             base.properties
         }
         _ => return None,
@@ -559,6 +593,7 @@ mod tests {
         declared::get_declared_class_interface_or_type_parameter,
         object_members::{self, PropertyObjectState},
         production::GlobalMergeCompletion,
+        relater::RelationUnavailable,
     };
 
     const SOURCE: &str = concat!(
@@ -906,13 +941,27 @@ mod tests {
         ));
         assert_eq!(
             validate_interface_heritage_members(&prepared.fixture.store, prepared.derived_type,),
-            InterfaceHeritageMembersValidation::Valid,
+            InterfaceHeritageMembersValidation::Malformed,
         );
         assert!(!validate_planned_interface_heritage_members(
             &prepared.fixture.store,
             &prepared.derived_plan,
             prepared.derived_type,
         ));
+        let relation_state = prepared.fixture.store.relation_state_snapshot();
+        assert_eq!(
+            prepared
+                .fixture
+                .store
+                .is_type_assignable_to(prepared.derived_type, prepared.base_type),
+            Err(RelationUnavailable::InvalidStructuredMembers(
+                prepared.derived_type
+            )),
+        );
+        assert_eq!(
+            prepared.fixture.store.relation_state_snapshot(),
+            relation_state,
+        );
         let wrong_base = derived_state(&prepared.fixture.store, prepared.derived_type, own);
         assert!(
             resolve_direct_interface_members(
@@ -920,7 +969,7 @@ mod tests {
                 &prepared.derived_plan,
                 prepared.derived_type,
                 &[prepared.number_type],
-                &[prepared.other_type],
+                &[prepared.base_type],
             )
             .is_err()
         );

@@ -133,6 +133,18 @@ pub(super) struct SourceCallableProvenance {
     pub(super) contextual_variable: Option<SemanticSymbolId>,
 }
 
+/// Immutable syntax-plan edge for the admitted direct-interface heritage slice.
+///
+/// `resolved_base_types` remains the pinned semantic cache, while this separate
+/// provenance lets store-only consumers prove that the cached edge still names
+/// the exact base selected by source planning.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct DirectInterfaceHeritageProvenance {
+    pub(super) owner_symbol: SemanticSymbolId,
+    pub(super) base_symbol: SemanticSymbolId,
+    pub(super) base_type: TypeId,
+}
+
 /// One declaration-order row for an exact source generic signature.
 ///
 /// Both the binder symbol and canonical type identity are retained on purpose:
@@ -295,6 +307,7 @@ pub struct SemanticStore<TypePayload, MapperPayload> {
     function_type_provenance: HashSet<TypeId>,
     declared_call_set_provenance: HashSet<TypeId>,
     declared_call_set_types_by_signature: HashMap<SignatureId, TypeId>,
+    direct_interface_heritage_provenance: HashMap<TypeId, DirectInterfaceHeritageProvenance>,
     source_callable_provenance: HashMap<TypeId, SourceCallableProvenance>,
     source_callable_types_by_declaration: HashMap<NodeRef, TypeId>,
     source_callable_types_by_owner: HashMap<SemanticSymbolId, TypeId>,
@@ -365,6 +378,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             function_type_provenance: HashSet::new(),
             declared_call_set_provenance: HashSet::new(),
             declared_call_set_types_by_signature: HashMap::new(),
+            direct_interface_heritage_provenance: HashMap::new(),
             source_callable_provenance: HashMap::new(),
             source_callable_types_by_declaration: HashMap::new(),
             source_callable_types_by_owner: HashMap::new(),
@@ -3374,6 +3388,65 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
 }
 
 impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
+    pub(super) fn try_reserve_direct_interface_heritage_provenance(
+        &mut self,
+        additional: usize,
+    ) -> bool {
+        self.direct_interface_heritage_provenance
+            .try_reserve(additional)
+            .is_ok()
+    }
+
+    pub(super) fn direct_interface_heritage_provenance(
+        &self,
+        type_: TypeId,
+    ) -> Option<DirectInterfaceHeritageProvenance> {
+        self.direct_interface_heritage_provenance
+            .get(&type_)
+            .copied()
+    }
+
+    /// Publishes one source-planned direct-base edge exactly once.
+    ///
+    /// Callers reserve the map slot before beginning their semantic transaction.
+    /// Both declared-type links are authoritative by the time heritage members
+    /// resolve, so accepting only those identities prevents a coherent but
+    /// source-wrong `resolved_base_types` cache from reaching structural relation.
+    pub(super) fn publish_direct_interface_heritage_provenance(
+        &mut self,
+        type_: TypeId,
+        provenance: DirectInterfaceHeritageProvenance,
+    ) -> bool {
+        let owner_is_exact = self.type_payload(type_).is_some_and(|record| {
+            matches!(record.data(), TypeData::Interface(_))
+                && record.symbol() == Some(provenance.owner_symbol)
+        }) && self.get_merged_symbol(provenance.owner_symbol)
+            == Some(provenance.owner_symbol)
+            && self
+                .declared_type_links(provenance.owner_symbol)
+                .is_some_and(|links| links.declared_type == Some(type_));
+        let base_is_exact = self
+            .type_payload(provenance.base_type)
+            .is_some_and(|record| {
+                matches!(record.data(), TypeData::Interface(_))
+                    && record.symbol() == Some(provenance.base_symbol)
+            })
+            && self.get_merged_symbol(provenance.base_symbol) == Some(provenance.base_symbol)
+            && self
+                .declared_type_links(provenance.base_symbol)
+                .is_some_and(|links| links.declared_type == Some(provenance.base_type));
+        if provenance.owner_symbol == provenance.base_symbol || !owner_is_exact || !base_is_exact {
+            return false;
+        }
+        let std::collections::hash_map::Entry::Vacant(entry) =
+            self.direct_interface_heritage_provenance.entry(type_)
+        else {
+            return false;
+        };
+        entry.insert(provenance);
+        true
+    }
+
     /// Publishes the type, signature, generic metadata, provenance reverse
     /// maps, owner barrier, return annotation, and signature link as one
     /// prevalidated transaction.

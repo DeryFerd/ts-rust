@@ -1289,10 +1289,7 @@ fn plan_members(
             return Err(invalid_plan(&provisional));
         }
     }
-    if policy == TypeLiteralMemberPolicy::General
-        && !indexes.is_empty()
-        && !properties.is_empty()
-    {
+    if policy == TypeLiteralMemberPolicy::General && !indexes.is_empty() && !properties.is_empty() {
         return Err(PropertyObjectError::UnsupportedMember {
             node: indexes[0].declaration,
             kind: SyntaxKind::IndexSignature,
@@ -1871,12 +1868,17 @@ pub(super) fn prepare_direct_interface_declared_properties(
     if record.flags() != TypeFlags::OBJECT
         || record.symbol() != Some(plan.symbol)
         || record.alias().is_some()
+        || store.get_merged_symbol(plan.symbol) != Some(plan.symbol)
+        || store
+            .declared_type_links(plan.symbol)
+            .is_none_or(|links| links.declared_type != Some(type_))
         || !valid_thisless_interface_identity(interface)
     {
         return Err(invalid_cache(plan, type_));
     }
     if record.object_flags() == ObjectFlags::INTERFACE
         && !interface.base_types_resolved
+        && store.direct_interface_heritage_provenance(type_).is_none()
         && valid_unresolved_interface_members(interface)
         && unresolved_property_links(store, plan)
     {
