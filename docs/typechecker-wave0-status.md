@@ -5,7 +5,7 @@
 - Upstream epoch: `dc37b5249ab60e2bbce936f71b883e6c8136167e`
 - Wave branch baseline: `cdbf749`
 - Integration branch: `july-ultra`
-- Current root adapter: `690f13e`
+- Current root adapters: `690f13e`, `2ef996a`
 
 This is the live execution record for Wave 0 of
 [`typechecker-completion-goal.md`](typechecker-completion-goal.md). The port
@@ -15,13 +15,19 @@ map remains authoritative for cluster state.
 
 | Lane | Branch/worktree | Current task | State |
 |---|---|---|---|
-| Root/integration | `july-ultra`; repository root | typed failure envelope, contract freeze, serial verification | `690f13e` committed; review pending |
+| Root/integration | `july-ultra`; repository root | typed failure envelope, declaration-target admission, serial verification | `690f13e` and `2ef996a` committed; reviews pending |
 | M0 | `agent/w0-m0-scorecard`; `../ts-rust-worktrees/w0-m0-scorecard` | retained-fatal scorecard, provenance, registry, fixed manifest | implementing |
 | S2a | `agent/w0-s2a-members`; `../ts-rust-worktrees/w0-s2a-members` | direct nongeneric interface heritage and inherited members | contract frozen; implementing |
 | S3 | `agent/w0-s3-instantiation`; `../ts-rust-worktrees/w0-s3-instantiation` | composite mapper and exact instantiation session | contract frozen; implementing |
 
 Only S2a and S3 are semantic writers. M0 consumes the root-owned typed failure
 envelope and does not edit checker/compiler query internals.
+
+The S1a compiler prerequisite is now present: a plain `.d.ts` external module
+may be the resolved target of a plain TypeScript ESM/Bundler source while the
+importing source gate remains unchanged. Declaration files are still bound and
+retained, `skipLibCheck` still suppresses their source check, and declaration-
+target value/type consumption remains an explicit S1b checker leaf.
 
 ## Frozen S2-S3 boundary
 
