@@ -317,6 +317,57 @@ fn exported_class_is_unsupported_before_export_symbol_planning() {
 }
 
 #[test]
+fn anonymous_class_declaration_is_unsupported_before_class_planning() {
+    // This is the pinned smoke regression. The parser currently also retains
+    // TS1003, but the bound anonymous declaration still reaches source checking.
+    let parsed = parse_source_file("class {\n  @x\n  m() {}\n};");
+    let file = FileId::new(0);
+    let declaration = parsed
+        .arena
+        .iter()
+        .find_map(|(node, record)| {
+            matches!(record.data, NodeData::ClassDeclaration(_)).then_some(NodeRef::new(
+                parsed.arena.id(),
+                file,
+                node,
+            ))
+        })
+        .expect("fixture has one anonymous class declaration");
+    let mut context = checker_context(&parsed, file);
+    let before = (
+        context.store().type_len(),
+        context.store().signature_len(),
+        context.store().symbol_len(),
+        context.store().symbol_store().symbol_table_len(),
+        context.store().relation_state_snapshot(),
+    );
+
+    assert_eq!(
+        context.check_source_file(file),
+        Err(SourceCheckError::Unsupported(
+            UnsupportedSourceSyntax::Class(declaration)
+        ))
+    );
+    assert_eq!(
+        (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.store().symbol_len(),
+            context.store().symbol_store().symbol_table_len(),
+            context.store().relation_state_snapshot(),
+        ),
+        before
+    );
+    assert!(
+        context
+            .source_file(file)
+            .and_then(|source| context.store().source_file_links(source))
+            .is_none_or(|links| !links.type_checked)
+    );
+    assert!(context.diagnostics().is_empty());
+}
+
+#[test]
 fn public_class_member_query_materializes_both_sides_and_default_constructor() {
     let parsed = parse_source_file(SOURCE);
     assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);

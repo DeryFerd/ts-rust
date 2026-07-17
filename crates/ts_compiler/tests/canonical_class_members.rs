@@ -93,3 +93,25 @@ fn canonical_program_rejects_exported_class_as_a_typed_boundary() {
         }
     );
 }
+
+#[test]
+fn canonical_program_rejects_anonymous_class_declaration_as_a_typed_boundary() {
+    let fs = MemoryFileSystem::new(true);
+    fs.write_file("/project/main.ts", "class {\n  @x\n  m() {}\n};\n")
+        .unwrap();
+
+    let error = Program::try_new_with_canonical_checker(
+        &fs,
+        "/project",
+        &["main.ts".to_owned()],
+        canonical_options(),
+    )
+    .unwrap_err();
+
+    assert_eq!(
+        error.failure_class(),
+        CanonicalProgramCheckFailureClass::Unsupported {
+            capability_code: "E00.SOURCE_SYNTAX",
+        }
+    );
+}

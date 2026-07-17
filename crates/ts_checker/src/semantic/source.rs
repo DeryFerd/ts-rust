@@ -1152,10 +1152,15 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                             },
                         ));
                     };
+                    let Some(name) = class.name else {
+                        return Err(SourceCheckError::Unsupported(
+                            UnsupportedSourceSyntax::Class(statement),
+                        ));
+                    };
                     self.reject_class_declaration_modifiers(
                         statement,
                         node.range,
-                        class.name,
+                        name,
                         class.modifiers.as_ref(),
                     )?;
                     let Some((store, host)) = self.semantic else {
@@ -2100,16 +2105,11 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         &self,
         declaration: NodeRef,
         declaration_range: TextRange,
-        name: Option<NodeId>,
+        name: NodeId,
         modifiers: Option<&ModifierList>,
     ) -> Result<(), SourceCheckError> {
         let Some(modifiers) = modifiers else {
             return Ok(());
-        };
-        let Some(name) = name else {
-            return Err(SourceCheckError::Unsupported(
-                UnsupportedSourceSyntax::Class(declaration),
-            ));
         };
         match self.validate_named_type_modifiers(
             declaration,
