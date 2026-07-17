@@ -359,6 +359,9 @@ fn validate_cached_nongeneric_keyof_result(
     let bootstrap = store
         .intrinsic_bootstrap()
         .ok_or(LiteralTypeCacheError::BootstrapUninitialized)?;
+    store
+        .validate_union_constituent(cached)
+        .map_err(|_| NongenericKeyofError::InvalidCachedResult(cached))?;
     let mut property_keys = Vec::with_capacity(plan.property_names.len());
     for name in &plan.property_names {
         let literal = bootstrap
