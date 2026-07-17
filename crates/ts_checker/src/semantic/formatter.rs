@@ -943,6 +943,7 @@ const fn source_callable_display_unavailable(
             }
             SourceCallableUnsupported::Async(_)
             | SourceCallableUnsupported::Generator(_)
+            | SourceCallableUnsupported::ExpandoProperties(_)
             | SourceCallableUnsupported::Modifiers(_)
             | SourceCallableUnsupported::RequiredAfterOptional(_) => {
                 FunctionTypeDisplayUnavailable::UnvalidatedCallable
