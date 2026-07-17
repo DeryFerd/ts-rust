@@ -2303,10 +2303,16 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         let Some((store, _)) = self.semantic else {
             return Err(self.unsupported_function_body(callable));
         };
-        let bootstrap = store.intrinsic_bootstrap().ok_or(SourceCheckError::LiteralCache(
-            SourceLiteralCacheError::BootstrapUninitialized,
-        ))?;
-        preflight_source_expression_cache(store, typeof_syntax.type_of_expression, bootstrap.typeof_type)?;
+        let bootstrap = store
+            .intrinsic_bootstrap()
+            .ok_or(SourceCheckError::LiteralCache(
+                SourceLiteralCacheError::BootstrapUninitialized,
+            ))?;
+        preflight_source_expression_cache(
+            store,
+            typeof_syntax.type_of_expression,
+            bootstrap.typeof_type,
+        )?;
         preflight_source_expression_cache(store, expression, bootstrap.boolean_type)?;
 
         Ok(PlannedSourceCondition::Typeof(Box::new(PlannedTypeofCondition {

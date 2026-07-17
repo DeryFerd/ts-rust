@@ -905,9 +905,13 @@ fn source_typeof_leaf_matches(
         if source_typeof_is_unbounded_empty_object(store, globals, type_, record)? {
             return Err(SourceTypeofNarrowingError::UnsupportedType(type_));
         }
-        Some(source_typeof_object_is_function(
-            store, globals, type_, record,
-        )?)
+        if matches!(tag, SourceTypeofTag::Object | SourceTypeofTag::Function) {
+            Some(source_typeof_object_is_function(
+                store, globals, type_, record,
+            )?)
+        } else {
+            None
+        }
     } else {
         None
     };

@@ -827,6 +827,8 @@ impl SyntaxPlanner<'_> {
                 SourceFunctionStatementsRole::Condition,
             ));
         }
+        self.validate_container(operator, callable)?;
+        self.validate_block_scope_container(operator, callable)?;
         let comparison = match operator_record.kind {
             SyntaxKind::EqualsEqualsEqualsToken => SourceTypeofComparison::Equal,
             SyntaxKind::ExclamationEqualsEqualsToken => SourceTypeofComparison::NotEqual,
