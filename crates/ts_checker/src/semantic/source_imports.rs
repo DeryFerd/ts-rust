@@ -1,15 +1,16 @@
-//! Exact source planning for direct named TypeScript ESM value imports.
+//! Exact source planning for named TypeScript ESM imports and reexports.
 //!
 //! This first slice accepts only leading, top-level imports of the form
 //! `import { exported as local } from "./target"`. The import and every
 //! specifier must be value-bearing, identifier-named, modifier-free, and
 //! attribute-free. Alias discovery is delegated to the production alias host;
-//! a successful alias must point directly at one unique, explicitly exported
-//! declaration in another retained TypeScript ESM source. Value preparation
-//! currently supports initialized annotated `const` declarations, exact
+//! a successful import alias may traverse exact named reexport aliases before
+//! reaching one unique, explicitly exported declaration in another retained
+//! TypeScript ESM source. Value preparation currently supports initialized
+//! annotated `const` declarations, exact
 //! `export declare const` declarations in retained declaration files, and
 //! annotated `FunctionDeclaration`s. Declaration-file bodies are never source
-//! checked by this leaf; only a directly imported annotation is queried.
+//! checked by this leaf; only the final imported annotation is queried.
 //!
 //! Source integration separates declaration checking from value use. Every
 //! binding is resolved through [`resolve_source_import_binding`], including
@@ -81,6 +82,38 @@ pub(super) struct SourceImportPlan {
     pub(super) bindings: Vec<SourceImportBindingPlan>,
 }
 
+/// One exact alias binding introduced into a module's export table.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) struct SourceNamedReexportBindingPlan {
+    pub(super) declaration: NodeRef,
+    pub(super) imported_name: NodeRef,
+    pub(super) exported_name: NodeRef,
+    pub(super) imported_text: String,
+    pub(super) exported_text: String,
+    pub(super) alias_symbol: SemanticSymbolId,
+    pub(super) syntactic_type_only: bool,
+}
+
+/// Read-only plan for one complete top-level named reexport statement.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) struct SourceNamedReexportPlan {
+    pub(super) declaration: NodeRef,
+    pub(super) module_specifier: NodeRef,
+    pub(super) bindings: Vec<SourceNamedReexportBindingPlan>,
+}
+
+/// One named reexport whose immediate and final alias identities were proven.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) struct ResolvedSourceNamedReexportBinding {
+    pub(super) binding: SourceNamedReexportBindingPlan,
+    pub(super) immediate_target_symbol: SemanticSymbolId,
+    pub(super) target_symbol: SemanticSymbolId,
+    pub(super) type_only_declaration: Option<NodeRef>,
+}
+
 /// A later identifier expression proven to read one planned import binding.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct PlannedSourceImportRead {
@@ -89,21 +122,23 @@ pub(super) struct PlannedSourceImportRead {
     pub(super) value_symbol: SemanticSymbolId,
 }
 
-/// A binding whose direct alias target has been resolved without querying its
-/// value type. Every import declaration uses this state, including imports
-/// that have no value read in the checked source.
+/// A binding whose immediate and final alias targets have been resolved
+/// without querying its value type. Every import declaration uses this state,
+/// including imports that have no value read in the checked source.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct ResolvedSourceImportBinding {
     pub(super) binding: SourceImportBindingPlan,
+    pub(super) immediate_target_symbol: SemanticSymbolId,
     pub(super) target_symbol: SemanticSymbolId,
 }
 
-/// One independently resolved type-only binding whose direct target is a
-/// simple exported type declaration in another retained ESM source.
+/// One independently resolved type-only binding whose final target is a simple
+/// exported type declaration in another retained ESM source.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[cfg_attr(not(test), allow(dead_code))]
 pub(super) struct ResolvedSourceTypeImportBinding {
     pub(super) binding: SourceImportBindingPlan,
+    pub(super) immediate_target_symbol: SemanticSymbolId,
     pub(super) target_symbol: SemanticSymbolId,
     pub(super) target_declaration: NodeRef,
 }
@@ -112,6 +147,7 @@ pub(super) struct ResolvedSourceTypeImportBinding {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct PreparedSourceImportValue {
     pub(super) binding: SourceImportBindingPlan,
+    pub(super) immediate_target_symbol: SemanticSymbolId,
     pub(super) target_symbol: SemanticSymbolId,
     pub(super) target_declaration: NodeRef,
     pub(super) type_: TypeId,
@@ -161,21 +197,24 @@ pub(super) enum SourceImportUnsupported {
     ScriptSource(NodeRef),
     DeclarationFile(NodeRef),
     ImportShape(NodeRef),
+    ExportShape(NodeRef),
     ImportClause(NodeRef),
+    ExportClause(NodeRef),
     NamedBindings(NodeRef),
     EmptyNamedBindings(NodeRef),
+    EmptyNamedExports(NodeRef),
     Binding(NodeRef),
+    ExportBinding(NodeRef),
     TypeOnly(NodeRef),
     DefaultImport(NodeRef),
+    DefaultExport(NodeRef),
     ImportAttributes(NodeRef),
+    ExportAttributes(NodeRef),
     NonIdentifierImportName(NodeRef),
     NonIdentifierLocalName(NodeRef),
+    NonIdentifierReexportName(NodeRef),
+    NonIdentifierExportName(NodeRef),
     MergedAlias(NodeRef),
-    TargetNotDirect {
-        alias: SemanticSymbolId,
-        immediate: Option<SemanticSymbolId>,
-        resolved: SemanticSymbolId,
-    },
     TargetSymbol {
         alias: SemanticSymbolId,
         target: SemanticSymbolId,
@@ -215,6 +254,7 @@ pub(super) enum SourceImportInvariant {
     MissingAliasSymbol(NodeRef),
     DuplicateAlias(SemanticSymbolId),
     DuplicateLocalName(NodeRef),
+    DuplicateExportName(NodeRef),
     AliasDeclarationMismatch {
         alias: SemanticSymbolId,
         declaration: NodeRef,
@@ -269,15 +309,23 @@ impl SourceImportError {
                 | SourceImportUnsupported::ScriptSource(node)
                 | SourceImportUnsupported::DeclarationFile(node)
                 | SourceImportUnsupported::ImportShape(node)
+                | SourceImportUnsupported::ExportShape(node)
                 | SourceImportUnsupported::ImportClause(node)
+                | SourceImportUnsupported::ExportClause(node)
                 | SourceImportUnsupported::NamedBindings(node)
                 | SourceImportUnsupported::EmptyNamedBindings(node)
+                | SourceImportUnsupported::EmptyNamedExports(node)
                 | SourceImportUnsupported::Binding(node)
+                | SourceImportUnsupported::ExportBinding(node)
                 | SourceImportUnsupported::TypeOnly(node)
                 | SourceImportUnsupported::DefaultImport(node)
+                | SourceImportUnsupported::DefaultExport(node)
                 | SourceImportUnsupported::ImportAttributes(node)
+                | SourceImportUnsupported::ExportAttributes(node)
                 | SourceImportUnsupported::NonIdentifierImportName(node)
                 | SourceImportUnsupported::NonIdentifierLocalName(node)
+                | SourceImportUnsupported::NonIdentifierReexportName(node)
+                | SourceImportUnsupported::NonIdentifierExportName(node)
                 | SourceImportUnsupported::MergedAlias(node)
                 | SourceImportUnsupported::TargetDeclaration(node)
                 | SourceImportUnsupported::TargetNotExportedConst(node)
@@ -290,8 +338,7 @@ impl SourceImportError {
                 | SourceImportUnsupported::TypeReference(node)
                 | SourceImportUnsupported::ValueUseOfTypeOnlyImport(node) => Some(node),
                 SourceImportUnsupported::SameSourceTarget { binding, .. } => Some(binding),
-                SourceImportUnsupported::TargetNotDirect { .. }
-                | SourceImportUnsupported::TargetSymbol { .. }
+                SourceImportUnsupported::TargetSymbol { .. }
                 | SourceImportUnsupported::TypeOnlyAlias(_)
                 | SourceImportUnsupported::ValueAlias(_) => None,
             },
@@ -302,6 +349,7 @@ impl SourceImportError {
                 | SourceImportInvariant::InvalidNode(node)
                 | SourceImportInvariant::MissingAliasSymbol(node)
                 | SourceImportInvariant::DuplicateLocalName(node)
+                | SourceImportInvariant::DuplicateExportName(node)
                 | SourceImportInvariant::AliasNameMismatch { name: node, .. }
                 | SourceImportInvariant::TargetNameMismatch { name: node, .. }
                 | SourceImportInvariant::InvalidIdentifierCache(node)
@@ -678,6 +726,341 @@ fn plan_top_level_named_import(
     })
 }
 
+/// Proves one complete top-level named reexport without checker writes.
+///
+/// Only identifier-named `export { source as public } from "./target"` forms
+/// are admitted. Default, namespace, star, local, attribute-bearing, and
+/// CommonJS forms remain separate module-system slices.
+#[cfg_attr(not(test), allow(dead_code))]
+#[allow(clippy::too_many_lines)] // One exact export-declaration provenance walk.
+pub(super) fn plan_top_level_named_reexport(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    declaration: NodeRef,
+) -> Result<SourceNamedReexportPlan, SourceImportError> {
+    let source = bound.source_file();
+    validate_source_identity(arena, bound, store, source)?;
+    let facts = bound
+        .source_facts()
+        .ok_or_else(|| invariant(SourceImportInvariant::MissingSourceFacts(source)))?;
+    if facts.is_javascript_file() {
+        return Err(unsupported(SourceImportUnsupported::JavaScriptSource(
+            source,
+        )));
+    }
+    if facts.is_common_js_module() {
+        return Err(unsupported(SourceImportUnsupported::CommonJsSource(source)));
+    }
+    if !facts.is_external_module() {
+        return Err(unsupported(SourceImportUnsupported::ScriptSource(source)));
+    }
+    if facts.is_declaration_file() {
+        return Err(unsupported(SourceImportUnsupported::DeclarationFile(
+            source,
+        )));
+    }
+
+    let source_record = checked_node(arena, bound, store, source)?;
+    let NodeData::SourceFile(source_data) = &source_record.data else {
+        return Err(invariant(SourceImportInvariant::InvalidSource(source)));
+    };
+    let record = checked_node(arena, bound, store, declaration)?;
+    let NodeData::ExportDeclaration(export) = &record.data else {
+        return Err(unsupported(SourceImportUnsupported::Declaration {
+            node: declaration,
+            kind: record.kind,
+        }));
+    };
+    if record.kind != SyntaxKind::ExportDeclaration {
+        return Err(unsupported(SourceImportUnsupported::Declaration {
+            node: declaration,
+            kind: record.kind,
+        }));
+    }
+    if record.parent != Some(source.node)
+        || !range_contains(source_record, record)
+        || source_data
+            .statements
+            .nodes
+            .iter()
+            .filter(|node| **node == declaration.node)
+            .count()
+            != 1
+    {
+        return Err(invariant(
+            SourceImportInvariant::InvalidTopLevelDeclaration(declaration),
+        ));
+    }
+    if record.flags.0 != 0
+        || export.flow_node.is_some()
+        || export.symbol.is_some()
+        || export.facts != 0
+        || export.modifiers.is_some()
+    {
+        return Err(unsupported(SourceImportUnsupported::ExportShape(
+            declaration,
+        )));
+    }
+    if export.attributes.is_some() {
+        return Err(unsupported(SourceImportUnsupported::ExportAttributes(
+            declaration,
+        )));
+    }
+
+    let module_specifier = export
+        .module_specifier
+        .map(|node| NodeRef::new(declaration.arena, declaration.file, node))
+        .ok_or_else(|| unsupported(SourceImportUnsupported::ExportShape(declaration)))?;
+    let specifier_record = checked_node(arena, bound, store, module_specifier)?;
+    if specifier_record.kind != SyntaxKind::StringLiteral
+        || specifier_record.parent != Some(declaration.node)
+        || specifier_record.flags.0 != 0
+        || !range_contains(record, specifier_record)
+        || !matches!(
+            &specifier_record.data,
+            NodeData::StringLiteral(literal) if literal.token_flags.0 == 0 && !literal.text.is_empty()
+        )
+    {
+        return Err(unsupported(SourceImportUnsupported::ExportShape(
+            module_specifier,
+        )));
+    }
+
+    let clause = export
+        .export_clause
+        .map(|node| NodeRef::new(declaration.arena, declaration.file, node))
+        .ok_or_else(|| unsupported(SourceImportUnsupported::ExportClause(declaration)))?;
+    let clause_record = checked_node(arena, bound, store, clause)?;
+    let NodeData::NamedExports(named) = &clause_record.data else {
+        return Err(unsupported(SourceImportUnsupported::ExportClause(clause)));
+    };
+    if clause_record.kind != SyntaxKind::NamedExports
+        || clause_record.parent != Some(declaration.node)
+        || clause_record.flags.0 != 0
+        || !range_contains(record, clause_record)
+        || named.facts != 0
+        || named.elements.range != clause_record.range
+        || named.elements.has_trailing_comma
+    {
+        return Err(unsupported(SourceImportUnsupported::ExportClause(clause)));
+    }
+    if named.elements.nodes.is_empty() {
+        return Err(unsupported(SourceImportUnsupported::EmptyNamedExports(
+            clause,
+        )));
+    }
+
+    let mut aliases = HashSet::with_capacity(named.elements.nodes.len());
+    let mut exported_names = HashSet::with_capacity(named.elements.nodes.len());
+    let mut bindings = Vec::with_capacity(named.elements.nodes.len());
+    for &binding in &named.elements.nodes {
+        let binding = NodeRef::new(declaration.arena, declaration.file, binding);
+        let binding_record = checked_node(arena, bound, store, binding)?;
+        let NodeData::ExportSpecifier(specifier) = &binding_record.data else {
+            return Err(unsupported(SourceImportUnsupported::ExportBinding(binding)));
+        };
+        if binding_record.kind != SyntaxKind::ExportSpecifier
+            || binding_record.parent != Some(clause.node)
+            || binding_record.flags.0 != 0
+            || !range_contains(clause_record, binding_record)
+            || specifier.local_symbol.is_some()
+            || specifier.symbol.is_some()
+            || specifier.facts != 0
+        {
+            return Err(unsupported(SourceImportUnsupported::ExportBinding(binding)));
+        }
+
+        let imported_name = NodeRef::new(
+            declaration.arena,
+            declaration.file,
+            specifier.property_name.unwrap_or(specifier.name),
+        );
+        let exported_name = NodeRef::new(declaration.arena, declaration.file, specifier.name);
+        let imported_text = exact_identifier(
+            arena,
+            bound,
+            store,
+            imported_name,
+            binding,
+            SourceImportUnsupported::NonIdentifierReexportName(imported_name),
+        )?;
+        let exported_text = exact_identifier(
+            arena,
+            bound,
+            store,
+            exported_name,
+            binding,
+            SourceImportUnsupported::NonIdentifierExportName(exported_name),
+        )?;
+        if imported_text == "default" || exported_text == "default" {
+            return Err(unsupported(SourceImportUnsupported::DefaultExport(binding)));
+        }
+
+        let alias_symbol = bound
+            .symbol(binding)
+            .ok_or_else(|| invariant(SourceImportInvariant::MissingAliasSymbol(binding)))?;
+        if !aliases.insert(alias_symbol) {
+            return Err(invariant(SourceImportInvariant::DuplicateAlias(
+                alias_symbol,
+            )));
+        }
+        if !exported_names.insert(exported_text.clone()) {
+            return Err(invariant(SourceImportInvariant::DuplicateExportName(
+                exported_name,
+            )));
+        }
+        validate_reexport_alias_symbol(
+            bound,
+            store,
+            source,
+            alias_symbol,
+            binding,
+            exported_name,
+            &exported_text,
+        )?;
+        preflight_alias_value_links(store, alias_symbol)?;
+        bindings.push(SourceNamedReexportBindingPlan {
+            declaration: binding,
+            imported_name,
+            exported_name,
+            imported_text,
+            exported_text,
+            alias_symbol,
+            syntactic_type_only: export.is_type_only || specifier.is_type_only,
+        });
+    }
+
+    Ok(SourceNamedReexportPlan {
+        declaration,
+        module_specifier,
+        bindings,
+    })
+}
+
+/// Resolves one named reexport through the exact module manifest.
+///
+/// The immediate alias identity is retained separately from the final target
+/// so a consumer can prove every named hop without reconstructing an export
+/// table. No value or declared type is queried here.
+#[cfg_attr(not(test), allow(dead_code))]
+#[allow(clippy::too_many_lines)] // Immediate/final cache proof is one transaction.
+pub(super) fn resolve_source_named_reexport_binding(
+    store: &mut CanonicalTypeMapperStore,
+    alias_host: &mut ProductionAliasTargetHost<'_, '_, '_>,
+    binding: &SourceNamedReexportBindingPlan,
+) -> Result<ResolvedSourceNamedReexportBinding, SourceImportError> {
+    let alias = binding.alias_symbol;
+    let record = store
+        .symbol(alias)
+        .ok_or_else(|| invariant(SourceImportInvariant::InvalidAliasSymbol(alias)))?;
+    if record.flags() != SymbolFlags::ALIAS
+        || record.check_flags() != CheckFlags::NONE
+        || record.declarations() != Some(&[binding.declaration])
+        || record.value_declaration().is_some()
+        || record.members().is_some()
+        || record.exports().is_some()
+        || record.parent().is_none()
+        || record.export_symbol().is_some()
+        || record.name().as_bytes() != binding.exported_text.as_bytes()
+        || store.get_merged_symbol(alias) != Some(alias)
+    {
+        return Err(invariant(SourceImportInvariant::InvalidAliasSymbol(alias)));
+    }
+    if binding.syntactic_type_only && !store.ensure_alias_symbol_links(alias) {
+        return Err(invariant(SourceImportInvariant::InvalidAliasLinks(alias)));
+    }
+
+    let independently_derived = alias_host
+        .get_target_of_alias_declaration(store, alias)
+        .map_err(|reason| {
+            SourceImportError::Alias(CanonicalAliasResolutionError::TargetUnavailable {
+                alias,
+                reason,
+            })
+        })?;
+    let CanonicalImmediateAliasTarget::Resolved(immediate_target) = independently_derived else {
+        return Err(invariant(SourceImportInvariant::InvalidAliasLinks(alias)));
+    };
+    let immediate_flags = store
+        .symbol(immediate_target)
+        .ok_or_else(|| invariant(SourceImportInvariant::InvalidTargetSymbol(immediate_target)))?
+        .flags();
+    if immediate_flags.intersects(SymbolFlags::ALIAS) && immediate_flags != SymbolFlags::ALIAS {
+        return Err(invariant(SourceImportInvariant::InvalidTargetSymbol(
+            immediate_target,
+        )));
+    }
+    if let Some(links) = store.alias_symbol_links(alias)
+        && (links
+            .immediate_target
+            .is_some_and(|cached| cached != immediate_target)
+            || (immediate_flags != SymbolFlags::ALIAS
+                && match links.alias_target {
+                    AliasTargetState::Unresolved => false,
+                    AliasTargetState::Resolved(cached) => cached != immediate_target,
+                    AliasTargetState::Unknown => true,
+                }))
+    {
+        return Err(invariant(SourceImportInvariant::InvalidAliasLinks(alias)));
+    }
+
+    let immediate =
+        CanonicalAliasResolver::new(store, alias_host).get_immediate_aliased_symbol(alias)?;
+    if immediate != Some(immediate_target) {
+        return Err(invariant(SourceImportInvariant::InvalidAliasLinks(alias)));
+    }
+    let resolution = CanonicalAliasResolver::new(store, alias_host).resolve_alias(alias)?;
+    let target = match resolution.target {
+        AliasTargetState::Unknown if immediate_flags == SymbolFlags::ALIAS => {
+            return Err(SourceImportError::CircularAlias {
+                alias,
+                events: resolution.events,
+            });
+        }
+        AliasTargetState::Unknown | AliasTargetState::Unresolved => {
+            return Err(invariant(SourceImportInvariant::InvalidAliasLinks(alias)));
+        }
+        AliasTargetState::Resolved(target) if !resolution.events.is_empty() => {
+            return Err(SourceImportError::CircularAlias {
+                alias,
+                events: resolution.events,
+            });
+        }
+        AliasTargetState::Resolved(target) => target,
+    };
+    if immediate_flags != SymbolFlags::ALIAS && target != immediate_target {
+        return Err(invariant(SourceImportInvariant::InvalidAliasLinks(alias)));
+    }
+
+    let links = store
+        .alias_symbol_links(alias)
+        .ok_or_else(|| invariant(SourceImportInvariant::InvalidAliasLinks(alias)))?;
+    let expected_type_only = if binding.syntactic_type_only {
+        Some(binding.declaration)
+    } else if immediate_flags == SymbolFlags::ALIAS {
+        store
+            .alias_symbol_links(immediate_target)
+            .ok_or_else(|| invariant(SourceImportInvariant::InvalidAliasLinks(immediate_target)))?
+            .type_only_declaration
+    } else {
+        None
+    };
+    if links.immediate_target != Some(immediate_target)
+        || links.alias_target != AliasTargetState::Resolved(target)
+        || links.type_only_declaration != expected_type_only
+    {
+        return Err(invariant(SourceImportInvariant::InvalidAliasLinks(alias)));
+    }
+
+    Ok(ResolvedSourceNamedReexportBinding {
+        binding: binding.clone(),
+        immediate_target_symbol: immediate_target,
+        target_symbol: target,
+        type_only_declaration: links.type_only_declaration,
+    })
+}
+
 /// Proves that an identifier expression reads the supplied import binding.
 pub(super) fn plan_source_import_identifier_read(
     arena: &NodeArena,
@@ -739,8 +1122,8 @@ pub(super) fn resolve_source_import_binding(
 }
 
 /// Resolves one type-only import through the exact module manifest and proves
-/// that its direct target is one explicitly exported, non-generic type alias
-/// or interface. The target's declared type remains lazy.
+/// that its final target is one explicitly exported, non-generic type alias or
+/// interface. The target's declared type remains lazy.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn resolve_source_type_import_binding(
     store: &mut CanonicalTypeMapperStore,
@@ -755,7 +1138,6 @@ pub(super) fn resolve_source_type_import_binding(
         declared_host,
         binding.alias_symbol,
         resolved.target_symbol,
-        &binding.imported_text,
     )?;
     if target_declaration.file == binding.declaration.file {
         return Err(unsupported(SourceImportUnsupported::SameSourceTarget {
@@ -765,6 +1147,7 @@ pub(super) fn resolve_source_type_import_binding(
     }
     Ok(ResolvedSourceTypeImportBinding {
         binding: binding.clone(),
+        immediate_target_symbol: resolved.immediate_target_symbol,
         target_symbol: resolved.target_symbol,
         target_declaration,
     })
@@ -874,14 +1257,7 @@ fn resolve_source_import_binding_phase(
         AliasTargetState::Resolved(target) => target,
     };
 
-    if direct_flags == SymbolFlags::ALIAS {
-        return Err(unsupported(SourceImportUnsupported::TargetNotDirect {
-            alias: binding.alias_symbol,
-            immediate: Some(direct_target),
-            resolved: resolved_target,
-        }));
-    }
-    if resolved_target != direct_target {
+    if direct_flags != SymbolFlags::ALIAS && resolved_target != direct_target {
         return Err(invariant(SourceImportInvariant::InvalidAliasLinks(
             binding.alias_symbol,
         )));
@@ -894,8 +1270,22 @@ fn resolve_source_import_binding_phase(
                 binding.alias_symbol,
             ))
         })?;
+    match (phase, alias_links.type_only_declaration) {
+        (SourceImportPhase::Value, Some(_)) => {
+            return Err(unsupported(SourceImportUnsupported::TypeOnlyAlias(
+                binding.alias_symbol,
+            )));
+        }
+        (SourceImportPhase::Type, Some(marker)) if marker == binding.declaration => {}
+        (SourceImportPhase::Type, _) => {
+            return Err(unsupported(SourceImportUnsupported::ValueAlias(
+                binding.alias_symbol,
+            )));
+        }
+        (SourceImportPhase::Value, None) => {}
+    }
     if alias_links.immediate_target != Some(direct_target)
-        || alias_links.alias_target != AliasTargetState::Resolved(direct_target)
+        || alias_links.alias_target != AliasTargetState::Resolved(resolved_target)
         || match phase {
             SourceImportPhase::Value => alias_links.type_only_declaration.is_some(),
             SourceImportPhase::Type => {
@@ -910,7 +1300,8 @@ fn resolve_source_import_binding_phase(
 
     Ok(ResolvedSourceImportBinding {
         binding: binding.clone(),
-        target_symbol: direct_target,
+        immediate_target_symbol: direct_target,
+        target_symbol: resolved_target,
     })
 }
 
@@ -1080,7 +1471,7 @@ pub(super) fn reject_source_type_import_value_use(
                 binding.alias_symbol,
             ))
         })?;
-    if links.immediate_target != Some(resolved.target_symbol)
+    if links.immediate_target != Some(resolved.immediate_target_symbol)
         || links.alias_target != AliasTargetState::Resolved(resolved.target_symbol)
         || links.type_only_declaration != Some(binding.declaration)
     {
@@ -1115,7 +1506,7 @@ pub(super) fn prepare_source_import_value(
                 binding.alias_symbol,
             ))
         })?;
-    if alias_links.immediate_target != Some(target)
+    if alias_links.immediate_target != Some(resolved.immediate_target_symbol)
         || alias_links.alias_target != AliasTargetState::Resolved(target)
         || alias_links.type_only_declaration.is_some()
     {
@@ -1130,7 +1521,6 @@ pub(super) fn prepare_source_import_value(
         global_types,
         binding.alias_symbol,
         target,
-        &binding.imported_text,
     )?;
     let target_declaration = match &planned_target {
         PlannedSourceImportValueTarget::AnnotatedConst { declaration, .. } => *declaration,
@@ -1211,6 +1601,7 @@ pub(super) fn prepare_source_import_value(
 
     Ok(PreparedSourceImportValue {
         binding: binding.clone(),
+        immediate_target_symbol: resolved.immediate_target_symbol,
         target_symbol: target,
         target_declaration,
         type_,
@@ -1399,6 +1790,83 @@ fn validate_alias_symbol(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn validate_reexport_alias_symbol(
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    source: NodeRef,
+    alias: SemanticSymbolId,
+    declaration: NodeRef,
+    name: NodeRef,
+    name_text: &str,
+) -> Result<(), SourceImportError> {
+    let module = bound
+        .symbol(source)
+        .ok_or_else(|| invariant(SourceImportInvariant::MissingAliasSymbol(source)))?;
+    let module_record = store
+        .symbol(module)
+        .ok_or_else(|| invariant(SourceImportInvariant::InvalidAliasSymbol(module)))?;
+    let exports = module_record
+        .exports()
+        .and_then(|exports| store.symbol_table(exports))
+        .ok_or_else(|| invariant(SourceImportInvariant::InvalidAliasSymbol(module)))?;
+    let record = store
+        .symbol(alias)
+        .ok_or_else(|| invariant(SourceImportInvariant::InvalidAliasSymbol(alias)))?;
+    let merged = store.get_merged_symbol(alias);
+    if merged.is_some_and(|target| target != alias)
+        || (record.flags().intersects(SymbolFlags::ALIAS)
+            && record.flags() != SymbolFlags::ALIAS
+            && record
+                .declarations()
+                .is_some_and(|declarations| declarations.contains(&declaration)))
+    {
+        return Err(unsupported(SourceImportUnsupported::MergedAlias(
+            declaration,
+        )));
+    }
+    if bound.symbol(declaration) != Some(alias)
+        || exports.get_source(name_text) != Some(alias)
+        || record.flags() != SymbolFlags::ALIAS
+        || record.check_flags() != CheckFlags::NONE
+        || record.value_declaration().is_some()
+        || record.members().is_some()
+        || record.exports().is_some()
+        || record.parent() != Some(module)
+        || record.export_symbol().is_some()
+        || merged != Some(alias)
+    {
+        return Err(invariant(SourceImportInvariant::InvalidAliasSymbol(alias)));
+    }
+    if record.declarations() != Some(&[declaration]) {
+        return Err(invariant(SourceImportInvariant::AliasDeclarationMismatch {
+            alias,
+            declaration,
+        }));
+    }
+    if record.name().as_bytes() != name_text.as_bytes() {
+        return Err(invariant(SourceImportInvariant::AliasNameMismatch {
+            alias,
+            name,
+        }));
+    }
+    if let Some(links) = store.alias_symbol_links(alias)
+        && (links
+            .immediate_target
+            .is_some_and(|target| store.symbol(target).is_none())
+            || links
+                .alias_target
+                .symbol()
+                .is_some_and(|target| store.symbol(target).is_none())
+            || links
+                .type_only_declaration
+                .is_some_and(|node| !store.contains_node_ref(node)))
+    {
+        return Err(invariant(SourceImportInvariant::InvalidAliasLinks(alias)));
+    }
+    Ok(())
+}
+
 fn preflight_alias_value_links(
     store: &CanonicalTypeMapperStore,
     alias: SemanticSymbolId,
@@ -1460,7 +1928,7 @@ fn validate_resolved_type_import(
                 binding.alias_symbol,
             ))
         })?;
-    if links.immediate_target != Some(resolved.target_symbol)
+    if links.immediate_target != Some(resolved.immediate_target_symbol)
         || links.alias_target != AliasTargetState::Resolved(resolved.target_symbol)
         || links.type_only_declaration != Some(binding.declaration)
         || plan_direct_exported_type_target(
@@ -1468,7 +1936,6 @@ fn validate_resolved_type_import(
             host,
             binding.alias_symbol,
             resolved.target_symbol,
-            &binding.imported_text,
         )? != resolved.target_declaration
     {
         return Err(invariant(SourceImportInvariant::InvalidAliasLinks(
@@ -1527,7 +1994,6 @@ fn plan_direct_exported_type_target(
     host: &DeclaredTypeHost<'_>,
     alias: SemanticSymbolId,
     target: SemanticSymbolId,
-    expected_name: &str,
 ) -> Result<NodeRef, SourceImportError> {
     let target_record = store
         .symbol(target)
@@ -1639,7 +2105,7 @@ fn plan_direct_exported_type_target(
                 if name_record.kind == SyntaxKind::Identifier
                     && name_record.flags.0 == 0
                     && identifier.flow_node.is_none()
-                    && identifier.text == expected_name
+                    && identifier.text.as_bytes() == target_record.name().as_bytes()
         )
     {
         return Err(invariant(SourceImportInvariant::TargetNameMismatch {
@@ -1661,7 +2127,6 @@ fn plan_direct_import_value_target(
     global_types: &CanonicalGlobalTypes,
     alias: SemanticSymbolId,
     target: SemanticSymbolId,
-    expected_name: &str,
 ) -> Result<PlannedSourceImportValueTarget, SourceImportError> {
     let flags = store
         .symbol(target)
@@ -1669,23 +2134,16 @@ fn plan_direct_import_value_target(
         .flags();
     if flags == SymbolFlags::BLOCK_SCOPED_VARIABLE {
         let (declaration, type_node) =
-            plan_direct_annotated_const_target(store, host, alias, target, expected_name)?;
+            plan_direct_annotated_const_target(store, host, alias, target)?;
         return Ok(PlannedSourceImportValueTarget::AnnotatedConst {
             declaration,
             type_node,
         });
     }
     if flags == SymbolFlags::FUNCTION {
-        return plan_direct_annotated_function_target(
-            store,
-            host,
-            global_types,
-            alias,
-            target,
-            expected_name,
-        )
-        .map(Box::new)
-        .map(PlannedSourceImportValueTarget::AnnotatedFunction);
+        return plan_direct_annotated_function_target(store, host, global_types, alias, target)
+            .map(Box::new)
+            .map(PlannedSourceImportValueTarget::AnnotatedFunction);
     }
     Err(unsupported(SourceImportUnsupported::TargetSymbol {
         alias,
@@ -1700,7 +2158,6 @@ fn plan_direct_annotated_function_target(
     global_types: &CanonicalGlobalTypes,
     alias: SemanticSymbolId,
     target: SemanticSymbolId,
-    expected_name: &str,
 ) -> Result<SourceCallablePlan, SourceImportError> {
     let target_record = store
         .symbol(target)
@@ -1720,9 +2177,7 @@ fn plan_direct_annotated_function_target(
         }));
     };
     let declaration = *declaration;
-    if target_record.value_declaration() != Some(declaration)
-        || target_record.name().as_bytes() != expected_name.as_bytes()
-    {
+    if target_record.value_declaration() != Some(declaration) {
         return Err(invariant(SourceImportInvariant::InvalidTargetSymbol(
             target,
         )));
@@ -1757,7 +2212,6 @@ fn plan_direct_annotated_const_target(
     host: &DeclaredTypeHost<'_>,
     alias: SemanticSymbolId,
     target: SemanticSymbolId,
-    expected_name: &str,
 ) -> Result<(NodeRef, NodeRef), SourceImportError> {
     let target_record = store
         .symbol(target)
@@ -1830,7 +2284,7 @@ fn plan_direct_annotated_const_target(
             name,
         )));
     }
-    if identifier.text != expected_name {
+    if identifier.text.as_bytes() != target_record.name().as_bytes() {
         return Err(invariant(SourceImportInvariant::TargetNameMismatch {
             target,
             name,
@@ -2167,7 +2621,7 @@ fn validate_prepared_import_value(
                 )
         }
     };
-    if alias_links.immediate_target != Some(prepared.target_symbol)
+    if alias_links.immediate_target != Some(prepared.immediate_target_symbol)
         || alias_links.alias_target != AliasTargetState::Resolved(prepared.target_symbol)
         || alias_links.type_only_declaration.is_some()
         || !target_valid
@@ -2272,6 +2726,34 @@ mod tests {
                 NodeRef::new(file.parsed.arena.id(), file.file, declaration),
             )
             .unwrap()
+        }
+
+        fn try_plan_reexport(
+            &self,
+            source: usize,
+            export: usize,
+        ) -> Result<SourceNamedReexportPlan, SourceImportError> {
+            let file = &self.files[source];
+            let bound = self.bound.get(&file.file).unwrap();
+            let declaration = file
+                .parsed
+                .arena
+                .iter()
+                .filter_map(|(node, record)| {
+                    (record.kind == SyntaxKind::ExportDeclaration).then_some(node)
+                })
+                .nth(export)
+                .expect("fixture contains requested export");
+            plan_top_level_named_reexport(
+                &file.parsed.arena,
+                bound,
+                &self.store,
+                NodeRef::new(file.parsed.arena.id(), file.file, declaration),
+            )
+        }
+
+        fn plan_reexport(&self, source: usize, export: usize) -> SourceNamedReexportPlan {
+            self.try_plan_reexport(source, export).unwrap()
         }
     }
 
@@ -2466,6 +2948,32 @@ mod tests {
             .map(|binding| {
                 resolve_source_type_import_binding(store, &mut alias_host, &declared_host, binding)
             })
+            .collect()
+    }
+
+    fn resolve_all_reexports(
+        fixture: &mut Fixture,
+        bindings: &[SourceNamedReexportBindingPlan],
+    ) -> Result<Vec<ResolvedSourceNamedReexportBinding>, SourceImportError> {
+        let Fixture {
+            files,
+            bound,
+            manifest,
+            store,
+            ..
+        } = fixture;
+        let sources = || {
+            files.iter().map(|file| {
+                (
+                    &file.parsed.arena,
+                    bound.get(&file.file).expect("fixture bound every file"),
+                )
+            })
+        };
+        let mut alias_host = ProductionAliasTargetHost::new(store, sources(), manifest).unwrap();
+        bindings
+            .iter()
+            .map(|binding| resolve_source_named_reexport_binding(store, &mut alias_host, binding))
             .collect()
     }
 
@@ -2811,6 +3319,316 @@ mod tests {
             .unwrap()
             .get_source(name)
             .unwrap()
+    }
+
+    #[test]
+    fn named_value_reexport_chain_retains_each_immediate_alias_and_final_target() {
+        let mut fixture = fixture(
+            &[
+                r#"
+                    import { publicValue as localValue } from "./barrel-b";
+                    const imported = localValue;
+                "#,
+                r#"export { intermediate as publicValue } from "./barrel-a";"#,
+                r#"export { original as intermediate } from "./base";"#,
+                r"export const original: number = 1;",
+            ],
+            &[
+                Route {
+                    source: 0,
+                    specifier: 0,
+                    target: Some(1),
+                },
+                Route {
+                    source: 1,
+                    specifier: 0,
+                    target: Some(2),
+                },
+                Route {
+                    source: 2,
+                    specifier: 0,
+                    target: Some(3),
+                },
+            ],
+        );
+        let import = fixture.plan_import(0, 0);
+        let barrel_b = fixture.plan_reexport(1, 0);
+        let barrel_a = fixture.plan_reexport(2, 0);
+        assert_eq!(barrel_b.bindings[0].imported_text, "intermediate");
+        assert_eq!(barrel_b.bindings[0].exported_text, "publicValue");
+        assert_eq!(barrel_a.bindings[0].imported_text, "original");
+        assert_eq!(barrel_a.bindings[0].exported_text, "intermediate");
+
+        let read = identifier_initializer(&fixture, 0, "localValue");
+        let bound = fixture.bound.get(&fixture.files[0].file).unwrap();
+        let planned_read = plan_source_import_identifier_read(
+            &fixture.files[0].parsed.arena,
+            bound,
+            &fixture.store,
+            &import.bindings[0],
+            read,
+            "localValue",
+            import.bindings[0].alias_symbol,
+        )
+        .unwrap();
+        let mut resolved_imports = resolve_all(&mut fixture, &import.bindings).unwrap();
+        assert_eq!(resolved_imports.len(), 1);
+        let resolved = resolved_imports.pop().unwrap();
+        let barrel_b_alias = direct_export(&fixture, 1, "publicValue");
+        let barrel_a_alias = direct_export(&fixture, 2, "intermediate");
+        let base = direct_export(&fixture, 3, "original");
+        assert_eq!(resolved.immediate_target_symbol, barrel_b_alias);
+        assert_eq!(resolved.target_symbol, base);
+
+        let mut resolved_barrel_b =
+            resolve_all_reexports(&mut fixture, &barrel_b.bindings).unwrap();
+        assert_eq!(resolved_barrel_b.len(), 1);
+        let resolved_barrel_b = resolved_barrel_b.pop().unwrap();
+        let mut resolved_barrel_a =
+            resolve_all_reexports(&mut fixture, &barrel_a.bindings).unwrap();
+        assert_eq!(resolved_barrel_a.len(), 1);
+        let resolved_barrel_a = resolved_barrel_a.pop().unwrap();
+        assert_eq!(resolved_barrel_b.immediate_target_symbol, barrel_a_alias);
+        assert_eq!(resolved_barrel_b.target_symbol, base);
+        assert_eq!(resolved_barrel_a.immediate_target_symbol, base);
+        assert_eq!(resolved_barrel_a.target_symbol, base);
+        assert_eq!(resolved_barrel_b.type_only_declaration, None);
+        assert_eq!(resolved_barrel_a.type_only_declaration, None);
+
+        let prepared = prepare_one(&mut fixture, &resolved, &planned_read).unwrap();
+        assert_eq!(
+            prepared.type_,
+            fixture.store.intrinsic_bootstrap().unwrap().number_type
+        );
+        assert_eq!(prepared.immediate_target_symbol, barrel_b_alias);
+        assert_eq!(prepared.target_symbol, base);
+        publish_for_test(&mut fixture.store, std::slice::from_ref(&prepared));
+
+        let mut warm_imports = resolve_all(&mut fixture, &import.bindings).unwrap();
+        assert_eq!(warm_imports.len(), 1);
+        let warm = warm_imports.pop().unwrap();
+        assert_eq!(warm, resolved);
+        let warm_prepared = prepare_one(&mut fixture, &warm, &planned_read).unwrap();
+        assert_eq!(warm_prepared, prepared);
+    }
+
+    #[test]
+    fn type_only_reexport_marker_propagates_through_a_named_value_barrel() {
+        let mut fixture = fixture(
+            &[
+                r#"
+                    import type { PublicModel as LocalModel } from "./barrel-b";
+                    const model: LocalModel = { id: 1 };
+                "#,
+                r#"export { IntermediateModel as PublicModel } from "./barrel-a";"#,
+                r#"export type { Model as IntermediateModel } from "./base";"#,
+                r"export type Model = { id: number };",
+            ],
+            &[
+                Route {
+                    source: 0,
+                    specifier: 0,
+                    target: Some(1),
+                },
+                Route {
+                    source: 1,
+                    specifier: 0,
+                    target: Some(2),
+                },
+                Route {
+                    source: 2,
+                    specifier: 0,
+                    target: Some(3),
+                },
+            ],
+        );
+        let import = fixture.plan_type_import(0, 0);
+        let barrel_b = fixture.plan_reexport(1, 0);
+        let barrel_a = fixture.plan_reexport(2, 0);
+        assert!(!barrel_b.bindings[0].syntactic_type_only);
+        assert!(barrel_a.bindings[0].syntactic_type_only);
+
+        let barrel_b_alias = direct_export(&fixture, 1, "PublicModel");
+        let barrel_a_alias = direct_export(&fixture, 2, "IntermediateModel");
+        let base = direct_export(&fixture, 3, "Model");
+
+        let mut resolved_barrel_a =
+            resolve_all_reexports(&mut fixture, &barrel_a.bindings).unwrap();
+        assert_eq!(resolved_barrel_a.len(), 1);
+        let resolved_barrel_a = resolved_barrel_a.pop().unwrap();
+        assert_eq!(resolved_barrel_a.immediate_target_symbol, base);
+        assert_eq!(resolved_barrel_a.target_symbol, base);
+        assert_eq!(
+            resolved_barrel_a.type_only_declaration,
+            Some(barrel_a.bindings[0].declaration)
+        );
+        let mut resolved_barrel_b =
+            resolve_all_reexports(&mut fixture, &barrel_b.bindings).unwrap();
+        assert_eq!(resolved_barrel_b.len(), 1);
+        let resolved_barrel_b = resolved_barrel_b.pop().unwrap();
+        assert_eq!(resolved_barrel_b.immediate_target_symbol, barrel_a_alias);
+        assert_eq!(resolved_barrel_b.target_symbol, base);
+        assert_eq!(
+            resolved_barrel_b.type_only_declaration,
+            Some(barrel_a.bindings[0].declaration)
+        );
+
+        let mut resolved_imports = resolve_all_types(&mut fixture, &import.bindings).unwrap();
+        assert_eq!(resolved_imports.len(), 1);
+        let resolved = resolved_imports.pop().unwrap();
+        assert_eq!(resolved.immediate_target_symbol, barrel_b_alias);
+        assert_eq!(resolved.target_symbol, base);
+        assert_eq!(
+            fixture
+                .store
+                .alias_symbol_links(import.bindings[0].alias_symbol)
+                .unwrap()
+                .type_only_declaration,
+            Some(import.bindings[0].declaration)
+        );
+
+        let reference = type_reference(&fixture, 0, "LocalModel");
+        let capability = plan_type_reference_capability(&fixture, &resolved, reference);
+        let imported =
+            query_type_with_import_capability(&mut fixture, reference, capability).unwrap();
+        assert_eq!(
+            fixture
+                .store
+                .type_alias_links(base)
+                .and_then(|links| links.declared_type),
+            Some(imported)
+        );
+        let mut warm_imports = resolve_all_types(&mut fixture, &import.bindings).unwrap();
+        assert_eq!(warm_imports.len(), 1);
+        let warm = warm_imports.pop().unwrap();
+        assert_eq!(warm, resolved);
+    }
+
+    #[test]
+    fn default_star_namespace_local_and_commonjs_reexports_remain_boundaries() {
+        let default = fixture(
+            &[
+                r#"export { default as publicValue } from "./base";"#,
+                r"export const value: number = 1;",
+            ],
+            &[Route {
+                source: 0,
+                specifier: 0,
+                target: Some(1),
+            }],
+        );
+        assert!(matches!(
+            default.try_plan_reexport(0, 0),
+            Err(SourceImportError::Unsupported(
+                SourceImportUnsupported::DefaultExport(_)
+            ))
+        ));
+
+        let star = fixture(
+            &[
+                r#"export * from "./base";"#,
+                r"export const value: number = 1;",
+            ],
+            &[Route {
+                source: 0,
+                specifier: 0,
+                target: Some(1),
+            }],
+        );
+        assert!(matches!(
+            star.try_plan_reexport(0, 0),
+            Err(SourceImportError::Unsupported(
+                SourceImportUnsupported::ExportClause(_)
+            ))
+        ));
+
+        let namespace = fixture(
+            &[
+                r#"export * as values from "./base";"#,
+                r"export const value: number = 1;",
+            ],
+            &[Route {
+                source: 0,
+                specifier: 0,
+                target: Some(1),
+            }],
+        );
+        assert!(matches!(
+            namespace.try_plan_reexport(0, 0),
+            Err(SourceImportError::Unsupported(
+                SourceImportUnsupported::ExportClause(_)
+            ))
+        ));
+
+        let local = fixture(&[r"const value: number = 1; export { value };"], &[]);
+        assert!(matches!(
+            local.try_plan_reexport(0, 0),
+            Err(SourceImportError::Unsupported(
+                SourceImportUnsupported::ExportShape(_)
+            ))
+        ));
+
+        let commonjs = fixture_with_module_states(
+            &[
+                r#"export { value } from "./base";"#,
+                r"export const value: number = 1;",
+            ],
+            &[Route {
+                source: 0,
+                specifier: 0,
+                target: Some(1),
+            }],
+            &[
+                CanonicalModuleState::CommonJs,
+                CanonicalModuleState::External,
+            ],
+        );
+        assert!(matches!(
+            commonjs.try_plan_reexport(0, 0),
+            Err(SourceImportError::Unsupported(
+                SourceImportUnsupported::CommonJsSource(_)
+            ))
+        ));
+    }
+
+    #[test]
+    fn value_import_through_a_type_only_reexport_remains_a_typed_boundary() {
+        let mut fixture = fixture(
+            &[
+                r#"import { PublicModel } from "./barrel";"#,
+                r#"export type { Model as PublicModel } from "./base";"#,
+                r"export type Model = { id: number };",
+            ],
+            &[
+                Route {
+                    source: 0,
+                    specifier: 0,
+                    target: Some(1),
+                },
+                Route {
+                    source: 1,
+                    specifier: 0,
+                    target: Some(2),
+                },
+            ],
+        );
+        let import = fixture.plan_import(0, 0);
+        let alias = import.bindings[0].alias_symbol;
+        assert_eq!(
+            resolve_all(&mut fixture, &import.bindings),
+            Err(SourceImportError::Unsupported(
+                SourceImportUnsupported::TypeOnlyAlias(alias)
+            ))
+        );
+        let barrel = fixture.plan_reexport(1, 0);
+        let mut resolved_barrels = resolve_all_reexports(&mut fixture, &barrel.bindings).unwrap();
+        assert_eq!(resolved_barrels.len(), 1);
+        let resolved_barrel = resolved_barrels.pop().unwrap();
+        assert_eq!(
+            resolved_barrel.type_only_declaration,
+            Some(barrel.bindings[0].declaration)
+        );
+        assert_eq!(fixture.store.value_symbol_links(alias), None);
     }
 
     #[test]
