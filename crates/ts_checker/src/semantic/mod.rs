@@ -16,6 +16,8 @@ pub mod bootstrap;
 mod callable_sets;
 mod callables;
 mod calls;
+#[allow(dead_code)] // Root owns the source/type-query adapter for the first class shell cut.
+mod classes;
 mod constraints;
 mod contextual;
 pub mod declared;
