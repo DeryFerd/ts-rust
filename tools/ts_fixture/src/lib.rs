@@ -894,8 +894,9 @@ pub fn run_upstream_diagnostic_baselines(
     options: &RunnerOptions,
     writer: &mut impl Write,
 ) -> io::Result<RunnerSummary> {
+    #[cfg(not(panic = "unwind"))]
     if options.canonical_checker {
-        require_canonical_checker_unwind_isolation()?;
+        return Err(canonical_checker_unwind_isolation_error());
     }
     let manifest = discover_upstream_manifest(repository)?;
     let manifest_summary = manifest.summary();
@@ -2964,16 +2965,6 @@ fn canonical_checker_unwind_isolation_error() -> io::Error {
         io::ErrorKind::Unsupported,
         "canonical checker diagnostic runs require panic=\"unwind\" so each variant can retain checker panics and continue; this binary was built with panic=\"abort\"",
     )
-}
-
-#[cfg(panic = "unwind")]
-fn require_canonical_checker_unwind_isolation() -> io::Result<()> {
-    Ok(())
-}
-
-#[cfg(not(panic = "unwind"))]
-fn require_canonical_checker_unwind_isolation() -> io::Result<()> {
-    Err(canonical_checker_unwind_isolation_error())
 }
 
 #[cfg(panic = "unwind")]
