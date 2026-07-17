@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
     process::Command,
@@ -8,6 +9,25 @@ use std::{
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
 struct TestRepository(PathBuf);
+
+struct TestArtifacts(PathBuf);
+
+impl TestArtifacts {
+    fn new() -> Self {
+        let sequence = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "ts-fixture-cli-artifacts-{}-{sequence}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(&path).unwrap();
+        Self(path)
+    }
+
+    fn path(&self, name: &str) -> PathBuf {
+        self.0.join(name)
+    }
+}
 
 impl TestRepository {
     fn new() -> Self {
@@ -127,11 +147,7 @@ fn canonical_scorecard_retains_capabilities_then_continues_to_exact_case() {
         "// @noLib: true\nconst value: number = 1;\n",
         None,
     );
-    repository.write_case(
-        "zzExact",
-        "const value: number = 1;\n",
-        None,
-    );
+    repository.write_case("zzExact", "const value: number = 1;\n", None);
     let scorecard_path = repository.0.join("canonical-frontier.json");
 
     let output = run(
@@ -145,9 +161,11 @@ fn canonical_scorecard_retains_capabilities_then_continues_to_exact_case() {
     );
     assert_eq!(output.status.code(), Some(1));
     let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(stdout.contains(
-        "MISMATCH testdata/tests/cases/compiler/functionExpandoPropertyDeclaration.ts"
-    ));
+    assert!(
+        stdout.contains(
+            "MISMATCH testdata/tests/cases/compiler/functionExpandoPropertyDeclaration.ts"
+        )
+    );
     assert!(stdout.contains("unsupported_details=2"));
     assert!(stdout.contains("fatal_invariants=0"));
     let scorecard: serde_json::Value =
@@ -170,10 +188,7 @@ fn canonical_scorecard_retains_capabilities_then_continues_to_exact_case() {
         variants[0]["frontierBlocker"]["outcomeClass"],
         "checker_capability"
     );
-    assert_eq!(
-        variants[0]["frontierBlocker"]["code"],
-        "E00.SOURCE_SYNTAX"
-    );
+    assert_eq!(variants[0]["frontierBlocker"]["code"], "E00.SOURCE_SYNTAX");
     assert_eq!(
         variants[1]["case"],
         "testdata/tests/cases/compiler/tsxUnsupported.tsx"
@@ -221,12 +236,321 @@ impl Drop for TestRepository {
     }
 }
 
+impl Drop for TestArtifacts {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
 fn run(repository: &Path, arguments: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_ts_fixture_baseline"))
         .args(arguments)
         .env("TS_GO_REPO", repository)
         .output()
         .unwrap()
+}
+
+fn fixed_manifest_digest(variants: &[serde_json::Value]) -> String {
+    let mut bytes = Vec::new();
+    for variant in variants {
+        bytes.extend_from_slice(
+            variant["variantKey"]
+                .as_str()
+                .expect("scorecard variants have stable keys")
+                .as_bytes(),
+        );
+        bytes.push(b'\n');
+    }
+    format!("{:032x}", xxhash_rust::xxh3::xxh3_128(&bytes))
+}
+
+fn make_fixed_manifest(scorecard: &serde_json::Value, upstream_sha: &str) -> serde_json::Value {
+    let variants = scorecard["variants"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rev()
+        .map(|variant| {
+            let expected_diagnostics = if variant["expectedHeader"].as_str().unwrap().is_empty() {
+                "clean"
+            } else {
+                "error"
+            };
+            serde_json::json!({
+                "variantKey": variant["variantKey"].clone(),
+                "family": "fixture",
+                "case": variant["case"].clone(),
+                "options": variant["options"].clone(),
+                "expectedBaseline": variant["expectedBaseline"].clone(),
+                "expectedDiagnostics": expected_diagnostics,
+                "fileShape": "single_file",
+                "sourceKinds": ["ts"],
+                "tags": ["fixture"],
+            })
+        })
+        .collect::<Vec<_>>();
+    let expected_clean = variants
+        .iter()
+        .filter(|variant| variant["expectedDiagnostics"] == "clean")
+        .count();
+    let expected_error = variants.len() - expected_clean;
+    let cases = variants
+        .iter()
+        .map(|variant| variant["case"].as_str().unwrap())
+        .collect::<BTreeSet<_>>()
+        .len();
+    let digest = fixed_manifest_digest(&variants);
+
+    serde_json::json!({
+        "schemaVersion": 1,
+        "name": "test-fixed-v1",
+        "upstream": {
+            "sha": upstream_sha,
+            "oracleManifestDigest": scorecard["provenance"]["manifestDigest"].clone(),
+        },
+        "variantKeyVersion": 1,
+        "selectionEvidence": {
+            "scorecardSchemaVersion": scorecard["schemaVersion"].clone(),
+            "rustSha": scorecard["provenance"]["rust"]["sha"].clone(),
+            "selectedCases": scorecard["summary"]["selectedCases"].clone(),
+            "executedVariants": scorecard["summary"]["executedVariants"].clone(),
+        },
+        "policy": {
+            "families": ["fixture"],
+            "quotaPerFamily": variants.len(),
+            "expectedDiagnosticsPerFamily": {
+                "clean": expected_clean,
+                "error": expected_error,
+            },
+        },
+        "coverage": {
+            "cases": cases,
+            "variants": variants.len(),
+            "expectedClean": expected_clean,
+            "expectedError": expected_error,
+            "singleFile": variants.len(),
+            "multiFile": 0,
+            "sourceKindMembership": {
+                "ts": variants.len(),
+            },
+        },
+        "digest": {
+            "algorithm": "xxh3-128",
+            "canonicalization": "ordered variantKey values encoded as UTF-8, each followed by LF",
+            "value": digest,
+        },
+        "variants": variants,
+    })
+}
+
+struct FixedCliFixture {
+    repository: TestRepository,
+    artifacts: TestArtifacts,
+    discovery_scorecard: serde_json::Value,
+    manifest: serde_json::Value,
+}
+
+impl FixedCliFixture {
+    fn new() -> Self {
+        let repository = TestRepository::new();
+        repository.write_case(
+            "aClean",
+            "// @noLib: true\nconst value: number = 1;\n",
+            None,
+        );
+        repository.write_case(
+            "zError",
+            concat!(
+                "// @noLib: true\n",
+                "// @noEmit: true\n",
+                "const value: string = 1;\n",
+            ),
+            None,
+        );
+        repository.write_baseline(
+            "zError.errors.txt",
+            concat!(
+                "zError.ts(1,7): error TS2322: Type 'number' is not assignable to type 'string'.\r\n",
+                "\r\n",
+                "\r\n",
+                "==== zError.ts (1 errors) ====\r\n",
+                "    const value: string = 1;\r\n",
+                "          ~~~~~~~~~~~~~~~~~\r\n",
+                "!!! error TS2322: Type 'number' is not assignable to type 'string'.\r\n",
+                "    ",
+            ),
+        );
+        let upstream_sha = repository.commit_all();
+        let artifacts = TestArtifacts::new();
+        let discovery_path = artifacts.path("discovery.json");
+        let discovery = run(
+            &repository.0,
+            &[
+                "--diagnostics",
+                "--scorecard-json",
+                discovery_path.to_str().unwrap(),
+            ],
+        );
+        assert!(
+            discovery.status.success(),
+            "stdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&discovery.stdout),
+            String::from_utf8_lossy(&discovery.stderr),
+        );
+        let discovery_scorecard: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(discovery_path).unwrap()).unwrap();
+        let manifest = make_fixed_manifest(&discovery_scorecard, &upstream_sha);
+        Self {
+            repository,
+            artifacts,
+            discovery_scorecard,
+            manifest,
+        }
+    }
+
+    fn write_manifest(&self, name: &str, manifest: &serde_json::Value) -> PathBuf {
+        let path = self.artifacts.path(name);
+        fs::write(&path, serde_json::to_vec_pretty(manifest).unwrap()).unwrap();
+        path
+    }
+
+    fn invalid_manifest_error(&self, name: &str, manifest: &serde_json::Value) -> String {
+        let path = self.write_manifest(name, manifest);
+        let output = run(
+            &self.repository.0,
+            &[
+                "--diagnostics",
+                "--variant-manifest",
+                path.to_str().unwrap(),
+            ],
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "stdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        String::from_utf8(output.stderr).unwrap()
+    }
+}
+
+#[test]
+fn fixed_variant_manifest_resolves_exact_keys_and_executes_manifest_order() {
+    let fixture = FixedCliFixture::new();
+    let manifest_path = fixture.write_manifest("fixed.json", &fixture.manifest);
+    let scorecard_path = fixture.artifacts.path("fixed-scorecard.json");
+
+    let output = run(
+        &fixture.repository.0,
+        &[
+            "--diagnostics",
+            "--variant-manifest",
+            manifest_path.to_str().unwrap(),
+            "--scorecard-json",
+            scorecard_path.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let scorecard: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(scorecard_path).unwrap()).unwrap();
+    let expected_keys = fixture.manifest["variants"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|variant| variant["variantKey"].clone())
+        .collect::<Vec<_>>();
+    let actual_keys = scorecard["variants"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|variant| variant["variantKey"].clone())
+        .collect::<Vec<_>>();
+
+    assert_eq!(actual_keys, expected_keys);
+    assert_eq!(
+        scorecard["variants"][0]["case"],
+        "testdata/tests/cases/compiler/zError.ts"
+    );
+    assert_eq!(
+        scorecard["variants"][1]["case"],
+        "testdata/tests/cases/compiler/aClean.ts"
+    );
+    assert_eq!(scorecard["summary"]["selectedCases"], 2);
+    assert_eq!(scorecard["summary"]["executedVariants"], 2);
+    assert_eq!(
+        scorecard["provenance"]["manifestDigest"],
+        fixture.discovery_scorecard["provenance"]["manifestDigest"]
+    );
+    assert_ne!(
+        scorecard["provenance"]["manifestDigest"],
+        fixture.manifest["digest"]["value"]
+    );
+    assert_eq!(
+        scorecard["provenance"]["fixedShard"],
+        serde_json::json!({
+            "name": "test-fixed-v1",
+            "schemaVersion": 1,
+            "variantKeyVersion": 1,
+            "digest": fixture.manifest["digest"]["value"].clone(),
+            "digestAlgorithm": "xxh3-128",
+            "variantCount": 2,
+        })
+    );
+}
+
+#[test]
+fn fixed_variant_manifest_rejects_tampering_stale_keys_and_dirty_upstream() {
+    let fixture = FixedCliFixture::new();
+
+    let mut wrong_digest = fixture.manifest.clone();
+    wrong_digest["digest"]["value"] = serde_json::Value::String("0".repeat(32));
+    assert!(
+        fixture
+            .invalid_manifest_error("wrong-digest.json", &wrong_digest)
+            .contains("ordered-key digest")
+    );
+
+    let mut wrong_metadata = fixture.manifest.clone();
+    wrong_metadata["variants"][0]["options"]["strict"] = serde_json::json!("true");
+    assert!(
+        fixture
+            .invalid_manifest_error("wrong-metadata.json", &wrong_metadata)
+            .contains("metadata disagrees")
+    );
+
+    let mut wrong_policy = fixture.manifest.clone();
+    wrong_policy["policy"]["expectedDiagnosticsPerFamily"]["clean"] = serde_json::json!(2);
+    wrong_policy["policy"]["expectedDiagnosticsPerFamily"]["error"] = serde_json::json!(0);
+    assert!(
+        fixture
+            .invalid_manifest_error("wrong-policy.json", &wrong_policy)
+            .contains("does not satisfy its quota and clean/error policy")
+    );
+
+    let mut stale_key = fixture.manifest.clone();
+    stale_key["variants"][0]["variantKey"] =
+        serde_json::json!("v1:00000000000000000000000000000000");
+    stale_key["digest"]["value"] = serde_json::Value::String(fixed_manifest_digest(
+        stale_key["variants"].as_array().unwrap(),
+    ));
+    assert!(
+        fixture
+            .invalid_manifest_error("stale-key.json", &stale_key)
+            .contains("do not resolve in the complete corpus")
+    );
+
+    fs::write(fixture.repository.0.join("dirty.txt"), "dirty\n").unwrap();
+    assert!(
+        fixture
+            .invalid_manifest_error("dirty-upstream.json", &fixture.manifest)
+            .contains("upstream checkout must be clean")
+    );
 }
 
 #[test]

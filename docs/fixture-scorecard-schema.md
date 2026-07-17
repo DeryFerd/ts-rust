@@ -19,6 +19,18 @@ The top-level `provenance` record contains:
 The manifest digest identifies discovery, ordering, disposition, and artifact
 counts. It is not a digest of only the filtered or limited selection.
 
+When `--variant-manifest` executes a fixed shard, provenance additionally
+contains `fixedShard`:
+
+- `name`;
+- `schemaVersion` and `variantKeyVersion`;
+- the ordered-key `digest` and `digestAlgorithm`; and
+- `variantCount`.
+
+This is additive schema-5 provenance. `manifestDigest` remains the digest of
+the complete upstream oracle manifest, so selection identity never replaces or
+changes the discovery identity.
+
 ## Stable variant identity
 
 Every variant has a `variantKey` in the form `v1:<32 lowercase hex digits>`.
@@ -30,6 +42,11 @@ identity, while a changed oracle produces a new identity.
 
 Fixed shard manifests must store these complete keys. A future identity
 algorithm requires a new key prefix and an explicit manifest migration.
+The runner expands every runnable case before resolving fixed keys, requires
+each key to resolve exactly once, checks redundant case/option/baseline/source
+metadata against discovery, and executes the resolved variants in manifest
+order. Fixed execution also requires a clean upstream checkout at the
+manifest's exact Git SHA and oracle-manifest digest.
 
 ## Outcome and frontier fields
 

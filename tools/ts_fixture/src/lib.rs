@@ -13,9 +13,10 @@ use std::{
     ops::Range,
     path::{Path, PathBuf},
     process::Command,
+    sync::Arc,
 };
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use ts_core::{SourceText, TextRange};
 use ts_vfs::{FileSystem, MemoryFileSystem, decode_utf16_bom};
 use xxhash_rust::xxh3::xxh3_128;
@@ -226,6 +227,8 @@ pub struct RunnerOptions {
     pub filter: Option<String>,
     pub skip: usize,
     pub limit: Option<usize>,
+    /// Execute one checked-in diagnostic shard by stable expanded-variant key.
+    pub variant_manifest: Option<PathBuf>,
     /// Compare compiler diagnostics with upstream `.errors.txt` baselines instead of emit.
     pub diagnostics: bool,
     /// Check through the experimental canonical diagnostics-only pipeline.
@@ -459,15 +462,128 @@ pub struct ScorecardCapabilityRegistry {
 pub struct DiagnosticScorecardProvenance {
     pub upstream: ScorecardRepositoryRevision,
     pub rust: ScorecardRepositoryRevision,
+    /// Digest of the complete deterministic upstream oracle manifest.
     pub manifest_digest: String,
     pub digest_algorithm: String,
+    /// Identity of the fixed subset used for this run, when present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fixed_shard: Option<ScorecardFixedShardProvenance>,
     pub invocation: Vec<String>,
     pub capability_registry: ScorecardCapabilityRegistry,
+}
+
+/// Independently versioned identity of a fixed diagnostic subset.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScorecardFixedShardProvenance {
+    pub name: String,
+    pub schema_version: u32,
+    pub variant_key_version: u32,
+    pub digest: String,
+    pub digest_algorithm: String,
+    pub variant_count: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct FixedVariantManifest {
+    schema_version: u32,
+    name: String,
+    upstream: FixedVariantManifestUpstream,
+    variant_key_version: u32,
+    selection_evidence: FixedVariantManifestSelectionEvidence,
+    policy: FixedVariantManifestPolicy,
+    coverage: FixedVariantManifestCoverage,
+    digest: FixedVariantManifestDigest,
+    variants: Vec<FixedVariantManifestEntry>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct FixedVariantManifestUpstream {
+    sha: String,
+    oracle_manifest_digest: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct FixedVariantManifestSelectionEvidence {
+    scorecard_schema_version: u32,
+    rust_sha: String,
+    selected_cases: usize,
+    executed_variants: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct FixedVariantManifestPolicy {
+    families: Vec<String>,
+    quota_per_family: usize,
+    expected_diagnostics_per_family: FixedExpectedDiagnosticCounts,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct FixedExpectedDiagnosticCounts {
+    clean: usize,
+    error: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct FixedVariantManifestCoverage {
+    cases: usize,
+    variants: usize,
+    expected_clean: usize,
+    expected_error: usize,
+    single_file: usize,
+    multi_file: usize,
+    source_kind_membership: BTreeMap<String, usize>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct FixedVariantManifestDigest {
+    algorithm: String,
+    canonicalization: String,
+    value: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct FixedVariantManifestEntry {
+    variant_key: String,
+    family: String,
+    case: String,
+    options: BTreeMap<String, String>,
+    expected_baseline: Option<String>,
+    expected_diagnostics: FixedExpectedDiagnostics,
+    file_shape: FixedFileShape,
+    source_kinds: Vec<String>,
+    tags: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd)]
+#[serde(rename_all = "snake_case")]
+enum FixedExpectedDiagnostics {
+    Clean,
+    Error,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum FixedFileShape {
+    SingleFile,
+    MultiFile,
 }
 
 const DIAGNOSTIC_SCORECARD_SCHEMA_VERSION: u32 = 5;
 const CAPABILITY_REGISTRY_VERSION: u32 = 1;
 const SCORECARD_DIGEST_ALGORITHM: &str = "xxh3-128";
+const FIXED_VARIANT_MANIFEST_SCHEMA_VERSION: u32 = 1;
+const DIAGNOSTIC_VARIANT_KEY_VERSION: u32 = 1;
+const FIXED_MANIFEST_CANONICALIZATION: &str =
+    "ordered variantKey values encoded as UTF-8, each followed by LF";
 #[cfg(panic = "unwind")]
 const CANONICAL_CHECKER_PANIC_INVARIANT: &str = "INV.CHECKER.PANIC";
 const CAPABILITY_REGISTRY: &str = include_str!("../../../docs/typechecker-capabilities.tsv");
@@ -500,6 +616,258 @@ fn stable_digest(bytes: &[u8]) -> String {
     format!("{:032x}", xxh3_128(bytes))
 }
 
+fn invalid_fixed_manifest(detail: impl Into<String>) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("invalid fixed variant manifest: {}", detail.into()),
+    )
+}
+
+fn is_lower_hex(value: &str, length: usize) -> bool {
+    value.len() == length
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+fn is_manifest_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-' | b'.')
+        })
+}
+
+fn fixed_variant_manifest_digest(entries: &[FixedVariantManifestEntry]) -> String {
+    let mut bytes = Vec::with_capacity(entries.len().saturating_mul(36));
+    for entry in entries {
+        bytes.extend_from_slice(entry.variant_key.as_bytes());
+        bytes.push(b'\n');
+    }
+    stable_digest(&bytes)
+}
+
+#[allow(clippy::too_many_lines)] // One fail-closed audit surface for the versioned schema.
+fn validate_fixed_variant_manifest_structure(manifest: &FixedVariantManifest) -> io::Result<()> {
+    if manifest.schema_version != FIXED_VARIANT_MANIFEST_SCHEMA_VERSION {
+        return Err(invalid_fixed_manifest(format!(
+            "schemaVersion must be {FIXED_VARIANT_MANIFEST_SCHEMA_VERSION}, got {}",
+            manifest.schema_version
+        )));
+    }
+    if !is_manifest_identifier(&manifest.name) {
+        return Err(invalid_fixed_manifest(format!(
+            "name {:?} is not a stable manifest identifier",
+            manifest.name
+        )));
+    }
+    if manifest.variant_key_version != DIAGNOSTIC_VARIANT_KEY_VERSION {
+        return Err(invalid_fixed_manifest(format!(
+            "variantKeyVersion must be {DIAGNOSTIC_VARIANT_KEY_VERSION}, got {}",
+            manifest.variant_key_version
+        )));
+    }
+    if !is_lower_hex(&manifest.upstream.sha, 40) {
+        return Err(invalid_fixed_manifest(
+            "upstream.sha must be a 40-character lowercase Git SHA",
+        ));
+    }
+    if !is_lower_hex(&manifest.upstream.oracle_manifest_digest, 32) {
+        return Err(invalid_fixed_manifest(
+            "upstream.oracleManifestDigest must be a 32-character lowercase digest",
+        ));
+    }
+    let evidence = &manifest.selection_evidence;
+    if evidence.scorecard_schema_version != DIAGNOSTIC_SCORECARD_SCHEMA_VERSION
+        || !is_lower_hex(&evidence.rust_sha, 40)
+        || evidence.selected_cases == 0
+        || evidence.executed_variants < evidence.selected_cases
+    {
+        return Err(invalid_fixed_manifest(
+            "selectionEvidence is malformed or does not identify a schema-5 scorecard",
+        ));
+    }
+
+    let policy = &manifest.policy;
+    if policy.families.is_empty() || policy.quota_per_family == 0 {
+        return Err(invalid_fixed_manifest(
+            "policy must contain at least one family and one variant per family",
+        ));
+    }
+    let mut policy_families = BTreeSet::new();
+    for family in &policy.families {
+        if !is_manifest_identifier(family) || !policy_families.insert(family.as_str()) {
+            return Err(invalid_fixed_manifest(format!(
+                "policy repeats or malforms family {family:?}"
+            )));
+        }
+    }
+    let diagnostics_per_family = policy
+        .expected_diagnostics_per_family
+        .clean
+        .checked_add(policy.expected_diagnostics_per_family.error)
+        .ok_or_else(|| invalid_fixed_manifest("diagnostic quota overflows usize"))?;
+    if diagnostics_per_family != policy.quota_per_family {
+        return Err(invalid_fixed_manifest(format!(
+            "clean/error quota {diagnostics_per_family} does not equal quotaPerFamily {}",
+            policy.quota_per_family
+        )));
+    }
+    let expected_variants = policy
+        .families
+        .len()
+        .checked_mul(policy.quota_per_family)
+        .ok_or_else(|| invalid_fixed_manifest("family quota overflows usize"))?;
+    if manifest.variants.len() != expected_variants {
+        return Err(invalid_fixed_manifest(format!(
+            "policy requires {expected_variants} variants, found {}",
+            manifest.variants.len()
+        )));
+    }
+
+    let mut keys = BTreeSet::new();
+    let mut cases = BTreeSet::new();
+    let mut family_counts = BTreeMap::<&str, usize>::new();
+    let mut family_diagnostics = BTreeMap::<(&str, FixedExpectedDiagnostics), usize>::new();
+    let mut expected_clean = 0usize;
+    let mut expected_error = 0usize;
+    let mut single_file = 0usize;
+    let mut multi_file = 0usize;
+    let mut source_kind_membership = BTreeMap::<String, usize>::new();
+    for entry in &manifest.variants {
+        let Some(digest) = entry.variant_key.strip_prefix("v1:") else {
+            return Err(invalid_fixed_manifest(format!(
+                "variant key {:?} does not use the v1 identity",
+                entry.variant_key
+            )));
+        };
+        if !is_lower_hex(digest, 32) || !keys.insert(entry.variant_key.as_str()) {
+            return Err(invalid_fixed_manifest(format!(
+                "variant key {:?} is malformed or duplicated",
+                entry.variant_key
+            )));
+        }
+        if !policy_families.contains(entry.family.as_str()) {
+            return Err(invalid_fixed_manifest(format!(
+                "variant {} uses unlisted family {:?}",
+                entry.variant_key, entry.family
+            )));
+        }
+        if entry.case.is_empty()
+            || entry.case.starts_with('/')
+            || entry.case.contains('\\')
+            || entry.case.split('/').any(|component| component == "..")
+        {
+            return Err(invalid_fixed_manifest(format!(
+                "variant {} has non-canonical case path {:?}",
+                entry.variant_key, entry.case
+            )));
+        }
+        if entry.source_kinds.is_empty() {
+            return Err(invalid_fixed_manifest(format!(
+                "variant {} has no source kinds",
+                entry.variant_key
+            )));
+        }
+        let mut source_kinds = BTreeSet::new();
+        for kind in &entry.source_kinds {
+            if !is_manifest_identifier(kind) || !source_kinds.insert(kind.as_str()) {
+                return Err(invalid_fixed_manifest(format!(
+                    "variant {} repeats or malforms source kind {kind:?}",
+                    entry.variant_key
+                )));
+            }
+            *source_kind_membership.entry(kind.clone()).or_default() += 1;
+        }
+        if entry.tags.is_empty() {
+            return Err(invalid_fixed_manifest(format!(
+                "variant {} has no semantic tags",
+                entry.variant_key
+            )));
+        }
+        let mut tags = BTreeSet::new();
+        for tag in &entry.tags {
+            if !is_manifest_identifier(tag) || !tags.insert(tag.as_str()) {
+                return Err(invalid_fixed_manifest(format!(
+                    "variant {} repeats or malforms tag {tag:?}",
+                    entry.variant_key
+                )));
+            }
+        }
+
+        cases.insert(entry.case.as_str());
+        *family_counts.entry(entry.family.as_str()).or_default() += 1;
+        *family_diagnostics
+            .entry((entry.family.as_str(), entry.expected_diagnostics))
+            .or_default() += 1;
+        match entry.expected_diagnostics {
+            FixedExpectedDiagnostics::Clean => expected_clean += 1,
+            FixedExpectedDiagnostics::Error => expected_error += 1,
+        }
+        match entry.file_shape {
+            FixedFileShape::SingleFile => single_file += 1,
+            FixedFileShape::MultiFile => multi_file += 1,
+        }
+    }
+    for family in &policy.families {
+        if family_counts.get(family.as_str()) != Some(&policy.quota_per_family)
+            || family_diagnostics
+                .get(&(family.as_str(), FixedExpectedDiagnostics::Clean))
+                .copied()
+                .unwrap_or_default()
+                != policy.expected_diagnostics_per_family.clean
+            || family_diagnostics
+                .get(&(family.as_str(), FixedExpectedDiagnostics::Error))
+                .copied()
+                .unwrap_or_default()
+                != policy.expected_diagnostics_per_family.error
+        {
+            return Err(invalid_fixed_manifest(format!(
+                "family {family:?} does not satisfy its quota and clean/error policy"
+            )));
+        }
+    }
+
+    let coverage = &manifest.coverage;
+    if coverage.cases != cases.len()
+        || coverage.variants != manifest.variants.len()
+        || coverage.expected_clean != expected_clean
+        || coverage.expected_error != expected_error
+        || coverage.single_file != single_file
+        || coverage.multi_file != multi_file
+        || coverage.source_kind_membership != source_kind_membership
+        || evidence.selected_cases < coverage.cases
+        || evidence.executed_variants < coverage.variants
+    {
+        return Err(invalid_fixed_manifest(
+            "coverage counters do not match the selected variant metadata",
+        ));
+    }
+    if manifest.digest.algorithm != SCORECARD_DIGEST_ALGORITHM
+        || manifest.digest.canonicalization != FIXED_MANIFEST_CANONICALIZATION
+        || !is_lower_hex(&manifest.digest.value, 32)
+    {
+        return Err(invalid_fixed_manifest(
+            "digest algorithm, canonicalization, or value shape is invalid",
+        ));
+    }
+    let actual_digest = fixed_variant_manifest_digest(&manifest.variants);
+    if manifest.digest.value != actual_digest {
+        return Err(invalid_fixed_manifest(format!(
+            "ordered-key digest is {}, expected {actual_digest}",
+            manifest.digest.value
+        )));
+    }
+    Ok(())
+}
+
+fn read_fixed_variant_manifest(path: &Path) -> io::Result<FixedVariantManifest> {
+    let bytes = fs::read(path)?;
+    let manifest = serde_json::from_slice(&bytes)
+        .map_err(|error| invalid_fixed_manifest(format!("{}: {error}", path.to_string_lossy())))?;
+    validate_fixed_variant_manifest_structure(&manifest)?;
+    Ok(manifest)
+}
+
 fn git_output(repository: &Path, arguments: &[&str]) -> Option<String> {
     let output = Command::new("git")
         .arg("-C")
@@ -528,6 +896,38 @@ fn repository_revision(repository: &Path) -> ScorecardRepositoryRevision {
         .map(|status| !status.is_empty())
     });
     ScorecardRepositoryRevision { sha, dirty }
+}
+
+fn oracle_manifest_digest(manifest: &UpstreamManifest) -> io::Result<String> {
+    let mut bytes = Vec::new();
+    manifest.write_to(&mut bytes)?;
+    Ok(stable_digest(&bytes))
+}
+
+fn validate_fixed_variant_manifest_upstream(
+    manifest: &FixedVariantManifest,
+    repository: &Path,
+    oracle_digest: &str,
+) -> io::Result<()> {
+    let revision = repository_revision(repository);
+    if revision.sha.as_deref() != Some(manifest.upstream.sha.as_str()) {
+        return Err(invalid_fixed_manifest(format!(
+            "upstream SHA is {:?}, expected {}",
+            revision.sha, manifest.upstream.sha
+        )));
+    }
+    if revision.dirty != Some(false) {
+        return Err(invalid_fixed_manifest(
+            "upstream checkout must be clean for fixed-shard execution",
+        ));
+    }
+    if manifest.upstream.oracle_manifest_digest != oracle_digest {
+        return Err(invalid_fixed_manifest(format!(
+            "complete oracle manifest digest is {}, expected {oracle_digest}",
+            manifest.upstream.oracle_manifest_digest
+        )));
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_lines)] // Keeps the versioned registry contract in one audit surface.
@@ -653,9 +1053,18 @@ fn capability_registry_metadata() -> io::Result<ScorecardCapabilityRegistry> {
 fn scorecard_provenance(
     repository: &Path,
     options: &RunnerOptions,
-    manifest: &UpstreamManifest,
+    oracle_digest: &str,
+    fixed_manifest: Option<&FixedVariantManifest>,
 ) -> io::Result<DiagnosticScorecardProvenance> {
     let capability_registry = capability_registry_metadata()?;
+    let fixed_shard = fixed_manifest.map(|manifest| ScorecardFixedShardProvenance {
+        name: manifest.name.clone(),
+        schema_version: manifest.schema_version,
+        variant_key_version: manifest.variant_key_version,
+        digest: manifest.digest.value.clone(),
+        digest_algorithm: manifest.digest.algorithm.clone(),
+        variant_count: manifest.variants.len(),
+    });
     if options.scorecard_json.is_none() {
         return Ok(DiagnosticScorecardProvenance {
             upstream: ScorecardRepositoryRevision {
@@ -668,18 +1077,18 @@ fn scorecard_provenance(
             },
             manifest_digest: String::new(),
             digest_algorithm: SCORECARD_DIGEST_ALGORITHM.to_owned(),
+            fixed_shard,
             invocation: options.invocation.clone(),
             capability_registry,
         });
     }
-    let mut manifest_bytes = Vec::new();
-    manifest.write_to(&mut manifest_bytes)?;
     let rust_repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     Ok(DiagnosticScorecardProvenance {
         upstream: repository_revision(repository),
         rust: repository_revision(&rust_repository),
-        manifest_digest: stable_digest(&manifest_bytes),
+        manifest_digest: oracle_digest.to_owned(),
         digest_algorithm: SCORECARD_DIGEST_ALGORITHM.to_owned(),
+        fixed_shard,
         invocation: options.invocation.clone(),
         capability_registry,
     })
@@ -777,6 +1186,12 @@ pub fn run_upstream_baselines(
     options: &RunnerOptions,
     writer: &mut impl Write,
 ) -> io::Result<RunnerSummary> {
+    if options.variant_manifest.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--variant-manifest requires diagnostic mode",
+        ));
+    }
     if options.canonical_checker {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -878,6 +1293,469 @@ pub fn run_upstream_baselines(
     Ok(summary)
 }
 
+struct DiagnosticVariantPlan {
+    case: Arc<Case>,
+    axes: Arc<[String]>,
+    variant: OptionVariant,
+    variant_key: String,
+    scorecard_case: String,
+    expected_baseline: Option<String>,
+    expected: String,
+}
+
+fn prepare_diagnostic_case_variants(
+    repository: &Path,
+    case_path: &Path,
+    baseline_files: &BTreeMap<String, Vec<PathBuf>>,
+) -> io::Result<Vec<DiagnosticVariantPlan>> {
+    let source = fs::read(case_path)?;
+    let case = Arc::new(
+        Case::parse(case_path, source)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
+    );
+    let axes = Arc::<[String]>::from(matrix_axes(&case));
+    let case_name = case_path
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    let candidates = baseline_files
+        .get(case_name)
+        .map_or_else(Vec::new, |paths| paths.iter().collect::<Vec<_>>());
+    let scorecard_case = relative_scorecard_path(repository, case_path);
+    expand_option_matrix(&case)
+        .into_iter()
+        .map(|variant| {
+            let selected = select_variant_baselines_with(
+                &candidates,
+                case_name,
+                &variant,
+                &axes,
+                error_baseline_base,
+            );
+            if selected.len() > 1 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "multiple error baselines match {}{}: {}",
+                        case_path.display(),
+                        variant_label(&variant, &axes),
+                        selected
+                            .iter()
+                            .map(|path| path.display().to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                ));
+            }
+            let expected_baseline = selected
+                .first()
+                .map(|path| relative_scorecard_path(repository, path));
+            let expected = selected
+                .first()
+                .map(fs::read_to_string)
+                .transpose()?
+                .unwrap_or_default();
+            let variant_key = diagnostic_variant_key(
+                &scorecard_case,
+                &variant,
+                expected_baseline.as_deref(),
+                &expected,
+            );
+            Ok(DiagnosticVariantPlan {
+                case: Arc::clone(&case),
+                axes: Arc::clone(&axes),
+                variant,
+                variant_key,
+                scorecard_case: scorecard_case.clone(),
+                expected_baseline,
+                expected,
+            })
+        })
+        .collect()
+}
+
+fn fixed_source_kind(path: &Path) -> String {
+    let path = path.to_string_lossy().to_ascii_lowercase();
+    [
+        ("d.mts", ".d.mts"),
+        ("d.cts", ".d.cts"),
+        ("d.ts", ".d.ts"),
+        ("tsx", ".tsx"),
+        ("jsx", ".jsx"),
+        ("mts", ".mts"),
+        ("cts", ".cts"),
+        ("mjs", ".mjs"),
+        ("cjs", ".cjs"),
+        ("js", ".js"),
+        ("json", ".json"),
+        ("ts", ".ts"),
+    ]
+    .into_iter()
+    .find_map(|(kind, suffix)| path.ends_with(suffix).then_some(kind))
+    .unwrap_or("other")
+    .to_owned()
+}
+
+fn fixed_case_source_kinds(case: &Case) -> Vec<String> {
+    let mut kinds = Vec::new();
+    for unit in &case.units {
+        let kind = fixed_source_kind(&unit.path);
+        if !kinds.contains(&kind) {
+            kinds.push(kind);
+        }
+    }
+    kinds
+}
+
+fn validate_fixed_variant_entry(
+    entry: &FixedVariantManifestEntry,
+    plan: &DiagnosticVariantPlan,
+) -> io::Result<()> {
+    let expected_diagnostics = if parse_error_baseline_header(&plan.expected).is_empty() {
+        FixedExpectedDiagnostics::Clean
+    } else {
+        FixedExpectedDiagnostics::Error
+    };
+    let file_shape = if plan.case.units.len() > 1 {
+        FixedFileShape::MultiFile
+    } else {
+        FixedFileShape::SingleFile
+    };
+    let source_kinds = fixed_case_source_kinds(&plan.case);
+    if entry.case != plan.scorecard_case
+        || entry.options != plan.variant.values
+        || entry.expected_baseline != plan.expected_baseline
+        || entry.expected_diagnostics != expected_diagnostics
+        || entry.file_shape != file_shape
+        || entry.source_kinds != source_kinds
+    {
+        return Err(invalid_fixed_manifest(format!(
+            "variant {} metadata disagrees with discovered case/options/baseline/source facts",
+            entry.variant_key
+        )));
+    }
+    Ok(())
+}
+
+fn resolve_fixed_variant_plans(
+    repository: &Path,
+    cases: &[(PathBuf, usize)],
+    baseline_sets: &[BTreeMap<String, Vec<PathBuf>>],
+    manifest: &FixedVariantManifest,
+) -> io::Result<Vec<DiagnosticVariantPlan>> {
+    let desired = manifest
+        .variants
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| (entry.variant_key.as_str(), (index, entry)))
+        .collect::<BTreeMap<_, _>>();
+    let mut resolved = std::iter::repeat_with(|| None)
+        .take(manifest.variants.len())
+        .collect::<Vec<Option<DiagnosticVariantPlan>>>();
+    for (case_path, baseline_index) in cases {
+        for plan in prepare_diagnostic_case_variants(
+            repository,
+            case_path,
+            &baseline_sets[*baseline_index],
+        )? {
+            let Some(&(index, entry)) = desired.get(plan.variant_key.as_str()) else {
+                continue;
+            };
+            if resolved[index].is_some() {
+                return Err(invalid_fixed_manifest(format!(
+                    "variant key {} resolves more than once in the complete corpus",
+                    plan.variant_key
+                )));
+            }
+            validate_fixed_variant_entry(entry, &plan)?;
+            resolved[index] = Some(plan);
+        }
+    }
+    let missing = manifest
+        .variants
+        .iter()
+        .zip(&resolved)
+        .filter_map(|(entry, plan)| plan.is_none().then_some(entry.variant_key.as_str()))
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err(invalid_fixed_manifest(format!(
+            "variant keys do not resolve in the complete corpus: {}",
+            missing.join(", ")
+        )));
+    }
+    Ok(resolved
+        .into_iter()
+        .map(|plan| plan.expect("missing fixed plans were rejected"))
+        .collect())
+}
+
+fn execute_diagnostic_variant(
+    mut plan: DiagnosticVariantPlan,
+    repository: &Path,
+    checker: FixtureChecker,
+    summary: &mut RunnerSummary,
+    scorecard: &mut DiagnosticScorecard,
+    writer: &mut impl Write,
+) -> io::Result<()> {
+    summary.executed_variants += 1;
+    let case_path = &plan.case.path;
+    let mut checker_frontier = None;
+    let compilation = match compile_case_variant(&plan.case, &mut plan.variant, checker) {
+        Ok(compilation) => compilation,
+        // A fixture filesystem failure makes scorecard persistence itself
+        // suspect. Keep it as a fail-closed harness error (CLI exit 2), never
+        // as a checker invariant or capability.
+        Err(FixtureCompilationFailure::Io(error)) => return Err(error),
+        Err(FixtureCompilationFailure::Canonical(error)) => {
+            let detail = format!("experimental canonical checker: {error}");
+            match error.failure_class() {
+                ts_compiler::CanonicalProgramCheckFailureClass::Unsupported { capability_code } => {
+                    if !capability_registry_contains(capability_code) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "typed checker capability {capability_code} is absent from the registry"
+                            ),
+                        ));
+                    }
+                    checker_frontier = Some((capability_code.to_owned(), detail.clone()));
+                    plan.variant.unsupported_details.push(detail);
+                    plan.variant.unsupported_details.sort();
+                    plan.variant.unsupported_details.dedup();
+                    Compilation::default()
+                }
+                ts_compiler::CanonicalProgramCheckFailureClass::Fatal { invariant_code } => {
+                    retain_fatal_variant(
+                        summary,
+                        scorecard,
+                        writer,
+                        FatalVariantRecord {
+                            case_path,
+                            repository,
+                            variant: &plan.variant,
+                            axes: &plan.axes,
+                            variant_key: plan.variant_key,
+                            scorecard_case: plan.scorecard_case,
+                            expected_baseline: plan.expected_baseline,
+                            expected: &plan.expected,
+                            invariant_code,
+                            detail,
+                        },
+                    )?;
+                    return Ok(());
+                }
+            }
+        }
+        #[cfg(panic = "unwind")]
+        Err(FixtureCompilationFailure::CanonicalPanic { detail }) => {
+            retain_fatal_variant(
+                summary,
+                scorecard,
+                writer,
+                FatalVariantRecord {
+                    case_path,
+                    repository,
+                    variant: &plan.variant,
+                    axes: &plan.axes,
+                    variant_key: plan.variant_key,
+                    scorecard_case: plan.scorecard_case,
+                    expected_baseline: plan.expected_baseline,
+                    expected: &plan.expected,
+                    invariant_code: CANONICAL_CHECKER_PANIC_INVARIANT,
+                    detail,
+                },
+            )?;
+            return Ok(());
+        }
+    };
+    let mut actual = render_error_baseline(&plan.case, &compilation.diagnostics);
+    actual
+        .unsupported_details
+        .extend(plan.variant.unsupported_details.iter().cloned());
+    let comparison =
+        compare_diagnostic_artifacts(&plan.expected, &actual, &compilation.diagnostics);
+    let checker_blocked = checker_frontier.is_some();
+    let status = if checker_blocked {
+        DiagnosticVariantStatus::UnsupportedDetail
+    } else {
+        comparison.status()
+    };
+    let (outcome_class, frontier_blocker) =
+        comparison_frontier(status, &comparison, checker_frontier);
+    if comparison.is_exact() && !checker_blocked {
+        summary.matched += 1;
+        scorecard.summary.exact_matches += 1;
+    } else {
+        summary.mismatched += 1;
+        summary.diagnostic_failures += 1;
+        if parse_error_baseline_header(&plan.expected) != parse_error_baseline_header(&actual.text)
+        {
+            scorecard.summary.header_mismatches += 1;
+        }
+        match status {
+            DiagnosticVariantStatus::ExactMatch | DiagnosticVariantStatus::FatalInvariant => {
+                unreachable!()
+            }
+            DiagnosticVariantStatus::HeaderOnlyMatch => {
+                scorecard.summary.header_only_matches += 1;
+            }
+            DiagnosticVariantStatus::CodeMismatch => {
+                scorecard.summary.code_mismatches += 1;
+            }
+            DiagnosticVariantStatus::SpanMismatch => {
+                scorecard.summary.span_mismatches += 1;
+            }
+            DiagnosticVariantStatus::MessageMismatch => {
+                scorecard.summary.message_mismatches += 1;
+            }
+            DiagnosticVariantStatus::OrderMismatch => {
+                scorecard.summary.order_mismatches += 1;
+            }
+            DiagnosticVariantStatus::UnsupportedDetail => {
+                scorecard.summary.unsupported_details += 1;
+            }
+            DiagnosticVariantStatus::HeaderMismatch => {}
+            DiagnosticVariantStatus::ArtifactMismatch => {
+                scorecard.summary.artifact_mismatches += 1;
+            }
+        }
+        let label = variant_label(&plan.variant, &plan.axes);
+        if let Some(difference) = comparison.first_difference.as_ref() {
+            writeln!(
+                writer,
+                "MISMATCH {}{label}: {status:?} at artifact line {}; expected {:?}, actual {:?}",
+                plan.scorecard_case, difference.line, difference.expected, difference.actual
+            )?;
+        } else {
+            writeln!(
+                writer,
+                "MISMATCH {}{label}: {status:?}: {}",
+                plan.scorecard_case,
+                comparison.unsupported_details.join("; ")
+            )?;
+        }
+    }
+    scorecard.summary.executed_variants += 1;
+    scorecard.summary.actual_diagnostics += compilation.diagnostics.len();
+    scorecard.variants.push(DiagnosticVariantResult {
+        variant_key: plan.variant_key,
+        case: plan.scorecard_case,
+        options: plan.variant.values,
+        expected_baseline: plan.expected_baseline,
+        comparison_scope: DiagnosticComparisonScope::FullArtifact,
+        status,
+        outcome_class,
+        frontier_blocker,
+        expected_header: parse_error_baseline_header(&plan.expected),
+        actual_header: parse_error_baseline_header(&actual.text),
+        mismatch_kinds: comparison.mismatch_kinds,
+        first_difference: comparison.first_difference,
+        unsupported_details: comparison.unsupported_details,
+        diagnostics: compilation
+            .diagnostics
+            .iter()
+            .map(DiagnosticScorecardDiagnostic::from)
+            .collect(),
+    });
+    Ok(())
+}
+
+fn run_fixed_variant_diagnostic_baselines(
+    repository: &Path,
+    options: &RunnerOptions,
+    manifest_path: &Path,
+    writer: &mut impl Write,
+) -> io::Result<RunnerSummary> {
+    if options.filter.is_some() || options.skip != 0 || options.limit.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--variant-manifest cannot be combined with --filter, --skip, or --limit",
+        ));
+    }
+    let oracle_manifest = discover_upstream_manifest(repository)?;
+    let manifest_summary = oracle_manifest.summary();
+    let oracle_digest = oracle_manifest_digest(&oracle_manifest)?;
+    let fixed_manifest = read_fixed_variant_manifest(manifest_path)?;
+    validate_fixed_variant_manifest_upstream(&fixed_manifest, repository, &oracle_digest)?;
+
+    let mut cases = Vec::new();
+    let mut baseline_sets = Vec::new();
+    for suite in &oracle_manifest.suites {
+        let baselines = collect_files(&suite.oracle_root, is_error_baseline_file)?;
+        let baseline_index = baseline_sets.len();
+        baseline_sets.push(index_baselines_with(baselines, error_baseline_base));
+        for case in &suite.cases {
+            if case.disposition == UpstreamCaseDisposition::Runnable {
+                cases.push((case.path.clone(), baseline_index));
+            }
+        }
+    }
+    let plans = resolve_fixed_variant_plans(repository, &cases, &baseline_sets, &fixed_manifest)?;
+    let selected_cases = plans
+        .iter()
+        .map(|plan| plan.scorecard_case.as_str())
+        .collect::<BTreeSet<_>>()
+        .len();
+    let provenance =
+        scorecard_provenance(repository, options, &oracle_digest, Some(&fixed_manifest))?;
+    let checker = if options.canonical_checker {
+        FixtureChecker::Canonical
+    } else {
+        FixtureChecker::Legacy
+    };
+    let mut summary = RunnerSummary {
+        discovered_cases: manifest_summary.discovered_cases,
+        upstream_skipped_cases: manifest_summary.upstream_skipped_cases,
+        selected_cases,
+        ..RunnerSummary::default()
+    };
+    let mut scorecard = DiagnosticScorecard {
+        schema_version: DIAGNOSTIC_SCORECARD_SCHEMA_VERSION,
+        provenance,
+        checker_mode: match checker {
+            FixtureChecker::Legacy => DiagnosticCheckerMode::Legacy,
+            FixtureChecker::Canonical => DiagnosticCheckerMode::Canonical,
+        },
+        comparison_scope: DiagnosticComparisonScope::FullArtifact,
+        full_artifact_comparison: true,
+        summary: DiagnosticScorecardSummary {
+            discovered_cases: summary.discovered_cases,
+            upstream_skipped_cases: summary.upstream_skipped_cases,
+            selected_cases: summary.selected_cases,
+            ..DiagnosticScorecardSummary::default()
+        },
+        variants: Vec::with_capacity(plans.len()),
+    };
+    for plan in plans {
+        execute_diagnostic_variant(
+            plan,
+            repository,
+            checker,
+            &mut summary,
+            &mut scorecard,
+            writer,
+        )?;
+    }
+    if let Some(path) = &options.scorecard_json {
+        scorecard.write_json(path)?;
+    }
+    writeln!(
+        writer,
+        "{summary} diagnostic_comparison=full-artifact exact_matches={} header_only_matches={} code_mismatches={} span_mismatches={} message_mismatches={} order_mismatches={} unsupported_details={} header_mismatches={} artifact_mismatches={} fatal_invariants={}",
+        scorecard.summary.exact_matches,
+        scorecard.summary.header_only_matches,
+        scorecard.summary.code_mismatches,
+        scorecard.summary.span_mismatches,
+        scorecard.summary.message_mismatches,
+        scorecard.summary.order_mismatches,
+        scorecard.summary.unsupported_details,
+        scorecard.summary.header_mismatches,
+        scorecard.summary.artifact_mismatches,
+        scorecard.summary.fatal_invariants,
+    )?;
+    Ok(summary)
+}
+
 /// Discovers upstream cases/reference baselines and compares compiler diagnostics.
 ///
 /// The comparison renders and compares the complete non-pretty TypeScript `.errors.txt`
@@ -898,9 +1776,13 @@ pub fn run_upstream_diagnostic_baselines(
     if options.canonical_checker {
         return Err(canonical_checker_unwind_isolation_error());
     }
+    if let Some(path) = options.variant_manifest.as_deref() {
+        return run_fixed_variant_diagnostic_baselines(repository, options, path, writer);
+    }
     let manifest = discover_upstream_manifest(repository)?;
     let manifest_summary = manifest.summary();
-    let provenance = scorecard_provenance(repository, options, &manifest)?;
+    let oracle_digest = oracle_manifest_digest(&manifest)?;
+    let provenance = scorecard_provenance(repository, options, &oracle_digest, None)?;
     let mut cases = Vec::new();
     let mut baseline_sets = Vec::new();
     for suite in &manifest.suites {
@@ -954,222 +1836,19 @@ pub fn run_upstream_diagnostic_baselines(
         variants: Vec::new(),
     };
     for (case_path, baseline_index) in cases {
-        let baseline_files = &baseline_sets[baseline_index];
-        let source = fs::read(&case_path)?;
-        let case = Case::parse(&case_path, source)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        let axes = matrix_axes(&case);
-        let case_name = case_path
-            .file_stem()
-            .and_then(|name| name.to_str())
-            .unwrap_or_default();
-        let candidates = baseline_files
-            .get(case_name)
-            .map_or_else(Vec::new, |paths| paths.iter().collect::<Vec<_>>());
-        for mut variant in expand_option_matrix(&case) {
-            summary.executed_variants += 1;
-            let selected = select_variant_baselines_with(
-                &candidates,
-                case_name,
-                &variant,
-                &axes,
-                error_baseline_base,
-            );
-            if selected.len() > 1 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "multiple error baselines match {}{}: {}",
-                        case_path.display(),
-                        variant_label(&variant, &axes),
-                        selected
-                            .iter()
-                            .map(|path| path.display().to_string())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ),
-                ));
-            }
-            let expected_baseline = selected
-                .first()
-                .map(|path| relative_scorecard_path(repository, path));
-            let expected = selected
-                .first()
-                .map(fs::read_to_string)
-                .transpose()?
-                .unwrap_or_default();
-            let scorecard_case = relative_scorecard_path(repository, &case_path);
-            let variant_key = diagnostic_variant_key(
-                &scorecard_case,
-                &variant,
-                expected_baseline.as_deref(),
-                &expected,
-            );
-            let mut checker_frontier = None;
-            let compilation = match compile_case_variant(&case, &mut variant, checker) {
-                Ok(compilation) => compilation,
-                // A fixture filesystem failure makes scorecard persistence
-                // itself suspect. Keep it as a fail-closed harness error (CLI
-                // exit 2), never as a checker invariant or capability.
-                Err(FixtureCompilationFailure::Io(error)) => return Err(error),
-                Err(FixtureCompilationFailure::Canonical(error)) => {
-                    let detail = format!("experimental canonical checker: {error}");
-                    match error.failure_class() {
-                        ts_compiler::CanonicalProgramCheckFailureClass::Unsupported {
-                            capability_code,
-                        } => {
-                            if !capability_registry_contains(capability_code) {
-                                return Err(io::Error::new(
-                                    io::ErrorKind::InvalidData,
-                                    format!(
-                                        "typed checker capability {capability_code} is absent from the registry"
-                                    ),
-                                ));
-                            }
-                            checker_frontier = Some((capability_code.to_owned(), detail.clone()));
-                            variant.unsupported_details.push(detail.clone());
-                            variant.unsupported_details.sort();
-                            variant.unsupported_details.dedup();
-                            Compilation::default()
-                        }
-                        ts_compiler::CanonicalProgramCheckFailureClass::Fatal {
-                            invariant_code,
-                        } => {
-                            retain_fatal_variant(
-                                &mut summary,
-                                &mut scorecard,
-                                writer,
-                                FatalVariantRecord {
-                                    case_path: &case_path,
-                                    repository,
-                                    variant: &variant,
-                                    axes: &axes,
-                                    variant_key,
-                                    scorecard_case,
-                                    expected_baseline,
-                                    expected: &expected,
-                                    invariant_code,
-                                    detail,
-                                },
-                            )?;
-                            continue;
-                        }
-                    }
-                }
-                #[cfg(panic = "unwind")]
-                Err(FixtureCompilationFailure::CanonicalPanic { detail }) => {
-                    retain_fatal_variant(
-                        &mut summary,
-                        &mut scorecard,
-                        writer,
-                        FatalVariantRecord {
-                            case_path: &case_path,
-                            repository,
-                            variant: &variant,
-                            axes: &axes,
-                            variant_key,
-                            scorecard_case,
-                            expected_baseline,
-                            expected: &expected,
-                            invariant_code: CANONICAL_CHECKER_PANIC_INVARIANT,
-                            detail,
-                        },
-                    )?;
-                    continue;
-                }
-            };
-            let mut actual = render_error_baseline(&case, &compilation.diagnostics);
-            actual
-                .unsupported_details
-                .extend(variant.unsupported_details.iter().cloned());
-            let comparison =
-                compare_diagnostic_artifacts(&expected, &actual, &compilation.diagnostics);
-            let checker_blocked = checker_frontier.is_some();
-            let status = if checker_blocked {
-                DiagnosticVariantStatus::UnsupportedDetail
-            } else {
-                comparison.status()
-            };
-            let (outcome_class, frontier_blocker) =
-                comparison_frontier(status, &comparison, checker_frontier);
-            if comparison.is_exact() && !checker_blocked {
-                summary.matched += 1;
-                scorecard.summary.exact_matches += 1;
-            } else {
-                summary.mismatched += 1;
-                summary.diagnostic_failures += 1;
-                if parse_error_baseline_header(&expected)
-                    != parse_error_baseline_header(&actual.text)
-                {
-                    scorecard.summary.header_mismatches += 1;
-                }
-                match status {
-                    DiagnosticVariantStatus::ExactMatch
-                    | DiagnosticVariantStatus::FatalInvariant => unreachable!(),
-                    DiagnosticVariantStatus::HeaderOnlyMatch => {
-                        scorecard.summary.header_only_matches += 1;
-                    }
-                    DiagnosticVariantStatus::CodeMismatch => {
-                        scorecard.summary.code_mismatches += 1;
-                    }
-                    DiagnosticVariantStatus::SpanMismatch => {
-                        scorecard.summary.span_mismatches += 1;
-                    }
-                    DiagnosticVariantStatus::MessageMismatch => {
-                        scorecard.summary.message_mismatches += 1;
-                    }
-                    DiagnosticVariantStatus::OrderMismatch => {
-                        scorecard.summary.order_mismatches += 1;
-                    }
-                    DiagnosticVariantStatus::UnsupportedDetail => {
-                        scorecard.summary.unsupported_details += 1;
-                    }
-                    DiagnosticVariantStatus::HeaderMismatch => {}
-                    DiagnosticVariantStatus::ArtifactMismatch => {
-                        scorecard.summary.artifact_mismatches += 1;
-                    }
-                }
-                let display_path = case_path
-                    .strip_prefix(repository)
-                    .unwrap_or(&case_path)
-                    .display();
-                let label = variant_label(&variant, &axes);
-                if let Some(difference) = comparison.first_difference.as_ref() {
-                    writeln!(
-                        writer,
-                        "MISMATCH {display_path}{label}: {status:?} at artifact line {}; expected {:?}, actual {:?}",
-                        difference.line, difference.expected, difference.actual
-                    )?;
-                } else {
-                    writeln!(
-                        writer,
-                        "MISMATCH {display_path}{label}: {status:?}: {}",
-                        comparison.unsupported_details.join("; ")
-                    )?;
-                }
-            }
-            scorecard.summary.executed_variants += 1;
-            scorecard.summary.actual_diagnostics += compilation.diagnostics.len();
-            scorecard.variants.push(DiagnosticVariantResult {
-                variant_key,
-                case: scorecard_case,
-                options: variant.values,
-                expected_baseline,
-                comparison_scope: DiagnosticComparisonScope::FullArtifact,
-                status,
-                outcome_class,
-                frontier_blocker,
-                expected_header: parse_error_baseline_header(&expected),
-                actual_header: parse_error_baseline_header(&actual.text),
-                mismatch_kinds: comparison.mismatch_kinds,
-                first_difference: comparison.first_difference,
-                unsupported_details: comparison.unsupported_details,
-                diagnostics: compilation
-                    .diagnostics
-                    .iter()
-                    .map(DiagnosticScorecardDiagnostic::from)
-                    .collect(),
-            });
+        for plan in prepare_diagnostic_case_variants(
+            repository,
+            &case_path,
+            &baseline_sets[baseline_index],
+        )? {
+            execute_diagnostic_variant(
+                plan,
+                repository,
+                checker,
+                &mut summary,
+                &mut scorecard,
+                writer,
+            )?;
         }
     }
     if let Some(path) = &options.scorecard_json {
@@ -4127,18 +4806,32 @@ mod tests {
         DiagnosticArtifactComparison, DiagnosticArtifactMismatchKind, DiagnosticCheckerMode,
         DiagnosticComparisonScope, DiagnosticScorecard, DiagnosticScorecardDiagnostic,
         DiagnosticScorecardProvenance, DiagnosticScorecardSummary, DiagnosticVariantOutcomeClass,
-        DiagnosticVariantStatus, FatalVariantRecord, FixtureChecker, OptionVariant,
-        OutputDifferenceKind, ParseError, RunnerOptions, RunnerSummary,
+        DiagnosticVariantStatus, FatalVariantRecord, FixedVariantManifest, FixtureChecker,
+        OptionVariant, OutputDifferenceKind, ParseError, RunnerOptions, RunnerSummary,
         ScorecardCapabilityRegistry, ScorecardRepositoryRevision, TYPED_CHECKER_CAPABILITY_CODES,
         capability_registry_contains, capability_registry_metadata,
         compare_case_emitted_output_sections, compare_diagnostic_artifacts,
         compare_emitted_output_sections, comparison_frontier, compile_case, compile_case_matrix,
         compile_case_matrix_with_checker, diagnostic_variant_key, error_baseline_unit_order,
-        expand_option_matrix, first_different_line, fixture_compiler_options, matrix_axes,
-        parse_baseline_sections, parse_error_baseline_header, render_error_baseline,
-        retain_fatal_variant, run_case_against_baseline, run_upstream_baselines,
-        select_variant_baselines, virtual_unit_path,
+        expand_option_matrix, first_different_line, fixed_variant_manifest_digest,
+        fixture_compiler_options, matrix_axes, parse_baseline_sections,
+        parse_error_baseline_header, render_error_baseline, retain_fatal_variant,
+        run_case_against_baseline, run_upstream_baselines, select_variant_baselines,
+        validate_fixed_variant_manifest_structure, virtual_unit_path,
     };
+
+    #[test]
+    fn checked_in_smoke_manifest_has_the_versioned_static_contract() {
+        let manifest: FixedVariantManifest =
+            serde_json::from_str(include_str!("../manifests/checker-smoke-v1.json")).unwrap();
+
+        validate_fixed_variant_manifest_structure(&manifest).unwrap();
+        assert_eq!(manifest.variants.len(), 96);
+        assert_eq!(
+            fixed_variant_manifest_digest(&manifest.variants),
+            "60dbd52bce2c3f9f94971819ad0d9cda"
+        );
+    }
 
     #[test]
     fn capability_registry_covers_every_typed_checker_code() {
@@ -4251,6 +4944,7 @@ mod tests {
                 },
                 manifest_digest: "0".repeat(32),
                 digest_algorithm: "xxh3-128".to_owned(),
+                fixed_shard: None,
                 invocation: Vec::new(),
                 capability_registry: ScorecardCapabilityRegistry {
                     version: 1,

@@ -52,6 +52,7 @@ fn main() -> ExitCode {
 
 fn parse_arguments(arguments: &[String]) -> Result<Option<RunnerOptions>, String> {
     let mut options = RunnerOptions::default();
+    let mut case_selection_requested = false;
     let mut index = 0;
     while index < arguments.len() {
         match arguments[index].as_str() {
@@ -59,6 +60,14 @@ fn parse_arguments(arguments: &[String]) -> Result<Option<RunnerOptions>, String
             "--diagnostics" => options.diagnostics = true,
             "--canonical-checker" => options.canonical_checker = true,
             "--manifest" => options.manifest = true,
+            "--variant-manifest" => {
+                index += 1;
+                options.variant_manifest = Some(PathBuf::from(required_value(
+                    arguments,
+                    index,
+                    "--variant-manifest",
+                )?));
+            }
             "--scorecard-json" => {
                 index += 1;
                 options.scorecard_json = Some(PathBuf::from(required_value(
@@ -68,10 +77,12 @@ fn parse_arguments(arguments: &[String]) -> Result<Option<RunnerOptions>, String
                 )?));
             }
             "--filter" => {
+                case_selection_requested = true;
                 index += 1;
                 options.filter = Some(required_value(arguments, index, "--filter")?);
             }
             "--limit" => {
+                case_selection_requested = true;
                 index += 1;
                 let value = required_value(arguments, index, "--limit")?;
                 options.limit = Some(
@@ -81,6 +92,7 @@ fn parse_arguments(arguments: &[String]) -> Result<Option<RunnerOptions>, String
                 );
             }
             "--skip" => {
+                case_selection_requested = true;
                 index += 1;
                 let value = required_value(arguments, index, "--skip")?;
                 options.skip = value
@@ -93,6 +105,17 @@ fn parse_arguments(arguments: &[String]) -> Result<Option<RunnerOptions>, String
     }
     if options.scorecard_json.is_some() && !options.diagnostics {
         return Err("--scorecard-json requires --diagnostics".to_owned());
+    }
+    if options.variant_manifest.is_some() && !options.diagnostics {
+        return Err("--variant-manifest requires --diagnostics".to_owned());
+    }
+    if options.variant_manifest.is_some() && options.manifest {
+        return Err("--variant-manifest cannot be used with --manifest".to_owned());
+    }
+    if options.variant_manifest.is_some() && case_selection_requested {
+        return Err(
+            "--variant-manifest cannot be combined with --filter, --skip, or --limit".to_owned(),
+        );
     }
     if options.scorecard_json.is_some() && options.manifest {
         return Err("--scorecard-json cannot be used with --manifest".to_owned());
@@ -116,7 +139,7 @@ fn required_value(arguments: &[String], index: usize, option: &str) -> Result<St
 
 fn print_help() {
     println!(
-        "Usage: ts_fixture_baseline [--diagnostics] [--canonical-checker] [--scorecard-json FILE] [--manifest] [--filter TEXT] [--skip COUNT] [--limit COUNT]"
+        "Usage: ts_fixture_baseline [--diagnostics] [--canonical-checker] [--scorecard-json FILE] [--variant-manifest FILE] [--manifest] [--filter TEXT] [--skip COUNT] [--limit COUNT]"
     );
     println!(
         "Reads the pinned typescript-go compiler/conformance corpus and actual baselines below TS_GO_REPO."
@@ -126,6 +149,9 @@ fn print_help() {
     );
     println!(
         "--canonical-checker opts diagnostic runs into the experimental canonical checker without emit or legacy fallback."
+    );
+    println!(
+        "--variant-manifest executes an exact validated expanded-variant shard in manifest order."
     );
 }
 
@@ -159,6 +185,23 @@ mod tests {
             Some(std::path::Path::new("scorecard.json"))
         );
         assert!(!options.manifest);
+        assert!(options.variant_manifest.is_none());
+    }
+
+    #[test]
+    fn parses_fixed_variant_manifest() {
+        let options = parse_arguments(&[
+            "--diagnostics".into(),
+            "--canonical-checker".into(),
+            "--variant-manifest".into(),
+            "checker-smoke-v1.json".into(),
+        ])
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            options.variant_manifest.as_deref(),
+            Some(std::path::Path::new("checker-smoke-v1.json"))
+        );
     }
 
     #[test]
@@ -176,6 +219,32 @@ mod tests {
         assert_eq!(
             parse_arguments(&["--canonical-checker".into()]),
             Err("--canonical-checker requires --diagnostics".to_owned())
+        );
+        assert_eq!(
+            parse_arguments(&["--variant-manifest".into(), "checker-smoke-v1.json".into(),]),
+            Err("--variant-manifest requires --diagnostics".to_owned())
+        );
+        assert_eq!(
+            parse_arguments(&[
+                "--diagnostics".into(),
+                "--variant-manifest".into(),
+                "checker-smoke-v1.json".into(),
+                "--filter".into(),
+                "case".into(),
+            ]),
+            Err(
+                "--variant-manifest cannot be combined with --filter, --skip, or --limit"
+                    .to_owned()
+            )
+        );
+        assert_eq!(
+            parse_arguments(&[
+                "--diagnostics".into(),
+                "--variant-manifest".into(),
+                "checker-smoke-v1.json".into(),
+                "--manifest".into(),
+            ]),
+            Err("--variant-manifest cannot be used with --manifest".to_owned())
         );
         assert_eq!(
             parse_arguments(&[

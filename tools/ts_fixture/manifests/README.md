@@ -47,10 +47,24 @@ Before the shard is used as a merge gate, the fixture runner must:
    capability and fatal outcomes; and
 7. write the manifest name and digest into scorecard provenance.
 
+The runner implements this contract with:
+
+```sh
+TS_GO_REPO=/path/to/typescript-go \
+  cargo run -p ts_fixture --bin ts_fixture_baseline -- \
+  --diagnostics \
+  --canonical-checker \
+  --variant-manifest tools/ts_fixture/manifests/checker-smoke-v1.json \
+  --scorecard-json checker-smoke-scorecard.json
+```
+
+Fixed-shard execution requires a clean upstream checkout at the manifest's
+exact SHA. The runner still computes `provenance.manifestDigest` from the
+complete oracle manifest; `provenance.fixedShard` separately records the fixed
+selection's name, schema/key versions, digest, algorithm, and variant count.
+
 Regeneration requires two identical discoveries at the pinned upstream epoch,
 a fresh schema-5 scorecard, and review of every added, removed, or retagged key.
-The current runner still needs a variant-key manifest input path; checking in
-this selection alone does not make the fixed shard executable.
 
 No explicit cross-file relative import/re-export cycle was identified in the
 completed 500-case selection source. Add a deterministic cycle case to the
