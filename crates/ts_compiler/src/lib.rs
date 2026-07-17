@@ -435,6 +435,7 @@ fn source_check_capability_code(error: &SourceCheckError) -> Option<&'static str
         | SourceCheckError::Call(_)
         | SourceCheckError::Enum(_)
         | SourceCheckError::Import(_)
+        | SourceCheckError::Class(_)
         | SourceCheckError::Property(_)
         | SourceCheckError::Element(_)
         | SourceCheckError::PrimitiveOperator(_)
@@ -502,6 +503,7 @@ fn source_check_invariant_code(error: &SourceCheckError) -> &'static str {
         SourceCheckError::Call(_) => "INV.SOURCE.CALL",
         SourceCheckError::Enum(_) => "INV.SOURCE.ENUM",
         SourceCheckError::Import(_) => "INV.SOURCE.IMPORT",
+        SourceCheckError::Class(_) => "INV.SOURCE.CLASS",
         SourceCheckError::Property(_) => "INV.SOURCE.PROPERTY",
         SourceCheckError::Element(_) => "INV.SOURCE.ELEMENT",
         SourceCheckError::PrimitiveOperator(_) => "INV.SOURCE.PRIMITIVE_OPERATOR",
@@ -7193,6 +7195,10 @@ mod tests {
             },
             CanonicalProgramCheckError::SourceCheck {
                 file_name: "/project/input.ts".to_owned(),
+                error: SourceCheckError::Unsupported(UnsupportedSourceSyntax::Class(node)),
+            },
+            CanonicalProgramCheckError::SourceCheck {
+                file_name: "/project/input.ts".to_owned(),
                 error: SourceCheckError::DeclaredType(DeclaredTypeError::TypeNodeUnavailable(
                     TypeNodeUnavailable::TypeArgumentsUnsupported(node),
                 )),
@@ -7278,6 +7284,18 @@ mod tests {
             }
         );
         assert!(!error.is_unsupported_boundary());
+
+        let class_error = CanonicalProgramCheckError::SourceCheck {
+            file_name: "/project/input.ts".to_owned(),
+            error: SourceCheckError::Class(node),
+        };
+        assert_eq!(
+            class_error.failure_class(),
+            CanonicalProgramCheckFailureClass::Fatal {
+                invariant_code: "INV.SOURCE.CLASS",
+            }
+        );
+        assert!(!class_error.is_unsupported_boundary());
     }
 
     #[test]
@@ -7604,6 +7622,10 @@ mod tests {
             CanonicalProgramCheckError::SourceCheck {
                 file_name: "/project/input.ts".to_owned(),
                 error: SourceCheckError::Import(node),
+            },
+            CanonicalProgramCheckError::SourceCheck {
+                file_name: "/project/input.ts".to_owned(),
+                error: SourceCheckError::Class(node),
             },
             CanonicalProgramCheckError::SourceCheck {
                 file_name: "/project/input.ts".to_owned(),

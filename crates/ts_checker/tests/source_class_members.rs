@@ -4,7 +4,8 @@ use ts_binder::{
     CheckFlags, EscapedName, SemanticSymbolId, SymbolFlags,
 };
 use ts_checker::semantic::{
-    CanonicalCheckerContext, CanonicalCheckerOptions, TypeData, TypeNodeLinks, ValueSymbolLinks,
+    CanonicalCheckerContext, CanonicalCheckerOptions, SourceCheckError, TypeData, TypeNodeLinks,
+    UnsupportedSourceSyntax, ValueSymbolLinks,
     signatures::SignatureFlags,
     type_records::TypeCacheState,
     types::{ObjectFlags, TypeFlags},
@@ -20,6 +21,14 @@ const SOURCE: &str = concat!(
 );
 
 fn checker_context(parsed: &ParseResult, file: FileId) -> CanonicalCheckerContext<'_> {
+    checker_context_with_module_state(parsed, file, CanonicalModuleState::Script)
+}
+
+fn checker_context_with_module_state(
+    parsed: &ParseResult,
+    file: FileId,
+    module_state: CanonicalModuleState,
+) -> CanonicalCheckerContext<'_> {
     let mut binder = CanonicalBinder::new();
     binder
         .bind_source_file_with_facts(
@@ -30,7 +39,7 @@ fn checker_context(parsed: &ParseResult, file: FileId) -> CanonicalCheckerContex
                 EscapedName::source("\"/project/class-members.ts\""),
                 CanonicalSourceLanguage::TypeScript,
                 false,
-                CanonicalModuleState::Script,
+                module_state,
             ),
         )
         .unwrap();
@@ -73,6 +82,29 @@ fn class_symbol(
     context.store().get_merged_symbol(raw).unwrap()
 }
 
+fn type_alias_symbol(
+    parsed: &ParseResult,
+    file: FileId,
+    context: &CanonicalCheckerContext<'_>,
+    expected: &str,
+) -> SemanticSymbolId {
+    let declaration = parsed
+        .arena
+        .iter()
+        .find_map(|(node, record)| {
+            let NodeData::TypeAliasDeclaration(alias) = &record.data else {
+                return None;
+            };
+            let NodeData::Identifier(name) = &parsed.arena.get(alias.name)?.data else {
+                return None;
+            };
+            (name.text == expected).then_some(NodeRef::new(parsed.arena.id(), file, node))
+        })
+        .unwrap_or_else(|| panic!("missing type alias {expected}"));
+    let raw = context.file(file).unwrap().1.symbol(declaration).unwrap();
+    context.store().get_merged_symbol(raw).unwrap()
+}
+
 fn property_type_node(parsed: &ParseResult, file: FileId, expected: &str) -> NodeRef {
     parsed
         .arena
@@ -94,6 +126,194 @@ fn property_type_node(parsed: &ParseResult, file: FileId, expected: &str) -> Nod
             })
         })
         .unwrap_or_else(|| panic!("missing property {expected}"))
+}
+
+#[test]
+fn source_check_materializes_class_members_and_accepts_unmarked_static_fields() {
+    let parsed = parse_source_file(SOURCE);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(0);
+    let mut context = checker_context(&parsed, file);
+    let symbol = class_symbol(&parsed, file, &context, "Model");
+
+    context.check_source_file(file).unwrap();
+
+    let members = context.get_nongeneric_class_members(symbol).unwrap();
+    assert_eq!(members.instance_properties().len(), 2);
+    assert_eq!(members.static_properties().len(), 1);
+    assert!(
+        context
+            .source_file(file)
+            .and_then(|source| context.store().source_file_links(source))
+            .is_some_and(|links| links.type_checked)
+    );
+    assert!(context.diagnostics().is_empty());
+
+    let warm = (
+        context.store().type_len(),
+        context.store().signature_len(),
+        context.store().symbol_len(),
+        context.store().symbol_store().symbol_table_len(),
+        context.store().relation_state_snapshot(),
+        context.diagnostics().len(),
+        context
+            .source_file(file)
+            .and_then(|source| context.store().source_file_links(source))
+            .is_some_and(|links| links.type_checked),
+    );
+    context.recheck_source_file(file).unwrap();
+    assert_eq!(
+        context.get_nongeneric_class_members(symbol).unwrap(),
+        members
+    );
+    assert_eq!(
+        (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.store().symbol_len(),
+            context.store().symbol_store().symbol_table_len(),
+            context.store().relation_state_snapshot(),
+            context.diagnostics().len(),
+            context
+                .source_file(file)
+                .and_then(|source| context.store().source_file_links(source))
+                .is_some_and(|links| links.type_checked),
+        ),
+        warm
+    );
+}
+
+#[test]
+fn supported_classes_execute_at_their_lexical_statement_positions() {
+    let parsed = parse_source_file(concat!(
+        "class First { value?: string; }\n",
+        "type Between = { marker: string };\n",
+        "class Second { value!: number; static count: number; }\n",
+    ));
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(0);
+    let mut context = checker_context(&parsed, file);
+    let first = class_symbol(&parsed, file, &context, "First");
+    let between = type_alias_symbol(&parsed, file, &context, "Between");
+    let second = class_symbol(&parsed, file, &context, "Second");
+
+    context.check_source_file(file).unwrap();
+
+    let first = context.get_nongeneric_class_members(first).unwrap();
+    let between = context
+        .store()
+        .type_alias_links(between)
+        .and_then(|links| links.declared_type)
+        .expect("the intervening type alias must be materialized");
+    let second = context.get_nongeneric_class_members(second).unwrap();
+    assert!(first.shells().value_type().get() < between.get());
+    assert!(between.get() < second.shells().instance_type().get());
+    assert!(first.default_construct_signature().get() < second.default_construct_signature().get());
+    assert!(context.diagnostics().is_empty());
+}
+
+#[test]
+fn later_unsafe_instance_field_preflights_before_earlier_class_publication() {
+    let parsed = parse_source_file(concat!(
+        "class Early { value?: string; }\n",
+        "class Later { value: string; static count: number; }\n",
+    ));
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(0);
+    let mut context = checker_context(&parsed, file);
+    let early = class_symbol(&parsed, file, &context, "Early");
+    let later = class_declaration(&parsed, file, "Later");
+    let before = (
+        context.store().type_len(),
+        context.store().signature_len(),
+        context.store().symbol_store().symbol_table_len(),
+        context.store().relation_state_snapshot(),
+    );
+
+    assert_eq!(
+        context.check_source_file(file),
+        Err(SourceCheckError::Unsupported(
+            UnsupportedSourceSyntax::Class(later)
+        ))
+    );
+    assert_eq!(
+        (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.store().symbol_store().symbol_table_len(),
+            context.store().relation_state_snapshot(),
+        ),
+        before
+    );
+    assert!(context.store().declared_type_links(early).is_none());
+    assert!(context.store().value_symbol_links(early).is_none());
+    assert!(context.diagnostics().is_empty());
+}
+
+#[test]
+fn exported_class_is_unsupported_before_export_symbol_planning() {
+    let parsed = parse_source_file("export class Exported { value?: string; }");
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(0);
+    let mut context =
+        checker_context_with_module_state(&parsed, file, CanonicalModuleState::External);
+    let declaration = class_declaration(&parsed, file, "Exported");
+    let bound = context.file(file).unwrap().1;
+    let exported = context
+        .store()
+        .get_merged_symbol(bound.symbol(declaration).unwrap())
+        .unwrap();
+    let local = context
+        .store()
+        .get_merged_symbol(bound.local_symbol(declaration).unwrap())
+        .unwrap();
+    let before = (
+        context.store().type_len(),
+        context.store().signature_len(),
+        context.store().symbol_len(),
+        context.store().symbol_store().symbol_table_len(),
+        context.store().relation_state_snapshot(),
+    );
+
+    assert_eq!(
+        context.check_source_file(file),
+        Err(SourceCheckError::Unsupported(
+            UnsupportedSourceSyntax::Class(declaration)
+        ))
+    );
+    assert_eq!(
+        (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.store().symbol_len(),
+            context.store().symbol_store().symbol_table_len(),
+            context.store().relation_state_snapshot(),
+        ),
+        before
+    );
+    for symbol in [exported, local] {
+        assert!(
+            context
+                .store()
+                .declared_type_links(symbol)
+                .and_then(|links| links.declared_type)
+                .is_none()
+        );
+        assert!(
+            context
+                .store()
+                .value_symbol_links(symbol)
+                .and_then(|links| links.resolved_type)
+                .is_none()
+        );
+    }
+    assert!(
+        context
+            .source_file(file)
+            .and_then(|source| context.store().source_file_links(source))
+            .is_none_or(|links| !links.type_checked)
+    );
+    assert!(context.diagnostics().is_empty());
 }
 
 #[test]

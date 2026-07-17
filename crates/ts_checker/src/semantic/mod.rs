@@ -16,7 +16,7 @@ pub mod bootstrap;
 mod callable_sets;
 mod callables;
 mod calls;
-#[allow(dead_code)] // Root owns source dispatch for the incremental class cuts.
+#[allow(dead_code)] // Incremental class cuts retain accessors reserved for later source stages.
 mod classes;
 mod constraints;
 mod contextual;

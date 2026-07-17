@@ -1,7 +1,8 @@
 //! Atomic canonical checking for the first source-statement slice.
 //!
 //! This module deliberately supports only unmodified type aliases and simple
-//! interfaces, top-level literal enums, empty external-module markers, exact
+//! interfaces, top-level nongeneric classes with primitive annotated fields,
+//! top-level literal enums, empty external-module markers, exact
 //! named ESM reexports,
 //! leading direct named ESM value imports, clause-level type-only named ESM
 //! imports in exact direct or union/parenthesized/array top-level variable
@@ -43,6 +44,10 @@ use super::{
     bootstrap::{LiteralTypeCacheError, UnionReduction},
     callables::{
         StoredSingleCallableValidation, ValidatedSingleCallable, validate_stored_single_callable,
+    },
+    classes::{
+        ClassMemberPlan, execute_nongeneric_class_members, plan_nongeneric_class_members,
+        preflight_nongeneric_class_members,
     },
     contextual::{
         LiteralTreatment, PreparedExpression, prepare_expression_context_with_global_types,
@@ -204,6 +209,7 @@ pub enum UnsupportedSourceSyntax {
     Call(NodeRef),
     Enum(NodeRef),
     Import(NodeRef),
+    Class(NodeRef),
     Property(NodeRef),
     Element(NodeRef),
 }
@@ -324,6 +330,7 @@ pub enum SourceCheckError {
     Call(NodeRef),
     Enum(NodeRef),
     Import(NodeRef),
+    Class(NodeRef),
     Property(NodeRef),
     Element(NodeRef),
     PrimitiveOperator(NodeRef),
@@ -354,6 +361,7 @@ impl std::fmt::Display for SourceCheckError {
             Self::Call(node) => write!(formatter, "call checking failed at {node:?}"),
             Self::Enum(node) => write!(formatter, "enum checking failed at {node:?}"),
             Self::Import(node) => write!(formatter, "import checking failed at {node:?}"),
+            Self::Class(node) => write!(formatter, "class checking failed at {node:?}"),
             Self::Property(node) => write!(formatter, "property checking failed at {node:?}"),
             Self::Element(node) => write!(formatter, "element checking failed at {node:?}"),
             Self::PrimitiveOperator(node) => {
@@ -393,6 +401,7 @@ impl std::error::Error for SourceCheckError {
             | Self::Call(_)
             | Self::Enum(_)
             | Self::Import(_)
+            | Self::Class(_)
             | Self::Property(_)
             | Self::Element(_)
             | Self::PrimitiveOperator(_)
@@ -808,6 +817,7 @@ struct DeferredAssertion {
 enum PlannedStatement {
     TypeAlias(SemanticSymbolId),
     Interface(SemanticSymbolId),
+    Class(ClassMemberPlan),
     Enum(SourceEnumPlan),
     ExternalModuleMarker,
     NamedReexport,
@@ -1131,6 +1141,44 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                             .map_err(|error| self.interface_plan_error(statement, error))?;
                     }
                     statements.push(PlannedStatement::Interface(symbol));
+                }
+                SyntaxKind::ClassDeclaration => {
+                    let node = self.node(statement)?;
+                    let NodeData::ClassDeclaration(class) = &node.data else {
+                        return Err(SourceCheckError::Provenance(
+                            SourceCheckProvenanceError::MismatchedNodeData {
+                                node: statement,
+                                kind: node.kind,
+                            },
+                        ));
+                    };
+                    self.reject_class_declaration_modifiers(
+                        statement,
+                        node.range,
+                        class.name,
+                        class.modifiers.as_ref(),
+                    )?;
+                    let Some((store, host)) = self.semantic else {
+                        return Err(SourceCheckError::Unsupported(
+                            UnsupportedSourceSyntax::Class(statement),
+                        ));
+                    };
+                    let symbol =
+                        self.bound
+                            .symbol(statement)
+                            .ok_or(SourceCheckError::Provenance(
+                                SourceCheckProvenanceError::MissingDeclarationSymbol(statement),
+                            ))?;
+                    let class = plan_nongeneric_class_members(store, host, symbol)
+                        .map_err(|error| Self::class_plan_error(statement, error))?;
+                    if !class.instance_properties_are_initialization_safe() {
+                        return Err(SourceCheckError::Unsupported(
+                            UnsupportedSourceSyntax::Class(statement),
+                        ));
+                    }
+                    preflight_nongeneric_class_members(store, host, &class)
+                        .map_err(|error| Self::class_plan_error(statement, error))?;
+                    statements.push(PlannedStatement::Class(class));
                 }
                 SyntaxKind::EnumDeclaration => {
                     let Some((store, host)) = self.semantic else {
@@ -1746,6 +1794,22 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         }
     }
 
+    fn class_plan_error(
+        declaration: NodeRef,
+        error: super::classes::ClassError,
+    ) -> SourceCheckError {
+        let node = error.node().unwrap_or(declaration);
+        match error {
+            super::classes::ClassError::Unsupported(_) => {
+                SourceCheckError::Unsupported(UnsupportedSourceSyntax::Class(node))
+            }
+            super::classes::ClassError::Invariant(_) => SourceCheckError::Class(node),
+            super::classes::ClassError::DeclaredType(error) => {
+                SourceCheckError::DeclaredType(error)
+            }
+        }
+    }
+
     fn import_plan_error(declaration: NodeRef, error: &SourceImportError) -> SourceCheckError {
         let node = error.node().unwrap_or(declaration);
         match error {
@@ -2030,6 +2094,36 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             return Err(self.unsupported(modifier, modifier_node.kind, role));
         }
         Ok(Some(modifier))
+    }
+
+    fn reject_class_declaration_modifiers(
+        &self,
+        declaration: NodeRef,
+        declaration_range: TextRange,
+        name: Option<NodeId>,
+        modifiers: Option<&ModifierList>,
+    ) -> Result<(), SourceCheckError> {
+        let Some(modifiers) = modifiers else {
+            return Ok(());
+        };
+        let Some(name) = name else {
+            return Err(SourceCheckError::Unsupported(
+                UnsupportedSourceSyntax::Class(declaration),
+            ));
+        };
+        match self.validate_named_type_modifiers(
+            declaration,
+            declaration_range,
+            name,
+            Some(modifiers),
+            SyntaxKind::ClassDeclaration,
+            SourceSyntaxRole::Statement,
+        ) {
+            Err(error @ SourceCheckError::Provenance(_)) => Err(error),
+            Ok(_) | Err(_) => Err(SourceCheckError::Unsupported(
+                UnsupportedSourceSyntax::Class(declaration),
+            )),
+        }
     }
 
     fn validate_function_modifiers(
@@ -8583,6 +8677,11 @@ pub(super) fn check_source_file(
                 merge_retry_diagnostics(diagnostics, statement_diagnostics);
                 result?;
             }
+            PlannedStatement::Class(class) => {
+                let declaration = class.declaration();
+                execute_nongeneric_class_members(store, host, &class)
+                    .map_err(|error| SourcePlanner::class_plan_error(declaration, error))?;
+            }
             PlannedStatement::Enum(enumeration) => {
                 let materialized =
                     execute_top_level_enum(store, host, &enumeration).map_err(|error| {
@@ -9067,7 +9166,7 @@ mod tests {
     use super::*;
     use crate::semantic::{
         AliasTargetState, CanonicalCheckerContext, DeclaredTypeHostError,
-        IntrinsicBootstrapOptions, RelationStateSnapshot, TypeNodeUnavailable,
+        IntrinsicBootstrapOptions, RelationStateSnapshot, TypeAliasLinks, TypeNodeUnavailable,
         module_resolution::{
             CanonicalModuleResolutionEntry, CanonicalModuleResolutionManifestInput,
             CanonicalModuleResolutionMode, CanonicalResolvedModuleInput,
@@ -9082,7 +9181,7 @@ mod tests {
     };
 
     type ObservableSourceState = (
-        [usize; 4],
+        [usize; 5],
         [usize; 26],
         usize,
         usize,
@@ -9705,6 +9804,7 @@ mod tests {
         (
             [
                 store.type_len(),
+                store.signature_len(),
                 store.mapper_len(),
                 store.symbol_len(),
                 store.symbol_store().symbol_table_len(),
@@ -10533,6 +10633,148 @@ mod tests {
         assert!(context.store().value_symbol_links(good).is_none());
         assert!(context.diagnostics().is_empty());
         assert!(!is_type_checked(&context, file));
+    }
+
+    #[test]
+    fn top_level_class_materializes_members_in_source_execution_and_replays_warm() {
+        let source = parsed(concat!(
+            "class Model { ",
+            "readonly value?: string; ",
+            "definite!: number; ",
+            "static count: number; ",
+            "}",
+        ));
+        let file = FileId::new(417);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        let owner = global_symbol(&context, "Model");
+
+        context.check_source_file(file).unwrap();
+
+        let members = context.get_nongeneric_class_members(owner).unwrap();
+        assert_eq!(members.instance_properties().len(), 2);
+        assert_eq!(members.static_properties().len(), 1);
+        assert_eq!(
+            context
+                .store()
+                .declared_type_links(owner)
+                .and_then(|links| links.declared_type),
+            Some(members.shells().instance_type())
+        );
+        assert_eq!(
+            context
+                .store()
+                .value_symbol_links(owner)
+                .and_then(|links| links.resolved_type),
+            Some(members.shells().value_type())
+        );
+        assert!(context.diagnostics().is_empty());
+        assert!(is_type_checked(&context, file));
+
+        let warm = observable_state(&context, file);
+        mark_source_unchecked(&mut context, file);
+        context.check_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn earlier_statement_failure_prevents_later_class_execution() {
+        let source = parsed(concat!(
+            "type Broken = string;\n",
+            "class Later { value?: string; static count: number; }\n",
+        ));
+        let file = FileId::new(418);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        let alias = global_symbol(&context, "Broken");
+        let class = global_symbol(&context, "Later");
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        assert!(context.store_mut_for_test().set_type_alias_links(
+            alias,
+            TypeAliasLinks {
+                declared_type: Some(number),
+                type_parameters: Some(Vec::new()),
+                ..TypeAliasLinks::default()
+            },
+        ));
+        let before = observable_state(&context, file);
+
+        assert_eq!(
+            context.check_source_file(file),
+            Err(SourceCheckError::DeclaredType(
+                DeclaredTypeError::TypeNodeUnavailable(
+                    TypeNodeUnavailable::InvalidCachedTypeAlias(alias)
+                )
+            ))
+        );
+        assert_eq!(observable_state(&context, file), before);
+        assert!(context.store().declared_type_links(class).is_none());
+        assert!(context.store().value_symbol_links(class).is_none());
+        assert!(context.diagnostics().is_empty());
+        assert!(!is_type_checked(&context, file));
+    }
+
+    #[test]
+    fn later_poisoned_class_preflights_before_earlier_publication_and_repairs() {
+        let source = parsed(concat!(
+            "class Early { value?: string; }\n",
+            "class Later { value!: number; static count: number; }\n",
+        ));
+        let file = FileId::new(419);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        let early = global_symbol(&context, "Early");
+        let later = global_symbol(&context, "Later");
+        let later_declaration = context
+            .store()
+            .symbol(later)
+            .and_then(|symbol| symbol.declarations())
+            .and_then(|declarations| declarations.first())
+            .copied()
+            .expect("Later has one declaration");
+        let wrong = context.store().intrinsic_bootstrap().unwrap().string_type;
+        assert!(context.store_mut_for_test().set_value_symbol_links(
+            later,
+            ValueSymbolLinks {
+                resolved_type: Some(wrong),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        let poisoned = observable_state(&context, file);
+
+        for _ in 0..2 {
+            assert_eq!(
+                context.check_source_file(file),
+                Err(SourceCheckError::Class(later_declaration))
+            );
+            assert_eq!(observable_state(&context, file), poisoned);
+            assert!(context.store().declared_type_links(early).is_none());
+            assert!(context.store().value_symbol_links(early).is_none());
+            assert!(context.diagnostics().is_empty());
+            assert!(!is_type_checked(&context, file));
+        }
+
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_value_symbol_links(later, ValueSymbolLinks::default())
+        );
+        context.check_source_file(file).unwrap();
+        assert_eq!(
+            context
+                .get_nongeneric_class_members(early)
+                .unwrap()
+                .instance_properties()
+                .len(),
+            1
+        );
+        assert_eq!(
+            context
+                .get_nongeneric_class_members(later)
+                .unwrap()
+                .static_properties()
+                .len(),
+            1
+        );
+        assert!(context.diagnostics().is_empty());
+        assert!(is_type_checked(&context, file));
     }
 
     #[test]

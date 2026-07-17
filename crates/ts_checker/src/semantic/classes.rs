@@ -1492,6 +1492,30 @@ fn class_member_state(
     Ok(None)
 }
 
+fn validated_nongeneric_class_member_state(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    plan: &ClassMemberPlan,
+) -> Result<Option<ClassMembers>, ClassError> {
+    let current = plan_nongeneric_class_members(store, host, plan.class.symbol)?;
+    if current != *plan {
+        return Err(invariant(ClassInvariant::InvalidPlan(
+            plan.class.declaration,
+        )));
+    }
+    class_member_state(store, host, plan)
+}
+
+/// Revalidates one exact member plan and every observable warm class cache
+/// without publishing a cold shell or member graph.
+pub(super) fn preflight_nongeneric_class_members(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    plan: &ClassMemberPlan,
+) -> Result<(), ClassError> {
+    validated_nongeneric_class_member_state(store, host, plan).map(drop)
+}
+
 /// Installs the exact primitive-property member graph and default constructor
 /// for a previously preflighted class.
 ///
@@ -1503,13 +1527,7 @@ pub(super) fn execute_nongeneric_class_members(
     host: &DeclaredTypeHost<'_>,
     plan: &ClassMemberPlan,
 ) -> Result<ClassMembers, ClassError> {
-    let current = plan_nongeneric_class_members(store, host, plan.class.symbol)?;
-    if current != *plan {
-        return Err(invariant(ClassInvariant::InvalidPlan(
-            plan.class.declaration,
-        )));
-    }
-    if let Some(members) = class_member_state(store, host, plan)? {
+    if let Some(members) = validated_nongeneric_class_member_state(store, host, plan)? {
         return Ok(members);
     }
     let shell = shell_state(store, host, &plan.class)?;
