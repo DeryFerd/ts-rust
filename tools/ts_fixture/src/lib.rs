@@ -468,6 +468,8 @@ pub struct DiagnosticScorecardProvenance {
 const DIAGNOSTIC_SCORECARD_SCHEMA_VERSION: u32 = 5;
 const CAPABILITY_REGISTRY_VERSION: u32 = 1;
 const SCORECARD_DIGEST_ALGORITHM: &str = "xxh3-128";
+#[cfg(panic = "unwind")]
+const CANONICAL_CHECKER_PANIC_INVARIANT: &str = "INV.CHECKER.PANIC";
 const CAPABILITY_REGISTRY: &str = include_str!("../../../docs/typechecker-capabilities.tsv");
 const TYPECHECKER_PORT_MAP: &str = include_str!("../../../docs/typechecker-port-map.tsv");
 
@@ -892,6 +894,9 @@ pub fn run_upstream_diagnostic_baselines(
     options: &RunnerOptions,
     writer: &mut impl Write,
 ) -> io::Result<RunnerSummary> {
+    if options.canonical_checker {
+        require_canonical_checker_unwind_isolation()?;
+    }
     let manifest = discover_upstream_manifest(repository)?;
     let manifest_summary = manifest.summary();
     let provenance = scorecard_provenance(repository, options, &manifest)?;
@@ -1049,6 +1054,27 @@ pub fn run_upstream_diagnostic_baselines(
                             continue;
                         }
                     }
+                }
+                #[cfg(panic = "unwind")]
+                Err(FixtureCompilationFailure::CanonicalPanic { detail }) => {
+                    retain_fatal_variant(
+                        &mut summary,
+                        &mut scorecard,
+                        writer,
+                        FatalVariantRecord {
+                            case_path: &case_path,
+                            repository,
+                            variant: &variant,
+                            axes: &axes,
+                            variant_key,
+                            scorecard_case,
+                            expected_baseline,
+                            expected: &expected,
+                            invariant_code: CANONICAL_CHECKER_PANIC_INVARIANT,
+                            detail,
+                        },
+                    )?;
+                    continue;
                 }
             };
             let mut actual = render_error_baseline(&case, &compilation.diagnostics);
@@ -2909,6 +2935,10 @@ enum FixtureChecker {
 enum FixtureCompilationFailure {
     Io(io::Error),
     Canonical(ts_compiler::CanonicalProgramCheckError),
+    #[cfg(panic = "unwind")]
+    CanonicalPanic {
+        detail: String,
+    },
 }
 
 impl FixtureCompilationFailure {
@@ -2916,6 +2946,8 @@ impl FixtureCompilationFailure {
         match self {
             Self::Io(error) => error,
             Self::Canonical(error) => io::Error::new(io::ErrorKind::InvalidData, error),
+            #[cfg(panic = "unwind")]
+            Self::CanonicalPanic { detail } => io::Error::new(io::ErrorKind::InvalidData, detail),
         }
     }
 }
@@ -2924,6 +2956,60 @@ impl From<io::Error> for FixtureCompilationFailure {
     fn from(error: io::Error) -> Self {
         Self::Io(error)
     }
+}
+
+#[cfg(not(panic = "unwind"))]
+fn canonical_checker_unwind_isolation_error() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Unsupported,
+        "canonical checker diagnostic runs require panic=\"unwind\" so each variant can retain checker panics and continue; this binary was built with panic=\"abort\"",
+    )
+}
+
+#[cfg(panic = "unwind")]
+fn require_canonical_checker_unwind_isolation() -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(not(panic = "unwind"))]
+fn require_canonical_checker_unwind_isolation() -> io::Result<()> {
+    Err(canonical_checker_unwind_isolation_error())
+}
+
+#[cfg(panic = "unwind")]
+fn canonical_checker_panic_detail(payload: &(dyn std::any::Any + Send)) -> String {
+    let message = if let Some(message) = payload.downcast_ref::<&str>() {
+        *message
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.as_str()
+    } else {
+        "<non-string panic payload>"
+    };
+    format!("canonical checker panicked: {message}")
+}
+
+#[cfg(panic = "unwind")]
+fn catch_canonical_checker_unwind<T>(
+    operation: impl FnOnce() -> Result<T, ts_compiler::CanonicalProgramCheckError>,
+) -> Result<T, FixtureCompilationFailure> {
+    // Every invocation owns its Program, options, and in-memory filesystem;
+    // none of that state is reused after an unwind. The assertion applies to
+    // this per-variant isolation boundary, not to arbitrary checker callbacks.
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation)) {
+        Ok(result) => result.map_err(FixtureCompilationFailure::Canonical),
+        Err(payload) => Err(FixtureCompilationFailure::CanonicalPanic {
+            detail: canonical_checker_panic_detail(payload.as_ref()),
+        }),
+    }
+}
+
+#[cfg(not(panic = "unwind"))]
+fn catch_canonical_checker_unwind<T>(
+    _operation: impl FnOnce() -> Result<T, ts_compiler::CanonicalProgramCheckError>,
+) -> Result<T, FixtureCompilationFailure> {
+    Err(FixtureCompilationFailure::Io(
+        canonical_checker_unwind_isolation_error(),
+    ))
 }
 
 fn compile_case_matrix_with_checker(
@@ -3090,17 +3176,14 @@ fn compile_case_variant(
             &roots,
             compiler_options,
         ),
-        FixtureChecker::Canonical => {
-            match ts_compiler::Program::try_new_with_canonical_checker(
+        FixtureChecker::Canonical => catch_canonical_checker_unwind(|| {
+            ts_compiler::Program::try_new_with_canonical_checker(
                 &file_system,
                 current_directory,
                 &roots,
                 compiler_options,
-            ) {
-                Ok(program) => program,
-                Err(error) => return Err(FixtureCompilationFailure::Canonical(error)),
-            }
-        }
+            )
+        })?,
     };
     // The Go harness baselines pre-emit program/syntactic/semantic/global and
     // declaration diagnostics. Emit-result diagnostics are not part of that
@@ -4080,6 +4163,26 @@ mod tests {
             TYPED_CHECKER_CAPABILITY_CODES
                 .iter()
                 .all(|code| !code.starts_with("INV."))
+        );
+    }
+
+    #[cfg(panic = "unwind")]
+    #[test]
+    fn canonical_checker_unwind_boundary_retains_the_panic_payload() {
+        let failure = super::catch_canonical_checker_unwind(
+            || -> Result<(), ts_compiler::CanonicalProgramCheckError> {
+                panic!("deterministic checker panic payload")
+            },
+        )
+        .unwrap_err();
+
+        let detail = match failure {
+            super::FixtureCompilationFailure::CanonicalPanic { detail } => detail,
+            other => panic!("expected a retained canonical checker panic, got {other:?}"),
+        };
+        assert_eq!(
+            detail,
+            "canonical checker panicked: deterministic checker panic payload"
         );
     }
 

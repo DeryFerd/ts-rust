@@ -40,7 +40,8 @@ algorithm requires a new key prefix and an explicit manifest migration.
 - `checker_capability` for a typed, intentionally unsupported compiler
   boundary;
 - `supported_mismatch` when the checker ran but its artifact differs; or
-- `fatal_invariant` for a typed compiler invariant failure.
+- `fatal_invariant` for a typed compiler invariant failure or a caught canonical
+  checker unwind.
 
 Every non-exact result has a `frontierBlocker`. Checker-capability blockers have
 a registry-backed code. Fatal blockers use the reserved `INV.*` namespace.
@@ -55,6 +56,20 @@ Canonical checker capability and invariant results are retained per variant;
 later variants continue to execute. Either outcome still makes the command exit
 1. A fixture filesystem I/O failure remains a process-level harness error and
 exits 2 because reliable scorecard persistence cannot be assumed.
+
+The runner isolates only the call to the canonical checker program constructor;
+fixture parsing, filesystem setup, baseline I/O, and legacy checking remain
+outside the unwind boundary. A checker panic is retained as
+`INV.CHECKER.PANIC`, with its string payload copied verbatim into the blocker
+detail after a stable `canonical checker panicked:` prefix. Non-string payloads
+use the deterministic `<non-string panic payload>` marker. Panic outcomes are
+fatal invariants, never capabilities, and do not stop later variants or JSON
+persistence. The normal panic hook is not replaced or suppressed.
+
+This isolation contract requires a binary built with `panic="unwind"`. A
+`panic="abort"` build rejects canonical diagnostic execution explicitly as a
+process-level unsupported harness configuration before fixture discovery; it
+does not claim it can retain an aborting process.
 
 ## Capability registry
 
