@@ -7,10 +7,14 @@
 //! canonical union domain. Other object, signature, alias, and origin
 //! instantiation needs its owning caches and is rejected instead of identity.
 
+use std::collections::{HashMap, HashSet};
+
 use super::{
-    TypeId, TypeMapperId,
+    TypeAliasId, TypeId, TypeMapperId,
     array_types::{ArrayTypeError, CanonicalArrayTargets},
-    bootstrap::LiteralTypeCacheError, mapper::CanonicalTypeMapperStore, type_records::TypeData,
+    bootstrap::LiteralTypeCacheError,
+    mapper::{CanonicalTypeMapperStore, TypeMapperApplication},
+    type_records::TypeData,
 };
 
 /// Pinned checker limits for one instantiation query.
@@ -130,28 +134,75 @@ impl From<ArrayTypeError> for InstantiationError {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-struct InstantiationState {
-    limits: InstantiationLimits,
-    count: usize,
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct InstantiationCacheKey {
+    type_: TypeId,
+    alias: Option<TypeAliasId>,
 }
 
-impl InstantiationState {
-    fn enter(&mut self, depth: usize) -> Result<(), InstantiationError> {
-        if depth >= self.limits.max_depth {
-            return Err(InstantiationError::DepthLimit {
-                depth,
-                limit: self.limits.max_depth,
-            });
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InstantiationMappingIdentity {
+    Stored(TypeMapperId),
+    Vector {
+        sources: usize,
+        source_count: usize,
+        targets: usize,
+        target_count: usize,
+    },
+}
+
+#[derive(Debug)]
+struct ActiveMapperFrame {
+    mapping: InstantiationMappingIdentity,
+    cache: HashMap<InstantiationCacheKey, TypeId>,
+}
+
+/// Checker-query-owned instantiation accounting and recursive mapper cache.
+///
+/// The per-query count is intentionally not reset by each instantiation call:
+/// upstream shares it across all work caused by one checked source element or
+/// expression. Query owners call [`Self::reset_query`] at that boundary. The
+/// total count remains cumulative across resets, matching checker telemetry.
+#[derive(Debug)]
+#[allow(dead_code)] // Installed ahead of the source-element query owner.
+pub(super) struct InstantiationSession {
+    limits: InstantiationLimits,
+    depth: usize,
+    count: usize,
+    total_count: usize,
+    active_mappers: Vec<ActiveMapperFrame>,
+}
+
+impl InstantiationSession {
+    pub(super) fn new(limits: InstantiationLimits) -> Self {
+        Self {
+            limits,
+            depth: 0,
+            count: 0,
+            total_count: 0,
+            active_mappers: Vec::new(),
         }
-        if self.count >= self.limits.max_count {
-            return Err(InstantiationError::CountLimit {
-                count: self.count,
-                limit: self.limits.max_count,
-            });
-        }
-        self.count += 1;
-        Ok(())
+    }
+
+    /// Starts the next source-element or expression query. This must not reset
+    /// `total_count`, which is checker-global upstream.
+    #[allow(dead_code)] // Called by the future source-element query owner.
+    pub(super) fn reset_query(&mut self) {
+        self.depth = 0;
+        self.count = 0;
+        self.active_mappers.clear();
+    }
+
+    #[cfg(test)]
+    const fn query_count(&self) -> usize {
+        self.count
+    }
+
+    /// Cumulative checker telemetry; unlike the query counter, this survives
+    /// [`Self::reset_query`].
+    #[allow(dead_code)] // Read by the future checker telemetry owner.
+    pub(super) const fn total_count(&self) -> usize {
+        self.total_count
     }
 }
 
@@ -172,17 +223,30 @@ pub(super) fn instantiate_type_with_limits(
     mapper: TypeMapperId,
     limits: InstantiationLimits,
 ) -> Result<TypeId, InstantiationError> {
+    let mut session = InstantiationSession::new(limits);
+    instantiate_type_with_session(store, type_, mapper, None, &mut session)
+}
+
+/// Instantiates inside an existing checker query. The caller owns the
+/// [`InstantiationSession::reset_query`] boundary.
+#[allow(dead_code)] // Installed ahead of the source-element query owner.
+pub(super) fn instantiate_type_with_session(
+    store: &mut CanonicalTypeMapperStore,
+    type_: TypeId,
+    mapper: TypeMapperId,
+    array_targets: Option<CanonicalArrayTargets>,
+    session: &mut InstantiationSession,
+) -> Result<TypeId, InstantiationError> {
     if store.mapper_payload(mapper).is_none() {
         return Err(InstantiationError::InvalidMapper(mapper));
     }
-    let mut state = InstantiationState { limits, count: 0 };
-    instantiate_type_worker(
+    instantiate_type_with_alias(
         store,
         type_,
         InstantiationMapping::Stored(mapper),
+        array_targets,
         None,
-        0,
-        &mut state,
+        session,
     )
 }
 
@@ -234,17 +298,14 @@ fn instantiate_type_with_vector_and_optional_array_targets(
             return Err(InstantiationError::InvalidType(*endpoint));
         }
     }
-    let mut state = InstantiationState {
-        limits: InstantiationLimits::default(),
-        count: 0,
-    };
-    instantiate_type_worker(
+    let mut session = InstantiationSession::new(InstantiationLimits::default());
+    instantiate_type_with_alias(
         store,
         type_,
         InstantiationMapping::Vector { sources, targets },
         array_targets,
-        0,
-        &mut state,
+        None,
+        &mut session,
     )
 }
 
@@ -258,20 +319,158 @@ enum InstantiationMapping<'a> {
 }
 
 impl InstantiationMapping<'_> {
-    fn map(self, store: &CanonicalTypeMapperStore, type_: TypeId) -> Option<TypeId> {
+    fn identity(self) -> InstantiationMappingIdentity {
         match self {
-            Self::Stored(mapper) => store.map_type(mapper, type_),
-            Self::Vector { sources, targets } => {
-                store.type_payload(type_)?;
-                Some(
-                    sources
-                        .iter()
-                        .position(|source| *source == type_)
-                        .map_or(type_, |index| targets[index]),
-                )
-            }
+            Self::Stored(mapper) => InstantiationMappingIdentity::Stored(mapper),
+            Self::Vector { sources, targets } => InstantiationMappingIdentity::Vector {
+                sources: sources.as_ptr() as usize,
+                source_count: sources.len(),
+                targets: targets.as_ptr() as usize,
+                target_count: targets.len(),
+            },
         }
     }
+}
+
+fn instantiate_type_with_alias(
+    store: &mut CanonicalTypeMapperStore,
+    type_: TypeId,
+    mapping: InstantiationMapping<'_>,
+    array_targets: Option<CanonicalArrayTargets>,
+    alias: Option<TypeAliasId>,
+    session: &mut InstantiationSession,
+) -> Result<TypeId, InstantiationError> {
+    if !could_contain_installed_type_variables(store, type_, array_targets)? {
+        return Ok(type_);
+    }
+    if session.depth == session.limits.max_depth {
+        return Err(InstantiationError::DepthLimit {
+            depth: session.depth,
+            limit: session.limits.max_depth,
+        });
+    }
+    if session.count >= session.limits.max_count {
+        return Err(InstantiationError::CountLimit {
+            count: session.count,
+            limit: session.limits.max_count,
+        });
+    }
+
+    let mapping_identity = mapping.identity();
+    let existing_index = session
+        .active_mappers
+        .iter()
+        .rposition(|frame| frame.mapping == mapping_identity);
+    let frame_index = match existing_index {
+        Some(index) => index,
+        None => {
+            session.active_mappers.push(ActiveMapperFrame {
+                mapping: mapping_identity,
+                cache: HashMap::new(),
+            });
+            session.active_mappers.len() - 1
+        }
+    };
+    let key = InstantiationCacheKey { type_, alias };
+    if let Some(cached) = session.active_mappers[frame_index].cache.get(&key) {
+        return Ok(*cached);
+    }
+
+    session.total_count += 1;
+    session.count += 1;
+    session.depth += 1;
+    let result = instantiate_type_worker(store, type_, mapping, array_targets, session);
+    if existing_index.is_none() {
+        let popped = session
+            .active_mappers
+            .pop()
+            .expect("a first active mapper owns its scratch cache");
+        debug_assert_eq!(popped.mapping, mapping_identity);
+    } else if let Ok(instantiated) = &result {
+        session.active_mappers[frame_index]
+            .cache
+            .insert(key, *instantiated);
+    }
+    session.depth -= 1;
+    result
+}
+
+fn could_contain_installed_type_variables(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<bool, InstantiationError> {
+    could_contain_installed_type_variables_worker(store, type_, array_targets, &mut HashSet::new())
+}
+
+fn could_contain_installed_type_variables_worker(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+    seen: &mut HashSet<TypeId>,
+) -> Result<bool, InstantiationError> {
+    if !seen.insert(type_) {
+        // The installed domain cannot construct a recursive union/array graph,
+        // but fail conservatively if a future producer exposes one.
+        return Ok(true);
+    }
+    let record = store
+        .type_payload(type_)
+        .ok_or(InstantiationError::InvalidType(type_))?;
+    let result = match record.data() {
+        TypeData::TypeParameter(_) => Ok(true),
+        TypeData::Intrinsic(_) | TypeData::Literal(_) | TypeData::UniqueEsSymbol(_) => Ok(false),
+        TypeData::Union(data) => {
+            // Preserve the installed slice's typed alias/origin boundaries.
+            // Their eventual implementations will inspect alias arguments and
+            // origin graphs as part of the full upstream predicate.
+            if record.alias().is_some() || data.origin.is_some() {
+                Ok(true)
+            } else {
+                let constituents = data.union.types.clone();
+                constituents
+                    .into_iter()
+                    .try_fold(false, |contains, constituent| {
+                        Ok(contains
+                            || could_contain_installed_type_variables_worker(
+                                store,
+                                constituent,
+                                array_targets,
+                                seen,
+                            )?)
+                    })
+            }
+        }
+        TypeData::TypeReference(_) => {
+            let Some(array_targets) = array_targets else {
+                return Ok(true);
+            };
+            match store.canonical_array_reference_with_targets(array_targets, type_)? {
+                Some(reference) => could_contain_installed_type_variables_worker(
+                    store,
+                    reference.element_type,
+                    Some(array_targets),
+                    seen,
+                ),
+                None => Ok(true),
+            }
+        }
+        _ => Ok(true),
+    };
+    seen.remove(&type_);
+    result
+}
+
+enum InstantiationWork {
+    TypeParameter,
+    Identity,
+    Union {
+        aliased: bool,
+        has_origin: bool,
+        constituents: Vec<TypeId>,
+    },
+    TypeReference,
+    Unsupported,
 }
 
 fn instantiate_type_worker(
@@ -279,39 +478,126 @@ fn instantiate_type_worker(
     type_: TypeId,
     mapping: InstantiationMapping<'_>,
     array_targets: Option<CanonicalArrayTargets>,
-    depth: usize,
-    state: &mut InstantiationState,
+    session: &mut InstantiationSession,
 ) -> Result<TypeId, InstantiationError> {
-    let record = store
-        .type_payload(type_)
-        .ok_or(InstantiationError::InvalidType(type_))?;
-    match record.data() {
-        TypeData::TypeParameter(_) => {
-            state.enter(depth)?;
-            mapping
-                .map(store, type_)
-                .ok_or(InstantiationError::InvalidType(type_))
+    let work = {
+        let record = store
+            .type_payload(type_)
+            .ok_or(InstantiationError::InvalidType(type_))?;
+        match record.data() {
+            TypeData::TypeParameter(_) => InstantiationWork::TypeParameter,
+            TypeData::Intrinsic(_) | TypeData::Literal(_) | TypeData::UniqueEsSymbol(_) => {
+                InstantiationWork::Identity
+            }
+            TypeData::Union(data) => InstantiationWork::Union {
+                aliased: record.alias().is_some(),
+                has_origin: data.origin.is_some(),
+                constituents: data.union.types.clone(),
+            },
+            TypeData::TypeReference(_) => InstantiationWork::TypeReference,
+            _ => InstantiationWork::Unsupported,
         }
-        TypeData::Intrinsic(_) | TypeData::Literal(_) | TypeData::UniqueEsSymbol(_) => Ok(type_),
-        TypeData::Union(data) => {
-            if record.alias().is_some() {
+    };
+    match work {
+        InstantiationWork::TypeParameter => {
+            apply_mapping(store, type_, mapping, array_targets, session)
+        }
+        InstantiationWork::Identity => Ok(type_),
+        InstantiationWork::Union {
+            aliased,
+            has_origin,
+            constituents,
+        } => {
+            if aliased {
                 return Err(InstantiationError::UnsupportedAliasedUnion(type_));
             }
-            if data.origin.is_some() {
+            if has_origin {
                 return Err(InstantiationError::UnsupportedUnionOrigin(type_));
             }
-            let constituents = data.union.types.clone();
-            instantiate_union(store, type_, &constituents, mapping, array_targets, depth, state)
+            instantiate_union(store, type_, &constituents, mapping, array_targets, session)
         }
-        TypeData::TypeReference(_) => instantiate_array_reference(
+        InstantiationWork::TypeReference => instantiate_array_reference(
             store,
             type_,
             mapping,
             array_targets.ok_or(InstantiationError::UnsupportedType(type_))?,
-            depth,
-            state,
+            session,
         ),
-        _ => Err(InstantiationError::UnsupportedType(type_)),
+        InstantiationWork::Unsupported => Err(InstantiationError::UnsupportedType(type_)),
+    }
+}
+
+fn apply_mapping(
+    store: &mut CanonicalTypeMapperStore,
+    type_: TypeId,
+    mapping: InstantiationMapping<'_>,
+    array_targets: Option<CanonicalArrayTargets>,
+    session: &mut InstantiationSession,
+) -> Result<TypeId, InstantiationError> {
+    match mapping {
+        InstantiationMapping::Vector { sources, targets } => {
+            if store.type_payload(type_).is_none() {
+                return Err(InstantiationError::InvalidType(type_));
+            }
+            Ok(sources
+                .iter()
+                .position(|source| *source == type_)
+                .map_or(type_, |index| targets[index]))
+        }
+        InstantiationMapping::Stored(mapper) => {
+            if store.type_payload(type_).is_none() {
+                return Err(InstantiationError::InvalidType(type_));
+            }
+            let application = store
+                .mapper_application(mapper, type_)
+                .ok_or(InstantiationError::InvalidMapper(mapper))?;
+            match application {
+                TypeMapperApplication::Direct(mapped) => Ok(mapped),
+                TypeMapperApplication::Merged { first, second } => {
+                    let intermediate = apply_mapping(
+                        store,
+                        type_,
+                        InstantiationMapping::Stored(first),
+                        array_targets,
+                        session,
+                    )?;
+                    apply_mapping(
+                        store,
+                        intermediate,
+                        InstantiationMapping::Stored(second),
+                        array_targets,
+                        session,
+                    )
+                }
+                TypeMapperApplication::Composite { first, second } => {
+                    let intermediate = apply_mapping(
+                        store,
+                        type_,
+                        InstantiationMapping::Stored(first),
+                        array_targets,
+                        session,
+                    )?;
+                    if intermediate != type_ {
+                        instantiate_type_with_alias(
+                            store,
+                            intermediate,
+                            InstantiationMapping::Stored(second),
+                            array_targets,
+                            None,
+                            session,
+                        )
+                    } else {
+                        apply_mapping(
+                            store,
+                            type_,
+                            InstantiationMapping::Stored(second),
+                            array_targets,
+                            session,
+                        )
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -320,20 +606,19 @@ fn instantiate_array_reference(
     source: TypeId,
     mapping: InstantiationMapping<'_>,
     array_targets: CanonicalArrayTargets,
-    depth: usize,
-    state: &mut InstantiationState,
+    session: &mut InstantiationSession,
 ) -> Result<TypeId, InstantiationError> {
-    let Some(reference) = store.canonical_array_reference_with_targets(array_targets, source)? else {
+    let Some(reference) = store.canonical_array_reference_with_targets(array_targets, source)?
+    else {
         return Err(InstantiationError::UnsupportedType(source));
     };
-    state.enter(depth)?;
-    let element = instantiate_type_worker(
+    let element = instantiate_type_with_alias(
         store,
         reference.element_type,
         mapping,
         Some(array_targets),
-        depth + 1,
-        state,
+        None,
+        session,
     )?;
     if element == reference.element_type {
         return Ok(source);
@@ -349,8 +634,7 @@ fn instantiate_union(
     constituents: &[TypeId],
     mapping: InstantiationMapping<'_>,
     array_targets: Option<CanonicalArrayTargets>,
-    depth: usize,
-    state: &mut InstantiationState,
+    session: &mut InstantiationSession,
 ) -> Result<TypeId, InstantiationError> {
     let mut mapped_types = Vec::with_capacity(constituents.len());
     let mut changed = false;
@@ -375,15 +659,14 @@ fn instantiate_union(
     if !contains_type_parameter {
         return Ok(source);
     }
-    state.enter(depth)?;
     for constituent in constituents {
-        let instantiated = instantiate_type_worker(
+        let instantiated = instantiate_type_with_alias(
             store,
             *constituent,
             mapping,
             array_targets,
-            depth + 1,
-            state,
+            None,
+            session,
         )?;
         changed |= instantiated != *constituent;
         mapped_types.push(instantiated);
@@ -450,6 +733,92 @@ mod tests {
             panic!("two primitive constituents must remain a union");
         };
         assert_eq!(data.union.types, [string, number]);
+    }
+
+    #[test]
+    fn composite_mapper_recursively_instantiates_a_changed_intermediate() {
+        let mut store = initialized_store();
+        let (string, number) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (bootstrap.string_type, bootstrap.number_type)
+        };
+        let outer = store.alloc_type_parameter(None).unwrap();
+        let inner = store.alloc_type_parameter(None).unwrap();
+        let intermediate = store
+            .alloc_union_type(ObjectFlags::NONE, vec![inner, string])
+            .unwrap();
+        let first = store.new_simple_type_mapper(outer, intermediate).unwrap();
+        let second = store.new_simple_type_mapper(inner, number).unwrap();
+        let merged = store.merge_type_mappers(Some(first), second).unwrap();
+        let composite = store.combine_type_mappers(Some(first), second).unwrap();
+
+        assert_eq!(
+            instantiate_type(&mut store, outer, merged),
+            Ok(intermediate)
+        );
+        let instantiated = instantiate_type(&mut store, outer, composite).unwrap();
+        let TypeData::Union(data) = store.type_payload(instantiated).unwrap().data() else {
+            panic!("the recursively instantiated intermediate must remain a union");
+        };
+        assert_eq!(data.union.types, [string, number]);
+    }
+
+    #[test]
+    fn active_mapper_cache_precedes_instantiation_counter_increment() {
+        let mut store = initialized_store();
+        let (string, number) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (bootstrap.string_type, bootstrap.number_type)
+        };
+        let parameter = store.alloc_type_parameter(None).unwrap();
+        let source = store
+            .alloc_union_type(ObjectFlags::NONE, vec![parameter, parameter, string])
+            .unwrap();
+        let mapper = store.new_simple_type_mapper(parameter, number).unwrap();
+        let mut session = InstantiationSession::new(InstantiationLimits {
+            max_depth: 10,
+            max_count: 3,
+        });
+
+        let result =
+            instantiate_type_with_session(&mut store, source, mapper, None, &mut session).unwrap();
+
+        assert_eq!(session.query_count(), 2, "the repeated leaf must hit cache");
+        let TypeData::Union(data) = store.type_payload(result).unwrap().data() else {
+            panic!("the remaining string and number constituents must form a union");
+        };
+        assert_eq!(data.union.types, [string, number]);
+    }
+
+    #[test]
+    fn session_count_resets_only_at_the_explicit_query_boundary() {
+        let mut store = initialized_store();
+        let number = store.intrinsic_bootstrap().unwrap().number_type;
+        let parameter = store.alloc_type_parameter(None).unwrap();
+        let mapper = store.new_simple_type_mapper(parameter, number).unwrap();
+        let mut session = InstantiationSession::new(InstantiationLimits {
+            max_depth: 10,
+            max_count: 1,
+        });
+
+        assert_eq!(
+            instantiate_type_with_session(&mut store, parameter, mapper, None, &mut session),
+            Ok(number)
+        );
+        assert_eq!(session.query_count(), 1);
+        assert_eq!(session.total_count(), 1);
+        assert_eq!(
+            instantiate_type_with_session(&mut store, parameter, mapper, None, &mut session),
+            Err(InstantiationError::CountLimit { count: 1, limit: 1 })
+        );
+
+        session.reset_query();
+        assert_eq!(
+            instantiate_type_with_session(&mut store, parameter, mapper, None, &mut session),
+            Ok(number)
+        );
+        assert_eq!(session.query_count(), 1);
+        assert_eq!(session.total_count(), 2);
     }
 
     #[test]

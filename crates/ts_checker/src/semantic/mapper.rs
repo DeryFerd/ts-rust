@@ -2,12 +2,14 @@
 //!
 //! This is the dependency-closed portion of pinned `checker/mapper.go`.
 //! Simple, array, array-to-single, and merged mappers only need canonical
-//! `TypeId` identity, so they can be represented and evaluated exactly now.
+//! `TypeId` identity, so they can be represented and evaluated directly.
+//! Composite mappers delegate recursive substitution to `instantiateType`, so
+//! their graph is represented here and executed by [`super::instantiate`].
 //! `DeferredTypeMapper` and `FunctionTypeMapper` retain executable callbacks;
-//! `CompositeTypeMapper` calls `instantiateType`; and `InferenceTypeMapper`
-//! mutates an `InferenceContext`. Their constructors are intentionally absent
-//! until those owning algorithms land. Treating any of them as an identity
-//! mapper would make an unsupported semantic path look successful.
+//! `InferenceTypeMapper` mutates an `InferenceContext`. Their constructors are
+//! intentionally absent until those owning algorithms land. Treating any of
+//! them as an identity mapper would make an unsupported semantic path look
+//! successful.
 
 use super::{
     ids::{TypeId, TypeMapperId},
@@ -54,6 +56,26 @@ enum TypeMapperData {
         first: TypeMapperId,
         second: TypeMapperId,
     },
+    Composite {
+        first: TypeMapperId,
+        second: TypeMapperId,
+    },
+}
+
+/// One dependency-closed mapper operation exposed to the instantiation
+/// engine. Direct mappings need no semantic recursion. Merged and composite
+/// records retain their distinct pinned evaluation rules.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum TypeMapperApplication {
+    Direct(TypeId),
+    Merged {
+        first: TypeMapperId,
+        second: TypeMapperId,
+    },
+    Composite {
+        first: TypeMapperId,
+        second: TypeMapperId,
+    },
 }
 
 impl TypeMapper {
@@ -81,6 +103,12 @@ impl TypeMapper {
         }
     }
 
+    const fn composite(first: TypeMapperId, second: TypeMapperId) -> Self {
+        Self {
+            data: TypeMapperData::Composite { first, second },
+        }
+    }
+
     /// Mirrors the overrides in pinned `mapper.go`. Array-to-single inherits
     /// `TypeMapperBase.Kind`, so its exact kind is `Unknown`.
     #[must_use]
@@ -89,7 +117,9 @@ impl TypeMapper {
             TypeMapperData::Simple { .. } => TypeMapperKind::Simple,
             TypeMapperData::Array { .. } => TypeMapperKind::Array,
             TypeMapperData::Merged { .. } => TypeMapperKind::Merged,
-            TypeMapperData::ArrayToSingle { .. } => TypeMapperKind::Unknown,
+            TypeMapperData::ArrayToSingle { .. } | TypeMapperData::Composite { .. } => {
+                TypeMapperKind::Unknown
+            }
         }
     }
 }
@@ -170,7 +200,9 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     && sources == actual_sources.as_slice()
                     && targets == actual_targets.as_slice()
             }
-            TypeMapperData::ArrayToSingle { .. } | TypeMapperData::Merged { .. } => false,
+            TypeMapperData::ArrayToSingle { .. }
+            | TypeMapperData::Merged { .. }
+            | TypeMapperData::Composite { .. } => false,
         };
         Some(exact)
     }
@@ -220,6 +252,26 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         }
     }
 
+    /// Pinned `combineTypeMappers`. A nil first mapper returns `second`
+    /// without allocating. Otherwise a composite mapper first applies
+    /// `first`; when that changes the input, the changed result is recursively
+    /// instantiated through `second` rather than merely mapped as a whole.
+    pub fn combine_type_mappers(
+        &mut self,
+        first: Option<TypeMapperId>,
+        second: TypeMapperId,
+    ) -> Option<TypeMapperId> {
+        if self.mapper_payload(second).is_none()
+            || first.is_some_and(|mapper| self.mapper_payload(mapper).is_none())
+        {
+            return None;
+        }
+        match first {
+            None => Some(second),
+            Some(first) => Some(self.alloc_mapper(TypeMapper::composite(first, second))),
+        }
+    }
+
     /// Pinned `prependTypeMapping`.
     pub fn prepend_type_mapping(
         &mut self,
@@ -258,15 +310,55 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         }
     }
 
-    /// Applies a canonical mapper to one canonical type identity.
+    /// Applies a canonical mapper that needs no recursive instantiation to one
+    /// canonical type identity.
     ///
-    /// Foreign or missing handles return `None`. A valid mapping always returns
-    /// a type owned by this store, including the unchanged input identity.
+    /// Foreign or missing handles return `None`. Composite graphs also return
+    /// `None`; executing them without the instantiation session would silently
+    /// collapse their recursive substitution semantics into merged semantics.
     #[must_use]
     pub fn map_type(&self, mapper: TypeMapperId, type_id: TypeId) -> Option<TypeId> {
         self.type_payload(type_id)?;
         self.mapper_payload(mapper)?;
-        Some(self.map_type_unchecked(mapper, type_id))
+        self.map_type_without_instantiation(mapper, type_id)
+    }
+
+    /// Projects one mapper record without traversing another mapper edge.
+    /// Composite execution remains in `instantiate.rs`, which owns recursion,
+    /// budgets, and active-mapper caches.
+    pub(super) fn mapper_application(
+        &self,
+        mapper: TypeMapperId,
+        type_id: TypeId,
+    ) -> Option<TypeMapperApplication> {
+        self.type_payload(type_id)?;
+        let application = match &self.mapper_payload(mapper)?.data {
+            TypeMapperData::Simple { source, target } => {
+                TypeMapperApplication::Direct(if type_id == *source { *target } else { type_id })
+            }
+            TypeMapperData::Array { sources, targets } => TypeMapperApplication::Direct(
+                sources
+                    .iter()
+                    .position(|source| *source == type_id)
+                    .map_or(type_id, |index| targets[index]),
+            ),
+            TypeMapperData::ArrayToSingle { sources, target } => {
+                TypeMapperApplication::Direct(if sources.contains(&type_id) {
+                    *target
+                } else {
+                    type_id
+                })
+            }
+            TypeMapperData::Merged { first, second } => TypeMapperApplication::Merged {
+                first: *first,
+                second: *second,
+            },
+            TypeMapperData::Composite { first, second } => TypeMapperApplication::Composite {
+                first: *first,
+                second: *second,
+            },
+        };
+        Some(application)
     }
 
     #[must_use]
@@ -290,7 +382,8 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             }
             TypeMapperData::Array { .. }
             | TypeMapperData::ArrayToSingle { .. }
-            | TypeMapperData::Merged { .. } => None,
+            | TypeMapperData::Merged { .. }
+            | TypeMapperData::Composite { .. } => None,
         };
         Some(source.is_some_and(|source| {
             matches!(
@@ -306,7 +399,11 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             .all(|type_id| self.type_payload(*type_id).is_some())
     }
 
-    fn map_type_unchecked(&self, mapper: TypeMapperId, type_id: TypeId) -> TypeId {
+    fn map_type_without_instantiation(
+        &self,
+        mapper: TypeMapperId,
+        type_id: TypeId,
+    ) -> Option<TypeId> {
         match &self
             .mapper_payload(mapper)
             .expect("canonical mapper edges are validated at construction")
@@ -314,26 +411,27 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         {
             TypeMapperData::Simple { source, target } => {
                 if type_id == *source {
-                    *target
+                    Some(*target)
                 } else {
-                    type_id
+                    Some(type_id)
                 }
             }
             TypeMapperData::Array { sources, targets } => sources
                 .iter()
                 .position(|source| *source == type_id)
-                .map_or(type_id, |index| targets[index]),
+                .map_or(Some(type_id), |index| Some(targets[index])),
             TypeMapperData::ArrayToSingle { sources, target } => {
                 if sources.contains(&type_id) {
-                    *target
+                    Some(*target)
                 } else {
-                    type_id
+                    Some(type_id)
                 }
             }
             TypeMapperData::Merged { first, second } => {
-                let intermediate = self.map_type_unchecked(*first, type_id);
-                self.map_type_unchecked(*second, intermediate)
+                let intermediate = self.map_type_without_instantiation(*first, type_id)?;
+                self.map_type_without_instantiation(*second, intermediate)
             }
+            TypeMapperData::Composite { .. } => None,
         }
     }
 }
@@ -366,6 +464,7 @@ mod tests {
         let array = store.new_array_type_mapper(vec![a], vec![b]).unwrap();
         let array_to_single = store.new_array_to_single_type_mapper(vec![a], b).unwrap();
         let merged = store.merge_type_mappers(Some(simple), array).unwrap();
+        let composite = store.combine_type_mappers(Some(simple), array).unwrap();
 
         assert_eq!(store.mapper_kind(simple), Some(TypeMapperKind::Simple));
         assert_eq!(store.mapper_kind(array), Some(TypeMapperKind::Array));
@@ -374,6 +473,33 @@ mod tests {
             Some(TypeMapperKind::Unknown)
         );
         assert_eq!(store.mapper_kind(merged), Some(TypeMapperKind::Merged));
+        assert_eq!(store.mapper_kind(composite), Some(TypeMapperKind::Unknown));
+    }
+
+    #[test]
+    fn combined_mappers_retain_composite_semantics_for_instantiation() {
+        let mut store = CanonicalTypeMapperStore::new();
+        let a = type_(&mut store, "a");
+        let b = type_(&mut store, "b");
+        let c = type_(&mut store, "c");
+        let first = store.new_simple_type_mapper(a, b).unwrap();
+        let second = store.new_simple_type_mapper(b, c).unwrap();
+
+        let before = store.mapper_len();
+        assert_eq!(store.combine_type_mappers(None, second), Some(second));
+        assert_eq!(store.mapper_len(), before);
+
+        let composite = store.combine_type_mappers(Some(first), second).unwrap();
+        assert_eq!(store.map_type(composite, a), None);
+        assert_eq!(store.mapper_maps_this_only(composite), Some(false));
+        assert_eq!(
+            store.type_mapper_has_exact_endpoints(composite, &[a], &[c]),
+            Some(false)
+        );
+        assert_eq!(
+            store.mapper_application(composite, a),
+            Some(TypeMapperApplication::Composite { first, second })
+        );
     }
 
     #[test]
@@ -531,6 +657,11 @@ mod tests {
         assert_eq!(first.mapper_len(), before);
         assert_eq!(
             first.merge_type_mappers(Some(first_mapper), second_mapper),
+            None
+        );
+        assert_eq!(first.mapper_len(), before);
+        assert_eq!(
+            first.combine_type_mappers(Some(first_mapper), second_mapper),
             None
         );
         assert_eq!(first.mapper_len(), before);
