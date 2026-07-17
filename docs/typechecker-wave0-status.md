@@ -5,7 +5,7 @@
 - Upstream epoch: `dc37b5249ab60e2bbce936f71b883e6c8136167e`
 - Wave branch baseline: `cdbf749`
 - Integration branch: `july-ultra`
-- Current integrated semantic stack: through `75abbf5`
+- Current integrated semantic stack: through `d4719b3`
 
 This is the live execution record for Wave 0 of
 [`typechecker-completion-goal.md`](typechecker-completion-goal.md). The port
@@ -15,10 +15,10 @@ map remains authoritative for cluster state.
 
 | Lane | Branch/worktree | Current task | State |
 |---|---|---|---|
-| Root/integration | `july-ultra`; repository root | contract adapters, review, serial verification | M0, S1b, S2a, and the recovering S3 session core are integrated; root is the sole Cargo/build and fixed-shard owner |
+| Root/integration | `july-ultra`; repository root | contract adapters, review, serial verification | M0, S1b, S2a including readonly directionality, and the recovering S3 session core are integrated; root is the sole Cargo/build and fixed-shard owner |
 | M0 | `july-ultra`; repository root | deterministic checker scoring | schema-5 provenance, retained fatal outcomes, exact fixed-manifest execution, and selected-case preparation integrated through `174eebf` |
 | S2a | `july-ultra`; repository root | exact single-base interface heritage and relation-cache observation | integrated through `14ae6ce`; two exact-tip reviews found no P0/P1 issue, all five public heritage tests pass, and the fixed shard advances one interface fixture without an exact loss |
-| S2 readonly follow-up | `agent/s2-readonly-properties`; `../ts-rust-worktrees/s2-readonly-properties` | readonly property retention and strict-subtype directionality | active from `75abbf5`; owns only the bounded property/relation leaf and does not change store schema or root adapters |
+| S2 readonly follow-up | `july-ultra`; repository root | readonly property retention and strict-subtype directionality | integrated through `d4719b3`; two independent reviews found no P0/P1 issue, the public production target passes, focused strict Clippy is green, and the fixed shard is semantically unchanged |
 | S3 session core | `july-ultra`; repository root | recovering instantiation session and limit accounting | integrated through `75abbf5`; production check, focused strict Clippy, rustdoc, and a semantically identical fixed shard are green |
 | S3 generic calls | `agent/s3-generic-calls`; `../ts-rust-worktrees/s3-generic-calls` | lazy checked shells, parameter/return demand, and uncached recovery | active from `75abbf5`; owns only `semantic/generic_calls.rs` under the frozen contract in [`typechecker-s3-lazy-instantiation.md`](typechecker-s3-lazy-instantiation.md) |
 | S3 review/oracle | independent reviewer lane | session-core audit, generic-call adversarial review, and public TS2589 composition evidence | active; session core has no P0/P1 finding and the exact diagnostic/demand-order checklist is frozen before leaf integration |
@@ -45,6 +45,14 @@ invocation provenance, its sole semantic delta from `174eebf` is that
 to its first unsupported property declaration. The S3 session-core run at
 `75abbf5` has raw digest `f895b87f26f22da71aafa385709eba09` and is byte-for-
 byte identical to the normalized S2a scorecard (`9c64e6157ea7b7b8b6f0f0332a61d034`).
+
+The readonly-property follow-up through `d4719b3` has raw digest
+`0a63690ed0c698f2e0463e7aa521c241`. After deleting only Rust commit/dirty and
+invocation provenance, it is byte-identical to the `75abbf5` session-core run.
+The public target proves source-retained readonly state across interfaces,
+type literals, direct heritage, formatting, bidirectional assignability, and
+warm rechecks; internal relation evidence proves the pinned strict-subtype
+ordering and changed-versus-equal cache invalidation behavior.
 
 The current frontier is four exact variants, 90 typed capability boundaries,
 and two supported mismatches. The run discovers 12,750 upstream configurations,
@@ -99,8 +107,8 @@ the query-scoped instantiation session. Their next stacks meet at a generic
 |---|---|---|---|---|---|
 | `semantic/relater.rs` | W0.1 | `agent/w0-s2a-members` | `cdbf749` | heritage admission/relation helpers plus successful-relation dependency collection | expired at reviewed integration `14ae6ce` |
 | `semantic/store.rs` | W0.1 repair | `agent/w0-s2a-members` | `e867a88` | relation-observed identity sets and changed-write invalidation only; no unrelated store API work | expired at reviewed integration `14ae6ce` |
-| `semantic/generic_calls.rs` | W0.2 | `agent/s3-generic-calls` | `75abbf5` | frozen lazy checked-shell/demand/recovery rewrite only | reviewed S3 generic-call integration |
-| `semantic/relater.rs` | W0.2 | `agent/s2-readonly-properties` | `75abbf5` | readonly property strict-subtype branch and its focused tests only | reviewed readonly integration |
+| `semantic/generic_calls.rs` | W0.2 | `agent/s3-generic-calls` | `75abbf5` | frozen lazy checked-shell/demand/recovery rewrite only | pending reviewed S3 generic-call integration |
+| `semantic/relater.rs` | W0.2 | `agent/s2-readonly-properties` | `75abbf5` | readonly property strict-subtype branch and its focused tests only | expired at reviewed integration `d4719b3` |
 
 Root and every other worker treat the leased surface as read-only until the
 lease expires. `type_nodes.rs`, `source.rs`, `type_records.rs`, `production.rs`,
@@ -116,9 +124,10 @@ retain the exact identities whose later mutation invalidates that cache.
   invocation, and stable variant keys.
 - S2a proves inherited property order, missing-property diagnostics and related
   information, inherited reads, cold/warm identity, exact observed-dependency
-  invalidation, poison/foreign rejection, and cycle safety through a public
-  production path. Readonly strict-subtype behavior is the active bounded
-  follow-up rather than an implied completed capability.
+  invalidation, poison/foreign rejection, cycle safety, retained readonly
+  syntax, and pinned readonly strict-subtype directionality. A future public
+  strict-subtype query adapter and forced replay remain test-hardening debt,
+  not missing leaf semantics.
 - S3 proves Composite-versus-Merged behavior, no-op identity, cache-before-
   counter ordering, depth/count boundaries, active-mapper recursion, and
   query-local reset.

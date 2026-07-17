@@ -146,13 +146,18 @@ through `14ae6ce`; all five public heritage scenarios pass, and the fixed shard
 advances one interface fixture to its next unsupported property boundary. The
 recovering S3 instantiation session is integrated through `75abbf5`; its fixed
 shard is semantically byte-identical to the S2a run after removing only commit
-and invocation provenance.
+and invocation provenance. The bounded readonly-property follow-up is integrated
+through `d4719b3`: source properties retain exact readonly state, direct
+heritage preserves it, strict subtype is ordered readonly-to-mutable exactly as
+upstream, ordinary assignability remains symmetric, and changed observed bits
+invalidate warmed relations. Its public target and focused strict Clippy pass,
+and its fixed shard is semantically byte-identical to `75abbf5`.
 
 The active four-slot topology now matches the staffing model below: root owns
 integration/build/scoring, one worker owns the frozen `generic_calls.rs` lazy-
-demand rewrite, one owns the bounded readonly-property relation follow-up, and
-one independently audits S3 demand order, recovery, and TS2589 evidence. The
-live commit/worktree ledger is
+demand rewrite, one independently audits S3 demand order, recovery, and TS2589
+evidence, and the freed semantic lane inventories the next declaration/reexport
+slice. The live commit/worktree ledger is
 [`typechecker-wave0-status.md`](typechecker-wave0-status.md).
 
 ### Quantitative posture
@@ -162,7 +167,7 @@ At the planning baseline:
 | Evidence | Current value | Interpretation |
 |---|---:|---|
 | Semantic unit tests compiled | 923 | Broad invariant coverage; the monolithic binary cannot link in the current memory envelope |
-| Public checker integration tests | 63 across 20 targets | Executable production-path evidence and the mandatory home for new verticals |
+| Public checker integration tests | 64 across 21 targets | Executable production-path evidence and the mandatory home for new verticals |
 | Semantic modules | 58 | Enough leaf surfaces for bounded ownership |
 | `type_nodes.rs` | 16,820 lines | Shared type-family dispatch hotspot |
 | `source.rs` | 16,162 lines | Shared source-plan/execution hotspot |
@@ -1065,11 +1070,11 @@ maintainable.
 1. Finish and independently review the frozen lazy generic-call rewrite, then
    add the root-owned source/session adapter and public TS2554/TS2558/TS2344/
    TS2345/TS2589 demand-order vertical.
-2. Integrate the bounded readonly-property follow-up if its strict-subtype,
-   inheritance, formatting, assignability, and warm-cache evidence is clean.
-3. Score both leaves independently; retain all exact artifacts and record every
-   frontier movement in the Wave 0 ledger and port map.
-4. Use the freed worker slots for the first ordinary CFG/source vertical and
+2. Keep the integrated readonly-property slice green while composing its lazy
+   parameter/signature invalidation seam with S3.
+3. Score the generic-call leaf independently; retain all exact artifacts and
+   record every frontier movement in the Wave 0 ledger and port map.
+4. Use freed worker slots for the first ordinary CFG/source vertical and
    the next declaration/reexport slice, keeping source/compiler adapters at
    root.
 5. Close the Wave 0 CFG exit gate, then start the Wave 1 S5/S6 sub-wave instead
