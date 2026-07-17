@@ -159,18 +159,22 @@ pub struct ClassShells {
 }
 
 impl ClassShells {
+    #[must_use]
     pub const fn declaration(self) -> NodeRef {
         self.declaration
     }
 
+    #[must_use]
     pub const fn symbol(self) -> SemanticSymbolId {
         self.symbol
     }
 
+    #[must_use]
     pub const fn instance_type(self) -> TypeId {
         self.instance_type
     }
 
+    #[must_use]
     pub const fn value_type(self) -> TypeId {
         self.value_type
     }
@@ -194,30 +198,37 @@ pub struct ClassMembers {
 }
 
 impl ClassMembers {
+    #[must_use]
     pub const fn shells(&self) -> ClassShells {
         self.shells
     }
 
+    #[must_use]
     pub const fn instance_members(&self) -> Option<SymbolTableId> {
         self.instance_members
     }
 
+    #[must_use]
     pub const fn static_members(&self) -> SymbolTableId {
         self.static_members
     }
 
+    #[must_use]
     pub fn instance_properties(&self) -> &[SemanticSymbolId] {
         &self.instance_properties
     }
 
+    #[must_use]
     pub fn static_properties(&self) -> &[SemanticSymbolId] {
         &self.static_properties
     }
 
+    #[must_use]
     pub const fn prototype(&self) -> SemanticSymbolId {
         self.prototype
     }
 
+    #[must_use]
     pub const fn default_construct_signature(&self) -> SignatureId {
         self.default_construct_signature
     }
@@ -297,6 +308,7 @@ impl std::error::Error for ClassError {
 }
 
 impl ClassError {
+    #[must_use]
     pub const fn node(self) -> Option<NodeRef> {
         match self {
             Self::Unsupported(unsupported) => Some(match unsupported {
@@ -1312,7 +1324,9 @@ fn shell_state(
     };
     if let Some(instance) = instance {
         let Some(TypeData::Interface(interface)) =
-            store.type_payload(instance).map(|record| record.data())
+            store
+                .type_payload(instance)
+                .map(super::type_records::TypeRecord::data)
         else {
             return Err(invariant(ClassInvariant::InvalidInstanceCache(plan.symbol)));
         };
@@ -1390,7 +1404,7 @@ pub(super) fn execute_nongeneric_class_shells(
     let (base_types_resolved, base_constructor, base_types) = {
         let Some(TypeData::Interface(interface)) = store
             .type_payload(instance_type)
-            .map(|record| record.data())
+            .map(super::type_records::TypeRecord::data)
         else {
             return Err(invariant(ClassInvariant::InvalidInstanceCache(plan.symbol)));
         };
