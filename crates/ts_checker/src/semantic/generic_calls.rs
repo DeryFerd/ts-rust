@@ -534,6 +534,99 @@ pub(super) fn demand_generic_call_vector_return_with_session(
         .map(|(return_type, _)| return_type)
 }
 
+/// Proves that a mapper-backed signature is an exact lazy generic-call shell
+/// before its original target return is recursively resolved. This keeps a
+/// malformed outer shell from causing partial publication in an otherwise
+/// valid target signature.
+pub(super) fn preflight_generic_call_signature_return_target(
+    store: &CanonicalTypeMapperStore,
+    array_targets: Option<CanonicalArrayTargets>,
+    signature: SignatureId,
+) -> Result<SignatureId, GenericCallVectorError> {
+    let instantiated = store.signature(signature).ok_or(
+        GenericCallVectorInvariant::InvalidCachedInstantiation {
+            target: signature,
+            signature,
+        },
+    )?;
+    let target =
+        instantiated
+            .target()
+            .ok_or(GenericCallVectorInvariant::InvalidCachedInstantiation {
+                target: signature,
+                signature,
+            })?;
+    let mapper = instantiated
+        .mapper()
+        .ok_or(GenericCallVectorInvariant::InvalidCachedInstantiation { target, signature })?;
+    let callee = store
+        .source_callable_type_for_signature(target)
+        .ok_or(GenericCallVectorInvariant::InvalidCachedInstantiation { target, signature })?;
+    let callable = match validate_stored_single_callable(store, callee) {
+        StoredSingleCallableValidation::NotCallable => {
+            return Err(GenericCallVectorUnsupported::NotExactSingleCallable(callee).into());
+        }
+        StoredSingleCallableValidation::Pending { .. } => {
+            return Err(GenericCallVectorUnsupported::PendingCallable(callee).into());
+        }
+        StoredSingleCallableValidation::Malformed { .. } => {
+            return Err(GenericCallVectorInvariant::MalformedCallable(callee).into());
+        }
+        StoredSingleCallableValidation::Valid { callable, .. } => callable,
+    };
+    if callable.signature != target
+        || store
+            .signature(target)
+            .is_none_or(|target| target.target().is_some() || target.mapper().is_some())
+        || callable.return_type.is_none() && instantiated.resolved_return_type().is_some()
+    {
+        return Err(
+            GenericCallVectorInvariant::InvalidCachedInstantiation { target, signature }.into(),
+        );
+    }
+    let shape = match validate_generic_call_signature_shape_with_unresolved_return(
+        store,
+        callee,
+        &callable,
+        array_targets,
+        true,
+    ) {
+        Ok(shape) => shape,
+        Err(vector_error) => {
+            let provenance = identity_type_parameter_cache_provenance(store, callee, &callable);
+            match validate_identity_signature_shape(store, callee, &callable, provenance)
+                .ok()
+                .and_then(|identity| identity_generic_call_vector_shape(store, identity).ok())
+            {
+                Some(shape) => shape,
+                None => return Err(vector_error),
+            }
+        }
+    };
+    let sources = shape
+        .type_parameters
+        .iter()
+        .map(|parameter| parameter.type_)
+        .collect::<Vec<_>>();
+    let type_arguments = sources
+        .iter()
+        .map(|source| {
+            store
+                .map_type(mapper, *source)
+                .ok_or(GenericCallVectorInvariant::InvalidCachedInstantiation { target, signature })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if store.type_mapper_has_exact_endpoints(mapper, &sources, &type_arguments) != Some(true)
+        || validate_generic_call_vector_shell(store, &shape, &sources, &type_arguments, signature)?
+            != mapper
+    {
+        return Err(
+            GenericCallVectorInvariant::InvalidCachedInstantiation { target, signature }.into(),
+        );
+    }
+    Ok(target)
+}
+
 /// Demands the return of a mapper-backed generic-call shell when only the
 /// instantiated signature is available (for example from a type node).
 ///
@@ -919,6 +1012,22 @@ fn validate_generic_call_signature_shape(
     callable: &ValidatedSingleCallable,
     array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<GenericCallSignatureShape, GenericCallVectorError> {
+    validate_generic_call_signature_shape_with_unresolved_return(
+        store,
+        callee,
+        callable,
+        array_targets,
+        false,
+    )
+}
+
+fn validate_generic_call_signature_shape_with_unresolved_return(
+    store: &CanonicalTypeMapperStore,
+    callee: TypeId,
+    callable: &ValidatedSingleCallable,
+    array_targets: Option<CanonicalArrayTargets>,
+    allow_unresolved_return: bool,
+) -> Result<GenericCallSignatureShape, GenericCallVectorError> {
     if callable.owner != callee {
         return Err(GenericCallVectorInvariant::CallableOwnerMismatch {
             callee,
@@ -965,14 +1074,20 @@ fn validate_generic_call_signature_shape(
             GenericCallVectorInvariant::CallableSignatureMismatch(callable.signature).into(),
         );
     }
-    let Some(return_type) = callable.return_type else {
-        return Err(GenericCallVectorUnsupported::UnresolvedReturnType(callable.signature).into());
+    let return_type = match (callable.return_type, signature.resolved_return_type()) {
+        (Some(callable), Some(signature)) if callable == signature => Some(callable),
+        (None, None) if allow_unresolved_return => None,
+        (None, None) => {
+            return Err(
+                GenericCallVectorUnsupported::UnresolvedReturnType(callable.signature).into(),
+            );
+        }
+        _ => {
+            return Err(
+                GenericCallVectorInvariant::CallableSignatureMismatch(callable.signature).into(),
+            );
+        }
     };
-    if signature.resolved_return_type() != Some(return_type) {
-        return Err(
-            GenericCallVectorInvariant::CallableSignatureMismatch(callable.signature).into(),
-        );
-    }
 
     let no_constraint = store
         .intrinsic_bootstrap()
@@ -1042,19 +1157,21 @@ fn validate_generic_call_signature_shape(
             .into());
         }
     }
-    validate_generic_mapper_type(
-        store,
-        return_type,
-        &type_parameter_ids,
-        array_targets,
-        callable.signature,
-        &mut Vec::new(),
-    )?;
+    if let Some(return_type) = return_type {
+        validate_generic_mapper_type(
+            store,
+            return_type,
+            &type_parameter_ids,
+            array_targets,
+            callable.signature,
+            &mut Vec::new(),
+        )?;
+    }
     Ok(GenericCallSignatureShape {
         signature: callable.signature,
         type_parameters,
         parameter_templates: callable.parameters.clone(),
-        return_type,
+        return_type: return_type.unwrap_or(no_constraint),
         array_targets,
     })
 }

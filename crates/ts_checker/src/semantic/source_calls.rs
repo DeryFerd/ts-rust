@@ -755,6 +755,14 @@ fn preflight_call_links(
     if resolved_type.is_some() != resolved_signature.is_some() {
         return Err(SourceCheckError::Call(node));
     }
+    if let (Some(resolved_type), Some(resolved_signature)) = (resolved_type, resolved_signature)
+        && store
+            .signature(resolved_signature)
+            .and_then(super::signatures::Signature::resolved_return_type)
+            != Some(resolved_type)
+    {
+        return Err(SourceCheckError::Call(node));
+    }
     Ok(())
 }
 

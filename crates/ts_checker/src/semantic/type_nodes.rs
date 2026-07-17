@@ -25,7 +25,10 @@ use super::{
     functions::{
         self, FunctionTypeError, FunctionTypePlan, PendingFunctionTypeProof, PendingParameterTypes,
     },
-    generic_calls::demand_generic_call_signature_return_with_session,
+    generic_calls::{
+        demand_generic_call_signature_return_with_session,
+        preflight_generic_call_signature_return_target,
+    },
     global_types::{
         create_type_from_generic_global_type, preflight_generic_global_type_target,
         validate_generic_global_type_instantiation,
@@ -4612,6 +4615,23 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                         TypeNodeUnavailable::InvalidFunctionSignature(signature),
                     ));
                 }
+                let array_targets = self
+                    .global_types
+                    .as_ref()
+                    .map(CanonicalArrayTargets::from_global_types);
+                if preflight_generic_call_signature_return_target(
+                    self.store,
+                    array_targets,
+                    signature,
+                )
+                .map_err(|_| {
+                    type_node_unavailable(TypeNodeUnavailable::InvalidFunctionSignature(signature))
+                })? != target
+                {
+                    return Err(type_node_unavailable(
+                        TypeNodeUnavailable::InvalidFunctionSignature(signature),
+                    ));
+                }
                 if !self.resolving_instantiated_signatures.insert(signature) {
                     return Err(type_node_unavailable(
                         TypeNodeUnavailable::InvalidFunctionSignature(signature),
@@ -4619,10 +4639,6 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 }
                 let result = (|| {
                     self.get_return_type_of_signature(target)?;
-                    let array_targets = self
-                        .global_types
-                        .as_ref()
-                        .map(CanonicalArrayTargets::from_global_types);
                     if let Some(session) = self.instantiation_session.as_deref_mut() {
                         demand_generic_call_signature_return_with_session(
                             self.store,
