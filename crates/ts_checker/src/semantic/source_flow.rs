@@ -719,8 +719,15 @@ impl SourceFlowFrame<'_, '_> {
             ) else {
                 return Err(SourceFlowInvariant::MissingCurrentType(symbol).into());
             };
+            let candidates = self.join_identity_candidates(symbol);
             let joined_type = if then_type == else_type {
                 then_type
+            } else if let Some(candidate) = candidates
+                .iter()
+                .copied()
+                .find(|candidate| *candidate == then_type || *candidate == else_type)
+            {
+                candidate
             } else {
                 let anonymous = store
                     .expression_union_type_with_global_types(
@@ -729,22 +736,14 @@ impl SourceFlowFrame<'_, '_> {
                         UnionReduction::Literal,
                     )
                     .map_err(|error| SourceFlowError::Join { flow, error })?;
-                self.preferred_join_identity(store, symbol, anonymous)
+                Self::preferred_join_identity(store, anonymous, &candidates)
             };
             joined.insert(symbol, joined_type);
         }
         Ok(SourceFlowSnapshot::new(joined))
     }
 
-    fn preferred_join_identity(
-        &self,
-        store: &CanonicalTypeMapperStore,
-        symbol: SemanticSymbolId,
-        anonymous: TypeId,
-    ) -> TypeId {
-        let Some(anonymous_types) = union_constituents(store, anonymous) else {
-            return anonymous;
-        };
+    fn join_identity_candidates(&self, symbol: SemanticSymbolId) -> Vec<TypeId> {
         let mut candidates = Vec::new();
         if let Some(base) = self.base.type_of(symbol) {
             candidates.push(base);
@@ -763,7 +762,19 @@ impl SourceFlowFrame<'_, '_> {
             }
         }
         candidates
-            .into_iter()
+    }
+
+    fn preferred_join_identity(
+        store: &CanonicalTypeMapperStore,
+        anonymous: TypeId,
+        candidates: &[TypeId],
+    ) -> TypeId {
+        let Some(anonymous_types) = union_constituents(store, anonymous) else {
+            return anonymous;
+        };
+        candidates
+            .iter()
+            .copied()
             .find(|candidate| union_constituents(store, *candidate) == Some(anonymous_types))
             .unwrap_or(anonymous)
     }
@@ -809,7 +820,18 @@ fn narrow_by_typeof(
         }
         let matches = source_typeof_leaf_matches(store, globals, *leaf, tag)?;
         if matches == require_match {
-            retained.push(*leaf);
+            let retained_leaf = if require_match
+                && matches!(tag, SourceTypeofTag::Undefined)
+                && record.flags().intersects(TypeFlags::VOID)
+            {
+                store
+                    .intrinsic_bootstrap()
+                    .map(|bootstrap| bootstrap.undefined_type)
+                    .ok_or(SourceTypeofNarrowingError::MissingBootstrap)?
+            } else {
+                *leaf
+            };
+            retained.push(retained_leaf);
         } else if require_match
             && matches!(tag, SourceTypeofTag::Function)
             && record.flags().intersects(TypeFlags::NON_PRIMITIVE)

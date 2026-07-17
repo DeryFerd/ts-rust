@@ -92,6 +92,34 @@ const SOURCE: &str = concat!(
     "  const joinedAfter: string | number = value;\n",
     "  return joinedAfter;\n",
     "}\n",
+    "function broadFunctionJoin(value: object): object {\n",
+    "  if (typeof value === \"function\") {\n",
+    "    const broadSelected: object = value;\n",
+    "  } else {\n",
+    "    const broadRejected: object = value;\n",
+    "  }\n",
+    "  const broadAfter: object = value;\n",
+    "  return broadAfter;\n",
+    "}\n",
+    "function broadLocalJoin(input: object): object {\n",
+    "  const broadLocal: object = input;\n",
+    "  if (typeof broadLocal === \"function\") {\n",
+    "    const broadLocalSelected: object = broadLocal;\n",
+    "  } else {\n",
+    "    const broadLocalRejected: object = broadLocal;\n",
+    "  }\n",
+    "  const broadLocalAfter: object = broadLocal;\n",
+    "  return broadLocalAfter;\n",
+    "}\n",
+    "function voidCase(value: void): void {\n",
+    "  if (typeof value === \"undefined\") {\n",
+    "    const voidSelected: undefined = value;\n",
+    "    return voidSelected;\n",
+    "  } else {\n",
+    "    const voidRejected: never = value;\n",
+    "    return voidRejected;\n",
+    "  }\n",
+    "}\n",
 );
 
 fn context(parsed: &ParseResult, file: FileId) -> CanonicalCheckerContext<'_> {
@@ -193,6 +221,10 @@ fn strict_typeof_flow_narrows_all_tags_joins_and_replays_warm() {
         ("joinedString", "string"),
         ("joinedNumber", "number"),
         ("joinedAfter", "string | number"),
+        ("broadAfter", "object"),
+        ("broadLocalAfter", "object"),
+        ("voidSelected", "undefined"),
+        ("voidRejected", "never"),
     ] {
         assert_eq!(
             rendered_initializer_type(&context, &parsed, file, variable),
@@ -202,6 +234,27 @@ fn strict_typeof_flow_narrows_all_tags_joins_and_replays_warm() {
     }
 
     let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+    assert_eq!(
+        resolved_type(
+            &context,
+            variable_initializer(&parsed, file, "broadSelected"),
+        ),
+        context.global_types().function_type,
+    );
+    assert_eq!(
+        resolved_type(
+            &context,
+            variable_initializer(&parsed, file, "broadAfter"),
+        ),
+        bootstrap.non_primitive_type,
+    );
+    assert_eq!(
+        resolved_type(
+            &context,
+            variable_initializer(&parsed, file, "broadLocalAfter"),
+        ),
+        bootstrap.non_primitive_type,
+    );
     let typeof_type = bootstrap.typeof_type;
     let boolean_type = bootstrap.boolean_type;
     let mut typeof_count = 0;
@@ -220,8 +273,8 @@ fn strict_typeof_flow_narrows_all_tags_joins_and_replays_warm() {
             _ => {}
         }
     }
-    assert_eq!(typeof_count, 9);
-    assert_eq!(comparison_count, 9);
+    assert_eq!(typeof_count, 12);
+    assert_eq!(comparison_count, 12);
 
     let cold_counts = (
         context.store().type_len(),
