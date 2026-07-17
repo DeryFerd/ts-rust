@@ -197,6 +197,70 @@ pub(super) struct SourceCallableProvenance {
     pub(super) contextual_variable: Option<SemanticSymbolId>,
 }
 
+/// Exact annotation and value edges for one source-overload parameter.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct SourceOverloadParameterProvenance {
+    pub(super) declaration: NodeRef,
+    pub(super) symbol: SemanticSymbolId,
+    pub(super) annotation: NodeRef,
+    pub(super) annotation_null_literal_identity: bool,
+    pub(super) base_type: TypeId,
+    pub(super) call_type: TypeId,
+    pub(super) optional: bool,
+}
+
+/// One declaration-order signature row owned by a source overload group.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct SourceOverloadSignatureProvenance {
+    pub(super) declaration: NodeRef,
+    pub(super) signature: SignatureId,
+    pub(super) flags: SignatureFlags,
+    pub(super) parameters: Box<[SourceOverloadParameterProvenance]>,
+    pub(super) return_annotation: NodeRef,
+    pub(super) return_annotation_null_literal_identity: bool,
+    pub(super) return_type: TypeId,
+}
+
+/// Immutable source/binder provenance for one local ambient overload value.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct SourceOverloadProvenance {
+    pub(super) owner_symbol: SemanticSymbolId,
+    pub(super) signatures: Box<[SourceOverloadSignatureProvenance]>,
+    pub(super) array_targets: Option<CanonicalArrayTargets>,
+}
+
+/// Fully resolved parameter row staged before overload publication.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct PreparedSourceOverloadParameter {
+    pub(super) declaration: NodeRef,
+    pub(super) symbol: SemanticSymbolId,
+    pub(super) annotation: NodeRef,
+    pub(super) annotation_null_literal_identity: bool,
+    pub(super) base_type: TypeId,
+    pub(super) call_type: TypeId,
+    pub(super) optional: bool,
+}
+
+/// Fully resolved signature row staged before overload publication.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct PreparedSourceOverloadSignature {
+    pub(super) declaration: NodeRef,
+    pub(super) parameters: Vec<PreparedSourceOverloadParameter>,
+    pub(super) flags: SignatureFlags,
+    pub(super) min_argument_count: i32,
+    pub(super) return_annotation: NodeRef,
+    pub(super) return_annotation_null_literal_identity: bool,
+    pub(super) return_type: TypeId,
+}
+
+/// Dependency-closed transaction input for one source overload group.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct PreparedSourceOverloadPublication {
+    pub(super) owner_symbol: SemanticSymbolId,
+    pub(super) signatures: Vec<PreparedSourceOverloadSignature>,
+    pub(super) array_targets: Option<CanonicalArrayTargets>,
+}
+
 /// Immutable syntax-plan edge for the admitted direct-interface heritage slice.
 ///
 /// `resolved_base_types` remains the pinned semantic cache, while this separate
@@ -394,6 +458,10 @@ pub struct SemanticStore<TypePayload, MapperPayload> {
     source_callable_types_by_signature: HashMap<SignatureId, TypeId>,
     source_callable_type_parameters:
         HashMap<SignatureId, Box<[SourceCallableTypeParameterProvenance]>>,
+    source_overload_provenance: HashMap<TypeId, SourceOverloadProvenance>,
+    source_overload_types_by_declaration: HashMap<NodeRef, TypeId>,
+    source_overload_types_by_owner: HashMap<SemanticSymbolId, TypeId>,
+    source_overload_types_by_signature: HashMap<SignatureId, TypeId>,
     /// Pinned checker `cachedSignatures`, keyed by generic target and the
     /// ordered type-argument hash.
     cached_signatures: HashMap<(SignatureId, CacheHashKey), CachedSignatureEntry>,
@@ -486,6 +554,10 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             source_callable_types_by_owner: HashMap::new(),
             source_callable_types_by_signature: HashMap::new(),
             source_callable_type_parameters: HashMap::new(),
+            source_overload_provenance: HashMap::new(),
+            source_overload_types_by_declaration: HashMap::new(),
+            source_overload_types_by_owner: HashMap::new(),
+            source_overload_types_by_signature: HashMap::new(),
             cached_signatures: HashMap::new(),
             properties_types: HashMap::new(),
             function_signature_return_annotations: HashMap::new(),
@@ -1269,10 +1341,102 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         ]
     }
 
+    #[must_use]
+    pub(super) fn source_overload_provenance(
+        &self,
+        type_: TypeId,
+    ) -> Option<&SourceOverloadProvenance> {
+        self.observe_relation_type_read(type_);
+        self.source_overload_provenance.get(&type_)
+    }
+
+    #[must_use]
+    pub(super) fn source_overload_type_for_owner(
+        &self,
+        owner: SemanticSymbolId,
+    ) -> Option<TypeId> {
+        self.observe_relation_symbol_read(owner);
+        self.source_overload_types_by_owner.get(&owner).copied()
+    }
+
+    #[must_use]
+    pub(super) fn source_overload_type_for_declaration(
+        &self,
+        declaration: NodeRef,
+    ) -> Option<TypeId> {
+        self.observe_relation_node_read(declaration);
+        self.source_overload_types_by_declaration
+            .get(&declaration)
+            .copied()
+    }
+
+    #[must_use]
+    pub(super) fn source_overload_type_for_signature(
+        &self,
+        signature: SignatureId,
+    ) -> Option<TypeId> {
+        self.observe_relation_signature_read(signature);
+        self.source_overload_types_by_signature
+            .get(&signature)
+            .copied()
+    }
+
+    #[must_use]
+    pub(super) fn source_overload_provenance_claims(
+        &self,
+        owner: SemanticSymbolId,
+        declarations: &[NodeRef],
+    ) -> bool {
+        self.source_overload_provenance.values().any(|provenance| {
+            provenance.owner_symbol == owner
+                || provenance.signatures.iter().any(|signature| {
+                    declarations.contains(&signature.declaration)
+                })
+        })
+    }
+
+    pub(super) fn try_reserve_source_overload_provenance(
+        &mut self,
+        groups: usize,
+        declarations: usize,
+        signatures: usize,
+    ) -> bool {
+        self.source_overload_provenance.try_reserve(groups).is_ok()
+            && self
+                .source_overload_types_by_owner
+                .try_reserve(groups)
+                .is_ok()
+            && self
+                .source_overload_types_by_declaration
+                .try_reserve(declarations)
+                .is_ok()
+            && self
+                .source_overload_types_by_signature
+                .try_reserve(signatures)
+                .is_ok()
+    }
+
+    #[cfg(test)]
+    pub(super) fn replace_source_overload_type_for_declaration_for_test(
+        &mut self,
+        declaration: NodeRef,
+        replacement: Option<TypeId>,
+    ) -> Option<TypeId> {
+        match replacement {
+            Some(type_) => self
+                .source_overload_types_by_declaration
+                .insert(declaration, type_),
+            None => self
+                .source_overload_types_by_declaration
+                .remove(&declaration),
+        }
+    }
+
     fn has_callable_provenance(&self) -> bool {
         !self.function_type_provenance.is_empty()
             || !self.declared_call_set_provenance.is_empty()
             || !self.source_callable_provenance.is_empty()
+            || !self.source_overload_provenance.is_empty()
             || self.signatures.iter().any(|(_, signature)| {
                 signature.declaration().is_some_and(|node| {
                     self.source_node_kind(node) == Some(SyntaxKind::CallSignature)
@@ -1299,6 +1463,18 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             })
     }
 
+    fn node_is_source_overload_declaration(&self, node: NodeRef) -> bool {
+        self.source_overload_type_for_declaration(node)
+            .and_then(|type_| self.source_overload_provenance(type_))
+            .is_some_and(|provenance| {
+                provenance
+                    .signatures
+                    .iter()
+                    .any(|signature| signature.declaration == node)
+                    && self.source_node_kind(node) == Some(SyntaxKind::FunctionDeclaration)
+            })
+    }
+
     fn node_has_callable_ancestor(&self, mut node: NodeRef) -> bool {
         let mut visited = HashSet::new();
         loop {
@@ -1307,6 +1483,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             }
             if self.node_is_function_type(node)
                 || self.node_is_source_callable_declaration(node)
+                || self.node_is_source_overload_declaration(node)
                 || self.source_node_kind(node) == Some(SyntaxKind::CallSignature)
             {
                 return true;
@@ -1328,12 +1505,14 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                 Some(SourceNodeParent::Parent(parent))
                     if self.node_is_function_type(parent)
                         || self.node_is_source_callable_declaration(parent)
+                        || self.node_is_source_overload_declaration(parent)
                         || self.source_node_kind(parent) == Some(SyntaxKind::CallSignature)
             )
     }
 
     fn symbol_is_source_callable_owner(&self, symbol: SemanticSymbolId) -> bool {
         self.source_callable_types_by_owner.contains_key(&symbol)
+            || self.source_overload_types_by_owner.contains_key(&symbol)
     }
 
     fn signature_is_callable(&self, signature: SignatureId) -> bool {
@@ -1346,6 +1525,14 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                         .source_callable_type_for_signature(signature)
                         .and_then(|type_| self.source_callable_provenance(type_))
                         .is_some_and(|provenance| provenance.declaration == declaration)
+                    || self
+                        .source_overload_type_for_signature(signature)
+                        .and_then(|type_| self.source_overload_provenance(type_))
+                        .is_some_and(|provenance| {
+                            provenance.signatures.iter().any(|row| {
+                                row.declaration == declaration && row.signature == signature
+                            })
+                        })
             })
     }
 
@@ -1368,12 +1555,20 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                 .copied()
                 .filter(|type_| self.type_has_declared_call_set_provenance(*type_))
         } else {
-            self.source_callable_type_for_signature(signature)
-                .filter(|type_| {
+            self.source_callable_type_for_signature(signature).filter(|type_| {
                     self.source_callable_provenance(*type_)
                         .is_some_and(|provenance| {
                             provenance.declaration == declaration
                                 && provenance.signature == signature
+                        })
+                }).or_else(|| {
+                    self.source_overload_type_for_signature(signature)
+                        .filter(|type_| {
+                            self.source_overload_provenance(*type_).is_some_and(|provenance| {
+                                provenance.signatures.iter().any(|row| {
+                                    row.declaration == declaration && row.signature == signature
+                                })
+                            })
                         })
                 })
         };
@@ -1839,7 +2034,8 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         });
         let relation_dirty = self.relation_observable_nodes.contains(&node) && changed;
         let dirty = (self.node_is_function_type(node)
-            || self.node_is_source_callable_declaration(node))
+            || self.node_is_source_callable_declaration(node)
+            || self.node_is_source_overload_declaration(node))
             || self.source_node_kind(node) == Some(SyntaxKind::CallSignature);
         let dirty = dirty && published && changed;
         self.links.signature.replace_key(node, links);
@@ -3405,7 +3601,16 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             || self
                 .source_callable_type_for_signature(id)
                 .and_then(|type_| self.source_callable_provenance(type_))
-                .is_some_and(|provenance| provenance.declaration == declaration);
+                .is_some_and(|provenance| provenance.declaration == declaration)
+            || self
+                .source_overload_type_for_signature(id)
+                .and_then(|type_| self.source_overload_provenance(type_))
+                .is_some_and(|provenance| {
+                    provenance
+                        .signatures
+                        .iter()
+                        .any(|row| row.declaration == declaration && row.signature == id)
+                });
         if !valid_callable || self.function_signature_return_annotations.contains_key(&id) {
             return false;
         }
@@ -4124,6 +4329,296 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
 }
 
 impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
+    /// Publishes a dependency-closed batch of local ambient overload groups.
+    ///
+    /// Every source, binder, cache, and capacity edge is checked before the
+    /// first callable identity is allocated. Once allocation begins, all
+    /// reverse-map and link writes are infallible assertions over the reserved
+    /// batch.
+    pub(super) fn publish_source_overload_batch(
+        &mut self,
+        prepared: Vec<PreparedSourceOverloadPublication>,
+    ) -> Option<Vec<(TypeId, Box<[SignatureId]>)>> {
+        let group_count = prepared.len();
+        let signature_count = prepared
+            .iter()
+            .try_fold(0usize, |count, group| count.checked_add(group.signatures.len()))?;
+        let parameter_count = prepared.iter().try_fold(0usize, |count, group| {
+            group.signatures.iter().try_fold(count, |count, signature| {
+                count.checked_add(signature.parameters.len())
+            })
+        })?;
+        let mut owners = HashSet::with_capacity(group_count);
+        let mut declarations = HashSet::with_capacity(signature_count);
+        let mut parameter_declarations = HashSet::with_capacity(parameter_count);
+        let mut parameter_symbols = HashSet::with_capacity(parameter_count);
+
+        for group in &prepared {
+            let owner = self.symbol(group.owner_symbol)?;
+            let declaration_order = group
+                .signatures
+                .iter()
+                .map(|signature| signature.declaration)
+                .collect::<Vec<_>>();
+            let common_parent = declaration_order
+                .first()
+                .and_then(|declaration| self.source_node_parent(*declaration));
+            if group.signatures.len() < 2
+                || !owners.insert(group.owner_symbol)
+                || owner.flags() != SymbolFlags::FUNCTION
+                || owner.check_flags() != CheckFlags::NONE
+                || owner.declarations() != Some(declaration_order.as_slice())
+                || owner.value_declaration() != declaration_order.first().copied()
+                || owner.members().is_some()
+                || owner.exports().is_some()
+                || owner.parent().is_some()
+                || owner.export_symbol().is_some()
+                || self.get_merged_symbol(group.owner_symbol) != Some(group.owner_symbol)
+                || common_parent.is_none()
+                || common_parent
+                    .and_then(|parent| match parent {
+                        SourceNodeParent::Parent(parent) => self.source_node_kind(parent),
+                        SourceNodeParent::Root => None,
+                    })
+                    != Some(SyntaxKind::SourceFile)
+                || self.value_symbol_links(group.owner_symbol)
+                    .is_some_and(|links| links != &ValueSymbolLinks::default())
+                || self
+                    .source_callable_types_by_owner
+                    .contains_key(&group.owner_symbol)
+                || self
+                    .source_overload_types_by_owner
+                    .contains_key(&group.owner_symbol)
+                || self.source_overload_provenance_claims(
+                    group.owner_symbol,
+                    declaration_order.as_slice(),
+                )
+                || group.array_targets.is_some_and(|targets| {
+                    self.type_payload(targets.array_type()).is_none()
+                        || self.type_payload(targets.readonly_array_type()).is_none()
+                })
+            {
+                return None;
+            }
+            for signature in &group.signatures {
+                if !declarations.insert(signature.declaration)
+                    || self.source_node_kind(signature.declaration)
+                        != Some(SyntaxKind::FunctionDeclaration)
+                    || self.source_node_parent(signature.declaration) != common_parent
+                    || self
+                        .signature_links(signature.declaration)
+                        .is_some_and(|links| links != &SignatureLinks::default())
+                    || self
+                        .source_callable_types_by_declaration
+                        .contains_key(&signature.declaration)
+                    || self
+                        .source_overload_types_by_declaration
+                        .contains_key(&signature.declaration)
+                    || signature.flags.bits() & !SignatureFlags::HAS_LITERAL_TYPES.bits() != 0
+                    || signature.min_argument_count < 0
+                    || usize::try_from(signature.min_argument_count)
+                        .map_or(true, |minimum| minimum > signature.parameters.len())
+                    || self.type_payload(signature.return_type).is_none()
+                    || !self.contains_node_ref(signature.return_annotation)
+                {
+                    return None;
+                }
+                let mut optional_seen = false;
+                for parameter in &signature.parameters {
+                    let symbol = self.symbol(parameter.symbol)?;
+                    if !parameter_declarations.insert(parameter.declaration)
+                        || !parameter_symbols.insert(parameter.symbol)
+                        || self.source_node_kind(parameter.declaration)
+                            != Some(SyntaxKind::Parameter)
+                        || self.source_node_parent(parameter.declaration)
+                            != Some(SourceNodeParent::Parent(signature.declaration))
+                        || symbol.flags() != SymbolFlags::FUNCTION_SCOPED_VARIABLE
+                        || symbol.check_flags() != CheckFlags::NONE
+                        || symbol.declarations() != Some(&[parameter.declaration])
+                        || symbol.value_declaration() != Some(parameter.declaration)
+                        || symbol.members().is_some()
+                        || symbol.exports().is_some()
+                        || symbol.parent().is_some()
+                        || symbol.export_symbol().is_some()
+                        || self.get_merged_symbol(parameter.symbol) != Some(parameter.symbol)
+                        || self
+                            .value_symbol_links(parameter.symbol)
+                            .is_some_and(|links| links != &ValueSymbolLinks::default())
+                        || !self.contains_node_ref(parameter.annotation)
+                        || self.type_payload(parameter.base_type).is_none()
+                        || self.type_payload(parameter.call_type).is_none()
+                        || optional_seen && !parameter.optional
+                    {
+                        return None;
+                    }
+                    optional_seen |= parameter.optional;
+                }
+            }
+        }
+
+        let value_link_count = group_count.checked_add(parameter_count)?;
+        if !self.try_reserve_types(group_count)
+            || !self.try_reserve_signatures(signature_count)
+            || !self.try_reserve_source_overload_provenance(
+                group_count,
+                signature_count,
+                signature_count,
+            )
+            || !self.try_reserve_function_signature_return_annotations(signature_count)
+            || !self.try_reserve_callable_signature_parameter_types(signature_count)
+            || !self.links.signature.try_reserve(signature_count)
+            || !self.links.value_symbol.try_reserve(value_link_count)
+        {
+            return None;
+        }
+
+        let mut published = Vec::with_capacity(group_count);
+        for group in prepared {
+            let type_ = self
+                .alloc_plain_object_type(
+                    super::types::ObjectFlags::ANONYMOUS,
+                    Some(group.owner_symbol),
+                )
+                .expect("source overload owner was prevalidated");
+            let mut signature_ids = Vec::with_capacity(group.signatures.len());
+            for signature in &group.signatures {
+                let signature_id = self
+                    .alloc_signature(
+                        signature.flags,
+                        Some(signature.declaration),
+                        Vec::new(),
+                        None,
+                        signature
+                            .parameters
+                            .iter()
+                            .map(|parameter| parameter.symbol)
+                            .collect(),
+                        Some(signature.return_type),
+                        None,
+                        signature.min_argument_count,
+                    )
+                    .expect("source overload signature was prevalidated");
+                signature_ids.push(signature_id);
+            }
+            let provenance_rows = group
+                .signatures
+                .iter()
+                .zip(&signature_ids)
+                .map(|(signature, signature_id)| SourceOverloadSignatureProvenance {
+                    declaration: signature.declaration,
+                    signature: *signature_id,
+                    flags: signature.flags,
+                    parameters: signature
+                        .parameters
+                        .iter()
+                        .map(|parameter| SourceOverloadParameterProvenance {
+                            declaration: parameter.declaration,
+                            symbol: parameter.symbol,
+                            annotation: parameter.annotation,
+                            annotation_null_literal_identity: parameter
+                                .annotation_null_literal_identity,
+                            base_type: parameter.base_type,
+                            call_type: parameter.call_type,
+                            optional: parameter.optional,
+                        })
+                        .collect(),
+                    return_annotation: signature.return_annotation,
+                    return_annotation_null_literal_identity: signature
+                        .return_annotation_null_literal_identity,
+                    return_type: signature.return_type,
+                })
+                .collect::<Box<[_]>>();
+            assert!(
+                self.source_overload_provenance
+                    .insert(
+                        type_,
+                        SourceOverloadProvenance {
+                            owner_symbol: group.owner_symbol,
+                            signatures: provenance_rows,
+                            array_targets: group.array_targets,
+                        },
+                    )
+                    .is_none()
+            );
+            assert!(
+                self.source_overload_types_by_owner
+                    .insert(group.owner_symbol, type_)
+                    .is_none()
+            );
+            for (signature, signature_id) in group.signatures.iter().zip(&signature_ids) {
+                assert!(
+                    self.source_overload_types_by_declaration
+                        .insert(signature.declaration, type_)
+                        .is_none()
+                );
+                assert!(
+                    self.source_overload_types_by_signature
+                        .insert(*signature_id, type_)
+                        .is_none()
+                );
+            }
+            assert!(self.set_value_symbol_links(
+                group.owner_symbol,
+                ValueSymbolLinks {
+                    resolved_type: Some(type_),
+                    ..ValueSymbolLinks::default()
+                },
+            ));
+            assert!(self.set_structured_type_members(
+                type_,
+                None,
+                None,
+                Some(signature_ids.clone()),
+                None,
+                None,
+            ));
+            for (signature, signature_id) in group.signatures.iter().zip(&signature_ids) {
+                assert!(self.set_signature_links(
+                    signature.declaration,
+                    SignatureLinks {
+                        resolved_signature: ResolvedSignatureState::Resolved(*signature_id),
+                        ..SignatureLinks::default()
+                    },
+                ));
+                assert!(self.set_function_signature_return_annotation(
+                    *signature_id,
+                    signature.return_annotation,
+                    signature.return_annotation_null_literal_identity,
+                ));
+            }
+            assert!(self.set_callable_signature_parameter_types_batch(
+                group
+                    .signatures
+                    .iter()
+                    .zip(&signature_ids)
+                    .map(|(signature, signature_id)| {
+                        (
+                            *signature_id,
+                            signature
+                                .parameters
+                                .iter()
+                                .map(|parameter| parameter.call_type)
+                                .collect(),
+                        )
+                    })
+                    .collect(),
+            ));
+            for signature in &group.signatures {
+                for parameter in &signature.parameters {
+                    assert!(self.set_value_symbol_links(
+                        parameter.symbol,
+                        ValueSymbolLinks {
+                            resolved_type: Some(parameter.call_type),
+                            ..ValueSymbolLinks::default()
+                        },
+                    ));
+                }
+            }
+            published.push((type_, signature_ids.into_boxed_slice()));
+        }
+        Some(published)
+    }
+
     pub(super) fn try_reserve_properties_type_cache(&mut self, additional: usize) -> bool {
         self.properties_types.try_reserve(additional).is_ok()
     }

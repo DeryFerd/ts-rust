@@ -55,6 +55,12 @@ pub(super) struct SourceCallableParameterPlan {
     pub(super) rest: bool,
 }
 
+impl SourceCallableParameterPlan {
+    pub(super) const fn annotation_identity(self) -> (NodeRef, bool) {
+        (self.identity_node, self.null_literal_identity)
+    }
+}
+
 /// One exact declared type-parameter identity owned by a source signature.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct SourceCallableTypeParameterPlan {
@@ -130,7 +136,7 @@ impl SourceCallableReturnPlan {
         }
     }
 
-    const fn annotation_identity(self) -> Option<(NodeRef, bool)> {
+    pub(super) const fn annotation_identity(self) -> Option<(NodeRef, bool)> {
         match self {
             Self::Annotated {
                 identity_node,
@@ -379,6 +385,12 @@ struct SourceSyntaxView<'a> {
     invalid_parser_cache: bool,
 }
 
+#[derive(Clone, Copy)]
+enum SourceCallableOwnerShape<'a> {
+    Unique,
+    AmbientOverload(&'a [NodeRef]),
+}
+
 /// Plans one exact source callable without publishing semantic records.
 pub(super) fn plan_source_callable(
     store: &CanonicalTypeMapperStore,
@@ -386,6 +398,47 @@ pub(super) fn plan_source_callable(
     declaration: NodeRef,
     owner_symbol: SemanticSymbolId,
     array_targets: Option<CanonicalArrayTargets>,
+) -> Result<SourceCallablePlan, SourceCallableError> {
+    plan_source_callable_with_owner_shape(
+        store,
+        host,
+        declaration,
+        owner_symbol,
+        array_targets,
+        SourceCallableOwnerShape::Unique,
+    )
+}
+
+/// Plans one declaration belonging to an exact local ambient overload group.
+///
+/// Publication and warm validation remain owned by `source_overloads`; this
+/// entry point only reuses the established declaration/parameter annotation
+/// proof without pretending that the declaration owns a singleton callable.
+pub(super) fn plan_source_ambient_overload_declaration(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    declaration: NodeRef,
+    owner_symbol: SemanticSymbolId,
+    declarations: &[NodeRef],
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<SourceCallablePlan, SourceCallableError> {
+    plan_source_callable_with_owner_shape(
+        store,
+        host,
+        declaration,
+        owner_symbol,
+        array_targets,
+        SourceCallableOwnerShape::AmbientOverload(declarations),
+    )
+}
+
+fn plan_source_callable_with_owner_shape(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    declaration: NodeRef,
+    owner_symbol: SemanticSymbolId,
+    array_targets: Option<CanonicalArrayTargets>,
+    owner_shape: SourceCallableOwnerShape<'_>,
 ) -> Result<SourceCallablePlan, SourceCallableError> {
     let record = preflight_node(store, host, declaration)?;
     let view = match &record.data {
@@ -485,10 +538,24 @@ pub(super) fn plan_source_callable(
     let owner = store
         .symbol(owner_symbol)
         .ok_or_else(|| invariant(SourceCallableInvariant::InvalidOwnerSymbol(declaration)))?;
+    let export_local = bound.local_symbol(declaration);
+    let exact_owner_declarations = match owner_shape {
+        SourceCallableOwnerShape::Unique => {
+            owner.declarations() == Some(&[declaration])
+                && owner.value_declaration() == Some(declaration)
+        }
+        SourceCallableOwnerShape::AmbientOverload(declarations) => {
+            declarations.len() >= 2
+                && declarations.contains(&declaration)
+                && owner.declarations() == Some(declarations)
+                && owner.value_declaration() == declarations.first().copied()
+                && owner.parent().is_none()
+                && export_local.is_none()
+        }
+    };
     if owner.flags() != SymbolFlags::FUNCTION
         || owner.check_flags() != CheckFlags::NONE
-        || owner.declarations() != Some(&[declaration])
-        || owner.value_declaration() != Some(declaration)
+        || !exact_owner_declarations
         || owner.members().is_some()
         || owner.export_symbol().is_some()
     {
@@ -496,7 +563,6 @@ pub(super) fn plan_source_callable(
             declaration,
         )));
     }
-    let export_local = bound.local_symbol(declaration);
     validate_owner_name_and_export_route(
         store,
         host,
@@ -825,7 +891,28 @@ pub(super) fn plan_source_callable(
         .map(|index| plan.type_parameters[index].declaration);
     plan.type_parameter_syntax.generic_fixed_return_is_exact =
         !plan.type_parameters.is_empty() && plan.generic_return_type_parameter_index.is_none();
-    source_callable_state(store, &plan, true)?;
+    match owner_shape {
+        SourceCallableOwnerShape::Unique => {
+            source_callable_state(store, &plan, true)?;
+        }
+        SourceCallableOwnerShape::AmbientOverload(_) => {
+            if plan.family != SourceCallableFamily::FunctionDeclaration
+                || plan.body_mode != SourceCallableBodyMode::AmbientDeclaration
+                || !plan.type_parameters.is_empty()
+                || plan.return_type.is_inferred()
+                || plan.export_local.is_some()
+                || plan.owner_parent.is_some()
+                || plan
+                    .parameters
+                    .iter()
+                    .any(|parameter| parameter.rest || parameter.initializer.is_some())
+            {
+                return Err(SourceCallableError::Unsupported(
+                    SourceCallableUnsupported::OverloadDeclaration(declaration),
+                ));
+            }
+        }
+    }
     Ok(plan)
 }
 
@@ -3983,7 +4070,7 @@ fn validate_cached_return_type(
     Ok(())
 }
 
-fn cached_annotation_identity(
+pub(super) fn cached_annotation_identity(
     store: &CanonicalTypeMapperStore,
     node: NodeRef,
     null_literal_identity: bool,
@@ -4058,7 +4145,7 @@ fn is_null_literal_type(
         && matches!(literal_record.data, NodeData::KeywordExpression(_)))
 }
 
-fn valid_optional_type(
+pub(super) fn valid_optional_type(
     store: &CanonicalTypeMapperStore,
     array_targets: Option<CanonicalArrayTargets>,
     base: TypeId,

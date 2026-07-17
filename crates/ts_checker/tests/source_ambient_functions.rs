@@ -320,8 +320,8 @@ fn ambient_function_forms_outside_the_exact_leaf_remain_typed_boundaries() {
             CanonicalModuleState::Script,
         ),
         (
-            "declare function merged(value: number): number;\
-             declare function merged(value: string): string;",
+            "declare function genericMerged<T>(value: T): T;\
+             declare function genericMerged<T>(value: T, other: T): T;",
             false,
             CanonicalModuleState::Script,
         ),

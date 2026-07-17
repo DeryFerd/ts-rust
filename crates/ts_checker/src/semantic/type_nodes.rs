@@ -49,6 +49,7 @@ use super::{
     source_callables::{
         self, PendingSourceCallableParameterTypes, SourceCallableError, SourceCallableFamily,
     },
+    source_overloads::{StoredSourceOverloadValidation, validate_stored_source_overload},
     structured_members,
     tuple_type_nodes::{self, TupleTypeNodeError, TupleTypeNodePlan, validate_warm_tuple_elements},
     tuple_types::{CanonicalTupleTypeRequest, TupleTypeError, TupleTypeQueryPreparationError},
@@ -5232,6 +5233,89 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         self.complete_type_query(result, &plan, &mut prepared)
     }
 
+    /// Proves the complete annotated type-node closure of one source callable
+    /// without allocating its object, signature, or parameter-value caches.
+    ///
+    /// Source checking uses this before any ambient callable provider
+    /// publishes, so a later unsupported singleton cannot leave an earlier
+    /// overload group partially installed.
+    pub(super) fn preflight_type_of_source_callable(
+        &mut self,
+        declaration: NodeRef,
+        owner_symbol: SemanticSymbolId,
+    ) -> Result<(), DeclaredTypeError> {
+        self.reject_type_reference_alias_capabilities()?;
+        if !self.pending_function_parameters.is_empty() {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidFunctionType(declaration),
+            ));
+        }
+        let array_targets = self
+            .global_types
+            .as_ref()
+            .map(CanonicalArrayTargets::from_global_types);
+        let family = match preflight_node(self.store, self.host, declaration)?.kind {
+            SyntaxKind::FunctionDeclaration => SourceCallableFamily::FunctionDeclaration,
+            SyntaxKind::ArrowFunction => SourceCallableFamily::ArrowFunction,
+            kind => {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::UnsupportedSyntax {
+                        node: declaration,
+                        kind,
+                    },
+                ));
+            }
+        };
+        let callable = source_callables::plan_source_callable(
+            self.store,
+            self.host,
+            declaration,
+            owner_symbol,
+            array_targets,
+        )
+        .map_err(|error| source_callable_error(error, family))?;
+        match source_callables::source_callable_state(self.store, &callable, true)
+            .map_err(|error| source_callable_error(error, callable.family))?
+        {
+            source_callables::SourceCallableState::AwaitingInferredReturn { .. }
+            | source_callables::SourceCallableState::Resolved { .. } => return Ok(()),
+            _ => {}
+        }
+
+        let mut planner = TypeQueryPlanner::new(
+            self.store,
+            self.host,
+            self.array_type,
+            array_targets,
+            self.options.strict_builtin_iterator_return,
+            &self.type_reference_alias_targets,
+        );
+        for type_parameter in &callable.type_parameters {
+            if let Some(constraint) = type_parameter.constraint {
+                planner.plan_type_node(constraint)?;
+            }
+            if let Some(default_type) = type_parameter.default_type {
+                planner.plan_type_node(default_type)?;
+            }
+        }
+        for parameter in &callable.parameters {
+            planner.plan_type_node(parameter.type_node)?;
+        }
+        if let Some(return_type) = callable.return_type.type_node() {
+            planner.plan_type_node(return_type)?;
+        }
+        let plan = planner.finish();
+        let (cold_source_types, source_optional_unions) =
+            source_callables::reserve_source_callable_capacities(self.store, &[&callable])
+                .map_err(|error| source_callable_error(error, callable.family))?;
+        drop(self.prepare_literal_types_with_additional(
+            &plan,
+            source_optional_unions,
+            cold_source_types,
+        )?);
+        Ok(())
+    }
+
     /// Resolves one exact annotated `FunctionDeclaration` or `ArrowFunction` into
     /// the callable value owned by its binder FUNCTION symbol.
     pub(super) fn get_type_of_source_callable(
@@ -5540,6 +5624,39 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             .ok_or_else(|| {
                 type_node_unavailable(TypeNodeUnavailable::InvalidFunctionSignature(signature))
             })?;
+        if let Some(type_) = self.store.source_overload_type_for_signature(signature) {
+            let exact = matches!(
+                validate_stored_source_overload(self.store, type_),
+                StoredSourceOverloadValidation::Valid(_)
+            ) && self
+                .store
+                .source_overload_provenance(type_)
+                .is_some_and(|provenance| {
+                    provenance.signatures.iter().any(|row| {
+                        row.signature == signature
+                            && row.declaration == declaration
+                            && self
+                                .store
+                                .signature(signature)
+                                .and_then(Signature::resolved_return_type)
+                                == Some(row.return_type)
+                    })
+                });
+            if exact {
+                return self
+                    .store
+                    .signature(signature)
+                    .and_then(Signature::resolved_return_type)
+                    .ok_or_else(|| {
+                        type_node_unavailable(
+                            TypeNodeUnavailable::InvalidFunctionSignature(signature),
+                        )
+                    });
+            }
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidFunctionSignature(signature),
+            ));
+        }
         match preflight_node(self.store, self.host, declaration)?.kind {
             SyntaxKind::FunctionDeclaration | SyntaxKind::ArrowFunction => {
                 return self.get_return_type_of_source_callable_signature(signature, declaration);

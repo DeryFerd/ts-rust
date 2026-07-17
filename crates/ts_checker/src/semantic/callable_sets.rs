@@ -15,6 +15,7 @@ use super::{
     },
     object_members::{StoredDeclaredCallSetValidation, validate_stored_declared_call_set},
     signatures::SignatureFlags,
+    source_overloads::{StoredSourceOverloadValidation, validate_stored_source_overload},
 };
 
 /// Immutable callable members after provider and store validation.
@@ -80,6 +81,25 @@ pub(super) fn validate_stored_callable_set(
                     call_signatures: Box::new([callable]),
                     construct_signatures: Box::new([]),
                 },
+                edges,
+            };
+        }
+    }
+    let family = CallableFamily::SourceFunctionOverloads;
+    match validate_stored_source_overload(store, type_) {
+        StoredSourceOverloadValidation::NotSourceOverload => {}
+        StoredSourceOverloadValidation::Malformed => {
+            return StoredCallableSetValidation::Malformed { family };
+        }
+        StoredSourceOverloadValidation::Valid(edges) => {
+            let Some(projection) =
+                validate_stored_callable_set_projection(store, type_, false)
+            else {
+                return StoredCallableSetValidation::Malformed { family };
+            };
+            return StoredCallableSetValidation::Valid {
+                family,
+                projection,
                 edges,
             };
         }

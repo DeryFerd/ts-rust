@@ -122,6 +122,11 @@ use super::{
         check_direct_default_new, plan_direct_default_new, preflight_direct_default_new,
         prepare_direct_default_news,
     },
+    source_overloads::{
+        MaterializedSourceOverload, ResolvedSourceOverloadSignature, SourceOverloadError,
+        SourceOverloadPlan, plan_source_ambient_overload_group,
+        prepare_source_overload_publication, publish_source_overload_batch,
+    },
     source_properties::{
         SourcePropertyDiagnostic, SourcePropertyError, SourcePropertyPlan,
         SourcePropertyUnsupported, check_direct_source_property,
@@ -697,6 +702,13 @@ struct PlannedFunction {
     body: PlannedFunctionBody,
 }
 
+#[derive(Clone, Debug)]
+struct PlannedFunctionHeader {
+    name: NodeRef,
+    name_text: String,
+    modifier_mode: PlannedFunctionModifierMode,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PlannedFunctionModifierMode {
     None,
@@ -848,6 +860,7 @@ enum PlannedStatement {
     ExternalModuleMarker,
     NamedReexport,
     AmbientVariables,
+    AmbientOverload,
     Function(usize),
     Arrow(usize),
     ContextualArrow(usize),
@@ -866,6 +879,7 @@ struct SourceCheckPlan {
     type_import_references: Vec<PlannedSourceTypeImportReference>,
     type_import_value_uses: Vec<PlannedSourceTypeImportValueUse>,
     ambient_variables: Vec<PlannedAmbientVariable>,
+    overloads: Vec<SourceOverloadPlan>,
     functions: Vec<PlannedFunction>,
     arrows: Vec<PlannedArrow>,
     contextual_arrows: Vec<PlannedContextualArrow>,
@@ -1064,22 +1078,70 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 _ => leading_import_prefix = false,
             }
         }
-        let mut preplanned_functions = HashMap::new();
+        let mut function_declarations_by_owner =
+            HashMap::<SemanticSymbolId, Vec<NodeRef>>::new();
         for statement in &source_statements {
             let statement = self.reference(*statement);
             if self.node(statement)?.kind != SyntaxKind::FunctionDeclaration {
                 continue;
             }
-            let callable = self.preplan_function_declaration(
-                statement,
+            let owner = self.bound.symbol(statement).ok_or(
+                SourceCheckError::Provenance(
+                    SourceCheckProvenanceError::MissingDeclarationSymbol(statement),
+                ),
+            )?;
+            function_declarations_by_owner
+                .entry(owner)
+                .or_default()
+                .push(statement);
+        }
+        let mut preplanned_functions = HashMap::new();
+        let mut preplanned_overload_declarations = HashSet::new();
+        let mut preplanned_overload_owners = HashSet::new();
+        let mut overloads = Vec::new();
+        for statement in &source_statements {
+            let statement = self.reference(*statement);
+            if self.node(statement)?.kind != SyntaxKind::FunctionDeclaration {
+                continue;
+            }
+            let owner = self.bound.symbol(statement).ok_or(
+                SourceCheckError::Provenance(
+                    SourceCheckProvenanceError::MissingDeclarationSymbol(statement),
+                ),
+            )?;
+            if !preplanned_overload_owners.insert(owner) {
+                continue;
+            }
+            let declarations = function_declarations_by_owner.get(&owner).ok_or(
+                SourceCheckError::Function(SourceFunctionInvariant::MissingDeclaration(statement)),
+            )?;
+            if declarations.len() == 1 {
+                let callable = self.preplan_function_declaration(
+                    statement,
+                    is_external_module,
+                    facts.is_declaration_file(),
+                )?;
+                if preplanned_functions.insert(statement, callable).is_some() {
+                    return Err(SourceCheckError::Function(
+                        SourceFunctionInvariant::DuplicateDeclaration(statement),
+                    ));
+                }
+                continue;
+            }
+            let overload = self.preplan_function_overload_group(
+                declarations,
                 is_external_module,
                 facts.is_declaration_file(),
             )?;
-            if preplanned_functions.insert(statement, callable).is_some() {
+            if declarations
+                .iter()
+                .any(|declaration| !preplanned_overload_declarations.insert(*declaration))
+            {
                 return Err(SourceCheckError::Function(
                     SourceFunctionInvariant::DuplicateDeclaration(statement),
                 ));
             }
+            overloads.push(overload);
         }
         let mut preplanned_ambient_variables = HashMap::new();
         for statement in &source_statements {
@@ -1304,6 +1366,10 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     }
                 }
                 SyntaxKind::FunctionDeclaration => {
+                    if preplanned_overload_declarations.remove(&statement) {
+                        statements.push(PlannedStatement::AmbientOverload);
+                        continue;
+                    }
                     let callable = preplanned_functions.remove(&statement).ok_or(
                         SourceCheckError::Function(SourceFunctionInvariant::MissingDeclaration(
                             statement,
@@ -1459,6 +1525,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             type_import_references: self.type_import_references,
             type_import_value_uses: self.type_import_value_uses,
             ambient_variables,
+            overloads,
             functions,
             arrows,
             contextual_arrows,
@@ -2148,6 +2215,19 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         }
     }
 
+    fn overload_plan_error(fallback: NodeRef, error: SourceOverloadError) -> SourceCheckError {
+        match error {
+            SourceOverloadError::Unsupported(node) => SourceCheckError::Unsupported(
+                UnsupportedSourceSyntax::Function(SourceFunctionUnsupported::Callable(node)),
+            ),
+            SourceOverloadError::Callable(error) => Self::callable_plan_error(error),
+            SourceOverloadError::Literal(error) => error.into(),
+            SourceOverloadError::Invariant(_) => SourceCheckError::Function(
+                SourceFunctionInvariant::Callable(error.node().unwrap_or(fallback)),
+            ),
+        }
+    }
+
     fn arrow_plan_error(error: SourceArrowError) -> SourceCheckError {
         let node = error.node();
         match error {
@@ -2182,12 +2262,12 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         }
     }
 
-    fn preplan_function_declaration(
-        &mut self,
+    fn preplan_function_header(
+        &self,
         declaration: NodeRef,
         is_external_module: bool,
         is_declaration_file: bool,
-    ) -> Result<SourceCallablePlan, SourceCheckError> {
+    ) -> Result<PlannedFunctionHeader, SourceCheckError> {
         let (range, flags, facts, modifiers, name_id) = {
             let node = self.node(declaration)?;
             let NodeData::FunctionDeclaration(function) = &node.data else {
@@ -2254,6 +2334,21 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             }
             _ => {}
         }
+        Ok(PlannedFunctionHeader {
+            name,
+            name_text,
+            modifier_mode,
+        })
+    }
+
+    fn preplan_function_declaration(
+        &mut self,
+        declaration: NodeRef,
+        is_external_module: bool,
+        is_declaration_file: bool,
+    ) -> Result<SourceCallablePlan, SourceCheckError> {
+        let header =
+            self.preplan_function_header(declaration, is_external_module, is_declaration_file)?;
         let Some((store, host)) = self.semantic else {
             return Err(self.unsupported(
                 declaration,
@@ -2265,9 +2360,12 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             self.bound,
             store,
             declaration,
-            name,
-            &name_text,
-            matches!(modifier_mode, PlannedFunctionModifierMode::Export(_)),
+            header.name,
+            &header.name_text,
+            matches!(
+                header.modifier_mode,
+                PlannedFunctionModifierMode::Export(_)
+            ),
         )
         .map_err(Self::function_plan_error)?;
         let callable = plan_source_callable(
@@ -2279,7 +2377,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         )
         .map_err(Self::callable_plan_error)?;
         let body_mode_matches = matches!(
-            (modifier_mode, callable.body_mode),
+            (header.modifier_mode, callable.body_mode),
             (
                 PlannedFunctionModifierMode::Declare(_),
                 SourceCallableBodyMode::AmbientDeclaration
@@ -2299,6 +2397,117 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             ));
         }
         Ok(callable)
+    }
+
+    fn preplan_function_overload_group(
+        &mut self,
+        declarations: &[NodeRef],
+        is_external_module: bool,
+        is_declaration_file: bool,
+    ) -> Result<SourceOverloadPlan, SourceCheckError> {
+        let Some(first) = declarations.first().copied() else {
+            return Err(SourceCheckError::Function(
+                SourceFunctionInvariant::MissingDeclaration(self.source.node_ref()),
+            ));
+        };
+        let Some((store, host)) = self.semantic else {
+            return Err(self.unsupported(
+                first,
+                SyntaxKind::FunctionDeclaration,
+                SourceSyntaxRole::FunctionDeclaration,
+            ));
+        };
+        let raw_owner = self.bound.symbol(first).ok_or(SourceCheckError::Provenance(
+            SourceCheckProvenanceError::MissingDeclarationSymbol(first),
+        ))?;
+        let owner = store
+            .get_merged_symbol(raw_owner)
+            .ok_or(SourceCheckError::Function(
+                SourceFunctionInvariant::InvalidMergedSymbol(raw_owner),
+            ))?;
+        if owner != raw_owner {
+            return Err(SourceCheckError::Unsupported(
+                UnsupportedSourceSyntax::Function(SourceFunctionUnsupported::MergedSymbol {
+                    node: first,
+                    source: raw_owner,
+                    target: owner,
+                }),
+            ));
+        }
+        let owner_record = store
+            .symbol(owner)
+            .ok_or(SourceCheckError::Function(
+                SourceFunctionInvariant::InvalidSymbol(owner),
+            ))?;
+        let actual_declarations = owner_record.declarations().ok_or(
+            SourceCheckError::Function(SourceFunctionInvariant::MissingDeclarations(owner)),
+        )?;
+        if owner_record.flags() != SymbolFlags::FUNCTION {
+            return Err(SourceCheckError::Unsupported(
+                UnsupportedSourceSyntax::Function(SourceFunctionUnsupported::NonFunctionSymbol {
+                    node: first,
+                    symbol: owner,
+                    flags: owner_record.flags(),
+                }),
+            ));
+        }
+        if actual_declarations != declarations
+            || owner_record.value_declaration() != Some(first)
+            || owner_record.parent().is_some()
+            || owner_record.export_symbol().is_some()
+            || owner_record.exports().is_some()
+        {
+            return Err(SourceCheckError::Unsupported(
+                UnsupportedSourceSyntax::Function(
+                    SourceFunctionUnsupported::NonUniqueDeclaration {
+                        node: first,
+                        symbol: owner,
+                        declaration_count: actual_declarations.len(),
+                    },
+                ),
+            ));
+        }
+        let mut expected_name = None;
+        for declaration in declarations {
+            let header = self.preplan_function_header(
+                *declaration,
+                is_external_module,
+                is_declaration_file,
+            )?;
+            if !matches!(
+                header.modifier_mode,
+                PlannedFunctionModifierMode::Declare(_)
+            ) || expected_name
+                .as_ref()
+                .is_some_and(|name: &String| name != &header.name_text)
+                || self.bound.symbol(*declaration) != Some(owner)
+            {
+                return Err(SourceCheckError::Unsupported(
+                    UnsupportedSourceSyntax::Function(
+                        SourceFunctionUnsupported::NonUniqueDeclaration {
+                            node: *declaration,
+                            symbol: owner,
+                            declaration_count: declarations.len(),
+                        },
+                    ),
+                ));
+            }
+            expected_name.get_or_insert(header.name_text);
+        }
+        let plan = plan_source_ambient_overload_group(
+            store,
+            host,
+            owner,
+            declarations,
+            self.array_targets,
+        )
+        .map_err(|error| Self::overload_plan_error(first, error))?;
+        if !self.hoisted_functions.insert(owner) {
+            return Err(SourceCheckError::Function(
+                SourceFunctionInvariant::DuplicateDeclaration(first),
+            ));
+        }
+        Ok(plan)
     }
 
     fn validate_named_type_modifiers(
@@ -8497,6 +8706,78 @@ struct MaterializedSourceCallable {
     signature: SignatureId,
 }
 
+#[allow(clippy::too_many_arguments)]
+fn materialize_source_overloads(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    overloads: &[SourceOverloadPlan],
+) -> Result<Vec<MaterializedSourceOverload>, SourceCheckError> {
+    let Some(batch_fallback) = overloads
+        .first()
+        .and_then(|overload| overload.declarations.first())
+        .map(|plan| plan.declaration)
+    else {
+        return Ok(Vec::new());
+    };
+    let mut prepared = Vec::with_capacity(overloads.len());
+    for overload in overloads {
+        let fallback = overload
+            .declarations
+            .first()
+            .map_or(batch_fallback, |plan| plan.declaration);
+        let mut resolved = Vec::with_capacity(overload.declarations.len());
+        for declaration in &overload.declarations {
+            let mut parameter_types = Vec::with_capacity(declaration.parameters.len());
+            for parameter in &declaration.parameters {
+                session.reset_query();
+                let mut annotation_diagnostics = CanonicalCheckerDiagnostics::default();
+                let result = CanonicalTypeQuery::new_with_global_types_and_session(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    session,
+                    &mut annotation_diagnostics,
+                )?
+                .get_type_from_type_node(parameter.type_node);
+                merge_retry_diagnostics(diagnostics, annotation_diagnostics);
+                parameter_types.push(result?);
+            }
+            let return_node = declaration.return_type.type_node().ok_or(
+                SourceCheckError::Function(SourceFunctionInvariant::Callable(
+                    declaration.declaration,
+                )),
+            )?;
+            session.reset_query();
+            let mut return_diagnostics = CanonicalCheckerDiagnostics::default();
+            let return_type = CanonicalTypeQuery::new_with_global_types_and_session(
+                store,
+                host,
+                global_types,
+                options,
+                session,
+                &mut return_diagnostics,
+            )?
+            .get_type_from_type_node(return_node);
+            merge_retry_diagnostics(diagnostics, return_diagnostics);
+            resolved.push(ResolvedSourceOverloadSignature {
+                parameter_types,
+                return_type: return_type?,
+            });
+        }
+        prepared.push(
+            prepare_source_overload_publication(store, global_types, overload, &resolved)
+                .map_err(|error| SourcePlanner::overload_plan_error(fallback, error))?,
+        );
+    }
+    publish_source_overload_batch(store, overloads, &prepared)
+        .map_err(|error| SourcePlanner::overload_plan_error(batch_fallback, error))
+}
+
 #[allow(clippy::too_many_arguments)] // Keeps callable source capabilities explicit.
 fn materialize_checked_source_callable(
     store: &mut CanonicalTypeMapperStore,
@@ -8991,6 +9272,7 @@ pub(super) fn check_source_file(
         type_import_references,
         type_import_value_uses,
         ambient_variables,
+        overloads,
         functions,
         arrows,
         contextual_arrows,
@@ -9118,6 +9400,48 @@ pub(super) fn check_source_file(
         )?
         .preflight_type_from_type_node(variable.type_node)?;
     }
+    for function in &functions {
+        session.reset_query();
+        CanonicalTypeQuery::new_with_global_types_and_session(
+            store,
+            host,
+            global_types,
+            options,
+            session,
+            &mut type_import_preflight_diagnostics,
+        )?
+        .preflight_type_of_source_callable(
+            function.callable.declaration,
+            function.callable.owner_symbol,
+        )?;
+    }
+    for arrow in &arrows {
+        session.reset_query();
+        CanonicalTypeQuery::new_with_global_types_and_session(
+            store,
+            host,
+            global_types,
+            options,
+            session,
+            &mut type_import_preflight_diagnostics,
+        )?
+        .preflight_type_of_source_callable(
+            arrow.source.callable.declaration,
+            arrow.source.callable.owner_symbol,
+        )?;
+    }
+    for arrow in &contextual_arrows {
+        session.reset_query();
+        CanonicalTypeQuery::new_with_global_types_and_session(
+            store,
+            host,
+            global_types,
+            options,
+            session,
+            &mut type_import_preflight_diagnostics,
+        )?
+        .preflight_type_from_type_node(arrow.source.contextual_type.type_node)?;
+    }
     debug_assert!(type_import_preflight_diagnostics.is_empty());
 
     let mut preflighted_type_import_value_uses = HashMap::new();
@@ -9225,6 +9549,38 @@ pub(super) fn check_source_file(
             return Err(SourceCheckError::Import(read.node));
         }
         prepared_imports.push(prepared);
+    }
+
+    let materialized_overloads = materialize_source_overloads(
+        store,
+        host,
+        global_types,
+        options,
+        session,
+        diagnostics,
+        &overloads,
+    )?;
+    if materialized_overloads.len() != overloads.len() {
+        return Err(SourceCheckError::Function(
+            SourceFunctionInvariant::Callable(source.node_ref()),
+        ));
+    }
+    for (overload, materialized) in overloads.iter().zip(&materialized_overloads) {
+        let fallback = overload
+            .declarations
+            .first()
+            .map_or(source.node_ref(), |declaration| declaration.declaration);
+        if materialized.signatures.len() != overload.declarations.len()
+            || store.source_overload_type_for_owner(overload.owner_symbol)
+                != Some(materialized.type_)
+            || current_flow_types
+                .insert(overload.owner_symbol, materialized.type_)
+                .is_some()
+        {
+            return Err(SourceCheckError::Function(
+                SourceFunctionInvariant::Callable(fallback),
+            ));
+        }
     }
 
     let mut materialized_functions = Vec::with_capacity(functions.len());
@@ -9349,7 +9705,8 @@ pub(super) fn check_source_file(
             }
             PlannedStatement::ExternalModuleMarker
             | PlannedStatement::NamedReexport
-            | PlannedStatement::AmbientVariables => {}
+            | PlannedStatement::AmbientVariables
+            | PlannedStatement::AmbientOverload => {}
             PlannedStatement::Function(index) => {
                 let function = functions.get(index).ok_or(SourceCheckError::Function(
                     SourceFunctionInvariant::InvalidStatementIndex(index),

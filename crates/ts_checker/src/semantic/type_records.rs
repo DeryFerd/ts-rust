@@ -658,6 +658,7 @@ pub type CanonicalSemanticStore<MapperPayload> = SemanticStore<TypeRecord, Mappe
 impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
     pub(super) fn type_is_exact_callable_object(&self, type_: TypeId) -> bool {
         self.source_callable_provenance(type_).is_some()
+            || self.source_overload_provenance(type_).is_some()
             || self.type_has_declared_call_set_provenance(type_)
             || self.type_payload(type_)
             .and_then(TypeRecord::symbol)
