@@ -21,9 +21,9 @@ use ts_binder::SemanticSymbolId;
 /// Pinned checker limits for one instantiation query.
 ///
 /// `max_depth` and `max_count` correspond to upstream's depth 100 and
-/// per-expression count 5,000,000 guards. The Rust leaf returns a typed error
-/// because publishing the checker error identity and TS2589 diagnostic belongs
-/// to the eventual query context.
+/// per-expression count 5,000,000 guards. Standalone callers fail with a typed
+/// error; a checker-owned recovering session substitutes its validated error
+/// type and records the event for the eventual TS2589 diagnostic owner.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[allow(dead_code)] // Installed ahead of the generic call/signature consumer.
 pub(super) struct InstantiationLimits {
@@ -45,6 +45,7 @@ impl Default for InstantiationLimits {
 #[allow(dead_code)] // Installed ahead of the generic call/signature consumer.
 pub(super) enum InstantiationError {
     InvalidType(TypeId),
+    InvalidRecoveryType(TypeId),
     InvalidMapper(TypeMapperId),
     InvalidAlias(TypeAliasId),
     DepthLimit {
@@ -71,6 +72,12 @@ impl std::fmt::Display for InstantiationError {
         match self {
             Self::InvalidType(type_) => {
                 write!(formatter, "cannot instantiate invalid type {type_:?}")
+            }
+            Self::InvalidRecoveryType(type_) => {
+                write!(
+                    formatter,
+                    "cannot recover instantiation with foreign type {type_:?}"
+                )
             }
             Self::InvalidMapper(mapper) => {
                 write!(
@@ -171,6 +178,21 @@ struct ActiveMapperFrame {
     cache: HashMap<InstantiationCacheKey, TypeId>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InstantiationLimitPolicy {
+    FailFast,
+    Recover { error_type: TypeId },
+}
+
+/// A point in the session's monotonic limit-event sequence.
+///
+/// Source-call checking records a mark before resolution and compares it after
+/// resolution to decide whether that call owns a TS2589 diagnostic. A mark is
+/// meaningful only when passed back to the same session that created it.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[allow(dead_code)] // Installed ahead of the source-call diagnostic owner.
+pub(super) struct InstantiationLimitEventMark(u64);
+
 /// Checker-query-owned instantiation accounting and recursive mapper cache.
 ///
 /// The per-query count is intentionally not reset by each instantiation call:
@@ -181,6 +203,8 @@ struct ActiveMapperFrame {
 #[allow(dead_code)] // Installed ahead of the source-element query owner.
 pub(super) struct InstantiationSession {
     limits: InstantiationLimits,
+    limit_policy: InstantiationLimitPolicy,
+    limit_event_generation: u64,
     depth: usize,
     count: usize,
     total_count: usize,
@@ -188,14 +212,40 @@ pub(super) struct InstantiationSession {
 }
 
 impl InstantiationSession {
+    /// Creates the compatibility policy used by standalone instantiation:
+    /// limits fail immediately with a typed error.
     pub(super) fn new(limits: InstantiationLimits) -> Self {
         Self {
             limits,
+            limit_policy: InstantiationLimitPolicy::FailFast,
+            limit_event_generation: 0,
             depth: 0,
             count: 0,
             total_count: 0,
             active_mappers: Vec::new(),
         }
+    }
+
+    /// Creates a production policy that substitutes a store-owned canonical
+    /// error type at the recursive boundary where a limit is reached.
+    #[allow(dead_code)] // Installed ahead of the production checker-session owner.
+    pub(super) fn new_recovering(
+        store: &CanonicalTypeMapperStore,
+        limits: InstantiationLimits,
+        error_type: TypeId,
+    ) -> Result<Self, InstantiationError> {
+        if store.type_payload(error_type).is_none() {
+            return Err(InstantiationError::InvalidRecoveryType(error_type));
+        }
+        Ok(Self {
+            limits,
+            limit_policy: InstantiationLimitPolicy::Recover { error_type },
+            limit_event_generation: 0,
+            depth: 0,
+            count: 0,
+            total_count: 0,
+            active_mappers: Vec::new(),
+        })
     }
 
     /// Starts the next source-element or expression query. Pinned query
@@ -216,8 +266,34 @@ impl InstantiationSession {
         }
     }
 
+    /// Records the current monotonic limit-event generation.
+    #[allow(dead_code)] // Read by the future source-call diagnostic owner.
+    pub(super) const fn limit_event_mark(&self) -> InstantiationLimitEventMark {
+        InstantiationLimitEventMark(self.limit_event_generation)
+    }
+
+    /// Whether a depth or count limit was reached after `mark`.
+    #[allow(dead_code)] // Read by the future source-call diagnostic owner.
+    pub(super) const fn limit_event_occurred_since(
+        &self,
+        mark: InstantiationLimitEventMark,
+    ) -> bool {
+        self.limit_event_generation > mark.0
+    }
+
+    fn handle_limit(&mut self, error: InstantiationError) -> Result<TypeId, InstantiationError> {
+        self.limit_event_generation = self
+            .limit_event_generation
+            .checked_add(1)
+            .expect("instantiation limit-event generation overflowed");
+        match self.limit_policy {
+            InstantiationLimitPolicy::FailFast => Err(error),
+            InstantiationLimitPolicy::Recover { error_type } => Ok(error_type),
+        }
+    }
+
     #[cfg(test)]
-    const fn query_count(&self) -> usize {
+    pub(super) const fn query_count(&self) -> usize {
         self.count
     }
 
@@ -280,6 +356,7 @@ pub(super) fn instantiate_type_with_session(
 /// the owning signature cache is ready to commit. Keeping this representation
 /// borrowed makes that resolution phase independent of mapper/signature cache
 /// publication while preserving the pinned mapper's first-match behavior.
+#[allow(dead_code)] // Retained for non-query callers and focused mapper tests.
 pub(super) fn instantiate_type_with_vector(
     store: &mut CanonicalTypeMapperStore,
     type_: TypeId,
@@ -290,6 +367,7 @@ pub(super) fn instantiate_type_with_vector(
 }
 
 /// Vector instantiation with retained canonical `Array` targets.
+#[allow(dead_code)] // Retained for non-query callers and focused mapper tests.
 pub(super) fn instantiate_type_with_vector_and_array_targets(
     store: &mut CanonicalTypeMapperStore,
     type_: TypeId,
@@ -313,6 +391,31 @@ fn instantiate_type_with_vector_and_optional_array_targets(
     targets: &[TypeId],
     array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<TypeId, InstantiationError> {
+    let mut session = InstantiationSession::new(InstantiationLimits::default());
+    instantiate_type_with_vector_and_session(
+        store,
+        type_,
+        sources,
+        targets,
+        array_targets,
+        &mut session,
+    )
+}
+
+/// Instantiates through a borrowed vector inside an existing checker query.
+///
+/// The caller owns the [`InstantiationSession::reset_query`] boundary. Alias
+/// instantiation remains private until its owning cache and symbol paths are
+/// dependency-closed.
+#[allow(dead_code)] // Installed ahead of the lazy generic-call consumer.
+pub(super) fn instantiate_type_with_vector_and_session(
+    store: &mut CanonicalTypeMapperStore,
+    type_: TypeId,
+    sources: &[TypeId],
+    targets: &[TypeId],
+    array_targets: Option<CanonicalArrayTargets>,
+    session: &mut InstantiationSession,
+) -> Result<TypeId, InstantiationError> {
     if sources.len() != targets.len() {
         return Err(InstantiationError::InvalidType(type_));
     }
@@ -321,14 +424,13 @@ fn instantiate_type_with_vector_and_optional_array_targets(
             return Err(InstantiationError::InvalidType(*endpoint));
         }
     }
-    let mut session = InstantiationSession::new(InstantiationLimits::default());
     instantiate_type_with_alias(
         store,
         type_,
         InstantiationMapping::Vector { sources, targets },
         array_targets,
         None,
-        &mut session,
+        session,
     )
 }
 
@@ -367,13 +469,13 @@ fn instantiate_type_with_alias(
         return Ok(type_);
     }
     if session.depth == session.limits.max_depth {
-        return Err(InstantiationError::DepthLimit {
+        return session.handle_limit(InstantiationError::DepthLimit {
             depth: session.depth,
             limit: session.limits.max_depth,
         });
     }
     if session.count >= session.limits.max_count {
-        return Err(InstantiationError::CountLimit {
+        return session.handle_limit(InstantiationError::CountLimit {
             count: session.count,
             limit: session.limits.max_count,
         });
@@ -735,8 +837,8 @@ pub(super) fn canonical_anonymous_union(
 mod tests {
     use super::*;
     use crate::semantic::{
-        IntrinsicBootstrapOptions, SemanticStore, mapper::TypeMapper, type_records::TypeRecord,
-        types::ObjectFlags,
+        DeclaredTypeLinks, IntrinsicBootstrapOptions, SemanticStore, declared::type_list_key,
+        mapper::TypeMapper, type_records::TypeRecord, types::ObjectFlags,
     };
     use ts_binder::{EscapedName, SymbolData, SymbolFlags};
 
@@ -746,6 +848,48 @@ mod tests {
             .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions::default())
             .unwrap();
         store
+    }
+
+    fn canonical_array_target(store: &mut CanonicalTypeMapperStore, name: &str) -> TypeId {
+        let symbol = store
+            .alloc_symbol(SymbolData::new(
+                SymbolFlags::INTERFACE,
+                EscapedName::source(name),
+            ))
+            .unwrap();
+        let parameter_symbol = store
+            .alloc_symbol(SymbolData::new(
+                SymbolFlags::TYPE_PARAMETER,
+                EscapedName::source("T"),
+            ))
+            .unwrap();
+        let parameter = store.alloc_type_parameter(Some(parameter_symbol)).unwrap();
+        assert!(store.set_declared_type_links(
+            parameter_symbol,
+            DeclaredTypeLinks {
+                declared_type: Some(parameter),
+                ..DeclaredTypeLinks::default()
+            },
+        ));
+        let target = store
+            .alloc_interface_type(ObjectFlags::INTERFACE, Some(symbol))
+            .unwrap();
+        let this_type = store.alloc_type_parameter(Some(symbol)).unwrap();
+        assert!(store.initialize_interface_type_parameters(
+            target,
+            vec![parameter, this_type],
+            0,
+            this_type,
+            type_list_key(&[parameter]),
+        ));
+        target
+    }
+
+    fn canonical_array_targets(store: &mut CanonicalTypeMapperStore) -> CanonicalArrayTargets {
+        CanonicalArrayTargets::for_test(
+            canonical_array_target(store, "Array"),
+            canonical_array_target(store, "ReadonlyArray"),
+        )
     }
 
     #[test]
@@ -878,6 +1022,96 @@ mod tests {
     }
 
     #[test]
+    fn limit_guard_precedes_an_active_mapper_cache_hit() {
+        let mut store = initialized_store();
+        let number = store.intrinsic_bootstrap().unwrap().number_type;
+        let parameter = store.alloc_type_parameter(None).unwrap();
+        let mapper = store.new_simple_type_mapper(parameter, number).unwrap();
+        let key = InstantiationCacheKey {
+            type_: parameter,
+            alias: InstantiationAliasCacheKey::None,
+        };
+        let mut session = InstantiationSession::new(InstantiationLimits {
+            max_depth: 10,
+            max_count: 5,
+        });
+        session.count = 4;
+        session.total_count = 9;
+        session.active_mappers.push(ActiveMapperFrame {
+            mapping: InstantiationMappingIdentity::Stored(mapper),
+            cache: HashMap::from([(key.clone(), number)]),
+        });
+
+        let before_hit = session.limit_event_mark();
+        assert_eq!(
+            instantiate_type_with_session(&mut store, parameter, mapper, None, &mut session),
+            Ok(number),
+        );
+        assert_eq!(session.query_count(), 4);
+        assert_eq!(session.total_count(), 9);
+        assert!(!session.limit_event_occurred_since(before_hit));
+
+        session.count = 5;
+        let before_first_limit = session.limit_event_mark();
+        assert_eq!(
+            instantiate_type_with_session(&mut store, parameter, mapper, None, &mut session),
+            Err(InstantiationError::CountLimit { count: 5, limit: 5 }),
+        );
+        assert!(session.limit_event_occurred_since(before_first_limit));
+        assert_eq!(session.query_count(), 5);
+        assert_eq!(session.total_count(), 9);
+        assert_eq!(session.active_mappers[0].cache.get(&key), Some(&number));
+
+        let before_second_limit = session.limit_event_mark();
+        assert_eq!(
+            instantiate_type_with_session(&mut store, parameter, mapper, None, &mut session),
+            Err(InstantiationError::CountLimit { count: 5, limit: 5 }),
+        );
+        assert!(
+            session.limit_event_occurred_since(before_second_limit),
+            "each limit event must advance the session's monotonic marker",
+        );
+        assert_eq!(session.query_count(), 5);
+        assert_eq!(session.total_count(), 9);
+    }
+
+    #[test]
+    fn recovering_guard_does_not_cache_the_directly_guarded_key() {
+        let mut store = initialized_store();
+        let (number, error_type) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (bootstrap.number_type, bootstrap.error_type)
+        };
+        let parameter = store.alloc_type_parameter(None).unwrap();
+        let mapper = store.new_simple_type_mapper(parameter, number).unwrap();
+        let mut session = InstantiationSession::new_recovering(
+            &store,
+            InstantiationLimits {
+                max_depth: 10,
+                max_count: 0,
+            },
+            error_type,
+        )
+        .unwrap();
+        session.active_mappers.push(ActiveMapperFrame {
+            mapping: InstantiationMappingIdentity::Stored(mapper),
+            cache: HashMap::new(),
+        });
+
+        assert_eq!(
+            instantiate_type_with_session(&mut store, parameter, mapper, None, &mut session),
+            Ok(error_type),
+        );
+        assert_eq!(session.query_count(), 0);
+        assert_eq!(session.total_count(), 0);
+        assert_eq!(session.active_mappers.len(), 1);
+        assert!(
+            session.active_mappers[0].cache.is_empty(),
+            "a recovered guard returns before the directly guarded cache key is located",
+        );
+    }
+
+    #[test]
     fn session_count_resets_only_at_the_explicit_query_boundary() {
         let mut store = initialized_store();
         let number = store.intrinsic_bootstrap().unwrap().number_type;
@@ -923,21 +1157,96 @@ mod tests {
         let mut session = InstantiationSession::new(InstantiationLimits::default());
         session.depth = 3;
         session.count = 7;
+        session.total_count = 11;
+        session.limit_event_generation = 13;
         session.active_mappers.push(ActiveMapperFrame {
             mapping: InstantiationMappingIdentity::Stored(mapper),
             cache,
         });
+        let limit_mark = session.limit_event_mark();
 
         session.reset_query();
         assert_eq!(session.depth, 3);
         assert_eq!(session.query_count(), 0);
+        assert_eq!(session.total_count(), 11);
+        assert_eq!(session.limit_event_mark(), limit_mark);
         assert_eq!(session.active_mappers.len(), 1);
         assert_eq!(session.active_mappers[0].cache.get(&key), Some(&number));
 
         session.clear_active_mapper_caches();
         assert_eq!(session.depth, 3);
+        assert_eq!(session.query_count(), 0);
+        assert_eq!(session.total_count(), 11);
+        assert_eq!(session.limit_event_mark(), limit_mark);
         assert_eq!(session.active_mappers.len(), 1);
         assert!(session.active_mappers[0].cache.is_empty());
+    }
+
+    #[test]
+    fn recovering_limits_retain_the_outer_array_wrapper() {
+        let mut store = initialized_store();
+        let (number, error_type) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (bootstrap.number_type, bootstrap.error_type)
+        };
+        let targets = canonical_array_targets(&mut store);
+        let parameter = store.alloc_type_parameter(None).unwrap();
+        let source = store
+            .create_canonical_array_type_with_targets(targets, parameter, false)
+            .unwrap();
+        let mapper = store.new_simple_type_mapper(parameter, number).unwrap();
+
+        for limits in [
+            InstantiationLimits {
+                max_depth: 1,
+                max_count: 10,
+            },
+            InstantiationLimits {
+                max_depth: 10,
+                max_count: 1,
+            },
+        ] {
+            let mut session =
+                InstantiationSession::new_recovering(&store, limits, error_type).unwrap();
+            let mark = session.limit_event_mark();
+            let result = instantiate_type_with_session(
+                &mut store,
+                source,
+                mapper,
+                Some(targets),
+                &mut session,
+            )
+            .unwrap();
+
+            let recovered = store
+                .canonical_array_reference_with_targets(targets, result)
+                .unwrap()
+                .expect("recovery at the recursive element must retain Array<_>");
+            assert_eq!(recovered.element_type, error_type);
+            assert!(!recovered.readonly);
+            assert_eq!(session.query_count(), 1);
+            assert_eq!(session.total_count(), 1);
+            assert_eq!(session.depth, 0);
+            assert!(session.active_mappers.is_empty());
+            assert!(session.limit_event_occurred_since(mark));
+        }
+    }
+
+    #[test]
+    fn recovering_session_rejects_a_foreign_error_type() {
+        let store = initialized_store();
+        let foreign = initialized_store();
+        let foreign_error = foreign.intrinsic_bootstrap().unwrap().error_type;
+
+        assert_eq!(
+            InstantiationSession::new_recovering(
+                &store,
+                InstantiationLimits::default(),
+                foreign_error,
+            )
+            .unwrap_err(),
+            InstantiationError::InvalidRecoveryType(foreign_error),
+        );
     }
 
     #[test]
@@ -1070,6 +1379,65 @@ mod tests {
     }
 
     #[test]
+    fn vector_instantiation_can_share_one_checker_query_session() {
+        let mut store = initialized_store();
+        let (string, number) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (bootstrap.string_type, bootstrap.number_type)
+        };
+        let first = store.alloc_type_parameter(None).unwrap();
+        let second = store.alloc_type_parameter(None).unwrap();
+        let sources = [first, second];
+        let targets = [string, number];
+        let mut session = InstantiationSession::new(InstantiationLimits {
+            max_depth: 10,
+            max_count: 1,
+        });
+
+        assert_eq!(
+            instantiate_type_with_vector_and_session(
+                &mut store,
+                first,
+                &sources,
+                &targets,
+                None,
+                &mut session,
+            ),
+            Ok(string),
+        );
+        assert_eq!(session.query_count(), 1);
+        assert_eq!(session.total_count(), 1);
+        assert_eq!(
+            instantiate_type_with_vector_and_session(
+                &mut store,
+                second,
+                &sources,
+                &targets,
+                None,
+                &mut session,
+            ),
+            Err(InstantiationError::CountLimit { count: 1, limit: 1 }),
+        );
+        assert_eq!(session.query_count(), 1);
+        assert_eq!(session.total_count(), 1);
+
+        session.reset_query();
+        assert_eq!(
+            instantiate_type_with_vector_and_session(
+                &mut store,
+                second,
+                &sources,
+                &targets,
+                None,
+                &mut session,
+            ),
+            Ok(number),
+        );
+        assert_eq!(session.query_count(), 1);
+        assert_eq!(session.total_count(), 2);
+    }
+
+    #[test]
     fn unchanged_generic_union_fails_closed_without_identity_validator() {
         let mut store = initialized_store();
         let string = store.intrinsic_bootstrap().unwrap().string_type;
@@ -1100,22 +1468,33 @@ mod tests {
             max_depth: 0,
             max_count: 0,
         };
+        let mut session = InstantiationSession::new(limits);
+        let mark = session.limit_event_mark();
         assert_eq!(
-            instantiate_type_with_limits(&mut store, string, mapper, limits),
-            Ok(string)
+            instantiate_type_with_session(&mut store, string, mapper, None, &mut session),
+            Ok(string),
         );
+        assert_eq!(session.query_count(), 0);
+        assert_eq!(session.total_count(), 0);
+        assert!(!session.limit_event_occurred_since(mark));
 
         let union = store
             .alloc_union_type(ObjectFlags::NONE, vec![string, number])
             .unwrap();
         assert_eq!(
-            instantiate_type_with_limits(&mut store, union, mapper, limits),
-            Ok(union)
+            instantiate_type_with_session(&mut store, union, mapper, None, &mut session),
+            Ok(union),
         );
+        assert_eq!(session.query_count(), 0);
+        assert_eq!(session.total_count(), 0);
+        assert!(!session.limit_event_occurred_since(mark));
         assert_eq!(
-            instantiate_type_with_limits(&mut store, parameter, mapper, limits),
-            Err(InstantiationError::DepthLimit { depth: 0, limit: 0 })
+            instantiate_type_with_session(&mut store, parameter, mapper, None, &mut session),
+            Err(InstantiationError::DepthLimit { depth: 0, limit: 0 }),
         );
+        assert_eq!(session.query_count(), 0);
+        assert_eq!(session.total_count(), 0);
+        assert!(session.limit_event_occurred_since(mark));
     }
 
     #[test]
