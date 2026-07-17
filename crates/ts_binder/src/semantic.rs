@@ -630,6 +630,37 @@ impl SymbolStore {
         true
     }
 
+    /// Retains the checker-observed `readonly` modifier on one bound,
+    /// property-only source symbol.
+    ///
+    /// Ordinary checker flags remain restricted to transient symbols. This
+    /// narrow exception lets later store-only relation queries distinguish
+    /// source property mutability without retaining an AST host.
+    pub fn set_source_property_readonly(
+        &mut self,
+        symbol: SemanticSymbolId,
+        readonly: bool,
+    ) -> bool {
+        if !self.contains_symbol(symbol) || self.checker_created_symbols[symbol.index()] {
+            return false;
+        }
+        let record = &self.symbols[symbol.index()];
+        let allowed_flags = SymbolFlags::PROPERTY | SymbolFlags::OPTIONAL;
+        if !record.flags.contains(SymbolFlags::PROPERTY)
+            || record.flags.without(allowed_flags) != SymbolFlags::NONE
+            || (record.check_flags != CheckFlags::NONE
+                && record.check_flags != CheckFlags::READONLY)
+        {
+            return false;
+        }
+        self.symbols[symbol.index()].check_flags = if readonly {
+            CheckFlags::READONLY
+        } else {
+            CheckFlags::NONE
+        };
+        true
+    }
+
     /// Atomically replaces declaration provenance after validating all nodes.
     pub fn set_symbol_declarations(
         &mut self,
@@ -985,12 +1016,20 @@ mod tests {
         let bound_before = store.symbol(bound).unwrap().clone();
         assert!(!store.set_symbol_flags(bound, SymbolFlags::PROPERTY, CheckFlags::LATE));
         assert_eq!(store.symbol(bound), Some(&bound_before));
+        assert!(store.set_source_property_readonly(bound, true));
+        assert_eq!(
+            store.symbol(bound).unwrap().check_flags(),
+            CheckFlags::READONLY
+        );
+        assert!(store.set_source_property_readonly(bound, false));
+        assert_eq!(store.symbol(bound), Some(&bound_before));
 
         let transient = store.alloc_transient_symbol(
             SymbolFlags::PROPERTY,
             EscapedName::source("late"),
             CheckFlags::LATE,
         );
+        assert!(!store.set_source_property_readonly(transient, true));
         assert!(store.set_symbol_flags(transient, SymbolFlags::PROPERTY, CheckFlags::LATE));
         let late = store.symbol(transient).unwrap();
         assert!(!late.flags().contains(SymbolFlags::TRANSIENT));

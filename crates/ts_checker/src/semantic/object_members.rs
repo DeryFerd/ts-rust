@@ -55,9 +55,16 @@ pub(super) struct PlannedProperty {
     pub name_node: NodeRef,
     pub type_node: NodeRef,
     pub optional: bool,
-    #[allow(dead_code)] // Retained for the next readonly-property diagnostic slice.
     pub readonly: bool,
     pub name: String,
+}
+
+const fn source_property_check_flags(readonly: bool) -> CheckFlags {
+    if readonly {
+        CheckFlags::READONLY
+    } else {
+        CheckFlags::NONE
+    }
 }
 
 /// One exact source-declared index signature admitted by the first A11 cut.
@@ -1209,8 +1216,10 @@ fn plan_members(
             } else {
                 SymbolFlags::NONE
             };
+        let expected_check_flags = source_property_check_flags(readonly);
         if property_record.flags() != expected_flags
-            || property_record.check_flags() != CheckFlags::NONE
+            || (property_record.check_flags() != CheckFlags::NONE
+                && property_record.check_flags() != expected_check_flags)
             || property_record.name().as_utf8() != Some(identifier.text.as_str())
             || property_record.declarations() != Some(&[member])
             || property_record.value_declaration() != Some(member)
@@ -1889,7 +1898,9 @@ pub(super) fn prepare_direct_interface_declared_properties(
             .iter()
             .zip(property_types)
             .all(|(property, type_)| {
-                store.value_symbol_links(property.symbol)
+                store.symbol(property.symbol).is_some_and(|record| {
+                    record.check_flags() == source_property_check_flags(property.readonly)
+                }) && store.value_symbol_links(property.symbol)
                     == Some(&ValueSymbolLinks {
                         resolved_type: Some(*type_),
                         ..ValueSymbolLinks::default()
@@ -1924,6 +1935,10 @@ pub(super) fn publish_prepared_direct_interface_declared_properties(
         return;
     }
     for (property, property_type) in plan.properties.iter().zip(property_types) {
+        assert!(
+            store.set_source_property_readonly(property.symbol, property.readonly),
+            "the direct-interface plan validated a bound source property"
+        );
         assert!(store.set_value_symbol_links(
             property.symbol,
             ValueSymbolLinks {
@@ -2670,7 +2685,7 @@ fn validate_declared_property_members(
         let allowed_flags = SymbolFlags::PROPERTY | SymbolFlags::OPTIONAL;
         if !property_record.flags().contains(SymbolFlags::PROPERTY)
             || property_record.flags().without(allowed_flags) != SymbolFlags::NONE
-            || property_record.check_flags() != CheckFlags::NONE
+            || property_record.check_flags().bits() & !CheckFlags::READONLY.bits() != 0
             || property_record.name().is_reserved_member_name()
             || property_record.name().is_private_identifier()
             || property_record.name().is_late_bound()
@@ -3038,7 +3053,10 @@ fn valid_object_literal_property(
 
 fn unresolved_property_links(store: &CanonicalTypeMapperStore, plan: &PropertyObjectPlan) -> bool {
     plan.properties.iter().all(|property| {
-        store
+        store.symbol(property.symbol).is_some_and(|record| {
+            let expected = source_property_check_flags(property.readonly);
+            record.check_flags() == CheckFlags::NONE || record.check_flags() == expected
+        }) && store
             .value_symbol_links(property.symbol)
             .is_none_or(|links| links == &ValueSymbolLinks::default())
     }) && plan.call_signatures.iter().all(|signature| {
@@ -3055,7 +3073,9 @@ fn unresolved_property_links(store: &CanonicalTypeMapperStore, plan: &PropertyOb
 
 fn resolved_property_links(store: &CanonicalTypeMapperStore, plan: &PropertyObjectPlan) -> bool {
     plan.properties.iter().all(|property| {
-        store
+        store.symbol(property.symbol).is_some_and(|record| {
+            record.check_flags() == source_property_check_flags(property.readonly)
+        }) && store
             .value_symbol_links(property.symbol)
             .is_some_and(|links| {
                 let expected = ValueSymbolLinks {
@@ -3176,7 +3196,9 @@ pub(super) fn validate_resolved_property_types(
                 .iter()
                 .zip(property_types)
                 .all(|(property, type_)| {
-                    store
+                    store.symbol(property.symbol).is_some_and(|record| {
+                        record.check_flags() == source_property_check_flags(property.readonly)
+                    }) && store
                         .value_symbol_links(property.symbol)
                         .and_then(|links| links.resolved_type)
                         == Some(*type_)
@@ -3435,6 +3457,10 @@ pub(super) fn publish_declared_members(
     // All fallible checks precede publication.  The store setters below can
     // only reject foreign identities, all of which were validated above.
     for (property, property_type) in plan.properties.iter().zip(property_types) {
+        assert!(
+            store.set_source_property_readonly(property.symbol, property.readonly),
+            "the declared-member plan validated a bound source property"
+        );
         let links = ValueSymbolLinks {
             resolved_type: Some(*property_type),
             ..ValueSymbolLinks::default()

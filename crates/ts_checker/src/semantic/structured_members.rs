@@ -286,7 +286,18 @@ pub(super) fn validate_planned_interface_heritage_members(
         .iter()
         .map(|property| property.symbol)
         .collect::<Vec<_>>();
-    surface.owner == plan.symbol && surface.declared_properties == planned_properties
+    surface.owner == plan.symbol
+        && surface.declared_properties == planned_properties
+        && plan.properties.iter().all(|property| {
+            store.symbol(property.symbol).is_some_and(|record| {
+                record.check_flags()
+                    == if property.readonly {
+                        CheckFlags::READONLY
+                    } else {
+                        CheckFlags::NONE
+                    }
+            })
+        })
 }
 
 /// Semantic-only exact proof consumed by structural relations.
@@ -506,7 +517,7 @@ fn valid_property_symbol(store: &CanonicalTypeMapperStore, property: SemanticSym
             SymbolFlags::NONE
         };
     record.flags() == expected_flags
-        && record.check_flags() == CheckFlags::NONE
+        && record.check_flags().bits() & !CheckFlags::READONLY.bits() == 0
         && record.value_declaration() == Some(declaration)
         && record.members().is_none()
         && record.exports().is_none()

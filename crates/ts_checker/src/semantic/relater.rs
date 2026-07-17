@@ -874,7 +874,7 @@ impl<'store> RelaterSession<'store> {
             // a merge, so proof-only invariants belong inside this branch.
             if record.flags() == SymbolFlags::PROPERTY {
                 if self.store.get_merged_symbol(member) != Some(member)
-                    || record.check_flags() != CheckFlags::NONE
+                    || record.check_flags().bits() & !CheckFlags::READONLY.bits() != 0
                     || record.members().is_some()
                     || record.exports().is_some()
                     || record.export_symbol().is_some()
@@ -2255,12 +2255,25 @@ impl<'store> RelaterSession<'store> {
         target_property: SemanticSymbolId,
         target_origin: ObjectPropertyOrigin,
     ) -> Result<Ternary, RelationUnavailable> {
-        let source_flags = self
-            .property_symbol(source_property, source_origin)?
-            .flags();
-        let target_flags = self
-            .property_symbol(target_property, target_origin)?
-            .flags();
+        let (source_flags, source_readonly) = {
+            let source = self.property_symbol(source_property, source_origin)?;
+            (
+                source.flags(),
+                source.check_flags().contains(CheckFlags::READONLY),
+            )
+        };
+        let (target_flags, target_readonly) = {
+            let target = self.property_symbol(target_property, target_origin)?;
+            (
+                target.flags(),
+                target.check_flags().contains(CheckFlags::READONLY),
+            )
+        };
+        // Pinned `propertyRelatedTo`: readonly affects only strict subtype
+        // ordering. Ordinary assignability remains intentionally symmetric.
+        if self.relation == RelationKind::StrictSubtype && source_readonly && !target_readonly {
+            return Ok(Ternary::False);
+        }
         let source_type = self.property_type(source_property)?;
         let target_type = self.property_type(target_property)?;
         let source_types = self.effective_property_types(
@@ -7468,6 +7481,89 @@ mod tests {
             "Comparable still performs fresh excess-property checks"
         );
         assert!(store.relation_cache_size(RelationKind::Comparable) >= 4);
+    }
+
+    #[test]
+    fn readonly_property_ordering_is_strict_subtype_only_and_cache_observed() {
+        let mut store = initialized(true);
+        let string = store.intrinsic_bootstrap().unwrap().string_type;
+        let readonly_property = alloc_typed_property(&mut store, "value", string, false);
+        assert!(store.set_source_property_readonly(readonly_property, true));
+        let readonly = alloc_property_object(&mut store, vec![readonly_property]);
+        let mutable_property = alloc_typed_property(&mut store, "value", string, false);
+        let mutable = alloc_property_object(&mut store, vec![mutable_property]);
+
+        assert_eq!(store.is_type_assignable_to(readonly, mutable), Ok(true));
+        assert_eq!(store.is_type_assignable_to(mutable, readonly), Ok(true));
+        assert_eq!(
+            store.is_type_strict_subtype_of(readonly, mutable),
+            Ok(false)
+        );
+        assert_eq!(store.is_type_strict_subtype_of(mutable, readonly), Ok(true));
+
+        let readonly_to_mutable = store
+            .relation_key_if_available(
+                readonly,
+                mutable,
+                super::IntersectionState::NONE,
+                false,
+                false,
+            )
+            .unwrap()
+            .key();
+        let mutable_to_readonly = store
+            .relation_key_if_available(
+                mutable,
+                readonly,
+                super::IntersectionState::NONE,
+                false,
+                false,
+            )
+            .unwrap()
+            .key();
+        assert_eq!(
+            store.relation_cache_get(RelationKind::StrictSubtype, readonly_to_mutable),
+            RelationComparisonResult::FAILED
+        );
+        assert!(
+            store
+                .relation_cache_get(RelationKind::Assignable, readonly_to_mutable)
+                .intersects(RelationComparisonResult::SUCCEEDED)
+        );
+        assert!(
+            store
+                .relation_cache_get(RelationKind::StrictSubtype, mutable_to_readonly)
+                .intersects(RelationComparisonResult::SUCCEEDED)
+        );
+
+        let warmed = store.relation_state_snapshot();
+        assert!(store.set_source_property_readonly(readonly_property, true));
+        assert_eq!(store.relation_state_snapshot(), warmed);
+        assert_eq!(
+            store.relation_cache_get(RelationKind::StrictSubtype, readonly_to_mutable),
+            RelationComparisonResult::FAILED,
+            "an equal readonly write preserves the warmed relation"
+        );
+        assert!(
+            store
+                .relation_cache_get(RelationKind::Assignable, readonly_to_mutable)
+                .intersects(RelationComparisonResult::SUCCEEDED),
+            "an equal readonly write preserves unrelated warmed relation kinds"
+        );
+
+        assert!(store.set_source_property_readonly(readonly_property, false));
+        assert_eq!(
+            store.relation_cache_get(RelationKind::StrictSubtype, readonly_to_mutable),
+            RelationComparisonResult::NONE,
+            "a changed observed readonly bit invalidates the warmed relation"
+        );
+        assert_eq!(
+            store.relation_cache_get(RelationKind::Assignable, readonly_to_mutable),
+            RelationComparisonResult::NONE,
+            "the observed-symbol mutation invalidates every relation cache kind"
+        );
+        assert_eq!(store.is_type_strict_subtype_of(readonly, mutable), Ok(true));
+        assert_eq!(store.is_type_assignable_to(readonly, mutable), Ok(true));
     }
 
     #[test]

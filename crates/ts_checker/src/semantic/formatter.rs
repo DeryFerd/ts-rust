@@ -1647,7 +1647,7 @@ fn validate_resolved_named_interface(
             .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
         if !record.flags().contains(SymbolFlags::PROPERTY)
             || record.flags().without(allowed_flags) != SymbolFlags::NONE
-            || record.check_flags() != CheckFlags::NONE
+            || record.check_flags().bits() & !CheckFlags::READONLY.bits() != 0
             || record.parent() != Some(owner)
             || record.value_declaration() != Some(*declaration)
             || record.members().is_some()
@@ -2456,10 +2456,15 @@ fn validate_declared_property(
     });
     let readonly =
         canonical_has_syntactic_modifier(arena, declaration.node, SyntaxKind::ReadonlyKeyword);
+    let expected_check_flags = if readonly {
+        CheckFlags::READONLY
+    } else {
+        CheckFlags::NONE
+    };
     if !name_matches
         || syntax_optional != optional
         || !valid_modifiers
-        || record.check_flags().contains(CheckFlags::READONLY) && !readonly
+        || record.check_flags() != expected_check_flags
     {
         return Err(TypeDisplayUnavailable::MalformedType(type_id));
     }
@@ -3920,6 +3925,7 @@ mod tests {
                 )
             })
             .unwrap();
+        assert!(store.set_source_property_readonly(properties[0], true));
         for (property, property_type) in properties.iter().zip([string, number]) {
             assert!(store.set_value_symbol_links(
                 *property,
@@ -3977,6 +3983,29 @@ mod tests {
                 target: "never".into(),
             },
         );
+
+        assert!(store.set_source_property_readonly(properties[0], false));
+        assert_eq!(
+            type_to_string_with_host_and_flags(
+                &store,
+                &host,
+                object,
+                CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT,
+            ),
+            Err(TypeDisplayUnavailable::MalformedType(object)),
+        );
+        assert!(store.set_source_property_readonly(properties[0], true));
+        assert!(store.set_source_property_readonly(properties[1], true));
+        assert_eq!(
+            type_to_string_with_host_and_flags(
+                &store,
+                &host,
+                object,
+                CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT,
+            ),
+            Err(TypeDisplayUnavailable::MalformedType(object)),
+        );
+        assert!(store.set_source_property_readonly(properties[1], false));
 
         let semantic_parent = store
             .alloc_symbol(SymbolData::new(

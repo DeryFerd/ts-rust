@@ -1526,6 +1526,27 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         true
     }
 
+    pub(super) fn set_source_property_readonly(
+        &mut self,
+        symbol: SemanticSymbolId,
+        readonly: bool,
+    ) -> bool {
+        let changed = self.symbol(symbol).is_some_and(|current| {
+            current.check_flags().contains(CheckFlags::READONLY) != readonly
+        });
+        let relation_dirty = self.relation_observable_symbols.contains(&symbol) && changed;
+        if !self.symbols.set_source_property_readonly(symbol, readonly) {
+            return false;
+        }
+        if relation_dirty {
+            self.mark_relation_inputs_dirty();
+        }
+        if changed && self.has_callable_provenance() {
+            self.mark_union_cache_validation_dirty();
+        }
+        true
+    }
+
     pub fn set_symbol_declarations(
         &mut self,
         symbol: SemanticSymbolId,
