@@ -1,6 +1,6 @@
 # Goal: complete typescript-go core typechecking in Rust
 
-- Status: proposed for review
+- Status: active; execution approved
 - Plan date: 2026-07-16
 - Integration branch: `july-ultra`
 - Planning baseline: `ded5eaa`

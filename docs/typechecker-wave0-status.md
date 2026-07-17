@@ -5,7 +5,7 @@
 - Upstream epoch: `dc37b5249ab60e2bbce936f71b883e6c8136167e`
 - Wave branch baseline: `cdbf749`
 - Integration branch: `july-ultra`
-- Current root adapters: `690f13e`, `2ef996a`, `1f74d5e`
+- Current integration head: `174eebf`
 
 This is the live execution record for Wave 0 of
 [`typechecker-completion-goal.md`](typechecker-completion-goal.md). The port
@@ -15,15 +15,30 @@ map remains authoritative for cluster state.
 
 | Lane | Branch/worktree | Current task | State |
 |---|---|---|---|
-| Root/integration | `july-ultra`; repository root | contract adapters, review, serial verification | M0, S1b, and the S3 kernel integrated; Cargo gates green |
-| M0 | `agent/w0-m0-scorecard`; `../ts-rust-worktrees/w0-m0-scorecard` | fixed balanced manifest after a fresh score | schema-5 scorecard and fatal continuation integrated; fixture tests and strict Clippy green |
-| S2a | `agent/w0-s2a-members`; `../ts-rust-worktrees/w0-s2a-members` | exact single-base interface heritage | independent review rejected the broad draft; narrowing order, collision, validation, and publication contracts |
+| Root/integration | `july-ultra`; repository root | contract adapters, review, serial verification | M0, S1b, S3 kernel, arrow capability recovery, and the fixed smoke lane integrated; root is the sole Cargo/build owner |
+| M0 | `july-ultra`; repository root | deterministic checker scoring | schema-5 provenance, retained fatal outcomes, exact fixed-manifest execution, and selected-case preparation integrated through `174eebf` |
+| S2a | `agent/w0-s2a-members`; `../ts-rust-worktrees/w0-s2a-members` | exact single-base interface heritage | implementation complete; repeated adversarial review found relation-cache invalidation bugs, so an observed-dependency redesign is in progress before integration |
 | S3 | `agent/w0-s3-instantiation`; `../ts-rust-worktrees/w0-s3-instantiation` | composite mapper and instantiation-session kernel | integrated through `4701c60`; checker check, strict Clippy, and rustdoc green |
-| S3b | `agent/w0-s3b-session`; `../ts-rust-worktrees/w0-s3b-session` | share query accounting across generic-call projection | implementing the remaining production-accounting review item |
+| S3b | `agent/w0-s3b-session`; `../ts-rust-worktrees/w0-s3b-session` | lazy generic-call demand and source-owned instantiation accounting | `a27ee8c`/`f11eb00` are rejected as-is; a fresh read-only Go/Rust audit is specifying the replacement slice |
 | S1b | `agent/w0-s1b-declarations`; `../ts-rust-worktrees/w0-s1b-declarations` | direct named `.d.ts` value/type consumption | integrated through `c23594d`; both program orders, warm reuse, skipLibCheck, and fail-closed boundaries pass |
 
-Only S2a and S3b are active semantic writers. M0 consumes the root-owned typed
-failure envelope and does not edit checker/compiler query internals.
+S2a is the only active semantic writer. S3b is a read-only audit until its
+ownership and lazy-demand contract is frozen. Root keeps integration, shared
+dispatch adapters, Cargo, and corpus scoring serialized while spare capacity
+rotates through independent Go-semantic and Rust-invariant review.
+
+## Fixed smoke evidence
+
+`checker-smoke-v1.json` freezes 96 unique variant keys across eight semantic
+families. Two clean executions at `174eebf` produced the same scorecard digest,
+`12dd493b4e782771446eb922579def8d`, with no fatal invariants. The fixed-shard
+digest is `60dbd52bce2c3f9f94971819ad0d9cda`; the complete pinned-oracle manifest
+digest is `667bc371832bee995194e09bc5b6e968`.
+
+The current frontier is four exact variants, 90 typed capability boundaries,
+and two supported mismatches. The run discovers 12,750 upstream configurations,
+selects 95 cases and 96 variants, and completes in about 88 seconds on the
+recorded machine. This is a deterministic merge gate, not a coverage claim.
 
 The S1a compiler prerequisite is now present: a plain `.d.ts` external module
 may be the resolved target of a plain TypeScript ESM/Bundler source while the
@@ -71,11 +86,14 @@ the query-scoped instantiation session. Their next stacks meet at a generic
 
 | Hub | Wave | Owner | Base | Allowed symbols | Expiry |
 |---|---|---|---|---|---|
-| `semantic/relater.rs` | W0.1 | `agent/w0-s2a-members` | `cdbf749` | `RelationUnavailable` additions; `ResolvedObjectMembers`; `structured_type_related_to`; `properties_related_to`; `call_signatures_related_to`; `resolved_object_members`; `SemanticStore::resolved_declared_property_object` heritage branch; new index-relation helpers | reviewed S2a integration commit |
+| `semantic/relater.rs` | W0.1 | `agent/w0-s2a-members` | `cdbf749` | heritage admission/relation helpers plus successful-relation dependency collection | reviewed S2a integration commit |
+| `semantic/store.rs` | W0.1 repair | `agent/w0-s2a-members` | `e867a88` | relation-observed identity sets and changed-write invalidation only; no unrelated store API work | reviewed S2a integration commit |
 
 Root and every other worker treat the leased surface as read-only until the
-lease expires. `type_nodes.rs`, `source.rs`, `store.rs`, `type_records.rs`,
-`production.rs`, `formatter.rs`, and `ts_compiler/src/lib.rs` remain root-owned.
+lease expires. `type_nodes.rs`, `source.rs`, `type_records.rs`, `production.rs`,
+`formatter.rs`, and `ts_compiler/src/lib.rs` remain root-owned. The temporary
+`store.rs` repair lease exists only because a successful relation cache must
+retain the exact identities whose later mutation invalidates that cache.
 
 ## Required integration evidence
 
