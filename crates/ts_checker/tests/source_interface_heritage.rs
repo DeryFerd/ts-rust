@@ -77,7 +77,30 @@ fn declared_type(context: &CanonicalCheckerContext<'_>, symbol: SemanticSymbolId
         .unwrap_or_else(|| panic!("missing declared type for {symbol:?}"))
 }
 
-fn read_access(parsed: &ParseResult, file: FileId) -> NodeRef {
+fn variable_name(parsed: &ParseResult, file: FileId, expected: &str) -> NodeRef {
+    let name = parsed
+        .arena
+        .iter()
+        .find_map(|(_, record)| {
+            let NodeData::VariableDeclaration(variable) = &record.data else {
+                return None;
+            };
+            let NodeData::Identifier(name) = &parsed.arena.get(variable.name)?.data else {
+                return None;
+            };
+            (name.text == expected).then_some(variable.name)
+        })
+        .unwrap_or_else(|| panic!("missing variable {expected}"));
+    NodeRef::new(parsed.arena.id(), file, name)
+}
+
+fn node_text(parsed: &ParseResult, node: NodeRef) -> &str {
+    let range = parsed.arena.get(node.node).unwrap().range;
+    &parsed.arena.source_text().unwrap()
+        [usize::try_from(range.start.get()).unwrap()..usize::try_from(range.end.get()).unwrap()]
+}
+
+fn read_access(parsed: &ParseResult, file: FileId, expected: &str) -> NodeRef {
     parsed
         .arena
         .iter()
@@ -88,9 +111,50 @@ fn read_access(parsed: &ParseResult, file: FileId) -> NodeRef {
             let NodeData::Identifier(name) = &parsed.arena.get(access.name)?.data else {
                 return None;
             };
-            (name.text == "id").then_some(NodeRef::new(parsed.arena.id(), file, node))
+            (name.text == expected).then_some(NodeRef::new(parsed.arena.id(), file, node))
         })
-        .expect("missing inherited property read")
+        .unwrap_or_else(|| panic!("missing property read {expected}"))
+}
+
+fn interface_property_names(
+    context: &CanonicalCheckerContext<'_>,
+    type_: TypeId,
+) -> (Vec<String>, Vec<String>) {
+    let TypeData::Interface(interface) = context.store().type_payload(type_).unwrap().data() else {
+        panic!("expected an interface type")
+    };
+    assert!(interface.declared_members_resolved);
+    let mut declared = interface
+        .declared_members
+        .and_then(|members| context.store().symbol_table(members))
+        .map(|members| {
+            members
+                .iter()
+                .map(|(name, _)| name.as_utf8().unwrap().to_owned())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    declared.sort();
+    let resolved = interface
+        .reference
+        .object
+        .structured
+        .properties
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .map(|property| {
+            context
+                .store()
+                .symbol(*property)
+                .unwrap()
+                .name()
+                .as_utf8()
+                .unwrap()
+                .to_owned()
+        })
+        .collect();
+    (declared, resolved)
 }
 
 #[test]
@@ -101,18 +165,33 @@ fn direct_interface_heritage_publishes_inherited_properties_for_relations_and_re
     let mut context = checker_context(&parsed, file, "/project/interface-heritage.ts");
     let base_symbol = interface_symbol(&parsed, file, &context, "Base");
     let derived_symbol = interface_symbol(&parsed, file, &context, "Derived");
-    let access = read_access(&parsed, file);
+    let access = read_access(&parsed, file, "id");
 
     context.check_source_file(file).unwrap();
 
     let diagnostics = context.diagnostics().as_slice();
     assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
     assert_eq!(diagnostics[0].diagnostic.code(), 2741);
-    assert_eq!(diagnostics[0].diagnostic.arguments[0], "id");
+    assert_eq!(
+        diagnostics[0].diagnostic.arguments,
+        ["id", "{ label: string; }", "Derived"]
+    );
+    assert_eq!(
+        diagnostics[0].node,
+        Some(variable_name(&parsed, file, "bad"))
+    );
     assert_eq!(diagnostics[0].related_information.len(), 1);
     assert_eq!(
         diagnostics[0].related_information[0].diagnostic.code(),
         2728
+    );
+    assert_eq!(
+        diagnostics[0].related_information[0].diagnostic.arguments,
+        ["id"]
+    );
+    assert_eq!(
+        node_text(&parsed, diagnostics[0].related_information[0].node.unwrap()),
+        "id"
     );
 
     let base_type = declared_type(&context, base_symbol);
@@ -126,27 +205,12 @@ fn direct_interface_heritage_publishes_inherited_properties_for_relations_and_re
         derived.resolved_base_types.as_deref(),
         Some(&[base_type][..])
     );
-    let properties = derived
-        .reference
-        .object
-        .structured
-        .properties
-        .as_deref()
-        .expect("Derived must publish its final property list");
     assert_eq!(
-        properties
-            .iter()
-            .map(|property| {
-                context
-                    .store()
-                    .symbol(*property)
-                    .unwrap()
-                    .name()
-                    .as_utf8()
-                    .unwrap()
-            })
-            .collect::<Vec<_>>(),
-        ["label", "id"]
+        interface_property_names(&context, derived_type),
+        (
+            vec!["label".to_owned()],
+            vec!["label".to_owned(), "id".to_owned()]
+        )
     );
     let read_type = context
         .store()
@@ -160,6 +224,185 @@ fn direct_interface_heritage_publishes_inherited_properties_for_relations_and_re
     );
     assert_eq!(
         context.is_type_assignable_to(base_type, derived_type),
+        Ok(false)
+    );
+
+    let warm_state = (
+        context.store().type_len(),
+        context.store().mapper_len(),
+        context.store().signature_len(),
+        context.store().index_info_len(),
+        context.store().symbol_store().symbol_table_len(),
+        context.store().relation_state_snapshot(),
+        context.diagnostics().clone(),
+    );
+    context.check_source_file(file).unwrap();
+    assert_eq!(
+        (
+            context.store().type_len(),
+            context.store().mapper_len(),
+            context.store().signature_len(),
+            context.store().index_info_len(),
+            context.store().symbol_store().symbol_table_len(),
+            context.store().relation_state_snapshot(),
+            context.diagnostics().clone(),
+        ),
+        warm_state
+    );
+}
+
+#[test]
+fn direct_interface_heritage_keeps_own_and_base_declaration_order_separate() {
+    let parsed = parse_source_file(concat!(
+        "interface Base { first: number; second: string }\n",
+        "interface Derived extends Base { third: boolean; fourth: number }\n",
+        "function read(value: Derived): string { return value.second; }\n",
+    ));
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(1);
+    let mut context = checker_context(&parsed, file, "/project/interface-heritage-member-order.ts");
+    let base_symbol = interface_symbol(&parsed, file, &context, "Base");
+    let derived_symbol = interface_symbol(&parsed, file, &context, "Derived");
+    let access = read_access(&parsed, file, "second");
+
+    context.check_source_file(file).unwrap();
+
+    assert!(context.diagnostics().is_empty());
+    let base_type = declared_type(&context, base_symbol);
+    let derived_type = declared_type(&context, derived_symbol);
+    assert_eq!(
+        interface_property_names(&context, base_type),
+        (
+            vec!["first".to_owned(), "second".to_owned()],
+            vec!["first".to_owned(), "second".to_owned()]
+        )
+    );
+    assert_eq!(
+        interface_property_names(&context, derived_type),
+        (
+            vec!["fourth".to_owned(), "third".to_owned()],
+            vec![
+                "third".to_owned(),
+                "fourth".to_owned(),
+                "first".to_owned(),
+                "second".to_owned(),
+            ]
+        )
+    );
+    let read_type = context
+        .store()
+        .type_node_links(access)
+        .and_then(|links| links.resolved_type)
+        .expect("the inherited property read must be typed");
+    assert_eq!(context.type_to_string(read_type).unwrap(), "string");
+}
+
+#[test]
+fn empty_and_optional_derived_interfaces_remain_structural() {
+    let parsed = parse_source_file(concat!(
+        "interface Base { id: number }\n",
+        "interface Empty extends Base {}\n",
+        "interface Optional extends Base { label?: string }\n",
+        "const base: Base = { id: 1 };\n",
+        "const empty: Empty = base;\n",
+        "const optional: Optional = base;\n",
+    ));
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(2);
+    let mut context = checker_context(&parsed, file, "/project/interface-heritage-structural.ts");
+    let base_symbol = interface_symbol(&parsed, file, &context, "Base");
+    let empty_symbol = interface_symbol(&parsed, file, &context, "Empty");
+    let optional_symbol = interface_symbol(&parsed, file, &context, "Optional");
+
+    context.check_source_file(file).unwrap();
+
+    assert!(context.diagnostics().is_empty());
+    let base_type = declared_type(&context, base_symbol);
+    let empty_type = declared_type(&context, empty_symbol);
+    let optional_type = declared_type(&context, optional_symbol);
+    assert_eq!(
+        interface_property_names(&context, empty_type),
+        (Vec::new(), vec!["id".to_owned()])
+    );
+    assert_eq!(
+        interface_property_names(&context, optional_type),
+        (
+            vec!["label".to_owned()],
+            vec!["label".to_owned(), "id".to_owned()]
+        )
+    );
+    for (source, target) in [
+        (empty_type, base_type),
+        (base_type, empty_type),
+        (optional_type, base_type),
+        (base_type, optional_type),
+        (empty_type, optional_type),
+        (optional_type, empty_type),
+    ] {
+        assert_eq!(
+            context.is_type_assignable_to(source, target),
+            Ok(true),
+            "{source:?} must be structurally assignable to {target:?}"
+        );
+    }
+}
+
+#[test]
+fn forward_base_with_recursive_derived_property_resolves_cold_and_warm() {
+    let parsed = parse_source_file(concat!(
+        "interface Forward extends Later { own: number }\n",
+        "interface Later { back: Forward }\n",
+        "function read(value: Forward): number { return value.own; }\n",
+    ));
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(3);
+    let mut context = checker_context(
+        &parsed,
+        file,
+        "/project/interface-heritage-forward-recursive.ts",
+    );
+    let forward_symbol = interface_symbol(&parsed, file, &context, "Forward");
+    let later_symbol = interface_symbol(&parsed, file, &context, "Later");
+
+    context.check_source_file(file).unwrap();
+
+    assert!(context.diagnostics().is_empty());
+    let forward_type = declared_type(&context, forward_symbol);
+    let later_type = declared_type(&context, later_symbol);
+    assert_eq!(
+        interface_property_names(&context, forward_type),
+        (
+            vec!["own".to_owned()],
+            vec!["own".to_owned(), "back".to_owned()]
+        )
+    );
+    let back_property = {
+        let TypeData::Interface(forward) =
+            context.store().type_payload(forward_type).unwrap().data()
+        else {
+            panic!("Forward must retain its interface payload")
+        };
+        forward
+            .reference
+            .object
+            .structured
+            .properties
+            .as_ref()
+            .unwrap()[1]
+    };
+    assert_eq!(
+        context
+            .store()
+            .value_symbol_links(back_property)
+            .and_then(|links| links.resolved_type),
+        Some(forward_type)
+    );
+    assert_eq!(
+        context.is_type_assignable_to(forward_type, later_type),
+        Ok(true)
+    );
+    assert_eq!(
+        context.is_type_assignable_to(later_type, forward_type),
         Ok(false)
     );
 
@@ -222,6 +465,63 @@ fn unsupported_interface_heritage_shapes_fail_before_semantic_publication() {
                 "interface Base { value: number }\n",
                 "interface Derived extends Base { value: number }\n",
                 "function read(value: Derived): number { return value.value; }\n",
+            ),
+        ),
+        (
+            "generic-base",
+            concat!(
+                "interface Base<T> { value: T }\n",
+                "interface Derived extends Base<number> { own: number }\n",
+                "function read(value: Derived): number { return value.own; }\n",
+            ),
+        ),
+        (
+            "generic-derived",
+            concat!(
+                "interface Base { value: number }\n",
+                "interface Derived<T> extends Base { own: T }\n",
+                "function read(value: Derived<number>): number { return value.own; }\n",
+            ),
+        ),
+        (
+            "base-call-signature",
+            concat!(
+                "interface Base { (): number }\n",
+                "interface Derived extends Base { own: number }\n",
+                "function read(value: Derived): number { return value.own; }\n",
+            ),
+        ),
+        (
+            "derived-call-signature",
+            concat!(
+                "interface Base { value: number }\n",
+                "interface Derived extends Base { (): number }\n",
+                "function read(value: Derived): number { return value.value; }\n",
+            ),
+        ),
+        (
+            "base-index-signature",
+            concat!(
+                "interface Base { [key: string]: number }\n",
+                "interface Derived extends Base { own: number }\n",
+                "function read(value: Derived): number { return value.own; }\n",
+            ),
+        ),
+        (
+            "alias-base",
+            concat!(
+                "interface Base { value: number }\n",
+                "type Alias = Base;\n",
+                "interface Derived extends Alias { own: number }\n",
+                "function read(value: Derived): number { return value.own; }\n",
+            ),
+        ),
+        (
+            "qualified-base",
+            concat!(
+                "namespace Types { export interface Base { value: number } }\n",
+                "interface Derived extends Types.Base { own: number }\n",
+                "function read(value: Derived): number { return value.own; }\n",
             ),
         ),
     ];
