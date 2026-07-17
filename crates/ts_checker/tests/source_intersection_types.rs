@@ -588,8 +588,8 @@ fn source_intersections_preserve_order_identity_properties_reduction_and_relatio
 fn unsupported_intersection_syntax_fails_before_semantic_writes() {
     let cases = [
         (
-            "type Bad = { value?: string } & { other: number };",
-            "optional",
+            "type Bad = { value: string[] } & { other: number };",
+            "array property",
         ),
         (
             "type Bad = ({ a: string } | { b: number }) & { c: boolean };",
@@ -600,8 +600,8 @@ fn unsupported_intersection_syntax_fails_before_semantic_writes() {
             "call signature",
         ),
         (
-            "type Bad = { nested: { value: string } } & { other: number };",
-            "object property",
+            "type A = { value: string }; type B = { other: number }; type Bad = { nested: A & B } & { final: boolean };",
+            "nested intersection property",
         ),
     ];
     for (index, (source, label)) in cases.into_iter().enumerate() {

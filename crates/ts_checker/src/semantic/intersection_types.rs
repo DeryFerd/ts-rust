@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use ts_binder::{
     CheckFlags, EscapedName, SemanticSymbolId, SymbolFlags, SymbolTableId,
     semantic::PreparedSymbolTable,
@@ -7,7 +9,8 @@ use super::{
     CanonicalTypeMapperStore, TypeId,
     links::ValueSymbolLinks,
     object_members::{
-        DeclaredPropertyObjectValidation, validate_resolved_declared_property_object,
+        DeclaredPropertyObjectValidation, resolved_declared_property_types,
+        validate_resolved_declared_property_object,
     },
     type_records::{StructuredTypeData, TypeData, TypeRecord},
     types::{ObjectFlags, TypeFlags},
@@ -24,7 +27,6 @@ pub(super) enum IntersectionTypeError {
     BootstrapUninitialized,
     Capacity,
     UnsupportedConstituent(TypeId),
-    UnsupportedOptionalProperty(SemanticSymbolId),
     UnsupportedPropertyType(TypeId),
     MalformedConstituent(TypeId),
     InvalidAliasSymbol(SemanticSymbolId),
@@ -44,7 +46,8 @@ struct SourceProperty {
     symbol: SemanticSymbolId,
     name: EscapedName,
     type_: TypeId,
-    readonly: bool,
+    symbol_flags: SymbolFlags,
+    check_flags: CheckFlags,
     literal: bool,
     explicit_never: bool,
 }
@@ -61,6 +64,7 @@ enum ExpectedProperty {
     Synthetic {
         name: EscapedName,
         type_: TypeId,
+        flags: SymbolFlags,
         check_flags: CheckFlags,
         declarations: Option<Vec<ts_ast::NodeRef>>,
     },
@@ -154,9 +158,11 @@ impl CanonicalTypeMapperStore {
                 property,
                 ExpectedProperty::Synthetic {
                     type_,
+                    flags,
                     check_flags,
                     ..
                 } if *type_ == never_type
+                    && !flags.contains(SymbolFlags::OPTIONAL)
                     && check_flags.contains(CheckFlags::NON_UNIFORM_AND_LITERAL)
                     && !check_flags.contains(CheckFlags::HAS_NEVER_TYPE)
             )
@@ -192,14 +198,11 @@ impl CanonicalTypeMapperStore {
                 ExpectedProperty::Synthetic {
                     name,
                     type_: property_type,
+                    flags,
                     check_flags,
                     declarations,
                 } => {
-                    let symbol = self.alloc_transient_symbol(
-                        SymbolFlags::PROPERTY,
-                        name.clone(),
-                        check_flags,
-                    );
+                    let symbol = self.alloc_transient_symbol(flags, name.clone(), check_flags);
                     if declarations.is_some() {
                         assert!(self.set_symbol_declarations(symbol, declarations, None));
                     }
@@ -366,13 +369,14 @@ impl CanonicalTypeMapperStore {
                 ExpectedProperty::Borrowed(_) => return Err(invalid()),
                 ExpectedProperty::Synthetic {
                     type_: property_type,
+                    flags,
                     check_flags,
                     declarations,
                     ..
                 } => {
                     let symbol = self.symbol(*actual).ok_or_else(invalid)?;
                     let links = self.value_symbol_links(*actual).ok_or_else(invalid)?;
-                    if symbol.flags() != SymbolFlags::PROPERTY | SymbolFlags::TRANSIENT
+                    if symbol.flags() != *flags | SymbolFlags::TRANSIENT
                         || symbol.check_flags() != *check_flags
                         || symbol.declarations() != declarations.as_deref()
                         || symbol.value_declaration().is_some()
@@ -399,9 +403,11 @@ impl CanonicalTypeMapperStore {
                 property,
                 ExpectedProperty::Synthetic {
                     type_: property_type,
+                    flags,
                     check_flags,
                     ..
                 } if *property_type == bootstrap.never_type
+                    && !flags.contains(SymbolFlags::OPTIONAL)
                     && check_flags.contains(CheckFlags::NON_UNIFORM_AND_LITERAL)
                     && !check_flags.contains(CheckFlags::HAS_NEVER_TYPE)
             )
@@ -448,6 +454,8 @@ fn expected_properties(
         .ok_or(IntersectionTypeError::BootstrapUninitialized)?
         .boolean_type;
     let mut groups: Vec<PropertyGroup> = Vec::new();
+    let mut validating_property_types = HashSet::new();
+    let mut validated_property_types = HashSet::new();
     for type_ in types {
         let record = store
             .type_payload(*type_)
@@ -460,16 +468,18 @@ fn expected_properties(
             let record = store
                 .symbol(*symbol)
                 .ok_or(IntersectionTypeError::MalformedConstituent(*type_))?;
-            if record.flags().contains(SymbolFlags::OPTIONAL) {
-                return Err(IntersectionTypeError::UnsupportedOptionalProperty(*symbol));
-            }
             let links = store
                 .value_symbol_links(*symbol)
                 .ok_or(IntersectionTypeError::MalformedConstituent(*type_))?;
             let property_type = links
                 .resolved_type
                 .ok_or(IntersectionTypeError::MalformedConstituent(*type_))?;
-            validate_property_type(store, property_type)?;
+            validate_property_type(
+                store,
+                property_type,
+                &mut validating_property_types,
+                &mut validated_property_types,
+            )?;
             let property_flags = store
                 .type_payload(property_type)
                 .ok_or(IntersectionTypeError::MalformedConstituent(*type_))?
@@ -478,7 +488,8 @@ fn expected_properties(
                 symbol: *symbol,
                 name: record.name().to_owned(),
                 type_: property_type,
-                readonly: record.check_flags().contains(CheckFlags::READONLY),
+                symbol_flags: record.flags(),
+                check_flags: record.check_flags(),
                 literal: property_type == boolean_type
                     || property_flags.intersects(TypeFlags::UNIT),
                 explicit_never: property_flags == TypeFlags::NEVER,
@@ -512,8 +523,22 @@ fn expected_properties(
                 .map(|source| source.type_)
                 .collect::<Vec<_>>();
             let type_ = intersect_property_types(store, &property_types)?;
+            let flags = SymbolFlags::PROPERTY
+                | if group
+                    .sources
+                    .iter()
+                    .all(|source| source.symbol_flags.contains(SymbolFlags::OPTIONAL))
+                {
+                    SymbolFlags::OPTIONAL
+                } else {
+                    SymbolFlags::NONE
+                };
             let mut check_flags = CheckFlags::SYNTHETIC_PROPERTY | CheckFlags::CONTAINS_PUBLIC;
-            if group.sources.iter().all(|source| source.readonly) {
+            if group
+                .sources
+                .iter()
+                .all(|source| source.check_flags.contains(CheckFlags::READONLY))
+            {
                 check_flags |= CheckFlags::READONLY;
             }
             if property_types
@@ -543,6 +568,7 @@ fn expected_properties(
             Ok(ExpectedProperty::Synthetic {
                 name: group.name,
                 type_,
+                flags,
                 check_flags,
                 declarations: (!declarations.is_empty()).then_some(declarations),
             })
@@ -553,6 +579,28 @@ fn expected_properties(
 fn validate_property_type(
     store: &CanonicalTypeMapperStore,
     type_: TypeId,
+    validating: &mut HashSet<TypeId>,
+    validated: &mut HashSet<TypeId>,
+) -> Result<(), IntersectionTypeError> {
+    if validated.contains(&type_) {
+        return Ok(());
+    }
+    if !validating.insert(type_) {
+        return Err(IntersectionTypeError::UnsupportedPropertyType(type_));
+    }
+    let result = validate_property_type_worker(store, type_, validating, validated);
+    assert!(validating.remove(&type_));
+    if result.is_ok() {
+        validated.insert(type_);
+    }
+    result
+}
+
+fn validate_property_type_worker(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    validating: &mut HashSet<TypeId>,
+    validated: &mut HashSet<TypeId>,
 ) -> Result<(), IntersectionTypeError> {
     if store
         .intrinsic_bootstrap()
@@ -562,10 +610,10 @@ fn validate_property_type(
         // `false | true` union. Admit only that exact bootstrap identity.
         return Ok(());
     }
-    let flags = store
+    let record = store
         .type_payload(type_)
-        .ok_or(IntersectionTypeError::UnsupportedPropertyType(type_))?
-        .flags();
+        .ok_or(IntersectionTypeError::UnsupportedPropertyType(type_))?;
+    let flags = record.flags();
     if matches!(
         flags,
         TypeFlags::ANY
@@ -585,10 +633,25 @@ fn validate_property_type(
             | TypeFlags::UNIQUE_ES_SYMBOL
             | TypeFlags::NEVER
     ) {
-        Ok(())
-    } else {
-        Err(IntersectionTypeError::UnsupportedPropertyType(type_))
+        return Ok(());
     }
+    if flags == TypeFlags::OBJECT {
+        return match validate_resolved_declared_property_object(store, type_) {
+            DeclaredPropertyObjectValidation::Valid(_) => {
+                let property_types = resolved_declared_property_types(store, type_)
+                    .ok_or(IntersectionTypeError::UnsupportedPropertyType(type_))?;
+                for property_type in property_types {
+                    validate_property_type(store, property_type, validating, validated)?;
+                }
+                Ok(())
+            }
+            DeclaredPropertyObjectValidation::NotDeclared
+            | DeclaredPropertyObjectValidation::Malformed => {
+                Err(IntersectionTypeError::UnsupportedPropertyType(type_))
+            }
+        };
+    }
+    Err(IntersectionTypeError::UnsupportedPropertyType(type_))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -641,6 +704,41 @@ fn intersect_property_types(
     let bootstrap = store
         .intrinsic_bootstrap()
         .ok_or(IntersectionTypeError::BootstrapUninitialized)?;
+    if let Some(first) = types.first().copied()
+        && types.iter().all(|type_| *type_ == first)
+    {
+        return Ok(first);
+    }
+    for type_ in types {
+        if *type_ == bootstrap.boolean_type {
+            continue;
+        }
+        let flags = store
+            .type_payload(*type_)
+            .ok_or(IntersectionTypeError::UnsupportedPropertyType(*type_))?
+            .flags();
+        if !matches!(
+            flags,
+            TypeFlags::ANY
+                | TypeFlags::UNKNOWN
+                | TypeFlags::UNDEFINED
+                | TypeFlags::NULL
+                | TypeFlags::VOID
+                | TypeFlags::STRING
+                | TypeFlags::NUMBER
+                | TypeFlags::BIG_INT
+                | TypeFlags::BOOLEAN
+                | TypeFlags::ES_SYMBOL
+                | TypeFlags::STRING_LITERAL
+                | TypeFlags::NUMBER_LITERAL
+                | TypeFlags::BIG_INT_LITERAL
+                | TypeFlags::BOOLEAN_LITERAL
+                | TypeFlags::UNIQUE_ES_SYMBOL
+                | TypeFlags::NEVER
+        ) {
+            return Err(IntersectionTypeError::UnsupportedPropertyType(*type_));
+        }
+    }
     if types.contains(&bootstrap.never_type) {
         return Ok(bootstrap.never_type);
     }
