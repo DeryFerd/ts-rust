@@ -168,6 +168,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
     /// Returns the exact endpoints only for the simple mapper representation.
     /// Evaluating a mapper is insufficient for cache validation because an
     /// unrelated simple mapper preserves an input by identity.
+    #[cfg(test)]
     pub(super) fn simple_type_mapper_endpoints(
         &self,
         mapper: TypeMapperId,
