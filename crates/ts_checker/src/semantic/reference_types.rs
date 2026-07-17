@@ -678,6 +678,14 @@ mod tests {
         for origin in [ObjectFlags::CLASS, ObjectFlags::INTERFACE] {
             let (target, parameters) = generic_target(&mut store, "Pair", origin, 2);
             assert_eq!(
+                validate_direct_generic_reference(&store, target),
+                Ok(DirectGenericReference {
+                    target,
+                    type_arguments: parameters.clone(),
+                }),
+                "the declared parameter vector owns the legal origin identity",
+            );
+            assert_eq!(
                 create_direct_generic_reference(
                     &mut store,
                     target,
@@ -691,6 +699,7 @@ mod tests {
                 }),
             );
             let before = store.type_len();
+            let before_mappers = store.mapper_len();
             let first = create_direct_generic_reference(
                 &mut store,
                 target,
@@ -699,6 +708,7 @@ mod tests {
             )
             .unwrap();
             assert_eq!(store.type_len(), before + 1);
+            assert_eq!(store.mapper_len(), before_mappers);
             let first_record = store.type_payload(first).unwrap();
             let TypeData::TypeReference(first_reference) = first_record.data() else {
                 panic!("a nonidentity direct instantiation is a type reference");
@@ -722,6 +732,7 @@ mod tests {
             .unwrap();
             assert_eq!(warm, first);
             assert_eq!(store.type_len(), before + 1);
+            assert_eq!(store.mapper_len(), before_mappers);
             assert_eq!(
                 validate_direct_generic_reference(&store, first),
                 Ok(DirectGenericReference {
