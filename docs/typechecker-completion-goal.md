@@ -176,9 +176,23 @@ exact, 90 typed capability boundaries, two supported mismatches, and zero
 fatal invariants; its established provenance-normalized digest remains
 `353dddd39af6749db775683da54d7c9a`.
 
-The four-slot topology can now rotate from the completed S5/S6 leaf pair to
-the next Wave 1 dependency cuts while root retains shared type-node, store,
-compiler, formatter, build, and scoring ownership. The live commit/worktree ledger is
+The next Wave 1 cut is integrated through `d443d1b`. Exact two-way union
+property synthesis now has a declared type-literal production adapter with
+source declaration/owner provenance, partial-member caching, a freshly
+allocated `string | bigint` public gate, and allocation-free warm validation.
+Direct nongeneric interface references can now participate in canonical union
+type nodes, while the member leaf still rejects interfaces and mixed modes
+before writes. Direct scalar conditional initializers are whole-source
+preflighted and replay exactly, and the first nongeneric/no-heritage class
+instance/value shells are installed with canonical no-base state. Independent
+review found no P0/P1 issue in the union and conditional cuts. The frozen
+96-variant shard remains four exact, 90 typed capability boundaries, two
+supported mismatches, and zero fatal invariants; its provenance-normalized
+digest is still `353dddd39af6749db775683da54d7c9a`.
+
+The four-slot topology has rotated from the completed S5/S6 leaf pair into
+S2b/S4b/S11a cuts while root retains shared type-node, store, compiler,
+formatter, build, and scoring ownership. The live commit/worktree ledger is
 [`typechecker-wave0-status.md`](typechecker-wave0-status.md).
 
 ### Quantitative posture
@@ -188,7 +202,7 @@ At the planning baseline:
 | Evidence | Current value | Interpretation |
 |---|---:|---|
 | Semantic unit tests compiled | 923 | Broad invariant coverage; the monolithic binary cannot link in the current memory envelope |
-| Public checker integration tests | 76 across 26 targets | Executable production-path evidence and the mandatory home for new verticals |
+| Public checker integration tests | 81 across 29 targets | Executable production-path evidence and the mandatory home for new verticals |
 | Semantic modules | 58 | Enough leaf surfaces for bounded ownership |
 | `type_nodes.rs` | 16,820 lines | Shared type-family dispatch hotspot |
 | `source.rs` | 16,162 lines | Shared source-plan/execution hotspot |

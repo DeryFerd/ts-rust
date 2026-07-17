@@ -5,7 +5,7 @@
 - Upstream epoch: `dc37b5249ab60e2bbce936f71b883e6c8136167e`
 - Wave branch baseline: `cdbf749`
 - Integration branch: `july-ultra`
-- Current integrated semantic stack: through `6c3bf97`
+- Current integrated semantic stack: through `d443d1b`
 
 This is the live execution record for Wave 0 of
 [`typechecker-completion-goal.md`](typechecker-completion-goal.md). The port
@@ -23,7 +23,10 @@ map remains authoritative for cluster state.
 | S1b | `july-ultra`; repository root | named ESM imports and two-hop renamed/type-only reexports | integrated through `6c3bf97`; 17 focused import/reexport public tests pass, sparse immediate-link timing matches pinned `resolveAlias`, warm alias/type-only/value poison is rejected, and independent review approved the slice |
 | W1 S5 | `july-ultra`; repository root | nongeneric `keyof`/property-key algebra | integrated through `c5c3cf9` plus cache hardening `7d97c9a`; direct and parenthesized property/index literals, nongeneric interfaces, exact `propertiesTypes` timing, eager Index origins, symbolic display, interface index publication, and cold/warm source identity pass independent review |
 | W1 S6 | `july-ultra`; repository root | direct explicit generic class/interface reference shells | integrated through `8132af9` with compiler classification `a478f13`; local full-arity class/interface references reuse target caches mapper-free/session-free, publish exact node/symbol links, and recover with pinned TS2314/TS2315 diagnostics |
-| W1 review/oracle | completed read-only lanes | pinned S5/S6 behavior, cache timing, and adversarial fixtures | complete; final S5 cache-poison finding was fixed in `7d97c9a`, and no P0/P1 issue remains in the reviewed S5/S6 cuts |
+| W1 S2b | `july-ultra`; repository root | exact two-way union property synthesis and declared source adapter | integrated through `e497d84`, with direct nongeneric interface-union admission in `d443d1b`; raw and declared type-literal modes stay disjoint, synthetic source provenance and cache identity are exact, interfaces/mixed modes reject before writes, and independent oracle review found no P0/P1 issue |
+| W1 S4b | `july-ultra`; repository root | direct scalar conditional initializers | integrated through `afb36f8`; boolean and ordinary scalar truthiness, branch-order joins, fixed/bootstrap and freshly allocated union identities, whole-source preflight, poison rejection, and forced warm replay pass the focused production gate and independent oracle review |
+| W1 S11a | `july-ultra`; repository root | first nongeneric class instance/value shells | integrated through `09c57b9`; local top-level nongeneric/no-heritage class declarations install exact instance, synthetic `this`, static value, and no-base constructor-cache identities with allocation-free warm reuse; annotated member materialization is active |
+| W1 review/oracle | rotating read-only lanes | pinned behavior, cache timing, and adversarial fixtures | S5/S6, scalar conditionals, declared union members, and direct interface-union admission are approved with no remaining P0/P1 issue; review rotates with each integrated leaf |
 
 The completed S5/S6 sub-wave validates the intended four-slot steady state:
 root integrates and builds, two isolated semantic workers own non-overlapping
@@ -70,6 +73,13 @@ with the established sorted normalization again produces
 `353dddd39af6749db775683da54d7c9a`, byte-identical to the `6c3bf97` semantic
 scorecard. The shard still reports four exact variants, 90 typed capability
 boundaries, two supported mismatches, and zero fatal invariants.
+
+The integrated S2b/S4b/S11a-shell stack through `d443d1b` has raw fixed-shard
+digest `514c967f1737901d80dbdd5af119cfb0`. Removing the Rust provenance object and
+invocation provenance produces `353dddd39af6749db775683da54d7c9a` again. The
+96 variants remain four exact, 90 typed capability boundaries, two supported
+mismatches, and zero fatal invariants. The focused public checker surface is
+now 81 tests across 29 independently runnable targets.
 
 The current frontier is four exact variants, 90 typed capability boundaries,
 and two supported mismatches. The run discovers 12,750 upstream configurations,
