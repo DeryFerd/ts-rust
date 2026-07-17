@@ -136,6 +136,25 @@ inline indexed access, property objects in unions, all eight strict `typeof`
 tags, reversed comparisons, object/function classification, `void` projection,
 and base/local join identity restoration.
 
+### Execution checkpoint: 2026-07-16
+
+The fixed 96-variant smoke lane is integrated and reproducible. The current
+frontier remains four exact variants, 90 typed capability boundaries, two
+supported mismatches, and zero fatal invariants. S2a's exact one-base interface
+heritage and successful-relation observed-dependency invalidation are integrated
+through `14ae6ce`; all five public heritage scenarios pass, and the fixed shard
+advances one interface fixture to its next unsupported property boundary. The
+recovering S3 instantiation session is integrated through `75abbf5`; its fixed
+shard is semantically byte-identical to the S2a run after removing only commit
+and invocation provenance.
+
+The active four-slot topology now matches the staffing model below: root owns
+integration/build/scoring, one worker owns the frozen `generic_calls.rs` lazy-
+demand rewrite, one owns the bounded readonly-property relation follow-up, and
+one independently audits S3 demand order, recovery, and TS2589 evidence. The
+live commit/worktree ledger is
+[`typechecker-wave0-status.md`](typechecker-wave0-status.md).
+
 ### Quantitative posture
 
 At the planning baseline:
@@ -173,9 +192,10 @@ the alphabetic `export*` tranche, then aborted at
 `functionExpandoPropertyDeclaration.ts` when arrow checking returned an
 unclassified fatal error. The M0 runner now retains typed capability and fatal
 outcomes per variant, continues the shard, and writes reproducible schema-5
-provenance and stable variant keys. A fresh complete current scorecard remains
-to be produced after integration; the previous abort is the historical reason
-this measurement contract landed before further semantic slices.
+provenance and stable variant keys. The balanced 96-variant merge gate is
+current; a fresh complete corpus scorecard remains to be produced at the next
+wave gate. The previous abort is the historical reason this measurement
+contract landed before further semantic slices.
 
 The historical first blockers were dominated by:
 
@@ -909,7 +929,8 @@ Required evidence:
 - relevant strict-option matrix;
 - cross-file test whenever identity can leave a file;
 - no hidden fallback, stub, fixture-name branch, or unexplained broad type;
-- `cargo check -p ts_checker --tests` through the capped runner;
+- production-library check plus compilation and execution of every affected
+  public integration target through the capped runner;
 - focused public integration tests;
 - strict checker Clippy and rustdoc warnings denied; and
 - fixed scorecard shard with zero exact losses, zero new supported mismatches,
@@ -931,13 +952,17 @@ Required evidence:
 The root integration lane owns slow builds and runs them serially:
 
 ```sh
-scripts/run-cargo-capped.sh check -p ts_checker --tests
+scripts/run-cargo-capped.sh check -p ts_checker --lib
+scripts/run-cargo-capped.sh check -p ts_checker --test <public-target>
+scripts/run-cargo-capped.sh test -p ts_checker --test <public-target> -- --nocapture
 
-scripts/run-cargo-capped.sh clippy -p ts_checker --all-targets --no-deps -- \
+scripts/run-cargo-capped.sh clippy -p ts_checker \
+  --lib --test <public-target> --no-deps -- \
   -D warnings \
   -A clippy::too_many_lines \
   -A clippy::nonminimal_bool \
-  -A clippy::match_same_arms
+  -A clippy::match_same_arms \
+  -A clippy::large_enum_variant
 
 scripts/run-cargo-capped.sh clippy -p ts_compiler --all-targets --no-deps -- \
   -D warnings
@@ -946,10 +971,12 @@ RUSTDOCFLAGS='-D warnings' \
   scripts/run-cargo-capped.sh doc -p ts_checker --no-deps
 ```
 
-The monolithic checker unit-test binary is not an executable gate on the
-current machine because linking exceeds the memory envelope. Do not repeatedly
-retry it. Compile all tests and put every new behavioral vertical in a focused
-public integration binary that can run.
+The checker-wide `cargo check --tests` and all-target Clippy invocations are not
+executable gates on the current 1 GiB machine: the unit-test crate reaches the
+cgroup ceiling before completion. Do not repeatedly retry them locally. Put
+every new behavioral vertical in a focused public integration binary that can
+compile and run here, and run the checker-wide compile/lint gates on a builder
+with a larger memory envelope before closing an integration wave.
 
 ### Objective modern-project manifest
 
@@ -1033,22 +1060,20 @@ maintainable.
 | Too many workers overload integration | Cap semantic writers around seven; put excess capacity into review, oracle, and fuzzing |
 | Upstream drift causes endless churn | Frozen epoch, drift ledger, one required roll-forward after parity |
 
-## Immediate next action after approval
+## Immediate execution queue
 
-1. Freeze the S2/S3 member-instantiation interface and the M0 capability-code
-   schema at root.
-2. With four slots, let Worker C land the M0 harness first and advance H02a
-   between reviews while Workers A/B inventory and then implement S2a/S3. Root
-   owns contract/compiler adapters; S1b stays queued until a semantic worker
-   frees.
-3. Land M0 before integrating either semantic stack. Worker C performs the Go
-   review and root the independent Rust review; Workers A/B review the
-   root/Worker-C M0 stack.
-4. Integrate one reviewed slice at a time, run the fixed shard after every
-   commit, and record frontier movement.
-5. Start S1b and the first S4a vertical in W0.2, stop Wave 0 only at its stated
-   gate, then begin S5/S6 rather than chasing whichever alphabetic fixture
-   happens to fail next.
+1. Finish and independently review the frozen lazy generic-call rewrite, then
+   add the root-owned source/session adapter and public TS2554/TS2558/TS2344/
+   TS2345/TS2589 demand-order vertical.
+2. Integrate the bounded readonly-property follow-up if its strict-subtype,
+   inheritance, formatting, assignability, and warm-cache evidence is clean.
+3. Score both leaves independently; retain all exact artifacts and record every
+   frontier movement in the Wave 0 ledger and port map.
+4. Use the freed worker slots for the first ordinary CFG/source vertical and
+   the next declaration/reexport slice, keeping source/compiler adapters at
+   root.
+5. Close the Wave 0 CFG exit gate, then start the Wave 1 S5/S6 sub-wave instead
+   of chasing fixtures individually.
 
 This is the shortest credible path to useful modern-project checking and then
 full typescript-go parity. It multiplies independent semantic work without

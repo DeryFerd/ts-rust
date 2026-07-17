@@ -5,7 +5,7 @@
 - Upstream epoch: `dc37b5249ab60e2bbce936f71b883e6c8136167e`
 - Wave branch baseline: `cdbf749`
 - Integration branch: `july-ultra`
-- Current integration head: `174eebf`
+- Current integrated semantic stack: through `75abbf5`
 
 This is the live execution record for Wave 0 of
 [`typechecker-completion-goal.md`](typechecker-completion-goal.md). The port
@@ -15,25 +15,36 @@ map remains authoritative for cluster state.
 
 | Lane | Branch/worktree | Current task | State |
 |---|---|---|---|
-| Root/integration | `july-ultra`; repository root | contract adapters, review, serial verification | M0, S1b, S3 kernel, arrow capability recovery, and the fixed smoke lane integrated; root is the sole Cargo/build owner |
+| Root/integration | `july-ultra`; repository root | contract adapters, review, serial verification | M0, S1b, S2a, and the recovering S3 session core are integrated; root is the sole Cargo/build and fixed-shard owner |
 | M0 | `july-ultra`; repository root | deterministic checker scoring | schema-5 provenance, retained fatal outcomes, exact fixed-manifest execution, and selected-case preparation integrated through `174eebf` |
-| S2a | `agent/w0-s2a-members`; `../ts-rust-worktrees/w0-s2a-members` | exact single-base interface heritage | implementation complete; repeated adversarial review found relation-cache invalidation bugs, so an observed-dependency redesign is in progress before integration |
-| S3 | `agent/w0-s3-instantiation`; `../ts-rust-worktrees/w0-s3-instantiation` | composite mapper and instantiation-session kernel | integrated through `4701c60`; checker check, strict Clippy, and rustdoc green |
-| S3b | `agent/w0-s3b-session`; `../ts-rust-worktrees/w0-s3b-session` | lazy generic-call demand and source-owned instantiation accounting | audit complete; `a27ee8c`/`f11eb00` are rejected as-is and the replacement contract is frozen in [`typechecker-s3-lazy-instantiation.md`](typechecker-s3-lazy-instantiation.md) |
+| S2a | `july-ultra`; repository root | exact single-base interface heritage and relation-cache observation | integrated through `14ae6ce`; two exact-tip reviews found no P0/P1 issue, all five public heritage tests pass, and the fixed shard advances one interface fixture without an exact loss |
+| S2 readonly follow-up | `agent/s2-readonly-properties`; `../ts-rust-worktrees/s2-readonly-properties` | readonly property retention and strict-subtype directionality | active from `75abbf5`; owns only the bounded property/relation leaf and does not change store schema or root adapters |
+| S3 session core | `july-ultra`; repository root | recovering instantiation session and limit accounting | integrated through `75abbf5`; production check, focused strict Clippy, rustdoc, and a semantically identical fixed shard are green |
+| S3 generic calls | `agent/s3-generic-calls`; `../ts-rust-worktrees/s3-generic-calls` | lazy checked shells, parameter/return demand, and uncached recovery | active from `75abbf5`; owns only `semantic/generic_calls.rs` under the frozen contract in [`typechecker-s3-lazy-instantiation.md`](typechecker-s3-lazy-instantiation.md) |
+| S3 review/oracle | independent reviewer lane | session-core audit, generic-call adversarial review, and public TS2589 composition evidence | active; session core has no P0/P1 finding and the exact diagnostic/demand-order checklist is frozen before leaf integration |
 | S1b | `agent/w0-s1b-declarations`; `../ts-rust-worktrees/w0-s1b-declarations` | direct named `.d.ts` value/type consumption | integrated through `c23594d`; both program orders, warm reuse, skipLibCheck, and fail-closed boundaries pass |
 
-S2a is the only active semantic writer. S3b is a read-only audit until its
-ownership and lazy-demand contract is frozen. Root keeps integration, shared
-dispatch adapters, Cargo, and corpus scoring serialized while spare capacity
-rotates through independent Go-semantic and Rust-invariant review.
+The current four-slot topology is the intended steady state: root integrates
+and builds, two isolated semantic workers own non-overlapping leaves, and one
+reviewer/oracle lane audits both Go behavior and Rust cache invariants. Shared
+store, source-dispatch, compiler, and formatter adapters remain serialized at
+root.
 
 ## Fixed smoke evidence
 
 `checker-smoke-v1.json` freezes 96 unique variant keys across eight semantic
-families. Two clean executions at `174eebf` produced the same scorecard digest,
-`12dd493b4e782771446eb922579def8d`, with no fatal invariants. The fixed-shard
-digest is `60dbd52bce2c3f9f94971819ad0d9cda`; the complete pinned-oracle manifest
-digest is `667bc371832bee995194e09bc5b6e968`.
+families. Two clean executions at `174eebf` produced the same raw scorecard
+digest, `12dd493b4e782771446eb922579def8d`, with no fatal invariants. The
+fixed-shard digest is `60dbd52bce2c3f9f94971819ad0d9cda`; the complete
+pinned-oracle manifest digest is `667bc371832bee995194e09bc5b6e968`.
+
+The S2a integration run at `14ae6ce` has raw digest
+`efa3ce8f2047b2fa7e8e12a320dd3b73`. After removing only Rust commit/dirty and
+invocation provenance, its sole semantic delta from `174eebf` is that
+`anyIsAssignableToObject.ts` advances from the interface declaration boundary
+to its first unsupported property declaration. The S3 session-core run at
+`75abbf5` has raw digest `f895b87f26f22da71aafa385709eba09` and is byte-for-
+byte identical to the normalized S2a scorecard (`9c64e6157ea7b7b8b6f0f0332a61d034`).
 
 The current frontier is four exact variants, 90 typed capability boundaries,
 and two supported mismatches. The run discovers 12,750 upstream configurations,
@@ -86,8 +97,10 @@ the query-scoped instantiation session. Their next stacks meet at a generic
 
 | Hub | Wave | Owner | Base | Allowed symbols | Expiry |
 |---|---|---|---|---|---|
-| `semantic/relater.rs` | W0.1 | `agent/w0-s2a-members` | `cdbf749` | heritage admission/relation helpers plus successful-relation dependency collection | reviewed S2a integration commit |
-| `semantic/store.rs` | W0.1 repair | `agent/w0-s2a-members` | `e867a88` | relation-observed identity sets and changed-write invalidation only; no unrelated store API work | reviewed S2a integration commit |
+| `semantic/relater.rs` | W0.1 | `agent/w0-s2a-members` | `cdbf749` | heritage admission/relation helpers plus successful-relation dependency collection | expired at reviewed integration `14ae6ce` |
+| `semantic/store.rs` | W0.1 repair | `agent/w0-s2a-members` | `e867a88` | relation-observed identity sets and changed-write invalidation only; no unrelated store API work | expired at reviewed integration `14ae6ce` |
+| `semantic/generic_calls.rs` | W0.2 | `agent/s3-generic-calls` | `75abbf5` | frozen lazy checked-shell/demand/recovery rewrite only | reviewed S3 generic-call integration |
+| `semantic/relater.rs` | W0.2 | `agent/s2-readonly-properties` | `75abbf5` | readonly property strict-subtype branch and its focused tests only | reviewed readonly integration |
 
 Root and every other worker treat the leased surface as read-only until the
 lease expires. `type_nodes.rs`, `source.rs`, `type_records.rs`, `production.rs`,
@@ -101,13 +114,20 @@ retain the exact identities whose later mutation invalidates that cache.
   capability or invariant code, writes its scorecard, and exits nonzero.
 - The scorecard embeds upstream/Rust SHA, dirty state, manifest digest, exact
   invocation, and stable variant keys.
-- S2a proves inherited property order, missing-property diagnostics, inherited
-  reads, cold/warm identity, poison/foreign rejection, and cycle safety through
-  a public production path.
+- S2a proves inherited property order, missing-property diagnostics and related
+  information, inherited reads, cold/warm identity, exact observed-dependency
+  invalidation, poison/foreign rejection, and cycle safety through a public
+  production path. Readonly strict-subtype behavior is the active bounded
+  follow-up rather than an implied completed capability.
 - S3 proves Composite-versus-Merged behavior, no-op identity, cache-before-
   counter ordering, depth/count boundaries, active-mapper recursion, and
   query-local reset.
 - Every stack receives a Go-semantic review and a separate Rust-invariant
   review before serial integration.
-- Root runs focused tests, `cargo check --tests`, strict Clippy, rustdoc, and
-  the fixed scorecard after integration.
+- Root runs focused public tests, production-library check, strict focused
+  Clippy, rustdoc, and the fixed scorecard after integration. On the current
+  1 GiB machine, checker-wide `cargo check --tests` and all-target Clippy enter
+  the giant unit-test crate and are killed by the cgroup; the focused public
+  binaries are therefore the executable behavior gate, while all-target
+  compilation remains a tracked infrastructure limit rather than a claimed
+  success.
