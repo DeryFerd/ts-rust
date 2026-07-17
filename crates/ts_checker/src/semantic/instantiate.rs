@@ -16,6 +16,7 @@ use super::{
     mapper::{CanonicalTypeMapperStore, TypeMapperApplication},
     type_records::TypeData,
 };
+use ts_binder::SemanticSymbolId;
 
 /// Pinned checker limits for one instantiation query.
 ///
@@ -45,6 +46,7 @@ impl Default for InstantiationLimits {
 pub(super) enum InstantiationError {
     InvalidType(TypeId),
     InvalidMapper(TypeMapperId),
+    InvalidAlias(TypeAliasId),
     DepthLimit {
         depth: usize,
         limit: usize,
@@ -75,6 +77,9 @@ impl std::fmt::Display for InstantiationError {
                     formatter,
                     "cannot instantiate with invalid mapper {mapper:?}"
                 )
+            }
+            Self::InvalidAlias(alias) => {
+                write!(formatter, "cannot instantiate with invalid alias {alias:?}")
             }
             Self::DepthLimit { depth, limit } => write!(
                 formatter,
@@ -134,10 +139,19 @@ impl From<ArrayTypeError> for InstantiationError {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct InstantiationCacheKey {
     type_: TypeId,
-    alias: Option<TypeAliasId>,
+    alias: InstantiationAliasCacheKey,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+enum InstantiationAliasCacheKey {
+    None,
+    Some {
+        symbol: Option<SemanticSymbolId>,
+        type_arguments: Vec<TypeId>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -184,13 +198,22 @@ impl InstantiationSession {
         }
     }
 
-    /// Starts the next source-element or expression query. This must not reset
-    /// `total_count`, which is checker-global upstream.
+    /// Starts the next source-element or expression query. Pinned query
+    /// boundaries reset only this count; recursion depth and active mapper
+    /// frames belong to the dynamic instantiation stack and must survive a
+    /// re-entrant query boundary.
     #[allow(dead_code)] // Called by the future source-element query owner.
     pub(super) fn reset_query(&mut self) {
-        self.depth = 0;
         self.count = 0;
-        self.active_mappers.clear();
+    }
+
+    /// Mirrors pinned `clearActiveMapperCaches` without changing the active
+    /// mapper stack itself. Inference owns the eventual call site.
+    #[allow(dead_code)] // Installed ahead of the inference query owner.
+    pub(super) fn clear_active_mapper_caches(&mut self) {
+        for frame in &mut self.active_mappers {
+            frame.cache.clear();
+        }
     }
 
     #[cfg(test)]
@@ -356,6 +379,9 @@ fn instantiate_type_with_alias(
         });
     }
 
+    // Rust IDs can carry foreign provenance, unlike the upstream pointers.
+    // Validate the complete cache identity before mutating the dynamic stack.
+    let key = instantiation_cache_key(store, type_, alias)?;
     let mapping_identity = mapping.identity();
     let existing_index = session
         .active_mappers
@@ -370,7 +396,6 @@ fn instantiate_type_with_alias(
         });
         session.active_mappers.len() - 1
     };
-    let key = InstantiationCacheKey { type_, alias };
     if let Some(cached) = session.active_mappers[frame_index].cache.get(&key) {
         return Ok(*cached);
     }
@@ -392,6 +417,26 @@ fn instantiate_type_with_alias(
     }
     session.depth -= 1;
     result
+}
+
+fn instantiation_cache_key(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    alias: Option<TypeAliasId>,
+) -> Result<InstantiationCacheKey, InstantiationError> {
+    let alias = match alias {
+        None => InstantiationAliasCacheKey::None,
+        Some(alias) => {
+            let alias = store
+                .type_alias(alias)
+                .ok_or(InstantiationError::InvalidAlias(alias))?;
+            InstantiationAliasCacheKey::Some {
+                symbol: alias.symbol(),
+                type_arguments: alias.type_arguments().unwrap_or_default().to_vec(),
+            }
+        }
+    };
+    Ok(InstantiationCacheKey { type_, alias })
 }
 
 fn could_contain_installed_type_variables(
@@ -763,6 +808,46 @@ mod tests {
     }
 
     #[test]
+    fn composite_mapper_maps_unchanged_inputs_and_nested_composites_exactly() {
+        let mut store = initialized_store();
+        let (string, number) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (bootstrap.string_type, bootstrap.number_type)
+        };
+        let outer = store.alloc_type_parameter(None).unwrap();
+        let untouched = store.alloc_type_parameter(None).unwrap();
+        let inner = store.alloc_type_parameter(None).unwrap();
+        let leaf = store.alloc_type_parameter(None).unwrap();
+        let intermediate = store
+            .alloc_union_type(ObjectFlags::NONE, vec![inner, string])
+            .unwrap();
+
+        let first = store.new_simple_type_mapper(outer, intermediate).unwrap();
+        let unchanged_second = store.new_simple_type_mapper(untouched, number).unwrap();
+        let unchanged = store
+            .combine_type_mappers(Some(first), unchanged_second)
+            .unwrap();
+        assert_eq!(
+            instantiate_type(&mut store, untouched, unchanged),
+            Ok(number)
+        );
+
+        let inner_to_leaf = store.new_simple_type_mapper(inner, leaf).unwrap();
+        let leaf_to_number = store.new_simple_type_mapper(leaf, number).unwrap();
+        let nested_second = store
+            .combine_type_mappers(Some(inner_to_leaf), leaf_to_number)
+            .unwrap();
+        let nested = store
+            .combine_type_mappers(Some(first), nested_second)
+            .unwrap();
+        let instantiated = instantiate_type(&mut store, outer, nested).unwrap();
+        let TypeData::Union(data) = store.type_payload(instantiated).unwrap().data() else {
+            panic!("nested composites must recursively instantiate the union")
+        };
+        assert_eq!(data.union.types, [string, number]);
+    }
+
+    #[test]
     fn active_mapper_cache_precedes_instantiation_counter_increment() {
         let mut store = initialized_store();
         let (string, number) = {
@@ -818,6 +903,86 @@ mod tests {
         );
         assert_eq!(session.query_count(), 1);
         assert_eq!(session.total_count(), 2);
+    }
+
+    #[test]
+    fn query_reset_and_cache_clear_preserve_dynamic_mapper_frames() {
+        let mut store = initialized_store();
+        let number = store.intrinsic_bootstrap().unwrap().number_type;
+        let parameter = store.alloc_type_parameter(None).unwrap();
+        let mapper = store.new_simple_type_mapper(parameter, number).unwrap();
+        let key = InstantiationCacheKey {
+            type_: parameter,
+            alias: InstantiationAliasCacheKey::None,
+        };
+        let mut cache = HashMap::new();
+        cache.insert(key.clone(), number);
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        session.depth = 3;
+        session.count = 7;
+        session.active_mappers.push(ActiveMapperFrame {
+            mapping: InstantiationMappingIdentity::Stored(mapper),
+            cache,
+        });
+
+        session.reset_query();
+        assert_eq!(session.depth, 3);
+        assert_eq!(session.query_count(), 0);
+        assert_eq!(session.active_mappers.len(), 1);
+        assert_eq!(session.active_mappers[0].cache.get(&key), Some(&number));
+
+        session.clear_active_mapper_caches();
+        assert_eq!(session.depth, 3);
+        assert_eq!(session.active_mappers.len(), 1);
+        assert!(session.active_mappers[0].cache.is_empty());
+    }
+
+    #[test]
+    fn alias_cache_keys_use_symbol_and_ordered_arguments_not_record_identity() {
+        let mut store = initialized_store();
+        let number = store.intrinsic_bootstrap().unwrap().number_type;
+        let parameter = store.alloc_type_parameter(None).unwrap();
+        let first = store.alloc_type_alias(None).unwrap();
+        let second = store.alloc_type_alias(None).unwrap();
+        assert!(store.set_type_alias_arguments(first, Some(vec![parameter])));
+        assert!(store.set_type_alias_arguments(second, Some(vec![parameter])));
+
+        assert_eq!(
+            instantiation_cache_key(&store, number, Some(first)),
+            instantiation_cache_key(&store, number, Some(second)),
+        );
+
+        assert!(store.set_type_alias_arguments(second, Some(vec![number])));
+        assert_ne!(
+            instantiation_cache_key(&store, number, Some(first)),
+            instantiation_cache_key(&store, number, Some(second)),
+        );
+    }
+
+    #[test]
+    fn foreign_alias_rejection_does_not_mutate_the_dynamic_session() {
+        let mut store = initialized_store();
+        let parameter = store.alloc_type_parameter(None).unwrap();
+        let mapper = store.new_simple_type_mapper(parameter, parameter).unwrap();
+        let mut foreign = initialized_store();
+        let foreign_alias = foreign.alloc_type_alias(None).unwrap();
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+
+        assert_eq!(
+            instantiate_type_with_alias(
+                &mut store,
+                parameter,
+                InstantiationMapping::Stored(mapper),
+                None,
+                Some(foreign_alias),
+                &mut session,
+            ),
+            Err(InstantiationError::InvalidAlias(foreign_alias)),
+        );
+        assert_eq!(session.depth, 0);
+        assert_eq!(session.query_count(), 0);
+        assert_eq!(session.total_count(), 0);
+        assert!(session.active_mappers.is_empty());
     }
 
     #[test]

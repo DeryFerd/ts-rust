@@ -4,7 +4,8 @@
 //! Simple, array, array-to-single, and merged mappers only need canonical
 //! `TypeId` identity, so they can be represented and evaluated directly.
 //! Composite mappers delegate recursive substitution to `instantiateType`, so
-//! their graph is represented here and executed by [`super::instantiate`].
+//! their graph is represented here and executed by the private `instantiate`
+//! module.
 //! `DeferredTypeMapper` and `FunctionTypeMapper` retain executable callbacks;
 //! `InferenceTypeMapper` mutates an `InferenceContext`. Their constructors are
 //! intentionally absent until those owning algorithms land. Treating any of
@@ -56,6 +57,7 @@ enum TypeMapperData {
         first: TypeMapperId,
         second: TypeMapperId,
     },
+    #[allow(dead_code)] // Constructed by the generic signature/inference consumer.
     Composite {
         first: TypeMapperId,
         second: TypeMapperId,
@@ -103,6 +105,7 @@ impl TypeMapper {
         }
     }
 
+    #[allow(dead_code)] // Constructed by the generic signature/inference consumer.
     const fn composite(first: TypeMapperId, second: TypeMapperId) -> Self {
         Self {
             data: TypeMapperData::Composite { first, second },
@@ -256,7 +259,8 @@ impl SemanticStore<TypeRecord, TypeMapper> {
     /// without allocating. Otherwise a composite mapper first applies
     /// `first`; when that changes the input, the changed result is recursively
     /// instantiated through `second` rather than merely mapped as a whole.
-    pub fn combine_type_mappers(
+    #[allow(dead_code)] // Installed ahead of the generic signature/inference consumer.
+    pub(super) fn combine_type_mappers(
         &mut self,
         first: Option<TypeMapperId>,
         second: TypeMapperId,
