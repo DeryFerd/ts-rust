@@ -528,6 +528,7 @@ fn repository_revision(repository: &Path) -> ScorecardRepositoryRevision {
     ScorecardRepositoryRevision { sha, dirty }
 }
 
+#[allow(clippy::too_many_lines)] // Keeps the versioned registry contract in one audit surface.
 fn capability_registry_metadata() -> io::Result<ScorecardCapabilityRegistry> {
     let mut lines = CAPABILITY_REGISTRY.lines();
     if lines.next() != Some("# schema_version\t1") {
@@ -1076,7 +1077,8 @@ pub fn run_upstream_diagnostic_baselines(
                     scorecard.summary.header_mismatches += 1;
                 }
                 match status {
-                    DiagnosticVariantStatus::ExactMatch => unreachable!(),
+                    DiagnosticVariantStatus::ExactMatch
+                    | DiagnosticVariantStatus::FatalInvariant => unreachable!(),
                     DiagnosticVariantStatus::HeaderOnlyMatch => {
                         scorecard.summary.header_only_matches += 1;
                     }
@@ -1099,7 +1101,6 @@ pub fn run_upstream_diagnostic_baselines(
                     DiagnosticVariantStatus::ArtifactMismatch => {
                         scorecard.summary.artifact_mismatches += 1;
                     }
-                    DiagnosticVariantStatus::FatalInvariant => unreachable!(),
                 }
                 let display_path = case_path
                     .strip_prefix(repository)

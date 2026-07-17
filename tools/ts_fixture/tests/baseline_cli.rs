@@ -525,6 +525,7 @@ fn matches_a_nonempty_full_diagnostic_artifact_exactly() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // The scorecard contract is clearest as one end-to-end assertion.
 fn writes_deterministic_structured_full_artifact_scorecard() {
     let repository = TestRepository::new();
     repository.write_case(
