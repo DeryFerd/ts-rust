@@ -5,7 +5,7 @@
 - Upstream epoch: `dc37b5249ab60e2bbce936f71b883e6c8136167e`
 - Wave branch baseline: `cdbf749`
 - Integration branch: `july-ultra`
-- Current integrated semantic stack: through `d4719b3`
+- Current integrated semantic stack: through `6c3bf97`
 
 This is the live execution record for Wave 0 of
 [`typechecker-completion-goal.md`](typechecker-completion-goal.md). The port
@@ -15,14 +15,15 @@ map remains authoritative for cluster state.
 
 | Lane | Branch/worktree | Current task | State |
 |---|---|---|---|
-| Root/integration | `july-ultra`; repository root | contract adapters, review, serial verification | M0, S1b, S2a including readonly directionality, and the recovering S3 session core are integrated; root is the sole Cargo/build and fixed-shard owner |
+| Root/integration | `july-ultra`; repository root | contract adapters, review, serial verification | M0, S1b named reexports, S2a including readonly directionality, and the recovering/lazy S3 generic-call path are integrated; root is the sole Cargo/build and fixed-shard owner |
 | M0 | `july-ultra`; repository root | deterministic checker scoring | schema-5 provenance, retained fatal outcomes, exact fixed-manifest execution, and selected-case preparation integrated through `174eebf` |
 | S2a | `july-ultra`; repository root | exact single-base interface heritage and relation-cache observation | integrated through `14ae6ce`; two exact-tip reviews found no P0/P1 issue, all five public heritage tests pass, and the fixed shard advances one interface fixture without an exact loss |
 | S2 readonly follow-up | `july-ultra`; repository root | readonly property retention and strict-subtype directionality | integrated through `d4719b3`; two independent reviews found no P0/P1 issue, the public production target passes, focused strict Clippy is green, and the fixed shard is semantically unchanged |
-| S3 session core | `july-ultra`; repository root | recovering instantiation session and limit accounting | integrated through `75abbf5`; production check, focused strict Clippy, rustdoc, and a semantically identical fixed shard are green |
-| S3 generic calls | `agent/s3-generic-calls`; `../ts-rust-worktrees/s3-generic-calls` | lazy checked shells, parameter/return demand, and uncached recovery | active from `75abbf5`; owns only `semantic/generic_calls.rs` under the frozen contract in [`typechecker-s3-lazy-instantiation.md`](typechecker-s3-lazy-instantiation.md) |
-| S3 review/oracle | independent reviewer lane | session-core audit, generic-call adversarial review, and public TS2589 composition evidence | active; session core has no P0/P1 finding and the exact diagnostic/demand-order checklist is frozen before leaf integration |
-| S1b | `agent/w0-s1b-declarations`; `../ts-rust-worktrees/w0-s1b-declarations` | direct named `.d.ts` value/type consumption | integrated through `c23594d`; both program orders, warm reuse, skipLibCheck, and fail-closed boundaries pass |
+| S3 session/generic calls | `july-ultra`; repository root | lazy checked shells, shared query sessions, exact demand/recovery, and TS2589 | integrated through `010d93a`; the library check and focused `source_generic_calls`/`source_instantiation_limits` targets pass, and independent review found no remaining P0/P1 issue |
+| S1b | `july-ultra`; repository root | named ESM imports and two-hop renamed/type-only reexports | integrated through `6c3bf97`; 17 focused import/reexport public tests pass, sparse immediate-link timing matches pinned `resolveAlias`, warm alias/type-only/value poison is rejected, and independent review approved the slice |
+| W1 S5 | isolated worker worktree | dependency-independent nongeneric `keyof`/property-key algebra leaf | active from `6c3bf97`; worker owns new leaf modules and bounded indexed-access changes while root retains type-node/options/formatter adapters |
+| W1 S6 | isolated worker worktree | direct explicit generic class/interface reference shells | active from `6c3bf97`; worker owns the reference leaf and bounded instantiation/declared helpers while root retains type-node/store/source adapters |
+| W1 review/oracle | independent reviewer lane | pinned S5/S6 expected behavior, cache timing, and adversarial fixtures | active; no production writes or Cargo ownership |
 
 The current four-slot topology is the intended steady state: root integrates
 and builds, two isolated semantic workers own non-overlapping leaves, and one
@@ -53,6 +54,14 @@ The public target proves source-retained readonly state across interfaces,
 type literals, direct heritage, formatting, bidirectional assignability, and
 warm rechecks; internal relation evidence proves the pinned strict-subtype
 ordering and changed-versus-equal cache invalidation behavior.
+
+The integrated lazy-generic/session stack through `010d93a` has raw fixed-shard
+digest `dce743a4b3ed9fa6ddc09822a8f5e16e`. The complete named-reexport stack
+through `6c3bf97` has raw digest `25d72d4210b7a8f7ab46f1478a7855fc`.
+After removing only Rust commit/dirty and invocation provenance, both hash to
+`353dddd39af6749db775683da54d7c9a`, exactly matching the normalized readonly
+baseline. Both runs retain four exact variants, 90 typed capability boundaries,
+two supported mismatches, and zero fatal invariants.
 
 The current frontier is four exact variants, 90 typed capability boundaries,
 and two supported mismatches. The run discovers 12,750 upstream configurations,

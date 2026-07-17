@@ -153,11 +153,21 @@ upstream, ordinary assignability remains symmetric, and changed observed bits
 invalidate warmed relations. Its public target and focused strict Clippy pass,
 and its fixed shard is semantically byte-identical to `75abbf5`.
 
-The active four-slot topology now matches the staffing model below: root owns
-integration/build/scoring, one worker owns the frozen `generic_calls.rs` lazy-
-demand rewrite, one independently audits S3 demand order, recovery, and TS2589
-evidence, and the freed semantic lane inventories the next declaration/reexport
-slice. The live commit/worktree ledger is
+The recovering lazy-generic vertical is now integrated through `010d93a`,
+including query-owned sessions in source calls, assignment diagnostics, and
+import preparation; atomic mapper-shell preflight; nested generic arrays; and a
+public TS2589/limit oracle. Named ESM reexports are integrated through
+`6c3bf97`: two-hop renamed value/function barrels, transitive type-only markers,
+separate immediate/final alias identities, pinned lazy immediate-cache timing,
+and fail-closed warm-chain validation all pass focused public tests and
+independent review. Both stacks are semantically byte-identical to the frozen
+96-variant baseline after removing only commit/invocation provenance.
+
+The active four-slot topology has moved to Wave 1: root owns integration,
+builds, and scoring; one worker owns the dependency-independent nongeneric S5
+property-key leaf; one owns the first explicit generic-reference S6 leaf; and
+the fourth lane supplies the pinned Go oracle and adversarial cache review. The
+live commit/worktree ledger is
 [`typechecker-wave0-status.md`](typechecker-wave0-status.md).
 
 ### Quantitative posture
