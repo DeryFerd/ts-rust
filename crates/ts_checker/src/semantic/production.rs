@@ -21,7 +21,8 @@ use ts_binder::{
 };
 
 use super::{
-    AssignabilityErrorDisplay, CanonicalCheckerDiagnostics, CanonicalEnumSemantics,
+    AssignabilityErrorDisplay, CanonicalCheckerDiagnostics, CanonicalEnumSemantics, ClassError,
+    ClassShells,
     CanonicalGlobalTypeInitializationError, CanonicalGlobalTypes, CanonicalModuleResolutionLookup,
     CanonicalModuleResolutionManifest, CanonicalModuleResolutionManifestError,
     CanonicalModuleResolutionManifestInput, CanonicalTypeFormatFlags, CanonicalTypeMapperStore,
@@ -35,6 +36,7 @@ use super::{
     alias_provider::{
         ProductionAliasSourceRegistry, ProductionAliasTargetHost, ProductionAliasTargetHostError,
     },
+    classes::{execute_nongeneric_class_shells, plan_nongeneric_class},
     global_types::initialize_global_library_types,
     instantiate::{InstantiationLimits, InstantiationSession},
     module_resolution::validate_module_resolution_manifest,
@@ -658,7 +660,8 @@ impl<'arena> CanonicalCheckerContext<'arena> {
             store,
             files,
             GlobalMergeCompletion::new(options.name_resolution),
-        )?;
+        )
+        .map_err(DeclaredTypeError::from)?;
         CanonicalTypeQuery::new_with_global_types_and_session(
             store,
             &host,
@@ -668,6 +671,37 @@ impl<'arena> CanonicalCheckerContext<'arena> {
             diagnostics,
         )?
         .get_declared_type_of_symbol(symbol)
+    }
+
+    /// Installs or validates the exact instance and static identities for one
+    /// local nongeneric class declaration.
+    ///
+    /// This is the shell stage only: annotated members, constructor
+    /// signatures, heritage, and executable class checking remain separate
+    /// typed boundaries.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed syntax, binder, declared-type, capacity, or poisoned
+    /// cache error without publishing a partial class value graph.
+    pub fn get_nongeneric_class_shells(
+        &mut self,
+        symbol: SemanticSymbolId,
+    ) -> Result<ClassShells, ClassError> {
+        let Self {
+            options,
+            files,
+            store,
+            ..
+        } = self;
+        let host = DeclaredTypeHost::from_registry(
+            store,
+            files,
+            GlobalMergeCompletion::new(options.name_resolution),
+        )
+        .map_err(DeclaredTypeError::from)?;
+        let plan = plan_nongeneric_class(store, &host, symbol)?;
+        execute_nongeneric_class_shells(store, &host, &plan)
     }
 
     /// Publishes or validates the exact type/value/member identities for one

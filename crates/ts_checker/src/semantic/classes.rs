@@ -144,7 +144,7 @@ impl ClassDeclarationPlan {
 /// `instance_type` is the canonical `CLASS | REFERENCE` origin from
 /// `declared.rs`; `value_type` is the independent anonymous static side.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct ClassShells {
+pub struct ClassShells {
     declaration: NodeRef,
     symbol: SemanticSymbolId,
     instance_type: TypeId,
@@ -152,25 +152,25 @@ pub(super) struct ClassShells {
 }
 
 impl ClassShells {
-    pub(super) const fn declaration(self) -> NodeRef {
+    pub const fn declaration(self) -> NodeRef {
         self.declaration
     }
 
-    pub(super) const fn symbol(self) -> SemanticSymbolId {
+    pub const fn symbol(self) -> SemanticSymbolId {
         self.symbol
     }
 
-    pub(super) const fn instance_type(self) -> TypeId {
+    pub const fn instance_type(self) -> TypeId {
         self.instance_type
     }
 
-    pub(super) const fn value_type(self) -> TypeId {
+    pub const fn value_type(self) -> TypeId {
         self.value_type
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum ClassInvariant {
+pub enum ClassInvariant {
     SymbolNotOwned(SemanticSymbolId),
     InvalidOwnerSymbol(SemanticSymbolId),
     InvalidDeclaration(NodeRef),
@@ -187,7 +187,7 @@ pub(super) enum ClassInvariant {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum ClassUnsupported {
+pub enum ClassUnsupported {
     MergedDeclarations(SemanticSymbolId),
     NestedDeclaration(NodeRef),
     DeclarationModifiers(NodeRef),
@@ -205,7 +205,7 @@ pub(super) enum ClassUnsupported {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum ClassError {
+pub enum ClassError {
     Unsupported(ClassUnsupported),
     Invariant(ClassInvariant),
     DeclaredType(DeclaredTypeError),
@@ -217,8 +217,27 @@ impl From<DeclaredTypeError> for ClassError {
     }
 }
 
+impl std::fmt::Display for ClassError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unsupported(error) => write!(formatter, "class shell is unsupported: {error:?}"),
+            Self::Invariant(error) => write!(formatter, "class shell invariant failed: {error:?}"),
+            Self::DeclaredType(error) => write!(formatter, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for ClassError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::DeclaredType(error) => Some(error),
+            Self::Unsupported(_) | Self::Invariant(_) => None,
+        }
+    }
+}
+
 impl ClassError {
-    pub(super) const fn node(self) -> Option<NodeRef> {
+    pub const fn node(self) -> Option<NodeRef> {
         match self {
             Self::Unsupported(unsupported) => Some(match unsupported {
                 ClassUnsupported::MergedDeclarations(_) => return None,

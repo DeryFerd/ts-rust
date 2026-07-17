@@ -79,6 +79,7 @@ pub use bootstrap::{
     CheckerLinkCounts, CheckerStateSnapshot, IntrinsicBootstrap, IntrinsicBootstrapError,
     IntrinsicBootstrapOptions, SemanticArenaCounts, TypeResolutionStateSnapshot,
 };
+pub use classes::{ClassError, ClassInvariant, ClassShells, ClassUnsupported};
 pub use declared::{
     DeclaredTypeError, DeclaredTypeHost, DeclaredTypeHostError, DeclaredTypeUnavailable,
     UnsupportedDeclaredTypeKind, UnsupportedOuterTypeParameterContext,
