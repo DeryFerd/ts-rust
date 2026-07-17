@@ -122,6 +122,7 @@ pub use links::{
     TypeResolutionTargetError, TypeSystemPropertyName, ValueSymbolLinks, VarianceLinks,
 };
 pub use mapper::{CanonicalTypeMapperStore, TypeMapper, TypeMapperKind};
+pub use member_resolution::{CanonicalUnionPropertyError, ResolvedUnionProperty};
 pub use merge::{
     CheckerDiagnosticMergeHost, FailClosedSymbolMergeHost, SymbolMergeDiagnostic,
     SymbolMergeDiagnosticKind, SymbolMergeError, SymbolMergeHost, get_excluded_symbol_flags,

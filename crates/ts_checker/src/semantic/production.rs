@@ -26,9 +26,10 @@ use super::{
     CanonicalGlobalTypeInitializationError, CanonicalGlobalTypes, CanonicalModuleResolutionLookup,
     CanonicalModuleResolutionManifest, CanonicalModuleResolutionManifestError,
     CanonicalModuleResolutionManifestInput, CanonicalTypeFormatFlags, CanonicalTypeMapperStore,
-    DeclaredTypeError, DeclaredTypeHost, DeclaredTypeHostError, IntrinsicBootstrapError,
-    IntrinsicBootstrapOptions, RelationUnavailable, SignatureId, SourceCheckError,
-    SourceCheckProvenanceError, SourceFileRef, SymbolMergeError, TypeDisplayUnavailable, TypeId,
+    CanonicalUnionPropertyError, DeclaredTypeError, DeclaredTypeHost, DeclaredTypeHostError,
+    IntrinsicBootstrapError, IntrinsicBootstrapOptions, RelationUnavailable, ResolvedUnionProperty,
+    SignatureId, SourceCheckError, SourceCheckProvenanceError, SourceFileRef, SymbolMergeError,
+    TypeDisplayUnavailable, TypeId,
     alias::{CanonicalAliasResolution, CanonicalAliasResolutionError, CanonicalAliasResolver},
     alias_flags::{
         CanonicalSymbolFlagsError, CanonicalSymbolFlagsResolution, CanonicalSymbolFlagsResolver,
@@ -426,6 +427,29 @@ impl<'arena> CanonicalCheckerContext<'arena> {
     #[must_use]
     pub const fn store(&self) -> &CanonicalTypeMapperStore {
         &self.store
+    }
+
+    /// Resolves one property from an exact two-constituent union.
+    ///
+    /// The production adapter accepts either two already-resolved, raw
+    /// alias-free property objects or two source-declared type literals. A
+    /// declared union retains its canonical named-alias identity and every
+    /// selected source property's declaration/owner provenance. Partial
+    /// properties are cached internally and filtered from the public result.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CanonicalUnionPropertyError`] for a foreign or malformed
+    /// identity, an unsupported constituent/mixed mode, or a member/type
+    /// family outside this exact leaf.
+    pub fn get_union_property(
+        &mut self,
+        union: TypeId,
+        name: &str,
+    ) -> Result<Option<ResolvedUnionProperty>, CanonicalUnionPropertyError> {
+        self.store
+            .resolved_union_property(union, name)
+            .map_err(|error| CanonicalUnionPropertyError::from_internal(union, error))
     }
 
     #[cfg(test)]
