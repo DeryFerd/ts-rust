@@ -680,6 +680,13 @@ struct PlannedVariable {
     initializer: PlannedExpression,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct PlannedAmbientVariable {
+    symbol: SemanticSymbolId,
+    binding: VariableBindingKind,
+    type_node: NodeRef,
+}
+
 #[derive(Clone, Debug)]
 struct PlannedFunction {
     callable: SourceCallablePlan,
@@ -829,6 +836,7 @@ enum PlannedStatement {
     Enum(SourceEnumPlan),
     ExternalModuleMarker,
     NamedReexport,
+    AmbientVariables,
     Function(usize),
     Arrow(usize),
     ContextualArrow(usize),
@@ -845,6 +853,7 @@ struct SourceCheckPlan {
     import_reads: Vec<PlannedSourceImportRead>,
     type_import_references: Vec<PlannedSourceTypeImportReference>,
     type_import_value_uses: Vec<PlannedSourceTypeImportValueUse>,
+    ambient_variables: Vec<PlannedAmbientVariable>,
     functions: Vec<PlannedFunction>,
     arrows: Vec<PlannedArrow>,
     contextual_arrows: Vec<PlannedContextualArrow>,
@@ -883,6 +892,7 @@ struct SourcePlanner<'arena, 'semantic, 'sources> {
     hoisted_functions: HashSet<SemanticSymbolId>,
     prior_variables: HashSet<SemanticSymbolId>,
     readable_variables: HashSet<SemanticSymbolId>,
+    assignable_ambient_variables: HashSet<SemanticSymbolId>,
     prior_classes: HashMap<SemanticSymbolId, ClassMemberPlan>,
     assigned_variables: HashSet<SemanticSymbolId>,
     /// Exact roots minted only by assignment and direct-call syntax owners.
@@ -911,6 +921,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             hoisted_functions: HashSet::new(),
             prior_variables: HashSet::new(),
             readable_variables: HashSet::new(),
+            assignable_ambient_variables: HashSet::new(),
             prior_classes: HashMap::new(),
             assigned_variables: HashSet::new(),
             primitive_binary_position_roots: HashSet::new(),
@@ -943,6 +954,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             hoisted_functions: HashSet::new(),
             prior_variables: HashSet::new(),
             readable_variables: HashSet::new(),
+            assignable_ambient_variables: HashSet::new(),
             prior_classes: HashMap::new(),
             assigned_variables: HashSet::new(),
             primitive_binary_position_roots: HashSet::new(),
@@ -1053,9 +1065,32 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 ));
             }
         }
+        let mut preplanned_ambient_variables = HashMap::new();
+        for statement in &source_statements {
+            let statement = self.reference(*statement);
+            if self.node(statement)?.kind != SyntaxKind::VariableStatement {
+                continue;
+            }
+            let Some(variables) = self.preplan_ambient_variable_statement(
+                statement,
+                facts.is_declaration_file(),
+            )?
+            else {
+                continue;
+            };
+            if preplanned_ambient_variables
+                .insert(statement, variables)
+                .is_some()
+            {
+                return Err(SourceCheckError::Provenance(
+                    SourceCheckProvenanceError::RepeatedNode(statement),
+                ));
+            }
+        }
 
         let mut statements = Vec::with_capacity(source_statements.len());
         let mut named_reexports = Vec::new();
+        let mut ambient_variables = Vec::new();
         let mut functions = Vec::with_capacity(preplanned_functions.len());
         let mut arrows = Vec::new();
         let mut contextual_arrows = Vec::new();
@@ -1268,6 +1303,11 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     statements.push(PlannedStatement::Function(index));
                 }
                 SyntaxKind::VariableStatement => {
+                    if let Some(variables) = preplanned_ambient_variables.remove(&statement) {
+                        ambient_variables.extend(variables);
+                        statements.push(PlannedStatement::AmbientVariables);
+                        continue;
+                    }
                     let (declaration_list, exported) = {
                         let node = self.node(statement)?;
                         let NodeData::VariableStatement(variable) = &node.data else {
@@ -1328,9 +1368,20 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                             SourceSyntaxRole::Statement,
                         ));
                     };
-                    let assignment = super::assignment::plan_simple_assignment(
-                        self.arena, self.bound, store, host, statement,
-                    )
+                    let assignment = if self.assignable_ambient_variables.is_empty() {
+                        super::assignment::plan_simple_assignment(
+                            self.arena, self.bound, store, host, statement,
+                        )
+                    } else {
+                        super::assignment::plan_simple_assignment_with_ambient_targets(
+                            self.arena,
+                            self.bound,
+                            store,
+                            host,
+                            &self.assignable_ambient_variables,
+                            statement,
+                        )
+                    }
                     .map_err(Self::assignment_plan_error)?;
                     if !self.prior_variables.contains(&assignment.target_symbol) {
                         return Err(SourceCheckError::Unsupported(
@@ -1381,6 +1432,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             import_reads: self.import_reads,
             type_import_references: self.type_import_references,
             type_import_value_uses: self.type_import_value_uses,
+            ambient_variables,
             functions,
             arrows,
             contextual_arrows,
@@ -2840,6 +2892,260 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             return Err(self.unsupported(clause, clause_node.kind, SourceSyntaxRole::ExportClause));
         }
         Ok(())
+    }
+
+    fn preplan_ambient_variable_statement(
+        &mut self,
+        statement: NodeRef,
+        is_declaration_file: bool,
+    ) -> Result<Option<Vec<PlannedAmbientVariable>>, SourceCheckError> {
+        let statement_node = self.node(statement)?;
+        let NodeData::VariableStatement(variable) = &statement_node.data else {
+            return Err(SourceCheckError::Provenance(
+                SourceCheckProvenanceError::MismatchedNodeData {
+                    node: statement,
+                    kind: statement_node.kind,
+                },
+            ));
+        };
+        let Some(modifiers) = variable.modifiers.as_ref() else {
+            return Ok(None);
+        };
+        let [modifier_id] = modifiers.list.nodes.as_slice() else {
+            return Ok(None);
+        };
+        let modifier = self.reference(*modifier_id);
+        let modifier_node = self.node(modifier)?;
+        if modifier_node.kind != SyntaxKind::DeclareKeyword {
+            return Ok(None);
+        }
+        let declaration_list = self.reference(variable.declaration_list);
+        let declaration_start = self.node(declaration_list)?.range.start.get();
+        if statement_node.flags.0 != 0
+            || variable.flow_node.is_some()
+            || variable.facts != 0
+            || modifiers.flags.0 != 0
+            || modifiers.list.has_trailing_comma
+            || modifiers.list.range.start != statement_node.range.start
+            || modifiers.list.range.end.get() >= declaration_start
+            || !matches!(modifier_node.data, NodeData::Token(_))
+            || modifier_node.flags.0 != 0
+            || modifier_node.parent != Some(statement.node)
+            || modifier_node.range.start != statement_node.range.start
+            || modifier_node.range.end.get() >= modifiers.list.range.end.get()
+            || !self.source_spelling_matches(modifier, "declare")
+        {
+            return Err(self.unsupported(
+                modifier,
+                modifier_node.kind,
+                SourceSyntaxRole::VariableModifier,
+            ));
+        }
+        if is_declaration_file {
+            return Err(self.unsupported(
+                modifier,
+                modifier_node.kind,
+                SourceSyntaxRole::VariableModifier,
+            ));
+        }
+
+        let (
+            list_kind,
+            list_parent,
+            list_flags,
+            list_range,
+            declarations,
+            declaration_range,
+            trailing_comma,
+            facts,
+        ) = {
+            let list_node = self.node(declaration_list)?;
+            let NodeData::VariableDeclarationList(list_data) = &list_node.data else {
+                return Err(self.unsupported(
+                    declaration_list,
+                    list_node.kind,
+                    SourceSyntaxRole::VariableDeclarationList,
+                ));
+            };
+            (
+                list_node.kind,
+                list_node.parent,
+                list_node.flags.0,
+                list_node.range,
+                list_data.declarations.nodes.clone(),
+                list_data.declarations.range,
+                list_data.declarations.has_trailing_comma,
+                list_data.facts,
+            )
+        };
+        if list_kind != SyntaxKind::VariableDeclarationList
+            || list_parent != Some(statement.node)
+            || !matches!(list_flags, 0 | NODE_FLAG_LET | NODE_FLAG_CONST)
+            || declaration_range != list_range
+            || trailing_comma
+            || facts != 0
+        {
+            return Err(self.unsupported(
+                declaration_list,
+                list_kind,
+                SourceSyntaxRole::VariableDeclarationList,
+            ));
+        }
+        if declarations.is_empty() {
+            return Err(SourceCheckError::Unsupported(
+                UnsupportedSourceSyntax::EmptyVariableDeclarationList(declaration_list),
+            ));
+        }
+        let binding = match list_flags {
+            0 => VariableBindingKind::Var,
+            NODE_FLAG_LET => VariableBindingKind::Let,
+            NODE_FLAG_CONST => VariableBindingKind::Const,
+            _ => unreachable!("the ambient declaration-list gate accepted one binding kind"),
+        };
+
+        let mut variables = Vec::with_capacity(declarations.len());
+        for declaration in declarations {
+            variables.push(self.plan_ambient_variable_declaration(
+                declaration_list,
+                self.reference(declaration),
+                binding,
+            )?);
+        }
+        Ok(Some(variables))
+    }
+
+    fn plan_ambient_variable_declaration(
+        &mut self,
+        list: NodeRef,
+        declaration: NodeRef,
+        binding: VariableBindingKind,
+    ) -> Result<PlannedAmbientVariable, SourceCheckError> {
+        let (
+            declaration_kind,
+            declaration_parent,
+            declaration_flags,
+            name_id,
+            type_id,
+            initializer_id,
+            definite,
+            local_symbol,
+            symbol,
+            facts,
+        ) = {
+            let declaration_node = self.node(declaration)?;
+            let NodeData::VariableDeclaration(variable) = &declaration_node.data else {
+                return Err(self.unsupported(
+                    declaration,
+                    declaration_node.kind,
+                    SourceSyntaxRole::VariableDeclaration,
+                ));
+            };
+            (
+                declaration_node.kind,
+                declaration_node.parent,
+                declaration_node.flags.0,
+                variable.name,
+                variable.type_,
+                variable.initializer,
+                variable.exclamation_token.is_some(),
+                variable.local_symbol.is_some(),
+                variable.symbol.is_some(),
+                variable.facts,
+            )
+        };
+        if declaration_kind != SyntaxKind::VariableDeclaration
+            || declaration_parent != Some(list.node)
+            || declaration_flags != 0
+            || definite
+            || local_symbol
+            || symbol
+            || facts != 0
+        {
+            return Err(self.unsupported(
+                declaration,
+                declaration_kind,
+                SourceSyntaxRole::VariableDeclaration,
+            ));
+        }
+
+        let name = self.reference(name_id);
+        let name_node = self.node(name)?;
+        let NodeData::Identifier(identifier) = &name_node.data else {
+            return Err(self.unsupported(name, name_node.kind, SourceSyntaxRole::VariableName));
+        };
+        if name_node.kind != SyntaxKind::Identifier
+            || name_node.flags.0 != 0
+            || name_node.parent != Some(declaration.node)
+            || identifier.flow_node.is_some()
+        {
+            return Err(self.unsupported(name, name_node.kind, SourceSyntaxRole::VariableName));
+        }
+        let name_text = identifier.text.clone();
+        let Some((store, _)) = self.semantic else {
+            return Err(self.unsupported(
+                declaration,
+                declaration_kind,
+                SourceSyntaxRole::VariableDeclaration,
+            ));
+        };
+        let variable_symbol = plan_top_level_variable(
+            self.bound,
+            store,
+            declaration,
+            name,
+            &name_text,
+            binding,
+            false,
+        )
+        .map_err(Self::variable_plan_error)?;
+
+        if let Some(initializer) = initializer_id.map(|node| self.reference(node)) {
+            let initializer_node = self.node(initializer)?;
+            if initializer_node.parent != Some(declaration.node) {
+                return Err(self.unsupported(
+                    initializer,
+                    initializer_node.kind,
+                    SourceSyntaxRole::VariableInitializer,
+                ));
+            }
+            return Err(self.unsupported(
+                initializer,
+                initializer_node.kind,
+                SourceSyntaxRole::VariableInitializer,
+            ));
+        }
+        let type_node = type_id.map(|node| self.reference(node)).ok_or(
+            SourceCheckError::Unsupported(UnsupportedSourceSyntax::MissingVariableType(
+                declaration,
+            )),
+        )?;
+        if self.node(type_node)?.parent != Some(declaration.node) {
+            let kind = self.node(type_node)?.kind;
+            return Err(self.unsupported(type_node, kind, SourceSyntaxRole::VariableType));
+        }
+        self.plan_type_import_annotation_root(type_node)?;
+
+        if !self.prior_variables.insert(variable_symbol)
+            || !self.readable_variables.insert(variable_symbol)
+        {
+            return Err(SourceCheckError::Variable(
+                VariableInvariant::InvalidSymbolShape(variable_symbol),
+            ));
+        }
+        if !binding.is_const()
+            && !self
+                .assignable_ambient_variables
+                .insert(variable_symbol)
+        {
+            return Err(SourceCheckError::Variable(
+                VariableInvariant::InvalidSymbolShape(variable_symbol),
+            ));
+        }
+        Ok(PlannedAmbientVariable {
+            symbol: variable_symbol,
+            binding,
+            type_node,
+        })
     }
 
     fn validate_variable_modifiers(
@@ -8528,6 +8834,7 @@ pub(super) fn check_source_file(
         import_reads,
         type_import_references,
         type_import_value_uses,
+        ambient_variables,
         functions,
         arrows,
         contextual_arrows,
@@ -8640,6 +8947,21 @@ pub(super) fn check_source_file(
         )?
         .preflight_type_from_type_node(root)?;
     }
+    for variable in &ambient_variables {
+        if type_import_roots.contains(&variable.type_node) {
+            continue;
+        }
+        session.reset_query();
+        CanonicalTypeQuery::new_with_global_types_and_session(
+            store,
+            host,
+            global_types,
+            options,
+            session,
+            &mut type_import_preflight_diagnostics,
+        )?
+        .preflight_type_from_type_node(variable.type_node)?;
+    }
     debug_assert!(type_import_preflight_diagnostics.is_empty());
 
     let mut preflighted_type_import_value_uses = HashMap::new();
@@ -8667,6 +8989,57 @@ pub(super) fn check_source_file(
     let mut current_flow_types = HashMap::new();
     let mut mutable_variables = HashSet::new();
     let mut value_order = Vec::new();
+
+    for variable in &ambient_variables {
+        session.reset_query();
+        let mut annotation_diagnostics = CanonicalCheckerDiagnostics::default();
+        let type_reference_alias_targets: &[CanonicalTypeReferenceAliasTarget] =
+            type_import_capabilities
+                .get(&variable.type_node)
+                .map_or_else(|| &[], Vec::as_slice);
+        let declared_type = CanonicalTypeQuery::new_with_global_types_and_session(
+            store,
+            host,
+            global_types,
+            options,
+            session,
+            &mut annotation_diagnostics,
+        )?
+        .with_type_reference_alias_targets(
+            type_reference_alias_targets.iter().copied(),
+        )?
+        .get_type_from_type_node(variable.type_node);
+        merge_retry_diagnostics(diagnostics, annotation_diagnostics);
+        let declared_type = declared_type?;
+        stage_value_type(
+            store,
+            &mut staged_value_types,
+            &mut value_order,
+            variable.symbol,
+            declared_type,
+        )?;
+        if top_level_declared_types
+            .insert(variable.symbol, declared_type)
+            .is_some()
+        {
+            return Err(SourceCheckError::Variable(
+                VariableInvariant::DuplicateStagedValueType(variable.symbol),
+            ));
+        }
+        if !variable.binding.is_const() && !mutable_variables.insert(variable.symbol) {
+            return Err(SourceCheckError::Variable(
+                VariableInvariant::DuplicateCurrentFlowType(variable.symbol),
+            ));
+        }
+        if current_flow_types
+            .insert(variable.symbol, declared_type)
+            .is_some()
+        {
+            return Err(SourceCheckError::Variable(
+                VariableInvariant::DuplicateCurrentFlowType(variable.symbol),
+            ));
+        }
+    }
 
     let mut prepared_imports = Vec::<PreparedSourceImportValue>::new();
     let mut prepared_import_aliases = HashSet::new();
@@ -8816,7 +9189,9 @@ pub(super) fn check_source_file(
                     return Err(SourceCheckError::Enum(enumeration.declaration));
                 }
             }
-            PlannedStatement::ExternalModuleMarker | PlannedStatement::NamedReexport => {}
+            PlannedStatement::ExternalModuleMarker
+            | PlannedStatement::NamedReexport
+            | PlannedStatement::AmbientVariables => {}
             PlannedStatement::Function(index) => {
                 let function = functions.get(index).ok_or(SourceCheckError::Function(
                     SourceFunctionInvariant::InvalidStatementIndex(index),
@@ -12212,6 +12587,143 @@ mod tests {
         ));
         context.check_source_file(file).unwrap();
         assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn ambient_variable_links_preflight_atomically_and_repair_warm() {
+        let source = parsed(concat!(
+            "declare const early: number;\n",
+            "const read = early;\n",
+            "declare let later: string;\n",
+        ));
+        let file = FileId::new(2_103);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        let early = variable_symbol(&context, &source, file, "early");
+        let later = variable_symbol(&context, &source, file, "later");
+        let read_owner = variable_symbol(&context, &source, file, "read");
+        let read = variable_initializer(&source, file, "read");
+        let (number, string) = {
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            (bootstrap.number_type, bootstrap.string_type)
+        };
+
+        assert!(context.store_mut_for_test().set_value_symbol_links(
+            later,
+            ValueSymbolLinks {
+                resolved_type: Some(number),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        let poisoned = observable_state(&context, file);
+        assert_eq!(
+            context.check_source_file(file),
+            Err(SourceCheckError::Variable(
+                VariableInvariant::CachedValueTypeMismatch {
+                    symbol: later,
+                    cached: number,
+                    expected: string,
+                }
+            ))
+        );
+        assert_eq!(observable_state(&context, file), poisoned);
+        assert!(context.store().value_symbol_links(early).is_none());
+        assert!(context.store().value_symbol_links(read_owner).is_none());
+        assert!(context.store().symbol_node_links(read).is_none());
+        assert!(context.store().type_node_links(read).is_none());
+        assert!(!is_type_checked(&context, file));
+        assert!(context.diagnostics().is_empty());
+
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_value_symbol_links(later, ValueSymbolLinks::default())
+        );
+        assert!(context.store_mut_for_test().set_value_symbol_links(
+            later,
+            ValueSymbolLinks {
+                write_type: Some(string),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        let poisoned = observable_state(&context, file);
+        assert_eq!(
+            context.check_source_file(file),
+            Err(SourceCheckError::Variable(
+                VariableInvariant::InvalidValueLinks(later)
+            ))
+        );
+        assert_eq!(observable_state(&context, file), poisoned);
+        assert!(context.store().value_symbol_links(early).is_none());
+        assert!(context.store().value_symbol_links(read_owner).is_none());
+        assert!(context.store().symbol_node_links(read).is_none());
+        assert!(context.store().type_node_links(read).is_none());
+        assert!(!is_type_checked(&context, file));
+        assert!(context.diagnostics().is_empty());
+
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_value_symbol_links(later, ValueSymbolLinks::default())
+        );
+        context.check_source_file(file).unwrap();
+        assert_eq!(
+            context.store().value_symbol_links(early),
+            Some(&ValueSymbolLinks {
+                resolved_type: Some(number),
+                ..ValueSymbolLinks::default()
+            })
+        );
+        assert_eq!(
+            context.store().value_symbol_links(later),
+            Some(&ValueSymbolLinks {
+                resolved_type: Some(string),
+                ..ValueSymbolLinks::default()
+            })
+        );
+        assert_eq!(
+            context.store().value_symbol_links(read_owner),
+            Some(&ValueSymbolLinks {
+                resolved_type: Some(number),
+                ..ValueSymbolLinks::default()
+            })
+        );
+        assert_eq!(
+            context.store().symbol_node_links(read),
+            Some(&SymbolNodeLinks {
+                resolved_symbol: Some(early),
+            })
+        );
+        assert_eq!(
+            context.store().type_node_links(read),
+            Some(&TypeNodeLinks {
+                resolved_type: Some(number),
+                ..TypeNodeLinks::default()
+            })
+        );
+        assert!(context.diagnostics().is_empty());
+        assert!(is_type_checked(&context, file));
+
+        let warm = (
+            observable_state(&context, file),
+            context.store().value_symbol_links(early).cloned(),
+            context.store().value_symbol_links(later).cloned(),
+            context.store().value_symbol_links(read_owner).cloned(),
+            context.store().symbol_node_links(read).cloned(),
+            context.store().type_node_links(read).cloned(),
+        );
+        mark_source_unchecked(&mut context, file);
+        context.check_source_file(file).unwrap();
+        assert_eq!(
+            (
+                observable_state(&context, file),
+                context.store().value_symbol_links(early).cloned(),
+                context.store().value_symbol_links(later).cloned(),
+                context.store().value_symbol_links(read_owner).cloned(),
+                context.store().symbol_node_links(read).cloned(),
+                context.store().type_node_links(read).cloned(),
+            ),
+            warm
+        );
     }
 
     #[test]

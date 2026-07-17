@@ -3,9 +3,14 @@
 //! The installed slice is deliberately narrow: a top-level expression statement
 //! containing `identifier = expression`, where the identifier resolves to one
 //! unique, same-file, explicitly typed and initialized ordinary `var` declaration.
+//! Source planning may additionally supply an exact mutable-ambient capability;
+//! that route independently revalidates a typed, uninitialized direct
+//! `declare var`/`declare let` declaration before admission.
 //! Name lookup follows the pinned lexical resolver and checker export/merge routing.
 //! Valid syntax outside that closure is a typed unsupported result; malformed AST,
 //! binder, or semantic-store provenance is an invariant failure.
+
+use std::collections::HashSet;
 
 use ts_ast::{
     FileId, Node, NodeArena, NodeArenaId, NodeArenaRevision, NodeData, NodeRef, SyntaxKind,
@@ -183,6 +188,7 @@ struct AssignmentPlanner<'a, 'sources> {
     bound: &'a BoundFile,
     store: &'a CanonicalTypeMapperStore,
     host: &'a DeclaredTypeHost<'sources>,
+    ambient_targets: &'a HashSet<SemanticSymbolId>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -201,11 +207,33 @@ pub(super) fn plan_simple_assignment(
     host: &DeclaredTypeHost<'_>,
     statement: NodeRef,
 ) -> Result<SimpleAssignmentPlan, AssignmentPlanError> {
+    plan_simple_assignment_with_ambient_targets(
+        arena,
+        bound,
+        store,
+        host,
+        &HashSet::new(),
+        statement,
+    )
+}
+
+/// Plans one assignment with source-minted capabilities for exact mutable
+/// ambient declarations. Membership is not sufficient by itself: the target
+/// must still prove the direct `declare var`/`declare let` AST and binder shape.
+pub(super) fn plan_simple_assignment_with_ambient_targets(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    ambient_targets: &HashSet<SemanticSymbolId>,
+    statement: NodeRef,
+) -> Result<SimpleAssignmentPlan, AssignmentPlanError> {
     AssignmentPlanner {
         arena,
         bound,
         store,
         host,
+        ambient_targets,
     }
     .plan(statement)
 }
@@ -312,6 +340,7 @@ impl AssignmentPlanner<'_, '_> {
         }
         let target = routed.target;
         let export_local = routed.export_local;
+        let ambient_target = self.ambient_targets.contains(&target);
         let target_record = self
             .store
             .symbol(target)
@@ -325,7 +354,7 @@ impl AssignmentPlanner<'_, '_> {
                 },
             ));
         }
-        if flags.intersects(SymbolFlags::BLOCK_SCOPED_VARIABLE) {
+        if flags.intersects(SymbolFlags::BLOCK_SCOPED_VARIABLE) && !ambient_target {
             return Err(AssignmentPlanError::Unsupported(
                 AssignmentUnsupported::BlockScopedTarget {
                     node: left,
@@ -333,7 +362,11 @@ impl AssignmentPlanner<'_, '_> {
                 },
             ));
         }
-        if flags != SymbolFlags::FUNCTION_SCOPED_VARIABLE {
+        if (!ambient_target && flags != SymbolFlags::FUNCTION_SCOPED_VARIABLE)
+            || (ambient_target
+                && flags != SymbolFlags::FUNCTION_SCOPED_VARIABLE
+                && flags != SymbolFlags::BLOCK_SCOPED_VARIABLE)
+        {
             return Err(AssignmentPlanError::Unsupported(
                 AssignmentUnsupported::NonVariableTarget {
                     node: left,
@@ -389,7 +422,12 @@ impl AssignmentPlanner<'_, '_> {
         }
 
         self.validate_declaration_symbol(left, declaration, target, export_local, &name)?;
-        let target_type_node = self.validate_variable_declaration(left, declaration, &name)?;
+        let target_type_node = self.validate_variable_declaration(
+            left,
+            declaration,
+            &name,
+            ambient_target.then_some((target, flags)),
+        )?;
         Ok(SimpleAssignmentPlan {
             expression,
             left,
@@ -645,6 +683,7 @@ impl AssignmentPlanner<'_, '_> {
         left: NodeRef,
         declaration: NodeRef,
         reference_name: &str,
+        ambient_target: Option<(SemanticSymbolId, SymbolFlags)>,
     ) -> Result<NodeRef, AssignmentPlanError> {
         let declaration_node = self.node(declaration)?;
         let NodeData::VariableDeclaration(variable) = &declaration_node.data else {
@@ -696,6 +735,15 @@ impl AssignmentPlanner<'_, '_> {
         )?;
         self.require_parent(type_node, Some(declaration.node))?;
         self.node(type_node)?;
+        if let Some((ambient_target, ambient_flags)) = ambient_target {
+            self.validate_ambient_variable_statement(
+                left,
+                declaration,
+                ambient_target,
+                ambient_flags,
+            )?;
+            return Ok(type_node);
+        }
         let initializer = variable
             .initializer
             .map(|node| self.reference(node))
@@ -767,6 +815,138 @@ impl AssignmentPlanner<'_, '_> {
         }
         self.validate_variable_modifiers(variable_statement, statement.modifiers.as_ref())?;
         Ok(type_node)
+    }
+
+    fn validate_ambient_variable_statement(
+        &self,
+        left: NodeRef,
+        declaration: NodeRef,
+        ambient_target: SemanticSymbolId,
+        ambient_flags: SymbolFlags,
+    ) -> Result<(), AssignmentPlanError> {
+        let declaration_node = self.node(declaration)?;
+        let NodeData::VariableDeclaration(variable) = &declaration_node.data else {
+            return Err(Self::unsupported(
+                declaration,
+                declaration_node.kind,
+                AssignmentSyntaxRole::TargetDeclaration,
+            ));
+        };
+        if variable.initializer.is_some() {
+            return Err(AssignmentPlanError::Unsupported(
+                AssignmentUnsupported::NonOrdinaryVariable(declaration),
+            ));
+        }
+
+        let list = declaration_node
+            .parent
+            .map(|node| self.reference(node))
+            .ok_or(AssignmentInvariant::InvalidDeclarationList(declaration))?;
+        let list_node = self.node(list)?;
+        let NodeData::VariableDeclarationList(list_data) = &list_node.data else {
+            return Err(AssignmentInvariant::InvalidDeclarationList(list).into());
+        };
+        let expected_list_flags = if ambient_flags == SymbolFlags::FUNCTION_SCOPED_VARIABLE {
+            0
+        } else if ambient_flags == SymbolFlags::BLOCK_SCOPED_VARIABLE {
+            NODE_FLAG_LET
+        } else {
+            return Err(AssignmentInvariant::InvalidDeclarationList(list).into());
+        };
+        let occurrences = list_data
+            .declarations
+            .nodes
+            .iter()
+            .filter(|candidate| **candidate == declaration.node)
+            .count();
+        if list_node.kind != SyntaxKind::VariableDeclarationList
+            || list_data.facts != 0
+            || list_data.declarations.range != list_node.range
+            || occurrences != 1
+        {
+            return Err(AssignmentInvariant::InvalidDeclarationList(list).into());
+        }
+        if list_node.flags.0 != expected_list_flags {
+            if list_node.flags.0 & NODE_FLAG_CONST != 0 {
+                return Err(AssignmentPlanError::Unsupported(
+                    AssignmentUnsupported::BlockScopedTarget {
+                        node: left,
+                        symbol: ambient_target,
+                    },
+                ));
+            }
+            return Err(AssignmentInvariant::InvalidDeclarationList(list).into());
+        }
+        if list_data.declarations.has_trailing_comma {
+            return Err(AssignmentPlanError::Unsupported(
+                AssignmentUnsupported::NonOrdinaryVariable(list),
+            ));
+        }
+
+        let variable_statement = list_node
+            .parent
+            .map(|node| self.reference(node))
+            .ok_or(AssignmentInvariant::InvalidVariableStatement(list))?;
+        let statement_node = self.node(variable_statement)?;
+        let NodeData::VariableStatement(statement) = &statement_node.data else {
+            return Err(AssignmentInvariant::InvalidVariableStatement(variable_statement).into());
+        };
+        if statement_node.kind != SyntaxKind::VariableStatement
+            || statement_node.flags.0 != 0
+            || statement.declaration_list != list.node
+            || statement.flow_node.is_some()
+            || statement.facts != 0
+        {
+            return Err(AssignmentInvariant::InvalidVariableStatement(variable_statement).into());
+        }
+        if statement_node.parent != Some(self.bound.source_file().node) {
+            return Err(AssignmentPlanError::Unsupported(
+                AssignmentUnsupported::NestedTarget(variable_statement),
+            ));
+        }
+        self.validate_ambient_variable_modifiers(variable_statement, statement.modifiers.as_ref())?;
+        if !self.ambient_targets.contains(&ambient_target) {
+            return Err(AssignmentPlanError::Unsupported(
+                AssignmentUnsupported::BlockScopedTarget {
+                    node: left,
+                    symbol: ambient_target,
+                },
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_ambient_variable_modifiers(
+        &self,
+        statement: NodeRef,
+        modifiers: Option<&ts_ast::ModifierList>,
+    ) -> Result<(), AssignmentPlanError> {
+        let Some(modifiers) = modifiers else {
+            return Err(AssignmentPlanError::Unsupported(
+                AssignmentUnsupported::NonOrdinaryVariable(statement),
+            ));
+        };
+        let [modifier] = modifiers.list.nodes.as_slice() else {
+            return Err(AssignmentPlanError::Unsupported(
+                AssignmentUnsupported::NonOrdinaryVariable(statement),
+            ));
+        };
+        let modifier = self.reference(*modifier);
+        self.require_parent(modifier, Some(statement.node))?;
+        let modifier_node = self.node(modifier)?;
+        if modifier_node.kind != SyntaxKind::DeclareKeyword
+            || !matches!(modifier_node.data, NodeData::Token(_))
+            || modifier_node.flags.0 != 0
+            || modifiers.flags.0 != 0
+            || modifiers.list.has_trailing_comma
+        {
+            return Err(Self::unsupported(
+                modifier,
+                modifier_node.kind,
+                AssignmentSyntaxRole::TargetModifier,
+            ));
+        }
+        Ok(())
     }
 
     fn validate_variable_modifiers(
@@ -1210,6 +1390,74 @@ mod tests {
                     AssignmentUnsupported::NonVariableTarget { .. }
                 ))
             ));
+        }
+    }
+
+    #[test]
+    fn ambient_assignment_capability_requires_exact_mutable_declaration_provenance() {
+        for source in [
+            "declare var target: number; target = 1;",
+            "declare let target: number; target = 1;",
+        ] {
+            let fixture = Fixture::new(source);
+            let declaration = fixture.variable_declaration("target");
+            let raw = fixture.bound.symbol(declaration).unwrap();
+            let target = fixture.store.get_merged_symbol(raw).unwrap();
+            let ambient_targets = HashSet::from([target]);
+            let host = fixture.host();
+            let before = observable_state(&fixture.store);
+
+            assert!(
+                plan_simple_assignment_with_ambient_targets(
+                    &fixture.parsed.arena,
+                    &fixture.bound,
+                    &fixture.store,
+                    &host,
+                    &ambient_targets,
+                    fixture.expression_statement(0),
+                )
+                .is_ok(),
+                "exact mutable ambient target was rejected: {source}",
+            );
+            assert_eq!(observable_state(&fixture.store), before);
+        }
+
+        for source in [
+            "var target: number = 0; target = 1;",
+            "let target: number = 0; target = 1;",
+            "const target: number = 0; target = 1;",
+            "declare const target: number; target = 1;",
+        ] {
+            let fixture = Fixture::new(source);
+            let declaration = fixture.variable_declaration("target");
+            let raw = fixture.bound.symbol(declaration).unwrap();
+            let target = fixture.store.get_merged_symbol(raw).unwrap();
+            let ambient_targets = HashSet::from([target]);
+            let host = fixture.host();
+            let before = observable_state(&fixture.store);
+
+            let result = plan_simple_assignment_with_ambient_targets(
+                &fixture.parsed.arena,
+                &fixture.bound,
+                &fixture.store,
+                &host,
+                &ambient_targets,
+                fixture.expression_statement(0),
+            );
+            if source.starts_with("declare const") {
+                assert!(matches!(
+                    result,
+                    Err(AssignmentPlanError::Unsupported(
+                        AssignmentUnsupported::BlockScopedTarget { symbol, .. }
+                    )) if symbol == target
+                ));
+            } else {
+                assert!(
+                    result.is_err(),
+                    "forged ambient capability bypassed declaration proof: {source}",
+                );
+            }
+            assert_eq!(observable_state(&fixture.store), before);
         }
     }
 
