@@ -4668,7 +4668,8 @@ mod tests {
         CanonicalCheckerDiagnostics, CanonicalGlobalTypeInitializationError,
         CanonicalTypeMapperStore, DeclaredTypeHost, DeclaredTypeLinks, IntrinsicBootstrapOptions,
         MembersAndExportsLinks, MembersOrExportsResolutionKind, RelationComparisonResult,
-        RelationKind, SignatureId, TypeAliasLinks, TypeId, ValueSymbolLinks,
+        RelationKind, SignatureId, SignatureLinks, TypeAliasLinks, TypeId, TypeNodeLinks,
+        ValueSymbolLinks,
         array_types::CanonicalArrayTargets,
         declared::type_list_key,
         global_types::create_type_from_generic_global_type,
@@ -4991,6 +4992,112 @@ mod tests {
             "a legacy query cannot consume the option-aware callable cache"
         );
         assert_eq!(fixture.store.relation_state_snapshot(), cached);
+    }
+
+    #[test]
+    fn warmed_wrapper_relation_revalidates_nested_callable_links() {
+        let mut fixture =
+            function_relation_fixture("type Left = () => string; type Right = () => string;");
+        let left_node = alias_function_node(&fixture, "Left");
+        let (left, _) = query_function_alias(&mut fixture, "Left");
+        let (right, _) = query_function_alias(&mut fixture, "Right");
+        resolve_all_function_returns(&mut fixture);
+        let left_property = alloc_typed_property(&mut fixture.store, "callback", left, false);
+        let source = alloc_property_object(&mut fixture.store, vec![left_property]);
+        let right_property = alloc_typed_property(&mut fixture.store, "callback", right, false);
+        let target = alloc_property_object(&mut fixture.store, vec![right_property]);
+        assert_eq!(
+            fixture
+                .store
+                .is_type_assignable_to_with_strict_function_types(source, target, true),
+            Ok(true)
+        );
+        let root_key = fixture
+            .store
+            .relation_key_if_available(source, target, super::IntersectionState::NONE, false, false)
+            .unwrap()
+            .key();
+        assert!(
+            fixture
+                .store
+                .relation_cache_get(RelationKind::Assignable, root_key)
+                .intersects(RelationComparisonResult::SUCCEEDED)
+        );
+
+        let exact_signature_links = fixture.store.signature_links(left_node).unwrap().clone();
+        assert!(
+            fixture
+                .store
+                .set_signature_links(left_node, exact_signature_links.clone())
+        );
+        let warmed = fixture.store.relation_state_snapshot();
+        assert!(
+            fixture
+                .store
+                .relation_cache_get(RelationKind::Assignable, root_key)
+                .intersects(RelationComparisonResult::SUCCEEDED),
+            "an equal signature-link publication must preserve the root cache"
+        );
+        assert!(
+            fixture
+                .store
+                .set_signature_links(left_node, SignatureLinks::default())
+        );
+        assert_eq!(
+            fixture
+                .store
+                .relation_cache_get(RelationKind::Assignable, root_key),
+            RelationComparisonResult::NONE,
+        );
+        assert!(matches!(
+            fixture
+                .store
+                .is_type_assignable_to_with_strict_function_types(source, target, true),
+            Err(RelationUnavailable::UnresolvedFunctionType(type_)
+                | RelationUnavailable::MalformedFunctionType(type_))
+                if type_ == left
+        ));
+        assert_eq!(fixture.store.relation_state_snapshot(), warmed);
+
+        assert!(
+            fixture
+                .store
+                .set_signature_links(left_node, exact_signature_links)
+        );
+        assert_eq!(
+            fixture
+                .store
+                .is_type_assignable_to_with_strict_function_types(source, target, true),
+            Ok(true)
+        );
+        let rewarmed = fixture.store.relation_state_snapshot();
+        let exact_type_node_links = fixture.store.type_node_links(left_node).unwrap().clone();
+        assert!(
+            fixture
+                .store
+                .set_type_node_links(left_node, exact_type_node_links.clone())
+        );
+        assert_eq!(fixture.store.relation_state_snapshot(), rewarmed);
+        assert!(
+            fixture
+                .store
+                .set_type_node_links(left_node, TypeNodeLinks::default())
+        );
+        assert_eq!(
+            fixture
+                .store
+                .relation_cache_get(RelationKind::Assignable, root_key),
+            RelationComparisonResult::NONE,
+        );
+        assert!(matches!(
+            fixture
+                .store
+                .is_type_assignable_to_with_strict_function_types(source, target, true),
+            Err(RelationUnavailable::UnresolvedFunctionType(type_)
+                | RelationUnavailable::MalformedFunctionType(type_))
+                if type_ == left
+        ));
+        assert_eq!(fixture.store.relation_state_snapshot(), rewarmed);
     }
 
     #[test]
@@ -6175,6 +6282,11 @@ mod tests {
 
         let left = named_canonical_union(&mut store, "CacheLeft", &[string, boolean]);
         let right = named_canonical_union(&mut store, "CacheRight", &[string, boolean]);
+        assert_eq!(
+            store.relation_state_snapshot(),
+            after_large,
+            "initializing fresh union identities must preserve unrelated relation entries"
+        );
         assert_eq!(store.is_type_assignable_to(left, right), Ok(true));
         assert_eq!(store.relation_cache_size(RelationKind::Assignable), 2);
         assert_eq!(store.relation_cache_size(RelationKind::Subtype), 0);
@@ -8352,6 +8464,55 @@ mod tests {
         let plain_property = alloc_typed_property(&mut store, "x", string, false);
         let plain = alloc_property_object(&mut store, vec![plain_property]);
         assert_eq!(store.is_type_assignable_to(shape, plain), Ok(true));
+        let alias_key = store
+            .relation_key_if_available(shape, plain, super::IntersectionState::NONE, false, false)
+            .unwrap()
+            .key();
+        assert!(
+            store
+                .relation_cache_get(RelationKind::Assignable, alias_key)
+                .intersects(RelationComparisonResult::SUCCEEDED)
+        );
+        let exact_alias_links = store.type_alias_links(alias_symbol).unwrap().clone();
+        assert!(
+            store.set_type_alias_links(alias_symbol, exact_alias_links.clone()),
+            "an equal link publication remains an accepted no-op"
+        );
+        let warmed_alias_relations = store.relation_state_snapshot();
+        assert!(
+            store
+                .relation_cache_get(RelationKind::Assignable, alias_key)
+                .intersects(RelationComparisonResult::SUCCEEDED),
+            "an equal link publication must not stale a warmed relation"
+        );
+        let mut foreign = initialized(true);
+        let foreign_type = foreign.intrinsic_bootstrap().unwrap().string_type;
+        let mut rejected_alias_links = exact_alias_links.clone();
+        rejected_alias_links.declared_type = Some(foreign_type);
+        assert!(!store.set_type_alias_links(alias_symbol, rejected_alias_links));
+        assert_eq!(store.relation_state_snapshot(), warmed_alias_relations);
+        assert!(
+            store
+                .relation_cache_get(RelationKind::Assignable, alias_key)
+                .intersects(RelationComparisonResult::SUCCEEDED),
+            "a rejected link publication must not stale a warmed relation"
+        );
+        let mut wrong_alias_links = exact_alias_links;
+        wrong_alias_links.declared_type = Some(plain);
+        assert!(store.set_type_alias_links(alias_symbol, wrong_alias_links));
+        assert_eq!(
+            store.relation_cache_get(RelationKind::Assignable, alias_key),
+            RelationComparisonResult::NONE,
+        );
+        assert_eq!(
+            store.is_type_assignable_to(shape, plain),
+            Err(RelationUnavailable::UnsupportedStructuredType(shape))
+        );
+        assert_eq!(
+            store.relation_state_snapshot(),
+            warmed_alias_relations,
+            "a rejected warmed alias query must not publish relation writes"
+        );
 
         let transient_shape = alloc_synthetic_type_literal_object(&mut store, string);
         let transient_alias_symbol = store.alloc_transient_symbol(

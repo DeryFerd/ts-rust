@@ -326,6 +326,7 @@ pub struct SemanticStore<TypePayload, MapperPayload> {
     relations: RelationCaches,
     relation_inputs_generation: u64,
     relation_cache_generation: u64,
+    relation_observable_symbol_tables: HashSet<SymbolTableId>,
     pub(super) derived_types: DerivedTypeCaches,
     pub(super) intrinsic_bootstrap: Option<IntrinsicBootstrap>,
     claimed_strict_builtin_iterator_return: Option<bool>,
@@ -396,6 +397,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             relations: RelationCaches::default(),
             relation_inputs_generation: 0,
             relation_cache_generation: 0,
+            relation_observable_symbol_tables: HashSet::new(),
             derived_types: DerivedTypeCaches::default(),
             intrinsic_bootstrap: None,
             claimed_strict_builtin_iterator_return: None,
@@ -653,8 +655,6 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
     }
 
     pub(super) fn type_payload_mut(&mut self, id: TypeId) -> Option<&mut TypePayload> {
-        self.types.get(id)?;
-        self.mark_relation_inputs_dirty();
         self.types.get_mut(id)
     }
 
@@ -1315,7 +1315,9 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         }
 
         let previous = self.merged_symbols.insert(source, target);
-        self.mark_relation_inputs_dirty();
+        if previous.is_some_and(|previous| previous != target) {
+            self.mark_relation_inputs_dirty();
+        }
         if self.has_callable_provenance() {
             self.mark_union_cache_validation_dirty();
         }
@@ -1392,7 +1394,9 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         symbol: SemanticSymbolId,
     ) -> Option<Option<SemanticSymbolId>> {
         let previous = self.symbols.insert_symbol(table, name, symbol)?;
-        self.mark_relation_inputs_dirty();
+        if self.relation_observable_symbol_tables.contains(&table) && previous != Some(symbol) {
+            self.mark_relation_inputs_dirty();
+        }
         if self.has_callable_provenance() {
             self.mark_union_cache_validation_dirty();
         }
@@ -1409,10 +1413,21 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         flags: SymbolFlags,
         check_flags: CheckFlags,
     ) -> bool {
+        let relation_dirty = self.symbol(symbol).is_some_and(|current| {
+            (current.flags() != flags || current.check_flags() != check_flags)
+                && (current.declarations().is_some()
+                    || current.value_declaration().is_some()
+                    || current.members().is_some()
+                    || current.exports().is_some()
+                    || current.parent().is_some()
+                    || current.export_symbol().is_some())
+        });
         if !self.symbols.set_symbol_flags(symbol, flags, check_flags) {
             return false;
         }
-        self.mark_relation_inputs_dirty();
+        if relation_dirty {
+            self.mark_relation_inputs_dirty();
+        }
         if self.has_callable_provenance() {
             self.mark_union_cache_validation_dirty();
         }
@@ -1425,13 +1440,20 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         declarations: Option<Vec<NodeRef>>,
         value_declaration: Option<NodeRef>,
     ) -> bool {
+        let relation_dirty = self.symbol(symbol).is_some_and(|current| {
+            (current.declarations() != declarations.as_deref()
+                || current.value_declaration() != value_declaration)
+                && (current.declarations().is_some() || current.value_declaration().is_some())
+        });
         if !self
             .symbols
             .set_symbol_declarations(symbol, declarations, value_declaration)
         {
             return false;
         }
-        self.mark_relation_inputs_dirty();
+        if relation_dirty {
+            self.mark_relation_inputs_dirty();
+        }
         if self.has_callable_provenance() {
             self.mark_union_cache_validation_dirty();
         }
@@ -1446,13 +1468,28 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         parent: Option<SemanticSymbolId>,
         export_symbol: Option<SemanticSymbolId>,
     ) -> bool {
+        let relation_dirty = self.symbol(symbol).is_some_and(|current| {
+            (current.members() != members
+                || current.exports() != exports
+                || current.parent() != parent
+                || current.export_symbol() != export_symbol)
+                && (current.members().is_some()
+                    || current.exports().is_some()
+                    || current.parent().is_some()
+                    || current.export_symbol().is_some())
+        });
         if !self
             .symbols
             .set_symbol_relationships(symbol, members, exports, parent, export_symbol)
         {
             return false;
         }
-        self.mark_relation_inputs_dirty();
+        for table in [members, exports].into_iter().flatten() {
+            self.relation_observable_symbol_tables.insert(table);
+        }
+        if relation_dirty {
+            self.mark_relation_inputs_dirty();
+        }
         if self.has_callable_provenance() {
             self.mark_union_cache_validation_dirty();
         }
@@ -1528,11 +1565,14 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         {
             return false;
         }
-        let dirty = self.node_has_callable_ancestor(node)
-            && self
-                .type_node_links(node)
-                .is_some_and(|current| current != &TypeNodeLinks::default() && current != &links);
+        let relation_dirty = self
+            .type_node_links(node)
+            .is_some_and(|current| current != &TypeNodeLinks::default() && current != &links);
+        let dirty = self.node_has_callable_ancestor(node) && relation_dirty;
         self.links.type_node.replace_key(node, links);
+        if relation_dirty {
+            self.mark_relation_inputs_dirty();
+        }
         if dirty {
             self.mark_union_cache_validation_dirty();
         }
@@ -1606,14 +1646,17 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         {
             return false;
         }
+        let relation_dirty = self
+            .signature_links(node)
+            .is_some_and(|current| current != &SignatureLinks::default() && current != &links);
         let dirty = (self.node_is_function_type(node)
             || self.node_is_source_callable_declaration(node))
             || self.source_node_kind(node) == Some(SyntaxKind::CallSignature);
-        let dirty = dirty
-            && self
-                .signature_links(node)
-                .is_some_and(|current| current != &SignatureLinks::default() && current != &links);
+        let dirty = dirty && relation_dirty;
         self.links.signature.replace_key(node, links);
+        if relation_dirty {
+            self.mark_relation_inputs_dirty();
+        }
         if dirty {
             self.mark_union_cache_validation_dirty();
         }
@@ -1682,13 +1725,16 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         {
             return false;
         }
+        let relation_dirty = self
+            .value_symbol_links(symbol)
+            .is_some_and(|current| current != &ValueSymbolLinks::default() && current != &links);
         let dirty = (self.symbol_is_callable_parameter(symbol)
             || self.symbol_is_source_callable_owner(symbol))
-            && self.value_symbol_links(symbol).is_some_and(|current| {
-                current != &ValueSymbolLinks::default() && current != &links
-            });
+            && relation_dirty;
         self.links.value_symbol.replace_key(symbol, links);
-        self.mark_relation_inputs_dirty();
+        if relation_dirty {
+            self.mark_relation_inputs_dirty();
+        }
         if dirty {
             self.mark_union_cache_validation_dirty();
         }
@@ -1764,6 +1810,9 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         {
             return false;
         }
+        let relation_dirty = self
+            .type_alias_links(symbol)
+            .is_some_and(|current| current != &TypeAliasLinks::default() && current != &links);
         let dirty = self.type_alias_links(symbol).is_some_and(|current| {
             current != &TypeAliasLinks::default()
                 && current != &links
@@ -1779,6 +1828,9 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             .and_then(|links| links.declared_type);
         let declared_type = links.declared_type;
         self.links.type_alias.replace_key(symbol, links);
+        if relation_dirty {
+            self.mark_relation_inputs_dirty();
+        }
         if previous != declared_type {
             if let Some(previous) = previous {
                 let remove_entry = self
@@ -1841,8 +1893,13 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         if !self.symbols.contains_symbol(symbol) || !self.valid_optional_type(links.declared_type) {
             return false;
         }
+        let relation_dirty = self
+            .declared_type_links(symbol)
+            .is_some_and(|current| current != &DeclaredTypeLinks::default() && current != &links);
         self.links.declared_type.replace_key(symbol, links);
-        self.mark_relation_inputs_dirty();
+        if relation_dirty {
+            self.mark_relation_inputs_dirty();
+        }
         true
     }
 
@@ -2413,7 +2470,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
     /// write that can change assignability. Physical entries stay untouched
     /// until the next successful relation publication so failed queries remain
     /// transactionally read-only.
-    fn mark_relation_inputs_dirty(&mut self) {
+    pub(super) fn mark_relation_inputs_dirty(&mut self) {
         if !self.relation_cache_is_current() || self.relations.snapshot().is_pristine() {
             return;
         }
@@ -2424,6 +2481,12 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             return;
         };
         self.relation_inputs_generation = next;
+    }
+
+    pub(super) fn mark_relation_symbol_table_observable(&mut self, table: Option<SymbolTableId>) {
+        if let Some(table) = table {
+            self.relation_observable_symbol_tables.insert(table);
+        }
     }
 
     fn relation_cache_is_current(&self) -> bool {
@@ -2773,7 +2836,6 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                 instantiated,
             },
         );
-        self.mark_relation_inputs_dirty();
         true
     }
 
@@ -2849,7 +2911,6 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             previous.is_none(),
             "the return annotation was checked absent"
         );
-        self.mark_relation_inputs_dirty();
         true
     }
 
@@ -2898,7 +2959,6 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                 "callable parameter provenance was prevalidated absent"
             );
         }
-        self.mark_relation_inputs_dirty();
         true
     }
 
@@ -2925,11 +2985,17 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         id: SignatureId,
         count: i32,
     ) -> bool {
+        let relation_dirty = self.signature(id).is_some_and(|signature| {
+            signature.resolved_min_argument_count() != -1
+                && signature.resolved_min_argument_count() != count
+        });
         let dirty = self.signature_is_callable(id);
         if !self.signatures.set_resolved_min_argument_count(id, count) {
             return false;
         }
-        self.mark_relation_inputs_dirty();
+        if relation_dirty {
+            self.mark_relation_inputs_dirty();
+        }
         if dirty {
             self.mark_union_cache_validation_dirty();
         }
@@ -2944,11 +3010,17 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         if !self.valid_optional_type(type_id) {
             return false;
         }
+        let relation_dirty = self.signature(id).is_some_and(|signature| {
+            signature.resolved_return_type().is_some()
+                && signature.resolved_return_type() != type_id
+        });
         let dirty = self.signature_is_callable(id);
         if !self.signatures.set_resolved_return_type(id, type_id) {
             return false;
         }
-        self.mark_relation_inputs_dirty();
+        if relation_dirty {
+            self.mark_relation_inputs_dirty();
+        }
         let cleared_circular_provenance = self.circular_return_signatures.remove(&id).is_some();
         if dirty || cleared_circular_provenance {
             self.mark_union_cache_validation_dirty();
@@ -2997,7 +3069,6 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         );
         let published = self.signatures.set_resolved_return_type(id, Some(type_id));
         assert!(published, "the local function signature was prevalidated");
-        self.mark_relation_inputs_dirty();
         self.mark_union_cache_validation_dirty();
         true
     }
@@ -3010,11 +3081,17 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         if !self.valid_optional_predicate(predicate) {
             return false;
         }
+        let relation_dirty = self.signature(id).is_some_and(|signature| {
+            signature.resolved_type_predicate().is_some()
+                && signature.resolved_type_predicate() != predicate
+        });
         let dirty = self.signature_is_callable(id);
         if !self.signatures.set_resolved_type_predicate(id, predicate) {
             return false;
         }
-        self.mark_relation_inputs_dirty();
+        if relation_dirty {
+            self.mark_relation_inputs_dirty();
+        }
         if dirty {
             self.mark_union_cache_validation_dirty();
         }
@@ -3029,11 +3106,17 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         if !self.valid_optional_type(type_id) {
             return false;
         }
+        let relation_dirty = self.signature(id).is_some_and(|signature| {
+            signature.isolated_signature_type().is_some()
+                && signature.isolated_signature_type() != type_id
+        });
         let dirty = self.signature_is_callable(id);
         if !self.signatures.set_isolated_signature_type(id, type_id) {
             return false;
         }
-        self.mark_relation_inputs_dirty();
+        if relation_dirty {
+            self.mark_relation_inputs_dirty();
+        }
         if dirty {
             self.mark_union_cache_validation_dirty();
         }
@@ -3049,11 +3132,17 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         if !self.valid_optional_signature(target) || !self.valid_optional_mapper(mapper) {
             return false;
         }
+        let relation_dirty = self.signature(id).is_some_and(|signature| {
+            (signature.target().is_some() || signature.mapper().is_some())
+                && (signature.target() != target || signature.mapper() != mapper)
+        });
         let dirty = self.signature_is_callable(id);
         if !self.signatures.set_target_and_mapper(id, target, mapper) {
             return false;
         }
-        self.mark_relation_inputs_dirty();
+        if relation_dirty {
+            self.mark_relation_inputs_dirty();
+        }
         if dirty {
             self.mark_union_cache_validation_dirty();
         }
@@ -3073,11 +3162,16 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         }) {
             return false;
         }
+        let relation_dirty = self.signature(id).is_some_and(|signature| {
+            signature.composite().is_some() && signature.composite() != composite.as_ref()
+        });
         let dirty = self.signature_is_callable(id);
         if !self.signatures.set_composite(id, composite) {
             return false;
         }
-        self.mark_relation_inputs_dirty();
+        if relation_dirty {
+            self.mark_relation_inputs_dirty();
+        }
         if dirty {
             self.mark_union_cache_validation_dirty();
         }
@@ -3104,10 +3198,16 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
     /// signatures gain or lose upstream's `Abstract` flag.
     pub fn set_signature_flags(&mut self, id: SignatureId, flags: SignatureFlags) -> bool {
         let dirty = self.signature_is_callable(id);
+        let relation_dirty = dirty
+            && self
+                .signature(id)
+                .is_some_and(|signature| signature.flags() != flags);
         if !self.signatures.set_flags(id, flags) {
             return false;
         }
-        self.mark_relation_inputs_dirty();
+        if relation_dirty {
+            self.mark_relation_inputs_dirty();
+        }
         if dirty {
             self.mark_union_cache_validation_dirty();
         }
@@ -3124,11 +3224,17 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         if !self.valid_types(&type_parameters) {
             return false;
         }
+        let relation_dirty = self.signature(id).is_some_and(|signature| {
+            !signature.type_parameters().is_empty()
+                && signature.type_parameters() != type_parameters.as_slice()
+        });
         let dirty = self.signature_is_callable(id);
         if !self.signatures.set_type_parameters(id, type_parameters) {
             return false;
         }
-        self.mark_relation_inputs_dirty();
+        if relation_dirty {
+            self.mark_relation_inputs_dirty();
+        }
         if dirty {
             self.mark_union_cache_validation_dirty();
         }
@@ -3145,11 +3251,16 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         if !self.valid_optional_symbol(this_parameter) {
             return false;
         }
+        let relation_dirty = self.signature(id).is_some_and(|signature| {
+            signature.this_parameter().is_some() && signature.this_parameter() != this_parameter
+        });
         let dirty = self.signature_is_callable(id);
         if !self.signatures.set_this_parameter(id, this_parameter) {
             return false;
         }
-        self.mark_relation_inputs_dirty();
+        if relation_dirty {
+            self.mark_relation_inputs_dirty();
+        }
         if dirty {
             self.mark_union_cache_validation_dirty();
         }
@@ -3230,10 +3341,15 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         if !self.valid_optional_symbol(symbol) {
             return false;
         }
+        let relation_dirty = self
+            .index_info(id)
+            .is_some_and(|index| index.index_symbol().is_some() && index.index_symbol() != symbol);
         if !self.index_infos.set_index_symbol(id, symbol) {
             return false;
         }
-        self.mark_relation_inputs_dirty();
+        if relation_dirty {
+            self.mark_relation_inputs_dirty();
+        }
         true
     }
 
@@ -3524,7 +3640,6 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
             return false;
         };
         entry.insert(provenance);
-        self.mark_relation_inputs_dirty();
         true
     }
 
