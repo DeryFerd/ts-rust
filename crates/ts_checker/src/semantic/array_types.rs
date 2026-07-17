@@ -7,9 +7,12 @@
 use super::{
     CanonicalGlobalTypeInitializationError, CanonicalGlobalTypes, CanonicalTypeMapperStore, TypeId,
     declared::type_list_key,
-    global_types::{create_type_from_generic_global_type, preflight_generic_global_type_target},
+    global_types::{
+        create_type_from_generic_global_type, preflight_generic_global_type_target,
+        preflight_relation_generic_global_type_target,
+    },
     type_records::{TypeCacheState, TypeData, TypeReferenceData},
-    types::ObjectFlags,
+    types::{ObjectFlags, TypeFlags},
 };
 
 /// A canonical global-array reference and its normalized ordinary identity.
@@ -160,7 +163,7 @@ impl CanonicalTypeMapperStore {
         } else {
             return Ok(None);
         };
-        if preflight_generic_global_type_target(self, target)?.is_some() {
+        if self.preflight_array_target(target)?.is_some() {
             return Err(ArrayTypeError::InvalidReference(type_id));
         }
 
@@ -316,32 +319,80 @@ impl CanonicalTypeMapperStore {
         assert!(self.set_type_object_flags(clone, clone_flags));
         assert!(self.set_object_target_and_mapper(clone, Some(target), None));
         assert!(self.set_type_reference_resolution(clone, None, Some(resolved_type_arguments),));
+        let relation_dirty = self.relation_derived_cache_source_is_observable(base_type)
+            || self.relation_derived_cache_target_is_observable(clone);
         assert_eq!(
             self.derived_types
                 .array_literal_types
                 .insert(base_type, clone),
             None
         );
+        if relation_dirty {
+            self.mark_relation_inputs_dirty();
+        }
         Ok(clone)
     }
 
     fn validate_array_targets(&self, targets: CanonicalArrayTargets) -> Result<(), ArrayTypeError> {
-        preflight_generic_global_type_target(self, targets.array_type)?;
+        self.preflight_array_target(targets.array_type)?;
         if targets.readonly_array_type != targets.array_type {
-            preflight_generic_global_type_target(self, targets.readonly_array_type)?;
+            self.preflight_array_target(targets.readonly_array_type)?;
         }
         Ok(())
     }
 
+    fn preflight_array_target(
+        &self,
+        target: TypeId,
+    ) -> Result<Option<TypeId>, CanonicalGlobalTypeInitializationError> {
+        if self.relation_read_observation_is_active() {
+            preflight_relation_generic_global_type_target(self, target)
+        } else {
+            preflight_generic_global_type_target(self, target)
+        }
+    }
+
     fn canonical_array_base(&self, target: TypeId, element_type: TypeId) -> Option<TypeId> {
-        let TypeData::Interface(interface) = self.type_payload(target)?.data() else {
+        let base_type =
+            self.relation_object_instantiation(target, type_list_key(&[element_type]))?;
+        if base_type == target {
+            // The target shell's declared type parameter is its canonical
+            // identity entry; `preflight_array_target` validated that shell
+            // and the exact `(target, key) -> target` edge before this lookup.
+            return Some(target);
+        }
+        let target_symbol = self.type_payload(target)?.symbol()?;
+        let element_flags =
+            self.type_payload(element_type)?.object_flags() & ObjectFlags::PROPAGATING_FLAGS;
+        let base = self.type_payload(base_type)?;
+        let TypeData::TypeReference(reference) = base.data() else {
             return None;
         };
-        let TypeCacheState::Allocated(instantiations) = &interface.reference.object.instantiations
-        else {
-            return None;
-        };
-        instantiations.get(&type_list_key(&[element_type])).copied()
+        let allowed_flags = ObjectFlags::REFERENCE
+            | ObjectFlags::FROM_TYPE_NODE
+            | ObjectFlags::PROPAGATING_FLAGS
+            | ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES_COMPUTED
+            | ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES
+            | ObjectFlags::MEMBERS_RESOLVED
+            | ObjectFlags::CONTAINS_SPREAD
+            | ObjectFlags::OBJECT_REST_TYPE
+            | ObjectFlags::IDENTICAL_BASE_TYPE_CALCULATED
+            | ObjectFlags::IDENTICAL_BASE_TYPE_EXISTS
+            | ObjectFlags::UNRESOLVED_MEMBERS;
+        (base.flags() == TypeFlags::OBJECT
+            && reference.resolved_type_arguments.as_deref()
+                == Some(std::slice::from_ref(&element_type))
+            && reference.object.target == Some(target)
+            && reference.object.mapper.is_none()
+            && reference.object.instantiations == TypeCacheState::Unallocated
+            && reference.node.is_none()
+            && base.alias().is_none()
+            && base.symbol() == Some(target_symbol)
+            && base
+                .object_flags()
+                .contains(ObjectFlags::REFERENCE | element_flags)
+            && (base.object_flags() & !allowed_flags).is_empty())
+        .then_some(base_type)
     }
 
     pub(super) fn validate_array_literal_clone(
@@ -349,6 +400,7 @@ impl CanonicalTypeMapperStore {
         base_type: TypeId,
         cached: TypeId,
     ) -> Result<(), ArrayTypeError> {
+        self.observe_relation_derived_cache_source_read(base_type);
         let invalid = || ArrayTypeError::InvalidArrayLiteralCache {
             base: base_type,
             cached,
@@ -854,6 +906,44 @@ mod tests {
             before,
             "recursive cache poison is detected before any query write",
         );
+    }
+
+    #[test]
+    fn active_union_validation_rejects_a_malformed_exact_array_base() {
+        let mut context = array_context(FileId::new(919));
+        let global_types = context.global_types().clone();
+        let targets = CanonicalArrayTargets::from_global_types(&global_types);
+        let (number, string) = {
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            (bootstrap.number_type, bootstrap.string_type)
+        };
+        let store = context.store_mut_for_test();
+        let base = store
+            .create_canonical_array_type(&global_types, number, false)
+            .unwrap();
+        let union = store
+            .expression_union_type_with_global_types(
+                &global_types,
+                &[string, base],
+                UnionReduction::None,
+            )
+            .unwrap();
+        assert!(store.set_object_instantiations(
+            base,
+            TypeCacheState::Allocated(std::collections::HashMap::new()),
+        ));
+
+        let observation = store.begin_relation_read_observation().unwrap();
+        assert_eq!(
+            store.validate_union_constituent_with_array_targets(targets, union),
+            Err(LiteralTypeCacheError::ArrayType {
+                type_: base,
+                error: ArrayTypeError::InvalidReference(base),
+            })
+        );
+        assert!(store.discard_relation_read_observation(observation));
+        let retry = store.begin_relation_read_observation().unwrap();
+        assert!(store.discard_relation_read_observation(retry));
     }
 
     #[test]

@@ -46,7 +46,10 @@ pub(super) struct DerivedTypeCaches {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum DerivedObjectLiteralValidation {
     NotDerived,
-    Valid { owner: SemanticSymbolId },
+    Valid {
+        owner: SemanticSymbolId,
+        source: TypeId,
+    },
     Invalid,
 }
 
@@ -442,6 +445,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         ) {
             return DerivedObjectLiteralValidation::NotDerived;
         }
+        self.observe_relation_derived_cache_target_read(type_);
         let mut regular_source = None;
         for (source, cached) in &self.derived_types.regular_object_literals {
             if *cached == type_ && regular_source.replace(*source).is_some() {
@@ -455,31 +459,39 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             }
         }
 
-        let valid = match (regular_source, widened_source) {
+        let (source, valid) = match (regular_source, widened_source) {
             (None, None) => return DerivedObjectLiteralValidation::NotDerived,
             (Some(_), Some(_)) => return DerivedObjectLiteralValidation::Invalid,
             (Some(source), None) => {
                 let mut visiting = HashSet::new();
-                self.regular_cache_entry_is_valid(source, type_, &mut visiting)
+                (
+                    source,
+                    self.regular_cache_entry_is_valid(source, type_, &mut visiting),
+                )
             }
             (None, Some(source)) => {
                 let mut visiting = HashSet::new();
                 let mut regular_visiting = HashSet::new();
-                self.widened_cache_entry_is_valid(
+                (
                     source,
-                    type_,
-                    &mut visiting,
-                    &mut regular_visiting,
-                    array_targets,
+                    self.widened_cache_entry_is_valid(
+                        source,
+                        type_,
+                        &mut visiting,
+                        &mut regular_visiting,
+                        array_targets,
+                    ),
                 )
             }
         };
         if !valid {
             return DerivedObjectLiteralValidation::Invalid;
         }
+        self.observe_relation_derived_cache_source_read(source);
         match self.resolved_object_shape(type_) {
             Some(shape) => DerivedObjectLiteralValidation::Valid {
                 owner: shape.symbol,
+                source,
             },
             None => DerivedObjectLiteralValidation::Invalid,
         }
@@ -682,6 +694,11 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 .insert(plan.source, regular),
             None
         );
+        if self.relation_derived_cache_source_is_observable(plan.source)
+            || self.relation_derived_cache_target_is_observable(regular)
+        {
+            self.mark_relation_inputs_dirty();
+        }
     }
 
     fn publish_widened_type(
@@ -695,6 +712,11 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     self.derived_types.widened_types.insert(source, target),
                     None
                 );
+                if self.relation_derived_cache_source_is_observable(source)
+                    || self.relation_derived_cache_target_is_observable(target)
+                {
+                    self.mark_relation_inputs_dirty();
+                }
             }
             WidenPlan::Object {
                 source,
@@ -744,6 +766,11 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     self.derived_types.widened_types.insert(source, widened),
                     None
                 );
+                if self.relation_derived_cache_source_is_observable(source)
+                    || self.relation_derived_cache_target_is_observable(widened)
+                {
+                    self.mark_relation_inputs_dirty();
+                }
             }
             WidenPlan::Array {
                 source,
@@ -769,6 +796,11 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     self.derived_types.widened_types.insert(source, widened),
                     None
                 );
+                if self.relation_derived_cache_source_is_observable(source)
+                    || self.relation_derived_cache_target_is_observable(widened)
+                {
+                    self.mark_relation_inputs_dirty();
+                }
             }
         }
     }
@@ -1006,6 +1038,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         if record.object_flags().contains(ObjectFlags::FRESH_LITERAL) {
             return self.fresh_object_shape(type_);
         }
+        self.observe_relation_derived_cache_target_read(type_);
         let mut source = None;
         for (candidate, cached) in &self.derived_types.regular_object_literals {
             if *cached == type_ && source.replace(*candidate).is_some() {
@@ -1025,6 +1058,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         target: TypeId,
         visiting: &mut HashSet<TypeId>,
     ) -> bool {
+        self.observe_relation_derived_cache_source_read(source);
         if !visiting.insert(source) {
             return false;
         }
@@ -1087,6 +1121,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         regular_visiting: &mut HashSet<TypeId>,
         array_targets: Option<CanonicalArrayTargets>,
     ) -> bool {
+        self.observe_relation_derived_cache_source_read(source);
         let Some(source_record) = self.type_payload(source) else {
             return false;
         };
@@ -1105,21 +1140,20 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 .is_some_and(|bootstrap| target == bootstrap.any_type);
         }
         if let Some(array_targets) = array_targets {
-            let source_array = match self
-                .canonical_array_reference_with_targets(array_targets, source)
-            {
-                Ok(Some(source_array)) => source_array,
-                Ok(None) => {
-                    return self.widened_object_cache_entry_is_valid(
-                        source,
-                        target,
-                        visiting,
-                        regular_visiting,
-                        Some(array_targets),
-                    );
-                }
-                Err(_) => return false,
-            };
+            let source_array =
+                match self.canonical_array_reference_with_targets(array_targets, source) {
+                    Ok(Some(source_array)) => source_array,
+                    Ok(None) => {
+                        return self.widened_object_cache_entry_is_valid(
+                            source,
+                            target,
+                            visiting,
+                            regular_visiting,
+                            Some(array_targets),
+                        );
+                    }
+                    Err(_) => return false,
+                };
             if !visiting.insert(source) {
                 return false;
             }

@@ -864,6 +864,102 @@ pub(super) fn preflight_generic_global_type_target(
     Ok(None)
 }
 
+/// Validates the authoritative generic target shell used by one relation
+/// lookup without scanning unrelated target-local instantiations.
+///
+/// The relation path separately records and validates each exact `(target,
+/// key)` entry it consumes. Shell replacement invalidates the broad target
+/// observation, while ordinary target-cache insertion invalidates only an
+/// observed exact key (or an explicitly map-wide reader).
+pub(super) fn preflight_relation_generic_global_type_target(
+    store: &CanonicalTypeMapperStore,
+    target: TypeId,
+) -> Result<Option<TypeId>, CanonicalGlobalTypeInitializationError> {
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or(CanonicalGlobalTypeInitializationError::MissingBootstrap)?;
+    if target == bootstrap.empty_generic_type {
+        return Ok(Some(bootstrap.empty_object_type));
+    }
+
+    let target_record = store
+        .type_payload(target)
+        .ok_or(CanonicalGlobalTypeInitializationError::InvalidType(target))?;
+    let TypeData::Interface(interface) = target_record.data() else {
+        return Err(CanonicalGlobalTypeInitializationError::InvalidGenericTarget(target));
+    };
+    let Some(type_arguments) = interface.reference.resolved_type_arguments.as_deref() else {
+        return Err(CanonicalGlobalTypeInitializationError::InvalidGenericTarget(target));
+    };
+    let Some(all_type_parameters) = interface.all_type_parameters.as_deref() else {
+        return Err(CanonicalGlobalTypeInitializationError::InvalidGenericTarget(target));
+    };
+    let TypeCacheState::Allocated(_) = &interface.reference.object.instantiations else {
+        return Err(CanonicalGlobalTypeInitializationError::InvalidGenericTarget(target));
+    };
+    let target_symbol = target_record
+        .symbol()
+        .ok_or(CanonicalGlobalTypeInitializationError::InvalidGenericTarget(target))?;
+    let target_origin = target_record.object_flags() & ObjectFlags::CLASS_OR_INTERFACE;
+    let target_allowed_flags = ObjectFlags::CLASS_OR_INTERFACE
+        | ObjectFlags::REFERENCE
+        | ObjectFlags::PROPAGATING_FLAGS
+        | ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES_COMPUTED
+        | ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES
+        | ObjectFlags::MEMBERS_RESOLVED
+        | ObjectFlags::CONTAINS_SPREAD
+        | ObjectFlags::OBJECT_REST_TYPE
+        | ObjectFlags::IDENTICAL_BASE_TYPE_CALCULATED
+        | ObjectFlags::IDENTICAL_BASE_TYPE_EXISTS
+        | ObjectFlags::UNRESOLVED_MEMBERS;
+    if target_record.flags() != TypeFlags::OBJECT
+        || !matches!(target_origin, ObjectFlags::CLASS | ObjectFlags::INTERFACE)
+        || !target_record
+            .object_flags()
+            .contains(ObjectFlags::REFERENCE)
+        || !(target_record.object_flags() & !target_allowed_flags).is_empty()
+        || type_arguments.len() != 1
+        || all_type_parameters.len() != 2
+        || all_type_parameters.first() != type_arguments.first()
+        || all_type_parameters.last().copied() != interface.this_type
+        || interface.outer_type_parameter_count != 0
+        || interface.reference.object.target != Some(target)
+        || interface.reference.object.mapper.is_some()
+        || interface.reference.node.is_some()
+        || target_record.alias().is_some()
+        || cached_ordinary_type_parameter_owner(store, type_arguments[0]).is_none()
+    {
+        return Err(CanonicalGlobalTypeInitializationError::InvalidGenericTarget(target));
+    }
+    let this_type = interface
+        .this_type
+        .expect("the validated all-type-parameter tail is the this type");
+    let Some(this_record) = store.type_payload(this_type) else {
+        return Err(CanonicalGlobalTypeInitializationError::InvalidGenericTarget(target));
+    };
+    let this_flags = this_record.object_flags();
+    let resolved_type_parameter_flags = ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES_COMPUTED
+        | ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES;
+    if this_record.flags() != TypeFlags::TYPE_PARAMETER
+        || !(this_flags == ObjectFlags::NONE || this_flags == resolved_type_parameter_flags)
+        || this_record.symbol() != Some(target_symbol)
+        || this_record.alias().is_some()
+        || !matches!(
+            this_record.data(),
+            TypeData::TypeParameter(data)
+                if data.is_this_type
+                    && data.constraint == Some(target)
+                    && data.target.is_none()
+                    && data.mapper.is_none()
+        )
+        || store.relation_object_instantiation(target, type_list_key(type_arguments))
+            != Some(target)
+    {
+        return Err(CanonicalGlobalTypeInitializationError::InvalidGenericTarget(target));
+    }
+    Ok(None)
+}
+
 /// Returns whether `instantiation` is the canonical result owned by `target`.
 /// The malformed-library fallback is canonical only for the exact intrinsic
 /// empty-object identity; initialized targets accept only values present in

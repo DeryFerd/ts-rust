@@ -721,10 +721,17 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         {
             return false;
         }
+        let relation_dirty = self.relation_type_alias_is_observable(alias)
+            && self
+                .type_alias_payload(alias)
+                .is_some_and(|current| current.type_arguments() != type_arguments.as_deref());
         let Some(record) = self.type_alias_payload_mut(alias) else {
             return false;
         };
         record.type_arguments = type_arguments;
+        if relation_dirty {
+            self.mark_relation_inputs_dirty();
+        }
         self.mark_union_cache_validation_dirty();
         true
     }
@@ -1219,7 +1226,7 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         if record.object_flags == object_flags {
             return true;
         }
-        let relation_dirty = record.object_flags.contains(ObjectFlags::MEMBERS_RESOLVED);
+        let relation_dirty = self.relation_type_is_observable(id);
         let preserves_union_cache_identity = matches!(record.data, TypeData::Union(_))
             && Self::union_cache_lazy_object_flag_transition(record.object_flags, object_flags);
         let Some(record) = self.type_payload_mut(id) else {
@@ -1270,7 +1277,7 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         if record.flags == candidate {
             return true;
         }
-        let relation_dirty = record.object_flags.contains(ObjectFlags::MEMBERS_RESOLVED);
+        let relation_dirty = self.relation_type_is_observable(id);
         let Some(record) = self.type_payload_mut(id) else {
             return false;
         };
@@ -1297,9 +1304,7 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         if target_record.flags == source_flags {
             return true;
         }
-        let relation_dirty = target_record
-            .object_flags
-            .contains(ObjectFlags::MEMBERS_RESOLVED);
+        let relation_dirty = self.relation_type_is_observable(target);
         let Some(target_record) = self.type_payload_mut(target) else {
             return false;
         };
@@ -1321,7 +1326,7 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         if record.symbol == symbol {
             return true;
         }
-        let relation_dirty = record.symbol.is_some();
+        let relation_dirty = self.relation_type_is_observable(id);
         let Some(record) = self.type_payload_mut(id) else {
             return false;
         };
@@ -1343,7 +1348,7 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         if current == alias {
             return true;
         }
-        let relation_dirty = current.is_some();
+        let relation_dirty = self.relation_type_is_observable(id);
         let Some(record) = self.type_payload_mut(id) else {
             return false;
         };
@@ -1359,13 +1364,11 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         if !self.valid_optional_record_type(constraint) {
             return false;
         }
-        let relation_dirty = self
-            .type_payload(id)
-            .and_then(|record| record.data.constrained())
-            .is_some_and(|constrained| {
-                constrained.resolved_base_constraint.is_some()
-                    && constrained.resolved_base_constraint != constraint
-            });
+        let relation_dirty = self.relation_type_is_observable(id)
+            && self
+                .type_payload(id)
+                .and_then(|record| record.data.constrained())
+                .is_some_and(|constrained| constrained.resolved_base_constraint != constraint);
         let dirty = self.type_is_exact_callable_object(id);
         let Some(constrained) = self
             .type_payload_mut(id)
@@ -1419,18 +1422,16 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
                     .collect(),
             ),
         };
-        let relation_dirty = self.type_payload(id).is_some_and(|record| {
-            record
-                .object_flags()
-                .contains(ObjectFlags::MEMBERS_RESOLVED)
-                && record.data().structured().is_some_and(|structured| {
+        let relation_dirty = self.relation_type_is_observable(id)
+            && self.type_payload(id).is_some_and(|record| {
+                record.data().structured().is_some_and(|structured| {
                     structured.members != members
                         || structured.properties.as_ref() != properties.as_ref()
                         || structured.signatures.as_ref() != signatures.as_ref()
                         || structured.call_signature_count != call_count
                         || structured.index_infos.as_ref() != index_infos.as_ref()
                 })
-        });
+            });
         {
             let Some(record) = self.type_payload_mut(id) else {
                 return false;
@@ -1445,7 +1446,6 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
             structured.index_infos = index_infos;
             record.object_flags |= ObjectFlags::MEMBERS_RESOLVED;
         }
-        self.mark_relation_symbol_table_observable(members);
         if relation_dirty {
             self.mark_relation_inputs_dirty();
         }
@@ -1463,6 +1463,13 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         if !self.valid_optional_record_type(value) {
             return false;
         }
+        let relation_dirty = self.relation_type_is_observable(id)
+            && self
+                .type_payload(id)
+                .and_then(|record| record.data.structured())
+                .is_some_and(|structured| {
+                    structured.object_type_without_abstract_construct_signatures != value
+                });
         let dirty = self.type_is_exact_callable_object(id);
         let Some(structured) = self
             .type_payload_mut(id)
@@ -1471,6 +1478,9 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
             return false;
         };
         structured.object_type_without_abstract_construct_signatures = value;
+        if relation_dirty {
+            self.mark_relation_inputs_dirty();
+        }
         if dirty {
             self.mark_union_cache_validation_dirty();
         }
@@ -1492,13 +1502,11 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         ) {
             return false;
         }
-        let relation_dirty = self
-            .type_payload(id)
-            .and_then(|record| record.data.object())
-            .is_some_and(|object| {
-                (object.target.is_some() || object.mapper.is_some())
-                    && (object.target != target || object.mapper != mapper)
-            });
+        let relation_dirty = self.relation_type_is_observable(id)
+            && self
+                .type_payload(id)
+                .and_then(|record| record.data.object())
+                .is_some_and(|object| object.target != target || object.mapper != mapper);
         let dirty = self.type_is_exact_callable_object(id);
         let Some(object) = self
             .type_payload_mut(id)
@@ -1531,6 +1539,17 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         ) {
             return false;
         }
+        let relation_dirty = self
+            .type_payload(id)
+            .and_then(|record| record.data.object())
+            .is_some_and(|object| {
+                (self.relation_type_is_observable(id) && object.instantiations != instantiations)
+                    || self.relation_observes_object_instantiation_change(
+                        id,
+                        &object.instantiations,
+                        &instantiations,
+                    )
+            });
         let dirty = self.type_is_exact_callable_object(id);
         let Some(object) = self
             .type_payload_mut(id)
@@ -1539,10 +1558,31 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
             return false;
         };
         object.instantiations = instantiations;
+        if relation_dirty {
+            self.mark_relation_inputs_dirty();
+        }
         if dirty {
             self.mark_union_cache_validation_dirty();
         }
         true
+    }
+
+    /// Reads one exact object-instantiation entry for a relation query.
+    ///
+    /// The owner type is observed by [`Self::type_payload`], while the exact
+    /// key lets ordinary insertions avoid invalidating relations that read a
+    /// different entry in the same target-local cache.
+    pub(super) fn relation_object_instantiation(
+        &self,
+        id: TypeId,
+        key: CacheHashKey,
+    ) -> Option<TypeId> {
+        self.observe_relation_object_instantiation_read(id, key);
+        let object = self.type_payload(id)?.data.object()?;
+        let TypeCacheState::Allocated(instantiations) = &object.instantiations else {
+            return None;
+        };
+        instantiations.get(&key).copied()
     }
 
     /// Reserves target-local instantiation slots without allocating a nil map.
@@ -1594,6 +1634,8 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         {
             return None;
         }
+        let relation_dirty = self.relation_object_instantiation_map_is_observable(id)
+            || self.relation_object_instantiation_is_observable(id, key);
         let object = self
             .type_payload_mut(id)
             .and_then(|record| record.data.object_mut())?;
@@ -1607,6 +1649,9 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
             return None;
         }
         instantiations.insert(key, instantiation);
+        if relation_dirty {
+            self.mark_relation_inputs_dirty();
+        }
         Some(instantiation)
     }
 
@@ -1627,15 +1672,15 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         ) {
             return false;
         }
-        let relation_dirty = self
-            .type_payload(id)
-            .and_then(|record| record.data.reference())
-            .is_some_and(|reference| {
-                (reference.node.is_some() || reference.resolved_type_arguments.is_some())
-                    && (reference.node != node
+        let relation_dirty = self.relation_type_is_observable(id)
+            && self
+                .type_payload(id)
+                .and_then(|record| record.data.reference())
+                .is_some_and(|reference| {
+                    reference.node != node
                         || reference.resolved_type_arguments.as_ref()
-                            != resolved_type_arguments.as_ref())
-            });
+                            != resolved_type_arguments.as_ref()
+                });
         let Some(reference) = self
             .type_payload_mut(id)
             .and_then(|record| record.data.reference_mut())
@@ -1723,6 +1768,8 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         let resolved_type_arguments = all_type_parameters[..all_type_parameters.len() - 1].to_vec();
         let instantiations =
             TypeCacheState::Allocated(HashMap::from([(self_instantiation_key, id)]));
+        let relation_dirty =
+            self.relation_type_is_observable(id) || self.relation_type_is_observable(this_type);
 
         // Both records and their exact payload kinds were validated above, and
         // all allocations are complete before the first mutation is made.
@@ -1748,6 +1795,9 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         interface.reference.object.instantiations = instantiations;
         interface.reference.resolved_type_arguments = Some(resolved_type_arguments);
         record.object_flags |= ObjectFlags::REFERENCE;
+        if relation_dirty {
+            self.mark_relation_inputs_dirty();
+        }
         true
     }
 
@@ -1827,6 +1877,8 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         if cache.len() != 1 || cache.get(&type_list_key(&resolved_type_arguments)) != Some(&id) {
             return false;
         }
+        let relation_dirty =
+            self.relation_type_is_observable(id) || self.relation_type_is_observable(this_type);
 
         let Some(TypeData::TypeParameter(this_data)) = self
             .type_payload_mut(this_type)
@@ -1848,6 +1900,9 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         tuple.interface.reference.resolved_type_arguments = Some(resolved_type_arguments);
         tuple.interface.declared_members_resolved = true;
         tuple.interface.declared_members = Some(declared_members);
+        if relation_dirty {
+            self.mark_relation_inputs_dirty();
+        }
         true
     }
 
@@ -1863,18 +1918,16 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         {
             return false;
         }
-        let relation_dirty = self
-            .type_payload(id)
-            .and_then(|record| record.data.interface())
-            .is_some_and(|interface| {
-                (interface.base_types_resolved
-                    || interface.resolved_base_constructor_type.is_some()
-                    || interface.resolved_base_types.is_some())
-                    && (interface.base_types_resolved != base_types_resolved
+        let relation_dirty = self.relation_type_is_observable(id)
+            && self
+                .type_payload(id)
+                .and_then(|record| record.data.interface())
+                .is_some_and(|interface| {
+                    interface.base_types_resolved != base_types_resolved
                         || interface.resolved_base_constructor_type
                             != resolved_base_constructor_type
-                        || interface.resolved_base_types.as_ref() != resolved_base_types.as_ref())
-            });
+                        || interface.resolved_base_types.as_ref() != resolved_base_types.as_ref()
+                });
         let Some(interface) = self
             .type_payload_mut(id)
             .and_then(|record| record.data.interface_mut())
@@ -1895,6 +1948,7 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
     /// resolving bases invalidates the structured-member cache even when the
     /// resolved base list is absent rather than allocated empty.
     pub(super) fn publish_interface_no_base_resolution(&mut self, id: TypeId) -> bool {
+        let relation_dirty = self.relation_type_is_observable(id);
         let Some(record) = self.type_payload_mut(id) else {
             return false;
         };
@@ -1912,6 +1966,9 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         }
         interface.base_types_resolved = true;
         record.object_flags &= !ObjectFlags::MEMBERS_RESOLVED;
+        if relation_dirty {
+            self.mark_relation_inputs_dirty();
+        }
         true
     }
 
@@ -1932,22 +1989,18 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         {
             return false;
         }
-        let relation_dirty = self
-            .type_payload(id)
-            .and_then(|record| record.data.interface())
-            .is_some_and(|interface| {
-                (interface.declared_members_resolved
-                    || interface.declared_members.is_some()
-                    || interface.declared_call_signatures.is_some()
-                    || interface.declared_construct_signatures.is_some()
-                    || interface.declared_index_infos.is_some())
-                    && (interface.declared_members_resolved != resolved
+        let relation_dirty = self.relation_type_is_observable(id)
+            && self
+                .type_payload(id)
+                .and_then(|record| record.data.interface())
+                .is_some_and(|interface| {
+                    interface.declared_members_resolved != resolved
                         || interface.declared_members != members
                         || interface.declared_call_signatures.as_ref() != call_signatures.as_ref()
                         || interface.declared_construct_signatures.as_ref()
                             != construct_signatures.as_ref()
-                        || interface.declared_index_infos.as_ref() != index_infos.as_ref())
-            });
+                        || interface.declared_index_infos.as_ref() != index_infos.as_ref()
+                });
         let Some(interface) = self
             .type_payload_mut(id)
             .and_then(|record| record.data.interface_mut())
@@ -1959,7 +2012,6 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         interface.declared_call_signatures = call_signatures;
         interface.declared_construct_signatures = construct_signatures;
         interface.declared_index_infos = index_infos;
-        self.mark_relation_symbol_table_observable(members);
         if relation_dirty {
             self.mark_relation_inputs_dirty();
         }
@@ -1970,12 +2022,19 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         if !self.valid_record_node(node) {
             return false;
         }
+        let relation_dirty = self.relation_type_is_observable(id)
+            && self.type_payload(id).is_some_and(|record| {
+                matches!(&record.data, TypeData::InstantiationExpression(data) if data.node != node)
+            });
         let Some(TypeData::InstantiationExpression(data)) =
             self.type_payload_mut(id).map(|record| &mut record.data)
         else {
             return false;
         };
         data.node = node;
+        if relation_dirty {
+            self.mark_relation_inputs_dirty();
+        }
         true
     }
 
@@ -2006,6 +2065,18 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         {
             return false;
         }
+        let relation_dirty = self.relation_type_is_observable(id)
+            && self.type_payload(id).is_some_and(|record| {
+                matches!(&record.data, TypeData::Mapped(data)
+                    if data.declaration != declaration
+                        || data.type_parameter != type_parameter
+                        || data.constraint_type != constraint_type
+                        || data.name_type != name_type
+                        || data.template_type != template_type
+                        || data.modifiers_type != modifiers_type
+                        || data.resolved_apparent_type != resolved_apparent_type
+                        || data.contains_error != contains_error)
+            });
         let Some(TypeData::Mapped(data)) = self.type_payload_mut(id).map(|record| &mut record.data)
         else {
             return false;
@@ -2018,6 +2089,9 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         data.modifiers_type = modifiers_type;
         data.resolved_apparent_type = resolved_apparent_type;
         data.contains_error = contains_error;
+        if relation_dirty {
+            self.mark_relation_inputs_dirty();
+        }
         true
     }
 
@@ -2034,6 +2108,13 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         {
             return false;
         }
+        let relation_dirty = self.relation_type_is_observable(id)
+            && self.type_payload(id).is_some_and(|record| {
+                matches!(&record.data, TypeData::ReverseMapped(data)
+                    if data.source != source
+                        || data.mapped_type != mapped_type
+                        || data.constraint_type != constraint_type)
+            });
         let Some(TypeData::ReverseMapped(data)) =
             self.type_payload_mut(id).map(|record| &mut record.data)
         else {
@@ -2042,6 +2123,9 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         data.source = source;
         data.mapped_type = mapped_type;
         data.constraint_type = constraint_type;
+        if relation_dirty {
+            self.mark_relation_inputs_dirty();
+        }
         true
     }
 
@@ -2056,6 +2140,12 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         {
             return false;
         }
+        let relation_dirty = self.relation_type_is_observable(id)
+            && self.type_payload(id).is_some_and(|record| {
+                matches!(&record.data, TypeData::EvolvingArray(data)
+                    if data.element_type != element_type
+                        || data.final_array_type != final_array_type)
+            });
         let Some(TypeData::EvolvingArray(data)) =
             self.type_payload_mut(id).map(|record| &mut record.data)
         else {
@@ -2063,6 +2153,9 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         };
         data.element_type = element_type;
         data.final_array_type = final_array_type;
+        if relation_dirty {
+            self.mark_relation_inputs_dirty();
+        }
         true
     }
 
@@ -2079,6 +2172,18 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         {
             return false;
         }
+        let relation_dirty = self.relation_type_is_observable(id)
+            && self.type_payload(id).is_some_and(|record| {
+                let union = match &record.data {
+                    TypeData::Union(data) => &data.union,
+                    TypeData::Intersection(data) => &data.intersection,
+                    _ => return false,
+                };
+                union.property_cache != property_cache
+                    || union.property_cache_without_function_property_augment
+                        != property_cache_without_function_property_augment
+                    || union.resolved_properties.as_ref() != resolved_properties.as_ref()
+            });
         let Some(record) = self.type_payload_mut(id) else {
             return false;
         };
@@ -2091,6 +2196,9 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         union.property_cache_without_function_property_augment =
             property_cache_without_function_property_augment;
         union.resolved_properties = resolved_properties;
+        if relation_dirty {
+            self.mark_relation_inputs_dirty();
+        }
         true
     }
 
@@ -2111,6 +2219,15 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         {
             return false;
         }
+        let relation_dirty = self.relation_type_is_observable(id)
+            && self.type_payload(id).is_some_and(|record| {
+                matches!(&record.data, TypeData::Union(data)
+                    if data.resolved_reduced_type != resolved_reduced_type
+                        || data.regular_type != regular_type
+                        || data.origin != origin
+                        || data.key_property_name != key_property_name
+                        || data.constituent_map != constituent_map)
+            });
         let Some(TypeData::Union(data)) = self.type_payload_mut(id).map(|record| &mut record.data)
         else {
             return false;
@@ -2120,6 +2237,9 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         data.origin = origin;
         data.key_property_name = key_property_name;
         data.constituent_map = constituent_map;
+        if relation_dirty {
+            self.mark_relation_inputs_dirty();
+        }
         self.mark_union_cache_validation_dirty();
         true
     }
@@ -2135,6 +2255,13 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         {
             return false;
         }
+        let relation_dirty = self.relation_type_is_observable(id)
+            && self.type_payload(id).is_some_and(|record| {
+                matches!(&record.data, TypeData::Intersection(data)
+                    if data.resolved_apparent_type != resolved_apparent_type
+                        || data.unique_literal_filled_instantiation
+                            != unique_literal_filled_instantiation)
+            });
         let Some(TypeData::Intersection(data)) =
             self.type_payload_mut(id).map(|record| &mut record.data)
         else {
@@ -2142,6 +2269,9 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         };
         data.resolved_apparent_type = resolved_apparent_type;
         data.unique_literal_filled_instantiation = unique_literal_filled_instantiation;
+        if relation_dirty {
+            self.mark_relation_inputs_dirty();
+        }
         true
     }
 
@@ -2166,6 +2296,14 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         {
             return false;
         }
+        let relation_dirty = self.relation_type_is_observable(id)
+            && self.type_payload(id).is_some_and(|record| {
+                matches!(&record.data, TypeData::TypeParameter(data)
+                    if data.constraint != constraint
+                        || data.target != target
+                        || data.mapper != mapper
+                        || data.resolved_default_type != resolved_default_type)
+            });
         let Some(TypeData::TypeParameter(data)) =
             self.type_payload_mut(id).map(|record| &mut record.data)
         else {
@@ -2178,6 +2316,9 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         data.target = target;
         data.mapper = mapper;
         data.resolved_default_type = resolved_default_type;
+        if relation_dirty {
+            self.mark_relation_inputs_dirty();
+        }
         true
     }
 
@@ -2202,6 +2343,11 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         if !compatible {
             return false;
         }
+        let relation_dirty = self.relation_type_is_observable(id)
+            && self.type_payload(id).is_some_and(|record| {
+                matches!(&record.data, TypeData::Literal(data)
+                    if data.fresh_type != fresh_type || data.regular_type != regular_type)
+            });
         let Some(TypeData::Literal(data)) =
             self.type_payload_mut(id).map(|record| &mut record.data)
         else {
@@ -2209,6 +2355,9 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         };
         data.fresh_type = fresh_type;
         data.regular_type = regular_type;
+        if relation_dirty {
+            self.mark_relation_inputs_dirty();
+        }
         self.mark_union_cache_validation_dirty();
         true
     }
@@ -2239,6 +2388,18 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         {
             return false;
         }
+        let relation_dirty = self.relation_type_is_observable(id)
+            && self.type_payload(id).is_some_and(|record| {
+                matches!(&record.data, TypeData::Conditional(data)
+                    if data.resolved_true_type != resolved_true_type
+                        || data.resolved_false_type != resolved_false_type
+                        || data.resolved_inferred_true_type != resolved_inferred_true_type
+                        || data.resolved_default_constraint != resolved_default_constraint
+                        || data.resolved_constraint_of_distributive
+                            != resolved_constraint_of_distributive
+                        || data.mapper != mapper
+                        || data.combined_mapper != combined_mapper)
+            });
         let Some(TypeData::Conditional(data)) =
             self.type_payload_mut(id).map(|record| &mut record.data)
         else {
@@ -2251,6 +2412,9 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         data.resolved_constraint_of_distributive = resolved_constraint_of_distributive;
         data.mapper = mapper;
         data.combined_mapper = combined_mapper;
+        if relation_dirty {
+            self.mark_relation_inputs_dirty();
+        }
         true
     }
 

@@ -1805,7 +1805,7 @@ fn validate_structural_object_shell(
         None => store.validate_derived_object_literal_for_relation(type_id),
     };
     match derived {
-        DerivedObjectLiteralValidation::Valid { owner } if record.symbol() == Some(owner) => {
+        DerivedObjectLiteralValidation::Valid { owner, .. } if record.symbol() == Some(owner) => {
             return Ok(StructuralObjectProof::ObjectLiteral);
         }
         DerivedObjectLiteralValidation::Valid { .. } | DerivedObjectLiteralValidation::Invalid => {

@@ -3,6 +3,10 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     num::NonZeroU32,
+    sync::{
+        Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use ts_ast::{FileId, NodeArena, NodeArenaId, NodeData, NodeId, NodeRef, SyntaxKind};
@@ -39,7 +43,10 @@ use super::{
         TupleElementInfo, TupleMetadata, TypePredicate, TypePredicateArena, TypePredicateKind,
     },
     source_callables::SourceCallableTypeParameterSyntaxProof,
-    type_records::{CacheHashKey, ConditionalRoot, TypeAlias, TypeData, TypeRecord, type_list_key},
+    type_records::{
+        CacheHashKey, ConditionalRoot, TypeAlias, TypeCacheState, TypeData, TypeRecord,
+        type_list_key,
+    },
 };
 
 #[derive(Debug)]
@@ -70,6 +77,29 @@ struct CachedSignatureEntry {
     type_arguments: Box<[TypeId]>,
     instantiated: SignatureId,
 }
+
+#[derive(Debug, Default)]
+struct RelationReadObservations {
+    types: HashSet<TypeId>,
+    type_aliases: HashSet<TypeAliasId>,
+    signatures: HashSet<SignatureId>,
+    symbols: HashSet<SemanticSymbolId>,
+    symbol_tables: HashSet<SymbolTableId>,
+    object_instantiation_maps: HashSet<TypeId>,
+    object_instantiations: HashSet<(TypeId, CacheHashKey)>,
+    nodes: HashSet<NodeRef>,
+    derived_cache_sources: HashSet<TypeId>,
+    derived_cache_targets: HashSet<TypeId>,
+}
+
+#[derive(Debug)]
+struct ActiveRelationReadObservations {
+    token: RelationObservationToken,
+    observations: RelationReadObservations,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct RelationObservationToken(u64);
 
 /// Exact lookup state for pinned checker `cachedSignatures`. The hash remains
 /// the upstream key, while the retained ordered arguments make a rare hash
@@ -326,7 +356,19 @@ pub struct SemanticStore<TypePayload, MapperPayload> {
     relations: RelationCaches,
     relation_inputs_generation: u64,
     relation_cache_generation: u64,
+    relation_observable_types: HashSet<TypeId>,
+    relation_observable_type_aliases: HashSet<TypeAliasId>,
+    relation_observable_signatures: HashSet<SignatureId>,
+    relation_observable_symbols: HashSet<SemanticSymbolId>,
     relation_observable_symbol_tables: HashSet<SymbolTableId>,
+    relation_observable_object_instantiation_maps: HashSet<TypeId>,
+    relation_observable_object_instantiations: HashSet<(TypeId, CacheHashKey)>,
+    relation_observable_nodes: HashSet<NodeRef>,
+    relation_observable_derived_cache_sources: HashSet<TypeId>,
+    relation_observable_derived_cache_targets: HashSet<TypeId>,
+    relation_read_observation_active: AtomicBool,
+    active_relation_read_observations: Mutex<Option<ActiveRelationReadObservations>>,
+    next_relation_observation_token: u64,
     pub(super) derived_types: DerivedTypeCaches,
     pub(super) intrinsic_bootstrap: Option<IntrinsicBootstrap>,
     claimed_strict_builtin_iterator_return: Option<bool>,
@@ -397,7 +439,19 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             relations: RelationCaches::default(),
             relation_inputs_generation: 0,
             relation_cache_generation: 0,
+            relation_observable_types: HashSet::new(),
+            relation_observable_type_aliases: HashSet::new(),
+            relation_observable_signatures: HashSet::new(),
+            relation_observable_symbols: HashSet::new(),
             relation_observable_symbol_tables: HashSet::new(),
+            relation_observable_object_instantiation_maps: HashSet::new(),
+            relation_observable_object_instantiations: HashSet::new(),
+            relation_observable_nodes: HashSet::new(),
+            relation_observable_derived_cache_sources: HashSet::new(),
+            relation_observable_derived_cache_targets: HashSet::new(),
+            relation_read_observation_active: AtomicBool::new(false),
+            active_relation_read_observations: Mutex::new(None),
+            next_relation_observation_token: 0,
             derived_types: DerivedTypeCaches::default(),
             intrinsic_bootstrap: None,
             claimed_strict_builtin_iterator_return: None,
@@ -666,6 +720,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
     }
 
     pub(super) fn type_alias_payload(&self, id: TypeAliasId) -> Option<&TypeAlias> {
+        self.observe_relation_type_alias_read(id);
         self.type_aliases.get(id)
     }
 
@@ -704,6 +759,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
 
     #[must_use]
     pub fn type_payload(&self, id: TypeId) -> Option<&TypePayload> {
+        self.observe_relation_type_read(id);
         self.types.get(id)
     }
 
@@ -862,10 +918,15 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         if self.types.get(type_).is_none() || self.function_type_provenance.contains(&type_) {
             return false;
         }
-        self.function_type_provenance.insert(type_)
+        let inserted = self.function_type_provenance.insert(type_);
+        if inserted && self.relation_type_is_observable(type_) {
+            self.mark_relation_inputs_dirty();
+        }
+        inserted
     }
 
     pub(super) fn type_has_function_type_provenance(&self, type_: TypeId) -> bool {
+        self.observe_relation_type_read(type_);
         self.function_type_provenance.contains(&type_)
     }
 
@@ -906,6 +967,10 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         {
             return false;
         }
+        let relation_dirty = self.relation_type_is_observable(type_)
+            || signatures
+                .iter()
+                .any(|signature| self.relation_signature_is_observable(*signature));
         assert!(self.declared_call_set_provenance.insert(type_));
         for signature in signatures {
             assert!(
@@ -914,10 +979,14 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                     .is_none()
             );
         }
+        if relation_dirty {
+            self.mark_relation_inputs_dirty();
+        }
         true
     }
 
     pub(super) fn type_has_declared_call_set_provenance(&self, type_: TypeId) -> bool {
+        self.observe_relation_type_read(type_);
         self.declared_call_set_provenance.contains(&type_)
     }
 
@@ -925,6 +994,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         &self,
         signature: SignatureId,
     ) -> Option<TypeId> {
+        self.observe_relation_signature_read(signature);
         self.declared_call_set_types_by_signature
             .get(&signature)
             .copied()
@@ -956,6 +1026,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         &self,
         signature: SignatureId,
     ) -> Option<&[SourceCallableTypeParameterProvenance]> {
+        self.observe_relation_signature_read(signature);
         self.source_callable_type_parameters
             .get(&signature)
             .map(Box::as_ref)
@@ -1035,6 +1106,14 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         {
             return false;
         }
+        let relation_dirty = self.relation_type_is_observable(type_)
+            || self.relation_signature_is_observable(provenance.signature)
+            || self
+                .relation_observable_nodes
+                .contains(&provenance.declaration)
+            || self
+                .relation_observable_symbols
+                .contains(&provenance.owner_symbol);
         let by_type = self.source_callable_provenance.insert(type_, provenance);
         let by_declaration = self
             .source_callable_types_by_declaration
@@ -1052,6 +1131,9 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                 && by_signature.is_none(),
             "source callable reverse maps were prevalidated absent"
         );
+        if relation_dirty {
+            self.mark_relation_inputs_dirty();
+        }
         true
     }
 
@@ -1059,6 +1141,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         &self,
         type_: TypeId,
     ) -> Option<SourceCallableProvenance> {
+        self.observe_relation_type_read(type_);
         self.source_callable_provenance.get(&type_).copied()
     }
 
@@ -1091,6 +1174,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
     }
 
     pub(super) fn source_callable_type_for_owner(&self, owner: SemanticSymbolId) -> Option<TypeId> {
+        self.observe_relation_symbol_read(owner);
         self.source_callable_types_by_owner.get(&owner).copied()
     }
 
@@ -1098,6 +1182,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         &self,
         signature: SignatureId,
     ) -> Option<TypeId> {
+        self.observe_relation_signature_read(signature);
         self.source_callable_types_by_signature
             .get(&signature)
             .copied()
@@ -1107,6 +1192,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         &self,
         declaration: NodeRef,
     ) -> Option<TypeId> {
+        self.observe_relation_node_read(declaration);
         self.source_callable_types_by_declaration
             .get(&declaration)
             .copied()
@@ -1245,6 +1331,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
 
     #[must_use]
     pub fn symbol(&self, id: SemanticSymbolId) -> Option<&Symbol> {
+        self.observe_relation_symbol_read(id);
         self.symbols.symbol(id)
     }
 
@@ -1268,9 +1355,15 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
     /// validated when recorded, so a valid input always returns a valid symbol.
     #[must_use]
     pub fn get_merged_symbol(&self, symbol: SemanticSymbolId) -> Option<SemanticSymbolId> {
-        self.symbols
+        self.observe_relation_symbol_read(symbol);
+        let merged = self
+            .symbols
             .contains_symbol(symbol)
-            .then(|| self.merged_symbols.get(&symbol).copied().unwrap_or(symbol))
+            .then(|| self.merged_symbols.get(&symbol).copied().unwrap_or(symbol));
+        if let Some(merged) = merged {
+            self.observe_relation_symbol_read(merged);
+        }
+        merged
     }
 
     /// Number of exact source-to-merged redirects recorded by the checker.
@@ -1315,7 +1408,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         }
 
         let previous = self.merged_symbols.insert(source, target);
-        if previous.is_some_and(|previous| previous != target) {
+        if self.relation_observable_symbols.contains(&source) && previous != Some(target) {
             self.mark_relation_inputs_dirty();
         }
         if self.has_callable_provenance() {
@@ -1327,7 +1420,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
     /// Returns a symbol's raw parent after exactly one merged redirect.
     #[must_use]
     pub fn get_parent_of_symbol(&self, symbol: SemanticSymbolId) -> Option<SemanticSymbolId> {
-        let parent = self.symbols.symbol(symbol)?.parent()?;
+        let parent = self.symbol(symbol)?.parent()?;
         self.get_merged_symbol(parent)
     }
 
@@ -1384,6 +1477,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
 
     #[must_use]
     pub fn symbol_table(&self, id: SymbolTableId) -> Option<&SymbolTable> {
+        self.observe_relation_symbol_table_read(id);
         self.symbols.symbol_table(id)
     }
 
@@ -1413,15 +1507,10 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         flags: SymbolFlags,
         check_flags: CheckFlags,
     ) -> bool {
-        let relation_dirty = self.symbol(symbol).is_some_and(|current| {
-            (current.flags() != flags || current.check_flags() != check_flags)
-                && (current.declarations().is_some()
-                    || current.value_declaration().is_some()
-                    || current.members().is_some()
-                    || current.exports().is_some()
-                    || current.parent().is_some()
-                    || current.export_symbol().is_some())
-        });
+        let relation_dirty = self.relation_observable_symbols.contains(&symbol)
+            && self.symbol(symbol).is_some_and(|current| {
+                current.flags() != flags || current.check_flags() != check_flags
+            });
         if !self.symbols.set_symbol_flags(symbol, flags, check_flags) {
             return false;
         }
@@ -1440,11 +1529,11 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         declarations: Option<Vec<NodeRef>>,
         value_declaration: Option<NodeRef>,
     ) -> bool {
-        let relation_dirty = self.symbol(symbol).is_some_and(|current| {
-            (current.declarations() != declarations.as_deref()
-                || current.value_declaration() != value_declaration)
-                && (current.declarations().is_some() || current.value_declaration().is_some())
-        });
+        let relation_dirty = self.relation_observable_symbols.contains(&symbol)
+            && self.symbol(symbol).is_some_and(|current| {
+                current.declarations() != declarations.as_deref()
+                    || current.value_declaration() != value_declaration
+            });
         if !self
             .symbols
             .set_symbol_declarations(symbol, declarations, value_declaration)
@@ -1468,24 +1557,18 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         parent: Option<SemanticSymbolId>,
         export_symbol: Option<SemanticSymbolId>,
     ) -> bool {
-        let relation_dirty = self.symbol(symbol).is_some_and(|current| {
-            (current.members() != members
-                || current.exports() != exports
-                || current.parent() != parent
-                || current.export_symbol() != export_symbol)
-                && (current.members().is_some()
-                    || current.exports().is_some()
-                    || current.parent().is_some()
-                    || current.export_symbol().is_some())
-        });
+        let relation_dirty = self.relation_observable_symbols.contains(&symbol)
+            && self.symbol(symbol).is_some_and(|current| {
+                current.members() != members
+                    || current.exports() != exports
+                    || current.parent() != parent
+                    || current.export_symbol() != export_symbol
+            });
         if !self
             .symbols
             .set_symbol_relationships(symbol, members, exports, parent, export_symbol)
         {
             return false;
-        }
-        for table in [members, exports].into_iter().flatten() {
-            self.relation_observable_symbol_tables.insert(table);
         }
         if relation_dirty {
             self.mark_relation_inputs_dirty();
@@ -1499,6 +1582,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
     /// Reads already-allocated common node links without allocating on a miss.
     #[must_use]
     pub fn node_links(&self, node: NodeRef) -> Option<&NodeLinks> {
+        self.observe_relation_node_read(node);
         self.contains_node_ref(node)
             .then(|| self.links.node.try_get(&node))
             .flatten()
@@ -1516,12 +1600,20 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         if !self.contains_node_ref(node) || !links.flags.has_only_defined_bits() {
             return false;
         }
+        let relation_dirty = self.relation_observable_nodes.contains(&node)
+            && self
+                .node_links(node)
+                .is_none_or(|current| current != &links);
         self.links.node.replace_key(node, links);
+        if relation_dirty {
+            self.mark_relation_inputs_dirty();
+        }
         true
     }
 
     #[must_use]
     pub fn symbol_node_links(&self, node: NodeRef) -> Option<&SymbolNodeLinks> {
+        self.observe_relation_node_read(node);
         self.contains_node_ref(node)
             .then(|| self.links.symbol_node.try_get(&node))
             .flatten()
@@ -1539,12 +1631,20 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         if !self.contains_node_ref(node) || !self.valid_optional_symbol(links.resolved_symbol) {
             return false;
         }
+        let changed = self
+            .symbol_node_links(node)
+            .is_none_or(|current| current != &links);
+        let relation_dirty = self.relation_observable_nodes.contains(&node) && changed;
         self.links.symbol_node.replace_key(node, links);
+        if relation_dirty {
+            self.mark_relation_inputs_dirty();
+        }
         true
     }
 
     #[must_use]
     pub fn type_node_links(&self, node: NodeRef) -> Option<&TypeNodeLinks> {
+        self.observe_relation_node_read(node);
         self.contains_node_ref(node)
             .then(|| self.links.type_node.try_get(&node))
             .flatten()
@@ -1565,10 +1665,11 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         {
             return false;
         }
-        let relation_dirty = self
-            .type_node_links(node)
-            .is_some_and(|current| current != &TypeNodeLinks::default() && current != &links);
-        let dirty = self.node_has_callable_ancestor(node) && relation_dirty;
+        let (changed, published) = self.type_node_links(node).map_or((true, false), |current| {
+            (current != &links, current != &TypeNodeLinks::default())
+        });
+        let relation_dirty = self.relation_observable_nodes.contains(&node) && changed;
+        let dirty = self.node_has_callable_ancestor(node) && published && changed;
         self.links.type_node.replace_key(node, links);
         if relation_dirty {
             self.mark_relation_inputs_dirty();
@@ -1608,6 +1709,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
 
     #[must_use]
     pub fn signature_links(&self, node: NodeRef) -> Option<&SignatureLinks> {
+        self.observe_relation_node_read(node);
         self.node_is_signature_links_eligible(node)
             .then(|| self.links.signature.try_get(&node))
             .flatten()
@@ -1646,13 +1748,14 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         {
             return false;
         }
-        let relation_dirty = self
-            .signature_links(node)
-            .is_some_and(|current| current != &SignatureLinks::default() && current != &links);
+        let (changed, published) = self.signature_links(node).map_or((true, false), |current| {
+            (current != &links, current != &SignatureLinks::default())
+        });
+        let relation_dirty = self.relation_observable_nodes.contains(&node) && changed;
         let dirty = (self.node_is_function_type(node)
             || self.node_is_source_callable_declaration(node))
             || self.source_node_kind(node) == Some(SyntaxKind::CallSignature);
-        let dirty = dirty && relation_dirty;
+        let dirty = dirty && published && changed;
         self.links.signature.replace_key(node, links);
         if relation_dirty {
             self.mark_relation_inputs_dirty();
@@ -1696,6 +1799,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
 
     #[must_use]
     pub fn value_symbol_links(&self, symbol: SemanticSymbolId) -> Option<&ValueSymbolLinks> {
+        self.observe_relation_symbol_read(symbol);
         self.symbols
             .contains_symbol(symbol)
             .then(|| self.links.value_symbol.try_get(&symbol))
@@ -1725,12 +1829,16 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         {
             return false;
         }
-        let relation_dirty = self
+        let (changed, published) = self
             .value_symbol_links(symbol)
-            .is_some_and(|current| current != &ValueSymbolLinks::default() && current != &links);
+            .map_or((true, false), |current| {
+                (current != &links, current != &ValueSymbolLinks::default())
+            });
+        let relation_dirty = self.relation_observable_symbols.contains(&symbol) && changed;
         let dirty = (self.symbol_is_callable_parameter(symbol)
             || self.symbol_is_source_callable_owner(symbol))
-            && relation_dirty;
+            && published
+            && changed;
         self.links.value_symbol.replace_key(symbol, links);
         if relation_dirty {
             self.mark_relation_inputs_dirty();
@@ -1780,6 +1888,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
 
     #[must_use]
     pub fn type_alias_links(&self, symbol: SemanticSymbolId) -> Option<&TypeAliasLinks> {
+        self.observe_relation_symbol_read(symbol);
         self.symbols
             .contains_symbol(symbol)
             .then(|| self.links.type_alias.try_get(&symbol))
@@ -1810,9 +1919,21 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         {
             return false;
         }
-        let relation_dirty = self
-            .type_alias_links(symbol)
-            .is_some_and(|current| current != &TypeAliasLinks::default() && current != &links);
+        let previous = self
+            .links
+            .type_alias
+            .try_get(&symbol)
+            .and_then(|links| links.declared_type);
+        let declared_type = links.declared_type;
+        let relation_dirty = (self.relation_observable_symbols.contains(&symbol)
+            && self
+                .type_alias_links(symbol)
+                .is_none_or(|current| current != &links))
+            || (previous != declared_type
+                && [previous, declared_type]
+                    .into_iter()
+                    .flatten()
+                    .any(|type_| self.relation_type_is_observable(type_)));
         let dirty = self.type_alias_links(symbol).is_some_and(|current| {
             current != &TypeAliasLinks::default()
                 && current != &links
@@ -1821,12 +1942,6 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                     .flatten()
                     .any(|type_| self.function_type_provenance.contains(&type_))
         });
-        let previous = self
-            .links
-            .type_alias
-            .try_get(&symbol)
-            .and_then(|links| links.declared_type);
-        let declared_type = links.declared_type;
         self.links.type_alias.replace_key(symbol, links);
         if relation_dirty {
             self.mark_relation_inputs_dirty();
@@ -1866,11 +1981,13 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         &self,
         type_: TypeId,
     ) -> Option<&HashSet<SemanticSymbolId>> {
+        self.observe_relation_type_read(type_);
         self.type_alias_declared_type_owners.get(&type_)
     }
 
     #[must_use]
     pub fn declared_type_links(&self, symbol: SemanticSymbolId) -> Option<&DeclaredTypeLinks> {
+        self.observe_relation_symbol_read(symbol);
         self.symbols
             .contains_symbol(symbol)
             .then(|| self.links.declared_type.try_get(&symbol))
@@ -1893,9 +2010,10 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         if !self.symbols.contains_symbol(symbol) || !self.valid_optional_type(links.declared_type) {
             return false;
         }
-        let relation_dirty = self
-            .declared_type_links(symbol)
-            .is_some_and(|current| current != &DeclaredTypeLinks::default() && current != &links);
+        let relation_dirty = self.relation_observable_symbols.contains(&symbol)
+            && self
+                .declared_type_links(symbol)
+                .is_none_or(|current| current != &links);
         self.links.declared_type.replace_key(symbol, links);
         if relation_dirty {
             self.mark_relation_inputs_dirty();
@@ -2206,6 +2324,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         &self,
         symbol: SemanticSymbolId,
     ) -> Option<&MembersAndExportsLinks> {
+        self.observe_relation_symbol_read(symbol);
         self.symbols
             .contains_symbol(symbol)
             .then(|| self.links.members_and_exports.try_get(&symbol))
@@ -2234,7 +2353,14 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         {
             return false;
         }
+        let relation_dirty = self.relation_observable_symbols.contains(&symbol)
+            && self
+                .members_and_exports_links(symbol)
+                .is_none_or(|current| current != &links);
         self.links.members_and_exports.replace_key(symbol, links);
+        if relation_dirty {
+            self.mark_relation_inputs_dirty();
+        }
         true
     }
 
@@ -2476,6 +2602,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         }
         let Some(next) = self.relation_inputs_generation.checked_add(1) else {
             self.relations = RelationCaches::default();
+            self.clear_relation_observations();
             self.relation_inputs_generation = 0;
             self.relation_cache_generation = 0;
             return;
@@ -2483,10 +2610,263 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         self.relation_inputs_generation = next;
     }
 
-    pub(super) fn mark_relation_symbol_table_observable(&mut self, table: Option<SymbolTableId>) {
-        if let Some(table) = table {
-            self.relation_observable_symbol_tables.insert(table);
+    pub(super) fn relation_type_is_observable(&self, type_: TypeId) -> bool {
+        self.relation_observable_types.contains(&type_)
+    }
+
+    #[inline]
+    pub(super) fn relation_read_observation_is_active(&self) -> bool {
+        self.relation_read_observation_active
+            .load(Ordering::Relaxed)
+    }
+
+    pub(super) fn begin_relation_read_observation(&mut self) -> Option<RelationObservationToken> {
+        let active = self
+            .active_relation_read_observations
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self
+            .relation_read_observation_active
+            .load(Ordering::Relaxed)
+            || active.is_some()
+        {
+            return None;
         }
+        self.next_relation_observation_token = self
+            .next_relation_observation_token
+            .checked_add(1)
+            .unwrap_or(1);
+        let token = RelationObservationToken(self.next_relation_observation_token);
+        *active = Some(ActiveRelationReadObservations {
+            token,
+            observations: RelationReadObservations::default(),
+        });
+        self.relation_read_observation_active
+            .store(true, Ordering::Release);
+        Some(token)
+    }
+
+    pub(super) fn discard_relation_read_observation(
+        &mut self,
+        token: RelationObservationToken,
+    ) -> bool {
+        if !self
+            .relation_read_observation_active
+            .load(Ordering::Acquire)
+        {
+            return false;
+        }
+        let active = self
+            .active_relation_read_observations
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if active.as_ref().is_none_or(|active| active.token != token) {
+            return false;
+        }
+        *active = None;
+        self.relation_read_observation_active
+            .store(false, Ordering::Release);
+        true
+    }
+
+    fn take_relation_read_observations(
+        &mut self,
+        token: RelationObservationToken,
+    ) -> Option<RelationReadObservations> {
+        if !self
+            .relation_read_observation_active
+            .load(Ordering::Acquire)
+        {
+            return None;
+        }
+        let active = self
+            .active_relation_read_observations
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if active.as_ref().is_none_or(|active| active.token != token) {
+            return None;
+        }
+        let observations = active.take()?.observations;
+        self.relation_read_observation_active
+            .store(false, Ordering::Release);
+        Some(observations)
+    }
+
+    #[inline]
+    fn with_relation_read_observations(&self, observe: impl FnOnce(&mut RelationReadObservations)) {
+        if !self
+            .relation_read_observation_active
+            .load(Ordering::Relaxed)
+        {
+            return;
+        }
+        let mut active = self
+            .active_relation_read_observations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(active) = active.as_mut() else {
+            debug_assert!(false, "active relation observation lost its recorder");
+            return;
+        };
+        observe(&mut active.observations);
+    }
+
+    #[inline]
+    pub(super) fn observe_relation_type_read(&self, type_: TypeId) {
+        self.with_relation_read_observations(|observed| {
+            observed.types.insert(type_);
+        });
+    }
+
+    #[inline]
+    pub(super) fn observe_relation_type_alias_read(&self, alias: TypeAliasId) {
+        self.with_relation_read_observations(|observed| {
+            observed.type_aliases.insert(alias);
+        });
+    }
+
+    #[inline]
+    pub(super) fn observe_relation_signature_read(&self, signature: SignatureId) {
+        self.with_relation_read_observations(|observed| {
+            observed.signatures.insert(signature);
+        });
+    }
+
+    #[inline]
+    pub(super) fn observe_relation_symbol_read(&self, symbol: SemanticSymbolId) {
+        self.with_relation_read_observations(|observed| {
+            observed.symbols.insert(symbol);
+        });
+    }
+
+    #[inline]
+    pub(super) fn observe_relation_symbol_table_read(&self, table: SymbolTableId) {
+        self.with_relation_read_observations(|observed| {
+            observed.symbol_tables.insert(table);
+        });
+    }
+
+    #[inline]
+    pub(super) fn observe_relation_node_read(&self, node: NodeRef) {
+        self.with_relation_read_observations(|observed| {
+            observed.nodes.insert(node);
+        });
+    }
+
+    #[inline]
+    pub(super) fn observe_relation_object_instantiation_map_read(&self, type_: TypeId) {
+        self.with_relation_read_observations(|observed| {
+            observed.object_instantiation_maps.insert(type_);
+        });
+    }
+
+    #[inline]
+    pub(super) fn observe_relation_object_instantiation_read(
+        &self,
+        type_: TypeId,
+        key: CacheHashKey,
+    ) {
+        self.with_relation_read_observations(|observed| {
+            observed.object_instantiations.insert((type_, key));
+        });
+    }
+
+    #[inline]
+    pub(super) fn observe_relation_derived_cache_source_read(&self, type_: TypeId) {
+        self.with_relation_read_observations(|observed| {
+            observed.derived_cache_sources.insert(type_);
+        });
+    }
+
+    #[inline]
+    pub(super) fn observe_relation_derived_cache_target_read(&self, type_: TypeId) {
+        self.with_relation_read_observations(|observed| {
+            observed.derived_cache_targets.insert(type_);
+        });
+    }
+
+    pub(super) fn relation_type_alias_is_observable(&self, alias: TypeAliasId) -> bool {
+        self.relation_observable_type_aliases.contains(&alias)
+    }
+
+    pub(super) fn relation_signature_is_observable(&self, signature: SignatureId) -> bool {
+        self.relation_observable_signatures.contains(&signature)
+    }
+
+    pub(super) fn relation_object_instantiation_is_observable(
+        &self,
+        type_: TypeId,
+        key: CacheHashKey,
+    ) -> bool {
+        self.relation_observable_object_instantiations
+            .contains(&(type_, key))
+    }
+
+    pub(super) fn relation_object_instantiation_map_is_observable(&self, type_: TypeId) -> bool {
+        self.relation_observable_object_instantiation_maps
+            .contains(&type_)
+    }
+
+    pub(super) fn relation_derived_cache_source_is_observable(&self, type_: TypeId) -> bool {
+        self.relation_observable_derived_cache_sources
+            .contains(&type_)
+    }
+
+    pub(super) fn relation_derived_cache_target_is_observable(&self, type_: TypeId) -> bool {
+        self.relation_observable_derived_cache_targets
+            .contains(&type_)
+    }
+
+    pub(super) fn relation_observes_object_instantiation_change(
+        &self,
+        type_: TypeId,
+        current: &TypeCacheState,
+        candidate: &TypeCacheState,
+    ) -> bool {
+        if self.relation_object_instantiation_map_is_observable(type_) && current != candidate {
+            return true;
+        }
+        let lookup = |state: &TypeCacheState, key: CacheHashKey| match state {
+            TypeCacheState::Unallocated => None,
+            TypeCacheState::Allocated(instantiations) => instantiations.get(&key).copied(),
+        };
+        self.relation_observable_object_instantiations
+            .iter()
+            .filter_map(|(owner, key)| (*owner == type_).then_some(*key))
+            .any(|key| lookup(current, key) != lookup(candidate, key))
+    }
+
+    fn mark_relation_inputs_observable(&mut self, observed: RelationReadObservations) {
+        self.relation_observable_types.extend(observed.types);
+        self.relation_observable_type_aliases
+            .extend(observed.type_aliases);
+        self.relation_observable_signatures
+            .extend(observed.signatures);
+        self.relation_observable_symbols.extend(observed.symbols);
+        self.relation_observable_symbol_tables
+            .extend(observed.symbol_tables);
+        self.relation_observable_object_instantiation_maps
+            .extend(observed.object_instantiation_maps);
+        self.relation_observable_object_instantiations
+            .extend(observed.object_instantiations);
+        self.relation_observable_nodes.extend(observed.nodes);
+        self.relation_observable_derived_cache_sources
+            .extend(observed.derived_cache_sources);
+        self.relation_observable_derived_cache_targets
+            .extend(observed.derived_cache_targets);
+    }
+
+    fn clear_relation_observations(&mut self) {
+        self.relation_observable_types.clear();
+        self.relation_observable_type_aliases.clear();
+        self.relation_observable_signatures.clear();
+        self.relation_observable_symbols.clear();
+        self.relation_observable_symbol_tables.clear();
+        self.relation_observable_object_instantiation_maps.clear();
+        self.relation_observable_object_instantiations.clear();
+        self.relation_observable_nodes.clear();
+        self.relation_observable_derived_cache_sources.clear();
+        self.relation_observable_derived_cache_targets.clear();
     }
 
     fn relation_cache_is_current(&self) -> bool {
@@ -2496,6 +2876,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
     fn prepare_relation_cache_write(&mut self) {
         if !self.relation_cache_is_current() {
             self.relations = RelationCaches::default();
+            self.clear_relation_observations();
             self.relation_cache_generation = self.relation_inputs_generation;
         }
     }
@@ -2518,9 +2899,11 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         }
     }
 
-    /// Ports `Relation.set`, allocating the selected result map on its first
-    /// write and replacing any result already stored under `key`.
-    pub fn relation_cache_set(
+    /// Test-only raw `Relation.set` substrate. Production writes must use
+    /// [`Self::commit_relation_cache_writes`] so every physical entry is
+    /// published atomically with the semantic inputs that back it.
+    #[cfg(test)]
+    pub(crate) fn relation_cache_set(
         &mut self,
         relation: RelationKind,
         key: CacheHashKey,
@@ -2528,6 +2911,27 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
     ) {
         self.prepare_relation_cache_write();
         self.relations.set(relation, key, result);
+    }
+
+    pub(super) fn commit_relation_cache_writes(
+        &mut self,
+        observation: RelationObservationToken,
+        relation: RelationKind,
+        writes: impl IntoIterator<Item = (CacheHashKey, RelationComparisonResult)>,
+    ) -> bool {
+        let mut writes = writes.into_iter().peekable();
+        if writes.peek().is_none() {
+            return false;
+        }
+        let Some(observed) = self.take_relation_read_observations(observation) else {
+            return false;
+        };
+        self.prepare_relation_cache_write();
+        for (key, result) in writes {
+            self.relations.set(relation, key, result);
+        }
+        self.mark_relation_inputs_observable(observed);
+        true
     }
 
     #[must_use]
@@ -2593,6 +2997,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         };
         self.prepare_relation_cache_write();
         self.relations.enum_set(source_id, target_id, result);
+        self.relation_observable_symbols.extend([source, target]);
         true
     }
 
@@ -2764,6 +3169,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
 
     #[must_use]
     pub fn signature(&self, id: SignatureId) -> Option<&Signature> {
+        self.observe_relation_signature_read(id);
         self.signatures.get(id)
     }
 
@@ -2911,6 +3317,9 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             previous.is_none(),
             "the return annotation was checked absent"
         );
+        if self.relation_signature_is_observable(id) {
+            self.mark_relation_inputs_dirty();
+        }
         true
     }
 
@@ -2918,6 +3327,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         &self,
         id: SignatureId,
     ) -> Option<(NodeRef, bool)> {
+        self.observe_relation_signature_read(id);
         self.function_signature_return_annotations.get(&id).copied()
     }
 
@@ -2950,6 +3360,9 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         }) {
             return false;
         }
+        let relation_dirty = parameter_types
+            .iter()
+            .any(|(signature, _)| self.relation_signature_is_observable(*signature));
         for (signature, types) in parameter_types {
             let previous = self
                 .callable_signature_parameter_types
@@ -2959,6 +3372,9 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                 "callable parameter provenance was prevalidated absent"
             );
         }
+        if relation_dirty {
+            self.mark_relation_inputs_dirty();
+        }
         true
     }
 
@@ -2966,6 +3382,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         &self,
         signature: SignatureId,
     ) -> Option<&[TypeId]> {
+        self.observe_relation_signature_read(signature);
         self.callable_signature_parameter_types
             .get(&signature)
             .map(Vec::as_slice)
@@ -2985,11 +3402,11 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         id: SignatureId,
         count: i32,
     ) -> bool {
-        let relation_dirty = self.signature(id).is_some_and(|signature| {
-            signature.resolved_min_argument_count() != -1
-                && signature.resolved_min_argument_count() != count
-        });
         let dirty = self.signature_is_callable(id);
+        let relation_dirty = self.relation_signature_is_observable(id)
+            && self
+                .signature(id)
+                .is_some_and(|signature| signature.resolved_min_argument_count() != count);
         if !self.signatures.set_resolved_min_argument_count(id, count) {
             return false;
         }
@@ -3010,18 +3427,22 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         if !self.valid_optional_type(type_id) {
             return false;
         }
-        let relation_dirty = self.signature(id).is_some_and(|signature| {
-            signature.resolved_return_type().is_some()
-                && signature.resolved_return_type() != type_id
-        });
         let dirty = self.signature_is_callable(id);
+        let relation_observable = self.relation_signature_is_observable(id);
+        let had_circular_provenance = self.circular_return_signatures.contains_key(&id);
+        let relation_dirty = relation_observable
+            && (had_circular_provenance
+                || self
+                    .signature(id)
+                    .is_some_and(|signature| signature.resolved_return_type() != type_id));
         if !self.signatures.set_resolved_return_type(id, type_id) {
             return false;
         }
+        let cleared_circular_provenance = self.circular_return_signatures.remove(&id).is_some();
+        debug_assert_eq!(cleared_circular_provenance, had_circular_provenance);
         if relation_dirty {
             self.mark_relation_inputs_dirty();
         }
-        let cleared_circular_provenance = self.circular_return_signatures.remove(&id).is_some();
         if dirty || cleared_circular_provenance {
             self.mark_union_cache_validation_dirty();
         }
@@ -3035,10 +3456,12 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
     }
 
     pub(super) fn signature_has_circular_return_type(&self, id: SignatureId) -> bool {
+        self.observe_relation_signature_read(id);
         self.circular_return_signatures.contains_key(&id)
     }
 
     pub(super) fn circular_return_annotation_type(&self, id: SignatureId) -> Option<TypeId> {
+        self.observe_relation_signature_read(id);
         self.circular_return_signatures.get(&id).copied()
     }
 
@@ -3069,6 +3492,9 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         );
         let published = self.signatures.set_resolved_return_type(id, Some(type_id));
         assert!(published, "the local function signature was prevalidated");
+        if self.relation_signature_is_observable(id) {
+            self.mark_relation_inputs_dirty();
+        }
         self.mark_union_cache_validation_dirty();
         true
     }
@@ -3081,11 +3507,11 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         if !self.valid_optional_predicate(predicate) {
             return false;
         }
-        let relation_dirty = self.signature(id).is_some_and(|signature| {
-            signature.resolved_type_predicate().is_some()
-                && signature.resolved_type_predicate() != predicate
-        });
         let dirty = self.signature_is_callable(id);
+        let relation_dirty = self.relation_signature_is_observable(id)
+            && self
+                .signature(id)
+                .is_some_and(|signature| signature.resolved_type_predicate() != predicate);
         if !self.signatures.set_resolved_type_predicate(id, predicate) {
             return false;
         }
@@ -3106,11 +3532,11 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         if !self.valid_optional_type(type_id) {
             return false;
         }
-        let relation_dirty = self.signature(id).is_some_and(|signature| {
-            signature.isolated_signature_type().is_some()
-                && signature.isolated_signature_type() != type_id
-        });
         let dirty = self.signature_is_callable(id);
+        let relation_dirty = self.relation_signature_is_observable(id)
+            && self
+                .signature(id)
+                .is_some_and(|signature| signature.isolated_signature_type() != type_id);
         if !self.signatures.set_isolated_signature_type(id, type_id) {
             return false;
         }
@@ -3132,11 +3558,11 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         if !self.valid_optional_signature(target) || !self.valid_optional_mapper(mapper) {
             return false;
         }
-        let relation_dirty = self.signature(id).is_some_and(|signature| {
-            (signature.target().is_some() || signature.mapper().is_some())
-                && (signature.target() != target || signature.mapper() != mapper)
-        });
         let dirty = self.signature_is_callable(id);
+        let relation_dirty = self.relation_signature_is_observable(id)
+            && self.signature(id).is_some_and(|signature| {
+                signature.target() != target || signature.mapper() != mapper
+            });
         if !self.signatures.set_target_and_mapper(id, target, mapper) {
             return false;
         }
@@ -3162,10 +3588,11 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         }) {
             return false;
         }
-        let relation_dirty = self.signature(id).is_some_and(|signature| {
-            signature.composite().is_some() && signature.composite() != composite.as_ref()
-        });
         let dirty = self.signature_is_callable(id);
+        let relation_dirty = self.relation_signature_is_observable(id)
+            && self
+                .signature(id)
+                .is_some_and(|signature| signature.composite() != composite.as_ref());
         if !self.signatures.set_composite(id, composite) {
             return false;
         }
@@ -3198,7 +3625,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
     /// signatures gain or lose upstream's `Abstract` flag.
     pub fn set_signature_flags(&mut self, id: SignatureId, flags: SignatureFlags) -> bool {
         let dirty = self.signature_is_callable(id);
-        let relation_dirty = dirty
+        let relation_dirty = self.relation_signature_is_observable(id)
             && self
                 .signature(id)
                 .is_some_and(|signature| signature.flags() != flags);
@@ -3224,11 +3651,11 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         if !self.valid_types(&type_parameters) {
             return false;
         }
-        let relation_dirty = self.signature(id).is_some_and(|signature| {
-            !signature.type_parameters().is_empty()
-                && signature.type_parameters() != type_parameters.as_slice()
-        });
         let dirty = self.signature_is_callable(id);
+        let relation_dirty = self.relation_signature_is_observable(id)
+            && self
+                .signature(id)
+                .is_some_and(|signature| signature.type_parameters() != type_parameters.as_slice());
         if !self.signatures.set_type_parameters(id, type_parameters) {
             return false;
         }
@@ -3251,10 +3678,11 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         if !self.valid_optional_symbol(this_parameter) {
             return false;
         }
-        let relation_dirty = self.signature(id).is_some_and(|signature| {
-            signature.this_parameter().is_some() && signature.this_parameter() != this_parameter
-        });
         let dirty = self.signature_is_callable(id);
+        let relation_dirty = self.relation_signature_is_observable(id)
+            && self
+                .signature(id)
+                .is_some_and(|signature| signature.this_parameter() != this_parameter);
         if !self.signatures.set_this_parameter(id, this_parameter) {
             return false;
         }
@@ -3597,6 +4025,7 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         &self,
         type_: TypeId,
     ) -> Option<DirectInterfaceHeritageProvenance> {
+        self.observe_relation_type_read(type_);
         self.direct_interface_heritage_provenance
             .get(&type_)
             .copied()
@@ -3640,6 +4069,9 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
             return false;
         };
         entry.insert(provenance);
+        if self.relation_type_is_observable(type_) {
+            self.mark_relation_inputs_dirty();
+        }
         true
     }
 
@@ -4731,6 +5163,98 @@ mod tests {
             assert!(store.relation_cache_is_allocated(relation));
             assert_eq!(store.relation_comparison_budget(relation), 1_999_999);
         }
+    }
+
+    #[test]
+    fn relation_read_observations_reject_nesting_and_discard_without_a_write() {
+        let mut store = TestStore::new();
+        let table = store.alloc_symbol_table();
+        let first = store.begin_relation_read_observation().unwrap();
+        assert!(store.begin_relation_read_observation().is_none());
+        assert!(store.symbol_table(table).is_some());
+        assert!(store.discard_relation_read_observation(first));
+
+        let key = CacheHashKey::from_halves(13, 17);
+        store.relation_cache_set(
+            RelationKind::Assignable,
+            key,
+            RelationComparisonResult::SUCCEEDED,
+        );
+        let symbol = alloc_test_symbol(&mut store, "late");
+        assert_eq!(
+            store.insert_symbol(table, EscapedName::source("late"), symbol),
+            Some(None)
+        );
+        assert_eq!(
+            store.relation_cache_get(RelationKind::Assignable, key),
+            RelationComparisonResult::SUCCEEDED
+        );
+    }
+
+    #[test]
+    fn publishing_another_alias_owner_invalidates_an_observed_reverse_lookup() {
+        let mut seeded = seeded_store("alias target");
+        let first_alias = alloc_test_symbol(&mut seeded.store, "First");
+        assert!(seeded.store.set_type_alias_links(
+            first_alias,
+            TypeAliasLinks {
+                declared_type: Some(seeded.type_id),
+                ..TypeAliasLinks::default()
+            },
+        ));
+
+        let observation = seeded.store.begin_relation_read_observation().unwrap();
+        assert_eq!(
+            seeded
+                .store
+                .type_alias_declared_type_owners(seeded.type_id)
+                .map(HashSet::len),
+            Some(1)
+        );
+        let key = CacheHashKey::from_halves(19, 23);
+        assert!(seeded.store.commit_relation_cache_writes(
+            observation,
+            RelationKind::StrictSubtype,
+            [(key, RelationComparisonResult::SUCCEEDED)],
+        ));
+
+        let second_alias = alloc_test_symbol(&mut seeded.store, "Second");
+        assert!(seeded.store.set_type_alias_links(
+            second_alias,
+            TypeAliasLinks {
+                declared_type: Some(seeded.type_id),
+                ..TypeAliasLinks::default()
+            },
+        ));
+        assert_eq!(
+            seeded
+                .store
+                .relation_cache_get(RelationKind::StrictSubtype, key),
+            RelationComparisonResult::NONE
+        );
+    }
+
+    #[test]
+    fn first_members_and_exports_publication_invalidates_an_observed_miss() {
+        let mut store = TestStore::new();
+        let symbol = alloc_test_symbol(&mut store, "late-bound owner");
+        let observation = store.begin_relation_read_observation().unwrap();
+        assert_eq!(store.members_and_exports_links(symbol), None);
+        let key = CacheHashKey::from_halves(29, 31);
+        assert!(store.commit_relation_cache_writes(
+            observation,
+            RelationKind::StrictSubtype,
+            [(key, RelationComparisonResult::SUCCEEDED)],
+        ));
+
+        let members = store.alloc_symbol_table();
+        let mut links = MembersAndExportsLinks::default();
+        links.tables[0] = Some(members);
+        assert!(store.set_members_and_exports_links(symbol, links));
+        assert_eq!(
+            store.relation_cache_get(RelationKind::StrictSubtype, key),
+            RelationComparisonResult::NONE
+        );
     }
 
     #[test]
