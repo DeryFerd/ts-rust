@@ -46,6 +46,7 @@ use super::{
         CanonicalAliasTargetHost, CanonicalImmediateAliasTarget,
     },
     array_types::CanonicalArrayTargets,
+    instantiate::InstantiationSession,
     source_callables::{
         SourceCallableError, SourceCallableFamily, SourceCallablePlan,
         StoredSourceCallableValidation, plan_source_callable, validate_stored_source_callable,
@@ -1485,13 +1486,15 @@ pub(super) fn reject_source_type_import_value_use(
 }
 
 /// Lazily types one resolved binding for one proven value read while
-/// deferring all target/alias value-link writes.
+/// deferring all target/alias value-link writes. The caller owns the
+/// instantiation-session query boundary.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn prepare_source_import_value(
     store: &mut CanonicalTypeMapperStore,
     declared_host: &DeclaredTypeHost<'_>,
     global_types: &CanonicalGlobalTypes,
     options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
     diagnostics: &mut CanonicalCheckerDiagnostics,
     resolved: &ResolvedSourceImportBinding,
     read: &PlannedSourceImportRead,
@@ -1534,11 +1537,12 @@ pub(super) fn prepare_source_import_value(
     }
     let (type_, prepared_target) = match planned_target {
         PlannedSourceImportValueTarget::AnnotatedConst { type_node, .. } => {
-            let type_ = CanonicalTypeQuery::new_with_global_types(
+            let type_ = CanonicalTypeQuery::new_with_global_types_and_session(
                 store,
                 declared_host,
                 global_types,
                 options,
+                session,
                 diagnostics,
             )?
             .get_type_from_type_node(type_node)?;
@@ -1552,11 +1556,12 @@ pub(super) fn prepare_source_import_value(
             )
         }
         PlannedSourceImportValueTarget::AnnotatedFunction(callable) => {
-            let type_ = CanonicalTypeQuery::new_with_global_types(
+            let type_ = CanonicalTypeQuery::new_with_global_types_and_session(
                 store,
                 declared_host,
                 global_types,
                 options,
+                session,
                 diagnostics,
             )?
             .get_type_of_source_callable(callable.declaration, callable.owner_symbol)?;
@@ -1572,11 +1577,12 @@ pub(super) fn prepare_source_import_value(
                         callable.owner_symbol,
                     ))
                 })?;
-            CanonicalTypeQuery::new_with_global_types(
+            CanonicalTypeQuery::new_with_global_types_and_session(
                 store,
                 declared_host,
                 global_types,
                 options,
+                session,
                 diagnostics,
             )?
             .get_return_type_of_signature(provenance.signature)?;
@@ -2657,6 +2663,7 @@ mod tests {
     use crate::semantic::{
         AliasSymbolLinks, IntrinsicBootstrapOptions, SymbolNodeLinks,
         global_types::initialize_global_library_types,
+        instantiate::InstantiationLimits,
         module_resolution::{
             CanonicalModuleResolutionEntry, CanonicalModuleResolutionManifest,
             CanonicalModuleResolutionManifestInput, CanonicalModuleResolutionMode,
@@ -3256,11 +3263,13 @@ mod tests {
             GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
         )
         .unwrap();
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
         prepare_source_import_value(
             store,
             &declared_host,
             global_types,
             CanonicalCheckerOptions::default(),
+            &mut session,
             &mut CanonicalCheckerDiagnostics::default(),
             resolved,
             read,

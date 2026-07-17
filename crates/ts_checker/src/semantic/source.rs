@@ -7603,6 +7603,7 @@ pub(super) fn check_source_file(
             host,
             global_types,
             options,
+            session,
             diagnostics,
             resolved,
             read,
