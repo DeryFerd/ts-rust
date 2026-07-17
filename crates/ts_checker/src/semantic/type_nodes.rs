@@ -38,6 +38,7 @@ use super::{
     source_callables::{
         self, PendingSourceCallableParameterTypes, SourceCallableError, SourceCallableFamily,
     },
+    structured_members,
     tuple_type_nodes::{self, TupleTypeNodeError, TupleTypeNodePlan, validate_warm_tuple_elements},
     tuple_types::{CanonicalTupleTypeRequest, TupleTypeError, TupleTypeQueryPreparationError},
     type_records::{CacheHashKey, TypeData, TypeRecord},
@@ -1564,6 +1565,9 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             return Ok(());
         }
         let result = (|| {
+            for base in planned.heritage_base_symbols() {
+                self.plan_property_interface(base)?;
+            }
             for property in planned.property_type_nodes() {
                 self.plan_type_node_in_context(property, None, false)?;
             }
@@ -5330,8 +5334,14 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 .ok_or(DeclaredTypeError::Unavailable(
                     DeclaredTypeUnavailable::MissingDeclarations(symbol),
                 ))?;
-        let state = object_members::interface_state(self.store, &interface, declared_type)
-            .map_err(property_object_error)?;
+        let state = if interface.heritage.is_none() {
+            Some(
+                object_members::interface_state(self.store, &interface, declared_type)
+                    .map_err(property_object_error)?,
+            )
+        } else {
+            None
+        };
         if self.resolving_property_interfaces.contains(&symbol) {
             return Ok(declared_type);
         }
@@ -5342,6 +5352,20 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             let mut types = Vec::with_capacity(interface.properties.len());
             for property in interface.property_type_nodes() {
                 types.push(self.execute_type_node(property, plan, prepared)?);
+            }
+            if interface.heritage.is_some() {
+                let mut base_types = Vec::with_capacity(interface.heritage_base_symbols().len());
+                for base in interface.heritage_base_symbols() {
+                    base_types.push(self.execute_declared_type(base, plan, prepared)?);
+                }
+                return structured_members::resolve_direct_interface_members(
+                    self.store,
+                    &interface,
+                    declared_type,
+                    &types,
+                    &base_types,
+                )
+                .map_err(property_object_error);
             }
             let mut call_types = Vec::with_capacity(interface.call_signatures.len());
             for signature in &interface.call_signatures {
@@ -5359,6 +5383,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                     return_type,
                 });
             }
+            let state = state.expect("a no-heritage interface has object-member state");
             if state.is_resolved() {
                 object_members::validate_resolved_declared_member_types(
                     self.store,
