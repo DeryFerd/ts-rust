@@ -15,21 +15,22 @@ map remains authoritative for cluster state.
 
 | Lane | Branch/worktree | Current task | State |
 |---|---|---|---|
-| Root/integration | `july-ultra`; repository root | contract adapters, review, serial verification | M0, S1b named reexports, S2a including readonly directionality, and the recovering/lazy S3 generic-call path are integrated; root is the sole Cargo/build and fixed-shard owner |
+| Root/integration | `july-ultra`; repository root | contract adapters, review, serial verification | M0, S1b named reexports, S2a including readonly directionality, recovering/lazy S3, and the first S5/S6 Wave 1 sub-wave are integrated; root is the sole Cargo/build and fixed-shard owner |
 | M0 | `july-ultra`; repository root | deterministic checker scoring | schema-5 provenance, retained fatal outcomes, exact fixed-manifest execution, and selected-case preparation integrated through `174eebf` |
 | S2a | `july-ultra`; repository root | exact single-base interface heritage and relation-cache observation | integrated through `14ae6ce`; two exact-tip reviews found no P0/P1 issue, all five public heritage tests pass, and the fixed shard advances one interface fixture without an exact loss |
 | S2 readonly follow-up | `july-ultra`; repository root | readonly property retention and strict-subtype directionality | integrated through `d4719b3`; two independent reviews found no P0/P1 issue, the public production target passes, focused strict Clippy is green, and the fixed shard is semantically unchanged |
 | S3 session/generic calls | `july-ultra`; repository root | lazy checked shells, shared query sessions, exact demand/recovery, and TS2589 | integrated through `010d93a`; the library check and focused `source_generic_calls`/`source_instantiation_limits` targets pass, and independent review found no remaining P0/P1 issue |
 | S1b | `july-ultra`; repository root | named ESM imports and two-hop renamed/type-only reexports | integrated through `6c3bf97`; 17 focused import/reexport public tests pass, sparse immediate-link timing matches pinned `resolveAlias`, warm alias/type-only/value poison is rejected, and independent review approved the slice |
-| W1 S5 | isolated worker worktree | dependency-independent nongeneric `keyof`/property-key algebra leaf | active from `6c3bf97`; worker owns new leaf modules and bounded indexed-access changes while root retains type-node/options/formatter adapters |
-| W1 S6 | isolated worker worktree | direct explicit generic class/interface reference shells | active from `6c3bf97`; worker owns the reference leaf and bounded instantiation/declared helpers while root retains type-node/store/source adapters |
-| W1 review/oracle | independent reviewer lane | pinned S5/S6 expected behavior, cache timing, and adversarial fixtures | active; no production writes or Cargo ownership |
+| W1 S5 | `july-ultra`; repository root | nongeneric `keyof`/property-key algebra | integrated through `c5c3cf9` plus cache hardening `7d97c9a`; direct and parenthesized property/index literals, nongeneric interfaces, exact `propertiesTypes` timing, eager Index origins, symbolic display, interface index publication, and cold/warm source identity pass independent review |
+| W1 S6 | `july-ultra`; repository root | direct explicit generic class/interface reference shells | integrated through `8132af9` with compiler classification `a478f13`; local full-arity class/interface references reuse target caches mapper-free/session-free, publish exact node/symbol links, and recover with pinned TS2314/TS2315 diagnostics |
+| W1 review/oracle | completed read-only lanes | pinned S5/S6 behavior, cache timing, and adversarial fixtures | complete; final S5 cache-poison finding was fixed in `7d97c9a`, and no P0/P1 issue remains in the reviewed S5/S6 cuts |
 
-The current four-slot topology is the intended steady state: root integrates
-and builds, two isolated semantic workers own non-overlapping leaves, and one
-reviewer/oracle lane audits both Go behavior and Rust cache invariants. Shared
-store, source-dispatch, compiler, and formatter adapters remain serialized at
-root.
+The completed S5/S6 sub-wave validates the intended four-slot steady state:
+root integrates and builds, two isolated semantic workers own non-overlapping
+leaves, and one reviewer/oracle lane audits both Go behavior and Rust cache
+invariants. The worker slots can now rotate to the next Wave 1 leaves while
+shared store, source-dispatch, compiler, and formatter adapters remain
+serialized at root.
 
 ## Fixed smoke evidence
 
@@ -62,6 +63,13 @@ After removing only Rust commit/dirty and invocation provenance, both hash to
 `353dddd39af6749db775683da54d7c9a`, exactly matching the normalized readonly
 baseline. Both runs retain four exact variants, 90 typed capability boundaries,
 two supported mismatches, and zero fatal invariants.
+
+The integrated S5/S6 stack through `7d97c9a` has raw fixed-shard digest
+`4b87094f4e8a53b8e63689086aebcba2`. Removing Rust and invocation provenance
+with the established sorted normalization again produces
+`353dddd39af6749db775683da54d7c9a`, byte-identical to the `6c3bf97` semantic
+scorecard. The shard still reports four exact variants, 90 typed capability
+boundaries, two supported mismatches, and zero fatal invariants.
 
 The current frontier is four exact variants, 90 typed capability boundaries,
 and two supported mismatches. The run discovers 12,750 upstream configurations,

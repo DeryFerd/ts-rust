@@ -163,11 +163,22 @@ and fail-closed warm-chain validation all pass focused public tests and
 independent review. Both stacks are semantically byte-identical to the frozen
 96-variant baseline after removing only commit/invocation provenance.
 
-The active four-slot topology has moved to Wave 1: root owns integration,
-builds, and scoring; one worker owns the dependency-independent nongeneric S5
-property-key leaf; one owns the first explicit generic-reference S6 leaf; and
-the fourth lane supplies the pinned Go oracle and adversarial cache review. The
-live commit/worktree ledger is
+The first Wave 1 S5/S6 sub-wave is integrated through `7d97c9a`. Nongeneric
+`keyof` now resolves direct and parenthesized property/index literals plus
+nongeneric interfaces with exact `propertiesTypes` timing, eager `IndexType`
+origins, symbolic display, and fail-closed warm validation. Direct full-arity
+local generic class/interface references now reuse the target-owned
+instantiation cache without creating mappers or consuming instantiation
+sessions, with pinned TS2314/TS2315 recovery. The focused public targets and
+the adjacent indexed-access, index-signature, heritage, tuple, generic-call,
+import, and reexport targets pass. The fixed 96-variant shard remains four
+exact, 90 typed capability boundaries, two supported mismatches, and zero
+fatal invariants; its established provenance-normalized digest remains
+`353dddd39af6749db775683da54d7c9a`.
+
+The four-slot topology can now rotate from the completed S5/S6 leaf pair to
+the next Wave 1 dependency cuts while root retains shared type-node, store,
+compiler, formatter, build, and scoring ownership. The live commit/worktree ledger is
 [`typechecker-wave0-status.md`](typechecker-wave0-status.md).
 
 ### Quantitative posture
@@ -177,7 +188,7 @@ At the planning baseline:
 | Evidence | Current value | Interpretation |
 |---|---:|---|
 | Semantic unit tests compiled | 923 | Broad invariant coverage; the monolithic binary cannot link in the current memory envelope |
-| Public checker integration tests | 64 across 21 targets | Executable production-path evidence and the mandatory home for new verticals |
+| Public checker integration tests | 76 across 26 targets | Executable production-path evidence and the mandatory home for new verticals |
 | Semantic modules | 58 | Enough leaf surfaces for bounded ownership |
 | `type_nodes.rs` | 16,820 lines | Shared type-family dispatch hotspot |
 | `source.rs` | 16,162 lines | Shared source-plan/execution hotspot |
