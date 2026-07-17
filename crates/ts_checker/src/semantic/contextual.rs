@@ -359,6 +359,7 @@ fn prepare_expression(
         }
         PlannedExpressionKind::Binary(_)
         | PlannedExpressionKind::Logical(_)
+        | PlannedExpressionKind::Conditional(_)
         | PlannedExpressionKind::Element(_) => {
             return Err(SourceCheckError::Unsupported(
                 UnsupportedSourceSyntax::Syntax {

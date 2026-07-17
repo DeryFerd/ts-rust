@@ -676,7 +676,8 @@ fn is_context_insensitive_argument_plan(expression: &PlannedExpression) -> bool 
         | PlannedExpressionKind::TypeImportValueUse(_)
         | PlannedExpressionKind::Array(_)
         | PlannedExpressionKind::Object { .. }
-        | PlannedExpressionKind::Call(_) => false,
+        | PlannedExpressionKind::Call(_)
+        | PlannedExpressionKind::Conditional(_) => false,
     }
 }
 
@@ -712,7 +713,8 @@ fn is_context_insensitive_primitive_binary_operand_plan(expression: &PlannedExpr
         | PlannedExpressionKind::Array(_)
         | PlannedExpressionKind::Object { .. }
         | PlannedExpressionKind::Property(_)
-        | PlannedExpressionKind::Call(_) => false,
+        | PlannedExpressionKind::Call(_)
+        | PlannedExpressionKind::Conditional(_) => false,
     }
 }
 

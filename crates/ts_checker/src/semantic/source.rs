@@ -8,7 +8,8 @@
 //! annotations,
 //! annotated top-level function declarations, initialized identifier-named
 //! top-level variables (optionally exported), ordinary direct identifier
-//! calls, atomic primitive/literal scalar binary operators, required
+//! calls, atomic primitive/literal scalar binary operators, direct top-level
+//! conditional initializers, required
 //! own-property reads, direct indexed reads over supported objects, arrays,
 //! and strings, strict direct-identifier `typeof` flow checks, and direct
 //! assignments back to supported `var` declarations.
@@ -471,6 +472,15 @@ pub(super) struct LogicalBinaryPlan {
     parent: Option<DirectBinaryParent>,
 }
 
+/// Fully preflighted direct top-level conditional initializer.
+#[derive(Clone, Debug)]
+pub(super) struct ConditionalExpressionPlan {
+    node: NodeRef,
+    condition: PlannedExpression,
+    when_true: PlannedExpression,
+    when_false: PlannedExpression,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct LogicalGrammarDiagnostic {
     node: NodeRef,
@@ -547,6 +557,7 @@ pub(super) enum PlannedExpressionKind {
     Call(Box<SourceCallPlan>),
     Binary(Box<PrimitiveBinaryPlan>),
     Logical(Box<LogicalBinaryPlan>),
+    Conditional(Box<ConditionalExpressionPlan>),
 }
 
 /// A direct expression read of one clause-level type-only import. It remains
@@ -3230,6 +3241,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 ))
             }
             SyntaxKind::BinaryExpression => self.plan_binary(expression),
+            SyntaxKind::ConditionalExpression => self.plan_conditional(expression),
             SyntaxKind::PrefixUnaryExpression => self.plan_prefix_unary(expression),
             SyntaxKind::TypeAssertionExpression | SyntaxKind::AsExpression => {
                 self.plan_assertion(expression)
@@ -3322,6 +3334,183 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             }
             _ => Err(self.unsupported(expression, kind, SourceSyntaxRole::VariableInitializer)),
         }
+    }
+
+    fn plan_conditional(
+        &mut self,
+        expression: NodeRef,
+    ) -> Result<PlannedExpression, SourceCheckError> {
+        if !self.is_direct_top_level_variable_initializer(expression)? {
+            return Err(self.unsupported(
+                expression,
+                SyntaxKind::ConditionalExpression,
+                SourceSyntaxRole::VariableInitializer,
+            ));
+        }
+        let declaration = self
+            .node(expression)?
+            .parent
+            .map(|node| self.reference(node))
+            .ok_or_else(|| {
+                self.unsupported(
+                    expression,
+                    SyntaxKind::ConditionalExpression,
+                    SourceSyntaxRole::VariableInitializer,
+                )
+            })?;
+        let NodeData::VariableDeclaration(variable) = &self.node(declaration)?.data else {
+            return Err(self.unsupported(
+                expression,
+                SyntaxKind::ConditionalExpression,
+                SourceSyntaxRole::VariableInitializer,
+            ));
+        };
+        if variable.type_.is_some() {
+            return Err(self.unsupported(
+                expression,
+                SyntaxKind::ConditionalExpression,
+                SourceSyntaxRole::VariableInitializer,
+            ));
+        }
+        let (condition_id, question_id, when_true_id, colon_id, when_false_id) = {
+            let record = self.node(expression)?;
+            let NodeData::ConditionalExpression(conditional) = &record.data else {
+                return Err(self.unsupported(
+                    expression,
+                    record.kind,
+                    SourceSyntaxRole::VariableInitializer,
+                ));
+            };
+            if record.kind != SyntaxKind::ConditionalExpression
+                || record.flags.0 != 0
+                || conditional.facts != 0
+            {
+                return Err(self.unsupported(
+                    expression,
+                    record.kind,
+                    SourceSyntaxRole::VariableInitializer,
+                ));
+            }
+            (
+                conditional.condition,
+                conditional.question_token,
+                conditional.when_true,
+                conditional.colon_token,
+                conditional.when_false,
+            )
+        };
+        let condition = self.reference(condition_id);
+        let question = self.reference(question_id);
+        let when_true = self.reference(when_true_id);
+        let colon = self.reference(colon_id);
+        let when_false = self.reference(when_false_id);
+        let condition_record = self.node(condition)?;
+        let question_record = self.node(question)?;
+        let when_true_record = self.node(when_true)?;
+        let colon_record = self.node(colon)?;
+        let when_false_record = self.node(when_false)?;
+        if condition_record.parent != Some(expression.node)
+            || question_record.parent != Some(expression.node)
+            || when_true_record.parent != Some(expression.node)
+            || colon_record.parent != Some(expression.node)
+            || when_false_record.parent != Some(expression.node)
+            || question_record.kind != SyntaxKind::QuestionToken
+            || colon_record.kind != SyntaxKind::ColonToken
+            || question_record.flags.0 != 0
+            || colon_record.flags.0 != 0
+            || !matches!(question_record.data, NodeData::Token(_))
+            || !matches!(colon_record.data, NodeData::Token(_))
+            || condition_record.range.end > question_record.range.start
+            || question_record.range.end > when_true_record.range.start
+            || when_true_record.range.end > colon_record.range.start
+            || colon_record.range.end > when_false_record.range.start
+            || !self.source_spelling_matches(question, "?")
+            || !self.source_spelling_matches(colon, ":")
+        {
+            return Err(self.unsupported(
+                expression,
+                SyntaxKind::ConditionalExpression,
+                SourceSyntaxRole::VariableInitializer,
+            ));
+        }
+        if let Some((store, _)) = self.semantic
+            && let Some(links) = store.type_node_links(expression)
+        {
+            let expected = TypeNodeLinks {
+                resolved_type: links.resolved_type,
+                ..TypeNodeLinks::default()
+            };
+            if links != &expected
+                || links
+                    .resolved_type
+                    .is_some_and(|type_| store.type_payload(type_).is_none())
+            {
+                let expected = links
+                    .resolved_type
+                    .or_else(|| store.intrinsic_bootstrap().map(|bootstrap| bootstrap.error_type))
+                    .ok_or(SourceCheckError::LiteralCache(
+                        SourceLiteralCacheError::BootstrapUninitialized,
+                    ))?;
+                return Err(SourceCheckError::Assertion(
+                    SourceAssertionError::InvalidExpressionCache {
+                        node: expression,
+                        cached: links.resolved_type,
+                        expected,
+                    },
+                ));
+            }
+        }
+        let condition = self.plan_expression(condition)?;
+        let condition_target = condition.unparenthesized();
+        let PlannedExpressionKind::Identifier(condition_read) = &condition_target.kind else {
+            return Err(self.unsupported(
+                condition_target.node,
+                self.node(condition_target.node)?.kind,
+                SourceSyntaxRole::VariableInitializer,
+            ));
+        };
+        if condition_read.kind != PlannedIdentifierReadKind::Variable {
+            return Err(self.unsupported(
+                condition_target.node,
+                SyntaxKind::Identifier,
+                SourceSyntaxRole::VariableInitializer,
+            ));
+        }
+        let condition_symbol = condition_read.value_symbol;
+        let when_true = self.plan_expression(when_true)?;
+        if !conditional_scalar_operand_plan_is_supported(&when_true)
+            || planned_expression_reads_symbol(&when_true, condition_symbol)
+        {
+            return Err(self.unsupported(
+                when_true.node,
+                self.node(when_true.node)?.kind,
+                SourceSyntaxRole::VariableInitializer,
+            ));
+        }
+        let when_false = self.plan_expression(when_false)?;
+        if !conditional_scalar_operand_plan_is_supported(&when_false)
+            || planned_expression_reads_symbol(&when_false, condition_symbol)
+        {
+            return Err(self.unsupported(
+                when_false.node,
+                self.node(when_false.node)?.kind,
+                SourceSyntaxRole::VariableInitializer,
+            ));
+        }
+        if let Some((store, _)) = self.semantic {
+            preflight_uncached_conditional_operand_links(store, &condition)?;
+            preflight_uncached_conditional_operand_links(store, &when_true)?;
+            preflight_uncached_conditional_operand_links(store, &when_false)?;
+        }
+        Ok(PlannedExpression::new(
+            expression,
+            PlannedExpressionKind::Conditional(Box::new(ConditionalExpressionPlan {
+                node: expression,
+                condition,
+                when_true,
+                when_false,
+            })),
+        ))
     }
 
     fn plan_binary(&mut self, expression: NodeRef) -> Result<PlannedExpression, SourceCheckError> {
@@ -3986,8 +4175,79 @@ fn primitive_binary_operand_plan_is_supported(expression: &PlannedExpression) ->
         | PlannedExpressionKind::Assertion { .. }
         | PlannedExpressionKind::Array(_)
         | PlannedExpressionKind::Object { .. }
-        | PlannedExpressionKind::Property(_) => false,
+        | PlannedExpressionKind::Property(_)
+        | PlannedExpressionKind::Conditional(_) => false,
     }
+}
+
+fn conditional_scalar_operand_plan_is_supported(expression: &PlannedExpression) -> bool {
+    match &expression.kind {
+        PlannedExpressionKind::String(_)
+        | PlannedExpressionKind::Number { .. }
+        | PlannedExpressionKind::BigInt { .. }
+        | PlannedExpressionKind::Boolean(_) => true,
+        PlannedExpressionKind::Identifier(read) => {
+            read.kind == PlannedIdentifierReadKind::Variable
+        }
+        PlannedExpressionKind::Parenthesized(inner) => {
+            conditional_scalar_operand_plan_is_supported(inner)
+        }
+        PlannedExpressionKind::Null
+        | PlannedExpressionKind::GlobalUndefined
+        | PlannedExpressionKind::TypeImportValueUse(_)
+        | PlannedExpressionKind::Assertion { .. }
+        | PlannedExpressionKind::Array(_)
+        | PlannedExpressionKind::Object { .. }
+        | PlannedExpressionKind::Property(_)
+        | PlannedExpressionKind::Element(_)
+        | PlannedExpressionKind::Call(_)
+        | PlannedExpressionKind::Binary(_)
+        | PlannedExpressionKind::Logical(_)
+        | PlannedExpressionKind::Conditional(_) => false,
+    }
+}
+
+fn planned_expression_reads_symbol(
+    expression: &PlannedExpression,
+    symbol: SemanticSymbolId,
+) -> bool {
+    match &expression.kind {
+        PlannedExpressionKind::Identifier(read) => read.value_symbol == symbol,
+        PlannedExpressionKind::Parenthesized(inner) => {
+            planned_expression_reads_symbol(inner, symbol)
+        }
+        _ => false,
+    }
+}
+
+fn preflight_uncached_conditional_operand_links(
+    store: &CanonicalTypeMapperStore,
+    expression: &PlannedExpression,
+) -> Result<(), SourceCheckError> {
+    if store
+        .type_node_links(expression.node)
+        .is_some_and(|links| links != &TypeNodeLinks::default())
+    {
+        let expected = store
+            .intrinsic_bootstrap()
+            .map(|bootstrap| bootstrap.error_type)
+            .ok_or(SourceCheckError::LiteralCache(
+                SourceLiteralCacheError::BootstrapUninitialized,
+            ))?;
+        return Err(SourceCheckError::Assertion(
+            SourceAssertionError::InvalidExpressionCache {
+                node: expression.node,
+                cached: store
+                    .type_node_links(expression.node)
+                    .and_then(|links| links.resolved_type),
+                expected,
+            },
+        ));
+    }
+    if let PlannedExpressionKind::Parenthesized(inner) = &expression.kind {
+        preflight_uncached_conditional_operand_links(store, inner)?;
+    }
+    Ok(())
 }
 
 /// Proves that a hoisted inferred function can be checked before statement
@@ -4055,6 +4315,11 @@ fn preflight_inferred_function_return_dependencies(
             PlannedExpressionKind::Logical(logical) => {
                 expression_is_closed(&logical.left, parameters, functions)
                     && expression_is_closed(&logical.right, parameters, functions)
+            }
+            PlannedExpressionKind::Conditional(conditional) => {
+                expression_is_closed(&conditional.condition, parameters, functions)
+                    && expression_is_closed(&conditional.when_true, parameters, functions)
+                    && expression_is_closed(&conditional.when_false, parameters, functions)
             }
         }
     }
@@ -4838,6 +5103,77 @@ fn check_expression_type(
             preflighted_type_import_value_uses,
             read,
         ),
+        PlannedExpressionKind::Conditional(conditional) => {
+            if contextual_type.is_some() {
+                return Err(SourceCheckError::Unsupported(
+                    UnsupportedSourceSyntax::Syntax {
+                        node: conditional.node,
+                        kind: SyntaxKind::ConditionalExpression,
+                        role: SourceSyntaxRole::VariableInitializer,
+                    },
+                ));
+            }
+            let condition = check_uncached_conditional_scalar(
+                store,
+                current_flow_types,
+                &conditional.condition,
+            )?;
+            let condition_flags = store
+                .type_payload(condition.result)
+                .map(TypeRecord::flags)
+                .ok_or(SourceCheckError::LogicalOperator(conditional.condition.node))?;
+            if !condition_flags.intersects(TypeFlags::BOOLEAN_LIKE)
+                || (condition_flags & !TypeFlags::BOOLEAN_LIKE) != TypeFlags::NONE
+                || !source_truthiness_condition_type_is_supported(
+                    store,
+                    condition.result,
+                    conditional.condition.node,
+                    &mut HashSet::new(),
+                )?
+            {
+                return Err(SourceCheckError::Unsupported(
+                    UnsupportedSourceSyntax::Syntax {
+                        node: conditional.condition.node,
+                        kind: host
+                            .node(conditional.condition.node)
+                            .map_or(SyntaxKind::Identifier, |node| node.kind),
+                        role: SourceSyntaxRole::VariableInitializer,
+                    },
+                ));
+            }
+            emit_truthiness_operand_diagnostics(
+                store,
+                host,
+                diagnostics,
+                &conditional.condition,
+                condition.result,
+                conditional.node,
+            )?;
+            let when_true = check_uncached_conditional_scalar(
+                store,
+                current_flow_types,
+                &conditional.when_true,
+            )?;
+            validate_conditional_branch_type(store, host, &conditional.when_true, when_true.result)?;
+            let when_false = check_uncached_conditional_scalar(
+                store,
+                current_flow_types,
+                &conditional.when_false,
+            )?;
+            validate_conditional_branch_type(
+                store,
+                host,
+                &conditional.when_false,
+                when_false.result,
+            )?;
+            let result_type = store.expression_union_type_with_global_types(
+                global_types,
+                &[when_true.result, when_false.result],
+                UnionReduction::Subtype,
+            )?;
+            publish_expression_type(store, conditional.node, result_type)?;
+            Ok(CheckedExpressionTypes::leaf(result_type, result_type))
+        }
         PlannedExpressionKind::Element(element) => {
             let receiver = check_expression_type(
                 store,
@@ -5138,6 +5474,128 @@ fn check_expression_type(
     }
 }
 
+fn check_uncached_conditional_scalar(
+    store: &mut CanonicalTypeMapperStore,
+    current_flow_types: &HashMap<SemanticSymbolId, TypeId>,
+    expression: &PlannedExpression,
+) -> Result<CheckedExpressionTypes, SourceCheckError> {
+    match &expression.kind {
+        PlannedExpressionKind::Identifier(read)
+            if read.kind == PlannedIdentifierReadKind::Variable =>
+        {
+            let raw = *current_flow_types
+                .get(&read.value_symbol)
+                .ok_or(SourceCheckError::Variable(
+                    VariableInvariant::MissingCurrentFlowType(read.value_symbol),
+                ))?;
+            let result = identifier_expression_type(store, raw, LiteralTreatment::Identity)?;
+            Ok(CheckedExpressionTypes::leaf(raw, result))
+        }
+        PlannedExpressionKind::String(value) => {
+            let regular = store.regular_string_literal_type(value.clone())?;
+            let string = store
+                .intrinsic_bootstrap()
+                .ok_or(SourceCheckError::LiteralCache(
+                    SourceLiteralCacheError::BootstrapUninitialized,
+                ))?
+                .string_type;
+            checked_literal_types(store, regular, string, LiteralTreatment::Fresh)
+        }
+        PlannedExpressionKind::Number {
+            value,
+            unary_operand,
+        } => {
+            if let Some(operand) = unary_operand {
+                store.regular_number_literal_type(*operand)?;
+            }
+            let regular = store.regular_number_literal_type(*value)?;
+            let number = store
+                .intrinsic_bootstrap()
+                .ok_or(SourceCheckError::LiteralCache(
+                    SourceLiteralCacheError::BootstrapUninitialized,
+                ))?
+                .number_type;
+            checked_literal_types(store, regular, number, LiteralTreatment::Fresh)
+        }
+        PlannedExpressionKind::BigInt {
+            value,
+            unary_operand,
+        } => {
+            if let Some(operand) = unary_operand {
+                store.regular_bigint_literal_type(operand.clone())?;
+            }
+            let regular = store.regular_bigint_literal_type(value.clone())?;
+            let bigint = store
+                .intrinsic_bootstrap()
+                .ok_or(SourceCheckError::LiteralCache(
+                    SourceLiteralCacheError::BootstrapUninitialized,
+                ))?
+                .bigint_type;
+            checked_literal_types(store, regular, bigint, LiteralTreatment::Fresh)
+        }
+        PlannedExpressionKind::Boolean(value) => {
+            let bootstrap = store
+                .intrinsic_bootstrap()
+                .ok_or(SourceCheckError::LiteralCache(
+                    SourceLiteralCacheError::BootstrapUninitialized,
+                ))?;
+            let regular = if *value {
+                bootstrap.regular_true_type
+            } else {
+                bootstrap.regular_false_type
+            };
+            checked_literal_types(
+                store,
+                regular,
+                bootstrap.boolean_type,
+                LiteralTreatment::Fresh,
+            )
+        }
+        PlannedExpressionKind::Parenthesized(inner) => {
+            check_uncached_conditional_scalar(store, current_flow_types, inner)
+        }
+        _ => Err(SourceCheckError::Unsupported(
+            UnsupportedSourceSyntax::Syntax {
+                node: expression.node,
+                kind: SyntaxKind::ConditionalExpression,
+                role: SourceSyntaxRole::VariableInitializer,
+            },
+        )),
+    }
+}
+
+fn validate_conditional_branch_type(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    expression: &PlannedExpression,
+    type_: TypeId,
+) -> Result<(), SourceCheckError> {
+    let flags = store
+        .type_payload(type_)
+        .map(TypeRecord::flags)
+        .ok_or(SourceCheckError::LogicalOperator(expression.node))?;
+    let supported = TypeFlags::STRING
+        | TypeFlags::NUMBER
+        | TypeFlags::BIG_INT
+        | TypeFlags::BOOLEAN
+        | TypeFlags::STRING_LITERAL
+        | TypeFlags::NUMBER_LITERAL
+        | TypeFlags::BIG_INT_LITERAL
+        | TypeFlags::BOOLEAN_LITERAL;
+    if flags.intersects(supported) && (flags & !supported) == TypeFlags::NONE {
+        return Ok(());
+    }
+    Err(SourceCheckError::Unsupported(
+        UnsupportedSourceSyntax::Syntax {
+            node: expression.node,
+            kind: host
+                .node(expression.node)
+                .map_or(SyntaxKind::ConditionalExpression, |node| node.kind),
+            role: SourceSyntaxRole::VariableInitializer,
+        },
+    ))
+}
+
 fn narrow_logical_right_flow_types(
     store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -5195,6 +5653,17 @@ enum PredicateSemantics {
     Always,
     Never,
     Sometimes,
+}
+
+fn combine_predicate_semantics(
+    left: PredicateSemantics,
+    right: PredicateSemantics,
+) -> PredicateSemantics {
+    if left == right {
+        left
+    } else {
+        PredicateSemantics::Sometimes
+    }
 }
 
 fn emit_logical_grammar_diagnostic(
@@ -5353,6 +5822,10 @@ fn syntactic_truthiness(
                 PredicateSemantics::Always
             }
         }
+        PlannedExpressionKind::Conditional(conditional) => combine_predicate_semantics(
+            syntactic_truthiness(host, &conditional.when_true),
+            syntactic_truthiness(host, &conditional.when_false),
+        ),
         PlannedExpressionKind::Boolean(_)
         | PlannedExpressionKind::Identifier(_)
         | PlannedExpressionKind::TypeImportValueUse(_)
@@ -5384,6 +5857,10 @@ fn syntactic_nullishness(expression: &PlannedExpression) -> PredicateSemantics {
             SyntaxKind::QuestionQuestionToken => syntactic_nullishness(&binary.right),
             _ => PredicateSemantics::Never,
         },
+        PlannedExpressionKind::Conditional(conditional) => combine_predicate_semantics(
+            syntactic_nullishness(&conditional.when_true),
+            syntactic_nullishness(&conditional.when_false),
+        ),
         PlannedExpressionKind::String(_)
         | PlannedExpressionKind::Number { .. }
         | PlannedExpressionKind::BigInt { .. }
