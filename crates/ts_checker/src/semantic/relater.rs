@@ -794,10 +794,7 @@ impl<'store> RelaterSession<'store> {
         &mut self,
         target: TypeId,
     ) -> Result<bool, RelationUnavailable> {
-        let raw_target = self
-            .store
-            .type_payload(target)
-            .and_then(|record| record.symbol());
+        let raw_target = self.store.type_payload(target).and_then(TypeRecord::symbol);
         if let Some(raw_target) = raw_target {
             self.observe_merged_symbol_lookup(raw_target);
             let members = self

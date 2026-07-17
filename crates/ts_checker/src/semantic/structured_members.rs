@@ -273,7 +273,7 @@ pub(super) fn validate_planned_interface_heritage_members(
         || store.direct_interface_heritage_provenance(type_) != Some(expected_provenance)
         || store
             .type_payload(*base_type)
-            .and_then(|base| base.symbol())
+            .and_then(super::type_records::TypeRecord::symbol)
             != Some(planned_base.symbol)
     {
         return false;
@@ -295,8 +295,9 @@ pub(super) fn validate_interface_heritage_members(
     type_: TypeId,
 ) -> InterfaceHeritageMembersValidation {
     let retained_provenance = store.direct_interface_heritage_provenance(type_).is_some();
-    let Some(TypeData::Interface(interface)) =
-        store.type_payload(type_).map(|record| record.data())
+    let Some(TypeData::Interface(interface)) = store
+        .type_payload(type_)
+        .map(super::type_records::TypeRecord::data)
     else {
         return if retained_provenance {
             InterfaceHeritageMembersValidation::Malformed
