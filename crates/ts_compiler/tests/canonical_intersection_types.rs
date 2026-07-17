@@ -45,11 +45,41 @@ fn canonical_program_checks_direct_intersection_composition_and_reads() {
 }
 
 #[test]
-fn canonical_program_keeps_optional_intersection_properties_as_a_typed_boundary() {
+fn canonical_program_checks_optional_and_composite_intersection_properties() {
     let fs = MemoryFileSystem::new(true);
     fs.write_file(
         "/project/main.ts",
-        "export {};\ntype Unsupported = { value?: string } & { other: number };\n",
+        concat!(
+            "export {};\n",
+            "interface Payload { leaf: string }\n",
+            "interface Left { maybe?: Payload; node: Payload; value?: string }\n",
+            "type Right = { value: string; required: number };\n",
+            "type Combined = Left & Right;\n",
+            "declare const combined: Combined;\n",
+            "const node: Payload = combined.node;\n",
+            "const value: string = combined.value;\n",
+            "const required: number = combined.required;\n",
+        ),
+    )
+    .unwrap();
+
+    let program = Program::try_new_with_canonical_checker(
+        &fs,
+        "/project",
+        &["main.ts".to_owned()],
+        canonical_options(),
+    )
+    .unwrap();
+
+    assert!(program.diagnostics().is_empty());
+}
+
+#[test]
+fn canonical_program_keeps_array_intersection_properties_as_a_typed_boundary() {
+    let fs = MemoryFileSystem::new(true);
+    fs.write_file(
+        "/project/main.ts",
+        "export {};\ntype Unsupported = { items: string[] } & { other: number };\n",
     )
     .unwrap();
 
