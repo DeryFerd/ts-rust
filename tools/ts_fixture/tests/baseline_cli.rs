@@ -310,29 +310,24 @@ fn canonical_checker_matches_related_information_artifact_and_scorecard_exactly(
     repository.write_case(
         "relatedInformation",
         concat!(
-            "// @skipLibCheck: true\r\n",
-            "// @filename: /src/input.d.ts\r\n",
-            "export default class first {}\r\n",
-            "export default 0;",
+            "// @filename: /src/input.ts\r\n",
+            "function pair(left: string, right: number): number { return right; }\r\n",
+            "const result = pair(\"left\");",
         ),
         None,
     );
     repository.write_baseline(
         "relatedInformation.errors.txt",
         concat!(
-            "/src/input.d.ts(1,22): error TS2528: A module cannot have multiple default exports.\r\n",
-            "/src/input.d.ts(2,1): error TS2528: A module cannot have multiple default exports.\r\n",
+            "/src/input.ts(2,16): error TS2554: Expected 2 arguments, but got 1.\r\n",
             "\r\n",
             "\r\n",
-            "==== /src/input.d.ts (2 errors) ====\r\n",
-            "    export default class first {}\r\n",
-            "                         ~~~~~\r\n",
-            "!!! error TS2528: A module cannot have multiple default exports.\r\n",
-            "!!! related TS2753 /src/input.d.ts:2:1: Another export default is here.\r\n",
-            "    export default 0;\r\n",
-            "    ~~~~~~~~~~~~~~~~~\r\n",
-            "!!! error TS2528: A module cannot have multiple default exports.\r\n",
-            "!!! related TS2752 /src/input.d.ts:1:22: The first export default is here.",
+            "==== /src/input.ts (1 errors) ====\r\n",
+            "    function pair(left: string, right: number): number { return right; }\r\n",
+            "    const result = pair(\"left\");\r\n",
+            "                   ~~~~\r\n",
+            "!!! error TS2554: Expected 2 arguments, but got 1.\r\n",
+            "!!! related TS6210 /src/input.ts:1:29: An argument for 'right' was not provided.",
         ),
     );
 
@@ -350,33 +345,35 @@ fn canonical_checker_matches_related_information_artifact_and_scorecard_exactly(
     );
     assert!(
         output.status.success(),
-        "stdout:\n{}\nstderr:\n{}",
+        "stdout:\n{}\nstderr:\n{}\nscorecard:\n{}",
         String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
+        String::from_utf8_lossy(&output.stderr),
+        fs::read_to_string(&scorecard_path).unwrap_or_default(),
     );
     let scorecard: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(scorecard_path).unwrap()).unwrap();
     assert_eq!(scorecard["schemaVersion"], 5);
     assert_eq!(scorecard["checkerMode"], "canonical");
     assert_eq!(scorecard["summary"]["exactMatches"], 1);
-    assert_eq!(scorecard["summary"]["actualDiagnostics"], 2);
+    assert_eq!(scorecard["summary"]["actualDiagnostics"], 1);
     assert_eq!(scorecard["variants"][0]["status"], "exact_match");
 
     let diagnostics = scorecard["variants"][0]["diagnostics"].as_array().unwrap();
-    assert_eq!(diagnostics.len(), 2);
-    assert_eq!(diagnostics[0]["fileName"], "/src/input.d.ts");
+    assert_eq!(diagnostics.len(), 1);
+    assert_eq!(diagnostics[0]["fileName"], "/src/input.ts");
     assert_eq!(
         diagnostics[0]["relatedInformation"][0]["fileName"],
-        "/src/input.d.ts"
+        "/src/input.ts"
     );
-    assert_eq!(diagnostics[0]["relatedInformation"][0]["code"], 2753);
-    assert_eq!(diagnostics[0]["relatedInformation"][0]["category"], "error");
+    assert_eq!(diagnostics[0]["relatedInformation"][0]["code"], 6210);
+    assert_eq!(
+        diagnostics[0]["relatedInformation"][0]["category"],
+        "message"
+    );
     assert_eq!(
         diagnostics[0]["relatedInformation"][0]["relatedInformation"],
         serde_json::json!([])
     );
-    assert_eq!(diagnostics[1]["fileName"], "/src/input.d.ts");
-    assert_eq!(diagnostics[1]["relatedInformation"][0]["code"], 2752);
 }
 
 #[test]

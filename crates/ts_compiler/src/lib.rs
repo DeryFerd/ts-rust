@@ -8280,7 +8280,7 @@ mod tests {
     }
 
     #[test]
-    fn canonical_program_keeps_binder_related_records_nested_in_their_primary() {
+    fn canonical_program_suppresses_binder_related_records_for_skipped_declarations() {
         let fs = MemoryFileSystem::new(true);
         fs.write_file(
             "/project/input.d.ts",
@@ -8302,24 +8302,11 @@ mod tests {
         )
         .unwrap();
 
-        let duplicate_diagnostics = program
-            .diagnostics()
-            .iter()
-            .filter(|diagnostic| diagnostic.code == Some(2528))
-            .collect::<Vec<_>>();
-        assert_eq!(
-            duplicate_diagnostics.len(),
-            2,
+        assert!(
+            program.diagnostics().is_empty(),
             "{:?}",
             program.diagnostics()
         );
-        for (diagnostic, related_code) in duplicate_diagnostics.into_iter().zip([2753, 2752]) {
-            assert_eq!(diagnostic.related_information.len(), 1);
-            let related = &diagnostic.related_information[0];
-            assert_eq!(related.code, Some(related_code));
-            assert_eq!(related.file_name, diagnostic.file_name);
-            assert!(related.related_information.is_empty());
-        }
     }
 
     #[test]
