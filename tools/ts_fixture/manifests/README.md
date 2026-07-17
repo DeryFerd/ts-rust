@@ -17,7 +17,8 @@ files, TypeScript, TSX, JavaScript, Bundler/ESM, CommonJS, and NodeNext shapes.
 upstream oracle. `case`, `options`, `expectedBaseline`, `expectedDiagnostics`,
 `fileShape`, and `sourceKinds` are redundant audit fields. A manifest consumer
 must resolve the `variantKey` from discovery and reject the manifest if any
-redundant field disagrees with the discovered variant.
+redundant field is absent or disagrees with the discovered variant.
+`expectedBaseline` uses an explicit JSON `null` when no baseline exists.
 
 ## Digest
 
@@ -37,8 +38,9 @@ jq -r '.variants[].variantKey' checker-smoke-v1.json | xxh128sum
 Before the shard is used as a merge gate, the fixture runner must:
 
 1. require the pinned upstream SHA and complete oracle-manifest digest;
-2. discover and expand the corpus exactly as for an ordinary scorecard;
-3. resolve every manifest key exactly once after option/baseline expansion;
+2. discover the complete corpus/oracle exactly as for an ordinary scorecard;
+3. require every unique named case to resolve exactly once to a runnable case,
+   then fully expand those cases and resolve every manifest key exactly once;
 4. reject duplicate, missing, extra, stale, or differently attributed keys;
 5. validate the ordered-key digest, eight 12-key quotas, and six-clean/six-error
    split in every family from the upstream baseline rather than trusting the

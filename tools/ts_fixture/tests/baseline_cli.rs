@@ -355,7 +355,11 @@ impl FixedCliFixture {
         let repository = TestRepository::new();
         repository.write_case(
             "aClean",
-            "// @noLib: true\nconst value: number = 1;\n",
+            concat!(
+                "// @target: es2015, esnext\n",
+                "// @noLib: true\n",
+                "const value: number = 1;\n",
+            ),
             None,
         );
         repository.write_case(
@@ -481,8 +485,14 @@ fn fixed_variant_manifest_resolves_exact_keys_and_executes_manifest_order() {
         scorecard["variants"][1]["case"],
         "testdata/tests/cases/compiler/aClean.ts"
     );
+    assert_eq!(scorecard["variants"][1]["options"]["target"], "esnext");
+    assert_eq!(
+        scorecard["variants"][2]["case"],
+        "testdata/tests/cases/compiler/aClean.ts"
+    );
+    assert_eq!(scorecard["variants"][2]["options"]["target"], "es2015");
     assert_eq!(scorecard["summary"]["selectedCases"], 2);
-    assert_eq!(scorecard["summary"]["executedVariants"], 2);
+    assert_eq!(scorecard["summary"]["executedVariants"], 3);
     assert_eq!(
         scorecard["provenance"]["manifestDigest"],
         fixture.discovery_scorecard["provenance"]["manifestDigest"]
@@ -499,8 +509,64 @@ fn fixed_variant_manifest_resolves_exact_keys_and_executes_manifest_order() {
             "variantKeyVersion": 1,
             "digest": fixture.manifest["digest"]["value"].clone(),
             "digestAlgorithm": "xxh3-128",
-            "variantCount": 2,
+            "variantCount": 3,
         })
+    );
+}
+
+#[test]
+fn fixed_variant_manifest_does_not_parse_unrelated_runnable_cases() {
+    let mut fixture = FixedCliFixture::new();
+    fixture.repository.write_case(
+        "unrelatedMalformed",
+        concat!(
+            "const sourceBeforeFirstUnit = true;\n",
+            "// @filename: /actual.ts\n",
+            "const selected = false;\n",
+        ),
+        None,
+    );
+    let upstream_sha = fixture.repository.commit_all();
+    let oracle = run(&fixture.repository.0, &["--manifest"]);
+    assert!(
+        oracle.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&oracle.stderr)
+    );
+    assert!(String::from_utf8_lossy(&oracle.stdout).contains(concat!(
+        "case\tgo\tcompiler\trunnable\t",
+        "testdata/tests/cases/compiler/unrelatedMalformed.ts\n",
+    )));
+    let oracle_digest = format!("{:032x}", xxhash_rust::xxh3::xxh3_128(&oracle.stdout));
+    fixture.manifest["upstream"]["sha"] = serde_json::json!(upstream_sha);
+    fixture.manifest["upstream"]["oracleManifestDigest"] = serde_json::json!(oracle_digest.clone());
+
+    let manifest_path = fixture.write_manifest("malformed-unrelated.json", &fixture.manifest);
+    let scorecard_path = fixture.artifacts.path("malformed-unrelated-scorecard.json");
+    let output = run(
+        &fixture.repository.0,
+        &[
+            "--diagnostics",
+            "--variant-manifest",
+            manifest_path.to_str().unwrap(),
+            "--scorecard-json",
+            scorecard_path.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let scorecard: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(scorecard_path).unwrap()).unwrap();
+    assert_eq!(scorecard["summary"]["discoveredCases"], 3);
+    assert_eq!(scorecard["summary"]["selectedCases"], 2);
+    assert_eq!(scorecard["summary"]["executedVariants"], 3);
+    assert_eq!(
+        scorecard["provenance"]["manifestDigest"],
+        oracle_digest.as_str()
     );
 }
 
@@ -524,8 +590,25 @@ fn fixed_variant_manifest_rejects_tampering_stale_keys_and_dirty_upstream() {
             .contains("metadata disagrees")
     );
 
+    let mut missing_baseline_field = fixture.manifest.clone();
+    let removed = missing_baseline_field["variants"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|variant| variant["expectedBaseline"].is_null())
+        .unwrap()
+        .as_object_mut()
+        .unwrap()
+        .remove("expectedBaseline");
+    assert!(removed.is_some());
+    assert!(
+        fixture
+            .invalid_manifest_error("missing-baseline-field.json", &missing_baseline_field)
+            .contains("expectedBaseline")
+    );
+
     let mut wrong_policy = fixture.manifest.clone();
-    wrong_policy["policy"]["expectedDiagnosticsPerFamily"]["clean"] = serde_json::json!(2);
+    wrong_policy["policy"]["expectedDiagnosticsPerFamily"]["clean"] = serde_json::json!(3);
     wrong_policy["policy"]["expectedDiagnosticsPerFamily"]["error"] = serde_json::json!(0);
     assert!(
         fixture

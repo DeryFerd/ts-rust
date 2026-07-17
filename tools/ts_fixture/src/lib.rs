@@ -556,11 +556,26 @@ struct FixedVariantManifestEntry {
     family: String,
     case: String,
     options: BTreeMap<String, String>,
-    expected_baseline: Option<String>,
+    expected_baseline: FixedExpectedBaseline,
     expected_diagnostics: FixedExpectedDiagnostics,
     file_shape: FixedFileShape,
     source_kinds: Vec<String>,
     tags: Vec<String>,
+}
+
+/// A nullable value whose containing object must still include the field.
+///
+/// Serde treats a bare `Option<T>` field as optional during derived
+/// deserialization. The transparent wrapper preserves JSON `null` while
+/// making an omitted `expectedBaseline` a schema error.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(transparent)]
+struct FixedExpectedBaseline(Option<String>);
+
+impl FixedExpectedBaseline {
+    fn as_deref(&self) -> Option<&str> {
+        self.0.as_deref()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd)]
@@ -923,8 +938,8 @@ fn validate_fixed_variant_manifest_upstream(
     }
     if manifest.upstream.oracle_manifest_digest != oracle_digest {
         return Err(invalid_fixed_manifest(format!(
-            "complete oracle manifest digest is {}, expected {oracle_digest}",
-            manifest.upstream.oracle_manifest_digest
+            "complete oracle manifest digest is {oracle_digest}, expected {}",
+            manifest.upstream.oracle_manifest_digest,
         )));
     }
     Ok(())
@@ -1303,6 +1318,12 @@ struct DiagnosticVariantPlan {
     expected: String,
 }
 
+struct FixedDiagnosticCase {
+    path: PathBuf,
+    oracle_root: PathBuf,
+    disposition: UpstreamCaseDisposition,
+}
+
 fn prepare_diagnostic_case_variants(
     repository: &Path,
     case_path: &Path,
@@ -1424,7 +1445,7 @@ fn validate_fixed_variant_entry(
     let source_kinds = fixed_case_source_kinds(&plan.case);
     if entry.case != plan.scorecard_case
         || entry.options != plan.variant.values
-        || entry.expected_baseline != plan.expected_baseline
+        || entry.expected_baseline.as_deref() != plan.expected_baseline.as_deref()
         || entry.expected_diagnostics != expected_diagnostics
         || entry.file_shape != file_shape
         || entry.source_kinds != source_kinds
@@ -1435,6 +1456,60 @@ fn validate_fixed_variant_entry(
         )));
     }
     Ok(())
+}
+
+fn select_fixed_diagnostic_cases(
+    oracle_manifest: &UpstreamManifest,
+    manifest: &FixedVariantManifest,
+) -> io::Result<Vec<FixedDiagnosticCase>> {
+    let desired = manifest
+        .variants
+        .iter()
+        .map(|entry| entry.case.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut matches = BTreeMap::<String, Vec<FixedDiagnosticCase>>::new();
+    for suite in &oracle_manifest.suites {
+        for case in &suite.cases {
+            let relative_path = case.relative_path.to_string_lossy().replace('\\', "/");
+            if !desired.contains(relative_path.as_str()) {
+                continue;
+            }
+            matches
+                .entry(relative_path.clone())
+                .or_default()
+                .push(FixedDiagnosticCase {
+                    path: case.path.clone(),
+                    oracle_root: suite.oracle_root.clone(),
+                    disposition: case.disposition,
+                });
+        }
+    }
+
+    let mut selected = Vec::with_capacity(desired.len());
+    for case_name in desired {
+        let mut case_matches = matches.remove(case_name).unwrap_or_default();
+        if case_matches.is_empty() {
+            return Err(invalid_fixed_manifest(format!(
+                "case {case_name:?} does not exist in the complete oracle manifest"
+            )));
+        }
+        if case_matches.len() != 1 {
+            return Err(invalid_fixed_manifest(format!(
+                "case {case_name:?} resolves {} times in the complete oracle manifest",
+                case_matches.len()
+            )));
+        }
+        let case_match = case_matches
+            .pop()
+            .expect("one fixed case match was established");
+        if case_match.disposition != UpstreamCaseDisposition::Runnable {
+            return Err(invalid_fixed_manifest(format!(
+                "case {case_name:?} is not runnable in the complete oracle manifest"
+            )));
+        }
+        selected.push(case_match);
+    }
+    Ok(selected)
 }
 
 fn resolve_fixed_variant_plans(
@@ -1678,17 +1753,21 @@ fn run_fixed_variant_diagnostic_baselines(
     let fixed_manifest = read_fixed_variant_manifest(manifest_path)?;
     validate_fixed_variant_manifest_upstream(&fixed_manifest, repository, &oracle_digest)?;
 
+    let selected_case_sources = select_fixed_diagnostic_cases(&oracle_manifest, &fixed_manifest)?;
     let mut cases = Vec::new();
     let mut baseline_sets = Vec::new();
-    for suite in &oracle_manifest.suites {
-        let baselines = collect_files(&suite.oracle_root, is_error_baseline_file)?;
-        let baseline_index = baseline_sets.len();
-        baseline_sets.push(index_baselines_with(baselines, error_baseline_base));
-        for case in &suite.cases {
-            if case.disposition == UpstreamCaseDisposition::Runnable {
-                cases.push((case.path.clone(), baseline_index));
-            }
-        }
+    let mut baseline_indexes = BTreeMap::<PathBuf, usize>::new();
+    for selected_case in selected_case_sources {
+        let baseline_index = if let Some(index) = baseline_indexes.get(&selected_case.oracle_root) {
+            *index
+        } else {
+            let baselines = collect_files(&selected_case.oracle_root, is_error_baseline_file)?;
+            let index = baseline_sets.len();
+            baseline_sets.push(index_baselines_with(baselines, error_baseline_base));
+            baseline_indexes.insert(selected_case.oracle_root, index);
+            index
+        };
+        cases.push((selected_case.path, baseline_index));
     }
     let plans = resolve_fixed_variant_plans(repository, &cases, &baseline_sets, &fixed_manifest)?;
     let selected_cases = plans

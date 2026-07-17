@@ -42,11 +42,13 @@ identity, while a changed oracle produces a new identity.
 
 Fixed shard manifests must store these complete keys. A future identity
 algorithm requires a new key prefix and an explicit manifest migration.
-The runner expands every runnable case before resolving fixed keys, requires
-each key to resolve exactly once, checks redundant case/option/baseline/source
-metadata against discovery, and executes the resolved variants in manifest
-order. Fixed execution also requires a clean upstream checkout at the
-manifest's exact Git SHA and oracle-manifest digest.
+The runner discovers the complete oracle manifest, requires each unique named
+case to resolve exactly once to a runnable case, and fully expands only those
+named cases before resolving fixed keys. It requires each key to resolve
+exactly once, checks redundant case/option/baseline/source metadata against
+discovery, and executes the resolved variants in manifest order. Fixed
+execution also requires a clean upstream checkout at the manifest's exact Git
+SHA and oracle-manifest digest.
 
 ## Outcome and frontier fields
 
