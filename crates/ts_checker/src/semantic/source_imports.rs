@@ -6,8 +6,10 @@
 //! attribute-free. Alias discovery is delegated to the production alias host;
 //! a successful alias must point directly at one unique, explicitly exported
 //! declaration in another retained TypeScript ESM source. Value preparation
-//! currently supports initialized annotated `const` declarations and
-//! annotated `FunctionDeclaration`s.
+//! currently supports initialized annotated `const` declarations, exact
+//! `export declare const` declarations in retained declaration files, and
+//! annotated `FunctionDeclaration`s. Declaration-file bodies are never source
+//! checked by this leaf; only a directly imported annotation is queried.
 //!
 //! Source integration separates declaration checking from value use. Every
 //! binding is resolved through [`resolve_source_import_binding`], including
@@ -187,6 +189,7 @@ pub(super) enum SourceImportUnsupported {
     TargetNotExportedConst(NodeRef),
     MissingTargetAnnotation(NodeRef),
     MissingTargetInitializer(NodeRef),
+    UnexpectedTargetInitializer(NodeRef),
     TypeOnlyAlias(SemanticSymbolId),
     ValueAlias(SemanticSymbolId),
     #[cfg_attr(not(test), allow(dead_code))]
@@ -280,6 +283,7 @@ impl SourceImportError {
                 | SourceImportUnsupported::TargetNotExportedConst(node)
                 | SourceImportUnsupported::MissingTargetAnnotation(node)
                 | SourceImportUnsupported::MissingTargetInitializer(node)
+                | SourceImportUnsupported::UnexpectedTargetInitializer(node)
                 | SourceImportUnsupported::TargetTypeDeclaration(node)
                 | SourceImportUnsupported::TargetTypeNotExported(node)
                 | SourceImportUnsupported::TargetTypeShape(node)
@@ -1561,7 +1565,6 @@ fn plan_direct_exported_type_target(
     if facts.is_javascript_file()
         || facts.is_common_js_module()
         || !facts.is_external_module()
-        || facts.is_declaration_file()
         || !host.symbol_matches(store, declaration, target)
     {
         return Err(unsupported(SourceImportUnsupported::TargetTypeDeclaration(
@@ -1787,11 +1790,7 @@ fn plan_direct_annotated_const_target(
             bound.source_file(),
         ))
     })?;
-    if facts.is_javascript_file()
-        || facts.is_common_js_module()
-        || !facts.is_external_module()
-        || facts.is_declaration_file()
-    {
+    if facts.is_javascript_file() || facts.is_common_js_module() || !facts.is_external_module() {
         return Err(unsupported(SourceImportUnsupported::TargetDeclaration(
             declaration,
         )));
@@ -1852,6 +1851,8 @@ fn plan_direct_annotated_const_target(
         || list_record.flags.0 != NODE_FLAG_CONST
         || list_data.facts != 0
         || !list_data.declarations.nodes.contains(&declaration.node)
+        || (facts.is_declaration_file()
+            && list_data.declarations.nodes.as_slice() != [declaration.node])
     {
         return Err(unsupported(
             SourceImportUnsupported::TargetNotExportedConst(declaration),
@@ -1867,19 +1868,30 @@ fn plan_direct_annotated_const_target(
             SourceImportUnsupported::TargetNotExportedConst(declaration),
         ));
     };
-    if statement_record.kind != SyntaxKind::VariableStatement
-        || statement_record.parent != Some(bound.source_file().node)
-        || statement_record.flags.0 != 0
-        || statement_data.declaration_list != list.node
-        || statement_data.flow_node.is_some()
-        || statement_data.facts != 0
-        || !has_exact_export_modifier(
+    let has_exact_export_modifiers = if facts.is_declaration_file() {
+        has_exact_export_declare_modifiers(
             arena,
             bound,
             store,
             statement,
             statement_data.modifiers.as_ref(),
         )?
+    } else {
+        has_exact_export_modifier(
+            arena,
+            bound,
+            store,
+            statement,
+            statement_data.modifiers.as_ref(),
+        )?
+    };
+    if statement_record.kind != SyntaxKind::VariableStatement
+        || statement_record.parent != Some(bound.source_file().node)
+        || statement_record.flags.0 != 0
+        || statement_data.declaration_list != list.node
+        || statement_data.flow_node.is_some()
+        || statement_data.facts != 0
+        || !has_exact_export_modifiers
     {
         return Err(unsupported(
             SourceImportUnsupported::TargetNotExportedConst(declaration),
@@ -1926,18 +1938,30 @@ fn plan_direct_annotated_const_target(
             type_node,
         )));
     }
-    let initializer = variable
-        .initializer
-        .map(|node| NodeRef::new(declaration.arena, declaration.file, node))
-        .ok_or_else(|| {
-            unsupported(SourceImportUnsupported::MissingTargetInitializer(
-                declaration,
-            ))
-        })?;
-    if checked_node(arena, bound, store, initializer)?.parent != Some(declaration.node) {
-        return Err(unsupported(SourceImportUnsupported::TargetDeclaration(
-            initializer,
-        )));
+    match (facts.is_declaration_file(), variable.initializer) {
+        (true, None) => {}
+        (true, Some(initializer)) => {
+            return Err(unsupported(
+                SourceImportUnsupported::UnexpectedTargetInitializer(NodeRef::new(
+                    declaration.arena,
+                    declaration.file,
+                    initializer,
+                )),
+            ));
+        }
+        (false, None) => {
+            return Err(unsupported(
+                SourceImportUnsupported::MissingTargetInitializer(declaration),
+            ));
+        }
+        (false, Some(initializer)) => {
+            let initializer = NodeRef::new(declaration.arena, declaration.file, initializer);
+            if checked_node(arena, bound, store, initializer)?.parent != Some(declaration.node) {
+                return Err(unsupported(SourceImportUnsupported::TargetDeclaration(
+                    initializer,
+                )));
+            }
+        }
     }
     Ok((declaration, type_node))
 }
@@ -1963,6 +1987,80 @@ fn has_exact_export_modifier(
         && matches!(&record.data, NodeData::Token(_))
         && record.flags.0 == 0
         && record.parent == Some(statement.node))
+}
+
+fn has_exact_export_declare_modifiers(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    statement: NodeRef,
+    modifiers: Option<&ts_ast::ModifierList>,
+) -> Result<bool, SourceImportError> {
+    has_exact_modifier_sequence(
+        arena,
+        bound,
+        store,
+        statement,
+        modifiers,
+        &[
+            (SyntaxKind::ExportKeyword, "export"),
+            (SyntaxKind::DeclareKeyword, "declare"),
+        ],
+    )
+}
+
+fn has_exact_modifier_sequence(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    statement: NodeRef,
+    modifiers: Option<&ts_ast::ModifierList>,
+    expected: &[(SyntaxKind, &str)],
+) -> Result<bool, SourceImportError> {
+    let Some(modifiers) = modifiers else {
+        return Ok(false);
+    };
+    if modifiers.flags.0 != 0
+        || modifiers.list.has_trailing_comma
+        || modifiers.list.nodes.len() != expected.len()
+    {
+        return Ok(false);
+    }
+    let statement_record = checked_node(arena, bound, store, statement)?;
+    if modifiers.list.range.start != statement_record.range.start
+        || modifiers.list.range.end.get() > statement_record.range.end.get()
+    {
+        return Ok(false);
+    }
+    let mut previous_end = None;
+    for (index, (&modifier, &(expected_kind, expected_spelling))) in
+        modifiers.list.nodes.iter().zip(expected).enumerate()
+    {
+        let modifier = NodeRef::new(statement.arena, statement.file, modifier);
+        let record = checked_node(arena, bound, store, modifier)?;
+        if record.kind != expected_kind
+            || !matches!(&record.data, NodeData::Token(_))
+            || record.flags.0 != 0
+            || record.parent != Some(statement.node)
+            || !range_contains(statement_record, record)
+            || modifiers.list.range.start.get() > record.range.start.get()
+            || record.range.end.get() > modifiers.list.range.end.get()
+            || (index == 0 && record.range.start != statement_record.range.start)
+            || previous_end.is_some_and(|end| end > record.range.start.get())
+            || !source_spelling_matches(arena, record, expected_spelling)
+        {
+            return Ok(false);
+        }
+        previous_end = Some(record.range.end.get());
+    }
+    Ok(true)
+}
+
+fn source_spelling_matches(arena: &NodeArena, node: &Node, expected: &str) -> bool {
+    let Some(source) = arena.source_text() else {
+        return true;
+    };
+    source.get(node.range.start.get() as usize..node.range.end.get() as usize) == Some(expected)
 }
 
 fn prepare_value_links(
