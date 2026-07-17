@@ -626,7 +626,7 @@ fn unused_imports_resolve_without_eager_value_typing_or_partial_source_publicati
 
     let rejected = parse_source_file(concat!(
         "import { value } from './target'; ",
-        "class UnsupportedLater {}",
+        "debugger;",
     ));
     let rejected_file = FileId::new(4);
     let rejected_target_file = FileId::new(5);
