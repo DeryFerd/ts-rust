@@ -404,8 +404,9 @@ remains the cluster-level source of truth.
   all eleven canonical Program tests pass on the merged branch. The diagnostics
   runner's explicit `--canonical-checker` mode never emits or falls back to the
   legacy checker. It records genuine capability gaps as unsupported coverage,
-  aborts on provenance/cache/phase invariants, and writes schema-4 scorecards
-  with an explicit `checkerMode` and nested related records. The actual pinned
+  retains provenance/cache/phase invariants as fatal per-variant outcomes, and
+  writes schema-5 scorecards with reproducible provenance, stable variant keys,
+  an explicit `checkerMode`, and nested related records. The actual pinned
   12,750-case oracle discovers and checks `simpleTestMultiFile.ts` byte-for-byte
   exactly, including both TS2322 paths, spans, messages, and order. Canonical
   Program conversion now

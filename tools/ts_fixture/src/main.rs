@@ -6,8 +6,9 @@ use ts_fixture::{
 };
 
 fn main() -> ExitCode {
-    let arguments = env::args().skip(1).collect::<Vec<_>>();
-    let options = match parse_arguments(&arguments) {
+    let invocation = env::args().collect::<Vec<_>>();
+    let arguments = invocation.iter().skip(1).cloned().collect::<Vec<_>>();
+    let mut options = match parse_arguments(&arguments) {
         Ok(Some(options)) => options,
         Ok(None) => {
             print_help();
@@ -18,6 +19,7 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    options.invocation = invocation;
     let Some(repository) = env::var_os("TS_GO_REPO").map(PathBuf::from) else {
         eprintln!("error: TS_GO_REPO is not set");
         return ExitCode::from(2);

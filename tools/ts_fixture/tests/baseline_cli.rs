@@ -31,10 +31,20 @@ impl TestRepository {
     }
 
     fn write_case(&self, name: &str, source: &str, baseline: Option<&str>) {
+        self.write_case_with_extension(name, "ts", source, baseline);
+    }
+
+    fn write_case_with_extension(
+        &self,
+        name: &str,
+        extension: &str,
+        source: &str,
+        baseline: Option<&str>,
+    ) {
         fs::write(
             self.0
                 .join("testdata/tests/cases/compiler")
-                .join(format!("{name}.ts")),
+                .join(format!("{name}.{extension}")),
             source,
         )
         .unwrap();
@@ -58,6 +68,145 @@ impl TestRepository {
         )
         .unwrap();
     }
+
+    fn commit_all(&self) -> String {
+        let commands: &[&[&str]] = &[
+            &["init", "--quiet"],
+            &["config", "user.name", "Fixture Test"],
+            &["config", "user.email", "fixture@example.invalid"],
+            &["add", "."],
+            &[
+                "-c",
+                "commit.gpgSign=false",
+                "commit",
+                "--quiet",
+                "-m",
+                "fixture",
+            ],
+        ];
+        for arguments in commands {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(&self.0)
+                .args(arguments)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git stderr: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&self.0)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+}
+
+#[test]
+fn canonical_scorecard_retains_fatal_and_capability_then_continues_to_exact_case() {
+    let repository = TestRepository::new();
+    repository.write_case(
+        "functionExpandoPropertyDeclaration",
+        concat!(
+            "// @declaration: true\n",
+            "const foo = () => {}\n",
+            "foo.bar = 42\n",
+            "export {}\n",
+        ),
+        None,
+    );
+    repository.write_case_with_extension(
+        "tsxUnsupported",
+        "tsx",
+        "// @noLib: true\nconst value: number = 1;\n",
+        None,
+    );
+    repository.write_case(
+        "zzExact",
+        "// @noLib: true\nconst value: number = 1;\n",
+        None,
+    );
+    let scorecard_path = repository.0.join("canonical-frontier.json");
+
+    let output = run(
+        &repository.0,
+        &[
+            "--diagnostics",
+            "--canonical-checker",
+            "--scorecard-json",
+            scorecard_path.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout
+            .contains("FATAL testdata/tests/cases/compiler/functionExpandoPropertyDeclaration.ts")
+    );
+    assert!(stdout.contains("INV.SOURCE.ARROW"));
+    assert!(stdout.contains("fatal_invariants=1"));
+    let scorecard: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(scorecard_path).unwrap()).unwrap();
+    assert_eq!(scorecard["schemaVersion"], 5);
+    assert_eq!(scorecard["summary"]["executedVariants"], 3);
+    assert_eq!(scorecard["summary"]["exactMatches"], 1);
+    assert_eq!(scorecard["summary"]["unsupportedDetails"], 1);
+    assert_eq!(scorecard["summary"]["fatalInvariants"], 1);
+
+    let variants = scorecard["variants"].as_array().unwrap();
+    assert_eq!(variants.len(), 3);
+    assert_eq!(
+        variants[0]["case"],
+        "testdata/tests/cases/compiler/functionExpandoPropertyDeclaration.ts"
+    );
+    assert_eq!(variants[0]["status"], "fatal_invariant");
+    assert_eq!(variants[0]["outcomeClass"], "fatal_invariant");
+    assert_eq!(variants[0]["frontierBlocker"]["code"], "INV.SOURCE.ARROW");
+    assert_eq!(
+        variants[1]["case"],
+        "testdata/tests/cases/compiler/tsxUnsupported.tsx"
+    );
+    assert_eq!(variants[1]["status"], "unsupported_detail");
+    assert_eq!(variants[1]["outcomeClass"], "checker_capability");
+    assert_eq!(
+        variants[1]["frontierBlocker"]["outcomeClass"],
+        "checker_capability"
+    );
+    assert_eq!(variants[1]["frontierBlocker"]["code"], "C00.SOURCE_KIND");
+    assert_eq!(
+        variants[2]["case"],
+        "testdata/tests/cases/compiler/zzExact.ts"
+    );
+    assert_eq!(variants[2]["status"], "exact_match");
+    assert_eq!(variants[2]["outcomeClass"], "exact");
+}
+
+#[test]
+fn scorecard_provenance_identifies_the_upstream_git_revision_and_dirty_state() {
+    let repository = TestRepository::new();
+    repository.write_case("exact", "// @noLib: true\nconst value: number = 1;\n", None);
+    let expected_sha = repository.commit_all();
+    let scorecard_path = repository.0.join("scorecard.json");
+
+    let output = run(
+        &repository.0,
+        &[
+            "--diagnostics",
+            "--scorecard-json",
+            scorecard_path.to_str().unwrap(),
+        ],
+    );
+    assert!(output.status.success());
+    let scorecard: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(scorecard_path).unwrap()).unwrap();
+    assert_eq!(scorecard["provenance"]["upstream"]["sha"], expected_sha);
+    assert_eq!(scorecard["provenance"]["upstream"]["dirty"], false);
 }
 
 impl Drop for TestRepository {
@@ -147,7 +296,7 @@ fn canonical_checker_matches_pinned_simple_multi_file_diagnostic_baseline() {
     assert!(stdout.contains("diagnostic_comparison=full-artifact exact_matches=1"));
     let scorecard: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(scorecard_path).unwrap()).unwrap();
-    assert_eq!(scorecard["schemaVersion"], 4);
+    assert_eq!(scorecard["schemaVersion"], 5);
     assert_eq!(scorecard["checkerMode"], "canonical");
     assert_eq!(
         scorecard["variants"][0]["diagnostics"][0]["relatedInformation"],
@@ -207,7 +356,7 @@ fn canonical_checker_matches_related_information_artifact_and_scorecard_exactly(
     );
     let scorecard: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(scorecard_path).unwrap()).unwrap();
-    assert_eq!(scorecard["schemaVersion"], 4);
+    assert_eq!(scorecard["schemaVersion"], 5);
     assert_eq!(scorecard["checkerMode"], "canonical");
     assert_eq!(scorecard["summary"]["exactMatches"], 1);
     assert_eq!(scorecard["summary"]["actualDiagnostics"], 2);
@@ -221,19 +370,13 @@ fn canonical_checker_matches_related_information_artifact_and_scorecard_exactly(
         "/src/input.d.ts"
     );
     assert_eq!(diagnostics[0]["relatedInformation"][0]["code"], 2753);
-    assert_eq!(
-        diagnostics[0]["relatedInformation"][0]["category"],
-        "error"
-    );
+    assert_eq!(diagnostics[0]["relatedInformation"][0]["category"], "error");
     assert_eq!(
         diagnostics[0]["relatedInformation"][0]["relatedInformation"],
         serde_json::json!([])
     );
     assert_eq!(diagnostics[1]["fileName"], "/src/input.d.ts");
-    assert_eq!(
-        diagnostics[1]["relatedInformation"][0]["code"],
-        2752
-    );
+    assert_eq!(diagnostics[1]["relatedInformation"][0]["code"], 2752);
 }
 
 #[test]
@@ -340,7 +483,7 @@ fn upstream_skips_are_visible_but_never_executed() {
     assert!(output.status.success());
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
-        "summary: discovered_cases=1 upstream_skipped_cases=1 selected_cases=0 executed_variants=0 matched=0 mismatched=0 missing=0 content=0 missing_sections=0 unexpected_sections=0 diagnostics=0 diagnostic_comparison=full-artifact exact_matches=0 header_only_matches=0 code_mismatches=0 span_mismatches=0 message_mismatches=0 order_mismatches=0 unsupported_details=0 header_mismatches=0 artifact_mismatches=0\n"
+        "summary: discovered_cases=1 upstream_skipped_cases=1 selected_cases=0 executed_variants=0 matched=0 mismatched=0 missing=0 content=0 missing_sections=0 unexpected_sections=0 diagnostics=0 diagnostic_comparison=full-artifact exact_matches=0 header_only_matches=0 code_mismatches=0 span_mismatches=0 message_mismatches=0 order_mismatches=0 unsupported_details=0 header_mismatches=0 artifact_mismatches=0 fatal_invariants=0\n"
     );
 }
 
@@ -377,7 +520,7 @@ fn matches_a_nonempty_full_diagnostic_artifact_exactly() {
     assert!(output.status.success());
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
-        "summary: discovered_cases=1 upstream_skipped_cases=0 selected_cases=1 executed_variants=1 matched=1 mismatched=0 missing=0 content=0 missing_sections=0 unexpected_sections=0 diagnostics=0 diagnostic_comparison=full-artifact exact_matches=1 header_only_matches=0 code_mismatches=0 span_mismatches=0 message_mismatches=0 order_mismatches=0 unsupported_details=0 header_mismatches=0 artifact_mismatches=0\n"
+        "summary: discovered_cases=1 upstream_skipped_cases=0 selected_cases=1 executed_variants=1 matched=1 mismatched=0 missing=0 content=0 missing_sections=0 unexpected_sections=0 diagnostics=0 diagnostic_comparison=full-artifact exact_matches=1 header_only_matches=0 code_mismatches=0 span_mismatches=0 message_mismatches=0 order_mismatches=0 unsupported_details=0 header_mismatches=0 artifact_mismatches=0 fatal_invariants=0\n"
     );
 }
 
@@ -421,32 +564,31 @@ fn writes_deterministic_structured_full_artifact_scorecard() {
         ),
     );
 
-    let first_path = repository.0.join("scorecard-first.json");
+    let scorecard_path = repository.0.join("scorecard.json");
     let first = run(
         &repository.0,
         &[
             "--diagnostics",
             "--scorecard-json",
-            first_path.to_str().unwrap(),
+            scorecard_path.to_str().unwrap(),
         ],
     );
     assert_eq!(first.status.code(), Some(1));
-    let first_json = fs::read_to_string(&first_path).unwrap();
+    let first_json = fs::read_to_string(&scorecard_path).unwrap();
 
-    let second_path = repository.0.join("scorecard-second.json");
     let second = run(
         &repository.0,
         &[
             "--diagnostics",
             "--scorecard-json",
-            second_path.to_str().unwrap(),
+            scorecard_path.to_str().unwrap(),
         ],
     );
     assert_eq!(second.status.code(), Some(1));
-    assert_eq!(first_json, fs::read_to_string(second_path).unwrap());
+    assert_eq!(first_json, fs::read_to_string(&scorecard_path).unwrap());
 
     let scorecard: serde_json::Value = serde_json::from_str(&first_json).unwrap();
-    assert_eq!(scorecard["schemaVersion"], 4);
+    assert_eq!(scorecard["schemaVersion"], 5);
     assert_eq!(scorecard["checkerMode"], "legacy");
     assert_eq!(scorecard["comparisonScope"], "full_artifact");
     assert_eq!(scorecard["fullArtifactComparison"], true);
@@ -455,8 +597,39 @@ fn writes_deterministic_structured_full_artifact_scorecard() {
     assert_eq!(scorecard["summary"]["headerOnlyMatches"], 0);
     assert_eq!(scorecard["summary"]["codeMismatches"], 1);
     assert_eq!(scorecard["summary"]["unsupportedDetails"], 0);
+    assert_eq!(scorecard["summary"]["fatalInvariants"], 0);
     assert_eq!(scorecard["summary"]["headerMismatches"], 1);
     assert_eq!(scorecard["summary"]["actualDiagnostics"], 2);
+    assert_eq!(scorecard["provenance"]["digestAlgorithm"], "xxh3-128");
+    assert_eq!(
+        scorecard["provenance"]["upstream"]["sha"],
+        serde_json::Value::Null
+    );
+    assert_eq!(
+        scorecard["provenance"]["rust"]["sha"]
+            .as_str()
+            .unwrap()
+            .len(),
+        40
+    );
+    assert!(scorecard["provenance"]["rust"]["dirty"].is_boolean());
+    assert_eq!(
+        scorecard["provenance"]["manifestDigest"]
+            .as_str()
+            .unwrap()
+            .len(),
+        32
+    );
+    assert_eq!(scorecard["provenance"]["capabilityRegistry"]["version"], 1);
+    assert_eq!(
+        scorecard["provenance"]["invocation"],
+        serde_json::json!([
+            env!("CARGO_BIN_EXE_ts_fixture_baseline"),
+            "--diagnostics",
+            "--scorecard-json",
+            scorecard_path.to_str().unwrap()
+        ])
+    );
 
     let variants = scorecard["variants"].as_array().unwrap();
     assert_eq!(
@@ -464,12 +637,25 @@ fn writes_deterministic_structured_full_artifact_scorecard() {
         "testdata/tests/cases/compiler/aHeaderMatch.ts"
     );
     assert_eq!(variants[0]["status"], "exact_match");
+    assert_eq!(variants[0]["outcomeClass"], "exact");
+    assert_eq!(variants[0]["frontierBlocker"], serde_json::Value::Null);
+    assert!(
+        variants[0]["variantKey"]
+            .as_str()
+            .unwrap()
+            .starts_with("v1:")
+    );
     assert_eq!(variants[0]["comparisonScope"], "full_artifact");
     assert_eq!(
         variants[0]["expectedBaseline"],
         "testdata/baselines/reference/compiler/aHeaderMatch.errors.txt"
     );
     assert_eq!(variants[1]["status"], "code_mismatch");
+    assert_eq!(variants[1]["outcomeClass"], "supported_mismatch");
+    assert_eq!(
+        variants[1]["frontierBlocker"]["outcomeClass"],
+        "supported_mismatch"
+    );
 
     let diagnostic = &variants[0]["diagnostics"][0];
     assert_eq!(diagnostic["fileName"], "/.src/aHeaderMatch.ts");
@@ -570,6 +756,11 @@ fn omitted_pinned_boolean_axis_is_enumerated_but_never_counted_exact() {
         variants
             .iter()
             .all(|variant| variant["status"] == "unsupported_detail")
+    );
+    assert!(
+        variants
+            .iter()
+            .all(|variant| variant["outcomeClass"] == "harness_config")
     );
 }
 

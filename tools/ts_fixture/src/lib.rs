@@ -12,11 +12,13 @@ use std::{
     io::{self, Write},
     ops::Range,
     path::{Path, PathBuf},
+    process::Command,
 };
 
 use serde::Serialize;
 use ts_core::{SourceText, TextRange};
 use ts_vfs::{FileSystem, MemoryFileSystem, decode_utf16_bom};
+use xxhash_rust::xxh3::xxh3_128;
 
 mod oracle;
 
@@ -236,6 +238,12 @@ pub struct RunnerOptions {
     pub manifest: bool,
     /// Write a deterministic machine-readable diagnostic scorecard to this path.
     pub scorecard_json: Option<PathBuf>,
+    /// Exact process invocation recorded in scorecard provenance.
+    ///
+    /// Library callers may leave this empty. The CLI always fills it from
+    /// [`std::env::args`].
+    #[doc(hidden)]
+    pub invocation: Vec<String>,
 }
 
 /// Fidelity boundary of one diagnostic comparison.
@@ -268,6 +276,7 @@ pub enum DiagnosticVariantStatus {
     UnsupportedDetail,
     HeaderMismatch,
     ArtifactMismatch,
+    FatalInvariant,
 }
 
 /// Structured reason why two complete diagnostic artifacts differ.
@@ -282,6 +291,18 @@ pub enum DiagnosticArtifactMismatchKind {
     UnsupportedDetail,
     Header,
     Artifact,
+    FatalInvariant,
+}
+
+/// High-level reason a scorecard variant did or did not compare exactly.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiagnosticVariantOutcomeClass {
+    Exact,
+    HarnessConfig,
+    CheckerCapability,
+    SupportedMismatch,
+    FatalInvariant,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
@@ -301,6 +322,7 @@ pub struct DiagnosticScorecardSummary {
     pub unsupported_details: usize,
     pub header_mismatches: usize,
     pub artifact_mismatches: usize,
+    pub fatal_invariants: usize,
     pub actual_diagnostics: usize,
 }
 
@@ -365,17 +387,32 @@ impl From<&CompilationRelatedInformation> for DiagnosticScorecardDiagnostic {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DiagnosticVariantResult {
+    pub variant_key: String,
     pub case: String,
     pub options: BTreeMap<String, String>,
     pub expected_baseline: Option<String>,
     pub comparison_scope: DiagnosticComparisonScope,
     pub status: DiagnosticVariantStatus,
+    pub outcome_class: DiagnosticVariantOutcomeClass,
+    pub frontier_blocker: Option<DiagnosticFrontierBlocker>,
     pub expected_header: String,
     pub actual_header: String,
     pub mismatch_kinds: Vec<DiagnosticArtifactMismatchKind>,
     pub first_difference: Option<DiagnosticArtifactDifference>,
     pub unsupported_details: Vec<String>,
     pub diagnostics: Vec<DiagnosticScorecardDiagnostic>,
+}
+
+/// The first honest boundary reached by one scorecard variant.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagnosticFrontierBlocker {
+    pub outcome_class: DiagnosticVariantOutcomeClass,
+    /// Checker capability codes are registry-backed and invariant codes use
+    /// the reserved `INV.*` namespace. Harness and mismatch blockers have no
+    /// capability code.
+    pub code: Option<String>,
+    pub detail: String,
 }
 
 /// First byte-significant line difference for a diagnostic artifact mismatch.
@@ -392,11 +429,289 @@ pub struct DiagnosticArtifactDifference {
 #[serde(rename_all = "camelCase")]
 pub struct DiagnosticScorecard {
     pub schema_version: u32,
+    pub provenance: DiagnosticScorecardProvenance,
     pub checker_mode: DiagnosticCheckerMode,
     pub comparison_scope: DiagnosticComparisonScope,
     pub full_artifact_comparison: bool,
     pub summary: DiagnosticScorecardSummary,
     pub variants: Vec<DiagnosticVariantResult>,
+}
+
+/// Git identity for one source tree used by a scorecard run.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScorecardRepositoryRevision {
+    pub sha: Option<String>,
+    pub dirty: Option<bool>,
+}
+
+/// Version and content identity of the capability registry compiled into the runner.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScorecardCapabilityRegistry {
+    pub version: u32,
+    pub digest: String,
+}
+
+/// Inputs needed to reproduce and attribute a scorecard run.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagnosticScorecardProvenance {
+    pub upstream: ScorecardRepositoryRevision,
+    pub rust: ScorecardRepositoryRevision,
+    pub manifest_digest: String,
+    pub digest_algorithm: String,
+    pub invocation: Vec<String>,
+    pub capability_registry: ScorecardCapabilityRegistry,
+}
+
+const DIAGNOSTIC_SCORECARD_SCHEMA_VERSION: u32 = 5;
+const CAPABILITY_REGISTRY_VERSION: u32 = 1;
+const SCORECARD_DIGEST_ALGORITHM: &str = "xxh3-128";
+const CAPABILITY_REGISTRY: &str = include_str!("../../../docs/typechecker-capabilities.tsv");
+const TYPECHECKER_PORT_MAP: &str = include_str!("../../../docs/typechecker-port-map.tsv");
+
+const TYPED_CHECKER_CAPABILITY_CODES: [&str; 20] = [
+    "B02.DECLARATION_FAMILY",
+    "B03.NAME_RESOLUTION",
+    "C00.SOURCE_KIND",
+    "E00.DERIVED_TYPE",
+    "E00.ENUM_TYPE",
+    "E00.SOURCE_SYNTAX",
+    "M00.DECLARATION_FILE",
+    "M00.EXTERNAL_MODULE_TARGET",
+    "M00.FIXED_MODULE_FORMAT",
+    "M00.NODE_MODULE_FACTS",
+    "M00.PLAIN_ESM_MODE",
+    "M00.SPECIFIER_RESOLUTION_MODE",
+    "M03.IMPORT_META_MODULE_MODE",
+    "R01.RELATION",
+    "T04.GLOBAL_CONTEXT",
+    "T05.DECLARED_TYPE",
+    "T06.ARRAY_TYPE",
+    "T06.LITERAL_UNION",
+    "T06.TYPE_NODE",
+    "T07.TYPE_DISPLAY",
+];
+
+fn stable_digest(bytes: &[u8]) -> String {
+    format!("{:032x}", xxh3_128(bytes))
+}
+
+fn git_output(repository: &Path, arguments: &[&str]) -> Option<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repository)
+        .args(arguments)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(
+        String::from_utf8_lossy(&output.stdout)
+            .trim_end()
+            .to_owned(),
+    )
+}
+
+fn repository_revision(repository: &Path) -> ScorecardRepositoryRevision {
+    let sha = git_output(repository, &["rev-parse", "--verify", "HEAD"]);
+    let dirty = sha.as_ref().and_then(|_| {
+        git_output(
+            repository,
+            &["status", "--porcelain=v1", "--untracked-files=normal"],
+        )
+        .map(|status| !status.is_empty())
+    });
+    ScorecardRepositoryRevision { sha, dirty }
+}
+
+fn capability_registry_metadata() -> io::Result<ScorecardCapabilityRegistry> {
+    let mut lines = CAPABILITY_REGISTRY.lines();
+    if lines.next() != Some("# schema_version\t1") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "typechecker capability registry must declare schema version 1",
+        ));
+    }
+    let expected_header =
+        "code\tport_map_id\tdescription\towner_slice\tintroduced_version\tstatus\treplacement";
+    if lines.next() != Some(expected_header) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "typechecker capability registry has an invalid header",
+        ));
+    }
+    let mut port_map_ids = BTreeSet::new();
+    for line in TYPECHECKER_PORT_MAP.lines().skip(1) {
+        let Some(port_map_id) = line.split('\t').next().filter(|id| !id.is_empty()) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "typechecker port map contains an empty row identity",
+            ));
+        };
+        if !port_map_ids.insert(port_map_id) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("typechecker port map repeats row {port_map_id}"),
+            ));
+        }
+    }
+    let mut codes = BTreeSet::new();
+    let mut retired_replacements = Vec::new();
+    for (index, line) in lines.enumerate() {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let columns: [&str; 7] = match line.split('\t').collect::<Vec<_>>().try_into() {
+            Ok(columns) => columns,
+            Err(columns) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "typechecker capability registry line {} has {} columns, expected 7",
+                        index + 3,
+                        columns.len()
+                    ),
+                ));
+            }
+        };
+        let [
+            code,
+            port_map_id,
+            description,
+            owner_slice,
+            introduced_version,
+            status,
+            replacement,
+        ] = columns;
+        if code.starts_with("INV.") || !codes.insert(code) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid or duplicate capability code {code:?}"),
+            ));
+        }
+        if !port_map_ids.contains(port_map_id) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("capability {code} references unknown port-map row {port_map_id}"),
+            ));
+        }
+        if code.split_once('.').map(|(prefix, _)| prefix) != Some(port_map_id) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("capability {code} does not use its port-map row as the code prefix"),
+            ));
+        }
+        let lifecycle_is_valid = match status {
+            "active" => replacement == "-",
+            "retired" => {
+                retired_replacements.push((code, replacement));
+                !replacement.is_empty() && replacement != "-"
+            }
+            _ => false,
+        };
+        let introduced_version = introduced_version.parse::<u32>();
+        if description.is_empty()
+            || owner_slice.is_empty()
+            || !matches!(introduced_version, Ok(1..=CAPABILITY_REGISTRY_VERSION))
+            || !lifecycle_is_valid
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("capability {code} has invalid lifecycle metadata"),
+            ));
+        }
+    }
+    for (code, replacement) in retired_replacements {
+        if !codes.contains(replacement) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("retired capability {code} names unknown replacement {replacement}"),
+            ));
+        }
+    }
+    for capability_code in TYPED_CHECKER_CAPABILITY_CODES {
+        if !codes.contains(capability_code) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("typed checker capability {capability_code} is absent from the registry"),
+            ));
+        }
+    }
+    Ok(ScorecardCapabilityRegistry {
+        version: CAPABILITY_REGISTRY_VERSION,
+        digest: stable_digest(CAPABILITY_REGISTRY.as_bytes()),
+    })
+}
+
+fn scorecard_provenance(
+    repository: &Path,
+    options: &RunnerOptions,
+    manifest: &UpstreamManifest,
+) -> io::Result<DiagnosticScorecardProvenance> {
+    let capability_registry = capability_registry_metadata()?;
+    if options.scorecard_json.is_none() {
+        return Ok(DiagnosticScorecardProvenance {
+            upstream: ScorecardRepositoryRevision {
+                sha: None,
+                dirty: None,
+            },
+            rust: ScorecardRepositoryRevision {
+                sha: None,
+                dirty: None,
+            },
+            manifest_digest: String::new(),
+            digest_algorithm: SCORECARD_DIGEST_ALGORITHM.to_owned(),
+            invocation: options.invocation.clone(),
+            capability_registry,
+        });
+    }
+    let mut manifest_bytes = Vec::new();
+    manifest.write_to(&mut manifest_bytes)?;
+    let rust_repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    Ok(DiagnosticScorecardProvenance {
+        upstream: repository_revision(repository),
+        rust: repository_revision(&rust_repository),
+        manifest_digest: stable_digest(&manifest_bytes),
+        digest_algorithm: SCORECARD_DIGEST_ALGORITHM.to_owned(),
+        invocation: options.invocation.clone(),
+        capability_registry,
+    })
+}
+
+fn append_identity_field(identity: &mut Vec<u8>, name: &str, value: &str) {
+    let name_length = u64::try_from(name.len()).expect("field name length must fit u64");
+    let value_length = u64::try_from(value.len()).expect("field value length must fit u64");
+    identity.extend_from_slice(&name_length.to_le_bytes());
+    identity.extend_from_slice(name.as_bytes());
+    identity.extend_from_slice(&value_length.to_le_bytes());
+    identity.extend_from_slice(value.as_bytes());
+}
+
+fn diagnostic_variant_key(
+    case: &str,
+    variant: &OptionVariant,
+    expected_baseline: Option<&str>,
+    expected: &str,
+) -> String {
+    let mut identity = Vec::new();
+    append_identity_field(&mut identity, "case", case);
+    for (name, value) in &variant.values {
+        let canonical_name = name.to_ascii_lowercase();
+        let canonical_value =
+            normalized_option_value(name, value).unwrap_or_else(|| value.trim().to_owned());
+        append_identity_field(&mut identity, &canonical_name, &canonical_value);
+    }
+    append_identity_field(
+        &mut identity,
+        "expectedBaseline",
+        expected_baseline.unwrap_or("<none>"),
+    );
+    append_identity_field(&mut identity, "expectedContent", expected);
+    format!("v1:{}", stable_digest(&identity))
 }
 
 impl DiagnosticScorecard {
@@ -578,6 +893,7 @@ pub fn run_upstream_diagnostic_baselines(
 ) -> io::Result<RunnerSummary> {
     let manifest = discover_upstream_manifest(repository)?;
     let manifest_summary = manifest.summary();
+    let provenance = scorecard_provenance(repository, options, &manifest)?;
     let mut cases = Vec::new();
     let mut baseline_sets = Vec::new();
     for suite in &manifest.suites {
@@ -614,7 +930,8 @@ pub fn run_upstream_diagnostic_baselines(
         FixtureChecker::Legacy
     };
     let mut scorecard = DiagnosticScorecard {
-        schema_version: 4,
+        schema_version: DIAGNOSTIC_SCORECARD_SCHEMA_VERSION,
+        provenance,
         checker_mode: match checker {
             FixtureChecker::Legacy => DiagnosticCheckerMode::Legacy,
             FixtureChecker::Canonical => DiagnosticCheckerMode::Canonical,
@@ -642,7 +959,7 @@ pub fn run_upstream_diagnostic_baselines(
         let candidates = baseline_files
             .get(case_name)
             .map_or_else(Vec::new, |paths| paths.iter().collect::<Vec<_>>());
-        for (variant, compilation) in compile_case_matrix_with_checker(&case, checker)? {
+        for mut variant in expand_option_matrix(&case) {
             summary.executed_variants += 1;
             let selected = select_variant_baselines_with(
                 &candidates,
@@ -674,14 +991,80 @@ pub fn run_upstream_diagnostic_baselines(
                 .map(fs::read_to_string)
                 .transpose()?
                 .unwrap_or_default();
+            let scorecard_case = relative_scorecard_path(repository, &case_path);
+            let variant_key = diagnostic_variant_key(
+                &scorecard_case,
+                &variant,
+                expected_baseline.as_deref(),
+                &expected,
+            );
+            let mut checker_frontier = None;
+            let compilation = match compile_case_variant(&case, &mut variant, checker) {
+                Ok(compilation) => compilation,
+                // A fixture filesystem failure makes scorecard persistence
+                // itself suspect. Keep it as a fail-closed harness error (CLI
+                // exit 2), never as a checker invariant or capability.
+                Err(FixtureCompilationFailure::Io(error)) => return Err(error),
+                Err(FixtureCompilationFailure::Canonical(error)) => {
+                    let detail = format!("experimental canonical checker: {error}");
+                    match error.failure_class() {
+                        ts_compiler::CanonicalProgramCheckFailureClass::Unsupported {
+                            capability_code,
+                        } => {
+                            if !capability_registry_contains(capability_code) {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    format!(
+                                        "typed checker capability {capability_code} is absent from the registry"
+                                    ),
+                                ));
+                            }
+                            checker_frontier = Some((capability_code.to_owned(), detail.clone()));
+                            variant.unsupported_details.push(detail.clone());
+                            variant.unsupported_details.sort();
+                            variant.unsupported_details.dedup();
+                            Compilation::default()
+                        }
+                        ts_compiler::CanonicalProgramCheckFailureClass::Fatal {
+                            invariant_code,
+                        } => {
+                            retain_fatal_variant(
+                                &mut summary,
+                                &mut scorecard,
+                                writer,
+                                FatalVariantRecord {
+                                    case_path: &case_path,
+                                    repository,
+                                    variant: &variant,
+                                    axes: &axes,
+                                    variant_key,
+                                    scorecard_case,
+                                    expected_baseline,
+                                    expected: &expected,
+                                    invariant_code,
+                                    detail,
+                                },
+                            )?;
+                            continue;
+                        }
+                    }
+                }
+            };
             let mut actual = render_error_baseline(&case, &compilation.diagnostics);
             actual
                 .unsupported_details
                 .extend(variant.unsupported_details.iter().cloned());
             let comparison =
                 compare_diagnostic_artifacts(&expected, &actual, &compilation.diagnostics);
-            let status = comparison.status();
-            if comparison.is_exact() {
+            let checker_blocked = checker_frontier.is_some();
+            let status = if checker_blocked {
+                DiagnosticVariantStatus::UnsupportedDetail
+            } else {
+                comparison.status()
+            };
+            let (outcome_class, frontier_blocker) =
+                comparison_frontier(status, &comparison, checker_frontier);
+            if comparison.is_exact() && !checker_blocked {
                 summary.matched += 1;
                 scorecard.summary.exact_matches += 1;
             } else {
@@ -716,6 +1099,7 @@ pub fn run_upstream_diagnostic_baselines(
                     DiagnosticVariantStatus::ArtifactMismatch => {
                         scorecard.summary.artifact_mismatches += 1;
                     }
+                    DiagnosticVariantStatus::FatalInvariant => unreachable!(),
                 }
                 let display_path = case_path
                     .strip_prefix(repository)
@@ -739,11 +1123,14 @@ pub fn run_upstream_diagnostic_baselines(
             scorecard.summary.executed_variants += 1;
             scorecard.summary.actual_diagnostics += compilation.diagnostics.len();
             scorecard.variants.push(DiagnosticVariantResult {
-                case: relative_scorecard_path(repository, &case_path),
+                variant_key,
+                case: scorecard_case,
                 options: variant.values,
                 expected_baseline,
                 comparison_scope: DiagnosticComparisonScope::FullArtifact,
                 status,
+                outcome_class,
+                frontier_blocker,
                 expected_header: parse_error_baseline_header(&expected),
                 actual_header: parse_error_baseline_header(&actual.text),
                 mismatch_kinds: comparison.mismatch_kinds,
@@ -762,7 +1149,7 @@ pub fn run_upstream_diagnostic_baselines(
     }
     writeln!(
         writer,
-        "{summary} diagnostic_comparison=full-artifact exact_matches={} header_only_matches={} code_mismatches={} span_mismatches={} message_mismatches={} order_mismatches={} unsupported_details={} header_mismatches={} artifact_mismatches={}",
+        "{summary} diagnostic_comparison=full-artifact exact_matches={} header_only_matches={} code_mismatches={} span_mismatches={} message_mismatches={} order_mismatches={} unsupported_details={} header_mismatches={} artifact_mismatches={} fatal_invariants={}",
         scorecard.summary.exact_matches,
         scorecard.summary.header_only_matches,
         scorecard.summary.code_mismatches,
@@ -772,8 +1159,124 @@ pub fn run_upstream_diagnostic_baselines(
         scorecard.summary.unsupported_details,
         scorecard.summary.header_mismatches,
         scorecard.summary.artifact_mismatches,
+        scorecard.summary.fatal_invariants,
     )?;
     Ok(summary)
+}
+
+fn capability_registry_contains(code: &str) -> bool {
+    CAPABILITY_REGISTRY
+        .lines()
+        .skip(2)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .any(|line| line.split('\t').next() == Some(code))
+}
+
+fn comparison_frontier(
+    status: DiagnosticVariantStatus,
+    comparison: &DiagnosticArtifactComparison,
+    checker_frontier: Option<(String, String)>,
+) -> (
+    DiagnosticVariantOutcomeClass,
+    Option<DiagnosticFrontierBlocker>,
+) {
+    if let Some((code, detail)) = checker_frontier {
+        return (
+            DiagnosticVariantOutcomeClass::CheckerCapability,
+            Some(DiagnosticFrontierBlocker {
+                outcome_class: DiagnosticVariantOutcomeClass::CheckerCapability,
+                code: Some(code),
+                detail,
+            }),
+        );
+    }
+    if comparison.is_exact() {
+        return (DiagnosticVariantOutcomeClass::Exact, None);
+    }
+    if let Some(detail) = comparison.unsupported_details.first() {
+        return (
+            DiagnosticVariantOutcomeClass::HarnessConfig,
+            Some(DiagnosticFrontierBlocker {
+                outcome_class: DiagnosticVariantOutcomeClass::HarnessConfig,
+                code: None,
+                detail: detail.clone(),
+            }),
+        );
+    }
+    let detail = comparison.first_difference.as_ref().map_or_else(
+        || format!("diagnostic comparison ended with {status:?}"),
+        |difference| {
+            format!(
+                "artifact line {} differs: expected {:?}, actual {:?}",
+                difference.line, difference.expected, difference.actual
+            )
+        },
+    );
+    (
+        DiagnosticVariantOutcomeClass::SupportedMismatch,
+        Some(DiagnosticFrontierBlocker {
+            outcome_class: DiagnosticVariantOutcomeClass::SupportedMismatch,
+            code: None,
+            detail,
+        }),
+    )
+}
+
+struct FatalVariantRecord<'a> {
+    case_path: &'a Path,
+    repository: &'a Path,
+    variant: &'a OptionVariant,
+    axes: &'a [String],
+    variant_key: String,
+    scorecard_case: String,
+    expected_baseline: Option<String>,
+    expected: &'a str,
+    invariant_code: &'a str,
+    detail: String,
+}
+
+fn retain_fatal_variant(
+    summary: &mut RunnerSummary,
+    scorecard: &mut DiagnosticScorecard,
+    writer: &mut impl Write,
+    record: FatalVariantRecord<'_>,
+) -> io::Result<()> {
+    summary.mismatched += 1;
+    summary.diagnostic_failures += 1;
+    scorecard.summary.executed_variants += 1;
+    scorecard.summary.fatal_invariants += 1;
+    let display_path = record
+        .case_path
+        .strip_prefix(record.repository)
+        .unwrap_or(record.case_path)
+        .display();
+    let label = variant_label(record.variant, record.axes);
+    writeln!(
+        writer,
+        "FATAL {display_path}{label}: {}: {}",
+        record.invariant_code, record.detail
+    )?;
+    scorecard.variants.push(DiagnosticVariantResult {
+        variant_key: record.variant_key,
+        case: record.scorecard_case,
+        options: record.variant.values.clone(),
+        expected_baseline: record.expected_baseline,
+        comparison_scope: DiagnosticComparisonScope::FullArtifact,
+        status: DiagnosticVariantStatus::FatalInvariant,
+        outcome_class: DiagnosticVariantOutcomeClass::FatalInvariant,
+        frontier_blocker: Some(DiagnosticFrontierBlocker {
+            outcome_class: DiagnosticVariantOutcomeClass::FatalInvariant,
+            code: Some(record.invariant_code.to_owned()),
+            detail: record.detail,
+        }),
+        expected_header: parse_error_baseline_header(record.expected),
+        actual_header: String::new(),
+        mismatch_kinds: vec![DiagnosticArtifactMismatchKind::FatalInvariant],
+        first_difference: None,
+        unsupported_details: record.variant.unsupported_details.clone(),
+        diagnostics: Vec::new(),
+    });
+    Ok(())
 }
 
 fn relative_scorecard_path(repository: &Path, path: &Path) -> String {
@@ -2383,6 +2886,7 @@ pub fn compile_case(case: &Case) -> std::io::Result<Compilation> {
         .next()
         .unwrap_or_default();
     compile_case_variant(case, &mut variant, FixtureChecker::Legacy)
+        .map_err(FixtureCompilationFailure::into_io_error)
 }
 
 /// Compiles every scalar compiler-option variant in deterministic order.
@@ -2400,16 +2904,52 @@ enum FixtureChecker {
     Canonical,
 }
 
+#[derive(Debug)]
+enum FixtureCompilationFailure {
+    Io(io::Error),
+    Canonical(ts_compiler::CanonicalProgramCheckError),
+}
+
+impl FixtureCompilationFailure {
+    fn into_io_error(self) -> io::Error {
+        match self {
+            Self::Io(error) => error,
+            Self::Canonical(error) => io::Error::new(io::ErrorKind::InvalidData, error),
+        }
+    }
+}
+
+impl From<io::Error> for FixtureCompilationFailure {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
 fn compile_case_matrix_with_checker(
     case: &Case,
     checker: FixtureChecker,
 ) -> std::io::Result<Vec<(OptionVariant, Compilation)>> {
     expand_option_matrix(case)
         .into_iter()
-        .map(|mut variant| {
-            compile_case_variant(case, &mut variant, checker)
-                .map(|compilation| (variant, compilation))
-        })
+        .map(
+            |mut variant| match compile_case_variant(case, &mut variant, checker) {
+                Ok(compilation) => Ok((variant, compilation)),
+                Err(FixtureCompilationFailure::Canonical(error))
+                    if matches!(
+                        error.failure_class(),
+                        ts_compiler::CanonicalProgramCheckFailureClass::Unsupported { .. }
+                    ) =>
+                {
+                    variant
+                        .unsupported_details
+                        .push(format!("experimental canonical checker: {error}"));
+                    variant.unsupported_details.sort();
+                    variant.unsupported_details.dedup();
+                    Ok((variant, Compilation::default()))
+                }
+                Err(error) => Err(error.into_io_error()),
+            },
+        )
         .collect()
 }
 
@@ -2442,7 +2982,7 @@ fn compile_case_variant(
     case: &Case,
     variant: &mut OptionVariant,
     checker: FixtureChecker,
-) -> std::io::Result<Compilation> {
+) -> Result<Compilation, FixtureCompilationFailure> {
     let file_system = MemoryFileSystem::new(true);
     let project_directory = project_config_unit(case).and_then(|(path, _)| {
         path.rsplit_once('/')
@@ -2557,15 +3097,7 @@ fn compile_case_variant(
                 compiler_options,
             ) {
                 Ok(program) => program,
-                Err(error) if error.is_unsupported_boundary() => {
-                    variant
-                        .unsupported_details
-                        .push(format!("experimental canonical checker: {error}"));
-                    variant.unsupported_details.sort();
-                    variant.unsupported_details.dedup();
-                    return Ok(Compilation::default());
-                }
-                Err(error) => return Err(io::Error::new(io::ErrorKind::InvalidData, error)),
+                Err(error) => return Err(FixtureCompilationFailure::Canonical(error)),
             }
         }
     };
@@ -3517,15 +4049,170 @@ mod tests {
 
     use super::{
         Case, CompilationDiagnostic, CompilationDiagnosticCategory, CompilationRelatedInformation,
-        DiagnosticArtifactMismatchKind, DiagnosticScorecardDiagnostic, DiagnosticVariantStatus,
-        FixtureChecker, OptionVariant, OutputDifferenceKind, ParseError, RunnerOptions,
+        DiagnosticArtifactComparison, DiagnosticArtifactMismatchKind, DiagnosticCheckerMode,
+        DiagnosticComparisonScope, DiagnosticScorecard, DiagnosticScorecardDiagnostic,
+        DiagnosticScorecardProvenance, DiagnosticScorecardSummary, DiagnosticVariantOutcomeClass,
+        DiagnosticVariantStatus, FatalVariantRecord, FixtureChecker, OptionVariant,
+        OutputDifferenceKind, ParseError, RunnerOptions, RunnerSummary,
+        ScorecardCapabilityRegistry, ScorecardRepositoryRevision, TYPED_CHECKER_CAPABILITY_CODES,
+        capability_registry_contains, capability_registry_metadata,
         compare_case_emitted_output_sections, compare_diagnostic_artifacts,
-        compare_emitted_output_sections, compile_case, compile_case_matrix,
-        compile_case_matrix_with_checker, error_baseline_unit_order, expand_option_matrix,
-        first_different_line, fixture_compiler_options, matrix_axes, parse_baseline_sections,
-        parse_error_baseline_header, render_error_baseline, run_case_against_baseline,
-        run_upstream_baselines, select_variant_baselines, virtual_unit_path,
+        compare_emitted_output_sections, comparison_frontier, compile_case, compile_case_matrix,
+        compile_case_matrix_with_checker, diagnostic_variant_key, error_baseline_unit_order,
+        expand_option_matrix, first_different_line, fixture_compiler_options, matrix_axes,
+        parse_baseline_sections, parse_error_baseline_header, render_error_baseline,
+        retain_fatal_variant, run_case_against_baseline, run_upstream_baselines,
+        select_variant_baselines, virtual_unit_path,
     };
+
+    #[test]
+    fn capability_registry_covers_every_typed_checker_code() {
+        let metadata = capability_registry_metadata().unwrap();
+        assert_eq!(metadata.version, 1);
+        assert_eq!(metadata.digest.len(), 32);
+        assert!(
+            TYPED_CHECKER_CAPABILITY_CODES
+                .iter()
+                .all(|code| capability_registry_contains(code))
+        );
+        assert!(
+            TYPED_CHECKER_CAPABILITY_CODES
+                .iter()
+                .all(|code| !code.starts_with("INV."))
+        );
+    }
+
+    #[test]
+    fn typed_checker_frontier_dominates_empty_exact_artifacts() {
+        let comparison = DiagnosticArtifactComparison::default();
+        assert!(comparison.is_exact());
+
+        let (outcome, blocker) = comparison_frontier(
+            DiagnosticVariantStatus::UnsupportedDetail,
+            &comparison,
+            Some((
+                "C00.SOURCE_KIND".to_owned(),
+                "typed checker boundary".to_owned(),
+            )),
+        );
+
+        assert_eq!(outcome, DiagnosticVariantOutcomeClass::CheckerCapability);
+        assert_eq!(
+            blocker.as_ref().and_then(|blocker| blocker.code.as_deref()),
+            Some("C00.SOURCE_KIND")
+        );
+    }
+
+    #[test]
+    fn variant_keys_canonicalize_options_and_bind_expected_content() {
+        let mut es6 = OptionVariant::default();
+        es6.values.insert("target".to_owned(), "ES6".to_owned());
+        let mut es2015 = OptionVariant::default();
+        es2015
+            .values
+            .insert("TARGET".to_owned(), "es2015".to_owned());
+
+        let first = diagnostic_variant_key(
+            "tests/cases/compiler/input.ts",
+            &es6,
+            Some("tests/baselines/reference/compiler/input.errors.txt"),
+            "expected\n",
+        );
+        let alias = diagnostic_variant_key(
+            "tests/cases/compiler/input.ts",
+            &es2015,
+            Some("tests/baselines/reference/compiler/input.errors.txt"),
+            "expected\n",
+        );
+        let changed_oracle = diagnostic_variant_key(
+            "tests/cases/compiler/input.ts",
+            &es2015,
+            Some("tests/baselines/reference/compiler/input.errors.txt"),
+            "changed\n",
+        );
+
+        assert_eq!(first, alias);
+        assert_ne!(first, changed_oracle);
+        assert_eq!(first.len(), 35);
+        assert!(first.starts_with("v1:"));
+    }
+
+    #[test]
+    fn fatal_variant_is_retained_as_an_invariant_outcome() {
+        let mut summary = RunnerSummary {
+            executed_variants: 1,
+            ..RunnerSummary::default()
+        };
+        let mut scorecard = DiagnosticScorecard {
+            schema_version: 5,
+            provenance: DiagnosticScorecardProvenance {
+                upstream: ScorecardRepositoryRevision {
+                    sha: None,
+                    dirty: None,
+                },
+                rust: ScorecardRepositoryRevision {
+                    sha: None,
+                    dirty: None,
+                },
+                manifest_digest: "0".repeat(32),
+                digest_algorithm: "xxh3-128".to_owned(),
+                invocation: Vec::new(),
+                capability_registry: ScorecardCapabilityRegistry {
+                    version: 1,
+                    digest: "0".repeat(32),
+                },
+            },
+            checker_mode: DiagnosticCheckerMode::Canonical,
+            comparison_scope: DiagnosticComparisonScope::FullArtifact,
+            full_artifact_comparison: true,
+            summary: DiagnosticScorecardSummary::default(),
+            variants: Vec::new(),
+        };
+        let variant = OptionVariant::default();
+        let mut writer = Vec::new();
+
+        retain_fatal_variant(
+            &mut summary,
+            &mut scorecard,
+            &mut writer,
+            FatalVariantRecord {
+                case_path: Path::new("repo/input.ts"),
+                repository: Path::new("repo"),
+                variant: &variant,
+                axes: &[],
+                variant_key: "v1:00000000000000000000000000000000".to_owned(),
+                scorecard_case: "input.ts".to_owned(),
+                expected_baseline: None,
+                expected: "",
+                invariant_code: "INV.PROGRAM.DIAGNOSTIC_FORMAT",
+                detail: "typed fatal detail".to_owned(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(summary.executed_variants, 1);
+        assert_eq!(summary.mismatched, 1);
+        assert_eq!(summary.diagnostic_failures, 1);
+        assert!(!summary.is_success());
+        assert_eq!(scorecard.summary.executed_variants, 1);
+        assert_eq!(scorecard.summary.fatal_invariants, 1);
+        assert_eq!(scorecard.variants.len(), 1);
+        assert_eq!(
+            scorecard.variants[0].outcome_class,
+            DiagnosticVariantOutcomeClass::FatalInvariant
+        );
+        assert_eq!(
+            scorecard.variants[0]
+                .frontier_blocker
+                .as_ref()
+                .and_then(|blocker| blocker.code.as_deref()),
+            Some("INV.PROGRAM.DIAGNOSTIC_FORMAT")
+        );
+        assert_eq!(
+            String::from_utf8(writer).unwrap(),
+            "FATAL input.ts: INV.PROGRAM.DIAGNOSTIC_FORMAT: typed fatal detail\n"
+        );
+    }
 
     #[test]
     fn parses_single_file_with_pinned_unit_reconstruction() {

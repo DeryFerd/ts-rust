@@ -414,6 +414,7 @@ dependencies = [
  "ts_parser",
  "ts_path",
  "ts_vfs",
+ "xxhash-rust",
 ]
 
 [[package]]

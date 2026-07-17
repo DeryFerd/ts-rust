@@ -171,10 +171,11 @@ trailing parameter list being treated as a fatal callable invariant; that
 boundary is fixed in `adb9089`. The restarted run advanced farther, through
 the alphabetic `export*` tranche, then aborted at
 `functionExpandoPropertyDeclaration.ts` when arrow checking returned an
-unclassified fatal error. No complete current JSON scorecard exists because
-the runner still stops at the first fatal result. This is direct evidence for
-M0: the scorecard must retain stable frontiers and fatal results rather than
-aborting before it can attribute progress.
+unclassified fatal error. The M0 runner now retains typed capability and fatal
+outcomes per variant, continues the shard, and writes reproducible schema-5
+provenance and stable variant keys. A fresh complete current scorecard remains
+to be produced after integration; the previous abort is the historical reason
+this measurement contract landed before further semantic slices.
 
 The historical first blockers were dominated by:
 
