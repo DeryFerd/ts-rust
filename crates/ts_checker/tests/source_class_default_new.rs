@@ -397,11 +397,6 @@ fn unsupported_new_forms_stop_at_typed_boundaries() {
     for source in [
         "abstract class Model { value!: string; } const model = new Model();",
         "class Model { constructor() {} value!: string; } const model = new Model();",
-        concat!(
-            "class Base { base!: string; } ",
-            "class Model extends Base { value!: string; } ",
-            "const model = new Model();",
-        ),
     ] {
         let parsed = parse_source_file(source);
         assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
@@ -418,6 +413,25 @@ fn unsupported_new_forms_stop_at_typed_boundaries() {
         );
         assert!(context.diagnostics().is_empty());
     }
+
+    let source = concat!(
+        "class Base { base!: string; } ",
+        "class Model extends Base { value!: string; } ",
+        "const model = new Model();",
+    );
+    let parsed = parse_source_file(source);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(1_804);
+    let construction = first_new_expression(&parsed, file);
+    let constructor = constructor(&parsed, construction);
+    let mut context = checker_context(&parsed, file);
+    assert_eq!(
+        context.check_source_file(file),
+        Err(SourceCheckError::Unsupported(UnsupportedSourceSyntax::New(
+            constructor
+        )))
+    );
+    assert!(context.diagnostics().is_empty());
 
     let source = "class Model { value!: string; } const model = new Model?.();";
     let parsed = parse_source_file(source);

@@ -11,9 +11,10 @@
 //! retained readonly state, final instance/static structured caches, and the
 //! mandatory default construct signature. The public query additionally
 //! admits one direct local nongeneric base whose own completed graph is in the
-//! same exact property-only family. Methods, executable bodies, general
-//! heritage, non-primitive annotations, and class diagnostics remain later
-//! class stages.
+//! same exact property-only family; the whole-source adapter consumes that
+//! graph only after seeing the exact direct base plan earlier in source.
+//! Methods, executable bodies, general heritage, non-primitive annotations,
+//! and class diagnostics remain later class stages.
 
 use std::collections::HashSet;
 
@@ -155,7 +156,7 @@ impl ClassDeclarationPlan {
     }
 }
 
-/// Exact direct-identifier edge retained by the public class query.
+/// Exact direct-identifier edge retained by the class query and source plan.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct DirectClassBasePlan {
     clause: NodeRef,
@@ -1017,6 +1018,42 @@ pub(super) enum ClassMemberQueryPlan {
     },
 }
 
+impl ClassMemberQueryPlan {
+    pub(super) const fn declaration(&self) -> NodeRef {
+        match self {
+            Self::Direct(plan) | Self::Derived { class: plan, .. } => plan.declaration(),
+        }
+    }
+
+    pub(super) const fn symbol(&self) -> SemanticSymbolId {
+        match self {
+            Self::Direct(plan) | Self::Derived { class: plan, .. } => plan.symbol(),
+        }
+    }
+
+    pub(super) fn instance_properties_are_initialization_safe(&self) -> bool {
+        match self {
+            Self::Direct(plan) | Self::Derived { class: plan, .. } => {
+                plan.instance_properties_are_initialization_safe()
+            }
+        }
+    }
+
+    pub(super) const fn direct_plan(&self) -> Option<&ClassMemberPlan> {
+        match self {
+            Self::Direct(plan) => Some(plan),
+            Self::Derived { .. } => None,
+        }
+    }
+
+    pub(super) const fn base_plan(&self) -> Option<&ClassMemberPlan> {
+        match self {
+            Self::Direct(_) => None,
+            Self::Derived { base, .. } => Some(base),
+        }
+    }
+}
+
 fn primitive_keyword_type(
     store: &CanonicalTypeMapperStore,
     node: NodeRef,
@@ -1165,9 +1202,8 @@ pub(super) fn plan_nongeneric_class_members(
 
 /// Plans either the existing no-base class cut or one exact direct local base.
 ///
-/// Source checking deliberately continues to call
-/// [`plan_nongeneric_class_members`] and therefore cannot admit heritage
-/// through this public-query-only expansion.
+/// Both the public query and whole-source adapter retain this exact aggregate
+/// plan so the base dependency is proven before either class can publish.
 pub(super) fn plan_nongeneric_class_member_query(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -2523,7 +2559,7 @@ fn execute_direct_derived_class_members(
     .ok_or_else(|| invariant(ClassInvariant::Publication(plan.class.declaration)))
 }
 
-/// Executes the public member-query domain without widening source checking.
+/// Executes the shared public-query and whole-source member domain.
 pub(super) fn execute_nongeneric_class_member_query(
     store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -2547,6 +2583,29 @@ pub(super) fn execute_nongeneric_class_member_query(
         ClassMemberQueryPlan::Direct(plan) => execute_nongeneric_class_members(store, host, plan),
         ClassMemberQueryPlan::Derived { class, base } => {
             execute_direct_derived_class_members(store, host, class, base)
+        }
+    }
+}
+
+/// Revalidates one exact direct-base or no-base class member query without
+/// publishing either class identity or any inherited member surface.
+pub(super) fn preflight_nongeneric_class_member_query(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    plan: &ClassMemberQueryPlan,
+) -> Result<(), ClassError> {
+    let current = plan_nongeneric_class_member_query(store, host, plan.symbol())?;
+    if current != *plan {
+        return Err(invariant(ClassInvariant::InvalidPlan(plan.declaration())));
+    }
+    match plan {
+        ClassMemberQueryPlan::Direct(plan) => {
+            validated_nongeneric_class_member_state(store, host, plan).map(drop)
+        }
+        ClassMemberQueryPlan::Derived { class, base } => {
+            let surfaces = prepare_derived_member_surfaces(store, class, base)?;
+            let base_state = validated_nongeneric_class_member_state(store, host, base)?;
+            derived_class_member_state(store, class, base_state.as_ref(), &surfaces).map(drop)
         }
     }
 }

@@ -1,8 +1,10 @@
 //! Atomic canonical checking for the first source-statement slice.
 //!
 //! This module deliberately supports only unmodified type aliases and simple
-//! interfaces, top-level nongeneric classes with primitive annotated fields,
-//! exact zero-argument construction of one preceding admitted local class,
+//! interfaces, top-level nongeneric classes with primitive annotated fields
+//! and at most one exact direct preceding local nongeneric base,
+//! exact zero-argument construction of one preceding admitted no-base local
+//! class,
 //! top-level literal enums, empty external-module markers, exact
 //! named ESM reexports,
 //! leading direct named ESM value imports, clause-level type-only named ESM
@@ -50,8 +52,8 @@ use super::{
         StoredSingleCallableValidation, ValidatedSingleCallable, validate_stored_single_callable,
     },
     classes::{
-        ClassMemberPlan, execute_nongeneric_class_members, plan_nongeneric_class_members,
-        preflight_nongeneric_class_members,
+        ClassMemberPlan, ClassMemberQueryPlan, execute_nongeneric_class_member_query,
+        plan_nongeneric_class_member_query, preflight_nongeneric_class_member_query,
     },
     contextual::{
         LiteralTreatment, PreparedExpression, prepare_expression_context_with_global_types,
@@ -855,7 +857,7 @@ struct DeferredAssertion {
 enum PlannedStatement {
     TypeAlias(SemanticSymbolId),
     Interface(SemanticSymbolId),
-    Class(ClassMemberPlan),
+    Class(ClassMemberQueryPlan),
     Enum(SourceEnumPlan),
     ExternalModuleMarker,
     NamedReexport,
@@ -919,6 +921,7 @@ struct SourcePlanner<'arena, 'semantic, 'sources> {
     prior_variables: HashSet<SemanticSymbolId>,
     readable_variables: HashSet<SemanticSymbolId>,
     assignable_ambient_variables: HashSet<SemanticSymbolId>,
+    planned_classes: HashSet<SemanticSymbolId>,
     prior_classes: HashMap<SemanticSymbolId, ClassMemberPlan>,
     assigned_variables: HashSet<SemanticSymbolId>,
     /// Exact roots minted only by assignment and direct-call syntax owners.
@@ -948,6 +951,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             prior_variables: HashSet::new(),
             readable_variables: HashSet::new(),
             assignable_ambient_variables: HashSet::new(),
+            planned_classes: HashSet::new(),
             prior_classes: HashMap::new(),
             assigned_variables: HashSet::new(),
             primitive_binary_position_roots: HashSet::new(),
@@ -981,6 +985,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             prior_variables: HashSet::new(),
             readable_variables: HashSet::new(),
             assignable_ambient_variables: HashSet::new(),
+            planned_classes: HashSet::new(),
             prior_classes: HashMap::new(),
             assigned_variables: HashSet::new(),
             primitive_binary_position_roots: HashSet::new(),
@@ -1302,19 +1307,30 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                             .ok_or(SourceCheckError::Provenance(
                                 SourceCheckProvenanceError::MissingDeclarationSymbol(statement),
                             ))?;
-                    let class = plan_nongeneric_class_members(store, host, symbol)
+                    let class = plan_nongeneric_class_member_query(store, host, symbol)
                         .map_err(|error| Self::class_plan_error(statement, error))?;
+                    if class.base_plan().is_some_and(|base| {
+                        self.prior_classes.get(&base.symbol()) != Some(base)
+                    }) {
+                        return Err(SourceCheckError::Unsupported(
+                            UnsupportedSourceSyntax::Class(statement),
+                        ));
+                    }
                     if !class.instance_properties_are_initialization_safe() {
                         return Err(SourceCheckError::Unsupported(
                             UnsupportedSourceSyntax::Class(statement),
                         ));
                     }
-                    preflight_nongeneric_class_members(store, host, &class)
+                    preflight_nongeneric_class_member_query(store, host, &class)
                         .map_err(|error| Self::class_plan_error(statement, error))?;
-                    if self
-                        .prior_classes
-                        .insert(class.symbol(), class.clone())
-                        .is_some()
+                    if !self.planned_classes.insert(class.symbol()) {
+                        return Err(SourceCheckError::Class(statement));
+                    }
+                    if let Some(direct) = class.direct_plan()
+                        && self
+                            .prior_classes
+                            .insert(class.symbol(), direct.clone())
+                            .is_some()
                     {
                         return Err(SourceCheckError::Class(statement));
                     }
@@ -9681,7 +9697,7 @@ pub(super) fn check_source_file(
             }
             PlannedStatement::Class(class) => {
                 let declaration = class.declaration();
-                execute_nongeneric_class_members(store, host, &class)
+                execute_nongeneric_class_member_query(store, host, &class)
                     .map_err(|error| SourcePlanner::class_plan_error(declaration, error))?;
             }
             PlannedStatement::Enum(enumeration) => {
