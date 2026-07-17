@@ -3,7 +3,9 @@ use ts_binder::{
     CanonicalBinder, CanonicalModuleState, CanonicalSourceFileFacts, CanonicalSourceLanguage,
     EscapedName, SemanticSymbolId,
 };
-use ts_checker::semantic::{CanonicalCheckerContext, CanonicalCheckerOptions, TypeData, TypeId};
+use ts_checker::semantic::{
+    CanonicalCheckerContext, CanonicalCheckerOptions, SourceCheckError, TypeData, TypeId,
+};
 use ts_parser::{ParseResult, parse_source_file};
 
 const SOURCE: &str = concat!(
@@ -13,6 +15,36 @@ const SOURCE: &str = concat!(
     "const bad: Derived = { label: \"x\" };\n",
     "function read(value: Derived): number { return value.id; }\n",
 );
+
+fn checker_context<'arena>(
+    parsed: &'arena ParseResult,
+    file: FileId,
+    path: &str,
+) -> CanonicalCheckerContext<'arena> {
+    let mut binder = CanonicalBinder::new();
+    binder
+        .bind_source_file_with_facts(
+            &parsed.arena,
+            parsed.source_file,
+            file,
+            CanonicalSourceFileFacts::new(
+                EscapedName::source(format!("\"{path}\"")),
+                CanonicalSourceLanguage::TypeScript,
+                false,
+                CanonicalModuleState::Script,
+            ),
+        )
+        .unwrap();
+    binder
+        .bind_typescript_declaration_slice(&parsed.arena, file)
+        .unwrap();
+    CanonicalCheckerContext::new(
+        binder.finish(),
+        [(file, &parsed.arena)].into_iter().collect(),
+        CanonicalCheckerOptions::default(),
+    )
+    .unwrap()
+}
 
 fn interface_symbol(
     parsed: &ParseResult,
@@ -66,29 +98,7 @@ fn direct_interface_heritage_publishes_inherited_properties_for_relations_and_re
     let parsed = parse_source_file(SOURCE);
     assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
     let file = FileId::new(0);
-    let mut binder = CanonicalBinder::new();
-    binder
-        .bind_source_file_with_facts(
-            &parsed.arena,
-            parsed.source_file,
-            file,
-            CanonicalSourceFileFacts::new(
-                EscapedName::source("\"/project/interface-heritage.ts\""),
-                CanonicalSourceLanguage::TypeScript,
-                false,
-                CanonicalModuleState::Script,
-            ),
-        )
-        .unwrap();
-    binder
-        .bind_typescript_declaration_slice(&parsed.arena, file)
-        .unwrap();
-    let mut context = CanonicalCheckerContext::new(
-        binder.finish(),
-        [(file, &parsed.arena)].into_iter().collect(),
-        CanonicalCheckerOptions::default(),
-    )
-    .unwrap();
+    let mut context = checker_context(&parsed, file, "/project/interface-heritage.ts");
     let base_symbol = interface_symbol(&parsed, file, &context, "Base");
     let derived_symbol = interface_symbol(&parsed, file, &context, "Derived");
     let access = read_access(&parsed, file);
@@ -175,4 +185,78 @@ fn direct_interface_heritage_publishes_inherited_properties_for_relations_and_re
         ),
         warm_state
     );
+}
+
+#[test]
+fn unsupported_interface_heritage_shapes_fail_before_semantic_publication() {
+    let cases = [
+        (
+            "multiple-bases",
+            concat!(
+                "interface Left { left: number }\n",
+                "interface Right { right: number }\n",
+                "interface Both extends Left, Right { own: number }\n",
+                "const value: Both = { left: 1, right: 2, own: 3 };\n",
+            ),
+        ),
+        (
+            "cycle",
+            concat!(
+                "interface Left extends Right { left: number }\n",
+                "interface Right extends Left { right: number }\n",
+                "function read(value: Left): number { return value.left; }\n",
+            ),
+        ),
+        (
+            "chain",
+            concat!(
+                "interface Root { root: number }\n",
+                "interface Middle extends Root { middle: number }\n",
+                "interface Leaf extends Middle { leaf: number }\n",
+                "function read(value: Leaf): number { return value.leaf; }\n",
+            ),
+        ),
+        (
+            "collision",
+            concat!(
+                "interface Base { value: number }\n",
+                "interface Derived extends Base { value: number }\n",
+                "function read(value: Derived): number { return value.value; }\n",
+            ),
+        ),
+    ];
+
+    for (index, (name, source)) in cases.into_iter().enumerate() {
+        let parsed = parse_source_file(source);
+        assert!(
+            parsed.diagnostics.is_empty(),
+            "{name}: {:?}",
+            parsed.diagnostics
+        );
+        let file = FileId::new(u32::try_from(index + 10).unwrap());
+        let mut context = checker_context(
+            &parsed,
+            file,
+            &format!("/project/interface-heritage-{name}.ts"),
+        );
+        let before = (
+            context.store().type_len(),
+            context.store().symbol_store().symbol_table_len(),
+        );
+
+        let first = context.check_source_file(file).unwrap_err();
+        assert!(
+            matches!(first, SourceCheckError::Unsupported(_)),
+            "{name}: {first:?}"
+        );
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().symbol_store().symbol_table_len(),
+            ),
+            before,
+            "{name} published semantic identities before rejecting the boundary",
+        );
+        assert_eq!(context.check_source_file(file), Err(first), "{name}");
+    }
 }

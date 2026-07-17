@@ -63,6 +63,12 @@ pub(super) fn plan_direct_interface_heritage(
     {
         return Err(DirectInterfaceHeritageError::Invalid);
     }
+    if clause_data.types.nodes.len() != 1 {
+        return Err(DirectInterfaceHeritageError::Unsupported {
+            node: clause,
+            kind: SyntaxKind::HeritageClause,
+        });
+    }
 
     let mut bases = Vec::with_capacity(clause_data.types.nodes.len());
     let mut seen_nodes = HashSet::with_capacity(clause_data.types.nodes.len());
@@ -157,6 +163,7 @@ pub(super) fn plan_direct_interface_heritage(
             || symbol_record.flags() != SymbolFlags::INTERFACE
             || base_declaration_record.kind != SyntaxKind::InterfaceDeclaration
             || base_interface.type_parameters.is_some()
+            || base_interface.heritage_clauses.is_some()
             || !host.symbol_matches(store, *base_declaration, symbol)
             || !seen_symbols.insert(symbol)
         {

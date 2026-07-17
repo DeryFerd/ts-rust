@@ -37,7 +37,10 @@ use super::{
     },
     signatures::Ternary,
     store::SemanticStore,
-    structured_members::{InterfaceHeritageMembersValidation, validate_interface_heritage_members},
+    structured_members::{
+        InterfaceHeritageMembersValidation, validate_interface_heritage_members,
+        validate_planned_interface_heritage_members,
+    },
     type_records::{CacheHashKey, ConstrainedTypeData, TypeCacheState, TypeData, TypeRecord},
     types::{ObjectFlags, TypeFlags},
 };
@@ -3267,9 +3270,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     let plan = super::object_members::plan_interface(self, host, owner)
                         .map_err(|_| RelationUnavailable::InvalidStructuredMembers(type_id))?;
                     if plan.heritage.is_some() {
-                        if validate_interface_heritage_members(self, type_id)
-                            != InterfaceHeritageMembersValidation::Valid
-                        {
+                        if !validate_planned_interface_heritage_members(self, &plan, type_id) {
                             return Err(RelationUnavailable::InvalidStructuredMembers(type_id));
                         }
                     } else {

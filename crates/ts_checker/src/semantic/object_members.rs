@@ -800,6 +800,25 @@ pub(super) fn plan_interface(
     )?;
     plan.heritage = heritage;
     if let Some(heritage) = plan.heritage.as_ref() {
+        let [base] = heritage.bases.as_slice() else {
+            return Err(PropertyObjectError::UnsupportedMember {
+                node: heritage.clause,
+                kind: SyntaxKind::HeritageClause,
+            });
+        };
+        let base_plan = plan_interface(store, host, base.symbol)?;
+        if base_plan.heritage.is_some() {
+            return Err(PropertyObjectError::UnsupportedMember {
+                node: base.node,
+                kind: SyntaxKind::ExpressionWithTypeArguments,
+            });
+        }
+        if let Some(call) = base_plan.call_signatures.first() {
+            return Err(PropertyObjectError::UnsupportedMember {
+                node: call.declaration,
+                kind: SyntaxKind::CallSignature,
+            });
+        }
         if let Some(call) = plan.call_signatures.first() {
             return Err(PropertyObjectError::UnsupportedMember {
                 node: call.declaration,
@@ -810,6 +829,19 @@ pub(super) fn plan_interface(
             return Err(PropertyObjectError::UnsupportedMember {
                 node: heritage.clause,
                 kind: SyntaxKind::HeritageClause,
+            });
+        }
+        if let Some(property) = plan.properties.iter().find(|property| {
+            base_plan
+                .properties
+                .iter()
+                .any(|base_property| base_property.name == property.name)
+        }) {
+            return Err(PropertyObjectError::UnsupportedMember {
+                node: property.declaration,
+                kind: store
+                    .source_node_kind(property.declaration)
+                    .unwrap_or(SyntaxKind::PropertySignature),
             });
         }
     }
@@ -1844,6 +1876,7 @@ pub(super) fn prepare_direct_interface_declared_properties(
         return Err(invalid_cache(plan, type_));
     }
     if record.object_flags() == ObjectFlags::INTERFACE
+        && !interface.base_types_resolved
         && valid_unresolved_interface_members(interface)
         && unresolved_property_links(store, plan)
     {
