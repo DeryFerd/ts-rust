@@ -1,7 +1,8 @@
 //! Atomic canonical checking for the first source-statement slice.
 //!
 //! This module deliberately supports only unmodified type aliases and simple
-//! interfaces, top-level literal enums, empty external-module markers,
+//! interfaces, top-level literal enums, empty external-module markers, exact
+//! named ESM reexports,
 //! leading direct named ESM value imports, clause-level type-only named ESM
 //! imports in exact direct or union/parenthesized/array top-level variable
 //! annotations,
@@ -98,11 +99,12 @@ use super::{
     source_imports::{
         PlannedSourceImportRead, PreparedSourceImportPublication, PreparedSourceImportValue,
         ResolvedSourceImportBinding, ResolvedSourceTypeImportBinding, SourceImportBindingPlan,
-        SourceImportError, SourceImportPlan, SourceImportUnsupported,
+        SourceImportError, SourceImportPlan, SourceImportUnsupported, SourceNamedReexportPlan,
         plan_source_import_identifier_read, plan_source_type_import_reference,
-        plan_top_level_named_type_import, plan_top_level_named_value_import,
-        preflight_prepared_source_import_publications, prepare_source_import_value,
-        reject_source_type_import_value_use, resolve_source_import_binding,
+        plan_top_level_named_reexport, plan_top_level_named_type_import,
+        plan_top_level_named_value_import, preflight_prepared_source_import_publications,
+        prepare_source_import_value, reject_source_type_import_value_use,
+        resolve_source_import_binding, resolve_source_named_reexport_binding,
         resolve_source_type_import_binding,
     },
     source_properties::{
@@ -770,6 +772,7 @@ enum PlannedStatement {
     Interface(SemanticSymbolId),
     Enum(SourceEnumPlan),
     ExternalModuleMarker,
+    NamedReexport,
     Function(usize),
     Arrow(usize),
     ContextualArrow(usize),
@@ -782,6 +785,7 @@ struct SourceCheckPlan {
     statements: Vec<PlannedStatement>,
     value_imports: Vec<SourceImportPlan>,
     type_imports: Vec<SourceImportPlan>,
+    named_reexports: Vec<SourceNamedReexportPlan>,
     import_reads: Vec<PlannedSourceImportRead>,
     type_import_references: Vec<PlannedSourceTypeImportReference>,
     type_import_value_uses: Vec<PlannedSourceTypeImportValueUse>,
@@ -985,6 +989,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         }
 
         let mut statements = Vec::with_capacity(source_statements.len());
+        let mut named_reexports = Vec::new();
         let mut functions = Vec::with_capacity(preplanned_functions.len());
         let mut arrows = Vec::new();
         let mut contextual_arrows = Vec::new();
@@ -1107,8 +1112,29 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                             },
                         ));
                     }
-                    self.plan_external_module_marker(statement)?;
-                    statements.push(PlannedStatement::ExternalModuleMarker);
+                    let NodeData::ExportDeclaration(export) = &self.node(statement)?.data else {
+                        return Err(SourceCheckError::Provenance(
+                            SourceCheckProvenanceError::MismatchedNodeData {
+                                node: statement,
+                                kind: SyntaxKind::ExportDeclaration,
+                            },
+                        ));
+                    };
+                    if export.module_specifier.is_some() {
+                        let Some((store, _)) = self.semantic else {
+                            return Err(SourceCheckError::Unsupported(
+                                UnsupportedSourceSyntax::Import(statement),
+                            ));
+                        };
+                        let reexport =
+                            plan_top_level_named_reexport(self.arena, self.bound, store, statement)
+                                .map_err(|error| Self::import_plan_error(statement, &error))?;
+                        named_reexports.push(reexport);
+                        statements.push(PlannedStatement::NamedReexport);
+                    } else {
+                        self.plan_external_module_marker(statement)?;
+                        statements.push(PlannedStatement::ExternalModuleMarker);
+                    }
                 }
                 SyntaxKind::FunctionDeclaration => {
                     let callable = preplanned_functions.remove(&statement).ok_or(
@@ -1234,6 +1260,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             statements,
             value_imports,
             type_imports,
+            named_reexports,
             import_reads: self.import_reads,
             type_import_references: self.type_import_references,
             type_import_value_uses: self.type_import_value_uses,
@@ -7461,6 +7488,7 @@ pub(super) fn check_source_file(
         statements,
         value_imports,
         type_imports,
+        named_reexports,
         import_reads,
         type_import_references,
         type_import_value_uses,
@@ -7481,6 +7509,21 @@ pub(super) fn check_source_file(
     )
     .finish()?;
     preflight_inferred_function_return_dependencies(&functions)?;
+
+    let mut reexport_aliases = HashSet::new();
+    for reexport in &named_reexports {
+        for binding in &reexport.bindings {
+            if !reexport_aliases.insert(binding.alias_symbol) {
+                return Err(SourceCheckError::Import(binding.declaration));
+            }
+        }
+    }
+    for reexport in &named_reexports {
+        for binding in &reexport.bindings {
+            resolve_source_named_reexport_binding(store, alias_host, binding)
+                .map_err(|error| SourcePlanner::import_plan_error(binding.declaration, &error))?;
+        }
+    }
 
     let mut resolved_imports = HashMap::<SemanticSymbolId, ResolvedSourceImportBinding>::new();
     for import in &value_imports {
@@ -7729,7 +7772,7 @@ pub(super) fn check_source_file(
                     return Err(SourceCheckError::Enum(enumeration.declaration));
                 }
             }
-            PlannedStatement::ExternalModuleMarker => {}
+            PlannedStatement::ExternalModuleMarker | PlannedStatement::NamedReexport => {}
             PlannedStatement::Function(index) => {
                 let function = functions.get(index).ok_or(SourceCheckError::Function(
                     SourceFunctionInvariant::InvalidStatementIndex(index),
