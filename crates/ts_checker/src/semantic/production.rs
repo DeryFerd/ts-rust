@@ -36,6 +36,7 @@ use super::{
         ProductionAliasSourceRegistry, ProductionAliasTargetHost, ProductionAliasTargetHostError,
     },
     global_types::initialize_global_library_types,
+    instantiate::{InstantiationLimits, InstantiationSession},
     module_resolution::validate_module_resolution_manifest,
     name_resolution::{ProductionNameResolverHost, ProductionNameResolverHostError},
     source,
@@ -166,6 +167,7 @@ pub struct CanonicalCheckerContext<'arena> {
     file_order: Vec<FileId>,
     files: ProductionAliasSourceRegistry<'arena>,
     store: CanonicalTypeMapperStore,
+    instantiation_session: InstantiationSession,
     globals: SymbolTableId,
     global_types: CanonicalGlobalTypes,
     module_resolutions: CanonicalModuleResolutionManifest,
@@ -367,12 +369,23 @@ impl<'arena> CanonicalCheckerContext<'arena> {
             options.name_resolution,
         )
         .map_err(CanonicalCheckerContextError::GlobalInitialization)?;
+        let error_type = store
+            .intrinsic_bootstrap()
+            .expect("successful checker bootstrap remains installed")
+            .error_type;
+        let instantiation_session = InstantiationSession::new_recovering(
+            &store,
+            InstantiationLimits::default(),
+            error_type,
+        )
+        .expect("the bootstrap error type is a valid recovery identity");
 
         Ok(Self {
             options,
             file_order,
             files,
             store,
+            instantiation_session,
             globals: initialized.globals,
             global_types: initialized.global_types,
             module_resolutions,
@@ -635,20 +648,23 @@ impl<'arena> CanonicalCheckerContext<'arena> {
             options,
             files,
             store,
+            instantiation_session,
             diagnostics,
             global_types,
             ..
         } = self;
+        instantiation_session.reset_query();
         let host = DeclaredTypeHost::from_registry(
             store,
             files,
             GlobalMergeCompletion::new(options.name_resolution),
         )?;
-        CanonicalTypeQuery::new_with_global_types(
+        CanonicalTypeQuery::new_with_global_types_and_session(
             store,
             &host,
             global_types,
             *options,
+            instantiation_session,
             diagnostics,
         )?
         .get_declared_type_of_symbol(symbol)
@@ -669,20 +685,23 @@ impl<'arena> CanonicalCheckerContext<'arena> {
             options,
             files,
             store,
+            instantiation_session,
             diagnostics,
             global_types,
             ..
         } = self;
+        instantiation_session.reset_query();
         let host = DeclaredTypeHost::from_registry(
             store,
             files,
             GlobalMergeCompletion::new(options.name_resolution),
         )?;
-        CanonicalTypeQuery::new_with_global_types(
+        CanonicalTypeQuery::new_with_global_types_and_session(
             store,
             &host,
             global_types,
             *options,
+            instantiation_session,
             diagnostics,
         )?
         .get_enum_semantics(symbol)
@@ -699,20 +718,23 @@ impl<'arena> CanonicalCheckerContext<'arena> {
             options,
             files,
             store,
+            instantiation_session,
             diagnostics,
             global_types,
             ..
         } = self;
+        instantiation_session.reset_query();
         let host = DeclaredTypeHost::from_registry(
             store,
             files,
             GlobalMergeCompletion::new(options.name_resolution),
         )?;
-        CanonicalTypeQuery::new_with_global_types(
+        CanonicalTypeQuery::new_with_global_types_and_session(
             store,
             &host,
             global_types,
             *options,
+            instantiation_session,
             diagnostics,
         )?
         .get_type_from_type_node(node)
@@ -733,20 +755,23 @@ impl<'arena> CanonicalCheckerContext<'arena> {
             options,
             files,
             store,
+            instantiation_session,
             diagnostics,
             global_types,
             ..
         } = self;
+        instantiation_session.reset_query();
         let host = DeclaredTypeHost::from_registry(
             store,
             files,
             GlobalMergeCompletion::new(options.name_resolution),
         )?;
-        CanonicalTypeQuery::new_with_global_types(
+        CanonicalTypeQuery::new_with_global_types_and_session(
             store,
             &host,
             global_types,
             *options,
+            instantiation_session,
             diagnostics,
         )?
         .get_return_type_of_signature(signature)
@@ -771,6 +796,7 @@ impl<'arena> CanonicalCheckerContext<'arena> {
             options,
             files,
             store,
+            instantiation_session,
             diagnostics,
             source_diagnostic_staging,
             global_types,
@@ -804,6 +830,7 @@ impl<'arena> CanonicalCheckerContext<'arena> {
             global_types,
             store,
             *options,
+            instantiation_session,
             &mut staged,
         );
         let owners = match diagnostic_owners(files, source_file, &staged) {

@@ -25,6 +25,7 @@ use super::{
     functions::{
         self, FunctionTypeError, FunctionTypePlan, PendingFunctionTypeProof, PendingParameterTypes,
     },
+    generic_calls::demand_generic_call_signature_return_with_session,
     global_types::{
         create_type_from_generic_global_type, preflight_generic_global_type_target,
         validate_generic_global_type_instantiation,
@@ -33,6 +34,7 @@ use super::{
         ConcreteIndexedAccessError, ConcreteIndexedAccessPlan, finish_concrete_indexed_access,
         plan_concrete_indexed_access,
     },
+    instantiate::{InstantiationLimits, InstantiationSession},
     object_members::{self, PropertyObjectError, PropertyObjectPlan, PropertyObjectState},
     signatures::{ElementFlags, Signature},
     source_callables::{
@@ -3983,6 +3985,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
 
 pub(super) struct CanonicalTypeQuery<'store, 'host, 'arena, 'diagnostics> {
     store: &'store mut CanonicalTypeMapperStore,
+    instantiation_session: Option<&'store mut InstantiationSession>,
     host: &'host DeclaredTypeHost<'arena>,
     array_type: Option<TypeId>,
     global_types: Option<CanonicalGlobalTypes>,
@@ -4020,6 +4023,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         }
         Ok(Self {
             store,
+            instantiation_session: None,
             host,
             array_type: None,
             global_types: None,
@@ -4045,6 +4049,23 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         let mut query = Self::new(store, host, options, diagnostics)?;
         query.array_type = Some(array_type);
         query.global_types = Some(global_types.clone());
+        Ok(query)
+    }
+
+    /// Opens a production query with context-owned instantiation accounting.
+    /// The session spans every lazy mapper demand caused by this query; the
+    /// caller owns resetting it at the source-element or public-query boundary.
+    pub(super) fn new_with_global_types_and_session(
+        store: &'store mut CanonicalTypeMapperStore,
+        host: &'host DeclaredTypeHost<'arena>,
+        global_types: &CanonicalGlobalTypes,
+        options: impl Into<CanonicalTypeQueryOptions>,
+        instantiation_session: &'store mut InstantiationSession,
+        diagnostics: &'diagnostics mut CanonicalCheckerDiagnostics,
+    ) -> Result<Self, DeclaredTypeError> {
+        let mut query =
+            Self::new_with_global_types(store, host, global_types, options, diagnostics)?;
+        query.instantiation_session = Some(instantiation_session);
         Ok(query)
     }
 
@@ -4574,6 +4595,52 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             return Err(type_node_unavailable(
                 TypeNodeUnavailable::InvalidFunctionSignature(signature),
             ));
+        }
+        let instantiation = self
+            .store
+            .signature(signature)
+            .map(|record| (record.target(), record.mapper()))
+            .ok_or_else(|| {
+                type_node_unavailable(TypeNodeUnavailable::InvalidFunctionSignature(signature))
+            })?;
+        match instantiation {
+            (Some(target), Some(_)) => {
+                if target == signature {
+                    return Err(type_node_unavailable(
+                        TypeNodeUnavailable::InvalidFunctionSignature(signature),
+                    ));
+                }
+                self.get_return_type_of_signature(target)?;
+                let array_targets = self
+                    .global_types
+                    .as_ref()
+                    .map(CanonicalArrayTargets::from_global_types);
+                let result = if let Some(session) = self.instantiation_session.as_deref_mut() {
+                    demand_generic_call_signature_return_with_session(
+                        self.store,
+                        array_targets,
+                        signature,
+                        session,
+                    )
+                } else {
+                    let mut session = InstantiationSession::new(InstantiationLimits::default());
+                    demand_generic_call_signature_return_with_session(
+                        self.store,
+                        array_targets,
+                        signature,
+                        &mut session,
+                    )
+                };
+                return result.map_err(|_| {
+                    type_node_unavailable(TypeNodeUnavailable::InvalidFunctionSignature(signature))
+                });
+            }
+            (None, None) => {}
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidFunctionSignature(signature),
+                ));
+            }
         }
         let declaration = self
             .store

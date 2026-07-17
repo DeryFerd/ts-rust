@@ -26,11 +26,15 @@ use super::{
     generic_calls::{
         GenericCallVectorApplicability, GenericCallVectorError, GenericCallVectorRequest,
         GenericCallVectorResolution, GenericCallVectorUnsupported, IdentityGenericCallError,
-        IdentityGenericCallRequest, IdentityGenericCallUnsupported,
-        materialize_generic_call_vector_source, resolve_generic_call_vector,
-        resolve_source_identity_generic_call, source_declared_inference_candidate_is_exported,
+        IdentityGenericCallRequest, IdentityGenericCallResolution, IdentityGenericCallUnsupported,
+        demand_generic_call_vector_return_with_session,
+        demand_identity_generic_call_return_with_session, materialize_generic_call_vector_source,
+        resolve_generic_call_vector_with_session,
+        resolve_source_identity_generic_call_with_session,
+        source_declared_inference_candidate_is_exported,
     },
     inference::{NakedTypeCandidateError, NakedTypeInferenceError},
+    instantiate::InstantiationSession,
     source::{
         PlannedExpression, PlannedExpressionKind, SourceCheckError, UnsupportedSourceSyntax,
         logical_binary_operator_text, merge_retry_diagnostic, merge_retry_diagnostics,
@@ -770,6 +774,7 @@ struct ResolvedLegacySourceCall {
 enum ResolvedSourceCall {
     Legacy(ResolvedLegacySourceCall),
     Vector(GenericCallVectorResolution),
+    Identity(IdentityGenericCallResolution),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -793,6 +798,8 @@ fn resolve_source_call_once(
     host: &DeclaredTypeHost<'_>,
     global_types: &CanonicalGlobalTypes,
     options: CanonicalCheckerOptions,
+    existing_call_signature: Option<SignatureId>,
+    session: &mut InstantiationSession,
     request: SourceCallResolutionRequest<'_>,
 ) -> Result<ResolvedSourceCall, SourceCallResolutionError> {
     let SourceCallResolutionRequest {
@@ -866,11 +873,13 @@ fn resolve_source_call_once(
         callee: callee_type,
         arguments: argument_types,
     };
-    match resolve_generic_call_vector(
+    match resolve_generic_call_vector_with_session(
         store,
         global_types,
         options.strict_function_types,
         vector_request,
+        existing_call_signature,
+        session,
     ) {
         Ok(resolution) => return Ok(ResolvedSourceCall::Vector(resolution)),
         Err(
@@ -912,21 +921,16 @@ fn resolve_source_call_once(
         callee: callee_type,
         arguments: argument_types,
     };
-    match resolve_source_identity_generic_call(
+    match resolve_source_identity_generic_call_with_session(
         store,
         host,
         global_types,
         options.strict_function_types,
         request,
+        existing_call_signature,
+        session,
     ) {
-        Ok(resolution) => Ok(ResolvedSourceCall::Legacy(ResolvedLegacySourceCall {
-            signature: resolution.projection.signature,
-            return_type: resolution.projection.return_type,
-            minimum_argument_count: 1,
-            maximum_argument_count: 1,
-            has_effective_rest: false,
-            applicability: resolution.applicability,
-        })),
+        Ok(resolution) => Ok(ResolvedSourceCall::Identity(resolution)),
         Err(
             IdentityGenericCallError::Unsupported(
                 IdentityGenericCallUnsupported::UnresolvedReturnType(signature),
@@ -938,9 +942,11 @@ fn resolve_source_call_once(
         Err(IdentityGenericCallError::Relation(error)) => {
             Err(SourceCallResolutionError::Relation(error))
         }
-        Err(IdentityGenericCallError::Unsupported(_) | IdentityGenericCallError::Inference(_)) => {
-            Err(SourceCallResolutionError::Unsupported)
-        }
+        Err(
+            IdentityGenericCallError::Unsupported(_)
+            | IdentityGenericCallError::Inference(_)
+            | IdentityGenericCallError::Instantiation(_),
+        ) => Err(SourceCallResolutionError::Unsupported),
         Err(IdentityGenericCallError::Invariant(_)) => Err(SourceCallResolutionError::Invariant),
     }
 }
@@ -970,6 +976,7 @@ fn resolve_explicit_source_type_arguments(
     host: &DeclaredTypeHost<'_>,
     global_types: &CanonicalGlobalTypes,
     options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
     diagnostics: &mut CanonicalCheckerDiagnostics,
     type_arguments: Option<&[NodeRef]>,
 ) -> Result<Option<Vec<TypeId>>, SourceCheckError> {
@@ -981,11 +988,12 @@ fn resolve_explicit_source_type_arguments(
     }
     let mut type_argument_diagnostics = CanonicalCheckerDiagnostics::default();
     let result = (|| {
-        let mut query = CanonicalTypeQuery::new_with_global_types(
+        let mut query = CanonicalTypeQuery::new_with_global_types_and_session(
             store,
             host,
             global_types,
             options,
+            session,
             &mut type_argument_diagnostics,
         )?;
         type_arguments
@@ -1241,6 +1249,10 @@ fn prepare_vector_source_call_diagnostic(
     resolution: &GenericCallVectorResolution,
 ) -> Result<Option<CanonicalCheckerDiagnostic>, SourceCheckError> {
     let projection = resolution.projection();
+    let parameter_count = store
+        .signature(projection.generic_signature)
+        .map(|signature| signature.parameters().len())
+        .ok_or(SourceCheckError::Call(plan.node))?;
     let diagnostic = match resolution.applicability() {
         GenericCallVectorApplicability::Applicable => return Ok(None),
         GenericCallVectorApplicability::TypeArgumentArity {
@@ -1275,7 +1287,7 @@ fn prepare_vector_source_call_diagnostic(
             }
         }
         GenericCallVectorApplicability::TooFewArguments { expected, actual } => {
-            if expected != projection.instantiation.parameter_types.len()
+            if expected != parameter_count
                 || actual != plan.arguments.len()
                 || actual != argument_types.len()
             {
@@ -1298,7 +1310,7 @@ fn prepare_vector_source_call_diagnostic(
             }
         }
         GenericCallVectorApplicability::TooManyArguments { expected, actual } => {
-            if expected != projection.instantiation.parameter_types.len()
+            if expected != parameter_count
                 || actual != plan.arguments.len()
                 || actual != argument_types.len()
             {
@@ -1406,16 +1418,23 @@ pub(super) fn check_direct_source_call(
     host: &DeclaredTypeHost<'_>,
     global_types: &CanonicalGlobalTypes,
     options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
     diagnostics: &mut CanonicalCheckerDiagnostics,
     plan: &SourceCallPlan,
     callee_type: TypeId,
     argument_types: &[TypeId],
 ) -> Result<CheckedSourceCall, SourceCheckError> {
+    preflight_call_links(store, plan.node)?;
+    let existing_call_signature = store
+        .signature_links(plan.node)
+        .and_then(|links| links.resolved_signature.signature());
+    let limit_mark = session.limit_event_mark();
     let explicit_type_arguments = resolve_explicit_source_type_arguments(
         store,
         host,
         global_types,
         options,
+        session,
         diagnostics,
         plan.type_arguments
             .as_ref()
@@ -1428,6 +1447,8 @@ pub(super) fn check_direct_source_call(
             host,
             global_types,
             options,
+            existing_call_signature,
+            session,
             SourceCallResolutionRequest {
                 callee_form: plan.callee_form,
                 callee_type,
@@ -1444,6 +1465,7 @@ pub(super) fn check_direct_source_call(
                     host,
                     global_types,
                     options,
+                    session,
                     diagnostics,
                     signature,
                 )?;
@@ -1482,8 +1504,6 @@ pub(super) fn check_direct_source_call(
             (resolution.signature, resolution.return_type, diagnostic)
         }
         ResolvedSourceCall::Vector(resolution) => {
-            let return_type = resolution.projection().instantiation.return_type;
-            let existing = preflight_call_publication(store, plan.node, return_type)?;
             let diagnostic = prepare_vector_source_call_diagnostic(
                 store,
                 host,
@@ -1495,8 +1515,8 @@ pub(super) fn check_direct_source_call(
                 &resolution,
             )?;
             let materialized =
-                materialize_generic_call_vector_source(store, &resolution, existing).map_err(
-                    |error| match error {
+                materialize_generic_call_vector_source(store, &resolution, existing_call_signature)
+                    .map_err(|error| match error {
                         GenericCallVectorError::Relation(error)
                         | GenericCallVectorError::Inference(NakedTypeCandidateError::Relation(
                             error,
@@ -1507,14 +1527,79 @@ pub(super) fn check_direct_source_call(
                         | GenericCallVectorError::Instantiation(_) => {
                             SourceCheckError::Call(plan.node)
                         }
-                    },
-                )?;
+                    })?;
+            let return_type =
+                demand_generic_call_vector_return_with_session(store, &resolution, session)
+                    .map_err(|error| match error {
+                        GenericCallVectorError::Relation(error)
+                        | GenericCallVectorError::Inference(NakedTypeCandidateError::Relation(
+                            error,
+                        )) => SourceCheckError::from(error),
+                        GenericCallVectorError::Unsupported(_)
+                        | GenericCallVectorError::Invariant(_)
+                        | GenericCallVectorError::Inference(_)
+                        | GenericCallVectorError::Instantiation(_) => {
+                            SourceCheckError::Call(plan.node)
+                        }
+                    })?;
+            if preflight_call_publication(store, plan.node, return_type)? != existing_call_signature
+            {
+                return Err(SourceCheckError::Call(plan.node));
+            }
             (materialized.call_signature, return_type, diagnostic)
+        }
+        ResolvedSourceCall::Identity(resolution) => {
+            let return_type =
+                demand_identity_generic_call_return_with_session(store, &resolution, session)
+                    .map_err(|error| match error {
+                        IdentityGenericCallError::Relation(error) => SourceCheckError::from(error),
+                        IdentityGenericCallError::Unsupported(_)
+                        | IdentityGenericCallError::Invariant(_)
+                        | IdentityGenericCallError::Inference(_)
+                        | IdentityGenericCallError::Instantiation(_) => {
+                            SourceCheckError::Call(plan.node)
+                        }
+                    })?;
+            if preflight_call_publication(store, plan.node, return_type)? != existing_call_signature
+            {
+                return Err(SourceCheckError::Call(plan.node));
+            }
+            let legacy = ResolvedLegacySourceCall {
+                signature: resolution.projection.signature,
+                return_type,
+                minimum_argument_count: 1,
+                maximum_argument_count: 1,
+                has_effective_rest: false,
+                applicability: resolution.applicability,
+            };
+            let diagnostic = prepare_legacy_source_call_diagnostic(
+                store,
+                host,
+                global_types,
+                options,
+                plan,
+                argument_types,
+                legacy,
+            )?;
+            (resolution.projection.signature, return_type, diagnostic)
         }
     };
     publish_call_links(store, plan.node, signature, return_type)?;
     if let Some(diagnostic) = diagnostic {
         merge_retry_diagnostic(diagnostics, diagnostic);
+    }
+    if session.limit_event_occurred_since(limit_mark) {
+        merge_retry_diagnostic(
+            diagnostics,
+            CanonicalCheckerDiagnostic {
+                node: Some(plan.node),
+                range_override: None,
+                diagnostic: Diagnostic::new(
+                    message_by_code(2589).ok_or(SourceCheckError::MissingDiagnostic(2589))?,
+                ),
+                related_information: Vec::new(),
+            },
+        );
     }
     Ok(CheckedSourceCall { return_type })
 }
@@ -1525,15 +1610,17 @@ fn resolve_signature_return(
     host: &DeclaredTypeHost<'_>,
     global_types: &CanonicalGlobalTypes,
     options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
     diagnostics: &mut CanonicalCheckerDiagnostics,
     signature: super::SignatureId,
 ) -> Result<(), SourceCheckError> {
     let mut resolution_diagnostics = CanonicalCheckerDiagnostics::default();
-    let result = CanonicalTypeQuery::new_with_global_types(
+    let result = CanonicalTypeQuery::new_with_global_types_and_session(
         store,
         host,
         global_types,
         options,
+        session,
         &mut resolution_diagnostics,
     )?
     .get_return_type_of_signature(signature);
