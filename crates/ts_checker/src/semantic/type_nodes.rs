@@ -987,8 +987,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             SyntaxKind::ArrayType if union_constituent && self.array_targets.is_none() => Err(
                 type_node_unavailable(TypeNodeUnavailable::UnsupportedUnionConstituent(node)),
             ),
-            SyntaxKind::TypeLiteral
-            | SyntaxKind::IndexedAccessType
+            SyntaxKind::IndexedAccessType
             | SyntaxKind::TupleType
             | SyntaxKind::TypeOperator
                 if union_constituent =>
@@ -9004,34 +9003,65 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_union_closures_and_capacity_fail_atomically_and_retry() {
-        let mut unsupported = fixture("type Obj = { value: number }; type Bad = 1 | Obj;");
-        let bad = named_symbol(&unsupported, SyntaxKind::TypeAliasDeclaration, "Bad");
-        let before = union_state(&unsupported.store);
-        for _ in 0..2 {
-            let mut diagnostics = CanonicalCheckerDiagnostics::default();
-            assert!(matches!(
+    fn property_object_union_closures_replay_and_other_failures_remain_atomic() {
+        let mut objects = fixture(concat!(
+            "type Obj = { value: number }; type Named = 1 | Obj; ",
+            "type Direct = 1 | { other: string };",
+        ));
+        let object = named_symbol(&objects, SyntaxKind::TypeAliasDeclaration, "Obj");
+        let named = named_symbol(&objects, SyntaxKind::TypeAliasDeclaration, "Named");
+        let direct = named_symbol(&objects, SyntaxKind::TypeAliasDeclaration, "Direct");
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let named_result = query_declared(
+            &mut objects,
+            named,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        let object_type = objects
+            .store
+            .type_alias_links(object)
+            .and_then(|links| links.declared_type)
+            .unwrap();
+        assert!(union_types(&objects.store, named_result).contains(&object_type));
+        assert_eq!(objects.store.validate_union_constituent(object_type), Ok(()));
+
+        let direct_result = query_declared(
+            &mut objects,
+            direct,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        assert!(union_types(&objects.store, direct_result).iter().any(|type_| {
+            objects
+                .store
+                .type_payload(*type_)
+                .is_some_and(|record| record.flags().intersects(TypeFlags::OBJECT))
+        }));
+        let warm = union_state(&objects.store);
+        for (symbol, expected) in [(named, named_result), (direct, direct_result)] {
+            assert_eq!(
                 query_declared(
-                    &mut unsupported,
-                    bad,
+                    &mut objects,
+                    symbol,
                     CanonicalTypeQueryOptions::default(),
                     &mut diagnostics,
                 ),
-                Err(DeclaredTypeError::TypeNodeUnavailable(
-                    TypeNodeUnavailable::UnsupportedUnionConstituent(_)
-                ))
-            ));
-            assert_eq!(union_state(&unsupported.store), before);
-            assert!(diagnostics.is_empty());
+                Ok(expected),
+            );
+            assert_eq!(union_state(&objects.store), warm);
         }
+        assert!(diagnostics.is_empty());
 
         assert_eq!(
-            unsupported
+            objects
                 .store
                 .prepare_type_query_types(&[], &[], &[], usize::MAX, 0),
             Err(LiteralTypeCacheError::Capacity)
         );
-        assert_eq!(union_state(&unsupported.store), before);
+        assert_eq!(union_state(&objects.store), warm);
 
         let mut cached = fixture("class C {} type Seed = never; type Bad = 1 | Seed;");
         let class = named_symbol(&cached, SyntaxKind::ClassDeclaration, "C");

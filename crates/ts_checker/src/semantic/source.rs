@@ -2261,7 +2261,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 {
                     read.value_symbol
                 }
-                _ => return Err(self.unsupported_function_body(callable)),
+                _ => return Err(Self::unsupported_function_body(callable)),
             };
             return Ok(PlannedSourceCondition::Truthiness { expression, symbol });
         };
@@ -2289,7 +2289,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             {
                 read.value_symbol
             }
-            _ => return Err(self.unsupported_function_body(callable)),
+            _ => return Err(Self::unsupported_function_body(callable)),
         };
         let literal = self.plan_expression(typeof_syntax.literal)?;
         if !matches!(
@@ -2302,7 +2302,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         }
 
         let Some((store, _)) = self.semantic else {
-            return Err(self.unsupported_function_body(callable));
+            return Err(Self::unsupported_function_body(callable));
         };
         let bootstrap = store
             .intrinsic_bootstrap()
@@ -2328,7 +2328,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         })))
     }
 
-    fn unsupported_function_body(&self, callable: &SourceCallablePlan) -> SourceCheckError {
+    fn unsupported_function_body(callable: &SourceCallablePlan) -> SourceCheckError {
         SourceCheckError::Unsupported(UnsupportedSourceSyntax::Function(
             SourceFunctionUnsupported::FunctionBody(callable.body),
         ))
