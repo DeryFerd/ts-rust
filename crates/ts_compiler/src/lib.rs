@@ -3134,6 +3134,14 @@ impl Program {
 
         let mut diagnostics = Vec::new();
         for source in &self.source_files {
+            // Keep declaration files bound so their symbols remain available
+            // to importers, but mirror pinned SkipTypeChecking by suppressing
+            // their bind diagnostics together with checker diagnostics.
+            if self.options.skip_lib_check
+                && ts_path::is_declaration_file(&source.file_name)
+            {
+                continue;
+            }
             let bound = binder.file(source.id).ok_or_else(|| {
                 CanonicalProgramCheckError::MissingBoundFile {
                     file_name: source.file_name.clone(),
