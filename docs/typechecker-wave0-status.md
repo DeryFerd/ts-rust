@@ -5,7 +5,7 @@
 - Upstream epoch: `dc37b5249ab60e2bbce936f71b883e6c8136167e`
 - Wave branch baseline: `cdbf749`
 - Integration branch: `july-ultra`
-- Current integrated semantic stack: through `74ea3ca`
+- Current integrated semantic stack: through `693d0be`
 
 This is the live execution record for Wave 0 of
 [`typechecker-completion-goal.md`](typechecker-completion-goal.md). The port
@@ -15,7 +15,7 @@ map remains authoritative for cluster state.
 
 | Lane | Branch/worktree | Current task | State |
 |---|---|---|---|
-| Root/integration | `july-ultra`; repository root | contract adapters, review, serial verification | direct intersections, their compiler classification/gate, and exact singleton ambient functions are integrated through `74ea3ca`; root is the sole Cargo/build and fixed-shard owner |
+| Root/integration | `july-ultra`; repository root | contract adapters, review, serial verification | optional/composite intersections and exact generic ambient functions are integrated through `693d0be`; root is the sole Cargo/build and fixed-shard owner |
 | M0 | `july-ultra`; repository root | deterministic checker scoring | schema-5 provenance, retained fatal outcomes, exact fixed-manifest execution, and selected-case preparation integrated through `174eebf` |
 | S2a | `july-ultra`; repository root | exact single-base interface heritage and relation-cache observation | integrated through `14ae6ce`; two exact-tip reviews found no P0/P1 issue, all five public heritage tests pass, and the fixed shard advances one interface fixture without an exact loss |
 | S2 readonly follow-up | `july-ultra`; repository root | readonly property retention and strict-subtype directionality | integrated through `d4719b3`; two independent reviews found no P0/P1 issue, the public production target passes, focused strict Clippy is green, and the fixed shard is semantically unchanged |
@@ -29,10 +29,11 @@ map remains authoritative for cluster state.
 | W1 S11a heritage | `july-ultra`; repository root | one exact direct local nongeneric base class plus class relations | integrated through `673bd70`; pinned owner/base instance/value provenance, own-first instance/static composition, distinct resolved member tables, derived default construction, exact class relation admission, and warm poison/cache-masking gates pass public tests and independent review |
 | W1 S11b default construction | `july-ultra`; repository root | direct zero-argument `new Model()` | integrated through `67d072d`; source execution consumes the canonical class construct signature, publishes exact constructor/symbol/signature/result links through a whole-plan validate/reserve/ensure phase, and retains arguments, type arguments, missing parentheses, aliases, forward classes, abstract/explicit constructors, heritage, and optional chaining as typed boundaries |
 | W1 A16 | `july-ultra`; repository root | first direct nongeneric intersection kernel, source bridge, relations, and display | integrated through `01f8ea7` with compiler classification/gates in `1bbe265`; ordered identity, flattening/deduplication, required primitive/literal property synthesis, discriminant-never reduction, exact relation ordering, source consumption, display, and cold/warm/poison behavior passed focused gates and independent P0/P1 review |
-| W1 A16 optional/composite follow-up | isolated worker worktree | optional properties and recursive source-owned property-object types | active from `1bbe265`; the worker owns the narrow intersection/type-node closure while root retains Cargo and integration review |
+| W1 A16 optional/composite follow-up | `july-ultra`; repository root | optional properties and recursive source-owned property-object types | integrated through `3b1b713` with compiler coverage in `365da82`; pinned optional/readonly merge rules, recursively validated local composite property objects, optional-discriminant reduction, warm replay, and fail-closed boundaries passed focused gates and independent P0/P1 review |
 | W1 ambient functions | `july-ultra`; repository root | exact singleton nongeneric `declare function` declarations | integrated through `74ea3ca`; script/external-module hoisting, canonical callable/signature identity, optional parameters, TS2345, whole-source atomicity, warm replay, and typed generic/overload/export/`.d.ts` boundaries passed checker/compiler gates and independent P0/P1 review |
-| W1 ambient generic follow-up | isolated worker worktree | exact singleton generic ambient functions | active from `74ea3ca`; reuses the existing generic signature/call machinery while keeping overload families serialized behind it |
-| W1 review/oracle | rotating read-only lanes | pinned behavior, cache timing, and adversarial fixtures | repaired direct intersections and singleton ambient functions are approved with no remaining P0/P1 issue; the next ranked sequence is generic ambient singleton, ambient overload family, then broader source-flow work |
+| W1 ambient generic follow-up | `july-ultra`; repository root | exact singleton generic ambient functions and strict top-level direct call statements | integrated through `693d0be`; generic constraints/defaults, inference/explicit arguments, exact TS2558/TS2344/TS2345 ranges, hoisting, whole-plan atomicity, and warm replay passed focused/adjacent/compiler/strict-Clippy gates and independent P0/P1 review |
+| W1 ambient overload follow-up | isolated worker worktree | exact local nongeneric ambient overload families | active from `693d0be`; the worker owns the ordered multi-signature provider and source bridge while root retains Cargo, compiler integration, and fixed-shard scoring |
+| W1 review/oracle | rotating read-only lanes | pinned behavior, cache timing, and adversarial fixtures | optional intersections and generic ambient functions are approved with no remaining P0/P1 issue; the active oracle is freezing annotated uninitialized-variable semantics behind the overload fixture |
 
 The completed S5/S6 sub-wave validates the intended four-slot steady state:
 root integrates and builds, two isolated semantic workers own non-overlapping
@@ -129,10 +130,28 @@ public checker surface is now 111 tests across 36 independently runnable
 targets. Both new semantic leaves passed strict focused Clippy, compiler gates,
 and independent P0/P1 review.
 
-The current frontier is four exact variants, 90 typed capability boundaries,
-and two supported mismatches. The run discovers 12,750 upstream configurations,
-selects 95 cases and 96 variants, and completes in about 88 seconds on the
-recorded machine. This is a deterministic merge gate, not a coverage claim.
+The optional/composite-intersection and generic-ambient-function stack through
+`693d0be` has raw fixed-shard digest
+`16a26f90058c7b7090a3f0462f10daf6`. Removing only Rust commit/dirty and
+invocation provenance produces `beab382c4f923f0d393b4abd0a61d4bb`.
+The shard advances `typeArgumentArityErrorSkipsTrivia.ts` from the generic
+ambient callable boundary to an exact two-diagnostic TS2558 match, leaving five
+exact variants, 89 typed capability boundaries, two supported mismatches, and
+zero fatal invariants. Exactly two other records change:
+`moduleKeywordSkipLibCheck.ts` and
+`exactOptionalPropertyTypesArgumentError.ts` move only from the old assignment-
+fallback spelling to the new direct-call boundary; neither changes status or
+capability class. No other record changes, and the intersection extension
+changes no fixed-shard record. The focused public checker surface is now 121
+tests across 38 independently runnable targets. The combined integration gate
+ran 77 checker tests, eight compiler tests, the checker library check,
+and strict focused Clippy.
+
+The current frontier is five exact variants, 89 typed capability boundaries,
+two supported mismatches, and zero fatal invariants. The run discovers 12,750
+upstream configurations, selects 95 cases and 96 variants, and completes in
+about 82 seconds on the recorded machine. This is a deterministic merge gate,
+not a coverage claim.
 
 The S1a compiler prerequisite is now present: a plain `.d.ts` external module
 may be the resolved target of a plain TypeScript ESM/Bundler source while the

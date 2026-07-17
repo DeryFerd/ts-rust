@@ -139,7 +139,7 @@ and base/local join identity restoration.
 ### Execution checkpoint: 2026-07-17
 
 The fixed 96-variant smoke lane is integrated and reproducible. The current
-frontier remains four exact variants, 90 typed capability boundaries, two
+frontier is five exact variants, 89 typed capability boundaries, two
 supported mismatches, and zero fatal invariants. S2a's exact one-base interface
 heritage and successful-relation observed-dependency invalidation are integrated
 through `14ae6ce`; all five public heritage scenarios pass, and the fixed shard
@@ -242,13 +242,33 @@ The fixed shard remains four exact, 90 typed capability boundaries, two
 supported mismatches, and zero fatal invariants; exactly five ambient-function
 frontiers advance without a status or exact loss.
 
-The four-slot topology has rotated into generic singleton ambient functions and
-optional/composite intersection properties, with an adversarial review slot
-and root retaining shared store, compiler, formatter, build, and scoring
-ownership. Ambient overload families are serialized behind the generic
-singleton leaf because they share callable ownership and source dispatch. The
-live commit/worktree ledger is
-[`typechecker-wave0-status.md`](typechecker-wave0-status.md).
+The follow-up cut is integrated through `693d0be`. Direct intersections now
+merge optional and readonly state with pinned all-contributor rules, retain
+borrowed unique-property provenance, admit recursively validated local
+nongeneric property-object graphs, and keep conflicting optional discriminants
+as optional `never` properties instead of reducing the whole intersection.
+Generic singleton ambient functions now reuse the ordered generic-signature
+engine for constraints, defaults, inference, explicit type arguments, and exact
+TS2558/TS2344/TS2345 diagnostics. A strict top-level direct-identifier call
+statement leaf lets those declarations execute in the same source forms as the
+pinned fixtures while preserving whole-source preflight and warm replay. Both
+leaves passed independent P0/P1 review, 77 combined checker tests, eight
+compiler tests, library checking, and strict focused Clippy. The fixed shard
+has raw digest `16a26f90058c7b7090a3f0462f10daf6` and provenance-
+normalized digest `beab382c4f923f0d393b4abd0a61d4bb`. Its only status
+change advances `typeArgumentArityErrorSkipsTrivia.ts` to an exact match; only
+`moduleKeywordSkipLibCheck.ts` and
+`exactOptionalPropertyTypesArgumentError.ts` otherwise change, both from the
+old assignment-fallback spelling to the direct-call boundary. The result is
+five exact variants, 89 typed capability boundaries, two supported mismatches,
+and zero fatal invariants.
+
+The four-slot topology has rotated into local ambient overload families plus a
+read-only annotated-uninitialized-variable oracle, with an adversarial review
+slot and root retaining shared store, compiler, formatter, build, and scoring
+ownership. The variable implementation is serialized behind overloads because
+both change source identifier-read and flow planning. The live commit/worktree
+ledger is [`typechecker-wave0-status.md`](typechecker-wave0-status.md).
 
 ### Quantitative posture
 
@@ -256,13 +276,13 @@ At the current checkpoint:
 
 | Evidence | Current value | Interpretation |
 |---|---:|---|
-| Semantic unit tests present | 1,021 | Broad invariant coverage; the monolithic binary cannot link in the current memory envelope |
-| Public checker integration tests | 111 across 36 targets | Executable production-path evidence and the mandatory home for new verticals |
+| Semantic unit tests present | 1,022 | Broad invariant coverage; the monolithic binary cannot link in the current memory envelope |
+| Public checker integration tests | 121 across 38 targets | Executable production-path evidence and the mandatory home for new verticals |
 | Semantic modules | 65 | Enough leaf surfaces for bounded ownership |
-| `type_nodes.rs` | 18,101 lines | Shared type-family dispatch hotspot |
-| `source.rs` | 18,372 lines | Shared source-plan/execution hotspot |
+| `type_nodes.rs` | 18,176 lines | Shared type-family dispatch hotspot |
+| `source.rs` | 18,602 lines | Shared source-plan/execution hotspot |
 | `relater.rs` | 10,946 lines | Shared relation hotspot |
-| Port-map clusters | 46 | 11 verified, 22 porting, 12 blocked, 1 unmapped at this checkpoint |
+| Port-map clusters | 46 | 11 verified, 24 porting, 10 blocked, 1 unmapped at this checkpoint |
 
 The implementation is no longer bottlenecked on basic representation. It is
 bottlenecked on semantic breadth behind intentionally fail-closed gates.
@@ -1157,18 +1177,16 @@ maintainable.
 
 ## Immediate execution queue
 
-1. Finish and independently review the frozen lazy generic-call rewrite, then
-   add the root-owned source/session adapter and public TS2554/TS2558/TS2344/
-   TS2345/TS2589 demand-order vertical.
-2. Keep the integrated readonly-property slice green while composing its lazy
-   parameter/signature invalidation seam with S3.
-3. Score the generic-call leaf independently; retain all exact artifacts and
-   record every frontier movement in the Wave 0 ledger and port map.
-4. Use freed worker slots for the first ordinary CFG/source vertical and
-   the next declaration/reexport slice, keeping source/compiler adapters at
-   root.
-5. Close the Wave 0 CFG exit gate, then start the Wave 1 S5/S6 sub-wave instead
-   of chasing fixtures individually.
+1. Finish, independently review, and integrate exact local nongeneric ambient
+   overload families, preserving declaration order, canonical multi-signature
+   ownership, transactional publication, and the existing overload resolver.
+2. Add direct annotated uninitialized variables so the overload fixture can
+   advance beyond its next source boundary without weakening identifier-read or
+   flow validation.
+3. Rerun the fixed shard, record every status/frontier delta, and choose the
+   next dependency-closed source/callable leaf from that ranked evidence.
+4. Keep root as the sole shared-adapter, Cargo, compiler-gate, and scorecard
+   owner while semantic workers and independent reviewers rotate around it.
 
 This is the shortest credible path to useful modern-project checking and then
 full typescript-go parity. It multiplies independent semantic work without
