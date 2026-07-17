@@ -117,12 +117,6 @@ impl SourceFlowCondition {
     }
 }
 
-impl From<SourceTruthinessCondition> for SourceFlowCondition {
-    fn from(condition: SourceTruthinessCondition) -> Self {
-        Self::Truthiness(condition)
-    }
-}
-
 /// One initialized local represented by a binder assignment node.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct SourceFlowAssignment {
@@ -267,26 +261,6 @@ impl SourceFlowPlan {
     /// Freezes and validates every flow chain that the source executor may
     /// request. No semantic store state is read or written during preflight.
     pub(super) fn preflight(
-        bound: &BoundFile,
-        container: NodeRef,
-        expected_start_payload: Option<NodeRef>,
-        points: impl IntoIterator<Item = NodeRef>,
-        conditions: impl IntoIterator<Item = SourceTruthinessCondition>,
-        assignments: impl IntoIterator<Item = SourceFlowAssignment>,
-    ) -> Result<Self, SourceFlowError> {
-        Self::preflight_conditions(
-            bound,
-            container,
-            expected_start_payload,
-            points,
-            conditions.into_iter().map(SourceFlowCondition::from),
-            assignments,
-        )
-    }
-
-    /// General typed-condition entry used once a statement syntax leaf has
-    /// proved more than direct identifier truthiness.
-    pub(super) fn preflight_conditions(
         bound: &BoundFile,
         container: NodeRef,
         expected_start_payload: Option<NodeRef>,
@@ -915,6 +889,19 @@ fn source_typeof_leaf_matches(
     }
 
     let function_object = if flags.intersects(TypeFlags::OBJECT) {
+        let known_function = store
+            .intrinsic_bootstrap()
+            .map(|bootstrap| {
+                type_ == globals.function_type || type_ == bootstrap.any_function_type
+            })
+            .ok_or(SourceTypeofNarrowingError::MissingBootstrap)?;
+        if !known_function
+            && !record
+                .object_flags()
+                .intersects(ObjectFlags::MEMBERS_RESOLVED)
+        {
+            return Err(SourceTypeofNarrowingError::UnsupportedType(type_));
+        }
         if source_typeof_is_unbounded_empty_object(store, globals, type_, record)? {
             return Err(SourceTypeofNarrowingError::UnsupportedType(type_));
         }
@@ -999,7 +986,18 @@ fn source_typeof_object_is_function(
     if structured.call_signature_count > signature_count {
         return Err(SourceTypeofNarrowingError::InvalidType(type_));
     }
-    Ok(signature_count != 0)
+    if signature_count != 0 {
+        return Ok(true);
+    }
+    for property in structured.properties.as_deref().unwrap_or_default() {
+        let symbol = store
+            .symbol(*property)
+            .ok_or(SourceTypeofNarrowingError::InvalidType(type_))?;
+        if symbol.name().as_bytes() == b"bind" {
+            return Err(SourceTypeofNarrowingError::UnsupportedType(type_));
+        }
+    }
+    Ok(false)
 }
 
 fn validate_container(graph: &BoundFlowGraph, container: NodeRef) -> Result<(), SourceFlowError> {

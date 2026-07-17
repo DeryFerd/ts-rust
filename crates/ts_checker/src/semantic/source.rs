@@ -701,7 +701,7 @@ enum PlannedSourceCondition {
         expression: PlannedExpression,
         symbol: SemanticSymbolId,
     },
-    Typeof(PlannedTypeofCondition),
+    Typeof(Box<PlannedTypeofCondition>),
 }
 
 #[derive(Clone, Debug)]
@@ -2225,7 +2225,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 symbol: local.symbol,
             })
             .collect::<Vec<_>>();
-        let flow = SourceFlowPlan::preflight_conditions(
+        let flow = SourceFlowPlan::preflight(
             self.bound,
             callable.declaration,
             None,
@@ -2309,7 +2309,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         preflight_source_expression_cache(store, typeof_syntax.type_of_expression, bootstrap.typeof_type)?;
         preflight_source_expression_cache(store, expression, bootstrap.boolean_type)?;
 
-        Ok(PlannedSourceCondition::Typeof(PlannedTypeofCondition {
+        Ok(PlannedSourceCondition::Typeof(Box::new(PlannedTypeofCondition {
             expression,
             type_of_expression: typeof_syntax.type_of_expression,
             identifier,
@@ -2318,7 +2318,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             comparison: typeof_syntax.comparison,
             type_of_on_left: typeof_syntax.type_of_on_left,
             symbol,
-        }))
+        })))
     }
 
     fn unsupported_function_body(&self, callable: &SourceCallablePlan) -> SourceCheckError {
@@ -2408,7 +2408,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 symbol: local.symbol,
             })
             .collect::<Vec<_>>();
-        let flow = SourceFlowPlan::preflight_conditions(
+        let flow = SourceFlowPlan::preflight(
             self.bound,
             callable.declaration,
             None,

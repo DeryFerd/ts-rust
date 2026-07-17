@@ -145,13 +145,11 @@ fn variable_initializer(parsed: &ParseResult, file: FileId, expected: &str) -> N
             let NodeData::Identifier(name) = &parsed.arena.get(variable.name)?.data else {
                 return None;
             };
-            (name.text == expected).then(|| {
-                NodeRef::new(
-                    parsed.arena.id(),
-                    file,
-                    variable.initializer.expect("expected initialized variable"),
-                )
-            })
+            (name.text == expected).then_some(NodeRef::new(
+                parsed.arena.id(),
+                file,
+                variable.initializer.expect("expected initialized variable"),
+            ))
         })
         .unwrap_or_else(|| panic!("expected one variable named {expected:?}"))
 }
