@@ -113,6 +113,45 @@ An already resolved parameter or return is reused without re-instantiation so a
 warm validation does not change accounting. A wrong or foreign cached value
 fails atomically.
 
+### Concrete generic-call replacement map
+
+The current eager implementation is concentrated enough to remain one leaf.
+Its two implementation commits should make these replacements:
+
+1. Add one checked-signature shell get/create path and allocation-free warm
+   validator. `prepare_generic_call_vector_signature` and
+   `publish_prepared_generic_call_vector_signature` must publish transient
+   parameter links with `resolved_type: None` and signatures with
+   `resolved_return_type: None`. Both existing materializers must use this one
+   publisher instead of building duplicate eager graphs.
+2. Reorder `project_validated_generic_call_vector` to perform arity, explicit
+   constraints, checked-shell publication, left-to-right applicability, and
+   uncached recovery in that order. Replace `instantiate_generic_call_shape`
+   and `generic_call_projection` with individual parameter/return demand and
+   recovery-shell helpers. Thread the same `InstantiationSession` through
+   defaults, inference, constraints, and demand, clearing active mapper caches
+   immediately after each inferred type is finalized.
+
+`check_generic_call_arguments` must demand one parameter slot before each
+relation and stop at the first mismatch. Source finalization then demands only
+the selected checked or recovery return. The existing identity-call fallback
+keeps its source-only inference proof but must route its type argument through
+the same shell, demand, recovery, and return primitives; it must not remain a
+second eager semantic model.
+
+The existing store already supplies the required mapper, symbol, signature,
+value-link, cached-signature, reservation, and setter APIs. After S2 lands,
+ordinary `set_value_symbol_links` and `set_signature_resolved_return_type`
+writes also invalidate relations that observed a lazy `None` slot. No new
+semantic record or mandatory `store.rs` adapter is expected.
+
+Warm validation of an already resolved union return must remain allocation
+free. Prefer a local exact mapper-result verifier over the currently installed
+intrinsic, literal, type-parameter, Array, and anonymous-union domain. If that
+becomes unreasonably duplicative, the only acceptable extra substrate is a
+read-only union-cache identity lookup; warm validation must never intern a type
+or repair a poisoned cache.
+
 ### Root-owned adapters
 
 Root serializes the high-fanout changes:
@@ -207,4 +246,3 @@ with any S3 attempt to edit `store.rs`, so S3 rebases only after S2 lands.
 6. Land root context/source/return-demand integration and TS2589.
 7. Land public production and S2/S3 composition tests.
 8. Run the fixed checker smoke manifest and update the execution ledger.
-
