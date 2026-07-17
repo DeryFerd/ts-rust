@@ -715,6 +715,11 @@ fn type_node_error_is_unsupported(error: &TypeNodeUnavailable) -> bool {
         | TypeNodeUnavailable::JsDocTypeAlias(_)
         | TypeNodeUnavailable::UnsupportedUnionConstituent(_)
         | TypeNodeUnavailable::UnsupportedUnionConstituentType(_)
+        | TypeNodeUnavailable::UnsupportedIntersectionConstituent(_)
+        | TypeNodeUnavailable::UnsupportedIntersectionProperty(_)
+        | TypeNodeUnavailable::UnsupportedIntersectionConstituentType(_)
+        | TypeNodeUnavailable::UnsupportedIntersectionOptionalProperty(_)
+        | TypeNodeUnavailable::UnsupportedIntersectionPropertyType(_)
         | TypeNodeUnavailable::UnsupportedTupleElementOrder { .. }
         | TypeNodeUnavailable::RecursiveTupleAliasUnsupported { .. } => true,
         TypeNodeUnavailable::InvalidParenthesizedType(_)
@@ -738,6 +743,9 @@ fn type_node_error_is_unsupported(error: &TypeNodeUnavailable) -> bool {
         | TypeNodeUnavailable::InvalidUnionType(_)
         | TypeNodeUnavailable::MissingPlannedUnionType(_)
         | TypeNodeUnavailable::InvalidCachedUnionType(_)
+        | TypeNodeUnavailable::InvalidIntersectionType(_)
+        | TypeNodeUnavailable::MissingPlannedIntersectionType(_)
+        | TypeNodeUnavailable::InvalidCachedIntersectionType(_)
         | TypeNodeUnavailable::InvalidCachedArrayType(_)
         | TypeNodeUnavailable::InvalidIndexedAccessType(_)
         | TypeNodeUnavailable::MissingPlannedIndexedAccessType(_)
@@ -804,6 +812,7 @@ fn relation_error_is_unsupported(error: &RelationUnavailable) -> bool {
         | RelationUnavailable::Symbol(_)
         | RelationUnavailable::MalformedLiteral(_)
         | RelationUnavailable::MalformedUnion(_)
+        | RelationUnavailable::MalformedIntersection(_)
         | RelationUnavailable::InvalidUnionAlias(_)
         | RelationUnavailable::InvalidUnionPreparation(_)
         | RelationUnavailable::UnionValidationCapacity(_)
@@ -837,6 +846,7 @@ fn display_error_is_unsupported(error: &TypeDisplayUnavailable) -> bool {
         TypeDisplayUnavailable::Type(_)
         | TypeDisplayUnavailable::MalformedType(_)
         | TypeDisplayUnavailable::InvalidUnion(_)
+        | TypeDisplayUnavailable::InvalidIntersection(_)
         | TypeDisplayUnavailable::InvalidLiteralLinks(_)
         | TypeDisplayUnavailable::MissingBootstrap
         | TypeDisplayUnavailable::EmptyTupleType(_)
