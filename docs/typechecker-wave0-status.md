@@ -5,7 +5,7 @@
 - Upstream epoch: `dc37b5249ab60e2bbce936f71b883e6c8136167e`
 - Wave branch baseline: `cdbf749`
 - Integration branch: `july-ultra`
-- Current root adapters: `690f13e`, `2ef996a`
+- Current root adapters: `690f13e`, `2ef996a`, `1f74d5e`
 
 This is the live execution record for Wave 0 of
 [`typechecker-completion-goal.md`](typechecker-completion-goal.md). The port
@@ -15,20 +15,24 @@ map remains authoritative for cluster state.
 
 | Lane | Branch/worktree | Current task | State |
 |---|---|---|---|
-| Root/integration | `july-ultra`; repository root | contract adapters, review, serial verification | failure envelope and declaration admission reviewed; M0 integrated as `250857e` |
-| M0 | `agent/w0-m0-scorecard`; `../ts-rust-worktrees/w0-m0-scorecard` | retained-fatal scorecard, provenance, registry | integrated; Cargo gates running; fixed 96-key manifest follows fresh score |
-| S2a | `agent/w0-s2a-members`; `../ts-rust-worktrees/w0-s2a-members` | direct nongeneric interface heritage and inherited members | contract frozen; implementing |
-| S3 | `agent/w0-s3-instantiation`; `../ts-rust-worktrees/w0-s3-instantiation` | composite mapper and exact instantiation session | `5184cd1` committed; independent review and root gates running |
-| S1b | `agent/w0-s1b-declarations`; `../ts-rust-worktrees/w0-s1b-declarations` | direct named `.d.ts` value/type consumption | implementing over the S1a compiler prerequisite |
+| Root/integration | `july-ultra`; repository root | contract adapters, review, serial verification | M0, S1b, and the S3 kernel integrated; Cargo gates green |
+| M0 | `agent/w0-m0-scorecard`; `../ts-rust-worktrees/w0-m0-scorecard` | fixed balanced manifest after a fresh score | schema-5 scorecard and fatal continuation integrated; fixture tests and strict Clippy green |
+| S2a | `agent/w0-s2a-members`; `../ts-rust-worktrees/w0-s2a-members` | exact single-base interface heritage | independent review rejected the broad draft; narrowing order, collision, validation, and publication contracts |
+| S3 | `agent/w0-s3-instantiation`; `../ts-rust-worktrees/w0-s3-instantiation` | composite mapper and instantiation-session kernel | integrated through `4701c60`; checker check, strict Clippy, and rustdoc green |
+| S3b | `agent/w0-s3b-session`; `../ts-rust-worktrees/w0-s3b-session` | share query accounting across generic-call projection | implementing the remaining production-accounting review item |
+| S1b | `agent/w0-s1b-declarations`; `../ts-rust-worktrees/w0-s1b-declarations` | direct named `.d.ts` value/type consumption | integrated through `c23594d`; both program orders, warm reuse, skipLibCheck, and fail-closed boundaries pass |
 
-Only S2a and S3 are semantic writers. M0 consumes the root-owned typed failure
-envelope and does not edit checker/compiler query internals.
+Only S2a and S3b are active semantic writers. M0 consumes the root-owned typed
+failure envelope and does not edit checker/compiler query internals.
 
 The S1a compiler prerequisite is now present: a plain `.d.ts` external module
 may be the resolved target of a plain TypeScript ESM/Bundler source while the
 importing source gate remains unchanged. Declaration files are still bound and
 retained, `skipLibCheck` still suppresses their source check, and declaration-
-target value/type consumption remains an explicit S1b checker leaf.
+target value/type consumption now admits direct exported declaration constants,
+nongeneric aliases, and nongeneric interfaces. Declaration bind and checker
+diagnostics remain suppressed under `skipLibCheck` while the retained symbols
+and imported types stay available.
 
 ## Frozen S2-S3 boundary
 
