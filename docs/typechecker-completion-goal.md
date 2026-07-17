@@ -208,9 +208,27 @@ supported mismatches, and zero fatal invariants. The normalized digest changes
 to `c3dd4beaec5aae1377c60e50e7871d6f` solely because 15 frontier details move
 within the same capability/status classes; there are no exact losses.
 
-The four-slot topology has rotated from the completed S5/S6 leaf pair into
-S2b/S4b/S11a cuts while root retains shared type-node, store, compiler,
-formatter, build, and scoring ownership. The live commit/worktree ledger is
+The next class composition cut is integrated through `67d072d`. One exact
+direct non-alias source-owned nongeneric base class now contributes pinned
+base instance/value identities, own-first inherited instance/static surfaces,
+distinct resolved member tables, a derived-return default construct signature,
+and fail-closed class-only structural relations. Direct top-level
+`new Model()` for a preceding admitted no-base class now consumes that same
+canonical construct graph and publishes exact constructor symbol/static type,
+selected signature, result type, and variable/property identities through a
+whole-plan validate/reserve/ensure transaction. Arguments, type arguments,
+missing parentheses, aliases, forward classes, abstract or explicit
+constructors, heritage construction, optional chaining, and broader class
+families remain typed boundaries. Both leaves passed focused public gates,
+strict Clippy, and independent review with no remaining P0/P1 issue. The fixed
+96-variant shard is semantically byte-identical to `1ad5689` after provenance
+normalization: four exact, 90 typed capability boundaries, two supported
+mismatches, and zero fatal invariants.
+
+The four-slot topology has rotated from the completed class composition leaves
+into A16 intersection implementation plus the next source-frontier oracle,
+while root retains shared type-node, store, compiler, formatter, build, and
+scoring ownership. The live commit/worktree ledger is
 [`typechecker-wave0-status.md`](typechecker-wave0-status.md).
 
 ### Quantitative posture
@@ -220,7 +238,7 @@ At the planning baseline:
 | Evidence | Current value | Interpretation |
 |---|---:|---|
 | Semantic unit tests compiled | 923 | Broad invariant coverage; the monolithic binary cannot link in the current memory envelope |
-| Public checker integration tests | 94 across 31 targets | Executable production-path evidence and the mandatory home for new verticals |
+| Public checker integration tests | 102 across 33 targets | Executable production-path evidence and the mandatory home for new verticals |
 | Semantic modules | 58 | Enough leaf surfaces for bounded ownership |
 | `type_nodes.rs` | 16,820 lines | Shared type-family dispatch hotspot |
 | `source.rs` | 16,162 lines | Shared source-plan/execution hotspot |
