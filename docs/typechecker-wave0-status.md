@@ -15,10 +15,11 @@ map remains authoritative for cluster state.
 
 | Lane | Branch/worktree | Current task | State |
 |---|---|---|---|
-| Root/integration | `july-ultra`; repository root | typed failure envelope, declaration-target admission, serial verification | `690f13e` and `2ef996a` committed; reviews pending |
-| M0 | `agent/w0-m0-scorecard`; `../ts-rust-worktrees/w0-m0-scorecard` | retained-fatal scorecard, provenance, registry, fixed manifest | implementing |
+| Root/integration | `july-ultra`; repository root | contract adapters, review, serial verification | failure envelope and declaration admission reviewed; M0 integrated as `250857e` |
+| M0 | `agent/w0-m0-scorecard`; `../ts-rust-worktrees/w0-m0-scorecard` | retained-fatal scorecard, provenance, registry | integrated; Cargo gates running; fixed 96-key manifest follows fresh score |
 | S2a | `agent/w0-s2a-members`; `../ts-rust-worktrees/w0-s2a-members` | direct nongeneric interface heritage and inherited members | contract frozen; implementing |
-| S3 | `agent/w0-s3-instantiation`; `../ts-rust-worktrees/w0-s3-instantiation` | composite mapper and exact instantiation session | contract frozen; implementing |
+| S3 | `agent/w0-s3-instantiation`; `../ts-rust-worktrees/w0-s3-instantiation` | composite mapper and exact instantiation session | `5184cd1` committed; independent review and root gates running |
+| S1b | `agent/w0-s1b-declarations`; `../ts-rust-worktrees/w0-s1b-declarations` | direct named `.d.ts` value/type consumption | implementing over the S1a compiler prerequisite |
 
 Only S2a and S3 are semantic writers. M0 consumes the root-owned typed failure
 envelope and does not edit checker/compiler query internals.
