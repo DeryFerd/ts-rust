@@ -283,6 +283,7 @@ pub(super) enum SourceContextualArrowUnsupported {
     MissingVariableAnnotation(NodeRef),
     MissingInitializer(NodeRef),
     NonArrowInitializer(NodeRef),
+    ExpandoProperties(NodeRef),
     GenericSignature(NodeRef),
     Modifiers(NodeRef),
     TrailingParameterComma(NodeRef),
@@ -344,6 +345,7 @@ impl SourceContextualArrowError {
                 | SourceContextualArrowUnsupported::MissingVariableAnnotation(node)
                 | SourceContextualArrowUnsupported::MissingInitializer(node)
                 | SourceContextualArrowUnsupported::NonArrowInitializer(node)
+                | SourceContextualArrowUnsupported::ExpandoProperties(node)
                 | SourceContextualArrowUnsupported::GenericSignature(node)
                 | SourceContextualArrowUnsupported::Modifiers(node)
                 | SourceContextualArrowUnsupported::TrailingParameterComma(node)
@@ -716,12 +718,18 @@ pub(super) fn plan_contextual_source_arrow(
         || owner.declarations() != Some(&[initializer])
         || owner.value_declaration() != Some(initializer)
         || owner.members().is_some()
-        || owner.exports().is_some()
         || owner.parent().is_some()
         || owner.export_symbol().is_some()
     {
         return Err(contextual_invariant(
             SourceContextualArrowInvariant::InvalidOwnerSymbol(initializer),
+        ));
+    }
+    // Contextual arrows use a separate planner, but retain the same pinned
+    // expando ownership: valid property assignments live in owner exports.
+    if owner.exports().is_some() {
+        return Err(contextual_unsupported(
+            SourceContextualArrowUnsupported::ExpandoProperties(initializer),
         ));
     }
 
@@ -2008,6 +2016,25 @@ mod tests {
             wrapped.plan(0),
             Err(SourceArrowError::Unsupported(
                 SourceArrowUnsupported::NonArrowInitializer(_)
+            ))
+        ));
+    }
+
+    #[test]
+    fn classifies_bound_expando_properties_as_deferred_source_semantics() {
+        let direct = Fixture::new("const foo = () => {}; foo.bar = 42; export {};");
+        assert!(matches!(
+            direct.plan(0),
+            Err(SourceArrowError::Unsupported(
+                SourceArrowUnsupported::Callable(SourceCallableUnsupported::ExpandoProperties(_))
+            ))
+        ));
+
+        let contextual = Fixture::new("const foo: () => void = () => {}; foo.bar = 42; export {};");
+        assert!(matches!(
+            contextual.contextual_plan(0),
+            Err(SourceContextualArrowError::Unsupported(
+                SourceContextualArrowUnsupported::ExpandoProperties(_)
             ))
         ));
     }

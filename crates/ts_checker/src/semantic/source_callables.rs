@@ -181,6 +181,7 @@ pub(super) enum SourceCallableUnsupported {
     GenericSignature(NodeRef),
     Async(NodeRef),
     Generator(NodeRef),
+    ExpandoProperties(NodeRef),
     Modifiers(NodeRef),
     OverloadDeclaration(NodeRef),
     ThisParameter(NodeRef),
@@ -226,6 +227,7 @@ impl SourceCallableError {
                 SourceCallableUnsupported::GenericSignature(node)
                 | SourceCallableUnsupported::Async(node)
                 | SourceCallableUnsupported::Generator(node)
+                | SourceCallableUnsupported::ExpandoProperties(node)
                 | SourceCallableUnsupported::Modifiers(node)
                 | SourceCallableUnsupported::OverloadDeclaration(node)
                 | SourceCallableUnsupported::ThisParameter(node)
@@ -457,7 +459,6 @@ pub(super) fn plan_source_callable(
         || owner.declarations() != Some(&[declaration])
         || owner.value_declaration() != Some(declaration)
         || owner.members().is_some()
-        || owner.exports().is_some()
         || owner.export_symbol().is_some()
     {
         return Err(invariant(SourceCallableInvariant::InvalidOwnerSymbol(
@@ -474,6 +475,15 @@ pub(super) fn plan_source_callable(
         export_local,
         &view,
     )?;
+    // The pinned binder stores TypeScript expando assignments on the
+    // callable owner's exports table. That is valid source shape, but this
+    // callable cut does not yet materialize those object members. Classify it
+    // only after every other owner and export-route invariant is proven.
+    if owner.exports().is_some() {
+        return Err(SourceCallableError::Unsupported(
+            SourceCallableUnsupported::ExpandoProperties(declaration),
+        ));
+    }
 
     let mut parameters = Vec::with_capacity(view.parameters.nodes.len());
     let mut previous_end = view.parameters.range.start;
