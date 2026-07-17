@@ -9,10 +9,12 @@
 //! imports in exact direct or union/parenthesized/array top-level variable
 //! annotations,
 //! annotated top-level function declarations, exact direct non-exported
-//! ambient function declarations, initialized identifier-named
+//! ambient function declarations (including the existing generic callable
+//! closure), initialized identifier-named
 //! top-level variables (optionally exported), ordinary direct identifier
-//! calls, atomic primitive/literal scalar binary operators, direct top-level
-//! conditional initializers, required own-property reads (including exact
+//! calls (including strict top-level call expression statements), atomic
+//! primitive/literal scalar binary operators, direct top-level conditional
+//! initializers, required own-property reads (including exact
 //! two-constituent declared unions), direct indexed reads over supported
 //! objects, arrays, and strings, strict direct-identifier `typeof` flow checks,
 //! and direct assignments back to supported `var` declarations.
@@ -851,6 +853,7 @@ enum PlannedStatement {
     ContextualArrow(usize),
     Variables(Vec<PlannedVariable>),
     Assignment(PlannedAssignment),
+    ExpressionCall(PlannedExpression),
 }
 
 #[derive(Debug)]
@@ -1378,6 +1381,12 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     }
                 }
                 SyntaxKind::ExpressionStatement => {
+                    if let Some(call) =
+                        self.plan_top_level_direct_identifier_call_statement(statement)?
+                    {
+                        statements.push(PlannedStatement::ExpressionCall(call));
+                        continue;
+                    }
                     let Some((store, host)) = self.semantic else {
                         return Err(self.unsupported(
                             statement,
@@ -1700,6 +1709,92 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             }
         }
         Ok(())
+    }
+
+    /// Plans the strict top-level `identifier(arguments);` expression-statement
+    /// leaf. Every other expression statement remains on the existing simple
+    /// assignment route.
+    fn plan_top_level_direct_identifier_call_statement(
+        &mut self,
+        statement: NodeRef,
+    ) -> Result<Option<PlannedExpression>, SourceCheckError> {
+        let (statement_range, expression) = {
+            let node = self.node(statement)?;
+            let NodeData::ExpressionStatement(data) = &node.data else {
+                return Err(SourceCheckError::Provenance(
+                    SourceCheckProvenanceError::MismatchedNodeData {
+                        node: statement,
+                        kind: node.kind,
+                    },
+                ));
+            };
+            let expression = self.reference(data.expression);
+            if self.node(expression)?.kind != SyntaxKind::CallExpression {
+                return Ok(None);
+            }
+            if node.kind != SyntaxKind::ExpressionStatement
+                || node.flags.0 != 0
+                || node.parent != Some(self.source.node_ref().node)
+                || data.flow_node.is_some()
+            {
+                return Err(self.unsupported(
+                    statement,
+                    node.kind,
+                    SourceSyntaxRole::Statement,
+                ));
+            }
+            (node.range, expression)
+        };
+        let (expression_range, callee) = {
+            let node = self.node(expression)?;
+            let NodeData::CallExpression(call) = &node.data else {
+                return Err(SourceCheckError::Provenance(
+                    SourceCheckProvenanceError::MismatchedNodeData {
+                        node: expression,
+                        kind: node.kind,
+                    },
+                ));
+            };
+            if node.kind != SyntaxKind::CallExpression
+                || node.flags.0 != 0
+                || node.parent != Some(statement.node)
+                || node.range.start < statement_range.start
+                || node.range.end > statement_range.end
+                || call.question_dot_token.is_some()
+                || call.symbol.is_some()
+                || call.facts != 0
+            {
+                return Err(SourceCheckError::Unsupported(
+                    UnsupportedSourceSyntax::Call(expression),
+                ));
+            }
+            (node.range, self.reference(call.expression))
+        };
+        let callee_node = self.node(callee)?;
+        let NodeData::Identifier(identifier) = &callee_node.data else {
+            return Err(SourceCheckError::Unsupported(
+                UnsupportedSourceSyntax::Call(expression),
+            ));
+        };
+        if callee_node.kind != SyntaxKind::Identifier
+            || callee_node.flags.0 != 0
+            || callee_node.parent != Some(expression.node)
+            || callee_node.range.start < expression_range.start
+            || callee_node.range.end > expression_range.end
+            || identifier.text.is_empty()
+            || identifier.flow_node.is_some()
+        {
+            return Err(SourceCheckError::Unsupported(
+                UnsupportedSourceSyntax::Call(expression),
+            ));
+        }
+        let planned = self.plan_expression(expression)?;
+        if planned.node != expression
+            || !matches!(&planned.kind, PlannedExpressionKind::Call(_))
+        {
+            return Err(SourceCheckError::Call(expression));
+        }
+        Ok(Some(planned))
     }
 
     fn is_direct_top_level_variable_initializer(
@@ -9626,6 +9721,25 @@ pub(super) fn check_source_file(
                 )?;
                 current_flow_types.insert(assignment.target_symbol, current_flow_type);
             }
+            PlannedStatement::ExpressionCall(expression) => {
+                if !matches!(&expression.kind, PlannedExpressionKind::Call(_)) {
+                    return Err(SourceCheckError::Call(expression.node));
+                }
+                check_expression_type(
+                    store,
+                    host,
+                    global_types,
+                    source,
+                    options,
+                    session,
+                    diagnostics,
+                    &current_flow_types,
+                    &preflighted_type_import_value_uses,
+                    &expression,
+                    None,
+                    &mut deferred,
+                )?;
+            }
         }
     }
 
@@ -12887,6 +13001,122 @@ mod tests {
         assert!(context.store().signature_links(later_declaration).is_some());
         assert!(context.store().type_node_links(call).is_some());
         assert!(context.store().signature_links(call).is_some());
+        assert_eq!(
+            context
+                .store()
+                .symbol_node_links(*callee)
+                .and_then(|links| links.resolved_symbol),
+            Some(early)
+        );
+        assert!(context.diagnostics().is_empty());
+        assert!(is_type_checked(&context, file));
+
+        let warm = observable_state(&context, file);
+        mark_source_unchecked(&mut context, file);
+        context.check_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+        assert_eq!(
+            context.store().source_callable_type_for_owner(early),
+            Some(early_type)
+        );
+        assert_eq!(
+            context.store().source_callable_type_for_owner(later),
+            Some(later_type)
+        );
+    }
+
+    #[test]
+    fn later_generic_ambient_cache_poison_preflights_before_earlier_publication() {
+        let source = parsed(concat!(
+            "declare function early<T>(value: T): T;\n",
+            "const read = early(1);\n",
+            "declare function later<T extends string>(value: T): T;\n",
+        ));
+        let file = FileId::new(2_105);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        let early_declaration = function_declaration(&source, file, "early");
+        let later_declaration = function_declaration(&source, file, "later");
+        let early = function_symbol(&context, &source, file, "early");
+        let later = function_symbol(&context, &source, file, "later");
+        let read_owner = variable_symbol(&context, &source, file, "read");
+        let call = variable_initializer(&source, file, "read");
+        let callees = identifier_expressions(&source, file, "early");
+        let [callee] = callees.as_slice() else {
+            panic!("fixture must contain one generic ambient function read")
+        };
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+
+        assert!(context.store_mut_for_test().set_value_symbol_links(
+            later,
+            ValueSymbolLinks {
+                write_type: Some(string),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        let poisoned = observable_state(&context, file);
+        let expected =
+            SourceCheckError::Function(SourceFunctionInvariant::Callable(later_declaration));
+        for _ in 0..2 {
+            assert_eq!(context.check_source_file(file), Err(expected));
+            assert_eq!(observable_state(&context, file), poisoned);
+            assert!(context.store().value_symbol_links(early).is_none());
+            assert!(context.store().value_symbol_links(read_owner).is_none());
+            assert!(context.store().signature_links(early_declaration).is_none());
+            assert!(context.store().type_node_links(call).is_none());
+            assert!(context.store().signature_links(call).is_none());
+            assert!(context.store().symbol_node_links(*callee).is_none());
+            assert!(context.diagnostics().is_empty());
+            assert!(!is_type_checked(&context, file));
+        }
+
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_value_symbol_links(later, ValueSymbolLinks::default())
+        );
+        context.check_source_file(file).unwrap();
+        let early_type = context
+            .store()
+            .source_callable_type_for_owner(early)
+            .expect("the repaired generic ambient function must retain its callable type");
+        let later_type = context
+            .store()
+            .source_callable_type_for_owner(later)
+            .expect("the repaired later generic ambient function must retain its callable type");
+        let early_signature = context
+            .store()
+            .signature_links(early_declaration)
+            .and_then(|links| links.resolved_signature.signature())
+            .expect("the generic ambient declaration must own its signature");
+        let later_signature = context
+            .store()
+            .signature_links(later_declaration)
+            .and_then(|links| links.resolved_signature.signature())
+            .expect("the constrained generic ambient declaration must own its signature");
+        assert_ne!(early_type, later_type);
+        assert_eq!(
+            context
+                .store()
+                .signature(early_signature)
+                .map(|signature| signature.type_parameters().len()),
+            Some(1)
+        );
+        assert_eq!(
+            context
+                .store()
+                .signature(later_signature)
+                .map(|signature| signature.type_parameters().len()),
+            Some(1)
+        );
+        assert_eq!(
+            context
+                .store()
+                .value_symbol_links(read_owner)
+                .and_then(|links| links.resolved_type)
+                .and_then(|type_| context.store().type_payload(type_))
+                .map(TypeRecord::flags),
+            Some(TypeFlags::NUMBER_LITERAL)
+        );
         assert_eq!(
             context
                 .store()

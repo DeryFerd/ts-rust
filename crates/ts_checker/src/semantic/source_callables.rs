@@ -462,11 +462,6 @@ pub(super) fn plan_source_callable(
         ));
     }
     let body_mode = validate_modifiers(store, host, declaration, record.range, &view)?;
-    if body_mode.is_ambient() && !type_parameters.is_empty() {
-        return Err(SourceCallableError::Unsupported(
-            SourceCallableUnsupported::GenericSignature(declaration),
-        ));
-    }
 
     let bound = host
         .bound_file(declaration)

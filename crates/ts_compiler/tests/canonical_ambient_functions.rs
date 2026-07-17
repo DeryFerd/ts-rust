@@ -71,11 +71,11 @@ fn canonical_program_reports_ambient_function_argument_mismatch() {
 }
 
 #[test]
-fn canonical_program_keeps_generic_ambient_function_as_a_typed_boundary() {
+fn canonical_program_keeps_optional_generic_ambient_function_as_a_typed_boundary() {
     let fs = MemoryFileSystem::new(true);
     fs.write_file(
         "/project/main.ts",
-        "export {};\ndeclare function identity<T>(value: T): T;\n",
+        "export {};\ndeclare function identity<T>(value?: T): T;\n",
     )
     .unwrap();
 
