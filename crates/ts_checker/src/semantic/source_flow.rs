@@ -1,10 +1,10 @@
 //! Invocation-local control-flow snapshots for source checking.
 //!
 //! This slice accepts the flow chains needed by direct identifier truthiness
-//! checks in two-arm `if` statements: function `START`, initialized local
-//! `ASSIGNMENT` nodes, condition edges, and bounded two-antecedent branch
-//! labels. Loops, reachability, and mutation expressions remain typed
-//! capability boundaries.
+//! and strict `typeof` comparisons in two-arm `if` statements: function
+//! `START`, initialized local `ASSIGNMENT` nodes, condition edges, and bounded
+//! two-antecedent branch labels. Loops, reachability, and mutation expressions
+//! remain typed capability boundaries.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -775,11 +775,12 @@ pub(super) fn source_typeof_narrowing_type_is_supported(
     store: &CanonicalTypeMapperStore,
     globals: &CanonicalGlobalTypes,
     type_: TypeId,
+    tag: SourceTypeofTag,
 ) -> Result<bool, SourceTypeofNarrowingError> {
     let mut leaves = Vec::new();
     collect_source_typeof_leaves(store, type_, &mut leaves, &mut HashSet::new())?;
     for leaf in leaves {
-        match source_typeof_leaf_matches(store, globals, leaf, SourceTypeofTag::String) {
+        match source_typeof_leaf_matches(store, globals, leaf, tag) {
             Ok(_) => {}
             Err(SourceTypeofNarrowingError::UnsupportedType(_)) => return Ok(false),
             Err(error) => return Err(error),

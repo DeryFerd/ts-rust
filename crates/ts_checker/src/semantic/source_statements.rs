@@ -5,8 +5,10 @@
 //! final two-arm `if`, with a value return in each arm. The second contains one
 //! two-arm fallthrough `if` between leading and trailing declarations, followed
 //! by one final value return. It deliberately stops before expression planning,
-//! lexical admission-set mutation, flow narrowing, or checking. Those
-//! operations remain source-dispatch responsibilities.
+//! lexical admission-set mutation, flow narrowing, or checking. Direct
+//! identifier truthiness and the bounded strict `typeof` comparison form are
+//! proven here; their semantic execution remains a source-dispatch
+//! responsibility.
 
 use std::collections::HashSet;
 

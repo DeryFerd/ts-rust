@@ -9,7 +9,8 @@
 //! top-level variables (optionally exported), ordinary direct identifier
 //! calls, atomic primitive/literal scalar binary operators, required
 //! own-property reads, direct indexed reads over supported objects, arrays,
-//! and strings, and direct assignments back to supported `var` declarations.
+//! and strings, strict direct-identifier `typeof` flow checks, and direct
+//! assignments back to supported `var` declarations.
 //! The complete source tree and complete supported-statement plan are validated
 //! before semantic execution begins. Execution may retain safe canonical memo
 //! caches while discovering a type-dependent capability boundary.
@@ -6116,7 +6117,12 @@ fn check_planned_typeof_condition(
         .ok_or(SourceCheckError::Variable(
             VariableInvariant::MissingCurrentFlowType(condition.symbol),
         ))?;
-    let supported = source_typeof_narrowing_type_is_supported(store, global_types, current)
+    let supported = source_typeof_narrowing_type_is_supported(
+        store,
+        global_types,
+        current,
+        condition.tag,
+    )
         .map_err(|_| {
             SourceCheckError::Function(SourceFunctionInvariant::Callable(callable.declaration))
         })?;
