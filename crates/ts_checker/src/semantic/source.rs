@@ -9,10 +9,10 @@
 //! annotated top-level function declarations, initialized identifier-named
 //! top-level variables (optionally exported), ordinary direct identifier
 //! calls, atomic primitive/literal scalar binary operators, direct top-level
-//! conditional initializers, required
-//! own-property reads, direct indexed reads over supported objects, arrays,
-//! and strings, strict direct-identifier `typeof` flow checks, and direct
-//! assignments back to supported `var` declarations.
+//! conditional initializers, required own-property reads (including exact
+//! two-constituent declared unions), direct indexed reads over supported
+//! objects, arrays, and strings, strict direct-identifier `typeof` flow checks,
+//! and direct assignments back to supported `var` declarations.
 //! The complete source tree and complete supported-statement plan are validated
 //! before semantic execution begins. Execution may retain safe canonical memo
 //! caches while discovering a type-dependent capability boundary.
@@ -109,9 +109,10 @@ use super::{
         resolve_source_type_import_binding,
     },
     source_properties::{
-        SourcePropertyError, SourcePropertyPlan, SourcePropertyUnsupported,
-        check_direct_source_property, finish_direct_source_property_plan,
-        plan_direct_source_property_call_syntax, plan_direct_source_property_syntax,
+        SourcePropertyDiagnostic, SourcePropertyError, SourcePropertyPlan,
+        SourcePropertyUnsupported, check_direct_source_property,
+        finish_direct_source_property_plan, plan_direct_source_property_call_syntax,
+        plan_direct_source_property_syntax, prepare_source_property_diagnostic,
     },
     source_statements::{
         SourceFallthroughBranchSyntax, SourceFunctionStatementsError,
@@ -1786,12 +1787,39 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     | SourcePropertyUnsupported::Receiver(node)
                     | SourcePropertyUnsupported::MemberCall(node) => node,
                     SourcePropertyUnsupported::MissingOwnProperty { node, .. }
-                    | SourcePropertyUnsupported::OptionalProperty { node, .. } => node,
+                    | SourcePropertyUnsupported::OptionalProperty { node, .. }
+                    | SourcePropertyUnsupported::ApparentObjectProperty { node, .. }
+                    | SourcePropertyUnsupported::AmbiguousPropertySuggestion { node, .. } => node,
                 };
                 SourceCheckError::Unsupported(UnsupportedSourceSyntax::Property(node))
             }
             SourcePropertyError::InvalidCache(node) => SourceCheckError::Property(node),
+            SourcePropertyError::Union { node, error } => {
+                use super::member_resolution::UnionPropertyError;
+
+                match error {
+                    UnionPropertyError::UnsupportedUnion(_)
+                    | UnionPropertyError::UnsupportedConstituent(_)
+                    | UnionPropertyError::UnsupportedPropertyType(_)
+                    | UnionPropertyError::UnsupportedExactOptionalProperty(_) => {
+                        SourceCheckError::Unsupported(UnsupportedSourceSyntax::Property(node))
+                    }
+                    UnionPropertyError::InvalidUnion(_)
+                    | UnionPropertyError::InvalidProperty(_)
+                    | UnionPropertyError::InvalidCache(_)
+                    | UnionPropertyError::Capacity(_) => SourceCheckError::Property(node),
+                    UnionPropertyError::Relation(error) => {
+                        SourceCheckError::RelationUnavailable(error)
+                    }
+                    UnionPropertyError::TypeCache(error) => error.into(),
+                }
+            }
             SourcePropertyError::Relation(error) => SourceCheckError::RelationUnavailable(error),
+            SourcePropertyError::Display(error) => SourceCheckError::TypeDisplayUnavailable(error),
+            SourcePropertyError::Capacity(node) => SourceCheckError::Property(node),
+            SourcePropertyError::MissingDiagnostic(code) => {
+                SourceCheckError::MissingDiagnostic(code)
+            }
         }
     }
 
@@ -4693,7 +4721,16 @@ fn expression_type(
     expression: &PlannedExpression,
     prepared: &PreparedExpression,
 ) -> Result<TypeId, SourceCheckError> {
-    Ok(execute_expression_types(store, None, &HashMap::new(), expression, prepared)?.result)
+    let mut property_diagnostics = prepare_source_property_diagnostic_sink(expression)?;
+    Ok(execute_expression_types(
+        store,
+        None,
+        &HashMap::new(),
+        expression,
+        prepared,
+        &mut property_diagnostics,
+    )?
+    .result)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -4731,12 +4768,40 @@ impl CheckedExpressionTypes {
     }
 }
 
+fn prepare_source_property_diagnostic_sink(
+    expression: &PlannedExpression,
+) -> Result<Vec<SourcePropertyDiagnostic>, SourceCheckError> {
+    fn capacity(expression: &PlannedExpression) -> Option<usize> {
+        match &expression.kind {
+            PlannedExpressionKind::Parenthesized(inner) => capacity(inner),
+            PlannedExpressionKind::Array(elements) => elements.iter().try_fold(
+                0usize,
+                |count, element| count.checked_add(capacity(element)?),
+            ),
+            PlannedExpressionKind::Object { properties, .. } => properties.iter().try_fold(
+                0usize,
+                |count, property| count.checked_add(capacity(property)?),
+            ),
+            PlannedExpressionKind::Property(_) => Some(1),
+            _ => Some(0),
+        }
+    }
+
+    let capacity = capacity(expression).ok_or(SourceCheckError::Property(expression.node))?;
+    let mut diagnostics = Vec::new();
+    diagnostics
+        .try_reserve_exact(capacity)
+        .map_err(|_| SourceCheckError::Property(expression.node))?;
+    Ok(diagnostics)
+}
+
 fn execute_expression_types(
     store: &mut CanonicalTypeMapperStore,
     global_types: Option<&CanonicalGlobalTypes>,
     current_flow_types: &HashMap<SemanticSymbolId, TypeId>,
     expression: &PlannedExpression,
     prepared: &PreparedExpression,
+    property_diagnostics: &mut Vec<SourcePropertyDiagnostic>,
 ) -> Result<CheckedExpressionTypes, SourceCheckError> {
     let types = match (&expression.kind, prepared) {
         (PlannedExpressionKind::Null, PreparedExpression::Literal(LiteralTreatment::Identity)) => {
@@ -4850,7 +4915,14 @@ fn execute_expression_types(
         (
             PlannedExpressionKind::Parenthesized(inner),
             PreparedExpression::Parenthesized(prepared),
-        ) => execute_expression_types(store, global_types, current_flow_types, inner, prepared),
+        ) => execute_expression_types(
+            store,
+            global_types,
+            current_flow_types,
+            inner,
+            prepared,
+            property_diagnostics,
+        ),
         (PlannedExpressionKind::Array(elements), PreparedExpression::Array(prepared_elements)) => {
             debug_assert_eq!(elements.len(), prepared_elements.len());
             let global_types = global_types.ok_or(SourceCheckError::Unsupported(
@@ -4869,6 +4941,7 @@ fn execute_expression_types(
                     current_flow_types,
                     element,
                     prepared,
+                    property_diagnostics,
                 )?;
                 element_types.push(checked.result);
                 checked_elements.push(checked);
@@ -4918,6 +4991,7 @@ fn execute_expression_types(
                     current_flow_types,
                     property,
                     prepared,
+                    property_diagnostics,
                 )?;
                 property_types.push(checked.result);
                 checked_properties.push(checked);
@@ -4942,9 +5016,17 @@ fn execute_expression_types(
                 current_flow_types,
                 &property.receiver,
                 prepared_receiver,
+                property_diagnostics,
             )?;
-            let checked = check_direct_source_property(store, property, receiver.result)
-                .map_err(SourcePlanner::property_plan_error)?;
+            let checked =
+                check_direct_source_property(store, global_types, property, receiver.result)
+                    .map_err(SourcePlanner::property_plan_error)?;
+            if let Some(diagnostic) = checked.diagnostic {
+                if property_diagnostics.len() == property_diagnostics.capacity() {
+                    return Err(SourceCheckError::Property(property.node));
+                }
+                property_diagnostics.push(diagnostic);
+            }
             Ok(CheckedExpressionTypes::leaf(checked.type_, checked.type_))
         }
         _ => unreachable!("a prepared expression must retain its planned expression shape"),
@@ -5690,6 +5772,12 @@ fn check_expression_type(
             Ok(CheckedExpressionTypes::leaf(target, target))
         }
         _ => {
+            let mut property_diagnostics =
+                prepare_source_property_diagnostic_sink(expression)?;
+            let mut rendered_property_diagnostics = Vec::new();
+            rendered_property_diagnostics
+                .try_reserve_exact(property_diagnostics.capacity())
+                .map_err(|_| SourceCheckError::Property(expression.node))?;
             let prepared = if let Some(contextual_type) = contextual_type {
                 prepare_expression_context_with_global_types(
                     store,
@@ -5708,13 +5796,34 @@ fn check_expression_type(
                     expression,
                 )?
             };
-            execute_expression_types(
+            let checked = execute_expression_types(
                 store,
                 Some(global_types),
                 current_flow_types,
                 expression,
                 &prepared,
-            )
+                &mut property_diagnostics,
+            )?;
+            for deferred in &property_diagnostics {
+                let diagnostic = prepare_source_property_diagnostic(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    deferred,
+                )
+                .map_err(SourcePlanner::property_plan_error)?;
+                if rendered_property_diagnostics.len()
+                    == rendered_property_diagnostics.capacity()
+                {
+                    return Err(SourceCheckError::Property(expression.node));
+                }
+                rendered_property_diagnostics.push(diagnostic);
+            }
+            for diagnostic in rendered_property_diagnostics {
+                merge_retry_diagnostic(diagnostics, diagnostic);
+            }
+            Ok(checked)
         }
     }
 }
@@ -10568,6 +10677,111 @@ mod tests {
         mark_source_unchecked(&mut context, file);
         context.check_source_file(file).unwrap();
         assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn declared_union_read_access_cache_poison_retains_memo_and_repairs_warm() {
+        let source = parsed(concat!(
+            "type Left = { value: string }; ",
+            "type Right = { value: number }; ",
+            "type Both = Left | Right; ",
+            "function read(input: Both): string | number { return (input.value); }",
+        ));
+        let file = FileId::new(482);
+        let (access, receiver) = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::PropertyAccessExpression(access) = &record.data else {
+                    return None;
+                };
+                Some((
+                    NodeRef::new(source.arena.id(), file, node),
+                    NodeRef::new(source.arena.id(), file, access.expression),
+                ))
+            })
+            .expect("fixture must contain one property read");
+        let root = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ParenthesizedExpression)
+                    .then_some(NodeRef::new(source.arena.id(), file, node))
+            })
+            .expect("fixture must contain one parenthesized root");
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        let poison = context.store().intrinsic_bootstrap().unwrap().string_type;
+        assert!(context.store_mut_for_test().set_type_node_links(
+            access,
+            TypeNodeLinks {
+                resolved_type: Some(poison),
+                ..TypeNodeLinks::default()
+            },
+        ));
+
+        let error = SourceCheckError::Property(access);
+        assert_eq!(context.check_source_file(file), Err(error));
+        let union = resolved_node_type(&context, receiver);
+        let property = {
+            let TypeData::Union(union) = context.store().type_payload(union).unwrap().data()
+            else {
+                panic!("receiver must remain a union")
+            };
+            let cache = union
+                .union
+                .property_cache
+                .expect("rejected access must retain its safe union-property memo");
+            context
+                .store()
+                .symbol_table(cache)
+                .and_then(|cache| cache.get_source("value"))
+                .expect("full union property must be cached")
+        };
+        let property_type = context
+            .store()
+            .value_symbol_links(property)
+            .and_then(|links| links.resolved_type)
+            .expect("cached union property must retain its value type");
+        assert_ne!(property_type, poison);
+        assert_eq!(resolved_node_type(&context, access), poison);
+        assert!(context.store().symbol_node_links(access).is_none());
+        assert!(context.store().type_node_links(root).is_none());
+        assert!(context.diagnostics().is_empty());
+        assert!(!is_type_checked(&context, file));
+
+        let rejected = observable_state(&context, file);
+        assert_eq!(context.check_source_file(file), Err(error));
+        assert_eq!(observable_state(&context, file), rejected);
+
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_type_node_links(access, TypeNodeLinks::default())
+        );
+        context.check_source_file(file).unwrap();
+        assert_eq!(resolved_node_type(&context, access), property_type);
+        assert_eq!(
+            context
+                .store()
+                .symbol_node_links(access)
+                .and_then(|links| links.resolved_symbol),
+            Some(property)
+        );
+        assert_eq!(resolved_node_type(&context, root), property_type);
+        assert!(context.diagnostics().is_empty());
+        assert!(is_type_checked(&context, file));
+
+        let warm = observable_state(&context, file);
+        mark_source_unchecked(&mut context, file);
+        context.check_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+        assert_eq!(
+            context
+                .store()
+                .symbol_node_links(access)
+                .and_then(|links| links.resolved_symbol),
+            Some(property)
+        );
     }
 
     #[test]

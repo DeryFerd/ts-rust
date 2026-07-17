@@ -1,16 +1,30 @@
-//! Exact source integration for one required own `identifier.name` access.
+//! Exact source integration for one direct `identifier.name` read.
 //!
 //! The receiver must already have a canonical `any` type or belong to the
-//! validated own-property object domain in `relater`. Optional properties,
-//! missing/apparent/index members, and chains stay fail-closed. A member call
-//! is admitted only when its exact enclosing call grants callee capability.
+//! validated own-property object domain in `relater`. Exact two-constituent
+//! unions of source-declared type literals reuse the canonical union-property
+//! adapter. A property missing from any union constituent recovers with
+//! `errorType` plus a deferred TS2339 or stable-common-candidate TS2551
+//! descriptor. Global `Object` members, comparator-dependent suggestion ties,
+//! ordinary missing/optional own properties, apparent/index members, and
+//! chains stay fail-closed. A member call is admitted only when its exact
+//! enclosing call grants callee capability and deliberately does not use the
+//! union read adapter.
 
 use ts_ast::{NodeArena, NodeData, NodeRef, SyntaxKind};
 use ts_binder::SemanticSymbolId;
+use ts_diagnostics::{Diagnostic, message_by_code};
 
 use super::{
-    CanonicalTypeMapperStore, RelationUnavailable, SymbolNodeLinks, TypeId, TypeNodeLinks,
+    CanonicalCheckerDiagnostic, CanonicalCheckerOptions, CanonicalGlobalTypes,
+    CanonicalTypeFormatFlags, CanonicalTypeMapperStore, DeclaredTypeHost, RelationUnavailable,
+    SymbolNodeLinks, TypeDisplayUnavailable, TypeId, TypeNodeLinks,
+    formatter::type_to_string_with_host_global_types_and_flags,
+    member_resolution::UnionPropertyError,
     source::{PlannedExpression, PlannedExpressionKind},
+    spelling::get_spelling_suggestion,
+    type_records::TypeData,
+    types::TypeFlags,
 };
 
 /// A source property form outside the dependency-closed read slice.
@@ -27,6 +41,14 @@ pub(super) enum SourcePropertyUnsupported {
         node: NodeRef,
         property: SemanticSymbolId,
     },
+    ApparentObjectProperty {
+        node: NodeRef,
+        receiver_type: TypeId,
+    },
+    AmbiguousPropertySuggestion {
+        node: NodeRef,
+        receiver_type: TypeId,
+    },
 }
 
 /// Exact property planning/execution failure without a fallback result.
@@ -34,12 +56,25 @@ pub(super) enum SourcePropertyUnsupported {
 pub(super) enum SourcePropertyError {
     Unsupported(SourcePropertyUnsupported),
     InvalidCache(NodeRef),
+    Union {
+        node: NodeRef,
+        error: UnionPropertyError,
+    },
     Relation(RelationUnavailable),
+    Display(TypeDisplayUnavailable),
+    Capacity(NodeRef),
+    MissingDiagnostic(u32),
 }
 
 impl From<RelationUnavailable> for SourcePropertyError {
     fn from(error: RelationUnavailable) -> Self {
         Self::Relation(error)
+    }
+}
+
+impl From<TypeDisplayUnavailable> for SourcePropertyError {
+    fn from(error: TypeDisplayUnavailable) -> Self {
+        Self::Display(error)
     }
 }
 
@@ -52,7 +87,15 @@ impl std::fmt::Display for SourcePropertyError {
             Self::InvalidCache(node) => {
                 write!(formatter, "source property cache is invalid at {node:?}")
             }
+            Self::Union { error, .. } => error.fmt(formatter),
             Self::Relation(error) => write!(formatter, "{error}"),
+            Self::Display(error) => error.fmt(formatter),
+            Self::Capacity(node) => {
+                write!(formatter, "source property staging exhausted capacity at {node:?}")
+            }
+            Self::MissingDiagnostic(code) => {
+                write!(formatter, "source property diagnostic TS{code} is missing")
+            }
         }
     }
 }
@@ -61,7 +104,12 @@ impl std::error::Error for SourcePropertyError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Relation(error) => Some(error),
-            Self::Unsupported(_) | Self::InvalidCache(_) => None,
+            Self::Display(error) => Some(error),
+            Self::Unsupported(_)
+            | Self::InvalidCache(_)
+            | Self::Union { .. }
+            | Self::Capacity(_)
+            | Self::MissingDiagnostic(_) => None,
         }
     }
 }
@@ -110,11 +158,33 @@ impl SourcePropertyPlan {
     pub(super) fn is_call_callee_for(&self, call: NodeRef, name: NodeRef) -> bool {
         self.name_node == name && self.position == SourcePropertyPosition::CallCallee(call)
     }
+
+    fn is_read(&self) -> bool {
+        self.position == SourcePropertyPosition::Read
+    }
+}
+
+/// Unrendered pinned TS2339 recovery retained through recursive expression
+/// execution until the source checker can supply its formatter host/options.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct SourcePropertyDiagnostic {
+    name_node: NodeRef,
+    receiver_type: TypeId,
+    missing_type: TypeId,
+    suggestion: Option<SemanticSymbolId>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct CheckedSourceProperty {
     pub(super) type_: TypeId,
+    pub(super) diagnostic: Option<SourcePropertyDiagnostic>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CopiedSourcePropertySuggestion {
+    Unavailable,
+    None,
+    Candidate(SemanticSymbolId),
 }
 
 /// Proves the exact `identifier.name` syntax and all existing access-cache
@@ -263,6 +333,7 @@ pub(super) fn finish_direct_source_property_plan(
 /// exact symbol/type cache pair. Canonical `any` publishes only its type cache.
 pub(super) fn check_direct_source_property(
     store: &mut CanonicalTypeMapperStore,
+    global_types: Option<&CanonicalGlobalTypes>,
     plan: &SourcePropertyPlan,
     receiver_type: TypeId,
 ) -> Result<CheckedSourceProperty, SourcePropertyError> {
@@ -270,12 +341,95 @@ pub(super) fn check_direct_source_property(
         plan.receiver.kind,
         PlannedExpressionKind::Identifier(_)
     ));
-    let any = store
-        .intrinsic_bootstrap()
-        .ok_or(RelationUnavailable::MissingBootstrap)?
-        .any_type;
-    let (type_, property) = if receiver_type == any {
-        (any, None)
+    let (any, error_type) = {
+        let bootstrap = store
+            .intrinsic_bootstrap()
+            .ok_or(RelationUnavailable::MissingBootstrap)?;
+        (bootstrap.any_type, bootstrap.error_type)
+    };
+    let union_read = plan.is_read()
+        && store
+            .type_payload(receiver_type)
+            .is_some_and(|record| record.flags().intersects(TypeFlags::UNION));
+    let union_constituents = if union_read {
+        copied_union_constituents(store, receiver_type)
+    } else {
+        None
+    };
+    let missing_union_constituent = union_constituents
+        .and_then(|constituents| copied_first_missing_union_constituent(store, plan, constituents));
+    let union_suggestion = if missing_union_constituent.flatten().is_some() {
+        if let Some(global_types) = global_types
+            && global_object_affects_missing_property(store, global_types, plan.node, &plan.name)?
+        {
+            return Err(SourcePropertyError::Unsupported(
+                SourcePropertyUnsupported::ApparentObjectProperty {
+                    node: plan.node,
+                    receiver_type,
+                },
+            ));
+        }
+        match union_constituents
+            .map(|constituents| {
+                copied_common_union_property_candidates(store, plan.node, constituents)
+            })
+            .transpose()?
+            .flatten()
+        {
+            Some(candidates) => match stable_property_spelling_suggestion(
+                store,
+                &plan.name,
+                &candidates,
+            ) {
+                Ok(Some(candidate)) => CopiedSourcePropertySuggestion::Candidate(candidate),
+                Ok(None) => CopiedSourcePropertySuggestion::None,
+                Err(()) => {
+                    return Err(SourcePropertyError::Unsupported(
+                        SourcePropertyUnsupported::AmbiguousPropertySuggestion {
+                            node: plan.node,
+                            receiver_type,
+                        },
+                    ));
+                }
+            },
+            None => CopiedSourcePropertySuggestion::Unavailable,
+        }
+    } else {
+        CopiedSourcePropertySuggestion::Unavailable
+    };
+    let (type_, property, diagnostic) = if receiver_type == any {
+        (any, None, None)
+    } else if union_read {
+        match store
+            .resolved_union_property(receiver_type, &plan.name)
+            .map_err(|error| SourcePropertyError::Union {
+                node: plan.node,
+                error,
+            })? {
+            Some(property) => (property.type_id(), Some(property.symbol()), None),
+            None => {
+                let missing_type = missing_union_constituent
+                    .flatten()
+                    .ok_or(SourcePropertyError::InvalidCache(plan.node))?;
+                let suggestion = match union_suggestion {
+                    CopiedSourcePropertySuggestion::Candidate(candidate) => Some(candidate),
+                    CopiedSourcePropertySuggestion::None => None,
+                    CopiedSourcePropertySuggestion::Unavailable => {
+                        return Err(SourcePropertyError::InvalidCache(plan.node));
+                    }
+                };
+                (
+                    error_type,
+                    None,
+                    Some(SourcePropertyDiagnostic {
+                        name_node: plan.name_node,
+                        receiver_type,
+                        missing_type,
+                        suggestion,
+                    }),
+                )
+            }
+        }
     } else {
         let Some(property) = store.resolved_own_property(receiver_type, &plan.name)? else {
             return Err(SourcePropertyError::Unsupported(
@@ -293,11 +447,231 @@ pub(super) fn check_direct_source_property(
                 },
             ));
         }
-        (property.type_, Some(property.symbol))
+        (property.type_, Some(property.symbol), None)
     };
 
     publish_property_links(store, plan.node, property, type_)?;
-    Ok(CheckedSourceProperty { type_ })
+    Ok(CheckedSourceProperty { type_, diagnostic })
+}
+
+fn copied_union_constituents(
+    store: &CanonicalTypeMapperStore,
+    receiver_type: TypeId,
+) -> Option<[TypeId; 2]> {
+    let Some(TypeData::Union(union)) =
+        store.type_payload(receiver_type).map(|record| record.data())
+    else {
+        return None;
+    };
+    let [left, right] = union.union.types.as_slice() else {
+        return None;
+    };
+    Some([*left, *right])
+}
+
+fn copied_first_missing_union_constituent(
+    store: &CanonicalTypeMapperStore,
+    plan: &SourcePropertyPlan,
+    constituents: [TypeId; 2],
+) -> Option<Option<TypeId>> {
+    let mut first_missing = None;
+    for constituent in constituents {
+        let structured = store.type_payload(constituent)?.data().structured()?;
+        let present = match structured.members {
+            Some(members) => store.symbol_table(members)?.get_source(&plan.name).is_some(),
+            None => false,
+        };
+        if !present && first_missing.is_none() {
+            first_missing = Some(constituent);
+        }
+    }
+    Some(first_missing)
+}
+
+fn copied_common_union_property_candidates(
+    store: &CanonicalTypeMapperStore,
+    node: NodeRef,
+    constituents: [TypeId; 2],
+) -> Result<Option<Vec<SemanticSymbolId>>, SourcePropertyError> {
+    let Some(left) = store
+        .type_payload(constituents[0])
+        .and_then(|record| record.data().structured())
+    else {
+        return Ok(None);
+    };
+    let Some(right) = store
+        .type_payload(constituents[1])
+        .and_then(|record| record.data().structured())
+    else {
+        return Ok(None);
+    };
+    let Some(left_members) = left.members else {
+        return Ok(Some(Vec::new()));
+    };
+    let Some(right_members) = right.members else {
+        return Ok(Some(Vec::new()));
+    };
+    let Some(left_members) = store.symbol_table(left_members) else {
+        return Ok(None);
+    };
+    let Some(right_members) = store.symbol_table(right_members) else {
+        return Ok(None);
+    };
+    let mut candidates = Vec::new();
+    candidates
+        .try_reserve_exact(left_members.len())
+        .map_err(|_| SourcePropertyError::Capacity(node))?;
+    for (name, property) in left_members.iter() {
+        if name
+            .as_utf8()
+            .is_some_and(|name| right_members.get_source(name).is_some())
+        {
+            candidates.push(property);
+        }
+    }
+    Ok(Some(candidates))
+}
+
+fn stable_property_spelling_suggestion(
+    store: &CanonicalTypeMapperStore,
+    name: &str,
+    candidates: &[SemanticSymbolId],
+) -> Result<Option<SemanticSymbolId>, ()> {
+    let candidate_name = |candidate: &SemanticSymbolId| {
+        store
+            .symbol(*candidate)
+            .and_then(|record| record.name().as_utf8())
+    };
+    let ascending = get_spelling_suggestion(
+        name,
+        candidates.iter().copied(),
+        candidate_name,
+        |left, right| {
+            candidate_name(left)
+                .expect("an eligible property candidate retains its source name")
+                .cmp(
+                    candidate_name(right)
+                        .expect("an eligible property candidate retains its source name"),
+                )
+        },
+    );
+    let descending = get_spelling_suggestion(
+        name,
+        candidates.iter().copied(),
+        candidate_name,
+        |left, right| {
+            candidate_name(right)
+                .expect("an eligible property candidate retains its source name")
+                .cmp(
+                    candidate_name(left)
+                        .expect("an eligible property candidate retains its source name"),
+                )
+        },
+    );
+    match (ascending, descending) {
+        (None, None) => Ok(None),
+        (Some(ascending), Some(descending)) if ascending == descending => Ok(Some(ascending)),
+        _ => Err(()),
+    }
+}
+
+fn global_object_affects_missing_property(
+    store: &CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
+    node: NodeRef,
+    name: &str,
+) -> Result<bool, SourcePropertyError> {
+    let structured = store
+        .type_payload(global_types.object_type)
+        .and_then(|record| record.data().structured())
+        .ok_or(SourcePropertyError::InvalidCache(node))?;
+    let Some(members) = structured.members else {
+        return Ok(false);
+    };
+    let members = store
+        .symbol_table(members)
+        .ok_or(SourcePropertyError::InvalidCache(node))?;
+    if members.get_source(name).is_some() {
+        return Ok(true);
+    }
+    Ok(get_spelling_suggestion(
+        name,
+        members
+            .iter()
+            .filter_map(|(candidate, _)| candidate.as_utf8()),
+        |candidate| Some(*candidate),
+        Ord::cmp,
+    )
+    .is_some())
+}
+
+/// Renders the exact TS2339/TS2551 union diagnostic after recursive expression
+/// execution reaches the source-owned diagnostic staging boundary.
+pub(super) fn prepare_source_property_diagnostic(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    deferred: &SourcePropertyDiagnostic,
+) -> Result<CanonicalCheckerDiagnostic, SourcePropertyError> {
+    let mut flags = CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT;
+    if options.no_error_truncation {
+        flags |= CanonicalTypeFormatFlags::NO_TRUNCATION;
+    }
+    let name = match host.node(deferred.name_node) {
+        Some(node) if node.kind == SyntaxKind::Identifier => match &node.data {
+            NodeData::Identifier(identifier) if !identifier.text.is_empty() => {
+                identifier.text.as_str()
+            }
+            _ => return Err(SourcePropertyError::InvalidCache(deferred.name_node)),
+        },
+        _ => return Err(SourcePropertyError::InvalidCache(deferred.name_node)),
+    };
+    let suggestion = match deferred.suggestion {
+        Some(suggestion) => Some(
+            store
+                .symbol(suggestion)
+                .and_then(|record| record.name().as_utf8())
+                .ok_or(SourcePropertyError::InvalidCache(deferred.name_node))?,
+        ),
+        None => None,
+    };
+    let receiver = type_to_string_with_host_global_types_and_flags(
+        store,
+        host,
+        global_types,
+        deferred.receiver_type,
+        flags,
+    )?;
+    let missing = type_to_string_with_host_global_types_and_flags(
+        store,
+        host,
+        global_types,
+        deferred.missing_type,
+        flags,
+    )?;
+    let detail = Diagnostic::with_arguments(
+        message_by_code(2339).ok_or(SourcePropertyError::MissingDiagnostic(2339))?,
+        [name, missing.as_str()],
+    )
+    .render()
+    .expect("the pinned property diagnostic detail has complete arguments");
+    let diagnostic = match suggestion {
+        Some(suggestion) => Diagnostic::with_arguments(
+            message_by_code(2551).ok_or(SourcePropertyError::MissingDiagnostic(2551))?,
+            [name, receiver.as_str(), suggestion],
+        ),
+        None => Diagnostic::with_arguments(
+            message_by_code(2339).ok_or(SourcePropertyError::MissingDiagnostic(2339))?,
+            [name, receiver.as_str()],
+        ),
+    };
+    Ok(CanonicalCheckerDiagnostic {
+        node: Some(deferred.name_node),
+        range_override: None,
+        diagnostic: diagnostic.with_details([format!("  {detail}")]),
+        related_information: Vec::new(),
+    })
 }
 
 fn unsupported_access(node: NodeRef) -> SourcePropertyError {
@@ -477,8 +851,11 @@ mod tests {
                 .unwrap();
 
         assert_eq!(
-            check_direct_source_property(&mut store, &plan, object),
-            Ok(CheckedSourceProperty { type_: string })
+            check_direct_source_property(&mut store, None, &plan, object),
+            Ok(CheckedSourceProperty {
+                type_: string,
+                diagnostic: None,
+            })
         );
         assert_eq!(
             store
@@ -493,8 +870,11 @@ mod tests {
             Some(property)
         );
         assert_eq!(
-            check_direct_source_property(&mut store, &plan, object),
-            Ok(CheckedSourceProperty { type_: string })
+            check_direct_source_property(&mut store, None, &plan, object),
+            Ok(CheckedSourceProperty {
+                type_: string,
+                diagnostic: None,
+            })
         );
     }
 
@@ -519,8 +899,11 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            check_direct_source_property(&mut store, &plan, any),
-            Ok(CheckedSourceProperty { type_: any })
+            check_direct_source_property(&mut store, None, &plan, any),
+            Ok(CheckedSourceProperty {
+                type_: any,
+                diagnostic: None,
+            })
         );
         assert_eq!(
             store
@@ -546,7 +929,7 @@ mod tests {
                 finish_direct_source_property_plan(&syntax, identifier_receiver(&syntax, property))
                     .unwrap();
 
-            let result = check_direct_source_property(&mut store, &plan, object);
+            let result = check_direct_source_property(&mut store, None, &plan, object);
             if optional {
                 assert_eq!(
                     result,
@@ -695,7 +1078,7 @@ mod tests {
     }
 
     #[test]
-    fn union_receivers_fail_before_cache_publication() {
+    fn unsupported_union_receivers_fail_before_access_cache_publication() {
         let parsed = parsed("const result = object.value;");
         let file = FileId::new(508);
         let access = property_access(&parsed, file);
@@ -718,13 +1101,101 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(
-            check_direct_source_property(&mut store, &plan, union),
-            Err(SourcePropertyError::Relation(
-                RelationUnavailable::UnsupportedStructuredType(union),
-            ))
-        );
+        assert!(matches!(
+            check_direct_source_property(&mut store, None, &plan, union),
+            Err(SourcePropertyError::Union {
+                node,
+                error: UnionPropertyError::UnsupportedConstituent(type_),
+            }) if node == access && [string, number].contains(&type_)
+        ));
         assert!(store.type_node_links(access).is_none());
+        assert!(store.symbol_node_links(access).is_none());
+    }
+
+    #[test]
+    fn live_wrong_access_type_rejects_after_safe_union_memo_and_retries_warm() {
+        let parsed = parsed("const result = object.value;");
+        let file = FileId::new(510);
+        let access = property_access(&parsed, file);
+        let mut store = registered_store(&parsed, file);
+        let (string, number) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (bootstrap.string_type, bootstrap.number_type)
+        };
+        let (left, _) = property_object(&mut store, "value", string, false);
+        let (right, _) = property_object(&mut store, "value", number, false);
+        let mut constituents = vec![left, right];
+        constituents.sort();
+        let union = store
+            .alloc_union_type(ObjectFlags::NONE, constituents)
+            .unwrap();
+        let receiver_symbol = store
+            .alloc_symbol(SymbolData::new(
+                SymbolFlags::FUNCTION_SCOPED_VARIABLE,
+                EscapedName::source("object"),
+            ))
+            .unwrap();
+        assert!(store.set_type_node_links(
+            access,
+            TypeNodeLinks {
+                resolved_type: Some(string),
+                ..TypeNodeLinks::default()
+            },
+        ));
+        let syntax = plan_direct_source_property_syntax(&parsed.arena, &store, access).unwrap();
+        let plan = finish_direct_source_property_plan(
+            &syntax,
+            identifier_receiver(&syntax, receiver_symbol),
+        )
+        .unwrap();
+
+        assert_eq!(
+            check_direct_source_property(&mut store, None, &plan, union),
+            Err(SourcePropertyError::InvalidCache(access))
+        );
+        let TypeData::Union(union_data) = store.type_payload(union).unwrap().data() else {
+            panic!("fixture must remain a union")
+        };
+        let cache = union_data
+            .union
+            .property_cache
+            .expect("the safe union-property memo survives access-cache rejection");
+        assert!(
+            store
+                .symbol_table(cache)
+                .is_some_and(|cache| cache.get_source("value").is_some())
+        );
+        assert_eq!(
+            store
+                .type_node_links(access)
+                .and_then(|links| links.resolved_type),
+            Some(string)
+        );
+        assert!(store.symbol_node_links(access).is_none());
+        let cold = (
+            store.type_len(),
+            store.symbol_store().checker_created_symbol_len(),
+            store.symbol_store().symbol_table_len(),
+        );
+
+        assert_eq!(
+            check_direct_source_property(&mut store, None, &plan, union),
+            Err(SourcePropertyError::InvalidCache(access))
+        );
+        assert_eq!(
+            (
+                store.type_len(),
+                store.symbol_store().checker_created_symbol_len(),
+                store.symbol_store().symbol_table_len(),
+            ),
+            cold
+        );
+        assert_eq!(
+            store
+                .type_node_links(access)
+                .and_then(|links| links.resolved_type),
+            Some(string)
+        );
         assert!(store.symbol_node_links(access).is_none());
     }
 }
