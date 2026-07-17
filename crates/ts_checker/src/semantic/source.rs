@@ -1082,7 +1082,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                             ))?;
                     if let Some((store, host)) = self.semantic {
                         super::object_members::plan_interface(store, host, symbol)
-                            .map_err(|error| self.interface_plan_error(error))?;
+                            .map_err(|error| self.interface_plan_error(statement, error))?;
                     }
                     statements.push(PlannedStatement::Interface(symbol));
                 }
@@ -3694,6 +3694,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
 
     fn interface_plan_error(
         &self,
+        declaration: NodeRef,
         error: super::object_members::PropertyObjectError,
     ) -> SourceCheckError {
         use super::object_members::PropertyObjectError;
@@ -3711,10 +3712,22 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             | PropertyObjectError::InvalidCachedTypeLiteral { node, .. }
             | PropertyObjectError::Capacity(node) => (
                 node,
-                self.arena
-                    .get(node.node)
-                    .map_or(SyntaxKind::SourceFile, |record| record.kind),
+                if node.is_for(self.arena.id(), self.bound.file_id()) {
+                    self.arena
+                        .get(node.node)
+                        .map_or(SyntaxKind::SourceFile, |record| record.kind)
+                } else {
+                    SyntaxKind::InterfaceDeclaration
+                },
             ),
+        };
+        let (node, kind) = if node.is_for(self.arena.id(), self.bound.file_id()) {
+            (node, kind)
+        } else {
+            // A merged global interface may fail on a declaration contributed
+            // by a default library. Source diagnostics must remain anchored in
+            // the source currently being planned rather than crossing arenas.
+            (declaration, SyntaxKind::InterfaceDeclaration)
         };
         self.unsupported(node, kind, SourceSyntaxRole::InterfaceDeclaration)
     }
