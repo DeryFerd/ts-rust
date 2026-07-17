@@ -1,6 +1,14 @@
 # Goal: typescript-go core typechecking parity in Rust
 
-- Status: active
+> **2026-07-16 planning checkpoint:** a proposed completion strategy,
+> parallel dependency DAG, staffing model, and updated acceptance gates are in
+> [`typechecker-completion-goal.md`](typechecker-completion-goal.md). This file
+> remains the historical execution ledger and original architectural plan;
+> commit-scoped progress and “where we are” prose below are not current status.
+> The port map is authoritative for cluster status. If the proposed goal is
+> approved, it becomes authoritative for completion strategy and scheduling.
+
+- Status: historical execution ledger; superseded for current status/strategy
 - Audit date: 2026-07-15
 - Local branch: `july-ultra`
 - Audited upstream pin: `dc37b5249ab60e2bbce936f71b883e6c8136167e`
