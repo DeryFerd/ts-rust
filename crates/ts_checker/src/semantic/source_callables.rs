@@ -764,8 +764,8 @@ pub(super) fn plan_source_callable(
         .generic_return_type_parameter_declaration = plan
         .generic_return_type_parameter_index
         .map(|index| plan.type_parameters[index].declaration);
-    plan.type_parameter_syntax.generic_fixed_return_is_exact = !plan.type_parameters.is_empty()
-        && plan.generic_return_type_parameter_index.is_none();
+    plan.type_parameter_syntax.generic_fixed_return_is_exact =
+        !plan.type_parameters.is_empty() && plan.generic_return_type_parameter_index.is_none();
     source_callable_state(store, &plan, true)?;
     Ok(plan)
 }
@@ -1122,12 +1122,13 @@ fn validate_exact_generic_annotation_shape(
                 type_parameter,
             )?;
         }
-        if !exact && plan.array_targets.is_some() {
+        if !exact && let Some(array_targets) = plan.array_targets {
             exact = is_exact_source_generic_array_annotation(
                 store,
                 host,
                 parameter.identity_node,
                 &plan.type_parameters,
+                array_targets,
             )?;
         }
         if parameter.optional || parameter.initializer.is_some() || parameter.rest || !exact {
@@ -1162,19 +1163,117 @@ fn validate_exact_generic_annotation_shape(
     Ok(return_type_parameter)
 }
 
-/// Admits the first structured generic parameter shape used by ordinary
-/// collection helpers: exact `T[]` and `Array<T>` syntax over one declared
-/// source type parameter. The retained array capability still validates the
-/// resolved target before publication, so a shadowed `Array` cannot cross this
-/// syntax-only planning seam.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SourceGenericParameterCacheState {
+    Cold,
+    Warm(TypeId),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SourceGenericArraySyntax {
+    ArrayType,
+    TypeReference,
+}
+
+/// Admits an exact, nonempty chain of mutable `T[]` and `Array<T>` wrappers
+/// terminating in one declared source type parameter. Planning may encounter a
+/// completely cold chain or a previously queried chain. A warm wrapper is
+/// trusted only when every child is warm and the complete chain retains the
+/// authoritative mutable-array target and exact element identities.
 fn is_exact_source_generic_array_annotation(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     annotation: NodeRef,
     type_parameters: &[SourceCallableTypeParameterPlan],
+    array_targets: CanonicalArrayTargets,
 ) -> Result<bool, SourceCallableError> {
+    let mut active = HashSet::new();
+    let Some((syntax, element)) = exact_source_generic_array_syntax(store, host, annotation)?
+    else {
+        return Ok(false);
+    };
+    if !active.insert(annotation) {
+        return Err(invariant(SourceCallableInvariant::InvalidParameter(
+            annotation,
+        )));
+    }
+    let result = exact_source_generic_parameter_annotation(
+        store,
+        host,
+        element,
+        type_parameters,
+        array_targets,
+        &mut active,
+    )?
+    .map(|element_state| {
+        validate_source_generic_array_annotation_cache(
+            store,
+            annotation,
+            syntax,
+            element_state,
+            array_targets,
+        )
+    })
+    .transpose();
+    active.remove(&annotation);
+    Ok(result?.is_some())
+}
+
+fn exact_source_generic_parameter_annotation(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    annotation: NodeRef,
+    type_parameters: &[SourceCallableTypeParameterPlan],
+    array_targets: CanonicalArrayTargets,
+    active: &mut HashSet<NodeRef>,
+) -> Result<Option<SourceGenericParameterCacheState>, SourceCallableError> {
+    for type_parameter in type_parameters {
+        if is_naked_source_type_parameter_annotation(store, host, annotation, type_parameter)? {
+            return source_type_parameter_annotation_cache_state(store, annotation, type_parameter)
+                .map(Some);
+        }
+    }
+    let Some((syntax, element)) = exact_source_generic_array_syntax(store, host, annotation)?
+    else {
+        return Ok(None);
+    };
+    if !active.insert(annotation) {
+        return Err(invariant(SourceCallableInvariant::InvalidParameter(
+            annotation,
+        )));
+    }
+    let result = (|| {
+        let Some(element_state) = exact_source_generic_parameter_annotation(
+            store,
+            host,
+            element,
+            type_parameters,
+            array_targets,
+            active,
+        )?
+        else {
+            return Ok(None);
+        };
+        validate_source_generic_array_annotation_cache(
+            store,
+            annotation,
+            syntax,
+            element_state,
+            array_targets,
+        )
+        .map(Some)
+    })();
+    active.remove(&annotation);
+    result
+}
+
+fn exact_source_generic_array_syntax(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    annotation: NodeRef,
+) -> Result<Option<(SourceGenericArraySyntax, NodeRef)>, SourceCallableError> {
     let record = preflight_node(store, host, annotation)?;
-    let element = match &record.data {
+    match &record.data {
         NodeData::ArrayTypeNode(array) if record.kind == SyntaxKind::ArrayType => {
             let element = NodeRef::new(annotation.arena, annotation.file, array.element_type);
             let element_record = preflight_node(store, host, element)?;
@@ -1186,19 +1285,19 @@ fn is_exact_source_generic_array_annotation(
                     annotation,
                 )));
             }
-            element
+            Ok(Some((SourceGenericArraySyntax::ArrayType, element)))
         }
         NodeData::TypeReferenceNode(reference) if record.kind == SyntaxKind::TypeReference => {
             let Some(arguments) = &reference.type_arguments else {
-                return Ok(false);
+                return Ok(None);
             };
             let [argument] = arguments.nodes.as_slice() else {
-                return Ok(false);
+                return Ok(None);
             };
             let name = NodeRef::new(annotation.arena, annotation.file, reference.type_name);
             let name_record = preflight_node(store, host, name)?;
             let NodeData::Identifier(identifier) = &name_record.data else {
-                return Ok(false);
+                return Ok(None);
             };
             let argument = NodeRef::new(annotation.arena, annotation.file, *argument);
             let argument_record = preflight_node(store, host, argument)?;
@@ -1210,22 +1309,117 @@ fn is_exact_source_generic_array_annotation(
                 || argument_record.parent != Some(annotation.node)
                 || arguments.has_trailing_comma
                 || arguments.range.start < name_record.range.end
-                || arguments.range.end > record.range.end
-                || argument_record.range.start < arguments.range.start
-                || argument_record.range.end > arguments.range.end
+                || arguments.range.end != record.range.end
+                || arguments.range.start >= arguments.range.end
+                || argument_record.range.start <= arguments.range.start
+                || argument_record.range.end >= arguments.range.end
+                || argument_record.range.start < record.range.start
+                || argument_record.range.end > record.range.end
             {
-                return Ok(false);
+                return Ok(None);
             }
-            argument
+            Ok(Some((SourceGenericArraySyntax::TypeReference, argument)))
         }
-        _ => return Ok(false),
-    };
-    for type_parameter in type_parameters {
-        if is_naked_source_type_parameter_annotation(store, host, element, type_parameter)? {
-            return Ok(true);
-        }
+        _ => Ok(None),
     }
-    Ok(false)
+}
+
+fn source_type_parameter_annotation_cache_state(
+    store: &CanonicalTypeMapperStore,
+    annotation: NodeRef,
+    type_parameter: &SourceCallableTypeParameterPlan,
+) -> Result<SourceGenericParameterCacheState, SourceCallableError> {
+    let symbol_links = store.symbol_node_links(annotation);
+    let type_links = store.type_node_links(annotation);
+    let symbol_cold = symbol_links.is_none_or(|links| links == &SymbolNodeLinks::default());
+    let type_cold = type_links.is_none_or(|links| links == &TypeNodeLinks::default());
+    if symbol_cold && type_cold {
+        return Ok(SourceGenericParameterCacheState::Cold);
+    }
+    let declared_type = store
+        .declared_type_links(type_parameter.symbol)
+        .and_then(|links| links.declared_type)
+        .filter(|declared_type| {
+            cached_ordinary_type_parameter_owner(store, *declared_type)
+                == Some(type_parameter.symbol)
+        })
+        .filter(|declared_type| {
+            source_type_parameter_annotation_links_are_fully_warm(
+                store,
+                annotation,
+                type_parameter.symbol,
+                *declared_type,
+            )
+        })
+        .ok_or_else(|| invariant(SourceCallableInvariant::InvalidTypeCache(annotation)))?;
+    Ok(SourceGenericParameterCacheState::Warm(declared_type))
+}
+
+fn validate_source_generic_array_annotation_cache(
+    store: &CanonicalTypeMapperStore,
+    annotation: NodeRef,
+    syntax: SourceGenericArraySyntax,
+    element_state: SourceGenericParameterCacheState,
+    array_targets: CanonicalArrayTargets,
+) -> Result<SourceGenericParameterCacheState, SourceCallableError> {
+    let symbol_links = store.symbol_node_links(annotation);
+    let type_links = store.type_node_links(annotation);
+    let symbol_cold = symbol_links.is_none_or(|links| links == &SymbolNodeLinks::default());
+    let type_cold = type_links.is_none_or(|links| links == &TypeNodeLinks::default());
+    if symbol_cold && type_cold {
+        return Ok(SourceGenericParameterCacheState::Cold);
+    }
+    let SourceGenericParameterCacheState::Warm(element_type) = element_state else {
+        return Err(invariant(SourceCallableInvariant::InvalidTypeCache(
+            annotation,
+        )));
+    };
+    let Some(resolved) = type_links.and_then(|links| {
+        let resolved = links.resolved_type?;
+        (links
+            == &TypeNodeLinks {
+                resolved_type: Some(resolved),
+                outer_type_parameters: None,
+            })
+            .then_some(resolved)
+    }) else {
+        return Err(invariant(SourceCallableInvariant::InvalidTypeCache(
+            annotation,
+        )));
+    };
+    match syntax {
+        SourceGenericArraySyntax::ArrayType if !symbol_cold => {
+            return Err(invariant(SourceCallableInvariant::InvalidTypeCache(
+                annotation,
+            )));
+        }
+        SourceGenericArraySyntax::TypeReference => {
+            let expected_symbol = store
+                .type_payload(array_targets.array_type())
+                .and_then(TypeRecord::symbol)
+                .and_then(|symbol| store.get_merged_symbol(symbol))
+                .ok_or_else(|| invariant(SourceCallableInvariant::InvalidTypeCache(annotation)))?;
+            if symbol_links
+                != Some(&SymbolNodeLinks {
+                    resolved_symbol: Some(expected_symbol),
+                })
+            {
+                return Err(invariant(SourceCallableInvariant::InvalidTypeCache(
+                    annotation,
+                )));
+            }
+        }
+        SourceGenericArraySyntax::ArrayType => {}
+    }
+    let array = store
+        .canonical_array_reference_with_targets(array_targets, resolved)
+        .map_err(|_| invariant(SourceCallableInvariant::InvalidTypeCache(annotation)))?
+        .filter(|array| {
+            !array.readonly && !array.array_literal && array.element_type == element_type
+        })
+        .ok_or_else(|| invariant(SourceCallableInvariant::InvalidTypeCache(annotation)))?;
+    debug_assert_eq!(array.element_type, element_type);
+    Ok(SourceGenericParameterCacheState::Warm(resolved))
 }
 
 fn is_exact_source_generic_mapper_annotation(
@@ -1380,8 +1574,7 @@ fn source_type_parameter_annotation_links_are_cold_or_fully_warm(
     let type_links = store.type_node_links(annotation);
     let cold = symbol_links.is_none_or(|links| links == &SymbolNodeLinks::default())
         && type_links.is_none_or(|links| links == &TypeNodeLinks::default());
-    cold
-        || source_type_parameter_annotation_links_are_fully_warm(
+    cold || source_type_parameter_annotation_links_are_fully_warm(
         store,
         annotation,
         symbol,
@@ -2219,6 +2412,17 @@ pub(super) fn publish_source_callable_parameter_types(
                 callable.plan.declaration,
             )));
         }
+        let generic_type_parameters = if callable.plan.type_parameters.is_empty() {
+            None
+        } else {
+            Some(
+                planned_type_parameter_ids(store, &callable.plan).ok_or_else(|| {
+                    invariant(SourceCallableInvariant::Publication(
+                        callable.plan.declaration,
+                    ))
+                })?,
+            )
+        };
         for (parameter, base) in callable.plan.parameters.iter().zip(&callable.base_types) {
             if store.type_payload(*base).is_none()
                 || !default_parameter_links(store, parameter.symbol)
@@ -2241,6 +2445,16 @@ pub(super) fn publish_source_callable_parameter_types(
                 || store
                     .validate_cached_array_capability_prepared(*base, global_types, prepared)
                     .is_err()
+                || generic_type_parameters
+                    .as_ref()
+                    .is_some_and(|type_parameters| {
+                        !valid_generic_source_parameter_type(
+                            store,
+                            callable.plan.array_targets,
+                            *base,
+                            type_parameters,
+                        )
+                    })
             {
                 return Err(invariant(SourceCallableInvariant::InvalidParameterCache(
                     parameter.declaration,
@@ -2945,6 +3159,7 @@ pub(super) fn validate_stored_source_callable(
             store,
             signature_record,
             expected_parameter_types,
+            provenance.array_targets,
             &type_parameter_edges,
         )
         || !generic_return_provenance_valid
@@ -3071,8 +3286,7 @@ pub(super) fn validate_stored_source_callable(
                     return_type,
                     provenance.generic_return_type_parameter,
                     &type_parameter_edges,
-                ))
-        {
+                )) {
             false
         } else if let Some(circular_annotation) = store.circular_return_annotation_type(signature) {
             let valid = store.intrinsic_bootstrap().is_some_and(|bootstrap| {
@@ -3099,6 +3313,7 @@ fn valid_stored_generic_source_signature(
     store: &CanonicalTypeMapperStore,
     signature: &Signature,
     parameter_types: Option<&[TypeId]>,
+    array_targets: Option<CanonicalArrayTargets>,
     type_parameters: &[TypeId],
 ) -> bool {
     if type_parameters.is_empty() {
@@ -3110,36 +3325,64 @@ fn valid_stored_generic_source_signature(
         && parameter_types.is_none_or(|types| {
             types.len() == signature.parameters().len()
                 && types.iter().all(|type_| {
-                    valid_stored_generic_source_parameter_type(store, *type_, type_parameters)
+                    valid_generic_source_parameter_type(
+                        store,
+                        array_targets,
+                        *type_,
+                        type_parameters,
+                    )
                 })
         })
 }
 
-fn valid_stored_generic_source_parameter_type(
+fn valid_generic_source_parameter_type(
     store: &CanonicalTypeMapperStore,
+    array_targets: Option<CanonicalArrayTargets>,
     type_: TypeId,
     type_parameters: &[TypeId],
+) -> bool {
+    valid_generic_source_parameter_type_worker(
+        store,
+        array_targets,
+        type_,
+        type_parameters,
+        &mut HashSet::new(),
+    )
+}
+
+fn valid_generic_source_parameter_type_worker(
+    store: &CanonicalTypeMapperStore,
+    array_targets: Option<CanonicalArrayTargets>,
+    type_: TypeId,
+    type_parameters: &[TypeId],
+    active: &mut HashSet<TypeId>,
 ) -> bool {
     if type_parameters.contains(&type_) {
         return true;
     }
-    let Some(TypeData::TypeReference(reference)) = store.type_payload(type_).map(TypeRecord::data)
-    else {
+    let Some(array_targets) = array_targets else {
         return false;
     };
-    let Some(target) = reference.object.target else {
+    if !active.insert(type_) {
         return false;
-    };
-    store
-        .canonical_array_reference_with_targets(
-            CanonicalArrayTargets::for_single_target_validation(target),
-            type_,
-        )
+    }
+    let valid = store
+        .canonical_array_reference_with_targets(array_targets, type_)
         .is_ok_and(|array| {
             array.is_some_and(|array| {
-                !array.array_literal && type_parameters.contains(&array.element_type)
+                !array.readonly
+                    && !array.array_literal
+                    && valid_generic_source_parameter_type_worker(
+                        store,
+                        Some(array_targets),
+                        array.element_type,
+                        type_parameters,
+                        active,
+                    )
             })
-        })
+        });
+    active.remove(&type_);
+    valid
 }
 
 fn valid_stored_source_generic_return_provenance(
@@ -4200,8 +4443,8 @@ mod tests {
                 .unwrap();
             (proof, index, fixed)
         };
-        syntax.generic_return_type_parameter_declaration = generic_return_type_parameter_index
-            .map(|index| plans[index].declaration);
+        syntax.generic_return_type_parameter_declaration =
+            generic_return_type_parameter_index.map(|index| plans[index].declaration);
         syntax.generic_fixed_return_is_exact = generic_fixed_return_is_exact;
         let type_parameter_symbols = type_parameter_declarations
             .iter()
@@ -5143,12 +5386,18 @@ mod tests {
     }
 
     #[test]
-    fn generic_array_parameter_syntax_requires_an_array_capability() {
-        for (index, annotation) in ["T[]", "Array<T>"].into_iter().enumerate() {
+    fn recursive_generic_array_parameter_syntax_requires_an_array_capability() {
+        let annotations = [
+            "T[]".to_owned(),
+            "Array<T>".to_owned(),
+            "T[][]".to_owned(),
+            "Array<Array<T>>".to_owned(),
+            "Array<T[]>[]".to_owned(),
+            format!("T{}", "[]".repeat(101)),
+        ];
+        for (index, annotation) in annotations.into_iter().enumerate() {
             let fixture = QueryFixture::new(
-                &format!(
-                    "function first<T>(values: {annotation}): T {{ return values[0]; }}"
-                ),
+                &format!("function first<T>(values: {annotation}): T {{ return values[0]; }}"),
                 FileId::new(990 + u32::try_from(index).unwrap()),
             );
             let (declaration, _, _, _) = fixture.generic_parts();
@@ -5175,6 +5424,132 @@ mod tests {
             assert_eq!(plan.parameters.len(), 1);
             assert_eq!(plan.generic_return_type_parameter_index, Some(0));
         }
+    }
+
+    #[test]
+    fn recursive_generic_array_parameter_warm_cache_is_exact_at_every_wrapper() {
+        let parsed = parse_source_file(
+            "interface Array<T> {} interface ReadonlyArray<T> {} \
+             function deep<T>(values: Array<T[]>[]): T { return values[0][0][0]; }",
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(996);
+        let mut context = bind_context(&parsed, file);
+        let (declaration, _, parameter_type, _) = generic_function_parts(&parsed, file);
+        let resolved = context.get_type_from_type_node(parameter_type).unwrap();
+        let array_targets = CanonicalArrayTargets::from_global_types(context.global_types());
+        let owner = context.file(file).unwrap().1.symbol(declaration).unwrap();
+        {
+            let (_, bound) = context.file(file).unwrap();
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&parsed.arena, bound)],
+                GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+            )
+            .unwrap();
+            let plan = plan_source_callable(
+                context.store(),
+                &host,
+                declaration,
+                owner,
+                Some(array_targets),
+            )
+            .unwrap();
+            assert_eq!(plan.parameters.len(), 1);
+            assert_eq!(
+                context.store().type_node_links(parameter_type),
+                Some(&TypeNodeLinks {
+                    resolved_type: Some(resolved),
+                    outer_type_parameters: None,
+                })
+            );
+        }
+
+        let NodeData::ArrayTypeNode(outer) = &parsed.arena.get(parameter_type.node).unwrap().data
+        else {
+            panic!("the mixed fixture has an outer array type")
+        };
+        let inner_reference = NodeRef::new(parameter_type.arena, file, outer.element_type);
+        assert_eq!(
+            parsed.arena.get(inner_reference.node).unwrap().kind,
+            SyntaxKind::TypeReference
+        );
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        assert!(context.store_mut_for_test().set_type_node_links(
+            inner_reference,
+            TypeNodeLinks {
+                resolved_type: Some(number),
+                outer_type_parameters: None,
+            },
+        ));
+        let before = generic_transaction_state(context.store());
+        let (_, bound) = context.file(file).unwrap();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, bound)],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        assert!(
+            plan_source_callable(
+                context.store(),
+                &host,
+                declaration,
+                owner,
+                Some(array_targets),
+            )
+            .is_err()
+        );
+        assert_eq!(generic_transaction_state(context.store()), before);
+    }
+
+    #[test]
+    fn recursive_generic_array_semantic_shape_uses_authoritative_mutable_targets() {
+        let parsed = parse_source_file(
+            "interface Array<T> {} interface ReadonlyArray<T> {} \
+             function identity<T>(value: T): T { return value; }",
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(997);
+        let mut context = bind_context(&parsed, file);
+        let (_, _, parameter_type, _) = generic_function_parts(&parsed, file);
+        let type_parameter = context.get_type_from_type_node(parameter_type).unwrap();
+        let global_types = context.global_types().clone();
+        let array_targets = CanonicalArrayTargets::from_global_types(&global_types);
+        let store = context.store_mut_for_test();
+        let inner = store
+            .create_canonical_array_type_with_targets(array_targets, type_parameter, false)
+            .unwrap();
+        let outer = store
+            .create_canonical_array_type_with_targets(array_targets, inner, false)
+            .unwrap();
+        let readonly = store
+            .create_canonical_array_type_with_targets(array_targets, outer, true)
+            .unwrap();
+
+        assert!(valid_generic_source_parameter_type(
+            store,
+            Some(array_targets),
+            outer,
+            &[type_parameter],
+        ));
+        assert!(!valid_generic_source_parameter_type(
+            store,
+            None,
+            outer,
+            &[type_parameter],
+        ));
+        assert!(!valid_generic_source_parameter_type(
+            store,
+            Some(array_targets),
+            readonly,
+            &[type_parameter],
+        ));
+        let number = store.intrinsic_bootstrap().unwrap().number_type;
+        assert!(!valid_generic_source_parameter_type(
+            store,
+            Some(array_targets),
+            outer,
+            &[number],
+        ));
     }
 
     #[test]
@@ -5282,7 +5657,12 @@ mod tests {
                 .declared_type_links(type_parameter_symbol)
                 .is_none()
         );
-        assert!(fixture.store.source_callable_type_for_owner(owner).is_none());
+        assert!(
+            fixture
+                .store
+                .source_callable_type_for_owner(owner)
+                .is_none()
+        );
 
         let mut diagnostics = CanonicalCheckerDiagnostics::default();
         let callable = fixture
