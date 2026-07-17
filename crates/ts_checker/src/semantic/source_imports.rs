@@ -2043,8 +2043,6 @@ fn has_exact_modifier_sequence(
             || record.flags.0 != 0
             || record.parent != Some(statement.node)
             || !range_contains(statement_record, record)
-            || modifiers.list.range.start.get() > record.range.start.get()
-            || record.range.end.get() > modifiers.list.range.end.get()
             || (index == 0 && record.range.start != statement_record.range.start)
             || previous_end.is_some_and(|end| end > record.range.start.get())
             || !source_spelling_matches(arena, record, expected_spelling)
