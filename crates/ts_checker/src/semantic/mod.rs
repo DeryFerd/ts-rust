@@ -59,6 +59,7 @@ mod source_elements;
 mod source_flow;
 mod source_functions;
 mod source_imports;
+mod source_new;
 mod source_properties;
 mod source_statements;
 mod spelling;

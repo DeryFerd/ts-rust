@@ -2,6 +2,7 @@
 //!
 //! This module deliberately supports only unmodified type aliases and simple
 //! interfaces, top-level nongeneric classes with primitive annotated fields,
+//! exact zero-argument construction of one preceding admitted local class,
 //! top-level literal enums, empty external-module markers, exact
 //! named ESM reexports,
 //! leading direct named ESM value imports, clause-level type-only named ESM
@@ -113,6 +114,11 @@ use super::{
         resolve_source_import_binding, resolve_source_named_reexport_binding,
         resolve_source_type_import_binding,
     },
+    source_new::{
+        SourceDefaultNewPlan, SourceNewError, SourceNewInvariant, SourceNewUnsupported,
+        check_direct_default_new, plan_direct_default_new, preflight_direct_default_new,
+        prepare_direct_default_news,
+    },
     source_properties::{
         SourcePropertyDiagnostic, SourcePropertyError, SourcePropertyPlan,
         SourcePropertyUnsupported, check_direct_source_property,
@@ -212,6 +218,7 @@ pub enum UnsupportedSourceSyntax {
     Class(NodeRef),
     Property(NodeRef),
     Element(NodeRef),
+    New(NodeRef),
 }
 
 /// Source and AST identity rejected before semantic execution.
@@ -591,6 +598,7 @@ pub(super) enum PlannedExpressionKind {
     Property(Box<SourcePropertyPlan>),
     Element(Box<SourceElementPlan>),
     Call(Box<SourceCallPlan>),
+    New(Box<SourceDefaultNewPlan>),
     Binary(Box<PrimitiveBinaryPlan>),
     Logical(Box<LogicalBinaryPlan>),
     Conditional(Box<ConditionalExpressionPlan>),
@@ -841,6 +849,7 @@ struct SourceCheckPlan {
     arrows: Vec<PlannedArrow>,
     contextual_arrows: Vec<PlannedContextualArrow>,
     identifier_reads: Vec<(NodeRef, SemanticSymbolId)>,
+    default_news: Vec<SourceDefaultNewPlan>,
     strings: Vec<String>,
     numbers: Vec<Number>,
     bigints: Vec<PseudoBigInt>,
@@ -860,6 +869,7 @@ struct SourcePlanner<'arena, 'semantic, 'sources> {
     numbers: Vec<Number>,
     bigints: Vec<PseudoBigInt>,
     identifier_reads: Vec<(NodeRef, SemanticSymbolId)>,
+    default_news: Vec<SourceDefaultNewPlan>,
     value_import_bindings: HashMap<SemanticSymbolId, SourceImportBindingPlan>,
     type_import_bindings: HashMap<SemanticSymbolId, SourceImportBindingPlan>,
     import_reads: Vec<PlannedSourceImportRead>,
@@ -873,6 +883,7 @@ struct SourcePlanner<'arena, 'semantic, 'sources> {
     hoisted_functions: HashSet<SemanticSymbolId>,
     prior_variables: HashSet<SemanticSymbolId>,
     readable_variables: HashSet<SemanticSymbolId>,
+    prior_classes: HashMap<SemanticSymbolId, ClassMemberPlan>,
     assigned_variables: HashSet<SemanticSymbolId>,
     /// Exact roots minted only by assignment and direct-call syntax owners.
     primitive_binary_position_roots: HashSet<NodeRef>,
@@ -889,6 +900,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             numbers: Vec::new(),
             bigints: Vec::new(),
             identifier_reads: Vec::new(),
+            default_news: Vec::new(),
             value_import_bindings: HashMap::new(),
             type_import_bindings: HashMap::new(),
             import_reads: Vec::new(),
@@ -899,6 +911,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             hoisted_functions: HashSet::new(),
             prior_variables: HashSet::new(),
             readable_variables: HashSet::new(),
+            prior_classes: HashMap::new(),
             assigned_variables: HashSet::new(),
             primitive_binary_position_roots: HashSet::new(),
         }
@@ -919,6 +932,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             numbers: Vec::new(),
             bigints: Vec::new(),
             identifier_reads: Vec::new(),
+            default_news: Vec::new(),
             value_import_bindings: HashMap::new(),
             type_import_bindings: HashMap::new(),
             import_reads: Vec::new(),
@@ -929,6 +943,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             hoisted_functions: HashSet::new(),
             prior_variables: HashSet::new(),
             readable_variables: HashSet::new(),
+            prior_classes: HashMap::new(),
             assigned_variables: HashSet::new(),
             primitive_binary_position_roots: HashSet::new(),
         }
@@ -1183,6 +1198,13 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     }
                     preflight_nongeneric_class_members(store, host, &class)
                         .map_err(|error| Self::class_plan_error(statement, error))?;
+                    if self
+                        .prior_classes
+                        .insert(class.symbol(), class.clone())
+                        .is_some()
+                    {
+                        return Err(SourceCheckError::Class(statement));
+                    }
                     statements.push(PlannedStatement::Class(class));
                 }
                 SyntaxKind::EnumDeclaration => {
@@ -1363,6 +1385,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             arrows,
             contextual_arrows,
             identifier_reads: self.identifier_reads,
+            default_news: self.default_news,
             strings: self.strings,
             numbers: self.numbers,
             bigints: self.bigints,
@@ -1812,6 +1835,30 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             super::classes::ClassError::DeclaredType(error) => {
                 SourceCheckError::DeclaredType(error)
             }
+        }
+    }
+
+    fn new_plan_error(expression: NodeRef, error: SourceNewError) -> SourceCheckError {
+        let node = error.node().unwrap_or(expression);
+        match error {
+            SourceNewError::Unsupported(reason) => {
+                let boundary = match reason {
+                    SourceNewUnsupported::Expression(node)
+                    | SourceNewUnsupported::Constructor(node)
+                    | SourceNewUnsupported::MissingArgumentList(node)
+                    | SourceNewUnsupported::Arguments(node)
+                    | SourceNewUnsupported::TypeArguments(node)
+                    | SourceNewUnsupported::ConstructorClass { node, .. }
+                    | SourceNewUnsupported::ConstructorNotPrior { node, .. } => node,
+                };
+                SourceCheckError::Unsupported(UnsupportedSourceSyntax::New(boundary))
+            }
+            SourceNewError::Invariant(SourceNewInvariant::NameResolution { error, .. }) => {
+                SourceCheckError::Variable(VariableInvariant::NameResolution(error))
+            }
+            SourceNewError::Invariant(_) => SourceCheckError::Call(node),
+            SourceNewError::DeclaredType(error) => SourceCheckError::DeclaredType(error),
+            SourceNewError::Class(error) => Self::class_plan_error(expression, error),
         }
     }
 
@@ -3484,6 +3531,32 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     PlannedExpressionKind::Call(Box::new(call)),
                 ))
             }
+            SyntaxKind::NewExpression => {
+                if !self.is_direct_top_level_variable_initializer(expression)? {
+                    return Err(SourceCheckError::Unsupported(UnsupportedSourceSyntax::New(
+                        expression,
+                    )));
+                }
+                let Some((store, host)) = self.semantic else {
+                    return Err(SourceCheckError::Unsupported(UnsupportedSourceSyntax::New(
+                        expression,
+                    )));
+                };
+                let construction = plan_direct_default_new(
+                    self.arena,
+                    self.bound,
+                    store,
+                    host,
+                    &self.prior_classes,
+                    expression,
+                )
+                .map_err(|error| Self::new_plan_error(expression, error))?;
+                self.default_news.push(construction.clone());
+                Ok(PlannedExpression::new(
+                    expression,
+                    PlannedExpressionKind::New(Box::new(construction)),
+                ))
+            }
             _ => Err(self.unsupported(expression, kind, SourceSyntaxRole::VariableInitializer)),
         }
     }
@@ -4549,6 +4622,7 @@ fn primitive_binary_operand_plan_is_supported(expression: &PlannedExpression) ->
         | PlannedExpressionKind::Array(_)
         | PlannedExpressionKind::Object { .. }
         | PlannedExpressionKind::Property(_)
+        | PlannedExpressionKind::New(_)
         | PlannedExpressionKind::Conditional(_) => false,
     }
 }
@@ -4574,6 +4648,7 @@ fn conditional_scalar_operand_plan_is_supported(expression: &PlannedExpression) 
         | PlannedExpressionKind::Property(_)
         | PlannedExpressionKind::Element(_)
         | PlannedExpressionKind::Call(_)
+        | PlannedExpressionKind::New(_)
         | PlannedExpressionKind::Binary(_)
         | PlannedExpressionKind::Logical(_)
         | PlannedExpressionKind::Conditional(_) => false,
@@ -4649,6 +4724,7 @@ fn preflight_inferred_function_return_dependencies(
                         .any(|parameter| parameter.symbol == read.value_symbol)
             }
             PlannedExpressionKind::TypeImportValueUse(_) => false,
+            PlannedExpressionKind::New(_) => false,
             PlannedExpressionKind::Parenthesized(inner)
             | PlannedExpressionKind::Assertion { operand: inner, .. } => {
                 expression_is_closed(inner, parameters, functions)
@@ -5758,6 +5834,40 @@ fn check_expression_type(
                 resolution.recovery,
             ))
         }
+        PlannedExpressionKind::New(construction) => {
+            if contextual_type.is_some() {
+                return Err(SourceCheckError::Unsupported(UnsupportedSourceSyntax::New(
+                    construction.node(),
+                )));
+            }
+            preflight_direct_default_new(store, host, construction)
+                .map_err(|error| SourcePlanner::new_plan_error(construction.node(), error))?;
+            let checked = check_direct_default_new(store, host, construction)
+                .map_err(|error| SourcePlanner::new_plan_error(construction.node(), error))?;
+            if store
+                .symbol_node_links(construction.constructor())
+                .and_then(|links| links.resolved_symbol)
+                != Some(construction.resolved_symbol())
+                || store
+                    .type_node_links(construction.constructor())
+                    .and_then(|links| links.resolved_type)
+                    != Some(checked.value_type)
+                || store
+                    .signature_links(construction.node())
+                    .and_then(|links| links.resolved_signature.signature())
+                    != Some(checked.signature)
+                || store
+                    .type_node_links(construction.node())
+                    .and_then(|links| links.resolved_type)
+                    != Some(checked.instance_type)
+            {
+                return Err(SourceCheckError::Call(construction.node()));
+            }
+            Ok(CheckedExpressionTypes::leaf(
+                checked.instance_type,
+                checked.instance_type,
+            ))
+        }
         PlannedExpressionKind::Call(call) => {
             emit_call_type_argument_grammar_diagnostics(diagnostics, call)?;
             let callee = check_expression_type(
@@ -6258,6 +6368,7 @@ fn syntactic_truthiness(
         }
         PlannedExpressionKind::Array(_)
         | PlannedExpressionKind::Object { .. }
+        | PlannedExpressionKind::New(_)
         | PlannedExpressionKind::BigInt { .. } => PredicateSemantics::Always,
         PlannedExpressionKind::Null | PlannedExpressionKind::GlobalUndefined => {
             PredicateSemantics::Never
@@ -6314,6 +6425,7 @@ fn syntactic_nullishness(expression: &PlannedExpression) -> PredicateSemantics {
         | PlannedExpressionKind::Boolean(_)
         | PlannedExpressionKind::Array(_)
         | PlannedExpressionKind::Object { .. }
+        | PlannedExpressionKind::New(_)
         | PlannedExpressionKind::Binary(_) => PredicateSemantics::Never,
     }
 }
@@ -8420,6 +8532,7 @@ pub(super) fn check_source_file(
         arrows,
         contextual_arrows,
         identifier_reads,
+        default_news,
         strings,
         numbers,
         bigints,
@@ -8660,6 +8773,8 @@ pub(super) fn check_source_file(
         inferred_function_diagnostics[index] = Some(function_diagnostics);
     }
 
+    prepare_direct_default_news(store, host, &default_news)
+        .map_err(|error| SourcePlanner::new_plan_error(source.node_ref(), error))?;
     for statement in statements {
         session.reset_query();
         match statement {

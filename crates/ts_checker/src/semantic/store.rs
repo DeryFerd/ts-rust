@@ -1719,6 +1719,10 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         true
     }
 
+    pub(super) fn try_reserve_symbol_node_links(&mut self, additional: usize) -> bool {
+        self.links.symbol_node.try_reserve(additional)
+    }
+
     #[must_use]
     pub fn type_node_links(&self, node: NodeRef) -> Option<&TypeNodeLinks> {
         self.observe_relation_node_read(node);
@@ -1841,6 +1845,10 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             self.mark_union_cache_validation_dirty();
         }
         true
+    }
+
+    pub(super) fn try_reserve_signature_links(&mut self, additional: usize) -> bool {
+        self.links.signature.try_reserve(additional)
     }
 
     #[must_use]
