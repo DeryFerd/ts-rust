@@ -415,7 +415,6 @@ pub(super) fn plan_source_callable(
         || view.invalid_parser_cache
         || view.parameters.range.start < record.range.start
         || view.parameters.range.end > record.range.end
-        || view.parameters.has_trailing_comma
     {
         return Err(invariant(SourceCallableInvariant::InvalidSyntax(
             declaration,

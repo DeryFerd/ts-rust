@@ -12,11 +12,13 @@ use ts_parser::{ParseResult, parse_source_file};
 const SOURCE: &str = concat!(
     "function withDefault(seed: number, value: number = seed + 1): number { return value; }\n",
     "function incompatible(value: number = 'wrong'): number { return value; }\n",
+    "function trailingBeforeRequired(value: number = 2, required: string,): void {}\n",
     "const arrow = (seed: number, value: number = seed + 2): number => value;\n",
     "const omitted: number = withDefault(1);\n",
     "const explicitUndefined: number = withDefault(1, undefined);\n",
     "const supplied: number = withDefault(1, 4);\n",
     "const arrowOmitted: number = arrow(1);\n",
+    "const trailingCall: void = trailingBeforeRequired(undefined, 'ready');\n",
     "const wrongCall: number = withDefault(1, 'bad');\n",
 );
 
