@@ -19,7 +19,7 @@ map remains authoritative for cluster state.
 | M0 | `july-ultra`; repository root | deterministic checker scoring | schema-5 provenance, retained fatal outcomes, exact fixed-manifest execution, and selected-case preparation integrated through `174eebf` |
 | S2a | `agent/w0-s2a-members`; `../ts-rust-worktrees/w0-s2a-members` | exact single-base interface heritage | implementation complete; repeated adversarial review found relation-cache invalidation bugs, so an observed-dependency redesign is in progress before integration |
 | S3 | `agent/w0-s3-instantiation`; `../ts-rust-worktrees/w0-s3-instantiation` | composite mapper and instantiation-session kernel | integrated through `4701c60`; checker check, strict Clippy, and rustdoc green |
-| S3b | `agent/w0-s3b-session`; `../ts-rust-worktrees/w0-s3b-session` | lazy generic-call demand and source-owned instantiation accounting | `a27ee8c`/`f11eb00` are rejected as-is; a fresh read-only Go/Rust audit is specifying the replacement slice |
+| S3b | `agent/w0-s3b-session`; `../ts-rust-worktrees/w0-s3b-session` | lazy generic-call demand and source-owned instantiation accounting | audit complete; `a27ee8c`/`f11eb00` are rejected as-is and the replacement contract is frozen in [`typechecker-s3-lazy-instantiation.md`](typechecker-s3-lazy-instantiation.md) |
 | S1b | `agent/w0-s1b-declarations`; `../ts-rust-worktrees/w0-s1b-declarations` | direct named `.d.ts` value/type consumption | integrated through `c23594d`; both program orders, warm reuse, skipLibCheck, and fail-closed boundaries pass |
 
 S2a is the only active semantic writer. S3b is a read-only audit until its
