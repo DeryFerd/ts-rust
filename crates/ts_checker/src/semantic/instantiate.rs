@@ -149,7 +149,7 @@ struct InstantiationCacheKey {
 enum InstantiationAliasCacheKey {
     None,
     Some {
-        symbol: Option<SemanticSymbolId>,
+        symbol: SemanticSymbolId,
         type_arguments: Vec<TypeId>,
     },
 }
@@ -426,12 +426,14 @@ fn instantiation_cache_key(
 ) -> Result<InstantiationCacheKey, InstantiationError> {
     let alias = match alias {
         None => InstantiationAliasCacheKey::None,
-        Some(alias) => {
+        Some(alias_id) => {
             let alias = store
-                .type_alias(alias)
-                .ok_or(InstantiationError::InvalidAlias(alias))?;
+                .type_alias(alias_id)
+                .ok_or(InstantiationError::InvalidAlias(alias_id))?;
             InstantiationAliasCacheKey::Some {
-                symbol: alias.symbol(),
+                symbol: alias
+                    .symbol()
+                    .ok_or(InstantiationError::InvalidAlias(alias_id))?,
                 type_arguments: alias.type_arguments().unwrap_or_default().to_vec(),
             }
         }
@@ -736,6 +738,7 @@ mod tests {
         IntrinsicBootstrapOptions, SemanticStore, mapper::TypeMapper, type_records::TypeRecord,
         types::ObjectFlags,
     };
+    use ts_binder::{EscapedName, SymbolData, SymbolFlags};
 
     fn initialized_store() -> CanonicalTypeMapperStore {
         let mut store = SemanticStore::<TypeRecord, TypeMapper>::new();
@@ -942,43 +945,85 @@ mod tests {
         let mut store = initialized_store();
         let number = store.intrinsic_bootstrap().unwrap().number_type;
         let parameter = store.alloc_type_parameter(None).unwrap();
-        let first = store.alloc_type_alias(None).unwrap();
-        let second = store.alloc_type_alias(None).unwrap();
-        assert!(store.set_type_alias_arguments(first, Some(vec![parameter])));
-        assert!(store.set_type_alias_arguments(second, Some(vec![parameter])));
+        let first_symbol = store
+            .alloc_symbol(SymbolData::new(
+                SymbolFlags::TYPE_ALIAS,
+                EscapedName::source("First"),
+            ))
+            .unwrap();
+        let second_symbol = store
+            .alloc_symbol(SymbolData::new(
+                SymbolFlags::TYPE_ALIAS,
+                EscapedName::source("Second"),
+            ))
+            .unwrap();
+        let first = store.alloc_type_alias(Some(first_symbol)).unwrap();
+        let equivalent = store.alloc_type_alias(Some(first_symbol)).unwrap();
+        let different_symbol = store.alloc_type_alias(Some(second_symbol)).unwrap();
+        let reversed = store.alloc_type_alias(Some(first_symbol)).unwrap();
+        let no_arguments = store.alloc_type_alias(Some(first_symbol)).unwrap();
+        let empty_arguments = store.alloc_type_alias(Some(first_symbol)).unwrap();
+        for alias in [first, equivalent, different_symbol] {
+            assert!(store.set_type_alias_arguments(alias, Some(vec![parameter, number])));
+        }
+        assert!(store.set_type_alias_arguments(reversed, Some(vec![number, parameter])));
+        assert!(store.set_type_alias_arguments(empty_arguments, Some(Vec::new())));
 
         assert_eq!(
             instantiation_cache_key(&store, number, Some(first)),
-            instantiation_cache_key(&store, number, Some(second)),
+            instantiation_cache_key(&store, number, Some(equivalent)),
+            "record identity is not part of the pinned alias key",
         );
-
-        assert!(store.set_type_alias_arguments(second, Some(vec![number])));
         assert_ne!(
             instantiation_cache_key(&store, number, Some(first)),
-            instantiation_cache_key(&store, number, Some(second)),
+            instantiation_cache_key(&store, number, Some(different_symbol)),
+            "alias symbol identity is part of the pinned alias key",
+        );
+        assert_ne!(
+            instantiation_cache_key(&store, number, Some(first)),
+            instantiation_cache_key(&store, number, Some(reversed)),
+            "type argument order is part of the pinned alias key",
+        );
+        assert_eq!(
+            instantiation_cache_key(&store, number, Some(no_arguments)),
+            instantiation_cache_key(&store, number, Some(empty_arguments)),
+            "nil and empty argument slices have the same pinned length-and-elements key",
+        );
+
+        let old_key = instantiation_cache_key(&store, number, Some(equivalent)).unwrap();
+        let cache = HashMap::from([(old_key, parameter)]);
+        assert!(store.set_type_alias_arguments(equivalent, Some(vec![number, parameter])));
+        let mutated_key = instantiation_cache_key(&store, number, Some(equivalent)).unwrap();
+        assert_eq!(
+            cache.get(&mutated_key),
+            None,
+            "a live alias mutation must miss"
         );
     }
 
     #[test]
-    fn foreign_alias_rejection_does_not_mutate_the_dynamic_session() {
+    fn malformed_or_foreign_alias_rejection_does_not_mutate_the_dynamic_session() {
         let mut store = initialized_store();
         let parameter = store.alloc_type_parameter(None).unwrap();
         let mapper = store.new_simple_type_mapper(parameter, parameter).unwrap();
+        let malformed_alias = store.alloc_type_alias(None).unwrap();
         let mut foreign = initialized_store();
         let foreign_alias = foreign.alloc_type_alias(None).unwrap();
         let mut session = InstantiationSession::new(InstantiationLimits::default());
 
-        assert_eq!(
-            instantiate_type_with_alias(
-                &mut store,
-                parameter,
-                InstantiationMapping::Stored(mapper),
-                None,
-                Some(foreign_alias),
-                &mut session,
-            ),
-            Err(InstantiationError::InvalidAlias(foreign_alias)),
-        );
+        for alias in [malformed_alias, foreign_alias] {
+            assert_eq!(
+                instantiate_type_with_alias(
+                    &mut store,
+                    parameter,
+                    InstantiationMapping::Stored(mapper),
+                    None,
+                    Some(alias),
+                    &mut session,
+                ),
+                Err(InstantiationError::InvalidAlias(alias)),
+            );
+        }
         assert_eq!(session.depth, 0);
         assert_eq!(session.query_count(), 0);
         assert_eq!(session.total_count(), 0);
