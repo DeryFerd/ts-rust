@@ -8,8 +8,8 @@
 //! exact checked-instantiation cache publication. Recovery signatures remain a
 //! separate call-node concern and never enter the global signature cache. The
 //! original exact `<T>(value: T): T` entry points remain available for
-//! compatibility with the installed identity-call source path and its one-row
-//! cache protocol.
+//! compatibility with the installed identity-call source path, but now share
+//! the same lazy shell, demand, recovery, and cache protocol.
 
 #![allow(dead_code)] // Installed ahead of the source-call dispatch consumer.
 
@@ -34,8 +34,8 @@ use super::{
         validate_inference_leaf_with_array_targets,
     },
     instantiate::{
-        InstantiationError, InstantiationSession, instantiate_type_with_session,
-        instantiate_type_with_vector, instantiate_type_with_vector_and_array_targets,
+        InstantiationError, InstantiationLimits, InstantiationSession,
+        instantiate_type_with_session, instantiate_type_with_vector_and_session,
     },
     signatures::SignatureFlags,
     source_callables::{StoredSourceCallableValidation, validate_stored_source_callable},
@@ -179,13 +179,12 @@ impl From<RelationUnavailable> for GenericCallVectorError {
     }
 }
 
-/// One mapper-equivalent projection with no mapper/signature cache published.
+/// One exact mapper-backed instantiated-signature shell.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct GenericCallVectorInstantiation {
     pub(super) type_arguments: Vec<TypeId>,
-    pub(super) parameter_types: Vec<TypeId>,
-    pub(super) return_type: TypeId,
-    pub(super) return_kind: DirectCallReturnKind,
+    pub(super) signature: SignatureId,
+    pub(super) mapper: TypeMapperId,
 }
 
 /// Final selected signature view. On an erroneous sole-candidate call this is
@@ -241,11 +240,13 @@ impl GenericCallVectorApplicability {
     }
 }
 
-/// Complete pure-resolution result.
+/// Complete resolver result, including any checked/recovery shells published
+/// in pinned overload-resolution order.
 ///
-/// `checked_instantiation` retains the normal inference/default vector used to
-/// classify TS2344/TS2345. `projection` may instead contain the raw
-/// overload-failure vector used for the call expression's final return type.
+/// `checked_instantiation` retains the normal inference/default vector used by
+/// checked applicability and TS2345. Arity and TS2344 failures never create
+/// one. `projection` may instead contain the raw overload-failure vector used
+/// for the call expression's final return type.
 /// Fields are private so sibling consumers receive an immutable resolver-minted
 /// capability; cache publication never needs to recompute and potentially
 /// intern a forged union merely to validate it. The boxed capability keeps the
@@ -258,7 +259,7 @@ pub(super) struct GenericCallVectorResolution {
     capability: Box<GenericCallVectorCapability>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct GenericCallVectorCapability {
     checked_return_source: TypeId,
     array_targets: Option<CanonicalArrayTargets>,
@@ -285,7 +286,7 @@ pub(super) struct GenericCallVectorCachedInstantiation {
     pub(super) mapper: TypeMapperId,
 }
 
-/// Outcome of checked-instantiation materialization.
+/// Outcome of checked-shell validation after resolution.
 ///
 /// Type/value arity and explicit-constraint failures never reach pinned
 /// `getSignatureInstantiation`, so they are explicitly left unmaterialized.
@@ -295,7 +296,6 @@ pub(super) enum GenericCallVectorMaterialization {
         applicability: GenericCallVectorApplicability,
     },
     Reused(GenericCallVectorCachedInstantiation),
-    Published(GenericCallVectorCachedInstantiation),
 }
 
 /// The signature selected for one source call, together with the globally
@@ -346,25 +346,35 @@ struct PreparedGenericCallVectorSignature {
     min_argument_count: i32,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct GenericCallVectorReservation {
-    mappers: usize,
-    symbols: usize,
-    value_links: usize,
-    signatures: usize,
-    cached_signatures: usize,
-}
-
 /// Resolves the bounded full-vector generic branch through the canonical
-/// callable provider. It deliberately does not allocate a mapper, transient
-/// parameter symbol, instantiated signature, or cached-signature entry. The
-/// source provider must reject `const` type-parameter declarations before
-/// publication because stored type-parameter records do not retain that bit.
+/// callable provider. Checked and recovery signature shells are published
+/// during resolution, while parameter and return types remain lazy. The source
+/// provider must reject `const` type-parameter declarations before publication
+/// because stored type-parameter records do not retain that bit.
 pub(super) fn resolve_generic_call_vector(
     store: &mut CanonicalTypeMapperStore,
     global_types: &CanonicalGlobalTypes,
     strict_function_types: bool,
     request: GenericCallVectorRequest<'_>,
+) -> Result<GenericCallVectorResolution, GenericCallVectorError> {
+    let mut session = InstantiationSession::new(InstantiationLimits::default());
+    resolve_generic_call_vector_with_session(
+        store,
+        global_types,
+        strict_function_types,
+        request,
+        None,
+        &mut session,
+    )
+}
+
+pub(super) fn resolve_generic_call_vector_with_session(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
+    strict_function_types: bool,
+    request: GenericCallVectorRequest<'_>,
+    existing_call_signature: Option<SignatureId>,
+    session: &mut InstantiationSession,
 ) -> Result<GenericCallVectorResolution, GenericCallVectorError> {
     validate_generic_call_vector_request(store, request)?;
     let callable = match validate_stored_single_callable(store, request.callee) {
@@ -381,11 +391,13 @@ pub(super) fn resolve_generic_call_vector(
         }
         StoredSingleCallableValidation::Valid { callable, .. } => callable,
     };
-    project_validated_generic_call_vector(
+    project_validated_generic_call_vector_with_session(
         store,
         request,
         &callable,
         Some(CanonicalArrayTargets::from_global_types(global_types)),
+        existing_call_signature,
+        session,
         |store, source, target| {
             store.is_type_assignable_to_with_global_types_and_strict_function_types(
                 source,
@@ -431,15 +443,14 @@ pub(super) fn materialize_generic_call_vector_checked_instantiation(
     materialize_validated_generic_call_vector_checked_instantiation(store, resolution, &callable)
 }
 
-/// Materializes the signature graph selected by one source call as a single
-/// transaction. The resolver-minted capability supplies both the checked and
-/// overload-failure vectors; `existing_call_signature` is the call node's
-/// previously published signature, if any.
+/// Validates and exposes the signature shell selected during resolution.
+/// `existing_call_signature` is the call node's previously published
+/// signature, if any.
 ///
 /// Applicable calls use the authoritative global checked-signature cache.
 /// Every erroneous cold call receives a distinct uncached recovery signature.
-/// TS2345 additionally creates or reuses its checked signature, but never
-/// publishes that graph in a separate transaction from the recovery graph.
+/// TS2345 additionally creates or reuses its checked signature before
+/// applicability, while the recovery shell remains call-local.
 pub(super) fn materialize_generic_call_vector_source(
     store: &mut CanonicalTypeMapperStore,
     resolution: &GenericCallVectorResolution,
@@ -466,6 +477,146 @@ pub(super) fn materialize_generic_call_vector_source(
     )
 }
 
+/// Resolves only the return of the signature selected for this call. Checked
+/// returns stay cold through applicability, and erroneous calls resolve the
+/// uncached recovery return rather than the retained checked candidate.
+pub(super) fn demand_generic_call_vector_selected_return(
+    store: &mut CanonicalTypeMapperStore,
+    resolution: &GenericCallVectorResolution,
+    session: &mut InstantiationSession,
+) -> Result<(TypeId, DirectCallReturnKind), GenericCallVectorError> {
+    let callee = resolution.projection.callee;
+    let callable = match validate_stored_single_callable(store, callee) {
+        StoredSingleCallableValidation::NotCallable => {
+            return Err(GenericCallVectorUnsupported::NotExactSingleCallable(callee).into());
+        }
+        StoredSingleCallableValidation::Pending { .. } => {
+            return Err(GenericCallVectorUnsupported::PendingCallable(callee).into());
+        }
+        StoredSingleCallableValidation::Malformed { .. } => {
+            return Err(GenericCallVectorInvariant::MalformedCallable(callee).into());
+        }
+        StoredSingleCallableValidation::Valid { callable, .. } => callable,
+    };
+    let shape = validate_generic_call_signature_shape(
+        store,
+        callee,
+        &callable,
+        resolution.capability.array_targets,
+    )?;
+    let sources = validate_generic_call_vector_resolution(store, resolution, &shape)?;
+    let selected = &resolution.projection.instantiation;
+    let return_type = demand_generic_call_vector_return(
+        store,
+        &shape,
+        &sources,
+        &selected.type_arguments,
+        selected.signature,
+        session,
+    )?;
+    let return_kind = if store
+        .type_payload(return_type)
+        .is_some_and(|record| record.flags().intersects(TypeFlags::VOID))
+    {
+        DirectCallReturnKind::Void
+    } else {
+        DirectCallReturnKind::Value
+    };
+    Ok((return_type, return_kind))
+}
+
+pub(super) fn demand_generic_call_vector_return_with_session(
+    store: &mut CanonicalTypeMapperStore,
+    resolution: &GenericCallVectorResolution,
+    session: &mut InstantiationSession,
+) -> Result<TypeId, GenericCallVectorError> {
+    demand_generic_call_vector_selected_return(store, resolution, session)
+        .map(|(return_type, _)| return_type)
+}
+
+/// Demands the return of a mapper-backed generic-call shell when only the
+/// instantiated signature is available (for example from a type node).
+///
+/// This remains fail-closed to the bounded generic-call domain: it
+/// reconstructs the original source callable, recovers the mapper targets,
+/// and runs the same exact warm-shell validator before filling the return.
+pub(super) fn demand_generic_call_signature_return_with_session(
+    store: &mut CanonicalTypeMapperStore,
+    array_targets: Option<CanonicalArrayTargets>,
+    signature: SignatureId,
+    session: &mut InstantiationSession,
+) -> Result<TypeId, GenericCallVectorError> {
+    let instantiated = store.signature(signature).ok_or(
+        GenericCallVectorInvariant::InvalidCachedInstantiation {
+            target: signature,
+            signature,
+        },
+    )?;
+    let target =
+        instantiated
+            .target()
+            .ok_or(GenericCallVectorInvariant::InvalidCachedInstantiation {
+                target: signature,
+                signature,
+            })?;
+    let mapper = instantiated
+        .mapper()
+        .ok_or(GenericCallVectorInvariant::InvalidCachedInstantiation { target, signature })?;
+    let callee = store
+        .source_callable_type_for_signature(target)
+        .ok_or(GenericCallVectorInvariant::InvalidCachedInstantiation { target, signature })?;
+    let callable = match validate_stored_single_callable(store, callee) {
+        StoredSingleCallableValidation::NotCallable => {
+            return Err(GenericCallVectorUnsupported::NotExactSingleCallable(callee).into());
+        }
+        StoredSingleCallableValidation::Pending { .. } => {
+            return Err(GenericCallVectorUnsupported::PendingCallable(callee).into());
+        }
+        StoredSingleCallableValidation::Malformed { .. } => {
+            return Err(GenericCallVectorInvariant::MalformedCallable(callee).into());
+        }
+        StoredSingleCallableValidation::Valid { callable, .. } => callable,
+    };
+    if callable.signature != target {
+        return Err(
+            GenericCallVectorInvariant::InvalidCachedInstantiation { target, signature }.into(),
+        );
+    }
+    let shape = match validate_generic_call_signature_shape(store, callee, &callable, array_targets)
+    {
+        Ok(shape) => shape,
+        Err(vector_error) => {
+            let provenance = identity_type_parameter_cache_provenance(store, callee, &callable);
+            match validate_identity_signature_shape(store, callee, &callable, provenance)
+                .ok()
+                .and_then(|identity| identity_generic_call_vector_shape(store, identity).ok())
+            {
+                Some(shape) => shape,
+                None => return Err(vector_error),
+            }
+        }
+    };
+    let sources = shape
+        .type_parameters
+        .iter()
+        .map(|parameter| parameter.type_)
+        .collect::<Vec<_>>();
+    let type_arguments = sources
+        .iter()
+        .map(|source| {
+            store
+                .map_type(mapper, *source)
+                .ok_or(GenericCallVectorInvariant::InvalidCachedInstantiation { target, signature })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if store.type_mapper_has_exact_endpoints(mapper, &sources, &type_arguments) != Some(true) {
+        return Err(
+            GenericCallVectorInvariant::InvalidCachedInstantiation { target, signature }.into(),
+        );
+    }
+    demand_generic_call_vector_return(store, &shape, &sources, &type_arguments, signature, session)
+}
+
 fn generic_call_vector_resolution(
     projection: GenericCallVectorProjection,
     checked_instantiation: Option<GenericCallVectorInstantiation>,
@@ -489,6 +640,44 @@ fn project_validated_generic_call_vector(
     request: GenericCallVectorRequest<'_>,
     callable: &ValidatedSingleCallable,
     array_targets: Option<CanonicalArrayTargets>,
+    is_assignable: impl FnMut(
+        &mut CanonicalTypeMapperStore,
+        TypeId,
+        TypeId,
+    ) -> Result<bool, RelationUnavailable>,
+    is_strict_subtype: impl FnMut(
+        &mut CanonicalTypeMapperStore,
+        TypeId,
+        TypeId,
+    ) -> Result<bool, RelationUnavailable>,
+    is_subtype: impl FnMut(
+        &mut CanonicalTypeMapperStore,
+        TypeId,
+        TypeId,
+    ) -> Result<bool, RelationUnavailable>,
+) -> Result<GenericCallVectorResolution, GenericCallVectorError> {
+    let mut session = InstantiationSession::new(InstantiationLimits::default());
+    project_validated_generic_call_vector_with_session(
+        store,
+        request,
+        callable,
+        array_targets,
+        None,
+        &mut session,
+        is_assignable,
+        is_strict_subtype,
+        is_subtype,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn project_validated_generic_call_vector_with_session(
+    store: &mut CanonicalTypeMapperStore,
+    request: GenericCallVectorRequest<'_>,
+    callable: &ValidatedSingleCallable,
+    array_targets: Option<CanonicalArrayTargets>,
+    existing_call_signature: Option<SignatureId>,
+    session: &mut InstantiationSession,
     mut is_assignable: impl FnMut(
         &mut CanonicalTypeMapperStore,
         TypeId,
@@ -514,14 +703,26 @@ fn project_validated_generic_call_vector(
     };
     let shape =
         validate_generic_call_signature_shape(store, request.callee, callable, array_targets)?;
+    let sources = shape
+        .type_parameters
+        .iter()
+        .map(|parameter| parameter.type_)
+        .collect::<Vec<_>>();
     let minimum_type_arguments = minimum_type_argument_count(&shape.type_parameters);
     if let Some(explicit) = request.explicit_type_arguments
         && (explicit.len() < minimum_type_arguments || explicit.len() > shape.type_parameters.len())
     {
         let recovery = explicit_recovery_type_arguments(store, &shape, explicit)?;
-        let projection = generic_call_projection(store, request.callee, &shape, recovery, true)?;
+        let shell = get_or_create_generic_call_vector_recovery_shell(
+            store,
+            &shape,
+            &sources,
+            &recovery,
+            existing_call_signature,
+            None,
+        )?;
         return Ok(generic_call_vector_resolution(
-            projection,
+            generic_call_projection(request.callee, &shape, recovery, shell, true),
             None,
             GenericCallVectorApplicability::TypeArgumentArity {
                 minimum: minimum_type_arguments,
@@ -542,8 +743,16 @@ fn project_validated_generic_call_vector(
             &mut is_assignable,
             &mut is_strict_subtype,
             &mut is_subtype,
+            session,
         )?;
-        let projection = generic_call_projection(store, request.callee, &shape, recovery, true)?;
+        let shell = get_or_create_generic_call_vector_recovery_shell(
+            store,
+            &shape,
+            &sources,
+            &recovery,
+            existing_call_signature,
+            None,
+        )?;
         let applicability = if request.arguments.len() < expected_arguments {
             GenericCallVectorApplicability::TooFewArguments {
                 expected: expected_arguments,
@@ -556,7 +765,7 @@ fn project_validated_generic_call_vector(
             }
         };
         return Ok(generic_call_vector_resolution(
-            projection,
+            generic_call_projection(request.callee, &shape, recovery, shell, true),
             None,
             applicability,
             shape.return_type,
@@ -565,7 +774,7 @@ fn project_validated_generic_call_vector(
     }
 
     let selected_type_arguments = match request.explicit_type_arguments {
-        Some(explicit) => explicit_checked_type_arguments(store, &shape, explicit)?,
+        Some(explicit) => explicit_checked_type_arguments(store, &shape, explicit, session)?,
         None => infer_generic_call_type_arguments(
             store,
             &shape,
@@ -573,9 +782,9 @@ fn project_validated_generic_call_vector(
             &mut is_assignable,
             &mut is_strict_subtype,
             &mut is_subtype,
+            session,
         )?,
     };
-    let checked = instantiate_generic_call_shape(store, &shape, selected_type_arguments.clone())?;
 
     if let Some(explicit) = request.explicit_type_arguments
         && let Some(applicability) = check_explicit_type_argument_constraints(
@@ -584,32 +793,61 @@ fn project_validated_generic_call_vector(
             explicit,
             &selected_type_arguments,
             &mut is_assignable,
+            session,
         )?
     {
         let recovery = explicit_recovery_type_arguments(store, &shape, explicit)?;
-        let projection = generic_call_projection(store, request.callee, &shape, recovery, true)?;
+        let shell = get_or_create_generic_call_vector_recovery_shell(
+            store,
+            &shape,
+            &sources,
+            &recovery,
+            existing_call_signature,
+            None,
+        )?;
         return Ok(generic_call_vector_resolution(
-            projection,
-            Some(checked),
+            generic_call_projection(request.callee, &shape, recovery, shell, true),
+            None,
             applicability,
             shape.return_type,
             shape.array_targets,
         ));
     }
 
+    let (checked_shell, _) = get_or_create_checked_generic_call_vector_shell(
+        store,
+        &shape,
+        &sources,
+        &selected_type_arguments,
+    )?;
+    let checked = GenericCallVectorInstantiation {
+        type_arguments: selected_type_arguments.clone(),
+        signature: checked_shell.signature,
+        mapper: checked_shell.mapper,
+    };
     if let Some(applicability) = check_generic_call_arguments(
         store,
         request.arguments,
-        &checked.parameter_types,
+        &shape,
+        &sources,
+        &checked,
+        session,
         &mut is_assignable,
     )? {
         let recovery = match request.explicit_type_arguments {
             Some(explicit) => explicit_recovery_type_arguments(store, &shape, explicit)?,
             None => selected_type_arguments,
         };
-        let projection = generic_call_projection(store, request.callee, &shape, recovery, true)?;
+        let shell = get_or_create_generic_call_vector_recovery_shell(
+            store,
+            &shape,
+            &sources,
+            &recovery,
+            existing_call_signature,
+            Some(checked_shell),
+        )?;
         return Ok(generic_call_vector_resolution(
-            projection,
+            generic_call_projection(request.callee, &shape, recovery, shell, true),
             Some(checked),
             applicability,
             shape.return_type,
@@ -617,18 +855,22 @@ fn project_validated_generic_call_vector(
         ));
     }
 
+    if existing_call_signature.is_some_and(|existing| existing != checked.signature) {
+        return Err(GenericCallVectorInvariant::InvalidCallInstantiation {
+            target: shape.signature,
+            signature: existing_call_signature
+                .expect("the mismatching existing signature is present"),
+        }
+        .into());
+    }
     Ok(generic_call_vector_resolution(
-        GenericCallVectorProjection {
-            callee: request.callee,
-            generic_signature: shape.signature,
-            type_parameters: shape
-                .type_parameters
-                .iter()
-                .map(|parameter| parameter.type_)
-                .collect(),
-            instantiation: checked.clone(),
-            recovery: false,
-        },
+        generic_call_projection(
+            request.callee,
+            &shape,
+            selected_type_arguments,
+            checked_shell,
+            false,
+        ),
         Some(checked),
         GenericCallVectorApplicability::Applicable,
         shape.return_type,
@@ -1088,6 +1330,7 @@ fn explicit_checked_type_arguments(
     store: &mut CanonicalTypeMapperStore,
     shape: &GenericCallSignatureShape,
     explicit: &[TypeId],
+    session: &mut InstantiationSession,
 ) -> Result<Vec<TypeId>, GenericCallVectorError> {
     let sources = shape
         .type_parameters
@@ -1105,6 +1348,7 @@ fn explicit_checked_type_arguments(
             &sources[..index],
             &result[..index],
             shape.array_targets,
+            session,
         )?;
         result.push(instantiated);
     }
@@ -1155,6 +1399,7 @@ fn failure_type_arguments(
         TypeId,
         TypeId,
     ) -> Result<bool, RelationUnavailable>,
+    session: &mut InstantiationSession,
 ) -> Result<Vec<TypeId>, GenericCallVectorError> {
     match request.explicit_type_arguments {
         Some(explicit) => explicit_recovery_type_arguments(store, shape, explicit),
@@ -1165,6 +1410,7 @@ fn failure_type_arguments(
             is_assignable,
             is_strict_subtype,
             is_subtype,
+            session,
         ),
     }
 }
@@ -1188,6 +1434,7 @@ fn infer_generic_call_type_arguments(
         TypeId,
         TypeId,
     ) -> Result<bool, RelationUnavailable>,
+    session: &mut InstantiationSession,
 ) -> Result<Vec<TypeId>, GenericCallVectorError> {
     let type_parameters = shape
         .type_parameters
@@ -1227,6 +1474,7 @@ fn infer_generic_call_type_arguments(
                     &type_parameters[..index],
                     &inferred[..index],
                     shape.array_targets,
+                    session,
                 )
             })
             .transpose()?;
@@ -1268,6 +1516,7 @@ fn infer_generic_call_type_arguments(
                         &type_parameters[..index],
                         &inferred[..index],
                         shape.array_targets,
+                        session,
                     )
                 })
                 .transpose()?
@@ -1279,6 +1528,7 @@ fn infer_generic_call_type_arguments(
             argument = constraint;
         }
         inferred.push(argument);
+        session.clear_active_mapper_caches();
     }
     Ok(inferred)
 }
@@ -1390,6 +1640,7 @@ fn check_explicit_type_argument_constraints(
         TypeId,
         TypeId,
     ) -> Result<bool, RelationUnavailable>,
+    session: &mut InstantiationSession,
 ) -> Result<Option<GenericCallVectorApplicability>, GenericCallVectorError> {
     let sources = shape
         .type_parameters
@@ -1406,6 +1657,7 @@ fn check_explicit_type_argument_constraints(
             &sources,
             checked,
             shape.array_targets,
+            session,
         )?;
         if !is_assignable(store, type_argument, constraint)? {
             return Ok(Some(
@@ -1423,19 +1675,26 @@ fn check_explicit_type_argument_constraints(
 fn check_generic_call_arguments(
     store: &mut CanonicalTypeMapperStore,
     arguments: &[TypeId],
-    parameters: &[TypeId],
+    shape: &GenericCallSignatureShape,
+    sources: &[TypeId],
+    checked: &GenericCallVectorInstantiation,
+    session: &mut InstantiationSession,
     is_assignable: &mut impl FnMut(
         &mut CanonicalTypeMapperStore,
         TypeId,
         TypeId,
     ) -> Result<bool, RelationUnavailable>,
 ) -> Result<Option<GenericCallVectorApplicability>, GenericCallVectorError> {
-    for (index, (argument_type, parameter_type)) in arguments
-        .iter()
-        .copied()
-        .zip(parameters.iter().copied())
-        .enumerate()
-    {
+    for (index, argument_type) in arguments.iter().copied().enumerate() {
+        let parameter_type = demand_generic_call_vector_parameter(
+            store,
+            shape,
+            sources,
+            &checked.type_arguments,
+            checked.signature,
+            index,
+            session,
+        )?;
         if !is_assignable(store, argument_type, parameter_type)? {
             return Ok(Some(
                 GenericCallVectorApplicability::ArgumentNotAssignable {
@@ -1449,76 +1708,25 @@ fn check_generic_call_arguments(
     Ok(None)
 }
 
-fn instantiate_generic_call_shape(
-    store: &mut CanonicalTypeMapperStore,
-    shape: &GenericCallSignatureShape,
-    type_arguments: Vec<TypeId>,
-) -> Result<GenericCallVectorInstantiation, GenericCallVectorError> {
-    let sources = shape
-        .type_parameters
-        .iter()
-        .map(|parameter| parameter.type_)
-        .collect::<Vec<_>>();
-    let mut parameter_types = Vec::with_capacity(shape.parameter_templates.len());
-    for parameter in &shape.parameter_templates {
-        parameter_types.push(instantiate_generic_call_type(
-            store,
-            *parameter,
-            &sources,
-            &type_arguments,
-            shape.array_targets,
-        )?);
-    }
-    let return_type = instantiate_generic_call_type(
-        store,
-        shape.return_type,
-        &sources,
-        &type_arguments,
-        shape.array_targets,
-    )?;
-    let return_kind = if store
-        .type_payload(return_type)
-        .is_some_and(|record| record.flags().intersects(TypeFlags::VOID))
-    {
-        DirectCallReturnKind::Void
-    } else {
-        DirectCallReturnKind::Value
-    };
-    Ok(GenericCallVectorInstantiation {
-        type_arguments,
-        parameter_types,
-        return_type,
-        return_kind,
-    })
-}
-
 fn instantiate_generic_call_type(
     store: &mut CanonicalTypeMapperStore,
     type_: TypeId,
     sources: &[TypeId],
     targets: &[TypeId],
     array_targets: Option<CanonicalArrayTargets>,
+    session: &mut InstantiationSession,
 ) -> Result<TypeId, InstantiationError> {
-    match array_targets {
-        Some(array_targets) => instantiate_type_with_vector_and_array_targets(
-            store,
-            type_,
-            sources,
-            targets,
-            array_targets,
-        ),
-        None => instantiate_type_with_vector(store, type_, sources, targets),
-    }
+    instantiate_type_with_vector_and_session(store, type_, sources, targets, array_targets, session)
 }
 
 fn generic_call_projection(
-    store: &mut CanonicalTypeMapperStore,
     callee: TypeId,
     shape: &GenericCallSignatureShape,
     type_arguments: Vec<TypeId>,
+    shell: GenericCallVectorCachedInstantiation,
     recovery: bool,
-) -> Result<GenericCallVectorProjection, GenericCallVectorError> {
-    Ok(GenericCallVectorProjection {
+) -> GenericCallVectorProjection {
+    GenericCallVectorProjection {
         callee,
         generic_signature: shape.signature,
         type_parameters: shape
@@ -1526,9 +1734,13 @@ fn generic_call_projection(
             .iter()
             .map(|parameter| parameter.type_)
             .collect(),
-        instantiation: instantiate_generic_call_shape(store, shape, type_arguments)?,
+        instantiation: GenericCallVectorInstantiation {
+            type_arguments,
+            signature: shell.signature,
+            mapper: shell.mapper,
+        },
         recovery,
-    })
+    }
 }
 
 const fn generic_call_vector_caches_checked_instantiation(
@@ -1601,42 +1813,55 @@ fn get_or_create_checked_generic_call_vector_shell_with(
     Ok((published, true))
 }
 
+fn get_or_create_generic_call_vector_recovery_shell(
+    store: &mut CanonicalTypeMapperStore,
+    shape: &GenericCallSignatureShape,
+    sources: &[TypeId],
+    type_arguments: &[TypeId],
+    existing_call_signature: Option<SignatureId>,
+    checked: Option<GenericCallVectorCachedInstantiation>,
+) -> Result<GenericCallVectorCachedInstantiation, GenericCallVectorError> {
+    if let Some(existing) = existing_call_signature {
+        return validate_existing_generic_call_vector_recovery(
+            store,
+            shape,
+            sources,
+            type_arguments,
+            existing,
+            checked,
+        );
+    }
+
+    let plan = prepare_generic_call_vector_signature(store, shape, sources, type_arguments)?;
+    let parameter_count = shape.parameter_templates.len();
+    if !store.try_reserve_mappers(1)
+        || !store.try_reserve_checker_symbol_allocations(parameter_count, 0)
+        || !store.try_reserve_value_symbol_links(parameter_count)
+        || !store.try_reserve_signatures(1)
+    {
+        return Err(GenericCallVectorInvariant::Capacity(shape.signature).into());
+    }
+    let recovery =
+        publish_prepared_generic_call_vector_signature(store, shape, sources, type_arguments, plan);
+    assert_eq!(
+        store.cached_signatures_contain(recovery.signature),
+        Some(false),
+        "recovery signatures must remain absent from the global cache"
+    );
+    if let Some(checked) = checked {
+        assert_ne!(
+            recovery.signature, checked.signature,
+            "TS2345 recovery must be distinct from the checked signature"
+        );
+    }
+    Ok(recovery)
+}
+
 fn materialize_validated_generic_call_vector_source(
     store: &mut CanonicalTypeMapperStore,
     resolution: &GenericCallVectorResolution,
     callable: &ValidatedSingleCallable,
     existing_call_signature: Option<SignatureId>,
-) -> Result<GenericCallVectorSourceMaterialization, GenericCallVectorError> {
-    materialize_validated_generic_call_vector_source_with(
-        store,
-        resolution,
-        callable,
-        existing_call_signature,
-        |store, target, key, exact_type_arguments| {
-            store.cached_signature(target, key, exact_type_arguments)
-        },
-        |store, reservation| {
-            store.try_reserve_mappers(reservation.mappers)
-                && store.try_reserve_checker_symbol_allocations(reservation.symbols, 0)
-                && store.try_reserve_value_symbol_links(reservation.value_links)
-                && store.try_reserve_signatures(reservation.signatures)
-                && store.try_reserve_cached_signatures(reservation.cached_signatures)
-        },
-    )
-}
-
-fn materialize_validated_generic_call_vector_source_with(
-    store: &mut CanonicalTypeMapperStore,
-    resolution: &GenericCallVectorResolution,
-    callable: &ValidatedSingleCallable,
-    existing_call_signature: Option<SignatureId>,
-    mut checked_lookup: impl FnMut(
-        &CanonicalTypeMapperStore,
-        SignatureId,
-        super::CacheHashKey,
-        &[TypeId],
-    ) -> CachedSignatureLookup,
-    mut reserve: impl FnMut(&mut CanonicalTypeMapperStore, GenericCallVectorReservation) -> bool,
 ) -> Result<GenericCallVectorSourceMaterialization, GenericCallVectorError> {
     let shape = validate_generic_call_signature_shape(
         store,
@@ -1645,132 +1870,33 @@ fn materialize_validated_generic_call_vector_source_with(
         resolution.capability.array_targets,
     )?;
     let sources = validate_generic_call_vector_resolution(store, resolution, &shape)?;
-    let checked = if generic_call_vector_caches_checked_instantiation(resolution.applicability) {
-        Some(resolution.checked_instantiation.as_ref().ok_or(
-            GenericCallVectorInvariant::InvalidCheckedInstantiation(shape.signature),
-        )?)
-    } else {
-        None
-    };
-
-    let existing_recovery =
-        if resolution.applicability != GenericCallVectorApplicability::Applicable {
-            existing_call_signature
-                .map(|existing| {
-                    validate_existing_generic_call_vector_recovery(
-                        store,
-                        &shape,
-                        &sources,
-                        &resolution.projection.instantiation.type_arguments,
-                        existing,
-                        None,
-                    )
-                })
-                .transpose()?
-        } else {
-            None
-        };
-
-    let checked_instantiation = checked
+    let call = &resolution.projection.instantiation;
+    let call_mapper = validate_generic_call_vector_shell(
+        store,
+        &shape,
+        &sources,
+        &call.type_arguments,
+        call.signature,
+    )?;
+    if call_mapper != call.mapper
+        || existing_call_signature.is_some_and(|existing| existing != call.signature)
+    {
+        return Err(GenericCallVectorInvariant::InvalidCallInstantiation {
+            target: shape.signature,
+            signature: existing_call_signature.unwrap_or(call.signature),
+        }
+        .into());
+    }
+    let checked_instantiation = resolution
+        .checked_instantiation
+        .as_ref()
         .map(|checked| {
-            let key = type_list_key(&checked.type_arguments);
-            let lookup = checked_lookup(store, shape.signature, key, &checked.type_arguments);
-            get_or_create_checked_generic_call_vector_shell_with(
-                store,
-                &shape,
-                &sources,
-                &checked.type_arguments,
-                lookup,
-                |store, parameter_count| {
-                    reserve(
-                        store,
-                        GenericCallVectorReservation {
-                            mappers: 1,
-                            symbols: parameter_count,
-                            value_links: parameter_count,
-                            signatures: 1,
-                            cached_signatures: 1,
-                        },
-                    )
-                },
-            )
-            .map(|(cached, _)| cached)
+            validate_checked_generic_call_vector_instantiation(store, &shape, &sources, checked)
         })
         .transpose()?;
-
-    if resolution.applicability == GenericCallVectorApplicability::Applicable {
-        let checked_instantiation = checked_instantiation.ok_or(
-            GenericCallVectorInvariant::MissingCachedInstantiation(shape.signature),
-        )?;
-        if existing_call_signature
-            .is_some_and(|existing| existing != checked_instantiation.signature)
-        {
-            return Err(GenericCallVectorInvariant::InvalidCallInstantiation {
-                target: shape.signature,
-                signature: existing_call_signature
-                    .expect("the mismatching existing signature is present"),
-            }
-            .into());
-        }
-        return Ok(GenericCallVectorSourceMaterialization {
-            call_signature: checked_instantiation.signature,
-            call_mapper: checked_instantiation.mapper,
-            checked_instantiation: Some(checked_instantiation),
-        });
-    }
-
-    let call = if let Some(existing) = existing_recovery {
-        if checked_instantiation.is_some_and(|checked| checked.signature == existing.signature) {
-            return Err(GenericCallVectorInvariant::InvalidCallInstantiation {
-                target: shape.signature,
-                signature: existing.signature,
-            }
-            .into());
-        }
-        existing
-    } else {
-        let recovery_type_arguments = &resolution.projection.instantiation.type_arguments;
-        let plan = prepare_generic_call_vector_signature(
-            store,
-            &shape,
-            &sources,
-            recovery_type_arguments,
-        )?;
-        let parameter_count = shape.parameter_templates.len();
-        if !reserve(
-            store,
-            GenericCallVectorReservation {
-                mappers: 1,
-                symbols: parameter_count,
-                value_links: parameter_count,
-                signatures: 1,
-                cached_signatures: 0,
-            },
-        ) {
-            return Err(GenericCallVectorInvariant::Capacity(shape.signature).into());
-        }
-        publish_prepared_generic_call_vector_signature(
-            store,
-            &shape,
-            &sources,
-            recovery_type_arguments,
-            plan,
-        )
-    };
-    assert_eq!(
-        store.cached_signatures_contain(call.signature),
-        Some(false),
-        "recovery signatures must remain absent from the global cache"
-    );
-    if let Some(checked) = checked_instantiation {
-        assert_ne!(
-            call.signature, checked.signature,
-            "TS2345 recovery must be distinct from the checked signature"
-        );
-    }
     Ok(GenericCallVectorSourceMaterialization {
         call_signature: call.signature,
-        call_mapper: call.mapper,
+        call_mapper,
         checked_instantiation,
     })
 }
@@ -1938,26 +2064,6 @@ fn materialize_validated_generic_call_vector_checked_instantiation(
     resolution: &GenericCallVectorResolution,
     callable: &ValidatedSingleCallable,
 ) -> Result<GenericCallVectorMaterialization, GenericCallVectorError> {
-    materialize_validated_generic_call_vector_checked_instantiation_with_reservation(
-        store,
-        resolution,
-        callable,
-        |store, parameter_count| {
-            store.try_reserve_mappers(1)
-                && store.try_reserve_checker_symbol_allocations(parameter_count, 0)
-                && store.try_reserve_value_symbol_links(parameter_count)
-                && store.try_reserve_signatures(1)
-                && store.try_reserve_cached_signatures(1)
-        },
-    )
-}
-
-fn materialize_validated_generic_call_vector_checked_instantiation_with_reservation(
-    store: &mut CanonicalTypeMapperStore,
-    resolution: &GenericCallVectorResolution,
-    callable: &ValidatedSingleCallable,
-    reserve: impl FnOnce(&mut CanonicalTypeMapperStore, usize) -> bool,
-) -> Result<GenericCallVectorMaterialization, GenericCallVectorError> {
     if !generic_call_vector_caches_checked_instantiation(resolution.applicability) {
         return Ok(GenericCallVectorMaterialization::Unmaterialized {
             applicability: resolution.applicability,
@@ -1976,22 +2082,9 @@ fn materialize_validated_generic_call_vector_checked_instantiation_with_reservat
         .iter()
         .map(|parameter| parameter.type_)
         .collect::<Vec<_>>();
-    let type_arguments_key = type_list_key(&checked.type_arguments);
-    let lookup =
-        store.cached_signature(shape.signature, type_arguments_key, &checked.type_arguments);
-    let (cached, published) = get_or_create_checked_generic_call_vector_shell_with(
-        store,
-        &shape,
-        &sources,
-        &checked.type_arguments,
-        lookup,
-        reserve,
-    )?;
-    Ok(if published {
-        GenericCallVectorMaterialization::Published(cached)
-    } else {
-        GenericCallVectorMaterialization::Reused(cached)
-    })
+    let cached =
+        validate_checked_generic_call_vector_instantiation(store, &shape, &sources, &checked)?;
+    Ok(GenericCallVectorMaterialization::Reused(cached))
 }
 
 fn validate_generic_call_vector_resolution(
@@ -2013,38 +2106,24 @@ fn validate_generic_call_vector_resolution(
             GenericCallVectorInvariant::InvalidCheckedInstantiation(shape.signature).into(),
         );
     }
-    if !valid_generic_call_vector_instantiation(
-        store,
-        &resolution.projection.instantiation,
-        sources.len(),
-        shape.parameter_templates.len(),
-    ) || !valid_generic_call_vector_parameter_row(
-        store,
-        shape.array_targets,
-        &sources,
-        &shape.parameter_templates,
-        &resolution.projection.instantiation,
-    ) || resolution
-        .checked_instantiation
-        .as_ref()
-        .is_some_and(|checked| {
-            !valid_generic_call_vector_instantiation(
-                store,
-                checked,
-                sources.len(),
-                shape.parameter_templates.len(),
-            ) || !valid_generic_call_vector_parameter_row(
-                store,
-                shape.array_targets,
-                &sources,
-                &shape.parameter_templates,
-                checked,
-            )
-        })
+    let selected = &resolution.projection.instantiation;
+    if !valid_generic_call_vector_instantiation(store, selected, sources.len())
+        || validate_generic_call_vector_shell(
+            store,
+            shape,
+            &sources,
+            &selected.type_arguments,
+            selected.signature,
+        )? != selected.mapper
+        || store.cached_signatures_contain(selected.signature)
+            != Some(!resolution.projection.recovery)
     {
         return Err(
             GenericCallVectorInvariant::InvalidCheckedInstantiation(shape.signature).into(),
         );
+    }
+    if let Some(checked) = &resolution.checked_instantiation {
+        validate_checked_generic_call_vector_instantiation(store, shape, &sources, checked)?;
     }
     match resolution.applicability {
         GenericCallVectorApplicability::Applicable => {
@@ -2104,16 +2183,17 @@ fn validate_generic_call_vector_resolution(
             type_argument,
             constraint,
         } => {
-            let Some(checked) = resolution.checked_instantiation.as_ref() else {
-                return Err(GenericCallVectorInvariant::InvalidCheckedInstantiation(
-                    shape.signature,
-                )
-                .into());
-            };
             if !resolution.projection.recovery
+                || resolution.checked_instantiation.is_some()
                 || store.type_payload(type_argument).is_none()
                 || store.type_payload(constraint).is_none()
-                || checked.type_arguments.get(index).copied() != Some(type_argument)
+                || resolution
+                    .projection
+                    .instantiation
+                    .type_arguments
+                    .get(index)
+                    .copied()
+                    != Some(type_argument)
             {
                 return Err(GenericCallVectorInvariant::InvalidCheckedInstantiation(
                     shape.signature,
@@ -2134,7 +2214,10 @@ fn validate_generic_call_vector_resolution(
             };
             if !resolution.projection.recovery
                 || store.type_payload(argument_type).is_none()
-                || checked.parameter_types.get(index).copied() != Some(parameter_type)
+                || store.type_payload(parameter_type).is_none()
+                || checked.signature == resolution.projection.instantiation.signature
+                || resolved_generic_call_vector_parameter(store, checked.signature, index)
+                    != Some(parameter_type)
             {
                 return Err(GenericCallVectorInvariant::InvalidCheckedInstantiation(
                     shape.signature,
@@ -2144,6 +2227,52 @@ fn validate_generic_call_vector_resolution(
         }
     }
     Ok(sources)
+}
+
+fn validate_checked_generic_call_vector_instantiation(
+    store: &CanonicalTypeMapperStore,
+    shape: &GenericCallSignatureShape,
+    sources: &[TypeId],
+    instantiation: &GenericCallVectorInstantiation,
+) -> Result<GenericCallVectorCachedInstantiation, GenericCallVectorError> {
+    if !valid_generic_call_vector_instantiation(store, instantiation, sources.len())
+        || validate_generic_call_vector_shell(
+            store,
+            shape,
+            sources,
+            &instantiation.type_arguments,
+            instantiation.signature,
+        )? != instantiation.mapper
+        || store.cached_signatures_contain(instantiation.signature) != Some(true)
+        || !matches!(
+            store.cached_signature(
+                shape.signature,
+                type_list_key(&instantiation.type_arguments),
+                &instantiation.type_arguments,
+            ),
+            CachedSignatureLookup::Hit(signature) if signature == instantiation.signature
+        )
+    {
+        return Err(
+            GenericCallVectorInvariant::InvalidCheckedInstantiation(shape.signature).into(),
+        );
+    }
+    Ok(GenericCallVectorCachedInstantiation {
+        signature: instantiation.signature,
+        mapper: instantiation.mapper,
+    })
+}
+
+fn resolved_generic_call_vector_parameter(
+    store: &CanonicalTypeMapperStore,
+    signature: SignatureId,
+    index: usize,
+) -> Option<TypeId> {
+    store
+        .signature(signature)
+        .and_then(|signature| signature.parameters().get(index))
+        .and_then(|parameter| store.value_symbol_links(*parameter))
+        .and_then(|links| links.resolved_type)
 }
 
 fn validate_generic_call_vector_checked_resolution(
@@ -2162,29 +2291,6 @@ fn validate_generic_call_vector_checked_resolution(
     })
 }
 
-fn valid_generic_call_vector_parameter_row(
-    store: &CanonicalTypeMapperStore,
-    array_targets: Option<CanonicalArrayTargets>,
-    sources: &[TypeId],
-    parameter_templates: &[TypeId],
-    instantiation: &GenericCallVectorInstantiation,
-) -> bool {
-    parameter_templates
-        .iter()
-        .zip(&instantiation.parameter_types)
-        .all(|(template, actual)| {
-            generic_call_type_instantiation_matches(
-                store,
-                array_targets,
-                *template,
-                *actual,
-                sources,
-                &instantiation.type_arguments,
-                &mut Vec::new(),
-            )
-        })
-}
-
 #[allow(clippy::too_many_arguments)]
 fn generic_call_type_instantiation_matches(
     store: &CanonicalTypeMapperStore,
@@ -2195,6 +2301,15 @@ fn generic_call_type_instantiation_matches(
     targets: &[TypeId],
     active_templates: &mut Vec<TypeId>,
 ) -> bool {
+    // A recovering instantiation substitutes the canonical error type at the
+    // exact recursive boundary where the budget is exhausted. That boundary
+    // is valid at any depth, including inside retained Array/union wrappers.
+    if store
+        .intrinsic_bootstrap()
+        .is_some_and(|bootstrap| actual == bootstrap.error_type)
+    {
+        return true;
+    }
     if let Some(index) = sources.iter().position(|source| *source == template) {
         return targets.get(index).copied() == Some(actual);
     }
@@ -2374,28 +2489,17 @@ fn valid_generic_call_vector_instantiation(
     store: &CanonicalTypeMapperStore,
     instantiation: &GenericCallVectorInstantiation,
     type_parameter_count: usize,
-    parameter_count: usize,
 ) -> bool {
     if instantiation.type_arguments.len() != type_parameter_count
-        || instantiation.parameter_types.len() != parameter_count
         || instantiation
             .type_arguments
             .iter()
-            .chain(&instantiation.parameter_types)
-            .chain(std::iter::once(&instantiation.return_type))
             .any(|type_| store.type_payload(*type_).is_none())
     {
         return false;
     }
-    let return_is_void = store
-        .type_payload(instantiation.return_type)
-        .is_some_and(|record| record.flags().intersects(TypeFlags::VOID));
-    instantiation.return_kind
-        == if return_is_void {
-            DirectCallReturnKind::Void
-        } else {
-            DirectCallReturnKind::Value
-        }
+    store.signature(instantiation.signature).is_some()
+        && store.mapper_payload(instantiation.mapper).is_some()
 }
 
 fn cached_generic_call_vector_instantiation_from_lookup(
@@ -2547,11 +2651,14 @@ fn cached_instantiated_parameter_shell(
         && record.export_symbol().is_none()
         && store.get_merged_symbol(parameter) == Some(parameter)
         && store.value_symbol_links(parameter).is_some_and(|links| {
-            links.target == Some(target)
-                && links.mapper == Some(mapper)
-                && links.name_type == name_type
-                && links.write_type.is_none()
-                && links.containing_type.is_none()
+            links
+                == &ValueSymbolLinks {
+                    resolved_type: links.resolved_type,
+                    target: Some(target),
+                    mapper: Some(mapper),
+                    name_type,
+                    ..ValueSymbolLinks::default()
+                }
                 && links.resolved_type.is_none_or(|resolved| {
                     generic_call_type_instantiation_matches(
                         store,
@@ -2769,6 +2876,7 @@ pub(super) enum IdentityGenericCallError {
     Unsupported(IdentityGenericCallUnsupported),
     Invariant(IdentityGenericCallInvariant),
     Inference(NakedTypeInferenceError),
+    Instantiation(InstantiationError),
     Relation(RelationUnavailable),
 }
 
@@ -2787,6 +2895,12 @@ impl From<IdentityGenericCallInvariant> for IdentityGenericCallError {
 impl From<NakedTypeInferenceError> for IdentityGenericCallError {
     fn from(error: NakedTypeInferenceError) -> Self {
         Self::Inference(error)
+    }
+}
+
+impl From<InstantiationError> for IdentityGenericCallError {
+    fn from(error: InstantiationError) -> Self {
+        Self::Instantiation(error)
     }
 }
 
@@ -2865,6 +2979,25 @@ pub(super) fn resolve_identity_generic_call(
     strict_function_types: bool,
     request: IdentityGenericCallRequest<'_>,
 ) -> Result<IdentityGenericCallResolution, IdentityGenericCallError> {
+    let mut session = InstantiationSession::new(InstantiationLimits::default());
+    resolve_identity_generic_call_with_session(
+        store,
+        global_types,
+        strict_function_types,
+        request,
+        None,
+        &mut session,
+    )
+}
+
+pub(super) fn resolve_identity_generic_call_with_session(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
+    strict_function_types: bool,
+    request: IdentityGenericCallRequest<'_>,
+    existing_call_signature: Option<SignatureId>,
+    session: &mut InstantiationSession,
+) -> Result<IdentityGenericCallResolution, IdentityGenericCallError> {
     validate_request_form(store, request)?;
     let callable = match validate_stored_single_callable(store, request.callee) {
         StoredSingleCallableValidation::NotCallable => {
@@ -2887,6 +3020,8 @@ pub(super) fn resolve_identity_generic_call(
         request,
         &callable,
         cache_provenance,
+        existing_call_signature,
+        session,
         |store, source, target| {
             store.is_type_assignable_to_with_global_types_and_strict_function_types(
                 source,
@@ -2909,6 +3044,28 @@ pub(super) fn resolve_source_identity_generic_call(
     global_types: &CanonicalGlobalTypes,
     strict_function_types: bool,
     request: IdentityGenericCallRequest<'_>,
+) -> Result<IdentityGenericCallResolution, IdentityGenericCallError> {
+    let mut session = InstantiationSession::new(InstantiationLimits::default());
+    resolve_source_identity_generic_call_with_session(
+        store,
+        host,
+        global_types,
+        strict_function_types,
+        request,
+        None,
+        &mut session,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn resolve_source_identity_generic_call_with_session(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    strict_function_types: bool,
+    request: IdentityGenericCallRequest<'_>,
+    existing_call_signature: Option<SignatureId>,
+    session: &mut InstantiationSession,
 ) -> Result<IdentityGenericCallResolution, IdentityGenericCallError> {
     validate_request_form(store, request)?;
     let callable = match validate_stored_single_callable(store, request.callee) {
@@ -2942,6 +3099,8 @@ pub(super) fn resolve_source_identity_generic_call(
         &callable,
         cache_provenance,
         proofs,
+        existing_call_signature,
+        session,
         |store, source, target| {
             store.is_type_assignable_to_with_global_types_and_strict_function_types(
                 source,
@@ -3118,9 +3277,16 @@ fn project_validated_identity_call(
     callable: &ValidatedSingleCallable,
     cache_provenance: IdentityTypeParameterCacheProvenance,
 ) -> Result<IdentityGenericCallResolution, IdentityGenericCallError> {
-    resolve_validated_identity_call(store, request, callable, cache_provenance, |_, _, _| {
-        Ok(true)
-    })
+    let mut session = InstantiationSession::new(InstantiationLimits::default());
+    resolve_validated_identity_call(
+        store,
+        request,
+        callable,
+        cache_provenance,
+        None,
+        &mut session,
+        |_, _, _| Ok(true),
+    )
 }
 
 fn resolve_validated_identity_call(
@@ -3128,6 +3294,8 @@ fn resolve_validated_identity_call(
     request: IdentityGenericCallRequest<'_>,
     callable: &ValidatedSingleCallable,
     cache_provenance: IdentityTypeParameterCacheProvenance,
+    existing_call_signature: Option<SignatureId>,
+    session: &mut InstantiationSession,
     is_assignable: impl FnMut(
         &mut CanonicalTypeMapperStore,
         TypeId,
@@ -3140,6 +3308,8 @@ fn resolve_validated_identity_call(
         callable,
         cache_provenance,
         SourceIdentityInferenceProofs::default(),
+        existing_call_signature,
+        session,
         is_assignable,
     )
 }
@@ -3150,6 +3320,8 @@ fn resolve_validated_identity_call_with_proofs(
     callable: &ValidatedSingleCallable,
     cache_provenance: IdentityTypeParameterCacheProvenance,
     proofs: SourceIdentityInferenceProofs,
+    existing_call_signature: Option<SignatureId>,
+    session: &mut InstantiationSession,
     mut is_assignable: impl FnMut(
         &mut CanonicalTypeMapperStore,
         TypeId,
@@ -3163,17 +3335,56 @@ fn resolve_validated_identity_call_with_proofs(
         cache_provenance,
         proofs,
     )?;
-    // A poisoned existing cache is an invariant even when relation work would
-    // otherwise fail. Cache validation is read-only and must precede it.
-    let cached = cached_identity_instantiation(store, prepared.shape, prepared.type_argument)?;
-    // Relation/global-type resolution is fallible and may mutate only its own
-    // caches. Complete it before publishing a cold mapper/signature graph.
+    let shape = identity_generic_call_vector_shape(store, prepared.shape).map_err(|error| {
+        map_identity_vector_error(error, prepared.shape, prepared.type_argument)
+    })?;
+    let sources = [prepared.shape.type_parameter];
+    let type_arguments = [prepared.type_argument];
+    // Checked shells are cached before applicability, matching
+    // getSignatureInstantiationWithoutFillingInTypeArguments.
+    let (checked, _) =
+        get_or_create_checked_generic_call_vector_shell(store, &shape, &sources, &type_arguments)
+            .map_err(|error| {
+            map_identity_vector_error(error, prepared.shape, prepared.type_argument)
+        })?;
+    let parameter_type = demand_generic_call_vector_parameter(
+        store,
+        &shape,
+        &sources,
+        &type_arguments,
+        checked.signature,
+        0,
+        session,
+    )
+    .map_err(|error| map_identity_vector_error(error, prepared.shape, prepared.type_argument))?;
     let applicability = check_identity_argument_applicability(
         prepared.argument,
-        prepared.type_argument,
+        parameter_type,
         |source, target| is_assignable(store, source, target),
     )?;
-    project_prepared_identity_call(store, prepared, cached, applicability)
+    let selected = if applicability == DirectCallApplicability::Applicable {
+        if existing_call_signature.is_some_and(|existing| existing != checked.signature) {
+            return Err(IdentityGenericCallInvariant::InvalidCachedInstantiation {
+                target: prepared.shape.signature,
+                type_argument: prepared.type_argument,
+                signature: existing_call_signature
+                    .expect("the mismatching existing signature is present"),
+            }
+            .into());
+        }
+        checked
+    } else {
+        get_or_create_generic_call_vector_recovery_shell(
+            store,
+            &shape,
+            &sources,
+            &type_arguments,
+            existing_call_signature,
+            Some(checked),
+        )
+        .map_err(|error| map_identity_vector_error(error, prepared.shape, prepared.type_argument))?
+    };
+    project_prepared_identity_call(prepared, selected, parameter_type, applicability)
 }
 
 fn prepare_validated_identity_call(
@@ -3259,22 +3470,16 @@ fn validate_inference_leaf_with_source_proof(
 }
 
 fn project_prepared_identity_call(
-    store: &mut CanonicalTypeMapperStore,
     prepared: PreparedIdentityGenericCall,
-    cached: Option<(SignatureId, TypeMapperId)>,
+    selected: GenericCallVectorCachedInstantiation,
+    parameter_type: TypeId,
     applicability: DirectCallApplicability,
 ) -> Result<IdentityGenericCallResolution, IdentityGenericCallError> {
-    let (signature, mapper, parameter_type, return_type) = get_or_create_identity_instantiation(
-        store,
-        prepared.shape,
-        prepared.type_argument,
-        cached,
-    )?;
     let projection = IdentityGenericCallProjection {
         callee: prepared.callee,
         generic_signature: prepared.shape.signature,
-        signature,
-        mapper,
+        signature: selected.signature,
+        mapper: selected.mapper,
         type_parameter: prepared.shape.type_parameter,
         type_argument: prepared.type_argument,
         argument_target: DirectCallArgumentTarget {
@@ -3282,13 +3487,188 @@ fn project_prepared_identity_call(
             argument_type: prepared.argument,
             parameter_type,
         },
-        return_type,
+        return_type: prepared.type_argument,
         return_kind: prepared.return_kind,
     };
     Ok(IdentityGenericCallResolution {
         projection,
         applicability,
     })
+}
+
+fn identity_generic_call_vector_shape(
+    store: &CanonicalTypeMapperStore,
+    shape: IdentitySignatureShape,
+) -> Result<GenericCallSignatureShape, GenericCallVectorError> {
+    let no_constraint = store
+        .intrinsic_bootstrap()
+        .map(|bootstrap| bootstrap.no_constraint_type)
+        .ok_or(GenericCallVectorInvariant::MissingBootstrap)?;
+    Ok(GenericCallSignatureShape {
+        signature: shape.signature,
+        type_parameters: vec![GenericCallTypeParameter {
+            type_: shape.type_parameter,
+            constraint: None,
+            default_type: None,
+            base_constraint: no_constraint,
+        }],
+        parameter_templates: vec![shape.type_parameter],
+        return_type: shape.type_parameter,
+        array_targets: None,
+    })
+}
+
+fn map_identity_vector_error(
+    error: GenericCallVectorError,
+    shape: IdentitySignatureShape,
+    type_argument: TypeId,
+) -> IdentityGenericCallError {
+    match error {
+        GenericCallVectorError::Instantiation(error) => {
+            IdentityGenericCallError::Instantiation(error)
+        }
+        GenericCallVectorError::Relation(error) => IdentityGenericCallError::Relation(error),
+        GenericCallVectorError::Invariant(GenericCallVectorInvariant::Capacity(signature)) => {
+            IdentityGenericCallInvariant::Capacity(signature).into()
+        }
+        GenericCallVectorError::Invariant(
+            GenericCallVectorInvariant::InstantiationCacheHashCollision { target, cached },
+        ) => IdentityGenericCallInvariant::InstantiationCacheHashCollision {
+            target,
+            type_argument,
+            cached,
+        }
+        .into(),
+        GenericCallVectorError::Invariant(GenericCallVectorInvariant::InvalidSignature(
+            signature,
+        )) => IdentityGenericCallInvariant::InvalidSignature(signature).into(),
+        GenericCallVectorError::Invariant(
+            GenericCallVectorInvariant::InvalidCachedInstantiation { target, signature }
+            | GenericCallVectorInvariant::InvalidCallInstantiation { target, signature },
+        ) => IdentityGenericCallInvariant::InvalidCachedInstantiation {
+            target,
+            type_argument,
+            signature,
+        }
+        .into(),
+        GenericCallVectorError::Invariant(_) => {
+            IdentityGenericCallInvariant::InvalidCachedInstantiation {
+                target: shape.signature,
+                type_argument,
+                signature: shape.signature,
+            }
+            .into()
+        }
+        GenericCallVectorError::Unsupported(_) | GenericCallVectorError::Inference(_) => {
+            IdentityGenericCallInvariant::InvalidSignature(shape.signature).into()
+        }
+    }
+}
+
+/// Resolves the selected identity signature's return through the same lazy
+/// shell primitive used by the full-vector path.
+pub(super) fn demand_identity_generic_call_selected_return(
+    store: &mut CanonicalTypeMapperStore,
+    resolution: &IdentityGenericCallResolution,
+    session: &mut InstantiationSession,
+) -> Result<(TypeId, DirectCallReturnKind), IdentityGenericCallError> {
+    let callee = resolution.projection.callee;
+    let callable = match validate_stored_single_callable(store, callee) {
+        StoredSingleCallableValidation::NotCallable => {
+            return Err(IdentityGenericCallUnsupported::NotExactSingleCallable(callee).into());
+        }
+        StoredSingleCallableValidation::Pending { .. } => {
+            return Err(IdentityGenericCallUnsupported::PendingCallable(callee).into());
+        }
+        StoredSingleCallableValidation::Malformed { .. } => {
+            return Err(IdentityGenericCallInvariant::MalformedCallable(callee).into());
+        }
+        StoredSingleCallableValidation::Valid { callable, .. } => callable,
+    };
+    let provenance = identity_type_parameter_cache_provenance(store, callee, &callable);
+    demand_validated_identity_generic_call_selected_return(
+        store, resolution, &callable, provenance, session,
+    )
+}
+
+pub(super) fn demand_identity_generic_call_return_with_session(
+    store: &mut CanonicalTypeMapperStore,
+    resolution: &IdentityGenericCallResolution,
+    session: &mut InstantiationSession,
+) -> Result<TypeId, IdentityGenericCallError> {
+    demand_identity_generic_call_selected_return(store, resolution, session)
+        .map(|(return_type, _)| return_type)
+}
+
+fn demand_validated_identity_generic_call_selected_return(
+    store: &mut CanonicalTypeMapperStore,
+    resolution: &IdentityGenericCallResolution,
+    callable: &ValidatedSingleCallable,
+    provenance: IdentityTypeParameterCacheProvenance,
+    session: &mut InstantiationSession,
+) -> Result<(TypeId, DirectCallReturnKind), IdentityGenericCallError> {
+    let callee = resolution.projection.callee;
+    let identity_shape = validate_identity_signature_shape(store, callee, callable, provenance)?;
+    let shape = identity_generic_call_vector_shape(store, identity_shape).map_err(|error| {
+        map_identity_vector_error(error, identity_shape, resolution.projection.type_argument)
+    })?;
+    let sources = [identity_shape.type_parameter];
+    let type_arguments = [resolution.projection.type_argument];
+    let mapper = validate_generic_call_vector_shell(
+        store,
+        &shape,
+        &sources,
+        &type_arguments,
+        resolution.projection.signature,
+    )
+    .map_err(|error| {
+        map_identity_vector_error(error, identity_shape, resolution.projection.type_argument)
+    })?;
+    if mapper != resolution.projection.mapper
+        || store.cached_signatures_contain(resolution.projection.signature)
+            != Some(resolution.applicability == DirectCallApplicability::Applicable)
+    {
+        return Err(IdentityGenericCallInvariant::InvalidCachedInstantiation {
+            target: identity_shape.signature,
+            type_argument: resolution.projection.type_argument,
+            signature: resolution.projection.signature,
+        }
+        .into());
+    }
+    let return_type = demand_generic_call_vector_return(
+        store,
+        &shape,
+        &sources,
+        &type_arguments,
+        resolution.projection.signature,
+        session,
+    )
+    .map_err(|error| {
+        map_identity_vector_error(error, identity_shape, resolution.projection.type_argument)
+    })?;
+    let return_kind = if store
+        .type_payload(return_type)
+        .is_some_and(|record| record.flags().intersects(TypeFlags::VOID))
+    {
+        DirectCallReturnKind::Void
+    } else {
+        DirectCallReturnKind::Value
+    };
+    let recovered = store
+        .intrinsic_bootstrap()
+        .is_some_and(|bootstrap| return_type == bootstrap.error_type);
+    if !recovered
+        && (return_type != resolution.projection.return_type
+            || return_kind != resolution.projection.return_kind)
+    {
+        return Err(IdentityGenericCallInvariant::InvalidInstantiation {
+            source: identity_shape.type_parameter,
+            expected: resolution.projection.return_type,
+            actual: return_type,
+        }
+        .into());
+    }
+    Ok((return_type, return_kind))
 }
 
 fn map_inference_leaf_error(
@@ -3495,240 +3875,6 @@ fn validate_unconstrained_default_free_parameter(
         }
         Some(_) => Ok(()),
     }
-}
-
-fn get_or_create_identity_instantiation(
-    store: &mut CanonicalTypeMapperStore,
-    shape: IdentitySignatureShape,
-    type_argument: TypeId,
-    cached: Option<(SignatureId, TypeMapperId)>,
-) -> Result<(SignatureId, TypeMapperId, TypeId, TypeId), IdentityGenericCallError> {
-    if let Some((signature, mapper)) = cached {
-        return Ok((signature, mapper, type_argument, type_argument));
-    }
-
-    let exact_type_arguments: Box<[TypeId]> = Box::new([type_argument]);
-    let type_arguments_key = type_list_key(&exact_type_arguments);
-    let (mut parameter_data, name_type) = {
-        let parameter = store.symbol(shape.parameter_symbol).ok_or(
-            IdentityGenericCallInvariant::InvalidParameterSymbol(shape.parameter_symbol),
-        )?;
-        let mut data = SymbolData::new(
-            parameter.flags() | SymbolFlags::TRANSIENT,
-            parameter.name().to_owned(),
-        );
-        data.check_flags = CheckFlags::INSTANTIATED;
-        data.declarations = parameter.declarations().map(<[_]>::to_vec);
-        data.value_declaration = parameter.value_declaration();
-        data.parent = parameter.parent();
-        let name_type = store
-            .value_symbol_links(shape.parameter_symbol)
-            .and_then(|links| links.name_type);
-        (data, name_type)
-    };
-    let (signature_flags, declaration, min_argument_count) = {
-        let original = store.signature(shape.signature).ok_or(
-            IdentityGenericCallInvariant::InvalidSignature(shape.signature),
-        )?;
-        (
-            original.flags() & SignatureFlags::PROPAGATING_FLAGS,
-            original.declaration(),
-            original.min_argument_count(),
-        )
-    };
-    parameter_data.members = None;
-    parameter_data.exports = None;
-    parameter_data.export_symbol = None;
-    let mut instantiated_parameters = Vec::with_capacity(1);
-
-    if !store.try_reserve_mappers(1)
-        || !store.try_reserve_checker_symbol_allocations(1, 0)
-        || !store.try_reserve_value_symbol_links(1)
-        || !store.try_reserve_signatures(1)
-        || !store.try_reserve_cached_signatures(1)
-    {
-        return Err(IdentityGenericCallInvariant::Capacity(shape.signature).into());
-    }
-
-    // Every validation and fallible reservation precedes this point. The
-    // remaining writes form one dependency-ordered publication suffix, with
-    // the authoritative cachedSignatures entry committed last.
-    let mapper = store
-        .new_simple_type_mapper(shape.type_parameter, type_argument)
-        .expect("preflighted simple mapper endpoints belong to the store");
-    assert_eq!(
-        store.simple_type_mapper_endpoints(mapper),
-        Some((shape.type_parameter, type_argument)),
-        "newSimpleTypeMapper must preserve its exact endpoints"
-    );
-    let instantiated_parameter = store
-        .alloc_symbol(parameter_data)
-        .expect("reserved transient parameter allocation must succeed");
-    instantiated_parameters.push(instantiated_parameter);
-    assert!(store.set_value_symbol_links(
-        instantiated_parameter,
-        ValueSymbolLinks {
-            resolved_type: Some(type_argument),
-            target: Some(shape.parameter_symbol),
-            mapper: Some(mapper),
-            name_type,
-            ..ValueSymbolLinks::default()
-        },
-    ));
-    let signature = store
-        .alloc_signature(
-            signature_flags,
-            declaration,
-            Vec::new(),
-            None,
-            instantiated_parameters,
-            Some(type_argument),
-            None,
-            min_argument_count,
-        )
-        .expect("reserved instantiated signature allocation must succeed");
-    assert!(store.set_signature_target_and_mapper(signature, Some(shape.signature), Some(mapper)));
-    assert_eq!(
-        valid_cached_identity_instantiation(
-            store,
-            shape,
-            type_argument,
-            store
-                .signature(shape.signature)
-                .expect("validated generic signature must remain present"),
-            store
-                .signature(signature)
-                .expect("published instantiated signature must remain present"),
-        ),
-        Some(mapper),
-        "the publication suffix must build an exact cache entry"
-    );
-    assert!(store.set_cached_signature(
-        shape.signature,
-        type_arguments_key,
-        exact_type_arguments,
-        signature
-    ));
-    Ok((signature, mapper, type_argument, type_argument))
-}
-
-fn cached_identity_instantiation(
-    store: &CanonicalTypeMapperStore,
-    shape: IdentitySignatureShape,
-    type_argument: TypeId,
-) -> Result<Option<(SignatureId, TypeMapperId)>, IdentityGenericCallError> {
-    let original =
-        store
-            .signature(shape.signature)
-            .ok_or(IdentityGenericCallInvariant::InvalidSignature(
-                shape.signature,
-            ))?;
-    let type_arguments_key = type_list_key(&[type_argument]);
-    let cached = match store.cached_signature(shape.signature, type_arguments_key, &[type_argument])
-    {
-        CachedSignatureLookup::Missing => return Ok(None),
-        CachedSignatureLookup::Hit(signature) => signature,
-        CachedSignatureLookup::HashCollision(cached) => {
-            return Err(
-                IdentityGenericCallInvariant::InstantiationCacheHashCollision {
-                    target: shape.signature,
-                    type_argument,
-                    cached,
-                }
-                .into(),
-            );
-        }
-        CachedSignatureLookup::Invalid => {
-            return Err(IdentityGenericCallInvariant::InvalidSignature(shape.signature).into());
-        }
-    };
-    let signature = store.signature(cached).ok_or(
-        IdentityGenericCallInvariant::InvalidCachedInstantiation {
-            target: shape.signature,
-            type_argument,
-            signature: cached,
-        },
-    )?;
-    let mapper =
-        valid_cached_identity_instantiation(store, shape, type_argument, original, signature)
-            .ok_or(IdentityGenericCallInvariant::InvalidCachedInstantiation {
-                target: shape.signature,
-                type_argument,
-                signature: cached,
-            })?;
-    Ok(Some((cached, mapper)))
-}
-
-fn valid_cached_identity_instantiation(
-    store: &CanonicalTypeMapperStore,
-    shape: IdentitySignatureShape,
-    type_argument: TypeId,
-    original: &super::signatures::Signature,
-    signature: &super::signatures::Signature,
-) -> Option<TypeMapperId> {
-    let mapper = signature.mapper()?;
-    let [parameter] = signature.parameters() else {
-        return None;
-    };
-    if signature.flags() != original.flags() & SignatureFlags::PROPAGATING_FLAGS
-        || signature.declaration() != original.declaration()
-        || !signature.type_parameters().is_empty()
-        || signature.this_parameter().is_some()
-        || signature.resolved_return_type() != Some(type_argument)
-        || signature.resolved_type_predicate().is_some()
-        || signature.min_argument_count() != original.min_argument_count()
-        || signature.resolved_min_argument_count() != -1
-        || signature.target() != Some(shape.signature)
-        || store.simple_type_mapper_endpoints(mapper) != Some((shape.type_parameter, type_argument))
-        || signature.isolated_signature_type().is_some()
-        || signature.composite().is_some()
-        || !cached_instantiated_parameter(
-            store,
-            *parameter,
-            shape.parameter_symbol,
-            mapper,
-            type_argument,
-        )
-    {
-        return None;
-    }
-    Some(mapper)
-}
-
-fn cached_instantiated_parameter(
-    store: &CanonicalTypeMapperStore,
-    parameter: SemanticSymbolId,
-    target: SemanticSymbolId,
-    mapper: TypeMapperId,
-    type_argument: TypeId,
-) -> bool {
-    let Some(record) = store.symbol(parameter) else {
-        return false;
-    };
-    let Some(target_record) = store.symbol(target) else {
-        return false;
-    };
-    let name_type = store
-        .value_symbol_links(target)
-        .and_then(|links| links.name_type);
-    record.flags() == target_record.flags() | SymbolFlags::TRANSIENT
-        && record.check_flags() == CheckFlags::INSTANTIATED
-        && record.name() == target_record.name()
-        && record.declarations() == target_record.declarations()
-        && record.value_declaration() == target_record.value_declaration()
-        && record.parent() == target_record.parent()
-        && record.members().is_none()
-        && record.exports().is_none()
-        && record.export_symbol().is_none()
-        && store.get_merged_symbol(parameter) == Some(parameter)
-        && store.value_symbol_links(parameter)
-            == Some(&ValueSymbolLinks {
-                resolved_type: Some(type_argument),
-                target: Some(target),
-                mapper: Some(mapper),
-                name_type,
-                ..ValueSymbolLinks::default()
-            })
 }
 
 fn check_identity_argument_applicability(
@@ -4233,6 +4379,66 @@ mod tests {
         )
     }
 
+    fn demand_vector_parameter(
+        store: &mut CanonicalTypeMapperStore,
+        callable: &ValidatedSingleCallable,
+        resolution: &GenericCallVectorResolution,
+        instantiation: &GenericCallVectorInstantiation,
+        index: usize,
+    ) -> TypeId {
+        let shape = validate_generic_call_signature_shape(
+            store,
+            resolution.projection.callee,
+            callable,
+            resolution.capability.array_targets,
+        )
+        .unwrap();
+        let sources = shape
+            .type_parameters
+            .iter()
+            .map(|parameter| parameter.type_)
+            .collect::<Vec<_>>();
+        demand_generic_call_vector_parameter(
+            store,
+            &shape,
+            &sources,
+            &instantiation.type_arguments,
+            instantiation.signature,
+            index,
+            &mut InstantiationSession::new(InstantiationLimits::default()),
+        )
+        .unwrap()
+    }
+
+    fn demand_vector_return(
+        store: &mut CanonicalTypeMapperStore,
+        callable: &ValidatedSingleCallable,
+        resolution: &GenericCallVectorResolution,
+        instantiation: &GenericCallVectorInstantiation,
+    ) -> TypeId {
+        let shape = validate_generic_call_signature_shape(
+            store,
+            resolution.projection.callee,
+            callable,
+            resolution.capability.array_targets,
+        )
+        .unwrap();
+        let sources = shape
+            .type_parameters
+            .iter()
+            .map(|parameter| parameter.type_)
+            .collect::<Vec<_>>();
+        demand_generic_call_vector_return(
+            store,
+            &shape,
+            &sources,
+            &instantiation.type_arguments,
+            instantiation.signature,
+            &mut InstantiationSession::new(InstantiationLimits::default()),
+        )
+        .unwrap()
+    }
+
     #[derive(Debug, Eq, PartialEq)]
     struct VectorCacheGraphCounts {
         mappers: usize,
@@ -4285,13 +4491,7 @@ mod tests {
         let before = vector_cache_graph_counts(store);
         let first = materialize_source_vector(store, callable, resolution, None).unwrap();
         assert_eq!(first.checked_instantiation, None);
-        assert_eq!(store.mapper_len(), before.mappers + 1);
-        assert_eq!(
-            store.symbol_len(),
-            before.symbols + callable.parameters.len()
-        );
-        assert_eq!(store.signature_len(), before.signatures + 1);
-        assert_eq!(store.cached_signature_len(), before.cached_signatures);
+        assert_eq!(vector_cache_graph_counts(store), before);
         assert_eq!(
             store.cached_signatures_contain(first.call_signature),
             Some(false),
@@ -4306,8 +4506,7 @@ mod tests {
 
         let second = materialize_source_vector(store, callable, resolution, None).unwrap();
         assert_eq!(second.checked_instantiation, None);
-        assert_ne!(second.call_signature, first.call_signature);
-        assert_ne!(second.call_mapper, first.call_mapper);
+        assert_eq!(second, first);
         assert_eq!(
             store.cached_signatures_contain(second.call_signature),
             Some(false),
@@ -4333,8 +4532,6 @@ mod tests {
         let number = store.intrinsic_bootstrap().unwrap().number_type;
         let ordinary_argument = canonical_array_type(&mut store, targets, number, false);
         let argument = array_literal_clone(&mut store, targets, number);
-        let before_projection = vector_cache_graph_counts(&store);
-
         let resolution = project_array_vector(
             &mut store,
             targets,
@@ -4350,15 +4547,28 @@ mod tests {
         assert_eq!(resolution.projection.type_parameters, [type_parameter]);
         assert_eq!(resolution.projection.instantiation.type_arguments, [number]);
         assert_eq!(
-            resolution.projection.instantiation.parameter_types,
-            [ordinary_argument]
+            demand_vector_parameter(
+                &mut store,
+                &first,
+                &resolution,
+                &resolution.projection.instantiation,
+                0,
+            ),
+            ordinary_argument,
         );
-        assert_eq!(resolution.projection.instantiation.return_type, number);
-        assert_eq!(vector_cache_graph_counts(&store), before_projection);
+        assert_eq!(
+            demand_vector_return(
+                &mut store,
+                &first,
+                &resolution,
+                &resolution.projection.instantiation,
+            ),
+            number,
+        );
 
-        let published = materialize_vector(&mut store, &first, &resolution).unwrap();
-        let GenericCallVectorMaterialization::Published(published) = published else {
-            panic!("the first checked Array instantiation must publish")
+        let materialized = materialize_vector(&mut store, &first, &resolution).unwrap();
+        let GenericCallVectorMaterialization::Reused(published) = materialized else {
+            panic!("resolution must already have published the checked Array shell")
         };
         let warm_counts = vector_cache_graph_counts(&store);
         assert_eq!(
@@ -4399,9 +4609,23 @@ mod tests {
         .unwrap();
         let readonly_string = canonical_array_type(&mut store, targets, string, true);
         assert_eq!(wrapped.projection.instantiation.type_arguments, [string]);
-        assert_eq!(wrapped.projection.instantiation.parameter_types, [string]);
         assert_eq!(
-            wrapped.projection.instantiation.return_type,
+            demand_vector_parameter(
+                &mut store,
+                &wrap,
+                &wrapped,
+                &wrapped.projection.instantiation,
+                0,
+            ),
+            string,
+        );
+        assert_eq!(
+            demand_vector_return(
+                &mut store,
+                &wrap,
+                &wrapped,
+                &wrapped.projection.instantiation,
+            ),
             readonly_string
         );
         assert_eq!(store.type_len(), before + 1);
@@ -4436,10 +4660,24 @@ mod tests {
         );
         assert_eq!(result.projection.instantiation.type_arguments, [number]);
         assert_eq!(
-            result.projection.instantiation.parameter_types,
-            [expected_parameter]
+            demand_vector_parameter(
+                &mut store,
+                &nested,
+                &result,
+                &result.projection.instantiation,
+                0,
+            ),
+            expected_parameter,
         );
-        assert_eq!(result.projection.instantiation.return_type, expected_return);
+        assert_eq!(
+            demand_vector_return(
+                &mut store,
+                &nested,
+                &result,
+                &result.projection.instantiation,
+            ),
+            expected_return,
+        );
     }
 
     #[test]
@@ -4466,8 +4704,25 @@ mod tests {
             GenericCallVectorApplicability::Applicable
         );
         assert_eq!(resolution.projection.instantiation.type_arguments, [array]);
-        assert_eq!(resolution.projection.instantiation.parameter_types, [array]);
-        assert_eq!(resolution.projection.instantiation.return_type, array);
+        assert_eq!(
+            demand_vector_parameter(
+                &mut store,
+                &identity,
+                &resolution,
+                &resolution.projection.instantiation,
+                0,
+            ),
+            array,
+        );
+        assert_eq!(
+            demand_vector_return(
+                &mut store,
+                &identity,
+                &resolution,
+                &resolution.projection.instantiation,
+            ),
+            array,
+        );
     }
 
     #[test]
@@ -4496,8 +4751,14 @@ mod tests {
             [unknown]
         );
         assert_eq!(
-            resolution.projection.instantiation.parameter_types,
-            [array_unknown]
+            demand_vector_parameter(
+                &mut store,
+                &first,
+                &resolution,
+                resolution.checked_instantiation.as_ref().unwrap(),
+                0,
+            ),
+            array_unknown,
         );
         assert_eq!(
             resolution.applicability,
@@ -4512,9 +4773,7 @@ mod tests {
         let first_call = materialize_source_vector(&mut store, &first, &resolution, None).unwrap();
         let checked = first_call.checked_instantiation.unwrap();
         assert_ne!(first_call.call_signature, checked.signature);
-        assert_eq!(store.cached_signature_len(), before.cached_signatures + 1);
-        assert_eq!(store.mapper_len(), before.mappers + 2);
-        assert_eq!(store.signature_len(), before.signatures + 2);
+        assert_eq!(vector_cache_graph_counts(&store), before);
         let warm_counts = vector_cache_graph_counts(&store);
         assert_eq!(
             materialize_source_vector(
@@ -4529,8 +4788,8 @@ mod tests {
 
         let second_call = materialize_source_vector(&mut store, &first, &resolution, None).unwrap();
         assert_eq!(second_call.checked_instantiation, Some(checked));
-        assert_ne!(second_call.call_signature, first_call.call_signature);
-        assert_eq!(store.cached_signature_len(), before.cached_signatures + 1);
+        assert_eq!(second_call.call_signature, first_call.call_signature);
+        assert_eq!(store.cached_signature_len(), before.cached_signatures);
         let second_warm_counts = vector_cache_graph_counts(&store);
         assert_eq!(
             materialize_source_vector(
@@ -4631,10 +4890,28 @@ mod tests {
             [string, one]
         );
         assert_eq!(
-            result.projection.instantiation.parameter_types,
-            [string, one]
+            [
+                demand_vector_parameter(
+                    &mut store,
+                    &pair,
+                    &result,
+                    &result.projection.instantiation,
+                    0,
+                ),
+                demand_vector_parameter(
+                    &mut store,
+                    &pair,
+                    &result,
+                    &result.projection.instantiation,
+                    1,
+                ),
+            ],
+            [string, one],
         );
-        assert_eq!(result.projection.instantiation.return_type, one);
+        assert_eq!(
+            demand_vector_return(&mut store, &pair, &result, &result.projection.instantiation,),
+            one,
+        );
         assert!(!result.projection.recovery);
         assert_eq!(
             (
@@ -4642,8 +4919,8 @@ mod tests {
                 store.signature_len(),
                 store.cached_signature_len(),
             ),
-            counts,
-            "pure vector projection must not publish mapper/signature cache state"
+            (counts.0 + 1, counts.1 + 1, counts.2 + 1),
+            "applicability publishes one globally cached checked shell"
         );
     }
 
@@ -4673,7 +4950,15 @@ mod tests {
             GenericCallVectorApplicability::Applicable
         );
         let inferred = result.projection.instantiation.type_arguments[0];
-        assert_eq!(result.projection.instantiation.return_type, inferred);
+        assert_eq!(
+            demand_vector_return(
+                &mut store,
+                &choose,
+                &result,
+                &result.projection.instantiation,
+            ),
+            inferred,
+        );
         let TypeData::Union(data) = store.type_payload(inferred).unwrap().data() else {
             panic!("choose('a', 'b') must infer a literal union");
         };
@@ -4705,7 +4990,15 @@ mod tests {
             fallback_result.projection.instantiation.type_arguments,
             [string, string]
         );
-        assert_eq!(fallback_result.projection.instantiation.return_type, string);
+        assert_eq!(
+            demand_vector_return(
+                &mut store,
+                &fallback,
+                &fallback_result,
+                &fallback_result.projection.instantiation,
+            ),
+            string,
+        );
 
         let (both, _) = vector_callable(
             &mut store,
@@ -4730,11 +5023,13 @@ mod tests {
             both_result.projection.instantiation.type_arguments,
             [text, one]
         );
-        let TypeData::Union(data) = store
-            .type_payload(both_result.projection.instantiation.return_type)
-            .unwrap()
-            .data()
-        else {
+        let both_return = demand_vector_return(
+            &mut store,
+            &both,
+            &both_result,
+            &both_result.projection.instantiation,
+        );
+        let TypeData::Union(data) = store.type_payload(both_return).unwrap().data() else {
             panic!("T | U must instantiate through the full mapper vector");
         };
         assert!(data.union.types.contains(&text));
@@ -4784,7 +5079,15 @@ mod tests {
             }
         );
         assert_eq!(result.applicability.diagnostic_code(), Some(2345));
-        assert_eq!(result.projection.instantiation.return_type, string);
+        assert_eq!(
+            demand_vector_return(
+                &mut store,
+                &dependent,
+                &result,
+                &result.projection.instantiation,
+            ),
+            string,
+        );
         assert_ne!(number, string);
     }
 
@@ -4890,7 +5193,15 @@ mod tests {
             }
         );
         assert_eq!(result.applicability.diagnostic_code(), Some(2344));
-        assert_eq!(result.projection.instantiation.return_type, number);
+        assert_eq!(
+            demand_vector_return(
+                &mut store,
+                &constrained,
+                &result,
+                &result.projection.instantiation,
+            ),
+            number,
+        );
         assert!(result.projection.recovery);
     }
 
@@ -4933,7 +5244,15 @@ mod tests {
             missing.projection.instantiation.type_arguments,
             [string, unknown]
         );
-        assert_eq!(missing.projection.instantiation.return_type, unknown);
+        assert_eq!(
+            demand_vector_return(
+                &mut store,
+                &pair,
+                &missing,
+                &missing.projection.instantiation,
+            ),
+            unknown,
+        );
 
         let (fallback, _) = vector_callable(
             &mut store,
@@ -4958,7 +5277,15 @@ mod tests {
             extra.projection.instantiation.type_arguments,
             [string, number]
         );
-        assert_eq!(extra.projection.instantiation.return_type, number);
+        assert_eq!(
+            demand_vector_return(
+                &mut store,
+                &fallback,
+                &extra,
+                &extra.projection.instantiation,
+            ),
+            number,
+        );
 
         let (defaulted, _) = vector_callable(
             &mut store,
@@ -5019,7 +5346,8 @@ mod tests {
             [string, parameters[0]]
         );
         assert_eq!(
-            result.projection.instantiation.return_type, parameters[0],
+            demand_vector_return(&mut store, &two, &result, &result.projection.instantiation,),
+            parameters[0],
             "pinned overload-failure recovery maps U to the raw default T once"
         );
     }
@@ -5207,7 +5535,15 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(result.projection.instantiation.return_type, one);
+        assert_eq!(
+            demand_vector_return(
+                &mut store,
+                &choose,
+                &result,
+                &result.projection.instantiation,
+            ),
+            one,
+        );
         assert_eq!(
             result.applicability,
             GenericCallVectorApplicability::ArgumentNotAssignable {
@@ -5243,15 +5579,10 @@ mod tests {
         let before = vector_cache_graph_counts(&store);
 
         let first = materialize_vector(&mut store, &pair, &resolution).unwrap();
-        let GenericCallVectorMaterialization::Published(cached) = first else {
-            panic!("cold checked vector must publish its global cache entry");
+        let GenericCallVectorMaterialization::Reused(cached) = first else {
+            panic!("resolution must publish the checked shell before applicability");
         };
-
-        assert_eq!(store.mapper_len(), before.mappers + 1);
-        assert_eq!(store.symbol_len(), before.symbols + 2);
-        assert_eq!(store.signature_len(), before.signatures + 1);
-        assert_eq!(store.cached_signature_len(), before.cached_signatures + 1);
-        assert_ne!(store.checker_link_allocated_lengths(), before.links);
+        assert_eq!(vector_cache_graph_counts(&store), before);
         assert_eq!(
             store.type_mapper_has_exact_endpoints(
                 cached.mapper,
@@ -5285,12 +5616,13 @@ mod tests {
         assert_eq!(instantiated.isolated_signature_type(), None);
         assert_eq!(instantiated.composite(), None);
         assert_eq!(instantiated.parameters().len(), 2);
-        for ((parameter, target), template) in instantiated
+        for (index, ((parameter, target), template)) in instantiated
             .parameters()
             .iter()
             .copied()
             .zip(original_parameters)
             .zip(pair.parameters.iter().copied())
+            .enumerate()
         {
             assert!(cached_instantiated_parameter_shell(
                 &store,
@@ -5306,7 +5638,8 @@ mod tests {
                 store
                     .value_symbol_links(parameter)
                     .and_then(|links| links.resolved_type),
-                None,
+                Some([string, number][index]),
+                "applicability must demand used parameters left-to-right",
             );
         }
         assert_eq!(
@@ -5320,30 +5653,6 @@ mod tests {
 
         let shape = validate_generic_call_signature_shape(&store, pair.owner, &pair, None).unwrap();
         let mut session = InstantiationSession::new(InstantiationLimits::default());
-        assert_eq!(
-            demand_generic_call_vector_parameter(
-                &mut store,
-                &shape,
-                &type_parameters,
-                &checked.type_arguments,
-                cached.signature,
-                0,
-                &mut session,
-            ),
-            Ok(string),
-        );
-        assert_eq!(
-            demand_generic_call_vector_parameter(
-                &mut store,
-                &shape,
-                &type_parameters,
-                &checked.type_arguments,
-                cached.signature,
-                1,
-                &mut session,
-            ),
-            Ok(number),
-        );
         assert_eq!(
             demand_generic_call_vector_return(
                 &mut store,
@@ -5393,10 +5702,10 @@ mod tests {
             GenericCallVectorApplicability::ArgumentNotAssignable { .. }
         ));
         let inferred_checked = inferred.checked_instantiation.as_ref().unwrap();
-        let GenericCallVectorMaterialization::Published(inferred_cached) =
+        let GenericCallVectorMaterialization::Reused(inferred_cached) =
             materialize_vector(&mut store, &choose, &inferred).unwrap()
         else {
-            panic!("an inferred TS2345 candidate must cache its checked signature");
+            panic!("an inferred TS2345 candidate is cached before applicability");
         };
         assert_eq!(
             store.type_mapper_has_exact_endpoints(
@@ -5411,7 +5720,28 @@ mod tests {
                 .signature(inferred_cached.signature)
                 .unwrap()
                 .resolved_return_type(),
-            Some(inferred_checked.return_type)
+            None,
+            "TS2345 must leave the retained checked return unresolved",
+        );
+        let inferred_recovery_return = demand_vector_return(
+            &mut store,
+            &choose,
+            &inferred,
+            &inferred.projection.instantiation,
+        );
+        assert_eq!(
+            store
+                .signature(inferred.projection.instantiation.signature)
+                .unwrap()
+                .resolved_return_type(),
+            Some(inferred_recovery_return),
+        );
+        assert_eq!(
+            store
+                .signature(inferred_cached.signature)
+                .unwrap()
+                .resolved_return_type(),
+            None,
         );
 
         let (two, type_parameters) = vector_callable(
@@ -5431,17 +5761,18 @@ mod tests {
         let explicit_checked = explicit.checked_instantiation.as_ref().unwrap();
         assert_eq!(explicit_checked.type_arguments, [string, string]);
         assert_eq!(
-            explicit.projection.instantiation.return_type,
-            type_parameters[0]
+            demand_vector_return(
+                &mut store,
+                &two,
+                &explicit,
+                &explicit.projection.instantiation,
+            ),
+            type_parameters[0],
         );
-        assert_ne!(
-            explicit_checked.return_type,
-            explicit.projection.instantiation.return_type
-        );
-        let GenericCallVectorMaterialization::Published(explicit_cached) =
+        let GenericCallVectorMaterialization::Reused(explicit_cached) =
             materialize_vector(&mut store, &two, &explicit).unwrap()
         else {
-            panic!("an explicit TS2345 candidate must cache its checked signature");
+            panic!("an explicit TS2345 candidate is cached before applicability");
         };
         assert_eq!(
             store.type_mapper_has_exact_endpoints(
@@ -5453,7 +5784,7 @@ mod tests {
             "raw default recovery must not leak into the global mapper"
         );
         let explicit_signature = store.signature(explicit_cached.signature).unwrap();
-        assert_eq!(explicit_signature.resolved_return_type(), Some(string));
+        assert_eq!(explicit_signature.resolved_return_type(), None);
         for parameter in explicit_signature.parameters() {
             assert_eq!(
                 store
@@ -5462,6 +5793,116 @@ mod tests {
                 Some(string)
             );
         }
+    }
+
+    #[test]
+    fn ts2345_stops_at_first_mismatch_and_a_later_warm_call_fills_only_the_suffix() {
+        let mut store = initialized_store();
+        let (string, number) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (bootstrap.string_type, bootstrap.number_type)
+        };
+        let (callable, _) = vector_callable(
+            &mut store,
+            &["T", "U", "V"],
+            &[None, None, None],
+            &[None, None, None],
+            &[0, 1, 2],
+            |_, parameters| parameters[2],
+        );
+        let failed = project_vector(
+            &mut store,
+            &callable,
+            vector_request(
+                callable.owner,
+                Some(&[string, string, string]),
+                &[number, string, string],
+            ),
+        )
+        .unwrap();
+        assert!(matches!(
+            failed.applicability,
+            GenericCallVectorApplicability::ArgumentNotAssignable { index: 0, .. },
+        ));
+        let checked = failed.checked_instantiation.as_ref().unwrap();
+        let checked_parameters = store
+            .signature(checked.signature)
+            .unwrap()
+            .parameters()
+            .to_vec();
+        assert_eq!(
+            checked_parameters
+                .iter()
+                .map(|parameter| {
+                    store
+                        .value_symbol_links(*parameter)
+                        .and_then(|links| links.resolved_type)
+                })
+                .collect::<Vec<_>>(),
+            [Some(string), None, None],
+        );
+        assert_eq!(
+            store
+                .signature(checked.signature)
+                .unwrap()
+                .resolved_return_type(),
+            None,
+        );
+        assert_eq!(
+            demand_vector_return(
+                &mut store,
+                &callable,
+                &failed,
+                &failed.projection.instantiation,
+            ),
+            string,
+        );
+        assert_eq!(
+            store
+                .signature(checked.signature)
+                .unwrap()
+                .resolved_return_type(),
+            None,
+        );
+
+        let before_warm = vector_cache_graph_counts(&store);
+        let applicable = project_vector(
+            &mut store,
+            &callable,
+            vector_request(
+                callable.owner,
+                Some(&[string, string, string]),
+                &[string, string, string],
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            applicable.applicability,
+            GenericCallVectorApplicability::Applicable,
+        );
+        assert_eq!(
+            applicable.projection.instantiation.signature,
+            checked.signature,
+        );
+        assert_eq!(
+            checked_parameters
+                .iter()
+                .map(|parameter| {
+                    store
+                        .value_symbol_links(*parameter)
+                        .and_then(|links| links.resolved_type)
+                })
+                .collect::<Vec<_>>(),
+            [Some(string), Some(string), Some(string)],
+        );
+        assert_eq!(
+            store
+                .signature(checked.signature)
+                .unwrap()
+                .resolved_return_type(),
+            None,
+        );
+        assert_eq!(vector_cache_graph_counts(&store), before_warm);
     }
 
     #[test]
@@ -5538,7 +5979,7 @@ mod tests {
     }
 
     #[test]
-    fn vector_cache_failures_are_atomic_and_capacity_failure_is_retryable() {
+    fn vector_cache_failures_are_atomic_and_warm_validation_is_retryable() {
         let mut store = initialized_store();
         let (string, number) = {
             let bootstrap = store.intrinsic_bootstrap().unwrap();
@@ -5560,19 +6001,6 @@ mod tests {
         .unwrap();
         let before = vector_cache_graph_counts(&store);
 
-        assert_eq!(
-            materialize_validated_generic_call_vector_checked_instantiation_with_reservation(
-                &mut store,
-                &resolution,
-                &pair,
-                |_, _| false,
-            ),
-            Err(GenericCallVectorError::Invariant(
-                GenericCallVectorInvariant::Capacity(pair.signature)
-            ))
-        );
-        assert_eq!(vector_cache_graph_counts(&store), before);
-
         let shape = validate_generic_call_signature_shape(&store, pair.owner, &pair, None).unwrap();
         let checked = resolution.checked_instantiation.as_ref().unwrap();
         assert_eq!(
@@ -5592,10 +6020,10 @@ mod tests {
         );
         assert_eq!(vector_cache_graph_counts(&store), before);
 
-        let GenericCallVectorMaterialization::Published(cached) =
+        let GenericCallVectorMaterialization::Reused(cached) =
             materialize_vector(&mut store, &pair, &resolution).unwrap()
         else {
-            panic!("retry after a capacity failure must publish exactly once");
+            panic!("resolution must already have published exactly once");
         };
         let wrong_mapper = store
             .new_type_mapper(type_parameters, vec![number, string])
@@ -5654,6 +6082,185 @@ mod tests {
     }
 
     #[test]
+    fn poisoned_cold_suffix_is_rejected_before_any_missing_slot_is_filled() {
+        let mut store = initialized_store();
+        let (string, number) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (bootstrap.string_type, bootstrap.number_type)
+        };
+        let (pair, type_parameters) = vector_callable(
+            &mut store,
+            &["T", "U"],
+            &[None, None],
+            &[None, None],
+            &[0, 1],
+            |_, parameters| parameters[1],
+        );
+        let resolution = project_vector(
+            &mut store,
+            &pair,
+            vector_request(pair.owner, Some(&[string, string]), &[number, string]),
+        )
+        .unwrap();
+        assert!(matches!(
+            resolution.applicability,
+            GenericCallVectorApplicability::ArgumentNotAssignable { index: 0, .. },
+        ));
+        let checked = resolution.checked_instantiation.as_ref().unwrap();
+        let parameters = store
+            .signature(checked.signature)
+            .unwrap()
+            .parameters()
+            .to_vec();
+        assert_eq!(
+            store
+                .value_symbol_links(parameters[1])
+                .and_then(|links| links.resolved_type),
+            None,
+        );
+        let mut poisoned = store.value_symbol_links(parameters[1]).unwrap().clone();
+        poisoned.function_or_constructor_checked = true;
+        assert!(store.set_value_symbol_links(parameters[1], poisoned.clone()));
+        let before = vector_cache_graph_counts(&store);
+        let shape = validate_generic_call_signature_shape(&store, pair.owner, &pair, None).unwrap();
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+
+        assert_eq!(
+            demand_generic_call_vector_parameter(
+                &mut store,
+                &shape,
+                &type_parameters,
+                &checked.type_arguments,
+                checked.signature,
+                1,
+                &mut session,
+            ),
+            Err(GenericCallVectorError::Invariant(
+                GenericCallVectorInvariant::InvalidCachedInstantiation {
+                    target: pair.signature,
+                    signature: checked.signature,
+                },
+            )),
+        );
+        assert_eq!(
+            store.value_symbol_links(parameters[1]),
+            Some(&poisoned),
+            "warm validation must not repair or partially fill a poisoned suffix",
+        );
+        assert_eq!(
+            store
+                .signature(checked.signature)
+                .unwrap()
+                .resolved_return_type(),
+            None,
+        );
+        assert_eq!(vector_cache_graph_counts(&store), before);
+    }
+
+    #[test]
+    fn recovering_deep_parameter_revalidates_then_warms_without_new_work() {
+        let mut store = initialized_store();
+        let targets = canonical_array_targets(&mut store);
+        let (callable, _) = structured_vector_callable(
+            &mut store,
+            |store, type_parameter| canonical_array_type(store, targets, type_parameter, false),
+            |_, type_parameter| type_parameter,
+        );
+        let (number, error_type) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (bootstrap.number_type, bootstrap.error_type)
+        };
+        let mut session = InstantiationSession::new_recovering(
+            &store,
+            InstantiationLimits {
+                max_depth: 100,
+                max_count: 1,
+            },
+            error_type,
+        )
+        .unwrap();
+        let mark = session.limit_event_mark();
+        let resolution = project_validated_generic_call_vector_with_session(
+            &mut store,
+            vector_request(callable.owner, Some(&[number]), &[number]),
+            &callable,
+            Some(targets),
+            None,
+            &mut session,
+            |_, _, _| Ok(true),
+            CanonicalTypeMapperStore::is_type_strict_subtype_of,
+            CanonicalTypeMapperStore::is_type_subtype_of,
+        )
+        .unwrap();
+        assert_eq!(
+            resolution.applicability,
+            GenericCallVectorApplicability::Applicable,
+        );
+        let checked = resolution.checked_instantiation.as_ref().unwrap();
+        let recovered_parameter =
+            demand_vector_parameter(&mut store, &callable, &resolution, checked, 0);
+        let recovered = store
+            .canonical_array_reference_with_targets(targets, recovered_parameter)
+            .unwrap()
+            .expect("the recovery boundary retains the outer Array wrapper");
+        assert_eq!(recovered.element_type, error_type);
+        assert!(session.limit_event_occurred_since(mark));
+
+        let shape =
+            validate_generic_call_signature_shape(&store, callable.owner, &callable, Some(targets))
+                .unwrap();
+        let sources = shape
+            .type_parameters
+            .iter()
+            .map(|parameter| parameter.type_)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            validate_generic_call_vector_resolution(&store, &resolution, &shape),
+            Ok(sources.clone()),
+        );
+        assert_eq!(
+            demand_generic_call_vector_return(
+                &mut store,
+                &shape,
+                &sources,
+                &checked.type_arguments,
+                checked.signature,
+                &mut session,
+            ),
+            Ok(error_type),
+        );
+
+        let warm_counts = vector_cache_graph_counts(&store);
+        let warm_mark = session.limit_event_mark();
+        let replay = project_validated_generic_call_vector_with_session(
+            &mut store,
+            vector_request(callable.owner, Some(&[number]), &[number]),
+            &callable,
+            Some(targets),
+            None,
+            &mut session,
+            |_, _, _| Ok(true),
+            CanonicalTypeMapperStore::is_type_strict_subtype_of,
+            CanonicalTypeMapperStore::is_type_subtype_of,
+        )
+        .unwrap();
+        assert_eq!(replay, resolution);
+        assert_eq!(
+            demand_generic_call_vector_return(
+                &mut store,
+                &shape,
+                &sources,
+                &checked.type_arguments,
+                checked.signature,
+                &mut session,
+            ),
+            Ok(error_type),
+        );
+        assert!(!session.limit_event_occurred_since(warm_mark));
+        assert_eq!(vector_cache_graph_counts(&store), warm_counts);
+    }
+
+    #[test]
     fn forged_checked_union_vector_is_rejected_read_only_before_cache_lookup() {
         let mut store = initialized_store();
         let (string, number) = {
@@ -5687,7 +6294,10 @@ mod tests {
         assert_eq!(
             materialize_vector(&mut store, &both, &forged),
             Err(GenericCallVectorError::Invariant(
-                GenericCallVectorInvariant::InvalidCheckedInstantiation(both.signature)
+                GenericCallVectorInvariant::InvalidCachedInstantiation {
+                    target: both.signature,
+                    signature: resolution.checked_instantiation.as_ref().unwrap().signature,
+                }
             ))
         );
         assert_eq!(
@@ -5761,10 +6371,7 @@ mod tests {
         let checked = first.checked_instantiation.unwrap();
         assert_eq!(first.call_signature, checked.signature);
         assert_eq!(first.call_mapper, checked.mapper);
-        assert_eq!(store.mapper_len(), before.mappers + 1);
-        assert_eq!(store.symbol_len(), before.symbols + 2);
-        assert_eq!(store.signature_len(), before.signatures + 1);
-        assert_eq!(store.cached_signature_len(), before.cached_signatures + 1);
+        assert_eq!(vector_cache_graph_counts(&store), before);
         assert_eq!(
             store.cached_signatures_contain(first.call_signature),
             Some(true),
@@ -5792,20 +6399,6 @@ mod tests {
         );
         assert_eq!(vector_cache_graph_counts(&store), shared_counts);
 
-        assert_eq!(
-            materialize_validated_generic_call_vector_source_with(
-                &mut store,
-                &partial,
-                &callable,
-                Some(first.call_signature),
-                |_, _, _, _| CachedSignatureLookup::Missing,
-                |_, _| panic!("warm cache poison must not reserve"),
-            ),
-            Err(GenericCallVectorError::Invariant(
-                GenericCallVectorInvariant::MissingCachedInstantiation(callable.signature),
-            )),
-        );
-        assert_eq!(vector_cache_graph_counts(&store), shared_counts);
         assert_eq!(
             materialize_source_vector(&mut store, &callable, &partial, Some(callable.signature),),
             Err(GenericCallVectorError::Invariant(
@@ -5836,7 +6429,7 @@ mod tests {
     }
 
     #[test]
-    fn source_ts2345_reserves_checked_and_raw_default_recovery_as_one_transaction() {
+    fn source_ts2345_uses_prepublished_checked_and_raw_default_recovery_shells() {
         let mut store = initialized_store();
         let (string, number) = {
             let bootstrap = store.intrinsic_bootstrap().unwrap();
@@ -5862,72 +6455,17 @@ mod tests {
         ));
         let checked_vector = resolution.checked_instantiation.as_ref().unwrap();
         assert_eq!(checked_vector.type_arguments, [string, string]);
-        assert_eq!(checked_vector.return_type, string);
         assert_eq!(
             resolution.projection.instantiation.type_arguments,
             [string, type_parameters[0]],
         );
-        assert_eq!(
-            resolution.projection.instantiation.return_type, type_parameters[0],
-            "overload-failure default U=T remains the raw T in the call projection",
-        );
         let before = vector_cache_graph_counts(&store);
-
-        assert_eq!(
-            materialize_validated_generic_call_vector_source_with(
-                &mut store,
-                &resolution,
-                &callable,
-                None,
-                |_, _, _, _| CachedSignatureLookup::HashCollision(callable.signature),
-                |_, _| panic!("a collision must fail before reservation"),
-            ),
-            Err(GenericCallVectorError::Invariant(
-                GenericCallVectorInvariant::InstantiationCacheHashCollision {
-                    target: callable.signature,
-                    cached: callable.signature,
-                },
-            )),
-        );
-        assert_eq!(vector_cache_graph_counts(&store), before);
-
-        let mut observed_reservation = None;
-        assert_eq!(
-            materialize_validated_generic_call_vector_source_with(
-                &mut store,
-                &resolution,
-                &callable,
-                None,
-                CanonicalTypeMapperStore::cached_signature,
-                |_, reservation| {
-                    observed_reservation = Some(reservation);
-                    false
-                },
-            ),
-            Err(GenericCallVectorError::Invariant(
-                GenericCallVectorInvariant::Capacity(callable.signature),
-            )),
-        );
-        assert_eq!(
-            observed_reservation,
-            Some(GenericCallVectorReservation {
-                mappers: 2,
-                symbols: 4,
-                value_links: 4,
-                signatures: 2,
-                cached_signatures: 1,
-            }),
-        );
-        assert_eq!(vector_cache_graph_counts(&store), before);
 
         let first = materialize_source_vector(&mut store, &callable, &resolution, None).unwrap();
         let checked = first.checked_instantiation.unwrap();
         assert_ne!(first.call_signature, checked.signature);
         assert_ne!(first.call_mapper, checked.mapper);
-        assert_eq!(store.mapper_len(), before.mappers + 2);
-        assert_eq!(store.symbol_len(), before.symbols + 4);
-        assert_eq!(store.signature_len(), before.signatures + 2);
-        assert_eq!(store.cached_signature_len(), before.cached_signatures + 1);
+        assert_eq!(vector_cache_graph_counts(&store), before);
         assert_eq!(
             store.cached_signatures_contain(checked.signature),
             Some(true),
@@ -5957,56 +6495,45 @@ mod tests {
                 .signature(checked.signature)
                 .unwrap()
                 .resolved_return_type(),
-            Some(string),
+            None,
         );
-        let original = store.signature(callable.signature).unwrap();
-        let original_parameters = original.parameters().to_vec();
-        let original_flags = original.flags();
-        let original_declaration = original.declaration();
-        let original_min_argument_count = original.min_argument_count();
         let recovery = store.signature(first.call_signature).unwrap();
-        assert_eq!(
-            recovery.flags(),
-            original_flags & SignatureFlags::PROPAGATING_FLAGS,
-        );
-        assert_eq!(recovery.declaration(), original_declaration);
-        assert_eq!(recovery.min_argument_count(), original_min_argument_count);
         assert_eq!(recovery.target(), Some(callable.signature));
         assert_eq!(recovery.mapper(), Some(first.call_mapper));
-        assert_eq!(recovery.resolved_return_type(), Some(type_parameters[0]));
-        for ((parameter, target), parameter_type) in recovery
-            .parameters()
-            .iter()
-            .copied()
-            .zip(original_parameters)
-            .zip(
-                resolution
-                    .projection
-                    .instantiation
-                    .parameter_types
-                    .iter()
-                    .copied(),
-            )
-        {
-            assert!(cached_instantiated_parameter(
-                &store,
-                parameter,
-                target,
-                first.call_mapper,
-                parameter_type,
-            ));
+        assert_eq!(recovery.resolved_return_type(), None);
+        for parameter in recovery.parameters() {
+            assert_eq!(
+                store
+                    .value_symbol_links(*parameter)
+                    .and_then(|links| links.resolved_type),
+                None,
+                "the recovery parameter row remains cold",
+            );
         }
-
+        assert_eq!(
+            demand_vector_return(
+                &mut store,
+                &callable,
+                &resolution,
+                &resolution.projection.instantiation,
+            ),
+            type_parameters[0],
+            "overload-failure default U=T remains the raw T in the recovery mapper",
+        );
+        assert_eq!(
+            store
+                .signature(checked.signature)
+                .unwrap()
+                .resolved_return_type(),
+            None,
+            "selected recovery finalization must not fill the checked return",
+        );
         let after_first = vector_cache_graph_counts(&store);
         let second = materialize_source_vector(&mut store, &callable, &resolution, None).unwrap();
         assert_eq!(second.checked_instantiation, Some(checked));
-        assert_ne!(second.call_signature, first.call_signature);
-        assert_ne!(second.call_mapper, first.call_mapper);
-        assert_eq!(store.mapper_len(), after_first.mappers + 1);
-        assert_eq!(store.symbol_len(), after_first.symbols + 2);
-        assert_eq!(store.signature_len(), after_first.signatures + 1);
-        assert_eq!(store.cached_signature_len(), after_first.cached_signatures,);
-        let warm_counts = vector_cache_graph_counts(&store);
+        assert_eq!(second, first);
+        assert_eq!(vector_cache_graph_counts(&store), after_first);
+        let warm_counts = after_first;
         assert_eq!(
             materialize_source_vector(
                 &mut store,
@@ -6027,20 +6554,6 @@ mod tests {
             )),
         );
         assert_eq!(vector_cache_graph_counts(&store), warm_counts);
-        assert_eq!(
-            materialize_validated_generic_call_vector_source_with(
-                &mut store,
-                &resolution,
-                &callable,
-                Some(first.call_signature),
-                |_, _, _, _| CachedSignatureLookup::Missing,
-                |_, _| panic!("warm missing cache state must not reserve"),
-            ),
-            Err(GenericCallVectorError::Invariant(
-                GenericCallVectorInvariant::MissingCachedInstantiation(callable.signature),
-            )),
-        );
-        assert_eq!(vector_cache_graph_counts(&store), warm_counts);
 
         assert!(store.set_signature_target_and_mapper(
             first.call_signature,
@@ -6056,7 +6569,7 @@ mod tests {
                 Some(first.call_signature),
             ),
             Err(GenericCallVectorError::Invariant(
-                GenericCallVectorInvariant::InvalidCallInstantiation {
+                GenericCallVectorInvariant::InvalidCachedInstantiation {
                     target: callable.signature,
                     signature: first.call_signature,
                 },
@@ -6149,7 +6662,10 @@ mod tests {
                 constraint,
             } if type_argument == number && constraint == string,
         ));
-        assert!(constraint.checked_instantiation.is_some());
+        assert!(
+            constraint.checked_instantiation.is_none(),
+            "TS2344 must not create a checked shell",
+        );
         let constraint_call =
             assert_recovery_only_source_lifecycle(&mut store, &constrained, &constraint);
         assert_eq!(constraint_call.checked_instantiation, None);
@@ -6175,10 +6691,7 @@ mod tests {
                 Some(constraint_call.call_signature),
             ),
             Err(GenericCallVectorError::Invariant(
-                GenericCallVectorInvariant::InvalidCallInstantiation {
-                    target: constrained.signature,
-                    signature: constraint_call.call_signature,
-                },
+                GenericCallVectorInvariant::InvalidCheckedInstantiation(constrained.signature),
             )),
         );
         assert_eq!(vector_cache_graph_counts(&store), poisoned_counts);
@@ -6352,6 +6865,90 @@ mod tests {
             ),
             counts
         );
+    }
+
+    #[test]
+    fn identity_recovery_at_count_limit_revalidates_return_and_warm_shell() {
+        let mut store = initialized_store();
+        let (callable, _) = identity_callable(&mut store);
+        let (string, error_type) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (bootstrap.string_type, bootstrap.error_type)
+        };
+        let mut session = InstantiationSession::new_recovering(
+            &store,
+            InstantiationLimits {
+                max_depth: 100,
+                max_count: 0,
+            },
+            error_type,
+        )
+        .unwrap();
+        let mark = session.limit_event_mark();
+        let resolution = resolve_validated_identity_call(
+            &mut store,
+            inferred_request(callable.owner, &[string]),
+            &callable,
+            EXACT_SOURCE,
+            None,
+            &mut session,
+            |_, _, _| Ok(true),
+        )
+        .unwrap();
+        assert_eq!(
+            resolution.applicability,
+            DirectCallApplicability::Applicable,
+        );
+        let [parameter] = store
+            .signature(resolution.projection.signature)
+            .unwrap()
+            .parameters()
+        else {
+            panic!("identity shell must retain one parameter")
+        };
+        assert_eq!(
+            store
+                .value_symbol_links(*parameter)
+                .and_then(|links| links.resolved_type),
+            Some(error_type),
+        );
+        assert_eq!(
+            demand_validated_identity_generic_call_selected_return(
+                &mut store,
+                &resolution,
+                &callable,
+                EXACT_SOURCE,
+                &mut session,
+            ),
+            Ok((error_type, DirectCallReturnKind::Value)),
+        );
+        assert!(session.limit_event_occurred_since(mark));
+
+        let warm_counts = vector_cache_graph_counts(&store);
+        let warm_mark = session.limit_event_mark();
+        let replay = resolve_validated_identity_call(
+            &mut store,
+            inferred_request(callable.owner, &[string]),
+            &callable,
+            EXACT_SOURCE,
+            None,
+            &mut session,
+            |_, _, _| Ok(true),
+        )
+        .unwrap();
+        assert_eq!(replay, resolution);
+        assert_eq!(
+            demand_validated_identity_generic_call_selected_return(
+                &mut store,
+                &replay,
+                &callable,
+                EXACT_SOURCE,
+                &mut session,
+            ),
+            Ok((error_type, DirectCallReturnKind::Value)),
+        );
+        assert!(!session.limit_event_occurred_since(warm_mark));
+        assert_eq!(vector_cache_graph_counts(&store), warm_counts);
     }
 
     #[test]
@@ -6603,7 +7200,7 @@ mod tests {
     }
 
     #[test]
-    fn relation_unavailable_precedes_cold_instantiation_publication() {
+    fn relation_unavailable_retains_the_checked_shell_published_before_applicability() {
         let mut store = initialized_store();
         let (callable, _) = identity_callable(&mut store);
         let string = store.intrinsic_bootstrap().unwrap().string_type;
@@ -6615,27 +7212,32 @@ mod tests {
             store.checker_link_allocated_lengths(),
         );
 
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
         assert_eq!(
             resolve_validated_identity_call(
                 &mut store,
                 inferred_request(callable.owner, &[string]),
                 &callable,
                 EXACT_SOURCE,
+                None,
+                &mut session,
                 |_, _, _| Err(RelationUnavailable::MissingBootstrap),
             ),
             Err(IdentityGenericCallError::Relation(
                 RelationUnavailable::MissingBootstrap
             ))
         );
-        assert_eq!(
-            (
-                store.mapper_len(),
-                store.symbol_len(),
-                store.signature_len(),
-                store.cached_signature_len(),
-                store.checker_link_allocated_lengths(),
-            ),
-            counts
+        assert_eq!(store.mapper_len(), counts.0 + 1);
+        assert_eq!(store.symbol_len(), counts.1 + 1);
+        assert_eq!(store.signature_len(), counts.2 + 1);
+        assert_eq!(store.cached_signature_len(), counts.3 + 1);
+        assert_ne!(store.checker_link_allocated_lengths(), counts.4);
+        let published = (
+            store.mapper_len(),
+            store.symbol_len(),
+            store.signature_len(),
+            store.cached_signature_len(),
+            store.checker_link_allocated_lengths(),
         );
 
         let repaired = project_validated_identity_call(
@@ -6646,7 +7248,16 @@ mod tests {
         )
         .unwrap();
         assert_eq!(repaired.projection.type_argument, string);
-        assert_eq!(store.cached_signature_len(), counts.3 + 1);
+        assert_eq!(
+            (
+                store.mapper_len(),
+                store.symbol_len(),
+                store.signature_len(),
+                store.cached_signature_len(),
+                store.checker_link_allocated_lengths(),
+            ),
+            published,
+        );
     }
 
     #[test]
