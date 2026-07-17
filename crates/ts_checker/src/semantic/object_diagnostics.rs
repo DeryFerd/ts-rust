@@ -27,6 +27,7 @@ use super::{
         type_to_string_with_host_global_types_and_flags,
     },
     functions::{StoredFunctionTypeValidation, validate_stored_function_type},
+    instantiate::InstantiationSession,
     object_members::{
         DeclaredPropertyTypeGraphValidation, PropertyObjectPlan,
         validate_resolved_declared_property_type_graph,
@@ -53,6 +54,7 @@ pub(super) fn diagnostics_for_failed_assignment(
     target_type: TypeId,
     fallback_node: NodeRef,
     options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
 ) -> Result<Vec<CanonicalCheckerDiagnostic>, SourceCheckError> {
     let mut prerequisite_diagnostics = Vec::new();
     let mut resolved_signatures = HashSet::new();
@@ -66,6 +68,7 @@ pub(super) fn diagnostics_for_failed_assignment(
             target_type,
             fallback_node,
             options,
+            session,
         ) {
             Ok(mut diagnostics) => {
                 prerequisite_diagnostics.append(&mut diagnostics);
@@ -86,11 +89,12 @@ pub(super) fn diagnostics_for_failed_assignment(
                     return Err(error);
                 }
                 let mut resolution_diagnostics = super::CanonicalCheckerDiagnostics::default();
-                let resolved = CanonicalTypeQuery::new_with_global_types(
+                let resolved = CanonicalTypeQuery::new_with_global_types_and_session(
                     store,
                     host,
                     global_types,
                     options,
+                    session,
                     &mut resolution_diagnostics,
                 )?
                 .get_return_type_of_signature(signature);
@@ -104,11 +108,12 @@ pub(super) fn diagnostics_for_failed_assignment(
                     return Err(RelationUnavailable::UnresolvedSignatureReturn(signature).into());
                 }
                 let mut resolution_diagnostics = super::CanonicalCheckerDiagnostics::default();
-                let resolved = CanonicalTypeQuery::new_with_global_types(
+                let resolved = CanonicalTypeQuery::new_with_global_types_and_session(
                     store,
                     host,
                     global_types,
                     options,
+                    session,
                     &mut resolution_diagnostics,
                 )?
                 .get_return_type_of_signature(signature);
@@ -130,6 +135,7 @@ fn diagnostics_for_failed_assignment_once(
     target_type: TypeId,
     fallback_node: NodeRef,
     options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
 ) -> Result<Vec<CanonicalCheckerDiagnostic>, SourceCheckError> {
     validate_checked_expression_shape(expression, checked)?;
     let flags = display_flags(options);
@@ -142,6 +148,7 @@ fn diagnostics_for_failed_assignment_once(
         target_type,
         flags,
         options,
+        session,
     )?;
     if !elaborated.is_empty() {
         return Ok(elaborated);
@@ -230,6 +237,7 @@ fn elaborate_expression(
     target_type: TypeId,
     flags: CanonicalTypeFormatFlags,
     options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
 ) -> Result<Vec<CanonicalCheckerDiagnostic>, SourceCheckError> {
     let expression = expression.unparenthesized();
     match (&expression.kind, &checked.shape) {
@@ -243,6 +251,7 @@ fn elaborate_expression(
                 target_type,
                 flags,
                 options,
+                session,
             )
         }
         (PlannedExpressionKind::Array(_), CheckedExpressionShape::Array(_)) => Ok(
@@ -254,6 +263,7 @@ fn elaborate_expression(
                 checked,
                 target_type,
                 options,
+                session,
             )?
             .unwrap_or_default(),
         ),
@@ -289,6 +299,7 @@ fn elaborate_known_properties(
     target_type: TypeId,
     flags: CanonicalTypeFormatFlags,
     options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
 ) -> Result<Vec<CanonicalCheckerDiagnostic>, SourceCheckError> {
     let expression = expression.unparenthesized();
     let PlannedExpressionKind::Object { plan, properties } = &expression.kind else {
@@ -340,6 +351,7 @@ fn elaborate_known_properties(
             target_property.type_,
             flags,
             options,
+            session,
         )?;
         if !nested.is_empty() {
             diagnostics.extend(nested);

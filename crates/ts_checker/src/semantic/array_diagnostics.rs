@@ -10,6 +10,7 @@ use ts_ast::NodeRef;
 use super::{
     CanonicalCheckerDiagnostic, CanonicalCheckerOptions, CanonicalGlobalTypes,
     CanonicalTypeMapperStore, DeclaredTypeHost, RelationUnavailable, TypeId,
+    instantiate::InstantiationSession,
     source::{
         CheckedExpressionShape, CheckedExpressionTypes, PlannedExpression, PlannedExpressionKind,
         SourceCheckError,
@@ -30,6 +31,7 @@ pub(super) fn diagnostics_for_failed_array_assignment(
     checked: &CheckedExpressionTypes,
     target_type: TypeId,
     options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
 ) -> Result<Option<Vec<CanonicalCheckerDiagnostic>>, SourceCheckError> {
     let Some(elements) = checked_array_elements(expression, checked)? else {
         return Ok(None);
@@ -64,6 +66,7 @@ pub(super) fn diagnostics_for_failed_array_assignment(
                 target_element,
                 diagnostic_node(element),
                 options,
+                session,
             )?,
         );
     }

@@ -5641,6 +5641,7 @@ fn check_planned_assignment(
             target,
             fallback_node,
             options,
+            session,
         )?;
         for diagnostic in staged {
             merge_retry_diagnostic(diagnostics, diagnostic);
@@ -11561,6 +11562,9 @@ mod tests {
             number,
             nested_plan.node,
             options,
+            &mut InstantiationSession::new(
+                crate::semantic::instantiate::InstantiationLimits::default(),
+            ),
         );
 
         assert!(matches!(
