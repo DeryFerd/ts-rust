@@ -243,6 +243,67 @@ fn property_calls_force_public_warm_replay_while_source_remains_unchecked() {
 }
 
 #[test]
+fn inherited_property_call_reuses_the_base_member_cold_and_warm() {
+    let parsed = parse_source_file(concat!(
+        "interface Base { fn: (value: number) => string; } ",
+        "interface API extends Base {} ",
+        "function use(api: API): string { return api.fn(1); }",
+    ));
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(19);
+    let calls = nodes_of_kind(&parsed, file, SyntaxKind::CallExpression);
+    let accesses = nodes_of_kind(&parsed, file, SyntaxKind::PropertyAccessExpression);
+    let [call] = calls.as_slice() else {
+        panic!("expected one call")
+    };
+    let [access] = accesses.as_slice() else {
+        panic!("expected one property access")
+    };
+    let mut context = context(&parsed, file);
+
+    context.check_source_file(file).unwrap();
+
+    let return_type = context
+        .store()
+        .type_node_links(*call)
+        .and_then(|links| links.resolved_type)
+        .expect("inherited call return type must be cached");
+    assert_eq!(context.type_to_string(return_type).unwrap(), "string");
+    let signature = context.store().signature_links(*call).cloned();
+    assert!(
+        signature
+            .as_ref()
+            .is_some_and(|links| links.resolved_signature.signature().is_some())
+    );
+    let property_type = context.store().type_node_links(*access).cloned();
+    let property_symbol = context.store().symbol_node_links(*access).cloned();
+    assert!(property_type.is_some());
+    assert!(
+        property_symbol
+            .as_ref()
+            .is_some_and(|links| links.resolved_symbol.is_some())
+    );
+    assert!(context.diagnostics().is_empty());
+
+    let counts = (context.store().type_len(), context.store().signature_len());
+    context.recheck_source_file(file).unwrap();
+    assert_eq!(
+        (context.store().type_len(), context.store().signature_len()),
+        counts
+    );
+    assert_eq!(context.store().signature_links(*call), signature.as_ref());
+    assert_eq!(
+        context.store().type_node_links(*access),
+        property_type.as_ref()
+    );
+    assert_eq!(
+        context.store().symbol_node_links(*access),
+        property_symbol.as_ref()
+    );
+    assert!(context.diagnostics().is_empty());
+}
+
+#[test]
 fn unsupported_property_call_families_fail_closed_without_call_publication() {
     let fixtures = [
         (
@@ -306,14 +367,6 @@ fn unsupported_property_call_families_fail_closed_without_call_publication() {
         (
             "any receiver",
             "function use(api: any): string { return api.fn(1); }",
-        ),
-        (
-            "inherited property",
-            concat!(
-                "interface Base { fn: (value: number) => string; } ",
-                "interface API extends Base {} ",
-                "function use(api: API): string { return api.fn(1); }",
-            ),
         ),
         (
             "apparent property",
