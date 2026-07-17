@@ -31,6 +31,7 @@ use super::{
     links::ValueSymbolLinks,
     object_members,
     source_callables::{SourceCallableDisplayError, SourceCallableUnsupported},
+    structured_members::{InterfaceHeritageMembersValidation, validate_interface_heritage_members},
     type_records::{
         LiteralTypeData, LiteralValue, TypeCacheState, TypeData, TypeDataKind, TypeRecord,
     },
@@ -1598,6 +1599,13 @@ fn validate_resolved_named_interface(
     owner: SemanticSymbolId,
     interface: &super::type_records::InterfaceTypeData,
 ) -> Result<(), TypeDisplayUnavailable> {
+    match validate_interface_heritage_members(store, type_id) {
+        InterfaceHeritageMembersValidation::Valid => return Ok(()),
+        InterfaceHeritageMembersValidation::Malformed => {
+            return Err(TypeDisplayUnavailable::MalformedType(type_id));
+        }
+        InterfaceHeritageMembersValidation::NotHeritage => {}
+    }
     let structured = &interface.reference.object.structured;
     if !interface.base_types_resolved
         || interface.resolved_base_constructor_type.is_some()
