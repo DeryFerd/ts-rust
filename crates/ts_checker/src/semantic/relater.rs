@@ -915,8 +915,9 @@ impl<'store> RelaterSession<'store> {
                 .store
                 .symbol(property)
                 .expect("the raw target table was shallow-validated")
-                .name();
-            if self.global_object_property(name)?.is_none() {
+                .name()
+                .to_owned();
+            if self.global_object_property(name.as_ref())?.is_none() {
                 return Ok(true);
             }
         }
@@ -2676,7 +2677,7 @@ impl<'store> RelaterSession<'store> {
     }
 
     fn canonical_object_literal_raw_members(
-        &mut self,
+        &self,
         owner: SemanticSymbolId,
     ) -> Option<CanonicalObjectLiteralRawMembers<'_>> {
         self.canonical_object_literal_raw_members_unobserved(owner)
@@ -7230,6 +7231,60 @@ mod tests {
             })
         );
         assert_eq!(store.enum_relation_cache_size(), 2);
+    }
+
+    #[test]
+    fn warmed_parent_relation_revalidates_the_exact_enum_pair() {
+        let mut store = initialized(true);
+        let source_symbol = alloc_symbol(&mut store, SymbolFlags::REGULAR_ENUM, "E");
+        let target_symbol = alloc_symbol(&mut store, SymbolFlags::REGULAR_ENUM, "E");
+        let source_enum = alloc_enum_type(&mut store, source_symbol);
+        let target_enum = alloc_enum_type(&mut store, target_symbol);
+        let source_property = alloc_typed_property(&mut store, "value", source_enum, false);
+        let source = alloc_property_object(&mut store, vec![source_property]);
+        let target_property = alloc_typed_property(&mut store, "value", target_enum, false);
+        let target = alloc_property_object(&mut store, vec![target_property]);
+
+        assert!(store.enum_relation_cache_set(
+            source_symbol,
+            target_symbol,
+            RelationComparisonResult::SUCCEEDED,
+        ));
+        assert_eq!(store.is_type_assignable_to(source, target), Ok(true));
+        let root_key = store
+            .relation_key_if_available(source, target, super::IntersectionState::NONE, false, false)
+            .unwrap()
+            .key();
+        assert!(
+            store
+                .relation_cache_get(RelationKind::Assignable, root_key)
+                .intersects(RelationComparisonResult::SUCCEEDED)
+        );
+
+        let warmed = store.relation_state_snapshot();
+        assert!(store.enum_relation_cache_set(
+            source_symbol,
+            target_symbol,
+            RelationComparisonResult::SUCCEEDED,
+        ));
+        assert!(
+            store
+                .relation_cache_get(RelationKind::Assignable, root_key)
+                .intersects(RelationComparisonResult::SUCCEEDED),
+            "an equal enum-pair publication must preserve the parent cache"
+        );
+        assert_eq!(store.relation_state_snapshot(), warmed);
+
+        assert!(store.enum_relation_cache_set(
+            source_symbol,
+            target_symbol,
+            RelationComparisonResult::FAILED,
+        ));
+        assert_eq!(
+            store.relation_cache_get(RelationKind::Assignable, root_key),
+            RelationComparisonResult::NONE,
+        );
+        assert_eq!(store.is_type_assignable_to(source, target), Ok(false));
     }
 
     #[test]

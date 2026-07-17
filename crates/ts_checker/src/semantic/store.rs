@@ -90,6 +90,7 @@ struct RelationReadObservations {
     nodes: HashSet<NodeRef>,
     derived_cache_sources: HashSet<TypeId>,
     derived_cache_targets: HashSet<TypeId>,
+    enum_pairs: HashSet<(SemanticSymbolId, SemanticSymbolId)>,
 }
 
 #[derive(Debug)]
@@ -366,6 +367,7 @@ pub struct SemanticStore<TypePayload, MapperPayload> {
     relation_observable_nodes: HashSet<NodeRef>,
     relation_observable_derived_cache_sources: HashSet<TypeId>,
     relation_observable_derived_cache_targets: HashSet<TypeId>,
+    relation_observable_enum_pairs: HashSet<(SemanticSymbolId, SemanticSymbolId)>,
     relation_read_observation_active: AtomicBool,
     active_relation_read_observations: Mutex<Option<ActiveRelationReadObservations>>,
     next_relation_observation_token: u64,
@@ -449,6 +451,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             relation_observable_nodes: HashSet::new(),
             relation_observable_derived_cache_sources: HashSet::new(),
             relation_observable_derived_cache_targets: HashSet::new(),
+            relation_observable_enum_pairs: HashSet::new(),
             relation_read_observation_active: AtomicBool::new(false),
             active_relation_read_observations: Mutex::new(None),
             next_relation_observation_token: 0,
@@ -2785,6 +2788,13 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         });
     }
 
+    #[inline]
+    fn observe_relation_enum_pair_read(&self, source: SemanticSymbolId, target: SemanticSymbolId) {
+        self.with_relation_read_observations(|observed| {
+            observed.enum_pairs.insert((source, target));
+        });
+    }
+
     pub(super) fn relation_type_alias_is_observable(&self, alias: TypeAliasId) -> bool {
         self.relation_observable_type_aliases.contains(&alias)
     }
@@ -2854,6 +2864,8 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             .extend(observed.derived_cache_sources);
         self.relation_observable_derived_cache_targets
             .extend(observed.derived_cache_targets);
+        self.relation_observable_enum_pairs
+            .extend(observed.enum_pairs);
     }
 
     fn clear_relation_observations(&mut self) {
@@ -2867,6 +2879,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         self.relation_observable_nodes.clear();
         self.relation_observable_derived_cache_sources.clear();
         self.relation_observable_derived_cache_targets.clear();
+        self.relation_observable_enum_pairs.clear();
     }
 
     fn relation_cache_is_current(&self) -> bool {
@@ -2975,6 +2988,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         target: SemanticSymbolId,
     ) -> Option<RelationComparisonResult> {
         let (source_id, target_id) = self.enum_relation_symbol_ids(source, target)?;
+        self.observe_relation_enum_pair_read(source, target);
         Some(if self.relation_cache_is_current() {
             self.relations.enum_get(source_id, target_id)
         } else {
@@ -2995,9 +3009,17 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         let Some((source_id, target_id)) = self.enum_relation_symbol_ids(source, target) else {
             return false;
         };
+        let pair = (source, target);
+        let relation_dirty = self.relation_cache_is_current()
+            && self.relation_observable_enum_pairs.contains(&pair)
+            && self.relations.enum_get(source_id, target_id) != result;
+        if relation_dirty {
+            self.mark_relation_inputs_dirty();
+        }
         self.prepare_relation_cache_write();
         self.relations.enum_set(source_id, target_id, result);
         self.relation_observable_symbols.extend([source, target]);
+        self.relation_observable_enum_pairs.insert(pair);
         true
     }
 
