@@ -58,14 +58,15 @@ pub(super) struct CanonicalTypeQueryOptions {
 }
 
 /// Immutable proof that one leaf in an exact importer annotation root names
-/// one alias whose direct type-only target was independently derived from the
-/// program's exact module-resolution manifest.
+/// one alias whose immediate and final type-only targets were independently
+/// derived from the program's exact module-resolution manifest.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct CanonicalTypeReferenceAliasTarget {
     root: NodeRef,
     reference: NodeRef,
     binding_declaration: NodeRef,
     alias: SemanticSymbolId,
+    immediate_target: SemanticSymbolId,
     target: SemanticSymbolId,
 }
 
@@ -76,6 +77,7 @@ impl CanonicalTypeReferenceAliasTarget {
         reference: NodeRef,
         binding_declaration: NodeRef,
         alias: SemanticSymbolId,
+        immediate_target: SemanticSymbolId,
         target: SemanticSymbolId,
     ) -> Self {
         Self {
@@ -83,6 +85,7 @@ impl CanonicalTypeReferenceAliasTarget {
             reference,
             binding_declaration,
             alias,
+            immediate_target,
             target,
         }
     }
@@ -3367,15 +3370,26 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             .store
             .get_merged_symbol(capability.target)
             .ok_or_else(&invalid)?;
+        let immediate_target = self
+            .store
+            .get_merged_symbol(capability.immediate_target)
+            .ok_or_else(&invalid)?;
         let target_flags = self.store.symbol(target).ok_or_else(&invalid)?.flags();
+        let immediate_flags = self
+            .store
+            .symbol(immediate_target)
+            .ok_or_else(&invalid)?
+            .flags();
         let alias_links = self
             .store
             .alias_symbol_links(capability.alias)
             .ok_or_else(&invalid)?;
         if target != capability.target
+            || immediate_target != capability.immediate_target
             || (target_flags != SymbolFlags::TYPE_ALIAS
                 && target_flags != SymbolFlags::INTERFACE)
-            || alias_links.immediate_target != Some(target)
+            || (immediate_target != target && immediate_flags != SymbolFlags::ALIAS)
+            || alias_links.immediate_target != Some(immediate_target)
             || alias_links.alias_target != super::AliasTargetState::Resolved(target)
             || alias_links.type_only_declaration != Some(capability.binding_declaration)
         {
@@ -4094,6 +4108,8 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 .and_then(|symbol| symbol.declarations());
             let target = self.canonical_symbol(capability.target)?;
             let target_flags = self.symbol_flags(target)?;
+            let immediate_target = self.canonical_symbol(capability.immediate_target)?;
+            let immediate_flags = self.symbol_flags(immediate_target)?;
             let links = self
                 .store
                 .alias_symbol_links(capability.alias)
@@ -4117,9 +4133,11 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 || alias_declarations != Some(&[capability.binding_declaration])
                 || self.store.get_merged_symbol(capability.alias) != Some(capability.alias)
                 || target != capability.target
+                || immediate_target != capability.immediate_target
                 || (target_flags != SymbolFlags::TYPE_ALIAS
                     && target_flags != SymbolFlags::INTERFACE)
-                || links.immediate_target != Some(target)
+                || (immediate_target != target && immediate_flags != SymbolFlags::ALIAS)
+                || links.immediate_target != Some(immediate_target)
                 || links.alias_target != super::AliasTargetState::Resolved(target)
                 || links.type_only_declaration != Some(capability.binding_declaration)
             {

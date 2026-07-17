@@ -763,6 +763,56 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
         }
         Ok(())
     }
+
+    /// Re-derives one immediate target and exposes the declaration only when
+    /// that exact alias hop is syntactically type-only. The ordinary alias
+    /// provider uses the same path, while source import validation retains the
+    /// marker to prove transitive warm-cache propagation independently.
+    pub(super) fn get_target_and_type_only_of_alias_declaration<MapperPayload>(
+        &mut self,
+        store: &mut CanonicalSemanticStore<MapperPayload>,
+        alias: SemanticSymbolId,
+    ) -> Result<
+        (CanonicalImmediateAliasTarget, Option<NodeRef>),
+        CanonicalAliasTargetUnavailable,
+    > {
+        if store.id() != self.store {
+            return Err(CanonicalAliasTargetUnavailable::ForeignStore {
+                expected: self.store,
+                actual: store.id(),
+            });
+        }
+        let declaration = self.alias_declaration(store, alias)?;
+        let supported = self.supported_declaration(store, declaration)?;
+        let (specifier, type_only) = match &supported {
+            SupportedAliasDeclaration::NamespaceImport {
+                specifier,
+                type_only,
+            }
+            | SupportedAliasDeclaration::NamedModuleMember {
+                specifier,
+                type_only,
+                ..
+            } => (*specifier, *type_only),
+        };
+        if type_only {
+            Self::mark_type_only(store, alias, declaration)?;
+        }
+        let resolved = self.resolved_module(declaration, specifier, store)?;
+        let module = self.plain_esm_module(store, declaration, resolved)?;
+        let target = match &supported {
+            SupportedAliasDeclaration::NamespaceImport { .. } => {
+                Self::direct_namespace_target(store, declaration, module)?
+            }
+            SupportedAliasDeclaration::NamedModuleMember { name, .. } => {
+                Self::direct_export(store, declaration, module, name)?
+            }
+        };
+        Ok((
+            CanonicalImmediateAliasTarget::Resolved(target),
+            type_only.then_some(declaration),
+        ))
+    }
 }
 
 fn validate_source<MapperPayload>(
@@ -833,39 +883,8 @@ impl<MapperPayload> CanonicalAliasTargetHost<MapperPayload>
         store: &mut CanonicalSemanticStore<MapperPayload>,
         alias: SemanticSymbolId,
     ) -> Result<CanonicalImmediateAliasTarget, CanonicalAliasTargetUnavailable> {
-        if store.id() != self.store {
-            return Err(CanonicalAliasTargetUnavailable::ForeignStore {
-                expected: self.store,
-                actual: store.id(),
-            });
-        }
-        let declaration = self.alias_declaration(store, alias)?;
-        let supported = self.supported_declaration(store, declaration)?;
-        let (specifier, type_only) = match &supported {
-            SupportedAliasDeclaration::NamespaceImport {
-                specifier,
-                type_only,
-            }
-            | SupportedAliasDeclaration::NamedModuleMember {
-                specifier,
-                type_only,
-                ..
-            } => (*specifier, *type_only),
-        };
-        if type_only {
-            Self::mark_type_only(store, alias, declaration)?;
-        }
-        let resolved = self.resolved_module(declaration, specifier, store)?;
-        let module = self.plain_esm_module(store, declaration, resolved)?;
-        let target = match &supported {
-            SupportedAliasDeclaration::NamespaceImport { .. } => {
-                Self::direct_namespace_target(store, declaration, module)?
-            }
-            SupportedAliasDeclaration::NamedModuleMember { name, .. } => {
-                Self::direct_export(store, declaration, module, name)?
-            }
-        };
-        Ok(CanonicalImmediateAliasTarget::Resolved(target))
+        self.get_target_and_type_only_of_alias_declaration(store, alias)
+            .map(|(target, _)| target)
     }
 }
 

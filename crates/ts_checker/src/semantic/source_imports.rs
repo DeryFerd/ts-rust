@@ -920,7 +920,12 @@ pub(super) fn plan_top_level_named_reexport(
             exported_name,
             &exported_text,
         )?;
-        preflight_alias_value_links(store, alias_symbol)?;
+        let syntactic_type_only = export.is_type_only || specifier.is_type_only;
+        if syntactic_type_only {
+            preflight_type_import_value_links(store, alias_symbol)?;
+        } else {
+            preflight_alias_value_links(store, alias_symbol)?;
+        }
         bindings.push(SourceNamedReexportBindingPlan {
             declaration: binding,
             imported_name,
@@ -928,7 +933,7 @@ pub(super) fn plan_top_level_named_reexport(
             imported_text,
             exported_text,
             alias_symbol,
-            syntactic_type_only: export.is_type_only || specifier.is_type_only,
+            syntactic_type_only,
         });
     }
 
@@ -1030,6 +1035,14 @@ pub(super) fn resolve_source_named_reexport_binding(
         }
         AliasTargetState::Resolved(target) => target,
     };
+    let (independent_immediate, independent_target) = independently_resolve_source_alias_chain(
+        store,
+        alias_host,
+        alias,
+    )?;
+    if independent_immediate != immediate_target || independent_target != target {
+        return Err(invariant(SourceImportInvariant::InvalidAliasLinks(alias)));
+    }
     if immediate_flags != SymbolFlags::ALIAS && target != immediate_target {
         return Err(invariant(SourceImportInvariant::InvalidAliasLinks(alias)));
     }
@@ -1047,6 +1060,9 @@ pub(super) fn resolve_source_named_reexport_binding(
     } else {
         None
     };
+    if expected_type_only.is_some() {
+        preflight_type_import_value_links(store, alias)?;
+    }
     if links.immediate_target != Some(immediate_target)
         || links.alias_target != AliasTargetState::Resolved(target)
         || links.type_only_declaration != expected_type_only
@@ -1257,6 +1273,16 @@ fn resolve_source_import_binding_phase(
         }
         AliasTargetState::Resolved(target) => target,
     };
+    let (independent_immediate, independent_target) = independently_resolve_source_alias_chain(
+        store,
+        alias_host,
+        binding.alias_symbol,
+    )?;
+    if independent_immediate != direct_target || independent_target != resolved_target {
+        return Err(invariant(SourceImportInvariant::InvalidAliasLinks(
+            binding.alias_symbol,
+        )));
+    }
 
     if direct_flags != SymbolFlags::ALIAS && resolved_target != direct_target {
         return Err(invariant(SourceImportInvariant::InvalidAliasLinks(
@@ -1304,6 +1330,88 @@ fn resolve_source_import_binding_phase(
         immediate_target_symbol: direct_target,
         target_symbol: resolved_target,
     })
+}
+
+/// Re-derives one alias chain directly from the immutable production host and
+/// compares every already-published hop with that chain. This prevents a warm
+/// cached final target from bypassing module-resolution provenance while
+/// preserving the pinned laziness of nested `immediate_target` links.
+fn independently_resolve_source_alias_chain(
+    store: &mut CanonicalTypeMapperStore,
+    alias_host: &mut ProductionAliasTargetHost<'_, '_, '_>,
+    alias: SemanticSymbolId,
+) -> Result<(SemanticSymbolId, SemanticSymbolId), SourceImportError> {
+    let mut current = alias;
+    let mut visited = HashSet::new();
+    let mut hops = Vec::new();
+    let mut first_target = None;
+    loop {
+        if !visited.insert(current) {
+            return Err(SourceImportError::CircularAlias {
+                alias,
+                events: Vec::new(),
+            });
+        }
+        let flags = store
+            .symbol(current)
+            .ok_or_else(|| invariant(SourceImportInvariant::InvalidTargetSymbol(current)))?
+            .flags();
+        if flags != SymbolFlags::ALIAS {
+            if flags.intersects(SymbolFlags::ALIAS) {
+                return Err(invariant(SourceImportInvariant::InvalidTargetSymbol(
+                    current,
+                )));
+            }
+            break;
+        }
+        let (target, syntactic_type_only) = alias_host
+            .get_target_and_type_only_of_alias_declaration(store, current)
+            .map_err(|reason| {
+                SourceImportError::Alias(CanonicalAliasResolutionError::TargetUnavailable {
+                    alias: current,
+                    reason,
+                })
+            })?;
+        let CanonicalImmediateAliasTarget::Resolved(next) = target else {
+            return Err(invariant(SourceImportInvariant::InvalidAliasLinks(current)));
+        };
+        if store.symbol(next).is_none() {
+            return Err(invariant(SourceImportInvariant::InvalidTargetSymbol(next)));
+        }
+        if first_target.is_none() {
+            first_target = Some(next);
+        }
+        hops.push((current, next, syntactic_type_only));
+        current = next;
+    }
+
+    let first_target = first_target
+        .ok_or_else(|| invariant(SourceImportInvariant::InvalidAliasSymbol(alias)))?;
+    let mut resolved = current;
+    let mut root_target = None;
+    let mut propagated_type_only = None;
+    for (hop, immediate, syntactic_type_only) in hops.into_iter().rev() {
+        let expected_type_only = syntactic_type_only.or(propagated_type_only);
+        let links = store
+            .alias_symbol_links(hop)
+            .ok_or_else(|| invariant(SourceImportInvariant::InvalidAliasLinks(hop)))?;
+        if links
+            .immediate_target
+            .is_some_and(|cached| cached != immediate)
+            || links.alias_target != AliasTargetState::Resolved(resolved)
+            || links.type_only_declaration != expected_type_only
+        {
+            return Err(invariant(SourceImportInvariant::InvalidAliasLinks(hop)));
+        }
+        root_target = Some(resolved);
+        propagated_type_only = expected_type_only;
+        resolved = store
+            .get_merged_symbol(resolved)
+            .ok_or_else(|| invariant(SourceImportInvariant::InvalidTargetSymbol(resolved)))?;
+    }
+    let root_target = root_target
+        .ok_or_else(|| invariant(SourceImportInvariant::InvalidAliasSymbol(alias)))?;
+    Ok((first_target, root_target))
 }
 
 /// Proves that one leaf of an exact importer annotation root references a
@@ -1427,6 +1535,7 @@ pub(super) fn plan_source_type_import_reference(
         reference,
         binding.declaration,
         binding.alias_symbol,
+        resolved.immediate_target_symbol,
         resolved.target_symbol,
     ))
 }
