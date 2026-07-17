@@ -5,7 +5,7 @@
 - Upstream epoch: `dc37b5249ab60e2bbce936f71b883e6c8136167e`
 - Wave branch baseline: `cdbf749`
 - Integration branch: `july-ultra`
-- Current integrated semantic stack: through `67d072d`
+- Current integrated semantic stack: through `74ea3ca`
 
 This is the live execution record for Wave 0 of
 [`typechecker-completion-goal.md`](typechecker-completion-goal.md). The port
@@ -15,7 +15,7 @@ map remains authoritative for cluster state.
 
 | Lane | Branch/worktree | Current task | State |
 |---|---|---|---|
-| Root/integration | `july-ultra`; repository root | contract adapters, review, serial verification | direct class inheritance and exact zero-argument default construction are integrated through `67d072d`; root is the sole Cargo/build and fixed-shard owner |
+| Root/integration | `july-ultra`; repository root | contract adapters, review, serial verification | direct intersections, their compiler classification/gate, and exact singleton ambient functions are integrated through `74ea3ca`; root is the sole Cargo/build and fixed-shard owner |
 | M0 | `july-ultra`; repository root | deterministic checker scoring | schema-5 provenance, retained fatal outcomes, exact fixed-manifest execution, and selected-case preparation integrated through `174eebf` |
 | S2a | `july-ultra`; repository root | exact single-base interface heritage and relation-cache observation | integrated through `14ae6ce`; two exact-tip reviews found no P0/P1 issue, all five public heritage tests pass, and the fixed shard advances one interface fixture without an exact loss |
 | S2 readonly follow-up | `july-ultra`; repository root | readonly property retention and strict-subtype directionality | integrated through `d4719b3`; two independent reviews found no P0/P1 issue, the public production target passes, focused strict Clippy is green, and the fixed shard is semantically unchanged |
@@ -28,8 +28,11 @@ map remains authoritative for cluster state.
 | W1 S11a | `july-ultra`; repository root | primitive class declarations through source/compiler | integrated through `b909237` with classifier repair `1ad5689`; local named nongeneric/no-heritage classes install exact instance/static member graphs and a default construct signature at lexical source positions, whole-file preflight rejects unsafe or poisoned later classes before earlier publication, exported/anonymous classes remain typed boundaries, and independent review found no remaining P0/P1 issue |
 | W1 S11a heritage | `july-ultra`; repository root | one exact direct local nongeneric base class plus class relations | integrated through `673bd70`; pinned owner/base instance/value provenance, own-first instance/static composition, distinct resolved member tables, derived default construction, exact class relation admission, and warm poison/cache-masking gates pass public tests and independent review |
 | W1 S11b default construction | `july-ultra`; repository root | direct zero-argument `new Model()` | integrated through `67d072d`; source execution consumes the canonical class construct signature, publishes exact constructor/symbol/signature/result links through a whole-plan validate/reserve/ensure phase, and retains arguments, type arguments, missing parentheses, aliases, forward classes, abstract/explicit constructors, heritage, and optional chaining as typed boundaries |
-| W1 A16 | isolated worker worktree | first direct nongeneric intersection kernel, source bridge, relations, and display | active implementation from `67d072d`; ordered raw identity, nested flattening/deduplication, property-first synthesis, lazy discriminant-never reduction, relation seams, and public cold/warm/poison gates are the frozen contract |
-| W1 review/oracle | rotating read-only lanes | pinned behavior, cache timing, and adversarial fixtures | direct class heritage and default construction are approved with no remaining P0/P1 issue; an ambient `declare` source oracle is inventorying the next high-yield source frontier |
+| W1 A16 | `july-ultra`; repository root | first direct nongeneric intersection kernel, source bridge, relations, and display | integrated through `01f8ea7` with compiler classification/gates in `1bbe265`; ordered identity, flattening/deduplication, required primitive/literal property synthesis, discriminant-never reduction, exact relation ordering, source consumption, display, and cold/warm/poison behavior passed focused gates and independent P0/P1 review |
+| W1 A16 optional/composite follow-up | isolated worker worktree | optional properties and recursive source-owned property-object types | active from `1bbe265`; the worker owns the narrow intersection/type-node closure while root retains Cargo and integration review |
+| W1 ambient functions | `july-ultra`; repository root | exact singleton nongeneric `declare function` declarations | integrated through `74ea3ca`; script/external-module hoisting, canonical callable/signature identity, optional parameters, TS2345, whole-source atomicity, warm replay, and typed generic/overload/export/`.d.ts` boundaries passed checker/compiler gates and independent P0/P1 review |
+| W1 ambient generic follow-up | isolated worker worktree | exact singleton generic ambient functions | active from `74ea3ca`; reuses the existing generic signature/call machinery while keeping overload families serialized behind it |
+| W1 review/oracle | rotating read-only lanes | pinned behavior, cache timing, and adversarial fixtures | repaired direct intersections and singleton ambient functions are approved with no remaining P0/P1 issue; the next ranked sequence is generic ambient singleton, ambient overload family, then broader source-flow work |
 
 The completed S5/S6 sub-wave validates the intended four-slot steady state:
 root integrates and builds, two isolated semantic workers own non-overlapping
@@ -108,6 +111,23 @@ mismatches, and zero fatal invariants, with no frontier-record change. Five
 public direct-heritage tests and three public default-construction tests raise
 the focused checker surface to 102 tests across 33 independently runnable
 targets. Both leaves passed focused strict Clippy and independent P0/P1 review.
+
+The ambient-variable, direct-intersection, and singleton-ambient-function stack
+through `74ea3ca` has raw fixed-shard digest
+`5f0cb46a0a4222d821a08e1df2190b33`. Removing only Rust commit/dirty and
+invocation provenance produces `95cbefd8e0b7555007cad37877c4db03`.
+The shard remains four exact variants, 90 typed capability boundaries, two
+supported mismatches, and zero fatal invariants. Relative to the ambient-
+variable checkpoint, exactly five frontier records change and every change is
+forward-only: `freshObjectLiteralSubtype.ts` and
+`exactOptionalPropertyTypesArgumentError.ts` advance through the admitted
+nongeneric ambient declaration; `inferenceWithNeverSource1.ts` and
+`typeArgumentArityErrorSkipsTrivia.ts` reach the intentional generic callable
+boundary; and `ambiguousOverloadResolution.ts` reaches the intentional merged-
+overload boundary. There are no status changes or exact losses. The focused
+public checker surface is now 111 tests across 36 independently runnable
+targets. Both new semantic leaves passed strict focused Clippy, compiler gates,
+and independent P0/P1 review.
 
 The current frontier is four exact variants, 90 typed capability boundaries,
 and two supported mismatches. The run discovers 12,750 upstream configurations,

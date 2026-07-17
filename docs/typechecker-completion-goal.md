@@ -225,24 +225,43 @@ strict Clippy, and independent review with no remaining P0/P1 issue. The fixed
 normalization: four exact, 90 typed capability boundaries, two supported
 mismatches, and zero fatal invariants.
 
-The four-slot topology has rotated from the completed class composition leaves
-into A16 intersection implementation plus the next source-frontier oracle,
-while root retains shared type-node, store, compiler, formatter, build, and
-scoring ownership. The live commit/worktree ledger is
+The next type-algebra/source-declaration cut is integrated through `74ea3ca`.
+Direct nongeneric intersections now preserve ordered raw identity, flatten and
+deduplicate nested constituents, synthesize required primitive/literal property
+surfaces, reduce conflicting discriminants to `never`, format symbolically, and
+participate in pinned identity/assignability/comparability ordering with excess-
+property and weak-target checks before decomposition. Exact direct nonexported
+singleton `declare function` declarations in ordinary `.ts` now reuse the
+canonical source-callable graph, hoist before lexical calls, retain one owner/
+type/signature identity, accept the existing supported annotated parameter
+surface, and never enter body or inferred-return execution. Both leaves are
+fail-closed at optional/composite intersection properties and generic/merged/
+exported/declaration-file ambient functions respectively. Checker/compiler
+gates, strict focused Clippy, and independent reviews found no P0/P1 blocker.
+The fixed shard remains four exact, 90 typed capability boundaries, two
+supported mismatches, and zero fatal invariants; exactly five ambient-function
+frontiers advance without a status or exact loss.
+
+The four-slot topology has rotated into generic singleton ambient functions and
+optional/composite intersection properties, with an adversarial review slot
+and root retaining shared store, compiler, formatter, build, and scoring
+ownership. Ambient overload families are serialized behind the generic
+singleton leaf because they share callable ownership and source dispatch. The
+live commit/worktree ledger is
 [`typechecker-wave0-status.md`](typechecker-wave0-status.md).
 
 ### Quantitative posture
 
-At the planning baseline:
+At the current checkpoint:
 
 | Evidence | Current value | Interpretation |
 |---|---:|---|
-| Semantic unit tests compiled | 923 | Broad invariant coverage; the monolithic binary cannot link in the current memory envelope |
-| Public checker integration tests | 102 across 33 targets | Executable production-path evidence and the mandatory home for new verticals |
-| Semantic modules | 58 | Enough leaf surfaces for bounded ownership |
-| `type_nodes.rs` | 16,820 lines | Shared type-family dispatch hotspot |
-| `source.rs` | 16,162 lines | Shared source-plan/execution hotspot |
-| `relater.rs` | 9,718 lines | Shared relation hotspot |
+| Semantic unit tests present | 1,021 | Broad invariant coverage; the monolithic binary cannot link in the current memory envelope |
+| Public checker integration tests | 111 across 36 targets | Executable production-path evidence and the mandatory home for new verticals |
+| Semantic modules | 65 | Enough leaf surfaces for bounded ownership |
+| `type_nodes.rs` | 18,101 lines | Shared type-family dispatch hotspot |
+| `source.rs` | 18,372 lines | Shared source-plan/execution hotspot |
+| `relater.rs` | 10,946 lines | Shared relation hotspot |
 | Port-map clusters | 46 | 11 verified, 22 porting, 12 blocked, 1 unmapped at this checkpoint |
 
 The implementation is no longer bottlenecked on basic representation. It is
