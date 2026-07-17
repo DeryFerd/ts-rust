@@ -3019,7 +3019,6 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         self.prepare_relation_cache_write();
         self.relations.enum_set(source_id, target_id, result);
         self.relation_observable_symbols.extend([source, target]);
-        self.relation_observable_enum_pairs.insert(pair);
         true
     }
 
@@ -4830,7 +4829,7 @@ fn canonical_type_resolution_property(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
 
     use ts_ast::{
         FileId, IdentifierData, Node, NodeArena, NodeData, NodeFlags, NodeId, NodeRef,
