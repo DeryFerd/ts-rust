@@ -1415,10 +1415,13 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
             (Some(call), None) if call.is_empty() => None,
             (None, Some(construct)) if construct.is_empty() => None,
             (Some(call), Some(construct)) if call.is_empty() && construct.is_empty() => None,
-            (call, construct) => Some(
+            (Some(call), None) => Some(call),
+            (None, Some(construct)) => Some(construct),
+            (Some(call), Some(construct)) if call.is_empty() => Some(construct),
+            (Some(call), Some(construct)) if construct.is_empty() => Some(call),
+            (Some(call), Some(construct)) => Some(
                 call.into_iter()
-                    .flatten()
-                    .chain(construct.into_iter().flatten())
+                    .chain(construct)
                     .collect(),
             ),
         };
@@ -3123,6 +3126,78 @@ mod tests {
                 .object_flags()
                 .contains(ObjectFlags::MEMBERS_RESOLVED)
         );
+    }
+
+    #[test]
+    fn one_sided_structured_signatures_reuse_input_allocations_and_order() {
+        let mut seeded = seeded_store("local");
+        let second = seeded
+            .store
+            .alloc_signature(
+                SignatureFlags::CONSTRUCT,
+                None,
+                Vec::new(),
+                None,
+                Vec::new(),
+                Some(seeded.base),
+                None,
+                0,
+            )
+            .unwrap();
+
+        let call_object = seeded
+            .store
+            .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(seeded.symbol))
+            .unwrap();
+        let mut calls = Vec::with_capacity(4);
+        calls.extend([seeded.signature, second]);
+        let calls_pointer = calls.as_ptr();
+        let calls_capacity = calls.capacity();
+        assert!(seeded.store.set_structured_type_members(
+            call_object,
+            None,
+            None,
+            Some(calls),
+            None,
+            None,
+        ));
+        let TypeData::Object(call_data) =
+            seeded.store.type_payload(call_object).unwrap().data()
+        else {
+            panic!("expected object")
+        };
+        let stored_calls = call_data.structured.signatures.as_ref().unwrap();
+        assert_eq!(stored_calls.as_slice(), &[seeded.signature, second]);
+        assert_eq!(stored_calls.as_ptr(), calls_pointer);
+        assert_eq!(stored_calls.capacity(), calls_capacity);
+        assert_eq!(call_data.structured.call_signature_count, 2);
+
+        let construct_object = seeded
+            .store
+            .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(seeded.symbol))
+            .unwrap();
+        let mut constructs = Vec::with_capacity(4);
+        constructs.extend([second, seeded.signature]);
+        let constructs_pointer = constructs.as_ptr();
+        let constructs_capacity = constructs.capacity();
+        assert!(seeded.store.set_structured_type_members(
+            construct_object,
+            None,
+            None,
+            None,
+            Some(constructs),
+            None,
+        ));
+        let TypeData::Object(construct_data) =
+            seeded.store.type_payload(construct_object).unwrap().data()
+        else {
+            panic!("expected object")
+        };
+        let stored_constructs = construct_data.structured.signatures.as_ref().unwrap();
+        assert_eq!(stored_constructs.as_slice(), &[second, seeded.signature]);
+        assert_eq!(stored_constructs.as_ptr(), constructs_pointer);
+        assert_eq!(stored_constructs.capacity(), constructs_capacity);
+        assert_eq!(construct_data.structured.call_signature_count, 0);
     }
 
     #[test]

@@ -1,4 +1,4 @@
-//! Exact local class declaration shells for the first S11a cut.
+//! Exact local class shells and primitive annotated members for S11a.
 //!
 //! Pinned `getDeclaredTypeOfClassOrInterface` already lives in
 //! [`super::declared`]. This module composes that canonical instance identity
@@ -7,21 +7,29 @@
 //! retains the exact split between annotated instance properties
 //! (`symbol.members`) and annotated static properties (`symbol.exports`).
 //!
-//! This is deliberately a shell boundary, not a claim that a class has been
-//! checked. Property annotations, readonly publication, structured member
-//! tables, the mandatory default construct signature, bodies, heritage, and
-//! diagnostics remain for the root-owned adapters and later class stages.
+//! The first member transaction adds direct primitive property annotations,
+//! retained readonly state, final instance/static structured caches, and the
+//! mandatory default construct signature. Methods, executable bodies,
+//! heritage, non-primitive annotations, and class diagnostics remain later
+//! class stages.
 
 use std::collections::HashSet;
 
 use ts_ast::{NodeData, NodeRef, SyntaxKind};
-use ts_binder::{CheckFlags, SemanticSymbolId, SymbolFlags, SymbolTableId};
+use ts_binder::{
+    CheckFlags, EscapedName, SemanticSymbolId, SymbolFlags, SymbolTableId,
+    semantic::PreparedSymbolTable,
+};
 
 use super::{
-    CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHost, TypeId,
-    declared::{preflight_class_or_interface_reference, preflight_node},
-    links::ValueSymbolLinks,
-    type_records::{ObjectTypeData, TypeData},
+    CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHost, SignatureId, TypeId,
+    declared::{preflight_class_or_interface_reference, preflight_node, type_list_key},
+    links::{TypeNodeLinks, ValueSymbolLinks},
+    signatures::SignatureFlags,
+    type_records::{
+        ConstrainedTypeData, ObjectTypeData, StructuredTypeData, TypeCacheState, TypeData,
+        TypeParameterData,
+    },
     types::{ObjectFlags, TypeFlags},
 };
 
@@ -90,9 +98,8 @@ impl ClassPropertyPlan {
 
 /// Opaque, read-only syntax and binder proof for one admitted class.
 ///
-/// This proof is intentionally prepublication: property check flags must
-/// still be the binder's `NONE`. The later member stage will need a distinct
-/// evolved-state validator after it publishes readonly and annotation caches.
+/// Bound properties may be cold or carry the exact retained readonly bit
+/// published by this module's member transaction.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct ClassDeclarationPlan {
     declaration: NodeRef,
@@ -169,6 +176,53 @@ impl ClassShells {
     }
 }
 
+/// Exact member identities installed for one admitted class declaration.
+///
+/// `instance_members` is the maps-`this` table used by the class instance
+/// reference. It is distinct from the binder's declared-member table whenever
+/// the class has instance properties. `static_members` is the binder-owned
+/// export table and therefore also contains `prototype`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClassMembers {
+    shells: ClassShells,
+    instance_members: Option<SymbolTableId>,
+    static_members: SymbolTableId,
+    instance_properties: Vec<SemanticSymbolId>,
+    static_properties: Vec<SemanticSymbolId>,
+    prototype: SemanticSymbolId,
+    default_construct_signature: SignatureId,
+}
+
+impl ClassMembers {
+    pub const fn shells(&self) -> ClassShells {
+        self.shells
+    }
+
+    pub const fn instance_members(&self) -> Option<SymbolTableId> {
+        self.instance_members
+    }
+
+    pub const fn static_members(&self) -> SymbolTableId {
+        self.static_members
+    }
+
+    pub fn instance_properties(&self) -> &[SemanticSymbolId] {
+        &self.instance_properties
+    }
+
+    pub fn static_properties(&self) -> &[SemanticSymbolId] {
+        &self.static_properties
+    }
+
+    pub const fn prototype(&self) -> SemanticSymbolId {
+        self.prototype
+    }
+
+    pub const fn default_construct_signature(&self) -> SignatureId {
+        self.default_construct_signature
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ClassInvariant {
     SymbolNotOwned(SemanticSymbolId),
@@ -181,6 +235,11 @@ pub enum ClassInvariant {
     InvalidPlan(NodeRef),
     InvalidInstanceCache(SemanticSymbolId),
     InvalidValueCache(SemanticSymbolId),
+    InvalidPropertyTypeCache(NodeRef),
+    InvalidPropertyValueCache(SemanticSymbolId),
+    InvalidInstanceMembers(SemanticSymbolId),
+    InvalidStaticMembers(SemanticSymbolId),
+    InvalidConstructSignature(SemanticSymbolId),
     BootstrapUnavailable(NodeRef),
     Capacity(NodeRef),
     Publication(NodeRef),
@@ -197,6 +256,7 @@ pub enum ClassUnsupported {
     Member { node: NodeRef, kind: SyntaxKind },
     PropertyInitializer(NodeRef),
     MissingPropertyType(NodeRef),
+    PropertyType { node: NodeRef, kind: SyntaxKind },
     PropertyName { node: NodeRef, kind: SyntaxKind },
     PropertyModifiers(NodeRef),
     StaticDefiniteAssignment(NodeRef),
@@ -248,6 +308,7 @@ impl ClassError {
                 | ClassUnsupported::ClassExpression(node)
                 | ClassUnsupported::PropertyInitializer(node)
                 | ClassUnsupported::MissingPropertyType(node)
+                | ClassUnsupported::PropertyType { node, .. }
                 | ClassUnsupported::PropertyModifiers(node)
                 | ClassUnsupported::StaticDefiniteAssignment(node)
                 | ClassUnsupported::ReservedStaticProperty(node)
@@ -261,10 +322,15 @@ impl ClassError {
                 | ClassInvariant::InvalidPrototype(_)
                 | ClassInvariant::InvalidInstanceCache(_)
                 | ClassInvariant::InvalidValueCache(_) => return None,
+                ClassInvariant::InvalidPropertyValueCache(_)
+                | ClassInvariant::InvalidInstanceMembers(_)
+                | ClassInvariant::InvalidStaticMembers(_)
+                | ClassInvariant::InvalidConstructSignature(_) => return None,
                 ClassInvariant::InvalidDeclaration(node)
                 | ClassInvariant::InvalidName(node)
                 | ClassInvariant::InvalidProperty(node)
                 | ClassInvariant::InvalidPropertySymbol(node)
+                | ClassInvariant::InvalidPropertyTypeCache(node)
                 | ClassInvariant::InvalidPlan(node)
                 | ClassInvariant::BootstrapUnavailable(node)
                 | ClassInvariant::Capacity(node)
@@ -454,13 +520,19 @@ fn plan_property(
         } else {
             SymbolFlags::NONE
         };
+    let expected_check_flags = if readonly {
+        CheckFlags::READONLY
+    } else {
+        CheckFlags::NONE
+    };
     let table = match side {
         ClassPropertySide::Instance => instance_members,
         ClassPropertySide::Static => Some(static_members),
     }
     .and_then(|table| store.symbol_table(table));
     if symbol_record.flags() != expected_flags
-        || symbol_record.check_flags() != CheckFlags::NONE
+        || (symbol_record.check_flags() != CheckFlags::NONE
+            && symbol_record.check_flags() != expected_check_flags)
         || symbol_record.name().as_utf8() != Some(identifier.text.as_str())
         || symbol_record.declarations() != Some(&[member])
         || symbol_record.value_declaration() != Some(member)
@@ -713,10 +785,461 @@ pub(super) fn plan_nongeneric_class(
     })
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct ClassMemberPlan {
+    class: ClassDeclarationPlan,
+    property_types: Vec<TypeId>,
+}
+
+impl ClassMemberPlan {
+    pub(super) const fn declaration(&self) -> NodeRef {
+        self.class.declaration
+    }
+
+    pub(super) const fn symbol(&self) -> SemanticSymbolId {
+        self.class.symbol
+    }
+
+    /// Whether every instance property avoids the first strict-property-
+    /// initialization diagnostic boundary through `?` or `!`.
+    pub(super) fn instance_properties_are_initialization_safe(&self) -> bool {
+        self.class
+            .instance_properties
+            .iter()
+            .all(|property| property.optional || property.definite)
+    }
+}
+
+fn primitive_keyword_type(
+    store: &CanonicalTypeMapperStore,
+    node: NodeRef,
+    kind: SyntaxKind,
+) -> Result<TypeId, ClassError> {
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or_else(|| invariant(ClassInvariant::BootstrapUnavailable(node)))?;
+    match kind {
+        SyntaxKind::AnyKeyword => Ok(bootstrap.any_type),
+        SyntaxKind::UnknownKeyword => Ok(bootstrap.unknown_type),
+        SyntaxKind::StringKeyword => Ok(bootstrap.string_type),
+        SyntaxKind::NumberKeyword => Ok(bootstrap.number_type),
+        SyntaxKind::BigIntKeyword => Ok(bootstrap.bigint_type),
+        SyntaxKind::BooleanKeyword => Ok(bootstrap.boolean_type),
+        SyntaxKind::SymbolKeyword => Ok(bootstrap.es_symbol_type),
+        SyntaxKind::VoidKeyword => Ok(bootstrap.void_type),
+        SyntaxKind::UndefinedKeyword => Ok(bootstrap.undefined_type),
+        SyntaxKind::NeverKeyword => Ok(bootstrap.never_type),
+        SyntaxKind::ObjectKeyword => Ok(bootstrap.non_primitive_type),
+        _ => Err(unsupported(ClassUnsupported::PropertyType { node, kind })),
+    }
+}
+
+fn expected_property_check_flags(property: &ClassPropertyPlan) -> CheckFlags {
+    if property.readonly {
+        CheckFlags::READONLY
+    } else {
+        CheckFlags::NONE
+    }
+}
+
+fn exact_property_value_links(
+    store: &CanonicalTypeMapperStore,
+    property: &ClassPropertyPlan,
+    property_type: TypeId,
+) -> bool {
+    store.value_symbol_links(property.symbol)
+        == Some(&ValueSymbolLinks {
+            resolved_type: Some(property_type),
+            ..ValueSymbolLinks::default()
+        })
+}
+
+fn validate_property_cache_state(
+    store: &CanonicalTypeMapperStore,
+    property: &ClassPropertyPlan,
+    property_type: TypeId,
+) -> Result<(), ClassError> {
+    match store.type_node_links(property.type_node) {
+        None => {}
+        Some(links) if links == &TypeNodeLinks::default() => {}
+        Some(links)
+            if links
+                == &(TypeNodeLinks {
+                    resolved_type: Some(property_type),
+                    ..TypeNodeLinks::default()
+                }) => {}
+        Some(_) => {
+            return Err(invariant(ClassInvariant::InvalidPropertyTypeCache(
+                property.type_node,
+            )));
+        }
+    }
+
+    let expected_check_flags = expected_property_check_flags(property);
+    let check_flags = store
+        .symbol(property.symbol)
+        .ok_or_else(|| invariant(ClassInvariant::InvalidPropertySymbol(property.declaration)))?
+        .check_flags();
+    match store.value_symbol_links(property.symbol) {
+        None => {
+            if check_flags != CheckFlags::NONE {
+                return Err(invariant(ClassInvariant::InvalidPropertyValueCache(
+                    property.symbol,
+                )));
+            }
+        }
+        Some(links) if links == &ValueSymbolLinks::default() => {
+            if check_flags != CheckFlags::NONE {
+                return Err(invariant(ClassInvariant::InvalidPropertyValueCache(
+                    property.symbol,
+                )));
+            }
+        }
+        Some(links)
+            if links
+                == &(ValueSymbolLinks {
+                    resolved_type: Some(property_type),
+                    ..ValueSymbolLinks::default()
+                })
+                && check_flags == expected_check_flags => {}
+        Some(_) => {
+            return Err(invariant(ClassInvariant::InvalidPropertyValueCache(
+                property.symbol,
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Preflights the first exact class-member cut.
+///
+/// Every property must have one direct primitive keyword annotation. This
+/// keeps the class transaction dependency-closed without executing several
+/// independent type-node queries whose later failure could expose an earlier
+/// property publication.
+pub(super) fn plan_nongeneric_class_members(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    symbol: SemanticSymbolId,
+) -> Result<ClassMemberPlan, ClassError> {
+    let class = plan_nongeneric_class(store, host, symbol)?;
+    let mut property_types = Vec::new();
+    property_types
+        .try_reserve_exact(class.properties.len())
+        .map_err(|_| invariant(ClassInvariant::Capacity(class.declaration)))?;
+    for property in &class.properties {
+        let record = preflight_node(store, host, property.type_node)?;
+        if record.flags.0 != 0
+            || !matches!(record.data, NodeData::KeywordTypeNode(_))
+            || record.parent != Some(property.declaration.node)
+        {
+            return Err(unsupported(ClassUnsupported::PropertyType {
+                node: property.type_node,
+                kind: record.kind,
+            }));
+        }
+        let property_type = primitive_keyword_type(store, property.type_node, record.kind)?;
+        validate_property_cache_state(store, property, property_type)?;
+        property_types.push(property_type);
+    }
+    Ok(ClassMemberPlan {
+        class,
+        property_types,
+    })
+}
+
+fn prototype_symbol(
+    store: &CanonicalTypeMapperStore,
+    plan: &ClassDeclarationPlan,
+) -> Option<SemanticSymbolId> {
+    store
+        .symbol_table(plan.static_members)
+        .and_then(|members| members.get_source(PROTOTYPE_NAME))
+}
+
+fn exact_member_table(
+    store: &CanonicalTypeMapperStore,
+    table: Option<SymbolTableId>,
+    properties: &[ClassPropertyPlan],
+) -> bool {
+    match (table, properties.is_empty()) {
+        (None, true) => true,
+        (Some(table), false) => store.symbol_table(table).is_some_and(|table| {
+            table.len() == properties.len()
+                && properties
+                    .iter()
+                    .all(|property| table.get_source(&property.name) == Some(property.symbol))
+        }),
+        _ => false,
+    }
+}
+
+fn exact_instance_identity<'a>(
+    store: &'a CanonicalTypeMapperStore,
+    plan: &ClassDeclarationPlan,
+    instance_type: TypeId,
+) -> Option<&'a super::type_records::InterfaceTypeData> {
+    let record = store.type_payload(instance_type)?;
+    let TypeData::Interface(instance) = record.data() else {
+        return None;
+    };
+    let [this_type] = instance.all_type_parameters.as_deref()? else {
+        return None;
+    };
+    let this_record = store.type_payload(*this_type)?;
+    let TypeData::TypeParameter(this) = this_record.data() else {
+        return None;
+    };
+    let TypeCacheState::Allocated(instantiations) =
+        &instance.reference.object.instantiations
+    else {
+        return None;
+    };
+    (record.flags() == TypeFlags::OBJECT
+        && record.symbol() == Some(plan.symbol)
+        && record.alias().is_none()
+        && instance.outer_type_parameter_count == 0
+        && instance.this_type == Some(*this_type)
+        && instance.reference.object.target == Some(instance_type)
+        && instance.reference.object.mapper.is_none()
+        && instantiations.len() == 1
+        && instantiations.get(&type_list_key(&[])) == Some(&instance_type)
+        && instance.reference.node.is_none()
+        && instance.reference.resolved_type_arguments.as_deref() == Some(&[][..])
+        && this_record.flags() == TypeFlags::TYPE_PARAMETER
+        && this_record.object_flags() == ObjectFlags::NONE
+        && this_record.symbol() == Some(plan.symbol)
+        && this_record.alias().is_none()
+        && this
+            == &(TypeParameterData {
+                constraint: Some(instance_type),
+                is_this_type: true,
+                ..TypeParameterData::default()
+            }))
+        .then_some(instance)
+}
+
+fn exact_default_construct_signature(
+    store: &CanonicalTypeMapperStore,
+    signature: SignatureId,
+    instance_type: TypeId,
+) -> bool {
+    store.signature(signature).is_some_and(|signature| {
+        signature.flags() == SignatureFlags::CONSTRUCT
+            && signature.min_argument_count() == 0
+            && signature.resolved_min_argument_count() == -1
+            && signature.declaration().is_none()
+            && signature.type_parameters().is_empty()
+            && signature.parameters().is_empty()
+            && signature.this_parameter().is_none()
+            && signature.resolved_return_type() == Some(instance_type)
+            && signature.resolved_type_predicate().is_none()
+            && signature.target().is_none()
+            && signature.mapper().is_none()
+            && signature.isolated_signature_type().is_none()
+            && signature.composite().is_none()
+    })
+}
+
+fn completed_class_members(
+    store: &CanonicalTypeMapperStore,
+    plan: &ClassMemberPlan,
+    instance_type: TypeId,
+    value_type: TypeId,
+) -> Option<ClassMembers> {
+    let undefined_type = store.intrinsic_bootstrap()?.undefined_type;
+    let instance = exact_instance_identity(store, &plan.class, instance_type)?;
+    if store
+        .declared_type_links(plan.class.symbol)
+        .and_then(|links| links.declared_type)
+        != Some(instance_type)
+        || !instance.base_types_resolved
+        || instance.resolved_base_constructor_type != Some(undefined_type)
+        || instance.resolved_base_types.is_some()
+        || !instance.declared_members_resolved
+        || instance.declared_members != plan.class.instance_members
+        || instance.declared_call_signatures.is_some()
+        || instance.declared_construct_signatures.is_some()
+        || instance.declared_index_infos.is_some()
+    {
+        return None;
+    }
+
+    let instance_structured = &instance.reference.object.structured;
+    let instance_properties = plan
+        .class
+        .instance_properties
+        .iter()
+        .map(|property| property.symbol)
+        .collect::<Vec<_>>();
+    if store
+        .type_payload(instance_type)
+        .is_none_or(|record| {
+            record.object_flags()
+                != (ObjectFlags::CLASS | ObjectFlags::REFERENCE | ObjectFlags::MEMBERS_RESOLVED)
+        })
+        || instance_structured.constrained != ConstrainedTypeData::default()
+        || instance_structured.properties.as_deref()
+            != (!instance_properties.is_empty()).then_some(instance_properties.as_slice())
+        || instance_structured.signatures.is_some()
+        || instance_structured.call_signature_count != 0
+        || instance_structured.index_infos.is_some()
+        || instance_structured
+            .object_type_without_abstract_construct_signatures
+            .is_some()
+        || instance_structured.members == plan.class.instance_members
+            && instance_structured.members.is_some()
+        || !exact_member_table(
+            store,
+            instance_structured.members,
+            &plan.class.instance_properties,
+        )
+    {
+        return None;
+    }
+
+    let value_record = store.type_payload(value_type)?;
+    let TypeData::Object(value) = value_record.data() else {
+        return None;
+    };
+    let prototype = prototype_symbol(store, &plan.class)?;
+    let static_properties = plan
+        .class
+        .static_properties
+        .iter()
+        .map(|property| property.symbol)
+        .collect::<Vec<_>>();
+    let mut all_static_properties = static_properties.clone();
+    all_static_properties.push(prototype);
+    let [default_construct_signature] = value.structured.signatures.as_deref()? else {
+        return None;
+    };
+    if value_record.flags() != TypeFlags::OBJECT
+        || value_record.object_flags()
+            != (ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED)
+        || value_record.symbol() != Some(plan.class.symbol)
+        || value_record.alias().is_some()
+        || value.target.is_some()
+        || value.mapper.is_some()
+        || value.instantiations != TypeCacheState::Unallocated
+        || value.structured.constrained != ConstrainedTypeData::default()
+        || value.structured.members != Some(plan.class.static_members)
+        || value.structured.properties.as_deref() != Some(all_static_properties.as_slice())
+        || value.structured.call_signature_count != 0
+        || value.structured.index_infos.is_some()
+        || value
+            .structured
+            .object_type_without_abstract_construct_signatures
+            .is_some()
+        || !exact_default_construct_signature(
+            store,
+            *default_construct_signature,
+            instance_type,
+        )
+    {
+        return None;
+    }
+
+    if plan
+        .class
+        .properties
+        .iter()
+        .zip(&plan.property_types)
+        .any(|(property, property_type)| {
+            store
+                .type_node_links(property.type_node)
+                .is_none_or(|links| {
+                    links
+                        != &(TypeNodeLinks {
+                            resolved_type: Some(*property_type),
+                            ..TypeNodeLinks::default()
+                        })
+                })
+                || store.symbol(property.symbol).is_none_or(|symbol| {
+                    symbol.check_flags() != expected_property_check_flags(property)
+                })
+                || !exact_property_value_links(store, property, *property_type)
+        })
+    {
+        return None;
+    }
+
+    Some(ClassMembers {
+        shells: ClassShells {
+            declaration: plan.class.declaration,
+            symbol: plan.class.symbol,
+            instance_type,
+            value_type,
+        },
+        instance_members: instance_structured.members,
+        static_members: plan.class.static_members,
+        instance_properties,
+        static_properties,
+        prototype,
+        default_construct_signature: *default_construct_signature,
+    })
+}
+
+fn has_instance_member_publication(
+    store: &CanonicalTypeMapperStore,
+    instance_type: TypeId,
+) -> bool {
+    store.type_payload(instance_type).is_some_and(|record| {
+        record.object_flags().contains(ObjectFlags::MEMBERS_RESOLVED)
+            || matches!(record.data(), TypeData::Interface(interface) if
+                interface.base_types_resolved
+                || interface.declared_members_resolved
+                || interface.declared_members.is_some()
+                || interface.declared_call_signatures.is_some()
+                || interface.declared_construct_signatures.is_some()
+                || interface.declared_index_infos.is_some()
+                || interface.reference.object.structured != StructuredTypeData::default())
+    })
+}
+
+fn has_static_member_publication(
+    store: &CanonicalTypeMapperStore,
+    value_type: TypeId,
+) -> bool {
+    store.type_payload(value_type).is_some_and(|record| {
+        record.object_flags().contains(ObjectFlags::MEMBERS_RESOLVED)
+            || record
+                .data()
+                .structured()
+                .is_some_and(|structured| structured != &StructuredTypeData::default())
+    })
+}
+
+fn cached_primitive_member_plan(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    class: &ClassDeclarationPlan,
+) -> Option<ClassMemberPlan> {
+    let mut property_types = Vec::with_capacity(class.properties.len());
+    for property in &class.properties {
+        let record = preflight_node(store, host, property.type_node).ok()?;
+        if record.flags.0 != 0
+            || !matches!(record.data, NodeData::KeywordTypeNode(_))
+            || record.parent != Some(property.declaration.node)
+        {
+            return None;
+        }
+        let property_type =
+            primitive_keyword_type(store, property.type_node, record.kind).ok()?;
+        validate_property_cache_state(store, property, property_type).ok()?;
+        property_types.push(property_type);
+    }
+    Some(ClassMemberPlan {
+        class: class.clone(),
+        property_types,
+    })
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum StaticShellState {
     Cold,
-    Warm(TypeId),
+    WarmShell(TypeId),
+    WarmMembers(TypeId),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -742,6 +1265,7 @@ fn exact_static_shell(
 
 fn shell_state(
     store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
     plan: &ClassDeclarationPlan,
 ) -> Result<ClassShellState, ClassError> {
     let instance = store
@@ -759,11 +1283,20 @@ fn shell_state(
                     resolved_type: Some(type_),
                     ..ValueSymbolLinks::default()
                 })
-                || !exact_static_shell(store, plan.symbol, type_)
             {
                 return Err(invariant(ClassInvariant::InvalidValueCache(plan.symbol)));
             }
-            StaticShellState::Warm(type_)
+            if exact_static_shell(store, plan.symbol, type_) {
+                StaticShellState::WarmShell(type_)
+            } else if instance.is_some_and(|instance| {
+                cached_primitive_member_plan(store, host, plan).is_some_and(|members| {
+                    completed_class_members(store, &members, instance, type_).is_some()
+                })
+            }) {
+                StaticShellState::WarmMembers(type_)
+            } else {
+                return Err(invariant(ClassInvariant::InvalidValueCache(plan.symbol)));
+            }
         }
         Some(_) => {
             return Err(invariant(ClassInvariant::InvalidValueCache(plan.symbol)));
@@ -783,17 +1316,18 @@ fn shell_state(
         else {
             return Err(invariant(ClassInvariant::InvalidInstanceCache(plan.symbol)));
         };
-        if interface.base_types_resolved
-            || interface.resolved_base_types.is_some()
-            || interface
-                .resolved_base_constructor_type
-                .is_some_and(|type_| type_ != undefined_type)
-            || matches!(value, StaticShellState::Warm(_))
-                && interface.resolved_base_constructor_type != Some(undefined_type)
+        if !matches!(value, StaticShellState::WarmMembers(_))
+            && (interface.base_types_resolved
+                || interface.resolved_base_types.is_some()
+                || interface
+                    .resolved_base_constructor_type
+                    .is_some_and(|type_| type_ != undefined_type)
+                || matches!(value, StaticShellState::WarmShell(_))
+                    && interface.resolved_base_constructor_type != Some(undefined_type))
         {
             return Err(invariant(ClassInvariant::InvalidInstanceCache(plan.symbol)));
         }
-    } else if matches!(value, StaticShellState::Warm(_)) {
+    } else if !matches!(value, StaticShellState::Cold) {
         return Err(invariant(ClassInvariant::InvalidValueCache(plan.symbol)));
     }
     Ok(ClassShellState { instance, value })
@@ -815,8 +1349,10 @@ pub(super) fn execute_nongeneric_class_shells(
     if current != *plan {
         return Err(invariant(ClassInvariant::InvalidPlan(plan.declaration)));
     }
-    let state = shell_state(store, plan)?;
-    if let StaticShellState::Warm(value_type) = state.value {
+    let state = shell_state(store, host, plan)?;
+    if let StaticShellState::WarmShell(value_type) | StaticShellState::WarmMembers(value_type) =
+        state.value
+    {
         let instance_type = state
             .instance
             .expect("a validated warm static shell requires its instance");
@@ -886,9 +1422,9 @@ pub(super) fn execute_nongeneric_class_shells(
         },
     ));
 
-    let resolved = shell_state(store, plan)?;
+    let resolved = shell_state(store, host, plan)?;
     if resolved.instance != Some(instance_type)
-        || resolved.value != StaticShellState::Warm(value_type)
+        || resolved.value != StaticShellState::WarmShell(value_type)
     {
         return Err(invariant(ClassInvariant::Publication(plan.declaration)));
     }
@@ -897,6 +1433,258 @@ pub(super) fn execute_nongeneric_class_shells(
         symbol: plan.symbol,
         instance_type,
         value_type,
+    })
+}
+
+fn resolved_class_value_type(
+    store: &CanonicalTypeMapperStore,
+    symbol: SemanticSymbolId,
+) -> Option<TypeId> {
+    let links = store.value_symbol_links(symbol)?;
+    let type_ = links.resolved_type?;
+    (links
+        == &(ValueSymbolLinks {
+            resolved_type: Some(type_),
+            ..ValueSymbolLinks::default()
+        }))
+    .then_some(type_)
+}
+
+fn class_member_state(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    plan: &ClassMemberPlan,
+) -> Result<Option<ClassMembers>, ClassError> {
+    let instance = store
+        .declared_type_links(plan.class.symbol)
+        .and_then(|links| links.declared_type);
+    let value = resolved_class_value_type(store, plan.class.symbol);
+    if let (Some(instance), Some(value)) = (instance, value)
+        && let Some(members) = completed_class_members(store, plan, instance, value)
+    {
+        return Ok(Some(members));
+    }
+    if instance.is_some_and(|instance| has_instance_member_publication(store, instance)) {
+        return Err(invariant(ClassInvariant::InvalidInstanceMembers(
+            plan.class.symbol,
+        )));
+    }
+    if value.is_some_and(|value| has_static_member_publication(store, value)) {
+        return Err(invariant(ClassInvariant::InvalidStaticMembers(
+            plan.class.symbol,
+        )));
+    }
+    shell_state(store, host, &plan.class)?;
+    Ok(None)
+}
+
+/// Installs the exact primitive-property member graph and default constructor
+/// for a previously preflighted class.
+///
+/// All typed checks, owned allocations, sparse-link capacity, and member-table
+/// entry capacity are staged before the shell executor can publish the first
+/// class identity. Static structured members are the final commit point.
+pub(super) fn execute_nongeneric_class_members(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    plan: &ClassMemberPlan,
+) -> Result<ClassMembers, ClassError> {
+    let current = plan_nongeneric_class_members(store, host, plan.class.symbol)?;
+    if current != *plan {
+        return Err(invariant(ClassInvariant::InvalidPlan(
+            plan.class.declaration,
+        )));
+    }
+    if let Some(members) = class_member_state(store, host, plan)? {
+        return Ok(members);
+    }
+    let shell = shell_state(store, host, &plan.class)?;
+    let cold_instance = shell.instance.is_none();
+    let cold_value = matches!(shell.value, StaticShellState::Cold);
+    let additional_types = usize::from(cold_value)
+        .checked_add(usize::from(cold_instance) * 2)
+        .ok_or_else(|| invariant(ClassInvariant::Capacity(plan.class.declaration)))?;
+
+    let prototype = prototype_symbol(store, &plan.class)
+        .ok_or_else(|| invariant(ClassInvariant::InvalidPrototype(plan.class.symbol)))?;
+    let prepared_instance_members = if plan.class.instance_properties.is_empty() {
+        None
+    } else {
+        Some(
+            PreparedSymbolTable::new(plan.class.instance_properties.len())
+                .ok_or_else(|| invariant(ClassInvariant::Capacity(plan.class.declaration)))?,
+        )
+    };
+
+    let mut instance_properties = Vec::new();
+    let mut instance_member_entries = Vec::new();
+    let mut static_properties = Vec::new();
+    let mut all_static_properties = Vec::new();
+    let mut construct_signatures = Vec::new();
+    instance_properties
+        .try_reserve_exact(plan.class.instance_properties.len())
+        .map_err(|_| invariant(ClassInvariant::Capacity(plan.class.declaration)))?;
+    instance_member_entries
+        .try_reserve_exact(plan.class.instance_properties.len())
+        .map_err(|_| invariant(ClassInvariant::Capacity(plan.class.declaration)))?;
+    static_properties
+        .try_reserve_exact(plan.class.static_properties.len())
+        .map_err(|_| invariant(ClassInvariant::Capacity(plan.class.declaration)))?;
+    all_static_properties
+        .try_reserve_exact(
+            plan.class
+                .static_properties
+                .len()
+                .checked_add(1)
+                .ok_or_else(|| invariant(ClassInvariant::Capacity(plan.class.declaration)))?,
+        )
+        .map_err(|_| invariant(ClassInvariant::Capacity(plan.class.declaration)))?;
+    construct_signatures
+        .try_reserve_exact(1)
+        .map_err(|_| invariant(ClassInvariant::Capacity(plan.class.declaration)))?;
+    instance_properties.extend(
+        plan.class
+            .instance_properties
+            .iter()
+            .map(|property| property.symbol),
+    );
+    instance_member_entries.extend(plan.class.instance_properties.iter().map(|property| {
+        (
+            EscapedName::source(property.name.as_str()),
+            property.symbol,
+        )
+    }));
+    static_properties.extend(
+        plan.class
+            .static_properties
+            .iter()
+            .map(|property| property.symbol),
+    );
+    all_static_properties.extend_from_slice(&static_properties);
+    all_static_properties.push(prototype);
+
+    let missing_type_node_links = plan
+        .class
+        .properties
+        .iter()
+        .filter(|property| store.type_node_links(property.type_node).is_none())
+        .count();
+    let missing_property_value_links = plan
+        .class
+        .properties
+        .iter()
+        .filter(|property| store.value_symbol_links(property.symbol).is_none())
+        .count();
+    let missing_owner_value_link = usize::from(
+        store
+            .value_symbol_links(plan.class.symbol)
+            .is_none(),
+    );
+    let missing_value_links = missing_property_value_links
+        .checked_add(missing_owner_value_link)
+        .ok_or_else(|| invariant(ClassInvariant::Capacity(plan.class.declaration)))?;
+    if !store.try_reserve_types(additional_types)
+        || !store.try_reserve_signatures(1)
+        || !store.try_reserve_checker_symbol_allocations(
+            0,
+            usize::from(prepared_instance_members.is_some()),
+        )
+        || !store.try_reserve_type_node_links(missing_type_node_links)
+        || !store.try_reserve_value_symbol_links(missing_value_links)
+    {
+        return Err(invariant(ClassInvariant::Capacity(plan.class.declaration)));
+    }
+
+    let shells = execute_nongeneric_class_shells(store, host, &plan.class)?;
+    let instance_members = prepared_instance_members.map(|prepared| {
+        let table = store.alloc_prepared_symbol_table(prepared);
+        for (name, symbol) in instance_member_entries {
+            assert_eq!(
+                store.insert_symbol(table, name, symbol),
+                Some(None),
+            );
+        }
+        table
+    });
+    let default_construct_signature = store
+        .alloc_signature(
+            SignatureFlags::CONSTRUCT,
+            None,
+            Vec::new(),
+            None,
+            Vec::new(),
+            Some(shells.instance_type),
+            None,
+            0,
+        )
+        .expect("the class-member transaction reserved one exact default signature");
+    construct_signatures.push(default_construct_signature);
+
+    for (property, property_type) in plan.class.properties.iter().zip(&plan.property_types) {
+        assert!(store.set_type_node_links(
+            property.type_node,
+            TypeNodeLinks {
+                resolved_type: Some(*property_type),
+                ..TypeNodeLinks::default()
+            },
+        ));
+        assert!(store.set_source_property_readonly(
+            property.symbol,
+            property.readonly,
+        ));
+        assert!(store.set_value_symbol_links(
+            property.symbol,
+            ValueSymbolLinks {
+                resolved_type: Some(*property_type),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+    }
+    assert!(store.set_interface_declared_members(
+        shells.instance_type,
+        true,
+        plan.class.instance_members,
+        None,
+        None,
+        None,
+    ));
+    let undefined_type = store
+        .intrinsic_bootstrap()
+        .expect("the member plan validated intrinsic bootstrap")
+        .undefined_type;
+    assert!(store.set_interface_base_resolution(
+        shells.instance_type,
+        true,
+        Some(undefined_type),
+        None,
+    ));
+    assert!(store.set_structured_type_members(
+        shells.instance_type,
+        instance_members,
+        (!instance_properties.is_empty()).then_some(instance_properties),
+        None,
+        None,
+        None,
+    ));
+    assert!(store.set_structured_type_members(
+        shells.value_type,
+        Some(plan.class.static_members),
+        Some(all_static_properties),
+        None,
+        Some(construct_signatures),
+        None,
+    ));
+
+    completed_class_members(
+        store,
+        plan,
+        shells.instance_type,
+        shells.value_type,
+    )
+    .unwrap_or_else(|| {
+        panic!(
+            "the fully preflighted class-member transaction published an invalid final graph"
+        )
     })
 }
 
@@ -1327,5 +2115,155 @@ mod tests {
                     .is_none_or(|links| links == &ValueSymbolLinks::default())
             );
         }
+    }
+
+    #[test]
+    fn unsupported_later_annotation_is_rejected_before_any_class_publication() {
+        let fixture = fixture(
+            "class Missing {} class Model { first: string; second: Missing; }",
+        );
+        let symbol = class_symbol(&fixture, "Model");
+        let bound = &fixture.files[&fixture.file];
+        let host = host(&fixture.parsed.arena, bound);
+        let state = (
+            fixture.store.type_len(),
+            fixture.store.signature_len(),
+            fixture.store.symbol_store().symbol_table_len(),
+            fixture.store.checker_link_allocated_lengths(),
+            fixture.store.relation_state_snapshot(),
+        );
+
+        assert!(matches!(
+            plan_nongeneric_class_members(&fixture.store, &host, symbol),
+            Err(ClassError::Unsupported(ClassUnsupported::PropertyType {
+                kind: SyntaxKind::TypeReference,
+                ..
+            }))
+        ));
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.symbol_store().symbol_table_len(),
+                fixture.store.checker_link_allocated_lengths(),
+                fixture.store.relation_state_snapshot(),
+            ),
+            state
+        );
+        assert!(
+            fixture
+                .store
+                .declared_type_links(symbol)
+                .and_then(|links| links.declared_type)
+                .is_none()
+        );
+        assert!(
+            fixture
+                .store
+                .value_symbol_links(symbol)
+                .is_none_or(|links| links == &ValueSymbolLinks::default())
+        );
+    }
+
+    #[test]
+    fn wrong_later_annotation_cache_rejects_before_an_earlier_property_or_shell_is_written() {
+        let mut fixture = fixture("class Model { first: string; second: number; }");
+        let symbol = class_symbol(&fixture, "Model");
+        let bound = &fixture.files[&fixture.file];
+        let host = host(&fixture.parsed.arena, bound);
+        let shell_plan = plan_nongeneric_class(&fixture.store, &host, symbol).unwrap();
+        let second = shell_plan.properties()[1].type_node();
+        let wrong = fixture.store.intrinsic_bootstrap().unwrap().string_type;
+        assert!(fixture.store.set_type_node_links(
+            second,
+            TypeNodeLinks {
+                resolved_type: Some(wrong),
+                ..TypeNodeLinks::default()
+            },
+        ));
+        let state = (
+            fixture.store.type_len(),
+            fixture.store.signature_len(),
+            fixture.store.symbol_store().symbol_table_len(),
+            fixture.store.checker_link_allocated_lengths(),
+            fixture.store.relation_state_snapshot(),
+        );
+
+        assert_eq!(
+            plan_nongeneric_class_members(&fixture.store, &host, symbol),
+            Err(invariant(ClassInvariant::InvalidPropertyTypeCache(second)))
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.symbol_store().symbol_table_len(),
+                fixture.store.checker_link_allocated_lengths(),
+                fixture.store.relation_state_snapshot(),
+            ),
+            state
+        );
+        assert!(
+            shell_plan.properties().iter().all(|property| fixture
+                .store
+                .value_symbol_links(property.symbol())
+                .is_none_or(|links| links == &ValueSymbolLinks::default()))
+        );
+        assert!(
+            fixture
+                .store
+                .declared_type_links(symbol)
+                .and_then(|links| links.declared_type)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn poisoned_completed_constructor_is_rejected_without_further_mutation() {
+        let mut fixture = fixture("class Model { value: string; static count: number; }");
+        let symbol = class_symbol(&fixture, "Model");
+        let bound = &fixture.files[&fixture.file];
+        let host = host(&fixture.parsed.arena, bound);
+        let plan = plan_nongeneric_class_members(&fixture.store, &host, symbol).unwrap();
+        let members =
+            execute_nongeneric_class_members(&mut fixture.store, &host, &plan).unwrap();
+        let wrong = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+        assert!(fixture.store.set_signature_resolved_return_type(
+            members.default_construct_signature(),
+            Some(wrong),
+        ));
+        let state = (
+            fixture.store.type_len(),
+            fixture.store.signature_len(),
+            fixture.store.symbol_store().symbol_table_len(),
+            fixture.store.checker_link_allocated_lengths(),
+            fixture.store.relation_state_snapshot(),
+        );
+
+        let retry_plan = plan_nongeneric_class_members(&fixture.store, &host, symbol).unwrap();
+        assert!(matches!(
+            execute_nongeneric_class_members(&mut fixture.store, &host, &retry_plan),
+            Err(ClassError::Invariant(
+                ClassInvariant::InvalidInstanceMembers(_)
+                    | ClassInvariant::InvalidStaticMembers(_)
+            ))
+        ));
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.symbol_store().symbol_table_len(),
+                fixture.store.checker_link_allocated_lengths(),
+                fixture.store.relation_state_snapshot(),
+            ),
+            state
+        );
+        assert_eq!(
+            fixture
+                .store
+                .signature(members.default_construct_signature())
+                .and_then(|signature| signature.resolved_return_type()),
+            Some(wrong)
+        );
     }
 }

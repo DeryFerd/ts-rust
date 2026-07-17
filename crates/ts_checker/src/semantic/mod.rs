@@ -16,7 +16,7 @@ pub mod bootstrap;
 mod callable_sets;
 mod callables;
 mod calls;
-#[allow(dead_code)] // Root owns the source/type-query adapter for the first class shell cut.
+#[allow(dead_code)] // Root owns source dispatch for the incremental class cuts.
 mod classes;
 mod constraints;
 mod contextual;
@@ -80,7 +80,7 @@ pub use bootstrap::{
     CheckerLinkCounts, CheckerStateSnapshot, IntrinsicBootstrap, IntrinsicBootstrapError,
     IntrinsicBootstrapOptions, SemanticArenaCounts, TypeResolutionStateSnapshot,
 };
-pub use classes::{ClassError, ClassInvariant, ClassShells, ClassUnsupported};
+pub use classes::{ClassError, ClassInvariant, ClassMembers, ClassShells, ClassUnsupported};
 pub use declared::{
     DeclaredTypeError, DeclaredTypeHost, DeclaredTypeHostError, DeclaredTypeUnavailable,
     UnsupportedDeclaredTypeKind, UnsupportedOuterTypeParameterContext,

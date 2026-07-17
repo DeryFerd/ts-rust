@@ -22,7 +22,7 @@ use ts_binder::{
 
 use super::{
     AssignabilityErrorDisplay, CanonicalCheckerDiagnostics, CanonicalEnumSemantics, ClassError,
-    ClassShells,
+    ClassMembers, ClassShells,
     CanonicalGlobalTypeInitializationError, CanonicalGlobalTypes, CanonicalModuleResolutionLookup,
     CanonicalModuleResolutionManifest, CanonicalModuleResolutionManifestError,
     CanonicalModuleResolutionManifestInput, CanonicalTypeFormatFlags, CanonicalTypeMapperStore,
@@ -37,7 +37,10 @@ use super::{
     alias_provider::{
         ProductionAliasSourceRegistry, ProductionAliasTargetHost, ProductionAliasTargetHostError,
     },
-    classes::{execute_nongeneric_class_shells, plan_nongeneric_class},
+    classes::{
+        execute_nongeneric_class_members, execute_nongeneric_class_shells,
+        plan_nongeneric_class, plan_nongeneric_class_members,
+    },
     global_types::initialize_global_library_types,
     instantiate::{InstantiationLimits, InstantiationSession},
     module_resolution::validate_module_resolution_manifest,
@@ -726,6 +729,37 @@ impl<'arena> CanonicalCheckerContext<'arena> {
         .map_err(DeclaredTypeError::from)?;
         let plan = plan_nongeneric_class(store, &host, symbol)?;
         execute_nongeneric_class_shells(store, &host, &plan)
+    }
+
+    /// Materializes exact primitive annotated members and the default
+    /// construct signature for one local nongeneric class declaration.
+    ///
+    /// The admitted class has no heritage, executable members, initializers,
+    /// or non-keyword property annotations. The operation preflights and
+    /// reserves the entire graph before publishing a cold shell.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed syntax, binder, capacity, declared-type, or poisoned
+    /// cache error without publishing a partial class member graph.
+    pub fn get_nongeneric_class_members(
+        &mut self,
+        symbol: SemanticSymbolId,
+    ) -> Result<ClassMembers, ClassError> {
+        let Self {
+            options,
+            files,
+            store,
+            ..
+        } = self;
+        let host = DeclaredTypeHost::from_registry(
+            store,
+            files,
+            GlobalMergeCompletion::new(options.name_resolution),
+        )
+        .map_err(DeclaredTypeError::from)?;
+        let plan = plan_nongeneric_class_members(store, &host, symbol)?;
+        execute_nongeneric_class_members(store, &host, &plan)
     }
 
     /// Publishes or validates the exact type/value/member identities for one

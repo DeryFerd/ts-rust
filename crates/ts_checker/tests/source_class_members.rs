@@ -1,0 +1,308 @@
+use ts_ast::{FileId, NodeData, NodeRef};
+use ts_binder::{
+    CanonicalBinder, CanonicalModuleState, CanonicalSourceFileFacts, CanonicalSourceLanguage,
+    CheckFlags, EscapedName, SemanticSymbolId, SymbolFlags,
+};
+use ts_checker::semantic::{
+    CanonicalCheckerContext, CanonicalCheckerOptions, TypeData, TypeNodeLinks, ValueSymbolLinks,
+    signatures::SignatureFlags,
+    type_records::TypeCacheState,
+    types::{ObjectFlags, TypeFlags},
+};
+use ts_parser::{ParseResult, parse_source_file};
+
+const SOURCE: &str = concat!(
+    "class Model {\n",
+    "  readonly value?: string;\n",
+    "  definite!: number;\n",
+    "  static readonly count: number;\n",
+    "}\n",
+);
+
+fn checker_context(parsed: &ParseResult, file: FileId) -> CanonicalCheckerContext<'_> {
+    let mut binder = CanonicalBinder::new();
+    binder
+        .bind_source_file_with_facts(
+            &parsed.arena,
+            parsed.source_file,
+            file,
+            CanonicalSourceFileFacts::new(
+                EscapedName::source("\"/project/class-members.ts\""),
+                CanonicalSourceLanguage::TypeScript,
+                false,
+                CanonicalModuleState::Script,
+            ),
+        )
+        .unwrap();
+    binder
+        .bind_typescript_declaration_slice(&parsed.arena, file)
+        .unwrap();
+    CanonicalCheckerContext::new(
+        binder.finish(),
+        [(file, &parsed.arena)].into_iter().collect(),
+        CanonicalCheckerOptions::default(),
+    )
+    .unwrap()
+}
+
+fn class_declaration(parsed: &ParseResult, file: FileId, expected: &str) -> NodeRef {
+    parsed
+        .arena
+        .iter()
+        .find_map(|(node, record)| {
+            let NodeData::ClassDeclaration(class) = &record.data else {
+                return None;
+            };
+            let name = class.name.and_then(|name| parsed.arena.get(name))?;
+            let NodeData::Identifier(name) = &name.data else {
+                return None;
+            };
+            (name.text == expected).then_some(NodeRef::new(parsed.arena.id(), file, node))
+        })
+        .unwrap_or_else(|| panic!("missing class {expected}"))
+}
+
+fn class_symbol(
+    parsed: &ParseResult,
+    file: FileId,
+    context: &CanonicalCheckerContext<'_>,
+    expected: &str,
+) -> SemanticSymbolId {
+    let declaration = class_declaration(parsed, file, expected);
+    let raw = context.file(file).unwrap().1.symbol(declaration).unwrap();
+    context.store().get_merged_symbol(raw).unwrap()
+}
+
+fn property_type_node(parsed: &ParseResult, file: FileId, expected: &str) -> NodeRef {
+    parsed
+        .arena
+        .iter()
+        .find_map(|(node, record)| {
+            let NodeData::PropertyDeclaration(property) = &record.data else {
+                return None;
+            };
+            let name = parsed.arena.get(property.name)?;
+            let NodeData::Identifier(name) = &name.data else {
+                return None;
+            };
+            (name.text == expected).then(|| {
+                NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    property.type_.expect("fixture properties are annotated"),
+                )
+            })
+        })
+        .unwrap_or_else(|| panic!("missing property {expected}"))
+}
+
+#[test]
+fn public_class_member_query_materializes_both_sides_and_default_constructor() {
+    let parsed = parse_source_file(SOURCE);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(0);
+    let mut context = checker_context(&parsed, file);
+    let symbol = class_symbol(&parsed, file, &context, "Model");
+    let class_record = context.store().symbol(symbol).unwrap();
+    let declared_members = class_record.members().unwrap();
+    let static_members = class_record.exports().unwrap();
+    let counts = (
+        context.store().type_len(),
+        context.store().signature_len(),
+        context.store().symbol_len(),
+        context.store().symbol_store().symbol_table_len(),
+    );
+
+    let members = context.get_nongeneric_class_members(symbol).unwrap();
+
+    assert_eq!(context.store().type_len(), counts.0 + 3);
+    assert_eq!(context.store().signature_len(), counts.1 + 1);
+    assert_eq!(context.store().symbol_len(), counts.2);
+    assert_eq!(
+        context.store().symbol_store().symbol_table_len(),
+        counts.3 + 1
+    );
+    assert_ne!(members.instance_members(), Some(declared_members));
+    assert_eq!(members.static_members(), static_members);
+    assert_eq!(members.instance_properties().len(), 2);
+    assert_eq!(members.static_properties().len(), 1);
+
+    let instance_table = context
+        .store()
+        .symbol_table(members.instance_members().unwrap())
+        .unwrap();
+    assert_eq!(instance_table.len(), 2);
+    assert_eq!(
+        instance_table.get_source("value"),
+        Some(members.instance_properties()[0])
+    );
+    assert_eq!(
+        instance_table.get_source("definite"),
+        Some(members.instance_properties()[1])
+    );
+    let static_table = context.store().symbol_table(static_members).unwrap();
+    assert_eq!(
+        static_table.get_source("count"),
+        Some(members.static_properties()[0])
+    );
+    assert_eq!(
+        static_table.get_source("prototype"),
+        Some(members.prototype())
+    );
+
+    let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+    let string_type = bootstrap.string_type;
+    let number_type = bootstrap.number_type;
+    let undefined_type = bootstrap.undefined_type;
+    let property_expectations = [
+        (
+            members.instance_properties()[0],
+            "value",
+            string_type,
+            SymbolFlags::PROPERTY | SymbolFlags::OPTIONAL,
+            CheckFlags::READONLY,
+        ),
+        (
+            members.instance_properties()[1],
+            "definite",
+            number_type,
+            SymbolFlags::PROPERTY,
+            CheckFlags::NONE,
+        ),
+        (
+            members.static_properties()[0],
+            "count",
+            number_type,
+            SymbolFlags::PROPERTY,
+            CheckFlags::READONLY,
+        ),
+    ];
+    for (property, name, type_, flags, check_flags) in property_expectations {
+        let record = context.store().symbol(property).unwrap();
+        assert_eq!(record.flags(), flags);
+        assert_eq!(record.check_flags(), check_flags);
+        assert_eq!(
+            context.store().value_symbol_links(property),
+            Some(&ValueSymbolLinks {
+                resolved_type: Some(type_),
+                ..ValueSymbolLinks::default()
+            })
+        );
+        assert_eq!(
+            context
+                .store()
+                .type_node_links(property_type_node(&parsed, file, name)),
+            Some(&TypeNodeLinks {
+                resolved_type: Some(type_),
+                ..TypeNodeLinks::default()
+            })
+        );
+    }
+
+    let shells = members.shells();
+    let instance_record = context
+        .store()
+        .type_payload(shells.instance_type())
+        .unwrap();
+    assert_eq!(
+        instance_record.object_flags(),
+        ObjectFlags::CLASS | ObjectFlags::REFERENCE | ObjectFlags::MEMBERS_RESOLVED
+    );
+    let TypeData::Interface(instance) = instance_record.data() else {
+        panic!("class instance must use interface storage")
+    };
+    assert!(instance.base_types_resolved);
+    assert_eq!(
+        instance.resolved_base_constructor_type,
+        Some(undefined_type)
+    );
+    assert_eq!(instance.resolved_base_types, None);
+    assert!(instance.declared_members_resolved);
+    assert_eq!(instance.declared_members, Some(declared_members));
+    assert_eq!(instance.declared_call_signatures, None);
+    assert_eq!(instance.declared_construct_signatures, None);
+    assert_eq!(instance.declared_index_infos, None);
+    assert_eq!(
+        instance.reference.object.structured.members,
+        members.instance_members()
+    );
+    assert_eq!(
+        instance.reference.object.structured.properties.as_deref(),
+        Some(members.instance_properties())
+    );
+    assert_eq!(instance.reference.object.structured.signatures, None);
+    assert_eq!(instance.reference.object.structured.call_signature_count, 0);
+    assert_eq!(instance.reference.object.structured.index_infos, None);
+    assert_eq!(instance.reference.resolved_type_arguments, Some(Vec::new()));
+    let TypeCacheState::Allocated(instantiations) = &instance.reference.object.instantiations
+    else {
+        panic!("class instance owns its self-instantiation")
+    };
+    assert_eq!(instantiations.len(), 1);
+
+    let value_record = context.store().type_payload(shells.value_type()).unwrap();
+    assert_eq!(value_record.flags(), TypeFlags::OBJECT);
+    assert_eq!(
+        value_record.object_flags(),
+        ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED
+    );
+    let TypeData::Object(value) = value_record.data() else {
+        panic!("class value must use object storage")
+    };
+    assert_eq!(value.structured.members, Some(static_members));
+    assert_eq!(
+        value.structured.properties.as_deref(),
+        Some(&[members.static_properties()[0], members.prototype()][..])
+    );
+    assert_eq!(value.structured.call_signature_count, 0);
+    assert_eq!(
+        value.structured.signatures.as_deref(),
+        Some(&[members.default_construct_signature()][..])
+    );
+    assert_eq!(value.structured.index_infos, None);
+
+    let signature = context
+        .store()
+        .signature(members.default_construct_signature())
+        .unwrap();
+    assert_eq!(signature.flags(), SignatureFlags::CONSTRUCT);
+    assert_eq!(signature.declaration(), None);
+    assert!(signature.type_parameters().is_empty());
+    assert!(signature.parameters().is_empty());
+    assert_eq!(signature.this_parameter(), None);
+    assert_eq!(
+        signature.resolved_return_type(),
+        Some(shells.instance_type())
+    );
+    assert_eq!(signature.resolved_type_predicate(), None);
+    assert_eq!(signature.min_argument_count(), 0);
+    assert_eq!(signature.resolved_min_argument_count(), -1);
+    assert_eq!(signature.target(), None);
+    assert_eq!(signature.mapper(), None);
+    assert_eq!(signature.isolated_signature_type(), None);
+    assert_eq!(signature.composite(), None);
+
+    let warm_counts = (
+        context.store().type_len(),
+        context.store().signature_len(),
+        context.store().symbol_len(),
+        context.store().symbol_store().symbol_table_len(),
+        context.store().relation_state_snapshot(),
+    );
+    assert_eq!(
+        context.get_nongeneric_class_members(symbol).unwrap(),
+        members
+    );
+    assert_eq!(context.get_nongeneric_class_shells(symbol).unwrap(), shells);
+    assert_eq!(
+        (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.store().symbol_len(),
+            context.store().symbol_store().symbol_table_len(),
+            context.store().relation_state_snapshot(),
+        ),
+        warm_counts
+    );
+    assert!(context.diagnostics().is_empty());
+}
