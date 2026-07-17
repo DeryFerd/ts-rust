@@ -66,7 +66,7 @@ the query-scoped instantiation session. Their next stacks meet at a generic
 
 | Hub | Wave | Owner | Base | Allowed symbols | Expiry |
 |---|---|---|---|---|---|
-| `semantic/relater.rs` | W0.1 | `agent/w0-s2a-members` | `cdbf749` | `RelationUnavailable` additions; `ResolvedObjectMembers`; `structured_type_related_to`; `properties_related_to`; `call_signatures_related_to`; `resolved_object_members`; new index-relation helpers | reviewed S2a integration commit |
+| `semantic/relater.rs` | W0.1 | `agent/w0-s2a-members` | `cdbf749` | `RelationUnavailable` additions; `ResolvedObjectMembers`; `structured_type_related_to`; `properties_related_to`; `call_signatures_related_to`; `resolved_object_members`; `SemanticStore::resolved_declared_property_object` heritage branch; new index-relation helpers | reviewed S2a integration commit |
 
 Root and every other worker treat the leased surface as read-only until the
 lease expires. `type_nodes.rs`, `source.rs`, `store.rs`, `type_records.rs`,
