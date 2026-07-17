@@ -186,6 +186,24 @@ fn assert_alias_chain(
     assert_eq!(links.type_only_declaration, type_only_declaration);
 }
 
+fn assert_lazy_alias_target(
+    context: &CanonicalCheckerContext<'_>,
+    alias: SemanticSymbolId,
+    target: SemanticSymbolId,
+    type_only_declaration: Option<NodeRef>,
+) {
+    let links = context
+        .store()
+        .alias_symbol_links(alias)
+        .expect("transitively resolved alias has links");
+    assert_eq!(
+        links.immediate_target, None,
+        "transitive resolution must not populate the distinct immediate-target cache"
+    );
+    assert_eq!(links.alias_target, AliasTargetState::Resolved(target));
+    assert_eq!(links.type_only_declaration, type_only_declaration);
+}
+
 fn source_is_checked(context: &CanonicalCheckerContext<'_>, file: FileId) -> bool {
     context
         .source_file(file)
@@ -312,18 +330,26 @@ fn two_hop_renamed_value_and_function_reexports_are_exact_and_warm_stable() {
 
     assert_alias_chain(&context, imported_value, public_value, original_value, None);
     assert_alias_chain(&context, imported_take, public_take, original_take, None);
-    assert_alias_chain(&context, public_value, middle_value, original_value, None);
-    assert_alias_chain(&context, public_take, middle_take, original_take, None);
-    assert_alias_chain(&context, middle_value, original_value, original_value, None);
-    assert_alias_chain(&context, middle_take, original_take, original_take, None);
+    assert_lazy_alias_target(&context, public_value, original_value, None);
+    assert_lazy_alias_target(&context, public_take, original_take, None);
+    assert_lazy_alias_target(&context, middle_value, original_value, None);
+    assert_lazy_alias_target(&context, middle_take, original_take, None);
 
     context.check_source_file(barrel_b_file).unwrap();
     assert!(source_is_checked(&context, barrel_b_file));
     assert!(!source_is_checked(&context, barrel_a_file));
     assert!(!source_is_checked(&context, base_file));
+    assert_alias_chain(&context, public_value, middle_value, original_value, None);
+    assert_alias_chain(&context, public_take, middle_take, original_take, None);
+    assert_lazy_alias_target(&context, middle_value, original_value, None);
+    assert_lazy_alias_target(&context, middle_take, original_take, None);
+
     context.check_source_file(barrel_a_file).unwrap();
     assert!(source_is_checked(&context, barrel_a_file));
     assert!(!source_is_checked(&context, base_file));
+    assert_alias_chain(&context, middle_value, original_value, original_value, None);
+    assert_alias_chain(&context, middle_take, original_take, original_take, None);
+
     context.check_source_file(base_file).unwrap();
     assert!(source_is_checked(&context, base_file));
     assert_eq!(context.diagnostics().as_slice().len(), 1);
@@ -436,20 +462,8 @@ fn transitive_type_only_reexport_markers_preserve_annotation_checking() {
         model,
         Some(consumer_binding),
     );
-    assert_alias_chain(
-        &context,
-        public_model,
-        intermediate_model,
-        model,
-        Some(barrel_a_binding),
-    );
-    assert_alias_chain(
-        &context,
-        intermediate_model,
-        model,
-        model,
-        Some(barrel_a_binding),
-    );
+    assert_lazy_alias_target(&context, public_model, model, Some(barrel_a_binding));
+    assert_lazy_alias_target(&context, intermediate_model, model, Some(barrel_a_binding));
     assert!(context.store().value_symbol_links(imported_model).is_none());
     assert!(context.store().value_symbol_links(public_model).is_none());
     assert!(
@@ -459,9 +473,32 @@ fn transitive_type_only_reexport_markers_preserve_annotation_checking() {
             .is_none()
     );
 
-    for file in [barrel_b_file, barrel_a_file, base_file] {
-        context.check_source_file(file).unwrap();
-    }
+    context.check_source_file(barrel_b_file).unwrap();
+    assert!(source_is_checked(&context, barrel_b_file));
+    assert!(!source_is_checked(&context, barrel_a_file));
+    assert!(!source_is_checked(&context, base_file));
+    assert_alias_chain(
+        &context,
+        public_model,
+        intermediate_model,
+        model,
+        Some(barrel_a_binding),
+    );
+    assert_lazy_alias_target(&context, intermediate_model, model, Some(barrel_a_binding));
+
+    context.check_source_file(barrel_a_file).unwrap();
+    assert!(source_is_checked(&context, barrel_a_file));
+    assert!(!source_is_checked(&context, base_file));
+    assert_alias_chain(
+        &context,
+        intermediate_model,
+        model,
+        model,
+        Some(barrel_a_binding),
+    );
+
+    context.check_source_file(base_file).unwrap();
+    assert!(source_is_checked(&context, base_file));
     let warm_state = (
         context.store().type_len(),
         context.store().mapper_len(),
