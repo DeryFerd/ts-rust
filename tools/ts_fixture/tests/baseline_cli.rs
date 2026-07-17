@@ -88,7 +88,7 @@ impl TestRepository {
             let output = Command::new("git")
                 .arg("-C")
                 .arg(&self.0)
-                .args(arguments)
+                .args(*arguments)
                 .output()
                 .unwrap();
             assert!(
@@ -129,7 +129,7 @@ fn canonical_scorecard_retains_fatal_and_capability_then_continues_to_exact_case
     );
     repository.write_case(
         "zzExact",
-        "// @noLib: true\nconst value: number = 1;\n",
+        "const value: number = 1;\n",
         None,
     );
     let scorecard_path = repository.0.join("canonical-frontier.json");
@@ -155,7 +155,7 @@ fn canonical_scorecard_retains_fatal_and_capability_then_continues_to_exact_case
         serde_json::from_str(&fs::read_to_string(scorecard_path).unwrap()).unwrap();
     assert_eq!(scorecard["schemaVersion"], 5);
     assert_eq!(scorecard["summary"]["executedVariants"], 3);
-    assert_eq!(scorecard["summary"]["exactMatches"], 1);
+    assert_eq!(scorecard["summary"]["exactMatches"], 1, "{scorecard:#}");
     assert_eq!(scorecard["summary"]["unsupportedDetails"], 1);
     assert_eq!(scorecard["summary"]["fatalInvariants"], 1);
 
