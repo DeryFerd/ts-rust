@@ -213,6 +213,7 @@ fn canonical_program_consumes_declaration_exports_in_both_program_orders() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // Keeps every declaration near-miss in one table-driven boundary proof.
 fn canonical_program_fails_closed_on_declaration_import_near_misses() {
     let options = || CompilerOptions {
         module: ModuleKind::EsNext,
