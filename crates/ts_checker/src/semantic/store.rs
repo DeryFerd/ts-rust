@@ -324,6 +324,8 @@ pub struct SemanticStore<TypePayload, MapperPayload> {
     canonical_empty_tuple: Option<CanonicalEmptyTupleProvenance>,
     type_resolutions: TypeResolutionStack,
     relations: RelationCaches,
+    relation_inputs_generation: u64,
+    relation_cache_generation: u64,
     pub(super) derived_types: DerivedTypeCaches,
     pub(super) intrinsic_bootstrap: Option<IntrinsicBootstrap>,
     claimed_strict_builtin_iterator_return: Option<bool>,
@@ -392,6 +394,8 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             canonical_empty_tuple: None,
             type_resolutions: TypeResolutionStack::new(id),
             relations: RelationCaches::default(),
+            relation_inputs_generation: 0,
+            relation_cache_generation: 0,
             derived_types: DerivedTypeCaches::default(),
             intrinsic_bootstrap: None,
             claimed_strict_builtin_iterator_return: None,
@@ -649,6 +653,8 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
     }
 
     pub(super) fn type_payload_mut(&mut self, id: TypeId) -> Option<&mut TypePayload> {
+        self.types.get(id)?;
+        self.mark_relation_inputs_dirty();
         self.types.get_mut(id)
     }
 
@@ -1309,6 +1315,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         }
 
         let previous = self.merged_symbols.insert(source, target);
+        self.mark_relation_inputs_dirty();
         if self.has_callable_provenance() {
             self.mark_union_cache_validation_dirty();
         }
@@ -1385,6 +1392,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         symbol: SemanticSymbolId,
     ) -> Option<Option<SemanticSymbolId>> {
         let previous = self.symbols.insert_symbol(table, name, symbol)?;
+        self.mark_relation_inputs_dirty();
         if self.has_callable_provenance() {
             self.mark_union_cache_validation_dirty();
         }
@@ -1404,6 +1412,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         if !self.symbols.set_symbol_flags(symbol, flags, check_flags) {
             return false;
         }
+        self.mark_relation_inputs_dirty();
         if self.has_callable_provenance() {
             self.mark_union_cache_validation_dirty();
         }
@@ -1422,6 +1431,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         {
             return false;
         }
+        self.mark_relation_inputs_dirty();
         if self.has_callable_provenance() {
             self.mark_union_cache_validation_dirty();
         }
@@ -1442,6 +1452,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         {
             return false;
         }
+        self.mark_relation_inputs_dirty();
         if self.has_callable_provenance() {
             self.mark_union_cache_validation_dirty();
         }
@@ -1677,6 +1688,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                 current != &ValueSymbolLinks::default() && current != &links
             });
         self.links.value_symbol.replace_key(symbol, links);
+        self.mark_relation_inputs_dirty();
         if dirty {
             self.mark_union_cache_validation_dirty();
         }
@@ -1830,6 +1842,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             return false;
         }
         self.links.declared_type.replace_key(symbol, links);
+        self.mark_relation_inputs_dirty();
         true
     }
 
@@ -2396,6 +2409,34 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         true
     }
 
+    /// Makes every retained relation result logically stale after a semantic
+    /// write that can change assignability. Physical entries stay untouched
+    /// until the next successful relation publication so failed queries remain
+    /// transactionally read-only.
+    fn mark_relation_inputs_dirty(&mut self) {
+        if !self.relation_cache_is_current() || self.relations.snapshot().is_pristine() {
+            return;
+        }
+        let Some(next) = self.relation_inputs_generation.checked_add(1) else {
+            self.relations = RelationCaches::default();
+            self.relation_inputs_generation = 0;
+            self.relation_cache_generation = 0;
+            return;
+        };
+        self.relation_inputs_generation = next;
+    }
+
+    fn relation_cache_is_current(&self) -> bool {
+        self.relation_cache_generation == self.relation_inputs_generation
+    }
+
+    fn prepare_relation_cache_write(&mut self) {
+        if !self.relation_cache_is_current() {
+            self.relations = RelationCaches::default();
+            self.relation_cache_generation = self.relation_inputs_generation;
+        }
+    }
+
     /// Reads one exact relation-cache result without allocating the lazy map.
     ///
     /// Relation-key construction is intentionally outside this substrate. The
@@ -2407,7 +2448,11 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         relation: RelationKind,
         key: CacheHashKey,
     ) -> RelationComparisonResult {
-        self.relations.get(relation, key)
+        if self.relation_cache_is_current() {
+            self.relations.get(relation, key)
+        } else {
+            RelationComparisonResult::NONE
+        }
     }
 
     /// Ports `Relation.set`, allocating the selected result map on its first
@@ -2418,24 +2463,33 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         key: CacheHashKey,
         result: RelationComparisonResult,
     ) {
+        self.prepare_relation_cache_write();
         self.relations.set(relation, key, result);
     }
 
     #[must_use]
     pub fn relation_cache_size(&self, relation: RelationKind) -> usize {
-        self.relations.size(relation)
+        if self.relation_cache_is_current() {
+            self.relations.size(relation)
+        } else {
+            0
+        }
     }
 
     /// Distinguishes upstream's nil result map from an allocated map.
     #[must_use]
     pub fn relation_cache_is_allocated(&self, relation: RelationKind) -> bool {
-        self.relations.is_allocated(relation)
+        self.relation_cache_is_current() && self.relations.is_allocated(relation)
     }
 
     /// Exact initial work budget used by `checkTypeRelatedToEx` for this cache.
     #[must_use]
     pub fn relation_comparison_budget(&self, relation: RelationKind) -> isize {
-        self.relations.comparison_budget(relation)
+        if self.relation_cache_is_current() {
+            self.relations.comparison_budget(relation)
+        } else {
+            RelationCaches::default().comparison_budget(relation)
+        }
     }
 
     #[must_use]
@@ -2454,7 +2508,11 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         target: SemanticSymbolId,
     ) -> Option<RelationComparisonResult> {
         let (source_id, target_id) = self.enum_relation_symbol_ids(source, target)?;
-        Some(self.relations.enum_get(source_id, target_id))
+        Some(if self.relation_cache_is_current() {
+            self.relations.enum_get(source_id, target_id)
+        } else {
+            RelationComparisonResult::NONE
+        })
     }
 
     /// Writes the directional enum relation cache after validating both keys.
@@ -2470,13 +2528,18 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         let Some((source_id, target_id)) = self.enum_relation_symbol_ids(source, target) else {
             return false;
         };
+        self.prepare_relation_cache_write();
         self.relations.enum_set(source_id, target_id, result);
         true
     }
 
     #[must_use]
     pub fn enum_relation_cache_size(&self) -> usize {
-        self.relations.enum_size()
+        if self.relation_cache_is_current() {
+            self.relations.enum_size()
+        } else {
+            0
+        }
     }
 
     fn enum_relation_symbol_ids(
@@ -2710,6 +2773,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                 instantiated,
             },
         );
+        self.mark_relation_inputs_dirty();
         true
     }
 
@@ -2785,6 +2849,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             previous.is_none(),
             "the return annotation was checked absent"
         );
+        self.mark_relation_inputs_dirty();
         true
     }
 
@@ -2833,6 +2898,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                 "callable parameter provenance was prevalidated absent"
             );
         }
+        self.mark_relation_inputs_dirty();
         true
     }
 
@@ -2863,6 +2929,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         if !self.signatures.set_resolved_min_argument_count(id, count) {
             return false;
         }
+        self.mark_relation_inputs_dirty();
         if dirty {
             self.mark_union_cache_validation_dirty();
         }
@@ -2881,6 +2948,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         if !self.signatures.set_resolved_return_type(id, type_id) {
             return false;
         }
+        self.mark_relation_inputs_dirty();
         let cleared_circular_provenance = self.circular_return_signatures.remove(&id).is_some();
         if dirty || cleared_circular_provenance {
             self.mark_union_cache_validation_dirty();
@@ -2929,6 +2997,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         );
         let published = self.signatures.set_resolved_return_type(id, Some(type_id));
         assert!(published, "the local function signature was prevalidated");
+        self.mark_relation_inputs_dirty();
         self.mark_union_cache_validation_dirty();
         true
     }
@@ -2945,6 +3014,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         if !self.signatures.set_resolved_type_predicate(id, predicate) {
             return false;
         }
+        self.mark_relation_inputs_dirty();
         if dirty {
             self.mark_union_cache_validation_dirty();
         }
@@ -2963,6 +3033,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         if !self.signatures.set_isolated_signature_type(id, type_id) {
             return false;
         }
+        self.mark_relation_inputs_dirty();
         if dirty {
             self.mark_union_cache_validation_dirty();
         }
@@ -2982,6 +3053,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         if !self.signatures.set_target_and_mapper(id, target, mapper) {
             return false;
         }
+        self.mark_relation_inputs_dirty();
         if dirty {
             self.mark_union_cache_validation_dirty();
         }
@@ -3005,6 +3077,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         if !self.signatures.set_composite(id, composite) {
             return false;
         }
+        self.mark_relation_inputs_dirty();
         if dirty {
             self.mark_union_cache_validation_dirty();
         }
@@ -3034,6 +3107,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         if !self.signatures.set_flags(id, flags) {
             return false;
         }
+        self.mark_relation_inputs_dirty();
         if dirty {
             self.mark_union_cache_validation_dirty();
         }
@@ -3054,6 +3128,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         if !self.signatures.set_type_parameters(id, type_parameters) {
             return false;
         }
+        self.mark_relation_inputs_dirty();
         if dirty {
             self.mark_union_cache_validation_dirty();
         }
@@ -3074,6 +3149,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         if !self.signatures.set_this_parameter(id, this_parameter) {
             return false;
         }
+        self.mark_relation_inputs_dirty();
         if dirty {
             self.mark_union_cache_validation_dirty();
         }
@@ -3154,7 +3230,11 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         if !self.valid_optional_symbol(symbol) {
             return false;
         }
-        self.index_infos.set_index_symbol(id, symbol)
+        if !self.index_infos.set_index_symbol(id, symbol) {
+            return false;
+        }
+        self.mark_relation_inputs_dirty();
+        true
     }
 
     /// Creates one tuple element descriptor after validating its optional AST
@@ -3444,6 +3524,7 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
             return false;
         };
         entry.insert(provenance);
+        self.mark_relation_inputs_dirty();
         true
     }
 

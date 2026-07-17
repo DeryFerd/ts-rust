@@ -257,6 +257,19 @@ impl std::fmt::Display for RelationUnavailable {
 
 impl std::error::Error for RelationUnavailable {}
 
+fn validate_direct_interface_heritage_relation_endpoint(
+    store: &SemanticStore<TypeRecord, TypeMapper>,
+    type_: TypeId,
+) -> Result<(), RelationUnavailable> {
+    if store.direct_interface_heritage_provenance(type_).is_some()
+        && validate_interface_heritage_members(store, type_)
+            != InterfaceHeritageMembersValidation::Valid
+    {
+        return Err(RelationUnavailable::InvalidStructuredMembers(type_));
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy)]
 struct RelationBootstrapFacts {
     strict_null_checks: bool,
@@ -1019,6 +1032,10 @@ impl<'store> RelaterSession<'store> {
         recursion_flags: RecursionFlags,
         intersection_state: IntersectionState,
     ) -> Result<Ternary, RelationUnavailable> {
+        validate_direct_interface_heritage_relation_endpoint(self.store, original_source)?;
+        if original_target != original_source {
+            validate_direct_interface_heritage_relation_endpoint(self.store, original_target)?;
+        }
         if original_source == original_target {
             return Ok(Ternary::True);
         }
@@ -3928,6 +3945,10 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         let bootstrap = self.relation_bootstrap_facts()?;
         let source = self.regular_type_if_fresh(source)?;
         let target = self.regular_type_if_fresh(target)?;
+        validate_direct_interface_heritage_relation_endpoint(self, source)?;
+        if target != source {
+            validate_direct_interface_heritage_relation_endpoint(self, target)?;
+        }
         self.admit_callable_relation_type(source, strict_function_types)?;
         if target != source {
             self.admit_callable_relation_type(target, strict_function_types)?;

@@ -294,13 +294,22 @@ pub(super) fn validate_interface_heritage_members(
     store: &CanonicalTypeMapperStore,
     type_: TypeId,
 ) -> InterfaceHeritageMembersValidation {
+    let retained_provenance = store.direct_interface_heritage_provenance(type_).is_some();
     let Some(TypeData::Interface(interface)) =
         store.type_payload(type_).map(|record| record.data())
     else {
-        return InterfaceHeritageMembersValidation::NotHeritage;
+        return if retained_provenance {
+            InterfaceHeritageMembersValidation::Malformed
+        } else {
+            InterfaceHeritageMembersValidation::NotHeritage
+        };
     };
     if interface.resolved_base_types.is_none() {
-        return InterfaceHeritageMembersValidation::NotHeritage;
+        return if retained_provenance {
+            InterfaceHeritageMembersValidation::Malformed
+        } else {
+            InterfaceHeritageMembersValidation::NotHeritage
+        };
     }
     if validate_direct_heritage_property_interface(store, type_).is_some() {
         InterfaceHeritageMembersValidation::Valid
@@ -582,7 +591,7 @@ mod tests {
     use ts_ast::{FileId, NodeArena, NodeData, NodeRef};
     use ts_binder::{
         BoundFile, CanonicalBinder, CanonicalModuleState, CanonicalNameResolverOptions,
-        CanonicalSourceFileFacts, CanonicalSourceLanguage, EscapedName,
+        CanonicalSourceFileFacts, CanonicalSourceLanguage, EscapedName, SymbolData,
     };
     use ts_parser::{ParseResult, parse_source_file};
 
@@ -594,6 +603,7 @@ mod tests {
         object_members::{self, PropertyObjectState},
         production::GlobalMergeCompletion,
         relater::RelationUnavailable,
+        relation::{IntersectionState, RelationComparisonResult, RelationKind},
     };
 
     const SOURCE: &str = concat!(
@@ -795,6 +805,39 @@ mod tests {
         )
     }
 
+    fn property_wrapper(store: &mut CanonicalTypeMapperStore, property_type: TypeId) -> TypeId {
+        let property = store
+            .alloc_symbol(SymbolData::new(
+                SymbolFlags::PROPERTY,
+                EscapedName::source("value"),
+            ))
+            .unwrap();
+        assert!(store.set_value_symbol_links(
+            property,
+            ValueSymbolLinks {
+                resolved_type: Some(property_type),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        let members = store.alloc_symbol_table();
+        assert_eq!(
+            store.insert_symbol(members, EscapedName::source("value"), property),
+            Some(None),
+        );
+        let wrapper = store
+            .alloc_plain_object_type(ObjectFlags::ANONYMOUS, None)
+            .unwrap();
+        assert!(store.set_structured_type_members(
+            wrapper,
+            Some(members),
+            Some(vec![property]),
+            None,
+            None,
+            None,
+        ));
+        wrapper
+    }
+
     #[test]
     fn foreign_base_is_rejected_without_partial_publication() {
         let mut prepared = prepare();
@@ -852,7 +895,63 @@ mod tests {
     }
 
     #[test]
-    fn warm_validation_rejects_wrong_base_reorder_and_omission() {
+    fn warmed_wrapper_relation_rejects_nested_heritage_poison() {
+        let mut prepared = prepare();
+        resolve_direct_interface_members(
+            &mut prepared.fixture.store,
+            &prepared.derived_plan,
+            prepared.derived_type,
+            &[prepared.number_type],
+            &[prepared.base_type],
+        )
+        .unwrap();
+        let source = property_wrapper(&mut prepared.fixture.store, prepared.derived_type);
+        let target = property_wrapper(&mut prepared.fixture.store, prepared.base_type);
+        let before_warm = prepared.fixture.store.relation_state_snapshot();
+        assert_eq!(
+            prepared.fixture.store.is_type_assignable_to(source, target),
+            Ok(true),
+        );
+        let warmed = prepared.fixture.store.relation_state_snapshot();
+        assert!(warmed.assignable.entries > before_warm.assignable.entries);
+        let wrapper_key = prepared
+            .fixture
+            .store
+            .relation_key_if_available(source, target, IntersectionState::NONE, false, false)
+            .unwrap()
+            .key();
+        assert!(
+            prepared
+                .fixture
+                .store
+                .relation_cache_get(RelationKind::Assignable, wrapper_key)
+                .intersects(RelationComparisonResult::SUCCEEDED)
+        );
+
+        assert!(prepared.fixture.store.set_interface_base_resolution(
+            prepared.derived_type,
+            true,
+            None,
+            None,
+        ));
+        assert_eq!(
+            prepared
+                .fixture
+                .store
+                .relation_cache_get(RelationKind::Assignable, wrapper_key),
+            RelationComparisonResult::NONE,
+        );
+        assert_eq!(
+            prepared.fixture.store.is_type_assignable_to(source, target),
+            Err(RelationUnavailable::InvalidStructuredMembers(
+                prepared.derived_type
+            )),
+        );
+        assert_eq!(prepared.fixture.store.relation_state_snapshot(), warmed);
+    }
+
+    #[test]
+    fn warm_validation_rejects_missing_wrong_base_reorder_and_omission() {
         let mut prepared = prepare();
         resolve_direct_interface_members(
             &mut prepared.fixture.store,
@@ -867,6 +966,83 @@ mod tests {
             &prepared.derived_plan,
             prepared.derived_type,
         ));
+        let relation_state_before_warm = prepared.fixture.store.relation_state_snapshot();
+        assert_eq!(
+            prepared
+                .fixture
+                .store
+                .is_type_assignable_to(prepared.derived_type, prepared.base_type),
+            Ok(true),
+        );
+        let warmed_relation_state = prepared.fixture.store.relation_state_snapshot();
+        assert!(
+            warmed_relation_state.assignable.entries
+                > relation_state_before_warm.assignable.entries
+        );
+
+        assert!(prepared.fixture.store.set_interface_base_resolution(
+            prepared.derived_type,
+            true,
+            None,
+            None,
+        ));
+        assert_eq!(
+            validate_interface_heritage_members(&prepared.fixture.store, prepared.derived_type,),
+            InterfaceHeritageMembersValidation::Malformed,
+        );
+        assert!(!validate_planned_interface_heritage_members(
+            &prepared.fixture.store,
+            &prepared.derived_plan,
+            prepared.derived_type,
+        ));
+        assert_eq!(
+            prepared
+                .fixture
+                .store
+                .is_type_assignable_to(prepared.derived_type, prepared.base_type),
+            Err(RelationUnavailable::InvalidStructuredMembers(
+                prepared.derived_type
+            )),
+        );
+        assert_eq!(
+            prepared.fixture.store.relation_state_snapshot(),
+            warmed_relation_state,
+        );
+        let missing_base = derived_state(
+            &prepared.fixture.store,
+            prepared.derived_type,
+            prepared.derived_plan.properties[0].symbol,
+        );
+        assert!(
+            resolve_direct_interface_members(
+                &mut prepared.fixture.store,
+                &prepared.derived_plan,
+                prepared.derived_type,
+                &[prepared.number_type],
+                &[prepared.base_type],
+            )
+            .is_err()
+        );
+        assert_eq!(
+            derived_state(
+                &prepared.fixture.store,
+                prepared.derived_type,
+                prepared.derived_plan.properties[0].symbol,
+            ),
+            missing_base,
+        );
+        assert!(prepared.fixture.store.set_interface_base_resolution(
+            prepared.derived_type,
+            true,
+            None,
+            Some(vec![prepared.base_type]),
+        ));
+        assert!(validate_planned_interface_heritage_members(
+            &prepared.fixture.store,
+            &prepared.derived_plan,
+            prepared.derived_type,
+        ));
+
         let record = prepared
             .fixture
             .store
@@ -948,7 +1124,6 @@ mod tests {
             &prepared.derived_plan,
             prepared.derived_type,
         ));
-        let relation_state = prepared.fixture.store.relation_state_snapshot();
         assert_eq!(
             prepared
                 .fixture
@@ -960,7 +1135,7 @@ mod tests {
         );
         assert_eq!(
             prepared.fixture.store.relation_state_snapshot(),
-            relation_state,
+            warmed_relation_state,
         );
         let wrong_base = derived_state(&prepared.fixture.store, prepared.derived_type, own);
         assert!(
