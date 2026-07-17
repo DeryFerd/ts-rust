@@ -2,10 +2,11 @@
 //!
 //! This is the first exact slice of pinned `instantiateTypeWorker`. It covers
 //! primitive and literal leaves, direct type-parameter mapping, canonical
-//! Array/ReadonlyArray references under an explicit target capability, and
-//! anonymous origin-free unions whose constituents remain inside the installed
-//! canonical union domain. Other object, signature, alias, and origin
-//! instantiation needs its owning caches and is rejected instead of identity.
+//! Array/ReadonlyArray references under an explicit target capability, direct
+//! full-arity generic class/interface references, and anonymous origin-free
+//! unions whose constituents remain inside the installed canonical union
+//! domain. Other object, signature, alias, and origin instantiation needs its
+//! owning caches and is rejected instead of identity.
 
 use std::collections::{HashMap, HashSet};
 
@@ -14,7 +15,12 @@ use super::{
     array_types::{ArrayTypeError, CanonicalArrayTargets},
     bootstrap::LiteralTypeCacheError,
     mapper::{CanonicalTypeMapperStore, TypeMapperApplication},
+    reference_types::{
+        DirectGenericReferenceError, create_direct_generic_reference,
+        validate_direct_generic_reference,
+    },
     type_records::TypeData,
+    types::ObjectFlags,
 };
 use ts_binder::SemanticSymbolId;
 
@@ -64,6 +70,7 @@ pub(super) enum InstantiationError {
     /// parameters; the installed literal-union validator intentionally does not.
     UnvalidatedUnchangedUnion(TypeId),
     Array(ArrayTypeError),
+    Reference(DirectGenericReferenceError),
     Union(LiteralTypeCacheError),
 }
 
@@ -119,6 +126,7 @@ impl std::fmt::Display for InstantiationError {
                 "unchanged generic union {type_:?} requires canonical identity validation"
             ),
             Self::Array(error) => error.fmt(formatter),
+            Self::Reference(error) => error.fmt(formatter),
             Self::Union(error) => error.fmt(formatter),
         }
     }
@@ -128,6 +136,7 @@ impl std::error::Error for InstantiationError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Array(error) => Some(error),
+            Self::Reference(error) => Some(error),
             Self::Union(error) => Some(error),
             _ => None,
         }
@@ -143,6 +152,12 @@ impl From<LiteralTypeCacheError> for InstantiationError {
 impl From<ArrayTypeError> for InstantiationError {
     fn from(error: ArrayTypeError) -> Self {
         Self::Array(error)
+    }
+}
+
+impl From<DirectGenericReferenceError> for InstantiationError {
+    fn from(error: DirectGenericReferenceError) -> Self {
+        Self::Reference(error)
     }
 }
 
@@ -605,18 +620,42 @@ fn could_contain_installed_type_variables_worker(
                     })
             }
         }
-        TypeData::TypeReference(_) => {
-            let Some(array_targets) = array_targets else {
-                return Ok(true);
-            };
-            match store.canonical_array_reference_with_targets(array_targets, type_)? {
-                Some(reference) => could_contain_installed_type_variables_worker(
+        TypeData::Interface(interface)
+            if interface
+                .reference
+                .resolved_type_arguments
+                .as_ref()
+                .is_none_or(Vec::is_empty) =>
+        {
+            Ok(false)
+        }
+        TypeData::TypeReference(_) | TypeData::Interface(_) => {
+            if let Some(array_targets) = array_targets
+                && let Some(reference) =
+                    store.canonical_array_reference_with_targets(array_targets, type_)?
+            {
+                could_contain_installed_type_variables_worker(
                     store,
                     reference.element_type,
                     Some(array_targets),
                     seen,
-                ),
-                None => Ok(true),
+                )
+            } else {
+                match validate_direct_generic_reference(store, type_) {
+                    Ok(reference) => reference.type_arguments.into_iter().try_fold(
+                        false,
+                        |contains, argument| {
+                            Ok(contains
+                                || could_contain_installed_type_variables_worker(
+                                    store,
+                                    argument,
+                                    array_targets,
+                                    seen,
+                                )?)
+                        },
+                    ),
+                    Err(error) => Err(error.into()),
+                }
             }
         }
         _ => Ok(true),
@@ -659,6 +698,16 @@ fn instantiate_type_worker(
                 constituents: data.union.types.clone(),
             },
             TypeData::TypeReference(_) => InstantiationWork::TypeReference,
+            TypeData::Interface(interface)
+                if interface
+                    .reference
+                    .resolved_type_arguments
+                    .as_ref()
+                    .is_some_and(|arguments| !arguments.is_empty()) =>
+            {
+                InstantiationWork::TypeReference
+            }
+            TypeData::Interface(_) => InstantiationWork::Identity,
             _ => InstantiationWork::Unsupported,
         }
     };
@@ -680,15 +729,47 @@ fn instantiate_type_worker(
             }
             instantiate_union(store, type_, &constituents, mapping, array_targets, session)
         }
-        InstantiationWork::TypeReference => instantiate_array_reference(
-            store,
-            type_,
-            mapping,
-            array_targets.ok_or(InstantiationError::UnsupportedType(type_))?,
-            session,
-        ),
+        InstantiationWork::TypeReference => {
+            instantiate_reference(store, type_, mapping, array_targets, session)
+        }
         InstantiationWork::Unsupported => Err(InstantiationError::UnsupportedType(type_)),
     }
+}
+
+fn instantiate_reference(
+    store: &mut CanonicalTypeMapperStore,
+    source: TypeId,
+    mapping: InstantiationMapping<'_>,
+    array_targets: Option<CanonicalArrayTargets>,
+    session: &mut InstantiationSession,
+) -> Result<TypeId, InstantiationError> {
+    if let Some(array_targets) = array_targets
+        && store
+            .canonical_array_reference_with_targets(array_targets, source)?
+            .is_some()
+    {
+        return instantiate_array_reference(store, source, mapping, array_targets, session);
+    }
+
+    let reference = validate_direct_generic_reference(store, source)?;
+    let mut mapped_arguments = Vec::with_capacity(reference.type_arguments.len());
+    let mut changed = false;
+    for argument in &reference.type_arguments {
+        let mapped =
+            instantiate_type_with_alias(store, *argument, mapping, array_targets, None, session)?;
+        changed |= mapped != *argument;
+        mapped_arguments.push(mapped);
+    }
+    if !changed {
+        return Ok(source);
+    }
+    create_direct_generic_reference(
+        store,
+        reference.target,
+        &mapped_arguments,
+        ObjectFlags::NONE,
+    )
+    .map_err(Into::into)
 }
 
 fn apply_mapping(
