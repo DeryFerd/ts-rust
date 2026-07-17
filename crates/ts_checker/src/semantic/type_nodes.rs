@@ -3993,6 +3993,7 @@ pub(super) struct CanonicalTypeQuery<'store, 'host, 'arena, 'diagnostics> {
     type_reference_alias_targets: HashMap<NodeRef, CanonicalTypeReferenceAliasTarget>,
     diagnostics: &'diagnostics mut CanonicalCheckerDiagnostics,
     resolving_property_interfaces: HashSet<SemanticSymbolId>,
+    resolving_instantiated_signatures: HashSet<SignatureId>,
     pending_function_parameters: Vec<FunctionTypePlan>,
 }
 
@@ -4031,6 +4032,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             diagnostics,
             type_reference_alias_targets: HashMap::new(),
             resolving_property_interfaces: HashSet::new(),
+            resolving_instantiated_signatures: HashSet::new(),
             pending_function_parameters: Vec::new(),
         })
     }
@@ -4610,30 +4612,43 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                         TypeNodeUnavailable::InvalidFunctionSignature(signature),
                     ));
                 }
-                self.get_return_type_of_signature(target)?;
-                let array_targets = self
-                    .global_types
-                    .as_ref()
-                    .map(CanonicalArrayTargets::from_global_types);
-                let result = if let Some(session) = self.instantiation_session.as_deref_mut() {
-                    demand_generic_call_signature_return_with_session(
-                        self.store,
-                        array_targets,
-                        signature,
-                        session,
-                    )
-                } else {
-                    let mut session = InstantiationSession::new(InstantiationLimits::default());
-                    demand_generic_call_signature_return_with_session(
-                        self.store,
-                        array_targets,
-                        signature,
-                        &mut session,
-                    )
-                };
-                return result.map_err(|_| {
-                    type_node_unavailable(TypeNodeUnavailable::InvalidFunctionSignature(signature))
-                });
+                if !self.resolving_instantiated_signatures.insert(signature) {
+                    return Err(type_node_unavailable(
+                        TypeNodeUnavailable::InvalidFunctionSignature(signature),
+                    ));
+                }
+                let result = (|| {
+                    self.get_return_type_of_signature(target)?;
+                    let array_targets = self
+                        .global_types
+                        .as_ref()
+                        .map(CanonicalArrayTargets::from_global_types);
+                    if let Some(session) = self.instantiation_session.as_deref_mut() {
+                        demand_generic_call_signature_return_with_session(
+                            self.store,
+                            array_targets,
+                            signature,
+                            session,
+                        )
+                    } else {
+                        let mut session =
+                            InstantiationSession::new(InstantiationLimits::default());
+                        demand_generic_call_signature_return_with_session(
+                            self.store,
+                            array_targets,
+                            signature,
+                            &mut session,
+                        )
+                    }
+                    .map_err(|_| {
+                        type_node_unavailable(TypeNodeUnavailable::InvalidFunctionSignature(
+                            signature,
+                        ))
+                    })
+                })();
+                let removed = self.resolving_instantiated_signatures.remove(&signature);
+                debug_assert!(removed, "active instantiated signature remains registered");
+                return result;
             }
             (None, None) => {}
             (Some(_), None) | (None, Some(_)) => {
