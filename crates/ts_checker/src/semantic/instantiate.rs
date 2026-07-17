@@ -361,15 +361,14 @@ fn instantiate_type_with_alias(
         .active_mappers
         .iter()
         .rposition(|frame| frame.mapping == mapping_identity);
-    let frame_index = match existing_index {
-        Some(index) => index,
-        None => {
-            session.active_mappers.push(ActiveMapperFrame {
-                mapping: mapping_identity,
-                cache: HashMap::new(),
-            });
-            session.active_mappers.len() - 1
-        }
+    let frame_index = if let Some(index) = existing_index {
+        index
+    } else {
+        session.active_mappers.push(ActiveMapperFrame {
+            mapping: mapping_identity,
+            cache: HashMap::new(),
+        });
+        session.active_mappers.len() - 1
     };
     let key = InstantiationCacheKey { type_, alias };
     if let Some(cached) = session.active_mappers[frame_index].cache.get(&key) {
@@ -552,7 +551,7 @@ fn apply_mapping(
                 .mapper_application(mapper, type_)
                 .ok_or(InstantiationError::InvalidMapper(mapper))?;
             match application {
-                TypeMapperApplication::Direct(mapped) => Ok(mapped),
+                TypeMapperApplication::Direct(mapped_type) => Ok(mapped_type),
                 TypeMapperApplication::Merged { first, second } => {
                     let intermediate = apply_mapping(
                         store,
@@ -577,21 +576,21 @@ fn apply_mapping(
                         array_targets,
                         session,
                     )?;
-                    if intermediate != type_ {
+                    if intermediate == type_ {
+                        apply_mapping(
+                            store,
+                            type_,
+                            InstantiationMapping::Stored(second),
+                            array_targets,
+                            session,
+                        )
+                    } else {
                         instantiate_type_with_alias(
                             store,
                             intermediate,
                             InstantiationMapping::Stored(second),
                             array_targets,
                             None,
-                            session,
-                        )
-                    } else {
-                        apply_mapping(
-                            store,
-                            type_,
-                            InstantiationMapping::Stored(second),
-                            array_targets,
                             session,
                         )
                     }
