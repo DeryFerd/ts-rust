@@ -281,14 +281,24 @@ impl InstantiationSession {
         self.limit_event_generation > mark.0
     }
 
-    fn handle_limit(&mut self, error: InstantiationError) -> Result<TypeId, InstantiationError> {
+    fn handle_limit(
+        &mut self,
+        store: &CanonicalTypeMapperStore,
+        error: InstantiationError,
+    ) -> Result<TypeId, InstantiationError> {
         self.limit_event_generation = self
             .limit_event_generation
             .checked_add(1)
             .expect("instantiation limit-event generation overflowed");
         match self.limit_policy {
             InstantiationLimitPolicy::FailFast => Err(error),
-            InstantiationLimitPolicy::Recover { error_type } => Ok(error_type),
+            InstantiationLimitPolicy::Recover { error_type } => {
+                if store.type_payload(error_type).is_none() {
+                    Err(InstantiationError::InvalidRecoveryType(error_type))
+                } else {
+                    Ok(error_type)
+                }
+            }
         }
     }
 
@@ -469,16 +479,22 @@ fn instantiate_type_with_alias(
         return Ok(type_);
     }
     if session.depth == session.limits.max_depth {
-        return session.handle_limit(InstantiationError::DepthLimit {
-            depth: session.depth,
-            limit: session.limits.max_depth,
-        });
+        return session.handle_limit(
+            store,
+            InstantiationError::DepthLimit {
+                depth: session.depth,
+                limit: session.limits.max_depth,
+            },
+        );
     }
     if session.count >= session.limits.max_count {
-        return session.handle_limit(InstantiationError::CountLimit {
-            count: session.count,
-            limit: session.limits.max_count,
-        });
+        return session.handle_limit(
+            store,
+            InstantiationError::CountLimit {
+                count: session.count,
+                limit: session.limits.max_count,
+            },
+        );
     }
 
     // Rust IDs can carry foreign provenance, unlike the upstream pointers.
@@ -1247,6 +1263,37 @@ mod tests {
             .unwrap_err(),
             InstantiationError::InvalidRecoveryType(foreign_error),
         );
+    }
+
+    #[test]
+    fn recovering_session_revalidates_error_ownership_against_the_active_store() {
+        let first = initialized_store();
+        let first_error = first.intrinsic_bootstrap().unwrap().error_type;
+        let mut session = InstantiationSession::new_recovering(
+            &first,
+            InstantiationLimits {
+                max_depth: 10,
+                max_count: 0,
+            },
+            first_error,
+        )
+        .unwrap();
+
+        let mut second = initialized_store();
+        let number = second.intrinsic_bootstrap().unwrap().number_type;
+        let parameter = second.alloc_type_parameter(None).unwrap();
+        let mapper = second.new_simple_type_mapper(parameter, number).unwrap();
+        let mark = session.limit_event_mark();
+
+        assert_eq!(
+            instantiate_type_with_session(&mut second, parameter, mapper, None, &mut session),
+            Err(InstantiationError::InvalidRecoveryType(first_error)),
+        );
+        assert_eq!(session.query_count(), 0);
+        assert_eq!(session.total_count(), 0);
+        assert_eq!(session.depth, 0);
+        assert!(session.active_mappers.is_empty());
+        assert!(session.limit_event_occurred_since(mark));
     }
 
     #[test]
