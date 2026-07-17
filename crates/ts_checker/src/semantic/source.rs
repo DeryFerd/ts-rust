@@ -50,9 +50,10 @@ use super::{
         CanonicalTypeFormatFlags,
         get_type_names_for_assignability_error_with_host_global_types_and_flags,
     },
+    instantiate::InstantiationSession,
     logical_operators::{
-        LogicalBinaryError, LogicalBinaryInvariant, LogicalBinaryRequest,
-        LogicalBinaryUnsupported, check_logical_binary, narrow_logical_right_operand,
+        LogicalBinaryError, LogicalBinaryInvariant, LogicalBinaryRequest, LogicalBinaryUnsupported,
+        check_logical_binary, narrow_logical_right_operand,
     },
     object_members::{
         DeclaredPropertyObjectValidation, validate_resolved_declared_property_object,
@@ -85,14 +86,14 @@ use super::{
         plan_direct_source_element_syntax,
     },
     source_enums::{SourceEnumError, SourceEnumPlan, execute_top_level_enum, plan_top_level_enum},
+    source_flow::{
+        SourceFlowAssignment, SourceFlowCondition, SourceFlowError, SourceFlowFrame,
+        SourceFlowPlan, SourceTruthinessCondition, SourceTypeofComparison, SourceTypeofCondition,
+        SourceTypeofTag, source_typeof_narrowing_type_is_supported,
+    },
     source_functions::{
         PlannedFunctionRead, SourceFunctionInvariant, SourceFunctionPlanError,
         SourceFunctionUnsupported, plan_function_identifier_read, plan_top_level_function,
-    },
-    source_flow::{
-        SourceFlowAssignment, SourceFlowCondition, SourceFlowError, SourceFlowFrame,
-        SourceFlowPlan, SourceTruthinessCondition, SourceTypeofCondition,
-        SourceTypeofComparison, SourceTypeofTag, source_typeof_narrowing_type_is_supported,
     },
     source_imports::{
         PlannedSourceImportRead, PreparedSourceImportPublication, PreparedSourceImportValue,
@@ -115,8 +116,7 @@ use super::{
         SourceJoinedFunctionStatementsError, SourceJoinedFunctionStatementsInvariant,
         SourceJoinedFunctionStatementsSyntax, SourceLocalDeclarationSyntax,
         SourceReturnBranchSyntax, SourceTypeofConditionSyntax,
-        plan_source_function_statements_syntax,
-        plan_source_joined_function_statements_syntax,
+        plan_source_function_statements_syntax, plan_source_joined_function_statements_syntax,
     },
     type_nodes::{
         CanonicalTypeQuery, CanonicalTypeReferenceAliasTarget, normalize_bigint_literal,
@@ -1568,8 +1568,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     | SourceFunctionStatementsInvariant::InvalidCallableEdge(node)
                     | SourceFunctionStatementsInvariant::InvalidContainer { node, .. }
                     | SourceFunctionStatementsInvariant::InvalidBlockScopeContainer {
-                        node,
-                        ..
+                        node, ..
                     }
                     | SourceFunctionStatementsInvariant::MissingLocals(node)
                     | SourceFunctionStatementsInvariant::InvalidFlowContainer { node, .. }
@@ -1578,8 +1577,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     | SourceFunctionStatementsInvariant::UnexpectedReturnFlow(node)
                     | SourceFunctionStatementsInvariant::CyclicCondition(node) => node,
                     SourceFunctionStatementsInvariant::LocalTableMismatch {
-                        declaration,
-                        ..
+                        declaration, ..
                     } => declaration,
                     SourceFunctionStatementsInvariant::InvalidOrder { next, .. } => next,
                 };
@@ -1605,17 +1603,15 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 let node = match reason {
                     SourceJoinedFunctionStatementsInvariant::InvalidCallableEdge(node)
                     | SourceJoinedFunctionStatementsInvariant::InvalidFlowContainer {
-                        node,
-                        ..
+                        node, ..
                     }
                     | SourceJoinedFunctionStatementsInvariant::MissingFlowStart(node)
                     | SourceJoinedFunctionStatementsInvariant::UnexpectedFlowEnd(node)
                     | SourceJoinedFunctionStatementsInvariant::UnexpectedReturnFlow(node)
                     | SourceJoinedFunctionStatementsInvariant::MissingFlowPoint(node)
-                    | SourceJoinedFunctionStatementsInvariant::FlowPointMismatch {
-                        node,
-                        ..
-                    } => node,
+                    | SourceJoinedFunctionStatementsInvariant::FlowPointMismatch { node, .. } => {
+                        node
+                    }
                     SourceJoinedFunctionStatementsInvariant::MissingFlowNode(_)
                     | SourceJoinedFunctionStatementsInvariant::InvalidFlowNode(_) => {
                         callable.declaration
@@ -1635,14 +1631,12 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             | SourceFlowError::Narrowing {
                 error: LogicalBinaryError::Unsupported(LogicalBinaryUnsupported::Type(_)),
                 ..
-            } => {
-                SourceCheckError::Unsupported(UnsupportedSourceSyntax::Function(
-                    SourceFunctionUnsupported::FunctionBody(callable.body),
-                ))
+            } => SourceCheckError::Unsupported(UnsupportedSourceSyntax::Function(
+                SourceFunctionUnsupported::FunctionBody(callable.body),
+            )),
+            SourceFlowError::Invariant(_) => {
+                SourceCheckError::Function(SourceFunctionInvariant::Callable(callable.declaration))
             }
-            SourceFlowError::Invariant(_) => SourceCheckError::Function(
-                SourceFunctionInvariant::Callable(callable.declaration),
-            ),
             SourceFlowError::Narrowing {
                 condition,
                 error:
@@ -1652,8 +1646,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             #[cfg(not(test))]
             SourceFlowError::Narrowing {
                 condition,
-                error:
-                    LogicalBinaryError::Unsupported(LogicalBinaryUnsupported::MissingGlobalTypes),
+                error: LogicalBinaryError::Unsupported(LogicalBinaryUnsupported::MissingGlobalTypes),
             } => SourceCheckError::LogicalOperator(condition),
             SourceFlowError::Narrowing {
                 error: LogicalBinaryError::Literal(error),
@@ -2152,14 +2145,9 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             }
             Err(SourceFunctionStatementsError::Unsupported(_)) => {
                 let syntax = plan_source_joined_function_statements_syntax(
-                    self.arena,
-                    self.bound,
-                    store,
-                    callable,
+                    self.arena, self.bound, store, callable,
                 )
-                .map_err(|error| {
-                    Self::joined_function_statements_plan_error(callable, error)
-                })?;
+                .map_err(|error| Self::joined_function_statements_plan_error(callable, error))?;
                 let planned = self.finish_joined_function_statements(callable, syntax)?;
                 Ok(PlannedFunctionBody::JoinedStatements(Box::new(planned)))
             }
@@ -2202,19 +2190,9 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             .iter()
             .map(|local| local.name)
             .chain(std::iter::once(condition.flow_point()))
-            .chain(
-                then_branch
-                    .locals
-                    .iter()
-                    .map(|local| local.name),
-            )
+            .chain(then_branch.locals.iter().map(|local| local.name))
             .chain(std::iter::once(then_branch.return_statement))
-            .chain(
-                else_branch
-                    .locals
-                    .iter()
-                    .map(|local| local.name),
-            )
+            .chain(else_branch.locals.iter().map(|local| local.name))
             .chain(std::iter::once(else_branch.return_statement))
             .collect::<Vec<_>>();
         let assignments = leading
@@ -2316,16 +2294,18 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         )?;
         preflight_source_expression_cache(store, expression, bootstrap.boolean_type)?;
 
-        Ok(PlannedSourceCondition::Typeof(Box::new(PlannedTypeofCondition {
-            expression,
-            type_of_expression: typeof_syntax.type_of_expression,
-            identifier,
-            literal,
-            tag: typeof_syntax.tag,
-            comparison: typeof_syntax.comparison,
-            type_of_on_left: typeof_syntax.type_of_on_left,
-            symbol,
-        })))
+        Ok(PlannedSourceCondition::Typeof(Box::new(
+            PlannedTypeofCondition {
+                expression,
+                type_of_expression: typeof_syntax.type_of_expression,
+                identifier,
+                literal,
+                tag: typeof_syntax.tag,
+                comparison: typeof_syntax.comparison,
+                type_of_on_left: typeof_syntax.type_of_on_left,
+                symbol,
+            },
+        )))
     }
 
     fn unsupported_function_body(callable: &SourceCallablePlan) -> SourceCheckError {
@@ -3317,10 +3297,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         }
     }
 
-    fn plan_binary(
-        &mut self,
-        expression: NodeRef,
-    ) -> Result<PlannedExpression, SourceCheckError> {
+    fn plan_binary(&mut self, expression: NodeRef) -> Result<PlannedExpression, SourceCheckError> {
         let (left_id, operator_id, right_id) = {
             let record = self.node(expression)?;
             let NodeData::BinaryExpression(binary) = &record.data else {
@@ -4071,9 +4048,7 @@ fn preflight_inferred_function_return_dependencies(
             PlannedFunctionBody::Return { expression, .. } => {
                 expression_is_closed(expression, &function.callable.parameters, functions)
             }
-            PlannedFunctionBody::Statements(_) | PlannedFunctionBody::JoinedStatements(_) => {
-                false
-            }
+            PlannedFunctionBody::Statements(_) | PlannedFunctionBody::JoinedStatements(_) => false,
         };
         if !initializers_supported || !body_supported {
             return Err(SourceCheckError::Unsupported(
@@ -4128,9 +4103,7 @@ fn set_direct_binary_parent(expression: &mut PlannedExpression, parent: DirectBi
     }
 }
 
-fn logical_mix_grammar_diagnostic(
-    binary: &LogicalBinaryPlan,
-) -> Option<LogicalGrammarDiagnostic> {
+fn logical_mix_grammar_diagnostic(binary: &LogicalBinaryPlan) -> Option<LogicalGrammarDiagnostic> {
     fn direct_logical(expression: &PlannedExpression) -> Option<&LogicalBinaryPlan> {
         let PlannedExpressionKind::Logical(binary) = &expression.kind else {
             return None;
@@ -4589,9 +4562,9 @@ fn preflight_source_expression_cache(
         ..TypeNodeLinks::default()
     };
     if links != &canonical
-        || links.resolved_type.is_some_and(|cached| {
-            cached != expected || store.type_payload(cached).is_none()
-        })
+        || links
+            .resolved_type
+            .is_some_and(|cached| cached != expected || store.type_payload(cached).is_none())
     {
         return Err(SourceCheckError::Assertion(
             SourceAssertionError::InvalidExpressionCache {
@@ -4822,6 +4795,7 @@ fn check_expression_type(
     global_types: &CanonicalGlobalTypes,
     source: SourceFileRef,
     options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
     diagnostics: &mut CanonicalCheckerDiagnostics,
     current_flow_types: &HashMap<SemanticSymbolId, TypeId>,
     preflighted_type_import_value_uses: &HashMap<NodeRef, PreparedSourceTypeImportValueUse>,
@@ -4829,6 +4803,7 @@ fn check_expression_type(
     contextual_type: Option<TypeId>,
     deferred: &mut Vec<DeferredAssertion>,
 ) -> Result<CheckedExpressionTypes, SourceCheckError> {
+    session.reset_query();
     match &expression.kind {
         PlannedExpressionKind::TypeImportValueUse(read) => check_type_import_value_use(
             store,
@@ -4843,6 +4818,7 @@ fn check_expression_type(
                 global_types,
                 source,
                 options,
+                session,
                 diagnostics,
                 current_flow_types,
                 preflighted_type_import_value_uses,
@@ -4856,6 +4832,7 @@ fn check_expression_type(
                 global_types,
                 source,
                 options,
+                session,
                 diagnostics,
                 current_flow_types,
                 preflighted_type_import_value_uses,
@@ -4890,6 +4867,7 @@ fn check_expression_type(
                 global_types,
                 source,
                 options,
+                session,
                 diagnostics,
                 current_flow_types,
                 preflighted_type_import_value_uses,
@@ -4917,23 +4895,16 @@ fn check_expression_type(
                 global_types,
                 source,
                 options,
+                session,
                 diagnostics,
-                narrowed_flow_types
-                    .as_ref()
-                    .unwrap_or(current_flow_types),
+                narrowed_flow_types.as_ref().unwrap_or(current_flow_types),
                 preflighted_type_import_value_uses,
                 &binary.right,
                 right_contextual_type,
                 deferred,
             )?;
             emit_logical_grammar_diagnostic(diagnostics, binary)?;
-            emit_logical_operand_diagnostics(
-                store,
-                host,
-                diagnostics,
-                binary,
-                left.result,
-            )?;
+            emit_logical_operand_diagnostics(store, host, diagnostics, binary, left.result)?;
             let resolution = check_logical_binary(
                 store,
                 Some(global_types),
@@ -4957,6 +4928,7 @@ fn check_expression_type(
                 global_types,
                 source,
                 options,
+                session,
                 diagnostics,
                 current_flow_types,
                 preflighted_type_import_value_uses,
@@ -4970,6 +4942,7 @@ fn check_expression_type(
                 global_types,
                 source,
                 options,
+                session,
                 diagnostics,
                 current_flow_types,
                 preflighted_type_import_value_uses,
@@ -5009,6 +4982,7 @@ fn check_expression_type(
                 global_types,
                 source,
                 options,
+                session,
                 diagnostics,
                 current_flow_types,
                 preflighted_type_import_value_uses,
@@ -5025,6 +4999,7 @@ fn check_expression_type(
                         global_types,
                         source,
                         options,
+                        session,
                         diagnostics,
                         current_flow_types,
                         preflighted_type_import_value_uses,
@@ -5040,6 +5015,7 @@ fn check_expression_type(
                 host,
                 global_types,
                 options,
+                session,
                 diagnostics,
                 call,
                 callee.result,
@@ -5057,6 +5033,7 @@ fn check_expression_type(
                 global_types,
                 source,
                 options,
+                session,
                 diagnostics,
                 current_flow_types,
                 preflighted_type_import_value_uses,
@@ -5074,6 +5051,7 @@ fn check_expression_type(
                 global_types,
                 source,
                 options,
+                session,
                 diagnostics,
                 current_flow_types,
                 preflighted_type_import_value_uses,
@@ -5083,11 +5061,12 @@ fn check_expression_type(
             )?;
             publish_assertion_operand(store, expression.node, operand_types.result)?;
             let mut assertion_diagnostics = CanonicalCheckerDiagnostics::default();
-            let target = CanonicalTypeQuery::new_with_global_types(
+            let target = CanonicalTypeQuery::new_with_global_types_and_session(
                 store,
                 host,
                 global_types,
                 options,
+                session,
                 &mut assertion_diagnostics,
             )?
             .get_type_from_type_node(*type_node);
@@ -5170,17 +5149,14 @@ fn narrow_logical_right_flow_types(
         if !seen.insert(read.value_symbol) {
             continue;
         }
-        let current = *current_flow_types.get(&read.value_symbol).ok_or(
-            SourceCheckError::Variable(VariableInvariant::MissingCurrentFlowType(
-                read.value_symbol,
-            )),
-        )?;
-        let type_ = narrow_logical_right_operand(
-            store,
-            Some(global_types),
-            binary.operator,
-            current,
-        )
+        let current =
+            *current_flow_types
+                .get(&read.value_symbol)
+                .ok_or(SourceCheckError::Variable(
+                    VariableInvariant::MissingCurrentFlowType(read.value_symbol),
+                ))?;
+        let type_ =
+            narrow_logical_right_operand(store, Some(global_types), binary.operator, current)
                 .map_err(|error| logical_binary_check_error(host, binary, &error))?;
         narrowed.insert(read.value_symbol, type_);
     }
@@ -5365,9 +5341,7 @@ fn syntactic_truthiness(
 fn syntactic_nullishness(expression: &PlannedExpression) -> PredicateSemantics {
     match &expression.kind {
         PlannedExpressionKind::Parenthesized(inner)
-        | PlannedExpressionKind::Assertion { operand: inner, .. } => {
-            syntactic_nullishness(inner)
-        }
+        | PlannedExpressionKind::Assertion { operand: inner, .. } => syntactic_nullishness(inner),
         PlannedExpressionKind::Null | PlannedExpressionKind::GlobalUndefined => {
             PredicateSemantics::Always
         }
@@ -5410,7 +5384,9 @@ fn logical_binary_check_error(
             let node = binary.left.node;
             SourceCheckError::Unsupported(UnsupportedSourceSyntax::Syntax {
                 node,
-                kind: host.node(node).map_or(SyntaxKind::Unknown, |record| record.kind),
+                kind: host
+                    .node(node)
+                    .map_or(SyntaxKind::Unknown, |record| record.kind),
                 role: SourceSyntaxRole::BinaryOperand,
             })
         }
@@ -5516,6 +5492,7 @@ fn check_deferred_assertions(
     host: &DeclaredTypeHost<'_>,
     global_types: &CanonicalGlobalTypes,
     options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
     diagnostics: &mut CanonicalCheckerDiagnostics,
     deferred: &[DeferredAssertion],
 ) -> Result<(), SourceCheckError> {
@@ -5524,6 +5501,7 @@ fn check_deferred_assertions(
         flags |= CanonicalTypeFormatFlags::NO_TRUNCATION;
     }
     for assertion in deferred {
+        session.reset_query();
         let (operand, widened) =
             assertion_operand_types(store, global_types, assertion.operand_type)?;
         if store.is_type_comparable_to_with_global_types(
@@ -5598,6 +5576,7 @@ fn check_planned_assignment(
     global_types: &CanonicalGlobalTypes,
     source: SourceFileRef,
     options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
     diagnostics: &mut CanonicalCheckerDiagnostics,
     flow_types: &HashMap<SemanticSymbolId, TypeId>,
     preflighted_type_import_value_uses: &HashMap<NodeRef, PreparedSourceTypeImportValueUse>,
@@ -5609,11 +5588,12 @@ fn check_planned_assignment(
     assignment_expression: Option<NodeRef>,
 ) -> Result<CheckedAssignment, SourceCheckError> {
     let mut statement_diagnostics = CanonicalCheckerDiagnostics::default();
-    let target = CanonicalTypeQuery::new_with_global_types(
+    let target = CanonicalTypeQuery::new_with_global_types_and_session(
         store,
         host,
         global_types,
         options,
+        session,
         &mut statement_diagnostics,
     )?
     .with_type_reference_alias_targets(type_reference_alias_targets.iter().copied())?
@@ -5629,6 +5609,7 @@ fn check_planned_assignment(
         global_types,
         source,
         options,
+        session,
         diagnostics,
         flow_types,
         preflighted_type_import_value_uses,
@@ -5645,6 +5626,7 @@ fn check_planned_assignment(
         host,
         global_types,
         options,
+        session,
         diagnostics,
         source_type,
         target,
@@ -5675,6 +5657,7 @@ fn source_type_is_assignable_to(
     host: &DeclaredTypeHost<'_>,
     global_types: &CanonicalGlobalTypes,
     options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
     diagnostics: &mut CanonicalCheckerDiagnostics,
     source: TypeId,
     target: TypeId,
@@ -5693,11 +5676,12 @@ fn source_type_is_assignable_to(
                     return Err(RelationUnavailable::UnresolvedSignatureReturn(signature).into());
                 }
                 let mut resolution_diagnostics = CanonicalCheckerDiagnostics::default();
-                let resolved = CanonicalTypeQuery::new_with_global_types(
+                let resolved = CanonicalTypeQuery::new_with_global_types_and_session(
                     store,
                     host,
                     global_types,
                     options,
+                    session,
                     &mut resolution_diagnostics,
                 )?
                 .get_return_type_of_signature(signature);
@@ -5728,6 +5712,7 @@ fn check_callable_parameter_initializers(
     global_types: &CanonicalGlobalTypes,
     source: SourceFileRef,
     options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
     diagnostics: &mut CanonicalCheckerDiagnostics,
     outer_flow_types: &HashMap<SemanticSymbolId, TypeId>,
     preflighted_type_import_value_uses: &HashMap<NodeRef, PreparedSourceTypeImportValueUse>,
@@ -5760,6 +5745,7 @@ fn check_callable_parameter_initializers(
                 global_types,
                 source,
                 options,
+                session,
                 diagnostics,
                 &flow_types,
                 preflighted_type_import_value_uses,
@@ -5801,6 +5787,7 @@ fn check_planned_function_statements(
     global_types: &CanonicalGlobalTypes,
     source: SourceFileRef,
     options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
     diagnostics: &mut CanonicalCheckerDiagnostics,
     base_flow_types: HashMap<SemanticSymbolId, TypeId>,
     preflighted_type_import_value_uses: &HashMap<NodeRef, PreparedSourceTypeImportValueUse>,
@@ -5822,6 +5809,7 @@ fn check_planned_function_statements(
         global_types,
         source,
         options,
+        session,
         diagnostics,
         &mut frame,
         preflighted_type_import_value_uses,
@@ -5839,6 +5827,7 @@ fn check_planned_function_statements(
         global_types,
         source,
         options,
+        session,
         diagnostics,
         &mut frame,
         preflighted_type_import_value_uses,
@@ -5853,6 +5842,7 @@ fn check_planned_function_statements(
         global_types,
         source,
         options,
+        session,
         diagnostics,
         &mut frame,
         preflighted_type_import_value_uses,
@@ -5870,6 +5860,7 @@ fn check_planned_function_statements(
         global_types,
         source,
         options,
+        session,
         diagnostics,
         &mut frame,
         preflighted_type_import_value_uses,
@@ -5891,6 +5882,7 @@ fn check_planned_joined_function_statements(
     global_types: &CanonicalGlobalTypes,
     source: SourceFileRef,
     options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
     diagnostics: &mut CanonicalCheckerDiagnostics,
     base_flow_types: HashMap<SemanticSymbolId, TypeId>,
     preflighted_type_import_value_uses: &HashMap<NodeRef, PreparedSourceTypeImportValueUse>,
@@ -5912,6 +5904,7 @@ fn check_planned_joined_function_statements(
         global_types,
         source,
         options,
+        session,
         diagnostics,
         &mut frame,
         preflighted_type_import_value_uses,
@@ -5928,6 +5921,7 @@ fn check_planned_joined_function_statements(
         global_types,
         source,
         options,
+        session,
         diagnostics,
         &mut frame,
         preflighted_type_import_value_uses,
@@ -5941,6 +5935,7 @@ fn check_planned_joined_function_statements(
         global_types,
         source,
         options,
+        session,
         diagnostics,
         &mut frame,
         preflighted_type_import_value_uses,
@@ -5957,6 +5952,7 @@ fn check_planned_joined_function_statements(
         global_types,
         source,
         options,
+        session,
         diagnostics,
         &mut frame,
         preflighted_type_import_value_uses,
@@ -5973,6 +5969,7 @@ fn check_planned_joined_function_statements(
         global_types,
         source,
         options,
+        session,
         diagnostics,
         &mut frame,
         preflighted_type_import_value_uses,
@@ -5986,12 +5983,14 @@ fn check_planned_joined_function_statements(
     let snapshot = frame
         .snapshot_at(store, global_types, statements.return_statement)
         .map_err(|error| SourcePlanner::source_flow_plan_error(callable, error))?;
+    session.reset_query();
     check_planned_assignment(
         store,
         host,
         global_types,
         source,
         options,
+        session,
         diagnostics,
         snapshot.types(),
         preflighted_type_import_value_uses,
@@ -6012,6 +6011,7 @@ fn check_planned_source_condition(
     global_types: &CanonicalGlobalTypes,
     source: SourceFileRef,
     options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
     diagnostics: &mut CanonicalCheckerDiagnostics,
     frame: &mut SourceFlowFrame<'_, '_>,
     preflighted_type_import_value_uses: &HashMap<NodeRef, PreparedSourceTypeImportValueUse>,
@@ -6027,6 +6027,7 @@ fn check_planned_source_condition(
                 global_types,
                 source,
                 options,
+                session,
                 diagnostics,
                 frame,
                 preflighted_type_import_value_uses,
@@ -6042,6 +6043,7 @@ fn check_planned_source_condition(
             global_types,
             source,
             options,
+            session,
             diagnostics,
             frame,
             preflighted_type_import_value_uses,
@@ -6059,6 +6061,7 @@ fn check_planned_truthiness_condition(
     global_types: &CanonicalGlobalTypes,
     source: SourceFileRef,
     options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
     diagnostics: &mut CanonicalCheckerDiagnostics,
     frame: &mut SourceFlowFrame<'_, '_>,
     preflighted_type_import_value_uses: &HashMap<NodeRef, PreparedSourceTypeImportValueUse>,
@@ -6076,6 +6079,7 @@ fn check_planned_truthiness_condition(
         global_types,
         source,
         options,
+        session,
         diagnostics,
         condition_flow.types(),
         preflighted_type_import_value_uses,
@@ -6115,6 +6119,7 @@ fn check_planned_typeof_condition(
     global_types: &CanonicalGlobalTypes,
     source: SourceFileRef,
     options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
     diagnostics: &mut CanonicalCheckerDiagnostics,
     frame: &mut SourceFlowFrame<'_, '_>,
     preflighted_type_import_value_uses: &HashMap<NodeRef, PreparedSourceTypeImportValueUse>,
@@ -6130,15 +6135,11 @@ fn check_planned_typeof_condition(
         .ok_or(SourceCheckError::Variable(
             VariableInvariant::MissingCurrentFlowType(condition.symbol),
         ))?;
-    let supported = source_typeof_narrowing_type_is_supported(
-        store,
-        global_types,
-        current,
-        condition.tag,
-    )
-        .map_err(|_| {
-            SourceCheckError::Function(SourceFunctionInvariant::Callable(callable.declaration))
-        })?;
+    let supported =
+        source_typeof_narrowing_type_is_supported(store, global_types, current, condition.tag)
+            .map_err(|_| {
+                SourceCheckError::Function(SourceFunctionInvariant::Callable(callable.declaration))
+            })?;
     if !supported {
         return Err(SourceCheckError::Unsupported(
             UnsupportedSourceSyntax::Function(SourceFunctionUnsupported::FunctionBody(
@@ -6160,6 +6161,7 @@ fn check_planned_typeof_condition(
             global_types,
             source,
             options,
+            session,
             diagnostics,
             condition_flow.types(),
             preflighted_type_import_value_uses,
@@ -6179,6 +6181,7 @@ fn check_planned_typeof_condition(
             global_types,
             source,
             options,
+            session,
             diagnostics,
             condition_flow.types(),
             preflighted_type_import_value_uses,
@@ -6193,6 +6196,7 @@ fn check_planned_typeof_condition(
             global_types,
             source,
             options,
+            session,
             diagnostics,
             condition_flow.types(),
             preflighted_type_import_value_uses,
@@ -6206,6 +6210,7 @@ fn check_planned_typeof_condition(
             global_types,
             source,
             options,
+            session,
             diagnostics,
             condition_flow.types(),
             preflighted_type_import_value_uses,
@@ -6236,18 +6241,14 @@ fn source_truthiness_condition_type_is_supported(
         let named_promise = record
             .symbol()
             .and_then(|symbol| store.symbol(symbol))
-            .is_some_and(|symbol| {
-                matches!(symbol.name().as_bytes(), b"Promise" | b"PromiseLike")
-            });
+            .is_some_and(|symbol| matches!(symbol.name().as_bytes(), b"Promise" | b"PromiseLike"));
         let union_types = match record.data() {
             TypeData::Union(union) => Some(union.union.types.clone()),
             _ => None,
         };
         (record.flags(), named_promise, union_types)
     };
-    if flags.intersects(
-        TypeFlags::UNKNOWN | TypeFlags::TYPE_PARAMETER | TypeFlags::INTERSECTION,
-    ) {
+    if flags.intersects(TypeFlags::UNKNOWN | TypeFlags::TYPE_PARAMETER | TypeFlags::INTERSECTION) {
         return Ok(false);
     }
     if named_promise {
@@ -6312,6 +6313,7 @@ fn check_planned_function_locals(
     global_types: &CanonicalGlobalTypes,
     source: SourceFileRef,
     options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
     diagnostics: &mut CanonicalCheckerDiagnostics,
     frame: &mut SourceFlowFrame<'_, '_>,
     preflighted_type_import_value_uses: &HashMap<NodeRef, PreparedSourceTypeImportValueUse>,
@@ -6323,6 +6325,7 @@ fn check_planned_function_locals(
     value_order: &mut Vec<SemanticSymbolId>,
 ) -> Result<(), SourceCheckError> {
     for local in locals {
+        session.reset_query();
         let snapshot = frame
             .snapshot_at(store, global_types, local.name)
             .map_err(|error| SourcePlanner::source_flow_plan_error(callable, error))?;
@@ -6333,6 +6336,7 @@ fn check_planned_function_locals(
                 global_types,
                 source,
                 options,
+                session,
                 diagnostics,
                 snapshot.types(),
                 preflighted_type_import_value_uses,
@@ -6352,6 +6356,7 @@ fn check_planned_function_locals(
                     host,
                     global_types,
                     options,
+                    session,
                     diagnostics,
                     assignment,
                 )?,
@@ -6363,6 +6368,7 @@ fn check_planned_function_locals(
                 global_types,
                 source,
                 options,
+                session,
                 diagnostics,
                 snapshot.types(),
                 preflighted_type_import_value_uses,
@@ -6370,17 +6376,14 @@ fn check_planned_function_locals(
                 None,
                 deferred,
             )?;
-            let declared_type = inferred_variable_type(
-                store,
-                global_types,
-                local.binding,
-                initializer.result,
-            )?;
+            let declared_type =
+                inferred_variable_type(store, global_types, local.binding, initializer.result)?;
             let current_type = current_flow_type_after_assignment(
                 store,
                 host,
                 global_types,
                 options,
+                session,
                 diagnostics,
                 CheckedAssignment {
                     declared_type,
@@ -6410,6 +6413,7 @@ fn check_planned_return_branch(
     global_types: &CanonicalGlobalTypes,
     source: SourceFileRef,
     options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
     diagnostics: &mut CanonicalCheckerDiagnostics,
     frame: &mut SourceFlowFrame<'_, '_>,
     preflighted_type_import_value_uses: &HashMap<NodeRef, PreparedSourceTypeImportValueUse>,
@@ -6427,6 +6431,7 @@ fn check_planned_return_branch(
         global_types,
         source,
         options,
+        session,
         diagnostics,
         frame,
         preflighted_type_import_value_uses,
@@ -6440,12 +6445,14 @@ fn check_planned_return_branch(
     let snapshot = frame
         .snapshot_at(store, global_types, branch.return_statement)
         .map_err(|error| SourcePlanner::source_flow_plan_error(callable, error))?;
+    session.reset_query();
     check_planned_assignment(
         store,
         host,
         global_types,
         source,
         options,
+        session,
         diagnostics,
         snapshot.types(),
         preflighted_type_import_value_uses,
@@ -6464,6 +6471,7 @@ fn current_flow_type_after_assignment(
     host: &DeclaredTypeHost<'_>,
     global_types: &CanonicalGlobalTypes,
     options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
     diagnostics: &mut CanonicalCheckerDiagnostics,
     assignment: CheckedAssignment,
 ) -> Result<TypeId, SourceCheckError> {
@@ -6520,6 +6528,7 @@ fn current_flow_type_after_assignment(
             host,
             global_types,
             options,
+            session,
             diagnostics,
             &assigned_constituents,
             *target,
@@ -6535,6 +6544,7 @@ fn current_flow_type_after_assignment(
         host,
         global_types,
         options,
+        session,
         diagnostics,
         declared_type,
         &declared_constituents,
@@ -6552,6 +6562,7 @@ fn current_flow_type_after_assignment(
         host,
         global_types,
         options,
+        session,
         diagnostics,
         assigned_type,
         candidate,
@@ -6567,6 +6578,7 @@ fn assignment_type_maybe_assignable_to(
     host: &DeclaredTypeHost<'_>,
     global_types: &CanonicalGlobalTypes,
     options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
     diagnostics: &mut CanonicalCheckerDiagnostics,
     assigned_constituents: &[TypeId],
     target: TypeId,
@@ -6580,6 +6592,7 @@ fn assignment_type_maybe_assignable_to(
             host,
             global_types,
             options,
+            session,
             diagnostics,
             *source,
             target,
@@ -6596,6 +6609,7 @@ fn filtered_assignment_union_type(
     host: &DeclaredTypeHost<'_>,
     global_types: &CanonicalGlobalTypes,
     options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
     diagnostics: &mut CanonicalCheckerDiagnostics,
     declared_type: TypeId,
     declared_constituents: &[TypeId],
@@ -6627,6 +6641,7 @@ fn filtered_assignment_union_type(
                     host,
                     global_types,
                     options,
+                    session,
                     diagnostics,
                     assigned_constituents,
                     *constituent,
@@ -6962,15 +6977,17 @@ fn materialize_checked_source_callable(
     host: &DeclaredTypeHost<'_>,
     global_types: &CanonicalGlobalTypes,
     options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
     diagnostics: &mut CanonicalCheckerDiagnostics,
     callable: &SourceCallablePlan,
 ) -> Result<MaterializedSourceCallable, SourceCheckError> {
     let mut callable_diagnostics = CanonicalCheckerDiagnostics::default();
-    let type_result = CanonicalTypeQuery::new_with_global_types(
+    let type_result = CanonicalTypeQuery::new_with_global_types_and_session(
         store,
         host,
         global_types,
         options,
+        session,
         &mut callable_diagnostics,
     )
     .and_then(|mut query| {
@@ -7011,11 +7028,12 @@ fn materialize_checked_source_callable(
         ))?;
     if !callable.return_type.is_inferred() {
         let mut return_diagnostics = CanonicalCheckerDiagnostics::default();
-        let return_result = CanonicalTypeQuery::new_with_global_types(
+        let return_result = CanonicalTypeQuery::new_with_global_types_and_session(
             store,
             host,
             global_types,
             options,
+            session,
             &mut return_diagnostics,
         )
         .and_then(|mut query| query.get_return_type_of_signature(signature));
@@ -7032,6 +7050,7 @@ fn publish_checked_source_callable_return(
     global_types: &CanonicalGlobalTypes,
     source: SourceFileRef,
     options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
     diagnostics: &mut CanonicalCheckerDiagnostics,
     flow_types: &HashMap<SemanticSymbolId, TypeId>,
     preflighted_type_import_value_uses: &HashMap<NodeRef, PreparedSourceTypeImportValueUse>,
@@ -7048,6 +7067,7 @@ fn publish_checked_source_callable_return(
                 global_types,
                 source,
                 options,
+                session,
                 diagnostics,
                 flow_types,
                 preflighted_type_import_value_uses,
@@ -7091,7 +7111,11 @@ fn function_declaration_flow_types(
     declared_types: &HashMap<SemanticSymbolId, TypeId>,
 ) -> HashMap<SemanticSymbolId, TypeId> {
     let mut captured = current_flow_types.clone();
-    captured.extend(declared_types.iter().map(|(symbol, type_)| (*symbol, *type_)));
+    captured.extend(
+        declared_types
+            .iter()
+            .map(|(symbol, type_)| (*symbol, *type_)),
+    );
     captured
 }
 
@@ -7101,15 +7125,17 @@ fn resolve_contextual_callable_target(
     host: &DeclaredTypeHost<'_>,
     global_types: &CanonicalGlobalTypes,
     options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
     diagnostics: &mut CanonicalCheckerDiagnostics,
     arrow: &SourceContextualArrowPlan,
 ) -> Result<(TypeId, ValidatedSingleCallable), SourceCheckError> {
     let mut target_diagnostics = CanonicalCheckerDiagnostics::default();
-    let target = CanonicalTypeQuery::new_with_global_types(
+    let target = CanonicalTypeQuery::new_with_global_types_and_session(
         store,
         host,
         global_types,
         options,
+        session,
         &mut target_diagnostics,
     )?
     .get_type_from_type_node(arrow.contextual_type.type_node);
@@ -7126,11 +7152,12 @@ fn resolve_contextual_callable_target(
             }
             StoredSingleCallableValidation::Valid { callable, .. } if !resolved_return => {
                 let mut return_diagnostics = CanonicalCheckerDiagnostics::default();
-                let result = CanonicalTypeQuery::new_with_global_types(
+                let result = CanonicalTypeQuery::new_with_global_types_and_session(
                     store,
                     host,
                     global_types,
                     options,
+                    session,
                     &mut return_diagnostics,
                 )?
                 .get_return_type_of_signature(callable.signature);
@@ -7256,11 +7283,19 @@ fn materialize_contextual_source_arrow(
     host: &DeclaredTypeHost<'_>,
     global_types: &CanonicalGlobalTypes,
     options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
     diagnostics: &mut CanonicalCheckerDiagnostics,
     arrow: &SourceContextualArrowPlan,
 ) -> Result<(TypeId, TypeId), SourceCheckError> {
-    let (target, target_callable) =
-        resolve_contextual_callable_target(store, host, global_types, options, diagnostics, arrow)?;
+    let (target, target_callable) = resolve_contextual_callable_target(
+        store,
+        host,
+        global_types,
+        options,
+        session,
+        diagnostics,
+        arrow,
+    )?;
     preflight_contextual_source_publication(store, arrow, Some(target))?;
     let target_signature = store
         .signature(target_callable.signature)
@@ -7362,6 +7397,7 @@ fn materialize_contextual_source_arrow(
         host,
         global_types,
         options,
+        session,
         diagnostics,
         callable,
         target,
@@ -7405,6 +7441,7 @@ pub(super) fn check_source_file(
     global_types: &CanonicalGlobalTypes,
     store: &mut CanonicalTypeMapperStore,
     options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
     diagnostics: &mut CanonicalCheckerDiagnostics,
 ) -> Result<(), SourceCheckError> {
     if !store.contains_source_file(source) {
@@ -7504,11 +7541,13 @@ pub(super) fn check_source_file(
 
     let mut type_import_preflight_diagnostics = CanonicalCheckerDiagnostics::default();
     for root in type_import_root_order {
-        CanonicalTypeQuery::new_with_global_types(
+        session.reset_query();
+        CanonicalTypeQuery::new_with_global_types_and_session(
             store,
             host,
             global_types,
             options,
+            session,
             &mut type_import_preflight_diagnostics,
         )?
         .with_type_reference_alias_targets(
@@ -7554,6 +7593,7 @@ pub(super) fn check_source_file(
         if !prepared_import_aliases.insert(read.value_symbol) {
             continue;
         }
+        session.reset_query();
         let resolved = resolved_imports
             .get(&read.value_symbol)
             .ok_or(SourceCheckError::Import(read.node))?;
@@ -7578,11 +7618,13 @@ pub(super) fn check_source_file(
 
     let mut materialized_functions = Vec::with_capacity(functions.len());
     for function in &functions {
+        session.reset_query();
         let materialized = materialize_checked_source_callable(
             store,
             host,
             global_types,
             options,
+            session,
             diagnostics,
             &function.callable,
         )?;
@@ -7606,6 +7648,7 @@ pub(super) fn check_source_file(
         if !function.callable.return_type.is_inferred() {
             continue;
         }
+        session.reset_query();
         let mut function_diagnostics = CanonicalCheckerDiagnostics::default();
         let body_flow_types = check_callable_parameter_initializers(
             store,
@@ -7613,6 +7656,7 @@ pub(super) fn check_source_file(
             global_types,
             source,
             options,
+            session,
             &mut function_diagnostics,
             &current_flow_types,
             &preflighted_type_import_value_uses,
@@ -7635,6 +7679,7 @@ pub(super) fn check_source_file(
             global_types,
             source,
             options,
+            session,
             &mut function_diagnostics,
             &body_flow_types,
             &preflighted_type_import_value_uses,
@@ -7647,14 +7692,16 @@ pub(super) fn check_source_file(
     }
 
     for statement in statements {
+        session.reset_query();
         match statement {
             PlannedStatement::TypeAlias(symbol) | PlannedStatement::Interface(symbol) => {
                 let mut statement_diagnostics = CanonicalCheckerDiagnostics::default();
-                let result = CanonicalTypeQuery::new_with_global_types(
+                let result = CanonicalTypeQuery::new_with_global_types_and_session(
                     store,
                     host,
                     global_types,
                     options,
+                    session,
                     &mut statement_diagnostics,
                 )
                 .and_then(|mut query| query.get_declared_type_of_symbol(symbol));
@@ -7700,16 +7747,15 @@ pub(super) fn check_source_file(
                         SourceFunctionInvariant::Callable(function.callable.declaration),
                     ));
                 };
-                let captured_flow_types = function_declaration_flow_types(
-                    &current_flow_types,
-                    &top_level_declared_types,
-                );
+                let captured_flow_types =
+                    function_declaration_flow_types(&current_flow_types, &top_level_declared_types);
                 let body_flow_types = check_callable_parameter_initializers(
                     store,
                     host,
                     global_types,
                     source,
                     options,
+                    session,
                     diagnostics,
                     &captured_flow_types,
                     &preflighted_type_import_value_uses,
@@ -7723,12 +7769,14 @@ pub(super) fn check_source_file(
                         statement,
                         expression,
                     } => {
+                        session.reset_query();
                         check_planned_assignment(
                             store,
                             host,
                             global_types,
                             source,
                             options,
+                            session,
                             diagnostics,
                             &body_flow_types,
                             &preflighted_type_import_value_uses,
@@ -7748,6 +7796,7 @@ pub(super) fn check_source_file(
                             global_types,
                             source,
                             options,
+                            session,
                             diagnostics,
                             body_flow_types,
                             &preflighted_type_import_value_uses,
@@ -7768,6 +7817,7 @@ pub(super) fn check_source_file(
                             global_types,
                             source,
                             options,
+                            session,
                             diagnostics,
                             body_flow_types,
                             &preflighted_type_import_value_uses,
@@ -7791,6 +7841,7 @@ pub(super) fn check_source_file(
                     host,
                     global_types,
                     options,
+                    session,
                     diagnostics,
                     &arrow.source.callable,
                 )?;
@@ -7806,6 +7857,7 @@ pub(super) fn check_source_file(
                         global_types,
                         source,
                         options,
+                        session,
                         diagnostics,
                         &captured_flow_types,
                         &preflighted_type_import_value_uses,
@@ -7823,6 +7875,7 @@ pub(super) fn check_source_file(
                         global_types,
                         source,
                         options,
+                        session,
                         diagnostics,
                         &body_flow_types,
                         &preflighted_type_import_value_uses,
@@ -7857,6 +7910,7 @@ pub(super) fn check_source_file(
                     host,
                     global_types,
                     options,
+                    session,
                     diagnostics,
                     &arrow.source,
                 )?;
@@ -7886,6 +7940,7 @@ pub(super) fn check_source_file(
                                 global_types,
                                 source,
                                 options,
+                                session,
                                 diagnostics,
                                 &current_flow_types,
                                 &preflighted_type_import_value_uses,
@@ -7905,6 +7960,7 @@ pub(super) fn check_source_file(
                                     host,
                                     global_types,
                                     options,
+                                    session,
                                     diagnostics,
                                     assignment,
                                 )?,
@@ -7916,6 +7972,7 @@ pub(super) fn check_source_file(
                                 global_types,
                                 source,
                                 options,
+                                session,
                                 diagnostics,
                                 &current_flow_types,
                                 &preflighted_type_import_value_uses,
@@ -7934,6 +7991,7 @@ pub(super) fn check_source_file(
                                 host,
                                 global_types,
                                 options,
+                                session,
                                 diagnostics,
                                 CheckedAssignment {
                                     declared_type,
@@ -7989,6 +8047,7 @@ pub(super) fn check_source_file(
                     global_types,
                     source,
                     options,
+                    session,
                     diagnostics,
                     &current_flow_types,
                     &preflighted_type_import_value_uses,
@@ -8013,6 +8072,7 @@ pub(super) fn check_source_file(
                     host,
                     global_types,
                     options,
+                    session,
                     diagnostics,
                     checked,
                 )?;
@@ -8030,6 +8090,7 @@ pub(super) fn check_source_file(
         if arrow.source.callable.return_type.is_inferred() {
             continue;
         }
+        session.reset_query();
         let Some(return_type) = arrow.source.callable.return_type.type_node() else {
             return Err(SourceCheckError::Arrow(arrow.source.callable.declaration));
         };
@@ -8039,6 +8100,7 @@ pub(super) fn check_source_file(
             global_types,
             source,
             options,
+            session,
             diagnostics,
             &captured_flow_types,
             &preflighted_type_import_value_uses,
@@ -8052,12 +8114,14 @@ pub(super) fn check_source_file(
                 diagnostic_node,
                 expression,
             } => {
+                session.reset_query();
                 check_planned_assignment(
                     store,
                     host,
                     global_types,
                     source,
                     options,
+                    session,
                     diagnostics,
                     &body_flow_types,
                     &preflighted_type_import_value_uses,
@@ -8073,7 +8137,15 @@ pub(super) fn check_source_file(
     }
 
     validate_deferred_assertions(store, source, &deferred)?;
-    check_deferred_assertions(store, host, global_types, options, diagnostics, &deferred)?;
+    check_deferred_assertions(
+        store,
+        host,
+        global_types,
+        options,
+        session,
+        diagnostics,
+        &deferred,
+    )?;
     let import_publications =
         preflight_prepared_source_import_publications(store, &prepared_imports)
             .map_err(|error| SourcePlanner::import_plan_error(source.node_ref(), &error))?;
