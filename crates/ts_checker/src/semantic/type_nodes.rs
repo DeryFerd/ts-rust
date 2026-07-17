@@ -38,6 +38,7 @@ use super::{
         plan_concrete_indexed_access,
     },
     instantiate::{InstantiationLimits, InstantiationSession},
+    intersection_types::IntersectionTypeError,
     keyof_types::{
         NongenericKeyofError, cached_nongeneric_keyof_type, plan_nongeneric_keyof_type,
         resolve_nongeneric_keyof_type,
@@ -184,6 +185,14 @@ pub enum TypeNodeUnavailable {
     UnsupportedUnionConstituent(NodeRef),
     UnsupportedUnionConstituentType(TypeId),
     InvalidCachedUnionType(TypeId),
+    InvalidIntersectionType(NodeRef),
+    MissingPlannedIntersectionType(NodeRef),
+    UnsupportedIntersectionConstituent(NodeRef),
+    UnsupportedIntersectionProperty(NodeRef),
+    UnsupportedIntersectionConstituentType(TypeId),
+    UnsupportedIntersectionOptionalProperty(SemanticSymbolId),
+    UnsupportedIntersectionPropertyType(TypeId),
+    InvalidCachedIntersectionType(TypeId),
     InvalidCachedArrayType(TypeId),
     InvalidIndexedAccessType(NodeRef),
     MissingPlannedIndexedAccessType(NodeRef),
@@ -265,6 +274,7 @@ struct TypeQueryPlan {
     references: BTreeMap<NodeRef, PlannedTypeReference>,
     literals: BTreeMap<NodeRef, PlannedLiteralType>,
     unions: BTreeMap<NodeRef, PlannedUnionType>,
+    intersections: BTreeMap<NodeRef, PlannedIntersectionType>,
     type_literals: BTreeMap<NodeRef, PropertyObjectPlan>,
     interfaces: BTreeMap<SemanticSymbolId, PropertyObjectPlan>,
     functions: BTreeMap<NodeRef, FunctionTypePlan>,
@@ -280,6 +290,12 @@ struct PlannedArrayType {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct PlannedUnionType {
+    types: Vec<NodeRef>,
+    alias_symbol: Option<SemanticSymbolId>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PlannedIntersectionType {
     types: Vec<NodeRef>,
     alias_symbol: Option<SemanticSymbolId>,
 }
@@ -321,6 +337,7 @@ fn write_type_list(hasher: &mut Xxh3, types: &[TypeId]) {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CachedTypeAliasRhs {
     DirectUnion,
+    DirectIntersection(NodeRef),
     TypeReference(NodeRef),
     TypeLiteral(NodeRef),
     FunctionType(NodeRef),
@@ -577,6 +594,38 @@ fn type_construction_error(error: LiteralTypeCacheError) -> DeclaredTypeError {
         }
         LiteralTypeCacheError::Capacity => {
             type_node_unavailable(TypeNodeUnavailable::LiteralTypeCapacity)
+        }
+    }
+}
+
+fn intersection_type_error(
+    error: IntersectionTypeError,
+    node: NodeRef,
+) -> DeclaredTypeError {
+    match error {
+        IntersectionTypeError::BootstrapUninitialized => DeclaredTypeError::Unavailable(
+            DeclaredTypeUnavailable::IntrinsicBootstrapNotInitialized,
+        ),
+        IntersectionTypeError::Capacity => {
+            type_node_unavailable(TypeNodeUnavailable::LiteralTypeCapacity)
+        }
+        IntersectionTypeError::UnsupportedConstituent(type_) => type_node_unavailable(
+            TypeNodeUnavailable::UnsupportedIntersectionConstituentType(type_),
+        ),
+        IntersectionTypeError::UnsupportedOptionalProperty(symbol) => type_node_unavailable(
+            TypeNodeUnavailable::UnsupportedIntersectionOptionalProperty(symbol),
+        ),
+        IntersectionTypeError::UnsupportedPropertyType(type_) => type_node_unavailable(
+            TypeNodeUnavailable::UnsupportedIntersectionPropertyType(type_),
+        ),
+        IntersectionTypeError::MalformedConstituent(_) => {
+            type_node_unavailable(TypeNodeUnavailable::InvalidIntersectionType(node))
+        }
+        IntersectionTypeError::InvalidAliasSymbol(_) => {
+            type_node_unavailable(TypeNodeUnavailable::InvalidIntersectionType(node))
+        }
+        IntersectionTypeError::InvalidCachedIntersection(type_) => {
+            type_node_unavailable(TypeNodeUnavailable::InvalidCachedIntersectionType(type_))
         }
     }
 }
@@ -1064,6 +1113,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 self.plan_type_reference(node, alias_owner, union_constituent)
             }
             SyntaxKind::UnionType => self.plan_union_type(node, alias_owner),
+            SyntaxKind::IntersectionType => self.plan_intersection_type(node, alias_owner),
             kind if union_constituent => Err(type_node_unavailable(
                 TypeNodeUnavailable::UnsupportedUnionConstituent(node),
             )),
@@ -1372,6 +1422,18 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             NodeData::UnionTypeNode(union) if record.kind == SyntaxKind::UnionType => {
                 let mut contains = false;
                 for child in &union.types.nodes {
+                    contains |= self.type_node_contains_import_alias_reference(
+                        NodeRef::new(node.arena, node.file, *child),
+                        visited,
+                    )?;
+                }
+                contains
+            }
+            NodeData::IntersectionTypeNode(intersection)
+                if record.kind == SyntaxKind::IntersectionType =>
+            {
+                let mut contains = false;
+                for child in &intersection.types.nodes {
                     contains |= self.type_node_contains_import_alias_reference(
                         NodeRef::new(node.arena, node.file, *child),
                         visited,
@@ -1782,6 +1844,254 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         Ok(())
     }
 
+    fn plan_intersection_type(
+        &mut self,
+        node: NodeRef,
+        alias_symbol: Option<SemanticSymbolId>,
+    ) -> Result<(), DeclaredTypeError> {
+        let record = preflight_node(self.store, self.host, node)?;
+        let NodeData::IntersectionTypeNode(intersection) = &record.data else {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidIntersectionType(node),
+            ));
+        };
+        if intersection.types.nodes.len() < 2
+            || intersection.types.has_trailing_comma
+            || intersection.types.range != record.range
+        {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidIntersectionType(node),
+            ));
+        }
+        let mut types = Vec::with_capacity(intersection.types.nodes.len());
+        let mut previous_end = record.range.start;
+        for child in &intersection.types.nodes {
+            let child = NodeRef::new(node.arena, node.file, *child);
+            let child_record = preflight_node(self.store, self.host, child)?;
+            if child_record.parent != Some(node.node)
+                || child_record.range.start < previous_end
+                || child_record.range.start < record.range.start
+                || child_record.range.end > record.range.end
+                || types.contains(&child)
+            {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidIntersectionType(node),
+                ));
+            }
+            previous_end = child_record.range.end;
+            self.plan_type_node_in_context(child, None, false)?;
+            types.push(child);
+        }
+        let mut validating = HashSet::new();
+        for constituent in &types {
+            self.validate_planned_intersection_constituent(*constituent, &mut validating)?;
+        }
+        if self.type_node_contains_import_alias_reference(node, &mut HashSet::new())? {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::ImportAliasCapabilityUnsupported(node),
+            ));
+        }
+        let derived_alias = self.direct_union_alias(node)?;
+        if alias_symbol.is_some() && derived_alias != alias_symbol {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidIntersectionType(node),
+            ));
+        }
+        let planned = PlannedIntersectionType {
+            types,
+            alias_symbol: alias_symbol.or(derived_alias),
+        };
+        if let Some(existing) = self.plan.intersections.insert(node, planned.clone())
+            && existing != planned
+        {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidIntersectionType(node),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_planned_intersection_constituent(
+        &self,
+        node: NodeRef,
+        validating: &mut HashSet<NodeRef>,
+    ) -> Result<(), DeclaredTypeError> {
+        if !validating.insert(node) {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::UnsupportedIntersectionConstituent(node),
+            ));
+        }
+        let result = (|| {
+            let record = preflight_node(self.store, self.host, node)?;
+            match &record.data {
+                NodeData::ParenthesizedTypeNode(parenthesized)
+                    if record.kind == SyntaxKind::ParenthesizedType =>
+                {
+                    self.validate_planned_intersection_constituent(
+                        NodeRef::new(node.arena, node.file, parenthesized.type_),
+                        validating,
+                    )
+                }
+                NodeData::IntersectionTypeNode(_) if record.kind == SyntaxKind::IntersectionType => {
+                    let planned = self.plan.intersections.get(&node).ok_or_else(|| {
+                        type_node_unavailable(
+                            TypeNodeUnavailable::MissingPlannedIntersectionType(node),
+                        )
+                    })?;
+                    for constituent in &planned.types {
+                        self.validate_planned_intersection_constituent(*constituent, validating)?;
+                    }
+                    Ok(())
+                }
+                NodeData::TypeLiteralNode(_) if record.kind == SyntaxKind::TypeLiteral => {
+                    let planned = self.plan.type_literals.get(&node).ok_or_else(|| {
+                        type_node_unavailable(TypeNodeUnavailable::InvalidIntersectionType(node))
+                    })?;
+                    self.validate_intersection_property_plan(planned)
+                }
+                NodeData::TypeReferenceNode(reference)
+                    if record.kind == SyntaxKind::TypeReference =>
+                {
+                    if reference
+                        .type_arguments
+                        .as_ref()
+                        .is_some_and(|arguments| !arguments.nodes.is_empty())
+                    {
+                        return Err(type_node_unavailable(
+                            TypeNodeUnavailable::UnsupportedIntersectionConstituent(node),
+                        ));
+                    }
+                    if let Some(cached) = self
+                        .store
+                        .type_node_links(node)
+                        .and_then(|links| links.resolved_type)
+                    {
+                        return self
+                            .store
+                            .validate_intersection_constituent(cached)
+                            .map_err(|error| intersection_type_error(error, node));
+                    }
+                    let reference = self.plan.references.get(&node).ok_or_else(|| {
+                        type_node_unavailable(
+                            TypeNodeUnavailable::UnsupportedIntersectionConstituent(node),
+                        )
+                    })?;
+                    if reference.import_alias.is_some()
+                        || reference.global_array_target.is_some()
+                        || reference.direct_generic
+                        || !reference.type_arguments.is_empty()
+                        || reference.arity != PlannedTypeReferenceArity::Valid
+                    {
+                        return Err(type_node_unavailable(
+                            TypeNodeUnavailable::UnsupportedIntersectionConstituent(node),
+                        ));
+                    }
+                    let flags = self
+                        .store
+                        .symbol(reference.symbol)
+                        .ok_or(DeclaredTypeError::Unavailable(
+                            DeclaredTypeUnavailable::SymbolNotOwned(reference.symbol),
+                        ))?
+                        .flags();
+                    if flags.contains(SymbolFlags::INTERFACE)
+                        && !flags.contains(SymbolFlags::CLASS)
+                    {
+                        let planned =
+                            self.plan.interfaces.get(&reference.symbol).ok_or_else(|| {
+                                type_node_unavailable(
+                                    TypeNodeUnavailable::UnsupportedIntersectionConstituent(node),
+                                )
+                            })?;
+                        return self.validate_intersection_property_plan(planned);
+                    }
+                    if flags.contains(SymbolFlags::TYPE_ALIAS) {
+                        let alias = self.plan.aliases.get(&reference.symbol).ok_or_else(|| {
+                            type_node_unavailable(
+                                TypeNodeUnavailable::UnsupportedIntersectionConstituent(node),
+                            )
+                        })?;
+                        if !alias.type_parameters.is_empty() {
+                            return Err(type_node_unavailable(
+                                TypeNodeUnavailable::UnsupportedIntersectionConstituent(node),
+                            ));
+                        }
+                        return self.validate_planned_intersection_constituent(
+                            alias.type_node,
+                            validating,
+                        );
+                    }
+                    Err(type_node_unavailable(
+                        TypeNodeUnavailable::UnsupportedIntersectionConstituent(node),
+                    ))
+                }
+                _ => Err(type_node_unavailable(
+                    TypeNodeUnavailable::UnsupportedIntersectionConstituent(node),
+                )),
+            }
+        })();
+        assert!(validating.remove(&node));
+        result
+    }
+
+    fn validate_intersection_property_plan(
+        &self,
+        plan: &PropertyObjectPlan,
+    ) -> Result<(), DeclaredTypeError> {
+        if plan.heritage.is_some()
+            || !plan.indexes.is_empty()
+            || !plan.call_signatures.is_empty()
+        {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::UnsupportedIntersectionConstituent(plan.node),
+            ));
+        }
+        for property in &plan.properties {
+            if property.optional {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::UnsupportedIntersectionOptionalProperty(property.symbol),
+                ));
+            }
+            if !self.intersection_property_type_syntax(property.type_node)? {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::UnsupportedIntersectionProperty(property.type_node),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn intersection_property_type_syntax(
+        &self,
+        mut node: NodeRef,
+    ) -> Result<bool, DeclaredTypeError> {
+        loop {
+            let record = preflight_node(self.store, self.host, node)?;
+            if matches!(
+                record.kind,
+                SyntaxKind::AnyKeyword
+                    | SyntaxKind::UnknownKeyword
+                    | SyntaxKind::StringKeyword
+                    | SyntaxKind::NumberKeyword
+                    | SyntaxKind::BigIntKeyword
+                    | SyntaxKind::BooleanKeyword
+                    | SyntaxKind::SymbolKeyword
+                    | SyntaxKind::VoidKeyword
+                    | SyntaxKind::UndefinedKeyword
+                    | SyntaxKind::NullKeyword
+                    | SyntaxKind::NeverKeyword
+            ) {
+                return Ok(true);
+            }
+            if record.kind == SyntaxKind::LiteralType {
+                return Ok(self.plan.literals.contains_key(&node));
+            }
+            let NodeData::ParenthesizedTypeNode(parenthesized) = &record.data else {
+                return Ok(false);
+            };
+            node = NodeRef::new(node.arena, node.file, parenthesized.type_);
+        }
+    }
+
     fn direct_union_alias(
         &self,
         node: NodeRef,
@@ -1901,6 +2211,9 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             if record.kind != SyntaxKind::ParenthesizedType {
                 return Ok(match record.kind {
                     SyntaxKind::UnionType => CachedTypeAliasRhs::DirectUnion,
+                    SyntaxKind::IntersectionType => {
+                        CachedTypeAliasRhs::DirectIntersection(type_node)
+                    }
                     SyntaxKind::TypeReference => CachedTypeAliasRhs::TypeReference(type_node),
                     SyntaxKind::TypeLiteral => CachedTypeAliasRhs::TypeLiteral(type_node),
                     SyntaxKind::FunctionType => CachedTypeAliasRhs::FunctionType(type_node),
@@ -2043,6 +2356,38 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                     if remains_union || matches!(declared_data, Some(TypeData::TypeReference(_))) {
                         self.validate_cached_union_result(declared_type, Some(symbol))
                             .map_err(type_construction_error)?;
+                    }
+                    return Ok(());
+                }
+                CachedTypeAliasRhs::DirectIntersection(intersection) => {
+                    if !missing_generic_metadata.is_empty()
+                        || self
+                            .store
+                            .type_node_links(intersection)
+                            .and_then(|links| links.resolved_type)
+                            != Some(declared_type)
+                    {
+                        return Err(type_node_unavailable(
+                            TypeNodeUnavailable::InvalidCachedTypeAlias(root_symbol),
+                        ));
+                    }
+                    if matches!(declared_data, Some(TypeData::Intersection(_))) {
+                        let projection = self
+                            .store
+                            .validate_intersection_type(declared_type)
+                            .map_err(|error| intersection_type_error(error, intersection))?;
+                        let _ = projection;
+                        let alias_symbol = self
+                            .store
+                            .type_payload(declared_type)
+                            .and_then(TypeRecord::alias)
+                            .and_then(|alias| self.store.type_alias(alias))
+                            .and_then(super::type_records::TypeAlias::symbol);
+                        if alias_symbol != Some(symbol) {
+                            return Err(type_node_unavailable(
+                                TypeNodeUnavailable::InvalidCachedTypeAlias(root_symbol),
+                            ));
+                        }
                     }
                     return Ok(());
                 }
@@ -4131,6 +4476,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         if cached.is_none()
             || cached_array_capability_missing
             || cached_pending_function
+            || self.direct_intersection_rhs(type_node)?
             || self.direct_type_literal_rhs(type_node)?
             || self.direct_function_type_rhs(type_node)?
             || self.direct_indexed_access_rhs(type_node)?
@@ -4179,6 +4525,16 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             NodeData::UnionTypeNode(union) => {
                 let mut contains = false;
                 for child in &union.types.nodes {
+                    contains |= self.type_node_contains_builtin_array_reference(
+                        NodeRef::new(node.arena, node.file, *child),
+                        visited,
+                    )?;
+                }
+                contains
+            }
+            NodeData::IntersectionTypeNode(intersection) => {
+                let mut contains = false;
+                for child in &intersection.types.nodes {
                     contains |= self.type_node_contains_builtin_array_reference(
                         NodeRef::new(node.arena, node.file, *child),
                         visited,
@@ -4321,6 +4677,19 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         loop {
             let record = preflight_node(self.store, self.host, node)?;
             if record.kind == SyntaxKind::TypeLiteral {
+                return Ok(true);
+            }
+            let NodeData::ParenthesizedTypeNode(parenthesized) = &record.data else {
+                return Ok(false);
+            };
+            node = NodeRef::new(node.arena, node.file, parenthesized.type_);
+        }
+    }
+
+    fn direct_intersection_rhs(&self, mut node: NodeRef) -> Result<bool, DeclaredTypeError> {
+        loop {
+            let record = preflight_node(self.store, self.host, node)?;
+            if record.kind == SyntaxKind::IntersectionType {
                 return Ok(true);
             }
             let NodeData::ParenthesizedTypeNode(parenthesized) = &record.data else {
@@ -5511,6 +5880,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             .and_then(|count| count.checked_add(plan.references.len()))
             .and_then(|count| count.checked_add(plan.literals.len()))
             .and_then(|count| count.checked_add(plan.unions.len()))
+            .and_then(|count| count.checked_add(plan.intersections.len()))
             .and_then(|count| count.checked_add(plan.type_literals.len()))
             .and_then(|count| count.checked_add(plan.functions.len()))
             .and_then(|count| {
@@ -5532,6 +5902,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             .chain(plan.references.keys())
             .chain(plan.literals.keys())
             .chain(plan.unions.keys())
+            .chain(plan.intersections.keys())
             .chain(plan.type_literals.keys())
             .chain(plan.functions.keys())
             .chain(plan.tuples.keys())
@@ -6153,6 +6524,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             },
             SyntaxKind::TypeReference => self.execute_type_reference(node, plan, prepared),
             SyntaxKind::UnionType => self.execute_union_type(node, plan, prepared),
+            SyntaxKind::IntersectionType => self.execute_intersection_type(node, plan, prepared),
             kind => Err(type_node_unavailable(
                 TypeNodeUnavailable::UnsupportedSyntax { node, kind },
             )),
@@ -6744,6 +7116,50 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         if !self.store.set_type_node_links(node, links) {
             return Err(type_node_unavailable(
                 TypeNodeUnavailable::InvalidUnionType(node),
+            ));
+        }
+        Ok(resolved_type)
+    }
+
+    fn execute_intersection_type(
+        &mut self,
+        node: NodeRef,
+        plan: &TypeQueryPlan,
+        prepared: &mut PreparedTypeQueryTypes,
+    ) -> Result<TypeId, DeclaredTypeError> {
+        let intersection = plan.intersections.get(&node).cloned().ok_or_else(|| {
+            type_node_unavailable(TypeNodeUnavailable::MissingPlannedIntersectionType(node))
+        })?;
+        let mut types = Vec::with_capacity(intersection.types.len());
+        for constituent in intersection.types {
+            types.push(self.execute_type_node(constituent, plan, prepared)?);
+        }
+        let resolved_type = self
+            .store
+            .canonical_intersection_type(&types, intersection.alias_symbol)
+            .map_err(|error| intersection_type_error(error, node))?;
+        if let Some(cached) = self
+            .store
+            .type_node_links(node)
+            .and_then(|links| links.resolved_type)
+        {
+            return if cached == resolved_type {
+                Ok(cached)
+            } else {
+                Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidCachedIntersectionType(cached),
+                ))
+            };
+        }
+        let mut links = self
+            .store
+            .type_node_links(node)
+            .cloned()
+            .unwrap_or_default();
+        links.resolved_type = Some(resolved_type);
+        if !self.store.set_type_node_links(node, links) {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidIntersectionType(node),
             ));
         }
         Ok(resolved_type)
@@ -17562,6 +17978,124 @@ mod tests {
             ),
             before,
         );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn cached_intersection_poison_is_read_only_and_retryable() {
+        let mut fixture = fixture(
+            "interface A { a: string }\ninterface B { b: number }\ntype AB = A & B;",
+        );
+        let intersection_node = alias_parts(&fixture, "AB").2;
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let intersection =
+            query_node(&mut fixture, intersection_node, &mut diagnostics).unwrap();
+        let (members, properties) = {
+            let TypeData::Intersection(data) =
+                fixture.store.type_payload(intersection).unwrap().data()
+            else {
+                panic!("AB must retain its raw intersection")
+            };
+            (
+                data.intersection.property_cache,
+                data.intersection.resolved_properties.clone(),
+            )
+        };
+        assert!(fixture.store.set_union_or_intersection_caches(
+            intersection,
+            members,
+            None,
+            None,
+        ));
+        let poisoned = (
+            store_state(&fixture.store),
+            fixture.store.symbol_len(),
+            fixture.store.symbol_store().symbol_table_len(),
+        );
+
+        assert_eq!(
+            query_node(&mut fixture, intersection_node, &mut diagnostics),
+            Err(DeclaredTypeError::TypeNodeUnavailable(
+                TypeNodeUnavailable::InvalidCachedIntersectionType(intersection),
+            )),
+        );
+        assert_eq!(
+            (
+                store_state(&fixture.store),
+                fixture.store.symbol_len(),
+                fixture.store.symbol_store().symbol_table_len(),
+            ),
+            poisoned,
+        );
+
+        assert!(fixture.store.set_union_or_intersection_caches(
+            intersection,
+            members,
+            None,
+            properties,
+        ));
+        assert_eq!(
+            query_node(&mut fixture, intersection_node, &mut diagnostics),
+            Ok(intersection),
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn warmed_intersection_relation_rejects_graph_poison_before_cached_true() {
+        let mut fixture = fixture(
+            "interface A { a: string }\ninterface B { b: number }\ntype AB = A & B;",
+        );
+        let a_symbol =
+            canonical_fixture_symbol(&fixture, SyntaxKind::InterfaceDeclaration, "A");
+        let intersection_node = alias_parts(&fixture, "AB").2;
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let a = query_declared(
+            &mut fixture,
+            a_symbol,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        let intersection =
+            query_node(&mut fixture, intersection_node, &mut diagnostics).unwrap();
+
+        assert_eq!(
+            fixture.store.is_type_assignable_to(intersection, a),
+            Ok(true),
+        );
+        let warmed = fixture.store.relation_state_snapshot();
+        assert!(!warmed.is_pristine());
+        let key = fixture
+            .store
+            .intersection_keys_by_type
+            .remove(&intersection)
+            .expect("canonical intersection retains its reverse identity");
+
+        for _ in 0..2 {
+            assert_eq!(
+                fixture.store.is_type_assignable_to(intersection, a),
+                Err(
+                    super::super::relater::RelationUnavailable::MalformedIntersection(
+                        intersection,
+                    ),
+                ),
+            );
+            assert_eq!(fixture.store.relation_state_snapshot(), warmed);
+        }
+
+        assert_eq!(
+            fixture
+                .store
+                .intersection_keys_by_type
+                .insert(intersection, key),
+            None,
+        );
+        assert_eq!(
+            fixture.store.is_type_assignable_to(intersection, a),
+            Ok(true),
+        );
+        assert_eq!(fixture.store.relation_state_snapshot(), warmed);
         assert!(diagnostics.is_empty());
     }
 }

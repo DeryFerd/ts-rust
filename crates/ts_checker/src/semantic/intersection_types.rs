@@ -1,0 +1,694 @@
+use ts_binder::{
+    CheckFlags, EscapedName, SemanticSymbolId, SymbolFlags, SymbolTableId,
+    semantic::PreparedSymbolTable,
+};
+
+use super::{
+    CanonicalTypeMapperStore, TypeId,
+    links::ValueSymbolLinks,
+    object_members::{
+        DeclaredPropertyObjectValidation, validate_resolved_declared_property_object,
+    },
+    type_records::{StructuredTypeData, TypeData, TypeRecord},
+    types::{ObjectFlags, TypeFlags},
+};
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(super) struct IntersectionTypeCacheKey {
+    pub(super) types: Vec<TypeId>,
+    pub(super) alias_symbol: Option<SemanticSymbolId>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum IntersectionTypeError {
+    BootstrapUninitialized,
+    Capacity,
+    UnsupportedConstituent(TypeId),
+    UnsupportedOptionalProperty(SemanticSymbolId),
+    UnsupportedPropertyType(TypeId),
+    MalformedConstituent(TypeId),
+    InvalidAliasSymbol(SemanticSymbolId),
+    InvalidCachedIntersection(TypeId),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct IntersectionTypeProjection {
+    pub(super) types: Vec<TypeId>,
+    pub(super) members: SymbolTableId,
+    pub(super) properties: Vec<SemanticSymbolId>,
+    pub(super) reduced_to_never: bool,
+}
+
+#[derive(Clone, Debug)]
+struct SourceProperty {
+    symbol: SemanticSymbolId,
+    name: EscapedName,
+    type_: TypeId,
+    readonly: bool,
+    literal: bool,
+    explicit_never: bool,
+}
+
+#[derive(Clone, Debug)]
+struct PropertyGroup {
+    name: EscapedName,
+    sources: Vec<SourceProperty>,
+}
+
+#[derive(Clone, Debug)]
+enum ExpectedProperty {
+    Borrowed(SemanticSymbolId),
+    Synthetic {
+        name: EscapedName,
+        type_: TypeId,
+        check_flags: CheckFlags,
+        declarations: Option<Vec<ts_ast::NodeRef>>,
+    },
+}
+
+impl ExpectedProperty {
+    fn name(&self, store: &CanonicalTypeMapperStore) -> Option<EscapedName> {
+        match self {
+            Self::Borrowed(symbol) => Some(store.symbol(*symbol)?.name().to_owned()),
+            Self::Synthetic { name, .. } => Some(name.clone()),
+        }
+    }
+}
+
+impl CanonicalTypeMapperStore {
+    pub(super) fn validate_intersection_constituent(
+        &self,
+        type_: TypeId,
+    ) -> Result<(), IntersectionTypeError> {
+        let mut types = Vec::new();
+        self.append_intersection_constituent(type_, &mut types)?;
+        expected_properties(self, &types).map(|_| ())
+    }
+
+    pub(super) fn canonical_intersection_type(
+        &mut self,
+        input: &[TypeId],
+        alias_symbol: Option<SemanticSymbolId>,
+    ) -> Result<TypeId, IntersectionTypeError> {
+        let (unknown_type, never_type) = self
+            .intrinsic_bootstrap()
+            .map(|bootstrap| (bootstrap.unknown_type, bootstrap.never_type))
+            .ok_or(IntersectionTypeError::BootstrapUninitialized)?;
+        if let Some(symbol) = alias_symbol
+            && self.symbol(symbol).is_none_or(|record| {
+                !record.flags().contains(SymbolFlags::TYPE_ALIAS)
+                    || self.get_merged_symbol(symbol) != Some(symbol)
+            })
+        {
+            return Err(IntersectionTypeError::InvalidAliasSymbol(symbol));
+        }
+
+        let mut types = Vec::new();
+        for type_ in input {
+            self.append_intersection_constituent(*type_, &mut types)?;
+        }
+        if types.is_empty() {
+            return Ok(unknown_type);
+        }
+        if types.len() == 1 {
+            return Ok(types[0]);
+        }
+
+        let key = IntersectionTypeCacheKey {
+            types,
+            alias_symbol,
+        };
+        if let Some(cached) = self.intersection_types.get(&key).copied() {
+            self.validate_intersection_type(cached)?;
+            return Ok(cached);
+        }
+
+        let expected = expected_properties(self, &key.types)?;
+        let synthetic_count = expected
+            .iter()
+            .filter(|property| matches!(property, ExpectedProperty::Synthetic { .. }))
+            .count();
+        let alias_count = usize::from(key.alias_symbol.is_some());
+        let prepared_members =
+            PreparedSymbolTable::new(expected.len()).ok_or(IntersectionTypeError::Capacity)?;
+        if !self.try_reserve_types(1)
+            || !self.try_reserve_type_aliases(alias_count)
+            || !self.try_reserve_checker_symbol_allocations(synthetic_count, 1)
+            || !self.try_reserve_value_symbol_links(synthetic_count)
+            || self.intersection_types.try_reserve(1).is_err()
+            || self.intersection_keys_by_type.try_reserve(1).is_err()
+        {
+            return Err(IntersectionTypeError::Capacity);
+        }
+
+        let mut object_flags = key.types.iter().fold(ObjectFlags::NONE, |flags, type_| {
+            flags
+                | (self
+                    .type_payload(*type_)
+                    .expect("validated intersection constituent remains owned")
+                    .object_flags()
+                    & ObjectFlags::PROPAGATING_FLAGS)
+        });
+        let reduced_to_never = expected.iter().any(|property| {
+            matches!(
+                property,
+                ExpectedProperty::Synthetic {
+                    type_,
+                    check_flags,
+                    ..
+                } if *type_ == never_type
+                    && check_flags.contains(CheckFlags::NON_UNIFORM_AND_LITERAL)
+                    && !check_flags.contains(CheckFlags::HAS_NEVER_TYPE)
+            )
+        });
+        object_flags |= ObjectFlags::IS_NEVER_INTERSECTION_COMPUTED;
+        if reduced_to_never {
+            object_flags |= ObjectFlags::IS_NEVER_INTERSECTION;
+        }
+
+        let intersection_type = self
+            .alloc_intersection_type(object_flags, key.types.clone())
+            .expect("a preflighted intersection allocation is infallible");
+        if let Some(symbol) = key.alias_symbol {
+            let alias = self
+                .alloc_type_alias(Some(symbol))
+                .expect("a preflighted intersection alias allocation is infallible");
+            assert!(self.set_type_alias(intersection_type, Some(alias)));
+        }
+        assert!(self.set_structured_type_members(intersection_type, None, None, None, None, None));
+
+        let members = self.alloc_prepared_symbol_table(prepared_members);
+        let mut properties = Vec::with_capacity(expected.len());
+        for property in expected {
+            let (name, symbol) = match property {
+                ExpectedProperty::Borrowed(symbol) => {
+                    let name = self
+                        .symbol(symbol)
+                        .expect("validated borrowed property remains owned")
+                        .name()
+                        .to_owned();
+                    (name, symbol)
+                }
+                ExpectedProperty::Synthetic {
+                    name,
+                    type_: property_type,
+                    check_flags,
+                    declarations,
+                } => {
+                    let symbol = self.alloc_transient_symbol(
+                        SymbolFlags::PROPERTY,
+                        name.clone(),
+                        check_flags,
+                    );
+                    if declarations.is_some() {
+                        assert!(self.set_symbol_declarations(symbol, declarations, None));
+                    }
+                    assert!(self.set_value_symbol_links(
+                        symbol,
+                        ValueSymbolLinks {
+                            resolved_type: Some(property_type),
+                            containing_type: Some(intersection_type),
+                            ..ValueSymbolLinks::default()
+                        },
+                    ));
+                    (name, symbol)
+                }
+            };
+            assert_eq!(self.insert_symbol(members, name, symbol), Some(None));
+            properties.push(symbol);
+        }
+
+        assert!(self.set_union_or_intersection_caches(
+            intersection_type,
+            Some(members),
+            None,
+            Some(properties),
+        ));
+        assert!(
+            self.intersection_types
+                .insert(key.clone(), intersection_type)
+                .is_none()
+        );
+        assert!(
+            self.intersection_keys_by_type
+                .insert(intersection_type, key)
+                .is_none()
+        );
+        Ok(intersection_type)
+    }
+
+    fn append_intersection_constituent(
+        &self,
+        type_: TypeId,
+        output: &mut Vec<TypeId>,
+    ) -> Result<(), IntersectionTypeError> {
+        let Some(record) = self.type_payload(type_) else {
+            return Err(IntersectionTypeError::UnsupportedConstituent(type_));
+        };
+        if record.flags() == TypeFlags::INTERSECTION {
+            let projection = self.validate_intersection_type(type_)?;
+            for constituent in projection.types {
+                if !output.contains(&constituent) {
+                    output.push(constituent);
+                }
+            }
+            return Ok(());
+        }
+        match validate_resolved_declared_property_object(self, type_) {
+            DeclaredPropertyObjectValidation::Valid(_) => {
+                if !output.contains(&type_) {
+                    output.push(type_);
+                }
+                Ok(())
+            }
+            DeclaredPropertyObjectValidation::NotDeclared => {
+                Err(IntersectionTypeError::UnsupportedConstituent(type_))
+            }
+            DeclaredPropertyObjectValidation::Malformed => {
+                Err(IntersectionTypeError::MalformedConstituent(type_))
+            }
+        }
+    }
+
+    pub(super) fn validate_intersection_type(
+        &self,
+        type_: TypeId,
+    ) -> Result<IntersectionTypeProjection, IntersectionTypeError> {
+        let invalid = || IntersectionTypeError::InvalidCachedIntersection(type_);
+        let record = self.type_payload(type_).ok_or_else(invalid)?;
+        let TypeData::Intersection(data) = record.data() else {
+            return Err(invalid());
+        };
+        if record.flags() != TypeFlags::INTERSECTION
+            || record.symbol().is_some()
+            || data.intersection.types.len() < 2
+            || data
+                .intersection
+                .types
+                .iter()
+                .enumerate()
+                .any(|(index, constituent)| {
+                    data.intersection.types[..index].contains(constituent)
+                        || self
+                            .type_payload(*constituent)
+                            .is_none_or(|record| record.flags() == TypeFlags::INTERSECTION)
+                })
+        {
+            return Err(invalid());
+        }
+
+        let alias_symbol = match record.alias() {
+            None => None,
+            Some(alias) => {
+                let alias = self.type_alias(alias).ok_or_else(invalid)?;
+                if alias.type_arguments().is_some() {
+                    return Err(invalid());
+                }
+                let symbol = alias.symbol().ok_or_else(invalid)?;
+                if self.symbol(symbol).is_none_or(|record| {
+                    !record.flags().contains(SymbolFlags::TYPE_ALIAS)
+                        || self.get_merged_symbol(symbol) != Some(symbol)
+                }) {
+                    return Err(invalid());
+                }
+                Some(symbol)
+            }
+        };
+        let key = IntersectionTypeCacheKey {
+            types: data.intersection.types.clone(),
+            alias_symbol,
+        };
+        if self.intersection_types.get(&key) != Some(&type_)
+            || self.intersection_keys_by_type.get(&type_) != Some(&key)
+        {
+            return Err(invalid());
+        }
+
+        for constituent in &key.types {
+            match validate_resolved_declared_property_object(self, *constituent) {
+                DeclaredPropertyObjectValidation::Valid(_) => {}
+                DeclaredPropertyObjectValidation::NotDeclared
+                | DeclaredPropertyObjectValidation::Malformed => return Err(invalid()),
+            }
+        }
+        let expected = expected_properties(self, &key.types).map_err(|_| invalid())?;
+        let Some(members) = data.intersection.property_cache else {
+            return Err(invalid());
+        };
+        if data
+            .intersection
+            .property_cache_without_function_property_augment
+            .is_some()
+            || data.resolved_apparent_type.is_some()
+            || data.unique_literal_filled_instantiation.is_some()
+        {
+            return Err(invalid());
+        }
+        let properties = data
+            .intersection
+            .resolved_properties
+            .clone()
+            .ok_or_else(invalid)?;
+        if properties.len() != expected.len() {
+            return Err(invalid());
+        }
+        let table = self.symbol_table(members).ok_or_else(invalid)?;
+        if table.len() != expected.len() {
+            return Err(invalid());
+        }
+        for (expected, actual) in expected.iter().zip(&properties) {
+            let expected_name = expected.name(self).ok_or_else(invalid)?;
+            if table.get(expected_name.as_ref()) != Some(*actual) {
+                return Err(invalid());
+            }
+            match expected {
+                ExpectedProperty::Borrowed(symbol) if symbol == actual => {}
+                ExpectedProperty::Borrowed(_) => return Err(invalid()),
+                ExpectedProperty::Synthetic {
+                    type_: property_type,
+                    check_flags,
+                    declarations,
+                    ..
+                } => {
+                    let symbol = self.symbol(*actual).ok_or_else(invalid)?;
+                    let links = self.value_symbol_links(*actual).ok_or_else(invalid)?;
+                    if symbol.flags() != SymbolFlags::PROPERTY | SymbolFlags::TRANSIENT
+                        || symbol.check_flags() != *check_flags
+                        || symbol.declarations() != declarations.as_deref()
+                        || symbol.value_declaration().is_some()
+                        || symbol.members().is_some()
+                        || symbol.exports().is_some()
+                        || symbol.parent().is_some()
+                        || symbol.export_symbol().is_some()
+                        || links
+                            != &(ValueSymbolLinks {
+                                resolved_type: Some(*property_type),
+                                containing_type: Some(type_),
+                                ..ValueSymbolLinks::default()
+                            })
+                    {
+                        return Err(invalid());
+                    }
+                }
+            }
+        }
+
+        let bootstrap = self.intrinsic_bootstrap().ok_or_else(invalid)?;
+        let reduced_to_never = expected.iter().any(|property| {
+            matches!(
+                property,
+                ExpectedProperty::Synthetic {
+                    type_: property_type,
+                    check_flags,
+                    ..
+                } if *property_type == bootstrap.never_type
+                    && check_flags.contains(CheckFlags::NON_UNIFORM_AND_LITERAL)
+                    && !check_flags.contains(CheckFlags::HAS_NEVER_TYPE)
+            )
+        });
+        let propagated = key
+            .types
+            .iter()
+            .fold(ObjectFlags::NONE, |flags, constituent| {
+                flags
+                    | (self
+                        .type_payload(*constituent)
+                        .expect("validated constituent remains owned")
+                        .object_flags()
+                        & ObjectFlags::PROPAGATING_FLAGS)
+            });
+        let expected_flags = propagated
+            | ObjectFlags::MEMBERS_RESOLVED
+            | ObjectFlags::IS_NEVER_INTERSECTION_COMPUTED
+            | if reduced_to_never {
+                ObjectFlags::IS_NEVER_INTERSECTION
+            } else {
+                ObjectFlags::NONE
+            };
+        if record.object_flags() != expected_flags
+            || data.intersection.structured != StructuredTypeData::default()
+        {
+            return Err(invalid());
+        }
+        Ok(IntersectionTypeProjection {
+            types: key.types,
+            members,
+            properties,
+            reduced_to_never,
+        })
+    }
+}
+
+fn expected_properties(
+    store: &CanonicalTypeMapperStore,
+    types: &[TypeId],
+) -> Result<Vec<ExpectedProperty>, IntersectionTypeError> {
+    let boolean_type = store
+        .intrinsic_bootstrap()
+        .ok_or(IntersectionTypeError::BootstrapUninitialized)?
+        .boolean_type;
+    let mut groups: Vec<PropertyGroup> = Vec::new();
+    for type_ in types {
+        let record = store
+            .type_payload(*type_)
+            .ok_or(IntersectionTypeError::MalformedConstituent(*type_))?;
+        let structured = record
+            .data()
+            .structured()
+            .ok_or(IntersectionTypeError::MalformedConstituent(*type_))?;
+        for symbol in structured.properties.as_deref().unwrap_or_default() {
+            let record = store
+                .symbol(*symbol)
+                .ok_or(IntersectionTypeError::MalformedConstituent(*type_))?;
+            if record.flags().contains(SymbolFlags::OPTIONAL) {
+                return Err(IntersectionTypeError::UnsupportedOptionalProperty(*symbol));
+            }
+            let links = store
+                .value_symbol_links(*symbol)
+                .ok_or(IntersectionTypeError::MalformedConstituent(*type_))?;
+            let property_type = links
+                .resolved_type
+                .ok_or(IntersectionTypeError::MalformedConstituent(*type_))?;
+            validate_property_type(store, property_type)?;
+            let property_flags = store
+                .type_payload(property_type)
+                .ok_or(IntersectionTypeError::MalformedConstituent(*type_))?
+                .flags();
+            let source = SourceProperty {
+                symbol: *symbol,
+                name: record.name().to_owned(),
+                type_: property_type,
+                readonly: record.check_flags().contains(CheckFlags::READONLY),
+                literal: property_type == boolean_type
+                    || property_flags.intersects(TypeFlags::UNIT),
+                explicit_never: property_flags == TypeFlags::NEVER,
+            };
+            if let Some(group) = groups.iter_mut().find(|group| group.name == source.name) {
+                if !group
+                    .sources
+                    .iter()
+                    .any(|existing| existing.symbol == source.symbol)
+                {
+                    group.sources.push(source);
+                }
+            } else {
+                groups.push(PropertyGroup {
+                    name: source.name.clone(),
+                    sources: vec![source],
+                });
+            }
+        }
+    }
+
+    groups
+        .into_iter()
+        .map(|group| {
+            if let [source] = group.sources.as_slice() {
+                return Ok(ExpectedProperty::Borrowed(source.symbol));
+            }
+            let property_types = group
+                .sources
+                .iter()
+                .map(|source| source.type_)
+                .collect::<Vec<_>>();
+            let type_ = intersect_property_types(store, &property_types)?;
+            let mut check_flags = CheckFlags::SYNTHETIC_PROPERTY | CheckFlags::CONTAINS_PUBLIC;
+            if group.sources.iter().all(|source| source.readonly) {
+                check_flags |= CheckFlags::READONLY;
+            }
+            if property_types
+                .first()
+                .is_some_and(|first| property_types.iter().any(|type_| type_ != first))
+            {
+                check_flags |= CheckFlags::HAS_NON_UNIFORM_TYPE;
+            }
+            if group.sources.iter().any(|source| source.literal) {
+                check_flags |= CheckFlags::HAS_LITERAL_TYPE;
+            }
+            if group.sources.iter().any(|source| source.explicit_never) {
+                check_flags |= CheckFlags::HAS_NEVER_TYPE;
+            }
+            let declarations = group
+                .sources
+                .iter()
+                .flat_map(|source| {
+                    store
+                        .symbol(source.symbol)
+                        .and_then(|symbol| symbol.declarations())
+                        .unwrap_or_default()
+                        .iter()
+                        .copied()
+                })
+                .collect::<Vec<_>>();
+            Ok(ExpectedProperty::Synthetic {
+                name: group.name,
+                type_,
+                check_flags,
+                declarations: (!declarations.is_empty()).then_some(declarations),
+            })
+        })
+        .collect()
+}
+
+fn validate_property_type(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+) -> Result<(), IntersectionTypeError> {
+    if store
+        .intrinsic_bootstrap()
+        .is_some_and(|bootstrap| type_ == bootstrap.boolean_type)
+    {
+        // The canonical `boolean` primitive is represented by its fixed
+        // `false | true` union. Admit only that exact bootstrap identity.
+        return Ok(());
+    }
+    let flags = store
+        .type_payload(type_)
+        .ok_or(IntersectionTypeError::UnsupportedPropertyType(type_))?
+        .flags();
+    if matches!(
+        flags,
+        TypeFlags::ANY
+            | TypeFlags::UNKNOWN
+            | TypeFlags::UNDEFINED
+            | TypeFlags::NULL
+            | TypeFlags::VOID
+            | TypeFlags::STRING
+            | TypeFlags::NUMBER
+            | TypeFlags::BIG_INT
+            | TypeFlags::BOOLEAN
+            | TypeFlags::ES_SYMBOL
+            | TypeFlags::STRING_LITERAL
+            | TypeFlags::NUMBER_LITERAL
+            | TypeFlags::BIG_INT_LITERAL
+            | TypeFlags::BOOLEAN_LITERAL
+            | TypeFlags::UNIQUE_ES_SYMBOL
+            | TypeFlags::NEVER
+    ) {
+        Ok(())
+    } else {
+        Err(IntersectionTypeError::UnsupportedPropertyType(type_))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PrimitiveDomain {
+    String,
+    Number,
+    BigInt,
+    Boolean,
+    Symbol,
+    Undefined,
+    Null,
+}
+
+fn primitive_domain(flags: TypeFlags) -> Option<(PrimitiveDomain, bool)> {
+    match flags {
+        TypeFlags::STRING => Some((PrimitiveDomain::String, false)),
+        TypeFlags::STRING_LITERAL => Some((PrimitiveDomain::String, true)),
+        TypeFlags::NUMBER => Some((PrimitiveDomain::Number, false)),
+        TypeFlags::NUMBER_LITERAL => Some((PrimitiveDomain::Number, true)),
+        TypeFlags::BIG_INT => Some((PrimitiveDomain::BigInt, false)),
+        TypeFlags::BIG_INT_LITERAL => Some((PrimitiveDomain::BigInt, true)),
+        TypeFlags::BOOLEAN => Some((PrimitiveDomain::Boolean, false)),
+        TypeFlags::BOOLEAN_LITERAL => Some((PrimitiveDomain::Boolean, true)),
+        TypeFlags::ES_SYMBOL => Some((PrimitiveDomain::Symbol, false)),
+        TypeFlags::UNIQUE_ES_SYMBOL => Some((PrimitiveDomain::Symbol, true)),
+        TypeFlags::UNDEFINED => Some((PrimitiveDomain::Undefined, true)),
+        TypeFlags::NULL => Some((PrimitiveDomain::Null, true)),
+        // `void` is the wider member of the pinned `void & undefined`
+        // reduction, so it shares the domain while remaining the base.
+        TypeFlags::VOID => Some((PrimitiveDomain::Undefined, false)),
+        _ => None,
+    }
+}
+
+fn literal_values_equal(store: &CanonicalTypeMapperStore, left: TypeId, right: TypeId) -> bool {
+    let value = |type_| match store.type_payload(type_).map(TypeRecord::data) {
+        Some(TypeData::Literal(literal)) => Some(&literal.value),
+        _ => None,
+    };
+    match (value(left), value(right)) {
+        (Some(left), Some(right)) => left == right,
+        _ => left == right,
+    }
+}
+
+fn intersect_property_types(
+    store: &CanonicalTypeMapperStore,
+    types: &[TypeId],
+) -> Result<TypeId, IntersectionTypeError> {
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or(IntersectionTypeError::BootstrapUninitialized)?;
+    if types.contains(&bootstrap.never_type) {
+        return Ok(bootstrap.never_type);
+    }
+    if types.contains(&bootstrap.any_type) {
+        return Ok(bootstrap.any_type);
+    }
+    let significant = types
+        .iter()
+        .copied()
+        .filter(|type_| *type_ != bootstrap.unknown_type)
+        .collect::<Vec<_>>();
+    if significant.is_empty() {
+        return Ok(bootstrap.unknown_type);
+    }
+
+    let mut domain = None;
+    let mut base = None;
+    let mut literal = None;
+    for type_ in significant {
+        let flags = store
+            .type_payload(type_)
+            .ok_or(IntersectionTypeError::UnsupportedPropertyType(type_))?
+            .flags();
+        let (next_domain, is_literal) = if type_ == bootstrap.boolean_type {
+            (PrimitiveDomain::Boolean, false)
+        } else {
+            let Some(classification) = primitive_domain(flags) else {
+                return Err(IntersectionTypeError::UnsupportedPropertyType(type_));
+            };
+            classification
+        };
+        if domain.is_some_and(|domain| domain != next_domain) {
+            return Ok(bootstrap.never_type);
+        }
+        domain = Some(next_domain);
+        if is_literal {
+            if let Some(previous) = literal {
+                if !literal_values_equal(store, previous, type_) {
+                    return Ok(bootstrap.never_type);
+                }
+            } else {
+                literal = Some(type_);
+            }
+        } else {
+            base = Some(type_);
+        }
+    }
+    Ok(literal
+        .or(base)
+        .expect("a significant primitive type was classified"))
+}

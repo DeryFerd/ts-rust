@@ -138,6 +138,7 @@ pub enum TypeDisplayUnavailable {
     },
     MalformedType(TypeId),
     InvalidUnion(TypeId),
+    InvalidIntersection(TypeId),
     UnsupportedUnionConstituent {
         union: TypeId,
         constituent: TypeId,
@@ -184,6 +185,10 @@ impl std::fmt::Display for TypeDisplayUnavailable {
                     "type {type_id:?} is not a canonical display union"
                 )
             }
+            Self::InvalidIntersection(type_id) => write!(
+                formatter,
+                "type {type_id:?} is not a canonical display intersection"
+            ),
             Self::UnsupportedUnionConstituent { union, constituent } => write!(
                 formatter,
                 "union {union:?} contains unsupported display constituent {constituent:?}"
@@ -711,6 +716,17 @@ fn display_type_worker(
     }
     if type_flags.intersects(TypeFlags::UNION) {
         return display_union_type(store, host, global_types, type_id, flags, state, visiting);
+    }
+    if type_flags.intersects(TypeFlags::INTERSECTION) {
+        return display_intersection_type(
+            store,
+            host,
+            global_types,
+            type_id,
+            flags,
+            state,
+            visiting,
+        );
     }
     if type_flags.intersects(TypeFlags::OBJECT) {
         return display_object_type(
@@ -2561,6 +2577,51 @@ fn is_plain_identifier(name: &str) -> bool {
     (first.is_ascii_alphabetic() || matches!(first, '_' | '$'))
         && characters
             .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '$'))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn display_intersection_type(
+    store: &CanonicalTypeMapperStore,
+    host: Option<&DeclaredTypeHost<'_>>,
+    global_types: Option<&CanonicalGlobalTypes>,
+    type_id: TypeId,
+    flags: CanonicalTypeFormatFlags,
+    state: &mut DisplayState,
+    visiting: &mut HashSet<TypeId>,
+) -> Result<String, TypeDisplayUnavailable> {
+    let projection = store
+        .validate_intersection_type(type_id)
+        .map_err(|_| TypeDisplayUnavailable::InvalidIntersection(type_id))?;
+    if !visiting.insert(type_id) {
+        return Err(TypeDisplayUnavailable::CyclicType(type_id));
+    }
+    let result = (|| {
+        let record = store
+            .type_payload(type_id)
+            .ok_or(TypeDisplayUnavailable::Type(type_id))?;
+        if let Some(alias) = record.alias() {
+            return display_alias_name(store, type_id, alias, state);
+        }
+        let mut result = String::new();
+        for (index, constituent) in projection.types.iter().enumerate() {
+            if index != 0 {
+                state.add(3);
+                result.push_str(" & ");
+            }
+            result.push_str(&display_type_worker(
+                store,
+                host,
+                global_types,
+                *constituent,
+                flags,
+                state,
+                visiting,
+            )?);
+        }
+        Ok(result)
+    })();
+    visiting.remove(&type_id);
+    result
 }
 
 fn display_union_type(

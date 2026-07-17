@@ -28,6 +28,7 @@ use super::{
     derived_types::DerivedObjectLiteralValidation,
     enums,
     ids::{SignatureId, TypeId},
+    intersection_types::IntersectionTypeProjection,
     links::{MembersOrExportsResolutionKind, ValueSymbolLinks},
     mapper::TypeMapper,
     relation::{
@@ -53,6 +54,7 @@ pub enum RelationUnavailable {
     Symbol(SemanticSymbolId),
     MalformedLiteral(TypeId),
     MalformedUnion(TypeId),
+    MalformedIntersection(TypeId),
     UnsupportedUnionConstituent(TypeId),
     InvalidUnionAlias(SemanticSymbolId),
     InvalidUnionPreparation(TypeId),
@@ -110,6 +112,9 @@ impl std::fmt::Display for RelationUnavailable {
             }
             Self::MalformedUnion(type_id) => {
                 write!(formatter, "type {type_id:?} is not a canonical union")
+            }
+            Self::MalformedIntersection(type_id) => {
+                write!(formatter, "type {type_id:?} is not a canonical intersection")
             }
             Self::UnsupportedUnionConstituent(type_id) => write!(
                 formatter,
@@ -367,6 +372,7 @@ pub(super) struct ResolvedOwnProperty {
 enum ObjectPropertyOrigin {
     Declared,
     ValidatedClass,
+    Intersection(TypeId),
     FreshObjectLiteral(SemanticSymbolId),
     DerivedObjectLiteral(SemanticSymbolId),
 }
@@ -1037,6 +1043,31 @@ impl<'store> RelaterSession<'store> {
         Ok(types)
     }
 
+    fn intersection_projection(
+        &self,
+        type_id: TypeId,
+    ) -> Result<IntersectionTypeProjection, RelationUnavailable> {
+        self.store
+            .validate_intersection_type(type_id)
+            .map_err(|_| RelationUnavailable::MalformedIntersection(type_id))
+    }
+
+    fn reduced_intersection_type(
+        &self,
+        type_id: TypeId,
+    ) -> Result<TypeId, RelationUnavailable> {
+        let flags = self.store.type_flags(type_id)?;
+        if !flags.intersects(TypeFlags::INTERSECTION) {
+            return Ok(type_id);
+        }
+        let projection = self.intersection_projection(type_id)?;
+        Ok(if projection.reduced_to_never {
+            self.bootstrap.never_type
+        } else {
+            type_id
+        })
+    }
+
     fn union_length_for_cache_choice(&self, type_id: TypeId) -> Result<usize, RelationUnavailable> {
         let record = self
             .store
@@ -1066,15 +1097,10 @@ impl<'store> RelaterSession<'store> {
             validate_direct_interface_heritage_relation_endpoint(self.store, original_target)?;
             validate_class_members_relation_endpoint(self.store, original_target)?;
         }
+        let original_source = self.reduced_intersection_type(original_source)?;
+        let original_target = self.reduced_intersection_type(original_target)?;
         if original_source == original_target {
             return Ok(Ternary::True);
-        }
-        if intersection_state != IntersectionState::NONE {
-            return Err(RelationUnavailable::StructuralRelation {
-                source: original_source,
-                target: original_target,
-                relation: self.relation,
-            });
         }
 
         self.ensure_callable_relation_admission(original_source, true)?;
@@ -1122,7 +1148,7 @@ impl<'store> RelaterSession<'store> {
             if source_flags.intersects(TypeFlags::SINGLETON) {
                 return Ok(Ternary::True);
             }
-            if source_flags.intersects(TypeFlags::UNION) {
+            if source_flags.intersects(TypeFlags::UNION_OR_INTERSECTION) {
                 return self.recursive_type_related_to(
                     source,
                     target,
@@ -1137,8 +1163,7 @@ impl<'store> RelaterSession<'store> {
                     CanonicalArrayReferenceArguments::Unrelated => Ok(Ternary::False),
                 };
             }
-            if self.strict_function_types.is_some()
-                && source_flags.intersects(TypeFlags::OBJECT)
+            if source_flags.intersects(TypeFlags::OBJECT)
                 && target_flags.intersects(TypeFlags::OBJECT)
             {
                 return self.recursive_type_related_to(
@@ -1220,6 +1245,33 @@ impl<'store> RelaterSession<'store> {
         if source_flags.intersects(TypeFlags::STRUCTURED_OR_INSTANTIABLE)
             || target_flags.intersects(TypeFlags::STRUCTURED_OR_INSTANTIABLE)
         {
+            if supports_structured_object_relation(self.relation, self.strict_function_types) {
+                if target_flags.intersects(TypeFlags::INTERSECTION)
+                    && !intersection_state.intersects(IntersectionState::TARGET)
+                    && source_flags.intersects(TypeFlags::OBJECT)
+                    && self.is_fresh_object_literal(source)?
+                    && self.has_excess_properties(source, target)?
+                {
+                    return Ok(Ternary::False);
+                }
+                if source_flags.intersects(TypeFlags::INTERSECTION)
+                    && !intersection_state.intersects(IntersectionState::SOURCE)
+                    && target_flags.intersects(TypeFlags::OBJECT)
+                    && self.relation != RelationKind::Comparable
+                    && self.weak_target_lacks_common_properties(source, target)?
+                {
+                    return Ok(Ternary::False);
+                }
+            }
+            if source_flags.intersects(TypeFlags::INTERSECTION)
+                || target_flags.intersects(TypeFlags::INTERSECTION)
+            {
+                return self.union_or_intersection_related_to(
+                    source,
+                    target,
+                    intersection_state,
+                );
+            }
             if self.relation != RelationKind::Identity
                 && target_flags.intersects(TypeFlags::OBJECT)
                 && let Some(apparent_source) = self
@@ -1250,7 +1302,8 @@ impl<'store> RelaterSession<'store> {
                 && source_flags.intersects(TypeFlags::OBJECT)
                 && target_flags.intersects(TypeFlags::OBJECT)
             {
-                if self.is_fresh_object_literal(source)?
+                if !intersection_state.intersects(IntersectionState::TARGET)
+                    && self.is_fresh_object_literal(source)?
                     && self.has_excess_properties(source, target)?
                 {
                     return Ok(Ternary::False);
@@ -1493,28 +1546,35 @@ impl<'store> RelaterSession<'store> {
         target: TypeId,
         intersection_state: IntersectionState,
     ) -> Result<Ternary, RelationUnavailable> {
-        if intersection_state != IntersectionState::NONE {
-            return Err(RelationUnavailable::StructuralRelation {
-                source,
-                target,
-                relation: self.relation,
-            });
-        }
         let source_flags = self.store.type_flags(source)?;
         let target_flags = self.store.type_flags(target)?;
-        if self.relation.is_identity() && source_flags.intersects(TypeFlags::UNION) {
-            let mut result = self.each_type_related_to_some_type(source, target)?;
+        if self.relation.is_identity()
+            && source_flags.intersects(TypeFlags::UNION_OR_INTERSECTION)
+        {
+            let mut result =
+                self.each_union_or_intersection_type_related_to_some_type(source, target)?;
             if result != Ternary::False {
-                result &= self.each_type_related_to_some_type(target, source)?;
+                result &=
+                    self.each_union_or_intersection_type_related_to_some_type(target, source)?;
             }
             return Ok(result);
         }
-        if source_flags.intersects(TypeFlags::UNION) || target_flags.intersects(TypeFlags::UNION) {
+        if source_flags.intersects(TypeFlags::UNION)
+            || target_flags.intersects(TypeFlags::UNION)
+            || source_flags.intersects(TypeFlags::INTERSECTION)
+                && !intersection_state.intersects(IntersectionState::SOURCE)
+            || target_flags.intersects(TypeFlags::INTERSECTION)
+                && !intersection_state.intersects(IntersectionState::TARGET)
+        {
             return self.union_or_intersection_related_to(source, target, intersection_state);
         }
+        let source_is_object =
+            source_flags.intersects(TypeFlags::OBJECT | TypeFlags::INTERSECTION);
+        let target_is_object =
+            target_flags.intersects(TypeFlags::OBJECT | TypeFlags::INTERSECTION);
         if !supports_structured_object_relation(self.relation, self.strict_function_types)
-            || !source_flags.intersects(TypeFlags::OBJECT)
-            || !target_flags.intersects(TypeFlags::OBJECT)
+            || !source_is_object
+            || !target_is_object
         {
             return Err(RelationUnavailable::StructuralRelation {
                 source,
@@ -1525,18 +1585,6 @@ impl<'store> RelaterSession<'store> {
         let source_members = self.resolved_object_members(source, true)?;
         let allow_fresh_target = self.allows_fresh_object_target();
         let target_members = self.resolved_object_members(target, allow_fresh_target)?;
-        if self.relation.is_identity()
-            && !source_members.exact_callable
-            && !target_members.exact_callable
-            && source != self.bootstrap.any_function_type
-            && target != self.bootstrap.any_function_type
-        {
-            return Err(RelationUnavailable::StructuralRelation {
-                source,
-                target,
-                relation: self.relation,
-            });
-        }
         if matches!(
             self.relation,
             RelationKind::Subtype | RelationKind::StrictSubtype
@@ -1549,7 +1597,11 @@ impl<'store> RelaterSession<'store> {
         {
             return Ok(Ternary::False);
         }
-        let mut result = self.properties_related_to(source, &source_members, &target_members)?;
+        let mut result = if self.relation.is_identity() {
+            self.properties_identical_to(target, &source_members, &target_members)?
+        } else {
+            self.properties_related_to(source, &source_members, &target_members)?
+        };
         if result != Ternary::False {
             result &= self.call_signatures_related_to(
                 source,
@@ -1570,15 +1622,6 @@ impl<'store> RelaterSession<'store> {
     ) -> Result<Ternary, RelationUnavailable> {
         let source_flags = self.store.type_flags(source)?;
         let target_flags = self.store.type_flags(target)?;
-        if source_flags.intersects(TypeFlags::INTERSECTION)
-            || target_flags.intersects(TypeFlags::INTERSECTION)
-        {
-            return Err(RelationUnavailable::StructuralRelation {
-                source,
-                target,
-                relation: self.relation,
-            });
-        }
         if source_flags.intersects(TypeFlags::UNION) {
             self.union_types(source)?;
             if target_flags.intersects(TypeFlags::UNION) {
@@ -1594,6 +1637,49 @@ impl<'store> RelaterSession<'store> {
         }
         if target_flags.intersects(TypeFlags::UNION) {
             return self.type_related_to_some_type(source, target, intersection_state);
+        }
+        if target_flags.intersects(TypeFlags::INTERSECTION)
+            && !intersection_state.intersects(IntersectionState::TARGET)
+        {
+            let target_types = self.intersection_projection(target)?.types;
+            let mut result = Ternary::True;
+            for target_type in target_types {
+                let related = self.is_related_to_ex(
+                    source,
+                    target_type,
+                    RecursionFlags::TARGET,
+                    intersection_state | IntersectionState::TARGET,
+                )?;
+                if related == Ternary::False {
+                    return Ok(Ternary::False);
+                }
+                result &= related;
+            }
+            return Ok(result);
+        }
+        if source_flags.intersects(TypeFlags::INTERSECTION)
+            && !intersection_state.intersects(IntersectionState::SOURCE)
+        {
+            let source_types = self.intersection_projection(source)?.types;
+            for source_type in source_types {
+                let related = self.is_related_to_ex(
+                    source_type,
+                    target,
+                    RecursionFlags::SOURCE,
+                    intersection_state | IntersectionState::SOURCE,
+                )?;
+                if related != Ternary::False {
+                    return Ok(related);
+                }
+            }
+            if target_flags.intersects(TypeFlags::OBJECT) {
+                return self.structured_type_related_to(
+                    source,
+                    target,
+                    intersection_state | IntersectionState::SOURCE,
+                );
+            }
+            return Ok(Ternary::False);
         }
         Err(RelationUnavailable::StructuralRelation {
             source,
@@ -1799,23 +1885,55 @@ impl<'store> RelaterSession<'store> {
         Ok(Ternary::False)
     }
 
-    fn each_type_related_to_some_type(
+    fn each_union_or_intersection_type_related_to_some_type(
         &mut self,
         source: TypeId,
         target: TypeId,
     ) -> Result<Ternary, RelationUnavailable> {
-        let source_types = self.union_types(source)?;
-        self.union_types(target)?;
+        let source_types = self.union_or_intersection_types(source)?;
+        let target_types = self.union_or_intersection_types(target)?;
         let mut result = Ternary::True;
         for source_type in source_types {
-            let related =
-                self.type_related_to_some_type(source_type, target, IntersectionState::NONE)?;
+            if target_types.contains(&source_type) {
+                continue;
+            }
+            let mut related = Ternary::False;
+            for target_type in &target_types {
+                let candidate = self.is_related_to_ex(
+                    source_type,
+                    *target_type,
+                    RecursionFlags::TARGET,
+                    IntersectionState::NONE,
+                )?;
+                if candidate != Ternary::False {
+                    related = candidate;
+                    break;
+                }
+            }
             if related == Ternary::False {
                 return Ok(Ternary::False);
             }
             result &= related;
         }
         Ok(result)
+    }
+
+    fn union_or_intersection_types(
+        &mut self,
+        type_: TypeId,
+    ) -> Result<Vec<TypeId>, RelationUnavailable> {
+        let flags = self.store.type_flags(type_)?;
+        if flags.intersects(TypeFlags::UNION) {
+            return self.union_types(type_);
+        }
+        if flags.intersects(TypeFlags::INTERSECTION) {
+            return Ok(self.intersection_projection(type_)?.types);
+        }
+        Err(RelationUnavailable::StructuralRelation {
+            source: type_,
+            target: type_,
+            relation: self.relation,
+        })
     }
 
     fn weak_target_lacks_common_properties(
@@ -1886,7 +2004,8 @@ impl<'store> RelaterSession<'store> {
         // target and exempts the global Object target only for assignable and
         // comparable relations. Subtype relations retain fresh-literal excess
         // checking against those targets. Index signatures and
-        // union/intersection targets remain outside this property-only slice.
+        // Union targets remain outside this property-only slice; admitted
+        // intersections expose their already-validated combined property table.
         if matches!(
             self.relation,
             RelationKind::Assignable | RelationKind::Comparable
@@ -1943,6 +2062,70 @@ impl<'store> RelaterSession<'store> {
             return Ok(false);
         };
         Ok(self.observe_merged_symbol_lookup(type_symbol) == Some(global_object))
+    }
+
+    fn properties_identical_to(
+        &mut self,
+        target: TypeId,
+        source_members: &ResolvedObjectMembers,
+        target_members: &ResolvedObjectMembers,
+    ) -> Result<Ternary, RelationUnavailable> {
+        if source_members.properties.len() != target_members.properties.len() {
+            return Ok(Ternary::False);
+        }
+        if target_members.properties.is_empty() {
+            return Ok(Ternary::True);
+        }
+        let target_table = target_members
+            .members
+            .ok_or(RelationUnavailable::InvalidStructuredMembers(target))?;
+        self.observe_symbol_table(target_table);
+
+        let mut result = Ternary::True;
+        for source_property in &source_members.properties {
+            let (name, source_optional, source_readonly) = {
+                let source =
+                    self.property_symbol(*source_property, source_members.property_origin)?;
+                (
+                    source.name().to_owned(),
+                    source.flags().intersects(SymbolFlags::OPTIONAL),
+                    source.check_flags().contains(CheckFlags::READONLY),
+                )
+            };
+            let target_property = self
+                .store
+                .symbol_table(target_table)
+                .ok_or(RelationUnavailable::InvalidStructuredMembers(target))?
+                .get(name.as_ref());
+            let Some(target_property) = target_property else {
+                return Ok(Ternary::False);
+            };
+            let (target_optional, target_readonly) = {
+                let target =
+                    self.property_symbol(target_property, target_members.property_origin)?;
+                (
+                    target.flags().intersects(SymbolFlags::OPTIONAL),
+                    target.check_flags().contains(CheckFlags::READONLY),
+                )
+            };
+            if source_optional != target_optional || source_readonly != target_readonly {
+                return Ok(Ternary::False);
+            }
+            if *source_property == target_property {
+                continue;
+            }
+            let related = self.is_related_to_ex(
+                self.property_type(*source_property)?,
+                self.property_type(target_property)?,
+                RecursionFlags::BOTH,
+                IntersectionState::NONE,
+            )?;
+            if related == Ternary::False {
+                return Ok(Ternary::False);
+            }
+            result &= related;
+        }
+        Ok(result)
     }
 
     fn properties_related_to(
@@ -2583,6 +2766,17 @@ impl<'store> RelaterSession<'store> {
             .symbol(symbol)
             .ok_or(RelationUnavailable::Symbol(symbol))?;
         match origin {
+            ObjectPropertyOrigin::Intersection(owner) => {
+                return if self
+                    .intersection_projection(owner)?
+                    .properties
+                    .contains(&symbol)
+                {
+                    Ok(record)
+                } else {
+                    Err(RelationUnavailable::UnsupportedProperty(symbol))
+                };
+            }
             ObjectPropertyOrigin::FreshObjectLiteral(owner) => {
                 return if self.is_canonical_object_literal_property(symbol, record, owner) {
                     Ok(record)
@@ -2625,7 +2819,8 @@ impl<'store> RelaterSession<'store> {
                     SymbolFlags::INTERFACE | SymbolFlags::TYPE_LITERAL
                 }
                 ObjectPropertyOrigin::FreshObjectLiteral(_)
-                | ObjectPropertyOrigin::DerivedObjectLiteral(_) => {
+                | ObjectPropertyOrigin::DerivedObjectLiteral(_)
+                | ObjectPropertyOrigin::Intersection(_) => {
                     unreachable!("literal property origins return before declared validation")
                 }
             };
@@ -2755,13 +2950,25 @@ impl<'store> RelaterSession<'store> {
         let target_flags = self.store.type_flags(target)?;
         let source_is_union = source_flags.intersects(TypeFlags::UNION);
         let target_is_union = target_flags.intersects(TypeFlags::UNION);
+        let source_is_intersection = source_flags.intersects(TypeFlags::INTERSECTION);
+        let target_is_intersection = target_flags.intersects(TypeFlags::INTERSECTION);
         if source_is_union {
             self.union_types(source)?;
         }
         if target_is_union {
             self.union_types(target)?;
         }
-        if source_is_union || target_is_union {
+        if source_is_intersection {
+            self.intersection_projection(source)?;
+        }
+        if target_is_intersection {
+            self.intersection_projection(target)?;
+        }
+        if source_is_union
+            || target_is_union
+            || source_is_intersection
+            || target_is_intersection
+        {
             return Ok(());
         }
         if supports_structured_object_relation(self.relation, self.strict_function_types)
@@ -2811,6 +3018,10 @@ impl<'store> RelaterSession<'store> {
             .store
             .type_payload(type_id)
             .ok_or(RelationUnavailable::Type(type_id))?;
+        if record.flags() == TypeFlags::INTERSECTION {
+            self.intersection_projection(type_id)?;
+            return Ok(());
+        }
         if record.flags() != TypeFlags::OBJECT || !self.supports_property_object_alias(type_id) {
             return Err(RelationUnavailable::UnsupportedStructuredType(type_id));
         }
@@ -3051,6 +3262,20 @@ impl<'store> RelaterSession<'store> {
         type_id: TypeId,
         allow_fresh_literal: bool,
     ) -> Result<ResolvedObjectMembers, RelationUnavailable> {
+        if self
+            .store
+            .type_flags(type_id)?
+            .intersects(TypeFlags::INTERSECTION)
+        {
+            let projection = self.intersection_projection(type_id)?;
+            return Ok(ResolvedObjectMembers {
+                members: Some(projection.members),
+                properties: projection.properties,
+                property_origin: ObjectPropertyOrigin::Intersection(type_id),
+                call_signature: None,
+                exact_callable: false,
+            });
+        }
         let is_function = self
             .store
             .admit_callable_relation_type(type_id, self.strict_function_types)?;
@@ -4061,7 +4286,31 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         let original_source = source;
         let original_target = target;
         let source = self.regular_type_if_fresh(source)?;
+        let source = if self.type_flags(source)?.intersects(TypeFlags::INTERSECTION) {
+            let projection = self
+                .validate_intersection_type(source)
+                .map_err(|_| RelationUnavailable::MalformedIntersection(source))?;
+            if projection.reduced_to_never {
+                bootstrap.never_type
+            } else {
+                source
+            }
+        } else {
+            source
+        };
         let target = self.regular_type_if_fresh(target)?;
+        let target = if self.type_flags(target)?.intersects(TypeFlags::INTERSECTION) {
+            let projection = self
+                .validate_intersection_type(target)
+                .map_err(|_| RelationUnavailable::MalformedIntersection(target))?;
+            if projection.reduced_to_never {
+                bootstrap.never_type
+            } else {
+                target
+            }
+        } else {
+            target
+        };
         validate_direct_interface_heritage_relation_endpoint(self, source)?;
         validate_class_members_relation_endpoint(self, source)?;
         if target != source {
@@ -4140,8 +4389,8 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         if source_flags.intersects(TypeFlags::STRUCTURED_OR_INSTANTIABLE)
             || target_flags.intersects(TypeFlags::STRUCTURED_OR_INSTANTIABLE)
         {
-            let union_relation = source_flags.intersects(TypeFlags::UNION)
-                || target_flags.intersects(TypeFlags::UNION);
+            let union_relation = source_flags.intersects(TypeFlags::UNION_OR_INTERSECTION)
+                || target_flags.intersects(TypeFlags::UNION_OR_INTERSECTION);
             let supported_object_relation =
                 supports_structured_object_relation(relation, strict_function_types)
                     && source_flags.intersects(TypeFlags::OBJECT)
@@ -4695,10 +4944,9 @@ const fn supports_property_object_relation(relation: RelationKind) -> bool {
 
 const fn supports_structured_object_relation(
     relation: RelationKind,
-    strict_function_types: Option<bool>,
+    _strict_function_types: Option<bool>,
 ) -> bool {
-    supports_property_object_relation(relation)
-        || relation.is_identity() && strict_function_types.is_some()
+    supports_property_object_relation(relation) || relation.is_identity()
 }
 
 pub(super) const fn union_validation_unavailable(
@@ -4947,6 +5195,28 @@ mod tests {
             .and_then(|links| links.resolved_signature.signature())
             .expect("the function type has a resolved signature");
         (type_, signature)
+    }
+
+    fn query_type_alias(fixture: &mut FunctionRelationFixture, name: &str) -> TypeId {
+        let node = alias_function_node(fixture, name);
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let type_ = {
+            let host = relation_host(
+                &fixture.parsed.arena,
+                fixture.files.get(&fixture.file).unwrap(),
+            );
+            CanonicalTypeQuery::new(
+                &mut fixture.store,
+                &host,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_type_from_type_node(node)
+            .unwrap()
+        };
+        assert!(diagnostics.is_empty());
+        type_
     }
 
     fn resolve_all_function_returns(fixture: &mut FunctionRelationFixture) {
@@ -8527,6 +8797,33 @@ mod tests {
             Ok(true),
             "the exact global Object target is exempt from excess-property checks"
         );
+    }
+
+    #[test]
+    fn fresh_excess_uses_the_combined_target_intersection_surface() {
+        let mut fixture = function_relation_fixture(
+            "type Left = { a: string }; \
+             type Right = { b: string }; \
+             type Target = Left & Right;",
+        );
+        let target = query_type_alias(&mut fixture, "Target");
+        let string = fixture.store.intrinsic_bootstrap().unwrap().string_type;
+        let a = alloc_typed_property(&mut fixture.store, "a", string, false);
+        let b = alloc_typed_property(&mut fixture.store, "b", string, false);
+        let extra = alloc_typed_property(&mut fixture.store, "extra", string, false);
+        let source = alloc_fresh_property_object(&mut fixture.store, vec![a, b, extra]);
+        let before = fixture.store.relation_state_snapshot();
+
+        assert_eq!(
+            fixture.store.is_type_assignable_to(source, target),
+            Ok(false),
+        );
+        assert_eq!(fixture.store.relation_state_snapshot(), before);
+        assert_eq!(
+            fixture.store.is_type_comparable_to(source, target),
+            Ok(false),
+        );
+        assert_eq!(fixture.store.relation_state_snapshot(), before);
     }
 
     #[test]

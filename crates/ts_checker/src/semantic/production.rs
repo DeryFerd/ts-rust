@@ -568,6 +568,36 @@ impl<'arena> CanonicalCheckerContext<'arena> {
         )
     }
 
+    /// Tests exact type identity using the context's authoritative global identities.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RelationUnavailable`] when either type is malformed or the
+    /// identity relation requires a semantic family outside the installed checker cut.
+    pub fn is_type_identical_to(
+        &mut self,
+        source: TypeId,
+        target: TypeId,
+    ) -> Result<bool, RelationUnavailable> {
+        self.store
+            .is_type_identical_to_with_global_types(source, target, &self.global_types)
+    }
+
+    /// Tests comparability using the context's authoritative global identities.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RelationUnavailable`] when either type is malformed or the
+    /// comparable relation requires a semantic family outside the installed checker cut.
+    pub fn is_type_comparable_to(
+        &mut self,
+        source: TypeId,
+        target: TypeId,
+    ) -> Result<bool, RelationUnavailable> {
+        self.store
+            .is_type_comparable_to_with_global_types(source, target, &self.global_types)
+    }
+
     fn type_format_flags(&self, mut flags: CanonicalTypeFormatFlags) -> CanonicalTypeFormatFlags {
         if self.options.no_error_truncation {
             flags |= CanonicalTypeFormatFlags::NO_TRUNCATION;

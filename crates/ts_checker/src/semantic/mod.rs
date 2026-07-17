@@ -32,6 +32,7 @@ pub mod ids;
 mod indexed_access_types;
 mod inference;
 mod instantiate;
+mod intersection_types;
 mod interface_heritage;
 #[allow(dead_code)] // Root owns the checker-cache and type-node integration adapter.
 mod keyof_types;
