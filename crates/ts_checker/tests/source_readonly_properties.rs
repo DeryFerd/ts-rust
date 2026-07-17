@@ -17,10 +17,7 @@ const SOURCE: &str = concat!(
     "{ frozen: 1, open: \"x\" };\n",
 );
 
-fn checker_context<'arena>(
-    parsed: &'arena ParseResult,
-    file: FileId,
-) -> CanonicalCheckerContext<'arena> {
+fn checker_context(parsed: &ParseResult, file: FileId) -> CanonicalCheckerContext<'_> {
     let mut binder = CanonicalBinder::new();
     binder
         .bind_source_file_with_facts(
