@@ -8,7 +8,8 @@
 //! leading direct named ESM value imports, clause-level type-only named ESM
 //! imports in exact direct or union/parenthesized/array top-level variable
 //! annotations,
-//! annotated top-level function declarations, initialized identifier-named
+//! annotated top-level function declarations, exact direct non-exported
+//! ambient function declarations, initialized identifier-named
 //! top-level variables (optionally exported), ordinary direct identifier
 //! calls, atomic primitive/literal scalar binary operators, direct top-level
 //! conditional initializers, required own-property reads (including exact
@@ -77,11 +78,11 @@ use super::{
         resolve_contextual_arrow_parameter_origins,
     },
     source_callables::{
-        ContextualSourceCallableParameter, PreparedContextualSourceCallable, SourceCallableError,
-        SourceCallableFamily, SourceCallableParameterPlan, SourceCallablePlan,
-        SourceCallableReturnPlan, StoredSourceCallableValidation, plan_source_callable,
-        publish_contextual_source_callable, publish_inferred_source_callable_return,
-        validate_stored_source_callable,
+        ContextualSourceCallableParameter, PreparedContextualSourceCallable,
+        SourceCallableBodyMode, SourceCallableError, SourceCallableFamily,
+        SourceCallableParameterPlan, SourceCallablePlan, SourceCallableReturnPlan,
+        StoredSourceCallableValidation, plan_source_callable, publish_contextual_source_callable,
+        publish_inferred_source_callable_return, validate_stored_source_callable,
     },
     source_calls::{
         SourceCallCalleeForm, SourceCallPlan, check_direct_source_call,
@@ -694,6 +695,13 @@ struct PlannedFunction {
     body: PlannedFunctionBody,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PlannedFunctionModifierMode {
+    None,
+    Export(NodeRef),
+    Declare(NodeRef),
+}
+
 #[derive(Clone, Debug)]
 struct PlannedArrow {
     source: SourceArrowPlan,
@@ -723,6 +731,7 @@ enum PlannedArrowBody {
 
 #[derive(Clone, Debug)]
 enum PlannedFunctionBody {
+    Ambient,
     Empty,
     Return {
         statement: NodeRef,
@@ -1058,7 +1067,11 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             if self.node(statement)?.kind != SyntaxKind::FunctionDeclaration {
                 continue;
             }
-            let callable = self.preplan_function_declaration(statement, is_external_module)?;
+            let callable = self.preplan_function_declaration(
+                statement,
+                is_external_module,
+                facts.is_declaration_file(),
+            )?;
             if preplanned_functions.insert(statement, callable).is_some() {
                 return Err(SourceCheckError::Function(
                     SourceFunctionInvariant::DuplicateDeclaration(statement),
@@ -1293,7 +1306,11 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                             statement,
                         )),
                     )?;
-                    let (parameter_initializers, body) = self.plan_function_body(&callable)?;
+                    let (parameter_initializers, body) = if callable.body_mode.is_ambient() {
+                        (Vec::new(), PlannedFunctionBody::Ambient)
+                    } else {
+                        self.plan_function_body(&callable)?
+                    };
                     let index = functions.len();
                     functions.push(PlannedFunction {
                         callable,
@@ -2074,6 +2091,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         &mut self,
         declaration: NodeRef,
         is_external_module: bool,
+        is_declaration_file: bool,
     ) -> Result<SourceCallablePlan, SourceCheckError> {
         let (range, flags, facts, modifiers, name_id) = {
             let node = self.node(declaration)?;
@@ -2121,17 +2139,25 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             }
             (identifier.text.clone(), node.range.start.get())
         };
-        let export_modifier =
+        let modifier_mode =
             self.validate_function_modifiers(declaration, range, name_start, modifiers.as_ref())?;
-        if let Some(export_modifier) = export_modifier
-            && !is_external_module
-        {
-            return Err(SourceCheckError::Unsupported(
-                UnsupportedSourceSyntax::MissingExternalModuleFact {
-                    node: export_modifier,
-                    role: SourceSyntaxRole::FunctionModifier,
-                },
-            ));
+        match modifier_mode {
+            PlannedFunctionModifierMode::Export(export_modifier) if !is_external_module => {
+                return Err(SourceCheckError::Unsupported(
+                    UnsupportedSourceSyntax::MissingExternalModuleFact {
+                        node: export_modifier,
+                        role: SourceSyntaxRole::FunctionModifier,
+                    },
+                ));
+            }
+            PlannedFunctionModifierMode::Declare(declare_modifier) if is_declaration_file => {
+                return Err(self.unsupported(
+                    declare_modifier,
+                    SyntaxKind::DeclareKeyword,
+                    SourceSyntaxRole::FunctionModifier,
+                ));
+            }
+            _ => {}
         }
         let Some((store, host)) = self.semantic else {
             return Err(self.unsupported(
@@ -2146,7 +2172,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             declaration,
             name,
             &name_text,
-            export_modifier.is_some(),
+            matches!(modifier_mode, PlannedFunctionModifierMode::Export(_)),
         )
         .map_err(Self::function_plan_error)?;
         let callable = plan_source_callable(
@@ -2157,6 +2183,21 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             self.array_targets,
         )
         .map_err(Self::callable_plan_error)?;
+        let body_mode_matches = matches!(
+            (modifier_mode, callable.body_mode),
+            (
+                PlannedFunctionModifierMode::Declare(_),
+                SourceCallableBodyMode::AmbientDeclaration
+            ) | (
+                PlannedFunctionModifierMode::None | PlannedFunctionModifierMode::Export(_),
+                SourceCallableBodyMode::Present
+            )
+        );
+        if !body_mode_matches {
+            return Err(SourceCheckError::Function(
+                SourceFunctionInvariant::Callable(declaration),
+            ));
+        }
         if !self.hoisted_functions.insert(function.owner_symbol) {
             return Err(SourceCheckError::Function(
                 SourceFunctionInvariant::DuplicateDeclaration(declaration),
@@ -2231,9 +2272,9 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         declaration_range: TextRange,
         name_start: u32,
         modifiers: Option<&ModifierList>,
-    ) -> Result<Option<NodeRef>, SourceCheckError> {
+    ) -> Result<PlannedFunctionModifierMode, SourceCheckError> {
         let Some(modifiers) = modifiers else {
-            return Ok(None);
+            return Ok(PlannedFunctionModifierMode::None);
         };
         let [modifier_id] = modifiers.list.nodes.as_slice() else {
             return Err(self.unsupported(
@@ -2248,23 +2289,42 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             || modifiers.list.has_trailing_comma
             || modifiers.list.range.start != declaration_range.start
             || modifiers.list.range.end.get() > name_start
-            || node.kind != SyntaxKind::ExportKeyword
+            || !matches!(
+                node.kind,
+                SyntaxKind::ExportKeyword | SyntaxKind::DeclareKeyword
+            )
             || !matches!(node.data, NodeData::Token(_))
             || node.flags.0 != 0
             || node.parent != Some(declaration.node)
             || node.range.start != declaration_range.start
             || node.range.end.get() > modifiers.list.range.end.get()
-            || !self.source_spelling_matches(modifier, "export")
+            || !self.source_spelling_matches(
+                modifier,
+                if node.kind == SyntaxKind::ExportKeyword {
+                    "export"
+                } else {
+                    "declare"
+                },
+            )
         {
             return Err(self.unsupported(modifier, node.kind, SourceSyntaxRole::FunctionModifier));
         }
-        Ok(Some(modifier))
+        Ok(if node.kind == SyntaxKind::ExportKeyword {
+            PlannedFunctionModifierMode::Export(modifier)
+        } else {
+            PlannedFunctionModifierMode::Declare(modifier)
+        })
     }
 
     fn plan_function_body(
         &mut self,
         callable: &SourceCallablePlan,
     ) -> Result<(Vec<PlannedParameterInitializer>, PlannedFunctionBody), SourceCheckError> {
+        if callable.body_mode != SourceCallableBodyMode::Present {
+            return Err(SourceCheckError::Function(
+                SourceFunctionInvariant::Callable(callable.declaration),
+            ));
+        }
         let parameter_initializers = self.plan_parameter_initializers_and_enter_scope(callable)?;
         let body_prior_variables = self.prior_variables.clone();
         let body_readable_variables = self.readable_variables.clone();
@@ -5091,6 +5151,7 @@ fn preflight_inferred_function_return_dependencies(
             )
         });
         let body_supported = match &function.body {
+            PlannedFunctionBody::Ambient => !function.callable.return_type.is_inferred(),
             PlannedFunctionBody::Empty => true,
             PlannedFunctionBody::Return { expression, .. } => {
                 expression_is_closed(expression, &function.callable.parameters, functions)
@@ -9122,7 +9183,9 @@ pub(super) fn check_source_file(
         let expression = match &function.body {
             PlannedFunctionBody::Empty => None,
             PlannedFunctionBody::Return { expression, .. } => Some(expression),
-            PlannedFunctionBody::Statements(_) | PlannedFunctionBody::JoinedStatements(_) => {
+            PlannedFunctionBody::Ambient
+            | PlannedFunctionBody::Statements(_)
+            | PlannedFunctionBody::JoinedStatements(_) => {
                 return Err(SourceCheckError::Function(
                     SourceFunctionInvariant::Callable(function.callable.body),
                 ));
@@ -9196,6 +9259,22 @@ pub(super) fn check_source_file(
                 let function = functions.get(index).ok_or(SourceCheckError::Function(
                     SourceFunctionInvariant::InvalidStatementIndex(index),
                 ))?;
+                if matches!(function.body, PlannedFunctionBody::Ambient) {
+                    if function.callable.body_mode != SourceCallableBodyMode::AmbientDeclaration
+                        || function.callable.return_type.is_inferred()
+                        || !function.parameter_initializers.is_empty()
+                    {
+                        return Err(SourceCheckError::Function(
+                            SourceFunctionInvariant::Callable(function.callable.declaration),
+                        ));
+                    }
+                    continue;
+                }
+                if function.callable.body_mode != SourceCallableBodyMode::Present {
+                    return Err(SourceCheckError::Function(
+                        SourceFunctionInvariant::Callable(function.callable.declaration),
+                    ));
+                }
                 if function.callable.return_type.is_inferred() {
                     let function_diagnostics = inferred_function_diagnostics
                         .get_mut(index)
@@ -9228,6 +9307,11 @@ pub(super) fn check_source_file(
                     &function.parameter_initializers,
                 )?;
                 match &function.body {
+                    PlannedFunctionBody::Ambient => {
+                        return Err(SourceCheckError::Function(
+                            SourceFunctionInvariant::Callable(function.callable.declaration),
+                        ));
+                    }
                     PlannedFunctionBody::Empty => {}
                     PlannedFunctionBody::Return {
                         statement,
@@ -12723,6 +12807,107 @@ mod tests {
                 context.store().type_node_links(read).cloned(),
             ),
             warm
+        );
+    }
+
+    #[test]
+    fn later_ambient_function_cache_poison_preflights_before_earlier_publication() {
+        let source = parsed(concat!(
+            "declare function early(value: number): number;\n",
+            "const read = early(1);\n",
+            "declare function later(value: string): string;\n",
+        ));
+        let file = FileId::new(2_104);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        let early_declaration = function_declaration(&source, file, "early");
+        let later_declaration = function_declaration(&source, file, "later");
+        let early = function_symbol(&context, &source, file, "early");
+        let later = function_symbol(&context, &source, file, "later");
+        let read_owner = variable_symbol(&context, &source, file, "read");
+        let call = variable_initializer(&source, file, "read");
+        let callees = identifier_expressions(&source, file, "early");
+        let [callee] = callees.as_slice() else {
+            panic!("fixture must contain one ambient function read")
+        };
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+
+        assert!(context.store_mut_for_test().set_value_symbol_links(
+            later,
+            ValueSymbolLinks {
+                write_type: Some(string),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        let poisoned = observable_state(&context, file);
+        let expected =
+            SourceCheckError::Function(SourceFunctionInvariant::Callable(later_declaration));
+        for _ in 0..2 {
+            assert_eq!(context.check_source_file(file), Err(expected));
+            assert_eq!(observable_state(&context, file), poisoned);
+            assert!(context.store().value_symbol_links(early).is_none());
+            assert!(context.store().value_symbol_links(read_owner).is_none());
+            assert!(context.store().signature_links(early_declaration).is_none());
+            assert!(context.store().type_node_links(call).is_none());
+            assert!(context.store().signature_links(call).is_none());
+            assert!(context.store().symbol_node_links(*callee).is_none());
+            assert!(context.diagnostics().is_empty());
+            assert!(!is_type_checked(&context, file));
+        }
+
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_value_symbol_links(later, ValueSymbolLinks::default())
+        );
+        context.check_source_file(file).unwrap();
+        let early_type = context
+            .store()
+            .source_callable_type_for_owner(early)
+            .expect("the repaired ambient function must retain its callable type");
+        let later_type = context
+            .store()
+            .source_callable_type_for_owner(later)
+            .expect("the repaired later ambient function must retain its callable type");
+        assert_ne!(early_type, later_type);
+        assert_eq!(
+            context
+                .store()
+                .value_symbol_links(early)
+                .and_then(|links| links.resolved_type),
+            Some(early_type)
+        );
+        assert_eq!(
+            context
+                .store()
+                .value_symbol_links(later)
+                .and_then(|links| links.resolved_type),
+            Some(later_type)
+        );
+        assert!(context.store().signature_links(early_declaration).is_some());
+        assert!(context.store().signature_links(later_declaration).is_some());
+        assert!(context.store().type_node_links(call).is_some());
+        assert!(context.store().signature_links(call).is_some());
+        assert_eq!(
+            context
+                .store()
+                .symbol_node_links(*callee)
+                .and_then(|links| links.resolved_symbol),
+            Some(early)
+        );
+        assert!(context.diagnostics().is_empty());
+        assert!(is_type_checked(&context, file));
+
+        let warm = observable_state(&context, file);
+        mark_source_unchecked(&mut context, file);
+        context.check_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+        assert_eq!(
+            context.store().source_callable_type_for_owner(early),
+            Some(early_type)
+        );
+        assert_eq!(
+            context.store().source_callable_type_for_owner(later),
+            Some(later_type)
         );
     }
 

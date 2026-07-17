@@ -107,6 +107,21 @@ pub(super) enum SourceCallableReturnPlan {
     Inferred,
 }
 
+/// Whether a source function owns executable syntax or is an exact ambient
+/// declaration. Ambient callables retain their declaration as a diagnostic
+/// anchor, but no body consumer may run unless this capability is `Present`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SourceCallableBodyMode {
+    Present,
+    AmbientDeclaration,
+}
+
+impl SourceCallableBodyMode {
+    pub(super) const fn is_ambient(self) -> bool {
+        matches!(self, Self::AmbientDeclaration)
+    }
+}
+
 impl SourceCallableReturnPlan {
     pub(super) const fn type_node(self) -> Option<NodeRef> {
         match self {
@@ -169,6 +184,9 @@ pub(super) struct SourceCallablePlan {
     generic_return_type_parameter_index: Option<usize>,
     pub(super) parameters: Vec<SourceCallableParameterPlan>,
     pub(super) return_type: SourceCallableReturnPlan,
+    pub(super) body_mode: SourceCallableBodyMode,
+    /// The actual body for `Present`, or the declaration diagnostic anchor for
+    /// `AmbientDeclaration`.
     pub(super) body: NodeRef,
     pub(super) flags: SignatureFlags,
     pub(super) min_argument_count: i32,
@@ -189,6 +207,8 @@ pub(super) enum SourceCallableUnsupported {
     OptionalRestParameter(NodeRef),
     InitializedRestParameter(NodeRef),
     OptionalInitializedParameter(NodeRef),
+    AmbientRestParameter(NodeRef),
+    AmbientParameterInitializer(NodeRef),
     DestructuredParameter(NodeRef),
     ParameterModifiers(NodeRef),
     MissingParameterType(NodeRef),
@@ -235,6 +255,8 @@ impl SourceCallableError {
                 | SourceCallableUnsupported::OptionalRestParameter(node)
                 | SourceCallableUnsupported::InitializedRestParameter(node)
                 | SourceCallableUnsupported::OptionalInitializedParameter(node)
+                | SourceCallableUnsupported::AmbientRestParameter(node)
+                | SourceCallableUnsupported::AmbientParameterInitializer(node)
                 | SourceCallableUnsupported::DestructuredParameter(node)
                 | SourceCallableUnsupported::ParameterModifiers(node)
                 | SourceCallableUnsupported::MissingParameterType(node)
@@ -439,11 +461,25 @@ pub(super) fn plan_source_callable(
             SourceCallableUnsupported::Generator(asterisk),
         ));
     }
-    validate_modifiers(store, host, declaration, record.range, &view)?;
+    let body_mode = validate_modifiers(store, host, declaration, record.range, &view)?;
+    if body_mode.is_ambient() && !type_parameters.is_empty() {
+        return Err(SourceCallableError::Unsupported(
+            SourceCallableUnsupported::GenericSignature(declaration),
+        ));
+    }
 
     let bound = host
         .bound_file(declaration)
         .ok_or_else(|| invariant(SourceCallableInvariant::InvalidOwnerSymbol(declaration)))?;
+    if body_mode.is_ambient()
+        && bound
+            .source_facts()
+            .is_none_or(|facts| facts.is_declaration_file())
+    {
+        return Err(SourceCallableError::Unsupported(
+            SourceCallableUnsupported::Modifiers(declaration),
+        ));
+    }
     if bound.symbol(declaration) != Some(owner_symbol)
         || store.get_merged_symbol(owner_symbol) != Some(owner_symbol)
     {
@@ -473,6 +509,7 @@ pub(super) fn plan_source_callable(
         owner_symbol,
         owner,
         export_local,
+        body_mode,
         &view,
     )?;
     // The pinned binder stores TypeScript expando assignments on the
@@ -558,6 +595,11 @@ pub(super) fn plan_source_callable(
                     parameter,
                 )));
             }
+            if body_mode.is_ambient() {
+                return Err(SourceCallableError::Unsupported(
+                    SourceCallableUnsupported::AmbientRestParameter(parameter),
+                ));
+            }
             true
         } else {
             false
@@ -602,6 +644,11 @@ pub(super) fn plan_source_callable(
                 return Err(invariant(SourceCallableInvariant::InvalidParameter(
                     parameter,
                 )));
+            }
+            if body_mode.is_ambient() {
+                return Err(SourceCallableError::Unsupported(
+                    SourceCallableUnsupported::AmbientParameterInitializer(parameter),
+                ));
             }
         }
         if rest && optional {
@@ -697,6 +744,11 @@ pub(super) fn plan_source_callable(
             return_record.range.end,
         )
     } else {
+        if body_mode.is_ambient() {
+            return Err(SourceCallableError::Unsupported(
+                SourceCallableUnsupported::OverloadDeclaration(declaration),
+            ));
+        }
         if !type_parameters.is_empty() {
             return Err(SourceCallableError::Unsupported(
                 SourceCallableUnsupported::GenericInferredReturn(declaration),
@@ -707,30 +759,41 @@ pub(super) fn plan_source_callable(
             view.parameters.range.end,
         )
     };
-    let Some(body_id) = view.body else {
-        return Err(SourceCallableError::Unsupported(
-            SourceCallableUnsupported::OverloadDeclaration(declaration),
-        ));
+    let (body, body_start) = match (body_mode, view.body) {
+        (SourceCallableBodyMode::Present, Some(body_id)) => {
+            let body = NodeRef::new(declaration.arena, declaration.file, body_id);
+            let body_record = preflight_node(store, host, body)?;
+            if body_record.parent != Some(declaration.node)
+                || body_record.range.start < return_end
+                || body_record.range.end > record.range.end
+                || view.family == SourceCallableFamily::FunctionDeclaration
+                    && body_record.kind != SyntaxKind::Block
+            {
+                return Err(invariant(SourceCallableInvariant::InvalidSyntax(
+                    declaration,
+                )));
+            }
+            (body, body_record.range.start)
+        }
+        (SourceCallableBodyMode::Present, None) => {
+            return Err(SourceCallableError::Unsupported(
+                SourceCallableUnsupported::OverloadDeclaration(declaration),
+            ));
+        }
+        (SourceCallableBodyMode::AmbientDeclaration, None) => (declaration, record.range.end),
+        (SourceCallableBodyMode::AmbientDeclaration, Some(_)) => {
+            return Err(SourceCallableError::Unsupported(
+                SourceCallableUnsupported::Modifiers(declaration),
+            ));
+        }
     };
-    let body = NodeRef::new(declaration.arena, declaration.file, body_id);
-    let body_record = preflight_node(store, host, body)?;
-    if body_record.parent != Some(declaration.node)
-        || body_record.range.start < return_end
-        || body_record.range.end > record.range.end
-        || view.family == SourceCallableFamily::FunctionDeclaration
-            && body_record.kind != SyntaxKind::Block
-    {
-        return Err(invariant(SourceCallableInvariant::InvalidSyntax(
-            declaration,
-        )));
-    }
     if let Some(token_id) = view.equals_greater_than_token {
         let token = NodeRef::new(declaration.arena, declaration.file, token_id);
         let token_record = preflight_node(store, host, token)?;
         if token_record.kind != SyntaxKind::EqualsGreaterThanToken
             || token_record.parent != Some(declaration.node)
             || token_record.range.start < return_end
-            || token_record.range.end > body_record.range.start
+            || token_record.range.end > body_start
         {
             return Err(invariant(SourceCallableInvariant::InvalidSyntax(
                 declaration,
@@ -750,6 +813,7 @@ pub(super) fn plan_source_callable(
         generic_return_type_parameter_index: None,
         parameters,
         return_type,
+        body_mode,
         body,
         flags,
         min_argument_count,
@@ -1588,9 +1652,9 @@ fn validate_modifiers(
     declaration: NodeRef,
     declaration_range: ts_core::TextRange,
     view: &SourceSyntaxView<'_>,
-) -> Result<(), SourceCallableError> {
+) -> Result<SourceCallableBodyMode, SourceCallableError> {
     let Some(modifiers) = view.modifiers else {
-        return Ok(());
+        return Ok(SourceCallableBodyMode::Present);
     };
     for modifier_id in &modifiers.list.nodes {
         let modifier = NodeRef::new(declaration.arena, declaration.file, *modifier_id);
@@ -1612,7 +1676,10 @@ fn validate_modifiers(
         || modifiers.flags.0 != 0
         || modifiers.list.has_trailing_comma
         || modifiers.list.range.start != declaration_range.start
-        || modifier_record.kind != SyntaxKind::ExportKeyword
+        || !matches!(
+            modifier_record.kind,
+            SyntaxKind::ExportKeyword | SyntaxKind::DeclareKeyword
+        )
         || !matches!(modifier_record.data, NodeData::Token(_))
         || modifier_record.flags.0 != 0
         || modifier_record.parent != Some(declaration.node)
@@ -1623,7 +1690,11 @@ fn validate_modifiers(
             SourceCallableUnsupported::Modifiers(modifier),
         ));
     }
-    Ok(())
+    Ok(if modifier_record.kind == SyntaxKind::DeclareKeyword {
+        SourceCallableBodyMode::AmbientDeclaration
+    } else {
+        SourceCallableBodyMode::Present
+    })
 }
 
 fn validate_owner_name_and_export_route(
@@ -1633,6 +1704,7 @@ fn validate_owner_name_and_export_route(
     owner_symbol: SemanticSymbolId,
     owner: &ts_binder::semantic::Symbol,
     local_symbol: Option<SemanticSymbolId>,
+    body_mode: SourceCallableBodyMode,
     view: &SourceSyntaxView<'_>,
 ) -> Result<(), SourceCallableError> {
     match view.family {
@@ -1672,8 +1744,11 @@ fn validate_owner_name_and_export_route(
                 )));
             }
             match local_symbol {
-                None if view.modifiers.is_none() && owner.parent().is_none() => {}
-                Some(local) if view.modifiers.is_some() => {
+                None if owner.parent().is_none()
+                    && (view.modifiers.is_none() || body_mode.is_ambient()) => {}
+                Some(local)
+                    if view.modifiers.is_some() && body_mode == SourceCallableBodyMode::Present =>
+                {
                     let raw_source_owner = bound.symbol(bound.source_file()).ok_or_else(|| {
                         invariant(SourceCallableInvariant::InvalidExportRoute(declaration))
                     })?;

@@ -990,11 +990,13 @@ const fn source_callable_display_unavailable(
                 FunctionTypeDisplayUnavailable::ThisParameter
             }
             SourceCallableUnsupported::RestParameterNotLast(_)
-            | SourceCallableUnsupported::OptionalRestParameter(_) => {
+            | SourceCallableUnsupported::OptionalRestParameter(_)
+            | SourceCallableUnsupported::AmbientRestParameter(_) => {
                 FunctionTypeDisplayUnavailable::RestParameter
             }
             SourceCallableUnsupported::InitializedRestParameter(_)
-            | SourceCallableUnsupported::OptionalInitializedParameter(_) => {
+            | SourceCallableUnsupported::OptionalInitializedParameter(_)
+            | SourceCallableUnsupported::AmbientParameterInitializer(_) => {
                 FunctionTypeDisplayUnavailable::InitializedParameter
             }
             SourceCallableUnsupported::DestructuredParameter(_) => {
