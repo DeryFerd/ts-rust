@@ -264,11 +264,29 @@ five exact variants, 89 typed capability boundaries, two supported mismatches,
 and zero fatal invariants.
 
 The four-slot topology has rotated into local ambient overload families plus a
-read-only annotated-uninitialized-variable oracle, with an adversarial review
-slot and root retaining shared store, compiler, formatter, build, and scoring
-ownership. The variable implementation is serialized behind overloads because
-both change source identifier-read and flow planning. The live commit/worktree
-ledger is [`typechecker-wave0-status.md`](typechecker-wave0-status.md).
+direct class-heritage source adapter and a property-only generic-interface
+member kernel, with an adversarial review slot and root retaining shared store,
+compiler, formatter, build, and scoring ownership. The class-field and
+uninitialized-variable leaves remain serialized behind the heritage adapter
+because the pinned overload fixture encounters those boundaries in that order.
+The live commit/worktree ledger is
+[`typechecker-wave0-status.md`](typechecker-wave0-status.md).
+
+The ambient-overload cut is integrated through `290afc9`. Arbitrary-length
+local nongeneric `declare function` groups retain source order, one canonical
+callable object, exact owner/declaration/signature reverse maps, optional/minimum
+arity, literal-specialized candidate ordering, and the existing subtype-then-
+assignable resolver. Whole-source preflight now covers singleton functions,
+direct arrows, and contextual-arrow target closures before any overload group
+publishes. Two independent cache findings—callable-union dirtiness and retained
+signature literal flags—plus a cross-provider atomicity finding were repaired
+before integration. Six public checker tests, two compiler tests, the library
+check, strict focused Clippy, and independent P0/P1 review pass. The fixed shard
+has raw digest `9aaab16ed4d80a594c2686c2494d907b` and provenance-normalized
+digest `616f256f9ec771ae7eefa3324e52faa7`; its sole semantic delta is
+`ambiguousOverloadResolution.ts` advancing from the merged-function boundary
+to direct class heritage, with the headline unchanged at five exact, 89 typed
+capability boundaries, two supported mismatches, and zero fatal invariants.
 
 ### Quantitative posture
 
@@ -276,11 +294,11 @@ At the current checkpoint:
 
 | Evidence | Current value | Interpretation |
 |---|---:|---|
-| Semantic unit tests present | 1,022 | Broad invariant coverage; the monolithic binary cannot link in the current memory envelope |
-| Public checker integration tests | 121 across 38 targets | Executable production-path evidence and the mandatory home for new verticals |
-| Semantic modules | 65 | Enough leaf surfaces for bounded ownership |
-| `type_nodes.rs` | 18,176 lines | Shared type-family dispatch hotspot |
-| `source.rs` | 18,602 lines | Shared source-plan/execution hotspot |
+| Semantic unit tests present | 1,026 | Broad invariant coverage; the monolithic binary cannot link in the current memory envelope |
+| Public checker integration tests | 127 across 39 targets | Executable production-path evidence and the mandatory home for new verticals |
+| Semantic modules | 66 | Enough leaf surfaces for bounded ownership |
+| `type_nodes.rs` | 18,293 lines | Shared type-family dispatch hotspot |
+| `source.rs` | 18,959 lines | Shared source-plan/execution hotspot |
 | `relater.rs` | 10,946 lines | Shared relation hotspot |
 | Port-map clusters | 46 | 11 verified, 24 porting, 10 blocked, 1 unmapped at this checkpoint |
 
@@ -1177,15 +1195,20 @@ maintainable.
 
 ## Immediate execution queue
 
-1. Finish, independently review, and integrate exact local nongeneric ambient
-   overload families, preserving declaration order, canonical multi-signature
-   ownership, transactional publication, and the existing overload resolver.
-2. Add direct annotated uninitialized variables so the overload fixture can
-   advance beyond its next source boundary without weakening identifier-read or
-   flow validation.
-3. Rerun the fixed shard, record every status/frontier delta, and choose the
-   next dependency-closed source/callable leaf from that ranked evidence.
-4. Keep root as the sole shared-adapter, Cargo, compiler-gate, and scorecard
+1. Connect the existing exact direct local base-class transaction to whole-
+   source checking, preserving whole-file preflight and leaving derived `new`
+   expressions outside the leaf unless their existing constructor contract can
+   be reused without widening it.
+2. Project `strictPropertyInitialization` into the canonical checker and admit
+   annotated uninitialized instance fields only when the option disables that
+   diagnostic; then add direct annotated uninitialized `var` declarations under
+   the pinned loose-flow rules.
+3. Integrate the reviewed property-only generic-interface member kernel by
+   publishing the binder's property-only declared table, then admit its exact
+   transient instantiated properties in the relater and source/context query.
+4. Rerun the fixed shard after each source frontier, record every status and
+   frontier delta, and choose the next dependency-closed source/callable leaf.
+5. Keep root as the sole shared-adapter, Cargo, compiler-gate, and scorecard
    owner while semantic workers and independent reviewers rotate around it.
 
 This is the shortest credible path to useful modern-project checking and then

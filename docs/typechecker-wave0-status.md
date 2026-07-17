@@ -5,7 +5,7 @@
 - Upstream epoch: `dc37b5249ab60e2bbce936f71b883e6c8136167e`
 - Wave branch baseline: `cdbf749`
 - Integration branch: `july-ultra`
-- Current integrated semantic stack: through `693d0be`
+- Current integrated semantic stack: through `290afc9`
 
 This is the live execution record for Wave 0 of
 [`typechecker-completion-goal.md`](typechecker-completion-goal.md). The port
@@ -15,7 +15,7 @@ map remains authoritative for cluster state.
 
 | Lane | Branch/worktree | Current task | State |
 |---|---|---|---|
-| Root/integration | `july-ultra`; repository root | contract adapters, review, serial verification | optional/composite intersections and exact generic ambient functions are integrated through `693d0be`; root is the sole Cargo/build and fixed-shard owner |
+| Root/integration | `july-ultra`; repository root | contract adapters, review, serial verification | exact local ambient overload groups are integrated through `290afc9`; root is the sole Cargo/build and fixed-shard owner |
 | M0 | `july-ultra`; repository root | deterministic checker scoring | schema-5 provenance, retained fatal outcomes, exact fixed-manifest execution, and selected-case preparation integrated through `174eebf` |
 | S2a | `july-ultra`; repository root | exact single-base interface heritage and relation-cache observation | integrated through `14ae6ce`; two exact-tip reviews found no P0/P1 issue, all five public heritage tests pass, and the fixed shard advances one interface fixture without an exact loss |
 | S2 readonly follow-up | `july-ultra`; repository root | readonly property retention and strict-subtype directionality | integrated through `d4719b3`; two independent reviews found no P0/P1 issue, the public production target passes, focused strict Clippy is green, and the fixed shard is semantically unchanged |
@@ -32,8 +32,10 @@ map remains authoritative for cluster state.
 | W1 A16 optional/composite follow-up | `july-ultra`; repository root | optional properties and recursive source-owned property-object types | integrated through `3b1b713` with compiler coverage in `365da82`; pinned optional/readonly merge rules, recursively validated local composite property objects, optional-discriminant reduction, warm replay, and fail-closed boundaries passed focused gates and independent P0/P1 review |
 | W1 ambient functions | `july-ultra`; repository root | exact singleton nongeneric `declare function` declarations | integrated through `74ea3ca`; script/external-module hoisting, canonical callable/signature identity, optional parameters, TS2345, whole-source atomicity, warm replay, and typed generic/overload/export/`.d.ts` boundaries passed checker/compiler gates and independent P0/P1 review |
 | W1 ambient generic follow-up | `july-ultra`; repository root | exact singleton generic ambient functions and strict top-level direct call statements | integrated through `693d0be`; generic constraints/defaults, inference/explicit arguments, exact TS2558/TS2344/TS2345 ranges, hoisting, whole-plan atomicity, and warm replay passed focused/adjacent/compiler/strict-Clippy gates and independent P0/P1 review |
-| W1 ambient overload follow-up | isolated worker worktree | exact local nongeneric ambient overload families | active from `693d0be`; the worker owns the ordered multi-signature provider and source bridge while root retains Cargo, compiler integration, and fixed-shard scoring |
-| W1 review/oracle | rotating read-only lanes | pinned behavior, cache timing, and adversarial fixtures | optional intersections and generic ambient functions are approved with no remaining P0/P1 issue; the active oracle is freezing annotated uninitialized-variable semantics behind the overload fixture |
+| W1 ambient overload follow-up | `july-ultra`; repository root | exact local nongeneric ambient overload families | integrated through `290afc9`; ordered arbitrary-length signature groups, literal-first selection, complete reverse provenance, cross-provider preflight, warm poison rejection, and fail-closed recovery passed six public checker tests, two compiler tests, strict Clippy, and independent P0/P1 review |
+| W1 class-source heritage | isolated worker worktree | connect the existing direct local base-class graph to whole-source checking | active from `290afc9`; the worker is reusing the reviewed class member-query transaction while root retains Cargo, compiler integration, and scoring |
+| W1 generic interface members | isolated worker worktree | property-only concrete generic-interface member instantiation | the exact `[T..., this] -> [args..., reference]` kernel is frozen with three public tests and green check/Clippy; independent review is active before integration and the property-only declared-table/source adapter remains queued |
+| W1 review/oracle | rotating read-only lanes | pinned behavior, cache timing, and adversarial fixtures | ambient overloads are approved with no remaining P0/P1 issue; the active review audits recursive generic-interface member instantiation and its transient proxy/cache invariants |
 
 The completed S5/S6 sub-wave validates the intended four-slot steady state:
 root integrates and builds, two isolated semantic workers own non-overlapping
@@ -146,6 +148,17 @@ changes no fixed-shard record. The focused public checker surface is now 121
 tests across 38 independently runnable targets. The combined integration gate
 ran 77 checker tests, eight compiler tests, the checker library check,
 and strict focused Clippy.
+
+The local ambient-overload stack through `290afc9` has raw fixed-shard digest
+`9aaab16ed4d80a594c2686c2494d907b`. Removing only Rust commit/dirty and
+invocation provenance produces `616f256f9ec771ae7eefa3324e52faa7`.
+The shard remains five exact variants, 89 typed capability boundaries, two
+supported mismatches, and zero fatal invariants. Exactly one record changes:
+`ambiguousOverloadResolution.ts` advances from the merged-function boundary
+to the next honest boundary, the direct heritage on `class B`. No status,
+diagnostic, or exact-match record regresses. The focused public checker surface
+is now 127 tests across 39 independently runnable targets; the semantic module
+count is 66 and the retained semantic unit-test count is 1,026.
 
 The current frontier is five exact variants, 89 typed capability boundaries,
 two supported mismatches, and zero fatal invariants. The run discovers 12,750
