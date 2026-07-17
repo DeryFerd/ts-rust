@@ -901,6 +901,38 @@ impl<'arena> CanonicalCheckerContext<'arena> {
         result
     }
 
+    /// Forces one already-retained source through the complete checker
+    /// preflight and execution path again.
+    ///
+    /// This is the incremental validation boundary for callers that need to
+    /// verify warm semantic caches rather than accepting the source's
+    /// `type_checked` fast path. Existing canonical identities are retained;
+    /// malformed or stale caches fail through [`SourceCheckError`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the same typed failures as [`Self::check_source_file`], or a
+    /// provenance error when `file` is not retained by this context.
+    pub fn recheck_source_file(&mut self, file: FileId) -> Result<(), SourceCheckError> {
+        let source = self.source_file(file).ok_or(SourceCheckError::Provenance(
+            SourceCheckProvenanceError::MissingFile(file),
+        ))?;
+        let mut links = self
+            .store
+            .source_file_links(source)
+            .cloned()
+            .ok_or(SourceCheckError::Provenance(
+                SourceCheckProvenanceError::StoreSourceMismatch(source),
+            ))?;
+        links.type_checked = false;
+        if !self.store.set_source_file_links(source, links) {
+            return Err(SourceCheckError::Provenance(
+                SourceCheckProvenanceError::StoreSourceMismatch(source),
+            ));
+        }
+        self.check_source_file(file)
+    }
+
     /// Quoted ambient-module symbols deferred until global library types exist.
     /// Entries follow Program order and escaped-byte name order within a file.
     #[must_use]

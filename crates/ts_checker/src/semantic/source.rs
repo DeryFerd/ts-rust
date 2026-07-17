@@ -327,6 +327,7 @@ pub enum SourceCheckError {
     Element(NodeRef),
     PrimitiveOperator(NodeRef),
     LogicalOperator(NodeRef),
+    Conditional(NodeRef),
     MissingDiagnostic(u32),
 }
 
@@ -360,6 +361,9 @@ impl std::fmt::Display for SourceCheckError {
             Self::LogicalOperator(node) => {
                 write!(formatter, "logical operator checking failed at {node:?}")
             }
+            Self::Conditional(node) => {
+                write!(formatter, "conditional expression checking failed at {node:?}")
+            }
             Self::MissingDiagnostic(code) => {
                 write!(formatter, "diagnostic TS{code} is absent from the catalog")
             }
@@ -392,6 +396,7 @@ impl std::error::Error for SourceCheckError {
             | Self::Element(_)
             | Self::PrimitiveOperator(_)
             | Self::LogicalOperator(_)
+            | Self::Conditional(_)
             | Self::MissingDiagnostic(_) => None,
         }
     }
@@ -477,8 +482,29 @@ pub(super) struct LogicalBinaryPlan {
 pub(super) struct ConditionalExpressionPlan {
     node: NodeRef,
     condition: PlannedExpression,
+    condition_expectation: ConditionalScalarExpectation,
     when_true: PlannedExpression,
+    when_true_expectation: ConditionalScalarExpectation,
     when_false: PlannedExpression,
+    when_false_expectation: ConditionalScalarExpectation,
+    expected_result: TypeId,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ConditionalScalarFamily {
+    String,
+    Number,
+    BigInt,
+    Boolean,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ConditionalScalarExpectation {
+    Exact {
+        family: ConditionalScalarFamily,
+        type_: TypeId,
+    },
+    Literal(ConditionalScalarFamily),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -836,6 +862,7 @@ struct SourcePlanner<'arena, 'semantic, 'sources> {
     hoisted_functions: HashSet<SemanticSymbolId>,
     prior_variables: HashSet<SemanticSymbolId>,
     readable_variables: HashSet<SemanticSymbolId>,
+    assigned_variables: HashSet<SemanticSymbolId>,
     /// Exact roots minted only by assignment and direct-call syntax owners.
     primitive_binary_position_roots: HashSet<NodeRef>,
 }
@@ -861,6 +888,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             hoisted_functions: HashSet::new(),
             prior_variables: HashSet::new(),
             readable_variables: HashSet::new(),
+            assigned_variables: HashSet::new(),
             primitive_binary_position_roots: HashSet::new(),
         }
     }
@@ -890,6 +918,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             hoisted_functions: HashSet::new(),
             prior_variables: HashSet::new(),
             readable_variables: HashSet::new(),
+            assigned_variables: HashSet::new(),
             primitive_binary_position_roots: HashSet::new(),
         }
     }
@@ -1249,6 +1278,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     self.primitive_binary_position_roots
                         .insert(assignment.right);
                     let right = self.plan_expression(assignment.right)?;
+                    self.assigned_variables.insert(assignment.target_symbol);
                     statements.push(PlannedStatement::Assignment(PlannedAssignment {
                         expression: assignment.expression,
                         left: assignment.left,
@@ -3433,33 +3463,6 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 SourceSyntaxRole::VariableInitializer,
             ));
         }
-        if let Some((store, _)) = self.semantic
-            && let Some(links) = store.type_node_links(expression)
-        {
-            let expected = TypeNodeLinks {
-                resolved_type: links.resolved_type,
-                ..TypeNodeLinks::default()
-            };
-            if links != &expected
-                || links
-                    .resolved_type
-                    .is_some_and(|type_| store.type_payload(type_).is_none())
-            {
-                let expected = links
-                    .resolved_type
-                    .or_else(|| store.intrinsic_bootstrap().map(|bootstrap| bootstrap.error_type))
-                    .ok_or(SourceCheckError::LiteralCache(
-                        SourceLiteralCacheError::BootstrapUninitialized,
-                    ))?;
-                return Err(SourceCheckError::Assertion(
-                    SourceAssertionError::InvalidExpressionCache {
-                        node: expression,
-                        cached: links.resolved_type,
-                        expected,
-                    },
-                ));
-            }
-        }
         let condition = self.plan_expression(condition)?;
         let condition_target = condition.unparenthesized();
         let PlannedExpressionKind::Identifier(condition_read) = &condition_target.kind else {
@@ -3477,10 +3480,37 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             ));
         }
         let condition_symbol = condition_read.value_symbol;
+        let Some(condition_expectation) = self.conditional_scalar_expectation(&condition)? else {
+            return Err(self.unsupported(
+                condition_target.node,
+                SyntaxKind::Identifier,
+                SourceSyntaxRole::VariableInitializer,
+            ));
+        };
         let when_true = self.plan_expression(when_true)?;
         if !conditional_scalar_operand_plan_is_supported(&when_true)
             || planned_expression_reads_symbol(&when_true, condition_symbol)
         {
+            return Err(self.unsupported(
+                when_true.node,
+                self.node(when_true.node)?.kind,
+                SourceSyntaxRole::VariableInitializer,
+            ));
+        }
+        let Some(when_true_expectation) = self.conditional_scalar_expectation(&when_true)? else {
+            return Err(self.unsupported(
+                when_true.node,
+                self.node(when_true.node)?.kind,
+                SourceSyntaxRole::VariableInitializer,
+            ));
+        };
+        if matches!(
+            when_true_expectation,
+            ConditionalScalarExpectation::Exact {
+                family: ConditionalScalarFamily::Boolean,
+                ..
+            }
+        ) {
             return Err(self.unsupported(
                 when_true.node,
                 self.node(when_true.node)?.kind,
@@ -3497,7 +3527,37 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 SourceSyntaxRole::VariableInitializer,
             ));
         }
+        let Some(when_false_expectation) = self.conditional_scalar_expectation(&when_false)? else {
+            return Err(self.unsupported(
+                when_false.node,
+                self.node(when_false.node)?.kind,
+                SourceSyntaxRole::VariableInitializer,
+            ));
+        };
+        if matches!(
+            when_false_expectation,
+            ConditionalScalarExpectation::Exact {
+                family: ConditionalScalarFamily::Boolean,
+                ..
+            }
+        ) {
+            return Err(self.unsupported(
+                when_false.node,
+                self.node(when_false.node)?.kind,
+                SourceSyntaxRole::VariableInitializer,
+            ));
+        }
+        let Some(expected_result) =
+            self.conditional_expected_result(when_true_expectation, when_false_expectation)?
+        else {
+            return Err(self.unsupported(
+                expression,
+                SyntaxKind::ConditionalExpression,
+                SourceSyntaxRole::VariableInitializer,
+            ));
+        };
         if let Some((store, _)) = self.semantic {
+            preflight_source_expression_cache(store, expression, expected_result)?;
             preflight_uncached_conditional_operand_links(store, &condition)?;
             preflight_uncached_conditional_operand_links(store, &when_true)?;
             preflight_uncached_conditional_operand_links(store, &when_false)?;
@@ -3507,10 +3567,201 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             PlannedExpressionKind::Conditional(Box::new(ConditionalExpressionPlan {
                 node: expression,
                 condition,
+                condition_expectation,
                 when_true,
+                when_true_expectation,
                 when_false,
+                when_false_expectation,
+                expected_result,
             })),
         ))
+    }
+
+    fn conditional_scalar_expectation(
+        &self,
+        expression: &PlannedExpression,
+    ) -> Result<Option<ConditionalScalarExpectation>, SourceCheckError> {
+        let literal = match &expression.kind {
+            PlannedExpressionKind::String(_) => Some(ConditionalScalarFamily::String),
+            PlannedExpressionKind::Number { .. } => Some(ConditionalScalarFamily::Number),
+            PlannedExpressionKind::BigInt { .. } => Some(ConditionalScalarFamily::BigInt),
+            PlannedExpressionKind::Boolean(_) => Some(ConditionalScalarFamily::Boolean),
+            PlannedExpressionKind::Parenthesized(inner) => {
+                return self.conditional_scalar_expectation(inner);
+            }
+            PlannedExpressionKind::Identifier(read)
+                if read.kind == PlannedIdentifierReadKind::Variable =>
+            {
+                if self.assigned_variables.contains(&read.value_symbol) {
+                    return Ok(None);
+                }
+                let Some((store, _)) = self.semantic else {
+                    return Ok(None);
+                };
+                let declaration = store
+                    .symbol(read.value_symbol)
+                    .and_then(|symbol| symbol.value_declaration())
+                    .ok_or(SourceCheckError::Conditional(expression.node))?;
+                let declaration_record = self.node(declaration)?;
+                let NodeData::VariableDeclaration(variable) = &declaration_record.data else {
+                    return Err(SourceCheckError::Conditional(expression.node));
+                };
+                if declaration_record.kind != SyntaxKind::VariableDeclaration {
+                    return Err(SourceCheckError::Conditional(expression.node));
+                }
+                let Some(type_node) = variable.type_.map(|node| self.reference(node)) else {
+                    return Ok(None);
+                };
+                let type_record = self.node(type_node)?;
+                if type_record.parent != Some(declaration.node) {
+                    return Err(SourceCheckError::Conditional(type_node));
+                }
+                if type_record.flags.0 != 0 {
+                    return Ok(None);
+                }
+                let family = match type_record.kind {
+                    SyntaxKind::StringKeyword => ConditionalScalarFamily::String,
+                    SyntaxKind::NumberKeyword => ConditionalScalarFamily::Number,
+                    SyntaxKind::BigIntKeyword => ConditionalScalarFamily::BigInt,
+                    SyntaxKind::BooleanKeyword => ConditionalScalarFamily::Boolean,
+                    _ => return Ok(None),
+                };
+                if !matches!(type_record.data, NodeData::KeywordTypeNode(_)) {
+                    return Err(SourceCheckError::Conditional(type_node));
+                }
+                let bootstrap = store.intrinsic_bootstrap().ok_or(
+                    SourceCheckError::LiteralCache(
+                        SourceLiteralCacheError::BootstrapUninitialized,
+                    ),
+                )?;
+                let type_ = match family {
+                    ConditionalScalarFamily::String => bootstrap.string_type,
+                    ConditionalScalarFamily::Number => bootstrap.number_type,
+                    ConditionalScalarFamily::BigInt => bootstrap.bigint_type,
+                    ConditionalScalarFamily::Boolean => {
+                        let Some(initializer) =
+                            variable.initializer.map(|node| self.reference(node))
+                        else {
+                            return Ok(None);
+                        };
+                        match self.conditional_boolean_initializer(initializer)? {
+                            Some(true) => bootstrap.true_type,
+                            Some(false) => bootstrap.false_type,
+                            None => return Ok(None),
+                        }
+                    }
+                };
+                return Ok(Some(ConditionalScalarExpectation::Exact {
+                    family,
+                    type_,
+                }));
+            }
+            _ => None,
+        };
+        Ok(literal.map(ConditionalScalarExpectation::Literal))
+    }
+
+    fn conditional_boolean_initializer(
+        &self,
+        expression: NodeRef,
+    ) -> Result<Option<bool>, SourceCheckError> {
+        let record = self.node(expression)?;
+        if record.flags.0 != 0 {
+            return Ok(None);
+        }
+        match (&record.kind, &record.data) {
+            (SyntaxKind::TrueKeyword, NodeData::KeywordExpression(_)) => Ok(Some(true)),
+            (SyntaxKind::FalseKeyword, NodeData::KeywordExpression(_)) => Ok(Some(false)),
+            (
+                SyntaxKind::ParenthesizedExpression,
+                NodeData::ParenthesizedExpression(parenthesized),
+            ) => {
+                let inner = self.reference(parenthesized.expression);
+                if self.node(inner)?.parent != Some(expression.node) {
+                    return Err(SourceCheckError::Conditional(expression));
+                }
+                self.conditional_boolean_initializer(inner)
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn conditional_expected_result(
+        &self,
+        when_true: ConditionalScalarExpectation,
+        when_false: ConditionalScalarExpectation,
+    ) -> Result<Option<TypeId>, SourceCheckError> {
+        let Some((store, _)) = self.semantic else {
+            return Ok(None);
+        };
+        let bootstrap = store.intrinsic_bootstrap().ok_or(
+            SourceCheckError::LiteralCache(SourceLiteralCacheError::BootstrapUninitialized),
+        )?;
+        let result = match (when_true, when_false) {
+            (
+                ConditionalScalarExpectation::Exact {
+                    family: left_family,
+                    type_: left,
+                },
+                ConditionalScalarExpectation::Exact {
+                    family: right_family,
+                    type_: right,
+                },
+            ) if left == right && left_family == right_family => Some(left),
+            (
+                ConditionalScalarExpectation::Exact { family, type_ },
+                ConditionalScalarExpectation::Literal(literal),
+            )
+            | (
+                ConditionalScalarExpectation::Literal(literal),
+                ConditionalScalarExpectation::Exact { family, type_ },
+            ) if family == literal => Some(type_),
+            (
+                ConditionalScalarExpectation::Exact {
+                    family: ConditionalScalarFamily::String,
+                    ..
+                },
+                ConditionalScalarExpectation::Exact {
+                    family: ConditionalScalarFamily::Number,
+                    ..
+                },
+            )
+            | (
+                ConditionalScalarExpectation::Exact {
+                    family: ConditionalScalarFamily::Number,
+                    ..
+                },
+                ConditionalScalarExpectation::Exact {
+                    family: ConditionalScalarFamily::String,
+                    ..
+                },
+            ) => Some(bootstrap.string_or_number_type),
+            (
+                ConditionalScalarExpectation::Exact {
+                    family: ConditionalScalarFamily::Number,
+                    ..
+                },
+                ConditionalScalarExpectation::Exact {
+                    family: ConditionalScalarFamily::BigInt,
+                    ..
+                },
+            )
+            | (
+                ConditionalScalarExpectation::Exact {
+                    family: ConditionalScalarFamily::BigInt,
+                    ..
+                },
+                ConditionalScalarExpectation::Exact {
+                    family: ConditionalScalarFamily::Number,
+                    ..
+                },
+            ) => Some(bootstrap.number_or_bigint_type),
+            _ => None,
+        };
+        if let Some(result) = result {
+            store.validate_union_constituent(result)?;
+        }
+        Ok(result)
     }
 
     fn plan_binary(&mut self, expression: NodeRef) -> Result<PlannedExpression, SourceCheckError> {
@@ -5105,41 +5356,27 @@ fn check_expression_type(
         ),
         PlannedExpressionKind::Conditional(conditional) => {
             if contextual_type.is_some() {
-                return Err(SourceCheckError::Unsupported(
-                    UnsupportedSourceSyntax::Syntax {
-                        node: conditional.node,
-                        kind: SyntaxKind::ConditionalExpression,
-                        role: SourceSyntaxRole::VariableInitializer,
-                    },
-                ));
+                return Err(SourceCheckError::Conditional(conditional.node));
             }
             let condition = check_uncached_conditional_scalar(
                 store,
                 current_flow_types,
                 &conditional.condition,
             )?;
-            let condition_flags = store
-                .type_payload(condition.result)
-                .map(TypeRecord::flags)
-                .ok_or(SourceCheckError::LogicalOperator(conditional.condition.node))?;
-            if !condition_flags.intersects(TypeFlags::BOOLEAN_LIKE)
-                || (condition_flags & !TypeFlags::BOOLEAN_LIKE) != TypeFlags::NONE
-                || !source_truthiness_condition_type_is_supported(
-                    store,
-                    condition.result,
-                    conditional.condition.node,
-                    &mut HashSet::new(),
-                )?
+            validate_conditional_scalar_expectation(
+                store,
+                &conditional.condition,
+                condition.result,
+                conditional.condition_expectation,
+            )?;
+            if !source_truthiness_condition_type_is_supported(
+                store,
+                condition.result,
+                conditional.condition.node,
+                &mut HashSet::new(),
+            )?
             {
-                return Err(SourceCheckError::Unsupported(
-                    UnsupportedSourceSyntax::Syntax {
-                        node: conditional.condition.node,
-                        kind: host
-                            .node(conditional.condition.node)
-                            .map_or(SyntaxKind::Identifier, |node| node.kind),
-                        role: SourceSyntaxRole::VariableInitializer,
-                    },
-                ));
+                return Err(SourceCheckError::Conditional(conditional.condition.node));
             }
             emit_truthiness_operand_diagnostics(
                 store,
@@ -5154,23 +5391,31 @@ fn check_expression_type(
                 current_flow_types,
                 &conditional.when_true,
             )?;
-            validate_conditional_branch_type(store, host, &conditional.when_true, when_true.result)?;
+            validate_conditional_scalar_expectation(
+                store,
+                &conditional.when_true,
+                when_true.result,
+                conditional.when_true_expectation,
+            )?;
             let when_false = check_uncached_conditional_scalar(
                 store,
                 current_flow_types,
                 &conditional.when_false,
             )?;
-            validate_conditional_branch_type(
+            validate_conditional_scalar_expectation(
                 store,
-                host,
                 &conditional.when_false,
                 when_false.result,
+                conditional.when_false_expectation,
             )?;
             let result_type = store.expression_union_type_with_global_types(
                 global_types,
                 &[when_true.result, when_false.result],
                 UnionReduction::Subtype,
             )?;
+            if result_type != conditional.expected_result {
+                return Err(SourceCheckError::Conditional(conditional.node));
+            }
             publish_expression_type(store, conditional.node, result_type)?;
             Ok(CheckedExpressionTypes::leaf(result_type, result_type))
         }
@@ -5564,36 +5809,35 @@ fn check_uncached_conditional_scalar(
     }
 }
 
-fn validate_conditional_branch_type(
+fn validate_conditional_scalar_expectation(
     store: &CanonicalTypeMapperStore,
-    host: &DeclaredTypeHost<'_>,
     expression: &PlannedExpression,
     type_: TypeId,
+    expectation: ConditionalScalarExpectation,
 ) -> Result<(), SourceCheckError> {
-    let flags = store
-        .type_payload(type_)
-        .map(TypeRecord::flags)
-        .ok_or(SourceCheckError::LogicalOperator(expression.node))?;
-    let supported = TypeFlags::STRING
-        | TypeFlags::NUMBER
-        | TypeFlags::BIG_INT
-        | TypeFlags::BOOLEAN
-        | TypeFlags::STRING_LITERAL
-        | TypeFlags::NUMBER_LITERAL
-        | TypeFlags::BIG_INT_LITERAL
-        | TypeFlags::BOOLEAN_LITERAL;
-    if flags.intersects(supported) && (flags & !supported) == TypeFlags::NONE {
-        return Ok(());
+    store.validate_union_constituent(type_)?;
+    match expectation {
+        ConditionalScalarExpectation::Exact { type_: expected, .. } if type_ == expected => Ok(()),
+        ConditionalScalarExpectation::Literal(family) => {
+            let expected = match family {
+                ConditionalScalarFamily::String => TypeFlags::STRING_LITERAL,
+                ConditionalScalarFamily::Number => TypeFlags::NUMBER_LITERAL,
+                ConditionalScalarFamily::BigInt => TypeFlags::BIG_INT_LITERAL,
+                ConditionalScalarFamily::Boolean => TypeFlags::BOOLEAN_LITERAL,
+            };
+            if store
+                .type_payload(type_)
+                .is_some_and(|record| record.flags() == expected)
+            {
+                Ok(())
+            } else {
+                Err(SourceCheckError::Conditional(expression.node))
+            }
+        }
+        ConditionalScalarExpectation::Exact { .. } => {
+            Err(SourceCheckError::Conditional(expression.node))
+        }
     }
-    Err(SourceCheckError::Unsupported(
-        UnsupportedSourceSyntax::Syntax {
-            node: expression.node,
-            kind: host
-                .node(expression.node)
-                .map_or(SyntaxKind::ConditionalExpression, |node| node.kind),
-            role: SourceSyntaxRole::VariableInitializer,
-        },
-    ))
 }
 
 fn narrow_logical_right_flow_types(
@@ -10185,7 +10429,7 @@ mod tests {
     #[test]
     fn inferred_object_property_read_publishes_exact_type_and_symbol_and_replays_warm() {
         let source = parsed("const object = { value: 1 }; const result = object.value;");
-        let file = FileId::new(412);
+        let file = FileId::new(480);
         let access = variable_initializer(&source, file, "result");
         let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
 
@@ -10225,7 +10469,7 @@ mod tests {
             "const object: Model = { value: 'ok' }; ",
             "const result: number = object.value;",
         ));
-        let file = FileId::new(413);
+        let file = FileId::new(481);
         let access = variable_initializer(&source, file, "result");
         let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
 
@@ -16553,6 +16797,94 @@ mod tests {
         assert_eq!(diagnostic.diagnostic.code(), 2365);
         assert_eq!(diagnostic.diagnostic.arguments, ["+", "number", "boolean"]);
         assert_eq!(resolved_node_type(&context, binary), expected);
+        assert!(is_type_checked(&context, file));
+    }
+
+    #[test]
+    fn conditional_forced_replay_revalidates_exact_caches_without_allocating() {
+        let source = parsed(concat!(
+            "let condition: string = \"\"; ",
+            "let text: string = \"x\"; ",
+            "let count: number = 1; ",
+            "const mixed = condition ? text : count;",
+        ));
+        let file = FileId::new(412);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        let conditional = variable_initializer(&source, file, "mixed");
+
+        context.check_source_file(file).unwrap();
+        let result = resolved_node_type(&context, conditional);
+        let before = observable_state(&context, file);
+        mark_source_unchecked(&mut context, file);
+        context.check_source_file(file).unwrap();
+
+        assert_eq!(observable_state(&context, file), before);
+        assert_eq!(resolved_node_type(&context, conditional), result);
+        let NodeData::ConditionalExpression(data) =
+            &source.arena.get(conditional.node).unwrap().data
+        else {
+            unreachable!()
+        };
+        for child in [data.condition, data.when_true, data.when_false] {
+            assert!(
+                context
+                    .store()
+                    .type_node_links(NodeRef::new(source.arena.id(), file, child))
+                    .is_none()
+            );
+        }
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn conditional_wrong_root_cache_fails_before_any_source_publication() {
+        let source = parsed(concat!(
+            "let condition: boolean = true; ",
+            "let text: string = \"x\"; ",
+            "let count: number = 1; ",
+            "const mixed = condition ? text : count;",
+        ));
+        let file = FileId::new(413);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        let conditional = variable_initializer(&source, file, "mixed");
+        let (poison, expected) = {
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            (bootstrap.number_type, bootstrap.string_or_number_type)
+        };
+        assert_ne!(poison, expected);
+        assert!(context.store_mut_for_test().set_type_node_links(
+            conditional,
+            TypeNodeLinks {
+                resolved_type: Some(poison),
+                ..TypeNodeLinks::default()
+            },
+        ));
+        let before = observable_state(&context, file);
+        let error = SourceCheckError::Assertion(SourceAssertionError::InvalidExpressionCache {
+            node: conditional,
+            cached: Some(poison),
+            expected,
+        });
+
+        assert_eq!(context.check_source_file(file), Err(error));
+        assert_eq!(observable_state(&context, file), before);
+        assert!(context.diagnostics().is_empty());
+        assert!(!is_type_checked(&context, file));
+        for name in ["condition", "text", "count", "mixed"] {
+            let symbol = variable_symbol(&context, &source, file, name);
+            assert!(context.store().value_symbol_links(symbol).is_none());
+        }
+        assert_eq!(context.check_source_file(file), Err(error));
+        assert_eq!(observable_state(&context, file), before);
+
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_type_node_links(conditional, TypeNodeLinks::default())
+        );
+        context.check_source_file(file).unwrap();
+        assert_eq!(resolved_node_type(&context, conditional), expected);
+        assert!(context.diagnostics().is_empty());
         assert!(is_type_checked(&context, file));
     }
 

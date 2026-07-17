@@ -439,6 +439,7 @@ fn source_check_capability_code(error: &SourceCheckError) -> Option<&'static str
         | SourceCheckError::Element(_)
         | SourceCheckError::PrimitiveOperator(_)
         | SourceCheckError::LogicalOperator(_)
+        | SourceCheckError::Conditional(_)
         | SourceCheckError::MissingDiagnostic(_) => None,
     }
 }
@@ -505,6 +506,7 @@ fn source_check_invariant_code(error: &SourceCheckError) -> &'static str {
         SourceCheckError::Element(_) => "INV.SOURCE.ELEMENT",
         SourceCheckError::PrimitiveOperator(_) => "INV.SOURCE.PRIMITIVE_OPERATOR",
         SourceCheckError::LogicalOperator(_) => "INV.SOURCE.LOGICAL_OPERATOR",
+        SourceCheckError::Conditional(_) => "INV.SOURCE.CONDITIONAL",
         SourceCheckError::MissingDiagnostic(_) => "INV.SOURCE.MISSING_DIAGNOSTIC",
     }
 }
@@ -7618,6 +7620,10 @@ mod tests {
             CanonicalProgramCheckError::SourceCheck {
                 file_name: "/project/input.ts".to_owned(),
                 error: SourceCheckError::LogicalOperator(node),
+            },
+            CanonicalProgramCheckError::SourceCheck {
+                file_name: "/project/input.ts".to_owned(),
+                error: SourceCheckError::Conditional(node),
             },
             CanonicalProgramCheckError::SourceCheck {
                 file_name: "/project/input.ts".to_owned(),
