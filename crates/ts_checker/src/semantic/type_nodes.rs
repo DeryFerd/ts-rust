@@ -38,6 +38,10 @@ use super::{
         plan_concrete_indexed_access,
     },
     instantiate::{InstantiationLimits, InstantiationSession},
+    keyof_types::{
+        NongenericKeyofError, cached_nongeneric_keyof_type, plan_nongeneric_keyof_type,
+        resolve_nongeneric_keyof_type,
+    },
     object_members::{self, PropertyObjectError, PropertyObjectPlan, PropertyObjectState},
     signatures::{ElementFlags, Signature},
     source_callables::{
@@ -182,6 +186,8 @@ pub enum TypeNodeUnavailable {
     InvalidCachedArrayType(TypeId),
     InvalidIndexedAccessType(NodeRef),
     MissingPlannedIndexedAccessType(NodeRef),
+    InvalidKeyofType(NodeRef),
+    MissingPlannedKeyofType(NodeRef),
     InvalidFunctionType(NodeRef),
     InvalidFunctionSignature(SignatureId),
     InvalidUnionAlias(SemanticSymbolId),
@@ -252,6 +258,7 @@ enum PlannedLiteralType {
 struct TypeQueryPlan {
     arrays: BTreeMap<NodeRef, PlannedArrayType>,
     indexed_accesses: BTreeMap<NodeRef, ConcreteIndexedAccessPlan>,
+    keyofs: BTreeMap<NodeRef, NodeRef>,
     aliases: BTreeMap<SemanticSymbolId, TypeAliasPlan>,
     references: BTreeMap<NodeRef, PlannedTypeReference>,
     literals: BTreeMap<NodeRef, PlannedLiteralType>,
@@ -316,6 +323,7 @@ enum CachedTypeAliasRhs {
     TypeLiteral(NodeRef),
     FunctionType(NodeRef),
     IndexedAccess(NodeRef),
+    Keyof(NodeRef),
     TupleType(NodeRef),
     NonUnion,
 }
@@ -376,6 +384,26 @@ fn indexed_access_error(error: ConcreteIndexedAccessError, root: NodeRef) -> Dec
                 node: root,
                 kind: SyntaxKind::IndexedAccessType,
             })
+        }
+    }
+}
+
+fn keyof_type_error(error: NongenericKeyofError, root: NodeRef) -> DeclaredTypeError {
+    match error {
+        NongenericKeyofError::LiteralCache(error) => type_construction_error(error),
+        NongenericKeyofError::UnsupportedObject(_)
+        | NongenericKeyofError::UnsupportedPropertyName { .. }
+        | NongenericKeyofError::PropertiesCacheRequired { .. } => {
+            type_node_unavailable(TypeNodeUnavailable::UnsupportedSyntax {
+                node: root,
+                kind: SyntaxKind::TypeOperator,
+            })
+        }
+        NongenericKeyofError::InvalidType(_)
+        | NongenericKeyofError::MalformedObject(_)
+        | NongenericKeyofError::InvalidCachedResult(_)
+        | NongenericKeyofError::CachePublication(_) => {
+            type_node_unavailable(TypeNodeUnavailable::InvalidKeyofType(root))
         }
     }
 }
@@ -1011,9 +1039,25 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             SyntaxKind::IndexedAccessType => {
                 self.plan_concrete_indexed_access_type(node, alias_owner)
             }
-            SyntaxKind::TupleType | SyntaxKind::TypeOperator => {
-                self.plan_tuple_type(node, alias_owner)
-            }
+            SyntaxKind::TupleType => self.plan_tuple_type(node, alias_owner),
+            SyntaxKind::TypeOperator => match &record.data {
+                NodeData::TypeOperatorNode(operator)
+                    if operator.operator == SyntaxKind::ReadonlyKeyword =>
+                {
+                    self.plan_tuple_type(node, alias_owner)
+                }
+                NodeData::TypeOperatorNode(operator)
+                    if operator.operator == SyntaxKind::KeyOfKeyword =>
+                {
+                    self.plan_keyof_type(node, alias_owner)
+                }
+                _ => Err(type_node_unavailable(
+                    TypeNodeUnavailable::UnsupportedSyntax {
+                        node,
+                        kind: record.kind,
+                    },
+                )),
+            },
             SyntaxKind::TypeReference => {
                 self.plan_type_reference(node, alias_owner, union_constituent)
             }
@@ -1311,6 +1355,18 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                     NodeRef::new(node.arena, node.file, array.element_type),
                     visited,
                 )?,
+            NodeData::TypeOperatorNode(operator)
+                if record.kind == SyntaxKind::TypeOperator
+                    && matches!(
+                        operator.operator,
+                        SyntaxKind::KeyOfKeyword | SyntaxKind::ReadonlyKeyword
+                    ) =>
+            {
+                self.type_node_contains_import_alias_reference(
+                    NodeRef::new(node.arena, node.file, operator.type_),
+                    visited,
+                )?
+            }
             NodeData::UnionTypeNode(union) if record.kind == SyntaxKind::UnionType => {
                 let mut contains = false;
                 for child in &union.types.nodes {
@@ -1392,8 +1448,14 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             .values()
             .find(|indexed| indexed.object_literal() == node)
             .map(|indexed| indexed.object_plan().clone());
+        let direct_keyof_operand =
+            alias_owner.is_none() && self.is_nongeneric_keyof_operand_node(node);
         let planned = match indexed_object_plan {
             Some(planned) if alias_owner.is_none() => planned,
+            None if direct_keyof_operand => {
+                object_members::plan_nongeneric_keyof_type_literal(self.store, self.host, node)
+                    .map_err(property_object_error)?
+            }
             _ => object_members::plan_type_literal(self.store, self.host, node, alias_owner)
                 .map_err(property_object_error)?,
         };
@@ -1449,6 +1511,27 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         result
     }
 
+    fn is_nongeneric_keyof_operand_node(&self, node: NodeRef) -> bool {
+        self.plan.keyofs.values().any(|target| {
+            let mut target = *target;
+            loop {
+                if target == node {
+                    return true;
+                }
+                let Some(record) = self.host.node(target) else {
+                    return false;
+                };
+                let NodeData::ParenthesizedTypeNode(parenthesized) = &record.data else {
+                    return false;
+                };
+                if record.kind != SyntaxKind::ParenthesizedType {
+                    return false;
+                }
+                target = NodeRef::new(target.arena, target.file, parenthesized.type_);
+            }
+        })
+    }
+
     fn plan_concrete_indexed_access_type(
         &mut self,
         node: NodeRef,
@@ -1482,6 +1565,53 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         self.plan.indexed_accesses.insert(node, planned.clone());
         self.plan_type_node_in_context(planned.object(), None, false)?;
         self.plan_type_node_in_context(planned.index(), None, false)
+    }
+
+    fn plan_keyof_type(
+        &mut self,
+        node: NodeRef,
+        alias_owner: Option<SemanticSymbolId>,
+    ) -> Result<(), DeclaredTypeError> {
+        if let Some(alias) = alias_owner
+            && self
+                .plan
+                .aliases
+                .get(&alias)
+                .is_some_and(|plan| !plan.type_parameters.is_empty())
+        {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::GenericReferenceUnsupported {
+                    node,
+                    symbol: alias,
+                },
+            ));
+        }
+        let record = preflight_node(self.store, self.host, node)?;
+        let NodeData::TypeOperatorNode(operator) = &record.data else {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidKeyofType(node),
+            ));
+        };
+        if record.kind != SyntaxKind::TypeOperator || operator.operator != SyntaxKind::KeyOfKeyword
+        {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidKeyofType(node),
+            ));
+        }
+        let target = NodeRef::new(node.arena, node.file, operator.type_);
+        if preflight_node(self.store, self.host, target)?.parent != Some(node.node) {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidKeyofType(node),
+            ));
+        }
+        if let Some(existing) = self.plan.keyofs.insert(node, target)
+            && existing != target
+        {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidKeyofType(node),
+            ));
+        }
+        self.plan_type_node_in_context(target, None, false)
     }
 
     fn plan_function_type(
@@ -1579,10 +1709,13 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             for property in planned.property_type_nodes() {
                 self.plan_type_node_in_context(property, None, false)?;
             }
+            for (key_type, value_type) in planned.index_type_nodes() {
+                self.plan_type_node_in_context(key_type, None, false)?;
+                self.plan_type_node_in_context(value_type, None, false)?;
+            }
             for annotation in planned.call_type_nodes() {
                 self.plan_type_node_in_context(annotation, None, false)?;
             }
-            debug_assert!(planned.indexes.is_empty());
             Ok(())
         })();
         assert!(self.planning_interfaces.remove(&symbol));
@@ -1769,8 +1902,15 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                     SyntaxKind::TypeReference => CachedTypeAliasRhs::TypeReference(type_node),
                     SyntaxKind::TypeLiteral => CachedTypeAliasRhs::TypeLiteral(type_node),
                     SyntaxKind::FunctionType => CachedTypeAliasRhs::FunctionType(type_node),
-                    SyntaxKind::IndexedAccessType => {
-                        CachedTypeAliasRhs::IndexedAccess(type_node)
+                    SyntaxKind::IndexedAccessType => CachedTypeAliasRhs::IndexedAccess(type_node),
+                    SyntaxKind::TypeOperator
+                        if matches!(
+                            &record.data,
+                            NodeData::TypeOperatorNode(operator)
+                                if operator.operator == SyntaxKind::KeyOfKeyword
+                        ) =>
+                    {
+                        CachedTypeAliasRhs::Keyof(type_node)
                     }
                     SyntaxKind::TupleType => CachedTypeAliasRhs::TupleType(type_node),
                     SyntaxKind::TypeOperator
@@ -1953,6 +2093,28 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                     let identity_seed = self
                         .store
                         .type_node_links(indexed_access)
+                        .and_then(|links| links.resolved_type);
+                    if !missing_generic_metadata.is_empty()
+                        || !identity_seed.is_some_and(|identity_seed| {
+                            valid_type_alias_identity_seed(
+                                self.store,
+                                symbol,
+                                declared_type,
+                                identity_seed,
+                                self.strict_builtin_iterator_return,
+                            )
+                        })
+                    {
+                        return Err(type_node_unavailable(
+                            TypeNodeUnavailable::InvalidCachedTypeAlias(root_symbol),
+                        ));
+                    }
+                    return Ok(());
+                }
+                CachedTypeAliasRhs::Keyof(keyof) => {
+                    let identity_seed = self
+                        .store
+                        .type_node_links(keyof)
                         .and_then(|links| links.resolved_type);
                     if !missing_generic_metadata.is_empty()
                         || !identity_seed.is_some_and(|identity_seed| {
@@ -3770,6 +3932,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             || self.direct_type_literal_rhs(type_node)?
             || self.direct_function_type_rhs(type_node)?
             || self.direct_indexed_access_rhs(type_node)?
+            || self.direct_keyof_rhs(type_node)?
             || self.direct_tuple_type_rhs(type_node)?
             || self.type_node_contains_builtin_array_reference(type_node, &mut HashSet::new())?
         {
@@ -3841,6 +4004,21 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 // descending here would route its type literal through the
                 // deliberately narrower general object-member capability.
                 true
+            }
+            NodeData::TypeOperatorNode(operator)
+                if record.kind == SyntaxKind::TypeOperator
+                    && matches!(
+                        operator.operator,
+                        SyntaxKind::KeyOfKeyword | SyntaxKind::ReadonlyKeyword
+                    ) =>
+            {
+                let target = NodeRef::new(node.arena, node.file, operator.type_);
+                if preflight_node(self.store, self.host, target)?.parent != Some(node.node) {
+                    return Err(type_node_unavailable(
+                        TypeNodeUnavailable::InvalidKeyofType(node),
+                    ));
+                }
+                self.type_node_contains_builtin_array_reference(target, visited)?
             }
             NodeData::TypeLiteralNode(literal) => {
                 if record.kind != SyntaxKind::TypeLiteral
@@ -3967,6 +4145,24 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         loop {
             let record = preflight_node(self.store, self.host, node)?;
             if record.kind == SyntaxKind::IndexedAccessType {
+                return Ok(true);
+            }
+            let NodeData::ParenthesizedTypeNode(parenthesized) = &record.data else {
+                return Ok(false);
+            };
+            node = NodeRef::new(node.arena, node.file, parenthesized.type_);
+        }
+    }
+
+    fn direct_keyof_rhs(&self, mut node: NodeRef) -> Result<bool, DeclaredTypeError> {
+        loop {
+            let record = preflight_node(self.store, self.host, node)?;
+            if matches!(
+                &record.data,
+                NodeData::TypeOperatorNode(operator)
+                    if record.kind == SyntaxKind::TypeOperator
+                        && operator.operator == SyntaxKind::KeyOfKeyword
+            ) {
                 return Ok(true);
             }
             let NodeData::ParenthesizedTypeNode(parenthesized) = &record.data else {
@@ -5109,6 +5305,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             .arrays
             .len()
             .checked_add(plan.indexed_accesses.len())
+            .and_then(|count| count.checked_add(plan.keyofs.len()))
             .and_then(|count| count.checked_add(plan.references.len()))
             .and_then(|count| count.checked_add(plan.literals.len()))
             .and_then(|count| count.checked_add(plan.unions.len()))
@@ -5129,6 +5326,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             .arrays
             .keys()
             .chain(plan.indexed_accesses.keys())
+            .chain(plan.keyofs.keys())
             .chain(plan.references.keys())
             .chain(plan.literals.keys())
             .chain(plan.unions.keys())
@@ -5314,7 +5512,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             .and_then(|count| count.checked_add(cold_function_types))
             .and_then(|count| count.checked_add(additional_source_types))
             .ok_or_else(|| Self::literal_cache_error(LiteralTypeCacheError::Capacity))?;
-        let index_infos = plan
+        let type_literal_index_infos = plan
             .type_literals
             .values()
             .try_fold(0usize, |count, literal| {
@@ -5328,6 +5526,35 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                         .ok_or_else(|| Self::literal_cache_error(LiteralTypeCacheError::Capacity))
                 }
             })?;
+        let interface_index_infos =
+            plan.interfaces
+                .values()
+                .try_fold(0usize, |count, interface| {
+                    if interface.indexes.is_empty() {
+                        return Ok(count);
+                    }
+                    let resolved = self
+                        .store
+                        .declared_type_links(interface.symbol)
+                        .and_then(|links| links.declared_type)
+                        .map(|type_| {
+                            object_members::interface_state(self.store, interface, type_)
+                                .map(PropertyObjectState::is_resolved)
+                                .map_err(property_object_error)
+                        })
+                        .transpose()?
+                        .unwrap_or(false);
+                    if resolved {
+                        Ok(count)
+                    } else {
+                        count.checked_add(interface.indexes.len()).ok_or_else(|| {
+                            Self::literal_cache_error(LiteralTypeCacheError::Capacity)
+                        })
+                    }
+                })?;
+        let index_infos = type_literal_index_infos
+            .checked_add(interface_index_infos)
+            .ok_or_else(|| Self::literal_cache_error(LiteralTypeCacheError::Capacity))?;
         let type_node_links = self.missing_planned_type_node_links(plan)?;
         if !self.store.try_reserve_index_infos(index_infos)
             || !self.store.try_reserve_types(additional_types)
@@ -5469,6 +5696,12 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             for property in interface.property_type_nodes() {
                 types.push(self.execute_type_node(property, plan, prepared)?);
             }
+            let mut index_types = Vec::with_capacity(interface.indexes.len());
+            for (key_node, value_node) in interface.index_type_nodes() {
+                let key_type = self.execute_type_node(key_node, plan, prepared)?;
+                let value_type = self.execute_type_node(value_node, plan, prepared)?;
+                index_types.push((key_type, value_type));
+            }
             if interface.heritage.is_some() {
                 let mut base_types = Vec::with_capacity(interface.heritage_base_symbols().len());
                 for base in interface.heritage_base_symbols() {
@@ -5505,7 +5738,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                     self.store,
                     &interface,
                     &types,
-                    &[],
+                    &index_types,
                     &call_types,
                 )
                 .map_err(property_object_error)?;
@@ -5516,7 +5749,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                     &interface,
                     state,
                     &types,
-                    &[],
+                    &index_types,
                     &call_types,
                 )
                 .map_err(property_object_error)
@@ -5543,6 +5776,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                     .direct_type_literal_plan_node(alias.type_node, plan)
                     .or_else(|| self.direct_function_type_plan_node(alias.type_node, plan))
                     .or_else(|| self.direct_indexed_access_plan_node(alias.type_node, plan))
+                    .or_else(|| self.direct_keyof_plan_node(alias.type_node, plan))
                     .or_else(|| self.direct_tuple_type_plan_node(alias.type_node, plan))
                 && !self
                     .pending_function_parameters
@@ -5696,9 +5930,25 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             SyntaxKind::IndexedAccessType => {
                 self.execute_concrete_indexed_access_type(node, plan, prepared)
             }
-            SyntaxKind::TupleType | SyntaxKind::TypeOperator => {
-                self.execute_tuple_type(node, plan, prepared)
-            }
+            SyntaxKind::TupleType => self.execute_tuple_type(node, plan, prepared),
+            SyntaxKind::TypeOperator => match &record.data {
+                NodeData::TypeOperatorNode(operator)
+                    if operator.operator == SyntaxKind::ReadonlyKeyword =>
+                {
+                    self.execute_tuple_type(node, plan, prepared)
+                }
+                NodeData::TypeOperatorNode(operator)
+                    if operator.operator == SyntaxKind::KeyOfKeyword =>
+                {
+                    self.execute_keyof_type(node, plan, prepared)
+                }
+                _ => Err(type_node_unavailable(
+                    TypeNodeUnavailable::UnsupportedSyntax {
+                        node,
+                        kind: record.kind,
+                    },
+                )),
+            },
             SyntaxKind::TypeReference => self.execute_type_reference(node, plan, prepared),
             SyntaxKind::UnionType => self.execute_union_type(node, plan, prepared),
             kind => Err(type_node_unavailable(
@@ -5733,6 +5983,104 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             ));
         }
         Ok(resolved)
+    }
+
+    fn execute_keyof_type(
+        &mut self,
+        node: NodeRef,
+        plan: &TypeQueryPlan,
+        prepared: &mut PreparedTypeQueryTypes,
+    ) -> Result<TypeId, DeclaredTypeError> {
+        let target = plan.keyofs.get(&node).copied().ok_or_else(|| {
+            type_node_unavailable(TypeNodeUnavailable::MissingPlannedKeyofType(node))
+        })?;
+        if let Some(cached) = self
+            .store
+            .type_node_links(node)
+            .and_then(|links| links.resolved_type)
+        {
+            let target_type = self.cached_keyof_operand_type(target, plan)?;
+            let keyof_plan = plan_nongeneric_keyof_type(self.store, target_type)
+                .map_err(|error| keyof_type_error(error, node))?;
+            return match cached_nongeneric_keyof_type(self.store, &keyof_plan)
+                .map_err(|error| keyof_type_error(error, node))?
+            {
+                Some(expected) if expected == cached => Ok(cached),
+                _ => Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidKeyofType(node),
+                )),
+            };
+        }
+        let target_type = self.execute_type_node(target, plan, prepared)?;
+        let keyof_plan = plan_nongeneric_keyof_type(self.store, target_type)
+            .map_err(|error| keyof_type_error(error, node))?;
+        let resolved = resolve_nongeneric_keyof_type(self.store, &keyof_plan)
+            .map_err(|error| keyof_type_error(error, node))?;
+        let mut links = self
+            .store
+            .type_node_links(node)
+            .cloned()
+            .unwrap_or_default();
+        links.resolved_type = Some(resolved);
+        if !self.store.set_type_node_links(node, links) {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidKeyofType(node),
+            ));
+        }
+        Ok(resolved)
+    }
+
+    fn cached_keyof_operand_type(
+        &self,
+        node: NodeRef,
+        plan: &TypeQueryPlan,
+    ) -> Result<TypeId, DeclaredTypeError> {
+        let record = preflight_node(self.store, self.host, node)?;
+        if matches!(
+            record.kind,
+            SyntaxKind::AnyKeyword
+                | SyntaxKind::UnknownKeyword
+                | SyntaxKind::StringKeyword
+                | SyntaxKind::NumberKeyword
+                | SyntaxKind::BigIntKeyword
+                | SyntaxKind::BooleanKeyword
+                | SyntaxKind::SymbolKeyword
+                | SyntaxKind::VoidKeyword
+                | SyntaxKind::UndefinedKeyword
+                | SyntaxKind::NullKeyword
+                | SyntaxKind::NeverKeyword
+                | SyntaxKind::ObjectKeyword
+                | SyntaxKind::IntrinsicKeyword
+        ) {
+            return self.keyword_type(record.kind);
+        }
+        if let NodeData::ParenthesizedTypeNode(parenthesized) = &record.data {
+            let inner = NodeRef::new(node.arena, node.file, parenthesized.type_);
+            if record.kind != SyntaxKind::ParenthesizedType
+                || preflight_node(self.store, self.host, inner)?.parent != Some(node.node)
+            {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidKeyofType(node),
+                ));
+            }
+            return self.cached_keyof_operand_type(inner, plan);
+        }
+        if plan.literals.get(&node) == Some(&PlannedLiteralType::Null) {
+            return self.keyword_type(SyntaxKind::NullKeyword);
+        }
+        let cached = self
+            .store
+            .type_node_links(node)
+            .and_then(|links| links.resolved_type)
+            .ok_or_else(|| {
+                type_node_unavailable(TypeNodeUnavailable::InvalidKeyofType(node))
+            })?;
+        if self.store.type_payload(cached).is_none() {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidKeyofType(node),
+            ));
+        }
+        Ok(cached)
     }
 
     fn execute_tuple_type(
@@ -6045,6 +6393,18 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
     ) -> Option<NodeRef> {
         loop {
             if plan.indexed_accesses.contains_key(&node) {
+                return Some(node);
+            }
+            let NodeData::ParenthesizedTypeNode(parenthesized) = &self.host.node(node)?.data else {
+                return None;
+            };
+            node = NodeRef::new(node.arena, node.file, parenthesized.type_);
+        }
+    }
+
+    fn direct_keyof_plan_node(&self, mut node: NodeRef, plan: &TypeQueryPlan) -> Option<NodeRef> {
+        loop {
+            if plan.keyofs.contains_key(&node) {
                 return Some(node);
             }
             let NodeData::ParenthesizedTypeNode(parenthesized) = &self.host.node(node)?.data else {

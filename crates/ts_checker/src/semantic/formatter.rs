@@ -28,8 +28,10 @@ use super::{
     derived_types::DerivedObjectLiteralValidation,
     enums,
     functions::{FunctionTypeDisplayError, FunctionTypeUnsupported},
+    keyof_types,
     links::ValueSymbolLinks,
     object_members,
+    signatures::IndexFlags,
     source_callables::{SourceCallableDisplayError, SourceCallableUnsupported},
     structured_members::{InterfaceHeritageMembersValidation, validate_interface_heritage_members},
     type_records::{
@@ -704,6 +706,9 @@ fn display_type_worker(
         state.add(6);
         return Ok("object".to_owned());
     }
+    if type_flags.intersects(TypeFlags::INDEX) {
+        return display_index_type(store, host, global_types, type_id, flags, state, visiting);
+    }
     if type_flags.intersects(TypeFlags::UNION) {
         return display_union_type(store, host, global_types, type_id, flags, state, visiting);
     }
@@ -726,6 +731,55 @@ fn display_type_worker(
         type_id,
         kind: record.data().kind(),
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn display_index_type(
+    store: &CanonicalTypeMapperStore,
+    host: Option<&DeclaredTypeHost<'_>>,
+    global_types: Option<&CanonicalGlobalTypes>,
+    type_id: TypeId,
+    flags: CanonicalTypeFormatFlags,
+    state: &mut DisplayState,
+    visiting: &mut HashSet<TypeId>,
+) -> Result<String, TypeDisplayUnavailable> {
+    let record = store
+        .type_payload(type_id)
+        .ok_or(TypeDisplayUnavailable::Type(type_id))?;
+    let TypeData::Index(data) = record.data() else {
+        return Err(TypeDisplayUnavailable::MalformedType(type_id));
+    };
+    let target = store
+        .type_payload(data.target)
+        .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+    if record.flags() != TypeFlags::INDEX
+        || record.object_flags() != ObjectFlags::NONE
+        || record.symbol().is_some()
+        || record.alias().is_some()
+        || data.index_flags != IndexFlags::NONE
+        || !target.flags().intersects(TypeFlags::OBJECT)
+    {
+        return Err(TypeDisplayUnavailable::MalformedType(type_id));
+    }
+    if !visiting.insert(type_id) {
+        return Err(TypeDisplayUnavailable::CyclicType(type_id));
+    }
+    state.add(6);
+    let result = match target.data() {
+        TypeData::Interface(_) => display_interface_name(store, host, data.target, target, state),
+        _ => display_type_worker(
+            store,
+            host,
+            global_types,
+            data.target,
+            flags,
+            state,
+            visiting,
+        ),
+    }
+    .map(|target| format!("keyof {target}"));
+    visiting.remove(&type_id);
+    result
 }
 
 #[derive(Default)]
@@ -1568,7 +1622,13 @@ fn display_interface_name(
         return Err(TypeDisplayUnavailable::MalformedType(type_id));
     }
     if resolved {
-        validate_resolved_named_interface(store, type_id, symbol_id, interface)?;
+        if validate_resolved_named_interface(store, type_id, symbol_id, interface).is_err()
+            && !keyof_types::plan_nongeneric_keyof_type(store, type_id).is_ok_and(|plan| {
+                plan.proof() == object_members::DeclaredPropertyObjectProof::Interface
+            })
+        {
+            return Err(TypeDisplayUnavailable::MalformedType(type_id));
+        }
     } else if interface != &super::type_records::InterfaceTypeData::default() {
         return Err(TypeDisplayUnavailable::MalformedType(type_id));
     }
@@ -2531,20 +2591,31 @@ fn display_union_type(
         let display_record = store
             .type_payload(display_union)
             .ok_or(TypeDisplayUnavailable::Type(display_union))?;
-        let TypeData::Union(display_data) = display_record.data() else {
-            return Err(TypeDisplayUnavailable::InvalidUnion(type_id));
-        };
-        let types = format_union_types(store, type_id, &display_data.union.types)?;
-        display_union_list(
-            store,
-            host,
-            global_types,
-            type_id,
-            &types,
-            flags,
-            state,
-            visiting,
-        )
+        match display_record.data() {
+            TypeData::Union(display_data) => {
+                let types = format_union_types(store, type_id, &display_data.union.types)?;
+                display_union_list(
+                    store,
+                    host,
+                    global_types,
+                    type_id,
+                    &types,
+                    flags,
+                    state,
+                    visiting,
+                )
+            }
+            TypeData::Index(_) => display_type_worker(
+                store,
+                host,
+                global_types,
+                display_union,
+                flags,
+                state,
+                visiting,
+            ),
+            _ => Err(TypeDisplayUnavailable::InvalidUnion(type_id)),
+        }
     })();
     visiting.remove(&type_id);
     result

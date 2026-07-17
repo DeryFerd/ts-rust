@@ -46,7 +46,7 @@ use super::{
     mapper::TypeMapper,
     object_members,
     relation::RelationStateSnapshot,
-    signatures::{SignatureFlags, TypePredicateKind},
+    signatures::{IndexFlags, SignatureFlags, TypePredicateKind},
     store::SemanticStore,
     tuple_types::PreparedCanonicalTupleType,
     type_records::{
@@ -312,11 +312,29 @@ struct UnionAliasCacheKey {
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
+enum UnionOriginCacheKey {
+    /// Pinned `getUnionKey` writes `|` followed by the denormalized union
+    /// constituents. The origin shell itself is intentionally not part of the
+    /// key and may therefore be allocated only after a cache miss.
+    DenormalizedUnion(Vec<TypeId>),
+    /// Pinned `getUnionKey` writes `#`, the exact index-origin identity, and
+    /// then the normalized constituent list already stored on the enclosing
+    /// [`UnionTypeCacheKey`].
+    Index(TypeId),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum UnionOriginPlan {
+    DenormalizedUnion(Vec<TypeId>),
+    ExistingIndex(TypeId),
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct UnionTypeCacheKey {
     types: Vec<TypeId>,
-    /// `Some` is the exact denormalized named-union origin key. `None` uses
-    /// the normalized constituent list, matching pinned `getUnionKey`.
-    origin_types: Option<Vec<TypeId>>,
+    /// `Some` is the exact pinned origin branch. `None` uses the normalized
+    /// constituent list, matching pinned `getUnionKey`.
+    origin: Option<UnionOriginCacheKey>,
     alias: Option<UnionAliasCacheKey>,
 }
 
@@ -324,7 +342,7 @@ impl UnionTypeCacheKey {
     fn anonymous(types: Vec<TypeId>) -> Self {
         Self {
             types,
-            origin_types: None,
+            origin: None,
             alias: None,
         }
     }
@@ -345,7 +363,7 @@ enum UnionPlan {
         types: Vec<TypeId>,
         object_flags: ObjectFlags,
         alias_symbol: Option<SemanticSymbolId>,
-        origin_types: Option<Vec<TypeId>>,
+        origin: Option<UnionOriginPlan>,
     },
 }
 
@@ -1078,7 +1096,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         if data.union.types != key.types
             || self.checked_union_alias_symbol(union, record.alias())?
                 != key.alias.map(|alias| alias.symbol)
-            || !self.union_origin_matches(data.origin, key.origin_types.as_deref())
+            || !self.union_origin_matches(union, data.origin, key.origin.as_ref())
         {
             return Err(LiteralTypeCacheError::InvalidCachedUnion(union));
         }
@@ -1118,17 +1136,23 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             key.reduction,
             alias_symbol,
             global_types,
+            true,
         )? {
             UnionPlan::Existing(expected) => expected,
             UnionPlan::Union {
                 types,
                 object_flags: _,
                 alias_symbol,
-                origin_types,
+                origin,
             } => {
                 let expected_key = UnionTypeCacheKey {
                     types,
-                    origin_types,
+                    origin: origin.map(|origin| match origin {
+                        UnionOriginPlan::DenormalizedUnion(types) => {
+                            UnionOriginCacheKey::DenormalizedUnion(types)
+                        }
+                        UnionOriginPlan::ExistingIndex(index) => UnionOriginCacheKey::Index(index),
+                    }),
                     alias: alias_symbol.map(|symbol| UnionAliasCacheKey { symbol }),
                 };
                 let expected = self
@@ -1187,10 +1211,15 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         Ok(Some(symbol))
     }
 
-    fn union_origin_matches(&self, origin: Option<TypeId>, expected: Option<&[TypeId]>) -> bool {
+    fn union_origin_matches(
+        &self,
+        union: TypeId,
+        origin: Option<TypeId>,
+        expected: Option<&UnionOriginCacheKey>,
+    ) -> bool {
         match (origin, expected) {
             (None, None) => true,
-            (Some(origin), Some(expected)) => {
+            (Some(origin), Some(UnionOriginCacheKey::DenormalizedUnion(expected))) => {
                 let Some(record) = self.type_payload(origin) else {
                     return false;
                 };
@@ -1202,10 +1231,37 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     && record.symbol().is_none()
                     && record.alias().is_none()
                     && data.origin.is_none()
-                    && data.union.types == expected
+                    && data.union.types == *expected
             }
+            (Some(origin), Some(UnionOriginCacheKey::Index(expected))) => origin == *expected
+                && self.valid_index_union_origin(origin)
+                && self.type_payload(origin).is_some_and(
+                    |record| matches!(record.data(), TypeData::Index(data) if data.target != union),
+                ),
             _ => false,
         }
+    }
+
+    fn valid_index_union_origin(&self, origin: TypeId) -> bool {
+        let Some(record) = self.type_payload(origin) else {
+            return false;
+        };
+        let TypeData::Index(data) = record.data() else {
+            return false;
+        };
+        let Some(target) = self.type_payload(data.target) else {
+            return false;
+        };
+        record.flags() == TypeFlags::INDEX
+            && record.object_flags() == ObjectFlags::NONE
+            && record.symbol().is_none()
+            && record.alias().is_none()
+            && data.index_flags == IndexFlags::NONE
+            && target.flags() == TypeFlags::OBJECT
+            && (target
+                .object_flags()
+                .intersects(ObjectFlags::CLASS_OR_INTERFACE | ObjectFlags::REFERENCE)
+                || target.alias().is_some())
     }
 
     fn union_types_are_strictly_sorted(&self, types: &[TypeId]) -> bool {
@@ -1291,26 +1347,33 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         let Some(record) = self.type_payload(origin) else {
             return Err(LiteralTypeCacheError::InvalidCachedUnion(union));
         };
-        let TypeData::Union(data) = record.data() else {
-            return Err(LiteralTypeCacheError::InvalidCachedUnion(union));
-        };
-        if origin == union
-            || record.flags() != TypeFlags::UNION
-            || !Self::valid_union_lazy_object_flags(record.object_flags())
-            || record.symbol().is_some()
-            || record.alias().is_some()
-            || data.origin.is_some()
-            || data.union.types.is_empty()
-            || data
-                .union
-                .types
-                .iter()
-                .any(|constituent| self.type_payload(*constituent).is_none())
-            || !self.union_types_are_strictly_sorted(&data.union.types)
-        {
+        if origin == union {
             return Err(LiteralTypeCacheError::InvalidCachedUnion(union));
         }
-        Ok(())
+        match record.data() {
+            TypeData::Union(data)
+                if record.flags() == TypeFlags::UNION
+                    && Self::valid_union_lazy_object_flags(record.object_flags())
+                    && record.symbol().is_none()
+                    && record.alias().is_none()
+                    && data.origin.is_none()
+                    && !data.union.types.is_empty()
+                    && data
+                        .union
+                        .types
+                        .iter()
+                        .all(|constituent| self.type_payload(*constituent).is_some())
+                    && self.union_types_are_strictly_sorted(&data.union.types) =>
+            {
+                Ok(())
+            }
+            TypeData::Index(data)
+                if data.target != union && self.valid_index_union_origin(origin) =>
+            {
+                Ok(())
+            }
+            _ => Err(LiteralTypeCacheError::InvalidCachedUnion(union)),
+        }
     }
 
     fn validate_union_structure(&self, union: TypeId) -> Result<(), LiteralTypeCacheError> {
@@ -1744,20 +1807,27 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         let alias = self
             .checked_union_alias_symbol(union, record.alias())?
             .map(|symbol| UnionAliasCacheKey { symbol });
-        let origin_types = data.origin.map(|origin| {
-            let Some(TypeData::Union(origin)) = self.type_payload(origin).map(TypeRecord::data)
-            else {
+        let origin = data.origin.map(|origin| {
+            let Some(record) = self.type_payload(origin) else {
                 return Err(LiteralTypeCacheError::InvalidCachedUnion(union));
             };
-            Ok(origin.union.types.clone())
+            match record.data() {
+                TypeData::Union(origin) => Ok(UnionOriginCacheKey::DenormalizedUnion(
+                    origin.union.types.clone(),
+                )),
+                TypeData::Index(_) if self.valid_index_union_origin(origin) => {
+                    Ok(UnionOriginCacheKey::Index(origin))
+                }
+                _ => Err(LiteralTypeCacheError::InvalidCachedUnion(union)),
+            }
         });
-        let origin_types = match origin_types {
-            Some(origin_types) => Some(origin_types?),
+        let origin = match origin {
+            Some(origin) => Some(origin?),
             None => None,
         };
         let key = UnionTypeCacheKey {
             types: data.union.types.clone(),
-            origin_types,
+            origin,
             alias,
         };
         let cached = self
@@ -2458,8 +2528,15 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         allowed_pending: &HashSet<TypeId>,
     ) -> Result<(), LiteralTypeCacheError> {
         self.validate_union_origin_structure(union, origin)?;
-        let Some(TypeData::Union(data)) = self.type_payload(origin).map(TypeRecord::data) else {
+        let Some(record) = self.type_payload(origin) else {
             return Err(LiteralTypeCacheError::InvalidCachedUnion(union));
+        };
+        let TypeData::Union(data) = record.data() else {
+            return if self.valid_index_union_origin(origin) {
+                Ok(())
+            } else {
+                Err(LiteralTypeCacheError::InvalidCachedUnion(union))
+            };
         };
         for constituent in &data.union.types {
             self.validate_union_constituent_worker(
@@ -2968,6 +3045,67 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         )
     }
 
+    /// Constructs the pinned `getLiteralTypeFromProperties` union shape for
+    /// a previously allocated `newIndexType(target, IndexFlagsNone)` origin.
+    ///
+    /// The explicit origin deliberately bypasses the union-of-union fast path
+    /// and named-union origin synthesis, matching `getUnionTypeEx(...,
+    /// origin)` in the pinned checker. The caller must allocate the index
+    /// shell only after the shared query preflight; one union operation
+    /// reserves enough type capacity for that shell and the normalized union.
+    pub(super) fn literal_union_type_prepared_with_index_origin(
+        &mut self,
+        types: &[TypeId],
+        origin: TypeId,
+        prepared: &mut PreparedTypeQueryTypes,
+    ) -> Result<TypeId, LiteralTypeCacheError> {
+        prepared.consume_union(self.id(), false, None)?;
+        if !prepared.pending_function_types.is_empty() {
+            self.mark_union_cache_validation_dirty();
+        }
+        if !self.valid_index_union_origin(origin) {
+            return Err(LiteralTypeCacheError::InvalidValue);
+        }
+        for type_ in types {
+            self.validate_union_constituent_worker(
+                *type_,
+                UnionArrayValidation::None,
+                &mut HashSet::new(),
+                &prepared.pending_function_types,
+            )?;
+        }
+        if types.is_empty() {
+            return self
+                .intrinsic_bootstrap
+                .as_ref()
+                .map(|bootstrap| bootstrap.never_type)
+                .ok_or(LiteralTypeCacheError::BootstrapUninitialized);
+        }
+        if types.len() == 1 {
+            return Ok(types[0]);
+        }
+        match self.plan_union_type(types, UnionReduction::Literal, None, None, false)? {
+            UnionPlan::Existing(existing) => Ok(existing),
+            UnionPlan::Union {
+                types,
+                object_flags,
+                alias_symbol: None,
+                ..
+            } => self.union_type_from_sorted_list(
+                types,
+                object_flags,
+                None,
+                Some(UnionOriginPlan::ExistingIndex(origin)),
+                None,
+                &prepared.pending_function_types,
+            ),
+            UnionPlan::Union {
+                alias_symbol: Some(_),
+                ..
+            } => Err(LiteralTypeCacheError::InvalidValue),
+        }
+    }
+
     fn union_type_prepared(
         &mut self,
         types: &[TypeId],
@@ -3068,18 +3206,18 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         global_types: Option<&CanonicalGlobalTypes>,
         allowed_pending: &HashSet<TypeId>,
     ) -> Result<TypeId, LiteralTypeCacheError> {
-        match self.plan_union_type(types, reduction, alias_symbol, global_types)? {
+        match self.plan_union_type(types, reduction, alias_symbol, global_types, true)? {
             UnionPlan::Existing(existing) => Ok(existing),
             UnionPlan::Union {
                 types,
                 object_flags,
                 alias_symbol,
-                origin_types,
+                origin,
             } => self.union_type_from_sorted_list(
                 types,
                 object_flags,
                 alias_symbol,
-                origin_types,
+                origin,
                 global_types,
                 allowed_pending,
             ),
@@ -3092,6 +3230,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         reduction: UnionReduction,
         alias_symbol: Option<SemanticSymbolId>,
         global_types: Option<&CanonicalGlobalTypes>,
+        synthesize_origin: bool,
     ) -> Result<UnionPlan, LiteralTypeCacheError> {
         let mut type_set = Vec::with_capacity(types.len());
         let mut includes = TypeFlags::NONE;
@@ -3190,8 +3329,8 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             }
         }
 
-        let mut origin_types = None;
-        if includes.intersects(TypeFlags::UNION) {
+        let mut origin = None;
+        if synthesize_origin && includes.intersects(TypeFlags::UNION) {
             let mut named = Vec::new();
             self.collect_named_unions(types, &mut named, &mut HashSet::new())?;
             let mut reduced = Vec::new();
@@ -3223,7 +3362,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 for union in named {
                     self.insert_union_type(&mut reduced, union)?;
                 }
-                origin_types = Some(reduced);
+                origin = Some(UnionOriginPlan::DenormalizedUnion(reduced));
             }
         }
 
@@ -3243,7 +3382,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             types: type_set,
             object_flags,
             alias_symbol,
-            origin_types,
+            origin,
         })
     }
 
@@ -3252,7 +3391,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         types: Vec<TypeId>,
         object_flags: ObjectFlags,
         alias_symbol: Option<SemanticSymbolId>,
-        origin_types: Option<Vec<TypeId>>,
+        origin: Option<UnionOriginPlan>,
         global_types: Option<&CanonicalGlobalTypes>,
         allowed_pending: &HashSet<TypeId>,
     ) -> Result<TypeId, LiteralTypeCacheError> {
@@ -3268,7 +3407,12 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         }
         let key = UnionTypeCacheKey {
             types: types.clone(),
-            origin_types,
+            origin: origin.as_ref().map(|origin| match origin {
+                UnionOriginPlan::DenormalizedUnion(types) => {
+                    UnionOriginCacheKey::DenormalizedUnion(types.clone())
+                }
+                UnionOriginPlan::ExistingIndex(index) => UnionOriginCacheKey::Index(*index),
+            }),
             alias: alias_symbol.map(|symbol| UnionAliasCacheKey { symbol }),
         };
         if let Some(cached) = self
@@ -3287,10 +3431,14 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         }
 
         let cache_was_dirty = self.union_cache_needs_validation;
-        let origin = key.origin_types.as_ref().map(|types| {
-            self.alloc_union_type(ObjectFlags::NONE, types.clone())
-                .expect("preflighted named-union origin is valid")
-        });
+        let origin = match origin {
+            Some(UnionOriginPlan::DenormalizedUnion(types)) => Some(
+                self.alloc_union_type(ObjectFlags::NONE, types)
+                    .expect("preflighted named-union origin is valid"),
+            ),
+            Some(UnionOriginPlan::ExistingIndex(index)) => Some(index),
+            None => None,
+        };
         let is_boolean = types.len() == 2
             && types.iter().all(|type_| {
                 self.type_payload(*type_)
@@ -5615,6 +5763,52 @@ mod tests {
     }
 
     #[test]
+    fn index_origin_unions_use_exact_origin_identity_and_validate_warm_hits() {
+        let mut store = initialized(IntrinsicBootstrapOptions::default());
+        let (string_type, number_type) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (bootstrap.string_type, bootstrap.number_type)
+        };
+        let target = store
+            .alloc_interface_type(ObjectFlags::INTERFACE, None)
+            .unwrap();
+        let types = [string_type, number_type];
+
+        let mut first_query = store.prepare_type_query_types(&[], &[], &[], 1, 0).unwrap();
+        let first_origin = store.alloc_index_type(target, IndexFlags::NONE).unwrap();
+        let first = store
+            .literal_union_type_prepared_with_index_origin(&types, first_origin, &mut first_query)
+            .unwrap();
+        let TypeData::Union(first_data) = store.type_payload(first).unwrap().data() else {
+            panic!("two primitive keys must remain a union");
+        };
+        assert_eq!(first_data.origin, Some(first_origin));
+
+        let mut warm_query = store.prepare_type_query_types(&[], &[], &[], 1, 0).unwrap();
+        assert_eq!(
+            store
+                .literal_union_type_prepared_with_index_origin(
+                    &types,
+                    first_origin,
+                    &mut warm_query,
+                )
+                .unwrap(),
+            first,
+        );
+
+        let mut second_query = store.prepare_type_query_types(&[], &[], &[], 1, 0).unwrap();
+        let second_origin = store.alloc_index_type(target, IndexFlags::NONE).unwrap();
+        let second = store
+            .literal_union_type_prepared_with_index_origin(&types, second_origin, &mut second_query)
+            .unwrap();
+        assert_ne!(second, first);
+        let TypeData::Union(second_data) = store.type_payload(second).unwrap().data() else {
+            panic!("two primitive keys must remain a union");
+        };
+        assert_eq!(second_data.origin, Some(second_origin));
+    }
+
+    #[test]
     fn cyclic_union_origins_fail_typed_cache_validation_without_recursing_forever() {
         let mut store = initialized(IntrinsicBootstrapOptions::default());
         let (string_type, number_type) = {
@@ -5689,7 +5883,7 @@ mod tests {
         assert!(store.set_type_alias(malformed, Some(malformed_alias)));
         let malformed_key = UnionTypeCacheKey {
             types: types.clone(),
-            origin_types: None,
+            origin: None,
             alias: Some(UnionAliasCacheKey { symbol: raw }),
         };
         store
@@ -5713,7 +5907,7 @@ mod tests {
         assert!(store.set_type_alias(repaired, Some(repaired_alias)));
         let repaired_key = UnionTypeCacheKey {
             types,
-            origin_types: None,
+            origin: None,
             alias: Some(UnionAliasCacheKey { symbol: canonical }),
         };
         let cache = &mut store.intrinsic_bootstrap.as_mut().unwrap().union_types;

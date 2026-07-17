@@ -569,6 +569,20 @@ pub(super) fn plan_type_literal(
     )
 }
 
+pub(super) fn plan_nongeneric_keyof_type_literal(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    node: NodeRef,
+) -> Result<PropertyObjectPlan, PropertyObjectError> {
+    plan_type_literal_with_policy(
+        store,
+        host,
+        node,
+        None,
+        TypeLiteralMemberPolicy::ConcreteIndexedAccess,
+    )
+}
+
 pub(super) fn plan_concrete_indexed_access_type_literal(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -807,6 +821,12 @@ pub(super) fn plan_interface(
     )?;
     plan.heritage = heritage;
     if let Some(heritage) = plan.heritage.as_ref() {
+        if let Some(index) = plan.indexes.first() {
+            return Err(PropertyObjectError::UnsupportedMember {
+                node: index.declaration,
+                kind: SyntaxKind::IndexSignature,
+            });
+        }
         let [base] = heritage.bases.as_slice() else {
             return Err(PropertyObjectError::UnsupportedMember {
                 node: heritage.clause,
@@ -814,6 +834,12 @@ pub(super) fn plan_interface(
             });
         };
         let base_plan = plan_interface(store, host, base.symbol)?;
+        if let Some(index) = base_plan.indexes.first() {
+            return Err(PropertyObjectError::UnsupportedMember {
+                node: index.declaration,
+                kind: SyntaxKind::IndexSignature,
+            });
+        }
         if base_plan.heritage.is_some() {
             return Err(PropertyObjectError::UnsupportedMember {
                 node: base.node,
@@ -1061,6 +1087,7 @@ fn plan_members(
                 member_record.kind,
                 SyntaxKind::PropertyDeclaration
                     | SyntaxKind::PropertySignature
+                    | SyntaxKind::IndexSignature
                     | SyntaxKind::CallSignature
             ),
         };
@@ -2039,7 +2066,8 @@ fn validate_interface_record(
         && interface.declared_call_signatures.as_deref()
             == resolved_call_signature_ids(store, plan).as_deref()
         && interface.declared_construct_signatures.is_none()
-        && interface.declared_index_infos.is_none()
+        && interface.declared_index_infos.as_deref()
+            == interface.reference.object.structured.index_infos.as_deref()
         && valid_declared_structured_members(store, &interface.reference.object, plan)
         && resolved_property_links(store, plan)
     {
@@ -3479,7 +3507,6 @@ pub(super) fn publish_declared_members(
             ));
         }
         PropertyObjectKind::Interface => {
-            debug_assert!(plan.indexes.is_empty());
             assert!(store.set_interface_declared_members(
                 type_,
                 true,

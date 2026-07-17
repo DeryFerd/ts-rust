@@ -7,12 +7,12 @@
 //! `number`, and a string index contributes `string | number`. The latter
 //! absorbs every explicit property and number index in the result.
 //!
-//! Anonymous type literals can use the existing canonical literal/union
-//! caches directly. A class/interface/reference or aliased object with two or
-//! more raw key contributions requires upstream's checker-owned `propertiesTypes`
-//! cache and an `IndexType(target)` union origin. Those shared facilities are
-//! deliberately not recreated here: [`resolve_nongeneric_keyof_type`] returns
-//! [`NongenericKeyofError::NamedOriginRequired`] before its first write.
+//! Anonymous type literals use the existing canonical literal/union caches.
+//! Class/interface/reference and aliased objects additionally preserve pinned
+//! `propertiesTypes` cache timing: cold resolution allocates an
+//! `IndexType(target)` shell before property literals even when the raw result
+//! has cardinality zero or one and discards that origin; warm resolution
+//! validates and returns the checker-owned cache entry without writes.
 //!
 //! Generic objects, unions, intersections, tuples, apparent/inherited
 //! members, computed/unique-symbol names, and unresolved member surfaces are
@@ -31,7 +31,8 @@ use super::{
         DeclaredPropertyObjectProof, DeclaredPropertyObjectValidation,
         validate_resolved_declared_property_object,
     },
-    store::SourceNodeParent,
+    signatures::IndexFlags,
+    store::{PropertiesTypeCacheKey, SourceNodeParent},
     type_records::{
         ConstrainedTypeData, InterfaceTypeData, ObjectTypeData, StructuredTypeData, TypeCacheState,
         TypeData, TypeRecord,
@@ -103,7 +104,13 @@ impl NongenericKeyofPlan {
             + usize::from(self.has_number_index)
     }
 
-    pub(super) fn named_origin_required(&self) -> bool {
+    /// Whether execution requires the checker-owned `propertiesTypes` cache.
+    pub(super) const fn root_cache_required(&self) -> bool {
+        self.preserves_origin
+    }
+
+    /// Whether the eager index origin survives pinned union construction.
+    pub(super) fn retains_index_origin(&self) -> bool {
         self.preserves_origin && self.raw_contribution_count() >= 2
     }
 }
@@ -114,11 +121,18 @@ pub(super) enum NongenericKeyofError {
     InvalidType(TypeId),
     UnsupportedObject(TypeId),
     MalformedObject(TypeId),
-    NamedOriginRequired {
+    UnsupportedPropertyName {
+        target: TypeId,
+        property: SemanticSymbolId,
+    },
+    PropertiesCacheRequired {
         target: TypeId,
         raw_contribution_count: usize,
         reduced_key_count: usize,
+        retains_index_origin: bool,
     },
+    InvalidCachedResult(TypeId),
+    CachePublication(TypeId),
     LiteralCache(LiteralTypeCacheError),
 }
 
@@ -171,8 +185,12 @@ pub(super) fn plan_nongeneric_keyof_type(
         .data()
         .structured()
         .ok_or(NongenericKeyofError::MalformedObject(target))?;
-    let property_names = exact_property_names(store, structured)
-        .ok_or(NongenericKeyofError::MalformedObject(target))?;
+    let property_names = exact_property_names(store, structured).map_err(|error| match error {
+        ExactPropertyNamesError::Malformed => NongenericKeyofError::MalformedObject(target),
+        ExactPropertyNamesError::Unsupported(property) => {
+            NongenericKeyofError::UnsupportedPropertyName { target, property }
+        }
+    })?;
     let (has_string_index, has_number_index) = exact_index_kinds(store, structured)
         .ok_or(NongenericKeyofError::MalformedObject(target))?;
     let preserves_origin = proof == DeclaredPropertyObjectProof::Interface
@@ -190,21 +208,62 @@ pub(super) fn plan_nongeneric_keyof_type(
     })
 }
 
-/// Resolves an already validated anonymous/nongeneric key plan.
+/// Resolves one validated nongeneric key plan through the exact checker-owned
+/// `propertiesTypes` cache.
 ///
-/// Repeated calls return the same literal/union identity and allocate nothing
-/// after the first call. Named multi-key plans return their typed boundary
-/// before literal-cache preparation, preserving atomic failure.
+/// Every cold result is published under the pinned key after dependency-closed
+/// cache preparation. Every warm result is independently rederived and
+/// validated before its identity is returned.
 pub(super) fn resolve_nongeneric_keyof_type(
     store: &mut CanonicalTypeMapperStore,
     plan: &NongenericKeyofPlan,
 ) -> Result<TypeId, NongenericKeyofError> {
+    if let Some(cached) = cached_nongeneric_keyof_type(store, plan)? {
+        return Ok(cached);
+    }
+    let key = properties_type_cache_key(store, plan)?;
+    if !store.try_reserve_properties_type_cache(1) {
+        return Err(LiteralTypeCacheError::Capacity.into());
+    }
+    let result = if plan.preserves_origin {
+        resolve_origin_preserving_nongeneric_keyof_type(store, plan)?
+    } else {
+        resolve_nongeneric_keyof_leaf(store, plan)?
+    };
+    if !store.cache_properties_type(key, result) {
+        return Err(NongenericKeyofError::CachePublication(plan.target));
+    }
+    Ok(result)
+}
+
+/// Validates a previously published `propertiesTypes` result without
+/// allocating or mutating any semantic cache.
+pub(super) fn cached_nongeneric_keyof_type(
+    store: &CanonicalTypeMapperStore,
+    plan: &NongenericKeyofPlan,
+) -> Result<Option<TypeId>, NongenericKeyofError> {
     validate_plan_against_store(store, plan)?;
-    if plan.named_origin_required() {
-        return Err(NongenericKeyofError::NamedOriginRequired {
+    let key = properties_type_cache_key(store, plan)?;
+    let Some(cached) = store.cached_properties_type(key) else {
+        return Ok(None);
+    };
+    validate_cached_nongeneric_keyof_result(store, plan, cached)?;
+    Ok(Some(cached))
+}
+
+/// Dependency-independent anonymous-object executor retained as an explicit
+/// composition boundary for adversarial tests.
+fn resolve_nongeneric_keyof_leaf(
+    store: &mut CanonicalTypeMapperStore,
+    plan: &NongenericKeyofPlan,
+) -> Result<TypeId, NongenericKeyofError> {
+    validate_plan_against_store(store, plan)?;
+    if plan.root_cache_required() {
+        return Err(NongenericKeyofError::PropertiesCacheRequired {
             target: plan.target,
             raw_contribution_count: plan.raw_contribution_count(),
             reduced_key_count: plan.reduced_key_count(),
+            retains_index_origin: plan.retains_index_origin(),
         });
     }
 
@@ -245,6 +304,136 @@ pub(super) fn resolve_nongeneric_keyof_type(
     }
 }
 
+fn resolve_origin_preserving_nongeneric_keyof_type(
+    store: &mut CanonicalTypeMapperStore,
+    plan: &NongenericKeyofPlan,
+) -> Result<TypeId, NongenericKeyofError> {
+    let strings = plan.property_names.clone();
+    let mut prepared = store.prepare_type_query_types(&strings, &[], &[], 1, 0)?;
+    let origin = store
+        .alloc_index_type(plan.target, IndexFlags::NONE)
+        .expect("the property-key preflight reserved the pinned Index origin");
+    let mut keys = Vec::with_capacity(plan.raw_contribution_count());
+    for name in &plan.property_names {
+        keys.push(store.regular_string_literal_type(name.clone())?);
+    }
+    let (number_type, string_or_number_type) = {
+        let bootstrap = store
+            .intrinsic_bootstrap()
+            .ok_or(LiteralTypeCacheError::BootstrapUninitialized)?;
+        (bootstrap.number_type, bootstrap.string_or_number_type)
+    };
+    if plan.has_string_index {
+        keys.push(string_or_number_type);
+    }
+    if plan.has_number_index {
+        keys.push(number_type);
+    }
+    store
+        .literal_union_type_prepared_with_index_origin(&keys, origin, &mut prepared)
+        .map_err(Into::into)
+}
+
+fn properties_type_cache_key(
+    store: &CanonicalTypeMapperStore,
+    plan: &NongenericKeyofPlan,
+) -> Result<PropertiesTypeCacheKey, NongenericKeyofError> {
+    let record = store
+        .type_payload(plan.target)
+        .ok_or(NongenericKeyofError::InvalidType(plan.target))?;
+    Ok(PropertiesTypeCacheKey::new(
+        plan.target,
+        TypeFlags::STRING_LIKE | TypeFlags::NUMBER_LIKE | TypeFlags::ES_SYMBOL_LIKE,
+        true,
+        record
+            .object_flags()
+            .intersects(ObjectFlags::UNRESOLVED_MEMBERS),
+    ))
+}
+
+fn validate_cached_nongeneric_keyof_result(
+    store: &CanonicalTypeMapperStore,
+    plan: &NongenericKeyofPlan,
+    cached: TypeId,
+) -> Result<(), NongenericKeyofError> {
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or(LiteralTypeCacheError::BootstrapUninitialized)?;
+    let mut property_keys = Vec::with_capacity(plan.property_names.len());
+    for name in &plan.property_names {
+        let literal = bootstrap
+            .cached_string_literal_type(name)
+            .ok_or(NongenericKeyofError::InvalidCachedResult(cached))?;
+        store
+            .validate_union_constituent(literal)
+            .map_err(|_| NongenericKeyofError::InvalidCachedResult(cached))?;
+        property_keys.push(literal);
+    }
+    let mut raw = property_keys.clone();
+    if plan.has_string_index {
+        raw.push(bootstrap.string_or_number_type);
+    }
+    if plan.has_number_index {
+        raw.push(bootstrap.number_type);
+    }
+    let expected_direct = match raw.as_slice() {
+        [] => Some(bootstrap.never_type),
+        [only] => Some(*only),
+        _ => None,
+    };
+    if let Some(expected) = expected_direct {
+        return (cached == expected)
+            .then_some(())
+            .ok_or(NongenericKeyofError::InvalidCachedResult(cached));
+    }
+
+    let normalized = if plan.has_string_index {
+        let Some(TypeData::Union(union)) = store
+            .type_payload(bootstrap.string_or_number_type)
+            .map(TypeRecord::data)
+        else {
+            return Err(NongenericKeyofError::InvalidCachedResult(cached));
+        };
+        union.union.types.clone()
+    } else {
+        if plan.has_number_index {
+            property_keys.push(bootstrap.number_type);
+        }
+        property_keys.sort_unstable();
+        property_keys.dedup();
+        property_keys
+    };
+
+    if plan.preserves_origin {
+        store
+            .validate_union_constituent(cached)
+            .map_err(|_| NongenericKeyofError::InvalidCachedResult(cached))?;
+        let Some(TypeData::Union(union)) = store.type_payload(cached).map(TypeRecord::data) else {
+            return Err(NongenericKeyofError::InvalidCachedResult(cached));
+        };
+        let Some(origin) = union.origin else {
+            return Err(NongenericKeyofError::InvalidCachedResult(cached));
+        };
+        let Some(TypeData::Index(index)) = store.type_payload(origin).map(TypeRecord::data) else {
+            return Err(NongenericKeyofError::InvalidCachedResult(cached));
+        };
+        if union.union.types != normalized
+            || index.target != plan.target
+            || index.index_flags != IndexFlags::NONE
+        {
+            return Err(NongenericKeyofError::InvalidCachedResult(cached));
+        }
+        return Ok(());
+    }
+
+    let expected = bootstrap
+        .cached_union_type(&normalized)
+        .ok_or(NongenericKeyofError::InvalidCachedResult(cached))?;
+    (cached == expected)
+        .then_some(())
+        .ok_or(NongenericKeyofError::InvalidCachedResult(cached))
+}
+
 fn validate_plan_against_store(
     store: &CanonicalTypeMapperStore,
     plan: &NongenericKeyofPlan,
@@ -257,23 +446,51 @@ fn validate_plan_against_store(
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExactPropertyNamesError {
+    Malformed,
+    Unsupported(SemanticSymbolId),
+}
+
 fn exact_property_names(
     store: &CanonicalTypeMapperStore,
     structured: &StructuredTypeData,
-) -> Option<Vec<String>> {
+) -> Result<Vec<String>, ExactPropertyNamesError> {
     let properties = structured.properties.as_deref().unwrap_or_default();
     let mut names = Vec::with_capacity(properties.len());
     let mut seen_symbols = HashSet::with_capacity(properties.len());
     let mut seen_names = HashSet::with_capacity(properties.len());
     for property in properties {
-        let record = store.symbol(*property)?;
-        let name = record.name().as_utf8()?.to_owned();
+        let record = store
+            .symbol(*property)
+            .ok_or(ExactPropertyNamesError::Malformed)?;
+        let name = record
+            .name()
+            .as_utf8()
+            .ok_or(ExactPropertyNamesError::Malformed)?
+            .to_owned();
+        if !is_unambiguous_identifier_property_name(&name) {
+            return Err(ExactPropertyNamesError::Unsupported(*property));
+        }
         if !seen_symbols.insert(*property) || !seen_names.insert(name.clone()) {
-            return None;
+            return Err(ExactPropertyNamesError::Malformed);
         }
         names.push(name);
     }
-    Some(names)
+    Ok(names)
+}
+
+/// Binder-owned symbol text does not retain whether `"0"` came from a
+/// numeric declaration or a quoted string declaration. This host-free leaf
+/// therefore accepts only conservative plain identifier spellings until
+/// source-name classification is installed.
+fn is_unambiguous_identifier_property_name(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    let Some(first) = bytes.next() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || matches!(first, b'_' | b'$'))
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$'))
 }
 
 fn exact_index_kinds(
@@ -625,7 +842,10 @@ mod tests {
     };
     use ts_parser::{ParseResult, parse_source_file};
 
-    use super::{NongenericKeyofError, plan_nongeneric_keyof_type, resolve_nongeneric_keyof_type};
+    use super::{
+        IndexFlags, NongenericKeyofError, plan_nongeneric_keyof_type,
+        resolve_nongeneric_keyof_leaf, resolve_nongeneric_keyof_type,
+    };
     use crate::semantic::{
         CanonicalTypeMapperStore, DeclaredTypeHost, IntrinsicBootstrapOptions, TypeAliasLinks,
         TypeId, object_members, type_records::TypeData,
@@ -817,12 +1037,13 @@ mod tests {
         }
     }
 
-    fn cache_state(store: &CanonicalTypeMapperStore) -> (usize, usize, usize) {
+    fn cache_state(store: &CanonicalTypeMapperStore) -> (usize, usize, usize, usize) {
         let bootstrap = store.intrinsic_bootstrap().unwrap();
         (
             store.type_len(),
             bootstrap.string_literal_cache_len(),
             bootstrap.union_cache_len(),
+            store.properties_type_cache_len(),
         )
     }
 
@@ -918,17 +1139,40 @@ mod tests {
         let interface = resolve_interface(&mut fixture);
         let plan = plan_nongeneric_keyof_type(&fixture.store, interface).unwrap();
         assert!(plan.preserves_origin());
-        assert!(plan.named_origin_required());
+        assert!(plan.root_cache_required());
+        assert!(plan.retains_index_origin());
         let before = cache_state(&fixture.store);
         assert_eq!(
-            resolve_nongeneric_keyof_type(&mut fixture.store, &plan),
-            Err(NongenericKeyofError::NamedOriginRequired {
+            resolve_nongeneric_keyof_leaf(&mut fixture.store, &plan),
+            Err(NongenericKeyofError::PropertiesCacheRequired {
                 target: interface,
                 raw_contribution_count: 2,
                 reduced_key_count: 2,
+                retains_index_origin: true,
             })
         );
         assert_eq!(cache_state(&fixture.store), before);
+
+        let cold = resolve_nongeneric_keyof_type(&mut fixture.store, &plan).unwrap();
+        let after_cold = cache_state(&fixture.store);
+        assert_eq!(after_cold.0, before.0 + 6);
+        assert_eq!(after_cold.1, before.1 + 2);
+        assert_eq!(after_cold.2, before.2 + 1);
+        assert_eq!(after_cold.3, before.3 + 1);
+        let TypeData::Union(union) = fixture.store.type_payload(cold).unwrap().data() else {
+            panic!("two named property keys must produce an index-origin union");
+        };
+        let origin = union.origin.expect("named keyof union keeps Index origin");
+        let TypeData::Index(index) = fixture.store.type_payload(origin).unwrap().data() else {
+            panic!("named keyof origin must be an Index shell");
+        };
+        assert_eq!(index.target, interface);
+        assert_eq!(index.index_flags, IndexFlags::NONE);
+        assert_eq!(
+            resolve_nongeneric_keyof_type(&mut fixture.store, &plan).unwrap(),
+            cold,
+        );
+        assert_eq!(cache_state(&fixture.store), after_cold);
     }
 
     #[test]
@@ -939,7 +1183,9 @@ mod tests {
         assert!(plan.preserves_origin());
         assert_eq!(plan.raw_contribution_count(), 1);
         assert_eq!(plan.reduced_key_count(), 2);
-        assert!(!plan.named_origin_required());
+        assert!(plan.root_cache_required());
+        assert!(!plan.retains_index_origin());
+        let before = cache_state(&index_only.store);
         assert_eq!(
             resolve_nongeneric_keyof_type(&mut index_only.store, &plan).unwrap(),
             index_only
@@ -948,6 +1194,20 @@ mod tests {
                 .unwrap()
                 .string_or_number_type
         );
+        let after_cold = cache_state(&index_only.store);
+        assert_eq!(after_cold.0, before.0 + 1);
+        assert_eq!(after_cold.1, before.1);
+        assert_eq!(after_cold.2, before.2);
+        assert_eq!(after_cold.3, before.3 + 1);
+        assert_eq!(
+            resolve_nongeneric_keyof_type(&mut index_only.store, &plan).unwrap(),
+            index_only
+                .store
+                .intrinsic_bootstrap()
+                .unwrap()
+                .string_or_number_type
+        );
+        assert_eq!(cache_state(&index_only.store), after_cold);
 
         let mut mixed = fixture("type Table = { named: string; [key: string]: string };");
         let table = resolve_aliased_literal(&mut mixed);
@@ -956,11 +1216,12 @@ mod tests {
         assert_eq!(plan.reduced_key_count(), 2);
         let before = cache_state(&mixed.store);
         assert_eq!(
-            resolve_nongeneric_keyof_type(&mut mixed.store, &plan),
-            Err(NongenericKeyofError::NamedOriginRequired {
+            resolve_nongeneric_keyof_leaf(&mut mixed.store, &plan),
+            Err(NongenericKeyofError::PropertiesCacheRequired {
                 target: table,
                 raw_contribution_count: 2,
                 reduced_key_count: 2,
+                retains_index_origin: true,
             })
         );
         assert_eq!(cache_state(&mixed.store), before);
@@ -972,6 +1233,7 @@ mod tests {
         let interface = resolve_interface(&mut fixture);
         let plan = plan_nongeneric_keyof_type(&fixture.store, interface).unwrap();
         assert_eq!(plan.property_names(), ["next"]);
+        let before = cache_state(&fixture.store);
         let result = resolve_nongeneric_keyof_type(&mut fixture.store, &plan).unwrap();
         assert_eq!(
             result,
@@ -982,6 +1244,16 @@ mod tests {
                 .cached_string_literal_type("next")
                 .unwrap()
         );
+        let after_cold = cache_state(&fixture.store);
+        assert_eq!(after_cold.0, before.0 + 3);
+        assert_eq!(after_cold.1, before.1 + 1);
+        assert_eq!(after_cold.2, before.2);
+        assert_eq!(after_cold.3, before.3 + 1);
+        assert_eq!(
+            resolve_nongeneric_keyof_type(&mut fixture.store, &plan).unwrap(),
+            result,
+        );
+        assert_eq!(cache_state(&fixture.store), after_cold);
     }
 
     #[test]

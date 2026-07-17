@@ -47,6 +47,7 @@ use super::{
         CacheHashKey, ConditionalRoot, TypeAlias, TypeCacheState, TypeData, TypeRecord,
         type_list_key,
     },
+    types::TypeFlags,
 };
 
 #[derive(Debug)]
@@ -111,6 +112,37 @@ pub(super) enum CachedSignatureLookup {
     Hit(SignatureId),
     HashCollision(SignatureId),
     Invalid,
+}
+
+/// Exact key for pinned checker `propertiesTypes`.
+///
+/// `include` and `include_origin` distinguish the internal
+/// `getLiteralTypeFromProperties` modes. `unresolved_members` is retained even
+/// when the first installed `keyof` slice accepts only fully resolved objects,
+/// because upstream deliberately prevents a WIP member surface from aliasing
+/// its final cache entry.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(super) struct PropertiesTypeCacheKey {
+    type_id: TypeId,
+    include: TypeFlags,
+    include_origin: bool,
+    unresolved_members: bool,
+}
+
+impl PropertiesTypeCacheKey {
+    pub(super) const fn new(
+        type_id: TypeId,
+        include: TypeFlags,
+        include_origin: bool,
+        unresolved_members: bool,
+    ) -> Self {
+        Self {
+            type_id,
+            include,
+            include_origin,
+            unresolved_members,
+        }
+    }
 }
 
 /// Source syntax family that owns one exact callable value object.
@@ -348,6 +380,9 @@ pub struct SemanticStore<TypePayload, MapperPayload> {
     /// Pinned checker `cachedSignatures`, keyed by generic target and the
     /// ordered type-argument hash.
     cached_signatures: HashMap<(SignatureId, CacheHashKey), CachedSignatureEntry>,
+    /// Pinned checker `propertiesTypes`, including its WIP unresolved-members
+    /// discriminator and origin-preservation mode.
+    properties_types: HashMap<PropertiesTypeCacheKey, TypeId>,
     function_signature_return_annotations: HashMap<SignatureId, (NodeRef, bool)>,
     callable_signature_parameter_types: HashMap<SignatureId, Vec<TypeId>>,
     circular_return_signatures: HashMap<SignatureId, TypeId>,
@@ -432,6 +467,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             source_callable_types_by_signature: HashMap::new(),
             source_callable_type_parameters: HashMap::new(),
             cached_signatures: HashMap::new(),
+            properties_types: HashMap::new(),
             function_signature_return_annotations: HashMap::new(),
             callable_signature_parameter_types: HashMap::new(),
             circular_return_signatures: HashMap::new(),
@@ -4054,6 +4090,44 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
 }
 
 impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
+    pub(super) fn try_reserve_properties_type_cache(&mut self, additional: usize) -> bool {
+        self.properties_types.try_reserve(additional).is_ok()
+    }
+
+    pub(super) fn cached_properties_type(&self, key: PropertiesTypeCacheKey) -> Option<TypeId> {
+        self.properties_types.get(&key).copied()
+    }
+
+    pub(super) fn cache_properties_type(
+        &mut self,
+        key: PropertiesTypeCacheKey,
+        result: TypeId,
+    ) -> bool {
+        let Some(target) = self.type_payload(key.type_id) else {
+            return false;
+        };
+        if self.type_payload(result).is_none()
+            || target
+                .object_flags()
+                .intersects(super::types::ObjectFlags::UNRESOLVED_MEMBERS)
+                != key.unresolved_members
+        {
+            return false;
+        }
+        match self.properties_types.get(&key) {
+            Some(cached) => *cached == result,
+            None => {
+                self.properties_types.insert(key, result);
+                true
+            }
+        }
+    }
+
+    #[must_use]
+    pub fn properties_type_cache_len(&self) -> usize {
+        self.properties_types.len()
+    }
+
     pub(super) fn try_reserve_direct_interface_heritage_provenance(
         &mut self,
         additional: usize,
