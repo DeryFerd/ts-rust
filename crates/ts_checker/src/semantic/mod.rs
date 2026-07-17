@@ -38,6 +38,7 @@ mod keyof_types;
 pub mod links;
 mod logical_operators;
 pub mod mapper;
+mod member_resolution;
 mod merge;
 pub mod module_resolution;
 pub mod name_resolution;
