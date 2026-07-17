@@ -279,7 +279,50 @@ pub enum CanonicalProgramCheckError {
     DiagnosticFormat(FormatError),
 }
 
+/// Stable corpus classification for a canonical checker construction failure.
+///
+/// Capability codes name an intentionally unsupported port-map boundary.
+/// Invariant codes name a failure that must stay fatal. Corpus tooling can use
+/// this typed envelope without parsing [`CanonicalProgramCheckError`]'s display
+/// text or weakening the compiler's fail-closed behavior.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CanonicalProgramCheckFailureClass {
+    Unsupported {
+        capability_code: &'static str,
+    },
+    Fatal {
+        invariant_code: &'static str,
+    },
+}
+
+impl CanonicalProgramCheckFailureClass {
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Unsupported { capability_code } => capability_code,
+            Self::Fatal { invariant_code } => invariant_code,
+        }
+    }
+
+    #[must_use]
+    pub const fn is_unsupported(self) -> bool {
+        matches!(self, Self::Unsupported { .. })
+    }
+}
+
 impl CanonicalProgramCheckError {
+    /// Returns the stable typed corpus classification for this failure.
+    #[must_use]
+    pub fn failure_class(&self) -> CanonicalProgramCheckFailureClass {
+        if let Some(capability_code) = canonical_program_capability_code(self) {
+            CanonicalProgramCheckFailureClass::Unsupported { capability_code }
+        } else {
+            CanonicalProgramCheckFailureClass::Fatal {
+                invariant_code: canonical_program_invariant_code(self),
+            }
+        }
+    }
+
     /// Returns whether this failure is an explicit, not-yet-ported semantic
     /// boundary rather than a violated compiler invariant.
     ///
@@ -288,30 +331,181 @@ impl CanonicalProgramCheckError {
     /// provenance, cache, catalog, or diagnostic-conversion failures.
     #[must_use]
     pub fn is_unsupported_boundary(&self) -> bool {
-        match self {
-            Self::UnsupportedSourceKind { .. }
-            | Self::FixedModuleFormatUnsupported { .. }
-            | Self::ImportMetaModuleIndicatorUnsupported { .. }
-            | Self::NodeModuleFactsUnsupported { .. }
-            | Self::PlainEsmModuleResolutionUnsupported { .. }
-            | Self::ModuleSpecifierResolutionModeUnsupported(_)
-            | Self::ExternalModuleTargetUnsupported { .. }
-            | Self::DeclarationFileCheckingUnsupported { .. } => true,
-            Self::DeclarationBind { error, .. } => {
-                canonical_declaration_error_is_unsupported(error)
-            }
-            Self::Context(error) => context_error_is_unsupported(error),
-            Self::SourceCheck { error, .. } => source_check_error_is_unsupported(error),
-            Self::Bind { .. }
-            | Self::MissingBoundFile { .. }
-            | Self::InvalidModuleSourceFile(_)
-            | Self::InvalidModuleSpecifier(_)
-            | Self::MissingResolvedModuleTarget { .. }
-            | Self::InvalidDiagnosticNode(_)
-            | Self::InvalidDiagnosticRange { .. }
-            | Self::InvalidRelatedDiagnosticNode { .. }
-            | Self::DiagnosticFormat(_) => false,
+        self.failure_class().is_unsupported()
+    }
+}
+
+fn canonical_program_capability_code(
+    error: &CanonicalProgramCheckError,
+) -> Option<&'static str> {
+    match error {
+        CanonicalProgramCheckError::UnsupportedSourceKind { .. } => Some("C00.SOURCE_KIND"),
+        CanonicalProgramCheckError::FixedModuleFormatUnsupported { .. } => {
+            Some("M00.FIXED_MODULE_FORMAT")
         }
+        CanonicalProgramCheckError::ImportMetaModuleIndicatorUnsupported { .. } => {
+            Some("M03.IMPORT_META_MODULE_MODE")
+        }
+        CanonicalProgramCheckError::NodeModuleFactsUnsupported { .. } => {
+            Some("M00.NODE_MODULE_FACTS")
+        }
+        CanonicalProgramCheckError::PlainEsmModuleResolutionUnsupported { .. } => {
+            Some("M00.PLAIN_ESM_MODE")
+        }
+        CanonicalProgramCheckError::ModuleSpecifierResolutionModeUnsupported(_) => {
+            Some("M00.SPECIFIER_RESOLUTION_MODE")
+        }
+        CanonicalProgramCheckError::DeclarationFileCheckingUnsupported { .. } => {
+            Some("M00.DECLARATION_FILE")
+        }
+        CanonicalProgramCheckError::DeclarationBind { error, .. }
+            if canonical_declaration_error_is_unsupported(error) =>
+        {
+            Some("B02.DECLARATION_FAMILY")
+        }
+        CanonicalProgramCheckError::Context(error) if context_error_is_unsupported(error) => {
+            Some("T04.GLOBAL_CONTEXT")
+        }
+        CanonicalProgramCheckError::SourceCheck { error, .. } => {
+            source_check_capability_code(error)
+        }
+        CanonicalProgramCheckError::ExternalModuleTargetUnsupported { .. } => {
+            Some("M00.EXTERNAL_MODULE_TARGET")
+        }
+        CanonicalProgramCheckError::Bind { .. }
+        | CanonicalProgramCheckError::DeclarationBind { .. }
+        | CanonicalProgramCheckError::Context(_)
+        | CanonicalProgramCheckError::MissingBoundFile { .. }
+        | CanonicalProgramCheckError::InvalidModuleSourceFile(_)
+        | CanonicalProgramCheckError::InvalidModuleSpecifier(_)
+        | CanonicalProgramCheckError::MissingResolvedModuleTarget { .. }
+        | CanonicalProgramCheckError::InvalidDiagnosticNode(_)
+        | CanonicalProgramCheckError::InvalidDiagnosticRange { .. }
+        | CanonicalProgramCheckError::InvalidRelatedDiagnosticNode { .. }
+        | CanonicalProgramCheckError::DiagnosticFormat(_) => None,
+    }
+}
+
+fn source_check_capability_code(error: &SourceCheckError) -> Option<&'static str> {
+    match error {
+        SourceCheckError::Unsupported(_) => Some("E00.SOURCE_SYNTAX"),
+        SourceCheckError::DeclaredType(error) if declared_type_error_is_unsupported(error) => {
+            Some(match error {
+                DeclaredTypeError::Unavailable(_)
+                | DeclaredTypeError::Host(_)
+                | DeclaredTypeError::NameResolverHost(_)
+                | DeclaredTypeError::TypeResolutionTarget(_) => "T05.DECLARED_TYPE",
+                DeclaredTypeError::TypeNodeUnavailable(_) => "T06.TYPE_NODE",
+                DeclaredTypeError::Enum(_) => "E00.ENUM_TYPE",
+                DeclaredTypeError::NameResolution(_) => "B03.NAME_RESOLUTION",
+            })
+        }
+        SourceCheckError::RelationUnavailable(error)
+            if relation_error_is_unsupported(error) =>
+        {
+            Some("R01.RELATION")
+        }
+        SourceCheckError::TypeDisplayUnavailable(error)
+            if display_error_is_unsupported(error) =>
+        {
+            Some("T07.TYPE_DISPLAY")
+        }
+        SourceCheckError::LiteralCache(error) if literal_cache_error_is_unsupported(error) => {
+            Some("T06.LITERAL_UNION")
+        }
+        SourceCheckError::ArrayType(error) if array_type_error_is_unsupported(error) => {
+            Some("T06.ARRAY_TYPE")
+        }
+        SourceCheckError::DerivedType(error) if derived_type_error_is_unsupported(error) => {
+            Some("E00.DERIVED_TYPE")
+        }
+        SourceCheckError::Provenance(_)
+        | SourceCheckError::DeclaredType(_)
+        | SourceCheckError::RelationUnavailable(_)
+        | SourceCheckError::TypeDisplayUnavailable(_)
+        | SourceCheckError::LiteralCache(_)
+        | SourceCheckError::ObjectLiteral(_)
+        | SourceCheckError::ArrayType(_)
+        | SourceCheckError::DerivedType(_)
+        | SourceCheckError::Assertion(_)
+        | SourceCheckError::Assignment(_)
+        | SourceCheckError::Arrow(_)
+        | SourceCheckError::Function(_)
+        | SourceCheckError::Variable(_)
+        | SourceCheckError::Call(_)
+        | SourceCheckError::Enum(_)
+        | SourceCheckError::Import(_)
+        | SourceCheckError::Property(_)
+        | SourceCheckError::Element(_)
+        | SourceCheckError::PrimitiveOperator(_)
+        | SourceCheckError::LogicalOperator(_)
+        | SourceCheckError::MissingDiagnostic(_) => None,
+    }
+}
+
+fn canonical_program_invariant_code(error: &CanonicalProgramCheckError) -> &'static str {
+    match error {
+        CanonicalProgramCheckError::Bind { .. } => "INV.PROGRAM.BIND",
+        CanonicalProgramCheckError::DeclarationBind { .. } => "INV.PROGRAM.DECLARATION_BIND",
+        CanonicalProgramCheckError::Context(_) => "INV.PROGRAM.CHECKER_CONTEXT",
+        CanonicalProgramCheckError::SourceCheck { error, .. } => source_check_invariant_code(error),
+        CanonicalProgramCheckError::MissingBoundFile { .. } => "INV.PROGRAM.MISSING_BOUND_FILE",
+        CanonicalProgramCheckError::InvalidModuleSourceFile(_) => {
+            "INV.PROGRAM.INVALID_MODULE_SOURCE"
+        }
+        CanonicalProgramCheckError::InvalidModuleSpecifier(_) => {
+            "INV.PROGRAM.INVALID_MODULE_SPECIFIER"
+        }
+        CanonicalProgramCheckError::MissingResolvedModuleTarget { .. } => {
+            "INV.PROGRAM.MISSING_MODULE_TARGET"
+        }
+        CanonicalProgramCheckError::InvalidDiagnosticNode(_) => {
+            "INV.PROGRAM.INVALID_DIAGNOSTIC_NODE"
+        }
+        CanonicalProgramCheckError::InvalidDiagnosticRange { .. } => {
+            "INV.PROGRAM.INVALID_DIAGNOSTIC_RANGE"
+        }
+        CanonicalProgramCheckError::InvalidRelatedDiagnosticNode { .. } => {
+            "INV.PROGRAM.INVALID_RELATED_DIAGNOSTIC"
+        }
+        CanonicalProgramCheckError::DiagnosticFormat(_) => "INV.PROGRAM.DIAGNOSTIC_FORMAT",
+        CanonicalProgramCheckError::UnsupportedSourceKind { .. }
+        | CanonicalProgramCheckError::FixedModuleFormatUnsupported { .. }
+        | CanonicalProgramCheckError::ImportMetaModuleIndicatorUnsupported { .. }
+        | CanonicalProgramCheckError::NodeModuleFactsUnsupported { .. }
+        | CanonicalProgramCheckError::PlainEsmModuleResolutionUnsupported { .. }
+        | CanonicalProgramCheckError::ModuleSpecifierResolutionModeUnsupported(_)
+        | CanonicalProgramCheckError::DeclarationFileCheckingUnsupported { .. }
+        | CanonicalProgramCheckError::ExternalModuleTargetUnsupported { .. } => {
+            "INV.PROGRAM.FAILURE_CLASSIFICATION"
+        }
+    }
+}
+
+fn source_check_invariant_code(error: &SourceCheckError) -> &'static str {
+    match error {
+        SourceCheckError::Provenance(_) => "INV.SOURCE.PROVENANCE",
+        SourceCheckError::Unsupported(_) => "INV.SOURCE.FAILURE_CLASSIFICATION",
+        SourceCheckError::DeclaredType(_) => "INV.SOURCE.DECLARED_TYPE",
+        SourceCheckError::RelationUnavailable(_) => "INV.SOURCE.RELATION",
+        SourceCheckError::TypeDisplayUnavailable(_) => "INV.SOURCE.TYPE_DISPLAY",
+        SourceCheckError::LiteralCache(_) => "INV.SOURCE.LITERAL_CACHE",
+        SourceCheckError::ObjectLiteral(_) => "INV.SOURCE.OBJECT_LITERAL",
+        SourceCheckError::ArrayType(_) => "INV.SOURCE.ARRAY_TYPE",
+        SourceCheckError::DerivedType(_) => "INV.SOURCE.DERIVED_TYPE",
+        SourceCheckError::Assertion(_) => "INV.SOURCE.ASSERTION",
+        SourceCheckError::Assignment(_) => "INV.SOURCE.ASSIGNMENT",
+        SourceCheckError::Arrow(_) => "INV.SOURCE.ARROW",
+        SourceCheckError::Function(_) => "INV.SOURCE.FUNCTION",
+        SourceCheckError::Variable(_) => "INV.SOURCE.VARIABLE",
+        SourceCheckError::Call(_) => "INV.SOURCE.CALL",
+        SourceCheckError::Enum(_) => "INV.SOURCE.ENUM",
+        SourceCheckError::Import(_) => "INV.SOURCE.IMPORT",
+        SourceCheckError::Property(_) => "INV.SOURCE.PROPERTY",
+        SourceCheckError::Element(_) => "INV.SOURCE.ELEMENT",
+        SourceCheckError::PrimitiveOperator(_) => "INV.SOURCE.PRIMITIVE_OPERATOR",
+        SourceCheckError::LogicalOperator(_) => "INV.SOURCE.LOGICAL_OPERATOR",
+        SourceCheckError::MissingDiagnostic(_) => "INV.SOURCE.MISSING_DIAGNOSTIC",
     }
 }
 
@@ -430,33 +624,6 @@ fn canonical_declaration_error_is_unsupported(error: &CanonicalDeclarationError)
         | CanonicalDeclarationError::MissingContainingClassSymbol(_)
         | CanonicalDeclarationError::MissingSourceFileFacts(_)
         | CanonicalDeclarationError::DuplicateDeclarationDispatch(_) => false,
-    }
-}
-
-fn source_check_error_is_unsupported(error: &SourceCheckError) -> bool {
-    match error {
-        SourceCheckError::Unsupported(_) => true,
-        SourceCheckError::DeclaredType(error) => declared_type_error_is_unsupported(error),
-        SourceCheckError::RelationUnavailable(error) => relation_error_is_unsupported(error),
-        SourceCheckError::TypeDisplayUnavailable(error) => display_error_is_unsupported(error),
-        SourceCheckError::LiteralCache(error) => literal_cache_error_is_unsupported(error),
-        SourceCheckError::ArrayType(error) => array_type_error_is_unsupported(error),
-        SourceCheckError::DerivedType(error) => derived_type_error_is_unsupported(error),
-        SourceCheckError::Provenance(_)
-        | SourceCheckError::ObjectLiteral(_)
-        | SourceCheckError::Assertion(_)
-        | SourceCheckError::Assignment(_)
-        | SourceCheckError::Arrow(_)
-        | SourceCheckError::Function(_)
-        | SourceCheckError::Variable(_)
-        | SourceCheckError::Call(_)
-        | SourceCheckError::Enum(_)
-        | SourceCheckError::Import(_)
-        | SourceCheckError::Property(_)
-        | SourceCheckError::Element(_)
-        | SourceCheckError::PrimitiveOperator(_)
-        | SourceCheckError::LogicalOperator(_)
-        | SourceCheckError::MissingDiagnostic(_) => false,
     }
 }
 
@@ -6900,10 +7067,11 @@ mod tests {
     use ts_vfs::{FileSystem, MemoryFileSystem};
 
     use super::{
-        CanonicalBindError, CanonicalDeclarationError, CanonicalProgramCheckError, FileId,
-        NodeData, Program, SourceFile, SyntaxKind, bind_source_file_in_file,
-        canonical_source_file_facts, defer_export_only_bundle_imports, empty_check_result,
-        parse_source_file, percent_encode_source_map_url, source_file_is_external_module,
+        CanonicalBindError, CanonicalDeclarationError, CanonicalProgramCheckError,
+        CanonicalProgramCheckFailureClass, FileId, NodeData, Program, SourceFile, SyntaxKind,
+        bind_source_file_in_file, canonical_source_file_facts, defer_export_only_bundle_imports,
+        empty_check_result, parse_source_file, percent_encode_source_map_url,
+        source_file_is_external_module,
     };
 
     fn plain_esm_bundler_options() -> CompilerOptions {
@@ -7054,6 +7222,35 @@ mod tests {
                 .iter()
                 .all(CanonicalProgramCheckError::is_unsupported_boundary)
         );
+        assert!(unsupported.iter().all(|error| {
+            matches!(
+                error.failure_class(),
+                CanonicalProgramCheckFailureClass::Unsupported { capability_code }
+                    if !capability_code.starts_with("INV.")
+            )
+        }));
+    }
+
+    #[test]
+    fn canonical_program_failure_class_exposes_stable_fatal_codes() {
+        let parsed = parse_source_file("const value = () => 1;");
+        let node = ts_ast::NodeRef::new(
+            parsed.arena.id(),
+            FileId::new(7),
+            parsed.source_file,
+        );
+        let error = CanonicalProgramCheckError::SourceCheck {
+            file_name: "/project/input.ts".to_owned(),
+            error: SourceCheckError::Arrow(node),
+        };
+
+        assert_eq!(
+            error.failure_class(),
+            CanonicalProgramCheckFailureClass::Fatal {
+                invariant_code: "INV.SOURCE.ARROW",
+            }
+        );
+        assert!(!error.is_unsupported_boundary());
     }
 
     #[test]
