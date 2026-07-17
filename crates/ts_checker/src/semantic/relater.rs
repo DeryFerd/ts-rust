@@ -8485,7 +8485,7 @@ mod tests {
                 .intersects(RelationComparisonResult::SUCCEEDED),
             "an equal link publication must not stale a warmed relation"
         );
-        let mut foreign = initialized(true);
+        let foreign = initialized(true);
         let foreign_type = foreign.intrinsic_bootstrap().unwrap().string_type;
         let mut rejected_alias_links = exact_alias_links.clone();
         rejected_alias_links.declared_type = Some(foreign_type);
