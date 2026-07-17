@@ -23,7 +23,7 @@ use super::{
     member_resolution::UnionPropertyError,
     source::{PlannedExpression, PlannedExpressionKind},
     spelling::get_spelling_suggestion,
-    type_records::TypeData,
+    type_records::{TypeData, TypeRecord},
     types::TypeFlags,
 };
 
@@ -91,7 +91,10 @@ impl std::fmt::Display for SourcePropertyError {
             Self::Relation(error) => write!(formatter, "{error}"),
             Self::Display(error) => error.fmt(formatter),
             Self::Capacity(node) => {
-                write!(formatter, "source property staging exhausted capacity at {node:?}")
+                write!(
+                    formatter,
+                    "source property staging exhausted capacity at {node:?}"
+                )
             }
             Self::MissingDiagnostic(code) => {
                 write!(formatter, "source property diagnostic TS{code} is missing")
@@ -185,6 +188,13 @@ enum CopiedSourcePropertySuggestion {
     Unavailable,
     None,
     Candidate(SemanticSymbolId),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CopiedMissingUnionProperty {
+    Unavailable,
+    PresentEverywhere,
+    Missing(TypeId),
 }
 
 /// Proves the exact `identifier.name` syntax and all existing access-cache
@@ -356,9 +366,14 @@ pub(super) fn check_direct_source_property(
     } else {
         None
     };
-    let missing_union_constituent = union_constituents
-        .and_then(|constituents| copied_first_missing_union_constituent(store, plan, constituents));
-    let union_suggestion = if missing_union_constituent.flatten().is_some() {
+    let missing_union_property = union_constituents
+        .map_or(CopiedMissingUnionProperty::Unavailable, |constituents| {
+            copied_first_missing_union_constituent(store, plan, constituents)
+        });
+    let union_suggestion = if matches!(
+        missing_union_property,
+        CopiedMissingUnionProperty::Missing(_)
+    ) {
         if let Some(global_types) = global_types
             && global_object_affects_missing_property(store, global_types, plan.node, &plan.name)?
         {
@@ -376,22 +391,20 @@ pub(super) fn check_direct_source_property(
             .transpose()?
             .flatten()
         {
-            Some(candidates) => match stable_property_spelling_suggestion(
-                store,
-                &plan.name,
-                &candidates,
-            ) {
-                Ok(Some(candidate)) => CopiedSourcePropertySuggestion::Candidate(candidate),
-                Ok(None) => CopiedSourcePropertySuggestion::None,
-                Err(()) => {
-                    return Err(SourcePropertyError::Unsupported(
-                        SourcePropertyUnsupported::AmbiguousPropertySuggestion {
-                            node: plan.node,
-                            receiver_type,
-                        },
-                    ));
+            Some(candidates) => {
+                match stable_property_spelling_suggestion(store, &plan.name, &candidates) {
+                    Ok(Some(candidate)) => CopiedSourcePropertySuggestion::Candidate(candidate),
+                    Ok(None) => CopiedSourcePropertySuggestion::None,
+                    Err(()) => {
+                        return Err(SourcePropertyError::Unsupported(
+                            SourcePropertyUnsupported::AmbiguousPropertySuggestion {
+                                node: plan.node,
+                                receiver_type,
+                            },
+                        ));
+                    }
                 }
-            },
+            }
             None => CopiedSourcePropertySuggestion::Unavailable,
         }
     } else {
@@ -400,35 +413,35 @@ pub(super) fn check_direct_source_property(
     let (type_, property, diagnostic) = if receiver_type == any {
         (any, None, None)
     } else if union_read {
-        match store
+        if let Some(property) = store
             .resolved_union_property(receiver_type, &plan.name)
             .map_err(|error| SourcePropertyError::Union {
                 node: plan.node,
                 error,
-            })? {
-            Some(property) => (property.type_id(), Some(property.symbol()), None),
-            None => {
-                let missing_type = missing_union_constituent
-                    .flatten()
-                    .ok_or(SourcePropertyError::InvalidCache(plan.node))?;
-                let suggestion = match union_suggestion {
-                    CopiedSourcePropertySuggestion::Candidate(candidate) => Some(candidate),
-                    CopiedSourcePropertySuggestion::None => None,
-                    CopiedSourcePropertySuggestion::Unavailable => {
-                        return Err(SourcePropertyError::InvalidCache(plan.node));
-                    }
-                };
-                (
-                    error_type,
-                    None,
-                    Some(SourcePropertyDiagnostic {
-                        name_node: plan.name_node,
-                        receiver_type,
-                        missing_type,
-                        suggestion,
-                    }),
-                )
-            }
+            })?
+        {
+            (property.type_id(), Some(property.symbol()), None)
+        } else {
+            let CopiedMissingUnionProperty::Missing(missing_type) = missing_union_property else {
+                return Err(SourcePropertyError::InvalidCache(plan.node));
+            };
+            let suggestion = match union_suggestion {
+                CopiedSourcePropertySuggestion::Candidate(candidate) => Some(candidate),
+                CopiedSourcePropertySuggestion::None => None,
+                CopiedSourcePropertySuggestion::Unavailable => {
+                    return Err(SourcePropertyError::InvalidCache(plan.node));
+                }
+            };
+            (
+                error_type,
+                None,
+                Some(SourcePropertyDiagnostic {
+                    name_node: plan.name_node,
+                    receiver_type,
+                    missing_type,
+                    suggestion,
+                }),
+            )
         }
     } else {
         let Some(property) = store.resolved_own_property(receiver_type, &plan.name)? else {
@@ -458,8 +471,7 @@ fn copied_union_constituents(
     store: &CanonicalTypeMapperStore,
     receiver_type: TypeId,
 ) -> Option<[TypeId; 2]> {
-    let Some(TypeData::Union(union)) =
-        store.type_payload(receiver_type).map(|record| record.data())
+    let Some(TypeData::Union(union)) = store.type_payload(receiver_type).map(TypeRecord::data)
     else {
         return None;
     };
@@ -473,19 +485,32 @@ fn copied_first_missing_union_constituent(
     store: &CanonicalTypeMapperStore,
     plan: &SourcePropertyPlan,
     constituents: [TypeId; 2],
-) -> Option<Option<TypeId>> {
+) -> CopiedMissingUnionProperty {
     let mut first_missing = None;
     for constituent in constituents {
-        let structured = store.type_payload(constituent)?.data().structured()?;
+        let Some(structured) = store
+            .type_payload(constituent)
+            .and_then(|record| record.data().structured())
+        else {
+            return CopiedMissingUnionProperty::Unavailable;
+        };
         let present = match structured.members {
-            Some(members) => store.symbol_table(members)?.get_source(&plan.name).is_some(),
+            Some(members) => {
+                let Some(members) = store.symbol_table(members) else {
+                    return CopiedMissingUnionProperty::Unavailable;
+                };
+                members.get_source(&plan.name).is_some()
+            }
             None => false,
         };
         if !present && first_missing.is_none() {
             first_missing = Some(constituent);
         }
     }
-    Some(first_missing)
+    first_missing.map_or(
+        CopiedMissingUnionProperty::PresentEverywhere,
+        CopiedMissingUnionProperty::Missing,
+    )
 }
 
 fn copied_common_union_property_candidates(
