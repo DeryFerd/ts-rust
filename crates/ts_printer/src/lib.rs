@@ -11530,9 +11530,18 @@ impl DeclarationPrinter<'_> {
                 self.writer.write(": ");
                 self.emit_semantic_type(type_id)?;
             } else if keyword == "const"
-                && declaration
-                    .initializer
-                    .is_some_and(|value| self.is_const_declaration_literal_initializer(value))
+                && let Some(literal_initializer) = declaration.initializer.and_then(|value| {
+                    self.is_const_declaration_literal_initializer(value)
+                        .then_some(value)
+                        .or_else(|| {
+                            matches!(
+                                self.arena.get(value).map(|node| &node.data),
+                                Some(NodeData::Identifier(_))
+                            )
+                            .then(|| self.const_literal_declaration_initializer(value))
+                            .flatten()
+                        })
+                })
             {
                 let declaration_name = declaration_name_text(self.arena, declaration.name);
                 let const_asserted = declaration_name.is_some_and(|name| {
@@ -11566,7 +11575,7 @@ impl DeclarationPrinter<'_> {
                 });
                 let previous = self.canonical_literal_quotes;
                 self.canonical_literal_quotes = true;
-                let result = self.emit_literal_expression(declaration.initializer.unwrap());
+                let result = self.emit_literal_expression(literal_initializer);
                 self.canonical_literal_quotes = previous;
                 result?;
             } else if keyword == "const"
