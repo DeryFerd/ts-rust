@@ -19,6 +19,7 @@ mod callables;
 mod calls;
 #[allow(dead_code)] // Incremental class cuts retain accessors reserved for later source stages.
 mod classes;
+mod conditional_types;
 mod constraints;
 mod contextual;
 pub mod declared;
@@ -36,11 +37,14 @@ mod instantiate;
 mod instantiated_members;
 mod interface_heritage;
 mod intersection_types;
+pub mod jsdoc;
+mod jsx;
 #[allow(dead_code)] // Root owns the checker-cache and type-node integration adapter.
 mod keyof_types;
 pub mod links;
 mod logical_operators;
 pub mod mapper;
+mod mapped_types;
 mod member_resolution;
 mod merge;
 pub mod module_resolution;
@@ -69,6 +73,7 @@ mod source_statements;
 mod spelling;
 mod store;
 mod structured_members;
+pub mod template_types;
 mod tuple_type_nodes;
 mod tuple_types;
 pub mod type_nodes;
@@ -133,6 +138,10 @@ pub use links::{
     TypeResolutionTargetError, TypeSystemPropertyName, ValueSymbolLinks, VarianceLinks,
 };
 pub use mapper::{CanonicalTypeMapperStore, TypeMapper, TypeMapperKind};
+pub use mapped_types::{
+    MappedTypeError, MappedTypeModifiers, MappedTypeRequest, ResolvedMappedProperty,
+    ResolvedMappedTypeMembers,
+};
 pub use member_resolution::{CanonicalUnionPropertyError, ResolvedUnionProperty};
 pub use merge::{
     CheckerDiagnosticMergeHost, FailClosedSymbolMergeHost, SymbolMergeDiagnostic,

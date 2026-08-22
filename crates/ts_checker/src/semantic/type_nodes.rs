@@ -15,6 +15,10 @@ use super::{
     SignatureId, TypeId, TypeResolutionTarget, TypeSystemPropertyName, UnsupportedDeclaredTypeKind,
     array_types::CanonicalArrayTargets,
     bootstrap::{LiteralTypeCacheError, PreparedTypeQueryTypes},
+    conditional_types::{
+        ConditionalTypeBranches, ConditionalTypeInstantiation, ConditionalTypeRequest,
+        get_conditional_type_instantiation, get_type_from_conditional_type,
+    },
     declared::{
         cached_ordinary_type_parameter_owner, execute_type_parameter,
         explicit_type_parameter_symbols, get_declared_class_interface_or_type_parameter,
@@ -43,6 +47,9 @@ use super::{
         NongenericKeyofError, cached_nongeneric_keyof_type, plan_nongeneric_keyof_type,
         resolve_nongeneric_keyof_type,
     },
+    mapped_types::{
+        MappedTypeDeclarationPlan, MappedTypeError, MappedTypeRequest, plan_mapped_type_declaration,
+    },
     object_members::{self, PropertyObjectError, PropertyObjectPlan, PropertyObjectState},
     reference_types::{create_direct_generic_reference, validate_direct_generic_reference},
     signatures::{ElementFlags, Signature},
@@ -51,10 +58,11 @@ use super::{
     },
     source_overloads::{StoredSourceOverloadValidation, validate_stored_source_overload},
     structured_members,
+    template_types::StringMappingKind,
     tuple_type_nodes::{self, TupleTypeNodeError, TupleTypeNodePlan, validate_warm_tuple_elements},
     tuple_types::{CanonicalTupleTypeRequest, TupleTypeError, TupleTypeQueryPreparationError},
     type_records::{CacheHashKey, TypeData, TypeRecord},
-    types::ObjectFlags,
+    types::{AccessFlags, ObjectFlags},
 };
 
 const NODE_FLAG_JSDOC: u32 = 1 << 22;
@@ -62,6 +70,7 @@ const NODE_FLAG_JSDOC: u32 = 1 << 22;
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(super) struct CanonicalTypeQueryOptions {
     pub strict_builtin_iterator_return: bool,
+    pub no_implicit_any: bool,
 }
 
 /// Immutable proof that one leaf in an exact importer annotation root names
@@ -102,6 +111,7 @@ impl From<CanonicalCheckerOptions> for CanonicalTypeQueryOptions {
     fn from(options: CanonicalCheckerOptions) -> Self {
         Self {
             strict_builtin_iterator_return: options.strict_builtin_iterator_return,
+            no_implicit_any: options.no_implicit_any,
         }
     }
 }
@@ -276,9 +286,14 @@ struct TypeQueryPlan {
     literals: BTreeMap<NodeRef, PlannedLiteralType>,
     unions: BTreeMap<NodeRef, PlannedUnionType>,
     intersections: BTreeMap<NodeRef, PlannedIntersectionType>,
+    conditionals: BTreeMap<NodeRef, PlannedConditionalType>,
+    infer_parameters: BTreeMap<NodeRef, SemanticSymbolId>,
+    mapped_types: BTreeMap<NodeRef, MappedTypeDeclarationPlan>,
+    mapped_indexed_accesses: BTreeMap<NodeRef, PlannedMappedIndexedAccess>,
     type_literals: BTreeMap<NodeRef, PropertyObjectPlan>,
     interfaces: BTreeMap<SemanticSymbolId, PropertyObjectPlan>,
     functions: BTreeMap<NodeRef, FunctionTypePlan>,
+    templates: BTreeMap<NodeRef, PlannedTemplateType>,
     tuples: BTreeMap<NodeRef, TupleTypeNodePlan>,
     pending_function_proofs: Vec<PendingFunctionTypeProof>,
 }
@@ -299,6 +314,28 @@ struct PlannedUnionType {
 struct PlannedIntersectionType {
     types: Vec<NodeRef>,
     alias_symbol: Option<SemanticSymbolId>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PlannedConditionalType {
+    check_type: NodeRef,
+    extends_type: NodeRef,
+    true_type: NodeRef,
+    false_type: NodeRef,
+    infer_parameters: Vec<SemanticSymbolId>,
+    outer_parameters: Vec<SemanticSymbolId>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PlannedTemplateType {
+    texts: Vec<String>,
+    types: Vec<NodeRef>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PlannedMappedIndexedAccess {
+    object: NodeRef,
+    index: NodeRef,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -345,6 +382,8 @@ enum CachedTypeAliasRhs {
     IndexedAccess(NodeRef),
     Keyof(NodeRef),
     TupleType(NodeRef),
+    Conditional(NodeRef),
+    Mapped(NodeRef),
     NonUnion,
 }
 
@@ -625,6 +664,22 @@ fn intersection_type_error(error: IntersectionTypeError, node: NodeRef) -> Decla
     }
 }
 
+fn mapped_type_error(error: MappedTypeError, node: NodeRef) -> DeclaredTypeError {
+    match error {
+        MappedTypeError::Declared(error) => error,
+        MappedTypeError::BootstrapUninitialized => DeclaredTypeError::Unavailable(
+            DeclaredTypeUnavailable::IntrinsicBootstrapNotInitialized,
+        ),
+        MappedTypeError::Capacity => {
+            type_node_unavailable(TypeNodeUnavailable::LiteralTypeCapacity)
+        }
+        _ => type_node_unavailable(TypeNodeUnavailable::UnsupportedSyntax {
+            node,
+            kind: SyntaxKind::MappedType,
+        }),
+    }
+}
+
 pub(super) fn normalize_numeric_separators(text: &str) -> Option<String> {
     if text.is_empty() || text.starts_with(['+', '-']) || text.ends_with('n') {
         return None;
@@ -706,6 +761,17 @@ fn symbol_is_builtin_iterator_return(
         .symbol(symbol)
         .and_then(|record| record.name().as_utf8())
         == Some("BuiltinIteratorReturn")
+}
+
+fn symbol_is_string_mapping_intrinsic(
+    store: &CanonicalTypeMapperStore,
+    symbol: SemanticSymbolId,
+) -> bool {
+    store
+        .symbol(symbol)
+        .and_then(|record| record.name().as_utf8())
+        .and_then(StringMappingKind::from_name)
+        .is_some()
 }
 
 fn valid_type_alias_identity_seed(
@@ -1066,6 +1132,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 self.plan_type_node_in_context(inner, alias_owner, union_constituent)
             }
             SyntaxKind::LiteralType => self.plan_literal_type(node),
+            SyntaxKind::TemplateLiteralType => self.plan_template_literal_type(node),
             // Global-aware shorthand `T[]` and named global arrays retain
             // their specialized target capability; ordinary direct generic
             // class/interface references are planned below.
@@ -1109,6 +1176,9 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             }
             SyntaxKind::UnionType => self.plan_union_type(node, alias_owner),
             SyntaxKind::IntersectionType => self.plan_intersection_type(node, alias_owner),
+            SyntaxKind::ConditionalType => self.plan_conditional_type(node, alias_owner),
+            SyntaxKind::InferType => self.plan_infer_type(node),
+            SyntaxKind::MappedType => self.plan_mapped_type(node, alias_owner),
             kind if union_constituent => Err(type_node_unavailable(
                 TypeNodeUnavailable::UnsupportedUnionConstituent(node),
             )),
@@ -1132,6 +1202,260 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 self.validate_cached_union_result(cached, None)
                     .map_err(type_construction_error)?;
             }
+        }
+        Ok(())
+    }
+
+    fn plan_conditional_type(
+        &mut self,
+        node: NodeRef,
+        alias_owner: Option<SemanticSymbolId>,
+    ) -> Result<(), DeclaredTypeError> {
+        if self.plan.conditionals.contains_key(&node) {
+            return Ok(());
+        }
+        let record = preflight_node(self.store, self.host, node)?;
+        let NodeData::ConditionalTypeNode(conditional) = &record.data else {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::UnsupportedSyntax {
+                    node,
+                    kind: SyntaxKind::ConditionalType,
+                },
+            ));
+        };
+        let check_type = NodeRef::new(node.arena, node.file, conditional.check_type);
+        let extends_type = NodeRef::new(node.arena, node.file, conditional.extends_type);
+        let true_type = NodeRef::new(node.arena, node.file, conditional.true_type);
+        let false_type = NodeRef::new(node.arena, node.file, conditional.false_type);
+        for child in [check_type, extends_type, true_type, false_type] {
+            if preflight_node(self.store, self.host, child)?.parent != Some(node.node) {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::UnsupportedSyntax {
+                        node,
+                        kind: SyntaxKind::ConditionalType,
+                    },
+                ));
+            }
+            self.plan_type_node_in_context(child, None, false)?;
+        }
+        let infer_parameters = self
+            .plan
+            .infer_parameters
+            .iter()
+            .filter_map(|(infer, symbol)| {
+                let mut current = *infer;
+                while let Some(parent) = self.host.node(current).and_then(|node| node.parent) {
+                    current = NodeRef::new(current.arena, current.file, parent);
+                    if current == node {
+                        return Some(*symbol);
+                    }
+                }
+                None
+            })
+            .collect();
+        let outer_parameters = alias_owner
+            .and_then(|owner| self.plan.aliases.get(&owner))
+            .map(|alias| {
+                alias
+                    .type_parameters
+                    .iter()
+                    .map(|parameter| parameter.symbol)
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.plan.conditionals.insert(
+            node,
+            PlannedConditionalType {
+                check_type,
+                extends_type,
+                true_type,
+                false_type,
+                infer_parameters,
+                outer_parameters,
+            },
+        );
+        Ok(())
+    }
+
+    fn plan_infer_type(&mut self, node: NodeRef) -> Result<(), DeclaredTypeError> {
+        let record = preflight_node(self.store, self.host, node)?;
+        let NodeData::InferTypeNode(infer) = &record.data else {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::UnsupportedSyntax {
+                    node,
+                    kind: SyntaxKind::InferType,
+                },
+            ));
+        };
+        let parameter = NodeRef::new(node.arena, node.file, infer.type_parameter);
+        if preflight_node(self.store, self.host, parameter)?.parent != Some(node.node) {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidTypeReference(node),
+            ));
+        }
+        let symbol = self
+            .host
+            .bound_file(parameter)
+            .and_then(|bound| bound.symbol(parameter))
+            .and_then(|symbol| self.store.get_merged_symbol(symbol))
+            .ok_or_else(|| {
+                type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node))
+            })?;
+        preflight_type_parameter_symbol(self.store, self.host, symbol, &mut HashSet::new())?;
+        self.plan.infer_parameters.insert(node, symbol);
+        Ok(())
+    }
+
+    fn plan_template_literal_type(&mut self, node: NodeRef) -> Result<(), DeclaredTypeError> {
+        let record = preflight_node(self.store, self.host, node)?;
+        let NodeData::TemplateLiteralTypeNode(template) = &record.data else {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidLiteralType(node),
+            ));
+        };
+        let head = NodeRef::new(node.arena, node.file, template.head);
+        let head_record = preflight_node(self.store, self.host, head)?;
+        let NodeData::TemplateHead(head_data) = &head_record.data else {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidLiteralType(node),
+            ));
+        };
+        if head_record.parent != Some(node.node) || template.template_spans.nodes.is_empty() {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidLiteralType(node),
+            ));
+        }
+        let mut texts = vec![head_data.text.clone()];
+        let mut types = Vec::with_capacity(template.template_spans.nodes.len());
+        for (index, span) in template.template_spans.nodes.iter().enumerate() {
+            let span_node = NodeRef::new(node.arena, node.file, *span);
+            let span_record = preflight_node(self.store, self.host, span_node)?;
+            let NodeData::TemplateLiteralTypeSpan(span_data) = &span_record.data else {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidLiteralType(node),
+                ));
+            };
+            let type_node = NodeRef::new(node.arena, node.file, span_data.type_);
+            let literal_node = NodeRef::new(node.arena, node.file, span_data.literal);
+            let type_record = preflight_node(self.store, self.host, type_node)?;
+            let literal_record = preflight_node(self.store, self.host, literal_node)?;
+            if span_record.parent != Some(node.node)
+                || type_record.parent != Some(span_node.node)
+                || literal_record.parent != Some(span_node.node)
+            {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidLiteralType(node),
+                ));
+            }
+            match &literal_record.data {
+                NodeData::TemplateMiddle(literal)
+                    if index + 1 < template.template_spans.nodes.len() =>
+                {
+                    texts.push(literal.text.clone());
+                }
+                NodeData::TemplateTail(literal)
+                    if index + 1 == template.template_spans.nodes.len() =>
+                {
+                    texts.push(literal.text.clone());
+                }
+                _ => {
+                    return Err(type_node_unavailable(
+                        TypeNodeUnavailable::InvalidLiteralType(node),
+                    ));
+                }
+            }
+            self.plan_type_node_in_context(type_node, None, false)?;
+            types.push(type_node);
+        }
+        let planned = PlannedTemplateType { texts, types };
+        if let Some(existing) = self.plan.templates.insert(node, planned.clone())
+            && existing != planned
+        {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidLiteralType(node),
+            ));
+        }
+        Ok(())
+    }
+
+    fn plan_mapped_type(
+        &mut self,
+        node: NodeRef,
+        alias_owner: Option<SemanticSymbolId>,
+    ) -> Result<(), DeclaredTypeError> {
+        if self.plan.mapped_types.contains_key(&node) {
+            return Ok(());
+        }
+        if let Some(alias) = alias_owner
+            && self
+                .plan
+                .aliases
+                .get(&alias)
+                .is_some_and(|alias| !alias.type_parameters.is_empty())
+        {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::GenericReferenceUnsupported {
+                    node,
+                    symbol: alias,
+                },
+            ));
+        }
+        let mapped = plan_mapped_type_declaration(self.store, self.host, node)
+            .map_err(|error| mapped_type_error(error, node))?;
+        self.plan.mapped_types.insert(node, mapped);
+        self.plan_type_node_in_context(mapped.constraint(), None, false)?;
+        if let Some(source) = mapped.modifiers_source() {
+            self.plan_type_node_in_context(source, None, false)?;
+        }
+        if let Some(template) = mapped.template() {
+            self.plan_mapped_template_type(template, mapped.type_parameter_symbol())?;
+        }
+        if let Some(name_type) = mapped.name_type() {
+            self.plan_type_node_in_context(name_type, None, false)?;
+        }
+        Ok(())
+    }
+
+    fn plan_mapped_template_type(
+        &mut self,
+        node: NodeRef,
+        type_parameter: SemanticSymbolId,
+    ) -> Result<(), DeclaredTypeError> {
+        let record = preflight_node(self.store, self.host, node)?;
+        let NodeData::IndexedAccessTypeNode(indexed) = &record.data else {
+            return self.plan_type_node_in_context(node, None, false);
+        };
+        if record.kind != SyntaxKind::IndexedAccessType {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidIndexedAccessType(node),
+            ));
+        }
+        let object = NodeRef::new(node.arena, node.file, indexed.object_type);
+        let index = NodeRef::new(node.arena, node.file, indexed.index_type);
+        if preflight_node(self.store, self.host, object)?.parent != Some(node.node)
+            || preflight_node(self.store, self.host, index)?.parent != Some(node.node)
+        {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidIndexedAccessType(node),
+            ));
+        }
+        self.plan_type_node_in_context(object, None, false)?;
+        self.plan_type_node_in_context(index, None, false)?;
+        if self
+            .plan
+            .references
+            .get(&index)
+            .is_none_or(|reference| reference.symbol != type_parameter)
+        {
+            return self.plan_type_node_in_context(node, None, false);
+        }
+        let planned = PlannedMappedIndexedAccess { object, index };
+        if let Some(existing) = self.plan.mapped_indexed_accesses.insert(node, planned)
+            && existing != planned
+        {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidIndexedAccessType(node),
+            ));
         }
         Ok(())
     }
@@ -2295,6 +2619,8 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                         CachedTypeAliasRhs::Keyof(type_node)
                     }
                     SyntaxKind::TupleType => CachedTypeAliasRhs::TupleType(type_node),
+                    SyntaxKind::ConditionalType => CachedTypeAliasRhs::Conditional(type_node),
+                    SyntaxKind::MappedType => CachedTypeAliasRhs::Mapped(type_node),
                     SyntaxKind::TypeOperator
                         if matches!(
                             &record.data,
@@ -2466,6 +2792,35 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                     if remains_union {
                         return Err(type_construction_error(
                             LiteralTypeCacheError::InvalidCachedUnion(declared_type),
+                        ));
+                    }
+                    return Ok(());
+                }
+                CachedTypeAliasRhs::Conditional(conditional) => {
+                    if !missing_generic_metadata.is_empty()
+                        || self
+                            .store
+                            .type_node_links(conditional)
+                            .and_then(|links| links.resolved_type)
+                            != Some(declared_type)
+                    {
+                        return Err(type_node_unavailable(
+                            TypeNodeUnavailable::InvalidCachedTypeAlias(root_symbol),
+                        ));
+                    }
+                    return Ok(());
+                }
+                CachedTypeAliasRhs::Mapped(mapped) => {
+                    if !missing_generic_metadata.is_empty()
+                        || self
+                            .store
+                            .type_node_links(mapped)
+                            .and_then(|links| links.resolved_type)
+                            != Some(declared_type)
+                        || !matches!(declared_data, Some(TypeData::Mapped(_)))
+                    {
+                        return Err(type_node_unavailable(
+                            TypeNodeUnavailable::InvalidCachedTypeAlias(root_symbol),
                         ));
                     }
                     return Ok(());
@@ -4066,6 +4421,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                     .intrinsic_bootstrap()
                     .is_some_and(|bootstrap| declared_type == bootstrap.intrinsic_marker_type)
                     && !symbol_is_builtin_iterator_return(self.store, reference_symbol)
+                    && !symbol_is_string_mapping_intrinsic(self.store, reference_symbol)
                 {
                     return Err(type_node_unavailable(
                         TypeNodeUnavailable::GenericAliasInstantiationUnsupported {
@@ -4091,8 +4447,10 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 Ok(())
             }
             _ if record.kind == SyntaxKind::IntrinsicKeyword
-                && alias_body
-                    .is_none_or(|owner| !symbol_is_builtin_iterator_return(self.store, owner)) =>
+                && alias_body.is_none_or(|owner| {
+                    !symbol_is_builtin_iterator_return(self.store, owner)
+                        && !symbol_is_string_mapping_intrinsic(self.store, owner)
+                }) =>
             {
                 let declared_type = self
                     .store
@@ -4513,13 +4871,21 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                             TypeNodeUnavailable::InvalidTypeAliasDeclaration(declaration),
                         ));
                     }
-                    if parameter_data.constraint.is_some() {
-                        return Err(type_node_unavailable(
-                            TypeNodeUnavailable::GenericAliasConstraintUnsupported {
-                                alias: symbol,
-                                parameter,
-                            },
-                        ));
+                    if let Some(constraint) = parameter_data.constraint {
+                        let constraint =
+                            NodeRef::new(declaration.arena, declaration.file, constraint);
+                        let constraint_record = preflight_node(self.store, self.host, constraint)?;
+                        if !symbol_is_string_mapping_intrinsic(self.store, symbol)
+                            || constraint_record.kind != SyntaxKind::StringKeyword
+                            || constraint_record.parent != Some(parameter.node)
+                        {
+                            return Err(type_node_unavailable(
+                                TypeNodeUnavailable::GenericAliasConstraintUnsupported {
+                                    alias: symbol,
+                                    parameter,
+                                },
+                            ));
+                        }
                     }
                     let default_type = parameter_data.default_type.map(|default_type| {
                         NodeRef::new(declaration.arena, declaration.file, default_type)
@@ -4572,6 +4938,8 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             || self.direct_indexed_access_rhs(type_node)?
             || self.direct_keyof_rhs(type_node)?
             || self.direct_tuple_type_rhs(type_node)?
+            || preflight_node(self.store, self.host, type_node)?.kind == SyntaxKind::ConditionalType
+            || preflight_node(self.store, self.host, type_node)?.kind == SyntaxKind::MappedType
             || self.type_node_contains_builtin_array_reference(type_node, &mut HashSet::new())?
         {
             self.plan_type_node_in_context(type_node, Some(symbol), union_constituent)?;
@@ -6089,8 +6457,11 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             .and_then(|count| count.checked_add(plan.literals.len()))
             .and_then(|count| count.checked_add(plan.unions.len()))
             .and_then(|count| count.checked_add(plan.intersections.len()))
+            .and_then(|count| count.checked_add(plan.mapped_types.len()))
+            .and_then(|count| count.checked_add(plan.mapped_indexed_accesses.len()))
             .and_then(|count| count.checked_add(plan.type_literals.len()))
             .and_then(|count| count.checked_add(plan.functions.len()))
+            .and_then(|count| count.checked_add(plan.templates.len()))
             .and_then(|count| {
                 plan.tuples
                     .len()
@@ -6111,8 +6482,11 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             .chain(plan.literals.keys())
             .chain(plan.unions.keys())
             .chain(plan.intersections.keys())
+            .chain(plan.mapped_types.keys())
+            .chain(plan.mapped_indexed_accesses.keys())
             .chain(plan.type_literals.keys())
             .chain(plan.functions.keys())
+            .chain(plan.templates.keys())
             .chain(plan.tuples.keys())
         {
             if !nodes.contains(node) {
@@ -6705,11 +7079,18 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 )
             }
             SyntaxKind::LiteralType => self.execute_literal_type(node, plan),
+            SyntaxKind::TemplateLiteralType => {
+                self.execute_template_literal_type(node, plan, prepared)
+            }
             SyntaxKind::ArrayType => self.execute_array_type(node, plan, prepared),
             SyntaxKind::TypeLiteral => self.execute_property_type_literal(node, plan, prepared),
             SyntaxKind::FunctionType => self.execute_function_type(node, plan, prepared),
             SyntaxKind::IndexedAccessType => {
-                self.execute_concrete_indexed_access_type(node, plan, prepared)
+                if plan.mapped_indexed_accesses.contains_key(&node) {
+                    self.execute_mapped_indexed_access_type(node, plan, prepared)
+                } else {
+                    self.execute_concrete_indexed_access_type(node, plan, prepared)
+                }
             }
             SyntaxKind::TupleType => self.execute_tuple_type(node, plan, prepared),
             SyntaxKind::TypeOperator => match &record.data {
@@ -6733,10 +7114,254 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             SyntaxKind::TypeReference => self.execute_type_reference(node, plan, prepared),
             SyntaxKind::UnionType => self.execute_union_type(node, plan, prepared),
             SyntaxKind::IntersectionType => self.execute_intersection_type(node, plan, prepared),
+            SyntaxKind::ConditionalType => self.execute_conditional_type(node, plan, prepared),
+            SyntaxKind::MappedType => self.execute_mapped_type(node, plan, prepared),
+            SyntaxKind::InferType => {
+                let symbol = plan.infer_parameters.get(&node).copied().ok_or_else(|| {
+                    type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node))
+                })?;
+                Ok(execute_type_parameter(self.store, symbol))
+            }
             kind => Err(type_node_unavailable(
                 TypeNodeUnavailable::UnsupportedSyntax { node, kind },
             )),
         }
+    }
+
+    fn execute_conditional_type(
+        &mut self,
+        node: NodeRef,
+        plan: &TypeQueryPlan,
+        prepared: &mut PreparedTypeQueryTypes,
+    ) -> Result<TypeId, DeclaredTypeError> {
+        let conditional = plan.conditionals.get(&node).cloned().ok_or_else(|| {
+            type_node_unavailable(TypeNodeUnavailable::UnsupportedSyntax {
+                node,
+                kind: SyntaxKind::ConditionalType,
+            })
+        })?;
+        let check_type = self.execute_type_node(conditional.check_type, plan, prepared)?;
+        let extends_type = self.execute_type_node(conditional.extends_type, plan, prepared)?;
+        let true_type = self.execute_type_node(conditional.true_type, plan, prepared)?;
+        let false_type = self.execute_type_node(conditional.false_type, plan, prepared)?;
+        let infer_type_parameters = conditional
+            .infer_parameters
+            .iter()
+            .map(|symbol| execute_type_parameter(self.store, *symbol))
+            .collect::<Vec<_>>();
+        let outer_type_parameters = conditional
+            .outer_parameters
+            .iter()
+            .map(|symbol| execute_type_parameter(self.store, *symbol))
+            .collect::<Vec<_>>();
+        get_type_from_conditional_type(
+            self.store,
+            ConditionalTypeRequest {
+                node,
+                check_type,
+                extends_type,
+                branches: ConditionalTypeBranches {
+                    true_type,
+                    false_type,
+                },
+                infer_type_parameters: &infer_type_parameters,
+                outer_type_parameters: &outer_type_parameters,
+                alias: None,
+            },
+            self.global_types.as_ref(),
+        )
+        .map_err(|_| {
+            type_node_unavailable(TypeNodeUnavailable::UnsupportedSyntax {
+                node,
+                kind: SyntaxKind::ConditionalType,
+            })
+        })
+    }
+
+    fn execute_template_literal_type(
+        &mut self,
+        node: NodeRef,
+        plan: &TypeQueryPlan,
+        prepared: &mut PreparedTypeQueryTypes,
+    ) -> Result<TypeId, DeclaredTypeError> {
+        if let Some(cached) = self
+            .store
+            .type_node_links(node)
+            .and_then(|links| links.resolved_type)
+        {
+            if self.store.type_payload(cached).is_none() {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidLiteralType(node),
+                ));
+            }
+            return Ok(cached);
+        }
+        let template =
+            plan.templates.get(&node).cloned().ok_or_else(|| {
+                type_node_unavailable(TypeNodeUnavailable::InvalidLiteralType(node))
+            })?;
+        let mut types = Vec::with_capacity(template.types.len());
+        for child in &template.types {
+            types.push(self.execute_type_node(*child, plan, prepared)?);
+        }
+        let resolved = self
+            .store
+            .get_template_literal_type(&template.texts, &types)
+            .map_err(|_| type_node_unavailable(TypeNodeUnavailable::InvalidLiteralType(node)))?;
+        let mut links = self
+            .store
+            .type_node_links(node)
+            .cloned()
+            .unwrap_or_default();
+        links.resolved_type = Some(resolved);
+        if !self.store.set_type_node_links(node, links) {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidLiteralType(node),
+            ));
+        }
+        Ok(resolved)
+    }
+
+    fn execute_mapped_type(
+        &mut self,
+        node: NodeRef,
+        plan: &TypeQueryPlan,
+        prepared: &mut PreparedTypeQueryTypes,
+    ) -> Result<TypeId, DeclaredTypeError> {
+        let mapped = plan.mapped_types.get(&node).copied().ok_or_else(|| {
+            type_node_unavailable(TypeNodeUnavailable::UnsupportedSyntax {
+                node,
+                kind: SyntaxKind::MappedType,
+            })
+        })?;
+        let constraint = self.execute_type_node(mapped.constraint(), plan, prepared)?;
+        let type_parameter = execute_type_parameter(self.store, mapped.type_parameter_symbol());
+        let (existing_constraint, target, mapper, default_type) = match self
+            .store
+            .type_payload(type_parameter)
+            .map(TypeRecord::data)
+        {
+            Some(TypeData::TypeParameter(parameter)) => (
+                parameter.constraint,
+                parameter.target,
+                parameter.mapper,
+                parameter.resolved_default_type,
+            ),
+            _ => {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidTypeReference(node),
+                ));
+            }
+        };
+        if existing_constraint.is_some_and(|existing| existing != constraint)
+            || existing_constraint.is_none()
+                && !self.store.set_type_parameter_resolution(
+                    type_parameter,
+                    Some(constraint),
+                    target,
+                    mapper,
+                    default_type,
+                )
+        {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidTypeReference(node),
+            ));
+        }
+        let template = match mapped.template() {
+            Some(template) => self.execute_type_node(template, plan, prepared)?,
+            None => {
+                if self.options.no_implicit_any {
+                    self.diagnostics.add(
+                        Some(node),
+                        Diagnostic::new(
+                            message_by_code(7039).expect("TS7039 is in the diagnostic catalog"),
+                        ),
+                    );
+                }
+                self.store
+                    .intrinsic_bootstrap()
+                    .ok_or(DeclaredTypeError::Unavailable(
+                        DeclaredTypeUnavailable::IntrinsicBootstrapNotInitialized,
+                    ))?
+                    .any_type
+            }
+        };
+        let modifiers_source = match mapped.modifiers_source() {
+            Some(source) => self.execute_type_node(source, plan, prepared)?,
+            None => {
+                self.store
+                    .intrinsic_bootstrap()
+                    .ok_or(DeclaredTypeError::Unavailable(
+                        DeclaredTypeUnavailable::IntrinsicBootstrapNotInitialized,
+                    ))?
+                    .unknown_type
+            }
+        };
+        let mut request = MappedTypeRequest::new(
+            mapped.node(),
+            mapped.symbol(),
+            type_parameter,
+            constraint,
+            template,
+            modifiers_source,
+        );
+        if let Some(name_type) = mapped.name_type() {
+            request = request.with_name_type(self.execute_type_node(name_type, plan, prepared)?);
+        }
+        self.store
+            .create_mapped_type(request)
+            .map_err(|error| mapped_type_error(error, node))
+    }
+
+    fn execute_mapped_indexed_access_type(
+        &mut self,
+        node: NodeRef,
+        plan: &TypeQueryPlan,
+        prepared: &mut PreparedTypeQueryTypes,
+    ) -> Result<TypeId, DeclaredTypeError> {
+        let indexed = plan
+            .mapped_indexed_accesses
+            .get(&node)
+            .copied()
+            .ok_or_else(|| {
+                type_node_unavailable(TypeNodeUnavailable::InvalidIndexedAccessType(node))
+            })?;
+        let object_type = self.execute_type_node(indexed.object, plan, prepared)?;
+        let index_type = self.execute_type_node(indexed.index, plan, prepared)?;
+        if let Some(cached) = self
+            .store
+            .type_node_links(node)
+            .and_then(|links| links.resolved_type)
+        {
+            return match self.store.type_payload(cached).map(TypeRecord::data) {
+                Some(TypeData::IndexedAccess(access))
+                    if access.object_type == object_type && access.index_type == index_type =>
+                {
+                    Ok(cached)
+                }
+                _ => Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidIndexedAccessType(node),
+                )),
+            };
+        }
+        let resolved = self
+            .store
+            .alloc_indexed_access_type(object_type, index_type, AccessFlags::NONE)
+            .ok_or_else(|| {
+                type_node_unavailable(TypeNodeUnavailable::InvalidIndexedAccessType(node))
+            })?;
+        let mut links = self
+            .store
+            .type_node_links(node)
+            .cloned()
+            .unwrap_or_default();
+        links.resolved_type = Some(resolved);
+        if !self.store.set_type_node_links(node, links) {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidIndexedAccessType(node),
+            ));
+        }
+        Ok(resolved)
     }
 
     fn execute_concrete_indexed_access_type(
@@ -7649,6 +8274,38 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         prepared: &mut PreparedTypeQueryTypes,
     ) -> Result<TypeId, DeclaredTypeError> {
         let symbol = reference.symbol;
+        if self
+            .store
+            .intrinsic_bootstrap()
+            .is_some_and(|bootstrap| declared_type == bootstrap.intrinsic_marker_type)
+            && symbol_is_string_mapping_intrinsic(self.store, symbol)
+        {
+            let [argument] = reference.type_arguments.as_slice() else {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidTypeReference(
+                        reference
+                            .type_arguments
+                            .first()
+                            .copied()
+                            .unwrap_or_else(|| {
+                                self.store
+                                    .symbol(symbol)
+                                    .and_then(|record| record.declarations())
+                                    .and_then(|declarations| declarations.first())
+                                    .copied()
+                                    .expect("intrinsic aliases have declarations")
+                            }),
+                    ),
+                ));
+            };
+            let target = self.execute_type_node(*argument, plan, prepared)?;
+            return self
+                .store
+                .get_string_mapping_type(symbol, target)
+                .map_err(|_| {
+                    type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(*argument))
+                });
+        }
         let metadata = plan.aliases.get(&symbol).cloned().ok_or_else(|| {
             type_node_unavailable(TypeNodeUnavailable::MissingGenericAliasMetadata(symbol))
         })?;
@@ -7702,12 +8359,48 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             )?;
             type_arguments.push(default_type);
         }
-        let instantiation = self.instantiate_direct_alias_type(
-            symbol,
-            declared_type,
-            &type_parameters,
-            &type_arguments,
-        )?;
+        let instantiation = if matches!(
+            self.store.type_payload(declared_type).map(TypeRecord::data),
+            Some(TypeData::Conditional(_))
+        ) {
+            let conditional = plan
+                .conditionals
+                .get(&metadata.type_node)
+                .cloned()
+                .ok_or_else(|| {
+                    type_node_unavailable(TypeNodeUnavailable::MissingGenericAliasMetadata(symbol))
+                })?;
+            let true_type = self.execute_type_node(conditional.true_type, plan, prepared)?;
+            let false_type = self.execute_type_node(conditional.false_type, plan, prepared)?;
+            get_conditional_type_instantiation(
+                self.store,
+                ConditionalTypeInstantiation {
+                    conditional_type: declared_type,
+                    type_arguments: &type_arguments,
+                    branches: ConditionalTypeBranches {
+                        true_type,
+                        false_type,
+                    },
+                    alias: None,
+                    for_constraint: false,
+                },
+                self.global_types.as_ref(),
+                self.instantiation_session.as_deref_mut(),
+            )
+            .map_err(|_| {
+                type_node_unavailable(TypeNodeUnavailable::GenericAliasInstantiationUnsupported {
+                    alias: symbol,
+                    declared_type,
+                })
+            })?
+        } else {
+            self.instantiate_direct_alias_type(
+                symbol,
+                declared_type,
+                &type_parameters,
+                &type_arguments,
+            )?
+        };
 
         if let Some(cached) = links
             .instantiations
@@ -11760,6 +12453,7 @@ mod tests {
             };
             let options = CanonicalTypeQueryOptions {
                 strict_builtin_iterator_return: strict,
+                ..CanonicalTypeQueryOptions::default()
             };
             let mut diagnostics = CanonicalCheckerDiagnostics::default();
             assert_eq!(
@@ -12035,6 +12729,7 @@ mod tests {
             };
             let options = CanonicalTypeQueryOptions {
                 strict_builtin_iterator_return: strict,
+                ..CanonicalTypeQueryOptions::default()
             };
             let mut diagnostics = CanonicalCheckerDiagnostics::default();
             assert_eq!(
@@ -12076,6 +12771,7 @@ mod tests {
             };
             let options = CanonicalTypeQueryOptions {
                 strict_builtin_iterator_return: strict,
+                ..CanonicalTypeQueryOptions::default()
             };
             let mut diagnostics = CanonicalCheckerDiagnostics::default();
             for _ in 0..2 {
@@ -12122,6 +12818,7 @@ mod tests {
                     wrapper,
                     CanonicalTypeQueryOptions {
                         strict_builtin_iterator_return: established,
+                        ..CanonicalTypeQueryOptions::default()
                     },
                     &mut diagnostics,
                 ),
@@ -12134,6 +12831,7 @@ mod tests {
                     wrapper,
                     CanonicalTypeQueryOptions {
                         strict_builtin_iterator_return: requested,
+                        ..CanonicalTypeQueryOptions::default()
                     },
                     &mut diagnostics,
                 ),
@@ -12420,8 +13118,6 @@ mod tests {
             "IntersectionAlias",
             "OperatorAlias",
             "MappedAlias",
-            "ConditionalAlias",
-            "InferAlias",
             "ImportTypeAlias",
             "QueryAlias",
             "ThisAlias",
