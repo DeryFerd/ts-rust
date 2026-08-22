@@ -704,9 +704,14 @@ impl<'a> Parser<'a> {
         let abstract_starts_expression = self.current.kind == SyntaxKind::AbstractKeyword
             && self.next_token_preceded_by_line_break();
         let declare_starts_expression = self.current.kind == SyntaxKind::DeclareKeyword
-            && (self.next_token_kind() == SyntaxKind::InstanceOfKeyword
-                || self.next_tokens_are(SyntaxKind::ModuleKeyword, SyntaxKind::OpenBraceToken)
-                || self.declare_precedes_invalid_namespace_name());
+            && match self.next_token_kind() {
+                SyntaxKind::InstanceOfKeyword => true,
+                SyntaxKind::ModuleKeyword => {
+                    self.next_tokens_are(SyntaxKind::ModuleKeyword, SyntaxKind::OpenBraceToken)
+                }
+                SyntaxKind::NamespaceKeyword => self.declare_precedes_invalid_namespace_name(),
+                _ => false,
+            };
         let async_starts_function = self.current.kind == SyntaxKind::AsyncKeyword
             && !self.next_token_preceded_by_line_break()
             && self.next_token_kind() == SyntaxKind::FunctionKeyword;
@@ -13517,6 +13522,85 @@ export as namespace GlobalName;
         let node = result.arena.get(*statement).unwrap();
         assert_eq!(node.kind, SyntaxKind::ModuleDeclaration);
         assert_eq!(node.range.end.get() as usize, source.len());
+    }
+
+    #[test]
+    fn distinguishes_declare_expressions_from_ambient_declarations() {
+        let declarations = parse_source_file(concat!(
+            "declare var value: number;\n",
+            "declare function callable(): void;\n",
+            "declare interface Shape {}\n",
+            "declare namespace Named {}\n",
+            "declare module \"named\" {}",
+        ));
+        assert!(
+            declarations.diagnostics.is_empty(),
+            "{:?}",
+            declarations.diagnostics
+        );
+        assert_eq!(
+            source_statements(&declarations)
+                .iter()
+                .map(|statement| declarations.arena.get(*statement).unwrap().kind)
+                .collect::<Vec<_>>(),
+            [
+                SyntaxKind::VariableStatement,
+                SyntaxKind::FunctionDeclaration,
+                SyntaxKind::InterfaceDeclaration,
+                SyntaxKind::ModuleDeclaration,
+                SyntaxKind::ModuleDeclaration,
+            ]
+        );
+
+        let instanceof = parse_source_file("declare instanceof Value;");
+        assert!(
+            instanceof.diagnostics.is_empty(),
+            "{:?}",
+            instanceof.diagnostics
+        );
+        let NodeData::ExpressionStatement(statement) = &instanceof
+            .arena
+            .get(source_statements(&instanceof)[0])
+            .unwrap()
+            .data
+        else {
+            panic!("expected declare instanceof expression");
+        };
+        let NodeData::BinaryExpression(binary) =
+            &instanceof.arena.get(statement.expression).unwrap().data
+        else {
+            panic!("expected instanceof binary expression");
+        };
+        assert_eq!(identifier_text(&instanceof, binary.left), "declare");
+        assert_eq!(
+            instanceof.arena.get(binary.operator_token).unwrap().kind,
+            SyntaxKind::InstanceOfKeyword
+        );
+
+        let anonymous_module = parse_source_file("declare module {}");
+        assert_eq!(
+            source_statements(&anonymous_module)
+                .iter()
+                .map(|statement| anonymous_module.arena.get(*statement).unwrap().kind)
+                .collect::<Vec<_>>(),
+            [
+                SyntaxKind::ExpressionStatement,
+                SyntaxKind::ExpressionStatement,
+                SyntaxKind::Block,
+            ]
+        );
+        assert_eq!(
+            anonymous_module
+                .diagnostics
+                .iter()
+                .map(|diagnostic| (
+                    diagnostic.code,
+                    diagnostic.range.start.get(),
+                    diagnostic.range.end.get()
+                ))
+                .collect::<Vec<_>>(),
+            [(Some(1005), 8, 14), (Some(1437), 15, 16)]
+        );
     }
 
     #[test]
