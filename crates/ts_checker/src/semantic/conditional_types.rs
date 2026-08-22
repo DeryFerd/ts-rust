@@ -3748,10 +3748,7 @@ mod tests {
                 false,
             ))
             .unwrap();
-        for elements in [
-            &[string, number, number, string][..],
-            &[string, string][..],
-        ] {
+        for elements in [&[string, number, number, string][..], &[string, string][..]] {
             let infos = vec![required; elements.len()];
             let source = fixture
                 .store
