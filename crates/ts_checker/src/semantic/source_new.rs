@@ -1,12 +1,13 @@
 //! Exact source integration for one default class construction.
 //!
-//! This is the dependency-closed `new Model()` branch of pinned
+//! This is the dependency-closed `new Model()` and `new Model` branch of pinned
 //! TypeScript-Go `checkCallExpression`, `getResolvedSignature`,
 //! `resolveNewExpression`, and `resolveCall`. The admitted constructor is one
 //! preceding local class whose primitive member transaction owns exactly one
-//! non-abstract, zero-parameter construct signature. Planning proves the
-//! complete syntax, resolver route, class provenance, and cold/warm cache
-//! shape before source execution may publish any class or expression state.
+//! non-abstract, zero-parameter construct signature. Direct local inheritance
+//! reuses the existing completed class graph. Planning proves the complete
+//! syntax, resolver route, class provenance, and cold/warm cache shape before
+//! source execution may publish any class or expression state.
 
 use std::collections::{HashMap, HashSet};
 
@@ -21,7 +22,8 @@ use super::{
     ResolvedSignatureState, SignatureId, SignatureLinks, SymbolNodeLinks, TypeData, TypeId,
     TypeNodeLinks, ValueSymbolLinks,
     classes::{
-        ClassMemberPlan, execute_nongeneric_class_members, preflight_nongeneric_class_members,
+        ClassMemberPlan, ClassMemberQueryPlan, execute_nongeneric_class_member_query,
+        plan_nongeneric_class_member_query, preflight_nongeneric_class_member_query,
     },
     signatures::SignatureFlags,
 };
@@ -126,13 +128,13 @@ const fn invariant(reason: SourceNewInvariant) -> SourceNewError {
     SourceNewError::Invariant(reason)
 }
 
-/// Opaque syntax, resolver, and class proof for one `new Model()`.
+/// Opaque syntax, resolver, and class proof for one default construction.
 #[derive(Clone, Debug)]
 pub(super) struct SourceDefaultNewPlan {
     node: NodeRef,
     constructor: NodeRef,
     resolved_symbol: SemanticSymbolId,
-    class: ClassMemberPlan,
+    class: ClassMemberQueryPlan,
 }
 
 impl SourceDefaultNewPlan {
@@ -180,24 +182,26 @@ pub(super) fn plan_direct_default_new(
     if new_expression.type_arguments.is_some() {
         return Err(unsupported(SourceNewUnsupported::TypeArguments(node)));
     }
-    let arguments = new_expression
-        .arguments
-        .as_ref()
-        .ok_or_else(|| unsupported(SourceNewUnsupported::MissingArgumentList(node)))?;
-    if !arguments.nodes.is_empty()
-        || arguments.has_trailing_comma
-        || arguments.range.start < record.range.start
-        || arguments.range.end != record.range.end
-        || arguments.range.end.get() < arguments.range.start.get().saturating_add(2)
-        || arena.source_text().is_some_and(|source| {
-            let open = usize::try_from(arguments.range.start.get()).ok();
-            let close = usize::try_from(arguments.range.end.get().saturating_sub(1)).ok();
-            open.is_none_or(|open| source.as_bytes().get(open) != Some(&b'('))
-                || close.is_none_or(|close| source.as_bytes().get(close) != Some(&b')'))
-        })
-    {
-        return Err(unsupported(SourceNewUnsupported::Arguments(node)));
-    }
+    let argument_start = match new_expression.arguments.as_ref() {
+        Some(arguments) => {
+            if !arguments.nodes.is_empty()
+                || arguments.has_trailing_comma
+                || arguments.range.start < record.range.start
+                || arguments.range.end != record.range.end
+                || arguments.range.end.get() < arguments.range.start.get().saturating_add(2)
+                || arena.source_text().is_some_and(|source| {
+                    let open = usize::try_from(arguments.range.start.get()).ok();
+                    let close = usize::try_from(arguments.range.end.get().saturating_sub(1)).ok();
+                    open.is_none_or(|open| source.as_bytes().get(open) != Some(&b'('))
+                        || close.is_none_or(|close| source.as_bytes().get(close) != Some(&b')'))
+                })
+            {
+                return Err(unsupported(SourceNewUnsupported::Arguments(node)));
+            }
+            arguments.range.start
+        }
+        None => record.range.end,
+    };
 
     let constructor = NodeRef::new(node.arena, node.file, new_expression.expression);
     let constructor_record = arena
@@ -210,11 +214,14 @@ pub(super) fn plan_direct_default_new(
         || constructor_record.flags.0 != 0
         || constructor_record.parent != Some(node.node)
         || constructor_record.range.start < record.range.start
-        || constructor_record.range.end > arguments.range.start
+        || constructor_record.range.end > argument_start
         || identifier.flow_node.is_some()
         || identifier.text.is_empty()
     {
         return Err(unsupported(SourceNewUnsupported::Constructor(constructor)));
+    }
+    if new_expression.arguments.is_none() && constructor_record.range.end != record.range.end {
+        return Err(unsupported(SourceNewUnsupported::MissingArgumentList(node)));
     }
 
     let mut callback_host = host.name_resolver_host(store)?;
@@ -265,24 +272,52 @@ pub(super) fn plan_direct_default_new(
             symbol,
         }));
     }
-    let class = prior_classes.get(&symbol).ok_or_else(|| {
-        unsupported(SourceNewUnsupported::ConstructorNotPrior {
-            node: constructor,
-            symbol,
-        })
-    })?;
+    let class = if let Some(class) = prior_classes.get(&symbol) {
+        ClassMemberQueryPlan::Direct(class.clone())
+    } else {
+        let class = plan_nongeneric_class_member_query(store, host, symbol)?;
+        let ClassMemberQueryPlan::Derived {
+            class: derived,
+            base,
+        } = &class
+        else {
+            return Err(unsupported(SourceNewUnsupported::ConstructorNotPrior {
+                node: constructor,
+                symbol,
+            }));
+        };
+        let declaration = derived.declaration();
+        if !declaration.is_for(node.arena, node.file) {
+            return Err(unsupported(SourceNewUnsupported::ConstructorNotPrior {
+                node: constructor,
+                symbol,
+            }));
+        }
+        let declaration_record = arena
+            .get(declaration.node)
+            .ok_or_else(|| invariant(SourceNewInvariant::MissingNode(declaration)))?;
+        if declaration_record.range.end > record.range.start
+            || prior_classes.get(&base.symbol()) != Some(base)
+        {
+            return Err(unsupported(SourceNewUnsupported::ConstructorNotPrior {
+                node: constructor,
+                symbol,
+            }));
+        }
+        class
+    };
     if class.symbol() != symbol {
         return Err(invariant(SourceNewInvariant::InvalidClassPlan(
             class.declaration(),
         )));
     }
-    preflight_nongeneric_class_members(store, host, class)?;
+    preflight_nongeneric_class_member_query(store, host, &class)?;
 
     let plan = SourceDefaultNewPlan {
         node,
         constructor,
         resolved_symbol,
-        class: class.clone(),
+        class,
     };
     preflight_default_new_cache(store, &plan)?;
     Ok(plan)
@@ -294,7 +329,7 @@ pub(super) fn preflight_direct_default_new(
     host: &DeclaredTypeHost<'_>,
     plan: &SourceDefaultNewPlan,
 ) -> Result<(), SourceNewError> {
-    preflight_nongeneric_class_members(store, host, &plan.class)?;
+    preflight_nongeneric_class_member_query(store, host, &plan.class)?;
     preflight_default_new_cache(store, plan)
 }
 
@@ -377,7 +412,7 @@ pub(super) fn check_direct_default_new(
 ) -> Result<CheckedSourceDefaultNew, SourceNewError> {
     preflight_direct_default_new(store, host, plan)?;
     preflight_prepared_default_new_cache(store, plan)?;
-    let members = execute_nongeneric_class_members(store, host, &plan.class)?;
+    let members = execute_nongeneric_class_member_query(store, host, &plan.class)?;
     let value_type = members.shells().value_type();
     let instance_type = members.shells().instance_type();
     let signature = members.default_construct_signature();

@@ -298,6 +298,99 @@ fn direct_default_new_publishes_exact_instance_signature_and_warm_caches() {
 }
 
 #[test]
+fn derived_default_new_accepts_optional_parentheses_and_reuses_inherited_members() {
+    let parsed = parse_source_file(concat!(
+        "class Base { base!: string; static count: number; }\n",
+        "class Derived extends Base { own!: number; }\n",
+        "const explicit = new Derived();\n",
+        "const implicit = new Derived;\n",
+        "const inherited = implicit.base;\n",
+        "const own = explicit.own;\n",
+    ));
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(1_807);
+    let mut context = checker_context(&parsed, file);
+    let base_symbol = class_symbol(&parsed, file, &context, "Base");
+    let derived_symbol = class_symbol(&parsed, file, &context, "Derived");
+    let explicit = variable_initializer(&parsed, file, "explicit");
+    let implicit = variable_initializer(&parsed, file, "implicit");
+    let inherited = variable_symbol(&parsed, file, &context, "inherited");
+    let own = variable_symbol(&parsed, file, &context, "own");
+
+    context.check_source_file(file).unwrap();
+
+    let base = context.get_nongeneric_class_members(base_symbol).unwrap();
+    let derived = context
+        .get_nongeneric_class_members(derived_symbol)
+        .unwrap();
+    assert_eq!(
+        derived.base().map(|identities| identities.instance_type()),
+        Some(base.shells().instance_type())
+    );
+    for construction in [explicit, implicit] {
+        assert_eq!(
+            context
+                .store()
+                .symbol_node_links(constructor(&parsed, construction)),
+            Some(&SymbolNodeLinks {
+                resolved_symbol: Some(derived_symbol),
+            })
+        );
+        assert_eq!(
+            context.store().type_node_links(construction),
+            Some(&TypeNodeLinks {
+                resolved_type: Some(derived.shells().instance_type()),
+                ..TypeNodeLinks::default()
+            })
+        );
+        assert_eq!(
+            context.store().signature_links(construction),
+            Some(&SignatureLinks {
+                resolved_signature: ResolvedSignatureState::Resolved(
+                    derived.default_construct_signature(),
+                ),
+                ..SignatureLinks::default()
+            })
+        );
+    }
+    let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+    assert_eq!(
+        context
+            .store()
+            .value_symbol_links(inherited)
+            .and_then(|links| links.resolved_type),
+        Some(bootstrap.string_type)
+    );
+    assert_eq!(
+        context
+            .store()
+            .value_symbol_links(own)
+            .and_then(|links| links.resolved_type),
+        Some(bootstrap.number_type)
+    );
+
+    let warm = (
+        context.store().type_len(),
+        context.store().signature_len(),
+        context.store().symbol_len(),
+        context.store().symbol_store().symbol_table_len(),
+        context.store().relation_state_snapshot(),
+    );
+    context.recheck_source_file(file).unwrap();
+    assert_eq!(
+        (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.store().symbol_len(),
+            context.store().symbol_store().symbol_table_len(),
+            context.store().relation_state_snapshot(),
+        ),
+        warm
+    );
+    assert!(context.diagnostics().is_empty());
+}
+
+#[test]
 fn later_invalid_new_preflights_before_earlier_class_or_new_publication() {
     let parsed = parse_source_file(concat!(
         "class Early { value!: string; }\n",
@@ -362,10 +455,6 @@ fn unsupported_new_forms_stop_at_typed_boundaries() {
             "new",
         ),
         (
-            "class Model { value!: string; } const model = new Model;",
-            "new",
-        ),
-        (
             "const factory = 1; const model = new factory();",
             "constructor",
         ),
@@ -413,25 +502,6 @@ fn unsupported_new_forms_stop_at_typed_boundaries() {
         );
         assert!(context.diagnostics().is_empty());
     }
-
-    let source = concat!(
-        "class Base { base!: string; } ",
-        "class Model extends Base { value!: string; } ",
-        "const model = new Model();",
-    );
-    let parsed = parse_source_file(source);
-    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
-    let file = FileId::new(1_804);
-    let construction = first_new_expression(&parsed, file);
-    let constructor = constructor(&parsed, construction);
-    let mut context = checker_context(&parsed, file);
-    assert_eq!(
-        context.check_source_file(file),
-        Err(SourceCheckError::Unsupported(UnsupportedSourceSyntax::New(
-            constructor
-        )))
-    );
-    assert!(context.diagnostics().is_empty());
 
     let source = "class Model { value!: string; } const model = new Model?.();";
     let parsed = parse_source_file(source);

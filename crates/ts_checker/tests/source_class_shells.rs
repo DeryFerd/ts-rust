@@ -1,10 +1,11 @@
 use ts_ast::{FileId, NodeData, NodeRef};
 use ts_binder::{
     CanonicalBinder, CanonicalModuleState, CanonicalSourceFileFacts, CanonicalSourceLanguage,
-    EscapedName, SemanticSymbolId,
+    CheckFlags, EscapedName, SemanticSymbolId,
 };
 use ts_checker::semantic::{
-    CanonicalCheckerContext, CanonicalCheckerOptions, TypeData, ValueSymbolLinks,
+    CanonicalCheckerContext, CanonicalCheckerOptions, IntrinsicBootstrapOptions, TypeData,
+    ValueSymbolLinks,
     type_records::{ObjectTypeData, TypeCacheState},
     types::{ObjectFlags, TypeFlags},
 };
@@ -19,6 +20,14 @@ const SOURCE: &str = concat!(
 );
 
 fn checker_context(parsed: &ParseResult, file: FileId) -> CanonicalCheckerContext<'_> {
+    checker_context_with_options(parsed, file, CanonicalCheckerOptions::default())
+}
+
+fn checker_context_with_options(
+    parsed: &ParseResult,
+    file: FileId,
+    options: CanonicalCheckerOptions,
+) -> CanonicalCheckerContext<'_> {
     let mut binder = CanonicalBinder::new();
     binder
         .bind_source_file_with_facts(
@@ -39,7 +48,7 @@ fn checker_context(parsed: &ParseResult, file: FileId) -> CanonicalCheckerContex
     CanonicalCheckerContext::new(
         binder.finish(),
         [(file, &parsed.arena)].into_iter().collect(),
-        CanonicalCheckerOptions::default(),
+        options,
     )
     .unwrap()
 }
@@ -169,4 +178,220 @@ fn public_class_shell_query_installs_exact_instance_and_static_identities() {
         warm_counts
     );
     assert!(context.diagnostics().is_empty());
+}
+
+#[test]
+fn explicit_public_field_modifiers_preserve_instance_static_and_readonly_state() {
+    let parsed = parse_source_file(concat!(
+        "class Model {\n",
+        "  public value!: string;\n",
+        "  public readonly label?: string;\n",
+        "  public static count: number;\n",
+        "  public static readonly total: number;\n",
+        "}\n",
+    ));
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(1);
+    let mut context = checker_context(&parsed, file);
+    let symbol = class_symbol(&parsed, file, &context, "Model");
+
+    context.check_source_file(file).unwrap();
+    let members = context.get_nongeneric_class_members(symbol).unwrap();
+    let instance_names = members
+        .instance_properties()
+        .iter()
+        .map(|property| {
+            context
+                .store()
+                .symbol(*property)
+                .unwrap()
+                .name()
+                .as_utf8()
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let static_names = members
+        .static_properties()
+        .iter()
+        .map(|property| {
+            context
+                .store()
+                .symbol(*property)
+                .unwrap()
+                .name()
+                .as_utf8()
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(instance_names, ["value", "label"]);
+    assert_eq!(static_names, ["count", "total"]);
+    assert_eq!(
+        context
+            .store()
+            .symbol(members.instance_properties()[0])
+            .unwrap()
+            .check_flags(),
+        CheckFlags::NONE
+    );
+    assert_eq!(
+        context
+            .store()
+            .symbol(members.instance_properties()[1])
+            .unwrap()
+            .check_flags(),
+        CheckFlags::READONLY
+    );
+    assert_eq!(
+        context
+            .store()
+            .symbol(members.static_properties()[1])
+            .unwrap()
+            .check_flags(),
+        CheckFlags::READONLY
+    );
+
+    let warm = (
+        context.store().type_len(),
+        context.store().signature_len(),
+        context.store().symbol_len(),
+        context.store().symbol_store().symbol_table_len(),
+    );
+    context.recheck_source_file(file).unwrap();
+    assert_eq!(
+        (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.store().symbol_len(),
+            context.store().symbol_store().symbol_table_len(),
+        ),
+        warm
+    );
+    assert!(context.diagnostics().is_empty());
+}
+
+#[test]
+fn strict_property_initialization_exempts_any_unknown_and_undefined_fields() {
+    let parsed = parse_source_file(concat!(
+        "class Safe {\n",
+        "  anyValue: any;\n",
+        "  unknownValue: unknown;\n",
+        "  undefinedValue: undefined;\n",
+        "  optional?: string;\n",
+        "  definite!: number;\n",
+        "}\n",
+    ));
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(2);
+    let mut context = checker_context_with_options(
+        &parsed,
+        file,
+        CanonicalCheckerOptions {
+            intrinsic: IntrinsicBootstrapOptions {
+                strict_null_checks: true,
+                ..IntrinsicBootstrapOptions::default()
+            },
+            strict_property_initialization: true,
+            ..CanonicalCheckerOptions::default()
+        },
+    );
+    let symbol = class_symbol(&parsed, file, &context, "Safe");
+
+    context.check_source_file(file).unwrap();
+
+    let members = context.get_nongeneric_class_members(symbol).unwrap();
+    assert_eq!(members.instance_properties().len(), 5);
+    assert!(context.diagnostics().is_empty());
+
+    let warm = (
+        context.store().type_len(),
+        context.store().signature_len(),
+        context.store().symbol_len(),
+        context.store().symbol_store().symbol_table_len(),
+    );
+    context.recheck_source_file(file).unwrap();
+    assert_eq!(
+        (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.store().symbol_len(),
+            context.store().symbol_store().symbol_table_len(),
+        ),
+        warm
+    );
+    assert!(context.diagnostics().is_empty());
+}
+
+#[test]
+fn strict_property_initialization_reports_required_fields_in_declaration_order() {
+    let parsed = parse_source_file(concat!(
+        "class Mixed {\n",
+        "  safeAny: any;\n",
+        "  requiredString: string;\n",
+        "  safeUnknown: unknown;\n",
+        "  requiredVoid: void;\n",
+        "  safeUndefined: undefined;\n",
+        "  optional?: boolean;\n",
+        "  definite!: string;\n",
+        "  readonly requiredNumber: number;\n",
+        "  static ignored: string;\n",
+        "}\n",
+    ));
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(3);
+    let mut context = checker_context_with_options(
+        &parsed,
+        file,
+        CanonicalCheckerOptions {
+            intrinsic: IntrinsicBootstrapOptions {
+                strict_null_checks: true,
+                ..IntrinsicBootstrapOptions::default()
+            },
+            strict_property_initialization: true,
+            ..CanonicalCheckerOptions::default()
+        },
+    );
+    let symbol = class_symbol(&parsed, file, &context, "Mixed");
+
+    context.check_source_file(file).unwrap();
+
+    let diagnostics = context.diagnostics().as_slice();
+    assert_eq!(diagnostics.len(), 3);
+    for (diagnostic, expected) in
+        diagnostics
+            .iter()
+            .zip(["requiredString", "requiredVoid", "requiredNumber"])
+    {
+        assert_eq!(diagnostic.diagnostic.code(), 2564);
+        assert_eq!(diagnostic.diagnostic.arguments, [expected]);
+        let name = diagnostic.node.expect("TS2564 anchors the field name");
+        let NodeData::Identifier(identifier) =
+            &parsed.arena.get(name.node).expect("field name exists").data
+        else {
+            panic!("TS2564 must anchor an identifier")
+        };
+        assert_eq!(identifier.text, expected);
+        assert_eq!(diagnostic.range_override, None);
+    }
+    let members = context.get_nongeneric_class_members(symbol).unwrap();
+    assert_eq!(members.instance_properties().len(), 8);
+    assert_eq!(members.static_properties().len(), 1);
+
+    let warm = (
+        context.store().type_len(),
+        context.store().signature_len(),
+        context.store().symbol_len(),
+        context.store().symbol_store().symbol_table_len(),
+        context.diagnostics().as_slice().to_vec(),
+    );
+    context.recheck_source_file(file).unwrap();
+    assert_eq!(
+        (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.store().symbol_len(),
+            context.store().symbol_store().symbol_table_len(),
+            context.diagnostics().as_slice().to_vec(),
+        ),
+        warm
+    );
 }
