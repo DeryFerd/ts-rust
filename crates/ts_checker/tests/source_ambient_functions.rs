@@ -112,7 +112,9 @@ fn is_type_checked(context: &CanonicalCheckerContext<'_>, file: FileId) -> bool 
 fn ambient_object_arguments_report_exact_optional_property_mismatches() {
     let parsed = parse_source_file(concat!(
         "declare function accept(value: { y?: string }): void; ",
+        "declare function generic<T>(value: T): T; ",
         "accept({ y: undefined });",
+        "generic<{ y?: string }>({ y: undefined });",
     ));
     assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
 
@@ -151,7 +153,7 @@ fn ambient_object_arguments_report_exact_optional_property_mismatches() {
         context.check_source_file(file).unwrap();
 
         let expected = if exact_optional_property_types {
-            vec![2379]
+            vec![2379, 2379]
         } else {
             Vec::new()
         };
@@ -165,13 +167,26 @@ fn ambient_object_arguments_report_exact_optional_property_mismatches() {
             expected
         );
         if exact_optional_property_types {
-            assert_eq!(
-                context.diagnostics().as_slice()[0]
-                    .diagnostic
-                    .render()
-                    .unwrap(),
-                "Argument of type '{ y: undefined; }' is not assignable to parameter of type '{ y?: string; }' with 'exactOptionalPropertyTypes: true'. Consider adding 'undefined' to the types of the target's properties."
-            );
+            for diagnostic in context.diagnostics().as_slice() {
+                assert_eq!(
+                    diagnostic.diagnostic.render().unwrap(),
+                    concat!(
+                        "Argument of type '{ y: undefined; }' is not assignable to ",
+                        "parameter of type '{ y?: string; }' with ",
+                        "'exactOptionalPropertyTypes: true'. Consider adding ",
+                        "'undefined' to the types of the target's properties.\n",
+                        "  Types of property 'y' are incompatible.\n",
+                        "    Type 'undefined' is not assignable to type 'string'.",
+                    )
+                );
+                assert_eq!(
+                    diagnostic.diagnostic.details,
+                    [
+                        "  Types of property 'y' are incompatible.",
+                        "    Type 'undefined' is not assignable to type 'string'.",
+                    ]
+                );
+            }
         }
     }
 }
