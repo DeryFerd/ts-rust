@@ -363,6 +363,34 @@ impl ParseOptionsResult {
 }
 
 impl CompilerOptions {
+    /// Applies `strict` to strict-family options that were not explicitly set.
+    pub fn normalize_strict_flags(&mut self) {
+        if !self.no_implicit_any_specified {
+            self.no_implicit_any = self.strict;
+        }
+        if !self.no_implicit_this_specified {
+            self.no_implicit_this = self.strict;
+        }
+        if !self.strict_bind_call_apply_specified {
+            self.strict_bind_call_apply = self.strict;
+        }
+        if !self.strict_builtin_iterator_return_specified {
+            self.strict_builtin_iterator_return = self.strict;
+        }
+        if !self.strict_function_types_specified {
+            self.strict_function_types = self.strict;
+        }
+        if !self.strict_null_checks_specified {
+            self.strict_null_checks = self.strict;
+        }
+        if !self.strict_property_initialization_specified {
+            self.strict_property_initialization = self.strict;
+        }
+        if !self.use_unknown_in_catch_variables_specified {
+            self.use_unknown_in_catch_variables = self.strict;
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     pub fn apply_overrides(&mut self, overrides: &Self, names: &BTreeSet<String>) {
         for name in names {
@@ -2148,6 +2176,52 @@ mod tests {
         assert!(implicit_this_explicit_false.strict);
         assert!(!implicit_this_explicit_false.no_implicit_this);
         assert!(implicit_this_explicit_false.no_implicit_this_specified);
+    }
+
+    #[test]
+    fn normalizes_directly_constructed_strict_false_options() {
+        let mut options = CompilerOptions {
+            strict: false,
+            ..CompilerOptions::default()
+        };
+
+        options.normalize_strict_flags();
+
+        assert!(!options.no_implicit_any);
+        assert!(!options.no_implicit_this);
+        assert!(!options.strict_bind_call_apply);
+        assert!(!options.strict_builtin_iterator_return);
+        assert!(!options.strict_function_types);
+        assert!(!options.strict_null_checks);
+        assert!(!options.strict_property_initialization);
+        assert!(!options.use_unknown_in_catch_variables);
+    }
+
+    #[test]
+    fn strict_flag_normalization_preserves_explicit_individual_overrides() {
+        let mut disabled = parse_compiler_options(&object([
+            ("strict", JsonValue::Bool(false)),
+            ("noImplicitThis", JsonValue::Bool(true)),
+            ("strictNullChecks", JsonValue::Bool(true)),
+            ("strictPropertyInitialization", JsonValue::Bool(true)),
+        ]))
+        .options;
+        disabled.normalize_strict_flags();
+        assert!(!disabled.no_implicit_any);
+        assert!(disabled.no_implicit_this);
+        assert!(disabled.strict_null_checks);
+        assert!(disabled.strict_property_initialization);
+
+        let mut enabled = parse_compiler_options(&object([
+            ("strict", JsonValue::Bool(true)),
+            ("strictFunctionTypes", JsonValue::Bool(false)),
+            ("useUnknownInCatchVariables", JsonValue::Bool(false)),
+        ]))
+        .options;
+        enabled.normalize_strict_flags();
+        assert!(enabled.no_implicit_any);
+        assert!(!enabled.strict_function_types);
+        assert!(!enabled.use_unknown_in_catch_variables);
     }
 
     #[test]

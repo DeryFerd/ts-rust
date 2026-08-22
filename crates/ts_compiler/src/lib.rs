@@ -50,6 +50,12 @@ use ts_printer::{
 use ts_sourcemap::{SourceMap, SourceMapBuilder};
 use ts_vfs::FileSystem;
 
+pub use ts_checker::semantic::artifact_queries::CanonicalArtifactQueryError;
+pub use ts_checker::semantic::{
+    CanonicalTypeFormatFlags, SemanticStoreId as CanonicalSemanticStoreId,
+    SemanticSymbolId as CanonicalSymbolId, TypeId as CanonicalTypeId,
+};
+
 /// One parsed source file owned by a Program.
 #[derive(Debug)]
 pub struct SourceFile {
@@ -1217,6 +1223,97 @@ pub struct Program {
     checker: ProgramChecker,
 }
 
+/// Scoped access to the original canonical checker graph of one Program.
+///
+/// The checker borrows the Program's AST arenas, so this value can be used
+/// only inside [`Program::try_new_with_canonical_checker_and_queries`]. Query
+/// results must be converted to owned data before the callback returns.
+#[derive(Debug)]
+pub struct CanonicalProgramQueries<'arena> {
+    context: CanonicalCheckerContext<'arena>,
+}
+
+impl CanonicalProgramQueries<'_> {
+    /// Returns the canonical type recorded for an exact Program node.
+    ///
+    /// # Errors
+    ///
+    /// Returns the original checker's provenance or unsupported-query error.
+    pub fn get_type_at_location(
+        &mut self,
+        node: NodeRef,
+    ) -> Result<CanonicalTypeId, CanonicalArtifactQueryError> {
+        self.context.get_type_at_location(node)
+    }
+
+    /// Returns the canonical declaration or reference symbol for a Program node.
+    ///
+    /// # Errors
+    ///
+    /// Returns the original checker's provenance or unsupported-query error.
+    pub fn get_symbol_at_location(
+        &mut self,
+        node: NodeRef,
+    ) -> Result<Option<CanonicalSymbolId>, CanonicalArtifactQueryError> {
+        self.context.get_symbol_at_location(node)
+    }
+
+    /// Returns declarations owned by the same canonical symbol graph.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the symbol or any declaration is foreign.
+    pub fn get_symbol_declarations(
+        &self,
+        symbol: CanonicalSymbolId,
+    ) -> Result<&[NodeRef], CanonicalArtifactQueryError> {
+        self.context.get_symbol_declarations(symbol)
+    }
+
+    /// Formats a type from this Program's canonical checker graph.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the type is foreign or cannot yet be displayed.
+    pub fn type_to_string(
+        &self,
+        type_id: CanonicalTypeId,
+    ) -> Result<String, TypeDisplayUnavailable> {
+        self.context.type_to_string(type_id)
+    }
+
+    /// Formats a canonical type with explicit TypeScript display flags.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the type is foreign or cannot yet be displayed.
+    pub fn type_to_string_with_flags(
+        &self,
+        type_id: CanonicalTypeId,
+        flags: CanonicalTypeFormatFlags,
+    ) -> Result<String, TypeDisplayUnavailable> {
+        self.context.type_to_string_with_flags(type_id, flags)
+    }
+
+    /// Formats a canonical symbol name using the checker's escaped-name rules.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the symbol belongs to another checker graph.
+    pub fn symbol_to_string(
+        &self,
+        symbol: CanonicalSymbolId,
+    ) -> Result<String, CanonicalArtifactQueryError> {
+        self.context.symbol_to_string(symbol)
+    }
+
+    /// Returns the identity shared by this Program's canonical types and symbols.
+    #[must_use]
+    pub fn semantic_store_id(&self) -> CanonicalSemanticStoreId {
+        self.context.id()
+    }
+}
+
 impl Program {
     /// Creates a Program from explicit root file names.
     #[must_use]
@@ -1448,8 +1545,9 @@ impl Program {
         file_system: &dyn FileSystem,
         current_directory: &str,
         root_names: &[String],
-        options: CompilerOptions,
+        mut options: CompilerOptions,
     ) -> Self {
+        options.normalize_strict_flags();
         let mut program =
             Self::new_unchecked_with_options(file_system, current_directory, root_names, options);
         program.load_remaining_program_graph(file_system);
@@ -1485,6 +1583,35 @@ impl Program {
         root_names: &[String],
         options: CompilerOptions,
     ) -> Result<Self, CanonicalProgramCheckError> {
+        Self::try_new_with_canonical_checker_and_queries(
+            file_system,
+            current_directory,
+            root_names,
+            options,
+            |_, _| (),
+        )
+        .map(|(program, _)| program)
+    }
+
+    /// Checks a Program and runs queries against its original canonical graph.
+    ///
+    /// The callback runs after every source has checked successfully and
+    /// before the checker releases its borrowed Program arenas. Its return
+    /// value is owned, so neither checker references nor AST borrows escape.
+    /// When `noCheck` skips checker construction, the callback is not called
+    /// and the query result is `None`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same atomic construction failures as
+    /// [`Self::try_new_with_canonical_checker`].
+    pub fn try_new_with_canonical_checker_and_queries<T>(
+        file_system: &dyn FileSystem,
+        current_directory: &str,
+        root_names: &[String],
+        options: CompilerOptions,
+        queries: impl FnOnce(&Self, &mut CanonicalProgramQueries<'_>) -> T,
+    ) -> Result<(Self, Option<T>), CanonicalProgramCheckError> {
         let mut program = Self::new_unchecked_with_options_and_checker(
             file_system,
             current_directory,
@@ -1493,12 +1620,14 @@ impl Program {
             ProgramChecker::Canonical,
         );
         program.load_remaining_program_graph(file_system);
+        let mut result = None;
         if !program.options.no_check {
-            let diagnostics = program.check_program_canonical()?;
+            let (diagnostics, queried) = program.check_program_canonical(queries)?;
             program.diagnostics.extend(diagnostics);
+            result = Some(queried);
         }
         program.diagnostics.sort_by(compare_program_diagnostics);
-        Ok(program)
+        Ok((program, result))
     }
 
     fn load_remaining_program_graph(&mut self, file_system: &dyn FileSystem) {
@@ -3161,9 +3290,10 @@ impl Program {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn check_program_canonical(
+    fn check_program_canonical<T>(
         &self,
-    ) -> Result<Vec<ProgramDiagnostic>, CanonicalProgramCheckError> {
+        queries: impl FnOnce(&Self, &mut CanonicalProgramQueries<'_>) -> T,
+    ) -> Result<(Vec<ProgramDiagnostic>, T), CanonicalProgramCheckError> {
         let mut binder = CanonicalBinder::new();
         let source_facts = self
             .source_files
@@ -3308,7 +3438,9 @@ impl Program {
             );
         }
 
-        Ok(diagnostics)
+        let mut canonical_queries = CanonicalProgramQueries { context };
+        let result = queries(self, &mut canonical_queries);
+        Ok((diagnostics, result))
     }
 
     fn canonical_commonjs_object_collisions(
