@@ -20,6 +20,23 @@ pub enum ResolutionMode {
     Bundler,
 }
 
+/// The runtime module format implied by a source or declaration file.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum ModuleFormat {
+    CommonJs,
+    Esm,
+}
+
+/// Package scope and format facts attached to one compiler input file.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ModuleFileFacts {
+    pub format: Option<ModuleFormat>,
+    pub is_declaration_file: bool,
+    pub has_fixed_format: bool,
+    pub package_json: Option<String>,
+    pub package_type: Option<String>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct ResolutionOptions {
@@ -100,10 +117,12 @@ pub struct PackageJson {
     pub imports: Option<Value>,
 }
 
+type ResolutionCacheKey = (String, String, Option<ModuleFormat>);
+
 pub struct Resolver<'a, F: FileSystem + ?Sized> {
     file_system: &'a F,
     options: ResolutionOptions,
-    cache: RwLock<BTreeMap<(String, String), ResolutionResult>>,
+    cache: RwLock<BTreeMap<ResolutionCacheKey, ResolutionResult>>,
 }
 
 impl<'a, F: FileSystem + ?Sized> Resolver<'a, F> {
@@ -123,7 +142,89 @@ impl<'a, F: FileSystem + ?Sized> Resolver<'a, F> {
 
     #[must_use]
     pub fn resolve(&self, specifier: &str, containing_file: &str) -> ResolutionResult {
-        let key = (specifier.to_owned(), normalize_path(containing_file));
+        self.resolve_worker(specifier, containing_file, None)
+    }
+
+    /// Resolves one specifier using its exact import or require syntax mode.
+    #[must_use]
+    pub fn resolve_with_mode(
+        &self,
+        specifier: &str,
+        containing_file: &str,
+        mode: ModuleFormat,
+    ) -> ResolutionResult {
+        self.resolve_worker(specifier, containing_file, Some(mode))
+    }
+
+    /// Reads the nearest package scope and the file extension's Node format.
+    #[must_use]
+    pub fn file_module_facts(&self, file_name: &str) -> ModuleFileFacts {
+        let normalized = normalize_path(file_name);
+        let extension = ts_path::extension_from_path(&normalized);
+        let package = ancestors(&directory_path(&normalized))
+            .into_iter()
+            .find_map(|directory| {
+                let package_json = join(&directory, "package.json");
+                self.file_system
+                    .file_exists(&package_json)
+                    .then_some(package_json)
+            });
+        let fixed_format = match extension {
+            Some(FileExtension::Mts | FileExtension::Mjs | FileExtension::Dmts) => {
+                Some(ModuleFormat::Esm)
+            }
+            Some(FileExtension::Cts | FileExtension::Cjs | FileExtension::Dcts) => {
+                Some(ModuleFormat::CommonJs)
+            }
+            _ => None,
+        };
+        let use_package_type = fixed_format.is_none()
+            && matches!(
+                self.options.mode,
+                ResolutionMode::Node16 | ResolutionMode::NodeNext
+            )
+            || normalized.contains("/node_modules/");
+        let package_type =
+            package
+                .as_deref()
+                .filter(|_| use_package_type)
+                .and_then(|package_json| {
+                    self.file_system
+                        .read_file(package_json)
+                        .ok()
+                        .and_then(|contents| parse_package_json(&contents).ok())
+                        .and_then(|package| package.package_type)
+                });
+        let format = fixed_format.or_else(|| match extension {
+            Some(
+                FileExtension::Ts
+                | FileExtension::Tsx
+                | FileExtension::Dts
+                | FileExtension::Js
+                | FileExtension::Jsx,
+            ) => Some(if package_type.as_deref() == Some("module") {
+                ModuleFormat::Esm
+            } else {
+                ModuleFormat::CommonJs
+            }),
+            _ => None,
+        });
+        ModuleFileFacts {
+            format,
+            is_declaration_file: extension.is_some_and(FileExtension::is_declaration),
+            has_fixed_format: fixed_format.is_some(),
+            package_json: package,
+            package_type,
+        }
+    }
+
+    fn resolve_worker(
+        &self,
+        specifier: &str,
+        containing_file: &str,
+        mode: Option<ModuleFormat>,
+    ) -> ResolutionResult {
+        let key = (specifier.to_owned(), normalize_path(containing_file), mode);
         if let Some(cached) = self
             .cache
             .read()
@@ -140,7 +241,10 @@ impl<'a, F: FileSystem + ?Sized> Resolver<'a, F> {
             specifier_uses_ts_extension: is_typescript_extension(specifier),
             candidate_ending_is_from_config: false,
         };
-        state.import_condition = state.use_import_condition(containing_file);
+        state.import_condition = mode.map_or_else(
+            || state.use_import_condition(containing_file),
+            |mode| mode == ModuleFormat::Esm,
+        );
         let containing_directory = directory_path(containing_file);
         let resolved = if is_relative(specifier) {
             let candidate = resolve_path(&containing_directory, &[specifier]);
@@ -1197,6 +1301,129 @@ mod tests {
             fs.write_file(path, contents).unwrap();
         }
         fs
+    }
+
+    #[test]
+    fn derives_node_formats_from_fixed_extensions_and_nearest_package_scope() {
+        let fs = fs(&[
+            ("/repo/package.json", r#"{"type":"module"}"#),
+            ("/repo/nested/package.json", r#"{"type":"commonjs"}"#),
+        ]);
+        let resolver = Resolver::new(
+            &fs,
+            ResolutionOptions {
+                mode: ResolutionMode::NodeNext,
+                ..ResolutionOptions::default()
+            },
+        );
+
+        let esm_declaration = resolver.file_module_facts("/repo/types/index.d.mts");
+        assert_eq!(esm_declaration.format, Some(ModuleFormat::Esm));
+        assert!(esm_declaration.is_declaration_file);
+        assert!(esm_declaration.has_fixed_format);
+        assert_eq!(
+            esm_declaration.package_json.as_deref(),
+            Some("/repo/package.json")
+        );
+
+        let commonjs_declaration = resolver.file_module_facts("/repo/types/index.d.cts");
+        assert_eq!(commonjs_declaration.format, Some(ModuleFormat::CommonJs));
+        assert!(commonjs_declaration.is_declaration_file);
+        assert!(commonjs_declaration.has_fixed_format);
+
+        let package_module = resolver.file_module_facts("/repo/src/index.ts");
+        assert_eq!(package_module.format, Some(ModuleFormat::Esm));
+        assert!(!package_module.is_declaration_file);
+        assert!(!package_module.has_fixed_format);
+        assert_eq!(package_module.package_type.as_deref(), Some("module"));
+
+        let nested_commonjs = resolver.file_module_facts("/repo/nested/index.d.ts");
+        assert_eq!(nested_commonjs.format, Some(ModuleFormat::CommonJs));
+        assert!(nested_commonjs.is_declaration_file);
+        assert_eq!(nested_commonjs.package_type.as_deref(), Some("commonjs"));
+
+        assert_eq!(resolver.file_module_facts("/repo/data.json").format, None);
+    }
+
+    #[test]
+    fn mode_aware_resolution_caches_import_and_require_targets_separately() {
+        let fs = fs(&[
+            ("/app/package.json", r#"{"type":"module"}"#),
+            (
+                "/app/node_modules/pkg/package.json",
+                r#"{"exports":{".":{"import":"./esm.d.mts","require":"./commonjs.d.cts"}}}"#,
+            ),
+            ("/app/node_modules/pkg/esm.d.mts", ""),
+            ("/app/node_modules/pkg/commonjs.d.cts", ""),
+        ]);
+        let resolver = Resolver::new(
+            &fs,
+            ResolutionOptions {
+                mode: ResolutionMode::NodeNext,
+                ..ResolutionOptions::default()
+            },
+        );
+
+        let expected_esm = "/app/node_modules/pkg/esm.d.mts";
+        let expected_commonjs = "/app/node_modules/pkg/commonjs.d.cts";
+        assert_eq!(
+            resolver
+                .resolve("pkg", "/app/main.ts")
+                .resolved
+                .unwrap()
+                .resolved_file_name,
+            expected_esm
+        );
+        assert_eq!(
+            resolver
+                .resolve_with_mode("pkg", "/app/main.ts", ModuleFormat::CommonJs)
+                .resolved
+                .unwrap()
+                .resolved_file_name,
+            expected_commonjs
+        );
+        assert_eq!(
+            resolver
+                .resolve_with_mode("pkg", "/app/main.ts", ModuleFormat::Esm)
+                .resolved
+                .unwrap()
+                .resolved_file_name,
+            expected_esm
+        );
+        assert_eq!(
+            resolver
+                .resolve_with_mode("pkg", "/app/main.ts", ModuleFormat::CommonJs)
+                .resolved
+                .unwrap()
+                .resolved_file_name,
+            expected_commonjs
+        );
+    }
+
+    #[test]
+    fn package_type_applies_to_node_resolution_or_installed_dependencies() {
+        let fs = fs(&[
+            ("/repo/package.json", r#"{"type":"module"}"#),
+            (
+                "/repo/node_modules/pkg/package.json",
+                r#"{"type":"module"}"#,
+            ),
+        ]);
+        let bundler = Resolver::new(
+            &fs,
+            ResolutionOptions {
+                mode: ResolutionMode::Bundler,
+                ..ResolutionOptions::default()
+            },
+        );
+
+        let local = bundler.file_module_facts("/repo/source.ts");
+        assert_eq!(local.format, Some(ModuleFormat::CommonJs));
+        assert!(local.package_type.is_none());
+
+        let dependency = bundler.file_module_facts("/repo/node_modules/pkg/index.d.ts");
+        assert_eq!(dependency.format, Some(ModuleFormat::Esm));
+        assert_eq!(dependency.package_type.as_deref(), Some("module"));
     }
 
     #[test]

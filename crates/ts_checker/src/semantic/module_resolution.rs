@@ -13,6 +13,7 @@ use ts_ast::{
     FileId, NodeArena, NodeArenaId, NodeArenaRevision, NodeData, NodeId, NodeRef, SyntaxKind,
 };
 use ts_binder::{BoundFile, SemanticSymbolId, SymbolFlags, SymbolStore};
+use ts_path::FileExtension;
 
 /// Local equivalent of the resolution modes consumed by checker module
 /// interoperability queries.
@@ -25,6 +26,130 @@ pub enum CanonicalModuleResolutionMode {
     None,
     CommonJs,
     Esm,
+}
+
+impl CanonicalModuleResolutionMode {
+    /// Derives the Node format for implementation and declaration files.
+    #[must_use]
+    pub fn for_file(file_name: &str, package_type: Option<&str>) -> Self {
+        match ts_path::extension_from_path(file_name) {
+            Some(FileExtension::Mts | FileExtension::Mjs | FileExtension::Dmts) => Self::Esm,
+            Some(FileExtension::Cts | FileExtension::Cjs | FileExtension::Dcts) => Self::CommonJs,
+            Some(
+                FileExtension::Ts
+                | FileExtension::Tsx
+                | FileExtension::Dts
+                | FileExtension::Js
+                | FileExtension::Jsx,
+            ) => {
+                if package_type == Some("module") {
+                    Self::Esm
+                } else {
+                    Self::CommonJs
+                }
+            }
+            _ => Self::None,
+        }
+    }
+
+    /// Derives the exact usage mode from a supported module-specifier node.
+    #[must_use]
+    pub fn for_specifier(arena: &NodeArena, specifier: NodeId, file_mode: Self) -> Option<Self> {
+        let parent_id = arena.get(specifier)?.parent?;
+        let parent = arena.get(parent_id)?;
+        match &parent.data {
+            NodeData::ImportDeclaration(import) if import.module_specifier == specifier => {
+                let is_type_only = import.import_clause.is_some_and(|clause| {
+                    matches!(
+                        arena.get(clause).map(|node| &node.data),
+                        Some(NodeData::ImportClause(clause))
+                            if clause.phase_modifier == Some(SyntaxKind::TypeKeyword)
+                    )
+                });
+                Some(if is_type_only {
+                    resolution_mode_override(arena, import.attributes).unwrap_or(file_mode)
+                } else {
+                    file_mode
+                })
+            }
+            NodeData::ExportDeclaration(export) if export.module_specifier == Some(specifier) => {
+                Some(if export.is_type_only {
+                    resolution_mode_override(arena, export.attributes).unwrap_or(file_mode)
+                } else {
+                    file_mode
+                })
+            }
+            NodeData::ExternalModuleReference(reference)
+                if reference.expression == specifier
+                    && parent.parent.is_some_and(|import| {
+                        matches!(
+                            arena.get(import).map(|node| &node.data),
+                            Some(NodeData::ImportEqualsDeclaration(import))
+                                if import.module_reference == parent_id
+                        )
+                    }) =>
+            {
+                Some(Self::CommonJs)
+            }
+            NodeData::LiteralTypeNode(literal) if literal.literal == specifier => {
+                let import_type_id = parent.parent?;
+                let NodeData::ImportTypeNode(import) = &arena.get(import_type_id)?.data else {
+                    return None;
+                };
+                (import.argument == parent_id).then(|| {
+                    resolution_mode_override(arena, import.attributes).unwrap_or(file_mode)
+                })
+            }
+            NodeData::CallExpression(call)
+                if call.arguments.nodes.first().copied() == Some(specifier) =>
+            {
+                match &arena.get(call.expression)?.data {
+                    NodeData::Identifier(identifier) if identifier.text == "import" => {
+                        Some(Self::Esm)
+                    }
+                    NodeData::Identifier(identifier) if identifier.text == "require" => {
+                        Some(Self::CommonJs)
+                    }
+                    _ => None,
+                }
+            }
+            NodeData::JsDocImportTag(import) if import.module_specifier == specifier => {
+                Some(resolution_mode_override(arena, import.attributes).unwrap_or(file_mode))
+            }
+            _ => None,
+        }
+    }
+}
+
+fn resolution_mode_override(
+    arena: &NodeArena,
+    attributes: Option<NodeId>,
+) -> Option<CanonicalModuleResolutionMode> {
+    let NodeData::ImportAttributes(attributes) = &arena.get(attributes?)?.data else {
+        return None;
+    };
+    let [attribute] = attributes.attributes.nodes.as_slice() else {
+        return None;
+    };
+    let NodeData::ImportAttribute(attribute) = &arena.get(*attribute)?.data else {
+        return None;
+    };
+    if string_literal_like_text(arena, attribute.name)? != "resolution-mode" {
+        return None;
+    }
+    match string_literal_like_text(arena, attribute.value)? {
+        "import" => Some(CanonicalModuleResolutionMode::Esm),
+        "require" => Some(CanonicalModuleResolutionMode::CommonJs),
+        _ => None,
+    }
+}
+
+fn string_literal_like_text(arena: &NodeArena, node: NodeId) -> Option<&str> {
+    match &arena.get(node)?.data {
+        NodeData::StringLiteral(literal) => Some(&literal.text),
+        NodeData::NoSubstitutionTemplateLiteral(literal) => Some(&literal.text),
+        _ => None,
+    }
 }
 
 /// A successful compiler-owned resolution before checker validation.
@@ -471,37 +596,12 @@ fn validate_specifier(
 }
 
 fn is_supported_specifier_position(arena: &NodeArena, specifier: NodeId) -> bool {
-    let Some(parent_id) = arena.get(specifier).and_then(|node| node.parent) else {
-        return false;
-    };
-    let Some(parent) = arena.get(parent_id) else {
-        return false;
-    };
-    match (parent.kind, &parent.data) {
-        (
-            SyntaxKind::ImportDeclaration | SyntaxKind::JsImportDeclaration,
-            NodeData::ImportDeclaration(import),
-        ) => import.module_specifier == specifier,
-        (SyntaxKind::ExportDeclaration, NodeData::ExportDeclaration(export)) => {
-            export.module_specifier == Some(specifier)
-        }
-        (SyntaxKind::ExternalModuleReference, NodeData::ExternalModuleReference(reference))
-            if reference.expression == specifier =>
-        {
-            let Some(import_equals_id) = parent.parent else {
-                return false;
-            };
-            matches!(
-                arena.get(import_equals_id),
-                Some(ts_ast::Node {
-                    kind: SyntaxKind::ImportEqualsDeclaration,
-                    data: NodeData::ImportEqualsDeclaration(import),
-                    ..
-                }) if import.module_reference == parent_id
-            )
-        }
-        _ => false,
-    }
+    CanonicalModuleResolutionMode::for_specifier(
+        arena,
+        specifier,
+        CanonicalModuleResolutionMode::None,
+    )
+    .is_some()
 }
 
 fn validate_target(
@@ -637,6 +737,113 @@ mod tests {
             CanonicalModuleResolutionMode::Esm,
             CanonicalModuleResolutionMode::CommonJs,
         )
+    }
+
+    #[test]
+    fn file_modes_follow_fixed_extensions_and_package_type() {
+        for (file_name, package_type, expected) in [
+            (
+                "/project/source.mts",
+                Some("commonjs"),
+                CanonicalModuleResolutionMode::Esm,
+            ),
+            (
+                "/project/source.d.mts",
+                None,
+                CanonicalModuleResolutionMode::Esm,
+            ),
+            (
+                "/project/source.cts",
+                Some("module"),
+                CanonicalModuleResolutionMode::CommonJs,
+            ),
+            (
+                "/project/source.d.cts",
+                Some("module"),
+                CanonicalModuleResolutionMode::CommonJs,
+            ),
+            (
+                "/project/source.d.ts",
+                Some("module"),
+                CanonicalModuleResolutionMode::Esm,
+            ),
+            (
+                "/project/source.tsx",
+                None,
+                CanonicalModuleResolutionMode::CommonJs,
+            ),
+            (
+                "/project/source.json",
+                Some("module"),
+                CanonicalModuleResolutionMode::None,
+            ),
+        ] {
+            assert_eq!(
+                CanonicalModuleResolutionMode::for_file(file_name, package_type),
+                expected,
+                "incorrect format for {file_name}"
+            );
+        }
+    }
+
+    #[test]
+    fn specifier_modes_follow_import_syntax_and_type_only_overrides() {
+        let importer = parsed(
+            r#"
+                import type { Value } from "./type" with { "resolution-mode": "require" };
+                export type { Value } from "./export" with { "resolution-mode": "import" };
+                import value from "./json" with { type: "json" };
+                import legacy = require("./legacy");
+                type Deferred = import("./deferred", { with: { "resolution-mode": "require" } }).Value;
+                const dynamic = import("./dynamic");
+                const runtime = require("./runtime");
+            "#,
+        );
+        let specifiers = module_specifiers(&importer);
+        assert_eq!(specifiers.len(), 7);
+        let modes = specifiers
+            .into_iter()
+            .map(|specifier| {
+                CanonicalModuleResolutionMode::for_specifier(
+                    &importer.arena,
+                    specifier,
+                    CanonicalModuleResolutionMode::Esm,
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            modes,
+            [
+                CanonicalModuleResolutionMode::CommonJs,
+                CanonicalModuleResolutionMode::Esm,
+                CanonicalModuleResolutionMode::Esm,
+                CanonicalModuleResolutionMode::CommonJs,
+                CanonicalModuleResolutionMode::CommonJs,
+                CanonicalModuleResolutionMode::Esm,
+                CanonicalModuleResolutionMode::CommonJs,
+            ]
+        );
+    }
+
+    #[test]
+    fn resolution_mode_attributes_do_not_override_value_imports() {
+        let importer =
+            parsed(r#"import value from "./target" with { "resolution-mode": "require" };"#);
+        let specifiers = module_specifiers(&importer);
+        let [specifier] = specifiers.as_slice() else {
+            panic!("expected one static module specifier");
+        };
+
+        assert_eq!(
+            CanonicalModuleResolutionMode::for_specifier(
+                &importer.arena,
+                *specifier,
+                CanonicalModuleResolutionMode::Esm,
+            ),
+            Some(CanonicalModuleResolutionMode::Esm)
+        );
     }
 
     #[test]
