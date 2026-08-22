@@ -524,6 +524,13 @@ impl<'a> Parser<'a> {
             if recover_static_member && self.starts_recovered_class_member() {
                 break;
             }
+            if self.current.kind == SyntaxKind::Unknown
+                && self.current.text == "#"
+                && self.next_token_kind() == SyntaxKind::ExclamationToken
+            {
+                self.bump();
+                continue;
+            }
             if self.current.kind == SyntaxKind::Unknown && self.current.text == "#" {
                 let range = self.current.range;
                 self.invalid_token_recovery_ranges.push(range);
@@ -1146,7 +1153,9 @@ impl<'a> Parser<'a> {
             || is_import_binding_identifier_kind(next)
             || matches!(
                 next,
-                SyntaxKind::OpenBraceToken | SyntaxKind::OpenBracketToken
+                SyntaxKind::OpenBraceToken
+                    | SyntaxKind::OpenBracketToken
+                    | SyntaxKind::ColonToken
             )
     }
 
@@ -1218,9 +1227,13 @@ impl<'a> Parser<'a> {
                         .current
                         .flags
                         .contains(ScannerTokenFlags::PRECEDING_LINE_BREAK)
+                    && self.current.range.start >= self.node_end(declaration)
                 {
                     self.error_current("Expected ','.");
                     continue;
+                }
+                if self.current.kind == SyntaxKind::LessThanToken {
+                    self.error_current("Expected ','.");
                 }
                 break;
             }
@@ -1246,6 +1259,7 @@ impl<'a> Parser<'a> {
         );
         let end = if self.current.kind == SyntaxKind::Unknown
             && self.next_token_kind() == SyntaxKind::EqualsToken
+            || self.current.range.start < declarations_end
         {
             declarations_end
         } else {
@@ -1294,7 +1308,13 @@ impl<'a> Parser<'a> {
             && self.current.kind == SyntaxKind::EqualsGreaterThanToken
             && let Some(left) = initializer
         {
-            self.error_current("Expected ','.");
+            let close = self.node_end(left);
+            self.error_code_at(
+                TextRange::new(TextPos::new(close.get().saturating_sub(1)), close),
+                1005,
+                [",".to_owned()],
+            );
+            self.error_current("Expected ';'.");
             let arrow = self.consume();
             if self.current.kind == SyntaxKind::Identifier {
                 let right = self.alloc_node(
@@ -5631,8 +5651,7 @@ impl<'a> Parser<'a> {
                 || (!matches!(
                     self.next_token_kind(),
                     SyntaxKind::OpenParenToken | SyntaxKind::EqualsGreaterThanToken
-                ) && (!is_expression_terminator(self.next_token_kind())
-                    || self.await_identifier_context)))
+                ) && !is_expression_terminator(self.next_token_kind())))
         {
             return self.parse_await_expression();
         }
@@ -6836,6 +6855,7 @@ impl<'a> Parser<'a> {
                 let position = self.current.range.start;
                 self.error_current("Expected an expression.");
                 if self.current.kind != SyntaxKind::Unknown
+                    && self.current.kind != SyntaxKind::EqualsGreaterThanToken
                     && binary_precedence(self.current.kind).is_none()
                     && !is_expression_terminator(self.current.kind)
                 {
@@ -9301,6 +9321,13 @@ impl<'a> Parser<'a> {
     }
 
     fn error_current(&mut self, message: &str) {
+        if self
+            .diagnostics
+            .last()
+            .is_some_and(|diagnostic| diagnostic.range.start == self.current.range.start)
+        {
+            return;
+        }
         self.diagnostics
             .push(parser_diagnostic(self.current.range, message));
     }
@@ -9311,6 +9338,13 @@ impl<'a> Parser<'a> {
         code: u32,
         arguments: impl IntoIterator<Item = String>,
     ) {
+        if self
+            .diagnostics
+            .last()
+            .is_some_and(|diagnostic| diagnostic.range.start == range.start)
+        {
+            return;
+        }
         let message = message_by_code(code).expect("parser diagnostic code exists");
         let arguments = arguments.into_iter().collect::<Vec<_>>();
         self.diagnostics.push(Diagnostic::typescript(
@@ -16389,6 +16423,24 @@ export as namespace GlobalName;
             &result.arena.get(arrow.body).unwrap().data,
             NodeData::Identifier(identifier) if identifier.text == "await"
         ));
+        assert_eq!(
+            result
+                .diagnostics
+                .iter()
+                .map(|diagnostic| {
+                    (
+                        diagnostic.code,
+                        diagnostic.message.as_str(),
+                        diagnostic.range.start.get(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            [
+                (Some(1005), "',' expected.", 36),
+                (Some(1005), "',' expected.", 45),
+                (Some(1109), "Expression expected.", 52),
+            ]
+        );
     }
 
     #[test]
