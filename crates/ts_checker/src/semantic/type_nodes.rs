@@ -18479,6 +18479,12 @@ mod tests {
         let global_types = initialize_fixture_global_types(&mut fixture);
         let item_symbol = named_symbol(&fixture, SyntaxKind::InterfaceDeclaration, "Item");
         let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let second_interface_declaration = fixture
+            .store
+            .symbol(item_symbol)
+            .unwrap()
+            .declarations()
+            .unwrap()[1];
         let members = fixture
             .store
             .symbol(item_symbol)
@@ -18507,9 +18513,12 @@ mod tests {
 
         assert!(matches!(
             query_global_declared(&mut fixture, &global_types, item_symbol, &mut diagnostics,),
-            Err(DeclaredTypeError::Unavailable(
-                DeclaredTypeUnavailable::InvalidInterfaceDeclaration(_)
-            ))
+            Err(DeclaredTypeError::TypeNodeUnavailable(
+                TypeNodeUnavailable::UnsupportedSyntax {
+                    node,
+                    kind: SyntaxKind::InterfaceDeclaration,
+                }
+            )) if node == second_interface_declaration
         ));
         assert_eq!(store_state(&fixture.store), cold);
 

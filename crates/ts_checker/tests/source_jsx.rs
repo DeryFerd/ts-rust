@@ -649,6 +649,81 @@ fn production_source_checker_matches_upstream_multiline_jsx_diagnostics() {
 }
 
 #[test]
+fn production_source_checker_resolves_staged_ambient_jsx_components() {
+    for (index, source) in [
+        concat!(
+            "/**\n * @fileoverview comment\n * @jsx h\n */\n",
+            "declare var h: any;\n",
+            "declare var Fragment: any;\n",
+            "declare namespace JSX { interface Element {} }\n",
+            "const view = <Fragment></Fragment>;\n",
+        ),
+        concat!(
+            "/** Authored by foo@example.com @jsx h */\n",
+            "declare var h: any;\n",
+            "declare var React: any;\n",
+            "declare var Fragment: any;\n",
+            "declare namespace JSX { interface Element {} }\n",
+            "const view = <Fragment></Fragment>;\n",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let parsed = parse_jsx_source_file(source);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(3_715 + u32::try_from(index).unwrap());
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/ambient-component.tsx\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        let mut context = CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![(file, &parsed.arena)],
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap();
+
+        context.check_source_file(file).unwrap();
+
+        assert!(
+            context.diagnostics().is_empty(),
+            "{:?}",
+            context.diagnostics()
+        );
+        let warm = (
+            context.store().type_len(),
+            context.store().symbol_len(),
+            context.store().signature_len(),
+            context.diagnostics().clone(),
+        );
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().signature_len(),
+                context.diagnostics().clone(),
+            ),
+            warm
+        );
+    }
+}
+
+#[test]
 fn missing_intrinsic_property_emits_ts2339_on_the_full_opening() {
     let source = format!("{NAMESPACE}const view = <section />;\n");
     let mut fixture = Fixture::new(&source, FileId::new(3_702));

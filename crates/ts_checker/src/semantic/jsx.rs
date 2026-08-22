@@ -1824,11 +1824,40 @@ fn jsx_component_value_type(
     if annotation_record.parent != Some(declaration.node) {
         return Err(SourceCheckError::Call(location));
     }
-    store
-        .type_node_links(annotation)
-        .and_then(|links| links.resolved_type)
-        .filter(|type_| store.type_payload(*type_).is_some())
-        .ok_or(SourceCheckError::Call(location))
+    if let Some(links) = store.type_node_links(annotation) {
+        if let Some(type_) = links.resolved_type {
+            return store
+                .type_payload(type_)
+                .map(|_| type_)
+                .ok_or(SourceCheckError::Call(location));
+        }
+        if links != &TypeNodeLinks::default() {
+            return Err(SourceCheckError::Call(location));
+        }
+    }
+
+    if !matches!(&annotation_record.data, NodeData::KeywordTypeNode(_)) {
+        return Err(unsupported(annotation, annotation_record.kind));
+    }
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or(SourceCheckError::LiteralCache(
+            SourceLiteralCacheError::BootstrapUninitialized,
+        ))?;
+    match annotation_record.kind {
+        SyntaxKind::AnyKeyword => Ok(bootstrap.any_type),
+        SyntaxKind::UnknownKeyword => Ok(bootstrap.unknown_type),
+        SyntaxKind::StringKeyword => Ok(bootstrap.string_type),
+        SyntaxKind::NumberKeyword => Ok(bootstrap.number_type),
+        SyntaxKind::BigIntKeyword => Ok(bootstrap.bigint_type),
+        SyntaxKind::BooleanKeyword => Ok(bootstrap.boolean_type),
+        SyntaxKind::SymbolKeyword => Ok(bootstrap.es_symbol_type),
+        SyntaxKind::VoidKeyword => Ok(bootstrap.void_type),
+        SyntaxKind::UndefinedKeyword => Ok(bootstrap.undefined_type),
+        SyntaxKind::NeverKeyword => Ok(bootstrap.never_type),
+        SyntaxKind::ObjectKeyword => Ok(bootstrap.non_primitive_type),
+        _ => Err(unsupported(annotation, annotation_record.kind)),
+    }
 }
 
 fn add_missing_component_diagnostic(
@@ -3205,6 +3234,85 @@ mod runtime_tests {
                 Some(any),
             );
         }
+    }
+
+    #[test]
+    fn ambient_component_resolves_an_uncached_annotation_without_publishing_it() {
+        let mut fixture = RuntimeFixture::new(
+            "declare var Fragment: any;\nconst view = <Fragment></Fragment>;\n",
+            FileId::new(8_116),
+        );
+        let expression = fixture.expression("view");
+        let (declaration, annotation) = fixture
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::VariableDeclaration(variable) = &record.data else {
+                    return None;
+                };
+                let NodeData::Identifier(name) = &fixture.parsed.arena.get(variable.name)?.data
+                else {
+                    return None;
+                };
+                (name.text == "Fragment").then_some((
+                    NodeRef::new(fixture.parsed.arena.id(), fixture.file, node),
+                    NodeRef::new(fixture.parsed.arena.id(), fixture.file, variable.type_?),
+                ))
+            })
+            .unwrap();
+        let symbol = fixture.bound.symbol(declaration).unwrap();
+
+        assert!(fixture.store.type_node_links(annotation).is_none());
+        assert!(fixture.store.value_symbol_links(symbol).is_none());
+
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        fixture.check(expression, CanonicalJsxRuntime::Preserve, &mut diagnostics);
+
+        assert!(diagnostics.is_empty());
+        assert!(fixture.store.type_node_links(annotation).is_none());
+        assert!(fixture.store.value_symbol_links(symbol).is_none());
+    }
+
+    #[test]
+    fn source_check_accepts_ambient_component_before_value_publication() {
+        let source = concat!(
+            "/** @jsx h */\n",
+            "declare var h: any;\n",
+            "declare var Fragment: any;\n",
+            "declare namespace JSX { interface Element {} }\n",
+            "const view = <Fragment></Fragment>;\n",
+        );
+        let parsed = parse_jsx_source_file(source);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(8_117);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/pragma.tsx\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        let mut context = crate::semantic::CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![(file, &parsed.arena)],
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap();
+
+        context.check_source_file(file).unwrap();
+
+        assert!(context.diagnostics().is_empty());
     }
 
     #[test]

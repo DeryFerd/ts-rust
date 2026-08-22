@@ -737,6 +737,12 @@ pub(super) fn plan_interface(
             {
                 declaration = Some(*candidate);
             }
+            (SyntaxKind::InterfaceDeclaration, NodeData::InterfaceDeclaration(_)) => {
+                return Err(PropertyObjectError::UnsupportedMember {
+                    node: *candidate,
+                    kind: SyntaxKind::InterfaceDeclaration,
+                });
+            }
             (SyntaxKind::VariableDeclaration, NodeData::VariableDeclaration(_)) => {
                 value_declarations.push(*candidate);
             }
