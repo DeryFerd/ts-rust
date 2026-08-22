@@ -294,3 +294,84 @@ fn source_keyof_aliases_preserve_canonical_keys_origins_and_warm_caches() {
         warm,
     );
 }
+
+#[test]
+fn source_keyof_distributes_over_object_unions_and_intersections() {
+    let source = concat!(
+        "interface Left { shared: string; left: number }\n",
+        "interface Right { shared: string; right: boolean }\n",
+        "type All = keyof (Left & Right);\n",
+        "type Common = keyof (Left | Right);\n",
+        "type Empty = keyof ({ first: string } | { second: number });\n",
+        "type AnyKeys = keyof any;\n",
+        "type UnknownKeys = keyof unknown;\n",
+        "type NeverKeys = keyof never;\n",
+        "type ImpossibleKeys = keyof ({ kind: 'left' } & { kind: 'right' });\n",
+    );
+    let parsed = parse_source_file(source);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(9_021);
+    let mut context = context(&parsed, file);
+
+    context.check_source_file(file).unwrap_or_else(|error| {
+        let aliases = [
+            "All",
+            "Common",
+            "Empty",
+            "AnyKeys",
+            "UnknownKeys",
+            "NeverKeys",
+            "ImpossibleKeys",
+        ]
+        .map(|name| (name, alias_parts(&parsed, file, &context, name).1));
+        panic!("source checking failed: {error:?}; aliases: {aliases:?}");
+    });
+    assert!(
+        context.diagnostics().is_empty(),
+        "{:?}",
+        context.diagnostics()
+    );
+
+    let type_of = |name| {
+        let (alias, _) = alias_parts(&parsed, file, &context, name);
+        alias_type(&context, alias)
+    };
+    let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+    let shared = bootstrap.cached_string_literal_type("shared").unwrap();
+    let left = bootstrap.cached_string_literal_type("left").unwrap();
+    let right = bootstrap.cached_string_literal_type("right").unwrap();
+    let (all, _) = union_parts(&context, type_of("All"));
+    assert_eq!(all.len(), 3);
+    assert!(all.contains(&shared));
+    assert!(all.contains(&left));
+    assert!(all.contains(&right));
+    assert_eq!(type_of("Common"), shared);
+    assert_eq!(type_of("Empty"), bootstrap.never_type);
+    assert_eq!(type_of("AnyKeys"), bootstrap.string_number_symbol_type);
+    assert_eq!(type_of("UnknownKeys"), bootstrap.never_type);
+    assert_eq!(type_of("NeverKeys"), bootstrap.string_number_symbol_type);
+    assert_eq!(
+        type_of("ImpossibleKeys"),
+        bootstrap.string_number_symbol_type
+    );
+
+    let warm = (
+        context.store().type_len(),
+        context.store().properties_type_cache_len(),
+        bootstrap.string_literal_cache_len(),
+        bootstrap.union_cache_len(),
+        context.diagnostics().clone(),
+    );
+    context.recheck_source_file(file).unwrap();
+    let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+    assert_eq!(
+        (
+            context.store().type_len(),
+            context.store().properties_type_cache_len(),
+            bootstrap.string_literal_cache_len(),
+            bootstrap.union_cache_len(),
+            context.diagnostics().clone(),
+        ),
+        warm,
+    );
+}

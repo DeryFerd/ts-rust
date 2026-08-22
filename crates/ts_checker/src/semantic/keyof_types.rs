@@ -14,9 +14,11 @@
 //! has cardinality zero or one and discards that origin; warm resolution
 //! validates and returns the checker-owned cache entry without writes.
 //!
-//! Generic objects, unions, intersections, tuples, apparent/inherited
-//! members, computed/unique-symbol names, and unresolved member surfaces are
-//! explicit composition boundaries.
+//! Object unions intersect their constituent key sets. Object intersections
+//! unite them after checking whether the intersection reduces to `never`.
+//! `any`, `unknown`, and `never` use their pinned intrinsic key identities.
+//! Generic objects, tuples, apparent/inherited members, computed/unique-symbol
+//! names, and unresolved member surfaces remain explicit boundaries.
 
 use std::collections::HashSet;
 
@@ -54,6 +56,14 @@ pub(super) struct NongenericKeyofPlan {
     has_string_index: bool,
     has_number_index: bool,
     preserves_origin: bool,
+    composition: Option<KeyofComposition>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum KeyofComposition {
+    Union(Vec<NongenericKeyofPlan>),
+    Intersection(Vec<NongenericKeyofPlan>),
+    Intrinsic(TypeId),
 }
 
 impl NongenericKeyofPlan {
@@ -169,6 +179,43 @@ pub(super) fn plan_nongeneric_keyof_type(
         .type_payload(target)
         .ok_or(NongenericKeyofError::InvalidType(target))?;
 
+    if record
+        .flags()
+        .intersects(TypeFlags::ANY | TypeFlags::NEVER | TypeFlags::UNKNOWN)
+    {
+        let bootstrap = store
+            .intrinsic_bootstrap()
+            .ok_or(LiteralTypeCacheError::BootstrapUninitialized)?;
+        let result = if target == bootstrap.wildcard_type {
+            bootstrap.wildcard_type
+        } else if record.flags().intersects(TypeFlags::UNKNOWN) {
+            bootstrap.never_type
+        } else {
+            bootstrap.string_number_symbol_type
+        };
+        return Ok(intrinsic_keyof_plan(target, result));
+    }
+
+    match record.data() {
+        TypeData::Union(union) => {
+            return plan_composite_keyof_type(store, target, &union.union.types, true);
+        }
+        TypeData::Intersection(_) => {
+            let projection = store
+                .validate_intersection_type(target)
+                .map_err(|_| NongenericKeyofError::MalformedObject(target))?;
+            if projection.reduced_to_never {
+                let result = store
+                    .intrinsic_bootstrap()
+                    .ok_or(LiteralTypeCacheError::BootstrapUninitialized)?
+                    .string_number_symbol_type;
+                return Ok(intrinsic_keyof_plan(target, result));
+            }
+            return plan_composite_keyof_type(store, target, &projection.types, false);
+        }
+        _ => {}
+    }
+
     let proof = match validate_resolved_declared_property_object(store, target) {
         DeclaredPropertyObjectValidation::Valid(proof) => proof,
         DeclaredPropertyObjectValidation::Malformed => {
@@ -205,6 +252,101 @@ pub(super) fn plan_nongeneric_keyof_type(
         has_string_index,
         has_number_index,
         preserves_origin,
+        composition: None,
+    })
+}
+
+fn intrinsic_keyof_plan(target: TypeId, result: TypeId) -> NongenericKeyofPlan {
+    NongenericKeyofPlan {
+        target,
+        proof: DeclaredPropertyObjectProof::TypeLiteral,
+        property_names: Vec::new(),
+        has_string_index: false,
+        has_number_index: false,
+        preserves_origin: false,
+        composition: Some(KeyofComposition::Intrinsic(result)),
+    }
+}
+
+fn plan_composite_keyof_type(
+    store: &CanonicalTypeMapperStore,
+    target: TypeId,
+    types: &[TypeId],
+    is_union: bool,
+) -> Result<NongenericKeyofPlan, NongenericKeyofError> {
+    if types.len() < 2 {
+        return Err(NongenericKeyofError::MalformedObject(target));
+    }
+
+    let mut constituents = Vec::with_capacity(types.len());
+    for type_ in types {
+        let constituent =
+            plan_nongeneric_keyof_type(store, *type_).map_err(|error| match error {
+                NongenericKeyofError::UnsupportedObject(_) => {
+                    NongenericKeyofError::UnsupportedObject(target)
+                }
+                other => other,
+            })?;
+        if matches!(
+            constituent.composition,
+            Some(KeyofComposition::Intrinsic(_))
+        ) {
+            return Err(NongenericKeyofError::UnsupportedObject(target));
+        }
+        constituents.push(constituent);
+    }
+
+    if is_union {
+        store
+            .validate_union_constituent(target)
+            .map_err(|_| NongenericKeyofError::MalformedObject(target))?;
+    }
+
+    let mut property_names = Vec::new();
+    for constituent in &constituents {
+        for name in &constituent.property_names {
+            if !property_names.contains(name) {
+                property_names.push(name.clone());
+            }
+        }
+    }
+    let (has_string_index, has_number_index) = if is_union {
+        property_names.retain(|name| {
+            constituents.iter().all(|constituent| {
+                constituent.has_string_index || constituent.property_names.contains(name)
+            })
+        });
+        (
+            constituents
+                .iter()
+                .all(|constituent| constituent.has_string_index),
+            constituents
+                .iter()
+                .all(|constituent| constituent.has_string_index || constituent.has_number_index),
+        )
+    } else {
+        (
+            constituents
+                .iter()
+                .any(|constituent| constituent.has_string_index),
+            constituents
+                .iter()
+                .any(|constituent| constituent.has_number_index),
+        )
+    };
+
+    Ok(NongenericKeyofPlan {
+        target,
+        proof: DeclaredPropertyObjectProof::TypeLiteral,
+        property_names,
+        has_string_index,
+        has_number_index,
+        preserves_origin: false,
+        composition: Some(if is_union {
+            KeyofComposition::Union(constituents)
+        } else {
+            KeyofComposition::Intersection(constituents)
+        }),
     })
 }
 
@@ -220,6 +362,9 @@ pub(super) fn resolve_nongeneric_keyof_type(
 ) -> Result<TypeId, NongenericKeyofError> {
     if let Some(cached) = cached_nongeneric_keyof_type(store, plan)? {
         return Ok(cached);
+    }
+    if let Some(composition) = &plan.composition {
+        return resolve_composite_keyof_type(store, plan, composition);
     }
     let key = properties_type_cache_key(store, plan)?;
     if !store.try_reserve_properties_type_cache(1) {
@@ -243,12 +388,271 @@ pub(super) fn cached_nongeneric_keyof_type(
     plan: &NongenericKeyofPlan,
 ) -> Result<Option<TypeId>, NongenericKeyofError> {
     validate_plan_against_store(store, plan)?;
+    if let Some(composition) = &plan.composition {
+        return cached_composite_keyof_type(store, plan, composition);
+    }
     let key = properties_type_cache_key(store, plan)?;
     let Some(cached) = store.cached_properties_type(key) else {
         return Ok(None);
     };
     validate_cached_nongeneric_keyof_result(store, plan, cached)?;
     Ok(Some(cached))
+}
+
+fn resolve_composite_keyof_type(
+    store: &mut CanonicalTypeMapperStore,
+    plan: &NongenericKeyofPlan,
+    composition: &KeyofComposition,
+) -> Result<TypeId, NongenericKeyofError> {
+    let constituents = match composition {
+        KeyofComposition::Intrinsic(result) => return Ok(*result),
+        KeyofComposition::Union(constituents) | KeyofComposition::Intersection(constituents) => {
+            constituents
+        }
+    };
+
+    let mut cold_strings = Vec::new();
+    let mut cold_count = 0usize;
+    let mut union_operations = 1usize;
+    for constituent in constituents {
+        if cached_nongeneric_keyof_type(store, constituent)?.is_some() {
+            continue;
+        }
+        cold_count += 1;
+        cold_strings.extend(constituent.property_names.iter().cloned());
+        if constituent.preserves_origin
+            || !constituent.has_string_index && constituent.reduced_key_count() >= 2
+        {
+            union_operations += 1;
+        }
+    }
+    if !store.try_reserve_properties_type_cache(cold_count) {
+        return Err(LiteralTypeCacheError::Capacity.into());
+    }
+    store.prepare_type_query_types(&cold_strings, &[], &[], union_operations, 0)?;
+
+    let mut results = Vec::with_capacity(constituents.len());
+    for constituent in constituents {
+        results.push(resolve_nongeneric_keyof_type(store, constituent)?);
+    }
+
+    match composition {
+        KeyofComposition::Intersection(_) => {
+            let mut prepared = store.prepare_type_query_types(&[], &[], &[], 1, 0)?;
+            store
+                .literal_union_type_prepared(&results, None, &mut prepared)
+                .map_err(Into::into)
+        }
+        KeyofComposition::Union(_) => {
+            let keys = composite_key_types(store, plan)?;
+            match keys.as_slice() {
+                [] => Ok(store
+                    .intrinsic_bootstrap()
+                    .ok_or(LiteralTypeCacheError::BootstrapUninitialized)?
+                    .never_type),
+                [only] => Ok(*only),
+                _ => {
+                    let mut prepared = store.prepare_type_query_types(&[], &[], &[], 1, 0)?;
+                    store
+                        .literal_union_type_prepared(&keys, None, &mut prepared)
+                        .map_err(Into::into)
+                }
+            }
+        }
+        KeyofComposition::Intrinsic(_) => unreachable!("intrinsic keys return before planning"),
+    }
+}
+
+fn cached_composite_keyof_type(
+    store: &CanonicalTypeMapperStore,
+    plan: &NongenericKeyofPlan,
+    composition: &KeyofComposition,
+) -> Result<Option<TypeId>, NongenericKeyofError> {
+    let constituents = match composition {
+        KeyofComposition::Intrinsic(result) => return Ok(Some(*result)),
+        KeyofComposition::Union(constituents) | KeyofComposition::Intersection(constituents) => {
+            constituents
+        }
+    };
+
+    let mut results = Vec::with_capacity(constituents.len());
+    let mut missing = false;
+    for constituent in constituents {
+        match cached_nongeneric_keyof_type(store, constituent)? {
+            Some(result) => results.push(result),
+            None => missing = true,
+        }
+    }
+    if missing {
+        return Ok(None);
+    }
+
+    let keys = composite_key_types(store, plan)?;
+    match keys.as_slice() {
+        [] => Ok(Some(
+            store
+                .intrinsic_bootstrap()
+                .ok_or(LiteralTypeCacheError::BootstrapUninitialized)?
+                .never_type,
+        )),
+        [only] => Ok(Some(*only)),
+        _ => cached_composite_key_union(
+            store,
+            &keys,
+            &results,
+            matches!(composition, KeyofComposition::Intersection(_)),
+        ),
+    }
+}
+
+fn composite_key_types(
+    store: &CanonicalTypeMapperStore,
+    plan: &NongenericKeyofPlan,
+) -> Result<Vec<TypeId>, NongenericKeyofError> {
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or(LiteralTypeCacheError::BootstrapUninitialized)?;
+    if plan.has_string_index {
+        return Ok(vec![bootstrap.string_type, bootstrap.number_type]);
+    }
+
+    let mut keys = Vec::with_capacity(plan.property_names.len() + 1);
+    for name in &plan.property_names {
+        keys.push(
+            bootstrap
+                .cached_string_literal_type(name)
+                .ok_or(NongenericKeyofError::InvalidCachedResult(plan.target))?,
+        );
+    }
+    if plan.has_number_index {
+        keys.push(bootstrap.number_type);
+    }
+    Ok(keys)
+}
+
+fn cached_composite_key_union(
+    store: &CanonicalTypeMapperStore,
+    keys: &[TypeId],
+    results: &[TypeId],
+    preserve_constituent_origins: bool,
+) -> Result<Option<TypeId>, NongenericKeyofError> {
+    let mut named_unions = Vec::new();
+    if preserve_constituent_origins {
+        for result in results {
+            collect_named_key_unions(store, *result, &mut named_unions)?;
+        }
+    }
+
+    if let [only] = named_unions.as_slice()
+        && union_contains_exact_keys(store, *only, keys)
+    {
+        store
+            .validate_union_constituent(*only)
+            .map_err(|_| NongenericKeyofError::InvalidCachedResult(*only))?;
+        return Ok(Some(*only));
+    }
+
+    let mut uncovered = Vec::new();
+    for key in keys {
+        if !named_unions.iter().any(|union| {
+            matches!(
+                store.type_payload(*union).map(TypeRecord::data),
+                Some(TypeData::Union(data)) if data.union.types.contains(key)
+            )
+        }) {
+            uncovered.push(*key);
+        }
+    }
+    let named_key_count = named_unions
+        .iter()
+        .map(
+            |union| match store.type_payload(*union).map(TypeRecord::data) {
+                Some(TypeData::Union(data)) => data.union.types.len(),
+                _ => 0,
+            },
+        )
+        .sum::<usize>();
+    let expected_origin =
+        !named_unions.is_empty() && named_key_count + uncovered.len() == keys.len();
+
+    for (candidate, record) in store.types() {
+        let TypeData::Union(union) = record.data() else {
+            continue;
+        };
+        if record.alias().is_some() || !union_contains_exact_keys(store, candidate, keys) {
+            continue;
+        }
+
+        let origin_matches = match union.origin {
+            None => !expected_origin,
+            Some(origin) if expected_origin => {
+                matches!(
+                    store.type_payload(origin).map(TypeRecord::data),
+                    Some(TypeData::Union(data))
+                        if data.union.types.len() == named_unions.len() + uncovered.len()
+                            && named_unions.iter().all(|named| data.union.types.contains(named))
+                            && uncovered.iter().all(|key| data.union.types.contains(key))
+                )
+            }
+            Some(_) => false,
+        };
+        if origin_matches {
+            store
+                .validate_union_constituent(candidate)
+                .map_err(|_| NongenericKeyofError::InvalidCachedResult(candidate))?;
+            return Ok(Some(candidate));
+        }
+    }
+    Ok(None)
+}
+
+fn collect_named_key_unions(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    named: &mut Vec<TypeId>,
+) -> Result<(), NongenericKeyofError> {
+    let record = store
+        .type_payload(type_)
+        .ok_or(NongenericKeyofError::InvalidCachedResult(type_))?;
+    let TypeData::Union(union) = record.data() else {
+        return Ok(());
+    };
+    match union.origin {
+        Some(origin)
+            if matches!(
+                store.type_payload(origin).map(TypeRecord::data),
+                Some(TypeData::Index(_))
+            ) =>
+        {
+            if !named.contains(&type_) {
+                named.push(type_);
+            }
+        }
+        Some(origin) => {
+            let Some(TypeData::Union(origin)) = store.type_payload(origin).map(TypeRecord::data)
+            else {
+                return Err(NongenericKeyofError::InvalidCachedResult(type_));
+            };
+            for constituent in &origin.union.types {
+                collect_named_key_unions(store, *constituent, named)?;
+            }
+        }
+        None => {}
+    }
+    Ok(())
+}
+
+fn union_contains_exact_keys(
+    store: &CanonicalTypeMapperStore,
+    union: TypeId,
+    keys: &[TypeId],
+) -> bool {
+    matches!(
+        store.type_payload(union).map(TypeRecord::data),
+        Some(TypeData::Union(data))
+            if data.union.types.len() == keys.len()
+                && keys.iter().all(|key| data.union.types.contains(key))
+    )
 }
 
 /// Dependency-independent anonymous-object executor retained as an explicit
@@ -402,8 +806,6 @@ fn validate_cached_nongeneric_keyof_result(
         if plan.has_number_index {
             property_keys.push(bootstrap.number_type);
         }
-        property_keys.sort_unstable();
-        property_keys.dedup();
         property_keys
     };
 
@@ -420,7 +822,10 @@ fn validate_cached_nongeneric_keyof_result(
         let Some(TypeData::Index(index)) = store.type_payload(origin).map(TypeRecord::data) else {
             return Err(NongenericKeyofError::InvalidCachedResult(cached));
         };
-        if union.union.types != normalized
+        if union.union.types.len() != normalized.len()
+            || !normalized
+                .iter()
+                .all(|expected| union.union.types.contains(expected))
             || index.target != plan.target
             || index.index_flags != IndexFlags::NONE
         {
@@ -429,8 +834,18 @@ fn validate_cached_nongeneric_keyof_result(
         return Ok(());
     }
 
+    let Some(TypeData::Union(union)) = store.type_payload(cached).map(TypeRecord::data) else {
+        return Err(NongenericKeyofError::InvalidCachedResult(cached));
+    };
+    if union.union.types.len() != normalized.len()
+        || !normalized
+            .iter()
+            .all(|expected| union.union.types.contains(expected))
+    {
+        return Err(NongenericKeyofError::InvalidCachedResult(cached));
+    }
     let expected = bootstrap
-        .cached_union_type(&normalized)
+        .cached_union_type(&union.union.types)
         .ok_or(NongenericKeyofError::InvalidCachedResult(cached))?;
     (cached == expected)
         .then_some(())
