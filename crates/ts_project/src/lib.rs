@@ -79,15 +79,50 @@ impl<'a> BuildFileSystem<'a> {
     }
 
     fn output(&self, path: &str) -> Option<&OutputFile> {
-        self.outputs.get(&canonical_config_path(self.backing, path))
+        self.outputs
+            .get(&canonical_config_path(self.backing, path))
+            .or_else(|| {
+                let real_path = self.resolved_output_path(path);
+                self.outputs
+                    .get(&canonical_config_path(self.backing, &real_path))
+            })
     }
 
     fn contains_output_directory(&self, path: &str) -> bool {
         let directory = canonical_config_path(self.backing, path);
-        let prefix = format!("{}/", directory.trim_end_matches('/'));
-        self.outputs
-            .keys()
-            .any(|output| output.starts_with(&prefix))
+        let real_directory = canonical_config_path(self.backing, &self.resolved_output_path(path));
+        [directory, real_directory].into_iter().any(|directory| {
+            let prefix = format!("{}/", directory.trim_end_matches('/'));
+            self.outputs
+                .keys()
+                .any(|output| output.starts_with(&prefix))
+        })
+    }
+
+    fn resolved_output_path(&self, path: &str) -> String {
+        let path = normalize_path(path);
+        let mut current = Path::new(&path);
+        let mut missing: Vec<String> = Vec::new();
+        loop {
+            let current_path = current.to_string_lossy();
+            let resolved = self.backing.realpath(&current_path);
+            if resolved != current_path.as_ref()
+                || self.backing.file_exists(&current_path)
+                || self.backing.directory_exists(&current_path)
+            {
+                return missing.iter().rev().fold(resolved, |parent, component| {
+                    resolve_path(&parent, &[component])
+                });
+            }
+            let Some(component) = current.file_name() else {
+                return path;
+            };
+            let Some(parent) = current.parent() else {
+                return path;
+            };
+            missing.push(component.to_string_lossy().into_owned());
+            current = parent;
+        }
     }
 }
 
@@ -105,7 +140,10 @@ impl FileSystem for BuildFileSystem<'_> {
     }
 
     fn realpath(&self, path: &str) -> String {
-        self.backing.realpath(path)
+        self.output(path).map_or_else(
+            || self.backing.realpath(path),
+            |_| self.resolved_output_path(path),
+        )
     }
 
     fn modified_time(&self, path: &str) -> Option<u128> {
@@ -131,8 +169,13 @@ impl FileSystem for BuildFileSystem<'_> {
             Err(error) => return Err(error),
         };
         let directory = Path::new(path);
+        let real_path = self.resolved_output_path(path);
+        let real_directory = Path::new(&real_path);
         for output in self.outputs.values() {
-            let Ok(relative) = Path::new(&output.file_name).strip_prefix(directory) else {
+            let Ok(relative) = Path::new(&output.file_name)
+                .strip_prefix(directory)
+                .or_else(|_| Path::new(&output.file_name).strip_prefix(real_directory))
+            else {
                 continue;
             };
             let mut components = relative.components();
@@ -633,10 +676,10 @@ fn render_message(code: u32, arguments: &[&str]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use ts_compiler::ProgramOptionsOverride;
+    use ts_compiler::{OutputFile, ProgramOptionsOverride};
     use ts_vfs::{FileSystem, MemoryFileSystem};
 
-    use super::{BuildResult, build_projects, load_project_graph};
+    use super::{BuildFileSystem, BuildResult, build_projects, load_project_graph};
 
     fn write_build_outputs(file_system: &MemoryFileSystem, result: BuildResult) {
         for project in result.projects {
@@ -651,6 +694,77 @@ mod tests {
                     .unwrap();
             }
         }
+    }
+
+    #[test]
+    fn generated_declarations_are_visible_through_package_symlinks() {
+        let file_system = MemoryFileSystem::new(true);
+        file_system.add_directory_link("/repo/packages/lib", "/repo/node_modules/lib");
+        let mut build_file_system = BuildFileSystem::new(&file_system);
+        build_file_system.add_outputs(&[OutputFile {
+            file_name: "/repo/packages/lib/dist/index.d.ts".to_owned(),
+            text: "export declare const value: number;\n".to_owned(),
+        }]);
+
+        let directory = "/repo/node_modules/lib/dist";
+        let declaration = "/repo/node_modules/lib/dist/index.d.ts";
+        assert!(build_file_system.directory_exists(directory));
+        assert!(build_file_system.file_exists(declaration));
+        assert_eq!(
+            build_file_system.read_file(declaration).unwrap(),
+            "export declare const value: number;\n"
+        );
+        assert_eq!(
+            build_file_system.read_directory(directory).unwrap().files,
+            ["index.d.ts"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generated_declarations_follow_existing_os_symlink_ancestors() {
+        use std::{
+            os::unix::fs::symlink,
+            sync::atomic::{AtomicU64, Ordering},
+        };
+
+        static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "ts-project-links-{}-{}",
+            std::process::id(),
+            NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed)
+        ));
+        let package = root.join("packages/lib");
+        let node_modules = root.join("node_modules");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::create_dir_all(&node_modules).unwrap();
+        symlink(&package, node_modules.join("lib")).unwrap();
+
+        let file_system = ts_vfs::OsFileSystem::default();
+        let mut build_file_system = BuildFileSystem::new(&file_system);
+        let declaration = package.join("dist/index.d.ts");
+        build_file_system.add_outputs(&[OutputFile {
+            file_name: declaration.to_string_lossy().into_owned(),
+            text: "export declare const value: number;\n".to_owned(),
+        }]);
+        let linked_directory = node_modules.join("lib/dist");
+        let linked_declaration = linked_directory.join("index.d.ts");
+
+        assert!(build_file_system.directory_exists(&linked_directory.to_string_lossy()));
+        assert!(build_file_system.file_exists(&linked_declaration.to_string_lossy()));
+        assert_eq!(
+            build_file_system.realpath(&linked_declaration.to_string_lossy()),
+            declaration.to_string_lossy().into_owned()
+        );
+        assert_eq!(
+            build_file_system
+                .read_directory(&linked_directory.to_string_lossy())
+                .unwrap()
+                .files,
+            ["index.d.ts"]
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

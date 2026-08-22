@@ -256,7 +256,7 @@ impl Default for FsEventSource {
     fn default() -> Self {
         let (sender, receiver) = mpsc::channel();
         Self {
-            watcher: Watcher::default(),
+            watcher: Watcher::default().with_ignore(should_ignore_watch_path),
             watches: BTreeMap::new(),
             sender,
             receiver,
