@@ -24,7 +24,7 @@ use super::{
 
 /// A malformed or unsupported direct generic reference graph.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) enum DirectGenericReferenceError {
+pub enum DirectGenericReferenceError {
     InvalidTarget(TypeId),
     NonGenericTarget(TypeId),
     OuterTypeParameters(TypeId),
@@ -592,6 +592,28 @@ pub(super) fn create_direct_generic_reference(
         })
     );
     Ok(reference)
+}
+
+impl CanonicalTypeMapperStore {
+    /// Creates or reuses one node-less, full-arity direct class/interface
+    /// reference from the target-owned canonical instantiation cache.
+    ///
+    /// This context-free adapter deliberately does not grant
+    /// `ObjectFlags::FROM_TYPE_NODE`; source type-node queries retain ownership
+    /// of that provenance bit.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DirectGenericReferenceError`] for a foreign or malformed
+    /// target/cache, invalid arity or argument identity, recursion poison, or
+    /// capacity failure.
+    pub fn create_direct_generic_reference_type(
+        &mut self,
+        target: TypeId,
+        type_arguments: &[TypeId],
+    ) -> Result<TypeId, DirectGenericReferenceError> {
+        create_direct_generic_reference(self, target, type_arguments, ObjectFlags::NONE)
+    }
 }
 
 #[cfg(test)]

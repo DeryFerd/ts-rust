@@ -9,6 +9,7 @@
 pub mod alias;
 pub mod alias_flags;
 pub mod alias_provider;
+pub mod artifact_queries;
 mod array_diagnostics;
 mod array_types;
 mod assignment;
@@ -32,8 +33,9 @@ pub mod ids;
 mod indexed_access_types;
 mod inference;
 mod instantiate;
-mod intersection_types;
+mod instantiated_members;
 mod interface_heritage;
+mod intersection_types;
 #[allow(dead_code)] // Root owns the checker-cache and type-node integration adapter.
 mod keyof_types;
 pub mod links;
@@ -55,8 +57,8 @@ pub mod source;
 mod source_arrows;
 mod source_callables;
 mod source_calls;
-mod source_enums;
 mod source_elements;
+mod source_enums;
 mod source_flow;
 mod source_functions;
 mod source_imports;
@@ -113,6 +115,10 @@ pub use global_types::{
 pub use ids::{
     ConditionalRootId, IndexInfoId, SignatureId, TypeAliasId, TypeId, TypeMapperId, TypePredicateId,
 };
+pub use instantiated_members::{
+    GenericInterfaceArrayTarget, GenericInterfaceMemberError, InstantiatedInterfaceMembers,
+    InstantiatedInterfaceProperty,
+};
 pub use links::{
     AccessibleChainCacheKey, AliasSymbolLinks, AliasTargetState, ArrayLiteralLinks, AssertionLinks,
     ContainingSymbolLinks, DeclaredTypeLinks, DecoratorSignatureState, DeferredSymbolLinks,
@@ -143,6 +149,7 @@ pub use production::{
     CanonicalAliasQueryError, CanonicalCheckerContext, CanonicalCheckerContextError,
     CanonicalCheckerOptions, CanonicalGlobalInitializationError,
 };
+pub use reference_types::DirectGenericReferenceError;
 pub use relater::RelationUnavailable;
 pub use relation::{
     ExpandingFlags, IntersectionState, MinArgumentCountFlags, RecursionFlags,

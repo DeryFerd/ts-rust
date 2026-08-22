@@ -19,8 +19,8 @@ use super::{
         DirectGenericReferenceError, create_direct_generic_reference,
         validate_direct_generic_reference,
     },
-    type_records::TypeData,
-    types::ObjectFlags,
+    type_records::{TypeData, TypeRecord},
+    types::{ObjectFlags, TypeFlags},
 };
 use ts_binder::SemanticSymbolId;
 
@@ -54,21 +54,12 @@ pub(super) enum InstantiationError {
     InvalidRecoveryType(TypeId),
     InvalidMapper(TypeMapperId),
     InvalidAlias(TypeAliasId),
-    DepthLimit {
-        depth: usize,
-        limit: usize,
-    },
-    CountLimit {
-        count: usize,
-        limit: usize,
-    },
+    DepthLimit { depth: usize, limit: usize },
+    CountLimit { count: usize, limit: usize },
     UnsupportedType(TypeId),
     UnsupportedAliasedUnion(TypeId),
     UnsupportedUnionOrigin(TypeId),
     UnsupportedUnionConstituent(TypeId),
-    /// Needs a read-only canonical union identity validator that admits type
-    /// parameters; the installed literal-union validator intentionally does not.
-    UnvalidatedUnchangedUnion(TypeId),
     Array(ArrayTypeError),
     Reference(DirectGenericReferenceError),
     Union(LiteralTypeCacheError),
@@ -120,10 +111,6 @@ impl std::fmt::Display for InstantiationError {
             Self::UnsupportedUnionConstituent(type_) => write!(
                 formatter,
                 "union constituent {type_:?} is outside the primitive/literal mapper slice"
-            ),
-            Self::UnvalidatedUnchangedUnion(type_) => write!(
-                formatter,
-                "unchanged generic union {type_:?} requires canonical identity validation"
             ),
             Self::Array(error) => error.fmt(formatter),
             Self::Reference(error) => error.fmt(formatter),
@@ -664,6 +651,397 @@ fn could_contain_installed_type_variables_worker(
     result
 }
 
+/// Read-only proof for the value-type graph admitted by instantiated generic
+/// interface properties.
+///
+/// This mirrors the exact families handled by [`instantiate_type_worker`].
+/// Unlike the general predicate above, it also proves that every type
+/// parameter belongs to the target interface's mapper domain. That prevents a
+/// foreign or lexically captured parameter from being preserved by identity
+/// and later masquerading as a successfully instantiated member.
+pub(super) fn validate_instantiable_member_type(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    mapper_parameters: &[TypeId],
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<(), InstantiationError> {
+    if mapper_parameters.is_empty()
+        || mapper_parameters
+            .iter()
+            .any(|parameter| store.type_payload(*parameter).is_none())
+        || mapper_parameters
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>()
+            .len()
+            != mapper_parameters.len()
+    {
+        return Err(InstantiationError::InvalidType(type_));
+    }
+    validate_instantiable_member_type_worker(
+        store,
+        type_,
+        mapper_parameters,
+        array_targets,
+        &mut HashSet::new(),
+    )
+}
+
+/// Proves the installed property-type domain and returns the pinned
+/// `couldContainTypeVariables` classification used by `instantiateSymbol`.
+pub(super) fn instantiable_member_type_contains_variables(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    mapper_parameters: &[TypeId],
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<bool, InstantiationError> {
+    validate_instantiable_member_type(store, type_, mapper_parameters, array_targets)?;
+    could_contain_installed_type_variables(store, type_, array_targets)
+}
+
+fn validate_instantiable_member_type_worker(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    mapper_parameters: &[TypeId],
+    array_targets: Option<CanonicalArrayTargets>,
+    active: &mut HashSet<TypeId>,
+) -> Result<(), InstantiationError> {
+    if !active.insert(type_) {
+        return Err(InstantiationError::UnsupportedType(type_));
+    }
+    let record = store
+        .type_payload(type_)
+        .ok_or(InstantiationError::InvalidType(type_))?;
+    let result = match record.data() {
+        TypeData::Intrinsic(_) | TypeData::Literal(_) => {
+            if is_exact_optional_missing_type(store, type_) {
+                Ok(())
+            } else {
+                store
+                    .validate_union_constituent(type_)
+                    .map_err(InstantiationError::Union)
+            }
+        }
+        TypeData::TypeParameter(_) if mapper_parameters.contains(&type_) => Ok(()),
+        TypeData::TypeParameter(_) => Err(InstantiationError::UnsupportedType(type_)),
+        TypeData::Union(data) => {
+            if record.alias().is_some() {
+                Err(InstantiationError::UnsupportedAliasedUnion(type_))
+            } else if data.origin.is_some() {
+                Err(InstantiationError::UnsupportedUnionOrigin(type_))
+            } else if data.union.types.len() < 2
+                || data
+                    .union
+                    .types
+                    .iter()
+                    .copied()
+                    .collect::<HashSet<_>>()
+                    .len()
+                    != data.union.types.len()
+            {
+                Err(InstantiationError::UnsupportedUnionConstituent(type_))
+            } else {
+                data.union.types.iter().try_for_each(|constituent| {
+                    if !matches!(
+                        store.type_payload(*constituent).map(TypeRecord::data),
+                        Some(
+                            TypeData::Intrinsic(_)
+                                | TypeData::Literal(_)
+                                | TypeData::TypeParameter(_)
+                        )
+                    ) {
+                        return Err(InstantiationError::UnsupportedUnionConstituent(
+                            *constituent,
+                        ));
+                    }
+                    validate_instantiable_member_type_worker(
+                        store,
+                        *constituent,
+                        mapper_parameters,
+                        array_targets,
+                        active,
+                    )
+                })
+            }
+        }
+        TypeData::TypeReference(_) | TypeData::Interface(_) => {
+            if let Some(targets) = array_targets
+                && let Some(reference) =
+                    store.canonical_array_reference_with_targets(targets, type_)?
+            {
+                validate_instantiable_member_type_worker(
+                    store,
+                    reference.element_type,
+                    mapper_parameters,
+                    Some(targets),
+                    active,
+                )
+            } else {
+                let reference = validate_direct_generic_reference(store, type_)?;
+                reference.type_arguments.iter().try_for_each(|argument| {
+                    validate_instantiable_member_type_worker(
+                        store,
+                        *argument,
+                        mapper_parameters,
+                        array_targets,
+                        active,
+                    )
+                })
+            }
+        }
+        TypeData::UniqueEsSymbol(_) => Err(InstantiationError::UnsupportedType(type_)),
+        _ => Err(InstantiationError::UnsupportedType(type_)),
+    };
+    active.remove(&type_);
+    result
+}
+
+fn is_exact_optional_missing_type(store: &CanonicalTypeMapperStore, type_: TypeId) -> bool {
+    store.intrinsic_bootstrap().is_some_and(|bootstrap| {
+        bootstrap.options.strict_null_checks
+            && bootstrap.options.exact_optional_property_types
+            && type_ == bootstrap.missing_type
+    })
+}
+
+/// Checks an instantiated property result without allocating semantic records
+/// or calling the normal, mutating instantiation path.
+pub(super) fn instantiated_member_type_matches(
+    store: &CanonicalTypeMapperStore,
+    template: TypeId,
+    actual: TypeId,
+    mapper: TypeMapperId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<bool, InstantiationError> {
+    if store.mapper_payload(mapper).is_none() {
+        return Err(InstantiationError::InvalidMapper(mapper));
+    }
+    if store.type_payload(actual).is_none() {
+        return Err(InstantiationError::InvalidType(actual));
+    }
+    instantiated_member_type_matches_worker(
+        store,
+        template,
+        actual,
+        mapper,
+        array_targets,
+        &mut HashSet::new(),
+    )
+}
+
+fn instantiated_member_type_matches_worker(
+    store: &CanonicalTypeMapperStore,
+    template: TypeId,
+    actual: TypeId,
+    mapper: TypeMapperId,
+    array_targets: Option<CanonicalArrayTargets>,
+    active: &mut HashSet<TypeId>,
+) -> Result<bool, InstantiationError> {
+    if !active.insert(template) {
+        return Err(InstantiationError::UnsupportedType(template));
+    }
+    let record = store
+        .type_payload(template)
+        .ok_or(InstantiationError::InvalidType(template))?;
+    let result = match record.data() {
+        TypeData::Intrinsic(_) | TypeData::Literal(_) => Ok(template == actual),
+        TypeData::TypeParameter(_) => Ok(store
+            .map_type(mapper, template)
+            .ok_or(InstantiationError::InvalidMapper(mapper))?
+            == actual),
+        TypeData::Union(union) => instantiated_member_union_matches(
+            store,
+            template,
+            &union.union.types,
+            actual,
+            mapper,
+            array_targets,
+        ),
+        TypeData::TypeReference(_) | TypeData::Interface(_) => {
+            if let Some(targets) = array_targets
+                && let Some(source) =
+                    store.canonical_array_reference_with_targets(targets, template)?
+            {
+                let actual = store.canonical_array_reference_with_targets(targets, actual)?;
+                match actual {
+                    Some(actual)
+                        if source.readonly == actual.readonly
+                            && source.array_literal == actual.array_literal =>
+                    {
+                        instantiated_member_type_matches_worker(
+                            store,
+                            source.element_type,
+                            actual.element_type,
+                            mapper,
+                            array_targets,
+                            active,
+                        )
+                    }
+                    _ => Ok(false),
+                }
+            } else {
+                let source = validate_direct_generic_reference(store, template)?;
+                match validate_direct_generic_reference(store, actual) {
+                    Ok(actual)
+                        if source.target == actual.target
+                            && source.type_arguments.len() == actual.type_arguments.len() =>
+                    {
+                        source
+                            .type_arguments
+                            .iter()
+                            .zip(actual.type_arguments)
+                            .try_fold(true, |matches, (source, actual)| {
+                                if !matches {
+                                    return Ok(false);
+                                }
+                                instantiated_member_type_matches_worker(
+                                    store,
+                                    *source,
+                                    actual,
+                                    mapper,
+                                    array_targets,
+                                    active,
+                                )
+                            })
+                    }
+                    Ok(_) | Err(_) => Ok(false),
+                }
+            }
+        }
+        _ => Err(InstantiationError::UnsupportedType(template)),
+    };
+    active.remove(&template);
+    result
+}
+
+fn instantiated_member_union_matches(
+    store: &CanonicalTypeMapperStore,
+    template: TypeId,
+    constituents: &[TypeId],
+    actual: TypeId,
+    mapper: TypeMapperId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<bool, InstantiationError> {
+    let mapped = constituents
+        .iter()
+        .map(|constituent| {
+            let record = store
+                .type_payload(*constituent)
+                .ok_or(InstantiationError::InvalidType(*constituent))?;
+            if matches!(record.data(), TypeData::TypeParameter(_)) {
+                store
+                    .map_type(mapper, *constituent)
+                    .ok_or(InstantiationError::InvalidMapper(mapper))
+            } else {
+                Ok(*constituent)
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if mapped.as_slice() == constituents {
+        return Ok(actual == template);
+    }
+
+    let actual_record = store
+        .type_payload(actual)
+        .ok_or(InstantiationError::InvalidType(actual))?;
+    let actual_types = match actual_record.data() {
+        TypeData::Union(union) if actual_record.alias().is_none() && union.origin.is_none() => {
+            let validation = match array_targets {
+                Some(targets) => {
+                    store.validate_cached_union_result_with_array_targets(targets, actual, None)
+                }
+                None => store.validate_cached_union_result(actual, None),
+            };
+            if validation.is_err()
+                && !union
+                    .union
+                    .types
+                    .iter()
+                    .copied()
+                    .any(|type_| is_exact_optional_missing_type(store, type_))
+            {
+                return Ok(false);
+            }
+            if store
+                .intrinsic_bootstrap()
+                .and_then(|bootstrap| bootstrap.cached_union_type(&union.union.types))
+                != Some(actual)
+            {
+                return Ok(false);
+            }
+            union.union.types.as_slice()
+        }
+        TypeData::Union(_) => return Ok(false),
+        _ => std::slice::from_ref(&actual),
+    };
+
+    if actual_record.flags().intersects(TypeFlags::ANY_OR_UNKNOWN) {
+        let Some(bootstrap) = store.intrinsic_bootstrap() else {
+            return Ok(false);
+        };
+        let has_any = mapped.iter().any(|type_| {
+            store
+                .type_payload(*type_)
+                .is_some_and(|record| record.flags().intersects(TypeFlags::ANY))
+        });
+        let expected = if has_any {
+            if mapped.contains(&bootstrap.wildcard_type) {
+                bootstrap.wildcard_type
+            } else if mapped.contains(&bootstrap.error_type) {
+                bootstrap.error_type
+            } else {
+                bootstrap.any_type
+            }
+        } else {
+            bootstrap.unknown_type
+        };
+        return Ok(mapped.contains(&actual) && actual == expected);
+    }
+
+    if actual_types
+        .iter()
+        .any(|candidate| !mapped.contains(candidate))
+    {
+        return Ok(false);
+    }
+    Ok(mapped.iter().all(|type_| {
+        actual_types.contains(type_)
+            || mapped_member_union_type_is_redundant(store, *type_, actual_types)
+    }))
+}
+
+fn mapped_member_union_type_is_redundant(
+    store: &CanonicalTypeMapperStore,
+    mapped: TypeId,
+    actual_types: &[TypeId],
+) -> bool {
+    let Some(record) = store.type_payload(mapped) else {
+        return false;
+    };
+    if record.flags().intersects(TypeFlags::NEVER) {
+        return true;
+    }
+    if store.intrinsic_bootstrap().is_some_and(|bootstrap| {
+        !bootstrap.options.strict_null_checks && record.flags().intersects(TypeFlags::NULLABLE)
+    }) {
+        return !actual_types.is_empty();
+    }
+    let TypeData::Literal(literal) = record.data() else {
+        return false;
+    };
+    actual_types.iter().any(|actual| {
+        *actual == literal.regular_type
+            || store.type_payload(*actual).is_some_and(|actual| {
+                record.flags().intersects(TypeFlags::STRING_LITERAL)
+                    && actual.flags().intersects(TypeFlags::STRING)
+                    || record.flags().intersects(TypeFlags::NUMBER_LITERAL)
+                        && actual.flags().intersects(TypeFlags::NUMBER)
+                    || record.flags().intersects(TypeFlags::BIG_INT_LITERAL)
+                        && actual.flags().intersects(TypeFlags::BIG_INT)
+            })
+    })
+}
+
 enum InstantiationWork {
     TypeParameter,
     Identity,
@@ -917,7 +1295,7 @@ fn instantiate_union(
         mapped_types.push(instantiated);
     }
     if !changed {
-        return Err(InstantiationError::UnvalidatedUnchangedUnion(source));
+        return Ok(source);
     }
     canonical_anonymous_union(store, &mapped_types).map_err(Into::into)
 }
@@ -1566,7 +1944,7 @@ mod tests {
     }
 
     #[test]
-    fn unchanged_generic_union_fails_closed_without_identity_validator() {
+    fn unchanged_generic_union_preserves_its_original_identity() {
         let mut store = initialized_store();
         let string = store.intrinsic_bootstrap().unwrap().string_type;
         let parameter = store.alloc_type_parameter(None).unwrap();
@@ -1576,10 +1954,7 @@ mod tests {
         let mapper = store.new_simple_type_mapper(parameter, parameter).unwrap();
         let before = store.type_len();
 
-        assert_eq!(
-            instantiate_type(&mut store, source, mapper),
-            Err(InstantiationError::UnvalidatedUnchangedUnion(source))
-        );
+        assert_eq!(instantiate_type(&mut store, source, mapper), Ok(source));
         assert_eq!(store.type_len(), before);
     }
 
