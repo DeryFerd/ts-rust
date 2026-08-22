@@ -72,6 +72,7 @@ impl SourceMapBuilder {
     }
 
     /// Adds a generated position that does not identify an original source.
+    /// Generated columns count UTF-16 code units, not UTF-8 bytes.
     ///
     /// # Errors
     ///
@@ -84,7 +85,8 @@ impl SourceMapBuilder {
         self.add_pending_mapping(generated_line, generated_column, None)
     }
 
-    /// Adds one mapping segment.
+    /// Adds one mapping segment. Generated and original columns both count
+    /// UTF-16 code units, as required by Source Map v3.
     ///
     /// # Errors
     ///

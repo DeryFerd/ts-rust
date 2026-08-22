@@ -5,7 +5,7 @@ use std::io;
 
 use ts_path::{
     CaseSensitivity, FileExtension, SUPPORTED_TS_EXTENSIONS, canonical_file_name, normalize_path,
-    resolve_path,
+    resolve_path, root_length,
 };
 use ts_vfs::FileSystem;
 
@@ -18,6 +18,7 @@ enum Component {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GlobPattern {
+    root: String,
     components: Vec<Component>,
     case_sensitive: bool,
     exclude: bool,
@@ -32,7 +33,9 @@ impl GlobPattern {
         exclude: bool,
     ) -> Option<Self> {
         let spec = resolve_path(base_path, &[spec]);
-        let mut parts: Vec<String> = spec
+        let root_end = root_length(&spec);
+        let root = normalized_root(&spec[..root_end]).to_owned();
+        let mut parts: Vec<String> = spec[root_end..]
             .split('/')
             .filter(|part| !part.is_empty() && *part != ".")
             .map(str::to_owned)
@@ -59,6 +62,7 @@ impl GlobPattern {
             })
             .collect();
         Some(Self {
+            root,
             components,
             case_sensitive,
             exclude,
@@ -68,7 +72,14 @@ impl GlobPattern {
     #[must_use]
     pub fn matches(&self, path: &str) -> bool {
         let normalized = normalize_path(path);
-        let parts: Vec<&str> = normalized
+        let root_end = root_length(&normalized);
+        if !self
+            .root
+            .eq_ignore_ascii_case(normalized_root(&normalized[..root_end]))
+        {
+            return false;
+        }
+        let parts: Vec<&str> = normalized[root_end..]
             .split('/')
             .filter(|part| !part.is_empty())
             .collect();
@@ -307,12 +318,33 @@ fn include_traversal_root<F: FileSystem + ?Sized>(
 }
 
 fn contains_path(directory: &str, path: &str, case_sensitive: bool) -> bool {
-    let directory = canonical(directory, case_sensitive);
-    let path = canonical(path, case_sensitive);
+    let directory_root = root_length(directory);
+    let path_root = root_length(path);
+    if !normalized_root(&directory[..directory_root])
+        .eq_ignore_ascii_case(normalized_root(&path[..path_root]))
+    {
+        return false;
+    }
+    let directory = canonical(
+        directory[directory_root..].trim_end_matches('/'),
+        case_sensitive,
+    );
+    let path = canonical(&path[path_root..], case_sensitive);
+    if directory.is_empty() {
+        return true;
+    }
     path == directory
         || path
             .strip_prefix(&directory)
-            .is_some_and(|remainder| directory.ends_with('/') || remainder.starts_with('/'))
+            .is_some_and(|remainder| remainder.starts_with('/'))
+}
+
+fn normalized_root(root: &str) -> &str {
+    if root.len() > 1 {
+        root.strip_suffix('/').unwrap_or(root)
+    } else {
+        root
+    }
 }
 
 fn wildcard_component_matches(pattern: &str, value: &str, case_sensitive: bool) -> bool {
@@ -515,6 +547,39 @@ mod tests {
 
         let sensitive = file_system(true, &["/dev/Src/Main.ts"]);
         assert!(discover_files(&sensitive, &options).unwrap().is_empty());
+    }
+
+    #[test]
+    fn glob_patterns_preserve_network_and_url_root_identity() {
+        let network = GlobPattern::compile("//server/share/**/*.ts", "/project", true, false)
+            .expect("network pattern compiles");
+        assert!(network.matches("//SERVER/share/nested/index.ts"));
+        assert!(!network.matches("/server/share/nested/index.ts"));
+
+        let url = GlobPattern::compile("file:///project/**/*.ts", "/project", true, false)
+            .expect("file URL pattern compiles");
+        assert!(url.matches("file:///project/index.ts"));
+        assert!(!url.matches("file:/project/index.ts"));
+
+        let dynamic = GlobPattern::compile("^/untitled/**/*.ts", "/project", true, false)
+            .expect("dynamic pattern compiles");
+        assert!(dynamic.matches("^/untitled/index.ts"));
+        assert!(!dynamic.matches("/untitled/index.ts"));
+    }
+
+    #[test]
+    fn discovers_network_paths_without_treating_them_as_local_paths() {
+        let file_system = file_system(
+            false,
+            &["//Server/share/network.ts", "/server/share/local.ts"],
+        );
+        let mut options = DiscoveryOptions::new("/");
+        options.include = vec!["//server/share/**/*.ts".into()];
+
+        assert_eq!(
+            discover_files(&file_system, &options).unwrap(),
+            vec!["//server/share/network.ts"]
+        );
     }
 
     #[test]

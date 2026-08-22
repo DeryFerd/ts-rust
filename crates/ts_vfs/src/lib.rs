@@ -273,12 +273,25 @@ struct MemoryFile {
     modified_time: u128,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LinkKind {
+    Directory,
+    File,
+}
+
+#[derive(Clone, Debug)]
+struct MemoryLink {
+    alias: String,
+    source: String,
+    kind: LinkKind,
+}
+
 /// A deterministic, thread-safe file system for compiler tests.
 #[derive(Debug)]
 pub struct MemoryFileSystem {
     case_sensitive: bool,
     files: RwLock<BTreeMap<String, MemoryFile>>,
-    directory_links: RwLock<Vec<(String, String)>>,
+    links: RwLock<Vec<MemoryLink>>,
     clock: AtomicU64,
 }
 
@@ -288,18 +301,31 @@ impl MemoryFileSystem {
         Self {
             case_sensitive,
             files: RwLock::new(BTreeMap::new()),
-            directory_links: RwLock::new(Vec::new()),
+            links: RwLock::new(Vec::new()),
             clock: AtomicU64::new(0),
         }
     }
 
     /// Registers a directory alias whose contents physically live at `source`.
     pub fn add_directory_link(&self, source: &str, alias: &str) {
+        self.add_link(source, alias, LinkKind::Directory);
+    }
+
+    /// Registers a file alias that shares its contents and identity with `source`.
+    pub fn add_file_link(&self, source: &str, alias: &str) {
+        self.add_link(source, alias, LinkKind::File);
+    }
+
+    fn add_link(&self, source: &str, alias: &str, kind: LinkKind) {
         let source = normalize_path(source);
         let alias = normalize_path(alias);
-        if let Ok(mut links) = self.directory_links.write() {
-            links.push((alias, source));
-            links.sort_by(|left, right| right.0.len().cmp(&left.0.len()));
+        if let Ok(mut links) = self.links.write() {
+            links.push(MemoryLink {
+                alias,
+                source,
+                kind,
+            });
+            links.sort_by(|left, right| right.alias.len().cmp(&left.alias.len()));
         }
     }
 
@@ -338,28 +364,29 @@ impl MemoryFileSystem {
 
     fn resolve_linked_path(&self, path: &str) -> String {
         let mut path = normalize_path(path);
-        let Ok(links) = self.directory_links.read() else {
+        let Ok(links) = self.links.read() else {
             return path;
         };
         for _ in 0..links.len() {
             let canonical = self.canonical_path(&path);
-            let Some((alias, source)) = links.iter().find(|(alias, _)| {
-                let canonical_alias = self.canonical_path(alias);
+            let Some(link) = links.iter().find(|link| {
+                let canonical_alias = self.canonical_path(&link.alias);
                 canonical == canonical_alias
-                    || canonical
-                        .strip_prefix(&canonical_alias)
-                        .is_some_and(|rest| rest.starts_with('/'))
+                    || link.kind == LinkKind::Directory
+                        && canonical
+                            .strip_prefix(&canonical_alias)
+                            .is_some_and(|rest| rest.starts_with('/'))
             }) else {
                 break;
             };
-            let canonical_alias = self.canonical_path(alias);
+            let canonical_alias = self.canonical_path(&link.alias);
             if canonical == canonical_alias {
-                path.clone_from(source);
+                path.clone_from(&link.source);
             } else {
                 let remainder = path_relative_to(&canonical, &canonical_alias)
                     .expect("matched directory alias has a relative suffix");
                 let suffix = display_remainder(&path, remainder);
-                path = format!("{source}/{suffix}");
+                path = format!("{}/{suffix}", link.source);
             }
         }
         path
@@ -390,9 +417,9 @@ impl MemoryFileSystem {
 
         let canonical_directory = self.canonical_path(directory);
         let alias_prefix = format!("{canonical_directory}/");
-        self.directory_links.read().is_ok_and(|links| {
-            links.iter().any(|(alias, _)| {
-                self.canonical_path(alias)
+        self.links.read().is_ok_and(|links| {
+            links.iter().any(|link| {
+                self.canonical_path(&link.alias)
                     .strip_prefix(&alias_prefix)
                     .is_some_and(|remainder| !remainder.is_empty())
             })
@@ -530,12 +557,9 @@ impl FileSystem for MemoryFileSystem {
         }
 
         let canonical_requested_directory = self.canonical_path(&normalized);
-        let links = self
-            .directory_links
-            .read()
-            .map_err(|_| Self::lock_error())?;
-        for (alias, _) in links.iter() {
-            let canonical_alias = self.canonical_path(alias);
+        let links = self.links.read().map_err(|_| Self::lock_error())?;
+        for link in links.iter() {
+            let canonical_alias = self.canonical_path(&link.alias);
             let Some(remainder) =
                 path_relative_to(&canonical_alias, &canonical_requested_directory)
             else {
@@ -544,9 +568,14 @@ impl FileSystem for MemoryFileSystem {
             if remainder.is_empty() {
                 continue;
             }
-            let display = display_remainder(alias, remainder);
-            let child = display.split('/').next().unwrap_or(display);
-            child_directories.insert(child.to_owned());
+            let display = display_remainder(&link.alias, remainder);
+            if let Some((child, _)) = display.split_once('/') {
+                child_directories.insert(child.to_owned());
+            } else if link.kind == LinkKind::File {
+                child_files.insert(display.to_owned());
+            } else {
+                child_directories.insert(display.to_owned());
+            }
         }
 
         Ok(DirectoryEntries {
@@ -760,6 +789,62 @@ mod tests {
         );
         file_system.write_file("/app/node_modules/package/new.ts", "new")?;
         assert_eq!(file_system.read_file("/real/package/new.ts")?, "new");
+        Ok(())
+    }
+
+    #[test]
+    fn file_links_share_identity_contents_and_directory_entries() -> io::Result<()> {
+        let file_system = MemoryFileSystem::new(false);
+        file_system.write_file("/packages/Shared/index.d.ts", "before")?;
+        file_system.add_file_link(
+            "/packages/Shared/index.d.ts",
+            "/app/node_modules/shared/INDEX.d.ts",
+        );
+
+        assert!(file_system.directory_exists("/app/node_modules/shared"));
+        assert!(file_system.file_exists("/APP/NODE_MODULES/SHARED/index.D.TS"));
+        assert!(!file_system.directory_exists("/app/node_modules/shared/index.d.ts"));
+        assert_eq!(
+            file_system.realpath("/app/node_modules/shared/index.d.ts"),
+            "/packages/Shared/index.d.ts"
+        );
+        assert_eq!(
+            file_system.read_directory("/app/node_modules/shared")?,
+            DirectoryEntries {
+                files: vec!["INDEX.d.ts".into()],
+                directories: Vec::new(),
+            }
+        );
+        file_system.write_file("/app/node_modules/shared/index.d.ts", "after")?;
+        assert_eq!(
+            file_system.read_file("/packages/Shared/index.d.ts")?,
+            "after"
+        );
+        assert_eq!(
+            file_system.file_paths()?,
+            vec!["/packages/Shared/index.d.ts"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn file_links_follow_linked_parent_directories() -> io::Result<()> {
+        let file_system = MemoryFileSystem::new(true);
+        file_system.write_file("/real/package/index.ts", "value")?;
+        file_system.add_directory_link("/real/package", "/workspace/package");
+        file_system.add_file_link(
+            "/workspace/package/index.ts",
+            "/app/node_modules/package/index.ts",
+        );
+
+        assert_eq!(
+            file_system.realpath("/app/node_modules/package/index.ts"),
+            "/real/package/index.ts"
+        );
+        assert_eq!(
+            file_system.read_file("/app/node_modules/package/index.ts")?,
+            "value"
+        );
         Ok(())
     }
 

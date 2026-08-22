@@ -413,19 +413,21 @@ pub fn ensure_trailing_directory_separator(path: &str) -> String {
 
 #[must_use]
 pub fn remove_file_extension(path: &str) -> &str {
-    if let Some(extension) = extension_from_path(path) {
+    if let Some(extension) = extension_from_path(path)
+        && extension != FileExtension::TsBuildInfo
+    {
         return &path[..path.len() - extension.as_str().len()];
     }
-    let file_start = path.rfind(['/', '\\']).map_or(0, |separator| separator + 1);
-    path[file_start..]
-        .rfind('.')
-        .filter(|dot| *dot != 0)
-        .map_or(path, |dot| &path[..file_start + dot])
+    path
 }
 
 #[must_use]
 pub fn change_extension(path: &str, extension: &str) -> String {
-    format!("{}{}", remove_file_extension(path), extension)
+    let without_extension = remove_file_extension(path);
+    if without_extension.len() == path.len() {
+        return path.to_owned();
+    }
+    format!("{without_extension}{extension}")
 }
 
 #[must_use]
@@ -584,9 +586,21 @@ mod tests {
         assert_eq!(base_file_name("file:///src/nested/"), "nested");
         assert_eq!(ensure_trailing_directory_separator("/src"), "/src/");
         assert_eq!(remove_file_extension("/src/file.d.mts"), "/src/file");
-        assert_eq!(remove_file_extension("/src/file.custom"), "/src/file");
+        assert_eq!(
+            remove_file_extension("/src/file.custom"),
+            "/src/file.custom"
+        );
+        assert_eq!(
+            remove_file_extension("/src/build.tsbuildinfo"),
+            "/src/build.tsbuildinfo"
+        );
         assert_eq!(remove_file_extension("/src/.config"), "/src/.config");
         assert_eq!(change_extension("/src/file.ts", ".js"), "/src/file.js");
+        assert_eq!(
+            change_extension("/src/styles.css", ".js"),
+            "/src/styles.css"
+        );
+        assert_eq!(change_extension("/src/file", ".js"), "/src/file");
         assert_eq!(declaration_emit_extension("entry.mts"), ".d.mts");
         assert_eq!(declaration_emit_extension("entry.cjs"), ".d.cts");
         assert_eq!(declaration_emit_extension("entry.tsx"), ".d.ts");
