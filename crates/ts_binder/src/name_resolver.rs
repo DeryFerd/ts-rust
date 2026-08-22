@@ -421,8 +421,7 @@ pub trait CanonicalNameResolverHost {
         None
     }
 
-    /// Retained for the later JavaScript closure. It is not called by this
-    /// TypeScript-only resolver.
+    /// Supplies the intrinsic `require` symbol after JavaScript scope lookup.
     fn require_symbol(&mut self, _store: &SymbolStore) -> Option<SemanticSymbolId> {
         None
     }
@@ -1035,6 +1034,22 @@ impl<'a, H: CanonicalNameResolverHost> CanonicalNameResolver<'a, H> {
             result = self.lookup(globals, name, meaning | SymbolFlags::GLOBAL_LOOKUP)?;
         }
 
+        if result.is_none()
+            && self
+                .bound
+                .source_facts()
+                .is_some_and(crate::CanonicalSourceFileFacts::is_javascript_file)
+            && let Some(CanonicalResolutionLocation::Bound(location)) = original_location
+            && self
+                .node(location.node)
+                .parent
+                .is_some_and(|parent| is_require_call(self.arena, parent))
+        {
+            let require = self.host.require_symbol(self.symbols);
+            self.validate_optional_symbol(require)?;
+            return Ok(require);
+        }
+
         if let Some(message) = name_not_found_message {
             if let Some(property) = property_with_invalid_initializer
                 && self.host.on_property_with_invalid_initializer(
@@ -1145,7 +1160,25 @@ impl<'a, H: CanonicalNameResolverHost> CanonicalNameResolver<'a, H> {
         if name == "default" {
             Ok(None)
         } else {
-            self.lookup(exports, name, meaning & SymbolFlags::MODULE_MEMBER)
+            let result = self.lookup(exports, name, meaning & SymbolFlags::MODULE_MEMBER)?;
+            if self.kind(location) == SyntaxKind::SourceFile
+                && self
+                    .bound
+                    .source_facts()
+                    .is_some_and(crate::CanonicalSourceFileFacts::is_common_js_module)
+                && result.is_some_and(|symbol| {
+                    !self
+                        .symbols
+                        .symbol(symbol)
+                        .expect("lookup results are store-owned")
+                        .flags()
+                        .intersects(SymbolFlags::TYPE)
+                })
+            {
+                Ok(None)
+            } else {
+                Ok(result)
+            }
         }
     }
 
@@ -2002,6 +2035,13 @@ fn is_nullish_coalesce(arena: &NodeArena, node: NodeId) -> bool {
         .is_some_and(|operator| operator.kind == SyntaxKind::QuestionQuestionToken)
 }
 
+fn is_require_call(arena: &NodeArena, node: NodeId) -> bool {
+    let Some(NodeData::CallExpression(call)) = arena.get(node).map(|node| &node.data) else {
+        return false;
+    };
+    call.arguments.nodes.len() == 1 && identifier_text(arena, call.expression) == Some("require")
+}
+
 /// Reconstructs the pinned parser's `NodeFlagsOptionalChain` from the exact
 /// receiver/qdot shape. The Rust parser does not yet persist that derived bit.
 fn is_optional_chain(arena: &NodeArena, node: NodeId) -> bool {
@@ -2231,6 +2271,7 @@ mod tests {
         local_symbols: HashMap<NodeRef, SemanticSymbolId>,
         globals: Option<SymbolTableId>,
         arguments: Option<SemanticSymbolId>,
+        require: Option<SemanticSymbolId>,
         lookup_override: Option<SemanticSymbolId>,
         lookup_error: Option<CanonicalNameResolutionError>,
         synthetic_scopes: Option<CanonicalSyntheticScopeStore>,
@@ -2334,6 +2375,11 @@ mod tests {
 
         fn arguments_symbol(&mut self, _store: &SymbolStore) -> Option<SemanticSymbolId> {
             self.arguments
+        }
+
+        fn require_symbol(&mut self, _store: &SymbolStore) -> Option<SemanticSymbolId> {
+            self.events.push("require");
+            self.require
         }
 
         fn synthetic_scope(
@@ -3910,6 +3956,97 @@ export { remote } from "pkg";
                 "{name}"
             );
         }
+    }
+
+    #[test]
+    fn commonjs_value_exports_are_not_lexical_names() {
+        let parsed =
+            parse_javascript_source_file("exports.hidden = 1; function read() { return hidden; }");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                FILE,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/export-scope.cjs\""),
+                    CanonicalSourceLanguage::JavaScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_javascript_declaration_slice(&parsed.arena, FILE)
+            .unwrap();
+        let source = BoundSource {
+            parsed,
+            bindings: binder.finish(),
+        };
+        let location = identifier_in(&source, "return hidden", "hidden");
+        let mut host = TestHost::for_source(&source);
+
+        assert_eq!(
+            resolve(&source, &mut host, location, "hidden", SymbolFlags::VALUE),
+            Ok(None)
+        );
+        assert_eq!(host.failed.last().unwrap().1.as_str(), "hidden");
+    }
+
+    #[test]
+    fn javascript_require_falls_back_to_the_validated_host_symbol() {
+        let parsed = parse_javascript_source_file("const marker = 1; require('pkg');");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                FILE,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/require-fallback.cjs\""),
+                    CanonicalSourceLanguage::JavaScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_javascript_declaration_slice(&parsed.arena, FILE)
+            .unwrap();
+        let source = BoundSource {
+            parsed,
+            bindings: binder.finish(),
+        };
+        let locals = bound(&source).locals(bound(&source).source_file()).unwrap();
+        let expected = table_symbol(&source, locals, "marker");
+        let location = identifier_in(&source, "require('pkg')", "require");
+        let mut host = TestHost::for_source(&source);
+        host.require = Some(expected);
+
+        assert_eq!(
+            resolve(&source, &mut host, location, "require", SymbolFlags::VALUE),
+            Ok(Some(expected))
+        );
+        assert!(host.failed.is_empty());
+        assert!(host.succeeded.is_empty());
+        assert_eq!(host.events.last(), Some(&"require"));
+
+        let mut foreign = SymbolStore::new();
+        let foreign_symbol = foreign
+            .alloc_symbol(SymbolData::new(
+                SymbolFlags::PROPERTY,
+                EscapedName::source("require"),
+            ))
+            .unwrap();
+        host.require = Some(foreign_symbol);
+        assert_eq!(
+            resolve(&source, &mut host, location, "require", SymbolFlags::VALUE),
+            Err(CanonicalNameResolutionError::InvalidHostSymbol(
+                foreign_symbol
+            ))
+        );
     }
 
     #[test]

@@ -3058,15 +3058,7 @@ impl CanonicalBinder {
         if is_binding_pattern(arena, name) {
             return Ok(());
         }
-        if facts.is_javascript_file()
-            && arena
-                .get(node)
-                .and_then(|node| match &node.data {
-                    NodeData::VariableDeclaration(variable) => variable.initializer,
-                    _ => None,
-                })
-                .is_some_and(|initializer| is_javascript_require_call(arena, initializer))
-        {
+        if facts.is_javascript_file() && is_javascript_require_alias(arena, node) {
             self.declare_symbol_and_add_to_symbol_table(
                 arena,
                 file,
@@ -4444,6 +4436,51 @@ fn is_javascript_require_call(arena: &NodeArena, node: NodeId) -> bool {
             .get(call.expression)
             .is_some_and(|expression| expression.kind == SyntaxKind::Identifier)
         && node_text(arena, call.expression).as_deref() == Some("require")
+}
+
+fn is_javascript_require_alias(arena: &NodeArena, node: NodeId) -> bool {
+    let declaration = if arena
+        .get(node)
+        .is_some_and(|node| node.kind == SyntaxKind::BindingElement)
+    {
+        let Some(pattern) = arena.get(node).and_then(|node| node.parent) else {
+            return false;
+        };
+        let Some(declaration) = arena.get(pattern).and_then(|pattern| pattern.parent) else {
+            return false;
+        };
+        declaration
+    } else {
+        node
+    };
+    let Some(NodeData::VariableDeclaration(variable)) =
+        arena.get(declaration).map(|node| &node.data)
+    else {
+        return false;
+    };
+    if variable.type_.is_some()
+        || has_combined_modifier(arena, declaration, SyntaxKind::ExportKeyword)
+        || has_javascript_type_annotation(arena, declaration)
+    {
+        return false;
+    }
+    let Some(initializer) = variable.initializer else {
+        return false;
+    };
+    if !is_javascript_require_call(arena, initializer) {
+        return false;
+    }
+    matches!(
+        arena
+            .get(initializer)
+            .and_then(|node| match &node.data {
+                NodeData::CallExpression(call) => call.arguments.nodes.first().copied(),
+                _ => None,
+            })
+            .and_then(|argument| arena.get(argument))
+            .map(|argument| argument.kind),
+        Some(SyntaxKind::StringLiteral | SyntaxKind::NoSubstitutionTemplateLiteral)
+    )
 }
 
 fn has_javascript_type_annotation(arena: &NodeArena, declaration: NodeId) -> bool {
@@ -9466,6 +9503,16 @@ Merged.fresh = 1;
             (
                 "const dependency = require(first);",
                 true,
+                SymbolFlags::BLOCK_SCOPED_VARIABLE,
+            ),
+            (
+                "const dependency = require('pkg');",
+                true,
+                SymbolFlags::ALIAS,
+            ),
+            (
+                "const dependency = require(`pkg`);",
+                true,
                 SymbolFlags::ALIAS,
             ),
         ]
@@ -9511,6 +9558,97 @@ Merged.fresh = 1;
             );
             assert_eq!(locals.get_source("module").is_some(), expected_commonjs);
             assert_eq!(locals.get_source("exports").is_some(), expected_commonjs);
+        }
+    }
+
+    #[test]
+    fn javascript_require_aliases_reject_annotations_and_exported_declarations() {
+        for (index, (source, module_state, expected_flags)) in [
+            (
+                "/** @type {object} */ const dependency = require('pkg');",
+                CanonicalModuleState::Script,
+                SymbolFlags::BLOCK_SCOPED_VARIABLE,
+            ),
+            (
+                "export const dependency = require('pkg');",
+                CanonicalModuleState::External,
+                SymbolFlags::BLOCK_SCOPED_VARIABLE,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let parsed = parse_javascript_source_file(source);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let file = FileId::new(96 + u32::try_from(index).unwrap());
+            let mut binder = CanonicalBinder::new();
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new(
+                        EscapedName::source("\"/project/require-alias.js\""),
+                        CanonicalSourceLanguage::JavaScript,
+                        false,
+                        module_state,
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_javascript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+
+            let bound = binder.file(file).unwrap();
+            let declaration = nodes_of_kind(&parsed.arena, SyntaxKind::VariableDeclaration)[0];
+            let symbol = bound
+                .symbol(node_ref(&parsed.arena, file, declaration))
+                .unwrap();
+            assert_eq!(
+                binder.symbol_store().symbol(symbol).unwrap().flags(),
+                expected_flags,
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn javascript_destructured_literal_requires_bind_each_element_as_an_alias() {
+        let parsed =
+            parse_javascript_source_file("const { direct, renamed: local } = require('pkg');");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(98);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/require-pattern.js\""),
+                    CanonicalSourceLanguage::JavaScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_javascript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+
+        let bound = binder.file(file).unwrap();
+        assert!(bound.source_facts().unwrap().is_common_js_module());
+        let locals = binder
+            .symbol_store()
+            .symbol_table(bound.locals(bound.source_file()).unwrap())
+            .unwrap();
+        for name in ["direct", "local"] {
+            let symbol = locals.get_source(name).unwrap();
+            assert_eq!(
+                binder.symbol_store().symbol(symbol).unwrap().flags(),
+                SymbolFlags::ALIAS,
+                "{name}"
+            );
         }
     }
 
