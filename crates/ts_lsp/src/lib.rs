@@ -3356,12 +3356,17 @@ fn file_name_from_uri(uri: &DocumentUri) -> String {
     let Some(encoded_path) = uri.0.strip_prefix("file://") else {
         return format!("/__lsp/{}.ts", stable_hash(uri.0.as_bytes()));
     };
+    let encoded_path = encoded_path.split(['?', '#']).next().unwrap_or_default();
     let path = percent_decode(encoded_path).unwrap_or_else(|| encoded_path.to_owned());
-    if path.as_bytes().get(2) == Some(&b':') && path.starts_with('/') {
-        path[1..].to_owned()
-    } else {
-        path
+    if !path.starts_with('/') {
+        return format!("//{path}");
     }
+    if path.as_bytes().get(2) != Some(&b':') || !path.as_bytes()[1].is_ascii_alphabetic() {
+        return path;
+    }
+    let mut path = path[1..].to_owned();
+    path[..1].make_ascii_lowercase();
+    path
 }
 
 fn percent_decode(value: &str) -> Option<String> {
@@ -3727,6 +3732,23 @@ mod tests {
             .map(|message| serde_json::to_value(message).unwrap())
             .find(|message| message["params"]["uri"] == uri)
             .unwrap()
+    }
+
+    #[test]
+    fn file_document_uris_preserve_network_paths_and_decode_local_paths() {
+        for (uri, expected) in [
+            ("file:///workspace/main.ts", "/workspace/main.ts"),
+            ("file://server/share/main.ts", "//server/share/main.ts"),
+            (
+                "file://shares/code/c%23/main.ts",
+                "//shares/code/c#/main.ts",
+            ),
+            ("file:///D%3A/work/main.ts", "d:/work/main.ts"),
+            ("file:///workspace/main.ts#section", "/workspace/main.ts"),
+            ("file:///workspace/a%3Fb.ts?version=1", "/workspace/a?b.ts"),
+        ] {
+            assert_eq!(file_name_from_uri(&DocumentUri(uri.to_owned())), expected);
+        }
     }
 
     #[test]
@@ -4213,6 +4235,35 @@ mod tests {
         assert_eq!(response(13)["result"]["uri"], main_uri.0);
         assert_eq!(response(13)["result"]["range"]["start"]["line"], 1);
         assert!(response(14)["result"].is_null());
+    }
+
+    #[test]
+    fn cross_file_definitions_resolve_network_file_uris() {
+        let dependency_uri = DocumentUri("file://server/share/dep.ts".to_owned());
+        let main_uri = DocumentUri("file://server/share/main.ts".to_owned());
+        let source = "import { value } from './dep'; value;";
+        let mut input = begin_framed_session();
+        write_open(
+            &mut input,
+            dependency_uri.clone(),
+            "export const value = 1;",
+        );
+        write_open(&mut input, main_uri.clone(), source);
+        write_position_request(
+            &mut input,
+            15,
+            "textDocument/definition",
+            main_uri,
+            position_at(
+                source,
+                u32::try_from(source.rfind("value").unwrap()).unwrap(),
+            ),
+        );
+
+        let output = finish_framed_session(input);
+        let response = output.iter().find(|message| message["id"] == 15).unwrap();
+        assert_eq!(response["result"]["uri"], dependency_uri.0);
+        assert_eq!(response["result"]["range"]["start"]["line"], 0);
     }
 
     #[test]
