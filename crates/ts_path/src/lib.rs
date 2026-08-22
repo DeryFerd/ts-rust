@@ -297,6 +297,74 @@ pub fn resolve_path(first: &str, paths: &[&str]) -> String {
     normalize_path(&combine_paths(first, paths))
 }
 
+/// Returns the path from `directory` to `target` using filesystem case rules.
+/// Paths on different roots remain absolute.
+#[must_use]
+pub fn relative_path_from_directory(
+    directory: &str,
+    target: &str,
+    case_sensitivity: CaseSensitivity,
+) -> String {
+    let directory = normalize_path(directory);
+    let target = normalize_path(target);
+    let directory_root = root_length(&directory);
+    let target_root = root_length(&target);
+    if !directory[..directory_root].eq_ignore_ascii_case(&target[..target_root]) {
+        return path_from_components(
+            &target[..target_root],
+            &path_components(&target, target_root),
+        );
+    }
+
+    let directory_components = path_components(&directory, directory_root);
+    let target_components = path_components(&target, target_root);
+    let common = directory_components
+        .iter()
+        .zip(&target_components)
+        .take_while(|(left, right)| {
+            canonical_file_name(left, case_sensitivity)
+                == canonical_file_name(right, case_sensitivity)
+        })
+        .count();
+    let mut parts = vec![".."; directory_components.len().saturating_sub(common)];
+    parts.extend(target_components[common..].iter().copied());
+    parts.join("/")
+}
+
+/// Returns a source-map path, converting an unrelated disk root into a file URL.
+#[must_use]
+pub fn relative_path_to_directory_or_url(
+    directory: &str,
+    target: &str,
+    case_sensitivity: CaseSensitivity,
+) -> String {
+    let relative = relative_path_from_directory(directory, target, case_sensitivity);
+    if !is_rooted_disk_path(&relative) {
+        return relative;
+    }
+    if relative.starts_with('/') {
+        format!("file://{relative}")
+    } else {
+        format!("file:///{relative}")
+    }
+}
+
+fn path_components(path: &str, root_len: usize) -> Vec<&str> {
+    path[root_len..]
+        .split('/')
+        .filter(|component| !component.is_empty())
+        .collect()
+}
+
+fn path_from_components(root: &str, components: &[&str]) -> String {
+    if root.is_empty() {
+        return components.join("/");
+    }
+    let mut result = ensure_trailing_directory_separator(root);
+    result.push_str(&components.join("/"));
+    result
+}
+
 #[must_use]
 pub fn canonicalize(
     path: &str,
@@ -557,6 +625,82 @@ mod tests {
         assert_eq!(
             canonical_file_name("/SRC/CAF\u{00c9}/\u{0130}.ts", CaseSensitivity::Insensitive),
             "/src/caf\u{00e9}/\u{0130}.ts"
+        );
+    }
+
+    #[test]
+    fn computes_relative_paths_with_root_and_case_identity() {
+        assert_eq!(
+            relative_path_from_directory(
+                "/project/testfiles",
+                "/project/testFiles/app.ts",
+                CaseSensitivity::Insensitive,
+            ),
+            "app.ts"
+        );
+        assert_eq!(
+            relative_path_from_directory(
+                "/project/testfiles",
+                "/project/testFiles/app.ts",
+                CaseSensitivity::Sensitive,
+            ),
+            "../testFiles/app.ts"
+        );
+        assert_eq!(
+            relative_path_from_directory("/a/b/c", "/a/b", CaseSensitivity::Sensitive),
+            ".."
+        );
+        assert_eq!(
+            relative_path_from_directory("/a/b", "/a/b", CaseSensitivity::Sensitive),
+            ""
+        );
+        assert_eq!(
+            relative_path_from_directory("C:/work", "D:/src/a.ts", CaseSensitivity::Sensitive),
+            "D:/src/a.ts"
+        );
+        assert_eq!(
+            relative_path_from_directory(
+                "//server/share",
+                "//other/share/a.ts",
+                CaseSensitivity::Sensitive,
+            ),
+            "//other/share/a.ts"
+        );
+        assert_eq!(
+            relative_path_from_directory(
+                "file:///src/lib",
+                "file:///src/main.ts",
+                CaseSensitivity::Sensitive,
+            ),
+            "../main.ts"
+        );
+    }
+
+    #[test]
+    fn converts_unrelated_source_map_disk_roots_to_file_urls() {
+        assert_eq!(
+            relative_path_to_directory_or_url(
+                "C:/build",
+                "D:/src/main.ts",
+                CaseSensitivity::Insensitive,
+            ),
+            "file:///D:/src/main.ts"
+        );
+        assert_eq!(
+            relative_path_to_directory_or_url(
+                "/build",
+                "//server/share/main.ts",
+                CaseSensitivity::Sensitive,
+            ),
+            "file:////server/share/main.ts"
+        );
+        assert_eq!(
+            relative_path_to_directory_or_url(
+                "/project/dist",
+                "/project/src/main.ts",
+                CaseSensitivity::Sensitive,
+            ),
+            "../src/main.ts"
         );
     }
 

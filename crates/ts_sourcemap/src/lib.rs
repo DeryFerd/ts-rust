@@ -29,14 +29,17 @@ impl Error for MappingOrderError {}
 #[derive(Clone, Debug, Default)]
 pub struct SourceMapBuilder {
     mappings: String,
+    names: Vec<String>,
     generated_line: u32,
     generated_column: u32,
     previous_source: i64,
     previous_original_line: i64,
     previous_original_column: i64,
+    previous_name: i64,
     has_segment_on_line: bool,
     has_mapping: bool,
     previous_mapping_has_source: bool,
+    previous_mapping_name: Option<u32>,
     pending: Option<PendingMapping>,
 }
 
@@ -52,6 +55,7 @@ struct SourcePosition {
     source: u32,
     original_line: u32,
     original_column: u32,
+    name: Option<u32>,
 }
 
 impl SourceMapBuilder {
@@ -59,16 +63,30 @@ impl SourceMapBuilder {
     pub const fn new() -> Self {
         Self {
             mappings: String::new(),
+            names: Vec::new(),
             generated_line: 0,
             generated_column: 0,
             previous_source: 0,
             previous_original_line: 0,
             previous_original_column: 0,
+            previous_name: 0,
             has_segment_on_line: false,
             has_mapping: false,
             previous_mapping_has_source: false,
+            previous_mapping_name: None,
             pending: None,
         }
+    }
+
+    /// Registers a source-map name and returns its stable index.
+    pub fn add_name(&mut self, name: &str) -> u32 {
+        if let Some(index) = self.names.iter().position(|existing| existing == name) {
+            return u32::try_from(index).expect("source-map name index exceeds u32::MAX");
+        }
+        let index =
+            u32::try_from(self.names.len()).expect("source-map name count exceeds u32::MAX");
+        self.names.push(name.to_owned());
+        index
     }
 
     /// Adds a generated position that does not identify an original source.
@@ -106,6 +124,39 @@ impl SourceMapBuilder {
                 source,
                 original_line,
                 original_column,
+                name: None,
+            }),
+        )
+    }
+
+    /// Adds a source mapping that also identifies a registered source-map name.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unknown name index or non-monotonic generated positions.
+    pub fn add_named_mapping(
+        &mut self,
+        generated_line: u32,
+        generated_column: u32,
+        source: u32,
+        original_line: u32,
+        original_column: u32,
+        name: u32,
+    ) -> Result<(), MappingOrderError> {
+        if usize::try_from(name)
+            .ok()
+            .is_none_or(|index| index >= self.names.len())
+        {
+            return Err(MappingOrderError);
+        }
+        self.add_pending_mapping(
+            generated_line,
+            generated_column,
+            Some(SourcePosition {
+                source,
+                original_line,
+                original_column,
+                name: Some(name),
             }),
         )
     }
@@ -138,11 +189,12 @@ impl SourceMapBuilder {
             if changed_position || backtracked_source {
                 self.commit_pending_mapping();
             } else {
-                if let Some(source) = source {
-                    self.pending
-                        .as_mut()
-                        .expect("pending mapping exists")
-                        .source = Some(source);
+                if let Some(mut source) = source {
+                    let pending = self.pending.as_mut().expect("pending mapping exists");
+                    if source.name.is_none() {
+                        source.name = pending.source.and_then(|position| position.name);
+                    }
+                    pending.source = Some(source);
                 }
                 return Ok(());
             }
@@ -170,6 +222,7 @@ impl SourceMapBuilder {
                         && i64::from(source.source) == self.previous_source
                         && i64::from(source.original_line) == self.previous_original_line
                         && i64::from(source.original_column) == self.previous_original_column
+                        && source.name == self.previous_mapping_name
                 }
             };
         if duplicates_previous {
@@ -202,6 +255,10 @@ impl SourceMapBuilder {
                 i64::from(source.original_column) - self.previous_original_column,
                 &mut self.mappings,
             );
+            if let Some(name) = source.name {
+                encode_vlq(i64::from(name) - self.previous_name, &mut self.mappings);
+                self.previous_name = i64::from(name);
+            }
             self.previous_source = i64::from(source.source);
             self.previous_original_line = i64::from(source.original_line);
             self.previous_original_column = i64::from(source.original_column);
@@ -210,6 +267,7 @@ impl SourceMapBuilder {
         self.has_segment_on_line = true;
         self.has_mapping = true;
         self.previous_mapping_has_source = pending.source.is_some();
+        self.previous_mapping_name = pending.source.and_then(|source| source.name);
     }
 
     /// Appends delta-encoded mappings at a generated-line and source-index offset.
@@ -226,6 +284,7 @@ impl SourceMapBuilder {
         let mut source = 0_i64;
         let mut original_line = 0_i64;
         let mut original_column = 0_i64;
+        let mut name = 0_i64;
         for (line_index, line) in mappings.split(';').enumerate() {
             let mut generated_column = 0_i64;
             for segment in line.split(',').filter(|segment| !segment.is_empty()) {
@@ -254,13 +313,31 @@ impl SourceMapBuilder {
                         let source_index = i64::from(source_offset)
                             .checked_add(source)
                             .ok_or(MappingOrderError)?;
-                        self.add_mapping(
-                            generated_line,
-                            generated_column,
-                            u32::try_from(source_index).map_err(|_| MappingOrderError)?,
-                            u32::try_from(original_line).map_err(|_| MappingOrderError)?,
-                            u32::try_from(original_column).map_err(|_| MappingOrderError)?,
-                        )?;
+                        let source_index =
+                            u32::try_from(source_index).map_err(|_| MappingOrderError)?;
+                        let original_line =
+                            u32::try_from(original_line).map_err(|_| MappingOrderError)?;
+                        let original_column =
+                            u32::try_from(original_column).map_err(|_| MappingOrderError)?;
+                        if let Some(name_delta) = values.get(4) {
+                            name = name.checked_add(*name_delta).ok_or(MappingOrderError)?;
+                            self.add_named_mapping(
+                                generated_line,
+                                generated_column,
+                                source_index,
+                                original_line,
+                                original_column,
+                                u32::try_from(name).map_err(|_| MappingOrderError)?,
+                            )?;
+                        } else {
+                            self.add_mapping(
+                                generated_line,
+                                generated_column,
+                                source_index,
+                                original_line,
+                                original_column,
+                            )?;
+                        }
                     }
                     _ => return Err(MappingOrderError),
                 }
@@ -276,7 +353,7 @@ impl SourceMapBuilder {
             version: 3,
             file,
             sources,
-            names: Vec::new(),
+            names: self.names,
             mappings: self.mappings,
             sources_content: None,
         }
@@ -367,6 +444,48 @@ mod tests {
         builder.append_mappings("AAAA,IAAI;AACJ", 2, 3).unwrap();
         let map = builder.finish(None, vec![]);
         assert_eq!(map.mappings, ";;AGAA,IAAI;AACJ");
+    }
+
+    #[test]
+    fn registers_and_emits_named_source_mappings() {
+        let mut builder = SourceMapBuilder::new();
+        let first = builder.add_name("foo");
+        let second = builder.add_name("bar");
+        assert_eq!(first, 0);
+        assert_eq!(second, 1);
+        assert_eq!(builder.add_name("foo"), first);
+
+        builder.add_named_mapping(0, 0, 0, 0, 0, second).unwrap();
+        builder.add_named_mapping(0, 1, 0, 0, 0, first).unwrap();
+        let map = builder.finish(None, vec!["input.ts".into()]);
+
+        assert_eq!(map.names, ["foo", "bar"]);
+        assert_eq!(map.mappings, "AAAAC,CAAAD");
+    }
+
+    #[test]
+    fn appends_named_segments_with_registered_names() {
+        let mut builder = SourceMapBuilder::new();
+        builder.add_name("first");
+        builder.add_name("second");
+        builder.append_mappings("AAAAC,CAAAD", 2, 3).unwrap();
+
+        let map = builder.finish(None, Vec::new());
+        assert_eq!(map.names, ["first", "second"]);
+        assert_eq!(map.mappings, ";;AGAAC,CAAAD");
+    }
+
+    #[test]
+    fn rejects_unregistered_source_map_names() {
+        let mut builder = SourceMapBuilder::new();
+        assert_eq!(
+            builder.add_named_mapping(0, 0, 0, 0, 0, 0),
+            Err(MappingOrderError)
+        );
+        assert_eq!(
+            builder.append_mappings("AAAAA", 0, 0),
+            Err(MappingOrderError)
+        );
     }
 
     #[test]
