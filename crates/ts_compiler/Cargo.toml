@@ -21,6 +21,7 @@ ts_outputpaths = { path = "../ts_outputpaths" }
 ts_parser = { path = "../ts_parser" }
 ts_path = { path = "../ts_path" }
 ts_printer = { path = "../ts_printer" }
+ts_scanner = { path = "../ts_scanner" }
 ts_sourcemap = { path = "../ts_sourcemap" }
 ts_vfs = { path = "../ts_vfs" }
 

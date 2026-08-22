@@ -557,10 +557,17 @@ impl CanonicalCheckerContext<'_> {
         else {
             return Ok(None);
         };
-        self.store()
-            .symbol(symbol)
-            .map(|_| Some(symbol))
-            .ok_or(CanonicalArtifactQueryError::InvalidSymbol { node, symbol })
+        if self.store().symbol(symbol).is_none() {
+            return Err(CanonicalArtifactQueryError::InvalidSymbol { node, symbol });
+        }
+        if self
+            .store()
+            .intrinsic_bootstrap()
+            .is_some_and(|bootstrap| symbol == bootstrap.unknown_symbol)
+        {
+            return Ok(None);
+        }
+        Ok(Some(symbol))
     }
 
     fn merged_artifact_symbol(
@@ -677,7 +684,29 @@ impl CanonicalCheckerContext<'_> {
             .value_symbol_links(symbol)
             .and_then(|links| links.resolved_type)
         {
-            return self.validate_artifact_type(node, type_).map(Some);
+            let type_ = self.validate_artifact_type(node, type_)?;
+            if !flags.contains(SymbolFlags::PROPERTY | SymbolFlags::OPTIONAL)
+                || !self.options().intrinsic.strict_null_checks
+            {
+                return Ok(Some(type_));
+            }
+
+            let sentinel = self
+                .store()
+                .intrinsic_bootstrap()
+                .ok_or(CanonicalArtifactQueryError::InvalidType { node, type_ })?
+                .undefined_or_missing_type;
+            if type_ == sentinel
+                || matches!(
+                    self.store().type_payload(type_).map(TypeRecord::data),
+                    Some(TypeData::Union(union)) if union.union.types.contains(&sentinel)
+                )
+            {
+                return Ok(Some(type_));
+            }
+
+            let read_type = self.artifact_union_type(&[type_, sentinel])?;
+            return self.validate_artifact_type(node, read_type).map(Some);
         }
 
         if flags.intersects(SymbolFlags::PROPERTY)
@@ -992,7 +1021,7 @@ fn supports_symbol_location(data: &NodeData) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use ts_ast::{FileId, NodeData, NodeRef};
+    use ts_ast::{FileId, NodeData, NodeRef, SyntaxKind};
     use ts_binder::{
         CanonicalBinder, CanonicalModuleState, CanonicalSourceFileFacts, CanonicalSourceLanguage,
         EscapedName,
@@ -1000,9 +1029,17 @@ mod tests {
     use ts_parser::{ParseResult, parse_source_file};
 
     use super::CanonicalCheckerContext;
-    use crate::semantic::CanonicalCheckerOptions;
+    use crate::semantic::{CanonicalCheckerOptions, IntrinsicBootstrapOptions, TypeData};
 
     fn context(parsed: &ParseResult, file: FileId) -> CanonicalCheckerContext<'_> {
+        context_with_options(parsed, file, CanonicalCheckerOptions::default())
+    }
+
+    fn context_with_options(
+        parsed: &ParseResult,
+        file: FileId,
+        options: CanonicalCheckerOptions,
+    ) -> CanonicalCheckerContext<'_> {
         let mut binder = CanonicalBinder::new();
         binder
             .bind_source_file_with_facts(
@@ -1020,12 +1057,7 @@ mod tests {
         binder
             .bind_typescript_declaration_slice(&parsed.arena, file)
             .unwrap();
-        CanonicalCheckerContext::new(
-            binder.finish(),
-            vec![(file, &parsed.arena)],
-            CanonicalCheckerOptions::default(),
-        )
-        .unwrap()
+        CanonicalCheckerContext::new(binder.finish(), vec![(file, &parsed.arena)], options).unwrap()
     }
 
     #[test]
@@ -1192,5 +1224,160 @@ mod tests {
                     .undefined_symbol
             )
         );
+    }
+
+    #[test]
+    fn unresolved_names_hide_unknown_symbols_but_keep_their_error_types() {
+        let parsed = parse_source_file("const first = missing; const second = absent;");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(6_007);
+        let mut context = context(&parsed, file);
+        context.check_source_file(file).unwrap();
+        let (unknown, error_type) = {
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            (bootstrap.unknown_symbol, bootstrap.error_type)
+        };
+
+        let unresolved = parsed
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                matches!(
+                    &record.data,
+                    NodeData::Identifier(identifier)
+                        if matches!(identifier.text.as_str(), "missing" | "absent")
+                )
+                .then_some(NodeRef::new(parsed.arena.id(), file, node))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(unresolved.len(), 2);
+        assert_eq!(
+            context
+                .diagnostics()
+                .as_slice()
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.code())
+                .collect::<Vec<_>>(),
+            [2304, 2304]
+        );
+
+        for node in unresolved {
+            assert_eq!(
+                context
+                    .store()
+                    .symbol_node_links(node)
+                    .and_then(|links| links.resolved_symbol),
+                Some(unknown)
+            );
+            assert_eq!(context.get_symbol_at_location(node).unwrap(), None);
+            assert_eq!(context.get_type_at_location(node).unwrap(), error_type);
+            assert_eq!(
+                context
+                    .store()
+                    .symbol_node_links(node)
+                    .and_then(|links| links.resolved_symbol),
+                Some(unknown)
+            );
+        }
+    }
+
+    #[test]
+    fn optional_property_queries_build_read_unions_without_changing_write_types() {
+        let parsed = parse_source_file(concat!(
+            "declare function accept(input: { value?: string }): void;\n",
+            "accept({ value: undefined });\n",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+
+        for (index, (strict_null_checks, exact_optional_property_types)) in
+            [(true, true), (true, false), (false, false)]
+                .into_iter()
+                .enumerate()
+        {
+            let file = FileId::new(6_004 + u32::try_from(index).unwrap());
+            let mut context = context_with_options(
+                &parsed,
+                file,
+                CanonicalCheckerOptions {
+                    intrinsic: IntrinsicBootstrapOptions {
+                        strict_null_checks,
+                        exact_optional_property_types,
+                    },
+                    ..CanonicalCheckerOptions::default()
+                },
+            );
+            context.check_source_file(file).unwrap();
+            let (declaration, name) = parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    let NodeData::PropertyDeclaration(property) = &record.data else {
+                        return None;
+                    };
+                    let question = property.postfix_token?;
+                    (parsed.arena.get(question)?.kind == SyntaxKind::QuestionToken).then_some((
+                        NodeRef::new(parsed.arena.id(), file, node),
+                        NodeRef::new(parsed.arena.id(), file, property.name),
+                    ))
+                })
+                .unwrap();
+            let symbol = context.file(file).unwrap().1.symbol(declaration).unwrap();
+            let write_type = context
+                .store()
+                .value_symbol_links(symbol)
+                .and_then(|links| links.resolved_type)
+                .unwrap();
+            let (string, sentinel) = {
+                let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+                (bootstrap.string_type, bootstrap.undefined_or_missing_type)
+            };
+            assert_eq!(write_type, string);
+
+            let read_type = context.get_type_at_location(name).unwrap();
+            if strict_null_checks {
+                let TypeData::Union(union) =
+                    context.store().type_payload(read_type).unwrap().data()
+                else {
+                    panic!("strict optional properties must have a canonical read union")
+                };
+                assert_eq!(union.union.types.len(), 2);
+                assert!(union.union.types.contains(&string));
+                assert!(union.union.types.contains(&sentinel));
+                assert_eq!(
+                    context.type_to_string(read_type).unwrap(),
+                    "string | undefined"
+                );
+            } else {
+                assert_eq!(read_type, write_type);
+            }
+            assert_eq!(
+                context
+                    .store()
+                    .value_symbol_links(symbol)
+                    .and_then(|links| links.resolved_type),
+                Some(write_type)
+            );
+
+            let warm_counts = (
+                context.store().type_len(),
+                context
+                    .store()
+                    .intrinsic_bootstrap()
+                    .unwrap()
+                    .union_cache_len(),
+            );
+            assert_eq!(context.get_type_at_location(name).unwrap(), read_type);
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context
+                        .store()
+                        .intrinsic_bootstrap()
+                        .unwrap()
+                        .union_cache_len(),
+                ),
+                warm_counts
+            );
+        }
     }
 }

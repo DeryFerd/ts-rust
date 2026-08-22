@@ -26,6 +26,7 @@ use super::{
     UnsupportedSourceSyntax, ValueSymbolLinks,
     callable_sets::{StoredCallableSetValidation, validate_stored_callable_set},
     formatter::{get_type_names_for_assignability_error, type_to_string},
+    production::CanonicalJsxRuntimeEvidence,
     signatures::SignatureFlags,
     source::merge_retry_diagnostic,
     spelling::get_spelling_suggestion,
@@ -200,6 +201,196 @@ impl CanonicalTypeMapperStore {
         let namespace = resolve_jsx_namespace(self, host, options, diagnostics, expression)?;
         execute_jsx_element(self, arena, bound, &namespace, &plan, options, diagnostics)
     }
+}
+
+pub(super) fn source_jsx_runtime_diagnostics(
+    store: &CanonicalTypeMapperStore,
+    arena: &NodeArena,
+    bound: &BoundFile,
+    runtime: CanonicalJsxRuntimeEvidence<'_>,
+) -> Result<CanonicalCheckerDiagnostics, SourceCheckError> {
+    let mut diagnostics = CanonicalCheckerDiagnostics::default();
+    match runtime {
+        CanonicalJsxRuntimeEvidence::Preserve => {}
+        CanonicalJsxRuntimeEvidence::Classic {
+            factory_namespace,
+            fragment_factory_namespace,
+            fragment_factory_required,
+            fragment_factory_pragma_required,
+        } => {
+            if factory_namespace.is_empty() || fragment_factory_namespace.is_empty() {
+                return Err(unsupported(bound.source_file(), SyntaxKind::SourceFile));
+            }
+            let mut openings = arena
+                .iter()
+                .filter_map(|(node, record)| {
+                    let (location, fragment) = match &record.data {
+                        NodeData::JsxOpeningElement(element)
+                            if record.kind == SyntaxKind::JsxOpeningElement =>
+                        {
+                            (element.tag_name, None)
+                        }
+                        NodeData::JsxSelfClosingElement(element)
+                            if record.kind == SyntaxKind::JsxSelfClosingElement =>
+                        {
+                            (element.tag_name, None)
+                        }
+                        NodeData::JsxFragment(fragment)
+                            if record.kind == SyntaxKind::JsxFragment =>
+                        {
+                            (fragment.opening_fragment, Some(node))
+                        }
+                        _ => return None,
+                    };
+                    Some((
+                        record.range.start,
+                        NodeRef::new(arena.id(), bound.file_id(), location),
+                        fragment
+                            .map(|fragment| NodeRef::new(arena.id(), bound.file_id(), fragment)),
+                    ))
+                })
+                .collect::<Vec<_>>();
+            openings.sort_by_key(|(position, _, _)| *position);
+
+            let mut fragment_factory_checked = false;
+            for (_, location, fragment) in openings {
+                let Some(fragment) = fragment else {
+                    if !jsx_factory_is_in_scope_at(store, arena, bound, location, factory_namespace)
+                    {
+                        add_diagnostic(&mut diagnostics, location, 2874, [factory_namespace])?;
+                    }
+                    continue;
+                };
+
+                let missing_fragment_factory = fragment_factory_namespace != "null"
+                    && !jsx_factory_is_in_scope_at(
+                        store,
+                        arena,
+                        bound,
+                        location,
+                        fragment_factory_namespace,
+                    );
+                if missing_fragment_factory {
+                    add_diagnostic(
+                        &mut diagnostics,
+                        location,
+                        2874,
+                        [fragment_factory_namespace],
+                    )?;
+                }
+                if factory_namespace != fragment_factory_namespace
+                    && !jsx_factory_is_in_scope_at(store, arena, bound, location, factory_namespace)
+                {
+                    add_diagnostic(&mut diagnostics, location, 2874, [factory_namespace])?;
+                }
+                if !fragment_factory_checked && missing_fragment_factory {
+                    add_diagnostic(
+                        &mut diagnostics,
+                        location,
+                        2879,
+                        [fragment_factory_namespace],
+                    )?;
+                }
+                fragment_factory_checked = true;
+
+                if fragment_factory_required || fragment_factory_pragma_required {
+                    add_diagnostic(
+                        &mut diagnostics,
+                        fragment,
+                        if fragment_factory_required {
+                            17_016
+                        } else {
+                            17_017
+                        },
+                        std::iter::empty::<&str>(),
+                    )?;
+                }
+            }
+        }
+        CanonicalJsxRuntimeEvidence::Automatic {
+            module_specifier,
+            resolved_module,
+        } => {
+            if module_specifier.is_empty() {
+                return Err(unsupported(bound.source_file(), SyntaxKind::SourceFile));
+            }
+            if let Some(module) = resolved_module {
+                let record = store
+                    .symbol(module)
+                    .ok_or(SourceCheckError::Import(bound.source_file()))?;
+                if !record.flags().intersects(SymbolFlags::MODULE) {
+                    return Err(SourceCheckError::Import(bound.source_file()));
+                }
+            } else if let Some((_, expression)) = arena
+                .iter()
+                .filter_map(|(node, record)| {
+                    let location = match &record.data {
+                        NodeData::JsxElement(_) if record.kind == SyntaxKind::JsxElement => node,
+                        NodeData::JsxSelfClosingElement(_)
+                            if record.kind == SyntaxKind::JsxSelfClosingElement =>
+                        {
+                            node
+                        }
+                        NodeData::JsxFragment(fragment)
+                            if record.kind == SyntaxKind::JsxFragment =>
+                        {
+                            fragment.opening_fragment
+                        }
+                        _ => return None,
+                    };
+                    Some((
+                        record.range.start,
+                        NodeRef::new(arena.id(), bound.file_id(), location),
+                    ))
+                })
+                .min_by_key(|(position, _)| *position)
+            {
+                add_diagnostic(&mut diagnostics, expression, 2875, [module_specifier])?;
+            }
+        }
+    }
+    Ok(diagnostics)
+}
+
+fn jsx_factory_is_in_scope_at(
+    store: &CanonicalTypeMapperStore,
+    arena: &NodeArena,
+    bound: &BoundFile,
+    location: NodeRef,
+    namespace: &str,
+) -> bool {
+    let mut current = Some(location);
+    while let Some(node) = current {
+        if bound
+            .locals(node)
+            .and_then(|locals| store.symbol_table(locals))
+            .and_then(|locals| locals.get_source(namespace))
+            .and_then(|symbol| store.get_merged_symbol(symbol))
+            .and_then(|symbol| store.symbol(symbol))
+            .is_some_and(|symbol| {
+                symbol
+                    .flags()
+                    .intersects(SymbolFlags::VALUE | SymbolFlags::ALIAS)
+            })
+        {
+            return true;
+        }
+        current = arena
+            .get(node.node)
+            .and_then(|record| record.parent)
+            .map(|parent| NodeRef::new(node.arena, node.file, parent));
+    }
+    store
+        .intrinsic_bootstrap()
+        .and_then(|bootstrap| store.symbol_table(bootstrap.globals))
+        .and_then(|globals| globals.get_source(namespace))
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+        .and_then(|symbol| store.symbol(symbol))
+        .is_some_and(|symbol| {
+            symbol
+                .flags()
+                .intersects(SymbolFlags::VALUE | SymbolFlags::ALIAS)
+        })
 }
 
 #[allow(clippy::too_many_lines)] // Keep the three parser-owned JSX node forms together.
@@ -2266,4 +2457,615 @@ fn unsupported(node: NodeRef, kind: SyntaxKind) -> SourceCheckError {
         kind,
         role: SourceSyntaxRole::VariableInitializer,
     })
+}
+
+#[cfg(test)]
+mod runtime_tests {
+    use ts_ast::FileId;
+    use ts_binder::{
+        CanonicalBinder, CanonicalModuleState, CanonicalSourceFileFacts, CanonicalSourceLanguage,
+        EscapedName,
+    };
+    use ts_parser::{ParseResult, parse_jsx_source_file};
+
+    use super::*;
+    use crate::semantic::{IntrinsicBootstrapOptions, production::CanonicalJsxRuntime};
+
+    struct RuntimeFixture {
+        parsed: ParseResult,
+        file: FileId,
+        bound: BoundFile,
+        store: CanonicalTypeMapperStore,
+    }
+
+    impl RuntimeFixture {
+        fn new(source: &str, file: FileId) -> Self {
+            let parsed = parse_jsx_source_file(source);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let mut binder = CanonicalBinder::new();
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new(
+                        EscapedName::source("\"/project/runtime.tsx\""),
+                        CanonicalSourceLanguage::TypeScript,
+                        false,
+                        CanonicalModuleState::Script,
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+            let (symbols, mut files) = binder.finish().try_into_parts().unwrap();
+            let bound = files.remove(&file).unwrap();
+            let mut store = CanonicalTypeMapperStore::from_symbol_store(symbols);
+            store
+                .register_source_file(&parsed.arena, parsed.source_file, file)
+                .unwrap();
+            store
+                .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions::default())
+                .unwrap();
+            Self {
+                parsed,
+                file,
+                bound,
+                store,
+            }
+        }
+
+        fn expression(&self, name: &str) -> NodeRef {
+            self.parsed
+                .arena
+                .iter()
+                .find_map(|(_, record)| {
+                    let NodeData::VariableDeclaration(variable) = &record.data else {
+                        return None;
+                    };
+                    let NodeData::Identifier(identifier) =
+                        &self.parsed.arena.get(variable.name)?.data
+                    else {
+                        return None;
+                    };
+                    (identifier.text == name).then_some(NodeRef::new(
+                        self.parsed.arena.id(),
+                        self.file,
+                        variable.initializer?,
+                    ))
+                })
+                .unwrap_or_else(|| panic!("missing JSX variable {name}"))
+        }
+
+        fn check(
+            &mut self,
+            expression: NodeRef,
+            runtime: CanonicalJsxRuntime,
+            diagnostics: &mut CanonicalCheckerDiagnostics,
+        ) {
+            let evidence = match runtime {
+                CanonicalJsxRuntime::Preserve => CanonicalJsxRuntimeEvidence::Preserve,
+                CanonicalJsxRuntime::Classic => CanonicalJsxRuntimeEvidence::Classic {
+                    factory_namespace: "React",
+                    fragment_factory_namespace: "React",
+                    fragment_factory_required: false,
+                    fragment_factory_pragma_required: false,
+                },
+                CanonicalJsxRuntime::Automatic => CanonicalJsxRuntimeEvidence::Automatic {
+                    module_specifier: "react/jsx-runtime",
+                    resolved_module: None,
+                },
+            };
+            self.check_with_evidence(expression, runtime, evidence, diagnostics);
+        }
+
+        fn check_with_evidence(
+            &mut self,
+            expression: NodeRef,
+            runtime: CanonicalJsxRuntime,
+            evidence: CanonicalJsxRuntimeEvidence<'_>,
+            diagnostics: &mut CanonicalCheckerDiagnostics,
+        ) {
+            let runtime_diagnostics = source_jsx_runtime_diagnostics(
+                &self.store,
+                &self.parsed.arena,
+                &self.bound,
+                evidence,
+            )
+            .unwrap();
+            for diagnostic in runtime_diagnostics.into_vec() {
+                merge_retry_diagnostic(diagnostics, diagnostic);
+            }
+            let host = DeclaredTypeHost::new([(&self.parsed.arena, &self.bound)]).unwrap();
+            self.store
+                .check_jsx_element(
+                    &host,
+                    expression,
+                    CanonicalCheckerOptions {
+                        no_implicit_any: true,
+                        jsx_runtime: runtime,
+                        ..CanonicalCheckerOptions::default()
+                    },
+                    diagnostics,
+                )
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn classic_runtime_reports_missing_react_on_each_opening_tag_name() {
+        let mut fixture = RuntimeFixture::new(
+            "const first = <div>&amp;</div>;\nconst second = <div>text</div>;\n",
+            FileId::new(8_100),
+        );
+        let first = fixture.expression("first");
+        let second = fixture.expression("second");
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        fixture.check(first, CanonicalJsxRuntime::Classic, &mut diagnostics);
+        fixture.check(second, CanonicalJsxRuntime::Classic, &mut diagnostics);
+
+        let factory = diagnostics
+            .as_slice()
+            .iter()
+            .filter(|diagnostic| diagnostic.diagnostic.code() == 2874)
+            .collect::<Vec<_>>();
+        assert_eq!(factory.len(), 2);
+        for diagnostic in factory {
+            let node = diagnostic.node.unwrap();
+            let record = fixture.parsed.arena.get(node.node).unwrap();
+            assert_eq!(record.kind, SyntaxKind::Identifier);
+            let NodeData::Identifier(identifier) = &record.data else {
+                unreachable!("the runtime diagnostic is on the JSX tag")
+            };
+            assert_eq!(identifier.text, "div");
+            assert_eq!(
+                diagnostic.diagnostic.render().unwrap(),
+                "This JSX tag requires 'React' to be in scope, but it could not be found.",
+            );
+        }
+        assert_eq!(
+            diagnostics
+                .as_slice()
+                .iter()
+                .filter(|diagnostic| diagnostic.diagnostic.code() == 7026)
+                .count(),
+            4,
+        );
+    }
+
+    #[test]
+    fn classic_runtime_accepts_an_in_scope_react_factory() {
+        let mut fixture = RuntimeFixture::new(
+            "declare var React: any;\nconst view = <div></div>;\n",
+            FileId::new(8_101),
+        );
+        let expression = fixture.expression("view");
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        fixture.check(expression, CanonicalJsxRuntime::Classic, &mut diagnostics);
+
+        assert_eq!(
+            diagnostics
+                .as_slice()
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.code())
+                .collect::<Vec<_>>(),
+            [7026, 7026],
+        );
+    }
+
+    #[test]
+    fn automatic_runtime_reports_once_before_component_spelling_recovery() {
+        let mut fixture = RuntimeFixture::new(
+            "const app = <App />;\nconst next = <App />;\n",
+            FileId::new(8_102),
+        );
+        let first = fixture.expression("app");
+        let second = fixture.expression("next");
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        fixture.check(first, CanonicalJsxRuntime::Automatic, &mut diagnostics);
+        fixture.check(second, CanonicalJsxRuntime::Automatic, &mut diagnostics);
+
+        assert_eq!(
+            diagnostics
+                .as_slice()
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.code())
+                .collect::<Vec<_>>(),
+            [2875, 2552, 2552],
+        );
+        let runtime = &diagnostics.as_slice()[0];
+        assert_eq!(runtime.node, Some(first));
+        assert_eq!(
+            runtime.diagnostic.render().unwrap(),
+            "This JSX tag requires the module path 'react/jsx-runtime' to exist, but none could be found. Make sure you have types for the appropriate package installed.",
+        );
+        let suggestion = &diagnostics.as_slice()[1];
+        assert_eq!(suggestion.related_information.len(), 1);
+        assert_eq!(suggestion.related_information[0].diagnostic.code(), 2728);
+        assert!(
+            fixture
+                .store
+                .jsx_element_links(fixture.bound.source_file())
+                .is_none()
+        );
+
+        fixture.check(first, CanonicalJsxRuntime::Automatic, &mut diagnostics);
+        assert_eq!(diagnostics.len(), 3);
+    }
+
+    #[test]
+    fn classic_runtime_uses_the_exact_custom_factory_namespace() {
+        let mut fixture = RuntimeFixture::new("const view = <foo />;\n", FileId::new(8_103));
+        let expression = fixture.expression("view");
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        fixture.check_with_evidence(
+            expression,
+            CanonicalJsxRuntime::Classic,
+            CanonicalJsxRuntimeEvidence::Classic {
+                factory_namespace: "myReactLib",
+                fragment_factory_namespace: "myReactLib",
+                fragment_factory_required: false,
+                fragment_factory_pragma_required: false,
+            },
+            &mut diagnostics,
+        );
+
+        let factory = diagnostics
+            .as_slice()
+            .iter()
+            .find(|diagnostic| diagnostic.diagnostic.code() == 2874)
+            .unwrap();
+        assert_eq!(
+            factory.diagnostic.render().unwrap(),
+            "This JSX tag requires 'myReactLib' to be in scope, but it could not be found.",
+        );
+    }
+
+    #[test]
+    fn classic_runtime_accepts_an_exact_custom_factory_in_scope() {
+        let mut fixture = RuntimeFixture::new(
+            "declare var createElement: any;\nconst view = <foo />;\n",
+            FileId::new(8_104),
+        );
+        let expression = fixture.expression("view");
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        fixture.check_with_evidence(
+            expression,
+            CanonicalJsxRuntime::Classic,
+            CanonicalJsxRuntimeEvidence::Classic {
+                factory_namespace: "createElement",
+                fragment_factory_namespace: "createElement",
+                fragment_factory_required: false,
+                fragment_factory_pragma_required: false,
+            },
+            &mut diagnostics,
+        );
+
+        assert!(
+            diagnostics
+                .as_slice()
+                .iter()
+                .all(|diagnostic| diagnostic.diagnostic.code() == 7026)
+        );
+    }
+
+    #[test]
+    fn classic_runtime_reports_missing_element_and_fragment_factories() {
+        let fixture = RuntimeFixture::new("const view = <></>;\n", FileId::new(8_108));
+        let diagnostics = source_jsx_runtime_diagnostics(
+            &fixture.store,
+            &fixture.parsed.arena,
+            &fixture.bound,
+            CanonicalJsxRuntimeEvidence::Classic {
+                factory_namespace: "React",
+                fragment_factory_namespace: "React",
+                fragment_factory_required: false,
+                fragment_factory_pragma_required: false,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            diagnostics
+                .as_slice()
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.code())
+                .collect::<Vec<_>>(),
+            [2874, 2879],
+        );
+        for diagnostic in diagnostics.as_slice() {
+            assert_eq!(
+                fixture
+                    .parsed
+                    .arena
+                    .get(diagnostic.node.unwrap().node)
+                    .unwrap()
+                    .kind,
+                SyntaxKind::JsxOpeningFragment,
+            );
+        }
+        assert_eq!(
+            diagnostics.as_slice()[0].diagnostic.render().unwrap(),
+            "This JSX tag requires 'React' to be in scope, but it could not be found.",
+        );
+        assert_eq!(
+            diagnostics.as_slice()[1].diagnostic.render().unwrap(),
+            "Using JSX fragments requires fragment factory 'React' to be in scope, but it could not be found.",
+        );
+    }
+
+    #[test]
+    fn classic_runtime_reports_a_required_factory_on_each_entire_fragment() {
+        let fixture = RuntimeFixture::new(
+            "declare var h: any;\nconst first = <></>;\nconst second = <><span /><><span /></></>;\n",
+            FileId::new(8_109),
+        );
+        let diagnostics = source_jsx_runtime_diagnostics(
+            &fixture.store,
+            &fixture.parsed.arena,
+            &fixture.bound,
+            CanonicalJsxRuntimeEvidence::Classic {
+                factory_namespace: "h",
+                fragment_factory_namespace: "h",
+                fragment_factory_required: true,
+                fragment_factory_pragma_required: false,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(diagnostics.len(), 3);
+        for diagnostic in diagnostics.as_slice() {
+            assert_eq!(diagnostic.diagnostic.code(), 17_016);
+            assert_eq!(
+                fixture
+                    .parsed
+                    .arena
+                    .get(diagnostic.node.unwrap().node)
+                    .unwrap()
+                    .kind,
+                SyntaxKind::JsxFragment,
+            );
+            assert_eq!(
+                diagnostic.diagnostic.render().unwrap(),
+                "The 'jsxFragmentFactory' compiler option must be provided to use JSX fragments with the 'jsxFactory' compiler option.",
+            );
+        }
+    }
+
+    #[test]
+    fn classic_runtime_requires_a_fragment_pragma_on_the_entire_fragment() {
+        let fixture = RuntimeFixture::new(
+            "declare var dom: any;\nconst view = <><h></h></>;\n",
+            FileId::new(8_112),
+        );
+        let diagnostics = source_jsx_runtime_diagnostics(
+            &fixture.store,
+            &fixture.parsed.arena,
+            &fixture.bound,
+            CanonicalJsxRuntimeEvidence::Classic {
+                factory_namespace: "dom",
+                fragment_factory_namespace: "React",
+                fragment_factory_required: false,
+                fragment_factory_pragma_required: true,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            diagnostics
+                .as_slice()
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.code())
+                .collect::<Vec<_>>(),
+            [2874, 2879, 17_017],
+        );
+        for diagnostic in &diagnostics.as_slice()[..2] {
+            assert_eq!(
+                fixture
+                    .parsed
+                    .arena
+                    .get(diagnostic.node.unwrap().node)
+                    .unwrap()
+                    .kind,
+                SyntaxKind::JsxOpeningFragment,
+            );
+        }
+        let required = &diagnostics.as_slice()[2];
+        assert_eq!(
+            fixture
+                .parsed
+                .arena
+                .get(required.node.unwrap().node)
+                .unwrap()
+                .kind,
+            SyntaxKind::JsxFragment,
+        );
+        assert_eq!(
+            required.diagnostic.render().unwrap(),
+            "An @jsxFrag pragma is required when using an @jsx pragma with JSX fragments.",
+        );
+    }
+
+    #[test]
+    fn classic_runtime_keeps_configured_factory_errors_before_pragma_errors() {
+        let fixture = RuntimeFixture::new(
+            "declare var createElement: any;\nconst view = <></>;\n",
+            FileId::new(8_113),
+        );
+        let diagnostics = source_jsx_runtime_diagnostics(
+            &fixture.store,
+            &fixture.parsed.arena,
+            &fixture.bound,
+            CanonicalJsxRuntimeEvidence::Classic {
+                factory_namespace: "createElement",
+                fragment_factory_namespace: "createElement",
+                fragment_factory_required: true,
+                fragment_factory_pragma_required: true,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics.as_slice()[0].diagnostic.code(), 17_016);
+    }
+
+    #[test]
+    fn classic_runtime_resolves_the_exact_custom_fragment_factory_namespace() {
+        let fixture = RuntimeFixture::new(
+            "declare var createElement: any;\nconst view = <></>;\n",
+            FileId::new(8_110),
+        );
+        let diagnostics = source_jsx_runtime_diagnostics(
+            &fixture.store,
+            &fixture.parsed.arena,
+            &fixture.bound,
+            CanonicalJsxRuntimeEvidence::Classic {
+                factory_namespace: "createElement",
+                fragment_factory_namespace: "CustomFragments",
+                fragment_factory_required: false,
+                fragment_factory_pragma_required: false,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            diagnostics
+                .as_slice()
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.code())
+                .collect::<Vec<_>>(),
+            [2874, 2879],
+        );
+        assert!(diagnostics.as_slice().iter().all(|diagnostic| {
+            diagnostic
+                .diagnostic
+                .render()
+                .unwrap()
+                .contains("'CustomFragments'")
+        }));
+    }
+
+    #[test]
+    fn classic_runtime_accepts_a_null_fragment_factory() {
+        let fixture = RuntimeFixture::new(
+            "declare var createElement: any;\nconst view = <></>;\n",
+            FileId::new(8_111),
+        );
+        let diagnostics = source_jsx_runtime_diagnostics(
+            &fixture.store,
+            &fixture.parsed.arena,
+            &fixture.bound,
+            CanonicalJsxRuntimeEvidence::Classic {
+                factory_namespace: "createElement",
+                fragment_factory_namespace: "null",
+                fragment_factory_required: false,
+                fragment_factory_pragma_required: false,
+            },
+        )
+        .unwrap();
+
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn automatic_runtime_preserves_the_exact_custom_missing_module() {
+        let mut fixture = RuntimeFixture::new("const app = <App />;\n", FileId::new(8_105));
+        let expression = fixture.expression("app");
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        fixture.check_with_evidence(
+            expression,
+            CanonicalJsxRuntime::Automatic,
+            CanonicalJsxRuntimeEvidence::Automatic {
+                module_specifier: "preact/jsx-runtime",
+                resolved_module: None,
+            },
+            &mut diagnostics,
+        );
+
+        let runtime = diagnostics
+            .as_slice()
+            .iter()
+            .find(|diagnostic| diagnostic.diagnostic.code() == 2875)
+            .unwrap();
+        assert_eq!(
+            runtime.diagnostic.render().unwrap(),
+            "This JSX tag requires the module path 'preact/jsx-runtime' to exist, but none could be found. Make sure you have types for the appropriate package installed.",
+        );
+    }
+
+    #[test]
+    fn automatic_runtime_anchors_a_missing_module_to_the_opening_fragment() {
+        let fixture = RuntimeFixture::new("const view = <><span /></>;\n", FileId::new(8_107));
+        let diagnostics = source_jsx_runtime_diagnostics(
+            &fixture.store,
+            &fixture.parsed.arena,
+            &fixture.bound,
+            CanonicalJsxRuntimeEvidence::Automatic {
+                module_specifier: "preact/jsx-runtime",
+                resolved_module: None,
+            },
+        )
+        .unwrap();
+
+        let diagnostic = diagnostics.as_slice().first().unwrap();
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostic.diagnostic.code(), 2875);
+        assert_eq!(
+            fixture
+                .parsed
+                .arena
+                .get(diagnostic.node.unwrap().node)
+                .unwrap()
+                .kind,
+            SyntaxKind::JsxOpeningFragment,
+        );
+        assert_eq!(
+            diagnostic.diagnostic.render().unwrap(),
+            "This JSX tag requires the module path 'preact/jsx-runtime' to exist, but none could be found. Make sure you have types for the appropriate package installed.",
+        );
+    }
+
+    #[test]
+    fn automatic_runtime_does_not_diagnose_a_proven_module() {
+        let mut fixture = RuntimeFixture::new("const app = <App />;\n", FileId::new(8_106));
+        let module = fixture
+            .store
+            .alloc_symbol(SymbolData::new(
+                SymbolFlags::VALUE_MODULE,
+                EscapedName::source("\"preact/jsx-runtime\""),
+            ))
+            .unwrap();
+        let snapshot = (
+            fixture.store.type_len(),
+            fixture.store.symbol_len(),
+            fixture
+                .store
+                .jsx_element_links(fixture.bound.source_file())
+                .cloned(),
+        );
+        let diagnostics = source_jsx_runtime_diagnostics(
+            &fixture.store,
+            &fixture.parsed.arena,
+            &fixture.bound,
+            CanonicalJsxRuntimeEvidence::Automatic {
+                module_specifier: "preact/jsx-runtime",
+                resolved_module: Some(module),
+            },
+        )
+        .unwrap();
+
+        assert!(diagnostics.is_empty());
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.symbol_len(),
+                fixture
+                    .store
+                    .jsx_element_links(fixture.bound.source_file())
+                    .cloned(),
+            ),
+            snapshot,
+        );
+    }
 }

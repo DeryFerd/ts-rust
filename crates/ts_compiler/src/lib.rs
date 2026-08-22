@@ -13,6 +13,7 @@ use ts_binder::{
     CanonicalSourceLanguage, EscapedName, SymbolFlags, bind_source_file_in_file,
 };
 use ts_checker::semantic::formatter::FunctionTypeDisplayUnavailable;
+use ts_checker::semantic::production::{CanonicalJsxRuntime, CanonicalJsxRuntimeEvidence};
 use ts_checker::semantic::{
     ArrayTypeError, CanonicalCheckerContext, CanonicalCheckerContextError,
     CanonicalCheckerDiagnosticRange, CanonicalCheckerOptions, CanonicalGlobalInitializationError,
@@ -30,7 +31,9 @@ use ts_config::{ConfigDiagnostic, resolve_config_file};
 use ts_core::{TextPos, TextRange};
 use ts_diagnostics::{Category, Diagnostic, FormatError, message_by_code};
 use ts_glob::{DiscoveryOptions, GlobPattern, discover_files};
-use ts_module::{ResolutionOptions, Resolver, automatic_type_directive_names, parse_package_json};
+use ts_module::{
+    ModuleFormat, ResolutionOptions, Resolver, automatic_type_directive_names, parse_package_json,
+};
 use ts_options::{
     CompilerOptions, ModuleDetectionKind, ModuleKind, ModuleResolutionKind, PrinterSettings,
     ScriptTarget, parse_project_options,
@@ -52,8 +55,9 @@ use ts_vfs::FileSystem;
 
 pub use ts_checker::semantic::artifact_queries::CanonicalArtifactQueryError;
 pub use ts_checker::semantic::{
-    CanonicalTypeFormatFlags, SemanticStoreId as CanonicalSemanticStoreId,
-    SemanticSymbolId as CanonicalSymbolId, TypeId as CanonicalTypeId,
+    CanonicalModuleResolutionLookup, CanonicalTypeFormatFlags,
+    SemanticStoreId as CanonicalSemanticStoreId, SemanticSymbolId as CanonicalSymbolId,
+    TypeId as CanonicalTypeId,
 };
 
 /// One parsed source file owned by a Program.
@@ -1082,15 +1086,17 @@ fn source_check_js_directive(source: &str) -> Option<bool> {
     let mut remaining = source.strip_prefix('\u{feff}').unwrap_or(source);
     if remaining.starts_with("#!") {
         remaining = remaining
-            .split_once('\n')
+            .split_once(['\r', '\n', '\u{2028}', '\u{2029}'])
             .map_or("", |(_, source)| source);
     }
 
     let mut directive = None;
     loop {
-        remaining = remaining.trim_start_matches([' ', '\t', '\r', '\n']);
+        remaining = remaining.trim_start_matches([' ', '\t', '\r', '\n', '\u{2028}', '\u{2029}']);
         if let Some(comment) = remaining.strip_prefix("//") {
-            let (line, rest) = comment.split_once('\n').unwrap_or((comment, ""));
+            let (line, rest) = comment
+                .split_once(['\r', '\n', '\u{2028}', '\u{2029}'])
+                .unwrap_or((comment, ""));
             remaining = rest;
             let pragma = line
                 .strip_prefix('/')
@@ -1120,6 +1126,74 @@ fn source_check_js_directive(source: &str) -> Option<bool> {
     }
 
     directive
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SourceCommentDirective {
+    range: TextRange,
+    expect_error: bool,
+    used: bool,
+}
+
+fn source_line_starts(source: &str) -> Vec<usize> {
+    let mut line_starts = vec![0];
+    let bytes = source.as_bytes();
+    for (position, character) in source.char_indices() {
+        match character {
+            '\r' => line_starts.push(
+                position
+                    + if bytes.get(position + 1) == Some(&b'\n') {
+                        2
+                    } else {
+                        1
+                    },
+            ),
+            '\n' if position == 0 || bytes[position - 1] != b'\r' => {
+                line_starts.push(position + 1);
+            }
+            '\u{2028}' | '\u{2029}' => line_starts.push(position + character.len_utf8()),
+            _ => {}
+        }
+    }
+    line_starts
+}
+
+fn source_line_of_position(line_starts: &[usize], position: usize) -> usize {
+    line_starts
+        .partition_point(|start| *start <= position)
+        .saturating_sub(1)
+}
+
+fn source_comment_directives(
+    source: &str,
+    line_starts: &[usize],
+) -> BTreeMap<usize, SourceCommentDirective> {
+    let mut scanner = ts_scanner::Scanner::new(source);
+    scanner
+        .scan_comment_directives()
+        .iter()
+        .filter_map(|directive| {
+            let position = usize::try_from(directive.range.start.get()).ok()?;
+            Some((
+                source_line_of_position(line_starts, position),
+                SourceCommentDirective {
+                    range: directive.range,
+                    expect_error: directive.expect_error,
+                    used: false,
+                },
+            ))
+        })
+        .collect()
+}
+
+fn source_line_is_comment_or_blank(line: &str) -> bool {
+    let line = line.trim_start_matches([' ', '\t']);
+    line.is_empty()
+        || line.starts_with("//")
+        || line
+            .chars()
+            .next()
+            .is_some_and(|character| matches!(character, '\r' | '\n' | '\u{2028}' | '\u{2029}'))
 }
 
 fn source_printer_settings(mut settings: PrinterSettings, source: &str) -> PrinterSettings {
@@ -1343,6 +1417,12 @@ impl CanonicalProgramQueries<'_> {
     pub fn semantic_store_id(&self) -> CanonicalSemanticStoreId {
         self.context.id()
     }
+
+    /// Returns the exact module resolution attached to a source specifier.
+    #[must_use]
+    pub fn module_resolution(&self, specifier: NodeRef) -> CanonicalModuleResolutionLookup {
+        self.context.module_resolution(specifier)
+    }
 }
 
 impl Program {
@@ -1406,6 +1486,15 @@ impl Program {
             checker,
             ..Self::default()
         };
+        if checker == ProgramChecker::Canonical
+            && program.options.check_js
+            && !program.options.allow_js
+            && program.options.allow_js_specified
+        {
+            program
+                .diagnostics
+                .push(check_js_requires_allow_js_diagnostic());
+        }
         for root_name in root_names {
             let file_name = if is_absolute(root_name) {
                 ts_path::normalize_path(root_name)
@@ -1417,6 +1506,17 @@ impl Program {
                 &program.current_directory,
                 program.case_sensitivity,
             ));
+            if checker == ProgramChecker::Canonical
+                && !(program.options.allow_js
+                    || (program.options.check_js && !program.options.allow_js_specified))
+                && is_javascript_file_name(&file_name)
+            {
+                let display_name = relative_path(&program.current_directory, &file_name);
+                program
+                    .diagnostics
+                    .push(javascript_file_not_allowed_diagnostic(&display_name));
+                continue;
+            }
             program.load_file(file_system, &file_name, true);
         }
         program
@@ -1437,6 +1537,7 @@ impl Program {
         program
     }
 
+    #[allow(clippy::too_many_lines)] // Preserve upstream reference and import discovery order.
     fn load_module_graph(
         &mut self,
         file_system: &dyn FileSystem,
@@ -1475,9 +1576,69 @@ impl Program {
                 &mut ambient_modules,
             );
             let containing_file = self.source_files[file_index].file_name.clone();
+            let implicit_jsx_runtime = {
+                let source = &self.source_files[file_index];
+                source_contains_jsx(&source.parse).then(|| {
+                    self.options.jsx_runtime_module_specifier_for_source(
+                        source_jsx_pragma_value(&source.source_text, "@jsxRuntime"),
+                        source_jsx_pragma_value(&source.source_text, "@jsxImportSource"),
+                    )
+                })
+            }
+            .flatten();
+            if let Some(specifier) = implicit_jsx_runtime
+                && let Some(resolved) = resolver
+                    .resolve_with_mode(&specifier, &containing_file, ModuleFormat::Esm)
+                    .resolved
+            {
+                if let Some(package_json) = resolved.package_json.as_deref() {
+                    self.register_package_export_specifiers(file_system, package_json);
+                }
+                let containing = canonicalize(
+                    &containing_file,
+                    &self.current_directory,
+                    self.case_sensitivity,
+                );
+                let target = canonicalize(
+                    &resolved.resolved_file_name,
+                    &self.current_directory,
+                    self.case_sensitivity,
+                );
+                self.resolved_modules
+                    .insert((containing, specifier), target);
+                self.load_file(file_system, &resolved.resolved_file_name, false);
+            }
+            let source_mode = self.canonical_emit_module_mode(&self.source_files[file_index]);
+            let usage_modes = canonical_static_module_specifiers(&self.source_files[file_index])
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|(specifier, _, requested_mode)| {
+                    self.source_files[file_index]
+                        .parse
+                        .arena
+                        .get(specifier.node)
+                        .map(|node| (node.range, requested_mode.unwrap_or(source_mode)))
+                })
+                .collect::<Vec<_>>();
             let specifiers = module_specifiers(&self.source_files[file_index].parse);
             for (specifier, range, can_resolve_ambient, side_effect_only) in specifiers {
-                let result = resolver.resolve(&specifier, &containing_file);
+                let mode = usage_modes
+                    .iter()
+                    .find_map(|(candidate, mode)| (*candidate == range).then_some(*mode))
+                    .unwrap_or(source_mode);
+                let result = match mode {
+                    CanonicalModuleResolutionMode::CommonJs => resolver.resolve_with_mode(
+                        &specifier,
+                        &containing_file,
+                        ModuleFormat::CommonJs,
+                    ),
+                    CanonicalModuleResolutionMode::Esm => {
+                        resolver.resolve_with_mode(&specifier, &containing_file, ModuleFormat::Esm)
+                    }
+                    CanonicalModuleResolutionMode::None => {
+                        resolver.resolve(&specifier, &containing_file)
+                    }
+                };
                 if let Some(resolved) = result.resolved {
                     if let Some(package_json) = resolved.package_json.as_deref() {
                         self.register_package_export_specifiers(file_system, package_json);
@@ -2122,11 +2283,14 @@ impl Program {
                                 .source_map
                                 .clone()
                                 .unwrap_or_else(|| format!("{file_name}.map"));
-                            let source_map_directory =
+                            let source_map_directory = if self.options.source_root.is_some() {
+                                common_source_directory.clone()
+                            } else {
                                 self.logical_source_map_path(&source_map_file).map_or_else(
-                                    || common_source_directory.clone(),
+                                    || directory_path(&file_name),
                                     |path| directory_path(&path),
-                                );
+                                )
+                            };
                             make_source_map_sources_relative(
                                 &mut source_map,
                                 &source_map_directory,
@@ -3224,18 +3388,18 @@ impl Program {
     ) -> Result<CanonicalModuleResolutionManifestInput, CanonicalProgramCheckError> {
         let mut entries = Vec::new();
         for source in &self.source_files {
-            let specifiers = canonical_static_esm_module_specifiers(source)?;
+            let specifiers = canonical_static_module_specifiers(source)?;
             if specifiers.is_empty() {
                 continue;
             }
-            self.require_plain_esm_bundler_source(source)?;
+            self.require_supported_module_source(source)?;
 
             let containing = canonicalize(
                 &source.file_name,
                 &self.current_directory,
                 self.case_sensitivity,
             );
-            for (specifier, text) in specifiers {
+            for (specifier, text, requested_mode) in specifiers {
                 let Some(resolved_file_name) =
                     self.resolved_modules.get(&(containing.clone(), text))
                 else {
@@ -3253,8 +3417,10 @@ impl Program {
                         resolved_file_name: resolved_file_name.clone(),
                     });
                 };
-                self.require_plain_esm_bundler_target(target)?;
-                if !source_file_is_external_module(&target.parse) {
+                self.require_supported_module_source(target)?;
+                if !canonical_source_file_facts(target, &self.options)?
+                    .is_external_or_common_js_module()
+                {
                     return Err(
                         CanonicalProgramCheckError::ExternalModuleTargetUnsupported {
                             specifier,
@@ -3262,12 +3428,14 @@ impl Program {
                         },
                     );
                 }
+                let usage_mode =
+                    requested_mode.unwrap_or_else(|| self.canonical_emit_module_mode(source));
                 entries.push(CanonicalModuleResolutionEntry::resolved(
                     specifier,
                     CanonicalResolvedModuleInput::new(
                         target.id,
-                        CanonicalModuleResolutionMode::Esm,
-                        CanonicalModuleResolutionMode::Esm,
+                        usage_mode,
+                        self.canonical_emit_module_mode(target),
                     ),
                 ));
             }
@@ -3275,24 +3443,9 @@ impl Program {
         Ok(CanonicalModuleResolutionManifestInput::new(entries))
     }
 
-    fn require_plain_esm_bundler_source(
+    fn require_supported_module_source(
         &self,
         source: &SourceFile,
-    ) -> Result<(), CanonicalProgramCheckError> {
-        self.require_plain_esm_bundler_file(source, false)
-    }
-
-    fn require_plain_esm_bundler_target(
-        &self,
-        source: &SourceFile,
-    ) -> Result<(), CanonicalProgramCheckError> {
-        self.require_plain_esm_bundler_file(source, true)
-    }
-
-    fn require_plain_esm_bundler_file(
-        &self,
-        source: &SourceFile,
-        allow_declaration_file: bool,
     ) -> Result<(), CanonicalProgramCheckError> {
         let source_kind = ts_path::script_kind_from_path(&source.file_name);
         let supported_source = (matches!(
@@ -3303,27 +3456,15 @@ impl Program {
                 source_kind,
                 ts_path::ScriptKind::Js | ts_path::ScriptKind::Jsx
             )))
-            && (allow_declaration_file || !ts_path::is_declaration_file(&source.file_name))
             && Path::new(&source.file_name)
                 .extension()
                 .and_then(|extension| extension.to_str())
                 .is_some_and(|extension| {
-                    ["ts", "tsx", "js", "jsx"]
+                    ["ts", "tsx", "js", "jsx", "mts", "cts", "mjs", "cjs"]
                         .iter()
                         .any(|candidate| extension.eq_ignore_ascii_case(candidate))
                 });
-        let esm_emit = matches!(
-            self.options.module,
-            ModuleKind::Es2015
-                | ModuleKind::Es2020
-                | ModuleKind::Es2022
-                | ModuleKind::EsNext
-                | ModuleKind::Preserve
-        );
-        if supported_source
-            && esm_emit
-            && self.options.module_resolution == ModuleResolutionKind::Bundler
-        {
+        if supported_source {
             return Ok(());
         }
         Err(
@@ -3333,6 +3474,49 @@ impl Program {
                 module_resolution: self.options.module_resolution,
             },
         )
+    }
+
+    fn canonical_emit_module_mode(&self, source: &SourceFile) -> CanonicalModuleResolutionMode {
+        if is_javascript_file_name(&source.file_name)
+            && source_file_has_commonjs_indicator(&source.parse)
+        {
+            return CanonicalModuleResolutionMode::CommonJs;
+        }
+        let extension = Path::new(&source.file_name)
+            .extension()
+            .and_then(|extension| extension.to_str());
+        if extension.is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("mts") || extension.eq_ignore_ascii_case("mjs")
+        }) {
+            return CanonicalModuleResolutionMode::Esm;
+        }
+        if extension.is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("cts") || extension.eq_ignore_ascii_case("cjs")
+        }) {
+            return CanonicalModuleResolutionMode::CommonJs;
+        }
+
+        match self.options.module {
+            ModuleKind::CommonJs | ModuleKind::Amd | ModuleKind::Umd | ModuleKind::System => {
+                CanonicalModuleResolutionMode::CommonJs
+            }
+            ModuleKind::Node16 | ModuleKind::Node18 | ModuleKind::Node20 | ModuleKind::NodeNext => {
+                if source.implied_node_format == ModuleKind::CommonJs {
+                    CanonicalModuleResolutionMode::CommonJs
+                } else {
+                    CanonicalModuleResolutionMode::Esm
+                }
+            }
+            ModuleKind::None if self.options.module_specified => {
+                CanonicalModuleResolutionMode::CommonJs
+            }
+            ModuleKind::None
+            | ModuleKind::Es2015
+            | ModuleKind::Es2020
+            | ModuleKind::Es2022
+            | ModuleKind::EsNext
+            | ModuleKind::Preserve => CanonicalModuleResolutionMode::Esm,
+        }
     }
 
     #[allow(clippy::too_many_lines)]
@@ -3378,7 +3562,9 @@ impl Program {
             // Keep declaration files bound so their symbols remain available
             // to importers, but mirror pinned SkipTypeChecking by suppressing
             // their bind diagnostics together with checker diagnostics.
-            if self.options.skip_lib_check && ts_path::is_declaration_file(&source.file_name) {
+            if self.options.skip_lib_check && ts_path::is_declaration_file(&source.file_name)
+                || source_check_js_directive(&source.source_text) == Some(false)
+            {
                 continue;
             }
             let bound = binder.file(source.id).ok_or_else(|| {
@@ -3436,6 +3622,13 @@ impl Program {
             strict_function_types: self.options.strict_function_types,
             strict_property_initialization: self.options.strict_property_initialization,
             no_implicit_any: self.options.no_implicit_any,
+            jsx_runtime: if self.options.jsx_runtime_module_specifier().is_some() {
+                CanonicalJsxRuntime::Automatic
+            } else if self.options.jsx == ts_options::JsxEmit::React {
+                CanonicalJsxRuntime::Classic
+            } else {
+                CanonicalJsxRuntime::Preserve
+            },
             emit_common_js: self.options.module == ModuleKind::CommonJs,
             no_emit: self.options.no_emit,
             no_error_truncation: self.options.no_error_truncation,
@@ -3450,28 +3643,77 @@ impl Program {
         )
         .map_err(CanonicalProgramCheckError::Context)?;
 
+        let mut checked_sources = Vec::new();
         for (file, file_name, is_declaration_file, is_javascript_file) in check_files {
-            if is_declaration_file {
-                if self.options.skip_lib_check {
-                    continue;
-                }
-                return Err(
-                    CanonicalProgramCheckError::DeclarationFileCheckingUnsupported { file_name },
-                );
+            if is_declaration_file && self.options.skip_lib_check {
+                continue;
             }
-            if is_javascript_file
-                && !self
-                    .source_file_by_id(file)
-                    .is_some_and(|source| {
-                        source_check_js_directive(&source.source_text)
-                            .unwrap_or(self.options.check_js)
-                    })
+            let source = self.source_file_by_id(file).ok_or_else(|| {
+                CanonicalProgramCheckError::MissingBoundFile {
+                    file_name: file_name.clone(),
+                    file,
+                }
+            })?;
+            let check_directive = source_check_js_directive(&source.source_text);
+            if check_directive == Some(false)
+                || is_javascript_file && !check_directive.unwrap_or(self.options.check_js)
             {
                 continue;
             }
+            let runtime_pragma = source_jsx_pragma_value(&source.source_text, "@jsxRuntime");
+            let runtime_module = self.options.jsx_runtime_module_specifier_for_source(
+                runtime_pragma,
+                source_jsx_pragma_value(&source.source_text, "@jsxImportSource"),
+            );
+            let runtime = if let Some(module_specifier) = runtime_module.as_deref() {
+                let containing = canonicalize(
+                    &source.file_name,
+                    &self.current_directory,
+                    self.case_sensitivity,
+                );
+                let resolved_module = self
+                    .resolved_modules
+                    .get(&(containing, module_specifier.to_owned()))
+                    .and_then(|target| self.file_index.get(target))
+                    .and_then(|index| self.source_files.get(*index))
+                    .and_then(|target| context.file(target.id))
+                    .and_then(|(_, bound)| bound.symbol(bound.source_file()));
+                CanonicalJsxRuntimeEvidence::Automatic {
+                    module_specifier,
+                    resolved_module,
+                }
+            } else if runtime_pragma == Some("classic")
+                || self.options.jsx == ts_options::JsxEmit::React
+            {
+                let factory_pragma = source_jsx_pragma_value(&source.source_text, "@jsx ");
+                let fragment_factory_pragma =
+                    source_jsx_pragma_value(&source.source_text, "@jsxFrag")
+                        .or_else(|| source_jsx_pragma_value(&source.source_text, "@jsxfrag"));
+                CanonicalJsxRuntimeEvidence::Classic {
+                    factory_namespace: self.options.jsx_factory_namespace_for_source(
+                        factory_pragma,
+                        fragment_factory_pragma,
+                        false,
+                    ),
+                    fragment_factory_namespace: self.options.jsx_factory_namespace_for_source(
+                        factory_pragma,
+                        fragment_factory_pragma,
+                        true,
+                    ),
+                    fragment_factory_required: self.options.jsx_factory.is_some()
+                        && self.options.jsx_fragment_factory.is_none()
+                        && fragment_factory_pragma.is_none(),
+                    fragment_factory_pragma_required: factory_pragma.is_some()
+                        && self.options.jsx_fragment_factory.is_none()
+                        && fragment_factory_pragma.is_none(),
+                }
+            } else {
+                CanonicalJsxRuntimeEvidence::Preserve
+            };
             context
-                .check_source_file(file)
+                .check_source_file_with_jsx_runtime(file, runtime)
                 .map_err(|error| CanonicalProgramCheckError::SourceCheck { file_name, error })?;
+            checked_sources.push(file);
         }
 
         for diagnostic in context.global_types().diagnostics() {
@@ -3496,9 +3738,72 @@ impl Program {
             );
         }
 
+        self.apply_comment_directives(&mut diagnostics, &checked_sources);
+
         let mut canonical_queries = CanonicalProgramQueries { context };
         let result = queries(self, &mut canonical_queries);
         Ok((diagnostics, result))
+    }
+
+    fn apply_comment_directives(
+        &self,
+        diagnostics: &mut Vec<ProgramDiagnostic>,
+        checked_sources: &[FileId],
+    ) {
+        for file in checked_sources {
+            let Some(source) = self.source_file_by_id(*file) else {
+                continue;
+            };
+            let line_starts = source_line_starts(&source.source_text);
+            let mut directives = source_comment_directives(&source.source_text, &line_starts);
+            if directives.is_empty() {
+                continue;
+            }
+            diagnostics.retain(|diagnostic| {
+                if diagnostic.file_name.as_deref() != Some(source.file_name.as_str()) {
+                    return true;
+                }
+                let Some(position) = diagnostic
+                    .range
+                    .and_then(|range| usize::try_from(range.start.get()).ok())
+                    .filter(|position| *position <= source.source_text.len())
+                else {
+                    return true;
+                };
+                let line = source_line_of_position(&line_starts, position);
+                for previous in (0..line).rev() {
+                    if let Some(directive) = directives.get_mut(&previous) {
+                        directive.used = true;
+                        return false;
+                    }
+                    let start = line_starts[previous];
+                    let end = line_starts
+                        .get(previous + 1)
+                        .copied()
+                        .unwrap_or(source.source_text.len());
+                    if !source_line_is_comment_or_blank(&source.source_text[start..end]) {
+                        break;
+                    }
+                }
+                true
+            });
+            let Some(message) = message_by_code(2578) else {
+                continue;
+            };
+            for directive in directives
+                .into_values()
+                .filter(|directive| directive.expect_error && !directive.used)
+            {
+                diagnostics.push(ProgramDiagnostic {
+                    file_name: Some(source.file_name.clone()),
+                    range: Some(directive.range),
+                    code: Some(message.code()),
+                    category: message.category(),
+                    message: message.text().to_owned(),
+                    related_information: Vec::new(),
+                });
+            }
+        }
     }
 
     fn canonical_commonjs_object_collisions(
@@ -3698,32 +4003,45 @@ impl Program {
                 .source_files
                 .iter()
                 .zip(&module_maps)
-                .map(|(source_file, resolved_modules)| ProgramSource {
-                    arena: &source_file.parse.arena,
-                    source_file: source_file.parse.source_file,
-                    bindings: &source_file.binding,
-                    resolved_modules,
-                    is_default_library: source_file.is_default_library,
-                    skip_diagnostics: self.options.no_check
-                        || (is_javascript_file_name(&source_file.file_name)
-                            && !source_check_js_directive(&source_file.source_text)
-                                .unwrap_or(self.options.check_js))
-                        || (self.options.skip_lib_check
-                            && ts_path::is_declaration_file(&source_file.file_name)),
-                    checker_options: CheckerOptions {
-                        allow_unreachable_code: self.options.allow_unreachable_code,
-                        exact_optional_property_types: self.options.exact_optional_property_types,
-                        is_declaration_file: ts_path::is_declaration_file(&source_file.file_name),
-                        is_javascript_file: is_javascript_file_name(&source_file.file_name),
-                        no_fallthrough_cases_in_switch: self.options.no_fallthrough_cases_in_switch,
-                        strict_null_checks: self.options.strict_null_checks,
-                        strict_property_initialization: self.options.strict_property_initialization,
-                        no_implicit_any: self.options.no_implicit_any,
-                        no_implicit_returns: self.options.no_implicit_returns,
-                        no_unused_locals: self.options.no_unused_locals,
-                        no_unused_parameters: self.options.no_unused_parameters,
-                        use_unknown_in_catch_variables: self.options.use_unknown_in_catch_variables,
-                    },
+                .map(|(source_file, resolved_modules)| {
+                    let check_directive = source_check_js_directive(&source_file.source_text);
+                    ProgramSource {
+                        arena: &source_file.parse.arena,
+                        source_file: source_file.parse.source_file,
+                        bindings: &source_file.binding,
+                        resolved_modules,
+                        is_default_library: source_file.is_default_library,
+                        skip_diagnostics: self.options.no_check
+                            || check_directive == Some(false)
+                            || (is_javascript_file_name(&source_file.file_name)
+                                && !check_directive.unwrap_or(self.options.check_js))
+                            || (self.options.skip_lib_check
+                                && ts_path::is_declaration_file(&source_file.file_name)),
+                        checker_options: CheckerOptions {
+                            allow_unreachable_code: self.options.allow_unreachable_code,
+                            exact_optional_property_types: self
+                                .options
+                                .exact_optional_property_types,
+                            is_declaration_file: ts_path::is_declaration_file(
+                                &source_file.file_name,
+                            ),
+                            is_javascript_file: is_javascript_file_name(&source_file.file_name),
+                            no_fallthrough_cases_in_switch: self
+                                .options
+                                .no_fallthrough_cases_in_switch,
+                            strict_null_checks: self.options.strict_null_checks,
+                            strict_property_initialization: self
+                                .options
+                                .strict_property_initialization,
+                            no_implicit_any: self.options.no_implicit_any,
+                            no_implicit_returns: self.options.no_implicit_returns,
+                            no_unused_locals: self.options.no_unused_locals,
+                            no_unused_parameters: self.options.no_unused_parameters,
+                            use_unknown_in_catch_variables: self
+                                .options
+                                .use_unknown_in_catch_variables,
+                        },
+                    }
                 })
                 .collect::<Vec<_>>();
             check_program_with_paths(&inputs, &source_paths)
@@ -3744,7 +4062,9 @@ impl Program {
             checking
                 .diagnostics
                 .extend(portability_diagnostics[index].iter().cloned());
-            if self.options.no_check {
+            if self.options.no_check
+                || source_check_js_directive(&source_file.source_text) == Some(false)
+            {
                 checking.diagnostics.clear();
             }
             for diagnostic in &checking.diagnostics {
@@ -4096,7 +4416,9 @@ impl Program {
         // consumers. Canonical mode never publishes its diagnostics or passes
         // it to the canonical checker.
         let binding = bind_source_file_in_file(&parse.arena, parse.source_file, file_id);
-        if self.checker == ProgramChecker::Legacy {
+        if self.checker == ProgramChecker::Legacy
+            && source_check_js_directive(&source_text) != Some(false)
+        {
             for diagnostic in &binding.diagnostics {
                 let range = parse.arena.get(diagnostic.node).map(|node| node.range);
                 self.diagnostics.push(ProgramDiagnostic {
@@ -4303,15 +4625,6 @@ fn canonical_source_file_facts(
     let extension = Path::new(&source.file_name)
         .extension()
         .and_then(|extension| extension.to_str());
-    if !source.is_default_library
-        && extension.is_some_and(|extension| {
-            extension.eq_ignore_ascii_case("mts") || extension.eq_ignore_ascii_case("cts")
-        })
-    {
-        return Err(CanonicalProgramCheckError::FixedModuleFormatUnsupported {
-            file_name: source.file_name.clone(),
-        });
-    }
     if source_contains_import_meta(&source.parse) {
         return Err(
             CanonicalProgramCheckError::ImportMetaModuleIndicatorUnsupported {
@@ -4320,28 +4633,36 @@ fn canonical_source_file_facts(
         );
     }
 
-    let node_module = matches!(
+    let fixed_module_file = extension.is_some_and(|extension| {
+        ["mts", "cts", "mjs", "cjs"]
+            .iter()
+            .any(|candidate| extension.eq_ignore_ascii_case(candidate))
+    });
+    let node_esm_file = matches!(
         options.module,
         ModuleKind::Node16 | ModuleKind::Node18 | ModuleKind::Node20 | ModuleKind::NodeNext
-    );
-    let node_resolution = matches!(
-        options.module_resolution,
-        ModuleResolutionKind::Node16 | ModuleResolutionKind::NodeNext
-    );
-    if !source.is_default_library && (node_module || node_resolution) {
-        return Err(CanonicalProgramCheckError::NodeModuleFactsUnsupported {
-            file_name: source.file_name.clone(),
-            module: options.module,
-            module_resolution: options.module_resolution,
-        });
-    }
-
+    ) && source.implied_node_format == ModuleKind::EsNext;
+    let jsx_module = matches!(
+        options.jsx,
+        ts_options::JsxEmit::ReactJsx | ts_options::JsxEmit::ReactJsxDev
+    ) && source.parse.arena.iter().any(|(_, node)| {
+        matches!(
+            node.data,
+            NodeData::JsxElement(_) | NodeData::JsxSelfClosingElement(_) | NodeData::JsxFragment(_)
+        )
+    });
     let is_external_module = source_file_is_external_module(&source.parse)
-        || (!is_declaration_file && options.module_detection == ModuleDetectionKind::Force);
-    let module_state = if is_external_module {
-        CanonicalModuleState::External
-    } else {
-        CanonicalModuleState::Script
+        || (!is_declaration_file
+            && (options.module_detection == ModuleDetectionKind::Force
+                || (options.module_detection == ModuleDetectionKind::Auto
+                    && (fixed_module_file || node_esm_file || jsx_module))));
+    let is_common_js_module = language == CanonicalSourceLanguage::JavaScript
+        && source_file_has_commonjs_indicator(&source.parse);
+    let module_state = match (is_external_module, is_common_js_module) {
+        (true, true) => CanonicalModuleState::ExternalAndCommonJs,
+        (true, false) => CanonicalModuleState::External,
+        (false, true) => CanonicalModuleState::CommonJs,
+        (false, false) => CanonicalModuleState::Script,
     };
     Ok(CanonicalSourceFileFacts::new_with_default_library(
         EscapedName::source(format!("\"{}\"", remove_file_extension(&source.file_name))),
@@ -6887,9 +7208,10 @@ fn percent_encode_source_map_url(url: &str) -> String {
     encoded
 }
 
-fn canonical_static_esm_module_specifiers(
+fn canonical_static_module_specifiers(
     source: &SourceFile,
-) -> Result<Vec<(NodeRef, String)>, CanonicalProgramCheckError> {
+) -> Result<Vec<(NodeRef, String, Option<CanonicalModuleResolutionMode>)>, CanonicalProgramCheckError>
+{
     let source_ref = NodeRef::new(source.parse.arena.id(), source.id, source.parse.source_file);
     let Some(NodeData::SourceFile(file)) = source
         .parse
@@ -6908,13 +7230,28 @@ fn canonical_static_esm_module_specifiers(
                 source_ref,
             ));
         };
-        let (specifier, has_attributes) = match &node.data {
-            NodeData::ImportDeclaration(import) => {
-                (Some(import.module_specifier), import.attributes.is_some())
-            }
-            NodeData::ExportDeclaration(export) => {
-                (export.module_specifier, export.attributes.is_some())
-            }
+        let (specifier, attributes, type_only, syntax_mode) = match &node.data {
+            NodeData::ImportDeclaration(import) => (
+                Some(import.module_specifier),
+                import.attributes,
+                import
+                    .import_clause
+                    .and_then(|clause| source.parse.arena.get(clause))
+                    .is_some_and(|clause| {
+                        matches!(
+                            &clause.data,
+                            NodeData::ImportClause(clause)
+                                if clause.phase_modifier == Some(SyntaxKind::TypeKeyword)
+                        )
+                    }),
+                None,
+            ),
+            NodeData::ExportDeclaration(export) => (
+                export.module_specifier,
+                export.attributes,
+                export.is_type_only,
+                None,
+            ),
             NodeData::ImportEqualsDeclaration(import) => {
                 let Some(NodeData::ExternalModuleReference(reference)) = source
                     .parse
@@ -6924,11 +7261,12 @@ fn canonical_static_esm_module_specifiers(
                 else {
                     continue;
                 };
-                let specifier =
-                    NodeRef::new(source.parse.arena.id(), source.id, reference.expression);
-                return Err(
-                    CanonicalProgramCheckError::ModuleSpecifierResolutionModeUnsupported(specifier),
-                );
+                (
+                    Some(reference.expression),
+                    None,
+                    import.is_type_only,
+                    Some(CanonicalModuleResolutionMode::CommonJs),
+                )
             }
             _ => continue,
         };
@@ -6936,19 +7274,64 @@ fn canonical_static_esm_module_specifiers(
             continue;
         };
         let specifier = NodeRef::new(source.parse.arena.id(), source.id, specifier);
-        if has_attributes {
-            return Err(
-                CanonicalProgramCheckError::ModuleSpecifierResolutionModeUnsupported(specifier),
-            );
-        }
+        let requested_mode =
+            canonical_resolution_mode_override(source, attributes, type_only, specifier)?
+                .or(syntax_mode);
         let Some((text, _)) = string_literal(&source.parse.arena, specifier.node) else {
             return Err(CanonicalProgramCheckError::InvalidModuleSpecifier(
                 specifier,
             ));
         };
-        specifiers.push((specifier, text));
+        specifiers.push((specifier, text, requested_mode));
     }
     Ok(specifiers)
+}
+
+fn canonical_resolution_mode_override(
+    source: &SourceFile,
+    attributes: Option<NodeId>,
+    type_only: bool,
+    specifier: NodeRef,
+) -> Result<Option<CanonicalModuleResolutionMode>, CanonicalProgramCheckError> {
+    if !type_only {
+        return Ok(None);
+    }
+    let Some(attributes) = attributes else {
+        return Ok(None);
+    };
+    let Some(NodeData::ImportAttributes(attributes)) =
+        source.parse.arena.get(attributes).map(|node| &node.data)
+    else {
+        return Err(
+            CanonicalProgramCheckError::ModuleSpecifierResolutionModeUnsupported(specifier),
+        );
+    };
+    let [attribute] = attributes.attributes.nodes.as_slice() else {
+        return Ok(None);
+    };
+    let Some(NodeData::ImportAttribute(attribute)) =
+        source.parse.arena.get(*attribute).map(|node| &node.data)
+    else {
+        return Err(
+            CanonicalProgramCheckError::ModuleSpecifierResolutionModeUnsupported(specifier),
+        );
+    };
+    let Some((name, _)) = string_literal(&source.parse.arena, attribute.name) else {
+        return Ok(None);
+    };
+    if name != "resolution-mode" {
+        return Ok(None);
+    }
+    let Some((value, _)) = string_literal(&source.parse.arena, attribute.value) else {
+        return Err(
+            CanonicalProgramCheckError::ModuleSpecifierResolutionModeUnsupported(specifier),
+        );
+    };
+    match value.as_str() {
+        "import" => Ok(Some(CanonicalModuleResolutionMode::Esm)),
+        "require" => Ok(Some(CanonicalModuleResolutionMode::CommonJs)),
+        _ => Err(CanonicalProgramCheckError::ModuleSpecifierResolutionModeUnsupported(specifier)),
+    }
 }
 
 fn module_specifiers(parse: &ParseResult) -> Vec<(String, TextRange, bool, bool)> {
@@ -7018,6 +7401,14 @@ fn jsdoc_import_specifiers(source: &str) -> Vec<(String, TextRange, bool, bool)>
         let mut import_search = 0;
         while let Some(relative_import) = comment[import_search..].find("import(") {
             let import_start = body_start + import_search + relative_import;
+            if source[..import_start]
+                .chars()
+                .next_back()
+                .is_some_and(|character| character == '@' || is_identifier_character(character))
+            {
+                import_search += relative_import + "import(".len();
+                continue;
+            }
             let argument_start = import_start + "import(".len();
             let argument = &source[argument_start..comment_end];
             let whitespace = argument.len() - argument.trim_start().len();
@@ -7124,6 +7515,69 @@ fn source_file_is_external_module(parse: &ParseResult) -> bool {
             }),
         }
     }) || source_contains_import_meta(parse)
+}
+
+fn source_file_has_commonjs_indicator(parse: &ParseResult) -> bool {
+    let Some(NodeData::SourceFile(source)) =
+        parse.arena.get(parse.source_file).map(|node| &node.data)
+    else {
+        return false;
+    };
+    source.statements.nodes.iter().any(|statement| {
+        let Some(NodeData::ExpressionStatement(statement)) =
+            parse.arena.get(*statement).map(|node| &node.data)
+        else {
+            return false;
+        };
+        let Some(NodeData::BinaryExpression(assignment)) =
+            parse.arena.get(statement.expression).map(|node| &node.data)
+        else {
+            return false;
+        };
+        parse
+            .arena
+            .get(assignment.operator_token)
+            .is_some_and(|operator| operator.kind == SyntaxKind::EqualsToken)
+            && commonjs_export_access(&parse.arena, assignment.left)
+    })
+}
+
+fn commonjs_export_access(arena: &ts_ast::NodeArena, node: NodeId) -> bool {
+    match arena.get(node).map(|node| &node.data) {
+        Some(NodeData::Identifier(identifier)) => identifier.text == "exports",
+        Some(NodeData::PropertyAccessExpression(access)) => {
+            let module_exports = matches!(
+                arena.get(access.expression).map(|node| &node.data),
+                Some(NodeData::Identifier(identifier)) if identifier.text == "module"
+            ) && matches!(
+                arena.get(access.name).map(|node| &node.data),
+                Some(NodeData::Identifier(identifier)) if identifier.text == "exports"
+            );
+            module_exports || commonjs_export_access(arena, access.expression)
+        }
+        Some(NodeData::ElementAccessExpression(access)) => {
+            let module_exports = matches!(
+                arena.get(access.expression).map(|node| &node.data),
+                Some(NodeData::Identifier(identifier)) if identifier.text == "module"
+            ) && matches!(
+                arena
+                    .get(access.argument_expression)
+                    .map(|node| &node.data),
+                Some(NodeData::StringLiteral(value)) if value.text == "exports"
+            );
+            module_exports || commonjs_export_access(arena, access.expression)
+        }
+        _ => false,
+    }
+}
+
+fn source_contains_jsx(parse: &ParseResult) -> bool {
+    parse.arena.iter().any(|(_, node)| {
+        matches!(
+            node.data,
+            NodeData::JsxElement(_) | NodeData::JsxSelfClosingElement(_) | NodeData::JsxFragment(_)
+        )
+    })
 }
 
 fn source_contains_import_meta(parse: &ParseResult) -> bool {
@@ -7241,6 +7695,37 @@ fn missing_file_diagnostic(file_name: &str) -> ProgramDiagnostic {
         message: message
             .format(&[file_name.to_owned()])
             .expect("TS6053 has one formatting argument"),
+        related_information: Vec::new(),
+    }
+}
+
+fn check_js_requires_allow_js_diagnostic() -> ProgramDiagnostic {
+    let message = message_by_code(5052).expect("TS5052 must be in the generated catalog");
+    ProgramDiagnostic {
+        file_name: None,
+        range: None,
+        code: Some(message.code()),
+        category: message.category(),
+        message: message
+            .format(&["checkJs".to_owned(), "allowJs".to_owned()])
+            .expect("TS5052 has two formatting arguments"),
+        related_information: Vec::new(),
+    }
+}
+
+fn javascript_file_not_allowed_diagnostic(file_name: &str) -> ProgramDiagnostic {
+    let message = message_by_code(6504).expect("TS6504 must be in the generated catalog");
+    let reason = message_by_code(1430).expect("TS1430 must be in the generated catalog");
+    let root = message_by_code(1427).expect("TS1427 must be in the generated catalog");
+    let primary = message
+        .format(&[file_name.to_owned()])
+        .expect("TS6504 has one formatting argument");
+    ProgramDiagnostic {
+        file_name: None,
+        range: None,
+        code: Some(message.code()),
+        category: message.category(),
+        message: format!("{primary}\n  {}\n    {}", reason.text(), root.text()),
         related_information: Vec::new(),
     }
 }
@@ -8178,10 +8663,23 @@ mod tests {
     }
 
     #[test]
-    fn canonical_module_manifest_rejects_non_bundler_or_non_esm_configuration() {
-        for (module, module_resolution) in [
-            (ModuleKind::CommonJs, ModuleResolutionKind::Bundler),
-            (ModuleKind::EsNext, ModuleResolutionKind::Node10),
+    fn canonical_module_manifest_preserves_commonjs_and_esm_configuration() {
+        for (module, module_resolution, expected_mode) in [
+            (
+                ModuleKind::CommonJs,
+                ModuleResolutionKind::Bundler,
+                CanonicalModuleResolutionMode::CommonJs,
+            ),
+            (
+                ModuleKind::CommonJs,
+                ModuleResolutionKind::Node10,
+                CanonicalModuleResolutionMode::CommonJs,
+            ),
+            (
+                ModuleKind::EsNext,
+                ModuleResolutionKind::Node10,
+                CanonicalModuleResolutionMode::Esm,
+            ),
         ] {
             let fs = MemoryFileSystem::new(true);
             fs.write_file("/project/target.ts", "export const value: number = 1;")
@@ -8194,26 +8692,36 @@ mod tests {
             let program =
                 Program::new_with_options(&fs, "/project", &["importer.ts".to_owned()], options);
 
-            let error = program.canonical_module_resolution_manifest().unwrap_err();
-            assert!(error.is_unsupported_boundary());
-            assert!(matches!(
-                error,
-                CanonicalProgramCheckError::PlainEsmModuleResolutionUnsupported {
-                    file_name,
-                    module: actual_module,
-                    module_resolution: actual_resolution,
-                } if file_name == "/project/importer.ts"
-                    && actual_module == module
-                    && actual_resolution == module_resolution
-            ));
+            let manifest = program.canonical_module_resolution_manifest().unwrap();
+            let [entry] = manifest.entries() else {
+                panic!("expected one module resolution for {module:?}/{module_resolution:?}");
+            };
+            let CanonicalModuleResolutionInput::Resolved(resolved) = entry.resolution() else {
+                panic!("expected a resolved module for {module:?}/{module_resolution:?}");
+            };
+            assert_eq!(resolved.usage_mode(), expected_mode);
+            assert_eq!(resolved.target_mode(), expected_mode);
         }
     }
 
     #[test]
-    fn canonical_module_manifest_rejects_ambiguous_static_resolution_modes() {
-        for importer_text in [
-            "import value = require('./target');",
-            "import { value } from './target' with { type: 'json' };",
+    fn canonical_module_manifest_retains_import_equals_and_attribute_modes() {
+        for (importer_text, expected_mode) in [
+            (
+                "import value = require('./target');",
+                CanonicalModuleResolutionMode::CommonJs,
+            ),
+            (
+                "import { value } from './target' with { type: 'json' };",
+                CanonicalModuleResolutionMode::Esm,
+            ),
+            (
+                concat!(
+                    "import type { Value } from './target' ",
+                    "with { 'resolution-mode': 'require' };",
+                ),
+                CanonicalModuleResolutionMode::CommonJs,
+            ),
         ] {
             let fs = MemoryFileSystem::new(true);
             fs.write_file("/project/target.ts", "export const value: number = 1;")
@@ -8227,12 +8735,15 @@ mod tests {
                 plain_esm_bundler_options(),
             );
 
-            let error = program.canonical_module_resolution_manifest().unwrap_err();
-            assert!(error.is_unsupported_boundary());
-            assert!(matches!(
-                error,
-                CanonicalProgramCheckError::ModuleSpecifierResolutionModeUnsupported(_)
-            ));
+            let manifest = program.canonical_module_resolution_manifest().unwrap();
+            let [entry] = manifest.entries() else {
+                panic!("expected one module resolution for {importer_text}");
+            };
+            let CanonicalModuleResolutionInput::Resolved(resolved) = entry.resolution() else {
+                panic!("expected a resolved module for {importer_text}");
+            };
+            assert_eq!(resolved.usage_mode(), expected_mode);
+            assert_eq!(resolved.target_mode(), CanonicalModuleResolutionMode::Esm);
         }
     }
 
@@ -8701,10 +9212,13 @@ mod tests {
         let fs = MemoryFileSystem::new(true);
         fs.write_file("/project/first.ts", r#"const first: number = "wrong";"#)
             .unwrap();
-        fs.write_file("/project/later.ts", "class Later { method() {} }")
-            .unwrap();
+        fs.write_file(
+            "/project/later.ts",
+            "class Later { method(value: string) {} }",
+        )
+        .unwrap();
 
-        let error = Program::try_new_with_canonical_checker(
+        let Err(error) = Program::try_new_with_canonical_checker(
             &fs,
             "/project",
             &["first.ts".to_owned(), "later.ts".to_owned()],
@@ -8712,8 +9226,9 @@ mod tests {
                 lib: Some(vec!["es5".to_owned()]),
                 ..CompilerOptions::default()
             },
-        )
-        .unwrap_err();
+        ) else {
+            panic!("expected unsupported syntax in the later source file");
+        };
 
         assert!(matches!(
             error,
@@ -8784,13 +9299,18 @@ mod tests {
     }
 
     #[test]
-    fn canonical_program_rejects_fixed_module_formats_without_guessing() {
+    fn canonical_program_preserves_fixed_module_formats() {
         for file_name in ["module.mts", "module.cts", "module.d.mts", "module.d.cts"] {
             let fs = MemoryFileSystem::new(true);
-            fs.write_file(&format!("/project/{file_name}"), "const value: number = 1;")
+            let source = if ts_path::is_declaration_file(file_name) {
+                "export interface Value { value: number }"
+            } else {
+                "export const value: number = 1;"
+            };
+            fs.write_file(&format!("/project/{file_name}"), source)
                 .unwrap();
 
-            let error = Program::try_new_with_canonical_checker(
+            let program = Program::try_new_with_canonical_checker(
                 &fs,
                 "/project",
                 &[file_name.to_owned()],
@@ -8800,12 +9320,15 @@ mod tests {
                     ..CompilerOptions::default()
                 },
             )
-            .unwrap_err();
-            assert!(matches!(
-                error,
-                CanonicalProgramCheckError::FixedModuleFormatUnsupported { file_name: actual }
-                    if actual == format!("/project/{file_name}")
-            ));
+            .unwrap_or_else(|error| panic!("failed to check {file_name}: {error:?}"));
+            let source = program
+                .source_file(&format!("/project/{file_name}"))
+                .unwrap();
+            assert!(
+                canonical_source_file_facts(source, program.options())
+                    .unwrap()
+                    .is_external_module()
+            );
         }
     }
 
@@ -8833,12 +9356,12 @@ mod tests {
     }
 
     #[test]
-    fn canonical_program_requires_skip_lib_check_for_ordinary_declarations() {
+    fn canonical_program_checks_supported_ordinary_declarations() {
         let fs = MemoryFileSystem::new(true);
-        fs.write_file("/project/lib.es5.d.ts", "declare const value: number;")
+        fs.write_file("/project/lib.es5.d.ts", "interface Value { value: number }")
             .unwrap();
 
-        let error = Program::try_new_with_canonical_checker(
+        let checked = Program::try_new_with_canonical_checker(
             &fs,
             "/project",
             &["lib.es5.d.ts".to_owned()],
@@ -8847,12 +9370,12 @@ mod tests {
                 ..CompilerOptions::default()
             },
         )
-        .unwrap_err();
-        assert!(matches!(
-            error,
-            CanonicalProgramCheckError::DeclarationFileCheckingUnsupported { file_name }
-                if file_name == "/project/lib.es5.d.ts"
-        ));
+        .unwrap();
+        assert!(
+            checked.diagnostics().is_empty(),
+            "{:?}",
+            checked.diagnostics()
+        );
 
         let program = Program::try_new_with_canonical_checker(
             &fs,
@@ -8889,12 +9412,14 @@ mod tests {
     }
 
     #[test]
-    fn canonical_program_rejects_unported_node_implied_module_facts() {
+    fn canonical_program_preserves_node_package_module_facts() {
         let fs = MemoryFileSystem::new(true);
+        fs.write_file("/project/package.json", r#"{"type":"module"}"#)
+            .unwrap();
         fs.write_file("/project/main.ts", "const value: number = 1;")
             .unwrap();
 
-        let error = Program::try_new_with_canonical_checker(
+        let program = Program::try_new_with_canonical_checker(
             &fs,
             "/project",
             &["main.ts".to_owned()],
@@ -8906,16 +9431,18 @@ mod tests {
                 ..CompilerOptions::default()
             },
         )
-        .unwrap_err();
-
-        assert!(matches!(
-            error,
-            CanonicalProgramCheckError::NodeModuleFactsUnsupported {
-                file_name,
-                module: ModuleKind::NodeNext,
-                module_resolution: ModuleResolutionKind::NodeNext,
-            } if file_name == "/project/main.ts"
-        ));
+        .unwrap();
+        let source = program.source_file("/project/main.ts").unwrap();
+        assert!(
+            canonical_source_file_facts(source, program.options())
+                .unwrap()
+                .is_external_module()
+        );
+        assert!(
+            program.diagnostics().is_empty(),
+            "{:?}",
+            program.diagnostics()
+        );
     }
 
     #[test]
@@ -13401,23 +13928,22 @@ export function create() { return new M.Value(); }"#,
             .find(|file| file.file_name == "/project/a.d.ts")
             .unwrap()
             .text;
-        assert!(declaration.starts_with("export function use(input?: P): void;\n"));
-        assert!(declaration.contains("export let cast: P;"), "{declaration}");
-        assert!(
-            declaration.contains("/** @readonly */ readonly field: P;"),
-            "{declaration}"
-        );
-        assert!(
-            declaration.contains("set current(next: P);\n    get current(): P;"),
-            "{declaration}"
-        );
-        assert!(
-            declaration.contains("declare const _default: P;"),
-            "{declaration}"
-        );
-        assert!(
-            declaration.contains("export type P = {} & {"),
-            "{declaration}"
+        assert_eq!(
+            declaration,
+            concat!(
+                "export type P = {} & {\n",
+                "    name?: string;\n",
+                "};\n",
+                "export declare let cast: P;\n",
+                "export declare function use(input?: P): void;\n",
+                "export declare class C {\n",
+                "    /** @readonly */ readonly field: P;\n",
+                "    get current(): P;\n",
+                "    set current(next: P);\n",
+                "}\n",
+                "declare const _default: P;\n",
+                "export default _default;\n",
+            )
         );
     }
 

@@ -48,6 +48,50 @@ use super::{
     type_nodes::CanonicalTypeQuery,
 };
 
+/// JSX runtime behavior retained from the compiler's emit setting.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum CanonicalJsxRuntime {
+    /// JSX stays unchanged and does not require a runtime factory.
+    #[default]
+    Preserve,
+    /// Classic JSX requires the `React` factory to be in scope.
+    Classic,
+    /// Automatic JSX requires the `react/jsx-runtime` module.
+    Automatic,
+}
+
+/// Exact per-source JSX runtime facts supplied by the compiler.
+///
+/// Names are borrowed only while the source is checked. A resolved automatic
+/// module must be an external-module symbol owned by the checker context.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CanonicalJsxRuntimeEvidence<'source> {
+    /// JSX remains unchanged and does not require a runtime.
+    Preserve,
+    /// Classic element and fragment factories resolve independently.
+    Classic {
+        factory_namespace: &'source str,
+        fragment_factory_namespace: &'source str,
+        fragment_factory_required: bool,
+        fragment_factory_pragma_required: bool,
+    },
+    /// The named automatic module is either resolved or proven absent.
+    Automatic {
+        module_specifier: &'source str,
+        resolved_module: Option<SemanticSymbolId>,
+    },
+}
+
+impl CanonicalJsxRuntimeEvidence<'_> {
+    const fn mode(self) -> CanonicalJsxRuntime {
+        match self {
+            Self::Preserve => CanonicalJsxRuntime::Preserve,
+            Self::Classic { .. } => CanonicalJsxRuntime::Classic,
+            Self::Automatic { .. } => CanonicalJsxRuntime::Automatic,
+        }
+    }
+}
+
 /// Compiler options consumed by the installed production-construction slice.
 ///
 /// The intrinsic pair controls bootstrap identity. `strict_bind_call_apply`
@@ -59,6 +103,7 @@ use super::{
 /// admission check when intrinsic strict-null identity is also enabled.
 /// `no_implicit_any` controls diagnostics and evolving inference for
 /// unannotated declarations.
+/// `jsx_runtime` retains classic or automatic JSX factory requirements.
 /// `emit_common_js` and `no_emit` preserve the emission conditions needed for
 /// module-scope reserved-name diagnostics.
 /// `no_error_truncation` raises semantic type display to the pinned hard output
@@ -72,6 +117,7 @@ pub struct CanonicalCheckerOptions {
     pub strict_function_types: bool,
     pub strict_property_initialization: bool,
     pub no_implicit_any: bool,
+    pub jsx_runtime: CanonicalJsxRuntime,
     pub emit_common_js: bool,
     pub no_emit: bool,
     pub no_error_truncation: bool,
@@ -87,6 +133,7 @@ impl From<IntrinsicBootstrapOptions> for CanonicalCheckerOptions {
             strict_function_types: false,
             strict_property_initialization: false,
             no_implicit_any: false,
+            jsx_runtime: CanonicalJsxRuntime::Preserve,
             emit_common_js: false,
             no_emit: false,
             no_error_truncation: false,
@@ -627,6 +674,19 @@ impl<'arena> CanonicalCheckerContext<'arena> {
         &self.global_types
     }
 
+    pub(super) fn artifact_union_type(
+        &mut self,
+        types: &[TypeId],
+    ) -> Result<TypeId, SourceCheckError> {
+        self.store
+            .expression_union_type_with_global_types(
+                &self.global_types,
+                types,
+                super::bootstrap::UnionReduction::Literal,
+            )
+            .map_err(SourceCheckError::from)
+    }
+
     /// The immutable, checker-owned module-resolution capability.
     #[must_use]
     pub const fn module_resolutions(&self) -> &CanonicalModuleResolutionManifest {
@@ -998,6 +1058,38 @@ impl<'arena> CanonicalCheckerContext<'arena> {
             }
         }
         result
+    }
+
+    /// Checks one source using its exact, compiler-resolved JSX runtime.
+    ///
+    /// Automatic runtime availability and custom factory names are Program
+    /// facts. The compiler supplies them per file so checker diagnostics never
+    /// guess a module path or report a resolved module as missing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SourceCheckError`] for invalid source or module provenance,
+    /// conflicting runtime state, or any ordinary source-checking failure.
+    pub fn check_source_file_with_jsx_runtime(
+        &mut self,
+        file: FileId,
+        runtime: CanonicalJsxRuntimeEvidence<'_>,
+    ) -> Result<(), SourceCheckError> {
+        let (arena, bound) = self
+            .files
+            .snapshot(file)
+            .ok_or(SourceCheckError::Provenance(
+                SourceCheckProvenanceError::MissingFile(file),
+            ))?;
+        let diagnostics =
+            super::jsx::source_jsx_runtime_diagnostics(&self.store, arena, bound, runtime)?;
+        let previous = self.options.jsx_runtime;
+        self.options.jsx_runtime = runtime.mode();
+        let checked = self.check_source_file(file);
+        self.options.jsx_runtime = previous;
+        checked?;
+        source::merge_retry_diagnostics(&mut self.diagnostics, diagnostics);
+        Ok(())
     }
 
     /// Forces one already-retained source through the complete checker
@@ -2301,6 +2393,7 @@ mod tests {
         assert!(!defaults.strict_function_types);
         assert!(!defaults.strict_property_initialization);
         assert!(!defaults.no_implicit_any);
+        assert_eq!(defaults.jsx_runtime, CanonicalJsxRuntime::Preserve);
         assert!(!defaults.emit_common_js);
         assert!(!defaults.no_emit);
         assert!(!defaults.no_error_truncation);
@@ -2315,6 +2408,7 @@ mod tests {
         assert!(!options.strict_function_types);
         assert!(!options.strict_property_initialization);
         assert!(!options.no_implicit_any);
+        assert_eq!(options.jsx_runtime, CanonicalJsxRuntime::Preserve);
         assert!(!options.emit_common_js);
         assert!(!options.no_emit);
         assert!(!options.no_error_truncation);

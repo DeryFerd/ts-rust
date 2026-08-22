@@ -356,6 +356,7 @@ dependencies = [
  "ts_parser",
  "ts_path",
  "ts_printer",
+ "ts_scanner",
  "ts_sourcemap",
  "ts_vfs",
 ]
