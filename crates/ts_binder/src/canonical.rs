@@ -8601,9 +8601,218 @@ const object = {};
     }
 
     #[test]
+    fn reopened_interfaces_merge_method_index_and_accessor_symbols() {
+        let parsed = parse_source_file(concat!(
+            "interface Combined { ",
+            "method(value: string): number; ",
+            "[key: string]: number; ",
+            "get item(): number; ",
+            "set item(value: number); ",
+            "} ",
+            "interface Combined { ",
+            "method(value: number): number; ",
+            "[key: number]: number; ",
+            "}",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(93);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/merged-interface.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+
+        let bound = binder.file(file).unwrap();
+        let locals = binder
+            .symbol_store()
+            .symbol_table(bound.locals(bound.source_file()).unwrap())
+            .unwrap();
+        let interface = locals.get_source("Combined").unwrap();
+        assert_eq!(
+            binder
+                .symbol_store()
+                .symbol(interface)
+                .unwrap()
+                .declarations()
+                .unwrap()
+                .len(),
+            2
+        );
+        let members = binder
+            .symbol_store()
+            .symbol_table(
+                binder
+                    .symbol_store()
+                    .symbol(interface)
+                    .unwrap()
+                    .members()
+                    .unwrap(),
+            )
+            .unwrap();
+        for (name, expected_flags, declaration_count) in [
+            ("method", SymbolFlags::METHOD, 2),
+            (
+                "item",
+                SymbolFlags::GET_ACCESSOR | SymbolFlags::SET_ACCESSOR,
+                2,
+            ),
+        ] {
+            let symbol = members.get_source(name).unwrap();
+            let record = binder.symbol_store().symbol(symbol).unwrap();
+            assert_eq!(record.flags(), expected_flags);
+            assert_eq!(record.parent(), Some(interface));
+            assert_eq!(record.declarations().unwrap().len(), declaration_count);
+        }
+        let indexes = members.get(InternalSymbolName::Index.as_ref()).unwrap();
+        let index_record = binder.symbol_store().symbol(indexes).unwrap();
+        assert_eq!(index_record.flags(), SymbolFlags::SIGNATURE);
+        assert_eq!(index_record.declarations().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn constructor_parameter_properties_keep_distinct_locals_and_class_members() {
+        let parsed = parse_source_file(concat!(
+            "class Model { constructor(",
+            "private readonly hidden: string, ",
+            "protected shared: number, ",
+            "readonly fixed = 1, ",
+            "public optional?: boolean",
+            ") {} }",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(94);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/parameters.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+
+        let bound = binder.file(file).unwrap();
+        let class = nodes_of_kind(&parsed.arena, SyntaxKind::ClassDeclaration)[0];
+        let class_symbol = bound.symbol(node_ref(&parsed.arena, file, class)).unwrap();
+        let members = binder
+            .symbol_store()
+            .symbol_table(
+                binder
+                    .symbol_store()
+                    .symbol(class_symbol)
+                    .unwrap()
+                    .members()
+                    .unwrap(),
+            )
+            .unwrap();
+        let constructor = nodes_of_kind(&parsed.arena, SyntaxKind::Constructor)[0];
+        let locals = binder
+            .symbol_store()
+            .symbol_table(
+                bound
+                    .locals(node_ref(&parsed.arena, file, constructor))
+                    .unwrap(),
+            )
+            .unwrap();
+        for name in ["hidden", "shared", "fixed", "optional"] {
+            let property = members.get_source(name).unwrap();
+            let local = locals.get_source(name).unwrap();
+            assert_ne!(property, local, "{name}");
+            let expected_flags = SymbolFlags::PROPERTY
+                | if name == "optional" {
+                    SymbolFlags::OPTIONAL
+                } else {
+                    SymbolFlags::NONE
+                };
+            assert_eq!(
+                binder.symbol_store().symbol(property).unwrap().flags(),
+                expected_flags,
+                "{name}"
+            );
+            assert_eq!(
+                binder.symbol_store().symbol(property).unwrap().parent(),
+                Some(class_symbol)
+            );
+        }
+    }
+
+    #[test]
+    fn loop_binding_patterns_keep_iteration_and_body_scope_symbols() {
+        let parsed = parse_source_file(concat!(
+            "for (const [key, value] of entries) { ",
+            "const { inner, nested: { deep } } = value; ",
+            "}",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(95);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/loop-bindings.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+
+        let bound = binder.file(file).unwrap();
+        assert!(bound.flow_graph().is_complete(), "{:?}", bound.flow_graph());
+        let loop_node = nodes_of_kind(&parsed.arena, SyntaxKind::ForOfStatement)[0];
+        let loop_locals = binder
+            .symbol_store()
+            .symbol_table(
+                bound
+                    .locals(node_ref(&parsed.arena, file, loop_node))
+                    .unwrap(),
+            )
+            .unwrap();
+        for name in ["key", "value"] {
+            assert!(loop_locals.get_source(name).is_some(), "{name}");
+        }
+        let body = nodes_of_kind(&parsed.arena, SyntaxKind::Block)[0];
+        let body_locals = binder
+            .symbol_store()
+            .symbol_table(bound.locals(node_ref(&parsed.arena, file, body)).unwrap())
+            .unwrap();
+        for name in ["inner", "deep"] {
+            assert!(body_locals.get_source(name).is_some(), "{name}");
+            assert!(loop_locals.get_source(name).is_none());
+        }
+        assert_eq!(bound.locals(bound.source_file()), None);
+    }
+
+    #[test]
     fn object_shorthand_and_computed_members_keep_exact_declaration_symbols() {
         let parsed = parse_source_file(
-            "const value = 1; const object = { value, ['named']: value, [1]: value, [dynamic]: value };",
+            "const value = 1; const source = { source: value }; const object = { ...source, value, ['named']: value, [1]: value, [dynamic]: value };",
         );
         assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
         let file = FileId::new(91);
@@ -8626,7 +8835,7 @@ const object = {};
             .unwrap();
 
         let bound = binder.file(file).unwrap();
-        let object = nodes_of_kind(&parsed.arena, SyntaxKind::ObjectLiteralExpression)[0];
+        let object = variable_initializers_named(&parsed.arena, "object")[0];
         let owner = bound.symbol(node_ref(&parsed.arena, file, object)).unwrap();
         let members = binder
             .symbol_store()
@@ -8656,6 +8865,8 @@ const object = {};
         let dynamic_record = binder.symbol_store().symbol(dynamic_symbol).unwrap();
         assert_eq!(dynamic_record.name(), InternalSymbolName::Computed.as_ref());
         assert_eq!(dynamic_record.parent(), Some(owner));
+        let spread = nodes_of_kind(&parsed.arena, SyntaxKind::SpreadAssignment)[0];
+        assert_eq!(bound.symbol(node_ref(&parsed.arena, file, spread)), None);
     }
 
     #[test]

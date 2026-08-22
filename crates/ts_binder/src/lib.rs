@@ -4088,7 +4088,7 @@ mod tests {
     }
 
     #[test]
-    fn for_await_of_destructuring_invalidates_only_its_flow_container() {
+    fn for_await_of_destructuring_assigns_each_binding_in_its_loop_container() {
         let parsed = parse_source_file(
             r"
                 async function consume(entries: any) {
@@ -4103,25 +4103,77 @@ mod tests {
         let graph = result
             .flow_graph(&parsed.arena, parsed.source_file)
             .unwrap();
-        assert!(!graph.is_complete());
+        assert!(graph.is_complete(), "{:?}", graph.unsupported());
 
         let function = nodes_of_kind(&parsed.arena, SyntaxKind::FunctionDeclaration)[0];
         let function_ref = node_ref(&parsed.arena, file, function);
         let source_ref = node_ref(&parsed.arena, file, parsed.source_file);
-        assert_eq!(graph.container_is_complete(function_ref), Some(false));
+        assert_eq!(graph.container_is_complete(function_ref), Some(true));
         assert_eq!(graph.container_is_complete(source_ref), Some(true));
-        assert_eq!(graph.unsupported().len(), 1);
-        assert_eq!(
-            graph.unsupported()[0].kind,
-            UnsupportedFlowKind::DestructuringAssignment
-        );
-        assert_eq!(graph.unsupported()[0].container, function_ref);
+        for element in nodes_of_kind(&parsed.arena, SyntaxKind::BindingElement) {
+            let reference = node_ref(&parsed.arena, file, element);
+            assert!(graph.nodes().iter().any(|flow| {
+                flow.flags.contains(FlowFlags::ASSIGNMENT)
+                    && flow.payload == Some(FlowNodePayload::Ast(reference))
+            }));
+        }
         let after = source_statements(&parsed.arena, parsed.source_file)[1];
         assert!(
             graph
                 .flow_at(node_ref(&parsed.arena, file, after))
                 .is_some()
         );
+    }
+
+    #[test]
+    fn nested_destructuring_defaults_preserve_assignment_flow_order() {
+        let parsed = parse_source_file(concat!(
+            "let fallback = 0; ",
+            "const { first = (fallback = 1), nested: [second, ...rest] } = input; ",
+            "after;",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(91);
+        let result = bind_source_file_in_file(&parsed.arena, parsed.source_file, file);
+        let graph = result
+            .flow_graph(&parsed.arena, parsed.source_file)
+            .unwrap();
+        assert!(graph.is_complete(), "{:?}", graph.unsupported());
+
+        let expected = nodes_of_kind(&parsed.arena, SyntaxKind::BindingElement)
+            .into_iter()
+            .filter(|element| {
+                matches!(
+                    parsed.arena.get(*element).map(|node| &node.data),
+                    Some(NodeData::BindingElement(binding))
+                        if binding.name.is_some_and(|name| {
+                            matches!(
+                                parsed.arena.get(name).map(|node| &node.data),
+                                Some(NodeData::Identifier(identifier))
+                                    if matches!(identifier.text.as_str(), "first" | "second" | "rest")
+                            )
+                        })
+                )
+            })
+            .map(|element| node_ref(&parsed.arena, file, element))
+            .collect::<Vec<_>>();
+        let actual = graph
+            .nodes()
+            .iter()
+            .filter_map(|flow| {
+                if !flow.flags.contains(FlowFlags::ASSIGNMENT) {
+                    return None;
+                }
+                let Some(FlowNodePayload::Ast(node)) = flow.payload.as_ref() else {
+                    return None;
+                };
+                expected.contains(node).then_some(*node)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+        assert!(graph.nodes().iter().any(|flow| {
+            flow.flags.contains(FlowFlags::BRANCH_LABEL) && flow.antecedents.len() == 2
+        }));
     }
 
     #[test]

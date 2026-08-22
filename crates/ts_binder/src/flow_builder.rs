@@ -1173,15 +1173,6 @@ impl<'a, 'hooks> FlowBuilder<'a, 'hooks> {
                 _ => return,
             };
         let initialized_by_iteration = self.is_for_in_or_of_initializer(node_id);
-        if (initializer.is_some() || initialized_by_iteration)
-            && matches!(
-                self.node_kind(name),
-                Some(SyntaxKind::ObjectBindingPattern | SyntaxKind::ArrayBindingPattern)
-            )
-        {
-            self.mark_unsupported(node_id, UnsupportedFlowKind::DestructuringAssignment);
-            return;
-        }
         self.bind_node(name);
         if let Some(exclamation) = exclamation {
             self.bind_node(exclamation);
@@ -1193,6 +1184,25 @@ impl<'a, 'hooks> FlowBuilder<'a, 'hooks> {
             self.bind_node(initializer);
         }
         if initializer.is_some() || initialized_by_iteration {
+            self.bind_initialized_variable_flow(node_id);
+        }
+    }
+
+    fn bind_initialized_variable_flow(&mut self, node_id: NodeId) {
+        let name = match self.ast.get(node_id).map(|node| &node.data) {
+            Some(NodeData::VariableDeclaration(data)) => Some(data.name),
+            Some(NodeData::BindingElement(data)) => data.name,
+            _ => None,
+        };
+        if let Some(name) = name
+            && let Some(NodeData::BindingPattern(pattern)) =
+                self.ast.get(name).map(|node| &node.data)
+        {
+            let elements = pattern.elements.nodes.clone();
+            for element in elements {
+                self.bind_initialized_variable_flow(element);
+            }
+        } else {
             self.create_flow_mutation(FlowFlags::ASSIGNMENT, node_id);
         }
     }
@@ -1213,15 +1223,6 @@ impl<'a, 'hooks> FlowBuilder<'a, 'hooks> {
                 ),
                 _ => return,
             };
-        if initializer.is_some()
-            && matches!(
-                self.node_kind(name),
-                Some(SyntaxKind::ObjectBindingPattern | SyntaxKind::ArrayBindingPattern)
-            )
-        {
-            self.mark_unsupported(node_id, UnsupportedFlowKind::DestructuringAssignment);
-            return;
-        }
         for modifier in modifiers {
             self.bind_node(modifier);
         }
@@ -1252,15 +1253,14 @@ impl<'a, 'hooks> FlowBuilder<'a, 'hooks> {
                 ),
                 _ => return,
             };
-        if initializer.is_some() {
-            self.mark_unsupported(node_id, UnsupportedFlowKind::DestructuringAssignment);
-            return;
-        }
         if let Some(dot_dot_dot) = dot_dot_dot {
             self.bind_node(dot_dot_dot);
         }
         if let Some(property_name) = property_name {
             self.bind_node(property_name);
+        }
+        if let Some(initializer) = initializer {
+            self.bind_initializer(initializer);
         }
         if let Some(name) = name {
             self.bind_node(name);
