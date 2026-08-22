@@ -4373,6 +4373,11 @@ pub fn emit_declaration_file_with_semantics_and_options(
         }
     }
     let declaration_prefix_len = printer.writer.output.len();
+    if printer.javascript_source
+        && let Some(statement) = data.statements.nodes.first()
+    {
+        printer.emit_leading_jsdoc_declarations(*statement);
+    }
     if let Some((name, type_id)) = printer.amd_like_factory_export(data) {
         printer.writer.write("export = ");
         printer.writer.write(&name);
@@ -4404,25 +4409,27 @@ pub fn emit_declaration_file_with_semantics_and_options(
                 _ => {}
             }
         }
-        for statement in &data.statements.nodes {
-            if matches!(
-                printer.arena.get(*statement).map(|node| &node.data),
-                Some(NodeData::FunctionDeclaration(_))
-            ) {
-                printer.emit_statement(*statement, false, source_file)?;
+        if !printer.module_file {
+            for statement in &data.statements.nodes {
+                if matches!(
+                    printer.arena.get(*statement).map(|node| &node.data),
+                    Some(NodeData::FunctionDeclaration(_))
+                ) {
+                    printer.emit_statement(*statement, false, source_file)?;
+                }
             }
         }
     }
     for statement in &data.statements.nodes {
         if printer.javascript_source
-            && matches!(
+            && (matches!(
                 printer.arena.get(*statement).map(|node| &node.data),
-                Some(
-                    NodeData::ImportDeclaration(_)
-                        | NodeData::ImportEqualsDeclaration(_)
-                        | NodeData::FunctionDeclaration(_)
-                )
-            )
+                Some(NodeData::ImportDeclaration(_) | NodeData::ImportEqualsDeclaration(_))
+            ) || (!printer.module_file
+                && matches!(
+                    printer.arena.get(*statement).map(|node| &node.data),
+                    Some(NodeData::FunctionDeclaration(_))
+                )))
         {
             continue;
         }
@@ -5899,7 +5906,7 @@ impl DeclarationPrinter<'_> {
                     return Ok(());
                 } else if !self.emit_javascript_object_namespaces(&node, data.declaration_list)? {
                     if !in_namespace {
-                        self.emit_declaration_prefix(&node, !(self.javascript_source && exported));
+                        self.emit_declaration_prefix(&node, true);
                     } else if namespace_export {
                         self.writer.write("export ");
                     }
@@ -6199,7 +6206,7 @@ impl DeclarationPrinter<'_> {
                     self.writer.newline();
                 }
                 if !in_namespace {
-                    self.emit_declaration_prefix(&node, !(self.javascript_source && exported));
+                    self.emit_declaration_prefix(&node, true);
                 } else if namespace_export
                     || (exported
                         && declaration_has_modifier(self.arena, &node, SyntaxKind::DefaultKeyword))
@@ -6246,30 +6253,6 @@ impl DeclarationPrinter<'_> {
                 }
                 let mut member_order = (0..data.members.nodes.len()).collect::<Vec<_>>();
                 if self.javascript_source {
-                    for index in 0..data.members.nodes.len().saturating_sub(1) {
-                        let getter = self.arena.get(data.members.nodes[index]);
-                        let setter = self.arena.get(data.members.nodes[index + 1]);
-                        let paired = matches!(
-                            getter.map(|node| &node.data),
-                            Some(NodeData::GetAccessorDeclaration(_))
-                        ) && matches!(
-                            setter.map(|node| &node.data),
-                            Some(NodeData::SetAccessorDeclaration(_))
-                        ) && getter.and_then(|node| match &node.data {
-                            NodeData::GetAccessorDeclaration(accessor) => {
-                                declaration_name_text(self.arena, accessor.name)
-                            }
-                            _ => None,
-                        }) == setter.and_then(|node| match &node.data {
-                            NodeData::SetAccessorDeclaration(accessor) => {
-                                declaration_name_text(self.arena, accessor.name)
-                            }
-                            _ => None,
-                        });
-                        if paired {
-                            member_order.swap(index, index + 1);
-                        }
-                    }
                     member_order.sort_by_key(|index| {
                         !matches!(
                             self.arena
@@ -87503,6 +87486,39 @@ class Board {
                 " * @param {Props} [props-like]\n",
                 " * @returns {Props}\n",
                 " */\n",
+            )
+        );
+    }
+
+    #[test]
+    fn javascript_module_declarations_preserve_typedef_and_member_source_order() {
+        let source = concat!(
+            "/** @typedef {{ } & { name?: string }} P */\n",
+            "const value = /** @type {*} */(null);\n",
+            "export let cast = /** @type {P} */(value);\n",
+            "export function use(input = /** @type {P} */(value)) {}\n",
+            "export class C {\n",
+            "  /** @readonly */ field = /** @type {P} */(value);\n",
+            "  get current() { return /** @type {P} */(value); }\n",
+            "  set current(next) {}\n",
+            "}\n",
+            "export default /** @type {P} */(value);\n",
+        );
+        assert_eq!(
+            emit_javascript_declarations_with_semantics(source),
+            concat!(
+                "export type P = {} & {\n",
+                "    name?: string;\n",
+                "};\n",
+                "export declare let cast: P;\n",
+                "export declare function use(input?: P): void;\n",
+                "export declare class C {\n",
+                "    /** @readonly */ readonly field: P;\n",
+                "    get current(): P;\n",
+                "    set current(next: P);\n",
+                "}\n",
+                "declare const _default: P;\n",
+                "export default _default;\n",
             )
         );
     }
