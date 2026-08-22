@@ -2858,6 +2858,8 @@ fn materialize_imported_module_namespace(
     module: SemanticSymbolId,
     members: Vec<PlannedSourceImportModuleMember>,
 ) -> Result<(TypeId, Vec<PreparedSourceImportModuleProperty>), SourceImportError> {
+    let owner =
+        (store.source_node_kind(declaration) == Some(SyntaxKind::SourceFile)).then_some(module);
     if let Some(existing) = store
         .value_symbol_links(module)
         .and_then(|links| links.resolved_type)
@@ -2865,7 +2867,7 @@ fn materialize_imported_module_namespace(
         let structured = store
             .type_payload(existing)
             .filter(|record| {
-                record.symbol().is_none()
+                record.symbol() == owner
                     && record.object_flags()
                         == ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED
             })
@@ -2887,7 +2889,7 @@ fn materialize_imported_module_namespace(
                     .ok_or_else(|| invariant(SourceImportInvariant::InvalidTargetLinks(module)))?;
                 let type_ = store
                     .value_symbol_links(symbol)
-                    .filter(|links| links.target.is_none())
+                    .filter(|links| links.target == owner.map(|_| member.symbol))
                     .and_then(|links| links.resolved_type)
                     .ok_or_else(|| invariant(SourceImportInvariant::InvalidTargetLinks(module)))?;
                 if store
@@ -3041,6 +3043,7 @@ fn materialize_imported_module_namespace(
             symbol,
             ValueSymbolLinks {
                 resolved_type: Some(type_),
+                target: owner.map(|_| target_symbol),
                 ..ValueSymbolLinks::default()
             },
         ) || table
@@ -3057,7 +3060,7 @@ fn materialize_imported_module_namespace(
         });
     }
     let type_ = store
-        .alloc_plain_object_type(ObjectFlags::ANONYMOUS, None)
+        .alloc_plain_object_type(ObjectFlags::ANONYMOUS, owner)
         .ok_or_else(|| invariant(SourceImportInvariant::InvalidTargetLinks(module)))?;
     let property_symbols = (!properties.is_empty())
         .then(|| properties.iter().map(|property| property.symbol).collect());
@@ -3664,9 +3667,12 @@ fn validate_prepared_import_value(
             let members = structured
                 .members
                 .and_then(|members| store.symbol_table(members));
+            let owner = (store.source_node_kind(prepared.target_declaration)
+                == Some(SyntaxKind::SourceFile))
+            .then_some(prepared.target_symbol);
             target.flags().intersects(SymbolFlags::MODULE)
                 && target.declarations() == Some(&[prepared.target_declaration])
-                && record.symbol().is_none()
+                && record.symbol() == owner
                 && record.object_flags() == ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED
                 && symbols.len() == properties.len()
                 && members.map_or(0, ts_binder::semantic::SymbolTable::len) == properties.len()
@@ -3684,7 +3690,7 @@ fn validate_prepared_import_value(
                             .value_symbol_links(property.symbol)
                             .is_some_and(|links| {
                                 links.resolved_type == Some(property.type_)
-                                    && links.target.is_none()
+                                    && links.target == owner.map(|_| property.target_symbol)
                             })
                         && store.symbol(property.target_symbol).is_some_and(|target| {
                             if target.flags() == SymbolFlags::ALIAS {
@@ -3740,7 +3746,8 @@ mod tests {
 
     use super::*;
     use crate::semantic::{
-        AliasSymbolLinks, IntrinsicBootstrapOptions, SymbolNodeLinks,
+        AliasSymbolLinks, CanonicalTypeFormatFlags, IntrinsicBootstrapOptions, SymbolNodeLinks,
+        formatter::type_to_string_with_host_global_types_and_flags,
         global_types::initialize_global_library_types,
         instantiate::InstantiationLimits,
         module_resolution::{
@@ -4421,6 +4428,33 @@ mod tests {
         )
     }
 
+    fn display_type(fixture: &Fixture, type_: TypeId) -> String {
+        let sources = || {
+            fixture.files.iter().map(|file| {
+                (
+                    &file.parsed.arena,
+                    fixture
+                        .bound
+                        .get(&file.file)
+                        .expect("fixture bound every file"),
+                )
+            })
+        };
+        let host = DeclaredTypeHost::new_after_global_merge(
+            sources(),
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        type_to_string_with_host_global_types_and_flags(
+            &fixture.store,
+            &host,
+            &fixture.global_types,
+            type_,
+            CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT,
+        )
+        .unwrap()
+    }
+
     fn publish_for_test(
         store: &mut CanonicalTypeMapperStore,
         prepared: &[PreparedSourceImportValue],
@@ -4629,6 +4663,7 @@ mod tests {
         };
         assert_eq!(properties.len(), 2);
         let namespace = fixture.store.type_payload(prepared.type_).unwrap();
+        assert_eq!(namespace.symbol(), Some(resolved[0].target_symbol));
         let members = namespace
             .data()
             .structured()
@@ -4641,6 +4676,7 @@ mod tests {
                 .expect("module export must be an own property");
             let target = direct_export(&fixture, 1, name);
             let links = fixture.store.value_symbol_links(property).unwrap();
+            assert_eq!(links.target, Some(target));
             assert!(properties.iter().any(|prepared| {
                 prepared.symbol == property && prepared.target_symbol == target
             }));
@@ -4655,10 +4691,17 @@ mod tests {
                 .value_symbol_links(plan.bindings[0].alias_symbol)
                 .is_none()
         );
+        assert_eq!(
+            display_type(&fixture, prepared.type_),
+            "typeof import(\"701\")"
+        );
 
         publish_for_test(&mut fixture.store, std::slice::from_ref(&prepared));
+        let published = store_state(&fixture.store);
         let warm = prepare_one(&mut fixture, &resolved[0], &planned_read).unwrap();
         assert_eq!(warm, prepared);
+        assert_eq!(store_state(&fixture.store), published);
+        assert_eq!(display_type(&fixture, warm.type_), "typeof import(\"701\")");
     }
 
     #[test]
@@ -4861,6 +4904,23 @@ mod tests {
         };
         assert_eq!(property.target_symbol, reexport.bindings[0].alias_symbol);
         assert_eq!(property.value_symbol, direct_export(&fixture, 2, "ready"));
+        assert_eq!(
+            fixture
+                .store
+                .value_symbol_links(property.symbol)
+                .and_then(|links| links.target),
+            Some(reexport.bindings[0].alias_symbol),
+        );
+        assert_eq!(
+            display_type(&fixture, prepared.type_),
+            "typeof import(\"701\")"
+        );
+
+        publish_for_test(&mut fixture.store, std::slice::from_ref(&prepared));
+        let published = store_state(&fixture.store);
+        let warm = prepare_one(&mut fixture, &resolved[0], &planned_read).unwrap();
+        assert_eq!(warm, prepared);
+        assert_eq!(store_state(&fixture.store), published);
     }
 
     #[test]

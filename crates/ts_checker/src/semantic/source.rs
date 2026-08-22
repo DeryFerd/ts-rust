@@ -6928,6 +6928,24 @@ fn widened_fresh_literal_type(
     let TypeData::Literal(literal) = record.data() else {
         return Ok(type_);
     };
+    if record.flags().intersects(TypeFlags::ENUM_LIKE) {
+        let owner = super::enums::canonical_enum_type_owner(store, type_).ok_or(
+            SourceCheckError::LiteralCache(SourceLiteralCacheError::InvalidCachedLiteral(type_)),
+        )?;
+        if literal.fresh_type != Some(type_) || literal.regular_type == type_ {
+            return Ok(type_);
+        }
+        let declared = store
+            .declared_type_links(owner)
+            .and_then(|links| links.declared_type)
+            .filter(|declared| {
+                super::enums::canonical_enum_type_owner(store, *declared) == Some(owner)
+            })
+            .ok_or(SourceCheckError::LiteralCache(
+                SourceLiteralCacheError::InvalidCachedLiteral(type_),
+            ))?;
+        return Ok(declared);
+    }
     store.validate_union_constituent(type_)?;
     if literal.fresh_type != Some(type_) || literal.regular_type == type_ {
         return Ok(type_);
@@ -9945,6 +9963,16 @@ fn current_flow_type_after_assignment(
         .ok_or(RelationUnavailable::Type(declared_type))?;
     if !declared_record.flags().intersects(TypeFlags::UNION) {
         return Ok(declared_type);
+    }
+    if super::enums::is_canonical_enum_union(store, declared_type) {
+        let declared_owner = super::enums::canonical_enum_type_owner(store, declared_type);
+        return Ok(
+            if super::enums::canonical_enum_type_owner(store, assigned_type) == declared_owner {
+                assigned_type
+            } else {
+                declared_type
+            },
+        );
     }
     let assigned_flags = store
         .type_payload(assigned_type)
@@ -14727,6 +14755,49 @@ mod tests {
                 .and_then(|links| links.resolved_type),
             Some(value)
         );
+    }
+
+    #[test]
+    fn mutable_enum_member_values_widen_to_their_declared_enum_and_replay_warm() {
+        let source = parsed(concat!(
+            "enum Colors { First, Second } ",
+            "var current = Colors.First; ",
+            "current = Colors.Second; ",
+            "const exact = Colors.First;",
+        ));
+        let file = FileId::new(8_299);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let owner = global_symbol(&context, "Colors");
+        let declared = context
+            .store()
+            .declared_type_links(owner)
+            .and_then(|links| links.declared_type)
+            .expect("Colors must retain its declared enum type");
+        let exact = variable_value_type(&context, &source, file, "exact");
+        let regular = match context.store().type_payload(exact).unwrap().data() {
+            TypeData::Literal(literal) => literal.regular_type,
+            _ => panic!("Colors.First must retain an enum literal type"),
+        };
+        assert_eq!(
+            variable_value_type(&context, &source, file, "current"),
+            declared
+        );
+        assert_eq!(
+            widened_fresh_literal_type(context.store(), exact),
+            Ok(declared)
+        );
+        assert_eq!(
+            widened_fresh_literal_type(context.store(), regular),
+            Ok(regular)
+        );
+        assert!(context.diagnostics().is_empty());
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
     }
 
     #[test]

@@ -22,6 +22,7 @@ use super::{
     SymbolNodeLinks, TypeDisplayUnavailable, TypeId, TypeNodeLinks,
     array_types::CanonicalArrayTargets,
     bootstrap::{LiteralTypeCacheError, UnionReduction},
+    enums,
     formatter::{
         type_to_string_with_host_and_flags, type_to_string_with_host_global_types_and_flags,
     },
@@ -615,7 +616,13 @@ fn classify_index(
         .type_payload(index_type)
         .ok_or(SourceElementError::InvalidType(index_type))?;
     let flags = record.flags();
-    if flags.intersects(TypeFlags::FRESHABLE) {
+    if flags.intersects(TypeFlags::ENUM_LIKE) {
+        if enums::canonical_enum_type_owner(store, index_type).is_none() {
+            return Err(SourceElementError::Literal(
+                LiteralTypeCacheError::InvalidCachedLiteral(index_type),
+            ));
+        }
+    } else if flags.intersects(TypeFlags::FRESHABLE) {
         store.validate_union_constituent(index_type)?;
     }
     if flags == TypeFlags::STRING {
@@ -664,8 +671,10 @@ fn classify_index(
         });
     };
     let name = match &literal.value {
-        LiteralValue::String(value) if flags == TypeFlags::STRING_LITERAL => value.clone(),
-        LiteralValue::Number(value) if flags == TypeFlags::NUMBER_LITERAL => value.to_string(),
+        LiteralValue::String(value) if flags.intersects(TypeFlags::STRING_LITERAL) => value.clone(),
+        LiteralValue::Number(value) if flags.intersects(TypeFlags::NUMBER_LITERAL) => {
+            value.to_string()
+        }
         _ => {
             return Ok(ClassifiedIndex {
                 shape: IndexShape::Invalid,
@@ -1609,6 +1618,69 @@ mod tests {
             replacement,
             &[index],
         ));
+    }
+
+    #[test]
+    fn enum_member_literals_classify_as_their_numeric_and_string_values() {
+        let parsed = parse_fixture("enum Keys { Zero = 0, Label = 'name' }");
+        let file = FileId::new(620);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/enum-element-keys.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        let (symbols, files) = binder.finish().try_into_parts().unwrap();
+        let bound = &files[&file];
+        let declaration = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::EnumDeclaration).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let owner = bound.symbol(declaration).unwrap();
+        let mut store = CanonicalTypeMapperStore::from_symbol_store(symbols);
+        assert!(
+            store
+                .register_source_file(&parsed.arena, parsed.source_file, file)
+                .is_some()
+        );
+        store
+            .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions::default())
+            .unwrap();
+        let host = DeclaredTypeHost::new([(&parsed.arena, bound)]).unwrap();
+        let enumeration = enums::get_enum_semantics(&mut store, &host, owner).unwrap();
+
+        for (member, name, numeric_name) in [
+            (&enumeration.members[0], "0", true),
+            (&enumeration.members[1], "name", false),
+        ] {
+            let expected = ClassifiedIndex {
+                shape: IndexShape::Literal { numeric_name },
+                property_name: Some(name.to_owned()),
+            };
+            assert_eq!(
+                classify_index(&store, member.regular_type),
+                Ok(expected.clone())
+            );
+            assert_eq!(classify_index(&store, member.fresh_type), Ok(expected));
+        }
     }
 
     #[test]
