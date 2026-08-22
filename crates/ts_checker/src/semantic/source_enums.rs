@@ -21,7 +21,10 @@ use ts_binder::SemanticSymbolId;
 use super::{
     CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHost,
     declared::preflight_node,
-    enums::{self, CanonicalEnumSemantics, EnumTypeError, EnumTypeInvariant, EnumTypeUnsupported},
+    enums::{
+        self, CanonicalEnumSemantics, EnumMemberDiagnostic, EnumTypeError, EnumTypeInvariant,
+        EnumTypeUnsupported,
+    },
 };
 
 /// Binder route for the enum's value/type owner.
@@ -59,6 +62,7 @@ pub(super) struct SourceEnumPlan {
     /// Canonical enum owner used by declared/value type caches.
     pub(super) owner_symbol: SemanticSymbolId,
     pub(super) members: Vec<SourceEnumMemberPlan>,
+    pub(super) diagnostics: Vec<EnumMemberDiagnostic>,
     pub(super) export_route: SourceEnumExportRoute,
     pub(super) is_const: bool,
     pub(super) is_ambient: bool,
@@ -267,7 +271,7 @@ pub(super) fn plan_top_level_enum(
     let owner_symbol = store
         .get_merged_symbol(declaration_symbol)
         .ok_or_else(|| invariant(SourceEnumInvariant::InvalidMergedSymbol(declaration_symbol)))?;
-    enums::preflight_enum(store, host, owner_symbol)
+    let diagnostics = enums::preflight_enum_diagnostics(store, host, owner_symbol)
         .map_err(|error| canonical_error(declaration, error))?;
 
     let mut is_const = false;
@@ -404,6 +408,7 @@ pub(super) fn plan_top_level_enum(
         declaration_symbol,
         owner_symbol,
         members,
+        diagnostics,
         export_route,
         is_const,
         is_ambient,
@@ -650,6 +655,60 @@ mod tests {
             result.members[0].value,
             enums::CanonicalEnumMemberValue::Computed
         ));
+    }
+
+    #[test]
+    fn ambient_enum_plan_retains_nonconstant_initializer_diagnostics() {
+        let mut fixture = fixture(
+            "declare enum Ambient { Numeric = 4.23, Computed = 'foo'.length }",
+            CanonicalModuleState::Script,
+            false,
+        );
+        let declaration = statement(&fixture, 0);
+        let bound = &fixture.files[&fixture.file];
+        let host = host(&fixture.parsed.arena, bound);
+
+        let plan = plan_top_level_enum(&fixture.store, &host, declaration).unwrap();
+        assert!(plan.is_ambient);
+        assert_eq!(plan.diagnostics.len(), 1);
+        assert_eq!(plan.diagnostics[0].code, 1066);
+        assert_eq!(
+            fixture
+                .parsed
+                .arena
+                .get(plan.diagnostics[0].node.node)
+                .unwrap()
+                .kind,
+            SyntaxKind::PropertyAccessExpression
+        );
+
+        let materialized = execute_top_level_enum(&mut fixture.store, &host, &plan).unwrap();
+        assert_eq!(
+            materialized.members[1].value,
+            enums::CanonicalEnumMemberValue::Computed
+        );
+    }
+
+    #[test]
+    fn exported_ambient_enum_accepts_global_nan_and_infinity() {
+        let mut fixture = fixture(
+            "export declare enum E { A = -NaN, B = NaN, C = Infinity, D = -Infinity }",
+            CanonicalModuleState::External,
+            false,
+        );
+        let declaration = statement(&fixture, 0);
+        let bound = &fixture.files[&fixture.file];
+        let host = host(&fixture.parsed.arena, bound);
+
+        let plan = plan_top_level_enum(&fixture.store, &host, declaration).unwrap();
+        assert!(plan.diagnostics.is_empty());
+
+        let materialized = execute_top_level_enum(&mut fixture.store, &host, &plan).unwrap();
+        assert_eq!(materialized.members.len(), 4);
+        assert_eq!(
+            materialized.members[0].fresh_type,
+            materialized.members[1].fresh_type
+        );
     }
 
     #[test]

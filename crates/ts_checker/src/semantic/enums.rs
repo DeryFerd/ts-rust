@@ -52,6 +52,13 @@ pub enum CanonicalEnumMemberValue {
     Computed,
 }
 
+/// A nonfatal enum initializer diagnostic retained for source execution.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct EnumMemberDiagnostic {
+    pub(super) node: NodeRef,
+    pub(super) code: u32,
+}
+
 /// Published semantic identities for one enum member.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CanonicalEnumMemberSemantics {
@@ -129,6 +136,7 @@ struct EnumMemberPlan {
     declaration: NodeRef,
     symbol: SemanticSymbolId,
     value: CanonicalEnumMemberValue,
+    diagnostic: Option<EnumMemberDiagnostic>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -312,50 +320,81 @@ fn plan_enum(
         {
             return Err(invariant(EnumTypeInvariant::InvalidMemberSymbol(member)));
         }
-        let value = match member_data.initializer {
+        let (value, diagnostic) = match member_data.initializer {
             Some(initializer) => {
                 let initializer = NodeRef::new(member.arena, member.file, initializer);
-                let value = constant_initializer(
+                let evaluated = constant_initializer(
                     store,
                     host,
                     member,
                     initializer,
                     &identifier.text,
                     &members,
-                )?;
-                if is_const
-                    && matches!(
-                        value,
-                        CanonicalEnumMemberValue::Number(value)
-                            if value.is_nan() || value.is_infinite()
-                    )
-                {
-                    return Err(unsupported(EnumTypeUnsupported::Initializer(initializer)));
-                }
+                );
+                let (value, diagnostic) = match evaluated {
+                    Ok(CanonicalEnumMemberValue::Number(value)) if is_const && value.is_nan() => (
+                        CanonicalEnumMemberValue::Number(value),
+                        Some(EnumMemberDiagnostic {
+                            node: initializer,
+                            code: 2478,
+                        }),
+                    ),
+                    Ok(CanonicalEnumMemberValue::Number(value))
+                        if is_const && value.is_infinite() =>
+                    {
+                        (
+                            CanonicalEnumMemberValue::Number(value),
+                            Some(EnumMemberDiagnostic {
+                                node: initializer,
+                                code: 2477,
+                            }),
+                        )
+                    }
+                    Ok(value) => (value, None),
+                    Err(EnumTypeError::Unsupported(EnumTypeUnsupported::Initializer(_)))
+                        if is_const || is_ambient =>
+                    {
+                        (
+                            CanonicalEnumMemberValue::Computed,
+                            Some(EnumMemberDiagnostic {
+                                node: initializer,
+                                code: if is_const { 2474 } else { 1066 },
+                            }),
+                        )
+                    }
+                    Err(error) => return Err(error),
+                };
                 next_numeric = match &value {
                     CanonicalEnumMemberValue::Number(value) => Some(*value + Number::new(1.0)),
                     CanonicalEnumMemberValue::String(_) | CanonicalEnumMemberValue::Computed => {
                         None
                     }
                 };
-                value
+                (value, diagnostic)
             }
             None if is_ambient && !is_const => {
                 next_numeric = None;
-                CanonicalEnumMemberValue::Computed
+                (CanonicalEnumMemberValue::Computed, None)
             }
-            None => {
-                let value = next_numeric.ok_or_else(|| {
-                    unsupported(EnumTypeUnsupported::MissingInitializer(member_name))
-                })?;
-                next_numeric = Some(value + Number::new(1.0));
-                CanonicalEnumMemberValue::Number(value)
-            }
+            None => match next_numeric {
+                Some(value) => {
+                    next_numeric = Some(value + Number::new(1.0));
+                    (CanonicalEnumMemberValue::Number(value), None)
+                }
+                None => (
+                    CanonicalEnumMemberValue::Computed,
+                    Some(EnumMemberDiagnostic {
+                        node: member_name,
+                        code: 1061,
+                    }),
+                ),
+            },
         };
         members.push(EnumMemberPlan {
             declaration: member,
             symbol: member_symbol,
             value,
+            diagnostic,
         });
     }
     let plan = EnumPlan {
@@ -377,6 +416,20 @@ pub(super) fn preflight_enum(
     symbol: SemanticSymbolId,
 ) -> Result<(), EnumTypeError> {
     plan_enum(store, host, symbol).map(drop)
+}
+
+/// Returns nonfatal member diagnostics without publishing enum state.
+pub(super) fn preflight_enum_diagnostics(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    symbol: SemanticSymbolId,
+) -> Result<Vec<EnumMemberDiagnostic>, EnumTypeError> {
+    let plan = plan_enum(store, host, symbol)?;
+    Ok(plan
+        .members
+        .into_iter()
+        .filter_map(|member| member.diagnostic)
+        .collect())
 }
 
 fn validate_modifiers(
@@ -712,7 +765,28 @@ fn resolve_enum_entity(
             .symbol(member.symbol)
             .and_then(|symbol| symbol.name().as_utf8())
             == Some(member_name)
-    })?;
+    });
+    let Some(member) = member else {
+        if matches!(record.data, NodeData::Identifier(_))
+            && matches!(member_name, "NaN" | "Infinity")
+        {
+            let bound = host.bound_file(entity)?;
+            let local_symbol = bound
+                .locals(bound.source_file())
+                .and_then(|locals| store.symbol_table(locals))
+                .and_then(|locals| locals.get_source(member_name));
+            let global_symbol = store
+                .intrinsic_bootstrap()
+                .and_then(|bootstrap| store.symbol_table(bootstrap.globals))
+                .and_then(|globals| globals.get_source(member_name));
+            if local_symbol.is_none() || local_symbol == global_symbol {
+                return Some(Evaluation::known(Value::Number(Number::from_string(
+                    member_name,
+                ))));
+            }
+        }
+        return None;
+    };
     let value = match &member.value {
         CanonicalEnumMemberValue::Number(value) => Value::Number(*value),
         CanonicalEnumMemberValue::String(value) => Value::String(value.clone()),
@@ -1654,11 +1728,6 @@ mod tests {
             ("enum Condition { First = true ? 1 : 2 }", "Condition"),
             ("enum Assertion { First = 1 as number }", "Assertion"),
             ("enum Optional { First = Optional?.First }", "Optional"),
-            (
-                "const enum ConstInfinity { First = 1 / 0 }",
-                "ConstInfinity",
-            ),
-            ("const enum ConstNaN { First = 0 / 0 }", "ConstNaN"),
         ] {
             let mut fixture = fixture(source);
             let owner = symbol(&fixture, SyntaxKind::EnumDeclaration, name);
@@ -1737,6 +1806,140 @@ mod tests {
                 fixture.store.checker_link_allocated_lengths(),
             ),
             warm
+        );
+    }
+
+    #[test]
+    fn global_nan_and_infinity_identifiers_keep_pinned_enum_identities() {
+        let mut fixture = fixture(concat!(
+            "enum Exceptional { ",
+            "First = -NaN, ",
+            "Again = NaN, ",
+            "Positive = Infinity, ",
+            "Negative = -Infinity, ",
+            "}",
+        ));
+        let owner = symbol(&fixture, SyntaxKind::EnumDeclaration, "Exceptional");
+        let bound = &fixture.files[&fixture.file];
+        let host = host(&fixture.parsed.arena, bound);
+
+        let result = get_enum_semantics(&mut fixture.store, &host, owner).unwrap();
+        let first = member(&result, &fixture, "First");
+        let again = member(&result, &fixture, "Again");
+        assert!(matches!(
+            first.value,
+            CanonicalEnumMemberValue::Number(value) if value.is_nan()
+        ));
+        assert_eq!(first.regular_type, again.regular_type);
+        assert_eq!(first.fresh_type, again.fresh_type);
+        assert_eq!(
+            member(&result, &fixture, "Positive").value,
+            CanonicalEnumMemberValue::Number(Number::infinity(1))
+        );
+        assert_eq!(
+            member(&result, &fixture, "Negative").value,
+            CanonicalEnumMemberValue::Number(Number::infinity(-1))
+        );
+        assert!(
+            preflight_enum_diagnostics(&fixture.store, &host, owner)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn ambient_computed_initializers_publish_values_and_retain_ts1066() {
+        let mut fixture =
+            fixture("declare enum Ambient { Numeric = 4.23, Computed = 'foo'.length }");
+        let owner = symbol(&fixture, SyntaxKind::EnumDeclaration, "Ambient");
+        let bound = &fixture.files[&fixture.file];
+        let host = host(&fixture.parsed.arena, bound);
+
+        let diagnostics = preflight_enum_diagnostics(&fixture.store, &host, owner).unwrap();
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code, 1066);
+        assert_eq!(
+            fixture
+                .parsed
+                .arena
+                .get(diagnostics[0].node.node)
+                .unwrap()
+                .kind,
+            SyntaxKind::PropertyAccessExpression
+        );
+
+        let result = get_enum_semantics(&mut fixture.store, &host, owner).unwrap();
+        assert_eq!(
+            member(&result, &fixture, "Numeric").value,
+            CanonicalEnumMemberValue::Number(Number::new(4.23))
+        );
+        assert_eq!(
+            member(&result, &fixture, "Computed").value,
+            CanonicalEnumMemberValue::Computed
+        );
+        assert_eq!(
+            preflight_enum_diagnostics(&fixture.store, &host, owner),
+            Ok(diagnostics)
+        );
+    }
+
+    #[test]
+    fn invalid_const_initializers_retain_pinned_values_and_diagnostics() {
+        let mut fixture = fixture(concat!(
+            "const enum Invalid { ",
+            "Positive = 1 / 0, ",
+            "Negative = -1 / 0, ",
+            "NotANumber = 0 / 0, ",
+            "Unknown = external, ",
+            "}",
+        ));
+        let owner = symbol(&fixture, SyntaxKind::EnumDeclaration, "Invalid");
+        let bound = &fixture.files[&fixture.file];
+        let host = host(&fixture.parsed.arena, bound);
+
+        let diagnostics = preflight_enum_diagnostics(&fixture.store, &host, owner).unwrap();
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [2477, 2477, 2478, 2474]
+        );
+
+        let result = get_enum_semantics(&mut fixture.store, &host, owner).unwrap();
+        assert_eq!(
+            member(&result, &fixture, "Positive").value,
+            CanonicalEnumMemberValue::Number(Number::infinity(1))
+        );
+        assert_eq!(
+            member(&result, &fixture, "Negative").value,
+            CanonicalEnumMemberValue::Number(Number::infinity(-1))
+        );
+        assert!(matches!(
+            member(&result, &fixture, "NotANumber").value,
+            CanonicalEnumMemberValue::Number(value) if value.is_nan()
+        ));
+        assert_eq!(
+            member(&result, &fixture, "Unknown").value,
+            CanonicalEnumMemberValue::Computed
+        );
+    }
+
+    #[test]
+    fn missing_initializer_after_string_publishes_computed_member_and_ts1061() {
+        let mut fixture = fixture("enum Broken { First = 'value', Second }");
+        let owner = symbol(&fixture, SyntaxKind::EnumDeclaration, "Broken");
+        let bound = &fixture.files[&fixture.file];
+        let host = host(&fixture.parsed.arena, bound);
+
+        let diagnostics = preflight_enum_diagnostics(&fixture.store, &host, owner).unwrap();
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code, 1061);
+
+        let result = get_enum_semantics(&mut fixture.store, &host, owner).unwrap();
+        assert_eq!(
+            member(&result, &fixture, "Second").value,
+            CanonicalEnumMemberValue::Computed
         );
     }
 
@@ -2050,12 +2253,10 @@ mod tests {
     fn unsupported_and_poisoned_enum_queries_are_atomic() {
         let mut fixture = fixture(
             r#"
-                enum Broken { A = "a", B }
                 enum Computed { A = runtime }
                 enum Good { A }
             "#,
         );
-        let broken = symbol(&fixture, SyntaxKind::EnumDeclaration, "Broken");
         let computed = symbol(&fixture, SyntaxKind::EnumDeclaration, "Computed");
         let good = symbol(&fixture, SyntaxKind::EnumDeclaration, "Good");
         let bound = &fixture.files[&fixture.file];
@@ -2065,12 +2266,6 @@ mod tests {
             fixture.store.type_alias_len(),
             fixture.store.checker_link_allocated_lengths(),
         );
-        assert!(matches!(
-            get_enum_semantics(&mut fixture.store, &host, broken),
-            Err(EnumTypeError::Unsupported(
-                EnumTypeUnsupported::MissingInitializer(_)
-            ))
-        ));
         assert!(matches!(
             get_enum_semantics(&mut fixture.store, &host, computed),
             Err(EnumTypeError::Unsupported(

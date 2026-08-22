@@ -153,19 +153,26 @@ struct PrimitiveScalar {
 enum PrimitiveBinaryOperand {
     Scalar(PrimitiveScalar),
     Recovery(PrimitiveBinaryRecovery),
+    Nullish(PrimitiveNullishFamily),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PrimitiveNullishFamily {
+    Null,
+    Undefined,
 }
 
 impl PrimitiveBinaryOperand {
     const fn scalar(self) -> Option<PrimitiveScalar> {
         match self {
             Self::Scalar(scalar) => Some(scalar),
-            Self::Recovery(_) => None,
+            Self::Recovery(_) | Self::Nullish(_) => None,
         }
     }
 
     const fn recovery(self) -> Option<PrimitiveBinaryRecovery> {
         match self {
-            Self::Scalar(_) => None,
+            Self::Scalar(_) | Self::Nullish(_) => None,
             Self::Recovery(recovery) => Some(recovery),
         }
     }
@@ -209,7 +216,13 @@ impl PrimitiveBinaryOperator {
             | SyntaxKind::AsteriskToken
             | SyntaxKind::SlashToken
             | SyntaxKind::PercentToken
-            | SyntaxKind::AsteriskAsteriskToken => Self::Arithmetic(kind),
+            | SyntaxKind::AsteriskAsteriskToken
+            | SyntaxKind::BarToken
+            | SyntaxKind::AmpersandToken
+            | SyntaxKind::CaretToken
+            | SyntaxKind::LessThanLessThanToken
+            | SyntaxKind::GreaterThanGreaterThanToken
+            | SyntaxKind::GreaterThanGreaterThanGreaterThanToken => Self::Arithmetic(kind),
             SyntaxKind::LessThanToken
             | SyntaxKind::LessThanEqualsToken
             | SyntaxKind::GreaterThanToken
@@ -237,6 +250,12 @@ impl PrimitiveBinaryOperator {
             SyntaxKind::SlashToken => "/",
             SyntaxKind::PercentToken => "%",
             SyntaxKind::AsteriskAsteriskToken => "**",
+            SyntaxKind::BarToken => "|",
+            SyntaxKind::AmpersandToken => "&",
+            SyntaxKind::CaretToken => "^",
+            SyntaxKind::LessThanLessThanToken => "<<",
+            SyntaxKind::GreaterThanGreaterThanToken => ">>",
+            SyntaxKind::GreaterThanGreaterThanGreaterThanToken => ">>>",
             SyntaxKind::LessThanToken => "<",
             SyntaxKind::LessThanEqualsToken => "<=",
             SyntaxKind::GreaterThanToken => ">",
@@ -256,19 +275,47 @@ pub(super) fn check_primitive_binary(
     request: PrimitiveBinaryRequest,
 ) -> Result<PrimitiveBinaryResolution, PrimitiveBinaryError> {
     let operator = PrimitiveBinaryOperator::from_syntax(request.operator)?;
-    let left = primitive_binary_operand(
+    let mut left = primitive_binary_operand(
         store,
         request.left,
         request.left_type,
         request.left_recovery,
     )?;
-    let right = primitive_binary_operand(
+    let mut right = primitive_binary_operand(
         store,
         request.right,
         request.right_type,
         request.right_recovery,
     )?;
     let mut diagnostics = Vec::new();
+
+    let string_plus = operator == PrimitiveBinaryOperator::Plus
+        && (left
+            .scalar()
+            .is_some_and(|scalar| scalar.family == PrimitiveScalarFamily::String)
+            || right
+                .scalar()
+                .is_some_and(|scalar| scalar.family == PrimitiveScalarFamily::String));
+    if !matches!(operator, PrimitiveBinaryOperator::Equality(_)) && !string_plus {
+        left = check_non_null_operand(request.left, left, &mut diagnostics)?;
+        right = check_non_null_operand(request.right, right, &mut diagnostics)?;
+    }
+    if matches!(operator, PrimitiveBinaryOperator::Equality(_)) {
+        if matches!(left, PrimitiveBinaryOperand::Nullish(_)) {
+            return Err(PrimitiveBinaryUnsupported::Operand {
+                node: request.left,
+                type_: request.left_type,
+            }
+            .into());
+        }
+        if matches!(right, PrimitiveBinaryOperand::Nullish(_)) {
+            return Err(PrimitiveBinaryUnsupported::Operand {
+                node: request.right,
+                type_: request.right_type,
+            }
+            .into());
+        }
+    }
 
     let result = match operator {
         PrimitiveBinaryOperator::Plus => check_plus(store, request, left, right, &mut diagnostics)?,
@@ -297,6 +344,20 @@ fn primitive_binary_operand(
     recovery: Option<PrimitiveBinaryRecovery>,
 ) -> Result<PrimitiveBinaryOperand, PrimitiveBinaryError> {
     let Some(recovery) = recovery else {
+        let bootstrap = store
+            .intrinsic_bootstrap()
+            .ok_or(PrimitiveBinaryInvariant::MissingBootstrap)?;
+        let nullish = if type_ == bootstrap.null_type || type_ == bootstrap.null_widening_type {
+            Some(PrimitiveNullishFamily::Null)
+        } else if type_ == bootstrap.undefined_type || type_ == bootstrap.undefined_widening_type {
+            Some(PrimitiveNullishFamily::Undefined)
+        } else {
+            None
+        };
+        if let Some(nullish) = nullish {
+            store.validate_union_constituent(type_)?;
+            return Ok(PrimitiveBinaryOperand::Nullish(nullish));
+        }
         return primitive_scalar(store, node, type_).map(PrimitiveBinaryOperand::Scalar);
     };
     let bootstrap = store
@@ -310,6 +371,31 @@ fn primitive_binary_operand(
         return Err(PrimitiveBinaryInvariant::InvalidRecovery { type_, recovery }.into());
     }
     Ok(PrimitiveBinaryOperand::Recovery(recovery))
+}
+
+fn check_non_null_operand(
+    node: NodeRef,
+    operand: PrimitiveBinaryOperand,
+    diagnostics: &mut Vec<CanonicalCheckerDiagnostic>,
+) -> Result<PrimitiveBinaryOperand, PrimitiveBinaryError> {
+    let PrimitiveBinaryOperand::Nullish(kind) = operand else {
+        return Ok(operand);
+    };
+    let value = match kind {
+        PrimitiveNullishFamily::Null => "null",
+        PrimitiveNullishFamily::Undefined => "undefined",
+    };
+    let message =
+        message_by_code(18_050).ok_or(PrimitiveBinaryInvariant::MissingDiagnostic(18_050))?;
+    diagnostics.push(CanonicalCheckerDiagnostic {
+        node: Some(node),
+        range_override: None,
+        diagnostic: Diagnostic::with_arguments(message, [value.to_owned()]),
+        related_information: Vec::new(),
+    });
+    Ok(PrimitiveBinaryOperand::Recovery(
+        PrimitiveBinaryRecovery::Error,
+    ))
 }
 
 fn primitive_scalar(
@@ -749,6 +835,22 @@ mod tests {
             (SyntaxKind::PercentToken, bigint, bigint, bigint),
             (SyntaxKind::AsteriskAsteriskToken, number, number, number),
             (SyntaxKind::AsteriskAsteriskToken, bigint, bigint, bigint),
+            (SyntaxKind::BarToken, number, number, number),
+            (SyntaxKind::AmpersandToken, bigint, bigint, bigint),
+            (SyntaxKind::CaretToken, number, number, number),
+            (SyntaxKind::LessThanLessThanToken, number, number, number),
+            (
+                SyntaxKind::GreaterThanGreaterThanToken,
+                bigint,
+                bigint,
+                bigint,
+            ),
+            (
+                SyntaxKind::GreaterThanGreaterThanGreaterThanToken,
+                number,
+                number,
+                number,
+            ),
             (SyntaxKind::LessThanToken, number, bigint, boolean),
             (SyntaxKind::LessThanEqualsToken, string, string, boolean),
             (SyntaxKind::GreaterThanToken, boolean, boolean, boolean),
@@ -832,6 +934,94 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn nullish_bitwise_operands_report_ts18050_and_recover_to_number() {
+        let parsed = parse_source_file("const value = left | right;");
+        assert!(parsed.diagnostics.is_empty());
+        let nodes = binary_nodes(&parsed);
+        let mut store = initialized_store();
+        let (number, null, undefined, null_widening, undefined_widening) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (
+                bootstrap.number_type,
+                bootstrap.null_type,
+                bootstrap.undefined_type,
+                bootstrap.null_widening_type,
+                bootstrap.undefined_widening_type,
+            )
+        };
+
+        for (left, right, expected) in [
+            (
+                number,
+                null_widening,
+                vec![(nodes.right, "The value 'null' cannot be used here.")],
+            ),
+            (
+                number,
+                undefined_widening,
+                vec![(nodes.right, "The value 'undefined' cannot be used here.")],
+            ),
+            (
+                undefined,
+                undefined_widening,
+                vec![
+                    (nodes.left, "The value 'undefined' cannot be used here."),
+                    (nodes.right, "The value 'undefined' cannot be used here."),
+                ],
+            ),
+            (
+                null,
+                null_widening,
+                vec![
+                    (nodes.left, "The value 'null' cannot be used here."),
+                    (nodes.right, "The value 'null' cannot be used here."),
+                ],
+            ),
+        ] {
+            let resolution = check_primitive_binary(
+                &mut store,
+                request(nodes, SyntaxKind::BarToken, left, right),
+            )
+            .unwrap();
+            assert_eq!(resolution.result_type, number);
+            assert_eq!(resolution.recovery, None);
+            assert_eq!(
+                rendered(&resolution),
+                expected
+                    .into_iter()
+                    .map(|(node, message)| (node, 18_050, message.to_owned()))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn string_concatenation_accepts_nullish_operands_without_null_diagnostics() {
+        let parsed = parse_source_file("const value = left + right;");
+        assert!(parsed.diagnostics.is_empty());
+        let nodes = binary_nodes(&parsed);
+        let mut store = initialized_store();
+        let (string, null, undefined) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (
+                bootstrap.string_type,
+                bootstrap.null_widening_type,
+                bootstrap.undefined_widening_type,
+            )
+        };
+
+        for (left, right) in [(string, null), (undefined, string)] {
+            let resolution = check_primitive_binary(
+                &mut store,
+                request(nodes, SyntaxKind::PlusToken, left, right),
+            )
+            .unwrap();
+            assert_eq!(resolution.result_type, string);
+            assert!(resolution.diagnostics.is_empty());
+        }
     }
 
     #[test]
