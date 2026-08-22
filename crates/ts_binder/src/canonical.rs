@@ -11,8 +11,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use ts_ast::{
-    FileId, FlowRef, ModifierList, NodeArena, NodeArenaId, NodeArenaRevision, NodeData, NodeId,
-    NodeRef, SyntaxKind,
+    FileId, FlowRef, ModifierList, NodeArena, NodeArenaId, NodeArenaRevision, NodeData, NodeFlags,
+    NodeId, NodeRef, SyntaxKind,
 };
 use ts_diagnostics::{Diagnostic, message_by_code};
 
@@ -789,6 +789,15 @@ struct ExpandoAssignmentInfo {
     node: NodeId,
     container: Option<NodeId>,
     block_scope_container: Option<NodeId>,
+    this_container: Option<NodeId>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum JavaScriptAssignmentKind {
+    ModuleExports,
+    ExportsProperty,
+    ExpandoProperty,
+    ThisProperty,
 }
 
 #[derive(Debug, Default)]
@@ -1115,14 +1124,14 @@ impl CanonicalBinder {
 
     /// Binds ordinary JavaScript script and ES-module declarations.
     ///
-    /// Functions, variables, classes, imports, and exports use the same
-    /// declaration rules as TypeScript. `CommonJS`, JavaScript assignment
-    /// declarations, and synthetic `JSDoc` aliases stay unsupported.
+    /// Functions, variables, classes, imports, exports, `CommonJS` assignments,
+    /// expandos, constructor properties, and synthetic `JSDoc` aliases follow
+    /// the pinned JavaScript binder rules.
     ///
     /// # Errors
     ///
     /// Returns an error for invalid source provenance, duplicate dispatch,
-    /// unsupported JavaScript declaration families, or `CommonJS` modules.
+    /// unsupported JavaScript declaration families.
     ///
     /// # Panics
     ///
@@ -1163,7 +1172,7 @@ impl CanonicalBinder {
                 file,
             ));
         }
-        let Some(facts) = bound.source_facts.clone() else {
+        let Some(mut facts) = bound.source_facts.clone() else {
             return Err(CanonicalDeclarationError::MissingSourceFileFacts(file));
         };
         if facts.is_javascript_file() && !allow_javascript {
@@ -1171,22 +1180,43 @@ impl CanonicalBinder {
                 file,
             ));
         }
-        if facts.is_common_js_module() {
+        if facts.is_common_js_module() && (!allow_javascript || !facts.is_javascript_file()) {
             return Err(CanonicalDeclarationError::CommonJsDeclarationsDeferred(
                 file,
             ));
         }
         let order = bound.traversal_order.clone();
         if let Some(node) = order.iter().copied().find(|node| {
-            !declaration_family_supported(arena, *node)
+            !declaration_family_supported(arena, *node, &facts)
                 || declaration_name_shape_unsupported(arena, *node)
                 || (facts.is_javascript_file()
-                    && (is_typescript_expando_property_assignment(arena, *node)
-                        || assignment_name_requires_javascript_file_kind(arena, *node)))
+                    && ((assignment_name_requires_javascript_file_kind(arena, *node)
+                        && javascript_assignment_kind(arena, *node).is_none())
+                        || javascript_assignment_kind(arena, *node)
+                            == Some(JavaScriptAssignmentKind::ExportsProperty)
+                            && has_dynamic_name(arena, *node)))
         }) {
             return Err(CanonicalDeclarationError::UnsupportedDeclarationFamily(
                 NodeRef::new(arena.id(), file, node),
             ));
+        }
+        if facts.is_javascript_file()
+            && !facts.is_external_or_common_js_module()
+            && order.iter().copied().any(|node| {
+                matches!(
+                    javascript_assignment_kind(arena, node),
+                    Some(
+                        JavaScriptAssignmentKind::ModuleExports
+                            | JavaScriptAssignmentKind::ExportsProperty
+                    )
+                ) || is_javascript_require_call(arena, node)
+            })
+        {
+            facts.module_state = CanonicalModuleState::CommonJs;
+            self.files
+                .get_mut(&file)
+                .expect("declaration-dispatch file remains registered")
+                .source_facts = Some(facts.clone());
         }
         // TypeScript-Go records these while traversing, including the exact
         // scope pair active at the assignment. The immutable Rust traversal
@@ -1195,7 +1225,14 @@ impl CanonicalBinder {
         let expando_assignments = order
             .iter()
             .copied()
-            .filter(|node| is_typescript_expando_property_assignment(arena, *node))
+            .filter(|node| {
+                if facts.is_javascript_file() {
+                    javascript_assignment_kind(arena, *node)
+                        == Some(JavaScriptAssignmentKind::ExpandoProperty)
+                } else {
+                    is_typescript_expando_property_assignment(arena, *node)
+                }
+            })
             .map(|node| {
                 let binding = self
                     .files
@@ -1206,6 +1243,7 @@ impl CanonicalBinder {
                     node,
                     container: binding.container,
                     block_scope_container: binding.block_scope_container,
+                    this_container: binding.this_container,
                 }
             })
             .collect::<Vec<_>>();
@@ -1219,8 +1257,54 @@ impl CanonicalBinder {
             })
             .map(|node| (node, get_module_instance_state(arena, node)))
             .collect::<HashMap<_, _>>();
-        for node in order {
+        for node in order.iter().copied() {
+            if facts.is_javascript_file()
+                && arena
+                    .get(node)
+                    .is_some_and(|node| node.kind == SyntaxKind::JsTypeAliasDeclaration)
+                && self
+                    .files
+                    .get(&file)
+                    .and_then(|bound| bound.nodes.get(node.index()))
+                    .and_then(|binding| binding.block_scope_container)
+                    .is_some_and(|container| {
+                        arena
+                            .get(container)
+                            .is_some_and(|container| container.kind == SyntaxKind::SourceFile)
+                    })
+            {
+                continue;
+            }
             self.bind_declaration_node(arena, file, node, &facts, &module_states)?;
+        }
+        if facts.is_javascript_file() {
+            for node in order.iter().copied().filter(|node| {
+                arena
+                    .get(*node)
+                    .is_some_and(|node| node.kind == SyntaxKind::JsTypeAliasDeclaration)
+                    && arena
+                        .get(*node)
+                        .and_then(|node| node.parent)
+                        .is_some_and(|parent| {
+                            arena
+                                .get(parent)
+                                .is_some_and(|parent| parent.kind == SyntaxKind::SourceFile)
+                        })
+            }) {
+                self.bind_block_scoped_declaration(
+                    arena,
+                    file,
+                    node,
+                    SymbolFlags::TYPE_ALIAS,
+                    SymbolFlags::TYPE_ALIAS_EXCLUDES,
+                    &facts,
+                )?;
+            }
+        }
+        if facts.is_common_js_module() {
+            self.declare_commonjs_variable(arena, file, "module");
+            self.declare_commonjs_variable(arena, file, "exports");
+            self.bind_commonjs_type_exports(file);
         }
         self.bind_deferred_expando_assignments(arena, file, &expando_assignments);
         let bound = self
@@ -1247,6 +1331,111 @@ impl CanonicalBinder {
         let locals = self.symbols.alloc_symbol_table();
         binding.locals = Some(locals);
         locals
+    }
+
+    fn declare_commonjs_variable(&mut self, arena: &NodeArena, file: FileId, name: &str) {
+        let source = self
+            .files
+            .get(&file)
+            .expect("CommonJS file is registered")
+            .source_file;
+        let locals = self.ensure_node_locals(file, source);
+        if self
+            .symbols
+            .symbol_table(locals)
+            .expect("CommonJS locals belong to this store")
+            .get_source(name)
+            .is_some()
+        {
+            return;
+        }
+
+        let source_ref = NodeRef::new(arena.id(), file, source);
+        let escaped_name = EscapedName::source(name);
+        let symbol = self.new_symbol(file, escaped_name.clone());
+        self.or_symbol_flags(
+            symbol,
+            SymbolFlags::FUNCTION_SCOPED_VARIABLE | SymbolFlags::MODULE_EXPORTS,
+        );
+        assert!(self.symbols.set_symbol_declarations(
+            symbol,
+            Some(vec![source_ref]),
+            Some(source_ref),
+        ));
+
+        if name == "module" {
+            let exports_name = EscapedName::source("exports");
+            let exports = self.new_symbol(file, exports_name.clone());
+            self.or_symbol_flags(exports, SymbolFlags::MODULE_EXPORTS | SymbolFlags::PROPERTY);
+            assert!(self.symbols.set_symbol_declarations(
+                exports,
+                Some(vec![source_ref]),
+                Some(source_ref),
+            ));
+            assert!(
+                self.symbols
+                    .set_symbol_relationships(exports, None, None, Some(symbol), None,)
+            );
+            let members = self.ensure_symbol_members(symbol);
+            assert_eq!(
+                self.symbols.insert_symbol(members, exports_name, exports),
+                Some(None)
+            );
+        }
+
+        assert_eq!(
+            self.symbols.insert_symbol(locals, escaped_name, symbol),
+            Some(None)
+        );
+    }
+
+    fn bind_commonjs_type_exports(&mut self, file: FileId) {
+        let Some(source) = self
+            .files
+            .get(&file)
+            .and_then(|bound| bound.symbol(bound.source_file()))
+        else {
+            return;
+        };
+        let Some(exports) = self
+            .symbols
+            .symbol(source)
+            .and_then(|source| source.exports())
+        else {
+            return;
+        };
+        let Some(export_equals) = self
+            .symbols
+            .symbol_table(exports)
+            .and_then(|exports| exports.get(InternalSymbolName::ExportEquals.as_ref()))
+        else {
+            return;
+        };
+        let promoted = self
+            .symbols
+            .symbol_table(exports)
+            .expect("CommonJS exports belong to this store")
+            .iter()
+            .filter_map(|(name, symbol)| {
+                (name != InternalSymbolName::ExportEquals.as_ref()
+                    && self.symbols.symbol(symbol).is_some_and(|record| {
+                        record
+                            .flags()
+                            .intersects(SymbolFlags::TYPE | SymbolFlags::NAMESPACE)
+                    }))
+                .then(|| (name.to_owned(), symbol))
+            })
+            .collect::<Vec<_>>();
+        if promoted.is_empty() {
+            return;
+        }
+        let target = self.ensure_symbol_exports(export_equals);
+        for (name, symbol) in promoted {
+            self.symbols
+                .insert_symbol(target, name, symbol)
+                .expect("promoted CommonJS type export belongs to this store");
+        }
+        self.or_symbol_flags(export_equals, SymbolFlags::NAMESPACE_MODULE);
     }
 
     fn ensure_symbol_members(&mut self, symbol: SemanticSymbolId) -> SymbolTableId {
@@ -1382,6 +1571,7 @@ impl CanonicalBinder {
             | SyntaxKind::ArrowFunction
             | SyntaxKind::ClassStaticBlockDeclaration
             | SyntaxKind::TypeAliasDeclaration
+            | SyntaxKind::JsTypeAliasDeclaration
             | SyntaxKind::MappedType => {
                 let table = self.ensure_node_locals(file, container);
                 self.declare_symbol(arena, file, table, None, node, includes, excludes)
@@ -1399,7 +1589,9 @@ impl CanonicalBinder {
         excludes: SymbolFlags,
         facts: &CanonicalSourceFileFacts,
     ) -> Result<SemanticSymbolId, CanonicalDeclarationError> {
-        if facts.is_external_module() {
+        if facts.is_external_module()
+            || is_implicitly_exported_jsdoc_declaration(arena, node, facts)
+        {
             self.declare_module_member(arena, file, node, includes, excludes, facts)
         } else {
             let source_file = self
@@ -1428,7 +1620,8 @@ impl CanonicalBinder {
         let parent = self
             .bound_node_symbol(file, container)
             .expect("module/source declaration precedes its members");
-        let has_export_modifier = has_combined_modifier(arena, node, SyntaxKind::ExportKeyword);
+        let has_export_modifier = has_combined_modifier(arena, node, SyntaxKind::ExportKeyword)
+            || is_implicitly_exported_jsdoc_declaration(arena, node, facts);
         if includes.intersects(SymbolFlags::ALIAS) {
             if arena
                 .get(node)
@@ -1520,7 +1713,7 @@ impl CanonicalBinder {
             SyntaxKind::ModuleDeclaration => {
                 self.declare_module_member(arena, file, node, includes, excludes, facts)
             }
-            SyntaxKind::SourceFile if facts.is_external_module() => {
+            SyntaxKind::SourceFile if facts.is_external_or_common_js_module() => {
                 self.declare_module_member(arena, file, node, includes, excludes, facts)
             }
             _ => {
@@ -1544,7 +1737,7 @@ impl CanonicalBinder {
             .expect("declaration dispatch uses captured reachable nodes")
             .kind;
         match kind {
-            SyntaxKind::SourceFile if facts.is_external_module() => {
+            SyntaxKind::SourceFile if facts.is_external_or_common_js_module() => {
                 self.bind_anonymous_declaration(
                     arena,
                     file,
@@ -1717,7 +1910,7 @@ impl CanonicalBinder {
                     facts,
                 )?;
             }
-            SyntaxKind::TypeAliasDeclaration => {
+            SyntaxKind::TypeAliasDeclaration | SyntaxKind::JsTypeAliasDeclaration => {
                 self.bind_block_scoped_declaration(
                     arena,
                     file,
@@ -1807,6 +2000,11 @@ impl CanonicalBinder {
                     SymbolFlags::PROPERTY_EXCLUDES,
                     facts,
                 )?;
+            }
+            SyntaxKind::BinaryExpression | SyntaxKind::CallExpression
+                if facts.is_javascript_file() =>
+            {
+                self.bind_javascript_assignment_declaration(arena, file, node, facts)?;
             }
             _ => {}
         }
@@ -1947,6 +2145,158 @@ impl CanonicalBinder {
         )?;
         if assignment.is_export_equals {
             self.set_value_declaration(symbol, NodeRef::new(arena.id(), file, node));
+        }
+        Ok(())
+    }
+
+    fn bind_javascript_assignment_declaration(
+        &mut self,
+        arena: &NodeArena,
+        file: FileId,
+        node: NodeId,
+        facts: &CanonicalSourceFileFacts,
+    ) -> Result<(), CanonicalDeclarationError> {
+        match javascript_assignment_kind(arena, node) {
+            Some(JavaScriptAssignmentKind::ModuleExports) if facts.is_common_js_module() => {
+                self.bind_commonjs_assignment(arena, file, node, true)?;
+            }
+            Some(JavaScriptAssignmentKind::ExportsProperty) if facts.is_common_js_module() => {
+                self.bind_commonjs_assignment(arena, file, node, false)?;
+            }
+            Some(JavaScriptAssignmentKind::ThisProperty) => {
+                self.bind_javascript_this_property_assignment(arena, file, node)?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn bind_commonjs_assignment(
+        &mut self,
+        arena: &NodeArena,
+        file: FileId,
+        node: NodeId,
+        module_exports: bool,
+    ) -> Result<(), CanonicalDeclarationError> {
+        let source = self
+            .files
+            .get(&file)
+            .expect("CommonJS assignment file is registered")
+            .source_file;
+        let parent = self
+            .bound_node_symbol(file, source)
+            .expect("CommonJS source declaration precedes its assignments");
+        let exports = self.ensure_symbol_exports(parent);
+        let is_alias = match arena.get(node).map(|node| &node.data) {
+            Some(NodeData::BinaryExpression(binary)) => {
+                is_entity_name_expression(arena, binary.right)
+                    || arena
+                        .get(binary.right)
+                        .is_some_and(|right| right.kind == SyntaxKind::ClassExpression)
+            }
+            _ => false,
+        };
+        let includes = if is_alias {
+            SymbolFlags::ALIAS
+        } else if module_exports {
+            SymbolFlags::PROPERTY
+        } else {
+            SymbolFlags::FUNCTION_SCOPED_VARIABLE
+        };
+        let excludes = if module_exports {
+            SymbolFlags::NONE
+        } else {
+            SymbolFlags::FUNCTION_SCOPED_VARIABLE_EXCLUDES
+        };
+        let symbol = self.declare_symbol_ex_worker(
+            arena,
+            file,
+            exports,
+            Some(parent),
+            node,
+            includes,
+            excludes,
+            false,
+            false,
+            true,
+        )?;
+        if module_exports {
+            self.set_value_declaration(symbol, NodeRef::new(arena.id(), file, node));
+        }
+        Ok(())
+    }
+
+    fn bind_javascript_this_property_assignment(
+        &mut self,
+        arena: &NodeArena,
+        file: FileId,
+        node: NodeId,
+    ) -> Result<(), CanonicalDeclarationError> {
+        if let Some(NodeData::BinaryExpression(binary)) = arena.get(node).map(|node| &node.data)
+            && let Some(NodeData::PropertyAccessExpression(access)) =
+                arena.get(binary.left).map(|node| &node.data)
+            && arena
+                .get(access.name)
+                .is_some_and(|name| name.kind == SyntaxKind::PrivateIdentifier)
+        {
+            return Ok(());
+        }
+        let Some(this_container) = self
+            .files
+            .get(&file)
+            .and_then(|bound| bound.nodes.get(node.index()))
+            .and_then(|binding| binding.this_container)
+        else {
+            return Ok(());
+        };
+        let Some(kind) = arena.get(this_container).map(|node| node.kind) else {
+            return Ok(());
+        };
+        if !matches!(
+            kind,
+            SyntaxKind::Constructor
+                | SyntaxKind::PropertyDeclaration
+                | SyntaxKind::MethodDeclaration
+                | SyntaxKind::GetAccessor
+                | SyntaxKind::SetAccessor
+                | SyntaxKind::ClassStaticBlockDeclaration
+        ) {
+            return Ok(());
+        }
+        let Some(class) = arena
+            .get(this_container)
+            .and_then(|container| container.parent)
+        else {
+            return Ok(());
+        };
+        let Some(parent) = self.bound_node_symbol(file, class) else {
+            return Ok(());
+        };
+        let table = if is_static_declaration(arena, this_container) {
+            self.ensure_symbol_exports(parent)
+        } else {
+            self.ensure_symbol_members(parent)
+        };
+        let is_computed_name = has_dynamic_name(arena, node);
+        let includes = if is_computed_name {
+            SymbolFlags::PROPERTY
+        } else {
+            SymbolFlags::PROPERTY | SymbolFlags::ASSIGNMENT
+        };
+        self.declare_symbol_ex_worker(
+            arena,
+            file,
+            table,
+            Some(parent),
+            node,
+            includes,
+            SymbolFlags::NONE,
+            true,
+            is_computed_name,
+            true,
+        )?;
+        if is_computed_name {
+            self.add_late_bound_assignment_declaration(arena, file, node, parent);
         }
         Ok(())
     }
@@ -2212,20 +2562,20 @@ impl CanonicalBinder {
         assignment: ExpandoAssignmentInfo,
     ) {
         let parent = expando_assignment_parent(arena, assignment.node)
-            .expect("the TypeScript expando queue contains only access assignments");
-        let mut symbol = assignment
-            .block_scope_container
-            .and_then(|container| self.lookup_entity(arena, file, parent, container));
+            .expect("the expando queue contains only access assignments");
+        let mut symbol = assignment.block_scope_container.and_then(|container| {
+            self.lookup_entity(arena, file, parent, container, assignment.this_container)
+        });
         // A block-scope hit shadows the semantic-container table even when it
         // is not an expando-capable initializer. Only an actual lookup miss
         // takes the fallback, matching the pinned binder.
         if symbol.is_none() {
-            symbol = assignment
-                .container
-                .and_then(|container| self.lookup_entity(arena, file, parent, container));
+            symbol = assignment.container.and_then(|container| {
+                self.lookup_entity(arena, file, parent, container, assignment.this_container)
+            });
         }
-        let Some(symbol) = symbol
-            .and_then(|symbol| self.get_typescript_expando_initializer_symbol(arena, file, symbol))
+        let Some(symbol) =
+            symbol.and_then(|symbol| self.get_expando_initializer_symbol(arena, file, symbol))
         else {
             return;
         };
@@ -2245,7 +2595,7 @@ impl CanonicalBinder {
         let exports = self.ensure_symbol_exports(symbol);
         let name = self
             .get_declaration_name(arena, NodeRef::new(arena.id(), file, assignment.node))
-            .expect("TypeScript expando name shapes were preflighted");
+            .expect("expando name shapes were preflighted");
         let may_declare = self
             .symbols
             .symbol_table(exports)
@@ -2271,7 +2621,7 @@ impl CanonicalBinder {
                 false,
                 true,
             )
-            .expect("TypeScript expando declarations were preflighted");
+            .expect("expando declarations were preflighted");
         }
     }
 
@@ -2323,6 +2673,7 @@ impl CanonicalBinder {
         file: FileId,
         node: NodeId,
         container: NodeId,
+        this_container: Option<NodeId>,
     ) -> Option<SemanticSymbolId> {
         if arena
             .get(node)
@@ -2335,11 +2686,23 @@ impl CanonicalBinder {
             .get(expression)
             .is_some_and(|expression| expression.kind == SyntaxKind::ThisKeyword)
         {
-            // `this` access declarations are JavaScript-only in this closure.
-            return None;
+            let class_member = this_container?;
+            let class = arena.get(class_member)?.parent?;
+            let class_symbol = self.bound_node_symbol(file, class)?;
+            let class_record = self.symbols.symbol(class_symbol)?;
+            let table = if is_static_declaration(arena, class_member) {
+                class_record.exports()?
+            } else {
+                class_record.members()?
+            };
+            let name = element_or_property_access_name(arena, node)?;
+            return self
+                .symbols
+                .symbol_table(table)?
+                .get_source(&node_text(arena, name)?);
         }
-        let base = self.lookup_entity(arena, file, expression, container)?;
-        let base = self.get_typescript_expando_initializer_symbol(arena, file, base)?;
+        let base = self.lookup_entity(arena, file, expression, container, this_container)?;
+        let base = self.get_expando_initializer_symbol(arena, file, base)?;
         let exports = self.symbols.symbol(base)?.exports()?;
         let name = element_or_property_access_name(arena, node)?;
         self.symbols
@@ -2375,7 +2738,7 @@ impl CanonicalBinder {
         self.symbols.symbol_table(exports)?.get_source(&name)
     }
 
-    fn get_typescript_expando_initializer_symbol(
+    fn get_expando_initializer_symbol(
         &self,
         arena: &NodeArena,
         file: FileId,
@@ -2388,25 +2751,42 @@ impl CanonicalBinder {
             return None;
         }
         let declaration_node = arena.get(declaration.node)?;
-        if declaration_node.kind == SyntaxKind::FunctionDeclaration {
+        let javascript = self
+            .files
+            .get(&file)
+            .and_then(|bound| bound.source_facts.as_ref())
+            .is_some_and(CanonicalSourceFileFacts::is_javascript_file);
+        if declaration_node.kind == SyntaxKind::FunctionDeclaration
+            || javascript && declaration_node.kind == SyntaxKind::ClassDeclaration
+        {
             return Some(symbol);
         }
-        let NodeData::VariableDeclaration(variable) = &declaration_node.data else {
-            return None;
+        let initializer = match &declaration_node.data {
+            NodeData::VariableDeclaration(variable) => {
+                let parent = declaration_node
+                    .parent
+                    .and_then(|parent| arena.get(parent))?;
+                if !javascript && parent.flags.0 & NODE_FLAG_CONST == 0 {
+                    return None;
+                }
+                variable.initializer?
+            }
+            NodeData::BinaryExpression(binary) if javascript => binary.right,
+            _ => return None,
         };
-        let parent = declaration_node
-            .parent
-            .and_then(|parent| arena.get(parent))?;
-        if parent.flags.0 & NODE_FLAG_CONST == 0 {
-            return None;
-        }
-        let initializer = variable.initializer?;
-        if !arena.get(initializer).is_some_and(|initializer| {
-            matches!(
-                initializer.kind,
-                SyntaxKind::FunctionExpression | SyntaxKind::ArrowFunction
-            )
-        }) {
+        let initializer_record = arena.get(initializer)?;
+        let valid = matches!(
+            initializer_record.kind,
+            SyntaxKind::FunctionExpression | SyntaxKind::ArrowFunction
+        ) || javascript
+            && (initializer_record.kind == SyntaxKind::ClassExpression
+                || matches!(
+                    &initializer_record.data,
+                    NodeData::ObjectLiteralExpression(object)
+                        if object.properties.nodes.is_empty()
+                            && !has_javascript_type_annotation(arena, declaration.node)
+                ));
+        if !valid {
             return None;
         }
         self.bound_node_symbol(file, initializer)
@@ -2680,7 +3060,24 @@ impl CanonicalBinder {
         if is_binding_pattern(arena, name) {
             return Ok(());
         }
-        if is_block_or_catch_scoped(arena, node) {
+        if facts.is_javascript_file()
+            && arena
+                .get(node)
+                .and_then(|node| match &node.data {
+                    NodeData::VariableDeclaration(variable) => variable.initializer,
+                    _ => None,
+                })
+                .is_some_and(|initializer| is_javascript_require_call(arena, initializer))
+        {
+            self.declare_symbol_and_add_to_symbol_table(
+                arena,
+                file,
+                node,
+                SymbolFlags::ALIAS,
+                SymbolFlags::ALIAS_EXCLUDES,
+                facts,
+            )?;
+        } else if is_block_or_catch_scoped(arena, node) {
             self.bind_block_scoped_declaration(
                 arena,
                 file,
@@ -2830,6 +3227,16 @@ impl CanonicalBinder {
             } else {
                 InternalSymbolName::Default
             }));
+        }
+        if self
+            .files
+            .get(&declaration.file)
+            .and_then(|bound| bound.source_facts.as_ref())
+            .is_some_and(CanonicalSourceFileFacts::is_javascript_file)
+            && javascript_assignment_kind(arena, declaration.node)
+                == Some(JavaScriptAssignmentKind::ModuleExports)
+        {
+            return Ok(EscapedName::internal(InternalSymbolName::ExportEquals));
         }
 
         if let Some(name_id) = get_name_of_declaration(arena, declaration.node) {
@@ -3231,10 +3638,14 @@ fn assignment_variable_merge(incoming: SymbolFlags, existing: SymbolFlags) -> bo
             && existing.intersects(SymbolFlags::VARIABLE)
 }
 
-fn declaration_family_supported(arena: &NodeArena, node: NodeId) -> bool {
-    !arena
-        .get(node)
-        .is_some_and(|node| node.kind == SyntaxKind::JsTypeAliasDeclaration)
+fn declaration_family_supported(
+    arena: &NodeArena,
+    node: NodeId,
+    facts: &CanonicalSourceFileFacts,
+) -> bool {
+    !arena.get(node).is_some_and(|node| {
+        node.kind == SyntaxKind::JsTypeAliasDeclaration && !facts.is_javascript_file()
+    })
 }
 
 fn get_module_instance_state(arena: &NodeArena, node: NodeId) -> ModuleInstanceState {
@@ -3470,7 +3881,8 @@ fn declaration_name_shape_unsupported(arena: &NodeArena, node: NodeId) -> bool {
             | SyntaxKind::MethodSignature
             | SyntaxKind::GetAccessor
             | SyntaxKind::SetAccessor
-    ) || is_typescript_expando_property_assignment(arena, node);
+    ) || is_typescript_expando_property_assignment(arena, node)
+        || javascript_assignment_kind(arena, node) == Some(JavaScriptAssignmentKind::ThisProperty);
     if has_dynamic_name(arena, node) && !dynamic_is_handled {
         return true;
     }
@@ -3727,6 +4139,29 @@ fn container_has_export_context(
     is_ambient_node(arena, container, facts) && !has_export_declarations(arena, container)
 }
 
+fn is_implicitly_exported_jsdoc_declaration(
+    arena: &NodeArena,
+    node: NodeId,
+    facts: &CanonicalSourceFileFacts,
+) -> bool {
+    if !facts.is_javascript_file() || !facts.is_external_or_common_js_module() {
+        return false;
+    }
+    let Some(declaration) = arena.get(node) else {
+        return false;
+    };
+    if !declaration.parent.is_some_and(|parent| {
+        arena
+            .get(parent)
+            .is_some_and(|parent| parent.kind == SyntaxKind::SourceFile)
+    }) {
+        return false;
+    }
+    declaration.kind == SyntaxKind::JsTypeAliasDeclaration
+        || declaration.kind == SyntaxKind::ModuleDeclaration
+            && declaration.flags.0 & NodeFlags::REPARSED.0 != 0
+}
+
 fn has_export_declarations(arena: &NodeArena, node: NodeId) -> bool {
     let statements = match arena.get(node).map(|node| &node.data) {
         Some(NodeData::SourceFile(source)) => Some(&source.statements.nodes),
@@ -3923,7 +4358,7 @@ fn assignment_declaration_name(arena: &NodeArena, declaration: NodeId) -> Option
             let left = arena.get(binary.left)?;
             match &left.data {
                 NodeData::PropertyAccessExpression(access)
-                    if is_entity_name_expression(arena, access.expression)
+                    if is_entity_name_expression_ex(arena, access.expression, true)
                         && arena
                             .get(access.name)
                             .is_some_and(|name| name.kind == SyntaxKind::Identifier) =>
@@ -3931,7 +4366,7 @@ fn assignment_declaration_name(arena: &NodeArena, declaration: NodeId) -> Option
                     Some(access.name)
                 }
                 NodeData::ElementAccessExpression(access)
-                    if is_entity_name_expression(arena, access.expression) =>
+                    if is_entity_name_expression_ex(arena, access.expression, true) =>
                 {
                     let argument = skip_parentheses(arena, access.argument_expression)?;
                     arena
@@ -3943,8 +4378,123 @@ fn assignment_declaration_name(arena: &NodeArena, declaration: NodeId) -> Option
                 _ => None,
             }
         }
+        NodeData::CallExpression(call)
+            if is_bindable_object_define_property_call(arena, declaration) =>
+        {
+            call.arguments.nodes.get(1).copied()
+        }
         _ => None,
     }
+}
+
+fn javascript_assignment_kind(
+    arena: &NodeArena,
+    declaration: NodeId,
+) -> Option<JavaScriptAssignmentKind> {
+    match arena.get(declaration).map(|node| &node.data)? {
+        NodeData::BinaryExpression(binary)
+            if arena
+                .get(binary.operator_token)
+                .is_some_and(|operator| operator.kind == SyntaxKind::EqualsToken) =>
+        {
+            if is_module_exports_access(arena, binary.left) {
+                return Some(JavaScriptAssignmentKind::ModuleExports);
+            }
+            let base = access_expression_base(arena, binary.left)?;
+            if is_exports_identifier(arena, base) || is_module_exports_access(arena, base) {
+                Some(JavaScriptAssignmentKind::ExportsProperty)
+            } else if arena
+                .get(base)
+                .is_some_and(|base| base.kind == SyntaxKind::ThisKeyword)
+            {
+                Some(JavaScriptAssignmentKind::ThisProperty)
+            } else if is_entity_name_expression_ex(arena, base, true) {
+                Some(JavaScriptAssignmentKind::ExpandoProperty)
+            } else {
+                None
+            }
+        }
+        NodeData::CallExpression(call)
+            if is_bindable_object_define_property_call(arena, declaration) =>
+        {
+            let receiver = call.arguments.nodes[0];
+            Some(
+                if is_exports_identifier(arena, receiver)
+                    || is_module_exports_access(arena, receiver)
+                {
+                    JavaScriptAssignmentKind::ExportsProperty
+                } else {
+                    JavaScriptAssignmentKind::ExpandoProperty
+                },
+            )
+        }
+        _ => None,
+    }
+}
+
+fn is_javascript_require_call(arena: &NodeArena, node: NodeId) -> bool {
+    let Some(NodeData::CallExpression(call)) = arena.get(node).map(|node| &node.data) else {
+        return false;
+    };
+    !call.arguments.nodes.is_empty()
+        && arena
+            .get(call.expression)
+            .is_some_and(|expression| expression.kind == SyntaxKind::Identifier)
+        && node_text(arena, call.expression).as_deref() == Some("require")
+}
+
+fn has_javascript_type_annotation(arena: &NodeArena, declaration: NodeId) -> bool {
+    let Some(record) = arena.get(declaration) else {
+        return false;
+    };
+    if matches!(&record.data, NodeData::VariableDeclaration(variable) if variable.type_.is_some()) {
+        return true;
+    }
+    let mut host = declaration;
+    while let Some(parent) = arena.get(host).and_then(|node| node.parent) {
+        if arena.get(parent).is_some_and(|parent| {
+            matches!(
+                parent.kind,
+                SyntaxKind::VariableStatement | SyntaxKind::ExpressionStatement
+            )
+        }) {
+            host = parent;
+            break;
+        }
+        if arena.get(parent).is_some_and(|parent| {
+            !matches!(
+                parent.kind,
+                SyntaxKind::VariableDeclarationList | SyntaxKind::ParenthesizedExpression
+            )
+        }) {
+            break;
+        }
+        host = parent;
+    }
+    let Some(source) = arena.source_text() else {
+        return false;
+    };
+    let Some(start) = arena
+        .get(host)
+        .and_then(|node| usize::try_from(node.range.start.get()).ok())
+    else {
+        return false;
+    };
+    let prefix = source.get(..start).unwrap_or_default().trim_end();
+    if !prefix.ends_with("*/") {
+        return false;
+    }
+    let Some(comment_start) = prefix.rfind("/**") else {
+        return false;
+    };
+    prefix[comment_start..]
+        .match_indices("@type")
+        .any(|(index, _)| {
+            prefix[comment_start + index + "@type".len()..]
+                .chars()
+                .next()
+                .is_some_and(|next| next.is_whitespace() || next == '{')
+        })
 }
 
 fn assignment_name_requires_javascript_file_kind(arena: &NodeArena, declaration: NodeId) -> bool {
@@ -4028,10 +4578,11 @@ fn is_typescript_expando_property_assignment(arena: &NodeArena, node: NodeId) ->
 }
 
 fn expando_assignment_parent(arena: &NodeArena, node: NodeId) -> Option<NodeId> {
-    let NodeData::BinaryExpression(binary) = &arena.get(node)?.data else {
-        return None;
-    };
-    access_expression_base(arena, binary.left)
+    match &arena.get(node)?.data {
+        NodeData::BinaryExpression(binary) => access_expression_base(arena, binary.left),
+        NodeData::CallExpression(call) => call.arguments.nodes.first().copied(),
+        _ => None,
+    }
 }
 
 fn has_static_access_name(arena: &NodeArena, node: NodeId) -> bool {
@@ -8408,15 +8959,14 @@ Merged.fresh = 1;
     }
 
     #[test]
-    fn javascript_expandos_remain_unsupported_without_partial_declaration_writes() {
-        let parsed =
-            parse_javascript_source_file("F.staticName = 1; F[dynamic] = 2; function F() {}");
+    fn javascript_dynamic_commonjs_exports_reject_without_partial_declaration_writes() {
+        let parsed = parse_javascript_source_file("function F() {} exports[dynamic] = F;");
         assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
         let file = FileId::new(69);
         let assignment = node_with_source(
             &parsed.arena,
             SyntaxKind::BinaryExpression,
-            "F.staticName = 1",
+            "exports[dynamic] = F",
         );
         let mut binder = CanonicalBinder::new();
         binder
@@ -8457,6 +9007,403 @@ Merged.fresh = 1;
         );
         assert_eq!(binder.symbol_store().symbol_len(), 0);
         assert_eq!(binder.symbol_store().symbol_table_len(), 0);
+    }
+
+    #[test]
+    fn javascript_commonjs_assignments_create_exact_source_exports_and_locals() {
+        let parsed = parse_javascript_source_file(concat!(
+            "exports.first = 1;\n",
+            "exports.alias = local;\n",
+            "module.exports = local;\n",
+            "module.exports[1] = 2;\n",
+            "Object.defineProperty(exports, 'defined', {});\n",
+            "const local = {};\n",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(73);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/common.js\""),
+                    CanonicalSourceLanguage::JavaScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_javascript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+
+        let bound = binder.file(file).unwrap();
+        assert!(bound.source_facts().unwrap().is_common_js_module());
+        assert!(!bound.source_facts().unwrap().is_external_module());
+        let source = bound.symbol(bound.source_file()).unwrap();
+        let source_record = binder.symbol_store().symbol(source).unwrap();
+        assert_eq!(source_record.flags(), SymbolFlags::VALUE_MODULE);
+        let exports = binder
+            .symbol_store()
+            .symbol_table(source_record.exports().unwrap())
+            .unwrap();
+        for name in ["first", "alias", "1", "defined"] {
+            assert!(exports.get_source(name).is_some(), "{name}");
+        }
+        assert_eq!(
+            binder
+                .symbol_store()
+                .symbol(exports.get_source("first").unwrap())
+                .unwrap()
+                .flags(),
+            SymbolFlags::FUNCTION_SCOPED_VARIABLE
+        );
+        assert_eq!(
+            binder
+                .symbol_store()
+                .symbol(exports.get_source("alias").unwrap())
+                .unwrap()
+                .flags(),
+            SymbolFlags::ALIAS
+        );
+        let export_equals = exports
+            .get(InternalSymbolName::ExportEquals.as_ref())
+            .unwrap();
+        let assignment = node_with_source(
+            &parsed.arena,
+            SyntaxKind::BinaryExpression,
+            "module.exports = local",
+        );
+        assert_eq!(
+            binder
+                .symbol_store()
+                .symbol(export_equals)
+                .unwrap()
+                .value_declaration(),
+            Some(node_ref(&parsed.arena, file, assignment))
+        );
+
+        let locals = binder
+            .symbol_store()
+            .symbol_table(bound.locals(bound.source_file()).unwrap())
+            .unwrap();
+        let module = locals.get_source("module").unwrap();
+        let exports_local = locals.get_source("exports").unwrap();
+        assert!(
+            binder
+                .symbol_store()
+                .symbol(exports_local)
+                .unwrap()
+                .flags()
+                .contains(SymbolFlags::FUNCTION_SCOPED_VARIABLE | SymbolFlags::MODULE_EXPORTS)
+        );
+        let module_exports = binder
+            .symbol_store()
+            .symbol_table(
+                binder
+                    .symbol_store()
+                    .symbol(module)
+                    .unwrap()
+                    .members()
+                    .unwrap(),
+            )
+            .unwrap()
+            .get_source("exports")
+            .unwrap();
+        assert_eq!(
+            binder
+                .symbol_store()
+                .symbol(module_exports)
+                .unwrap()
+                .parent(),
+            Some(module)
+        );
+    }
+
+    #[test]
+    fn javascript_expandos_follow_function_class_object_and_annotation_rules() {
+        let parsed = parse_javascript_source_file(concat!(
+            "Forward.before = 0;\n",
+            "function Forward() {}\n",
+            "var bag = {};\n",
+            "bag['if'] = 1;\n",
+            "let callback = () => {};\n",
+            "callback.value = 2;\n",
+            "class Box {}\n",
+            "Box.staticValue = 3;\n",
+            "/** @type {Record<string, boolean>} */\n",
+            "let typed = {};\n",
+            "typed.ignored = true;\n",
+            "function owner() {}\n",
+            "/** @type {Record<string, boolean>} */\n",
+            "owner.bucket = {};\n",
+            "owner.bucket.ignored = true;\n",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(74);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/expandos.js\""),
+                    CanonicalSourceLanguage::JavaScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_javascript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+
+        let bound = binder.file(file).unwrap();
+        let locals = binder
+            .symbol_store()
+            .symbol_table(bound.locals(bound.source_file()).unwrap())
+            .unwrap();
+        for (owner, initializer, property) in [
+            ("Forward", None, "before"),
+            ("bag", Some("bag"), "if"),
+            ("callback", Some("callback"), "value"),
+            ("Box", None, "staticValue"),
+        ] {
+            let symbol = initializer.map_or_else(
+                || locals.get_source(owner).unwrap(),
+                |name| {
+                    let initializer = variable_initializers_named(&parsed.arena, name)[0];
+                    bound
+                        .symbol(node_ref(&parsed.arena, file, initializer))
+                        .unwrap()
+                },
+            );
+            let exports = binder
+                .symbol_store()
+                .symbol_table(
+                    binder
+                        .symbol_store()
+                        .symbol(symbol)
+                        .unwrap()
+                        .exports()
+                        .unwrap(),
+                )
+                .unwrap();
+            let declaration = exports.get_source(property).unwrap();
+            assert_eq!(
+                binder.symbol_store().symbol(declaration).unwrap().flags(),
+                SymbolFlags::PROPERTY | SymbolFlags::ASSIGNMENT
+            );
+        }
+
+        let typed_initializer = variable_initializers_named(&parsed.arena, "typed")[0];
+        let typed = bound
+            .symbol(node_ref(&parsed.arena, file, typed_initializer))
+            .unwrap();
+        assert_eq!(binder.symbol_store().symbol(typed).unwrap().exports(), None);
+
+        let owner = locals.get_source("owner").unwrap();
+        let owner_exports = binder
+            .symbol_store()
+            .symbol_table(
+                binder
+                    .symbol_store()
+                    .symbol(owner)
+                    .unwrap()
+                    .exports()
+                    .unwrap(),
+            )
+            .unwrap();
+        let bucket = owner_exports.get_source("bucket").unwrap();
+        assert_eq!(
+            binder.symbol_store().symbol(bucket).unwrap().exports(),
+            None
+        );
+    }
+
+    #[test]
+    fn javascript_this_assignments_preserve_method_replacement_and_static_ownership() {
+        let parsed = parse_javascript_source_file(concat!(
+            "class Fields { constructor() { this.value = 1; this.value = 2; } }\n",
+            "class Replaced { constructor() { this.work = () => {}; } work() {} }\n",
+            "class Kept { work() {} constructor() { this.work = () => {}; } }\n",
+            "class Static { static init() { this.value = 1; } }\n",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(75);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/classes.js\""),
+                    CanonicalSourceLanguage::JavaScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_javascript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+
+        let bound = binder.file(file).unwrap();
+        let locals = binder
+            .symbol_store()
+            .symbol_table(bound.locals(bound.source_file()).unwrap())
+            .unwrap();
+        let fields = locals.get_source("Fields").unwrap();
+        let fields_members = binder
+            .symbol_store()
+            .symbol_table(
+                binder
+                    .symbol_store()
+                    .symbol(fields)
+                    .unwrap()
+                    .members()
+                    .unwrap(),
+            )
+            .unwrap();
+        let value = fields_members.get_source("value").unwrap();
+        let value_record = binder.symbol_store().symbol(value).unwrap();
+        assert!(
+            value_record
+                .flags()
+                .contains(SymbolFlags::PROPERTY | SymbolFlags::ASSIGNMENT)
+        );
+        assert_eq!(value_record.declarations().unwrap().len(), 2);
+
+        for class in ["Replaced", "Kept"] {
+            let symbol = locals.get_source(class).unwrap();
+            let members = binder
+                .symbol_store()
+                .symbol_table(
+                    binder
+                        .symbol_store()
+                        .symbol(symbol)
+                        .unwrap()
+                        .members()
+                        .unwrap(),
+                )
+                .unwrap();
+            assert_eq!(
+                binder
+                    .symbol_store()
+                    .symbol(members.get_source("work").unwrap())
+                    .unwrap()
+                    .flags(),
+                SymbolFlags::METHOD,
+                "{class}"
+            );
+        }
+
+        let static_class = locals.get_source("Static").unwrap();
+        let static_exports = binder
+            .symbol_store()
+            .symbol_table(
+                binder
+                    .symbol_store()
+                    .symbol(static_class)
+                    .unwrap()
+                    .exports()
+                    .unwrap(),
+            )
+            .unwrap();
+        assert!(static_exports.get_source("value").is_some());
+    }
+
+    #[test]
+    fn javascript_jsdoc_aliases_and_namespaces_export_from_commonjs_assignments() {
+        let mut parsed = parse_source_file(concat!(
+            "type Alias = number;\n",
+            "namespace Docs { export type Nested = string; }\n",
+            "const value = 1;\n",
+            "module.exports = value;\n",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let alias = nodes_of_kind(&parsed.arena, SyntaxKind::TypeAliasDeclaration)[0];
+        parsed.arena.get_mut(alias).unwrap().kind = SyntaxKind::JsTypeAliasDeclaration;
+        let namespace = nodes_of_kind(&parsed.arena, SyntaxKind::ModuleDeclaration)[0];
+        parsed.arena.get_mut(namespace).unwrap().flags.0 |= NodeFlags::REPARSED.0;
+        let file = FileId::new(76);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/docs.js\""),
+                    CanonicalSourceLanguage::JavaScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_javascript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+
+        let bound = binder.file(file).unwrap();
+        let source = bound.symbol(bound.source_file()).unwrap();
+        let exports = binder
+            .symbol_store()
+            .symbol_table(
+                binder
+                    .symbol_store()
+                    .symbol(source)
+                    .unwrap()
+                    .exports()
+                    .unwrap(),
+            )
+            .unwrap();
+        let alias_symbol = exports.get_source("Alias").unwrap();
+        let namespace_symbol = exports.get_source("Docs").unwrap();
+        assert!(
+            binder
+                .symbol_store()
+                .symbol(alias_symbol)
+                .unwrap()
+                .flags()
+                .contains(SymbolFlags::TYPE_ALIAS)
+        );
+        assert!(
+            binder
+                .symbol_store()
+                .symbol(namespace_symbol)
+                .unwrap()
+                .flags()
+                .contains(SymbolFlags::NAMESPACE_MODULE)
+        );
+        let export_equals = exports
+            .get(InternalSymbolName::ExportEquals.as_ref())
+            .unwrap();
+        let promoted = binder
+            .symbol_store()
+            .symbol_table(
+                binder
+                    .symbol_store()
+                    .symbol(export_equals)
+                    .unwrap()
+                    .exports()
+                    .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(promoted.get_source("Alias"), Some(alias_symbol));
+        assert_eq!(promoted.get_source("Docs"), Some(namespace_symbol));
+        assert!(
+            binder
+                .symbol_store()
+                .symbol(export_equals)
+                .unwrap()
+                .flags()
+                .contains(SymbolFlags::NAMESPACE_MODULE)
+        );
     }
 
     #[test]
