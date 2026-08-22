@@ -188,14 +188,24 @@ impl<'a> Scanner<'a> {
 
     pub fn scan(&mut self) -> Token<'a> {
         let full_start = self.byte_pos;
+        let mut forced_trivia_flags = TokenFlags::NONE;
         if !self.skip_trivia && self.byte_pos == 0 && self.starts_with("#!") {
             while self.peek().is_some_and(|ch| !is_line_break(ch)) {
                 self.bump();
             }
         }
+        if !self.skip_trivia {
+            while let Some(ch @ ('\u{0085}' | '\u{2028}' | '\u{2029}')) = self.peek() {
+                if is_line_break(ch) {
+                    forced_trivia_flags.insert(TokenFlags::PRECEDING_LINE_BREAK);
+                }
+                self.bump();
+            }
+        }
         if !self.skip_trivia
-            && let Some((kind, flags, start)) = self.scan_trivia_token()
+            && let Some((kind, mut flags, start)) = self.scan_trivia_token()
         {
+            flags.insert(forced_trivia_flags);
             self.last_flags = flags;
             self.last_value = None;
             return self.finish_token(kind, full_start, start);
@@ -203,7 +213,7 @@ impl<'a> Scanner<'a> {
         let mut flags = if self.skip_trivia {
             self.skip_trivia()
         } else {
-            TokenFlags::NONE
+            forced_trivia_flags
         };
         if self.skip_jsdoc_leading_asterisks != 0
             && flags.contains(TokenFlags::PRECEDING_LINE_BREAK)
@@ -400,7 +410,7 @@ impl<'a> Scanner<'a> {
                 text[index + needle.len()..]
                     .chars()
                     .next()
-                    .is_none_or(|ch| ch.is_whitespace() || matches!(ch, '}' | '*'))
+                    .is_none_or(|ch| matches!(ch, ' ' | '\t' | '\n' | '\r' | '}' | '*'))
             }) {
                 flags.insert(flag);
             }
@@ -581,7 +591,7 @@ impl<'a> Scanner<'a> {
                 None => {
                     self.last_flags.insert(TokenFlags::UNTERMINATED);
                     self.error(
-                        self.last_start,
+                        self.byte_pos,
                         self.byte_pos,
                         "Unterminated template literal.",
                     );
@@ -617,10 +627,6 @@ impl<'a> Scanner<'a> {
         self.last_value = None;
         let kind = match self.peek() {
             None => SyntaxKind::EndOfFile,
-            Some('<') if self.is_conflict_marker_at(start) => {
-                self.scan_conflict_marker();
-                SyntaxKind::ConflictMarkerTrivia
-            }
             Some('<') if self.peek_next() == Some('/') => {
                 self.bump_ascii(2);
                 SyntaxKind::LessThanSlashToken
@@ -637,7 +643,18 @@ impl<'a> Scanner<'a> {
                 let mut saw_line_break_before_content = false;
                 let mut saw_non_whitespace = false;
                 while let Some(ch) = self.peek() {
-                    if matches!(ch, '<' | '{') {
+                    if ch == '<' {
+                        if self.is_conflict_marker_at(self.byte_pos) {
+                            self.scan_conflict_marker();
+                            return self.finish_token(
+                                SyntaxKind::ConflictMarkerTrivia,
+                                full_start,
+                                start,
+                            );
+                        }
+                        break;
+                    }
+                    if ch == '{' {
                         break;
                     }
                     if ch == '>' {
@@ -727,7 +744,7 @@ impl<'a> Scanner<'a> {
                 self.bump();
             } else {
                 self.last_flags.insert(TokenFlags::UNTERMINATED);
-                self.error(start, self.byte_pos, "Unterminated string literal.");
+                self.error(self.byte_pos, self.byte_pos, "Unterminated string literal.");
             }
             self.last_value = Some(value);
             return self.finish_token(SyntaxKind::StringLiteral, full_start, start);
@@ -957,9 +974,8 @@ impl<'a> Scanner<'a> {
 
         let started_with_zero = self.peek() == Some('0');
         let separator_after_leading_zero = self.starts_with("0_");
-        let mut normalized = self.scan_digit_sequence(|ch| ch.is_ascii_digit());
-        let mut can_be_bigint = true;
         if separator_after_leading_zero {
+            self.last_flags.insert(TokenFlags::CONTAINS_SEPARATOR);
             self.last_flags
                 .insert(TokenFlags::CONTAINS_INVALID_SEPARATOR);
             self.error(
@@ -968,6 +984,8 @@ impl<'a> Scanner<'a> {
                 "Numeric separators are not allowed here.",
             );
         }
+        let mut normalized = self.scan_digit_sequence(|ch| ch.is_ascii_digit());
+        let mut can_be_bigint = true;
         if started_with_zero
             && normalized.len() > 1
             && !self.last_flags.contains(TokenFlags::CONTAINS_SEPARATOR)
@@ -1168,7 +1186,6 @@ impl<'a> Scanner<'a> {
     }
 
     fn scan_string(&mut self, quote: char) -> SyntaxKind {
-        let start = self.byte_pos;
         let mut value = JsString::default();
         if quote == '\'' {
             self.last_flags.insert(TokenFlags::SINGLE_QUOTE);
@@ -1195,7 +1212,7 @@ impl<'a> Scanner<'a> {
         }
         if !terminated {
             self.last_flags.insert(TokenFlags::UNTERMINATED);
-            self.error(start, self.byte_pos, "Unterminated string literal.");
+            self.error(self.byte_pos, self.byte_pos, "Unterminated string literal.");
         }
         self.last_value = Some(value);
         SyntaxKind::StringLiteral
@@ -1358,7 +1375,6 @@ impl<'a> Scanner<'a> {
     }
 
     fn scan_template(&mut self) -> SyntaxKind {
-        let start = self.byte_pos;
         let mut value = JsString::default();
         self.bump();
         while let Some(ch) = self.peek() {
@@ -1391,7 +1407,11 @@ impl<'a> Scanner<'a> {
             }
         }
         self.last_flags.insert(TokenFlags::UNTERMINATED);
-        self.error(start, self.byte_pos, "Unterminated template literal.");
+        self.error(
+            self.byte_pos,
+            self.byte_pos,
+            "Unterminated template literal.",
+        );
         self.last_value = Some(value);
         SyntaxKind::NoSubstitutionTemplateLiteral
     }
@@ -1638,7 +1658,26 @@ const fn diagnostic_category(category: Category) -> DiagnosticCategory {
 }
 
 fn is_identifier_start(ch: char) -> bool {
-    matches!(ch, '$' | '_') || unicode_ident::is_xid_start(ch)
+    matches!(
+        ch,
+        '$'
+            | '_'
+            | '\u{037a}'
+            | '\u{0e33}'
+            | '\u{0eb3}'
+            | '\u{309b}'..='\u{309c}'
+            | '\u{fc5e}'..='\u{fc63}'
+            | '\u{fdfa}'..='\u{fdfb}'
+            | '\u{fe70}'
+            | '\u{fe72}'
+            | '\u{fe74}'
+            | '\u{fe76}'
+            | '\u{fe78}'
+            | '\u{fe7a}'
+            | '\u{fe7c}'
+            | '\u{fe7e}'
+            | '\u{ff9e}'..='\u{ff9f}'
+    ) || unicode_ident::is_xid_start(ch)
 }
 
 fn text_pos(byte_pos: usize) -> TextPos {
@@ -1669,7 +1708,9 @@ fn is_radix_digit(ch: char, radix: u32) -> bool {
 }
 
 fn is_identifier_part(ch: char) -> bool {
-    matches!(ch, '$' | '\u{200c}' | '\u{200d}') || unicode_ident::is_xid_continue(ch)
+    is_identifier_start(ch)
+        || matches!(ch, '\u{200c}' | '\u{200d}')
+        || unicode_ident::is_xid_continue(ch)
 }
 
 fn is_line_break(ch: char) -> bool {
@@ -1850,6 +1891,42 @@ mod tests {
             scanner.diagnostics()[0].message,
             "Unterminated string literal."
         );
+    }
+
+    #[test]
+    fn unterminated_literals_report_at_the_missing_closing_delimiter() {
+        for (source, expected_code, expected_position) in [
+            ("'oops", 1002, 5),
+            ("'oops\nnext", 1002, 5),
+            ("`oops", 1160, 5),
+        ] {
+            let mut scanner = Scanner::new(source);
+            scanner.scan();
+            let diagnostic = &scanner.diagnostics()[0];
+            assert_eq!(diagnostic.code, Some(expected_code), "source: {source:?}");
+            assert_eq!(diagnostic.range.start.get(), expected_position);
+            assert_eq!(diagnostic.range.end.get(), expected_position);
+        }
+
+        let mut scanner = Scanner::new("  'oops");
+        scanner.scan_jsx_attribute_value();
+        let diagnostic = &scanner.diagnostics()[0];
+        assert_eq!(diagnostic.code, Some(1002));
+        assert_eq!(diagnostic.range.start.get(), 7);
+        assert_eq!(diagnostic.range.end.get(), 7);
+
+        let mut scanner = Scanner::new("`head${value}tail");
+        assert_eq!(scanner.scan().kind, SyntaxKind::TemplateHead);
+        assert_eq!(scanner.scan().kind, SyntaxKind::Identifier);
+        assert_eq!(scanner.scan().kind, SyntaxKind::CloseBraceToken);
+        assert_eq!(
+            scanner.rescan_template_token().kind,
+            SyntaxKind::TemplateTail
+        );
+        let diagnostic = &scanner.diagnostics()[0];
+        assert_eq!(diagnostic.code, Some(1160));
+        assert_eq!(diagnostic.range.start.get(), 17);
+        assert_eq!(diagnostic.range.end.get(), 17);
     }
 
     #[test]
@@ -2133,6 +2210,46 @@ mod tests {
     }
 
     #[test]
+    fn accepts_all_upstream_id_start_characters_excluded_from_xid_start() {
+        for character in [
+            '\u{037a}', '\u{0e33}', '\u{0eb3}', '\u{309b}', '\u{309c}', '\u{fc5e}', '\u{fc5f}',
+            '\u{fc60}', '\u{fc61}', '\u{fc62}', '\u{fc63}', '\u{fdfa}', '\u{fdfb}', '\u{fe70}',
+            '\u{fe72}', '\u{fe74}', '\u{fe76}', '\u{fe78}', '\u{fe7a}', '\u{fe7c}', '\u{fe7e}',
+            '\u{ff9e}', '\u{ff9f}',
+        ] {
+            let source = format!("{character} a{character} #\\u{:04x}", u32::from(character));
+            let mut scanner = Scanner::new(&source);
+
+            let start = scanner.scan();
+            assert_eq!(
+                start.kind,
+                SyntaxKind::Identifier,
+                "character: {character:?}"
+            );
+            assert_eq!(
+                start.value.unwrap().to_string_lossy(),
+                character.to_string()
+            );
+
+            let part = scanner.scan();
+            assert_eq!(part.kind, SyntaxKind::Identifier);
+            assert_eq!(
+                part.value.unwrap().to_string_lossy(),
+                format!("a{character}")
+            );
+
+            let private = scanner.scan();
+            assert_eq!(private.kind, SyntaxKind::PrivateIdentifier);
+            assert_eq!(
+                private.value.unwrap().to_string_lossy(),
+                format!("#{character}")
+            );
+            assert!(private.flags.contains(TokenFlags::UNICODE_ESCAPE));
+            assert!(scanner.diagnostics().is_empty());
+        }
+    }
+
+    #[test]
     fn records_numeric_values_and_specifier_flags() {
         let mut scanner = Scanner::new("1_000 0xCA_FE 0b1010_0101 0o7_7 1e+2");
         let cases = [
@@ -2246,6 +2363,28 @@ mod tests {
     }
 
     #[test]
+    fn leading_zero_separator_diagnostics_keep_upstream_source_order() {
+        let mut scanner = Scanner::new("0__1");
+        let token = scanner.scan();
+        assert_eq!(token.kind, SyntaxKind::NumericLiteral);
+        assert_eq!(token.value.unwrap().to_string_lossy(), "1");
+        assert_eq!(
+            scanner
+                .diagnostics()
+                .iter()
+                .map(|diagnostic| {
+                    (
+                        diagnostic.code,
+                        diagnostic.range.start.get(),
+                        diagnostic.range.end.get(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            vec![(Some(6188), 1, 2), (Some(6189), 2, 3)]
+        );
+    }
+
+    #[test]
     fn invalid_bigint_suffix_is_consumed_with_numeric_token() {
         for source in ["1.0n", "1e2n"] {
             let mut scanner = Scanner::new(source);
@@ -2329,6 +2468,65 @@ mod tests {
     }
 
     #[test]
+    fn unicode_line_separators_and_next_line_follow_upstream_trivia_rules() {
+        for (source, expected_line_break) in [
+            ("\u{0085}value", false),
+            ("\u{2028}value", true),
+            ("\u{2029}value", true),
+        ] {
+            let mut scanner = Scanner::new(source);
+            scanner.set_skip_trivia(false);
+            let token = scanner.scan();
+            assert_eq!(token.kind, SyntaxKind::Identifier, "source: {source:?}");
+            assert_eq!(token.text, "value");
+            assert_eq!(token.full_start.get(), 0);
+            assert_eq!(
+                token.flags.contains(TokenFlags::PRECEDING_LINE_BREAK),
+                expected_line_break
+            );
+        }
+
+        let mut scanner = Scanner::new("\u{2028}  value");
+        scanner.set_skip_trivia(false);
+        let whitespace = scanner.scan();
+        assert_eq!(whitespace.kind, SyntaxKind::WhitespaceTrivia);
+        assert_eq!(whitespace.text, "  ");
+        assert!(whitespace.flags.contains(TokenFlags::PRECEDING_LINE_BREAK));
+        assert_eq!(scanner.scan().text, "value");
+    }
+
+    #[test]
+    fn jsdoc_tag_flags_require_upstream_ascii_terminators() {
+        for (source, expected_deprecated, expected_link) in [
+            ("/** @deprecated */value", true, false),
+            ("/** @deprecated\t*/value", true, false),
+            ("/** @deprecated\u{00a0}*/value", false, false),
+            ("/** @deprecated\u{000b}*/value", false, false),
+            ("/** @link} */value", false, true),
+            ("/** @link\u{00a0}*/value", false, false),
+            ("/** @link\u{2028}*/value", false, false),
+        ] {
+            let mut scanner = Scanner::new(source);
+            let token = scanner.scan();
+            assert_eq!(token.kind, SyntaxKind::Identifier);
+            assert_eq!(
+                token
+                    .flags
+                    .contains(TokenFlags::PRECEDING_JSDOC_WITH_DEPRECATED),
+                expected_deprecated,
+                "source: {source:?}"
+            );
+            assert_eq!(
+                token
+                    .flags
+                    .contains(TokenFlags::PRECEDING_JSDOC_WITH_SEE_OR_LINK),
+                expected_link,
+                "source: {source:?}"
+            );
+        }
+    }
+
+    #[test]
     fn skips_conflict_markers_and_discarded_merge_sections() {
         let mut scanner = Scanner::new(concat!(
             "left\n",
@@ -2366,14 +2564,20 @@ mod tests {
     }
 
     #[test]
-    fn reports_conflict_marker_tokens_while_scanning_jsx_text() {
+    fn jsx_conflict_markers_match_upstream_token_boundaries() {
         let mut scanner = Scanner::new("<<<<<<< HEAD");
         scanner.set_language_variant(LanguageVariant::Jsx);
-        assert_eq!(
-            scanner.scan_jsx_token().kind,
-            SyntaxKind::ConflictMarkerTrivia
-        );
-        assert_eq!(scanner.scan_jsx_token().kind, SyntaxKind::EndOfFile);
+        assert_eq!(scanner.scan_jsx_token().kind, SyntaxKind::LessThanToken);
+        assert!(scanner.diagnostics().is_empty());
+
+        let mut scanner = Scanner::new("prefix\n<<<<<<< HEAD\nrest");
+        scanner.set_language_variant(LanguageVariant::Jsx);
+        let marker = scanner.scan_jsx_token();
+        assert_eq!(marker.kind, SyntaxKind::ConflictMarkerTrivia);
+        assert_eq!(marker.text, "prefix\n<<<<<<< HEAD");
+        assert_eq!(scanner.diagnostics()[0].code, Some(1185));
+        assert_eq!(scanner.diagnostics()[0].range.start.get(), 7);
+        assert_eq!(scanner.diagnostics()[0].range.end.get(), 14);
     }
 
     #[test]

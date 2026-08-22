@@ -110,11 +110,15 @@ impl<'a> ByteScanner<'a> {
 
     fn sync_diagnostics(&mut self) {
         for diagnostic in &self.inner.diagnostics()[self.copied_inner_diagnostics..] {
-            if !self
-                .diagnostics
-                .iter()
-                .any(|existing| existing.range == diagnostic.range)
-            {
+            let start = usize::try_from(diagnostic.range.start.get()).unwrap();
+            let end = usize::try_from(diagnostic.range.end.get()).unwrap();
+            let invalid_source_byte = diagnostic.code == Some(1127)
+                && self
+                    .source
+                    .invalid_byte_ranges()
+                    .iter()
+                    .any(|range| range.start <= start && end <= range.end);
+            if !invalid_source_byte {
                 self.diagnostics.push(diagnostic.clone());
             }
         }
@@ -132,6 +136,7 @@ mod tests {
     use ts_core::SourceText;
 
     use super::ByteScanner;
+    use crate::Scanner;
 
     #[test]
     fn invalid_bytes_are_lossless_and_do_not_panic() {
@@ -172,5 +177,39 @@ mod tests {
         assert_eq!(regex.text, b"/\x80/u");
         assert_eq!(regex.range.end.get(), 23);
         assert_eq!(scanner.diagnostics()[0].range.start.get(), 20);
+    }
+
+    #[test]
+    fn valid_source_keeps_distinct_scanner_diagnostics_at_the_same_position() {
+        let text = "\"\\";
+        let source = SourceText::from(text);
+        let mut expected = Scanner::new(text);
+        let mut actual = ByteScanner::new(&source);
+
+        assert_eq!(expected.scan().kind, SyntaxKind::StringLiteral);
+        assert_eq!(actual.scan().kind, SyntaxKind::StringLiteral);
+        assert_eq!(
+            expected
+                .diagnostics()
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            vec![Some(1126), Some(1002)]
+        );
+        assert_eq!(actual.diagnostics(), expected.diagnostics());
+    }
+
+    #[test]
+    fn incomplete_multibyte_sequences_produce_one_lossless_diagnostic() {
+        let source = SourceText::from_bytes(vec![b'a', b' ', 0xe2, 0x82, b' ', b'b']);
+        let mut scanner = ByteScanner::new(&source);
+
+        assert_eq!(scanner.scan().kind, SyntaxKind::Identifier);
+        assert_eq!(scanner.scan().text, &[0xe2]);
+        assert_eq!(scanner.scan().text, &[0x82]);
+        assert_eq!(scanner.scan().kind, SyntaxKind::Identifier);
+        assert_eq!(scanner.diagnostics().len(), 1);
+        assert_eq!(scanner.diagnostics()[0].range.start.get(), 2);
+        assert_eq!(scanner.diagnostics()[0].range.end.get(), 4);
     }
 }
