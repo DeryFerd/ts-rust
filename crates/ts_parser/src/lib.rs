@@ -6420,6 +6420,7 @@ impl<'a> Parser<'a> {
         let mut parenthesis_depth = 1_u32;
         let mut brace_depth = 0_u32;
         let mut bracket_depth = 0_u32;
+        let mut angle_depth = 0_u32;
         let mut typed_parameter = false;
         let mut top_level_question = false;
         let mut at_parameter_start = true;
@@ -6439,6 +6440,7 @@ impl<'a> Parser<'a> {
                 && parenthesis_depth == 1
                 && brace_depth == 0
                 && bracket_depth == 0
+                && angle_depth == 0
                 && !matches!(
                     token.kind,
                     SyntaxKind::CommaToken | SyntaxKind::CloseParenToken
@@ -6495,13 +6497,27 @@ impl<'a> Parser<'a> {
                 SyntaxKind::CloseBraceToken => brace_depth = brace_depth.saturating_sub(1),
                 SyntaxKind::OpenBracketToken => bracket_depth += 1,
                 SyntaxKind::CloseBracketToken => bracket_depth = bracket_depth.saturating_sub(1),
+                SyntaxKind::LessThanToken if typed_parameter => angle_depth += 1,
+                SyntaxKind::GreaterThanToken if angle_depth != 0 => angle_depth -= 1,
+                SyntaxKind::GreaterThanGreaterThanToken if angle_depth != 0 => {
+                    angle_depth = angle_depth.saturating_sub(2);
+                }
+                SyntaxKind::GreaterThanGreaterThanGreaterThanToken if angle_depth != 0 => {
+                    angle_depth = angle_depth.saturating_sub(3);
+                }
                 SyntaxKind::QuestionToken
-                    if parenthesis_depth == 1 && brace_depth == 0 && bracket_depth == 0 =>
+                    if parenthesis_depth == 1
+                        && brace_depth == 0
+                        && bracket_depth == 0
+                        && angle_depth == 0 =>
                 {
                     top_level_question = true;
                 }
                 SyntaxKind::ColonToken
-                    if parenthesis_depth == 1 && brace_depth == 0 && bracket_depth == 0 =>
+                    if parenthesis_depth == 1
+                        && brace_depth == 0
+                        && bracket_depth == 0
+                        && angle_depth == 0 =>
                 {
                     if previous_kind != SyntaxKind::CloseParenToken
                         && (previous_kind == SyntaxKind::QuestionToken || !top_level_question)
@@ -6511,7 +6527,10 @@ impl<'a> Parser<'a> {
                     top_level_question = false;
                 }
                 SyntaxKind::CommaToken
-                    if parenthesis_depth == 1 && brace_depth == 0 && bracket_depth == 0 =>
+                    if parenthesis_depth == 1
+                        && brace_depth == 0
+                        && bracket_depth == 0
+                        && angle_depth == 0 =>
                 {
                     at_parameter_start = true;
                 }
@@ -11188,6 +11207,58 @@ mod tests {
                 .data,
             NodeData::ArrowFunction(_)
         ));
+    }
+
+    #[test]
+    fn parses_parenthesized_arrow_parameters_with_nested_generic_arguments() {
+        for (source, expected_parameters) in [
+            ("const fn = (value: Omit<O, 'prop'>) => {};", 1),
+            (
+                "const fn = (value: Wrapper<Omit<O, 'prop'>, Record<string, O>>) => value;",
+                1,
+            ),
+            (
+                concat!(
+                    "const fn = (value: O['prop'], omitted: Omit<O, 'prop'>, ",
+                    "key: keyof O, nested: Omit<O, keyof I>) => {};",
+                ),
+                4,
+            ),
+        ] {
+            let result = parse_source_file(source);
+            assert!(
+                result.diagnostics.is_empty(),
+                "source: {source}; diagnostics: {:?}",
+                result.diagnostics
+            );
+            let (list, _) = variable_list(&result, source_statements(&result)[0]);
+            let declaration = declaration_nodes(&result, list)[0];
+            let NodeData::VariableDeclaration(declaration) =
+                &result.arena.get(declaration).unwrap().data
+            else {
+                panic!("expected variable declaration");
+            };
+            let NodeData::ArrowFunction(arrow) = &result
+                .arena
+                .get(declaration.initializer.unwrap())
+                .unwrap()
+                .data
+            else {
+                panic!("expected arrow function");
+            };
+            assert_eq!(arrow.parameters.nodes.len(), expected_parameters);
+        }
+
+        let comparison = parse_source_file("const value = (left < right, next > last);");
+        assert!(
+            comparison.diagnostics.is_empty(),
+            "{:?}",
+            comparison.diagnostics
+        );
+        assert!(comparison
+            .arena
+            .iter()
+            .all(|(_, node)| !matches!(node.data, NodeData::ArrowFunction(_))));
     }
 
     #[test]
