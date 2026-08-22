@@ -499,7 +499,11 @@ pub fn change_extension(path: &str, extension: &str) -> String {
     if without_extension.len() == path.len() {
         return path.to_owned();
     }
-    format!("{without_extension}{extension}")
+    if extension.is_empty() || extension.starts_with('.') {
+        format!("{without_extension}{extension}")
+    } else {
+        format!("{without_extension}.{extension}")
+    }
 }
 
 #[must_use]
@@ -762,6 +766,8 @@ mod tests {
         );
         assert_eq!(remove_file_extension("/src/.config"), "/src/.config");
         assert_eq!(change_extension("/src/file.ts", ".js"), "/src/file.js");
+        assert_eq!(change_extension("/src/file.ts", "js"), "/src/file.js");
+        assert_eq!(change_extension("/src/file.ts", ""), "/src/file");
         assert_eq!(
             change_extension("/src/styles.css", ".js"),
             "/src/styles.css"
