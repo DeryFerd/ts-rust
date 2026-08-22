@@ -289,16 +289,20 @@ fn canonical_program_fails_closed_on_declaration_import_near_misses() {
         fs.write_file("/project/importer.ts", importer_source)
             .unwrap();
 
-        let error = Program::try_new_with_canonical_checker(
+        let Err(error) = Program::try_new_with_canonical_checker(
             &fs,
             "/project",
             &["importer.ts".to_owned()],
             options(),
-        )
-        .unwrap_err();
+        ) else {
+            panic!("expected unsupported declaration import: {case}");
+        };
         assert!(error.is_unsupported_boundary(), "{case}: {error:?}");
     }
+}
 
+#[test]
+fn canonical_program_resolves_declaration_reexports_without_fallback() {
     let fs = MemoryFileSystem::new(true);
     fs.write_file(
         "/project/importer.ts",
@@ -309,15 +313,27 @@ fn canonical_program_fails_closed_on_declaration_import_near_misses() {
         .unwrap();
     fs.write_file("/project/base.d.ts", "export declare const value: number;")
         .unwrap();
-    let error = Program::try_new_with_canonical_checker(
+    let program = Program::try_new_with_canonical_checker(
         &fs,
         "/project",
         &["importer.ts".to_owned()],
-        options(),
+        CompilerOptions {
+            module: ModuleKind::EsNext,
+            module_specified: true,
+            module_resolution: ModuleResolutionKind::Bundler,
+            lib: Some(vec!["es5".to_owned()]),
+            skip_lib_check: true,
+            strict: true,
+            ..CompilerOptions::default()
+        },
     )
-    .unwrap_err();
+    .unwrap_or_else(|error| panic!("declaration reexport failed: {error:?}"));
+
     assert!(
-        error.is_unsupported_boundary(),
-        "re-export must remain an explicit boundary: {error:?}"
+        program.diagnostics().is_empty(),
+        "{:?}",
+        program.diagnostics()
     );
+    assert!(program.source_file("/project/target.d.ts").is_some());
+    assert!(program.source_file("/project/base.d.ts").is_some());
 }
