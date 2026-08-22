@@ -304,6 +304,46 @@ fn inherited_property_call_reuses_the_base_member_cold_and_warm() {
 }
 
 #[test]
+fn nested_property_receivers_publish_their_call_signature_and_return_type() {
+    let parsed = parse_source_file(concat!(
+        "type API = { fn: (value: number) => string }; ",
+        "type Holder = { api: API }; ",
+        "function use(holder: Holder): string { return holder.api.fn(1); }",
+    ));
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(30);
+    let calls = nodes_of_kind(&parsed, file, SyntaxKind::CallExpression);
+    let [call] = calls.as_slice() else {
+        panic!("expected one nested property call")
+    };
+    let accesses = nodes_of_kind(&parsed, file, SyntaxKind::PropertyAccessExpression);
+    let mut context = context(&parsed, file);
+
+    context.check_source_file(file).unwrap();
+
+    let return_type = context
+        .store()
+        .type_node_links(*call)
+        .and_then(|links| links.resolved_type)
+        .expect("nested property call must retain its return type");
+    assert_eq!(context.type_to_string(return_type).unwrap(), "string");
+    assert!(
+        context
+            .store()
+            .signature_links(*call)
+            .is_some_and(|links| links.resolved_signature.signature().is_some())
+    );
+    assert_eq!(accesses.len(), 2);
+    assert!(accesses.iter().all(|access| {
+        context
+            .store()
+            .symbol_node_links(*access)
+            .is_some_and(|links| links.resolved_symbol.is_some())
+    }));
+    assert!(context.diagnostics().is_empty());
+}
+
+#[test]
 #[allow(clippy::too_many_lines)] // All unsupported call families share one publication check.
 fn unsupported_property_call_families_fail_closed_without_call_publication() {
     let fixtures = [
@@ -399,14 +439,6 @@ fn unsupported_property_call_families_fail_closed_without_call_publication() {
             concat!(
                 "type API = { fn: (value: number) => string }; ",
                 "function use(api: API): string { return (api.fn)(1); }",
-            ),
-        ),
-        (
-            "nested receiver",
-            concat!(
-                "type API = { fn: (value: number) => string }; ",
-                "type Holder = { api: API }; ",
-                "function use(holder: Holder): string { return holder.api.fn(1); }",
             ),
         ),
         (
