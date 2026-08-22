@@ -239,10 +239,7 @@ impl Default for FsEventSource {
 
 impl EventSource for FsEventSource {
     fn reconcile(&mut self, paths: &[WatchPath]) -> Result<(), WatchError> {
-        let desired = paths
-            .iter()
-            .map(|path| (path.directory.clone(), path.mode))
-            .collect::<BTreeMap<_, _>>();
+        let desired = resolve_watch_paths(paths);
         self.watches.retain(|directory, (mode, watch)| {
             if desired.get(directory) == Some(mode) {
                 true
@@ -297,6 +294,35 @@ impl EventSource for FsEventSource {
     }
 }
 
+fn resolve_watch_paths(paths: &[WatchPath]) -> BTreeMap<PathBuf, WatchMode> {
+    let mut resolved = BTreeMap::new();
+    for path in paths {
+        let mut directory = path.directory.as_path();
+        let mut mode = path.mode;
+        while !directory.is_dir() {
+            let Some(parent) = directory.parent() else {
+                break;
+            };
+            directory = parent;
+            mode = WatchMode::NonRecursive;
+        }
+        if !directory.is_dir() {
+            continue;
+        }
+
+        let directory = canonical_directory(directory);
+        resolved
+            .entry(directory)
+            .and_modify(|existing| {
+                if mode == WatchMode::Recursive {
+                    *existing = WatchMode::Recursive;
+                }
+            })
+            .or_insert(mode);
+    }
+    resolved
+}
+
 /// Computes config, root, and loaded import directories to watch.
 #[must_use]
 pub fn watch_paths_for_program(
@@ -341,7 +367,10 @@ fn canonical_directory(path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::VecDeque;
+    use std::{
+        collections::VecDeque,
+        sync::atomic::{AtomicU64, Ordering},
+    };
 
     use ts_vfs::{FileSystem, MemoryFileSystem};
 
@@ -383,6 +412,27 @@ mod tests {
     impl StopCondition for AfterCycles {
         fn should_stop(&mut self, completed_cycles: usize) -> bool {
             completed_cycles >= self.0
+        }
+    }
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new() -> Self {
+            static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+            let directory = std::env::temp_dir().join(format!(
+                "ts-watch-{}-{}",
+                std::process::id(),
+                NEXT_ID.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir_all(&directory).unwrap();
+            Self(directory)
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
         }
     }
 
@@ -438,6 +488,41 @@ mod tests {
         };
         let mut coordinator = Coordinator::new(compiler, events, |_| {});
         assert_eq!(coordinator.run().unwrap().completed_cycles, 1);
+    }
+
+    #[test]
+    fn missing_watch_directories_fall_back_to_existing_ancestors() {
+        let directory = TestDirectory::new();
+        let requested = directory.0.join("missing/nested");
+
+        let resolved = resolve_watch_paths(&[WatchPath::new(requested, WatchMode::Recursive)]);
+
+        assert_eq!(
+            resolved,
+            BTreeMap::from([(
+                fs::canonicalize(&directory.0).unwrap(),
+                WatchMode::NonRecursive
+            )])
+        );
+    }
+
+    #[test]
+    fn recursive_watch_mode_wins_for_duplicate_directories() {
+        let directory = TestDirectory::new();
+        let paths = [
+            WatchPath::new(&directory.0, WatchMode::Recursive),
+            WatchPath::new(&directory.0, WatchMode::NonRecursive),
+        ];
+
+        let resolved = resolve_watch_paths(&paths);
+
+        assert_eq!(
+            resolved,
+            BTreeMap::from([(
+                fs::canonicalize(&directory.0).unwrap(),
+                WatchMode::Recursive
+            )])
+        );
     }
 
     #[test]

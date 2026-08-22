@@ -6,11 +6,13 @@ use std::{
 };
 
 use ts_compiler::{EmitOutput, Program, ProgramOptionsOverride};
-use ts_config::resolve_config_file;
+use ts_config::{parse_config_file, resolve_config_file};
 use ts_core::TextRange;
 use ts_diagnostics::message_by_code;
 use ts_incremental::{BuildDecision, BuildInfo, hash_text};
-use ts_path::{change_extension, is_absolute, normalize_path, resolve_path};
+use ts_path::{
+    CaseSensitivity, canonicalize, change_extension, is_absolute, normalize_path, resolve_path,
+};
 use ts_printer::emit_declaration_file;
 use ts_vfs::FileSystem;
 
@@ -91,8 +93,12 @@ pub fn build_projects(
     let mut skipped = Vec::new();
     let mut signatures: BTreeMap<String, String> = BTreeMap::new();
     for config_path in &graph.projects {
+        if is_solution_project(file_system, &graph, config_path) {
+            continue;
+        }
         let program = Program::from_config_with_options(file_system, config_path, overrides);
         let enabled = incremental || program.options().incremental || program.options().composite;
+        let config_paths = project_config_paths(file_system, config_path);
         let dependencies = graph
             .references
             .get(config_path)
@@ -125,9 +131,9 @@ pub fn build_projects(
         );
         if enabled
             && BuildInfo::decision(previous.as_ref(), &preliminary, |path| {
-                output_is_current(file_system, path, config_path, &preliminary)
+                output_is_current(file_system, path, &config_paths, &preliminary)
             }) == BuildDecision::UpToDate
-            && output_is_current(file_system, &build_info_path, config_path, &preliminary)
+            && output_is_current(file_system, &build_info_path, &config_paths, &preliminary)
         {
             signatures.insert(config_path.clone(), preliminary.project_signature());
             skipped.push(config_path.clone());
@@ -164,6 +170,115 @@ pub fn build_projects(
         projects,
         skipped,
     }
+}
+
+fn is_solution_project(
+    file_system: &dyn FileSystem,
+    graph: &ProjectGraph,
+    config_path: &str,
+) -> bool {
+    graph
+        .references
+        .get(config_path)
+        .is_some_and(|references| !references.is_empty())
+        && resolve_config_file(file_system, config_path)
+            .value
+            .is_some_and(|config| {
+                config.files.as_ref().is_some_and(Vec::is_empty)
+                    && config.include.as_ref().is_none_or(Vec::is_empty)
+            })
+}
+
+fn project_config_paths(file_system: &dyn FileSystem, config_path: &str) -> Vec<String> {
+    let mut paths = Vec::new();
+    let mut seen = BTreeSet::new();
+    collect_project_config_paths(file_system, config_path, &mut paths, &mut seen);
+    paths
+}
+
+fn collect_project_config_paths(
+    file_system: &dyn FileSystem,
+    config_path: &str,
+    paths: &mut Vec<String>,
+    seen: &mut BTreeSet<String>,
+) {
+    let config_path = normalize_path(config_path);
+    let identity = canonical_config_path(file_system, &config_path);
+    if !seen.insert(identity) {
+        return;
+    }
+    paths.push(config_path.clone());
+
+    let Some(config) = parse_config_file(file_system, &config_path).value else {
+        return;
+    };
+    for extended_path in config.resolved_extends(file_system) {
+        if let Some(resolved_path) =
+            resolve_extended_config_path(file_system, &config_path, &extended_path)
+        {
+            collect_project_config_paths(file_system, &resolved_path, paths, seen);
+        }
+    }
+}
+
+fn resolve_extended_config_path(
+    file_system: &dyn FileSystem,
+    config_path: &str,
+    extended_path: &str,
+) -> Option<String> {
+    if let Some(path) = existing_config_path(file_system, extended_path) {
+        return Some(path);
+    }
+    if is_absolute(extended_path) {
+        return None;
+    }
+
+    let mut directory = Path::new(config_path).parent();
+    while let Some(parent) = directory {
+        let parent_path = parent.to_string_lossy();
+        let candidate = resolve_path(&parent_path, &["node_modules", extended_path]);
+        if let Some(path) = existing_config_path(file_system, &candidate) {
+            return Some(path);
+        }
+        directory = parent.parent();
+    }
+    None
+}
+
+fn existing_config_path(file_system: &dyn FileSystem, path: &str) -> Option<String> {
+    let path = normalize_path(path);
+    if file_system.file_exists(&path) {
+        return Some(path);
+    }
+    if Path::new(&path).extension().is_none() {
+        let json_path = format!("{path}.json");
+        if file_system.file_exists(&json_path) {
+            return Some(json_path);
+        }
+    }
+    if !file_system.directory_exists(&path) {
+        return None;
+    }
+
+    let package_path = resolve_path(&path, &["package.json"]);
+    if let Some(configured_path) = parse_config_file(file_system, &package_path)
+        .value
+        .and_then(|package| {
+            package
+                .raw
+                .get("tsconfig")
+                .and_then(ts_config::JsonValue::as_str)
+                .map(|configured| resolve_path(&path, &[configured]))
+        })
+        && file_system.file_exists(&configured_path)
+    {
+        return Some(configured_path);
+    }
+
+    let default_path = resolve_path(&path, &["tsconfig.json"]);
+    file_system
+        .file_exists(&default_path)
+        .then_some(default_path)
 }
 
 fn project_build_info(
@@ -222,7 +337,7 @@ fn declaration_signature(program: &Program) -> String {
 fn output_is_current(
     file_system: &dyn FileSystem,
     output: &str,
-    config_path: &str,
+    config_paths: &[String],
     info: &BuildInfo,
 ) -> bool {
     let Some(output_time) = file_system.modified_time(output) else {
@@ -231,9 +346,21 @@ fn output_is_current(
     info.files
         .keys()
         .map(String::as_str)
-        .chain(std::iter::once(config_path))
+        .chain(config_paths.iter().map(String::as_str))
         .filter_map(|path| file_system.modified_time(path))
         .all(|input_time| input_time <= output_time)
+}
+
+fn canonical_config_path(file_system: &dyn FileSystem, path: &str) -> String {
+    canonicalize(
+        path,
+        "/",
+        if file_system.use_case_sensitive_file_names() {
+            CaseSensitivity::Sensitive
+        } else {
+            CaseSensitivity::Insensitive
+        },
+    )
 }
 
 struct GraphLoader<'a> {
@@ -241,6 +368,7 @@ struct GraphLoader<'a> {
     graph: ProjectGraph,
     completed: BTreeSet<String>,
     visiting: BTreeMap<String, usize>,
+    display_paths: BTreeMap<String, String>,
     stack: Vec<String>,
 }
 
@@ -251,26 +379,37 @@ impl<'a> GraphLoader<'a> {
             graph: ProjectGraph::default(),
             completed: BTreeSet::new(),
             visiting: BTreeMap::new(),
+            display_paths: BTreeMap::new(),
             stack: Vec::new(),
         }
     }
 
     fn visit(&mut self, config_path: &str) {
+        self.visit_reference(config_path, false);
+    }
+
+    fn visit_reference(&mut self, config_path: &str, circular_context: bool) {
         let config_path = normalize_path(config_path);
-        if self.completed.contains(&config_path) {
+        let identity = canonical_config_path(self.file_system, &config_path);
+        if self.completed.contains(&identity) {
             return;
         }
-        if let Some(index) = self.visiting.get(&config_path).copied() {
-            self.report_cycle(index);
+        if let Some(index) = self.visiting.get(&identity).copied() {
+            if !circular_context {
+                self.report_cycle(index);
+            }
             return;
         }
         if !self.file_system.file_exists(&config_path) {
             self.report_missing(&config_path);
-            self.completed.insert(config_path);
+            self.completed.insert(identity);
             return;
         }
 
-        self.visiting.insert(config_path.clone(), self.stack.len());
+        self.display_paths
+            .entry(identity.clone())
+            .or_insert_with(|| config_path.clone());
+        self.visiting.insert(identity.clone(), self.stack.len());
         self.stack.push(config_path.clone());
         let parsed = resolve_config_file(self.file_system, &config_path);
         self.graph
@@ -287,22 +426,47 @@ impl<'a> GraphLoader<'a> {
                     }),
             );
         if let Some(config) = parsed.value {
-            let references = config
-                .resolved_references(self.file_system)
+            let config_directory = Path::new(&config_path)
+                .parent()
+                .and_then(Path::to_str)
+                .unwrap_or("/");
+            let mut references = Vec::new();
+            let mut seen_references = BTreeSet::new();
+            for reference in config.resolved_references(self.file_system) {
+                let reference_path =
+                    resolve_config_path(self.file_system, config_directory, &reference.path);
+                let reference_identity = canonical_config_path(self.file_system, &reference_path);
+                if !seen_references.insert(reference_identity.clone()) {
+                    continue;
+                }
+                let display_path = self
+                    .display_paths
+                    .get(&reference_identity)
+                    .cloned()
+                    .unwrap_or(reference_path);
+                references.push((display_path, reference.circular.unwrap_or(false)));
+            }
+            for (reference_path, circular) in &references {
+                self.visit_reference(reference_path, circular_context || *circular);
+            }
+            let references = references
                 .into_iter()
-                .map(|reference| resolve_config_path(self.file_system, "/", &reference.path))
-                .collect::<Vec<_>>();
+                .map(|(reference_path, _)| {
+                    let identity = canonical_config_path(self.file_system, &reference_path);
+                    self.display_paths
+                        .get(&identity)
+                        .cloned()
+                        .unwrap_or(reference_path)
+                })
+                .collect();
             self.graph
                 .references
-                .insert(config_path.clone(), references.clone());
-            for reference_path in references {
-                self.visit(&reference_path);
-            }
+                .insert(config_path.clone(), references);
             self.graph.projects.push(config_path.clone());
         }
         self.stack.pop();
-        self.visiting.remove(&config_path);
-        self.completed.insert(config_path);
+        self.visiting.remove(&identity);
+        self.completed.insert(identity);
     }
 
     fn report_cycle(&mut self, start: usize) {
@@ -432,6 +596,103 @@ mod tests {
     }
 
     #[test]
+    fn allows_explicitly_circular_project_references() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/repo/tsconfig.json",
+            r#"{"files":[],"references":[{"path":"./app","circular":true}]}"#,
+        )
+        .unwrap();
+        fs.write_file(
+            "/repo/app/tsconfig.json",
+            r#"{"files":[],"references":[{"path":".."}]}"#,
+        )
+        .unwrap();
+
+        let graph = load_project_graph(&fs, "/repo", &["tsconfig.json".into()]);
+
+        assert!(graph.diagnostics.is_empty(), "{:?}", graph.diagnostics);
+        assert!(!graph.has_cycle);
+        assert_eq!(
+            graph.projects,
+            ["/repo/app/tsconfig.json", "/repo/tsconfig.json"]
+        );
+    }
+
+    #[test]
+    fn deduplicates_reference_casing_on_case_insensitive_file_systems() {
+        let fs = MemoryFileSystem::new(false);
+        fs.write_file(
+            "/repo/tsconfig.json",
+            r#"{"files":[],"references":[{"path":"./lib"},{"path":"./LIB"}]}"#,
+        )
+        .unwrap();
+        fs.write_file("/repo/lib/tsconfig.json", r#"{"files":[]}"#)
+            .unwrap();
+
+        let graph = load_project_graph(&fs, "/repo", &["tsconfig.json".into()]);
+
+        assert!(graph.diagnostics.is_empty(), "{:?}", graph.diagnostics);
+        assert_eq!(
+            graph.projects,
+            ["/repo/lib/tsconfig.json", "/repo/tsconfig.json"]
+        );
+    }
+
+    #[test]
+    fn uses_first_project_casing_for_transitive_reference_edges() {
+        let fs = MemoryFileSystem::new(false);
+        fs.write_file(
+            "/repo/tsconfig.json",
+            r#"{"files":[],"references":[{"path":"./app"},{"path":"./lib"}]}"#,
+        )
+        .unwrap();
+        fs.write_file(
+            "/repo/app/tsconfig.json",
+            r#"{"files":[],"references":[{"path":"../LIB"}]}"#,
+        )
+        .unwrap();
+        fs.write_file("/repo/lib/tsconfig.json", r#"{"files":[]}"#)
+            .unwrap();
+
+        let graph = load_project_graph(&fs, "/repo", &["tsconfig.json".into()]);
+
+        assert!(graph.diagnostics.is_empty(), "{:?}", graph.diagnostics);
+        assert_eq!(
+            graph.references["/repo/tsconfig.json"],
+            ["/repo/app/tsconfig.json", "/repo/LIB/tsconfig.json"]
+        );
+        assert_eq!(
+            graph.projects,
+            [
+                "/repo/LIB/tsconfig.json",
+                "/repo/app/tsconfig.json",
+                "/repo/tsconfig.json"
+            ]
+        );
+    }
+
+    #[test]
+    fn resolves_bare_reference_paths_relative_to_the_parent_config() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/repo/tsconfig.json",
+            r#"{"files":[],"references":[{"path":"lib"}]}"#,
+        )
+        .unwrap();
+        fs.write_file("/repo/lib/tsconfig.json", r#"{"files":[]}"#)
+            .unwrap();
+
+        let graph = load_project_graph(&fs, "/repo", &["tsconfig.json".into()]);
+
+        assert!(graph.diagnostics.is_empty(), "{:?}", graph.diagnostics);
+        assert_eq!(
+            graph.projects,
+            ["/repo/lib/tsconfig.json", "/repo/tsconfig.json"]
+        );
+    }
+
+    #[test]
     fn reports_missing_referenced_configs() {
         let fs = MemoryFileSystem::new(true);
         fs.write_file(
@@ -446,6 +707,124 @@ mod tests {
                 .message
                 .contains("missing/tsconfig.json")
         );
+    }
+
+    #[test]
+    fn solution_configs_do_not_compile_or_write_build_info() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/repo/tsconfig.json",
+            r#"{"files":[],"references":[{"path":"./lib"}],"compilerOptions":{"composite":true,"noLib":true}}"#,
+        )
+        .unwrap();
+        fs.write_file(
+            "/repo/lib/tsconfig.json",
+            r#"{"files":["index.ts"],"compilerOptions":{"composite":true,"noLib":true,"outDir":"dist"}}"#,
+        )
+        .unwrap();
+        fs.write_file("/repo/lib/index.ts", "export const value = 1;\n")
+            .unwrap();
+
+        let result = build_projects(
+            &fs,
+            "/repo",
+            &["tsconfig.json".into()],
+            ProgramOptionsOverride::default(),
+            true,
+        );
+
+        assert_eq!(
+            result
+                .projects
+                .iter()
+                .map(|project| project.config_path.as_str())
+                .collect::<Vec<_>>(),
+            ["/repo/lib/tsconfig.json"]
+        );
+        write_build_outputs(&fs, result);
+        assert!(!fs.file_exists("/repo/tsconfig.tsbuildinfo"));
+        assert!(fs.file_exists("/repo/lib/tsconfig.tsbuildinfo"));
+    }
+
+    #[test]
+    fn extended_config_changes_invalidate_incremental_projects() {
+        let fs = MemoryFileSystem::new(true);
+        let base_config = r#"{"compilerOptions":{"composite":true,"noLib":true,"outDir":"dist"}}"#;
+        fs.write_file("/repo/tsconfig.base.json", base_config)
+            .unwrap();
+        fs.write_file(
+            "/repo/tsconfig.json",
+            r#"{"extends":"./tsconfig.base.json","files":["index.ts"]}"#,
+        )
+        .unwrap();
+        fs.write_file("/repo/index.ts", "export const value = 1;\n")
+            .unwrap();
+        write_build_outputs(
+            &fs,
+            build_projects(
+                &fs,
+                "/repo",
+                &["tsconfig.json".into()],
+                ProgramOptionsOverride::default(),
+                true,
+            ),
+        );
+
+        fs.write_file("/repo/tsconfig.base.json", base_config)
+            .unwrap();
+        let result = build_projects(
+            &fs,
+            "/repo",
+            &["tsconfig.json".into()],
+            ProgramOptionsOverride::default(),
+            true,
+        );
+
+        assert_eq!(result.projects.len(), 1);
+        assert!(result.skipped.is_empty());
+    }
+
+    #[test]
+    fn package_config_changes_invalidate_incremental_projects() {
+        let fs = MemoryFileSystem::new(true);
+        let base_config = r#"{"compilerOptions":{"composite":true,"noLib":true}}"#;
+        fs.write_file(
+            "/repo/node_modules/preset/package.json",
+            r#"{"tsconfig":"config/base.json"}"#,
+        )
+        .unwrap();
+        fs.write_file("/repo/node_modules/preset/config/base.json", base_config)
+            .unwrap();
+        fs.write_file(
+            "/repo/tsconfig.json",
+            r#"{"extends":"preset","files":["index.ts"],"compilerOptions":{"outDir":"dist"}}"#,
+        )
+        .unwrap();
+        fs.write_file("/repo/index.ts", "export const value = 1;\n")
+            .unwrap();
+        write_build_outputs(
+            &fs,
+            build_projects(
+                &fs,
+                "/repo",
+                &["tsconfig.json".into()],
+                ProgramOptionsOverride::default(),
+                true,
+            ),
+        );
+
+        fs.write_file("/repo/node_modules/preset/config/base.json", base_config)
+            .unwrap();
+        let result = build_projects(
+            &fs,
+            "/repo",
+            &["tsconfig.json".into()],
+            ProgramOptionsOverride::default(),
+            true,
+        );
+
+        assert_eq!(result.projects.len(), 1);
+        assert!(result.skipped.is_empty());
     }
 
     #[test]
@@ -522,7 +901,7 @@ mod tests {
             ProgramOptionsOverride::default(),
             true,
         );
-        assert_eq!(declaration_change.projects.len(), 3);
+        assert_eq!(declaration_change.projects.len(), 2);
         assert!(declaration_change.skipped.is_empty());
     }
 }
