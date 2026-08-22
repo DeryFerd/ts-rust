@@ -4421,6 +4421,9 @@ pub fn emit_declaration_file_with_semantics_and_options(
         }
     }
     for statement in &data.statements.nodes {
+        if printer.javascript_source {
+            printer.emit_leading_jsdoc_declarations(*statement);
+        }
         if printer.javascript_source
             && (matches!(
                 printer.arena.get(*statement).map(|node| &node.data),
@@ -6251,24 +6254,6 @@ impl DeclarationPrinter<'_> {
                     self.writer.write("constructor(...items: any[]);");
                     self.writer.newline();
                 }
-                let mut member_order = (0..data.members.nodes.len()).collect::<Vec<_>>();
-                if self.javascript_source {
-                    member_order.sort_by_key(|index| {
-                        !matches!(
-                            self.arena
-                                .get(data.members.nodes[*index])
-                                .map(|member| &member.data),
-                            Some(NodeData::ConstructorDeclaration(_))
-                        ) && !matches!(
-                            self.arena
-                                .get(data.members.nodes[*index])
-                                .map(|member| &member.data),
-                            Some(NodeData::MethodDeclaration(method))
-                                if declaration_name_text(self.arena, method.name)
-                                    == Some("constructor")
-                        )
-                    });
-                }
                 let private_name_members = data
                     .members
                     .nodes
@@ -6289,8 +6274,12 @@ impl DeclarationPrinter<'_> {
                     self.writer.write("#private;");
                     self.writer.newline();
                 }
-                for member_index in member_order {
-                    let member = &data.members.nodes[member_index];
+                if self.javascript_source {
+                    for member in &data.members.nodes {
+                        self.emit_javascript_instance_properties(id, *member)?;
+                    }
+                }
+                for (member_index, member) in data.members.nodes.iter().enumerate() {
                     if private_name_members.contains(member) {
                         if !self.javascript_source && !emitted_private_brand {
                             self.writer.write("#private;");
@@ -26875,9 +26864,32 @@ impl Writer {
             self.line_start = false;
         }
         self.output.push_str(text);
-        self.column = self
-            .column
-            .saturating_add(u32::try_from(text.encode_utf16().count()).unwrap_or(u32::MAX));
+        let mut previous_carriage_return = false;
+        for character in text.chars() {
+            match character {
+                '\r' | '\u{2028}' | '\u{2029}' => {
+                    self.line = self.line.saturating_add(1);
+                    self.column = 0;
+                    self.line_start = true;
+                    previous_carriage_return = character == '\r';
+                }
+                '\n' => {
+                    if !previous_carriage_return {
+                        self.line = self.line.saturating_add(1);
+                    }
+                    self.column = 0;
+                    self.line_start = true;
+                    previous_carriage_return = false;
+                }
+                _ => {
+                    self.column = self
+                        .column
+                        .saturating_add(u32::try_from(character.len_utf16()).unwrap_or(u32::MAX));
+                    self.line_start = false;
+                    previous_carriage_return = false;
+                }
+            }
+        }
     }
 
     fn write_comment_continuation(&mut self, text: &str, source_comment_column: usize) {
@@ -26972,12 +26984,15 @@ impl Writer {
 
 fn line_starts(source: &str) -> Vec<usize> {
     let mut starts = vec![0];
-    starts.extend(
-        source
-            .bytes()
-            .enumerate()
-            .filter_map(|(index, byte)| (byte == b'\n').then_some(index + 1)),
-    );
+    let bytes = source.as_bytes();
+    for (index, character) in source.char_indices() {
+        match character {
+            '\r' => starts.push(index + usize::from(bytes.get(index + 1) == Some(&b'\n')) + 1),
+            '\n' if index == 0 || bytes[index - 1] != b'\r' => starts.push(index + 1),
+            '\u{2028}' | '\u{2029}' => starts.push(index + character.len_utf8()),
+            _ => {}
+        }
+    }
     starts
 }
 
@@ -86523,6 +86538,26 @@ class Board {
     }
 
     #[test]
+    fn source_map_line_positions_recognize_all_javascript_line_terminators() {
+        let source = "a\rb\r\nc\u{2028}d\u{2029}😀";
+        let starts = super::line_starts(source);
+        assert_eq!(starts, vec![0, 2, 5, 9, 13]);
+        assert_eq!(original_position(source, &starts, 2), (1, 0));
+        assert_eq!(original_position(source, &starts, 5), (2, 0));
+        assert_eq!(original_position(source, &starts, 9), (3, 0));
+        assert_eq!(original_position(source, &starts, 17), (4, 2));
+    }
+
+    #[test]
+    fn multiline_writer_updates_generated_source_map_positions() {
+        let mut writer = super::Writer::default();
+        writer.write("first\rsecond\r\nthird\u{2028}fourth\u{2029}😀\n");
+        assert_eq!(writer.position(), (5, 0));
+        writer.write("end😀");
+        assert_eq!(writer.position(), (5, 5));
+    }
+
+    #[test]
     fn emits_ambient_declarations_for_exported_api() {
         let source = r#"
             import { Input } from "./types";
@@ -87525,6 +87560,61 @@ class Board {
     }
 
     #[test]
+    fn javascript_typedefs_on_filtered_statements_keep_source_order() {
+        let source = concat!(
+            "export let first = 1;\n",
+            "/** @typedef {{ label: string }} Later */\n",
+            "const hidden = {};\n",
+            "/**\n",
+            " * @param {Later} value\n",
+            " * @returns {Later}\n",
+            " */\n",
+            "export function read(value) { return value; }\n",
+        );
+        assert_eq!(
+            emit_javascript_declarations_with_semantics(source),
+            concat!(
+                "export declare let first: number;\n",
+                "export type Later = {\n",
+                "    label: string;\n",
+                "};\n",
+                "/**\n",
+                " * @param {Later} value\n",
+                " * @returns {Later}\n",
+                " */\n",
+                "export declare function read(value: Later): Later;\n",
+            )
+        );
+    }
+
+    #[test]
+    fn javascript_class_members_follow_inferred_properties_in_source_order() {
+        let source = concat!(
+            "export class Ordered {\n",
+            "    first = 1;\n",
+            "    constructor(value) { this.fromConstructor = value; }\n",
+            "    middle = 2;\n",
+            "    method(value) { this.fromMethod = value; }\n",
+            "    last = 3;\n",
+            "}\n",
+        );
+        assert_eq!(
+            emit_javascript_declarations_with_semantics(source),
+            concat!(
+                "export declare class Ordered {\n",
+                "    fromConstructor: any;\n",
+                "    fromMethod: any;\n",
+                "    first: number;\n",
+                "    constructor(value: any);\n",
+                "    middle: number;\n",
+                "    method(value: any): void;\n",
+                "    last: number;\n",
+                "}\n",
+            )
+        );
+    }
+
+    #[test]
     fn javascript_declaration_emit_parses_single_line_jsdoc_callbacks() {
         let source = concat!(
             "/** @callback Handler @param {string} value @returns {number} */\n",
@@ -87583,7 +87673,7 @@ class Board {
         .code;
         assert_eq!(
             output,
-            "declare class C {\n    foo(value: any): void;\n    item: any;\n}\n"
+            "declare class C {\n    item: any;\n    foo(value: any): void;\n}\n"
         );
     }
 
