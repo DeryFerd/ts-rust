@@ -4350,7 +4350,8 @@ mod tests {
     fn source_generic_signatures_preserve_constraints_defaults_and_parameter_names() {
         let parsed = parse_source_file(concat!(
             "declare function identity<T>(value: T): T; ",
-            "declare function constrained<T extends string = \"ready\">(value: T): T;",
+            "declare function constrained<T extends string, U extends T = T>",
+            "(left: T, right: U): U;",
         ));
         assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
         let file = FileId::new(198);
@@ -4362,7 +4363,7 @@ mod tests {
             ("identity", "<T>(value: T) => T"),
             (
                 "constrained",
-                "<T extends string = \"ready\">(value: T) => T",
+                "<T extends string, U extends T = T>(left: T, right: U) => U",
             ),
         ] {
             let declaration = parsed
