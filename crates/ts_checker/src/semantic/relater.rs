@@ -2474,6 +2474,7 @@ impl<'store> RelaterSession<'store> {
                 continue;
             }
             if self.relation.is_identity()
+                || !source_members.index_infos.is_empty()
                 || intersection_state.intersects(IntersectionState::SOURCE)
                 || self.relation == RelationKind::StrictSubtype
                     && !self.is_fresh_object_literal(source)?
@@ -9438,6 +9439,31 @@ mod tests {
 
     #[test]
     fn source_declared_index_signatures_compare_inferred_properties_and_value_types() {
+        fn declared_alias(fixture: &mut FunctionRelationFixture, name: &str) -> TypeId {
+            let globals = fixture.store.intrinsic_bootstrap().unwrap().globals;
+            let symbol = fixture
+                .store
+                .symbol_table(globals)
+                .and_then(|globals| globals.get_source(name))
+                .unwrap_or_else(|| panic!("missing declared alias {name}"));
+            let host = relation_host(
+                &fixture.parsed.arena,
+                fixture.files.get(&fixture.file).unwrap(),
+            );
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            let result = CanonicalTypeQuery::new(
+                &mut fixture.store,
+                &host,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_declared_type_of_symbol(symbol)
+            .unwrap();
+            assert!(diagnostics.is_empty());
+            result
+        }
+
         let mut fixture = function_relation_fixture(concat!(
             "type Numbers = { [key: string]: number }; ",
             "type Strings = { [key: string]: string }; ",
@@ -9445,11 +9471,11 @@ mod tests {
             "type NumericKeys = { [key: number]: number }; ",
             "type NumberProperty = { value: number };",
         ));
-        let numbers = query_type_alias(&mut fixture, "Numbers");
-        let strings = query_type_alias(&mut fixture, "Strings");
-        let readonly_numbers = query_type_alias(&mut fixture, "ReadonlyNumbers");
-        let numeric_keys = query_type_alias(&mut fixture, "NumericKeys");
-        let declared = query_type_alias(&mut fixture, "NumberProperty");
+        let numbers = declared_alias(&mut fixture, "Numbers");
+        let strings = declared_alias(&mut fixture, "Strings");
+        let readonly_numbers = declared_alias(&mut fixture, "ReadonlyNumbers");
+        let numeric_keys = declared_alias(&mut fixture, "NumericKeys");
+        let declared = declared_alias(&mut fixture, "NumberProperty");
         let (number, string, any) = {
             let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
             (
