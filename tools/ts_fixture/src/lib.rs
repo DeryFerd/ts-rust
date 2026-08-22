@@ -4461,12 +4461,15 @@ const RUST_APPLIED_COMPILER_OPTION_NAMES: &[&str] = &[
     "reactNamespace",
     "removeComments",
     "resolveJsonModule",
+    "resolvePackageJsonExports",
+    "resolvePackageJsonImports",
     "rewriteRelativeImportExtensions",
     "rootDir",
     "skipLibCheck",
     "sourceMap",
     "sourceRoot",
     "strict",
+    "strictBuiltinIteratorReturn",
     "strictNullChecks",
     "strictPropertyInitialization",
     "stripInternal",
@@ -6241,6 +6244,76 @@ mod tests {
                 "strictBuiltinIteratorReturn".to_owned(),
             ]
         );
+    }
+
+    #[test]
+    fn applies_strict_builtin_iterator_return_without_hiding_module_resolution_skips() {
+        let case = Case::parse(
+            "iteratorReturn.ts",
+            concat!(
+                "// @strict: true\n",
+                "// @strictBuiltinIteratorReturn: *\n",
+                "const value = 1;\n",
+            ),
+        )
+        .unwrap();
+        let variants = expand_option_matrix(&case);
+        assert_eq!(variants.len(), 2);
+        for (variant, expected) in variants.iter().zip([true, false]) {
+            assert!(variant.unsupported_details.is_empty());
+            let options = fixture_compiler_options(&case, variant);
+            assert_eq!(options.strict_builtin_iterator_return, expected);
+            assert!(options.strict_builtin_iterator_return_specified);
+        }
+
+        let classic = Case::parse(
+            "settingsSimpleTest.ts",
+            concat!(
+                "// @strict: true\n",
+                "// @strictBuiltinIteratorReturn: *, !true\n",
+                "// @moduleResolution: classic\n",
+                "const value = 1;\n",
+            ),
+        )
+        .unwrap();
+        let variants = expand_option_matrix(&classic);
+        assert_eq!(variants.len(), 1);
+        assert_eq!(variants[0].values["strictBuiltinIteratorReturn"], "false");
+        assert_eq!(
+            variants[0].unsupported_details,
+            ["pinned Go harness skips node10 and classic module resolution"]
+        );
+        let options = fixture_compiler_options(&classic, &variants[0]);
+        assert!(!options.strict_builtin_iterator_return);
+        assert!(options.strict_builtin_iterator_return_specified);
+    }
+
+    #[test]
+    fn applies_package_json_exports_and_imports_option_variants() {
+        let case = Case::parse(
+            "packageResolution.ts",
+            concat!(
+                "// @moduleResolution: bundler\n",
+                "// @resolvePackageJsonExports: *\n",
+                "// @resolvePackageJsonImports: *\n",
+                "const value = 1;\n",
+            ),
+        )
+        .unwrap();
+        let variants = expand_option_matrix(&case);
+        assert_eq!(variants.len(), 4);
+        for variant in variants {
+            assert!(variant.unsupported_details.is_empty());
+            let options = fixture_compiler_options(&case, &variant);
+            assert_eq!(
+                options.resolve_package_json_exports,
+                variant.values["resolvePackageJsonExports"] == "true"
+            );
+            assert_eq!(
+                options.resolve_package_json_imports,
+                variant.values["resolvePackageJsonImports"] == "true"
+            );
+        }
     }
 
     #[test]
