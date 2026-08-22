@@ -3,7 +3,9 @@
 use std::{error::Error, fmt, fmt::Write as _};
 
 use ts_ast::{Node, NodeArena, NodeData, NodeFlags, NodeId, NodeRef, SyntaxKind};
-use ts_compiler::{CanonicalProgramQueries, CanonicalTypeFormatFlags, Program, SourceFile};
+use ts_compiler::{
+    CanonicalProgramQueries, CanonicalTypeFormatFlags, CanonicalTypeId, Program, SourceFile,
+};
 
 use crate::{
     Case, baseline_unit_name, is_default_library_file, remove_test_path_prefixes, virtual_unit_path,
@@ -232,13 +234,21 @@ fn artifact_line(
             let type_id = queries
                 .get_type_at_location(reference)
                 .map_err(|error| format!("semantic .types query failed: {error}"))?;
-            queries
+            let display = queries
                 .type_to_string_with_flags(
                     type_id,
                     CanonicalTypeFormatFlags::NO_TRUNCATION
                         | CanonicalTypeFormatFlags::ALLOW_UNIQUE_ES_SYMBOL_TYPE,
                 )
-                .map_err(|error| format!("semantic .types formatting failed: {error}"))?
+                .map_err(|error| format!("semantic .types formatting failed: {error}"))?;
+            if !program.options().no_implicit_any
+                && display == "any"
+                && jsx_error_type(program, queries, source, reference, type_id)?
+            {
+                "error".to_owned()
+            } else {
+                display
+            }
         }
         SemanticArtifactKind::Symbols => {
             let Some(symbol) = queries
@@ -256,6 +266,71 @@ fn artifact_line(
         source_text,
         value,
     }))
+}
+
+fn jsx_error_type(
+    program: &Program,
+    queries: &mut CanonicalProgramQueries<'_>,
+    source: &SourceFile,
+    reference: NodeRef,
+    type_id: CanonicalTypeId,
+) -> Result<bool, String> {
+    let Some(record) = program.node(reference) else {
+        return Ok(false);
+    };
+    let expression = match &record.data {
+        NodeData::JsxElement(_) | NodeData::JsxSelfClosingElement(_) => reference,
+        NodeData::Identifier(_) => {
+            let Some(parent_id) = record.parent else {
+                return Ok(false);
+            };
+            let Some(NodeData::VariableDeclaration(variable)) =
+                source.parse.arena.get(parent_id).map(|parent| &parent.data)
+            else {
+                return Ok(false);
+            };
+            if variable.name != reference.node {
+                return Ok(false);
+            }
+            let Some(expression) = variable.initializer.and_then(|node| source.node_ref(node))
+            else {
+                return Ok(false);
+            };
+            expression
+        }
+        _ => return Ok(false),
+    };
+    let Some(record) = program.node(expression) else {
+        return Ok(false);
+    };
+    let tag = match &record.data {
+        NodeData::JsxElement(element) => {
+            let Some(NodeData::JsxOpeningElement(opening)) = source
+                .parse
+                .arena
+                .get(element.opening_element)
+                .map(|opening| &opening.data)
+            else {
+                return Ok(false);
+            };
+            opening.tag_name
+        }
+        NodeData::JsxSelfClosingElement(element) => element.tag_name,
+        _ => return Ok(false),
+    };
+    let Some(tag) = source.node_ref(tag) else {
+        return Ok(false);
+    };
+    let expression_type = queries
+        .get_type_at_location(expression)
+        .map_err(|error| format!("semantic JSX expression query failed: {error}"))?;
+    if expression_type != type_id {
+        return Ok(false);
+    }
+    let tag_type = queries
+        .get_type_at_location(tag)
+        .map_err(|error| format!("semantic JSX tag query failed: {error}"))?;
+    Ok(tag_type != expression_type)
 }
 
 fn render_symbol(
@@ -308,10 +383,63 @@ fn render_symbol(
 
 fn declaration_full_start(source: &str, position: usize) -> usize {
     let mut start = position.min(source.len());
-    while start > 0 && source.as_bytes()[start - 1].is_ascii_whitespace() {
-        start -= 1;
+    loop {
+        start = source[..start]
+            .trim_end_matches(|character: char| {
+                character.is_whitespace() || character == '\u{feff}'
+            })
+            .len();
+
+        if source[..start].ends_with("*/")
+            && let Some(comment_start) = source[..start - 2].rfind("/*")
+        {
+            start = comment_start;
+            continue;
+        }
+
+        let line_start = source[..start]
+            .rfind(['\r', '\n', '\u{2028}', '\u{2029}'])
+            .map_or(0, |line_break| {
+                line_break
+                    + source[line_break..]
+                        .chars()
+                        .next()
+                        .map_or(0, char::len_utf8)
+            });
+        if let Some(comment_start) = line_comment_start(&source[line_start..start]) {
+            start = line_start + comment_start;
+            continue;
+        }
+
+        return start;
     }
-    start
+}
+
+fn line_comment_start(line: &str) -> Option<usize> {
+    let bytes = line.as_bytes();
+    let mut index = 0;
+    let mut quote = None;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if let Some(delimiter) = quote {
+            if byte == b'\\' {
+                index += usize::from(index + 1 < bytes.len());
+            } else if byte == delimiter {
+                quote = None;
+            }
+        } else if matches!(byte, b'\'' | b'"' | b'`') {
+            quote = Some(byte);
+        } else if byte == b'/' && bytes.get(index + 1) == Some(&b'/') {
+            return Some(index);
+        } else if byte == b'/'
+            && bytes.get(index + 1) == Some(&b'*')
+            && let Some(end) = line[index + 2..].find("*/")
+        {
+            index += end + 3;
+        }
+        index += 1;
+    }
+    None
 }
 
 fn ecma_line_and_utf16_column(source: &str, position: usize) -> (usize, usize) {
@@ -713,7 +841,71 @@ mod tests {
 
     use crate::Case;
 
-    use super::walk_program;
+    use super::{declaration_full_start, ecma_line_and_utf16_column, render_program, walk_program};
+
+    #[test]
+    fn declaration_positions_include_leading_line_and_jsdoc_comments() {
+        let first = "// upstream issue\n\ntype Thing = string;";
+        assert_eq!(
+            declaration_full_start(first, first.find("type Thing").unwrap()),
+            0
+        );
+
+        let previous =
+            "const value = 1; // trailing detail\n\n/**\n * docs\n */\nfunction next() {}";
+        assert_eq!(
+            declaration_full_start(previous, previous.find("function next").unwrap()),
+            previous.find(';').unwrap() + 1
+        );
+
+        let url = "const address = \"https://example.test\"; // trailing\ninterface Shape {}";
+        assert_eq!(
+            declaration_full_start(url, url.find("interface Shape").unwrap()),
+            url.find(';').unwrap() + 1
+        );
+    }
+
+    #[test]
+    fn declaration_positions_count_supplementary_characters_in_utf16() {
+        let source = "const icon = \"😀\"; // comment\n\n/** docs */\nfunction next() {}";
+        let start = declaration_full_start(source, source.find("function next").unwrap());
+        assert_eq!(start, source.find(';').unwrap() + 1);
+        assert_eq!(ecma_line_and_utf16_column(source, start), (0, 18));
+
+        let after_separator = "first\u{2028}😀next";
+        let next = after_separator.find("next").unwrap();
+        assert_eq!(ecma_line_and_utf16_column(after_separator, next), (1, 2));
+    }
+
+    #[test]
+    fn clean_jsx_elements_print_their_error_intrinsic_without_changing_tag_any() {
+        let source = "const view = <div />;\n";
+        let case = Case::parse("view.tsx", source).unwrap();
+        let filesystem = MemoryFileSystem::new(true);
+        filesystem.write_file("/.src/view.tsx", source).unwrap();
+        let options = CompilerOptions {
+            no_lib: true,
+            no_implicit_any: false,
+            no_implicit_any_specified: true,
+            strict: false,
+            jsx: ts_options::JsxEmit::Preserve,
+            ..CompilerOptions::default()
+        };
+        let (_, artifacts) = Program::try_new_with_canonical_checker_and_queries(
+            &filesystem,
+            "/.src",
+            &["/.src/view.tsx".to_owned()],
+            options,
+            |program, queries| render_program(&case, program, queries),
+        )
+        .unwrap();
+        let artifacts = artifacts.unwrap().unwrap();
+        let types = artifacts.types.unwrap();
+
+        assert!(types.contains(">view : error\r\n"), "{types}");
+        assert!(types.contains("><div /> : error\r\n"), "{types}");
+        assert!(types.contains(">div : any\r\n"), "{types}");
+    }
 
     #[test]
     fn walks_type_and_symbol_candidates_in_source_child_order() {

@@ -187,6 +187,10 @@ impl CanonicalCheckerContext<'_> {
             return Ok(type_);
         }
 
+        if let Some((type_, _)) = self.heritage_artifact_target(node)? {
+            return self.validate_artifact_type(node, type_);
+        }
+
         let (kind, is_type_node, parent) = {
             let (arena, bound, record) = self.validated_artifact_node(node)?;
             (
@@ -255,7 +259,9 @@ impl CanonicalCheckerContext<'_> {
 
         if matches!(
             &self.validated_artifact_node(node)?.2.data,
-            NodeData::JsxElement(_)
+            NodeData::ArrowFunction(_)
+                | NodeData::ObjectLiteralExpression(_)
+                | NodeData::JsxElement(_)
                 | NodeData::JsxOpeningElement(_)
                 | NodeData::JsxClosingElement(_)
                 | NodeData::JsxSelfClosingElement(_)
@@ -267,6 +273,10 @@ impl CanonicalCheckerContext<'_> {
         }
 
         if let Some(symbol) = self.cached_artifact_symbol(node)? {
+            return Ok(Some(symbol));
+        }
+
+        if let Some((_, symbol)) = self.heritage_artifact_target(node)? {
             return Ok(Some(symbol));
         }
 
@@ -316,7 +326,70 @@ impl CanonicalCheckerContext<'_> {
                 | LocationParent::ElementAccess(access)
                 | LocationParent::QualifiedName(access),
             ) => self.cached_artifact_symbol(access),
-            None if supported => Ok(None),
+            None if supported => {
+                let (arena, bound, record) = self.validated_artifact_node(node)?;
+                let NodeData::Identifier(identifier) = &record.data else {
+                    return Ok(None);
+                };
+
+                if record
+                    .parent
+                    .and_then(|parent| arena.get(parent))
+                    .is_some_and(|parent| {
+                        matches!(
+                            &parent.data,
+                            NodeData::BinaryExpression(binary)
+                                if binary.left == node.node
+                                    && arena
+                                        .get(binary.operator_token)
+                                        .is_some_and(|operator| {
+                                            operator.kind.is_assignment_operator()
+                                        })
+                                    && parent
+                                        .parent
+                                        .and_then(|statement| arena.get(statement))
+                                        .is_some_and(|statement| {
+                                            matches!(
+                                                statement.data,
+                                                NodeData::ExpressionStatement(_)
+                                            ) && statement.parent
+                                                == Some(bound.source_file().node)
+                                        })
+                        )
+                    })
+                {
+                    let local = bound
+                        .locals(bound.source_file())
+                        .and_then(|locals| self.store().symbol_table(locals))
+                        .and_then(|locals| locals.get_source(&identifier.text));
+                    if let Some(symbol) = local {
+                        return self.merged_artifact_symbol(node, symbol).map(Some);
+                    }
+                }
+
+                if identifier.text != "undefined" {
+                    return Ok(None);
+                }
+                let Some(bootstrap) = self.store().intrinsic_bootstrap() else {
+                    return Ok(None);
+                };
+                let global = self
+                    .store()
+                    .symbol_table(bootstrap.globals)
+                    .and_then(|globals| globals.get_source("undefined"))
+                    .and_then(|symbol| self.store().get_merged_symbol(symbol));
+                let shadowed = bound
+                    .locals(bound.source_file())
+                    .and_then(|locals| self.store().symbol_table(locals))
+                    .and_then(|locals| locals.get_source("undefined"))
+                    .and_then(|symbol| self.store().get_merged_symbol(symbol))
+                    .is_some_and(|symbol| symbol != bootstrap.undefined_symbol);
+                if global == Some(bootstrap.undefined_symbol) && !shadowed {
+                    Ok(global)
+                } else {
+                    Ok(None)
+                }
+            }
             None => {
                 let (_, _, record) = self.validated_artifact_node(node)?;
                 Err(CanonicalArtifactQueryError::UnsupportedNode {
@@ -368,7 +441,34 @@ impl CanonicalCheckerContext<'_> {
             .store()
             .symbol(symbol)
             .ok_or(CanonicalArtifactQueryError::ForeignSymbol(symbol))?;
-        Ok(record.name().escaped_display().to_string())
+        let name = record.name().escaped_display().to_string();
+        if !record.flags().intersects(
+            SymbolFlags::PROPERTY
+                | SymbolFlags::METHOD
+                | SymbolFlags::ACCESSOR
+                | SymbolFlags::ENUM_MEMBER,
+        ) {
+            return Ok(name);
+        }
+
+        let mut names = vec![name];
+        let mut owner = record.parent();
+        while let Some(parent) = owner {
+            let record = self
+                .store()
+                .symbol(parent)
+                .ok_or(CanonicalArtifactQueryError::ForeignSymbol(parent))?;
+            if !record
+                .flags()
+                .intersects(SymbolFlags::CLASS | SymbolFlags::INTERFACE | SymbolFlags::ENUM)
+            {
+                break;
+            }
+            names.push(record.name().escaped_display().to_string());
+            owner = record.parent();
+        }
+        names.reverse();
+        Ok(names.join("."))
     }
 
     fn prepare_artifact_location(
@@ -471,6 +571,94 @@ impl CanonicalCheckerContext<'_> {
         self.store()
             .get_merged_symbol(symbol)
             .ok_or(CanonicalArtifactQueryError::InvalidSymbol { node, symbol })
+    }
+
+    fn heritage_artifact_target(
+        &self,
+        node: NodeRef,
+    ) -> Result<Option<(TypeId, SemanticSymbolId)>, CanonicalArtifactQueryError> {
+        let (arena, bound, record) = self.validated_artifact_node(node)?;
+        let Some(reference_id) = record.parent else {
+            return Ok(None);
+        };
+        let reference = NodeRef::new(node.arena, node.file, reference_id);
+        let Some(reference_record) = arena.get(reference_id) else {
+            return Err(CanonicalArtifactQueryError::ForeignNode(reference));
+        };
+        let NodeData::ExpressionWithTypeArguments(expression) = &reference_record.data else {
+            return Ok(None);
+        };
+        if expression.expression != node.node {
+            return Ok(None);
+        }
+
+        let Some(clause_id) = reference_record.parent else {
+            return Ok(None);
+        };
+        let clause = NodeRef::new(node.arena, node.file, clause_id);
+        let Some(clause_record) = arena.get(clause_id) else {
+            return Err(CanonicalArtifactQueryError::ForeignNode(clause));
+        };
+        let NodeData::HeritageClause(heritage) = &clause_record.data else {
+            return Ok(None);
+        };
+        let Some(owner_id) = clause_record.parent else {
+            return Ok(None);
+        };
+        let owner = NodeRef::new(node.arena, node.file, owner_id);
+        let Some(owner_record) = arena.get(owner_id) else {
+            return Err(CanonicalArtifactQueryError::ForeignNode(owner));
+        };
+        if !matches!(
+            owner_record.data,
+            NodeData::ClassDeclaration(_) | NodeData::InterfaceDeclaration(_)
+        ) {
+            return Ok(None);
+        }
+        if !bound.contains(reference) || !bound.contains(clause) || !bound.contains(owner) {
+            return Err(CanonicalArtifactQueryError::ForeignNode(node));
+        }
+
+        let Some(owner_symbol) = bound.symbol(owner) else {
+            return Ok(None);
+        };
+        let owner_symbol = self.merged_artifact_symbol(node, owner_symbol)?;
+        let Some(owner_type) = self
+            .store()
+            .declared_type_links(owner_symbol)
+            .and_then(|links| links.declared_type)
+        else {
+            return Ok(None);
+        };
+        let Some(TypeData::Interface(interface)) =
+            self.store().type_payload(owner_type).map(TypeRecord::data)
+        else {
+            return Err(CanonicalArtifactQueryError::InvalidType {
+                node,
+                type_: owner_type,
+            });
+        };
+        let Some(index) = heritage
+            .types
+            .nodes
+            .iter()
+            .position(|base| *base == reference_id)
+        else {
+            return Ok(None);
+        };
+        let Some(base) = interface
+            .resolved_base_types
+            .as_deref()
+            .and_then(|types| types.get(index))
+            .copied()
+        else {
+            return Ok(None);
+        };
+        let Some(symbol) = self.store().type_payload(base).and_then(TypeRecord::symbol) else {
+            return Err(CanonicalArtifactQueryError::InvalidType { node, type_: base });
+        };
+        let symbol = self.merged_artifact_symbol(node, symbol)?;
+        Ok(Some((base, symbol)))
     }
 
     fn type_of_artifact_symbol(
@@ -800,4 +988,209 @@ fn supports_symbol_location(data: &NodeData) -> bool {
                 | NodeData::NamespaceImport(_)
                 | NodeData::SourceFile(_)
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use ts_ast::{FileId, NodeData, NodeRef};
+    use ts_binder::{
+        CanonicalBinder, CanonicalModuleState, CanonicalSourceFileFacts, CanonicalSourceLanguage,
+        EscapedName,
+    };
+    use ts_parser::{ParseResult, parse_source_file};
+
+    use super::CanonicalCheckerContext;
+    use crate::semantic::CanonicalCheckerOptions;
+
+    fn context(parsed: &ParseResult, file: FileId) -> CanonicalCheckerContext<'_> {
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/artifacts.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![(file, &parsed.arena)],
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn anonymous_arrow_and_object_symbols_remain_checker_private() {
+        let parsed = parse_source_file(concat!(
+            "const run = (value: number): number => value;\n",
+            "const object = { value: 1 };\n",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(6_000);
+        let mut context = context(&parsed, file);
+        context.check_source_file(file).unwrap();
+        let arrow = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                matches!(record.data, NodeData::ArrowFunction(_)).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let internal = context.file(file).unwrap().1.symbol(arrow).unwrap();
+
+        assert_eq!(context.get_symbol_at_location(arrow).unwrap(), None);
+        assert_eq!(context.file(file).unwrap().1.symbol(arrow), Some(internal));
+
+        let object =
+            parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    matches!(record.data, NodeData::ObjectLiteralExpression(_))
+                        .then_some(NodeRef::new(parsed.arena.id(), file, node))
+                })
+                .unwrap();
+        let internal = context.file(file).unwrap().1.symbol(object).unwrap();
+        assert_eq!(context.get_symbol_at_location(object).unwrap(), None);
+        assert_eq!(context.file(file).unwrap().1.symbol(object), Some(internal));
+    }
+
+    #[test]
+    fn class_and_interface_member_names_include_their_owner() {
+        let parsed = parse_source_file(concat!(
+            "interface Shape { item: string; }\n",
+            "class Model { value!: number; }\n",
+            "const object = { value: 1 };\n",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(6_001);
+        let mut context = context(&parsed, file);
+        context.check_source_file(file).unwrap();
+
+        let mut names = Vec::new();
+        for (node, record) in parsed.arena.iter() {
+            if !matches!(
+                record.data,
+                NodeData::PropertyDeclaration(_) | NodeData::PropertyAssignment(_)
+            ) {
+                continue;
+            }
+            let declaration = NodeRef::new(parsed.arena.id(), file, node);
+            let symbol = context.file(file).unwrap().1.symbol(declaration).unwrap();
+            names.push(context.symbol_to_string(symbol).unwrap());
+        }
+
+        assert_eq!(names, ["Shape.item", "Model.value", "value"]);
+    }
+
+    #[test]
+    fn heritage_identifiers_reuse_resolved_base_types_and_symbols() {
+        let parsed = parse_source_file(concat!(
+            "interface Shape { item: string; }\n",
+            "interface Child extends Shape { next: number; }\n",
+            "class Base { value!: string; }\n",
+            "class Derived extends Base { other!: number; }\n",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(6_002);
+        let mut context = context(&parsed, file);
+        context.check_source_file(file).unwrap();
+
+        let references = parsed
+            .arena
+            .iter()
+            .filter_map(|(_, record)| {
+                let NodeData::ExpressionWithTypeArguments(expression) = &record.data else {
+                    return None;
+                };
+                let name = NodeRef::new(parsed.arena.id(), file, expression.expression);
+                let NodeData::Identifier(identifier) = &parsed.arena.get(name.node)?.data else {
+                    return None;
+                };
+                Some((name, identifier.text.as_str()))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(references.len(), 2);
+
+        for (reference, expected_name) in references {
+            let symbol = context.get_symbol_at_location(reference).unwrap().unwrap();
+            assert_eq!(context.symbol_to_string(symbol).unwrap(), expected_name);
+            let type_ = context.get_type_at_location(reference).unwrap();
+            assert_eq!(
+                context
+                    .store()
+                    .declared_type_links(symbol)
+                    .and_then(|links| links.declared_type),
+                Some(type_)
+            );
+        }
+    }
+
+    #[test]
+    fn assignment_targets_and_global_undefined_retain_their_public_symbols() {
+        let parsed = parse_source_file(concat!(
+            "var target: { value: number } = { value: 1 };\n",
+            "target = { value: 2 };\n",
+            "const missing = undefined;\n",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(6_003);
+        let mut context = context(&parsed, file);
+        context.check_source_file(file).unwrap();
+
+        let target = parsed
+            .arena
+            .iter()
+            .find_map(|(_, record)| {
+                let NodeData::BinaryExpression(binary) = &record.data else {
+                    return None;
+                };
+                Some(NodeRef::new(parsed.arena.id(), file, binary.left))
+            })
+            .unwrap();
+        let target_symbol = context
+            .file(file)
+            .unwrap()
+            .1
+            .locals(context.source_file(file).unwrap().node_ref())
+            .and_then(|locals| context.store().symbol_table(locals))
+            .and_then(|locals| locals.get_source("target"))
+            .unwrap();
+        assert_eq!(
+            context.get_symbol_at_location(target).unwrap(),
+            Some(target_symbol)
+        );
+
+        let undefined = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                matches!(&record.data, NodeData::Identifier(identifier) if identifier.text == "undefined")
+                    .then_some(NodeRef::new(parsed.arena.id(), file, node))
+            })
+            .unwrap();
+        assert_eq!(
+            context.get_symbol_at_location(undefined).unwrap(),
+            Some(
+                context
+                    .store()
+                    .intrinsic_bootstrap()
+                    .unwrap()
+                    .undefined_symbol
+            )
+        );
+    }
 }
