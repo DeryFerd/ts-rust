@@ -130,7 +130,10 @@ impl<'a, F: FileSystem + ?Sized> Resolver<'a, F> {
         let mut state = ResolutionState {
             resolver: self,
             failed_lookups: Vec::new(),
+            import_condition: false,
+            extension_priority: ExtensionPriority::All,
         };
+        state.import_condition = state.use_import_condition(containing_file);
         let containing_directory = directory_path(containing_file);
         let resolved = if is_relative(specifier) {
             let candidate = resolve_path(&containing_directory, &[specifier]);
@@ -176,22 +179,14 @@ impl<'a, F: FileSystem + ?Sized> Resolver<'a, F> {
         let mut state = ResolutionState {
             resolver: self,
             failed_lookups: Vec::new(),
+            import_condition: false,
+            extension_priority: ExtensionPriority::Types,
         };
+        state.import_condition = state.use_import_condition(containing_file);
         let containing_directory = directory_path(containing_file);
-        let type_root_name = name
-            .strip_prefix('@')
-            .and_then(|name| name.split_once('/'))
-            .map_or_else(
-                || name.to_owned(),
-                |(scope, package)| format!("{scope}__{package}"),
-            );
         let resolved = state
-            .resolve_from_type_roots(&type_root_name, &containing_directory)
-            .or_else(|| {
-                types_package_name(name).and_then(|types_name| {
-                    state.resolve_node_modules_types(&types_name, &containing_directory)
-                })
-            });
+            .resolve_type_reference_from_roots(name, &containing_directory)
+            .or_else(|| state.resolve_node_modules(name, &containing_directory));
         ResolutionResult {
             resolved,
             failed_lookups: state.failed_lookups,
@@ -209,6 +204,15 @@ impl<'a, F: FileSystem + ?Sized> Resolver<'a, F> {
 struct ResolutionState<'a, 'fs, F: FileSystem + ?Sized> {
     resolver: &'a Resolver<'fs, F>,
     failed_lookups: Vec<FailedLookup>,
+    import_condition: bool,
+    extension_priority: ExtensionPriority,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ExtensionPriority {
+    All,
+    Types,
+    JavaScript,
 }
 
 enum PackageMetadataResolution {
@@ -217,7 +221,66 @@ enum PackageMetadataResolution {
     Blocked,
 }
 
+enum PackageTargetResolution {
+    NotMatched,
+    Resolved(ResolvedModule),
+    Blocked,
+}
+
+struct PackageMapMatch<'a> {
+    target: &'a Value,
+    capture: String,
+    is_pattern: bool,
+}
+
 impl<F: FileSystem + ?Sized> ResolutionState<'_, '_, F> {
+    fn use_import_condition(&self, containing_file: &str) -> bool {
+        match self.resolver.options.mode {
+            ResolutionMode::Bundler => true,
+            ResolutionMode::Node16 | ResolutionMode::NodeNext => {
+                if containing_file.ends_with(".mts") || containing_file.ends_with(".mjs") {
+                    return true;
+                }
+                if containing_file.ends_with(".cts") || containing_file.ends_with(".cjs") {
+                    return false;
+                }
+                ancestors(&directory_path(containing_file))
+                    .into_iter()
+                    .find_map(|directory| {
+                        let package_json = join(&directory, "package.json");
+                        self.resolver
+                            .file_system
+                            .read_file(&package_json)
+                            .ok()
+                            .and_then(|contents| parse_package_json(&contents).ok())
+                    })
+                    .is_some_and(|package| package.package_type.as_deref() == Some("module"))
+            }
+            ResolutionMode::Classic | ResolutionMode::Node10 => false,
+        }
+    }
+
+    fn condition_matches(&self, condition: &str) -> bool {
+        match condition {
+            "default" => true,
+            "import" => self.import_condition,
+            "require" => !self.import_condition,
+            "types" => self.resolver.options.prefer_types,
+            "node" => matches!(
+                self.resolver.options.mode,
+                ResolutionMode::Node16 | ResolutionMode::NodeNext
+            ),
+            _ => {
+                self.resolver.options.prefer_types
+                    && condition
+                        .strip_prefix("types@")
+                        .and_then(|range| VersionRange::parse(range).ok())
+                        .zip(Version::parse(env!("CARGO_PKG_VERSION")).ok())
+                        .is_some_and(|(range, version)| range.test(&version))
+            }
+        }
+    }
+
     fn resolve_paths_or_base_url(&mut self, specifier: &str) -> Option<ResolvedModule> {
         if let Some((capture, substitutions)) =
             best_path_match(&self.resolver.options.paths, specifier)
@@ -288,35 +351,70 @@ impl<F: FileSystem + ?Sized> ResolutionState<'_, '_, F> {
         {
             return None;
         }
-        for ancestor in ancestors(containing_directory) {
-            let package_json_path = join(&ancestor, "package.json");
-            if !self.resolver.file_system.file_exists(&package_json_path) {
-                continue;
-            }
-            let package = self.read_package_json(&package_json_path)?;
-            let target = if specifier.starts_with('#') {
-                package.imports.as_ref().and_then(|imports| {
-                    package_map_target(imports, specifier, self.resolver.options.prefer_types)
-                })
+        let (package_directory, package_json_path, package) = ancestors(containing_directory)
+            .into_iter()
+            .find_map(|directory| {
+                let package_json = join(&directory, "package.json");
+                self.resolver
+                    .file_system
+                    .file_exists(&package_json)
+                    .then_some((directory, package_json))
+            })
+            .and_then(|(directory, package_json)| {
+                self.read_package_json(&package_json)
+                    .map(|package| (directory, package_json, package))
+            })?;
+        let is_imports = specifier.starts_with('#');
+        let matched = if is_imports {
+            package
+                .imports
+                .as_ref()
+                .and_then(|imports| package_map_match(imports, specifier))
+        } else {
+            let name = package.name.as_deref()?;
+            let rest = specifier
+                .strip_prefix(name)
+                .filter(|rest| rest.is_empty() || rest.starts_with('/'))?;
+            let key = if rest.is_empty() {
+                ".".to_owned()
             } else {
-                let name = package.name.as_deref()?;
-                let rest = specifier
-                    .strip_prefix(name)
-                    .filter(|rest| rest.is_empty() || rest.starts_with('/'))?;
-                let key = if rest.is_empty() {
-                    ".".to_owned()
-                } else {
-                    format!(".{rest}")
-                };
-                package.exports.as_ref().and_then(|exports| {
-                    package_export_target(exports, &key, self.resolver.options.prefer_types)
-                })
-            }?;
-            if target.starts_with("./") {
-                let candidate = resolve_path(&ancestor, &[target.trim_start_matches("./")]);
-                return self.resolve_candidate_with_package(&candidate, &package_json_path);
+                format!(".{rest}")
+            };
+            package
+                .exports
+                .as_ref()
+                .and_then(|exports| package_export_match(exports, &key))
+        }?;
+        match self.resolve_package_target(
+            matched.target,
+            &package_directory,
+            &package_json_path,
+            &matched.capture,
+            matched.is_pattern,
+            is_imports,
+        ) {
+            PackageTargetResolution::Resolved(resolved) => Some(resolved),
+            PackageTargetResolution::NotMatched | PackageTargetResolution::Blocked => None,
+        }
+    }
+
+    fn resolve_type_reference_from_roots(
+        &mut self,
+        specifier: &str,
+        containing_directory: &str,
+    ) -> Option<ResolvedModule> {
+        for root in effective_type_roots(&self.resolver.options, containing_directory) {
+            let root = normalize_path(&root);
+            let name = if root.ends_with("/node_modules/@types") {
+                mangled_scoped_package_name(specifier)
+            } else {
+                specifier.to_owned()
+            };
+            let candidate = resolve_path(&root, &[&name]);
+            if let Some(mut resolved) = self.resolve_candidate(&candidate, true) {
+                resolved.is_external_library_import = true;
+                return Some(resolved);
             }
-            return self.resolve_node_modules(&target, &ancestor);
         }
         None
     }
@@ -342,55 +440,67 @@ impl<F: FileSystem + ?Sized> ResolutionState<'_, '_, F> {
         containing_directory: &str,
     ) -> Option<ResolvedModule> {
         let (package_name, rest) = parse_package_name(specifier)?;
-        for ancestor in ancestors(containing_directory) {
-            if ancestor.ends_with("/node_modules") {
-                continue;
+        let previous_priority = self.extension_priority;
+        let priorities: &[ExtensionPriority] = match previous_priority {
+            ExtensionPriority::All
+                if self.resolver.options.allow_javascript || self.resolver.options.resolve_json =>
+            {
+                &[ExtensionPriority::Types, ExtensionPriority::JavaScript]
             }
-            let node_modules = join(&ancestor, "node_modules");
-            let package_directory = join(&node_modules, package_name);
-            match self.resolve_package_metadata(&package_directory, rest) {
-                PackageMetadataResolution::Resolved(resolved) => return Some(resolved),
-                PackageMetadataResolution::Blocked => return None,
-                PackageMetadataResolution::NotApplicable => {}
-            }
-            let candidate = if rest.is_empty() {
-                package_directory
-            } else {
-                join(&package_directory, rest)
-            };
-            if let Some(mut resolved) = self.resolve_candidate(&candidate, true) {
-                resolved.is_external_library_import = true;
-                return Some(resolved);
+            ExtensionPriority::All | ExtensionPriority::Types => &[ExtensionPriority::Types],
+            ExtensionPriority::JavaScript => &[ExtensionPriority::JavaScript],
+        };
+        let types_name = types_package_name(specifier);
+        for &priority in priorities {
+            self.extension_priority = priority;
+            for ancestor in ancestors(containing_directory) {
+                if ancestor.ends_with("/node_modules") {
+                    continue;
+                }
+                let node_modules = join(&ancestor, "node_modules");
+                if let Some(resolved) =
+                    self.resolve_node_modules_package(&node_modules, package_name, rest)
+                {
+                    self.extension_priority = previous_priority;
+                    return Some(resolved);
+                }
+                if priority == ExtensionPriority::Types
+                    && let Some(types_name) = types_name.as_deref()
+                    && let Some((types_package, types_rest)) = parse_package_name(types_name)
+                    && let Some(resolved) =
+                        self.resolve_node_modules_package(&node_modules, types_package, types_rest)
+                {
+                    self.extension_priority = previous_priority;
+                    return Some(resolved);
+                }
             }
         }
-        if let Some(types_name) = types_package_name(specifier) {
-            return self.resolve_node_modules_types(&types_name, containing_directory);
-        }
+        self.extension_priority = previous_priority;
         None
     }
 
-    fn resolve_node_modules_types(
+    fn resolve_node_modules_package(
         &mut self,
-        specifier: &str,
-        containing_directory: &str,
+        node_modules: &str,
+        package_name: &str,
+        rest: &str,
     ) -> Option<ResolvedModule> {
-        let (package_name, rest) = parse_package_name(specifier)?;
-        for ancestor in ancestors(containing_directory) {
-            if ancestor.ends_with("/node_modules") {
-                continue;
-            }
-            let package_directory = join(&join(&ancestor, "node_modules"), package_name);
-            let candidate = if rest.is_empty() {
-                package_directory
-            } else {
-                join(&package_directory, rest)
-            };
-            if let Some(mut resolved) = self.resolve_candidate(&candidate, true) {
-                resolved.is_external_library_import = true;
-                return Some(resolved);
-            }
+        let package_directory = join(node_modules, package_name);
+        match self.resolve_package_metadata(&package_directory, rest) {
+            PackageMetadataResolution::Resolved(resolved) => return Some(resolved),
+            PackageMetadataResolution::Blocked => return None,
+            PackageMetadataResolution::NotApplicable => {}
         }
-        None
+        let candidate = if rest.is_empty() {
+            package_directory
+        } else {
+            join(&package_directory, rest)
+        };
+        self.resolve_candidate(&candidate, true)
+            .map(|mut resolved| {
+                resolved.is_external_library_import = true;
+                resolved
+            })
     }
 
     fn resolve_package_metadata(
@@ -407,6 +517,7 @@ impl<F: FileSystem + ?Sized> ResolutionState<'_, '_, F> {
         };
         if self.resolver.options.resolve_package_json_exports
             && let Some(exports) = &package.exports
+            && !exports.is_null()
             && matches!(
                 self.resolver.options.mode,
                 ResolutionMode::Node16 | ResolutionMode::NodeNext | ResolutionMode::Bundler
@@ -417,19 +528,25 @@ impl<F: FileSystem + ?Sized> ResolutionState<'_, '_, F> {
             } else {
                 format!("./{rest}")
             };
-            let Some(target) =
-                package_export_target(exports, &key, self.resolver.options.prefer_types)
-            else {
+            let Some(matched) = package_export_match(exports, &key) else {
                 return PackageMetadataResolution::Blocked;
             };
-            let candidate = resolve_path(package_directory, &[target.trim_start_matches("./")]);
-            if let Some(mut resolved) =
-                self.resolve_candidate_with_package(&candidate, &package_json_path)
-            {
-                resolved.is_external_library_import = true;
-                return PackageMetadataResolution::Resolved(resolved);
+            match self.resolve_package_target(
+                matched.target,
+                package_directory,
+                &package_json_path,
+                &matched.capture,
+                matched.is_pattern,
+                false,
+            ) {
+                PackageTargetResolution::Resolved(mut resolved) => {
+                    resolved.is_external_library_import = true;
+                    return PackageMetadataResolution::Resolved(resolved);
+                }
+                PackageTargetResolution::NotMatched | PackageTargetResolution::Blocked => {
+                    return PackageMetadataResolution::Blocked;
+                }
             }
-            return PackageMetadataResolution::Blocked;
         }
         if !rest.is_empty()
             && let Some(types_versions) = &package.types_versions
@@ -438,7 +555,7 @@ impl<F: FileSystem + ?Sized> ResolutionState<'_, '_, F> {
             for target in targets {
                 let candidate = resolve_path(package_directory, &[&target]);
                 if let Some(mut resolved) =
-                    self.resolve_candidate_with_package(&candidate, &package_json_path)
+                    self.resolve_candidate_with_package(&candidate, &package_json_path, true)
                 {
                     resolved.is_external_library_import = true;
                     return PackageMetadataResolution::Resolved(resolved);
@@ -449,16 +566,100 @@ impl<F: FileSystem + ?Sized> ResolutionState<'_, '_, F> {
         PackageMetadataResolution::NotApplicable
     }
 
+    fn resolve_package_target(
+        &mut self,
+        target: &Value,
+        package_directory: &str,
+        package_json: &str,
+        capture: &str,
+        is_pattern: bool,
+        is_imports: bool,
+    ) -> PackageTargetResolution {
+        match target {
+            Value::String(target) => {
+                if !is_pattern && !capture.is_empty() && !target.ends_with('/') {
+                    return PackageTargetResolution::NotMatched;
+                }
+                let expanded = if is_pattern {
+                    target.replace('*', capture)
+                } else {
+                    format!("{target}{capture}")
+                };
+                if !target.starts_with("./") {
+                    if is_imports
+                        && !target.starts_with("../")
+                        && !is_absolute(target)
+                        && let Some(resolved) =
+                            self.resolve_node_modules(&expanded, package_directory)
+                    {
+                        return PackageTargetResolution::Resolved(resolved);
+                    }
+                    return PackageTargetResolution::NotMatched;
+                }
+                if invalid_package_path(target.trim_start_matches("./"))
+                    || invalid_package_path(capture)
+                {
+                    return PackageTargetResolution::NotMatched;
+                }
+                let candidate = resolve_path(package_directory, &[&expanded]);
+                let external = package_directory.contains("/node_modules/");
+                self.resolve_candidate_with_package(&candidate, package_json, external)
+                    .map_or(PackageTargetResolution::NotMatched, |mut resolved| {
+                        resolved.is_external_library_import = external;
+                        PackageTargetResolution::Resolved(resolved)
+                    })
+            }
+            Value::Array(targets) => {
+                for candidate in targets {
+                    let result = self.resolve_package_target(
+                        candidate,
+                        package_directory,
+                        package_json,
+                        capture,
+                        is_pattern,
+                        is_imports,
+                    );
+                    if !matches!(result, PackageTargetResolution::NotMatched) {
+                        return result;
+                    }
+                }
+                PackageTargetResolution::NotMatched
+            }
+            Value::Object(conditions) => {
+                for (condition, candidate) in conditions {
+                    if !self.condition_matches(condition) {
+                        continue;
+                    }
+                    let result = self.resolve_package_target(
+                        candidate,
+                        package_directory,
+                        package_json,
+                        capture,
+                        is_pattern,
+                        is_imports,
+                    );
+                    if !matches!(result, PackageTargetResolution::NotMatched) {
+                        return result;
+                    }
+                }
+                PackageTargetResolution::NotMatched
+            }
+            Value::Null => PackageTargetResolution::Blocked,
+            Value::Bool(_) | Value::Number(_) => PackageTargetResolution::NotMatched,
+        }
+    }
+
     fn resolve_candidate_with_package(
         &mut self,
         candidate: &str,
         package_json: &str,
+        external: bool,
     ) -> Option<ResolvedModule> {
-        if let Some(resolved) = self.resolve_file(candidate, true, Some(package_json)) {
+        if let Some(resolved) = self.resolve_file(candidate, external, Some(package_json)) {
             return Some(resolved);
         }
         if self.resolver.file_system.directory_exists(candidate) {
-            return self.resolve_index(candidate, true, Some(package_json));
+            return self.resolve_index(candidate, external, Some(package_json));
         }
         None
     }
@@ -491,9 +692,11 @@ impl<F: FileSystem + ?Sized> ResolutionState<'_, '_, F> {
                 if let Some(targets) = types_version_targets(types_versions, types_entry) {
                     for target in targets {
                         let candidate = resolve_path(directory, &[&target]);
-                        if let Some(mut resolved) =
-                            self.resolve_candidate_with_package(&candidate, &package_json_path)
-                        {
+                        if let Some(mut resolved) = self.resolve_candidate_with_package(
+                            &candidate,
+                            &package_json_path,
+                            external,
+                        ) {
                             resolved.package_json = Some(package_json_path.clone());
                             return Some(resolved);
                         }
@@ -591,6 +794,7 @@ impl<F: FileSystem + ?Sized> ResolutionState<'_, '_, F> {
                 }
             }
             Some(".json") if self.resolver.options.resolve_json => &[".d.json.ts", ".json"],
+            Some(".json") => &[".d.json.ts"],
             Some(extension) if self.resolver.options.allow_arbitrary_extensions => {
                 return vec![format!("{stem}.d{extension}.ts")];
             }
@@ -599,6 +803,18 @@ impl<F: FileSystem + ?Sized> ResolutionState<'_, '_, F> {
         endings
             .iter()
             .map(|ending| format!("{stem}{ending}"))
+            .filter(|path| {
+                let extension = source_extension(path);
+                let is_javascript = matches!(extension, Some(".js" | ".jsx" | ".mjs" | ".cjs"));
+                if is_javascript && !self.resolver.options.allow_javascript {
+                    return false;
+                }
+                match self.extension_priority {
+                    ExtensionPriority::All => true,
+                    ExtensionPriority::Types => !is_javascript && extension != Some(".json"),
+                    ExtensionPriority::JavaScript => is_javascript || extension == Some(".json"),
+                }
+            })
             .collect()
     }
 
@@ -678,31 +894,76 @@ fn path_suffix<'a>(path: &'a str, root: &str) -> Option<&'a str> {
     }
 }
 
-fn package_export_target(exports: &Value, key: &str, prefer_types: bool) -> Option<String> {
+fn package_export_match<'a>(exports: &'a Value, key: &str) -> Option<PackageMapMatch<'a>> {
     if let Some(object) = exports.as_object() {
-        if object.keys().any(|name| name.starts_with('.')) {
-            if let Some(value) = object.get(key) {
-                return select_export_condition(value, prefer_types).map(str::to_owned);
+        let has_subpaths = object.keys().any(|name| name.starts_with('.'));
+        if has_subpaths {
+            if object.keys().any(|name| !name.starts_with('.')) {
+                return None;
             }
-            let (value, capture) = wildcard_export(object, key)?;
-            return select_export_condition(value, prefer_types)
-                .map(|target| target.replace('*', &capture));
+            return package_map_match(exports, key);
         }
-        return select_export_condition(exports, prefer_types).map(str::to_owned);
     }
-    (key == ".")
-        .then(|| select_export_condition(exports, prefer_types))
-        .flatten()
-        .map(str::to_owned)
+    (key == ".").then(|| PackageMapMatch {
+        target: exports,
+        capture: String::new(),
+        is_pattern: false,
+    })
 }
 
-fn package_map_target(map: &Value, key: &str, prefer_types: bool) -> Option<String> {
+fn package_map_match<'a>(map: &'a Value, key: &str) -> Option<PackageMapMatch<'a>> {
     let object = map.as_object()?;
-    if let Some(value) = object.get(key) {
-        return select_export_condition(value, prefer_types).map(str::to_owned);
+    if !key.ends_with('/')
+        && !key.contains('*')
+        && let Some(target) = object.get(key)
+    {
+        return Some(PackageMapMatch {
+            target,
+            capture: String::new(),
+            is_pattern: false,
+        });
     }
-    let (value, capture) = wildcard_export(object, key)?;
-    select_export_condition(value, prefer_types).map(|target| target.replace('*', &capture))
+    object
+        .iter()
+        .filter_map(|(pattern, target)| {
+            let star = pattern.find('*');
+            let capture = if let Some(index) = star {
+                if pattern[index + 1..].contains('*') {
+                    return None;
+                }
+                match_pattern(pattern, key)?
+            } else if pattern.ends_with('/') {
+                key.strip_prefix(pattern)?
+            } else {
+                return None;
+            };
+            let prefix_length = star.map_or(pattern.len(), |index| index + 1);
+            Some((
+                (prefix_length, star.is_some(), pattern.len()),
+                PackageMapMatch {
+                    target,
+                    capture: capture.to_owned(),
+                    is_pattern: star.is_some(),
+                },
+            ))
+        })
+        .max_by_key(|(specificity, _)| *specificity)
+        .map(|(_, matched)| matched)
+}
+
+fn invalid_package_path(path: &str) -> bool {
+    path.split('/')
+        .any(|segment| matches!(segment, "." | ".." | "node_modules"))
+}
+
+fn mangled_scoped_package_name(specifier: &str) -> String {
+    specifier
+        .strip_prefix('@')
+        .and_then(|name| name.split_once('/'))
+        .map_or_else(
+            || specifier.to_owned(),
+            |(scope, package)| format!("{scope}__{package}"),
+        )
 }
 
 fn types_package_name(specifier: &str) -> Option<String> {
@@ -710,9 +971,7 @@ fn types_package_name(specifier: &str) -> Option<String> {
         return None;
     }
     let (package, rest) = parse_package_name(specifier)?;
-    let package = package
-        .strip_prefix('@')
-        .map_or_else(|| package.to_owned(), |name| name.replace('/', "__"));
+    let package = mangled_scoped_package_name(package);
     Some(if rest.is_empty() {
         format!("@types/{package}")
     } else {
@@ -780,40 +1039,6 @@ pub fn automatic_type_directive_names(
         .into_iter()
         .filter(|name| seen.insert(name.clone()))
         .collect()
-}
-
-fn wildcard_export<'a>(
-    exports: &'a serde_json::Map<String, Value>,
-    key: &str,
-) -> Option<(&'a Value, String)> {
-    exports
-        .iter()
-        .filter_map(|(pattern, value)| {
-            match_pattern(pattern, key).map(|capture| (pattern.len(), value, capture))
-        })
-        .max_by_key(|(specificity, _, _)| *specificity)
-        .map(|(_, value, capture)| (value, capture.to_owned()))
-}
-
-fn select_export_condition(value: &Value, prefer_types: bool) -> Option<&str> {
-    if let Some(target) = value.as_str() {
-        return Some(target);
-    }
-    if let Some(targets) = value.as_array() {
-        return targets
-            .iter()
-            .find_map(|target| select_export_condition(target, prefer_types));
-    }
-    let object = value.as_object()?;
-    let conditions: &[&str] = if prefer_types {
-        &["types", "import", "require", "default"]
-    } else {
-        &["import", "require", "default", "types"]
-    };
-    conditions
-        .iter()
-        .find_map(|condition| object.get(*condition))
-        .and_then(|value| select_export_condition(value, prefer_types))
 }
 
 fn types_version_targets(types_versions: &Value, rest: &str) -> Option<Vec<String>> {
@@ -1212,6 +1437,267 @@ mod tests {
     }
 
     #[test]
+    fn package_conditions_follow_json_order_and_skip_unresolved_targets() {
+        let fs = fs(&[
+            (
+                "/app/node_modules/ordered/package.json",
+                r#"{"exports":{".":{"default":"./default.d.ts","types":"./types.d.ts"}}}"#,
+            ),
+            ("/app/node_modules/ordered/default.d.ts", ""),
+            ("/app/node_modules/ordered/types.d.ts", ""),
+            (
+                "/app/node_modules/fallback/package.json",
+                r#"{"exports":{".":{"types":"./missing.d.ts","default":"./runtime.js"}}}"#,
+            ),
+            ("/app/node_modules/fallback/runtime.d.ts", ""),
+            (
+                "/app/node_modules/array/package.json",
+                r#"{"exports":{".":{"types":["./missing.d.ts","./actual.d.ts"]}}}"#,
+            ),
+            ("/app/node_modules/array/actual.d.ts", ""),
+        ]);
+        let resolver = Resolver::new(
+            &fs,
+            ResolutionOptions {
+                mode: ResolutionMode::Bundler,
+                ..ResolutionOptions::default()
+            },
+        );
+
+        assert_eq!(
+            resolver
+                .resolve("ordered", "/app/main.ts")
+                .resolved
+                .unwrap()
+                .resolved_file_name,
+            "/app/node_modules/ordered/default.d.ts"
+        );
+        assert_eq!(
+            resolver
+                .resolve("fallback", "/app/main.ts")
+                .resolved
+                .unwrap()
+                .resolved_file_name,
+            "/app/node_modules/fallback/runtime.d.ts"
+        );
+        assert_eq!(
+            resolver
+                .resolve("array", "/app/main.ts")
+                .resolved
+                .unwrap()
+                .resolved_file_name,
+            "/app/node_modules/array/actual.d.ts"
+        );
+    }
+
+    #[test]
+    fn node_conditions_follow_source_format_and_package_type() {
+        let fs = fs(&[
+            (
+                "/app/node_modules/pkg/package.json",
+                r#"{"exports":{".":{"import":"./esm.d.mts","require":"./commonjs.d.cts"}}}"#,
+            ),
+            ("/app/node_modules/pkg/esm.d.mts", ""),
+            ("/app/node_modules/pkg/commonjs.d.cts", ""),
+            ("/app/esm/package.json", r#"{"type":"module"}"#),
+            ("/app/commonjs/package.json", r#"{"type":"commonjs"}"#),
+        ]);
+        let resolver = Resolver::new(
+            &fs,
+            ResolutionOptions {
+                mode: ResolutionMode::NodeNext,
+                ..ResolutionOptions::default()
+            },
+        );
+
+        for containing_file in ["/app/esm/main.ts", "/app/main.mts"] {
+            assert_eq!(
+                resolver
+                    .resolve("pkg", containing_file)
+                    .resolved
+                    .unwrap()
+                    .resolved_file_name,
+                "/app/node_modules/pkg/esm.d.mts"
+            );
+        }
+        for containing_file in ["/app/commonjs/main.ts", "/app/main.cts"] {
+            assert_eq!(
+                resolver
+                    .resolve("pkg", containing_file)
+                    .resolved
+                    .unwrap()
+                    .resolved_file_name,
+                "/app/node_modules/pkg/commonjs.d.cts"
+            );
+        }
+    }
+
+    #[test]
+    fn node_condition_is_excluded_from_bundler_resolution() {
+        let fs = fs(&[
+            (
+                "/app/node_modules/pkg/package.json",
+                r#"{"exports":{".":{"node":"./node.d.ts","default":"./browser.d.ts"}}}"#,
+            ),
+            ("/app/node_modules/pkg/node.d.ts", ""),
+            ("/app/node_modules/pkg/browser.d.ts", ""),
+        ]);
+
+        for (mode, expected) in [
+            (ResolutionMode::Node16, "/app/node_modules/pkg/node.d.ts"),
+            (
+                ResolutionMode::Bundler,
+                "/app/node_modules/pkg/browser.d.ts",
+            ),
+        ] {
+            assert_eq!(
+                Resolver::new(
+                    &fs,
+                    ResolutionOptions {
+                        mode,
+                        ..ResolutionOptions::default()
+                    },
+                )
+                .resolve("pkg", "/app/main.ts")
+                .resolved
+                .unwrap()
+                .resolved_file_name,
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn package_exports_accept_matching_versioned_types_conditions() {
+        let fs = fs(&[
+            (
+                "/app/node_modules/pkg/package.json",
+                r#"{"exports":{".":{"types@<7":"./old.d.ts","types@>=7":"./current.d.ts","types":"./fallback.d.ts"}}}"#,
+            ),
+            ("/app/node_modules/pkg/old.d.ts", ""),
+            ("/app/node_modules/pkg/current.d.ts", ""),
+            ("/app/node_modules/pkg/fallback.d.ts", ""),
+        ]);
+        let resolved = Resolver::new(
+            &fs,
+            ResolutionOptions {
+                mode: ResolutionMode::NodeNext,
+                ..ResolutionOptions::default()
+            },
+        )
+        .resolve("pkg", "/app/main.ts")
+        .resolved
+        .unwrap();
+
+        assert_eq!(
+            resolved.resolved_file_name,
+            "/app/node_modules/pkg/current.d.ts"
+        );
+    }
+
+    #[test]
+    fn package_patterns_prioritize_the_longest_prefix() {
+        let fs = fs(&[
+            (
+                "/app/node_modules/pkg/package.json",
+                r#"{"exports":{"./features/*.development.js":"./broad/*.d.ts","./features/deep/*":"./deep/*.d.ts","./legacy/":"./legacy-types/"}}"#,
+            ),
+            ("/app/node_modules/pkg/broad/deep/tool.d.ts", ""),
+            ("/app/node_modules/pkg/deep/tool.development.js.d.ts", ""),
+            ("/app/node_modules/pkg/legacy-types/item.d.ts", ""),
+        ]);
+        let resolver = Resolver::new(
+            &fs,
+            ResolutionOptions {
+                mode: ResolutionMode::Bundler,
+                ..ResolutionOptions::default()
+            },
+        );
+
+        assert_eq!(
+            resolver
+                .resolve("pkg/features/deep/tool.development.js", "/app/main.ts")
+                .resolved
+                .unwrap()
+                .resolved_file_name,
+            "/app/node_modules/pkg/deep/tool.development.js.d.ts"
+        );
+        assert_eq!(
+            resolver
+                .resolve("pkg/legacy/item.js", "/app/main.ts")
+                .resolved
+                .unwrap()
+                .resolved_file_name,
+            "/app/node_modules/pkg/legacy-types/item.d.ts"
+        );
+    }
+
+    #[test]
+    fn null_root_exports_use_legacy_fields_but_null_conditions_block_fallback() {
+        let fs = fs(&[
+            (
+                "/app/node_modules/legacy/package.json",
+                r#"{"types":"./legacy.d.ts","exports":null}"#,
+            ),
+            ("/app/node_modules/legacy/legacy.d.ts", ""),
+            (
+                "/app/node_modules/blocked/package.json",
+                r#"{"exports":{".":{"types":null,"default":"./default.d.ts"}}}"#,
+            ),
+            ("/app/node_modules/blocked/default.d.ts", ""),
+        ]);
+        let resolver = Resolver::new(
+            &fs,
+            ResolutionOptions {
+                mode: ResolutionMode::NodeNext,
+                ..ResolutionOptions::default()
+            },
+        );
+
+        assert_eq!(
+            resolver
+                .resolve("legacy", "/app/main.ts")
+                .resolved
+                .unwrap()
+                .resolved_file_name,
+            "/app/node_modules/legacy/legacy.d.ts"
+        );
+        assert!(
+            resolver
+                .resolve("blocked", "/app/main.ts")
+                .resolved
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn package_maps_reject_paths_that_leave_the_package() {
+        let fs = fs(&[
+            (
+                "/app/node_modules/pkg/package.json",
+                r#"{"exports":{".":"../outside.d.ts","./unsafe/*":"./types/*"}}"#,
+            ),
+            ("/app/node_modules/outside.d.ts", ""),
+            ("/app/node_modules/pkg/private.d.ts", ""),
+        ]);
+        let resolver = Resolver::new(
+            &fs,
+            ResolutionOptions {
+                mode: ResolutionMode::Bundler,
+                ..ResolutionOptions::default()
+            },
+        );
+
+        assert!(resolver.resolve("pkg", "/app/main.ts").resolved.is_none());
+        assert!(
+            resolver
+                .resolve("pkg/unsafe/../private", "/app/main.ts")
+                .resolved
+                .is_none()
+        );
+    }
+
+    #[test]
     fn disabled_package_exports_use_legacy_package_resolution() {
         let fs = fs(&[
             (
@@ -1338,6 +1824,103 @@ mod tests {
     }
 
     #[test]
+    fn package_imports_support_external_packages_and_local_provenance() {
+        let fs = fs(&[
+            (
+                "/repo/package.json",
+                r##"{"imports":{"#local":"./src/local.d.ts","#dep":"dependency/entry"}}"##,
+            ),
+            ("/repo/src/local.d.ts", ""),
+            ("/repo/node_modules/dependency/entry.d.ts", ""),
+        ]);
+        let resolver = Resolver::new(
+            &fs,
+            ResolutionOptions {
+                mode: ResolutionMode::NodeNext,
+                ..ResolutionOptions::default()
+            },
+        );
+
+        let local = resolver
+            .resolve("#local", "/repo/main.ts")
+            .resolved
+            .unwrap();
+        assert_eq!(local.resolved_file_name, "/repo/src/local.d.ts");
+        assert!(!local.is_external_library_import);
+
+        let dependency = resolver.resolve("#dep", "/repo/main.ts").resolved.unwrap();
+        assert_eq!(
+            dependency.resolved_file_name,
+            "/repo/node_modules/dependency/entry.d.ts"
+        );
+        assert!(dependency.is_external_library_import);
+    }
+
+    #[test]
+    fn package_imports_use_only_the_nearest_package_scope() {
+        let fs = fs(&[
+            (
+                "/repo/package.json",
+                r##"{"imports":{"#shared":"./shared.d.ts"}}"##,
+            ),
+            ("/repo/shared.d.ts", ""),
+            ("/repo/nested/package.json", r#"{"name":"nested"}"#),
+        ]);
+        let resolver = Resolver::new(
+            &fs,
+            ResolutionOptions {
+                mode: ResolutionMode::Bundler,
+                ..ResolutionOptions::default()
+            },
+        );
+
+        assert!(
+            resolver
+                .resolve("#shared", "/repo/nested/main.ts")
+                .resolved
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn nodenext_accepts_rooted_import_patterns_but_node16_rejects_them() {
+        let fs = fs(&[
+            ("/repo/package.json", r##"{"imports":{"#/*":"./src/*"}}"##),
+            ("/repo/src/feature.ts", ""),
+        ]);
+
+        let nodenext = Resolver::new(
+            &fs,
+            ResolutionOptions {
+                mode: ResolutionMode::NodeNext,
+                ..ResolutionOptions::default()
+            },
+        );
+        assert_eq!(
+            nodenext
+                .resolve("#/feature.js", "/repo/main.ts")
+                .resolved
+                .unwrap()
+                .resolved_file_name,
+            "/repo/src/feature.ts"
+        );
+
+        let node16 = Resolver::new(
+            &fs,
+            ResolutionOptions {
+                mode: ResolutionMode::Node16,
+                ..ResolutionOptions::default()
+            },
+        );
+        assert!(
+            node16
+                .resolve("#/feature.js", "/repo/main.ts")
+                .resolved
+                .is_none()
+        );
+    }
+
+    #[test]
     fn disabled_package_imports_do_not_resolve_internal_specifiers() {
         let fs = fs(&[
             (
@@ -1425,6 +2008,90 @@ mod tests {
                 .unwrap()
                 .resolved_file_name,
             "/custom/types/ambient/index.d.ts"
+        );
+    }
+
+    #[test]
+    fn declaration_packages_take_priority_over_closer_javascript_packages() {
+        let fs = fs(&[
+            ("/repo/app/node_modules/pkg/index.js", ""),
+            ("/repo/node_modules/@types/pkg/index.d.ts", ""),
+        ]);
+        let resolved = Resolver::new(&fs, ResolutionOptions::default())
+            .resolve("pkg", "/repo/app/src/main.ts")
+            .resolved
+            .unwrap();
+
+        assert_eq!(
+            resolved.resolved_file_name,
+            "/repo/node_modules/@types/pkg/index.d.ts"
+        );
+    }
+
+    #[test]
+    fn type_references_follow_package_exports_and_bundler_import_conditions() {
+        let fs = fs(&[
+            (
+                "/node_modules/pkg/package.json",
+                r#"{"name":"pkg","exports":{".":{"import":{"types":"./esm.d.mts"},"default":{"types":"./commonjs.d.ts"}}}}"#,
+            ),
+            ("/node_modules/pkg/esm.d.mts", ""),
+            ("/node_modules/pkg/commonjs.d.ts", ""),
+        ]);
+        let resolved = Resolver::new(
+            &fs,
+            ResolutionOptions {
+                mode: ResolutionMode::Bundler,
+                types: Some(vec!["pkg".into()]),
+                ..ResolutionOptions::default()
+            },
+        )
+        .resolve_type_reference("pkg", "/__inferred type names__.ts")
+        .resolved
+        .unwrap();
+
+        assert_eq!(resolved.resolved_file_name, "/node_modules/pkg/esm.d.mts");
+    }
+
+    #[test]
+    fn scoped_type_references_use_scoped_names_under_custom_type_roots() {
+        let fs = fs(&[("/custom/@scope/pkg/index.d.ts", "")]);
+        let resolved = Resolver::new(
+            &fs,
+            ResolutionOptions {
+                type_roots: Some(vec!["/custom".into()]),
+                ..ResolutionOptions::default()
+            },
+        )
+        .resolve_type_reference("@scope/pkg", "/app/main.ts")
+        .resolved
+        .unwrap();
+
+        assert_eq!(resolved.resolved_file_name, "/custom/@scope/pkg/index.d.ts");
+    }
+
+    #[test]
+    fn javascript_mode_does_not_load_explicit_mjs_or_cjs_when_disabled() {
+        let fs = fs(&[("/src/value.mjs", ""), ("/src/other.cjs", "")]);
+        let resolver = Resolver::new(
+            &fs,
+            ResolutionOptions {
+                allow_javascript: false,
+                ..ResolutionOptions::default()
+            },
+        );
+
+        assert!(
+            resolver
+                .resolve("./value.mjs", "/src/main.ts")
+                .resolved
+                .is_none()
+        );
+        assert!(
+            resolver
+                .resolve("./other.cjs", "/src/main.ts")
+                .resolved
+                .is_none()
         );
     }
 
