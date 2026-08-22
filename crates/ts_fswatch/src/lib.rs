@@ -48,14 +48,30 @@ impl Event {
         }
     }
 
-    fn is_visible_from(&self, root: &Path, mode: WatchMode) -> bool {
-        let visible = |path: &Path| match mode {
-            WatchMode::Recursive => path.starts_with(root) && path != root,
-            WatchMode::NonRecursive => path.parent() == Some(root),
+    fn filter_paths(
+        self,
+        root: &Path,
+        mode: WatchMode,
+        ignore: Option<&IgnoreFilter>,
+    ) -> Option<Self> {
+        let visible = |path: &Path| {
+            let under_watch = match mode {
+                WatchMode::Recursive => path.starts_with(root) && path != root,
+                WatchMode::NonRecursive => path.parent() == Some(root),
+            };
+            under_watch && ignore.is_none_or(|filter| !filter(path))
         };
         match self {
-            Self::Create(path) | Self::Change(path) | Self::Delete(path) => visible(path),
-            Self::Rename { from, to } => visible(from) || visible(to),
+            Self::Create(path) if visible(&path) => Some(Self::Create(path)),
+            Self::Change(path) if visible(&path) => Some(Self::Change(path)),
+            Self::Delete(path) if visible(&path) => Some(Self::Delete(path)),
+            Self::Rename { from, to } => match (visible(&from), visible(&to)) {
+                (true, true) => Some(Self::Rename { from, to }),
+                (true, false) => Some(Self::Delete(from)),
+                (false, true) => Some(Self::Create(to)),
+                (false, false) => None,
+            },
+            Self::Create(_) | Self::Change(_) | Self::Delete(_) => None,
         }
     }
 }
@@ -97,6 +113,7 @@ pub struct WatchBatch {
 }
 
 pub type BackendSink = Arc<dyn Fn(BackendBatch) + Send + Sync>;
+type IgnoreFilter = Arc<dyn Fn(&Path) -> bool + Send + Sync>;
 
 /// Live backend-specific watch state.
 pub trait BackendWatch: Send {
@@ -215,6 +232,7 @@ impl EventCoalescer {
 pub struct Watcher<B = NotifyBackend> {
     backend: Arc<B>,
     debounce: DebounceConfig,
+    ignore: Option<IgnoreFilter>,
 }
 
 impl Default for Watcher<NotifyBackend> {
@@ -229,12 +247,20 @@ impl<B: Backend> Watcher<B> {
         Self {
             backend: Arc::new(backend),
             debounce: DebounceConfig::default(),
+            ignore: None,
         }
     }
 
     #[must_use]
     pub const fn with_debounce(mut self, debounce: DebounceConfig) -> Self {
         self.debounce = debounce;
+        self
+    }
+
+    /// Prevents matching paths from reaching callbacks while preserving watch errors.
+    #[must_use]
+    pub fn with_ignore(mut self, ignore: impl Fn(&Path) -> bool + Send + Sync + 'static) -> Self {
+        self.ignore = Some(Arc::new(ignore));
         self
     }
 
@@ -257,9 +283,10 @@ impl<B: Backend> Watcher<B> {
         });
         let backend_watch = self.backend.watch(&root, mode, sink)?;
         let debounce = self.debounce;
+        let ignore = self.ignore.clone();
         let worker_root = root.clone();
         let worker = thread::spawn(move || {
-            run_worker(&receiver, &worker_root, mode, debounce, callback);
+            run_worker(&receiver, &worker_root, mode, debounce, ignore, callback);
         });
         Ok(Watch {
             root,
@@ -379,6 +406,7 @@ fn run_worker(
     root: &Path,
     mode: WatchMode,
     config: DebounceConfig,
+    ignore: Option<IgnoreFilter>,
     callback: impl Fn(WatchBatch),
 ) {
     let mut pending = DebouncedEvents::new(config);
@@ -397,7 +425,7 @@ fn run_worker(
                     .events
                     .into_iter()
                     .map(|event| event.map_paths(|path| canonical_event_path(root, &path)))
-                    .filter(|event| event.is_visible_from(root, mode))
+                    .filter_map(|event| event.filter_paths(root, mode, ignore.as_ref()))
                     .collect();
                 if batch.events.is_empty() && batch.error.is_none() {
                     continue;
@@ -866,6 +894,98 @@ mod tests {
             Some(WatchError::Overflow("queue full".to_owned()))
         );
         assert_eq!(backend.registration().1, WatchMode::Recursive);
+        watch.close().unwrap();
+    }
+
+    #[test]
+    fn renames_crossing_a_watch_boundary_become_create_or_delete_events() {
+        let directory = TestDirectory::new();
+        let backend = FakeBackend::default();
+        let (sender, receiver) = mpsc::channel();
+        let mut watch = Watcher::new(backend.clone())
+            .with_debounce(DebounceConfig {
+                min_wait: Duration::ZERO,
+                max_wait: Duration::ZERO,
+            })
+            .watch(&directory.0, WatchMode::NonRecursive, move |batch| {
+                sender.send(batch).unwrap();
+            })
+            .unwrap();
+        let root = fs::canonicalize(&directory.0).unwrap();
+
+        backend.emit(BackendBatch {
+            events: vec![
+                Event::Rename {
+                    from: root.join("removed.ts"),
+                    to: root.join("nested/removed.ts"),
+                },
+                Event::Rename {
+                    from: root.join("nested/created.ts"),
+                    to: root.join("created.ts"),
+                },
+            ],
+            error: None,
+        });
+
+        assert_eq!(
+            receiver
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .events,
+            [
+                Event::Create(root.join("created.ts")),
+                Event::Delete(root.join("removed.ts"))
+            ]
+        );
+        watch.close().unwrap();
+    }
+
+    #[test]
+    fn ignore_option_filters_paths_without_hiding_backend_errors() {
+        let directory = TestDirectory::new();
+        let backend = FakeBackend::default();
+        let (sender, receiver) = mpsc::channel();
+        let mut watch = Watcher::new(backend.clone())
+            .with_debounce(DebounceConfig {
+                min_wait: Duration::ZERO,
+                max_wait: Duration::ZERO,
+            })
+            .with_ignore(|path| path.extension().is_some_and(|extension| extension == "tmp"))
+            .watch(&directory.0, WatchMode::NonRecursive, move |batch| {
+                sender.send(batch).unwrap();
+            })
+            .unwrap();
+        let root = fs::canonicalize(&directory.0).unwrap();
+
+        backend.emit(BackendBatch {
+            events: vec![
+                Event::Change(root.join("ignored.tmp")),
+                Event::Rename {
+                    from: root.join("saved.tmp"),
+                    to: root.join("source.ts"),
+                },
+            ],
+            error: None,
+        });
+        assert_eq!(
+            receiver
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .events,
+            [Event::Create(root.join("source.ts"))]
+        );
+
+        backend.emit(BackendBatch {
+            events: vec![Event::Change(root.join("ignored.tmp"))],
+            error: Some(WatchError::Overflow("queue full".to_owned())),
+        });
+        assert_eq!(
+            receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
+            WatchBatch {
+                events: Vec::new(),
+                error: Some(WatchError::Overflow("queue full".to_owned())),
+            }
+        );
         watch.close().unwrap();
     }
 

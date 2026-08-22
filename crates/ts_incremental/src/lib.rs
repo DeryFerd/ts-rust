@@ -125,6 +125,9 @@ impl BuildInfo {
         let Some(previous) = previous else {
             return current.files.keys().cloned().collect();
         };
+        let all_files_affected = previous.version != current.version
+            || previous.options_hash != current.options_hash
+            || previous.dependencies != current.dependencies;
         previous
             .files
             .keys()
@@ -132,7 +135,9 @@ impl BuildInfo {
             .cloned()
             .collect::<BTreeSet<_>>()
             .into_iter()
-            .filter(|path| previous.files.get(path) != current.files.get(path))
+            .filter(|path| {
+                all_files_affected || previous.files.get(path) != current.files.get(path)
+            })
             .collect()
     }
 
@@ -260,6 +265,45 @@ mod tests {
         assert_eq!(
             BuildInfo::decision(Some(&previous), &changed_options, |_| true),
             BuildDecision::Affected
+        );
+    }
+
+    #[test]
+    fn option_or_dependency_changes_invalidate_every_source() {
+        let files = [
+            ("/src/a.ts".to_owned(), "export const a = 1;".to_owned()),
+            ("/src/b.ts".to_owned(), "export const b = 2;".to_owned()),
+        ];
+        let dependencies = BTreeMap::from([("/dep/tsconfig.json".to_owned(), "before".to_owned())]);
+        let previous = BuildInfo::new(
+            "1",
+            "options",
+            files.clone(),
+            dependencies.clone(),
+            vec!["/dist/a.js".to_owned(), "/dist/b.js".to_owned()],
+        );
+        let changed_options = BuildInfo::new(
+            "1",
+            "updated options",
+            files.clone(),
+            dependencies,
+            previous.outputs.clone(),
+        );
+        let changed_dependency = BuildInfo::new(
+            "1",
+            "options",
+            files,
+            BTreeMap::from([("/dep/tsconfig.json".to_owned(), "after".to_owned())]),
+            previous.outputs.clone(),
+        );
+
+        assert_eq!(
+            BuildInfo::affected_files(Some(&previous), &changed_options),
+            ["/src/a.ts", "/src/b.ts"]
+        );
+        assert_eq!(
+            BuildInfo::affected_files(Some(&previous), &changed_dependency),
+            ["/src/a.ts", "/src/b.ts"]
         );
     }
 }
