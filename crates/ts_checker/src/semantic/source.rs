@@ -92,7 +92,7 @@ use super::{
     source_calls::{
         SourceCallCalleeForm, SourceCallPlan, check_direct_source_call,
         emit_call_type_argument_grammar_diagnostics, finish_direct_source_call_plan,
-        plan_direct_source_call_syntax,
+        plan_direct_source_call_syntax, source_call_argument_contextual_type,
     },
     source_elements::{
         SourceElementError, SourceElementPlan, SourceElementUnsupported,
@@ -5221,19 +5221,25 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 UnsupportedSourceSyntax::InvalidLiteralFlags(literal),
             ));
         }
-        if !self.source_spelling_matches(literal, &data.text) {
-            return Err(SourceCheckError::Unsupported(
-                UnsupportedSourceSyntax::InvalidLiteralSpelling(literal),
-            ));
-        }
-        let normalized = normalize_numeric_separators(&data.text).ok_or(
-            SourceCheckError::Unsupported(UnsupportedSourceSyntax::InvalidLiteralSpelling(literal)),
-        )?;
-        let value = ts_jsnum::from_string(&normalized);
+        let value = ts_jsnum::from_string(&data.text);
         if value.is_nan() {
             return Err(SourceCheckError::Unsupported(
                 UnsupportedSourceSyntax::InvalidLiteralSpelling(literal),
             ));
+        }
+        if let Some(source) = self.arena.source_text() {
+            let spelling = source
+                .get(node.range.start.get() as usize..node.range.end.get() as usize)
+                .and_then(normalize_numeric_separators)
+                .ok_or(SourceCheckError::Unsupported(
+                    UnsupportedSourceSyntax::InvalidLiteralSpelling(literal),
+                ))?;
+            let source_value = ts_jsnum::from_string(&spelling);
+            if source_value.is_nan() || source_value != value {
+                return Err(SourceCheckError::Unsupported(
+                    UnsupportedSourceSyntax::InvalidLiteralSpelling(literal),
+                ));
+            }
         }
         Ok(value)
     }
@@ -5252,15 +5258,24 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 UnsupportedSourceSyntax::InvalidLiteralFlags(literal),
             ));
         }
-        if !self.source_spelling_matches(literal, &data.text) {
-            return Err(SourceCheckError::Unsupported(
-                UnsupportedSourceSyntax::InvalidLiteralSpelling(literal),
-            ));
-        }
         let normalized = normalize_bigint_literal(&data.text).ok_or(
             SourceCheckError::Unsupported(UnsupportedSourceSyntax::InvalidLiteralSpelling(literal)),
         )?;
-        Ok(PseudoBigInt::parse_valid(&normalized))
+        let value = PseudoBigInt::parse_valid(&normalized);
+        if let Some(source) = self.arena.source_text() {
+            let spelling = source
+                .get(node.range.start.get() as usize..node.range.end.get() as usize)
+                .and_then(normalize_bigint_literal)
+                .ok_or(SourceCheckError::Unsupported(
+                    UnsupportedSourceSyntax::InvalidLiteralSpelling(literal),
+                ))?;
+            if PseudoBigInt::parse_valid(&spelling) != value {
+                return Err(SourceCheckError::Unsupported(
+                    UnsupportedSourceSyntax::InvalidLiteralSpelling(literal),
+                ));
+            }
+        }
+        Ok(value)
     }
 
     fn source_spelling_matches(&self, node: NodeRef, expected: &str) -> bool {
@@ -6832,7 +6847,14 @@ fn check_expression_type(
                 deferred,
             )?;
             let mut argument_types = Vec::with_capacity(call.arguments.len());
-            for argument in &call.arguments {
+            for (index, argument) in call.arguments.iter().enumerate() {
+                let contextual_type = source_call_argument_contextual_type(
+                    store,
+                    global_types,
+                    call,
+                    callee.result,
+                    index,
+                )?;
                 argument_types.push(
                     check_expression_type(
                         store,
@@ -6845,7 +6867,7 @@ fn check_expression_type(
                         current_flow_types,
                         preflighted_type_import_value_uses,
                         argument,
-                        None,
+                        contextual_type,
                         deferred,
                     )?
                     .result,
@@ -7316,13 +7338,7 @@ fn syntactic_truthiness(
             syntactic_truthiness(host, inner)
         }
         PlannedExpressionKind::Number { .. }
-            if host.node(expression.node).is_some_and(|node| {
-                matches!(
-                    &node.data,
-                    NodeData::NumericLiteral(literal)
-                        if literal.text == "0" || literal.text == "1"
-                )
-            }) =>
+            if numeric_literal_has_plain_boolean_idiom_spelling(host, expression.node) =>
         {
             PredicateSemantics::Sometimes
         }
@@ -7361,6 +7377,26 @@ fn syntactic_truthiness(
         | PlannedExpressionKind::Logical(_)
         | PlannedExpressionKind::Number { .. } => PredicateSemantics::Sometimes,
     }
+}
+
+fn numeric_literal_has_plain_boolean_idiom_spelling(
+    host: &DeclaredTypeHost<'_>,
+    literal: NodeRef,
+) -> bool {
+    let Some(node) = host.node(literal) else {
+        return false;
+    };
+    let NodeData::NumericLiteral(data) = &node.data else {
+        return false;
+    };
+    let spelling = host
+        .source(literal)
+        .and_then(|(arena, _)| arena.source_text())
+        .and_then(|source| {
+            source.get(node.range.start.get() as usize..node.range.end.get() as usize)
+        })
+        .unwrap_or(&data.text);
+    matches!(spelling, "0" | "1")
 }
 
 fn syntactic_nullishness(expression: &PlannedExpression) -> PredicateSemantics {
