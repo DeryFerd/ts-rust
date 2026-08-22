@@ -6048,18 +6048,11 @@ impl DeclarationPrinter<'_> {
                     {
                         self.writer.write("export ");
                     }
-                    let javascript_default_export_target = data
-                        .name
-                        .is_some_and(|name| self.javascript_class_is_default_export_target(name));
-                    self.writer.write(
-                        if in_namespace
-                            || (self.javascript_source && !javascript_default_export_target)
-                        {
-                            "namespace "
-                        } else {
-                            "declare namespace "
-                        },
-                    );
+                    self.writer.write(if in_namespace {
+                        "namespace "
+                    } else {
+                        "declare namespace "
+                    });
                     if let Some(name) = data.name {
                         self.emit_name(name)?;
                     }
@@ -6095,11 +6088,7 @@ impl DeclarationPrinter<'_> {
                         if has_reserved_property && !reserved {
                             self.writer.write("export ");
                         }
-                        self.writer.write(if self.javascript_source {
-                            "let "
-                        } else {
-                            "var "
-                        });
+                        self.writer.write("var ");
                         if reserved {
                             let alias = self.generate_declaration_temp_name();
                             self.writer.write(&alias);
@@ -12174,13 +12163,23 @@ impl DeclarationPrinter<'_> {
                 if self.arena.get(assignment.operator_token)?.kind != SyntaxKind::EqualsToken {
                     return None;
                 }
-                let NodeData::PropertyAccessExpression(access) =
-                    &self.arena.get(assignment.left)?.data
-                else {
-                    return None;
+                let (receiver, property, computed) = match &self.arena.get(assignment.left)?.data {
+                    NodeData::PropertyAccessExpression(access) => {
+                        (access.expression, access.name, false)
+                    }
+                    NodeData::ElementAccessExpression(access) => {
+                        (access.expression, access.argument_expression, true)
+                    }
+                    _ => return None,
                 };
-                if declaration_name_text(self.arena, access.expression) != Some(function_name) {
+                if declaration_name_text(self.arena, receiver) != Some(function_name) {
                     return None;
+                }
+                if computed {
+                    let (name, numeric) = self.late_bound_property_name(property)?;
+                    if numeric || !is_identifier_text(&name) {
+                        return None;
+                    }
                 }
                 let mut current = assignment_id;
                 while let Some(parent_id) = self.arena.get(current).and_then(|node| node.parent) {
@@ -12200,7 +12199,7 @@ impl DeclarationPrinter<'_> {
                     }
                     current = parent_id;
                 }
-                Some((node.range.start, access.name, assignment.right))
+                Some((node.range.start, property, assignment.right))
             })
             .collect::<Vec<_>>();
         assignments.sort_by_key(|(start, _, _)| *start);
@@ -18703,46 +18702,87 @@ impl DeclarationPrinter<'_> {
                 };
                 self.node_types?.get(&assignment.right).copied()
             });
-            self.emit_leading_jsdoc(assignment);
-            self.emit_semantic_property_name(&name);
-            self.writer.write(": ");
-            let mut jsdoc_optional = false;
-            let explicit_jsdoc_type = self.jsdoc_type_hint(assignment);
-            let has_explicit_jsdoc_type = explicit_jsdoc_type.is_some();
-            if let Some(hint) = explicit_jsdoc_type {
-                self.writer.write(&hint);
-            } else if let Some(hint) =
-                self.javascript_assignment_parameter_hint(assignment, member_id)
-            {
-                self.emit_jsdoc_type_hint(&hint);
-            } else if let Some((hint, optional)) = self.jsdoc_typedef_property_hint(&name) {
-                let constructed = matches!(
-                    self.arena.get(assignment).map(|node| &node.data),
-                    Some(NodeData::BinaryExpression(assignment))
-                        if matches!(
-                            self.arena.get(assignment.right).map(|node| &node.data),
-                            Some(NodeData::NewExpression(_))
-                        )
-                );
-                self.emit_jsdoc_type_hint(if constructed {
-                    hint.strip_prefix("typeof ").unwrap_or(&hint)
-                } else {
-                    &hint
-                });
-                jsdoc_optional = optional;
-            } else if let Some(type_id) = type_id {
-                self.emit_semantic_type(type_id)?;
-            } else {
-                self.writer.write("any");
-            }
-            if jsdoc_optional
-                || (!has_explicit_jsdoc_type && class_type.optional_properties.contains(&name))
-            {
-                self.writer.write(" | undefined");
-            }
-            self.writer.write(";");
-            self.writer.newline();
+            self.emit_javascript_instance_property(
+                assignment,
+                &name,
+                type_id,
+                &class_type,
+                member_id,
+            )?;
         }
+        Ok(())
+    }
+
+    fn emit_javascript_instance_property(
+        &mut self,
+        assignment: NodeId,
+        name: &str,
+        type_id: Option<TypeId>,
+        class_type: &ObjectType,
+        member_id: NodeId,
+    ) -> Result<(), EmitError> {
+        self.emit_leading_jsdoc(assignment);
+        let quoted_name = self
+            .arena
+            .get(assignment)
+            .and_then(|node| match &node.data {
+                NodeData::BinaryExpression(assignment) => {
+                    self.arena.get(assignment.left).and_then(|left| {
+                        let NodeData::ElementAccessExpression(access) = &left.data else {
+                            return None;
+                        };
+                        matches!(
+                            self.arena
+                                .get(access.argument_expression)
+                                .map(|node| &node.data),
+                            Some(NodeData::StringLiteral(_))
+                        )
+                        .then_some(access.argument_expression)
+                    })
+                }
+                _ => None,
+            });
+        if let Some(quoted_name) = quoted_name {
+            self.emit_name(quoted_name)?;
+        } else {
+            self.emit_semantic_property_name(name);
+        }
+        self.writer.write(": ");
+        let mut jsdoc_optional = false;
+        let explicit_jsdoc_type = self.jsdoc_type_hint(assignment);
+        let has_explicit_jsdoc_type = explicit_jsdoc_type.is_some();
+        if let Some(hint) = explicit_jsdoc_type {
+            self.writer.write(&hint);
+        } else if let Some(hint) = self.javascript_assignment_parameter_hint(assignment, member_id)
+        {
+            self.emit_jsdoc_type_hint(&hint);
+        } else if let Some((hint, optional)) = self.jsdoc_typedef_property_hint(name) {
+            let constructed = matches!(
+                self.arena.get(assignment).map(|node| &node.data),
+                Some(NodeData::BinaryExpression(assignment))
+                    if matches!(
+                        self.arena.get(assignment.right).map(|node| &node.data),
+                        Some(NodeData::NewExpression(_))
+                    )
+            );
+            self.emit_jsdoc_type_hint(if constructed {
+                hint.strip_prefix("typeof ").unwrap_or(&hint)
+            } else {
+                &hint
+            });
+            jsdoc_optional = optional;
+        } else if let Some(type_id) = type_id {
+            self.emit_semantic_type(type_id)?;
+        } else {
+            self.writer.write("any");
+        }
+        if jsdoc_optional
+            || (!has_explicit_jsdoc_type && class_type.optional_properties.contains(name))
+        {
+            self.writer.write(" | undefined");
+        }
+        self.writer.write(";");
+        self.writer.newline();
         Ok(())
     }
 
@@ -87678,6 +87718,63 @@ class Board {
                 "    middle: number;\n",
                 "    method(value: any): void;\n",
                 "    last: number;\n",
+                "}\n",
+            )
+        );
+    }
+
+    #[test]
+    fn javascript_instance_properties_preserve_quoted_element_access_names() {
+        let source = concat!(
+            "class Method {\n",
+            "    call() {\n",
+            "        /** @type object */\n",
+            "        this[\"arguments\"] = {};\n",
+            "    }\n",
+            "}\n",
+            "class Constructed {\n",
+            "    constructor() {\n",
+            "        /** @type object */\n",
+            "        this[\"arguments\"] = {};\n",
+            "    }\n",
+            "}\n",
+        );
+        assert_eq!(
+            emit_javascript_declarations_with_semantics(source),
+            concat!(
+                "declare class Method {\n",
+                "    /** @type object */\n",
+                "    \"arguments\": object;\n",
+                "    call(): void;\n",
+                "}\n",
+                "declare class Constructed {\n",
+                "    /** @type object */\n",
+                "    \"arguments\": object;\n",
+                "    constructor();\n",
+                "}\n",
+            )
+        );
+    }
+
+    #[test]
+    fn javascript_function_expandos_include_valid_computed_static_names() {
+        let source = concat!(
+            "const key = \"computed\";\n",
+            "export function fn() {}\n",
+            "fn.named = 1;\n",
+            "fn[key] = 2;\n",
+            "fn[\"direct\"] = 3;\n",
+            "fn[\"not valid\"] = 4;\n",
+            "fn[42] = 5;\n",
+        );
+        assert_eq!(
+            emit_javascript_declarations_with_semantics(source),
+            concat!(
+                "export declare function fn(): void;\n",
+                "export declare namespace fn {\n",
+                "    var named: number;\n",
+                "    var computed: number;\n",
+                "    var direct: number;\n",
                 "}\n",
             )
         );
