@@ -6,7 +6,7 @@
 
 use std::collections::HashSet;
 
-use ts_ast::{NodeArena, NodeRef};
+use ts_ast::{NodeArena, NodeRef, SyntaxKind};
 use ts_binder::{
     BoundFile, CanonicalNameResolutionError, CanonicalNameResolver, CanonicalResolutionLocation,
     CheckFlags, SemanticSymbolId, SymbolFlags,
@@ -295,8 +295,7 @@ pub(super) fn plan_identifier_read(
             },
         ));
     }
-    if flags != SymbolFlags::FUNCTION_SCOPED_VARIABLE && flags != SymbolFlags::BLOCK_SCOPED_VARIABLE
-    {
+    if variable_binding_flags(flags).is_none() {
         return Err(VariablePlanError::Unsupported(
             VariableUnsupported::NonVariableSymbol {
                 node,
@@ -308,16 +307,8 @@ pub(super) fn plan_identifier_read(
     let declarations = record
         .declarations()
         .ok_or(VariableInvariant::MissingDeclarations(routed.target))?;
-    let [declaration] = declarations else {
-        return Err(VariablePlanError::Unsupported(
-            VariableUnsupported::NonUniqueDeclaration {
-                node,
-                symbol: routed.target,
-                declaration_count: declarations.len(),
-            },
-        ));
-    };
-    let declaration = *declaration;
+    let declaration =
+        single_variable_declaration(store, node, routed.target, flags, declarations, true)?;
     if declaration.file != node.file || declaration.arena != node.arena {
         return Err(VariablePlanError::Unsupported(
             VariableUnsupported::CrossFileDeclaration { node, declaration },
@@ -462,7 +453,7 @@ fn validate_variable_target(
     let record = store
         .symbol(symbol)
         .ok_or(VariableInvariant::InvalidSymbol(symbol))?;
-    if record.flags() != expected_flags {
+    if variable_binding_flags(record.flags()) != Some(expected_flags) {
         return Err(VariablePlanError::Unsupported(
             VariableUnsupported::NonVariableSymbol {
                 node: declaration,
@@ -472,8 +463,8 @@ fn validate_variable_target(
         ));
     }
     if record.check_flags() != CheckFlags::NONE
-        || record.members().is_some()
-        || record.exports().is_some()
+        || record.members().is_some() && !record.flags().contains(SymbolFlags::INTERFACE)
+        || record.exports().is_some() && !record.flags().contains(SymbolFlags::NAMESPACE_MODULE)
         || record.export_symbol().is_some()
     {
         return Err(VariableInvariant::InvalidSymbolShape(symbol).into());
@@ -481,16 +472,15 @@ fn validate_variable_target(
     let declarations = record
         .declarations()
         .ok_or(VariableInvariant::MissingDeclarations(symbol))?;
-    let [actual] = declarations else {
-        return Err(VariablePlanError::Unsupported(
-            VariableUnsupported::NonUniqueDeclaration {
-                node: declaration,
-                symbol,
-                declaration_count: declarations.len(),
-            },
-        ));
-    };
-    if *actual != declaration {
+    let actual = single_variable_declaration(
+        store,
+        declaration,
+        symbol,
+        record.flags(),
+        declarations,
+        false,
+    )?;
+    if actual != declaration {
         return Err(VariableInvariant::InvalidSymbolShape(symbol).into());
     }
     if record.value_declaration() != Some(declaration) {
@@ -509,6 +499,56 @@ fn validate_variable_target(
         .into());
     }
     Ok(())
+}
+
+fn variable_binding_flags(flags: SymbolFlags) -> Option<SymbolFlags> {
+    let binding = flags & SymbolFlags::VARIABLE;
+    if binding != SymbolFlags::FUNCTION_SCOPED_VARIABLE
+        && binding != SymbolFlags::BLOCK_SCOPED_VARIABLE
+    {
+        return None;
+    }
+    let allowed = binding | SymbolFlags::INTERFACE | SymbolFlags::NAMESPACE_MODULE;
+    (flags.without(allowed) == SymbolFlags::NONE).then_some(binding)
+}
+
+fn single_variable_declaration(
+    store: &CanonicalTypeMapperStore,
+    node: NodeRef,
+    symbol: SemanticSymbolId,
+    flags: SymbolFlags,
+    declarations: &[NodeRef],
+    allow_parameter: bool,
+) -> Result<NodeRef, VariablePlanError> {
+    let mut variable = None;
+    for declaration in declarations.iter().copied() {
+        match store.source_node_kind(declaration) {
+            Some(SyntaxKind::VariableDeclaration) if variable.is_none() => {
+                variable = Some(declaration);
+            }
+            Some(SyntaxKind::Parameter)
+                if allow_parameter
+                    && variable.is_none()
+                    && declarations.len() == 1
+                    && flags == SymbolFlags::FUNCTION_SCOPED_VARIABLE =>
+            {
+                variable = Some(declaration);
+            }
+            Some(SyntaxKind::InterfaceDeclaration) if flags.contains(SymbolFlags::INTERFACE) => {}
+            Some(SyntaxKind::ModuleDeclaration)
+                if flags.contains(SymbolFlags::NAMESPACE_MODULE) => {}
+            _ => {
+                return Err(VariablePlanError::Unsupported(
+                    VariableUnsupported::NonUniqueDeclaration {
+                        node,
+                        symbol,
+                        declaration_count: declarations.len(),
+                    },
+                ));
+            }
+        }
+    }
+    variable.ok_or_else(|| VariableInvariant::InvalidSymbolShape(symbol).into())
 }
 
 fn validate_export_local(
@@ -606,5 +646,137 @@ fn name_resolution_error(node: NodeRef, error: CanonicalNameResolutionError) -> 
             VariablePlanError::Unsupported(VariableUnsupported::ResolverDeferred { node, error })
         }
         error => VariablePlanError::Invariant(VariableInvariant::NameResolution(error)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ts_ast::{FileId, NodeData};
+    use ts_binder::{
+        CanonicalBinder, CanonicalModuleState, CanonicalNameResolverOptions,
+        CanonicalSourceFileFacts, CanonicalSourceLanguage, EscapedName,
+    };
+    use ts_parser::parse_source_file;
+
+    use super::*;
+    use crate::semantic::{IntrinsicBootstrapOptions, production::GlobalMergeCompletion};
+
+    #[test]
+    fn merged_interface_and_type_only_namespace_preserve_variable_reads() {
+        for (source, merged_flag) in [
+            (
+                "interface Shared {} declare var Shared: string; const observed = Shared;",
+                SymbolFlags::INTERFACE,
+            ),
+            (
+                "declare var Shared: string; declare namespace Shared {} const observed = Shared;",
+                SymbolFlags::NAMESPACE_MODULE,
+            ),
+        ] {
+            let parsed = parse_source_file(source);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let file = FileId::new(917);
+            let mut binder = CanonicalBinder::new();
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new(
+                        EscapedName::source("\"/variables.ts\""),
+                        CanonicalSourceLanguage::TypeScript,
+                        false,
+                        CanonicalModuleState::Script,
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+            let (symbols, mut files) = binder.finish().try_into_parts().unwrap();
+            let bound = files.remove(&file).unwrap();
+            let mut store = CanonicalTypeMapperStore::from_symbol_store(symbols);
+            assert!(
+                store
+                    .register_source_file(&parsed.arena, parsed.source_file, file)
+                    .is_some()
+            );
+            store
+                .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions::default())
+                .unwrap();
+
+            let find_declaration = |text: &str| {
+                parsed.arena.iter().find_map(|(node, record)| {
+                    let NodeData::VariableDeclaration(variable) = &record.data else {
+                        return None;
+                    };
+                    let NodeData::Identifier(identifier) = &parsed.arena.get(variable.name)?.data
+                    else {
+                        return None;
+                    };
+                    (identifier.text == text).then_some((
+                        NodeRef::new(parsed.arena.id(), file, node),
+                        NodeRef::new(parsed.arena.id(), file, variable.name),
+                        variable
+                            .initializer
+                            .map(|initializer| NodeRef::new(parsed.arena.id(), file, initializer)),
+                    ))
+                })
+            };
+            let (declaration, name, _) = find_declaration("Shared").unwrap();
+            let (_, _, read) = find_declaration("observed").unwrap();
+            let read = read.unwrap();
+            let raw_symbol = bound.symbol(declaration).unwrap();
+            let globals = store.intrinsic_bootstrap().unwrap().globals;
+            assert_eq!(
+                store.merge_global_symbol(globals, raw_symbol).unwrap(),
+                raw_symbol
+            );
+
+            let symbol = plan_top_level_variable(
+                &bound,
+                &store,
+                declaration,
+                name,
+                "Shared",
+                VariableBindingKind::Var,
+                false,
+            )
+            .unwrap();
+            assert!(store.symbol(symbol).unwrap().flags().contains(merged_flag));
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&parsed.arena, &bound)],
+                GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+            )
+            .unwrap();
+            let planned = plan_identifier_read(
+                &parsed.arena,
+                &bound,
+                &store,
+                &host,
+                &HashSet::from([symbol]),
+                &HashSet::from([symbol]),
+                read,
+                "Shared",
+            )
+            .unwrap();
+            assert_eq!(planned.value_symbol, symbol);
+        }
+    }
+
+    #[test]
+    fn non_variable_value_merges_are_not_variable_bindings() {
+        for additional in [
+            SymbolFlags::CLASS,
+            SymbolFlags::FUNCTION,
+            SymbolFlags::REGULAR_ENUM,
+            SymbolFlags::CONST_ENUM,
+            SymbolFlags::VALUE_MODULE,
+        ] {
+            assert_eq!(
+                variable_binding_flags(SymbolFlags::FUNCTION_SCOPED_VARIABLE | additional),
+                None,
+            );
+        }
     }
 }

@@ -3,7 +3,7 @@ use ts_binder::{
     CanonicalBinder, CanonicalModuleState, CanonicalSourceFileFacts, CanonicalSourceLanguage,
     EscapedName,
 };
-use ts_checker::semantic::{CanonicalCheckerContext, CanonicalCheckerOptions, SourceCheckError};
+use ts_checker::semantic::{CanonicalCheckerContext, CanonicalCheckerOptions};
 use ts_parser::{ParseResult, parse_source_file};
 
 fn context(parsed: &ParseResult, file: FileId) -> CanonicalCheckerContext<'_> {
@@ -149,7 +149,47 @@ fn required_own_property_calls_publish_public_links_and_diagnostics() {
 }
 
 #[test]
-fn property_calls_force_public_warm_replay_while_source_remains_unchecked() {
+fn top_level_property_calls_check_arguments_and_publish_signatures() {
+    let parsed = parse_source_file(concat!(
+        "type API = { execute: (value: number) => string }; ",
+        "declare const api: API; ",
+        "api.execute(1); ",
+        "api.execute();",
+    ));
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(19);
+    let calls = nodes_of_kind(&parsed, file, SyntaxKind::CallExpression);
+    let accesses = nodes_of_kind(&parsed, file, SyntaxKind::PropertyAccessExpression);
+    let mut context = context(&parsed, file);
+
+    context.check_source_file(file).unwrap();
+
+    let [diagnostic] = context.diagnostics().as_slice() else {
+        panic!("expected one argument-count diagnostic")
+    };
+    assert_eq!(diagnostic.diagnostic.code(), 2554);
+    assert_eq!(
+        diagnostic.node,
+        Some(property_name(&parsed, file, accesses[1]))
+    );
+    for call in calls {
+        let type_ = context
+            .store()
+            .type_node_links(call)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        assert_eq!(context.type_to_string(type_).unwrap(), "string");
+        assert!(
+            context
+                .store()
+                .signature_links(call)
+                .is_some_and(|links| links.resolved_signature.signature().is_some())
+        );
+    }
+}
+
+#[test]
+fn noncallable_property_calls_report_ts2349_and_preserve_warm_publication() {
     let parsed = parse_source_file(concat!(
         "type API = { fn: (value: number) => string }; ",
         "function good(api: API): string { return api.fn(1); } ",
@@ -168,55 +208,51 @@ fn property_calls_force_public_warm_replay_while_source_remains_unchecked() {
     };
     let mut context = context(&parsed, file);
 
-    assert_eq!(
-        context.check_source_file(file),
-        Err(SourceCheckError::Call(*bad_call))
-    );
+    context.check_source_file(file).unwrap();
 
     assert!(context.store().type_node_links(*good_call).is_some());
     assert!(context.store().signature_links(*good_call).is_some());
-    assert!(context.store().type_node_links(*bad_call).is_none());
-    assert!(context.store().signature_links(*bad_call).is_none());
+    let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+    assert_eq!(
+        context
+            .store()
+            .type_node_links(*bad_call)
+            .and_then(|links| links.resolved_type),
+        Some(bootstrap.error_type)
+    );
+    assert_eq!(
+        context
+            .store()
+            .signature_links(*bad_call)
+            .and_then(|links| links.resolved_signature.signature()),
+        Some(bootstrap.unknown_signature)
+    );
+    let [diagnostic] = context.diagnostics().as_slice() else {
+        panic!("expected one noncallable-property diagnostic")
+    };
+    assert_eq!(diagnostic.diagnostic.code(), 2349);
+    assert_eq!(
+        diagnostic.node,
+        Some(property_name(&parsed, file, *bad_access))
+    );
+    assert_eq!(
+        diagnostic.diagnostic.render().unwrap(),
+        "This expression is not callable.\n  Type 'Number' has no call signatures."
+    );
     for access in [good_access, bad_access] {
         assert!(context.store().type_node_links(*access).is_some());
         assert!(context.store().symbol_node_links(*access).is_some());
     }
     let source = context.source_file(file).unwrap();
     assert!(
-        !context
+        context
             .store()
             .source_file_links(source)
             .is_some_and(|links| links.type_checked)
     );
     let type_count = context.store().type_len();
     let signature_count = context.store().signature_len();
-    let call_links = calls
-        .iter()
-        .map(|call| {
-            (
-                context.store().type_node_links(*call).cloned(),
-                context.store().signature_links(*call).cloned(),
-            )
-        })
-        .collect::<Vec<_>>();
-    let property_links = accesses
-        .iter()
-        .map(|access| {
-            (
-                context.store().type_node_links(*access).cloned(),
-                context.store().symbol_node_links(*access).cloned(),
-            )
-        })
-        .collect::<Vec<_>>();
-
-    assert_eq!(
-        context.check_source_file(file),
-        Err(SourceCheckError::Call(*bad_call))
-    );
-
-    assert_eq!(context.store().type_len(), type_count);
-    assert_eq!(context.store().signature_len(), signature_count);
-    assert_eq!(
+    let call_state = |context: &CanonicalCheckerContext<'_>| {
         calls
             .iter()
             .map(|call| {
@@ -225,10 +261,9 @@ fn property_calls_force_public_warm_replay_while_source_remains_unchecked() {
                     context.store().signature_links(*call).cloned(),
                 )
             })
-            .collect::<Vec<_>>(),
-        call_links
-    );
-    assert_eq!(
+            .collect::<Vec<_>>()
+    };
+    let property_state = |context: &CanonicalCheckerContext<'_>| {
         accesses
             .iter()
             .map(|access| {
@@ -237,9 +272,19 @@ fn property_calls_force_public_warm_replay_while_source_remains_unchecked() {
                     context.store().symbol_node_links(*access).cloned(),
                 )
             })
-            .collect::<Vec<_>>(),
-        property_links
-    );
+            .collect::<Vec<_>>()
+    };
+    let call_links = call_state(&context);
+    let property_links = property_state(&context);
+
+    let diagnostics = context.diagnostics().clone();
+    context.recheck_source_file(file).unwrap();
+
+    assert_eq!(context.store().type_len(), type_count);
+    assert_eq!(context.store().signature_len(), signature_count);
+    assert_eq!(context.diagnostics(), &diagnostics);
+    assert_eq!(call_state(&context), call_links);
+    assert_eq!(property_state(&context), property_links);
 }
 
 #[test]
@@ -362,14 +407,6 @@ fn unsupported_property_call_families_fail_closed_without_call_publication() {
             ),
         ),
         (
-            "generic source callable",
-            concat!(
-                "function identity<T>(value: T): T { return value; } ",
-                "const api = { fn: identity }; ",
-                "const result = api.fn(1);",
-            ),
-        ),
-        (
             "explicit this",
             concat!(
                 "type API = { fn: (this: API, value: number) => string }; ",
@@ -397,17 +434,6 @@ fn unsupported_property_call_families_fail_closed_without_call_publication() {
                 "type Right = { fn: (value: number) => string }; ",
                 "function use(api: Left | Right): string { return api.fn(1); }",
             ),
-        ),
-        (
-            "noncallable property",
-            concat!(
-                "type API = { fn: number }; ",
-                "function use(api: API): string { return api.fn(1); }",
-            ),
-        ),
-        (
-            "any receiver",
-            "function use(api: any): string { return api.fn(1); }",
         ),
         (
             "apparent property",

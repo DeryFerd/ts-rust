@@ -9,7 +9,7 @@
 use std::collections::HashSet;
 
 use super::{
-    RelationUnavailable, SemanticSymbolId, TypeId,
+    RelationUnavailable, SemanticSymbolId, TypeId, TypeResolutionTarget, TypeSystemPropertyName,
     bootstrap::LiteralTypeCacheError,
     conditional_types::{
         ConditionalTypeError, cached_conditional_branches, get_constraint_from_conditional_type,
@@ -326,7 +326,15 @@ impl<'store> ConstraintSession<'store> {
                 .type_payload(type_)
                 .ok_or(ConstraintError::InvalidType(type_))?;
             let kind = match record.data() {
-                TypeData::Intrinsic(_) | TypeData::Literal(_) | TypeData::UniqueEsSymbol(_) => {
+                TypeData::Intrinsic(_)
+                | TypeData::Literal(_)
+                | TypeData::UniqueEsSymbol(_)
+                | TypeData::Interface(_)
+                | TypeData::Tuple(_) => ConstraintKind::Leaf,
+                TypeData::TypeReference(reference)
+                    if reference.object.target.is_some()
+                        && reference.resolved_type_arguments.is_some() =>
+                {
                     ConstraintKind::Leaf
                 }
                 TypeData::TypeParameter(data) => ConstraintKind::Parameter {
@@ -385,69 +393,36 @@ impl<'store> ConstraintSession<'store> {
                 .extend(self.resolution_stack[cycle_start..].iter().copied());
             return Ok(BaseConstraint::Circular);
         }
+        if !self
+            .store
+            .push_type_resolution(
+                TypeResolutionTarget::Type(type_),
+                TypeSystemPropertyName::ResolvedBaseConstraint,
+            )
+            .map_err(|_| ConstraintError::InvalidConstraintPublication(type_))?
+        {
+            return Ok(BaseConstraint::Circular);
+        }
         self.resolution_stack.push(type_);
         let should_explore = stack.len() < MINIMUM_CONSTRAINT_DEPTH
             || stack.len() < MAXIMUM_CONSTRAINT_DEPTH && !stack.contains(&identity);
         let result = if should_explore {
             stack.push(identity);
-            let result = match kind {
-                ConstraintKind::Leaf => unreachable!("leaf types return before recursion limits"),
-                ConstraintKind::Parameter { is_this_type } => {
-                    let constraint = self.direct_constraint(type_)?;
-                    if is_this_type {
-                        Ok(constraint)
-                    } else {
-                        match constraint {
-                            BaseConstraint::Type(constraint) => {
-                                Ok(match self.resolve_base_constraint(constraint, stack)? {
-                                    BaseConstraint::Type(constraint) => {
-                                        BaseConstraint::Type(constraint)
-                                    }
-                                    BaseConstraint::None | BaseConstraint::Circular => {
-                                        BaseConstraint::None
-                                    }
-                                })
-                            }
-                            BaseConstraint::None | BaseConstraint::Circular => {
-                                Ok(BaseConstraint::None)
-                            }
-                        }
-                    }
-                }
-                ConstraintKind::Union(members) => {
-                    self.compute_union_constraint(type_, &members, stack)
-                }
-                ConstraintKind::Intersection(members) => {
-                    self.compute_intersection_constraint(type_, &members, stack)
-                }
-                ConstraintKind::Index => Ok(BaseConstraint::Type(
-                    self.store
-                        .intrinsic_bootstrap()
-                        .ok_or(ConstraintError::MissingBootstrap)?
-                        .string_number_symbol_type,
-                )),
-                ConstraintKind::Template { texts, types } => {
-                    self.compute_template_constraint(&texts, &types, stack)
-                }
-                ConstraintKind::StringMapping { symbol, target } => {
-                    self.compute_string_mapping_constraint(symbol, target, stack)
-                }
-                ConstraintKind::Conditional => self.compute_conditional_constraint(type_, stack),
-                ConstraintKind::Substitution {
-                    base_type,
-                    constraint,
-                } => self.compute_substitution_constraint(base_type, constraint, stack),
-                ConstraintKind::Unsupported => Err(ConstraintError::UnsupportedBaseType(type_)),
-            };
+            let result = self.compute_active_constraint(type_, kind, stack);
             stack.pop();
             result
         } else {
             Ok(BaseConstraint::None)
         };
+        let cycle_free = self
+            .store
+            .pop_type_resolution()
+            .ok_or(ConstraintError::InvalidConstraintPublication(type_))?;
         let popped = self.resolution_stack.pop();
         debug_assert_eq!(popped, Some(type_));
         let mut result = result?;
-        if self.failed_resolutions.remove(&type_) {
+        let failed = self.failed_resolutions.remove(&type_);
+        if !cycle_free || failed {
             result = BaseConstraint::Circular;
         }
         if constrained {
@@ -461,6 +436,54 @@ impl<'store> ConstraintSession<'store> {
             }
         }
         Ok(result)
+    }
+
+    fn compute_active_constraint(
+        &mut self,
+        type_: TypeId,
+        kind: ConstraintKind,
+        stack: &mut Vec<ConstraintRecursionIdentity>,
+    ) -> Result<BaseConstraint, ConstraintError> {
+        match kind {
+            ConstraintKind::Leaf => unreachable!("leaf types return before recursion limits"),
+            ConstraintKind::Parameter { is_this_type } => {
+                let constraint = self.direct_constraint(type_)?;
+                if is_this_type {
+                    return Ok(constraint);
+                }
+                match constraint {
+                    BaseConstraint::Type(constraint) => {
+                        Ok(match self.resolve_base_constraint(constraint, stack)? {
+                            BaseConstraint::Type(constraint) => BaseConstraint::Type(constraint),
+                            BaseConstraint::None | BaseConstraint::Circular => BaseConstraint::None,
+                        })
+                    }
+                    BaseConstraint::None | BaseConstraint::Circular => Ok(BaseConstraint::None),
+                }
+            }
+            ConstraintKind::Union(members) => self.compute_union_constraint(type_, &members, stack),
+            ConstraintKind::Intersection(members) => {
+                self.compute_intersection_constraint(type_, &members, stack)
+            }
+            ConstraintKind::Index => Ok(BaseConstraint::Type(
+                self.store
+                    .intrinsic_bootstrap()
+                    .ok_or(ConstraintError::MissingBootstrap)?
+                    .string_number_symbol_type,
+            )),
+            ConstraintKind::Template { texts, types } => {
+                self.compute_template_constraint(&texts, &types, stack)
+            }
+            ConstraintKind::StringMapping { symbol, target } => {
+                self.compute_string_mapping_constraint(symbol, target, stack)
+            }
+            ConstraintKind::Conditional => self.compute_conditional_constraint(type_, stack),
+            ConstraintKind::Substitution {
+                base_type,
+                constraint,
+            } => self.compute_substitution_constraint(base_type, constraint, stack),
+            ConstraintKind::Unsupported => Err(ConstraintError::UnsupportedBaseType(type_)),
+        }
     }
 
     fn compute_union_constraint(
@@ -722,7 +745,9 @@ pub(super) fn get_base_constraint_of_type_with_limits(
 
 #[cfg(test)]
 mod tests {
+    use ts_ast::{FileId, NodeRef, SyntaxKind};
     use ts_binder::{EscapedName, SymbolData, SymbolFlags};
+    use ts_parser::parse_source_file;
 
     use super::*;
     use crate::semantic::{
@@ -1167,5 +1192,118 @@ mod tests {
             unreachable!();
         };
         assert_eq!(data.constrained.resolved_base_constraint, Some(expected));
+    }
+
+    #[test]
+    fn array_like_and_keyof_parameter_bounds_preserve_their_exact_constraints() {
+        let mut store = initialized_store();
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        let (unknown, keys) = (bootstrap.unknown_type, bootstrap.string_number_symbol_type);
+        let target = store
+            .alloc_interface_type(ObjectFlags::INTERFACE, None)
+            .unwrap();
+        let array = store.alloc_type_reference(ObjectFlags::NONE, None).unwrap();
+        assert!(store.set_object_target_and_mapper(array, Some(target), None));
+        assert!(store.set_type_reference_resolution(array, None, Some(vec![unknown])));
+
+        let array_parameter = store.alloc_type_parameter(None).unwrap();
+        assert!(store.set_type_parameter_resolution(
+            array_parameter,
+            Some(array),
+            None,
+            None,
+            None,
+        ));
+        assert_eq!(
+            get_constraint_of_type(&mut store, array_parameter),
+            Ok(Some(array))
+        );
+        assert_eq!(
+            get_base_constraint_of_type(&mut store, array_parameter),
+            Ok(Some(array))
+        );
+
+        let keyof = store.alloc_index_type(unknown, IndexFlags::NONE).unwrap();
+        let key_parameter = store.alloc_type_parameter(None).unwrap();
+        assert!(store.set_type_parameter_resolution(key_parameter, Some(keyof), None, None, None,));
+        assert_eq!(
+            get_constraint_of_type(&mut store, key_parameter),
+            Ok(Some(keyof))
+        );
+        assert_eq!(
+            get_base_constraint_of_type(&mut store, key_parameter),
+            Ok(Some(keys))
+        );
+    }
+
+    #[test]
+    fn conditional_constraint_reentry_uses_the_shared_resolution_stack() {
+        let mut store = initialized_store();
+        let parsed = parse_source_file("type Loop<T> = T extends string ? string : string;");
+        assert!(parsed.diagnostics.is_empty());
+        let file = FileId::new(91);
+        assert!(
+            store
+                .register_source_file(&parsed.arena, parsed.source_file, file)
+                .is_some()
+        );
+        let node = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ConditionalType).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        let (string, circular) = (bootstrap.string_type, bootstrap.circular_constraint_type);
+        let parameter = store.alloc_type_parameter(None).unwrap();
+        let root = store
+            .alloc_conditional_root(
+                node,
+                parameter,
+                string,
+                true,
+                None,
+                Some(vec![parameter]),
+                None,
+            )
+            .unwrap();
+        let conditional = store
+            .alloc_conditional_type(root, parameter, string, None, None)
+            .unwrap();
+        assert!(store.set_conditional_resolution(
+            conditional,
+            Some(string),
+            Some(string),
+            Some(string),
+            None,
+            None,
+            None,
+            None,
+        ));
+        assert!(store.set_type_parameter_resolution(
+            parameter,
+            Some(conditional),
+            None,
+            None,
+            None,
+        ));
+
+        assert_eq!(get_base_constraint_of_type(&mut store, parameter), Ok(None));
+        assert!(store.type_resolution_is_empty());
+        for type_ in [parameter, conditional] {
+            let cached = store
+                .type_payload(type_)
+                .and_then(|record| record.data().constrained())
+                .and_then(|constraint| constraint.resolved_base_constraint);
+            assert_eq!(cached, Some(circular));
+        }
+        let warm = (store.type_len(), store.type_resolution_len());
+        assert_eq!(get_base_constraint_of_type(&mut store, parameter), Ok(None));
+        assert_eq!((store.type_len(), store.type_resolution_len()), warm);
     }
 }

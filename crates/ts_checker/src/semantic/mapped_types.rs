@@ -21,6 +21,7 @@ use super::{
     declared::{
         cached_ordinary_type_parameter_owner, preflight_node, preflight_type_parameter_symbol,
     },
+    indexed_access_types::{is_template_pattern_index_key, template_pattern_index_matches_name},
     instantiate::{
         InstantiationError, InstantiationLimits, InstantiationSession, canonical_anonymous_union,
         instantiate_type_with_session,
@@ -1026,7 +1027,9 @@ fn source_indexes(
         let info = store
             .index_info(*index)
             .ok_or(MappedTypeError::InvalidSource(type_))?;
-        if ![bootstrap.string_type, bootstrap.number_type].contains(&info.key_type())
+        let valid_key = [bootstrap.string_type, bootstrap.number_type].contains(&info.key_type())
+            || is_template_pattern_index_key(store, info.key_type());
+        if !valid_key
             || !seen.insert(info.key_type())
             || store.type_payload(info.value_type()).is_none()
         {
@@ -1064,12 +1067,16 @@ fn plan_mapped_index_signatures(
         {
             vec![shape.constraint_type]
         }
+        TypeData::TemplateLiteral(_)
+            if is_template_pattern_index_key(store, shape.constraint_type) =>
+        {
+            vec![shape.constraint_type]
+        }
         TypeData::Union(union)
-            if union
-                .union
-                .types
-                .iter()
-                .all(|key| [bootstrap.string_type, bootstrap.number_type].contains(key)) =>
+            if union.union.types.iter().all(|key| {
+                [bootstrap.string_type, bootstrap.number_type].contains(key)
+                    || is_template_pattern_index_key(store, *key)
+            }) =>
         {
             if shape.source_indexes.is_empty() {
                 union.union.types.clone()
@@ -1102,7 +1109,9 @@ fn plan_mapped_index_signatures(
             .iter()
             .find(|index| index.key_type == key_type)
             .or_else(|| {
-                if key_type == bootstrap.number_type {
+                if key_type == bootstrap.number_type
+                    || is_template_pattern_index_key(store, key_type)
+                {
                     shape
                         .source_indexes
                         .iter()
@@ -1912,14 +1921,35 @@ fn indexed_mapped_template(
         let source = shape
             .source_properties
             .iter()
-            .find(|property| property.name.as_ref().as_utf8() == Some(name.as_str()))
-            .ok_or(MappedTypeError::UnsupportedTemplate(shape.template_type))?;
-        let links = store
-            .value_symbol_links(source.symbol)
-            .ok_or(MappedTypeError::InvalidCachedProperty(source.symbol))?;
-        let property_type = match links.resolved_type {
-            Some(resolved) => resolved,
-            None => store.resolve_mapped_symbol_type(source.symbol)?,
+            .find(|property| property.name.as_ref().as_utf8() == Some(name.as_str()));
+        let property_type = if let Some(source) = source {
+            let links = store
+                .value_symbol_links(source.symbol)
+                .ok_or(MappedTypeError::InvalidCachedProperty(source.symbol))?;
+            match links.resolved_type {
+                Some(resolved) => resolved,
+                None => store.resolve_mapped_symbol_type(source.symbol)?,
+            }
+        } else {
+            let bootstrap = store
+                .intrinsic_bootstrap()
+                .ok_or(MappedTypeError::BootstrapUninitialized)?;
+            let selected = shape
+                .source_indexes
+                .iter()
+                .find(|index| {
+                    index.key_type == bootstrap.number_type
+                        && ts_jsnum::from_string(&name).to_string() == name
+                        || template_pattern_index_matches_name(store, index.key_type, &name)
+                })
+                .or_else(|| {
+                    shape
+                        .source_indexes
+                        .iter()
+                        .find(|index| index.key_type == bootstrap.string_type)
+                })
+                .ok_or(MappedTypeError::UnsupportedTemplate(shape.template_type))?;
+            selected.value_type
         };
         values.push(property_type);
     }
@@ -2464,6 +2494,46 @@ mod tests {
             assert_eq!(info.value_type(), number);
             assert_eq!(info.is_readonly(), readonly);
         }
+    }
+
+    #[test]
+    fn mapped_template_pattern_indexes_preserve_their_exact_key_identity() {
+        let parsed = parse_source_file("type Actions = { [K in `do-${string}`]: number };\n");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let mut context = checker_context(&parsed);
+        context.check_source_file(FileId::new(0)).unwrap();
+        let mapped = alias_type(&parsed, &context, "Actions");
+        let expected_key = match context.store().type_payload(mapped).unwrap().data() {
+            TypeData::Mapped(record) => record.constraint_type.unwrap(),
+            _ => unreachable!(),
+        };
+        let members = context
+            .store_mut_for_test()
+            .resolve_mapped_type_members(mapped, MappedTypeModifiers::NONE)
+            .unwrap();
+        assert!(members.properties().is_empty());
+        let TypeData::Mapped(record) = context.store().type_payload(mapped).unwrap().data() else {
+            unreachable!()
+        };
+        let [index] = record.object.structured.index_infos.as_deref().unwrap() else {
+            panic!("mapped pattern keys must publish one canonical index signature");
+        };
+        let info = context.store().index_info(*index).unwrap();
+        assert_eq!(info.key_type(), expected_key);
+        assert_eq!(
+            info.value_type(),
+            context.store().intrinsic_bootstrap().unwrap().number_type,
+        );
+        assert!(super::template_pattern_index_matches_name(
+            context.store(),
+            expected_key,
+            "do-click",
+        ));
+        assert!(!super::template_pattern_index_matches_name(
+            context.store(),
+            expected_key,
+            "ns:thing",
+        ));
     }
 
     #[test]

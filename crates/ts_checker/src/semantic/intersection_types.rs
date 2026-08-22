@@ -707,6 +707,15 @@ fn validate_property_type_worker(
     let record = store
         .type_payload(type_)
         .ok_or(IntersectionTypeError::UnsupportedPropertyType(type_))?;
+    if let TypeData::Union(union) = record.data() {
+        store
+            .validate_union_constituent(type_)
+            .map_err(|_| IntersectionTypeError::UnsupportedPropertyType(type_))?;
+        for constituent in &union.union.types {
+            validate_property_type(store, *constituent, validating, validated)?;
+        }
+        return Ok(());
+    }
     let flags = record.flags();
     if matches!(
         flags,
@@ -803,6 +812,15 @@ fn intersect_property_types(
     {
         return Ok(first);
     }
+    if types.iter().any(|type_| {
+        *type_ != bootstrap.boolean_type
+            && matches!(
+                store.type_payload(*type_).map(TypeRecord::data),
+                Some(TypeData::Union(_))
+            )
+    }) {
+        return intersect_union_property_types(store, types);
+    }
     for type_ in types {
         if *type_ == bootstrap.boolean_type {
             continue;
@@ -885,6 +903,82 @@ fn intersect_property_types(
         .expect("a significant primitive type was classified"))
 }
 
+fn intersect_union_property_types(
+    store: &CanonicalTypeMapperStore,
+    types: &[TypeId],
+) -> Result<TypeId, IntersectionTypeError> {
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or(IntersectionTypeError::BootstrapUninitialized)?;
+    let mut candidates = vec![bootstrap.unknown_type];
+
+    for type_ in types {
+        let record = store
+            .type_payload(*type_)
+            .ok_or(IntersectionTypeError::UnsupportedPropertyType(*type_))?;
+        let members = if *type_ != bootstrap.boolean_type
+            && let TypeData::Union(union) = record.data()
+        {
+            union.union.types.as_slice()
+        } else {
+            std::slice::from_ref(type_)
+        };
+        if candidates
+            .len()
+            .checked_mul(members.len())
+            .is_none_or(|count| count >= 100_000)
+        {
+            return Err(IntersectionTypeError::UnsupportedPropertyType(*type_));
+        }
+
+        let mut next = Vec::new();
+        for candidate in &candidates {
+            for member in members {
+                let intersection = intersect_property_types(store, &[*candidate, *member])?;
+                if intersection != bootstrap.never_type && !next.contains(&intersection) {
+                    next.push(intersection);
+                }
+            }
+        }
+        if next.is_empty() {
+            return Ok(bootstrap.never_type);
+        }
+        candidates = next;
+    }
+
+    if let [candidate] = candidates.as_slice() {
+        return Ok(*candidate);
+    }
+    for type_ in types {
+        let Some(TypeData::Union(union)) = store.type_payload(*type_).map(TypeRecord::data) else {
+            continue;
+        };
+        if union.union.types.len() == candidates.len()
+            && candidates
+                .iter()
+                .all(|candidate| union.union.types.contains(candidate))
+        {
+            return Ok(*type_);
+        }
+    }
+    for (candidate, record) in store.types() {
+        let TypeData::Union(union) = record.data() else {
+            continue;
+        };
+        if record.alias().is_none()
+            && union.origin.is_none()
+            && union.union.types.len() == candidates.len()
+            && candidates
+                .iter()
+                .all(|member| union.union.types.contains(member))
+            && bootstrap.cached_union_type(&union.union.types) == Some(candidate)
+        {
+            return Ok(candidate);
+        }
+    }
+    Err(IntersectionTypeError::UnsupportedPropertyType(types[0]))
+}
+
 #[cfg(test)]
 mod tests {
     use ts_ast::{FileId, NodeData, NodeRef};
@@ -895,7 +989,51 @@ mod tests {
     use ts_parser::parse_source_file;
 
     use super::*;
-    use crate::semantic::{CanonicalCheckerContext, CanonicalCheckerOptions};
+    use crate::semantic::{
+        CanonicalCheckerContext, CanonicalCheckerOptions, IntrinsicBootstrapOptions,
+    };
+
+    #[test]
+    fn finite_literal_property_unions_reduce_to_existing_canonical_identities() {
+        let mut store = CanonicalTypeMapperStore::new();
+        store
+            .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions::default())
+            .unwrap();
+        let left = store
+            .regular_string_literal_type("left".to_owned())
+            .unwrap();
+        let middle = store
+            .regular_string_literal_type("middle".to_owned())
+            .unwrap();
+        let right = store
+            .regular_string_literal_type("right".to_owned())
+            .unwrap();
+        let wide = store
+            .literal_union_type(&[left, middle, right], None)
+            .unwrap();
+        let narrow = store.literal_union_type(&[left, right], None).unwrap();
+        let alternate = store.literal_union_type(&[middle, right], None).unwrap();
+        let string = store.intrinsic_bootstrap().unwrap().string_type;
+        let number = store.intrinsic_bootstrap().unwrap().number_type;
+        let never = store.intrinsic_bootstrap().unwrap().never_type;
+
+        let mut visiting = HashSet::new();
+        let mut validated = HashSet::new();
+        assert_eq!(
+            validate_property_type(&store, wide, &mut visiting, &mut validated),
+            Ok(()),
+        );
+        assert_eq!(
+            intersect_property_types(&store, &[wide, narrow]),
+            Ok(narrow)
+        );
+        assert_eq!(
+            intersect_property_types(&store, &[narrow, alternate]),
+            Ok(right),
+        );
+        assert_eq!(intersect_property_types(&store, &[wide, string]), Ok(wide));
+        assert_eq!(intersect_property_types(&store, &[wide, number]), Ok(never));
+    }
 
     #[test]
     fn callable_intersections_preserve_order_deduplicate_signatures_and_reject_poison() {

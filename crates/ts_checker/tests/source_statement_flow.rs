@@ -492,7 +492,11 @@ fn missing_else_and_inferred_final_if_remain_explicit_atomic_boundaries() {
 #[test]
 fn final_if_flow_recreates_invocation_state_after_a_later_semantic_failure() {
     let source = concat!(
-        "type Broken = { fn: number };\n",
+        "interface Recovery {\n",
+        "  (value: number, other: number): string;\n",
+        "  (value: string): number;\n",
+        "}\n",
+        "type Broken = { fn: Recovery };\n",
         "function replay(flag: boolean): number {\n",
         "  let value: number = 1;\n",
         "  if (flag) {\n",
@@ -503,8 +507,8 @@ fn final_if_flow_recreates_invocation_state_after_a_later_semantic_failure() {
         "    return branch;\n",
         "  }\n",
         "}\n",
-        "const api: Broken = { fn: 1 };\n",
-        "const stopped = api.fn();\n",
+        "declare const api: Broken;\n",
+        "const stopped = api.fn(true);\n",
     );
     let parsed = parse_source_file(source);
     assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);

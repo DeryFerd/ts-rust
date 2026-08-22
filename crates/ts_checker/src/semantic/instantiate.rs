@@ -626,25 +626,40 @@ fn could_contain_installed_type_variables_worker(
             }
         }
         TypeData::Union(data) => {
-            // Preserve the installed slice's typed alias/origin boundaries.
-            // Their eventual implementations will inspect alias arguments and
-            // origin graphs as part of the full upstream predicate.
-            if record.alias().is_some() || data.origin.is_some() {
-                Ok(true)
-            } else {
-                let constituents = data.union.types.clone();
-                constituents
-                    .into_iter()
-                    .try_fold(false, |contains, constituent| {
-                        Ok(contains
-                            || could_contain_installed_type_variables_worker(
-                                store,
-                                constituent,
-                                array_targets,
-                                seen,
-                            )?)
-                    })
+            let mut contains = false;
+            for constituent in &data.union.types {
+                contains |= could_contain_installed_type_variables_worker(
+                    store,
+                    *constituent,
+                    array_targets,
+                    seen,
+                )?;
             }
+            if !contains && let Some(alias_id) = record.alias() {
+                let alias = store
+                    .type_alias(alias_id)
+                    .ok_or(InstantiationError::InvalidAlias(alias_id))?;
+                if alias.symbol().is_none() {
+                    return Err(InstantiationError::InvalidAlias(alias_id));
+                }
+                for argument in alias.type_arguments().unwrap_or_default() {
+                    contains |= could_contain_installed_type_variables_worker(
+                        store,
+                        *argument,
+                        array_targets,
+                        seen,
+                    )?;
+                }
+            }
+            if !contains && let Some(origin) = data.origin {
+                contains = could_contain_installed_type_variables_worker(
+                    store,
+                    origin,
+                    array_targets,
+                    seen,
+                )?;
+            }
+            Ok(contains)
         }
         TypeData::Interface(interface)
             if interface
@@ -792,9 +807,17 @@ fn validate_instantiable_member_type_worker(
         }
         TypeData::Union(data) => {
             if record.alias().is_some() {
-                Err(InstantiationError::UnsupportedAliasedUnion(type_))
+                if could_contain_installed_type_variables(store, type_, array_targets)? {
+                    Err(InstantiationError::UnsupportedAliasedUnion(type_))
+                } else {
+                    Ok(())
+                }
             } else if data.origin.is_some() {
-                Err(InstantiationError::UnsupportedUnionOrigin(type_))
+                if could_contain_installed_type_variables(store, type_, array_targets)? {
+                    Err(InstantiationError::UnsupportedUnionOrigin(type_))
+                } else {
+                    Ok(())
+                }
             } else if data.union.types.len() < 2
                 || data
                     .union
@@ -1815,6 +1838,46 @@ mod tests {
         assert_eq!(instantiate_type(&mut store, template, mapper), Ok(template));
         assert_eq!(instantiate_type(&mut store, mapping, mapper), Ok(mapping));
         assert_eq!(store.type_len(), before);
+    }
+
+    #[test]
+    fn concrete_named_unions_preserve_identity_without_consuming_instantiation_limits() {
+        let mut store = initialized_store();
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        let string = bootstrap.string_type;
+        let number = bootstrap.number_type;
+        let parameter = store.alloc_type_parameter(None).unwrap();
+        let symbol = store
+            .alloc_symbol(SymbolData::new(
+                SymbolFlags::TYPE_ALIAS,
+                EscapedName::source("Named"),
+            ))
+            .unwrap();
+        let alias = store.alloc_type_alias(Some(symbol)).unwrap();
+        let union = store
+            .alloc_union_type(ObjectFlags::PRIMITIVE_UNION, vec![string, number])
+            .unwrap();
+        assert!(store.set_type_alias(union, Some(alias)));
+        let mapper = store.new_simple_type_mapper(parameter, number).unwrap();
+        let mut session = InstantiationSession::new(InstantiationLimits {
+            max_depth: 0,
+            max_count: 0,
+        });
+
+        assert_eq!(
+            validate_instantiable_member_type(&store, union, &[parameter], None),
+            Ok(())
+        );
+        assert_eq!(
+            instantiate_type_with_session(&mut store, union, mapper, None, &mut session),
+            Ok(union)
+        );
+        assert_eq!(session.query_count(), 0);
+        assert_eq!(session.total_count(), 0);
+        assert_eq!(
+            instantiated_member_type_matches(&store, union, union, mapper, None),
+            Ok(true)
+        );
     }
 
     #[test]

@@ -12,7 +12,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use ts_ast::{NodeData, NodeRef, SyntaxKind};
+use ts_ast::{NodeData, NodeId, NodeRef, SyntaxKind};
 use ts_binder::{
     CheckFlags, EscapedName, InternalSymbolName, SemanticSymbolId, SymbolFlags, SymbolTableId,
 };
@@ -29,6 +29,7 @@ use super::{
     derived_types::DerivedObjectLiteralValidation,
     enums,
     ids::{IndexInfoId, SignatureId, TypeId},
+    indexed_access_types::{is_template_pattern_index_key, template_pattern_index_matches_name},
     instantiated_members::{GenericInterfaceMemberError, validate_generic_interface_members},
     intersection_types::IntersectionTypeProjection,
     links::{MembersOrExportsResolutionKind, ValueSymbolLinks},
@@ -1309,6 +1310,11 @@ impl<'store> RelaterSession<'store> {
                     .global_types
                     .and_then(|global_types| global_types.apparent_primitive_type(source_flags))
             {
+                if self
+                    .unresolved_primitive_wrapper_lacks_required_property(apparent_source, target)?
+                {
+                    return Ok(Ternary::False);
+                }
                 return self.is_related_to_ex(
                     apparent_source,
                     target,
@@ -2416,6 +2422,7 @@ impl<'store> RelaterSession<'store> {
             if info.key_type() == self.bootstrap.string_type
                 || info.key_type() == self.bootstrap.number_type
                     && ts_jsnum::from_string(name).to_string() == name
+                || template_pattern_index_matches_name(self.store, info.key_type(), name)
             {
                 return Ok(true);
             }
@@ -3044,6 +3051,127 @@ impl<'store> RelaterSession<'store> {
         };
         self.property_symbol(property, ObjectPropertyOrigin::Declared)?;
         Ok(Some(property))
+    }
+
+    fn unresolved_primitive_wrapper_lacks_required_property(
+        &mut self,
+        wrapper: TypeId,
+        target: TypeId,
+    ) -> Result<bool, RelationUnavailable> {
+        let (owner, eligible) = {
+            let record = self
+                .store
+                .type_payload(wrapper)
+                .ok_or(RelationUnavailable::Type(wrapper))?;
+            let TypeData::Interface(interface) = record.data() else {
+                return Ok(false);
+            };
+            let Some(owner) = record.symbol() else {
+                return Ok(false);
+            };
+            (
+                owner,
+                record.flags() == TypeFlags::OBJECT
+                    && record.object_flags().intersects(ObjectFlags::INTERFACE)
+                    && !record
+                        .object_flags()
+                        .intersects(ObjectFlags::CLASS | ObjectFlags::MEMBERS_RESOLVED)
+                    && interface.resolved_base_types.is_none()
+                    && self
+                        .store
+                        .direct_interface_heritage_provenance(wrapper)
+                        .is_none(),
+            )
+        };
+        if !eligible {
+            return Ok(false);
+        }
+        let owner_record = self
+            .store
+            .symbol(owner)
+            .ok_or(RelationUnavailable::Symbol(owner))?;
+        if owner_record.flags() & SymbolFlags::TYPE != SymbolFlags::INTERFACE
+            || self.observe_merged_symbol_lookup(owner) != Some(owner)
+            || self
+                .store
+                .declared_type_links(owner)
+                .and_then(|links| links.declared_type)
+                != Some(wrapper)
+        {
+            return Err(RelationUnavailable::InvalidStructuredMembers(wrapper));
+        }
+        if !self.interface_declarations_prove_no_heritage(owner, wrapper)? {
+            return Ok(false);
+        }
+
+        let target_members =
+            self.resolved_object_property_surface(target, self.allows_fresh_object_target())?;
+        for property in target_members.properties {
+            let (required, name) = {
+                let symbol = self.property_symbol(property, target_members.property_origin)?;
+                (
+                    !symbol.flags().contains(SymbolFlags::OPTIONAL),
+                    symbol.name().to_owned(),
+                )
+            };
+            if required
+                && self.raw_symbol_members_prove_absent(owner, name.as_ref())?
+                && self.global_object_property(name.as_ref())?.is_none()
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn interface_declarations_prove_no_heritage(
+        &self,
+        owner: SemanticSymbolId,
+        wrapper: TypeId,
+    ) -> Result<bool, RelationUnavailable> {
+        let declarations = self
+            .store
+            .symbol(owner)
+            .and_then(|symbol| symbol.declarations())
+            .ok_or(RelationUnavailable::InvalidStructuredMembers(wrapper))?;
+        let mut saw_interface = false;
+        for declaration in declarations {
+            match self.store.source_node_kind(*declaration) {
+                Some(SyntaxKind::VariableDeclaration) => continue,
+                Some(SyntaxKind::InterfaceDeclaration) => saw_interface = true,
+                _ => return Ok(false),
+            }
+
+            let mut found_name = false;
+            for index in (0..declaration.node.index()).rev() {
+                let node = NodeRef::new(
+                    declaration.arena,
+                    declaration.file,
+                    NodeId::new(
+                        u32::try_from(index)
+                            .map_err(|_| RelationUnavailable::InvalidStructuredMembers(wrapper))?,
+                    ),
+                );
+                if self.store.source_node_parent(node)
+                    != Some(SourceNodeParent::Parent(*declaration))
+                {
+                    continue;
+                }
+                match self.store.source_node_kind(node) {
+                    Some(SyntaxKind::HeritageClause) => return Ok(false),
+                    Some(SyntaxKind::Identifier) => {
+                        found_name = true;
+                        break;
+                    }
+                    Some(_) => {}
+                    None => return Err(RelationUnavailable::InvalidStructuredMembers(wrapper)),
+                }
+            }
+            if !found_name {
+                return Err(RelationUnavailable::InvalidStructuredMembers(wrapper));
+            }
+        }
+        Ok(saw_interface)
     }
 
     fn raw_symbol_members_prove_absent(
@@ -3881,7 +4009,6 @@ impl<'store> RelaterSession<'store> {
         type_id: TypeId,
         owner: Option<SemanticSymbolId>,
         structured: &StructuredTypeData,
-        properties: &[SemanticSymbolId],
     ) -> Result<Vec<IndexInfoId>, RelationUnavailable> {
         let indexes = structured.index_infos.as_deref().unwrap_or_default();
         if indexes.is_empty() {
@@ -3909,15 +4036,22 @@ impl<'store> RelaterSession<'store> {
                 !info.components().is_empty(),
             )
         };
-        let (owner_flags, owner_members, owner_declaration) = {
+        let (owner_flags, owner_members, owner_declarations) = {
             let owner_record = self
                 .store
                 .symbol(owner)
                 .ok_or(RelationUnavailable::InvalidStructuredMembers(type_id))?;
-            let Some([declaration]) = owner_record.declarations() else {
+            let Some(declarations) = owner_record
+                .declarations()
+                .filter(|declarations| !declarations.is_empty())
+            else {
                 return Err(RelationUnavailable::InvalidStructuredMembers(type_id));
             };
-            (owner_record.flags(), owner_record.members(), *declaration)
+            (
+                owner_record.flags(),
+                owner_record.members(),
+                declarations.to_vec(),
+            )
         };
         let members = structured
             .members
@@ -3934,13 +4068,24 @@ impl<'store> RelaterSession<'store> {
             .store
             .symbol(index_symbol)
             .ok_or(RelationUnavailable::InvalidStructuredMembers(type_id))?;
-        if !properties.is_empty()
-            || owner_flags != SymbolFlags::TYPE_LITERAL && owner_flags != SymbolFlags::INTERFACE
+        let symbol_key = self
+            .store
+            .intrinsic_bootstrap()
+            .ok_or(RelationUnavailable::MissingBootstrap)?
+            .es_symbol_type;
+        let declaration_parent = self.store.source_node_parent(declaration);
+        let supported_key = key_type == self.bootstrap.string_type
+            || key_type == self.bootstrap.number_type
+            || key_type == symbol_key
+            || is_template_pattern_index_key(self.store, key_type);
+        if owner_flags != SymbolFlags::TYPE_LITERAL
+            && owner_flags & SymbolFlags::TYPE != SymbolFlags::INTERFACE
             || owner_members != Some(members)
             || self.store.source_node_kind(declaration) != Some(SyntaxKind::IndexSignature)
-            || self.store.source_node_parent(declaration)
-                != Some(SourceNodeParent::Parent(owner_declaration))
-            || key_type != self.bootstrap.string_type && key_type != self.bootstrap.number_type
+            || !owner_declarations.iter().any(|owner_declaration| {
+                declaration_parent == Some(SourceNodeParent::Parent(*owner_declaration))
+            })
+            || !supported_key
             || self.store.type_payload(value_type).is_none()
             || has_index_symbol
             || has_components
@@ -4064,7 +4209,7 @@ impl<'store> RelaterSession<'store> {
         }
         let properties = structured.properties.clone().unwrap_or_default();
         let index_infos =
-            self.validated_declared_index_infos(type_id, record_symbol, &structured, &properties)?;
+            self.validated_declared_index_infos(type_id, record_symbol, &structured)?;
         let class_members = if property_origin.is_declared() {
             validate_class_heritage_members(self.store, type_id)
         } else {
@@ -5961,6 +6106,23 @@ mod tests {
         execute_nongeneric_class_member_query(&mut fixture.store, &host, &plan).unwrap()
     }
 
+    fn query_declared_interface(fixture: &mut FunctionRelationFixture, name: &str) -> TypeId {
+        let globals = fixture.store.intrinsic_bootstrap().unwrap().globals;
+        let symbol = fixture
+            .store
+            .symbol_table(globals)
+            .and_then(|globals| globals.get_source(name))
+            .unwrap_or_else(|| panic!("missing interface {name}"));
+        let host = relation_host(
+            &fixture.parsed.arena,
+            fixture.files.get(&fixture.file).unwrap(),
+        );
+        fixture
+            .store
+            .get_declared_type_of_symbol(&host, symbol)
+            .unwrap()
+    }
+
     fn resolve_all_function_returns(fixture: &mut FunctionRelationFixture) {
         let signatures = fixture
             .parsed
@@ -7490,7 +7652,7 @@ mod tests {
             "const value = {{ {} }};",
             property_facts
                 .iter()
-                .map(|(name, _)| format!("{name}: 0"))
+                .map(|(name, _)| format!("{name:?}: 0"))
                 .collect::<Vec<_>>()
                 .join(", ")
         );
@@ -8476,6 +8638,126 @@ mod tests {
             })
         );
         assert_eq!(store.relation_state_snapshot(), after_global_warmup);
+    }
+
+    #[test]
+    fn unresolved_primitive_wrappers_reject_proven_missing_required_properties() {
+        for (declaration, name) in [
+            ("interface Number { value: number }", "Number"),
+            ("interface String { value: string }", "String"),
+            ("interface Boolean { value: boolean }", "Boolean"),
+        ] {
+            let mut fixture = function_relation_fixture(declaration);
+            let wrapper = query_declared_interface(&mut fixture, name);
+            let (source, number, empty_generic) = {
+                let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+                (
+                    match name {
+                        "Number" => bootstrap.number_type,
+                        "String" => bootstrap.string_type,
+                        "Boolean" => bootstrap.boolean_type,
+                        _ => unreachable!("only primitive wrapper interfaces are covered"),
+                    },
+                    bootstrap.number_type,
+                    bootstrap.empty_generic_type,
+                )
+            };
+            let required = alloc_typed_property(&mut fixture.store, "id", number, false);
+            let target = alloc_property_object(&mut fixture.store, vec![required]);
+            let global_types = RelationGlobalTypes {
+                array_targets: CanonicalArrayTargets::for_test(empty_generic, empty_generic),
+                string_wrapper: wrapper,
+                number_wrapper: wrapper,
+                boolean_wrapper: wrapper,
+            };
+            let before = fixture.store.relation_state_snapshot();
+
+            assert_eq!(
+                fixture.store.is_type_related_to_with_optional_global_types(
+                    source,
+                    target,
+                    RelationKind::Assignable,
+                    Some(global_types),
+                ),
+                Ok(false)
+            );
+            assert_eq!(fixture.store.relation_state_snapshot(), before);
+        }
+    }
+
+    #[test]
+    fn unresolved_primitive_wrapper_checks_preserve_global_interface_augmentations() {
+        for source in [
+            "interface Number { id: number }",
+            "interface Number {} interface Object { id: number }",
+        ] {
+            let mut fixture = function_relation_fixture(source);
+            let wrapper = query_declared_interface(&mut fixture, "Number");
+            let object = source
+                .contains("interface Object")
+                .then(|| query_declared_interface(&mut fixture, "Object"));
+            let (number, empty_generic) = {
+                let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+                (bootstrap.number_type, bootstrap.empty_generic_type)
+            };
+            let required = alloc_typed_property(&mut fixture.store, "id", number, false);
+            let target = alloc_property_object(&mut fixture.store, vec![required]);
+            let global_types = RelationGlobalTypes {
+                array_targets: CanonicalArrayTargets::for_test(empty_generic, empty_generic),
+                string_wrapper: wrapper,
+                number_wrapper: wrapper,
+                boolean_wrapper: wrapper,
+            };
+            let before = fixture.store.relation_state_snapshot();
+
+            assert_eq!(
+                fixture.store.is_type_related_to_with_optional_global_types(
+                    number,
+                    target,
+                    RelationKind::Assignable,
+                    Some(global_types),
+                ),
+                Err(RelationUnavailable::UnresolvedStructuredMembers(
+                    object.unwrap_or(wrapper)
+                ))
+            );
+            assert_eq!(fixture.store.relation_state_snapshot(), before);
+        }
+    }
+
+    #[test]
+    fn unresolved_primitive_wrappers_do_not_ignore_inherited_interface_members() {
+        let mut fixture = function_relation_fixture(
+            "interface Extra { id: number } interface Number extends Extra {}",
+        );
+        let wrapper = query_declared_interface(&mut fixture, "Number");
+        let (number, empty_generic) = {
+            let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+            (bootstrap.number_type, bootstrap.empty_generic_type)
+        };
+        let required = alloc_typed_property(&mut fixture.store, "id", number, false);
+        let target = alloc_property_object(&mut fixture.store, vec![required]);
+        let global_types = RelationGlobalTypes {
+            array_targets: CanonicalArrayTargets::for_test(empty_generic, empty_generic),
+            string_wrapper: wrapper,
+            number_wrapper: wrapper,
+            boolean_wrapper: wrapper,
+        };
+        let before = fixture.store.relation_state_snapshot();
+
+        assert!(matches!(
+            fixture.store.is_type_related_to_with_optional_global_types(
+                number,
+                target,
+                RelationKind::Assignable,
+                Some(global_types),
+            ),
+            Err(
+                RelationUnavailable::UnresolvedStructuredMembers(type_)
+                    | RelationUnavailable::UnsupportedStructuredType(type_)
+            ) if type_ == wrapper
+        ));
+        assert_eq!(fixture.store.relation_state_snapshot(), before);
     }
 
     #[test]
@@ -9932,6 +10214,107 @@ mod tests {
                 .store
                 .is_type_identical_to(numbers, readonly_numbers),
             Ok(false)
+        );
+    }
+
+    #[test]
+    fn template_pattern_indexes_can_share_a_surface_with_declared_properties() {
+        fn declared_alias(fixture: &mut FunctionRelationFixture, name: &str) -> TypeId {
+            let globals = fixture.store.intrinsic_bootstrap().unwrap().globals;
+            let symbol = fixture
+                .store
+                .symbol_table(globals)
+                .and_then(|globals| globals.get_source(name))
+                .unwrap_or_else(|| panic!("missing declared alias {name}"));
+            let host = relation_host(
+                &fixture.parsed.arena,
+                fixture.files.get(&fixture.file).unwrap(),
+            );
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            let result = CanonicalTypeQuery::new(
+                &mut fixture.store,
+                &host,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_declared_type_of_symbol(symbol)
+            .unwrap();
+            assert!(diagnostics.is_empty());
+            result
+        }
+
+        let mut fixture = function_relation_fixture(concat!(
+            "type Attributes = { required: string; [name: `do-${string}`]: number }; ",
+            "type Same = { required: string; [name: `do-${string}`]: number };",
+        ));
+        let target = declared_alias(&mut fixture, "Attributes");
+        let same = declared_alias(&mut fixture, "Same");
+        let (string, number) = {
+            let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+            (bootstrap.string_type, bootstrap.number_type)
+        };
+
+        let required = alloc_typed_property(&mut fixture.store, "required", string, false);
+        let matching = alloc_typed_property(&mut fixture.store, "do-save", number, false);
+        let valid = alloc_fresh_property_object(&mut fixture.store, vec![required, matching]);
+        let required = alloc_typed_property(&mut fixture.store, "required", string, false);
+        let wrong_value = alloc_typed_property(&mut fixture.store, "do-save", string, false);
+        let wrong = alloc_fresh_property_object(&mut fixture.store, vec![required, wrong_value]);
+        let required = alloc_typed_property(&mut fixture.store, "required", string, false);
+        let unrelated = alloc_typed_property(&mut fixture.store, "other", number, false);
+        let excess = alloc_fresh_property_object(&mut fixture.store, vec![required, unrelated]);
+
+        assert_eq!(fixture.store.is_type_assignable_to(valid, target), Ok(true));
+        assert_eq!(
+            fixture.store.is_type_assignable_to(wrong, target),
+            Ok(false)
+        );
+        assert_eq!(
+            fixture.store.is_type_assignable_to(excess, target),
+            Ok(false)
+        );
+        assert_eq!(fixture.store.is_type_assignable_to(target, same), Ok(true));
+    }
+
+    #[test]
+    fn merged_interface_indexes_accept_properties_from_every_declaration() {
+        let mut fixture = function_relation_fixture(concat!(
+            "interface Attributes { label: string; } ",
+            "interface Attributes { [name: `do-${string}`]: number; }",
+        ));
+        let globals = fixture.store.intrinsic_bootstrap().unwrap().globals;
+        let symbol = fixture
+            .store
+            .symbol_table(globals)
+            .and_then(|globals| globals.get_source("Attributes"))
+            .unwrap();
+        let host = relation_host(
+            &fixture.parsed.arena,
+            fixture.files.get(&fixture.file).unwrap(),
+        );
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let target = CanonicalTypeQuery::new(
+            &mut fixture.store,
+            &host,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap()
+        .get_declared_type_of_symbol(symbol)
+        .unwrap();
+        assert!(diagnostics.is_empty());
+        let (string, number) = {
+            let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+            (bootstrap.string_type, bootstrap.number_type)
+        };
+        let required = alloc_typed_property(&mut fixture.store, "label", string, false);
+        let matching = alloc_typed_property(&mut fixture.store, "do-save", number, false);
+        let source = alloc_fresh_property_object(&mut fixture.store, vec![required, matching]);
+
+        assert_eq!(
+            fixture.store.is_type_assignable_to(source, target),
+            Ok(true)
         );
     }
 

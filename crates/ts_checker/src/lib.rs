@@ -7187,14 +7187,14 @@ impl<'a> Checker<'a> {
             let Some(node) = self.arena.get(*member) else {
                 continue;
             };
-            let (body, optional) = match &node.data {
-                NodeData::ConstructorDeclaration(constructor) => (constructor.body, false),
+            let body = match &node.data {
+                NodeData::ConstructorDeclaration(constructor) => constructor.body,
                 NodeData::MethodDeclaration(method)
                     if self.property_name(method.name).as_deref() == Some("constructor") =>
                 {
-                    (method.body, false)
+                    method.body
                 }
-                NodeData::MethodDeclaration(method) => (method.body, true),
+                NodeData::MethodDeclaration(method) => method.body,
                 _ => continue,
             };
             let Some(body) = body else {
@@ -7225,10 +7225,7 @@ impl<'a> Checker<'a> {
                     && let Some(name) = self.this_property_name(assignment.left)
                     && let Some(type_id) = self.jsdoc_type_annotation(node_id)
                 {
-                    properties
-                        .entry(name)
-                        .and_modify(|property| property.1 &= optional)
-                        .or_insert((type_id, optional));
+                    properties.entry(name).or_insert((type_id, false));
                 }
                 if let Some(children) = self.children.get(&node_id) {
                     pending.extend(children.iter().copied());
@@ -17303,12 +17300,6 @@ impl<'a> Checker<'a> {
             }
             self.result.node_types.insert(*parameter, type_id);
         }
-        let rest_parameter = body
-            .filter(|body| self.function_body_uses_arguments(*body))
-            .map(|_| {
-                let any = self.result.types.any();
-                self.result.types.alloc(TypeKind::Array(any))
-            });
         let inferred_void = body
             .filter(|body| {
                 matches!(
@@ -17325,7 +17316,6 @@ impl<'a> Checker<'a> {
             .map(|type_| &mut type_.kind)
         {
             signature.parameters = parameter_types;
-            signature.rest_parameter = rest_parameter;
             if return_annotation.is_none()
                 && let Some(return_type) = jsdoc.return_type.or(inferred_void)
             {
@@ -17333,65 +17323,6 @@ impl<'a> Checker<'a> {
             }
         }
         self.result.node_types.insert(node_id, signature_id);
-    }
-
-    fn function_body_uses_arguments(&self, body: NodeId) -> bool {
-        let mut pending = vec![body];
-        while let Some(node_id) = pending.pop() {
-            let Some(node) = self.arena.get(node_id) else {
-                continue;
-            };
-            if node_id != body
-                && matches!(
-                    node.data,
-                    NodeData::FunctionDeclaration(_)
-                        | NodeData::FunctionExpression(_)
-                        | NodeData::MethodDeclaration(_)
-                        | NodeData::ConstructorDeclaration(_)
-                        | NodeData::GetAccessorDeclaration(_)
-                        | NodeData::SetAccessorDeclaration(_)
-                        | NodeData::ClassDeclaration(_)
-                        | NodeData::ClassExpression(_)
-                )
-            {
-                continue;
-            }
-            if matches!(&node.data, NodeData::Identifier(identifier) if identifier.text == "arguments")
-                && self.identifier_is_arguments_value(node_id)
-            {
-                return true;
-            }
-            if let Some(children) = self.children.get(&node_id) {
-                pending.extend(children.iter().copied());
-            }
-        }
-        false
-    }
-
-    fn identifier_is_arguments_value(&self, identifier: NodeId) -> bool {
-        if self
-            .bindings
-            .resolve_name_at(identifier, "arguments")
-            .is_some()
-        {
-            return false;
-        }
-        let Some(parent) = self.arena.get(identifier).and_then(|node| node.parent) else {
-            return true;
-        };
-        !matches!(
-            self.arena.get(parent).map(|node| &node.data),
-            Some(NodeData::PropertyAccessExpression(access)) if access.name == identifier
-        ) && !matches!(
-            self.arena.get(parent).map(|node| &node.data),
-            Some(NodeData::VariableDeclaration(declaration)) if declaration.name == identifier
-        ) && !matches!(
-            self.arena.get(parent).map(|node| &node.data),
-            Some(NodeData::ParameterDeclaration(parameter)) if parameter.name == identifier
-        ) && !matches!(
-            self.arena.get(parent).map(|node| &node.data),
-            Some(NodeData::PropertyAssignment(property)) if property.name == identifier
-        )
     }
 
     #[allow(clippy::too_many_lines)]
@@ -29867,6 +29798,56 @@ mod tests {
     }
 
     #[test]
+    fn javascript_arguments_do_not_change_declared_function_arity() {
+        let parsed = parse_source_file(
+            r"
+                function zero() { arguments; }
+                zero(1);
+                function one(value) { arguments; }
+                one(1, 2);
+                function explicit(...values) { arguments; }
+                explicit(1, 2);
+            ",
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        let result = check_source_file_with_options(
+            &parsed.arena,
+            parsed.source_file,
+            &bindings,
+            CheckerOptions {
+                is_javascript_file: true,
+                ..CheckerOptions::default()
+            },
+        );
+
+        assert_eq!(
+            result
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.render().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "Expected 0 arguments, but got 1.",
+                "Expected 0-1 arguments, but got 2.",
+            ]
+        );
+
+        let root = bindings.root_scope().unwrap();
+        let explicit = result
+            .type_of_symbol(root.symbols.get("explicit").unwrap())
+            .unwrap();
+        let TypeKind::Function(explicit) = &result.types.get(explicit).unwrap().kind else {
+            panic!("expected an explicit rest function");
+        };
+        let rest = explicit.rest_parameter.expect("expected an explicit rest");
+        assert!(matches!(
+            result.types.get(rest).unwrap().kind,
+            TypeKind::Array(element) if element == result.types.any()
+        ));
+    }
+
+    #[test]
     fn javascript_body_only_functions_infer_void_and_remain_reachable() {
         let parsed = parse_source_file(
             r"
@@ -30004,7 +29985,7 @@ mod tests {
         let parsed = parse_source_file(
             r"
                 function f(x) { arguments; }
-                f(1, 2, 3);
+                f(1);
                 class Constructed {
                     /** @param {object} [foo={}] */
                     constructor(foo = {}) {
@@ -30051,11 +30032,7 @@ mod tests {
             panic!("expected f function");
         };
         assert_eq!(f.parameters, [result.types.any()]);
-        let rest = f.rest_parameter.expect("arguments adds an implicit rest");
-        assert!(matches!(
-            result.types.get(rest).unwrap().kind,
-            TypeKind::Array(element) if element == result.types.any()
-        ));
+        assert!(f.rest_parameter.is_none());
         assert_eq!(f.return_type, result.types.void());
 
         let class_object = |name: &str| {
@@ -30073,7 +30050,7 @@ mod tests {
 
         let method_assigned = class_object("MethodAssigned");
         assert!(method_assigned.properties.contains_key("arguments"));
-        assert!(method_assigned.optional_properties.contains("arguments"));
+        assert!(!method_assigned.optional_properties.contains("arguments"));
         let TypeKind::Function(method) = &result
             .types
             .get(method_assigned.properties["m"])
@@ -30100,7 +30077,7 @@ mod tests {
         else {
             panic!("expected arguments method");
         };
-        assert!(method.rest_parameter.is_some());
+        assert!(method.rest_parameter.is_none());
 
         let constructor = parsed
             .arena
@@ -30124,7 +30101,7 @@ mod tests {
         let TypeKind::Function(constructor) = &result.types.get(constructor).unwrap().kind else {
             panic!("expected constructor signature metadata");
         };
-        assert!(constructor.rest_parameter.is_some());
+        assert!(constructor.rest_parameter.is_none());
 
         let property_named = class_object("PropertyNamedArguments");
         let TypeKind::Function(method) = &result

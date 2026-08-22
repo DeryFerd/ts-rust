@@ -574,8 +574,8 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
                             type_only: import.is_type_only,
                         })
                     }
-                    Some(NodeData::Identifier(_)) => {
-                        let target = Self::local_module_member(
+                    Some(NodeData::Identifier(_) | NodeData::QualifiedName(_)) => {
+                        let target = Self::local_module_entity(
                             store,
                             source,
                             declaration,
@@ -685,6 +685,80 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
             ));
         };
         Ok(target)
+    }
+
+    fn local_module_entity<MapperPayload>(
+        store: &CanonicalSemanticStore<MapperPayload>,
+        source: ProductionAliasTargetSource<'_>,
+        declaration: NodeRef,
+        entity: NodeId,
+    ) -> Result<SemanticSymbolId, CanonicalAliasTargetUnavailable> {
+        let Some(record) = source.arena.get(entity) else {
+            return Err(CanonicalAliasTargetUnavailable::MalformedDeclaration(
+                declaration,
+            ));
+        };
+        match &record.data {
+            NodeData::Identifier(_) if record.kind == SyntaxKind::Identifier => {
+                Self::local_module_member(store, source, declaration, entity)
+            }
+            NodeData::QualifiedName(qualified) if record.kind == SyntaxKind::QualifiedName => {
+                let left = source.arena.get(qualified.left).ok_or(
+                    CanonicalAliasTargetUnavailable::MalformedDeclaration(declaration),
+                )?;
+                let right = source.arena.get(qualified.right).ok_or(
+                    CanonicalAliasTargetUnavailable::MalformedDeclaration(declaration),
+                )?;
+                let NodeData::Identifier(name) = &right.data else {
+                    return Err(CanonicalAliasTargetUnavailable::UnsupportedLocalExport(
+                        declaration,
+                    ));
+                };
+                if left.parent != Some(entity)
+                    || right.parent != Some(entity)
+                    || right.kind != SyntaxKind::Identifier
+                    || name.flow_node.is_some()
+                {
+                    return Err(CanonicalAliasTargetUnavailable::MalformedDeclaration(
+                        declaration,
+                    ));
+                }
+                let mut namespace =
+                    Self::local_module_entity(store, source, declaration, qualified.left)?;
+                if store
+                    .symbol(namespace)
+                    .is_some_and(|record| record.flags() == SymbolFlags::ALIAS)
+                {
+                    namespace = store
+                        .alias_symbol_links(namespace)
+                        .and_then(|links| links.alias_target.symbol())
+                        .ok_or(CanonicalAliasTargetUnavailable::UnsupportedLocalExport(
+                            declaration,
+                        ))?;
+                }
+                let record = store.symbol(namespace).ok_or(
+                    CanonicalAliasTargetUnavailable::UnsupportedLocalExport(declaration),
+                )?;
+                if !record.flags().intersects(SymbolFlags::NAMESPACE) {
+                    return Err(CanonicalAliasTargetUnavailable::UnsupportedLocalExport(
+                        declaration,
+                    ));
+                }
+                store
+                    .module_symbol_links(namespace)
+                    .and_then(|links| links.resolved_exports)
+                    .or_else(|| record.exports())
+                    .and_then(|exports| store.symbol_table(exports))
+                    .and_then(|exports| exports.get_source(&name.text))
+                    .and_then(|symbol| store.get_merged_symbol(symbol))
+                    .ok_or(CanonicalAliasTargetUnavailable::UnsupportedLocalExport(
+                        declaration,
+                    ))
+            }
+            _ => Err(CanonicalAliasTargetUnavailable::UnsupportedLocalExport(
+                declaration,
+            )),
+        }
     }
 
     fn alias_expression_target<MapperPayload>(
@@ -869,9 +943,24 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
         }
 
         let source = target.bound.source_file();
-        if !store.contains_node_ref(source)
-            || target.bound.symbol(source) != Some(resolved.target_symbol())
-        {
+        let valid_target = if resolved.is_ambient_module() {
+            !facts.is_external_or_common_js_module()
+                && store
+                    .symbol(resolved.target_symbol())
+                    .and_then(|module| module.declarations())
+                    .is_some_and(|declarations| {
+                        declarations.iter().copied().any(|module| {
+                            target.bound.symbol(module) == Some(resolved.target_symbol())
+                                && target.arena.get(module.node).is_some_and(|record| {
+                                    record.kind == SyntaxKind::ModuleDeclaration
+                                        && record.parent == Some(source.node)
+                                })
+                        })
+                    })
+        } else {
+            target.bound.symbol(source) == Some(resolved.target_symbol())
+        };
+        if !store.contains_node_ref(source) || !valid_target {
             return Err(CanonicalAliasTargetUnavailable::MalformedModuleSymbol {
                 declaration,
                 module: resolved.target_symbol(),
@@ -2780,6 +2869,110 @@ mod tests {
                 .type_only_declaration,
             Some(type_namespace_declaration)
         );
+    }
+
+    #[test]
+    fn qualified_local_import_equals_resolves_exported_namespace_members() {
+        let source = parsed(concat!(
+            "namespace Outer { export namespace Inner { export const value = 1; } } ",
+            "import Selected = Outer.Inner; export {};",
+        ));
+        let file = FileId::new(14);
+        let files = [(file, &source, CanonicalModuleState::External)];
+        let (mut store, bound_files, manifest) =
+            fixture(&files, CanonicalModuleResolutionManifestInput::new([]));
+        let mut host =
+            ProductionAliasTargetHost::new(&store, sources(&files, &bound_files), &manifest)
+                .unwrap();
+        let selected_declaration = alias_declaration_named(&source, file, "Selected");
+        let selected = alias(&bound_files, selected_declaration);
+        let inner = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::ModuleDeclaration(module) = &record.data else {
+                    return None;
+                };
+                matches!(
+                    source.arena.get(module.name).map(|name| &name.data),
+                    Some(NodeData::Identifier(name)) if name.text == "Inner"
+                )
+                .then_some(node_ref(&source, file, node))
+            })
+            .unwrap();
+        let target = bound_files.get(&file).unwrap().symbol(inner).unwrap();
+
+        assert_eq!(
+            CanonicalAliasResolver::new(&mut store, &mut host)
+                .resolve_alias(selected)
+                .unwrap()
+                .target,
+            AliasTargetState::Resolved(target),
+        );
+    }
+
+    #[test]
+    fn ambient_script_modules_supply_named_and_required_alias_targets() {
+        let importer = parsed(concat!(
+            "import { value } from 'ambient'; ",
+            "import required = require('ambient');",
+        ));
+        let ambient = parsed("declare module 'ambient' { export const value: number; }");
+        let importer_file = FileId::new(15);
+        let ambient_file = FileId::new(16);
+        let files = [
+            (importer_file, &importer, CanonicalModuleState::External),
+            (ambient_file, &ambient, CanonicalModuleState::Script),
+        ];
+        let entries = module_specifiers(&importer).into_iter().map(|specifier| {
+            CanonicalModuleResolutionEntry::resolved(
+                node_ref(&importer, importer_file, specifier),
+                CanonicalResolvedModuleInput::new(
+                    ambient_file,
+                    CanonicalModuleResolutionMode::CommonJs,
+                    CanonicalModuleResolutionMode::CommonJs,
+                ),
+            )
+        });
+        let (mut store, bound_files, manifest) =
+            fixture(&files, CanonicalModuleResolutionManifestInput::new(entries));
+        let mut host =
+            ProductionAliasTargetHost::new(&store, sources(&files, &bound_files), &manifest)
+                .unwrap();
+        let declaration = ambient
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ModuleDeclaration).then_some(node_ref(
+                    &ambient,
+                    ambient_file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let module = bound_files
+            .get(&ambient_file)
+            .unwrap()
+            .symbol(declaration)
+            .unwrap();
+        let value = store
+            .symbol(module)
+            .and_then(ts_binder::semantic::Symbol::exports)
+            .and_then(|exports| store.symbol_table(exports))
+            .and_then(|exports| exports.get_source("value"))
+            .unwrap();
+
+        for (name, expected) in [("value", value), ("required", module)] {
+            let declaration = alias_declaration_named(&importer, importer_file, name);
+            let alias = alias(&bound_files, declaration);
+            assert_eq!(
+                CanonicalAliasResolver::new(&mut store, &mut host)
+                    .resolve_alias(alias)
+                    .unwrap()
+                    .target,
+                AliasTargetState::Resolved(expected),
+            );
+        }
     }
 
     #[test]

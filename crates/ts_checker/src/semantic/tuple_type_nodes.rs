@@ -2,11 +2,10 @@
 //!
 //! This leaf owns the non-generic type-node slice of pinned
 //! `getTypeFromArrayOrTupleTypeNode`, `getTupleElementFlags`, and
-//! `getTupleElementInfo`. It deliberately stops before variadic tuples and
-//! named rest elements. A syntactic `...T[]` is admitted only with the
-//! authoritative global Array targets used by the canonical tuple constructor.
-//! Recursive tuple aliases remain an explicit planner boundary until deferred
-//! type references and normalized recursive tuple construction are installed.
+//! `getTupleElementInfo`. Array rest and generic variadic elements retain the
+//! distinct flags expected by the canonical tuple constructor. Array rest is
+//! admitted only with authoritative global Array targets. Named rest elements
+//! and recursive tuple aliases remain explicit planner boundaries.
 
 use ts_ast::{NodeData, NodeRef, SyntaxKind};
 
@@ -218,6 +217,7 @@ pub(super) fn plan_tuple_type_node(
         .map_err(|_| TupleTypeNodeError::Capacity(tuple))?;
     let mut previous_end = tuple_record.range.start;
     let mut saw_optional = false;
+    let mut saw_rest = false;
     let mut seen = Vec::new();
     seen.try_reserve(tuple_data.elements.nodes.len())
         .map_err(|_| TupleTypeNodeError::Capacity(tuple))?;
@@ -238,9 +238,10 @@ pub(super) fn plan_tuple_type_node(
         let planned = plan_tuple_element(store, host, element, array_targets)?;
         match planned.info.flags() {
             ElementFlags::REQUIRED if !saw_optional => {}
-            ElementFlags::OPTIONAL => saw_optional = true,
-            ElementFlags::REST if index + 1 == tuple_data.elements.nodes.len() => {}
-            ElementFlags::REQUIRED | ElementFlags::REST => {
+            ElementFlags::OPTIONAL if !saw_rest => saw_optional = true,
+            ElementFlags::REST if !saw_rest => saw_rest = true,
+            ElementFlags::VARIADIC => {}
+            ElementFlags::REQUIRED | ElementFlags::OPTIONAL | ElementFlags::REST => {
                 return Err(TupleTypeNodeError::UnsupportedElementOrder {
                     tuple,
                     element,
@@ -391,14 +392,20 @@ fn plan_tuple_element(
                     element,
                 ));
             };
-            let array = direct_child(store, host, element, rest.type_)?;
-            let Some(child) = parenthesized_array_element(store, host, array)? else {
+            let rest_type = direct_child(store, host, element, rest.type_)?;
+            if let Some(child) = parenthesized_array_element(store, host, rest_type)? {
+                (child, ElementFlags::REST, None)
+            } else if matches!(
+                preflight_node(store, host, rest_type)?.kind,
+                SyntaxKind::TypeReference | SyntaxKind::InferType
+            ) {
+                (rest_type, ElementFlags::VARIADIC, None)
+            } else {
                 return Err(TupleTypeNodeError::UnsupportedSyntax {
                     node: element,
                     kind: SyntaxKind::RestType,
                 });
-            };
-            (child, ElementFlags::REST, None)
+            }
         }
         (_, SyntaxKind::RestType | SyntaxKind::OptionalType | SyntaxKind::NamedTupleMember) => {
             return Err(TupleTypeNodeError::InvalidSyntax(element));

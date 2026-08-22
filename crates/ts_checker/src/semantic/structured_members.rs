@@ -414,9 +414,9 @@ fn validate_property_interface_worker(
         }
     };
     let owner_record = store.symbol(owner)?;
-    let [owner_declaration] = owner_record.declarations()? else {
-        return None;
-    };
+    let owner_declarations = owner_record
+        .declarations()
+        .filter(|declarations| !declarations.is_empty())?;
     if record.flags() != TypeFlags::OBJECT
         || record.object_flags() != ObjectFlags::INTERFACE | ObjectFlags::MEMBERS_RESOLVED
         || record.alias().is_some()
@@ -427,7 +427,9 @@ fn validate_property_interface_worker(
         || owner_record.exports().is_some()
         || owner_record.export_symbol().is_some()
         || store.get_merged_symbol(owner) != Some(owner)
-        || store.source_node_kind(*owner_declaration) != Some(SyntaxKind::InterfaceDeclaration)
+        || owner_declarations.iter().any(|declaration| {
+            store.source_node_kind(*declaration) != Some(SyntaxKind::InterfaceDeclaration)
+        })
         || store
             .declared_type_links(owner)
             .is_none_or(|links| links.declared_type != Some(type_))
@@ -454,7 +456,7 @@ fn validate_property_interface_worker(
     }
 
     let declared_properties =
-        declared_properties(store, owner, *owner_declaration, interface.declared_members)?;
+        declared_properties(store, owner, owner_declarations, interface.declared_members)?;
     let base_properties = match (
         requires_direct_base,
         interface.resolved_base_types.as_deref(),
@@ -516,7 +518,7 @@ fn validate_property_interface_worker(
 fn declared_properties(
     store: &CanonicalTypeMapperStore,
     owner: SemanticSymbolId,
-    owner_declaration: NodeRef,
+    owner_declarations: &[NodeRef],
     members: Option<SymbolTableId>,
 ) -> Option<Vec<SemanticSymbolId>> {
     let Some(members) = members else {
@@ -527,48 +529,63 @@ fn declared_properties(
         return None;
     }
     let mut properties = Vec::with_capacity(table.len());
+    let mut seen_declarations = HashSet::with_capacity(table.len());
     for (name, property) in table.iter() {
         let record = store.symbol(property)?;
-        let declaration = property_declaration(store, property)?;
+        let declarations = record
+            .declarations()
+            .filter(|declarations| !declarations.is_empty())?;
+        let mut earliest = None;
+        for declaration in declarations {
+            let Some(SourceNodeParent::Parent(parent)) = store.source_node_parent(*declaration)
+            else {
+                return None;
+            };
+            let owner_index = owner_declarations
+                .iter()
+                .position(|owner_declaration| *owner_declaration == parent)?;
+            if !declaration.is_for(parent.arena, parent.file)
+                || !seen_declarations.insert(*declaration)
+            {
+                return None;
+            }
+            let position = (owner_index, *declaration);
+            if earliest.is_none_or(|current| position < current) {
+                earliest = Some(position);
+            }
+        }
+        let (owner_index, declaration) = earliest?;
         if record.name() != name
-            || record.parent() != Some(owner)
-            || !declaration.is_for(owner_declaration.arena, owner_declaration.file)
-            || store.source_node_parent(declaration)
-                != Some(SourceNodeParent::Parent(owner_declaration))
+            || store.get_parent_of_symbol(property) != Some(owner)
             || !valid_property_symbol(store, property)
         {
             return None;
         }
-        properties.push(property);
+        properties.push((owner_index, declaration, property));
     }
-    properties.sort_unstable_by_key(|property| {
-        property_declaration(store, *property)
-            .expect("validated declared property retains its declaration")
-    });
+    properties.sort_unstable_by_key(|(owner_index, declaration, _)| (*owner_index, *declaration));
     if properties
         .windows(2)
-        .any(|pair| property_declaration(store, pair[0]) >= property_declaration(store, pair[1]))
+        .any(|pair| (pair[0].0, pair[0].1) >= (pair[1].0, pair[1].1))
     {
         return None;
     }
-    Some(properties)
-}
-
-fn property_declaration(
-    store: &CanonicalTypeMapperStore,
-    property: SemanticSymbolId,
-) -> Option<NodeRef> {
-    let [declaration] = store.symbol(property)?.declarations()? else {
-        return None;
-    };
-    Some(*declaration)
+    Some(
+        properties
+            .into_iter()
+            .map(|(_, _, property)| property)
+            .collect(),
+    )
 }
 
 fn valid_property_symbol(store: &CanonicalTypeMapperStore, property: SemanticSymbolId) -> bool {
     let Some(record) = store.symbol(property) else {
         return false;
     };
-    let Some(declaration) = property_declaration(store, property) else {
+    let Some(declarations) = record
+        .declarations()
+        .filter(|declarations| !declarations.is_empty())
+    else {
         return false;
     };
     let expected_flags = SymbolFlags::PROPERTY
@@ -579,16 +596,20 @@ fn valid_property_symbol(store: &CanonicalTypeMapperStore, property: SemanticSym
         };
     record.flags() == expected_flags
         && record.check_flags().bits() & !CheckFlags::READONLY.bits() == 0
-        && record.value_declaration() == Some(declaration)
+        && record
+            .value_declaration()
+            .is_some_and(|declaration| declarations.contains(&declaration))
         && record.members().is_none()
         && record.exports().is_none()
         && record.parent().is_some()
         && record.export_symbol().is_none()
         && store.get_merged_symbol(property) == Some(property)
-        && matches!(
-            store.source_node_kind(declaration),
-            Some(SyntaxKind::PropertyDeclaration | SyntaxKind::PropertySignature)
-        )
+        && declarations.iter().all(|declaration| {
+            matches!(
+                store.source_node_kind(*declaration),
+                Some(SyntaxKind::PropertyDeclaration | SyntaxKind::PropertySignature)
+            )
+        })
         && store.value_symbol_links(property).is_some_and(|links| {
             let Some(type_) = links.resolved_type else {
                 return false;

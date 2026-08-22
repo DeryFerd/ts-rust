@@ -2331,7 +2331,111 @@ fn union_result(
     }
 }
 
+/// Compares conditional operands, including concrete fixed tuple wrappers.
+pub(super) fn conditional_check_is_assignable(
+    store: &mut CanonicalTypeMapperStore,
+    source: TypeId,
+    target: TypeId,
+    global_types: Option<&CanonicalGlobalTypes>,
+) -> Result<bool, ConditionalTypeError> {
+    validate_owned_type(store, source)?;
+    validate_owned_type(store, target)?;
+    conditional_check_is_assignable_worker(store, source, target, global_types, &mut HashSet::new())
+}
+
 fn is_assignable(
+    store: &mut CanonicalTypeMapperStore,
+    source: TypeId,
+    target: TypeId,
+    global_types: Option<&CanonicalGlobalTypes>,
+) -> Result<bool, ConditionalTypeError> {
+    conditional_check_is_assignable(store, source, target, global_types)
+}
+
+fn conditional_check_is_assignable_worker(
+    store: &mut CanonicalTypeMapperStore,
+    source: TypeId,
+    target: TypeId,
+    global_types: Option<&CanonicalGlobalTypes>,
+    visiting: &mut HashSet<(TypeId, TypeId)>,
+) -> Result<bool, ConditionalTypeError> {
+    if source == target {
+        return Ok(true);
+    }
+    if !visiting.insert((source, target)) {
+        return Ok(true);
+    }
+    let result = if let (Some(source_shape), Some(target_shape)) = (
+        inference_tuple_shape(store, source)?,
+        inference_tuple_shape(store, target)?,
+    ) {
+        concrete_tuple_types_are_assignable(
+            store,
+            &source_shape,
+            &target_shape,
+            global_types,
+            visiting,
+        )
+    } else {
+        ordinary_assignability(store, source, target, global_types)
+    };
+    visiting.remove(&(source, target));
+    result
+}
+
+fn concrete_tuple_types_are_assignable(
+    store: &mut CanonicalTypeMapperStore,
+    source: &InferenceTupleShape,
+    target: &InferenceTupleShape,
+    global_types: Option<&CanonicalGlobalTypes>,
+    visiting: &mut HashSet<(TypeId, TypeId)>,
+) -> Result<bool, ConditionalTypeError> {
+    if source.readonly && !target.readonly {
+        return Ok(false);
+    }
+    let source_len = source.element_types.len();
+    let target_len = target.element_types.len();
+    if source_len < target.min_length {
+        return Ok(false);
+    }
+    let target_rest = target
+        .element_infos
+        .iter()
+        .position(|info| info.flags().intersects(ElementFlags::REST));
+    if target_rest.is_none() && source_len > target_len {
+        return Ok(false);
+    }
+    for (index, source_type) in source.element_types.iter().copied().enumerate() {
+        let target_index = if index < target_len {
+            index
+        } else if let Some(rest) = target_rest {
+            rest
+        } else {
+            return Ok(false);
+        };
+        if source.element_infos[index]
+            .flags()
+            .intersects(ElementFlags::OPTIONAL)
+            && target.element_infos[target_index]
+                .flags()
+                .intersects(ElementFlags::REQUIRED)
+        {
+            return Ok(false);
+        }
+        if !conditional_check_is_assignable_worker(
+            store,
+            source_type,
+            target.element_types[target_index],
+            global_types,
+            visiting,
+        )? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn ordinary_assignability(
     store: &mut CanonicalTypeMapperStore,
     source: TypeId,
     target: TypeId,
@@ -2711,6 +2815,90 @@ mod tests {
         .unwrap();
         let expected = canonical_anonymous_union(&mut fixture.store, &[number, boolean]).unwrap();
         assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn naked_any_uses_both_branches_but_tuple_wrapped_any_uses_only_the_true_branch() {
+        let mut naked = Fixture::new("type T = any extends number ? 1 : 0;");
+        let naked_node = naked.conditional();
+        let bootstrap = naked.store.intrinsic_bootstrap().unwrap();
+        let (any, number) = (bootstrap.any_type, bootstrap.number_type);
+        let one = naked
+            .store
+            .regular_number_literal_type(ts_jsnum::Number::new(1.0))
+            .unwrap();
+        let zero = naked
+            .store
+            .regular_number_literal_type(ts_jsnum::Number::new(0.0))
+            .unwrap();
+        let naked_result = get_type_from_conditional_type(
+            &mut naked.store,
+            ConditionalTypeRequest {
+                node: naked_node,
+                check_type: any,
+                extends_type: number,
+                branches: branches(one, zero),
+                infer_type_parameters: &[],
+                outer_type_parameters: &[],
+                alias: None,
+            },
+            None,
+        )
+        .unwrap();
+        let TypeData::Union(union) = naked.store.type_payload(naked_result).unwrap().data() else {
+            panic!("a naked any conditional must retain both numeric branches")
+        };
+        assert!(union.union.types.contains(&one));
+        assert!(union.union.types.contains(&zero));
+
+        let mut wrapped = Fixture::new("type U = [any] extends [number] ? 1 : 0;");
+        let wrapped_node = wrapped.conditional();
+        let bootstrap = wrapped.store.intrinsic_bootstrap().unwrap();
+        let (any, number) = (bootstrap.any_type, bootstrap.number_type);
+        let one = wrapped
+            .store
+            .regular_number_literal_type(ts_jsnum::Number::new(1.0))
+            .unwrap();
+        let zero = wrapped
+            .store
+            .regular_number_literal_type(ts_jsnum::Number::new(0.0))
+            .unwrap();
+        let required = wrapped
+            .store
+            .create_tuple_element_info(ElementFlags::REQUIRED, None)
+            .unwrap();
+        let check = wrapped
+            .store
+            .create_canonical_tuple_type(CanonicalTupleTypeRequest::new(&[any], &[required], false))
+            .unwrap();
+        let extends = wrapped
+            .store
+            .create_canonical_tuple_type(CanonicalTupleTypeRequest::new(
+                &[number],
+                &[required],
+                false,
+            ))
+            .unwrap();
+        assert_eq!(
+            conditional_check_is_assignable(&mut wrapped.store, check, extends, None),
+            Ok(true)
+        );
+        assert_eq!(
+            get_type_from_conditional_type(
+                &mut wrapped.store,
+                ConditionalTypeRequest {
+                    node: wrapped_node,
+                    check_type: check,
+                    extends_type: extends,
+                    branches: branches(one, zero),
+                    infer_type_parameters: &[],
+                    outer_type_parameters: &[],
+                    alias: None,
+                },
+                None,
+            ),
+            Ok(one)
+        );
     }
 
     #[test]

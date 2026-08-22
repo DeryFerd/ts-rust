@@ -705,6 +705,8 @@ mod tests {
         let name = match &node.data {
             NodeData::ClassDeclaration(data) => data.name?,
             NodeData::InterfaceDeclaration(data) => data.name,
+            NodeData::ImportEqualsDeclaration(data) => data.name,
+            NodeData::ModuleDeclaration(data) => data.name,
             _ => return None,
         };
         identifier_text(arena, name)
@@ -1172,6 +1174,104 @@ mod tests {
             host.lookup_name(locals, EscapedNameRef::source("NS"), SymbolFlags::NAMESPACE,),
             Ok(Some(alias)),
         );
+        assert_eq!(
+            host.resolve_entity_name(entity, SymbolFlags::TYPE),
+            Ok(Some(target)),
+        );
+    }
+
+    #[test]
+    fn qualified_entity_names_follow_exported_namespace_import_equals_aliases() {
+        let file = FileId::new(714);
+        let mut fixture = fixture(&[(
+            file,
+            concat!(
+                "namespace Outer { ",
+                "export namespace Inner { export interface Shape {} } ",
+                "export import Visible = Inner; ",
+                "} ",
+                "type Value = Outer.Visible.Shape;",
+            ),
+            CanonicalModuleState::Script,
+        )]);
+        let outer = script_namespace_symbol(&fixture, file, "Outer");
+        let outer = merge_globals(&mut fixture, &[outer]);
+        let exports = fixture.store.symbol(outer).unwrap().exports().unwrap();
+        let inner = fixture
+            .store
+            .symbol_table(exports)
+            .unwrap()
+            .get_source("Inner")
+            .unwrap();
+        let alias = declaration_symbol(
+            &fixture,
+            named_declaration(
+                &fixture,
+                file,
+                SyntaxKind::ImportEqualsDeclaration,
+                "Visible",
+            ),
+        );
+        assert!(fixture.store.set_alias_symbol_links(
+            alias,
+            AliasSymbolLinks {
+                immediate_target: Some(inner),
+                alias_target: AliasTargetState::Resolved(inner),
+                ..AliasSymbolLinks::default()
+            },
+        ));
+        let target = declaration_symbol(
+            &fixture,
+            named_declaration(&fixture, file, SyntaxKind::InterfaceDeclaration, "Shape"),
+        );
+        let entity = type_alias_entity_name(&fixture, file, "Value");
+        let mut host = production_host(&fixture);
+
+        assert_eq!(
+            host.resolve_entity_name(entity, SymbolFlags::TYPE),
+            Ok(Some(target)),
+        );
+    }
+
+    #[test]
+    fn qualified_entity_names_follow_private_namespace_import_equals_aliases() {
+        let file = FileId::new(715);
+        let mut fixture = fixture(&[(
+            file,
+            concat!(
+                "namespace Outer { ",
+                "namespace Hidden { export interface Shape {} } ",
+                "import Local = Hidden; ",
+                "type Value = Local.Shape; ",
+                "}",
+            ),
+            CanonicalModuleState::Script,
+        )]);
+        let outer = script_namespace_symbol(&fixture, file, "Outer");
+        merge_globals(&mut fixture, &[outer]);
+        let hidden = declaration_symbol(
+            &fixture,
+            named_declaration(&fixture, file, SyntaxKind::ModuleDeclaration, "Hidden"),
+        );
+        let alias = declaration_symbol(
+            &fixture,
+            named_declaration(&fixture, file, SyntaxKind::ImportEqualsDeclaration, "Local"),
+        );
+        assert!(fixture.store.set_alias_symbol_links(
+            alias,
+            AliasSymbolLinks {
+                immediate_target: Some(hidden),
+                alias_target: AliasTargetState::Resolved(hidden),
+                ..AliasSymbolLinks::default()
+            },
+        ));
+        let target = declaration_symbol(
+            &fixture,
+            named_declaration(&fixture, file, SyntaxKind::InterfaceDeclaration, "Shape"),
+        );
+        let entity = type_alias_entity_name(&fixture, file, "Value");
+        let mut host = production_host(&fixture);
+
         assert_eq!(
             host.resolve_entity_name(entity, SymbolFlags::TYPE),
             Ok(Some(target)),

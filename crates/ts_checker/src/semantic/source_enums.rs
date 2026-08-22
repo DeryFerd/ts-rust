@@ -460,6 +460,13 @@ fn validate_materialization(
                 && store
                     .value_symbol_links(planned.symbol)
                     .is_some_and(|links| links.resolved_type == Some(materialized.fresh_type))
+                && store
+                    .symbol(planned.symbol)
+                    .and_then(|symbol| symbol.name().as_utf8())
+                    .is_none_or(|name| {
+                        enums::enum_value_member_type(store, result.value_type, name)
+                            == Some((planned.symbol, materialized.fresh_type))
+                    })
         });
     if valid_header && valid_members {
         Ok(())

@@ -430,9 +430,22 @@ fn plan_contextual_target_syntax_shape(
 ) -> Result<SourceContextualSignatureShape, SourceContextualArrowError> {
     let (function, alias) =
         contextual_function_type_syntax(store, host, type_node, None, &mut HashSet::new())?;
-    let plan = plan_function_type(store, host, function, alias, false, array_targets)
-        .map_err(|error| contextual_target_plan_error(error, type_node))?;
-    let return_type = plan.return_type;
+    let function_record = preflight_node(store, host, function)?;
+    let (parameter_count, return_type) = match function_record.kind {
+        SyntaxKind::FunctionType => {
+            let plan = plan_function_type(store, host, function, alias, false, array_targets)
+                .map_err(|error| contextual_target_plan_error(error, type_node))?;
+            (plan.parameters.len(), plan.return_type)
+        }
+        SyntaxKind::TypeLiteral | SyntaxKind::InterfaceDeclaration => {
+            contextual_declared_call_signature_shape(store, host, function, type_node)?
+        }
+        _ => {
+            return Err(contextual_unsupported(
+                SourceContextualArrowUnsupported::ContextualTargetSyntax(type_node),
+            ));
+        }
+    };
     let return_record = preflight_node(store, host, return_type)?;
     if return_record.kind != SyntaxKind::VoidKeyword {
         return Err(contextual_unsupported(
@@ -442,9 +455,130 @@ fn plan_contextual_target_syntax_shape(
     Ok(SourceContextualSignatureShape {
         call_signature_count: 1,
         type_parameter_count: 0,
-        parameter_count: plan.parameters.len(),
+        parameter_count,
         has_effective_rest: false,
     })
+}
+
+#[allow(clippy::too_many_lines)] // Keep one declared-call syntax and ownership proof atomic.
+fn contextual_declared_call_signature_shape(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    owner: NodeRef,
+    target: NodeRef,
+) -> Result<(usize, NodeRef), SourceContextualArrowError> {
+    let record = preflight_node(store, host, owner)?;
+    let (members, expected_owner_flags) = match &record.data {
+        NodeData::TypeLiteralNode(literal) if record.kind == SyntaxKind::TypeLiteral => {
+            (&literal.members, SymbolFlags::TYPE_LITERAL)
+        }
+        NodeData::InterfaceDeclaration(interface)
+            if record.kind == SyntaxKind::InterfaceDeclaration =>
+        {
+            (&interface.members, SymbolFlags::INTERFACE)
+        }
+        _ => {
+            return Err(contextual_invariant(
+                SourceContextualArrowInvariant::InvalidVariableType(owner),
+            ));
+        }
+    };
+    let bound = host.bound_file(owner).ok_or_else(|| {
+        contextual_invariant(SourceContextualArrowInvariant::InvalidVariableType(owner))
+    })?;
+    let owner_symbol = bound.symbol(owner).ok_or_else(|| {
+        contextual_invariant(SourceContextualArrowInvariant::InvalidVariableType(owner))
+    })?;
+    if store.get_merged_symbol(owner_symbol) != Some(owner_symbol)
+        || store
+            .symbol(owner_symbol)
+            .is_none_or(|symbol| !symbol.flags().contains(expected_owner_flags))
+    {
+        return Err(contextual_invariant(
+            SourceContextualArrowInvariant::InvalidVariableType(owner),
+        ));
+    }
+
+    let mut signature = None;
+    for member in &members.nodes {
+        let member = NodeRef::new(owner.arena, owner.file, *member);
+        let member_record = preflight_node(store, host, member)?;
+        if member_record.parent != Some(owner.node)
+            || !range_contains(record.range, member_record.range)
+        {
+            return Err(contextual_invariant(
+                SourceContextualArrowInvariant::InvalidVariableType(member),
+            ));
+        }
+        if member_record.kind == SyntaxKind::CallSignature && signature.replace(member).is_some() {
+            return Err(contextual_unsupported(
+                SourceContextualArrowUnsupported::ContextualSignatureCount(target),
+            ));
+        }
+    }
+    let Some(signature) = signature else {
+        return Err(contextual_unsupported(
+            SourceContextualArrowUnsupported::ContextualSignatureCount(target),
+        ));
+    };
+    let signature_record = preflight_node(store, host, signature)?;
+    let NodeData::CallSignatureDeclaration(call) = &signature_record.data else {
+        return Err(contextual_invariant(
+            SourceContextualArrowInvariant::InvalidVariableType(signature),
+        ));
+    };
+    if signature_record.flags.0 != 0
+        || call.full_signature.is_some()
+        || call.next_container.is_some()
+        || call.symbol.is_some()
+        || call.type_parameters.is_some()
+        || call.parameters.has_trailing_comma
+    {
+        return Err(contextual_unsupported(
+            SourceContextualArrowUnsupported::ContextualTargetSyntax(signature),
+        ));
+    }
+    let Some(return_id) = call.type_ else {
+        return Err(contextual_unsupported(
+            SourceContextualArrowUnsupported::ContextualTargetSyntax(signature),
+        ));
+    };
+    let return_type = NodeRef::new(signature.arena, signature.file, return_id);
+    let return_record = preflight_node(store, host, return_type)?;
+    if return_record.parent != Some(signature.node)
+        || !range_contains(signature_record.range, return_record.range)
+    {
+        return Err(contextual_invariant(
+            SourceContextualArrowInvariant::InvalidVariableType(return_type),
+        ));
+    }
+    for parameter in &call.parameters.nodes {
+        let parameter = NodeRef::new(signature.arena, signature.file, *parameter);
+        let parameter_record = preflight_node(store, host, parameter)?;
+        let NodeData::ParameterDeclaration(data) = &parameter_record.data else {
+            return Err(contextual_invariant(
+                SourceContextualArrowInvariant::InvalidVariableType(parameter),
+            ));
+        };
+        if parameter_record.kind != SyntaxKind::Parameter
+            || parameter_record.parent != Some(signature.node)
+            || !range_contains(signature_record.range, parameter_record.range)
+        {
+            return Err(contextual_invariant(
+                SourceContextualArrowInvariant::InvalidVariableType(parameter),
+            ));
+        }
+        if data.type_.is_none()
+            || data.dot_dot_dot_token.is_some()
+            || data.initializer.is_some()
+            || data.modifiers.is_some()
+        {
+            return Err(contextual_unsupported(
+                SourceContextualArrowUnsupported::ContextualTargetSyntax(parameter),
+            ));
+        }
+    }
+    Ok((call.parameters.nodes.len(), return_type))
 }
 
 #[allow(clippy::too_many_lines)] // Keep the read-only alias and intersection proof atomic.
@@ -458,6 +592,20 @@ fn contextual_function_type_syntax(
     let record = preflight_node(store, host, node)?;
     match (&record.kind, &record.data) {
         (SyntaxKind::FunctionType, NodeData::FunctionTypeNode(_)) => Ok((node, alias)),
+        (SyntaxKind::TypeLiteral, NodeData::TypeLiteralNode(literal)) => {
+            let has_call_signature = literal.members.nodes.iter().any(|member| {
+                let member = NodeRef::new(node.arena, node.file, *member);
+                host.node(member)
+                    .is_some_and(|record| record.kind == SyntaxKind::CallSignature)
+            });
+            if has_call_signature {
+                Ok((node, alias))
+            } else {
+                Err(contextual_unsupported(
+                    SourceContextualArrowUnsupported::ContextualTargetSyntax(node),
+                ))
+            }
+        }
         (SyntaxKind::ParenthesizedType, NodeData::ParenthesizedTypeNode(parenthesized)) => {
             let child = NodeRef::new(node.arena, node.file, parenthesized.type_);
             let child_record = preflight_node(store, host, child)?;
@@ -530,10 +678,21 @@ fn contextual_function_type_syntax(
                     SourceContextualArrowUnsupported::ContextualTargetSyntax(node),
                 ));
             };
-            if symbol_record.flags() != SymbolFlags::TYPE_ALIAS
-                || !host.symbol_matches(store, *declaration, symbol)
-                || !active_aliases.insert(symbol)
-            {
+            if !host.symbol_matches(store, *declaration, symbol) {
+                return Err(contextual_unsupported(
+                    SourceContextualArrowUnsupported::ContextualTargetSyntax(node),
+                ));
+            }
+            if symbol_record.flags() == SymbolFlags::INTERFACE {
+                let declaration_record = preflight_node(store, host, *declaration)?;
+                if declaration_record.kind == SyntaxKind::InterfaceDeclaration {
+                    return Ok((*declaration, None));
+                }
+                return Err(contextual_invariant(
+                    SourceContextualArrowInvariant::InvalidVariableType(*declaration),
+                ));
+            }
+            if symbol_record.flags() != SymbolFlags::TYPE_ALIAS || !active_aliases.insert(symbol) {
                 return Err(contextual_unsupported(
                     SourceContextualArrowUnsupported::ContextualTargetSyntax(node),
                 ));
@@ -1471,31 +1630,12 @@ pub(super) fn plan_source_arrow(
         exported,
     )
     .map_err(map_variable_error)?;
-    let owner_symbol = bound
-        .symbol(initializer)
-        .ok_or_else(|| invariant(SourceArrowInvariant::InvalidOwnerSymbol(initializer)))?;
-    if owner_symbol == variable_symbol
-        || store.symbol(owner_symbol).is_some_and(|symbol| {
-            symbol.flags() != SymbolFlags::FUNCTION
-                || symbol.name() != InternalSymbolName::Function.as_ref()
-        })
-    {
+    let (callable, body) = plan_source_arrow_value(store, host, initializer, array_targets)?;
+    if callable.owner_symbol == variable_symbol {
         return Err(invariant(SourceArrowInvariant::InvalidOwnerSymbol(
             initializer,
         )));
     }
-
-    let callable = plan_source_callable(store, host, initializer, owner_symbol, array_targets)
-        .map_err(map_callable_error)?;
-    if callable.family != SourceCallableFamily::ArrowFunction
-        || callable.declaration != initializer
-        || callable.owner_symbol != owner_symbol
-    {
-        return Err(invariant(SourceArrowInvariant::InvalidOwnerSymbol(
-            initializer,
-        )));
-    }
-    let body = plan_body(store, host, &callable)?;
     Ok(SourceArrowPlan {
         variable_declaration,
         variable_name,
@@ -1503,6 +1643,56 @@ pub(super) fn plan_source_arrow(
         callable,
         body,
     })
+}
+
+/// Proves an arrow callable and its body independently of its containing
+/// expression, without publishing checker state.
+pub(super) fn plan_source_arrow_value(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    declaration: NodeRef,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<(SourceCallablePlan, SourceArrowBodyPlan), SourceArrowError> {
+    let record = preflight_node(store, host, declaration)?;
+    let NodeData::ArrowFunction(arrow) = &record.data else {
+        return Err(unsupported(SourceArrowUnsupported::NonArrowInitializer(
+            declaration,
+        )));
+    };
+    if record.kind != SyntaxKind::ArrowFunction || arrow.facts != 0 {
+        return Err(invariant(SourceArrowInvariant::InvalidInitializer(
+            declaration,
+        )));
+    }
+    let bound = host
+        .bound_file(declaration)
+        .ok_or_else(|| invariant(SourceArrowInvariant::InvalidOwnerSymbol(declaration)))?;
+    let owner_symbol = bound
+        .symbol(declaration)
+        .ok_or_else(|| invariant(SourceArrowInvariant::InvalidOwnerSymbol(declaration)))?;
+    let owner = store
+        .symbol(owner_symbol)
+        .ok_or_else(|| invariant(SourceArrowInvariant::InvalidOwnerSymbol(declaration)))?;
+    if owner.flags() != SymbolFlags::FUNCTION
+        || owner.name() != InternalSymbolName::Function.as_ref()
+    {
+        return Err(invariant(SourceArrowInvariant::InvalidOwnerSymbol(
+            declaration,
+        )));
+    }
+
+    let callable = plan_source_callable(store, host, declaration, owner_symbol, array_targets)
+        .map_err(map_callable_error)?;
+    if callable.family != SourceCallableFamily::ArrowFunction
+        || callable.declaration != declaration
+        || callable.owner_symbol != owner_symbol
+    {
+        return Err(invariant(SourceArrowInvariant::InvalidOwnerSymbol(
+            declaration,
+        )));
+    }
+    let body = plan_body(store, host, &callable)?;
+    Ok((callable, body))
 }
 
 fn plan_body(
@@ -1904,6 +2094,87 @@ mod tests {
     }
 
     #[test]
+    fn nested_arrow_values_reuse_exact_callable_and_body_planning() {
+        for source in [
+            "const container = { run: (value: string): string => value };",
+            "const callbacks = [(value: number): number => value];",
+        ] {
+            let fixture = Fixture::new(source);
+            let declaration = fixture
+                .parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::ArrowFunction).then_some(NodeRef::new(
+                        fixture.parsed.arena.id(),
+                        fixture.file,
+                        node,
+                    ))
+                })
+                .unwrap();
+            let owner = fixture.bound.symbol(declaration).unwrap();
+            let before = (
+                fixture.store.type_len(),
+                fixture.store.symbol_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+            let host = fixture.host();
+
+            let (callable, body) =
+                plan_source_arrow_value(&fixture.store, &host, declaration, None).unwrap();
+            assert_eq!(callable.declaration, declaration);
+            assert_eq!(callable.owner_symbol, owner);
+            assert_eq!(callable.parameters.len(), 1);
+            assert!(matches!(
+                body,
+                SourceArrowBodyPlan::ConciseExpression { expression }
+                    if fixture.parsed.arena.get(expression.node).unwrap().kind
+                        == SyntaxKind::Identifier
+            ));
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.symbol_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                before,
+            );
+            assert!(
+                fixture
+                    .store
+                    .source_callable_type_for_owner(owner)
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn jsx_arrow_bodies_preserve_concise_and_return_expression_identity() {
+        let parsed = ts_parser::parse_jsx_source_file(concat!(
+            "const concise = (): unknown => <div />; ",
+            "const returned = (): unknown => { return <span />; };",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let fixture = Fixture::from_parsed(parsed);
+
+        let concise = fixture.plan(0).unwrap();
+        assert!(matches!(
+            concise.body,
+            SourceArrowBodyPlan::ConciseExpression { expression }
+                if fixture.parsed.arena.get(expression.node).unwrap().kind
+                    == SyntaxKind::JsxSelfClosingElement
+        ));
+
+        let returned = fixture.plan(1).unwrap();
+        assert!(matches!(
+            returned.body,
+            SourceArrowBodyPlan::ReturnExpression { expression, .. }
+                if fixture.parsed.arena.get(expression.node).unwrap().kind
+                    == SyntaxKind::JsxSelfClosingElement
+        ));
+    }
+
+    #[test]
     fn direct_arrows_preserve_var_let_const_and_exported_variable_ownership() {
         let fixture = Fixture::new(concat!(
             "var first = (): string => \"first\"; ",
@@ -2019,6 +2290,48 @@ mod tests {
                     .store
                     .source_callable_type_for_owner(owner)
                     .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn declared_contextual_call_signatures_preserve_type_literal_and_interface_identity() {
+        for source in [
+            concat!(
+                "const callback: { (input: string): void } = ",
+                "(input) => {};",
+            ),
+            concat!(
+                "type Callback = { (input: string): void; label?: string }; ",
+                "export const callback: Callback = (input) => {};",
+            ),
+            concat!(
+                "interface Callback { (input: string): void; label?: string } ",
+                "export const callback: Callback = (input) => {};",
+            ),
+        ] {
+            let fixture = Fixture::new(source);
+            let before = (
+                fixture.store.type_len(),
+                fixture.store.symbol_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+
+            let plan = fixture.contextual_plan(0).unwrap();
+            assert_eq!(plan.contextual_signature_shape.call_signature_count, 1);
+            assert_eq!(plan.contextual_signature_shape.parameter_count, 1);
+            assert_eq!(plan.parameters.len(), 1);
+            assert_eq!(
+                plan.parameters[0].request,
+                SourceContextualParameterRequest::Position { index: 0 },
+            );
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.symbol_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                before,
             );
         }
     }

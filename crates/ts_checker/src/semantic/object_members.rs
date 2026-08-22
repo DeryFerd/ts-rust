@@ -7,7 +7,7 @@
 //! are limited to pure nongeneric, fixed-arity call-signature members; mixed
 //! and optional/rest/construct forms remain explicit boundaries.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use ts_ast::{NodeData, NodeList, NodeRef, SyntaxKind};
 use ts_binder::{
@@ -114,6 +114,7 @@ pub(super) struct ResolvedCallSignatureTypes {
 pub(super) struct PropertyObjectPlan {
     pub kind: PropertyObjectKind,
     pub node: NodeRef,
+    pub declarations: Vec<NodeRef>,
     pub symbol: SemanticSymbolId,
     pub members: Option<SymbolTableId>,
     pub properties: Vec<PlannedProperty>,
@@ -582,6 +583,7 @@ pub(super) fn plan_object_literal(
         symbol,
         symbol_record.members(),
         &object.properties,
+        &[],
         None,
         TypeLiteralMemberPolicy::General,
     )
@@ -683,6 +685,7 @@ fn plan_type_literal_with_policy(
         symbol,
         symbol_record.members(),
         &literal.members,
+        &[],
         alias_symbol,
         policy,
     )
@@ -709,7 +712,7 @@ pub(super) fn plan_interface(
     // independently of its value side. A function-scoped value declaration
     // such as the standard library's `declare var Object` is therefore inert
     // for this property-only interface plan.
-    let mut declaration = None;
+    let mut interface_declarations = Vec::new();
     let mut value_declarations = Vec::new();
     let mut seen_declarations = HashSet::new();
     for candidate in declarations {
@@ -732,16 +735,8 @@ pub(super) fn plan_interface(
             });
         }
         match (record.kind, &record.data) {
-            (SyntaxKind::InterfaceDeclaration, NodeData::InterfaceDeclaration(_))
-                if declaration.is_none() =>
-            {
-                declaration = Some(*candidate);
-            }
             (SyntaxKind::InterfaceDeclaration, NodeData::InterfaceDeclaration(_)) => {
-                return Err(PropertyObjectError::UnsupportedMember {
-                    node: *candidate,
-                    kind: SyntaxKind::InterfaceDeclaration,
-                });
+                interface_declarations.push(*candidate);
             }
             (SyntaxKind::VariableDeclaration, NodeData::VariableDeclaration(_)) => {
                 value_declarations.push(*candidate);
@@ -754,9 +749,95 @@ pub(super) fn plan_interface(
             }
         }
     }
-    let Some(declaration) = declaration else {
+    let Some(&declaration) = interface_declarations.first() else {
         return Err(PropertyObjectError::InvalidInterfaceSymbol(symbol));
     };
+    let expected_symbol_flags = SymbolFlags::INTERFACE
+        | if value_declarations.is_empty() {
+            SymbolFlags::NONE
+        } else {
+            SymbolFlags::FUNCTION_SCOPED_VARIABLE
+        };
+    let valid_value_declaration = match symbol_record.value_declaration() {
+        None => value_declarations.is_empty(),
+        Some(value) => value_declarations.contains(&value),
+    };
+    if symbol_record.flags() != expected_symbol_flags
+        || symbol_record.check_flags() != CheckFlags::NONE
+        || !valid_value_declaration
+        || symbol_record.exports().is_some()
+        || symbol_record.export_symbol().is_some()
+    {
+        return Err(PropertyObjectError::InvalidInterface {
+            declaration,
+            symbol,
+        });
+    }
+    let mut additional_members = Vec::with_capacity(interface_declarations.len() - 1);
+    let mut heritage = None;
+    for (index, &candidate) in interface_declarations.iter().enumerate() {
+        let invalid = || PropertyObjectError::InvalidInterface {
+            declaration: candidate,
+            symbol,
+        };
+        let record = preflight_node(store, host, candidate).map_err(|_| invalid())?;
+        let NodeData::InterfaceDeclaration(interface) = &record.data else {
+            return Err(invalid());
+        };
+        let name = NodeRef::new(candidate.arena, candidate.file, interface.name);
+        let name_record = preflight_node(store, host, name).map_err(|_| invalid())?;
+        let NodeData::Identifier(identifier) = &name_record.data else {
+            return Err(invalid());
+        };
+        let expected_parent = declared_type_declaration_parent(
+            store,
+            host,
+            candidate,
+            symbol,
+            name,
+            interface.modifiers.as_ref(),
+        )
+        .map_err(|()| invalid())?;
+        if record.kind != SyntaxKind::InterfaceDeclaration
+            || record.flags.0 != 0
+            || !host.symbol_matches(store, candidate, symbol)
+            || symbol_record.name().as_utf8() != Some(identifier.text.as_str())
+            || symbol_record.parent().is_some() != expected_parent.is_some()
+            || store.get_parent_of_symbol(symbol) != expected_parent
+            || name_record.kind != SyntaxKind::Identifier
+            || name_record.parent != Some(candidate.node)
+            || interface.flow_node.is_some()
+            || interface.local_symbol.is_some()
+            || interface.symbol.is_some()
+            || interface.type_parameters.is_some()
+            || interface.members.has_trailing_comma
+            || interface.members.range.start < record.range.start
+            || interface.members.range.end != record.range.end
+        {
+            return Err(invalid());
+        }
+        if let Some(clauses) = interface.heritage_clauses.as_ref() {
+            if interface_declarations.len() != 1 || heritage.is_some() {
+                return Err(PropertyObjectError::UnsupportedMember {
+                    node: candidate,
+                    kind: SyntaxKind::InterfaceDeclaration,
+                });
+            }
+            heritage = Some(
+                plan_direct_interface_heritage(store, host, candidate, symbol, clauses).map_err(
+                    |error| match error {
+                        DirectInterfaceHeritageError::Invalid => invalid(),
+                        DirectInterfaceHeritageError::Unsupported { node, kind } => {
+                            PropertyObjectError::UnsupportedMember { node, kind }
+                        }
+                    },
+                )?,
+            );
+        }
+        if index != 0 {
+            additional_members.push((candidate, &interface.members));
+        }
+    }
     let record = preflight_node(store, host, declaration).map_err(|_| {
         PropertyObjectError::InvalidInterface {
             declaration,
@@ -769,85 +850,6 @@ pub(super) fn plan_interface(
             symbol,
         });
     };
-    let name = NodeRef::new(declaration.arena, declaration.file, interface.name);
-    let name_record =
-        preflight_node(store, host, name).map_err(|_| PropertyObjectError::InvalidInterface {
-            declaration,
-            symbol,
-        })?;
-    let NodeData::Identifier(identifier) = &name_record.data else {
-        return Err(PropertyObjectError::InvalidInterface {
-            declaration,
-            symbol,
-        });
-    };
-    let expected_parent = declared_type_declaration_parent(
-        store,
-        host,
-        declaration,
-        symbol,
-        name,
-        interface.modifiers.as_ref(),
-    )
-    .map_err(|()| PropertyObjectError::InvalidInterface {
-        declaration,
-        symbol,
-    })?;
-    let expected_symbol_flags = SymbolFlags::INTERFACE
-        | if value_declarations.is_empty() {
-            SymbolFlags::NONE
-        } else {
-            SymbolFlags::FUNCTION_SCOPED_VARIABLE
-        };
-    let valid_value_declaration = match symbol_record.value_declaration() {
-        None => value_declarations.is_empty(),
-        Some(value) => value_declarations.contains(&value),
-    };
-    if record.kind != SyntaxKind::InterfaceDeclaration
-        || record.flags.0 != 0
-        || !host.symbol_matches(store, declaration, symbol)
-        || symbol_record.flags() != expected_symbol_flags
-        || symbol_record.check_flags() != CheckFlags::NONE
-        || symbol_record.name().as_utf8() != Some(identifier.text.as_str())
-        || !valid_value_declaration
-        || symbol_record.parent().is_some() != expected_parent.is_some()
-        || store.get_parent_of_symbol(symbol) != expected_parent
-        || symbol_record.exports().is_some()
-        || symbol_record.export_symbol().is_some()
-        || name_record.kind != SyntaxKind::Identifier
-        || name_record.parent != Some(declaration.node)
-        || interface.flow_node.is_some()
-        || interface.local_symbol.is_some()
-        || interface.symbol.is_some()
-        || interface.type_parameters.is_some()
-        || interface.members.has_trailing_comma
-        || interface.members.range.start < record.range.start
-        || interface.members.range.end != record.range.end
-    {
-        return Err(PropertyObjectError::InvalidInterface {
-            declaration,
-            symbol,
-        });
-    }
-    let heritage = interface
-        .heritage_clauses
-        .as_ref()
-        .map(|clauses| {
-            plan_direct_interface_heritage(store, host, declaration, symbol, clauses).map_err(
-                |error| match error {
-                    DirectInterfaceHeritageError::Invalid => {
-                        PropertyObjectError::InvalidInterface {
-                            declaration,
-                            symbol,
-                        }
-                    }
-                    DirectInterfaceHeritageError::Unsupported { node, kind } => {
-                        PropertyObjectError::UnsupportedMember { node, kind }
-                    }
-                },
-            )
-        })
-        .transpose()?;
     let mut plan = plan_members(
         store,
         host,
@@ -856,6 +858,7 @@ pub(super) fn plan_interface(
         symbol,
         symbol_record.members(),
         &interface.members,
+        &additional_members,
         None,
         TypeLiteralMemberPolicy::General,
     )?;
@@ -1042,6 +1045,7 @@ pub(super) fn plan_generic_interface(
         symbol,
         Some(raw_members),
         &interface.members,
+        &[],
         None,
         TypeLiteralMemberPolicy::GenericInterface,
     )?;
@@ -1328,12 +1332,20 @@ fn plan_members(
     symbol: SemanticSymbolId,
     members: Option<SymbolTableId>,
     member_nodes: &NodeList,
+    additional_members: &[(NodeRef, &NodeList)],
     alias_symbol: Option<SemanticSymbolId>,
     policy: TypeLiteralMemberPolicy,
 ) -> Result<PropertyObjectPlan, PropertyObjectError> {
     let provisional = PropertyObjectPlan {
         kind,
         node,
+        declarations: std::iter::once(node)
+            .chain(
+                additional_members
+                    .iter()
+                    .map(|(declaration, _)| *declaration),
+            )
+            .collect(),
         symbol,
         members,
         properties: Vec::new(),
@@ -1342,9 +1354,19 @@ fn plan_members(
         alias_symbol,
         heritage: None,
     };
-    if kind != PropertyObjectKind::ObjectLiteral && member_nodes.has_trailing_comma
+    let member_count = additional_members
+        .iter()
+        .try_fold(member_nodes.nodes.len(), |count, (_, members)| {
+            count.checked_add(members.nodes.len())
+        })
+        .ok_or(PropertyObjectError::Capacity(node))?;
+    if kind != PropertyObjectKind::ObjectLiteral
+        && (member_nodes.has_trailing_comma
+            || additional_members
+                .iter()
+                .any(|(_, members)| members.has_trailing_comma))
         || policy != TypeLiteralMemberPolicy::GenericInterface
-            && members.is_some() == member_nodes.nodes.is_empty()
+            && members.is_some() == (member_count == 0)
         || policy == TypeLiteralMemberPolicy::GenericInterface && members.is_none()
     {
         return Err(invalid_plan(&provisional));
@@ -1354,16 +1376,40 @@ fn plan_members(
         return Err(invalid_plan(&provisional));
     }
 
-    let owner_record = preflight_node(store, host, node).map_err(|_| invalid_plan(&provisional))?;
-    let mut previous_end = member_nodes.range.start;
     let mut seen_nodes = HashSet::new();
+    let mut member_entries = Vec::with_capacity(member_count);
+    for (owner, group) in
+        std::iter::once((node, member_nodes)).chain(additional_members.iter().copied())
+    {
+        let owner_record =
+            preflight_node(store, host, owner).map_err(|_| invalid_plan(&provisional))?;
+        let mut previous_end = group.range.start;
+        for member in &group.nodes {
+            let member = NodeRef::new(owner.arena, owner.file, *member);
+            let member_record =
+                preflight_node(store, host, member).map_err(|_| invalid_plan(&provisional))?;
+            if member_record.parent != Some(owner.node)
+                || member_record.flags.0 & NODE_FLAG_JSDOC != 0
+                || member_record.range.start < previous_end
+                || member_record.range.start < group.range.start
+                || member_record.range.end > group.range.end
+                || member_record.range.start < owner_record.range.start
+                || member_record.range.end > owner_record.range.end
+                || !seen_nodes.insert(member)
+            {
+                return Err(invalid_plan(&provisional));
+            }
+            previous_end = member_record.range.end;
+            member_entries.push((owner, member));
+        }
+    }
     let mut seen_symbols = HashSet::new();
     let mut seen_names = HashSet::new();
-    let mut properties = Vec::with_capacity(member_nodes.nodes.len());
+    let mut planned_symbol_declarations = HashMap::<SemanticSymbolId, Vec<NodeRef>>::new();
+    let mut properties = Vec::with_capacity(member_count);
     let mut indexes = Vec::with_capacity(1);
-    let mut call_signatures = Vec::with_capacity(member_nodes.nodes.len());
-    for member in &member_nodes.nodes {
-        let member = NodeRef::new(node.arena, node.file, *member);
+    let mut call_signatures = Vec::with_capacity(member_count);
+    for (member_owner, member) in member_entries {
         let member_record =
             preflight_node(store, host, member).map_err(|_| invalid_plan(&provisional))?;
         let admitted_kind = match kind {
@@ -1392,27 +1438,23 @@ fn plan_members(
                 kind: member_record.kind,
             });
         }
-        if member_record.parent != Some(node.node)
-            || member_record.flags.0 & NODE_FLAG_JSDOC != 0
-            || member_record.range.start < previous_end
-            || member_record.range.start < member_nodes.range.start
-            || member_record.range.end > member_nodes.range.end
-            || member_record.range.start < owner_record.range.start
-            || member_record.range.end > owner_record.range.end
-            || !seen_nodes.insert(member)
-        {
-            return Err(invalid_plan(&provisional));
-        }
-        previous_end = member_record.range.end;
-
         if member_record.kind == SyntaxKind::CallSignature {
-            call_signatures.push(plan_call_signature(store, host, node, symbol, member)?);
+            call_signatures.push(plan_call_signature(
+                store,
+                host,
+                member_owner,
+                symbol,
+                member,
+            )?);
             continue;
         }
 
         if member_record.kind == SyntaxKind::IndexSignature {
-            let index = plan_index_signature(store, host, node, symbol, member)?;
-            if policy == TypeLiteralMemberPolicy::General && !indexes.is_empty() {
+            let index = plan_index_signature(store, host, member_owner, symbol, member)?;
+            if kind != PropertyObjectKind::Interface
+                && policy == TypeLiteralMemberPolicy::General
+                && !indexes.is_empty()
+            {
                 return Err(PropertyObjectError::UnsupportedMember {
                     node: member,
                     kind: SyntaxKind::IndexSignature,
@@ -1502,8 +1544,26 @@ fn plan_members(
             NodeData::Identifier(identifier) if name_record.kind == SyntaxKind::Identifier => {
                 identifier.text.clone()
             }
+            NodeData::StringLiteral(literal)
+                if kind != PropertyObjectKind::TypeLiteral
+                    && name_record.kind == SyntaxKind::StringLiteral =>
+            {
+                literal.text.clone()
+            }
+            NodeData::NumericLiteral(literal)
+                if kind != PropertyObjectKind::TypeLiteral
+                    && name_record.kind == SyntaxKind::NumericLiteral =>
+            {
+                literal.text.clone()
+            }
+            NodeData::NoSubstitutionTemplateLiteral(literal)
+                if kind != PropertyObjectKind::TypeLiteral
+                    && name_record.kind == SyntaxKind::NoSubstitutionTemplateLiteral =>
+            {
+                literal.text.clone()
+            }
             NodeData::ComputedPropertyName(computed)
-                if kind == PropertyObjectKind::ObjectLiteral
+                if kind != PropertyObjectKind::TypeLiteral
                     && name_record.kind == SyntaxKind::ComputedPropertyName =>
             {
                 let expression = NodeRef::new(name.arena, name.file, computed.expression);
@@ -1550,7 +1610,6 @@ fn plan_members(
         if name_record.parent != Some(member.node)
             || name_record.range.start < member_record.range.start
             || name_record.range.end > member_record.range.end
-            || !seen_names.insert(property_name.clone())
         {
             return Err(invalid_plan(&provisional));
         }
@@ -1604,12 +1663,18 @@ fn plan_members(
                 SymbolFlags::NONE
             };
         let expected_check_flags = source_property_check_flags(readonly);
+        let symbol_declarations = property_record.declarations().unwrap_or_default();
+        let declarations_valid = if kind == PropertyObjectKind::Interface {
+            !symbol_declarations.is_empty() && symbol_declarations.contains(&member)
+        } else {
+            symbol_declarations == [member].as_slice()
+        };
         if property_record.flags() != expected_flags
             || (property_record.check_flags() != CheckFlags::NONE
                 && property_record.check_flags() != expected_check_flags)
             || property_record.name().as_utf8() != Some(property_name.as_str())
-            || property_record.declarations() != Some(&[member])
-            || property_record.value_declaration() != Some(member)
+            || !declarations_valid
+            || property_record.value_declaration() != symbol_declarations.first().copied()
             || property_record.members().is_some()
             || property_record.exports().is_some()
             || property_record.export_symbol().is_some()
@@ -1617,9 +1682,40 @@ fn plan_members(
                 .parent()
                 .and_then(|parent| store.get_merged_symbol(parent))
                 != Some(symbol)
-            || !seen_symbols.insert(property_symbol)
             || table.and_then(|table| table.get_source(&property_name)) != Some(property_symbol)
         {
+            return Err(invalid_plan(&provisional));
+        }
+        planned_symbol_declarations
+            .entry(property_symbol)
+            .or_default()
+            .push(member);
+        if !seen_symbols.insert(property_symbol) {
+            let Some(existing) = properties
+                .iter()
+                .find(|planned: &&PlannedProperty| planned.symbol == property_symbol)
+            else {
+                return Err(invalid_plan(&provisional));
+            };
+            if kind != PropertyObjectKind::Interface
+                || existing.name != property_name
+                || existing.optional != optional
+                || existing.readonly != readonly
+                || !equivalent_merged_property_annotations(
+                    store,
+                    host,
+                    existing.type_node,
+                    type_node,
+                )
+            {
+                return Err(PropertyObjectError::UnsupportedMember {
+                    node: member,
+                    kind: member_record.kind,
+                });
+            }
+            continue;
+        }
+        if !seen_names.insert(property_name.clone()) {
             return Err(invalid_plan(&provisional));
         }
         properties.push(PlannedProperty {
@@ -1633,14 +1729,30 @@ fn plan_members(
         });
     }
 
+    if planned_symbol_declarations
+        .iter()
+        .any(|(property, declarations)| {
+            store
+                .symbol(*property)
+                .and_then(ts_binder::semantic::Symbol::declarations)
+                != Some(declarations.as_slice())
+        })
+    {
+        return Err(invalid_plan(&provisional));
+    }
+
     let mut seen_index_kinds = HashSet::with_capacity(indexes.len());
     for index in &indexes {
-        let Some(kind @ (SyntaxKind::StringKeyword | SyntaxKind::NumberKeyword)) =
-            store.source_node_kind(index.key_type_node)
+        let Some(
+            kind @ (SyntaxKind::StringKeyword
+            | SyntaxKind::NumberKeyword
+            | SyntaxKind::SymbolKeyword
+            | SyntaxKind::TemplateLiteralType),
+        ) = store.source_node_kind(index.key_type_node)
         else {
             return Err(invalid_plan(&provisional));
         };
-        if !seen_index_kinds.insert(kind) {
+        if kind != SyntaxKind::TemplateLiteralType && !seen_index_kinds.insert(kind) {
             return Err(PropertyObjectError::UnsupportedMember {
                 node: index.declaration,
                 kind: SyntaxKind::IndexSignature,
@@ -1698,7 +1810,14 @@ fn plan_members(
             return Err(invalid_plan(&provisional));
         }
     }
-    if policy == TypeLiteralMemberPolicy::General && !indexes.is_empty() && !properties.is_empty() {
+    if kind != PropertyObjectKind::Interface
+        && policy == TypeLiteralMemberPolicy::General
+        && !indexes.is_empty()
+        && !properties.is_empty()
+        && indexes.iter().any(|index| {
+            store.source_node_kind(index.key_type_node) != Some(SyntaxKind::TemplateLiteralType)
+        })
+    {
         return Err(PropertyObjectError::UnsupportedMember {
             node: indexes[0].declaration,
             kind: SyntaxKind::IndexSignature,
@@ -1733,6 +1852,43 @@ fn plan_members(
         call_signatures,
         ..provisional
     })
+}
+
+fn equivalent_merged_property_annotations(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    first: NodeRef,
+    second: NodeRef,
+) -> bool {
+    let (Ok(first_record), Ok(second_record)) = (
+        preflight_node(store, host, first),
+        preflight_node(store, host, second),
+    ) else {
+        return false;
+    };
+    if first_record.kind != second_record.kind {
+        return false;
+    }
+    if first_record.kind.is_keyword_type() {
+        return true;
+    }
+    let Some((first_arena, _)) = host.source(first) else {
+        return false;
+    };
+    let Some((second_arena, _)) = host.source(second) else {
+        return false;
+    };
+    let Some(first_source) = first_arena.source_text() else {
+        return false;
+    };
+    let Some(second_source) = second_arena.source_text() else {
+        return false;
+    };
+    let first_text = first_source
+        .get(first_record.range.start.get() as usize..first_record.range.end.get() as usize);
+    let second_text = second_source
+        .get(second_record.range.start.get() as usize..second_record.range.end.get() as usize);
+    first_text.is_some() && first_text == second_text
 }
 
 fn plan_call_signature(
@@ -1987,7 +2143,10 @@ fn plan_index_signature(
     let key_record = preflight_node(store, host, key_type_node).map_err(|_| unsupported())?;
     if !matches!(
         key_record.kind,
-        SyntaxKind::StringKeyword | SyntaxKind::NumberKeyword
+        SyntaxKind::StringKeyword
+            | SyntaxKind::NumberKeyword
+            | SyntaxKind::SymbolKeyword
+            | SyntaxKind::TemplateLiteralType
     ) || key_record.parent != Some(parameter.node)
         || key_record.range.start < name_record.range.end
         || key_record.range.end > parameter_record.range.end
@@ -2417,9 +2576,19 @@ fn validate_interface_record(
     let TypeData::Interface(interface) = record.data() else {
         return None;
     };
+    let owner = store.symbol(plan.symbol)?;
+    let exact_declarations = owner
+        .declarations()?
+        .iter()
+        .copied()
+        .filter(|declaration| {
+            store.source_node_kind(*declaration) == Some(SyntaxKind::InterfaceDeclaration)
+        })
+        .eq(plan.declarations.iter().copied());
     if record.flags() != TypeFlags::OBJECT
         || record.symbol() != Some(plan.symbol)
         || record.alias().is_some()
+        || !exact_declarations
         || !valid_thisless_interface_identity(interface)
     {
         return None;
@@ -2672,10 +2841,10 @@ fn classify_declared_owner_members(
     store: &CanonicalTypeMapperStore,
     owner: SemanticSymbolId,
 ) -> DeclaredOwnerMemberDomain {
-    let Some(owner) = store.symbol(owner) else {
+    let Some(owner_record) = store.symbol(owner) else {
         return DeclaredOwnerMemberDomain::Malformed;
     };
-    let Some(members) = owner.members() else {
+    let Some(members) = owner_record.members() else {
         return DeclaredOwnerMemberDomain::PropertyOnly;
     };
     let Some(table) = store.symbol_table(members) else {
@@ -2713,7 +2882,9 @@ fn classify_declared_owner_members(
                                 )
                             )
                     }) {
-                        domain = DeclaredOwnerMemberDomain::Unsupported;
+                        if !owner_record.flags().contains(SymbolFlags::INTERFACE) {
+                            return DeclaredOwnerMemberDomain::Malformed;
+                        }
                     } else {
                         return DeclaredOwnerMemberDomain::Malformed;
                     }
@@ -2745,9 +2916,7 @@ fn validate_resolved_property_interface(
     record: &TypeRecord,
     interface: &InterfaceTypeData,
 ) -> DetailedDeclaredPropertyObjectValidation {
-    use DetailedDeclaredPropertyObjectValidation::{
-        Malformed, NotDeclared, TraversableBoundary, Valid,
-    };
+    use DetailedDeclaredPropertyObjectValidation::{Malformed, TraversableBoundary, Valid};
 
     let structured = &interface.reference.object.structured;
     if record.object_flags() != ObjectFlags::INTERFACE | ObjectFlags::MEMBERS_RESOLVED
@@ -2777,7 +2946,6 @@ fn validate_resolved_property_interface(
     ) {
         DeclaredPropertyOwnerValidation::Valid(declaration) => (declaration, false),
         DeclaredPropertyOwnerValidation::TraversableBoundary(declaration) => (declaration, true),
-        DeclaredPropertyOwnerValidation::Unsupported => return NotDeclared,
         DeclaredPropertyOwnerValidation::Malformed => return Malformed,
     };
     if validate_declared_property_members(store, owner, declaration, structured) {
@@ -2821,9 +2989,6 @@ fn validate_resolved_property_type_literal(
     ) {
         DeclaredPropertyOwnerValidation::Valid(declaration) => (declaration, false),
         DeclaredPropertyOwnerValidation::TraversableBoundary(declaration) => (declaration, true),
-        DeclaredPropertyOwnerValidation::Unsupported => {
-            return DetailedDeclaredPropertyObjectValidation::NotDeclared;
-        }
         DeclaredPropertyOwnerValidation::Malformed => return Malformed,
     };
     if validate_declared_property_members(store, owner, declaration, &object.structured) {
@@ -2853,7 +3018,6 @@ fn valid_resolved_declared_structured_shell(object: &ObjectTypeData) -> bool {
 enum DeclaredPropertyOwnerValidation {
     Valid(NodeRef),
     TraversableBoundary(NodeRef),
-    Unsupported,
     Malformed,
 }
 
@@ -2864,7 +3028,7 @@ fn validate_declared_property_owner(
     members: Option<SymbolTableId>,
     proof: DeclaredPropertyObjectProof,
 ) -> DeclaredPropertyOwnerValidation {
-    use DeclaredPropertyOwnerValidation::{Malformed, TraversableBoundary, Unsupported, Valid};
+    use DeclaredPropertyOwnerValidation::{Malformed, TraversableBoundary, Valid};
 
     let Some(owner_record) = store.symbol(owner) else {
         return Malformed;
@@ -2882,17 +3046,16 @@ fn validate_declared_property_owner(
         ),
     };
     let declarations = owner_record.declarations().unwrap_or_default();
-    if declarations.len() != 1 {
-        let mut unique = HashSet::with_capacity(declarations.len());
-        return if declarations.len() > 1
-            && declarations.iter().all(|declaration| {
-                unique.insert(*declaration)
-                    && store.source_node_kind(*declaration) == Some(expected_kind)
-            }) {
-            Unsupported
-        } else {
-            Malformed
-        };
+    if declarations.is_empty()
+        || proof != DeclaredPropertyObjectProof::Interface && declarations.len() != 1
+    {
+        return Malformed;
+    }
+    let mut unique = HashSet::with_capacity(declarations.len());
+    if !declarations.iter().all(|declaration| {
+        unique.insert(*declaration) && store.source_node_kind(*declaration) == Some(expected_kind)
+    }) {
+        return Malformed;
     }
     let declaration = declarations[0];
     if store.get_merged_symbol(owner) != Some(owner)
@@ -2922,7 +3085,9 @@ fn validate_declared_property_owner(
         || owner_record.exports().is_some()
         || owner_record.export_symbol().is_some();
     if proof == DeclaredPropertyObjectProof::Interface
-        && declaration_has_external_owner_shape(store, declaration)
+        && declarations
+            .iter()
+            .any(|declaration| declaration_has_external_owner_shape(store, *declaration))
     {
         TraversableBoundary(declaration)
     } else if has_owner_relationship {
@@ -3057,6 +3222,13 @@ fn validate_declared_property_members(
     owner_declaration: NodeRef,
     structured: &StructuredTypeData,
 ) -> bool {
+    let Some(owner_record) = store.symbol(owner) else {
+        return false;
+    };
+    let owner_declarations = owner_record.declarations().unwrap_or_default();
+    if !owner_declarations.contains(&owner_declaration) {
+        return false;
+    }
     let properties = match structured.properties.as_deref() {
         None => &[][..],
         Some(properties) if !properties.is_empty() => properties,
@@ -3072,7 +3244,7 @@ fn validate_declared_property_members(
     };
     let mut seen_properties = HashSet::with_capacity(properties.len());
     let mut seen_declarations = HashSet::with_capacity(properties.len());
-    let mut previous_declaration = None;
+    let mut previous_position = None;
     for property in properties {
         if !seen_properties.insert(*property) {
             return false;
@@ -3080,9 +3252,20 @@ fn validate_declared_property_members(
         let Some(property_record) = store.symbol(*property) else {
             return false;
         };
-        let [declaration] = property_record.declarations().unwrap_or_default() else {
+        let declarations = property_record.declarations().unwrap_or_default();
+        let Some(&declaration) = declarations.first() else {
             return false;
         };
+        let Some(SourceNodeParent::Parent(parent)) = store.source_node_parent(declaration) else {
+            return false;
+        };
+        let Some(owner_index) = owner_declarations
+            .iter()
+            .position(|candidate| *candidate == parent)
+        else {
+            return false;
+        };
+        let position = (owner_index, declaration);
         let allowed_flags = SymbolFlags::PROPERTY | SymbolFlags::OPTIONAL;
         if !property_record.flags().contains(SymbolFlags::PROPERTY)
             || property_record.flags().without(allowed_flags) != SymbolFlags::NONE
@@ -3091,22 +3274,31 @@ fn validate_declared_property_members(
             || property_record.name().is_private_identifier()
             || property_record.name().is_late_bound()
             || property_record.name().as_utf8().is_none()
-            || property_record.value_declaration() != Some(*declaration)
-            || property_record.parent() != Some(owner)
+            || property_record.value_declaration() != Some(declaration)
+            || store.get_parent_of_symbol(*property) != Some(owner)
             || property_record.members().is_some()
             || property_record.exports().is_some()
             || property_record.export_symbol().is_some()
             || store.get_merged_symbol(*property) != Some(*property)
-            || !matches!(
-                store.source_node_kind(*declaration),
-                Some(SyntaxKind::PropertyDeclaration | SyntaxKind::PropertySignature)
-            )
-            || !declaration.is_for(owner_declaration.arena, owner_declaration.file)
-            || *declaration >= owner_declaration
-            || previous_declaration.is_some_and(|previous| previous >= *declaration)
-            || !seen_declarations.insert(*declaration)
+            || previous_position.is_some_and(|previous| previous >= position)
             || table.and_then(|table| table.get(property_record.name())) != Some(*property)
         {
+            return false;
+        }
+        if !declarations.iter().all(|declaration| {
+            let Some(SourceNodeParent::Parent(parent)) = store.source_node_parent(*declaration)
+            else {
+                return false;
+            };
+            owner_declarations.contains(&parent)
+                && declaration.is_for(parent.arena, parent.file)
+                && *declaration < parent
+                && matches!(
+                    store.source_node_kind(*declaration),
+                    Some(SyntaxKind::PropertyDeclaration | SyntaxKind::PropertySignature)
+                )
+                && seen_declarations.insert(*declaration)
+        }) {
             return false;
         }
         let Some(links) = store.value_symbol_links(*property) else {
@@ -3124,7 +3316,7 @@ fn validate_declared_property_members(
         {
             return false;
         }
-        previous_declaration = Some(*declaration);
+        previous_position = Some(position);
     }
     table.is_none_or(|table| {
         table.iter().all(|(name, property)| {
@@ -3228,18 +3420,13 @@ fn valid_declared_index_infos(
     if indexes.len() != plan.indexes.len() || plan.indexes.is_empty() != index_infos.is_none() {
         return false;
     }
-    let Some(bootstrap) = store.intrinsic_bootstrap() else {
-        return false;
-    };
     let mut seen = HashSet::with_capacity(indexes.len());
     indexes.iter().zip(&plan.indexes).all(|(id, planned)| {
         if !seen.insert(*id) {
             return false;
         }
-        let expected_key = match store.source_node_kind(planned.key_type_node) {
-            Some(SyntaxKind::StringKeyword) => bootstrap.string_type,
-            Some(SyntaxKind::NumberKeyword) => bootstrap.number_type,
-            _ => return false,
+        let Some(expected_key) = cached_planned_type_identity(store, planned.key_type_node) else {
+            return false;
         };
         store.index_info(*id).is_some_and(|info| {
             info.key_type() == expected_key
@@ -3741,21 +3928,14 @@ pub(super) fn publish_declared_members(
         return Err(invalid_cache(plan, type_));
     }
 
-    let Some(bootstrap) = store.intrinsic_bootstrap() else {
-        return Err(invalid_cache(plan, type_));
-    };
     let mut seen_keys = HashSet::with_capacity(index_types.len());
     let valid_indexes = plan
         .indexes
         .iter()
         .zip(index_types)
         .all(|(planned, (key_type, _))| {
-            let expected = match store.source_node_kind(planned.key_type_node) {
-                Some(SyntaxKind::StringKeyword) => bootstrap.string_type,
-                Some(SyntaxKind::NumberKeyword) => bootstrap.number_type,
-                _ => return false,
-            };
-            *key_type == expected && seen_keys.insert(*key_type)
+            cached_planned_type_identity(store, planned.key_type_node) == Some(*key_type)
+                && seen_keys.insert(*key_type)
         });
     if !valid_indexes {
         return Err(invalid_cache(plan, type_));
@@ -4352,8 +4532,9 @@ mod generic_publication_tests {
 
     use super::*;
     use crate::semantic::{
-        IntrinsicBootstrapOptions, declared::get_declared_class_interface_or_type_parameter,
-        production::GlobalMergeCompletion,
+        CanonicalCheckerDiagnostics, CanonicalCheckerOptions, IntrinsicBootstrapOptions,
+        declared::get_declared_class_interface_or_type_parameter,
+        production::GlobalMergeCompletion, type_nodes::CanonicalTypeQuery,
     };
 
     struct Fixture {
@@ -4365,9 +4546,16 @@ mod generic_publication_tests {
     }
 
     fn fixture() -> Fixture {
-        let parsed = parse_source_file("interface Box<T> { value: T; readonly label: string }");
+        interface_fixture(
+            "interface Box<T> { value: T; readonly label: string }",
+            3_701,
+        )
+    }
+
+    fn interface_fixture(source: &str, file: u32) -> Fixture {
+        let parsed = parse_source_file(source);
         assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
-        let file = FileId::new(3_701);
+        let file = FileId::new(file);
         let mut binder = CanonicalBinder::new();
         binder
             .bind_source_file_with_facts(
@@ -4597,6 +4785,153 @@ mod generic_publication_tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn merged_interface_properties_publish_once_in_declaration_order() {
+        let mut fixture = interface_fixture(
+            "interface Item { first: string; shared: number } \
+             interface Item { shared: number; second: boolean }",
+            3_706,
+        );
+        let host = host(&fixture.parsed, &fixture.bound);
+        let plan = plan_interface(&fixture.store, &host, fixture.symbol).unwrap();
+        assert_eq!(plan.declarations.len(), 2);
+        assert_eq!(
+            plan.properties
+                .iter()
+                .map(|property| property.name.as_str())
+                .collect::<Vec<_>>(),
+            ["first", "shared", "second"]
+        );
+        assert_eq!(
+            fixture
+                .store
+                .symbol(plan.properties[1].symbol)
+                .and_then(ts_binder::semantic::Symbol::declarations)
+                .map(<[NodeRef]>::len),
+            Some(2)
+        );
+
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let type_ = CanonicalTypeQuery::new(
+            &mut fixture.store,
+            &host,
+            CanonicalCheckerOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap()
+        .get_declared_type_of_symbol(fixture.symbol)
+        .unwrap();
+        assert_eq!(
+            validate_resolved_declared_property_object(&fixture.store, type_),
+            DeclaredPropertyObjectValidation::Valid(DeclaredPropertyObjectProof::Interface)
+        );
+        let warm = (
+            fixture.store.type_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+        assert_eq!(
+            CanonicalTypeQuery::new(
+                &mut fixture.store,
+                &host,
+                CanonicalCheckerOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_declared_type_of_symbol(fixture.symbol),
+            Ok(type_)
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            warm
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn merged_interfaces_keep_quoted_properties_and_template_pattern_indexes() {
+        let mut fixture = interface_fixture(
+            "interface Attributes { key?: string } \
+             interface Attributes { \
+                [key: `do-${string}`]: number; \
+                'ns:thing'?: string; \
+             }",
+            3_707,
+        );
+        let host = host(&fixture.parsed, &fixture.bound);
+        let plan = plan_interface(&fixture.store, &host, fixture.symbol).unwrap();
+        assert_eq!(
+            plan.properties
+                .iter()
+                .map(|property| property.name.as_str())
+                .collect::<Vec<_>>(),
+            ["key", "ns:thing"]
+        );
+        let [index] = plan.indexes.as_slice() else {
+            panic!("merged interface must retain its template index")
+        };
+        assert_eq!(
+            fixture.store.source_node_kind(index.key_type_node),
+            Some(SyntaxKind::TemplateLiteralType)
+        );
+
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let type_ = CanonicalTypeQuery::new(
+            &mut fixture.store,
+            &host,
+            CanonicalCheckerOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap()
+        .get_declared_type_of_symbol(fixture.symbol)
+        .unwrap();
+        let TypeData::Interface(interface) = fixture.store.type_payload(type_).unwrap().data()
+        else {
+            panic!("merged declaration must publish one interface type")
+        };
+        let [index] = interface.declared_index_infos.as_deref().unwrap() else {
+            panic!("merged declaration must publish one template index")
+        };
+        assert!(
+            fixture
+                .store
+                .type_payload(fixture.store.index_info(*index).unwrap().key_type())
+                .unwrap()
+                .flags()
+                .contains(TypeFlags::TEMPLATE_LITERAL)
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn incompatible_merged_property_annotations_fail_before_publication() {
+        let fixture = interface_fixture(
+            "interface Item { value: string } interface Item { value: number }",
+            3_708,
+        );
+        let host = host(&fixture.parsed, &fixture.bound);
+        let before = (
+            fixture.store.type_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+        assert!(matches!(
+            plan_interface(&fixture.store, &host, fixture.symbol),
+            Err(PropertyObjectError::UnsupportedMember {
+                kind: SyntaxKind::PropertyDeclaration | SyntaxKind::PropertySignature,
+                ..
+            })
+        ));
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            before
+        );
     }
 
     #[test]

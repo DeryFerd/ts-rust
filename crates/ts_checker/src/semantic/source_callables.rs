@@ -31,7 +31,7 @@ use super::{
     signatures::{Signature, SignatureFlags},
     store::{
         PreparedSourceGenericCallablePublication, ResolvedSourceCallableTypeParameter,
-        SourceCallableProvenance, SourceCallableReturnProvenance,
+        SemanticStore, SourceCallableProvenance, SourceCallableReturnProvenance,
         SourceCallableTypeParameterProvenance, SourceNodeParent,
     },
     type_records::{ConstrainedTypeData, StructuredTypeData, TypeCacheState, TypeData, TypeRecord},
@@ -1214,12 +1214,7 @@ fn plan_exact_source_type_parameters(
             previous_child_end = bound_record.range.end;
         }
         if let (Some(constraint), Some(default_type)) = (constraint, default_type)
-            && !source_type_parameter_bounds_have_exact_identity(
-                store,
-                host,
-                constraint,
-                default_type,
-            )?
+            && !source_type_parameter_bounds_are_compatible(store, host, constraint, default_type)?
         {
             return Err(SourceCallableError::Unsupported(
                 SourceCallableUnsupported::GenericSignature(default_type),
@@ -1284,6 +1279,9 @@ fn is_exact_source_type_parameter_bound(
     ) {
         return Ok(true);
     }
+    if source_type_parameter_literal_kind(store, host, bound)?.is_some() {
+        return Ok(true);
+    }
     for type_parameter in earlier {
         if is_naked_source_type_parameter_annotation(store, host, bound, type_parameter)? {
             return Ok(true);
@@ -1292,7 +1290,7 @@ fn is_exact_source_type_parameter_bound(
     Ok(false)
 }
 
-fn source_type_parameter_bounds_have_exact_identity(
+fn source_type_parameter_bounds_are_compatible(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     constraint: NodeRef,
@@ -1301,7 +1299,22 @@ fn source_type_parameter_bounds_have_exact_identity(
     let constraint_record = preflight_node(store, host, constraint)?;
     let default_record = preflight_node(store, host, default_type)?;
     if constraint_record.kind.is_keyword_type() || default_record.kind.is_keyword_type() {
-        return Ok(constraint_record.kind == default_record.kind);
+        if constraint_record.kind == default_record.kind {
+            return Ok(true);
+        }
+        let literal_kind = source_type_parameter_literal_kind(store, host, default_type)?;
+        return Ok(matches!(
+            (constraint_record.kind, literal_kind),
+            (SyntaxKind::AnyKeyword | SyntaxKind::UnknownKeyword, Some(_))
+                | (SyntaxKind::StringKeyword, Some(SyntaxKind::StringLiteral))
+                | (SyntaxKind::NumberKeyword, Some(SyntaxKind::NumericLiteral))
+                | (SyntaxKind::BigIntKeyword, Some(SyntaxKind::BigIntLiteral))
+                | (
+                    SyntaxKind::BooleanKeyword,
+                    Some(SyntaxKind::TrueKeyword | SyntaxKind::FalseKeyword)
+                )
+                | (SyntaxKind::NullKeyword, Some(SyntaxKind::NullKeyword))
+        ));
     }
     let (
         NodeData::TypeReferenceNode(constraint_reference),
@@ -1339,6 +1352,64 @@ fn source_type_parameter_bounds_have_exact_identity(
         && constraint_identifier.text == default_identifier.text)
 }
 
+fn source_type_parameter_literal_kind(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    node: NodeRef,
+) -> Result<Option<SyntaxKind>, SourceCallableError> {
+    let record = preflight_node(store, host, node)?;
+    let NodeData::LiteralTypeNode(literal) = &record.data else {
+        return Ok(None);
+    };
+    if record.kind != SyntaxKind::LiteralType {
+        return Err(invariant(SourceCallableInvariant::InvalidSyntax(node)));
+    }
+    let literal = NodeRef::new(node.arena, node.file, literal.literal);
+    let literal_record = preflight_node(store, host, literal)?;
+    if literal_record.parent != Some(node.node) || literal_record.range != record.range {
+        return Err(invariant(SourceCallableInvariant::InvalidSyntax(node)));
+    }
+    Ok(matches!(
+        literal_record.kind,
+        SyntaxKind::StringLiteral
+            | SyntaxKind::NumericLiteral
+            | SyntaxKind::BigIntLiteral
+            | SyntaxKind::TrueKeyword
+            | SyntaxKind::FalseKeyword
+            | SyntaxKind::NullKeyword
+    )
+    .then_some(literal_record.kind))
+}
+
+/// Checks the primitive/literal default relationships admitted by source generics.
+pub(super) fn source_type_parameter_default_is_assignable<MapperPayload>(
+    store: &SemanticStore<TypeRecord, MapperPayload>,
+    constraint: TypeId,
+    default_type: TypeId,
+) -> bool {
+    if constraint == default_type {
+        return true;
+    }
+    let (Some(constraint_record), Some(default_record)) = (
+        store.type_payload(constraint),
+        store.type_payload(default_type),
+    ) else {
+        return false;
+    };
+    let constraint_flags = constraint_record.flags();
+    let default_flags = default_record.flags();
+    constraint_flags.intersects(TypeFlags::ANY_OR_UNKNOWN)
+        || default_flags.intersects(TypeFlags::NEVER)
+        || constraint_flags.intersects(TypeFlags::STRING)
+            && default_flags.intersects(TypeFlags::STRING_LITERAL)
+        || constraint_flags.intersects(TypeFlags::NUMBER)
+            && default_flags.intersects(TypeFlags::NUMBER_LITERAL)
+        || constraint_flags.intersects(TypeFlags::BIG_INT)
+            && default_flags.intersects(TypeFlags::BIG_INT_LITERAL)
+        || constraint_flags.intersects(TypeFlags::BOOLEAN)
+            && default_flags.intersects(TypeFlags::BOOLEAN_LITERAL)
+}
+
 fn validate_exact_generic_annotation_shape(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -1372,7 +1443,6 @@ fn validate_exact_generic_annotation_shape(
             )?;
         }
         if parameter.is_implicit_any()
-            || parameter.optional
             || parameter.initializer.is_some()
             || parameter.rest
             || !exact
@@ -3657,19 +3727,67 @@ fn valid_stored_generic_source_signature(
     if type_parameters.is_empty() {
         return true;
     }
+    let Ok(minimum_argument_count) = usize::try_from(signature.min_argument_count()) else {
+        return false;
+    };
     signature.flags() == SignatureFlags::NONE
-        && usize::try_from(signature.min_argument_count()).ok()
-            == Some(signature.parameters().len())
+        && minimum_argument_count <= signature.parameters().len()
         && parameter_types.is_none_or(|types| {
             types.len() == signature.parameters().len()
-                && types.iter().all(|type_| {
+                && types.iter().enumerate().all(|(index, type_)| {
                     valid_generic_source_parameter_type(
                         store,
                         array_targets,
                         *type_,
                         type_parameters,
-                    )
+                    ) || index >= minimum_argument_count
+                        && valid_optional_generic_source_parameter_type(
+                            store,
+                            array_targets,
+                            *type_,
+                            type_parameters,
+                        )
                 })
+        })
+}
+
+fn valid_optional_generic_source_parameter_type(
+    store: &CanonicalTypeMapperStore,
+    array_targets: Option<CanonicalArrayTargets>,
+    type_: TypeId,
+    type_parameters: &[TypeId],
+) -> bool {
+    let Some(undefined) = store
+        .intrinsic_bootstrap()
+        .map(|bootstrap| bootstrap.undefined_type)
+    else {
+        return false;
+    };
+    let Some(record) = store.type_payload(type_) else {
+        return false;
+    };
+    let TypeData::Union(union) = record.data() else {
+        return false;
+    };
+    if record.alias().is_some()
+        || union.origin.is_some()
+        || union.union.types.len() != 2
+        || !union.union.types.contains(&undefined)
+        || store
+            .intrinsic_bootstrap()
+            .and_then(|bootstrap| bootstrap.cached_union_type(&union.union.types))
+            != Some(type_)
+    {
+        return false;
+    }
+    union
+        .union
+        .types
+        .iter()
+        .copied()
+        .filter(|candidate| *candidate != undefined)
+        .all(|candidate| {
+            valid_generic_source_parameter_type(store, array_targets, candidate, type_parameters)
         })
 }
 
@@ -3882,9 +4000,9 @@ fn valid_stored_source_type_parameters(
         };
         let trailing_default_valid = !default_seen || provenance.default_type.is_some();
         default_seen |= provenance.default_type.is_some();
-        let exact_constraint_default_pair = provenance.constraint.is_none()
+        let compatible_constraint_default_pair = provenance.constraint.is_none()
             || provenance.default_type.is_none()
-            || constraint == default_type;
+            || source_type_parameter_default_is_assignable(store, constraint, default_type);
         if symbol_record.flags() != SymbolFlags::TYPE_PARAMETER
             || symbol_record.check_flags() != CheckFlags::NONE
             || symbol_record.value_declaration().is_some()
@@ -3900,7 +4018,7 @@ fn valid_stored_source_type_parameters(
             || !constraint_valid
             || !default_valid
             || !trailing_default_valid
-            || !exact_constraint_default_pair
+            || !compatible_constraint_default_pair
         {
             return None;
         }
@@ -6366,6 +6484,127 @@ mod tests {
                     .unwrap();
             assert_eq!(plan.parameters.len(), 1);
             assert_eq!(plan.generic_return_type_parameter_index, Some(0));
+        }
+    }
+
+    #[test]
+    fn optional_generic_signatures_preserve_reduced_arity_cold_and_warm() {
+        for (index, (source, expected_minimum, expected_parameters)) in [
+            ("declare function optional<T>(value?: T): T;", 0, 1),
+            (
+                "declare function fallback<T, U = T>(value: T, next?: U): U;",
+                1,
+                2,
+            ),
+            ("function direct<T>(value?: T): T { return value; }", 0, 1),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut fixture =
+                QueryFixture::new(source, FileId::new(1_110 + u32::try_from(index).unwrap()));
+            let (declaration, _, _, _) = fixture.generic_parts();
+            let owner = fixture.bound.symbol(declaration).unwrap();
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&fixture.parsed.arena, &fixture.bound)],
+                GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+            )
+            .unwrap();
+            let plan = plan_source_callable(&fixture.store, &host, declaration, owner, None)
+                .unwrap_or_else(|error| panic!("{source}: {error:?}"));
+            assert_eq!(plan.min_argument_count, expected_minimum);
+            assert_eq!(plan.parameters.len(), expected_parameters);
+            assert!(plan.parameters.last().unwrap().optional);
+            drop(host);
+
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            let callable = fixture
+                .query_callable(declaration, owner, &mut diagnostics)
+                .unwrap_or_else(|error| panic!("{source}: {error:?}"));
+            let signature = fixture
+                .store
+                .source_callable_provenance(callable)
+                .unwrap()
+                .signature;
+            assert_eq!(
+                fixture
+                    .store
+                    .signature(signature)
+                    .unwrap()
+                    .min_argument_count(),
+                expected_minimum
+            );
+            assert!(matches!(
+                validate_stored_source_callable(&fixture.store, callable),
+                StoredSourceCallableValidation::Valid(_)
+            ));
+            let warm = generic_transaction_state(&fixture.store);
+            assert_eq!(
+                fixture.query_callable(declaration, owner, &mut diagnostics),
+                Ok(callable)
+            );
+            assert_eq!(generic_transaction_state(&fixture.store), warm);
+            assert!(diagnostics.is_empty());
+        }
+    }
+
+    #[test]
+    fn primitive_constraints_accept_compatible_literal_default_syntax() {
+        for (index, source) in [
+            "declare function numeric<T extends number = 1>(value: T): T;",
+            "declare function text<T extends string = 'ready'>(value: T): T;",
+            "declare function truth<T extends boolean = true>(value: T): T;",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let fixture =
+                QueryFixture::new(source, FileId::new(1_120 + u32::try_from(index).unwrap()));
+            let (declaration, _, _, _) = fixture.generic_parts();
+            let owner = fixture.bound.symbol(declaration).unwrap();
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&fixture.parsed.arena, &fixture.bound)],
+                GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+            )
+            .unwrap();
+            let before = generic_transaction_state(&fixture.store);
+
+            let plan = plan_source_callable(&fixture.store, &host, declaration, owner, None)
+                .unwrap_or_else(|error| panic!("{source}: {error:?}"));
+            assert!(plan.type_parameters[0].constraint.is_some());
+            assert!(plan.type_parameters[0].default_type.is_some());
+            assert_eq!(generic_transaction_state(&fixture.store), before);
+        }
+    }
+
+    #[test]
+    fn incompatible_literal_defaults_are_rejected_before_publication() {
+        for (index, source) in [
+            "declare function text<T extends string = 1>(value: T): T;",
+            "declare function numeric<T extends number = 'wrong'>(value: T): T;",
+            "declare function truth<T extends boolean = 1>(value: T): T;",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let fixture =
+                QueryFixture::new(source, FileId::new(1_130 + u32::try_from(index).unwrap()));
+            let (declaration, _, _, _) = fixture.generic_parts();
+            let owner = fixture.bound.symbol(declaration).unwrap();
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&fixture.parsed.arena, &fixture.bound)],
+                GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+            )
+            .unwrap();
+            let before = generic_transaction_state(&fixture.store);
+
+            assert!(matches!(
+                plan_source_callable(&fixture.store, &host, declaration, owner, None),
+                Err(SourceCallableError::Unsupported(
+                    SourceCallableUnsupported::GenericSignature(_)
+                ))
+            ));
+            assert_eq!(generic_transaction_state(&fixture.store), before);
         }
     }
 

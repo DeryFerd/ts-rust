@@ -136,6 +136,7 @@ pub(super) struct ClassDeclarationPlan {
     declaration: NodeRef,
     symbol: SemanticSymbolId,
     base: Option<DirectClassBasePlan>,
+    implementations: Vec<DirectClassImplementationPlan>,
     constructor: Option<ClassConstructorPlan>,
     instance_members: Option<SymbolTableId>,
     static_members: SymbolTableId,
@@ -189,6 +190,14 @@ impl ClassDeclarationPlan {
 /// Exact direct-identifier edge retained by the class query and source plan.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct DirectClassBasePlan {
+    clause: NodeRef,
+    node: NodeRef,
+    expression: NodeRef,
+    symbol: SemanticSymbolId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DirectClassImplementationPlan {
     clause: NodeRef,
     node: NodeRef,
     expression: NodeRef,
@@ -1158,6 +1167,141 @@ fn plan_direct_class_base(
     })
 }
 
+fn plan_empty_class_implementations(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    declaration: NodeRef,
+    owner: SemanticSymbolId,
+    clauses: &ts_ast::NodeList,
+) -> Result<Vec<DirectClassImplementationPlan>, ClassError> {
+    let [clause_id] = clauses.nodes.as_slice() else {
+        return Err(unsupported(ClassUnsupported::Heritage(declaration)));
+    };
+    let clause = NodeRef::new(declaration.arena, declaration.file, *clause_id);
+    let clause_record = preflight_node(store, host, clause)?;
+    let NodeData::HeritageClause(data) = &clause_record.data else {
+        return Err(invariant(ClassInvariant::InvalidHeritage(clause)));
+    };
+    if clauses.has_trailing_comma
+        || clause_record.kind != SyntaxKind::HeritageClause
+        || clause_record.parent != Some(declaration.node)
+        || clause_record.flags.0 != 0
+        || data.facts != 0
+        || data.token != SyntaxKind::ImplementsKeyword
+        || data.types.has_trailing_comma
+        || data.types.nodes.is_empty()
+    {
+        return Err(unsupported(ClassUnsupported::Heritage(clause)));
+    }
+
+    let declaration_record = preflight_node(store, host, declaration)?;
+    let mut implementations = Vec::new();
+    implementations
+        .try_reserve_exact(data.types.nodes.len())
+        .map_err(|_| invariant(ClassInvariant::Capacity(declaration)))?;
+    let mut previous_end = data.types.range.start;
+    for implementation in &data.types.nodes {
+        let node = NodeRef::new(declaration.arena, declaration.file, *implementation);
+        let record = preflight_node(store, host, node)?;
+        let NodeData::ExpressionWithTypeArguments(target) = &record.data else {
+            return Err(unsupported(ClassUnsupported::Heritage(node)));
+        };
+        if record.kind != SyntaxKind::ExpressionWithTypeArguments
+            || record.parent != Some(clause.node)
+            || record.flags.0 != 0
+            || record.range.start < previous_end
+            || record.range.end > data.types.range.end
+            || target.facts != 0
+            || target.type_arguments.is_some()
+        {
+            return Err(unsupported(ClassUnsupported::Heritage(node)));
+        }
+        previous_end = record.range.end;
+
+        let expression = NodeRef::new(declaration.arena, declaration.file, target.expression);
+        let expression_record = preflight_node(store, host, expression)?;
+        let NodeData::Identifier(identifier) = &expression_record.data else {
+            return Err(unsupported(ClassUnsupported::Heritage(expression)));
+        };
+        if expression_record.kind != SyntaxKind::Identifier
+            || expression_record.parent != Some(node.node)
+            || expression_record.flags.0 != 0
+            || identifier.flow_node.is_some()
+            || expression_record.range.start < record.range.start
+            || expression_record.range.end > record.range.end
+        {
+            return Err(invariant(ClassInvariant::InvalidHeritage(expression)));
+        }
+
+        let (arena, bound) = host
+            .source(expression)
+            .ok_or_else(|| invariant(ClassInvariant::InvalidHeritage(expression)))?;
+        let mut callback_host = host.name_resolver_host(store)?;
+        let raw =
+            CanonicalNameResolver::new(arena, bound, store.symbol_store(), &mut callback_host)
+                .map_err(|_| invariant(ClassInvariant::InvalidHeritage(expression)))?
+                .resolve(
+                    Some(CanonicalResolutionLocation::Bound(expression)),
+                    &identifier.text,
+                    SymbolFlags::TYPE,
+                    None,
+                    false,
+                    false,
+                )
+                .map_err(|_| unsupported(ClassUnsupported::Heritage(expression)))?
+                .ok_or_else(|| unsupported(ClassUnsupported::Heritage(expression)))?;
+        let symbol = store
+            .get_merged_symbol(raw)
+            .ok_or_else(|| invariant(ClassInvariant::InvalidHeritage(expression)))?;
+        let target_record = store
+            .symbol(symbol)
+            .ok_or_else(|| invariant(ClassInvariant::InvalidHeritage(expression)))?;
+        let Some([target_declaration]) = target_record.declarations() else {
+            return Err(unsupported(ClassUnsupported::Heritage(expression)));
+        };
+        let target_declaration = *target_declaration;
+        let target_syntax = preflight_node(store, host, target_declaration)?;
+        let valid_target = match &target_syntax.data {
+            NodeData::ClassDeclaration(class) => {
+                target_record.flags() == SymbolFlags::CLASS
+                    && class.type_parameters.is_none()
+                    && class.heritage_clauses.is_none()
+            }
+            NodeData::InterfaceDeclaration(interface) => {
+                target_record.flags() == SymbolFlags::INTERFACE
+                    && interface.type_parameters.is_none()
+                    && interface.heritage_clauses.is_none()
+            }
+            _ => false,
+        };
+        let no_instance_members = target_record.members().is_none_or(|members| {
+            store.symbol_table(members).is_some_and(|table| {
+                table
+                    .iter()
+                    .all(|(name, _)| name == InternalSymbolName::Constructor.as_ref())
+            })
+        });
+        if symbol == owner
+            || !target_declaration.is_for(declaration.arena, declaration.file)
+            || target_syntax.range.end > declaration_record.range.start
+            || !valid_target
+            || !no_instance_members
+            || implementations
+                .iter()
+                .any(|current: &DirectClassImplementationPlan| current.symbol == symbol)
+        {
+            return Err(unsupported(ClassUnsupported::Heritage(expression)));
+        }
+        implementations.push(DirectClassImplementationPlan {
+            clause,
+            node,
+            expression,
+            symbol,
+        });
+    }
+    Ok(implementations)
+}
+
 /// Produces the opaque syntax/binder proof consumed by the class shell
 /// executor and the root annotation adapter.
 fn plan_class_declaration(
@@ -1224,16 +1368,38 @@ fn plan_class_declaration(
     if class.type_parameters.is_some() {
         return Err(unsupported(ClassUnsupported::Generic(declaration)));
     }
-    let base = match class.heritage_clauses.as_ref() {
-        None => None,
-        Some(clauses) if allow_direct_base => Some(plan_direct_class_base(
-            store,
-            host,
-            declaration,
-            symbol,
-            clauses,
-        )?),
-        Some(_) => return Err(unsupported(ClassUnsupported::Heritage(declaration))),
+    let (base, implementations) = match class.heritage_clauses.as_ref() {
+        None => (None, Vec::new()),
+        Some(clauses) => {
+            let implements = clauses.nodes.first().is_some_and(|clause| {
+                let clause = NodeRef::new(declaration.arena, declaration.file, *clause);
+                host.node(clause).is_some_and(|record| {
+                    matches!(
+                        &record.data,
+                        NodeData::HeritageClause(data) if data.token == SyntaxKind::ImplementsKeyword
+                    )
+                })
+            });
+            if implements {
+                (
+                    None,
+                    plan_empty_class_implementations(store, host, declaration, symbol, clauses)?,
+                )
+            } else if allow_direct_base {
+                (
+                    Some(plan_direct_class_base(
+                        store,
+                        host,
+                        declaration,
+                        symbol,
+                        clauses,
+                    )?),
+                    Vec::new(),
+                )
+            } else {
+                return Err(unsupported(ClassUnsupported::Heritage(declaration)));
+            }
+        }
     };
     let Some(name) = class.name else {
         return Err(invariant(ClassInvariant::InvalidDeclaration(declaration)));
@@ -1410,6 +1576,7 @@ fn plan_class_declaration(
         declaration,
         symbol,
         base,
+        implementations,
         constructor,
         instance_members,
         static_members,
@@ -4053,7 +4220,7 @@ mod tests {
 
     use super::*;
     use crate::semantic::{
-        IntrinsicBootstrapOptions, SemanticStore,
+        CanonicalCheckerContext, CanonicalCheckerOptions, IntrinsicBootstrapOptions, SemanticStore,
         declared::type_list_key,
         mapper::TypeMapper,
         production::GlobalMergeCompletion,
@@ -4154,6 +4321,73 @@ mod tests {
         fixture.files[&fixture.file]
             .symbol(class_node(fixture, name))
             .unwrap()
+    }
+
+    #[test]
+    fn empty_local_class_implements_clause_has_no_runtime_base() {
+        let mut fixture = fixture("class A {} class C implements A { static make() {} }");
+        let target = class_symbol(&fixture, "A");
+        let owner = class_symbol(&fixture, "C");
+        let bound = &fixture.files[&fixture.file];
+        let host = host(&fixture.parsed.arena, bound);
+        let plan = plan_nongeneric_class_member_query(&fixture.store, &host, owner).unwrap();
+        let ClassMemberQueryPlan::Direct(class) = &plan else {
+            panic!("implements does not install a runtime base")
+        };
+        assert_eq!(class.class.implementations.len(), 1);
+        assert_eq!(class.class.implementations[0].symbol, target);
+
+        let members =
+            execute_nongeneric_class_member_query(&mut fixture.store, &host, &plan).unwrap();
+
+        assert_eq!(members.base(), None);
+        assert_eq!(
+            validate_class_heritage_members(&fixture.store, members.shells().instance_type()),
+            ClassHeritageMembersValidation::Valid
+        );
+        assert!(fixture.store.declared_type_links(target).is_none());
+    }
+
+    #[test]
+    fn empty_local_class_and_interface_implements_clauses_check_from_source() {
+        for (index, source) in [
+            "class A {} class C implements A {}",
+            "interface Empty {} class C implements Empty {}",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let parsed = parse_source_file(source);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let file = FileId::new(300 + u32::try_from(index).unwrap());
+            let mut binder = CanonicalBinder::new();
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new(
+                        EscapedName::source("\"/implements.ts\""),
+                        CanonicalSourceLanguage::TypeScript,
+                        false,
+                        CanonicalModuleState::Script,
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+            let mut context = CanonicalCheckerContext::new(
+                binder.finish(),
+                [(file, &parsed.arena)].into_iter().collect(),
+                CanonicalCheckerOptions::default(),
+            )
+            .unwrap();
+
+            context.check_source_file(file).unwrap();
+
+            assert!(context.diagnostics().is_empty(), "{source}");
+        }
     }
 
     #[test]

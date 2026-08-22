@@ -14,10 +14,14 @@ use ts_binder::{
 use ts_diagnostics::{Diagnostic, message_by_code};
 
 use super::{
-    CanonicalCheckerDiagnostics, CanonicalCheckerOptions, CanonicalGlobalTypes,
+    AliasTargetState, CanonicalCheckerDiagnostics, CanonicalCheckerOptions, CanonicalGlobalTypes,
     CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHost, DeclaredTypeUnavailable,
     SourceCheckError, SourceCheckProvenanceError, SourceLiteralCacheError, SourceSyntaxRole,
-    TypeData, TypeId, UnsupportedSourceSyntax, ValueSymbolLinks, VariableInvariant,
+    TypeData, TypeId, TypeMapper, UnsupportedSourceSyntax, ValueSymbolLinks, VariableInvariant,
+    alias::{
+        CanonicalAliasResolutionEvent, CanonicalAliasResolver, CanonicalAliasTargetHost,
+        CanonicalAliasTargetUnavailable, CanonicalImmediateAliasTarget,
+    },
     bootstrap::UnionReduction,
     declared::cached_ordinary_type_parameter_owner,
     instantiate::InstantiationSession,
@@ -32,6 +36,7 @@ const AMBIENT_MODULE_NAME_CANNOT_BE_RELATIVE: u32 = 2_436;
 const GLOBAL_AUGMENTATION_CONTEXT: u32 = 2_669;
 const GLOBAL_AUGMENTATION_DECLARE: u32 = 2_670;
 const USE_NAMESPACE_KEYWORD: u32 = 1_540;
+const CIRCULAR_DEFINITION_OF_IMPORT_ALIAS: u32 = 2_303;
 
 /// One checked declaration inside a namespace or ambient module.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -90,6 +95,15 @@ struct NamespaceDiagnosticPlan {
     code: u32,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SourceNamespaceImportPlan {
+    declaration: NodeRef,
+    name_text: String,
+    symbol: SemanticSymbolId,
+    reference: NodeRef,
+    type_only: bool,
+}
+
 /// A complete, read-only namespace declaration and body plan.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct SourceNamespacePlan {
@@ -98,6 +112,7 @@ pub(super) struct SourceNamespacePlan {
     pub(super) symbol: SemanticSymbolId,
     pub(super) ambient: bool,
     pub(super) members: Vec<SourceNamespaceMemberPlan>,
+    imports: Vec<SourceNamespaceImportPlan>,
     diagnostics: Vec<NamespaceDiagnosticPlan>,
 }
 
@@ -114,6 +129,50 @@ struct PendingNamespaceValue {
     declaration: NodeRef,
     symbol: SemanticSymbolId,
     type_: super::TypeId,
+}
+
+#[derive(Clone, Copy)]
+struct ResolvedNamespaceImport<'plan> {
+    import: &'plan SourceNamespaceImportPlan,
+    target: SemanticSymbolId,
+}
+
+struct NamespaceAliasTargetHost<'plan> {
+    imports: Vec<ResolvedNamespaceImport<'plan>>,
+}
+
+impl CanonicalAliasTargetHost<TypeMapper> for NamespaceAliasTargetHost<'_> {
+    fn get_target_of_alias_declaration(
+        &mut self,
+        store: &mut CanonicalTypeMapperStore,
+        alias: SemanticSymbolId,
+    ) -> Result<CanonicalImmediateAliasTarget, CanonicalAliasTargetUnavailable> {
+        let Some(resolved) = self
+            .imports
+            .iter()
+            .find(|import| import.import.symbol == alias)
+        else {
+            return Err(CanonicalAliasTargetUnavailable::UnsupportedDeclarationFamily);
+        };
+        if store.symbol(resolved.target).is_none() {
+            return Err(CanonicalAliasTargetUnavailable::MalformedDeclaration(
+                resolved.import.declaration,
+            ));
+        }
+        if resolved.import.type_only {
+            let mut links = store
+                .alias_symbol_links(alias)
+                .cloned()
+                .ok_or(CanonicalAliasTargetUnavailable::InvalidAliasLinks(alias))?;
+            if links.type_only_declaration.is_none() {
+                links.type_only_declaration = Some(resolved.import.declaration);
+                if !store.set_alias_symbol_links(alias, links) {
+                    return Err(CanonicalAliasTargetUnavailable::InvalidAliasLinks(alias));
+                }
+            }
+        }
+        Ok(CanonicalImmediateAliasTarget::Resolved(resolved.target))
+    }
 }
 
 fn is_external_module_augmentation(
@@ -419,14 +478,30 @@ fn plan_generic_interface_property(
 ) -> Result<SourceNamespacePropertyPlan, SourceCheckError> {
     let name = child(declaration, syntax.name);
     let name_record = owned_node(arena, bound, store, name)?;
-    let NodeData::Identifier(identifier) = &name_record.data else {
-        return Err(unsupported(
-            name,
-            name_record.kind,
-            SourceSyntaxRole::InterfaceDeclaration,
-        ));
+    let property_name = match &name_record.data {
+        NodeData::Identifier(identifier) if name_record.kind == SyntaxKind::Identifier => {
+            identifier.text.clone()
+        }
+        NodeData::StringLiteral(literal) if name_record.kind == SyntaxKind::StringLiteral => {
+            literal.text.clone()
+        }
+        NodeData::NumericLiteral(literal) if name_record.kind == SyntaxKind::NumericLiteral => {
+            literal.text.clone()
+        }
+        NodeData::NoSubstitutionTemplateLiteral(literal)
+            if name_record.kind == SyntaxKind::NoSubstitutionTemplateLiteral =>
+        {
+            literal.text.clone()
+        }
+        _ => {
+            return Err(unsupported(
+                name,
+                name_record.kind,
+                SourceSyntaxRole::InterfaceDeclaration,
+            ));
+        }
     };
-    if name_record.kind != SyntaxKind::Identifier || name_record.parent != Some(declaration.node) {
+    if name_record.parent != Some(declaration.node) {
         return Err(invalid_parent(name, declaration, name_record.parent));
     }
 
@@ -475,7 +550,7 @@ fn plan_generic_interface_property(
         || store.get_parent_of_symbol(symbol) != Some(owner)
         || store
             .symbol_table(members)
-            .and_then(|table| table.get_source(&identifier.text))
+            .and_then(|table| table.get_source(&property_name))
             != Some(symbol)
         || record.check_flags() != CheckFlags::NONE && record.check_flags() != CheckFlags::READONLY
     {
@@ -486,7 +561,7 @@ fn plan_generic_interface_property(
     Ok(SourceNamespacePropertyPlan {
         declaration,
         symbol,
-        name: identifier.text.clone(),
+        name: property_name,
         annotation: syntax.annotation,
         optional,
         readonly,
@@ -701,6 +776,178 @@ fn plan_type_alias_member(
         declaration,
         symbol,
         annotation,
+    })
+}
+
+fn validate_namespace_import_reference(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    parent: NodeRef,
+    reference: NodeRef,
+) -> Result<(), SourceCheckError> {
+    let record = owned_node(arena, bound, store, reference)?;
+    if record.parent != Some(parent.node) {
+        return Err(invalid_parent(reference, parent, record.parent));
+    }
+    if record.flags.0 != 0 {
+        return Err(unsupported(
+            reference,
+            record.kind,
+            SourceSyntaxRole::Statement,
+        ));
+    }
+    match &record.data {
+        NodeData::Identifier(identifier)
+            if record.kind == SyntaxKind::Identifier
+                && !identifier.text.is_empty()
+                && identifier.flow_node.is_none() =>
+        {
+            Ok(())
+        }
+        NodeData::QualifiedName(qualified)
+            if record.kind == SyntaxKind::QualifiedName
+                && qualified.flow_node.is_none()
+                && qualified.facts == 0 =>
+        {
+            validate_namespace_import_reference(
+                arena,
+                bound,
+                store,
+                reference,
+                child(reference, qualified.left),
+            )?;
+            let right = child(reference, qualified.right);
+            let right_record = owned_node(arena, bound, store, right)?;
+            if !matches!(right_record.data, NodeData::Identifier(_)) {
+                return Err(unsupported(
+                    right,
+                    right_record.kind,
+                    SourceSyntaxRole::Statement,
+                ));
+            }
+            validate_namespace_import_reference(arena, bound, store, reference, right)
+        }
+        _ => Err(unsupported(
+            reference,
+            record.kind,
+            SourceSyntaxRole::Statement,
+        )),
+    }
+}
+
+fn plan_namespace_import(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    namespace: NodeRef,
+    owner: SemanticSymbolId,
+    declaration: NodeRef,
+) -> Result<SourceNamespaceImportPlan, SourceCheckError> {
+    let record = owned_node(arena, bound, store, declaration)?;
+    let NodeData::ImportEqualsDeclaration(import) = &record.data else {
+        return Err(SourceCheckError::Provenance(
+            SourceCheckProvenanceError::MismatchedNodeData {
+                node: declaration,
+                kind: record.kind,
+            },
+        ));
+    };
+    if record.kind != SyntaxKind::ImportEqualsDeclaration
+        || record.flags.0 != 0
+        || import.flow_node.is_some()
+        || import.local_symbol.is_some()
+        || import.symbol.is_some()
+        || import.facts != 0
+    {
+        return Err(unsupported(
+            declaration,
+            record.kind,
+            SourceSyntaxRole::Statement,
+        ));
+    }
+    let (exported, declared) =
+        modifier_flags(arena, bound, store, declaration, import.modifiers.as_ref())?;
+    if declared {
+        return Err(unsupported(
+            declaration,
+            record.kind,
+            SourceSyntaxRole::Statement,
+        ));
+    }
+
+    let name = child(declaration, import.name);
+    let name_record = owned_node(arena, bound, store, name)?;
+    let NodeData::Identifier(identifier) = &name_record.data else {
+        return Err(unsupported(
+            name,
+            name_record.kind,
+            SourceSyntaxRole::Statement,
+        ));
+    };
+    if name_record.kind != SyntaxKind::Identifier
+        || name_record.parent != Some(declaration.node)
+        || name_record.flags.0 != 0
+        || identifier.text.is_empty()
+        || identifier.flow_node.is_some()
+    {
+        return Err(invalid_parent(name, declaration, name_record.parent));
+    }
+
+    let reference = child(declaration, import.module_reference);
+    validate_namespace_import_reference(arena, bound, store, declaration, reference)?;
+    let symbol = declaration_symbol(bound, store, declaration, SymbolFlags::ALIAS)?;
+    let alias = store.symbol(symbol).ok_or(SourceCheckError::Provenance(
+        SourceCheckProvenanceError::MissingDeclarationSymbol(declaration),
+    ))?;
+    let namespace_table = if exported {
+        store
+            .symbol(owner)
+            .and_then(ts_binder::semantic::Symbol::exports)
+    } else {
+        bound.locals(namespace)
+    };
+    if alias.flags() != SymbolFlags::ALIAS
+        || alias.check_flags() != CheckFlags::NONE
+        || alias.declarations() != Some(&[declaration])
+        || alias.value_declaration().is_some()
+        || alias.members().is_some()
+        || alias.exports().is_some()
+        || alias.export_symbol().is_some()
+        || alias.name().as_utf8() != Some(identifier.text.as_str())
+        || alias.parent().is_some() != exported
+        || exported && store.get_parent_of_symbol(symbol) != Some(owner)
+        || namespace_table
+            .and_then(|table| store.symbol_table(table))
+            .and_then(|table| table.get_source(&identifier.text))
+            .and_then(|candidate| store.get_merged_symbol(candidate))
+            != Some(symbol)
+    {
+        return Err(SourceCheckError::Provenance(
+            SourceCheckProvenanceError::MissingDeclarationSymbol(declaration),
+        ));
+    }
+    if let Some(links) = store.alias_symbol_links(symbol)
+        && (links
+            .immediate_target
+            .is_some_and(|target| store.symbol(target).is_none())
+            || links
+                .alias_target
+                .symbol()
+                .is_some_and(|target| store.symbol(target).is_none())
+            || links
+                .type_only_declaration
+                .is_some_and(|marker| !store.contains_node_ref(marker)))
+    {
+        return Err(SourceCheckError::Import(declaration));
+    }
+
+    Ok(SourceNamespaceImportPlan {
+        declaration,
+        name_text: identifier.text.clone(),
+        symbol,
+        reference,
+        type_only: import.is_type_only,
     })
 }
 
@@ -920,6 +1167,7 @@ fn plan_namespace(
     }
 
     let mut members = Vec::new();
+    let mut imports = Vec::new();
     if let Some(body) = namespace.body {
         let body = child(declaration, body);
         let body_record = owned_node(arena, bound, store, body)?;
@@ -1012,6 +1260,16 @@ fn plan_namespace(
                                 &mut members,
                             )?;
                         }
+                        SyntaxKind::ImportEqualsDeclaration => {
+                            imports.push(plan_namespace_import(
+                                arena,
+                                bound,
+                                store,
+                                declaration,
+                                symbol,
+                                statement,
+                            )?);
+                        }
                         SyntaxKind::EmptyStatement => {}
                         kind => {
                             return Err(unsupported(statement, kind, SourceSyntaxRole::Statement));
@@ -1035,6 +1293,7 @@ fn plan_namespace(
         symbol,
         ambient,
         members,
+        imports,
         diagnostics,
     })
 }
@@ -1091,6 +1350,141 @@ fn namespace_annotations<'plan>(
         }
     }
     diagnostics.extend(plan.diagnostics.iter().copied());
+}
+
+fn namespace_imports<'plan>(
+    plan: &'plan SourceNamespacePlan,
+    imports: &mut Vec<&'plan SourceNamespaceImportPlan>,
+) {
+    imports.extend(&plan.imports);
+    for member in &plan.members {
+        if let SourceNamespaceMemberPlan::Namespace(nested) = member {
+            namespace_imports(nested, imports);
+        }
+    }
+}
+
+fn namespace_import_is_circular(
+    imports: &[ResolvedNamespaceImport<'_>],
+    alias: SemanticSymbolId,
+) -> bool {
+    let mut visited = HashSet::new();
+    let mut current = alias;
+    while visited.insert(current) {
+        let Some(import) = imports
+            .iter()
+            .find(|import| import.import.symbol == current)
+        else {
+            return false;
+        };
+        current = import.target;
+    }
+    true
+}
+
+fn resolve_namespace_imports(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    plan: &SourceNamespacePlan,
+) -> Result<(), SourceCheckError> {
+    let mut imports = Vec::new();
+    namespace_imports(plan, &mut imports);
+    if imports.is_empty() {
+        return Ok(());
+    }
+
+    let circular_message = message_by_code(CIRCULAR_DEFINITION_OF_IMPORT_ALIAS).ok_or(
+        SourceCheckError::MissingDiagnostic(CIRCULAR_DEFINITION_OF_IMPORT_ALIAS),
+    )?;
+    let mut resolved_imports = Vec::with_capacity(imports.len());
+    for import in imports {
+        let mut resolution_host = host.name_resolver_host(store)?;
+        let target = resolution_host
+            .resolve_entity_name(import.reference, SymbolFlags::MODULE_MEMBER)
+            .map_err(DeclaredTypeError::from)?
+            .ok_or(SourceCheckError::Unsupported(
+                UnsupportedSourceSyntax::Import(import.declaration),
+            ))?;
+        let target_record = store
+            .symbol(target)
+            .ok_or(SourceCheckError::Import(import.declaration))?;
+        if let Some(links) = store.alias_symbol_links(import.symbol)
+            && (links
+                .immediate_target
+                .is_some_and(|cached| cached != target)
+                || import.type_only
+                    && links
+                        .type_only_declaration
+                        .is_some_and(|marker| marker != import.declaration)
+                || target_record.flags() != SymbolFlags::ALIAS
+                    && match links.alias_target {
+                        AliasTargetState::Unresolved => false,
+                        AliasTargetState::Resolved(cached) => cached != target,
+                        AliasTargetState::Unknown => true,
+                    })
+        {
+            return Err(SourceCheckError::Import(import.declaration));
+        }
+        resolved_imports.push(ResolvedNamespaceImport { import, target });
+    }
+
+    let mut alias_host = NamespaceAliasTargetHost {
+        imports: resolved_imports,
+    };
+    let mut circular = Vec::new();
+    for index in 0..alias_host.imports.len() {
+        let import = alias_host.imports[index].import;
+        let immediate = CanonicalAliasResolver::new(store, &mut alias_host)
+            .get_immediate_aliased_symbol(import.symbol)
+            .map_err(|_| SourceCheckError::Import(import.declaration))?;
+        if immediate != Some(alias_host.imports[index].target) {
+            return Err(SourceCheckError::Import(import.declaration));
+        }
+
+        let resolution = CanonicalAliasResolver::new(store, &mut alias_host)
+            .resolve_alias(import.symbol)
+            .map_err(|_| SourceCheckError::Import(import.declaration))?;
+        match resolution.target {
+            AliasTargetState::Resolved(target) if store.symbol(target).is_some() => {}
+            AliasTargetState::Unknown
+                if namespace_import_is_circular(&alias_host.imports, import.symbol) => {}
+            AliasTargetState::Resolved(_)
+            | AliasTargetState::Unknown
+            | AliasTargetState::Unresolved => {
+                return Err(SourceCheckError::Import(import.declaration));
+            }
+        }
+        for event in resolution.events {
+            let CanonicalAliasResolutionEvent::CircularDefinitionOfImportAlias { alias } = event;
+            let circular_import = alias_host
+                .imports
+                .iter()
+                .find(|candidate| candidate.import.symbol == alias)
+                .map(|candidate| candidate.import)
+                .ok_or(SourceCheckError::Import(import.declaration))?;
+            circular.push(circular_import);
+        }
+    }
+    circular.sort_by_key(|import| {
+        host.node(import.declaration)
+            .map_or(u32::MAX, |node| node.range.start.get())
+    });
+    for import in circular {
+        super::source::merge_retry_diagnostic(
+            diagnostics,
+            super::CanonicalCheckerDiagnostic {
+                node: Some(import.declaration),
+                range_override: None,
+                diagnostic: Diagnostic::with_arguments(
+                    circular_message,
+                    [import.name_text.clone()],
+                ),
+                related_information: Vec::new(),
+            },
+        );
+    }
+    Ok(())
 }
 
 fn invalid_generic_namespace_interface(declaration: NodeRef) -> SourceCheckError {
@@ -1354,6 +1748,8 @@ pub(super) fn execute_source_namespace(
             return Err(SourceCheckError::MissingDiagnostic(diagnostic.code));
         }
     }
+
+    resolve_namespace_imports(store, host, diagnostics, plan)?;
 
     for annotation in annotations {
         session.reset_query();
@@ -1663,6 +2059,141 @@ mod tests {
     }
 
     #[test]
+    fn exported_namespace_imports_publish_canonical_alias_targets() {
+        let mut fixture = fixture(
+            "namespace Outer { export namespace Inner {} export import Visible = Inner; }",
+            CanonicalModuleState::Script,
+        );
+        let plan = plan(&fixture, 0);
+        let [SourceNamespaceMemberPlan::Namespace(inner)] = plan.members.as_slice() else {
+            panic!("the namespace must retain its exported target")
+        };
+        let [import] = plan.imports.as_slice() else {
+            panic!("the namespace must retain its import-equals declaration")
+        };
+        let alias = import.symbol;
+        let target = inner.symbol;
+        assert_eq!(import.name_text, "Visible");
+        assert!(fixture.context.store().alias_symbol_links(alias).is_none());
+
+        assert!(execute(&mut fixture, &plan).unwrap().is_empty());
+
+        let links = fixture.context.store().alias_symbol_links(alias).unwrap();
+        assert_eq!(links.immediate_target, Some(target));
+        assert_eq!(links.alias_target, AliasTargetState::Resolved(target));
+        assert_eq!(links.type_only_declaration, None);
+
+        let before = fixture.context.store().checker_link_allocated_lengths();
+        assert!(execute(&mut fixture, &plan).unwrap().is_empty());
+        assert_eq!(
+            fixture.context.store().checker_link_allocated_lengths(),
+            before,
+        );
+    }
+
+    #[test]
+    fn namespace_imports_can_reference_private_nested_namespaces() {
+        let mut fixture = fixture(
+            "namespace Outer { namespace Hidden {} export import Visible = Hidden; }",
+            CanonicalModuleState::Script,
+        );
+        let plan = plan(&fixture, 0);
+        let [SourceNamespaceMemberPlan::Namespace(hidden)] = plan.members.as_slice() else {
+            panic!("the namespace must retain its private target")
+        };
+        let [import] = plan.imports.as_slice() else {
+            panic!("the namespace must retain its exported import")
+        };
+        let alias = import.symbol;
+        let target = hidden.symbol;
+
+        assert!(execute(&mut fixture, &plan).unwrap().is_empty());
+        assert_eq!(
+            fixture
+                .context
+                .store()
+                .alias_symbol_links(alias)
+                .map(|links| links.alias_target),
+            Some(AliasTargetState::Resolved(target)),
+        );
+    }
+
+    #[test]
+    fn qualified_namespace_imports_follow_canonical_export_tables() {
+        let mut fixture = fixture(
+            concat!(
+                "namespace Outer { ",
+                "export namespace Inner { export namespace Leaf {} } ",
+                "export import Visible = Inner.Leaf; ",
+                "}",
+            ),
+            CanonicalModuleState::Script,
+        );
+        let plan = plan(&fixture, 0);
+        let [SourceNamespaceMemberPlan::Namespace(inner)] = plan.members.as_slice() else {
+            panic!("the namespace must retain its first target segment")
+        };
+        let [SourceNamespaceMemberPlan::Namespace(leaf)] = inner.members.as_slice() else {
+            panic!("the nested namespace must retain the final target segment")
+        };
+        let [import] = plan.imports.as_slice() else {
+            panic!("the namespace must retain its qualified import")
+        };
+        let alias = import.symbol;
+        let target = leaf.symbol;
+
+        assert!(execute(&mut fixture, &plan).unwrap().is_empty());
+        assert_eq!(
+            fixture
+                .context
+                .store()
+                .alias_symbol_links(alias)
+                .map(|links| links.alias_target),
+            Some(AliasTargetState::Resolved(target)),
+        );
+    }
+
+    #[test]
+    fn circular_namespace_imports_report_each_declaration_in_source_order() {
+        let mut fixture = fixture(
+            "namespace Outer { import First = Second; import Second = First; }",
+            CanonicalModuleState::Script,
+        );
+        let plan = plan(&fixture, 0);
+        let [first, second] = plan.imports.as_slice() else {
+            panic!("the namespace must retain both circular imports")
+        };
+        let first_symbol = first.symbol;
+        let second_symbol = second.symbol;
+        let first_declaration = first.declaration;
+        let second_declaration = second.declaration;
+
+        let diagnostics = execute(&mut fixture, &plan).unwrap();
+        assert_eq!(diagnostics.len(), 2);
+        assert_eq!(
+            diagnostics
+                .as_slice()
+                .iter()
+                .map(|diagnostic| (diagnostic.diagnostic.code(), diagnostic.node))
+                .collect::<Vec<_>>(),
+            [
+                (2303, Some(first_declaration)),
+                (2303, Some(second_declaration)),
+            ],
+        );
+        for symbol in [first_symbol, second_symbol] {
+            assert_eq!(
+                fixture
+                    .context
+                    .store()
+                    .alias_symbol_links(symbol)
+                    .map(|links| links.alias_target),
+                Some(AliasTargetState::Unknown),
+            );
+        }
+    }
+
+    #[test]
     fn ambient_jsx_namespace_keeps_interface_members_lazy() {
         let mut fixture = fixture(
             "declare namespace JSX { interface Element {} interface IntrinsicElements { div: any; } }",
@@ -1772,6 +2303,49 @@ mod tests {
                 .symbol(symbol)
                 .and_then(|record| record.declarations()),
             Some(&[declaration][..]),
+        );
+    }
+
+    #[test]
+    fn generic_namespace_interfaces_accept_quoted_property_names() {
+        let mut fixture = fixture(
+            "declare namespace Shapes { interface Box<T> { \"data-value\": T; } }",
+            CanonicalModuleState::Script,
+        );
+        let plan = plan(&fixture, 0);
+        let [
+            SourceNamespaceMemberPlan::Interface {
+                symbol,
+                generic: Some(generic),
+                ..
+            },
+        ] = plan.members.as_slice()
+        else {
+            panic!("the namespace must retain its generic interface")
+        };
+        let symbol = *symbol;
+        let property = generic.properties[0].symbol;
+        assert_eq!(generic.properties[0].name, "data-value");
+
+        assert!(execute(&mut fixture, &plan).unwrap().is_empty());
+
+        let target = fixture
+            .context
+            .store()
+            .declared_type_links(symbol)
+            .and_then(|links| links.declared_type)
+            .unwrap();
+        let TypeData::Interface(interface) =
+            fixture.context.store().type_payload(target).unwrap().data()
+        else {
+            panic!("the generic declaration must retain its interface type")
+        };
+        assert_eq!(
+            interface
+                .declared_members
+                .and_then(|members| fixture.context.store().symbol_table(members))
+                .and_then(|members| members.get_source("data-value")),
+            Some(property),
         );
     }
 

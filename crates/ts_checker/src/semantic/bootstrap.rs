@@ -40,6 +40,7 @@ use super::{
     array_types::{ArrayTypeError, CanonicalArrayTargets},
     callable_sets::{StoredCallableSetValidation, validate_stored_callable_set},
     callables::CallableFamily,
+    declared::cached_ordinary_type_parameter_owner,
     functions::{self, PendingFunctionTypeProof},
     ids::{IndexInfoId, SignatureId, TypeAliasId, TypeId, TypePredicateId},
     links::ValueSymbolLinks,
@@ -2353,6 +2354,28 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 self.validate_supported_literal_identity(type_, regular, fresh, &data.value)?;
                 Ok(())
             }
+            TypeData::TypeParameter(_) => {
+                let Some(symbol) = cached_ordinary_type_parameter_owner(self, type_) else {
+                    return Err(LiteralTypeCacheError::UnsupportedUnionConstituent(type_));
+                };
+                let Some(record) = self.symbol(symbol) else {
+                    return Err(LiteralTypeCacheError::UnsupportedUnionConstituent(type_));
+                };
+                let Some([declaration]) = record.declarations() else {
+                    return Err(LiteralTypeCacheError::UnsupportedUnionConstituent(type_));
+                };
+                if record.flags() != SymbolFlags::TYPE_PARAMETER
+                    || record.check_flags() != CheckFlags::NONE
+                    || record.value_declaration().is_some()
+                    || record.exports().is_some()
+                    || record.export_symbol().is_some()
+                    || self.get_merged_symbol(symbol) != Some(symbol)
+                    || self.source_node_kind(*declaration) != Some(SyntaxKind::TypeParameter)
+                {
+                    return Err(LiteralTypeCacheError::UnsupportedUnionConstituent(type_));
+                }
+                Ok(())
+            }
             TypeData::Object(object) => {
                 if self.validate_supported_unknown_empty_object(type_, record, object) {
                     return Ok(());
@@ -2397,15 +2420,32 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                             &mut HashSet::new(),
                             allowed_pending,
                         ),
-                    object_members::DeclaredPropertyObjectValidation::NotDeclared => self
-                        .validate_supported_fresh_property_object(
-                            type_,
-                            record,
-                            object,
-                            array_validation,
-                            visiting,
-                            allowed_pending,
-                        ),
+                    object_members::DeclaredPropertyObjectValidation::NotDeclared => {
+                        match object_members::validate_resolved_declared_property_type_graph(
+                            self, type_,
+                        ) {
+                            object_members::DeclaredPropertyTypeGraphValidation::Traversable(_) => {
+                                self.validate_cached_array_capability_worker(
+                                    type_,
+                                    array_validation,
+                                    &mut HashSet::new(),
+                                    allowed_pending,
+                                )
+                            }
+                            object_members::DeclaredPropertyTypeGraphValidation::Opaque => self
+                                .validate_supported_fresh_property_object(
+                                    type_,
+                                    record,
+                                    object,
+                                    array_validation,
+                                    visiting,
+                                    allowed_pending,
+                                ),
+                            object_members::DeclaredPropertyTypeGraphValidation::Malformed => {
+                                Err(LiteralTypeCacheError::InvalidCachedUnion(type_))
+                            }
+                        }
+                    }
                     object_members::DeclaredPropertyObjectValidation::Malformed => {
                         Err(LiteralTypeCacheError::InvalidCachedUnion(type_))
                     }
@@ -2453,7 +2493,24 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                             allowed_pending,
                         ),
                     object_members::DeclaredPropertyObjectValidation::NotDeclared => {
-                        Err(LiteralTypeCacheError::UnsupportedUnionConstituent(type_))
+                        match object_members::validate_resolved_declared_property_type_graph(
+                            self, type_,
+                        ) {
+                            object_members::DeclaredPropertyTypeGraphValidation::Traversable(_) => {
+                                self.validate_cached_array_capability_worker(
+                                    type_,
+                                    array_validation,
+                                    &mut HashSet::new(),
+                                    allowed_pending,
+                                )
+                            }
+                            object_members::DeclaredPropertyTypeGraphValidation::Opaque => {
+                                Err(LiteralTypeCacheError::UnsupportedUnionConstituent(type_))
+                            }
+                            object_members::DeclaredPropertyTypeGraphValidation::Malformed => {
+                                Err(LiteralTypeCacheError::InvalidCachedUnion(type_))
+                            }
+                        }
                     }
                     object_members::DeclaredPropertyObjectValidation::Malformed => {
                         Err(LiteralTypeCacheError::InvalidCachedUnion(type_))
@@ -2786,6 +2843,9 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 continue;
             }
             *includes |= flags & TypeFlags::INCLUDES_MASK;
+            if flags.intersects(TypeFlags::INSTANTIABLE) {
+                *includes |= TypeFlags::INCLUDES_INSTANTIABLE;
+            }
             if *type_ == bootstrap.wildcard_type {
                 *includes |= TypeFlags::INCLUDES_WILDCARD;
             }

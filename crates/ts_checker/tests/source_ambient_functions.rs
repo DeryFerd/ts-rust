@@ -567,11 +567,6 @@ fn ambient_function_forms_outside_the_exact_leaf_remain_typed_boundaries() {
             CanonicalModuleState::Script,
         ),
         (
-            "declare function optionalGeneric<T>(value?: T): T;",
-            false,
-            CanonicalModuleState::Script,
-        ),
-        (
             "declare function rest(...values: number[]): void;",
             false,
             CanonicalModuleState::Script,

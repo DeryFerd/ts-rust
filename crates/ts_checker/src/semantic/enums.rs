@@ -495,6 +495,23 @@ fn plan_enum(
                     {
                         (CanonicalEnumMemberValue::Computed, None)
                     }
+                    Err(EnumTypeError::Unsupported(EnumTypeUnsupported::Initializer(_)))
+                        if is_string_computed_initializer(
+                            store,
+                            host,
+                            initializer,
+                            &identifier.text,
+                            &members,
+                        ) =>
+                    {
+                        (
+                            CanonicalEnumMemberValue::Computed,
+                            Some(EnumMemberDiagnostic {
+                                node: initializer,
+                                code: 18_033,
+                            }),
+                        )
+                    }
                     Err(error) => return Err(error),
                 };
                 next_numeric = match &value {
@@ -772,6 +789,169 @@ fn is_numeric_computed_initializer(
         }
         _ => false,
     }
+}
+
+fn is_string_computed_initializer(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    expression: NodeRef,
+    enum_name: &str,
+    previous_members: &[EnumMemberPlan],
+) -> bool {
+    let Some(record) = host.node(expression) else {
+        return false;
+    };
+    match &record.data {
+        NodeData::StringLiteral(_)
+        | NodeData::NoSubstitutionTemplateLiteral(_)
+        | NodeData::TemplateExpression(_) => true,
+        NodeData::ParenthesizedExpression(parenthesized) => is_string_computed_initializer(
+            store,
+            host,
+            NodeRef::new(expression.arena, expression.file, parenthesized.expression),
+            enum_name,
+            previous_members,
+        ),
+        NodeData::Identifier(identifier) => {
+            if let Some(member) = previous_members.iter().find(|member| {
+                store
+                    .symbol(member.symbol)
+                    .and_then(|symbol| symbol.name().as_utf8())
+                    == Some(identifier.text.as_str())
+            }) {
+                return matches!(member.value, CanonicalEnumMemberValue::String(_));
+            }
+            local_constant_initializer(store, host, expression, &identifier.text).is_some_and(
+                |initializer| {
+                    is_string_computed_initializer(
+                        store,
+                        host,
+                        initializer,
+                        enum_name,
+                        previous_members,
+                    )
+                },
+            )
+        }
+        NodeData::BinaryExpression(binary) => {
+            let Some(operator) = host.node(NodeRef::new(
+                expression.arena,
+                expression.file,
+                binary.operator_token,
+            )) else {
+                return false;
+            };
+            operator.kind == SyntaxKind::PlusToken
+                && (is_string_computed_initializer(
+                    store,
+                    host,
+                    NodeRef::new(expression.arena, expression.file, binary.left),
+                    enum_name,
+                    previous_members,
+                ) || is_string_computed_initializer(
+                    store,
+                    host,
+                    NodeRef::new(expression.arena, expression.file, binary.right),
+                    enum_name,
+                    previous_members,
+                ))
+        }
+        NodeData::CallExpression(call)
+            if call.question_dot_token.is_none() && call.type_arguments.is_none() =>
+        {
+            is_numeric_string_method_call(
+                store,
+                host,
+                expression,
+                call,
+                enum_name,
+                previous_members,
+            )
+        }
+        _ => false,
+    }
+}
+
+fn local_constant_initializer(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    use_site: NodeRef,
+    name: &str,
+) -> Option<NodeRef> {
+    let bound = host.bound_file(use_site)?;
+    let local = bound
+        .locals(bound.source_file())
+        .and_then(|locals| store.symbol_table(locals))?
+        .get_source(name)?;
+    let local_record = store.symbol(local)?;
+    let symbol = store.symbol(local_record.export_symbol().unwrap_or(local))?;
+    if symbol.flags() != SymbolFlags::BLOCK_SCOPED_VARIABLE {
+        return None;
+    }
+    let [declaration] = symbol.declarations()? else {
+        return None;
+    };
+    let declaration_record = host.node(*declaration)?;
+    let NodeData::VariableDeclaration(variable) = &declaration_record.data else {
+        return None;
+    };
+    let initializer = variable.initializer?;
+    if variable.type_.is_some() || declaration_record.range.end > host.node(use_site)?.range.start {
+        return None;
+    }
+    let list = NodeRef::new(
+        declaration.arena,
+        declaration.file,
+        declaration_record.parent?,
+    );
+    let list = host.node(list)?;
+    if !matches!(list.data, NodeData::VariableDeclarationList(_)) || list.flags.0 & (1 << 1) == 0 {
+        return None;
+    }
+    Some(NodeRef::new(
+        declaration.arena,
+        declaration.file,
+        initializer,
+    ))
+}
+
+fn is_numeric_string_method_call(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    expression: NodeRef,
+    call: &ts_ast::CallExpressionData,
+    enum_name: &str,
+    previous_members: &[EnumMemberPlan],
+) -> bool {
+    let Some(callee) = host.node(NodeRef::new(
+        expression.arena,
+        expression.file,
+        call.expression,
+    )) else {
+        return false;
+    };
+    let NodeData::PropertyAccessExpression(access) = &callee.data else {
+        return false;
+    };
+    if access.question_dot_token.is_some() || call.arguments.nodes.len() > 1 {
+        return false;
+    }
+    let Some(name) = host.node(NodeRef::new(expression.arena, expression.file, access.name)) else {
+        return false;
+    };
+    let NodeData::Identifier(name) = &name.data else {
+        return false;
+    };
+    matches!(
+        name.text.as_str(),
+        "toFixed" | "toExponential" | "toPrecision" | "toString"
+    ) && is_known_numeric_expression(
+        store,
+        host,
+        NodeRef::new(expression.arena, expression.file, access.expression),
+        enum_name,
+        previous_members,
+    ) && has_numeric_call_arguments(store, host, expression, call, enum_name, previous_members)
 }
 
 fn is_numeric_computed_call(
@@ -1253,22 +1433,37 @@ fn resolve_enum_entity(
             == Some(member_name)
     });
     let Some(member) = member else {
-        if matches!(record.data, NodeData::Identifier(_))
-            && matches!(member_name, "NaN" | "Infinity")
-        {
-            let bound = host.bound_file(entity)?;
-            let local_symbol = bound
-                .locals(bound.source_file())
-                .and_then(|locals| store.symbol_table(locals))
-                .and_then(|locals| locals.get_source(member_name));
-            let global_symbol = store
-                .intrinsic_bootstrap()
-                .and_then(|bootstrap| store.symbol_table(bootstrap.globals))
-                .and_then(|globals| globals.get_source(member_name));
-            if local_symbol.is_none() || local_symbol == global_symbol {
-                return Some(Evaluation::known(Value::Number(Number::from_string(
-                    member_name,
-                ))));
+        if matches!(record.data, NodeData::Identifier(_)) {
+            if let Some(initializer) = local_constant_initializer(store, host, entity, member_name)
+            {
+                let (arena, _) = host.source(initializer)?;
+                let mut evaluation = evaluate_with(arena, initializer.node, &mut |reference| {
+                    let reference = NodeRef::new(initializer.arena, initializer.file, reference);
+                    resolve_enum_entity(store, host, reference, enum_name, previous_members)
+                        .unwrap_or_else(|| {
+                            Evaluation::unknown(UnknownReason::UnresolvedEntity(reference.node))
+                        })
+                });
+                if evaluation.value().is_some() {
+                    evaluation.metadata.has_external_references = true;
+                    return Some(evaluation);
+                }
+            }
+            if matches!(member_name, "NaN" | "Infinity") {
+                let bound = host.bound_file(entity)?;
+                let local_symbol = bound
+                    .locals(bound.source_file())
+                    .and_then(|locals| store.symbol_table(locals))
+                    .and_then(|locals| locals.get_source(member_name));
+                let global_symbol = store
+                    .intrinsic_bootstrap()
+                    .and_then(|bootstrap| store.symbol_table(bootstrap.globals))
+                    .and_then(|globals| globals.get_source(member_name));
+                if local_symbol.is_none() || local_symbol == global_symbol {
+                    return Some(Evaluation::known(Value::Number(Number::from_string(
+                        member_name,
+                    ))));
+                }
             }
         }
         return None;
@@ -1433,6 +1628,49 @@ fn validate_value_type(
         && object.mapper.is_none()
         && object.instantiations == TypeCacheState::Unallocated)
         .then_some(())
+}
+
+/// Resolves one published enum value member without forcing object members.
+pub(super) fn enum_value_member_type(
+    store: &CanonicalTypeMapperStore,
+    value_type: TypeId,
+    name: &str,
+) -> Option<(SemanticSymbolId, TypeId)> {
+    let value = store.type_payload(value_type)?;
+    let owner = value.symbol()?;
+    let owner_record = store.symbol(owner)?;
+    if !owner_record.flags().intersects(SymbolFlags::ENUM)
+        || validate_value_type(store, owner, value_type).is_none()
+        || store
+            .value_symbol_links(owner)
+            .and_then(|links| links.resolved_type)
+            != Some(value_type)
+    {
+        return None;
+    }
+    let member = owner_record
+        .exports()
+        .and_then(|exports| store.symbol_table(exports))?
+        .get_source(name)?;
+    let record = store.symbol(member)?;
+    if record.flags() != SymbolFlags::ENUM_MEMBER
+        || record.parent() != Some(owner)
+        || store.get_merged_symbol(member) != Some(member)
+    {
+        return None;
+    }
+    let type_ = store
+        .value_symbol_links(member)
+        .and_then(|links| links.resolved_type)?;
+    if store
+        .declared_type_links(member)
+        .and_then(|links| links.declared_type)
+        != Some(type_)
+        || canonical_enum_type_owner(store, type_) != Some(owner)
+    {
+        return None;
+    }
+    Some((member, type_))
 }
 
 fn validate_literal_pair(
@@ -2091,6 +2329,14 @@ mod tests {
                 Some(member.symbol)
             );
             assert_eq!(
+                enum_value_member_type(
+                    &fixture.store,
+                    first.value_type,
+                    member_name.as_utf8().unwrap(),
+                ),
+                Some((member.symbol, member.fresh_type))
+            );
+            assert_eq!(
                 fixture
                     .store
                     .is_type_assignable_to(member.fresh_type, first.declared_type),
@@ -2221,6 +2467,28 @@ mod tests {
         assert_eq!(
             member(&result, &fixture, "Copied").fresh_type,
             member(&result, &fixture, "non identifier").fresh_type
+        );
+    }
+
+    #[test]
+    fn escaped_unicode_member_names_resolve_by_their_decoded_symbol_names() {
+        let mut fixture = fixture(r"enum Unicode { \u0041 = 1, \u{42} = 2, Copied = Unicode.A }");
+        let owner = symbol(&fixture, SyntaxKind::EnumDeclaration, "Unicode");
+        let bound = &fixture.files[&fixture.file];
+        let host = host(&fixture.parsed.arena, bound);
+
+        let result = get_enum_semantics(&mut fixture.store, &host, owner).unwrap();
+        assert_eq!(
+            member(&result, &fixture, "A").value,
+            CanonicalEnumMemberValue::Number(Number::new(1.0))
+        );
+        assert_eq!(
+            member(&result, &fixture, "B").value,
+            CanonicalEnumMemberValue::Number(Number::new(2.0))
+        );
+        assert_eq!(
+            member(&result, &fixture, "Copied").fresh_type,
+            member(&result, &fixture, "A").fresh_type
         );
     }
 
@@ -2382,6 +2650,69 @@ mod tests {
                 fixture.store.checker_link_allocated_lengths(),
             ),
             warm
+        );
+    }
+
+    #[test]
+    fn prior_unannotated_const_variables_feed_numeric_and_string_enum_values() {
+        let mut fixture = fixture(concat!(
+            "const base = 2; ",
+            "const next = base + 3; ",
+            "const label = 'ready'; ",
+            "enum Values { ",
+            "First = base, ",
+            "Second = next * 2, ",
+            "Label = label, ",
+            "Combined = label + '-ok', ",
+            "}",
+        ));
+        let owner = symbol(&fixture, SyntaxKind::EnumDeclaration, "Values");
+        let bound = &fixture.files[&fixture.file];
+        let host = host(&fixture.parsed.arena, bound);
+
+        let result = get_enum_semantics(&mut fixture.store, &host, owner).unwrap();
+        assert_eq!(
+            member(&result, &fixture, "First").value,
+            CanonicalEnumMemberValue::Number(Number::new(2.0))
+        );
+        assert_eq!(
+            member(&result, &fixture, "Second").value,
+            CanonicalEnumMemberValue::Number(Number::new(10.0))
+        );
+        assert_eq!(
+            member(&result, &fixture, "Label").value,
+            CanonicalEnumMemberValue::String("ready".to_owned())
+        );
+        assert_eq!(
+            member(&result, &fixture, "Combined").value,
+            CanonicalEnumMemberValue::String("ready-ok".to_owned())
+        );
+        assert!(
+            preflight_enum_diagnostics(&fixture.store, &host, owner)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn local_numeric_constants_shadow_global_infinity_and_nan() {
+        let mut fixture = fixture(concat!(
+            "const Infinity = 4; ",
+            "const NaN = 5; ",
+            "enum Shadowed { First = Infinity, Second = NaN }",
+        ));
+        let owner = symbol(&fixture, SyntaxKind::EnumDeclaration, "Shadowed");
+        let bound = &fixture.files[&fixture.file];
+        let host = host(&fixture.parsed.arena, bound);
+
+        let result = get_enum_semantics(&mut fixture.store, &host, owner).unwrap();
+        assert_eq!(
+            member(&result, &fixture, "First").value,
+            CanonicalEnumMemberValue::Number(Number::new(4.0))
+        );
+        assert_eq!(
+            member(&result, &fixture, "Second").value,
+            CanonicalEnumMemberValue::Number(Number::new(5.0))
         );
     }
 
@@ -2679,6 +3010,44 @@ mod tests {
         assert_eq!(
             member(&result, &fixture, "Next").value,
             CanonicalEnumMemberValue::Number(Number::new(11.0))
+        );
+    }
+
+    #[test]
+    fn runtime_string_constants_issue_ts18033_on_computed_enum_initializers() {
+        let mut fixture = fixture(concat!(
+            "const BAR = 2..toFixed(0); ",
+            "enum Mixed { ",
+            "Template = `${BAR}`, ",
+            "StringPlus = '2' + BAR, ",
+            "Parenthesized = (`${BAR}`), ",
+            "Direct = BAR, ",
+            "NumberPlus = 2 + BAR, ",
+            "Prior = Template, ",
+            "MixedPlus = Prior + BAR, ",
+            "Final = Prior, ",
+            "}",
+        ));
+        let owner = symbol(&fixture, SyntaxKind::EnumDeclaration, "Mixed");
+        let bound = &fixture.files[&fixture.file];
+        let host = host(&fixture.parsed.arena, bound);
+
+        let diagnostics = preflight_enum_diagnostics(&fixture.store, &host, owner).unwrap();
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [18_033; 6]
+        );
+
+        let result = get_enum_semantics(&mut fixture.store, &host, owner).unwrap();
+        assert_eq!(result.members.len(), 8);
+        assert!(
+            result
+                .members
+                .iter()
+                .all(|member| member.value == CanonicalEnumMemberValue::Computed)
         );
     }
 

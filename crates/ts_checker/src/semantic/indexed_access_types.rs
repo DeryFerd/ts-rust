@@ -712,6 +712,75 @@ fn is_numeric_literal_name(name: &str) -> bool {
     ts_jsnum::from_string(name).to_string() == name
 }
 
+/// Returns whether an already-resolved key is a valid template index pattern.
+pub(super) fn is_template_pattern_index_key(
+    store: &CanonicalTypeMapperStore,
+    key_type: TypeId,
+) -> bool {
+    let Some(TypeData::TemplateLiteral(pattern)) =
+        store.type_payload(key_type).map(TypeRecord::data)
+    else {
+        return false;
+    };
+    !pattern.types.is_empty()
+        && pattern.texts.len() == pattern.types.len() + 1
+        && pattern.types.iter().all(|placeholder| {
+            store.type_payload(*placeholder).is_some_and(|record| {
+                record.flags().intersects(
+                    TypeFlags::ANY | TypeFlags::STRING | TypeFlags::NUMBER | TypeFlags::BIG_INT,
+                )
+            })
+        })
+}
+
+/// Checks a literal property name against one canonical template index key.
+pub(super) fn template_pattern_index_matches_name(
+    store: &CanonicalTypeMapperStore,
+    key_type: TypeId,
+    name: &str,
+) -> bool {
+    if !is_template_pattern_index_key(store, key_type) {
+        return false;
+    }
+    let Some(TypeData::TemplateLiteral(pattern)) =
+        store.type_payload(key_type).map(TypeRecord::data)
+    else {
+        return false;
+    };
+    let Some(mut remaining) = name.strip_prefix(&pattern.texts[0]) else {
+        return false;
+    };
+    for (index, placeholder) in pattern.types.iter().enumerate() {
+        let delimiter = &pattern.texts[index + 1];
+        let (matched, tail) = if index + 1 == pattern.types.len() {
+            let Some(value) = remaining.strip_suffix(delimiter) else {
+                return false;
+            };
+            (value, "")
+        } else if delimiter.is_empty() {
+            ("", remaining)
+        } else {
+            let Some(position) = remaining.find(delimiter) else {
+                return false;
+            };
+            (
+                &remaining[..position],
+                &remaining[position + delimiter.len()..],
+            )
+        };
+        let Some(record) = store.type_payload(*placeholder) else {
+            return false;
+        };
+        if record.flags().intersects(TypeFlags::NUMBER) && !is_numeric_literal_name(matched)
+            || record.flags().intersects(TypeFlags::BIG_INT) && matched.parse::<i128>().is_err()
+        {
+            return false;
+        }
+        remaining = tail;
+    }
+    remaining.is_empty()
+}
+
 fn select_concrete_member(
     store: &CanonicalTypeMapperStore,
     object: &PropertyObjectPlan,
@@ -989,4 +1058,55 @@ fn resolved_selection_type(
         .type_payload(result)
         .map(|_| result)
         .ok_or(ConcreteIndexedAccessError::InvalidType(result))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_template_pattern_index_key, template_pattern_index_matches_name};
+    use crate::semantic::{CanonicalTypeMapperStore, IntrinsicBootstrapOptions};
+
+    #[test]
+    fn template_pattern_index_matches_only_compatible_property_names() {
+        let mut store = CanonicalTypeMapperStore::new();
+        store
+            .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions::default())
+            .unwrap();
+        let string = store.intrinsic_bootstrap().unwrap().string_type;
+        let pattern = store
+            .get_template_literal_type(&["do-".to_owned(), String::new()], &[string])
+            .unwrap();
+
+        assert!(is_template_pattern_index_key(&store, pattern));
+        assert!(template_pattern_index_matches_name(
+            &store, pattern, "do-click"
+        ));
+        assert!(template_pattern_index_matches_name(&store, pattern, "do-"));
+        assert!(!template_pattern_index_matches_name(
+            &store, pattern, "ns:thing"
+        ));
+        assert!(!template_pattern_index_matches_name(
+            &store,
+            pattern,
+            "redo-click"
+        ));
+    }
+
+    #[test]
+    fn numeric_template_pattern_indexes_reject_non_numeric_substitutions() {
+        let mut store = CanonicalTypeMapperStore::new();
+        store
+            .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions::default())
+            .unwrap();
+        let number = store.intrinsic_bootstrap().unwrap().number_type;
+        let pattern = store
+            .get_template_literal_type(&["id-".to_owned(), String::new()], &[number])
+            .unwrap();
+
+        assert!(template_pattern_index_matches_name(
+            &store, pattern, "id-12"
+        ));
+        assert!(!template_pattern_index_matches_name(
+            &store, pattern, "id-value"
+        ));
+    }
 }

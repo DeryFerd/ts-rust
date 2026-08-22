@@ -58,7 +58,6 @@ use super::{
 pub(super) struct SourceCallPlan {
     pub(super) node: NodeRef,
     pub(super) callee: PlannedExpression,
-    callee_form: SourceCallCalleeForm,
     callee_diagnostic_node: NodeRef,
     type_arguments: Option<SourceTypeArgumentList>,
     pub(super) arguments: Vec<PlannedExpression>,
@@ -227,7 +226,6 @@ pub(super) fn plan_direct_source_call_syntax(
             if name_record.parent != Some(callee.node)
                 || name_record.kind != SyntaxKind::Identifier
                 || !matches!(&name_record.data, NodeData::Identifier(_))
-                || call.type_arguments.is_some()
             {
                 return Err(SourceCheckError::Unsupported(
                     UnsupportedSourceSyntax::Call(node),
@@ -426,7 +424,6 @@ pub(super) fn finish_direct_source_call_plan(
     Ok(SourceCallPlan {
         node: syntax.node,
         callee,
-        callee_form: syntax.callee_form,
         callee_diagnostic_node: syntax.callee_diagnostic_node,
         type_arguments: syntax.type_arguments.clone(),
         arguments,
@@ -907,7 +904,6 @@ enum SourceCallResolutionError {
 
 #[derive(Clone, Copy, Debug)]
 struct SourceCallResolutionRequest<'a> {
-    callee_form: SourceCallCalleeForm,
     callee_type: TypeId,
     argument_types: &'a [TypeId],
     explicit_type_arguments: Option<&'a [TypeId]>,
@@ -923,15 +919,10 @@ fn resolve_source_call_once(
     request: SourceCallResolutionRequest<'_>,
 ) -> Result<ResolvedSourceCall, SourceCallResolutionError> {
     let SourceCallResolutionRequest {
-        callee_form,
         callee_type,
         argument_types,
         explicit_type_arguments,
     } = request;
-    if callee_form == SourceCallCalleeForm::RequiredOwnProperty && explicit_type_arguments.is_some()
-    {
-        return Err(SourceCallResolutionError::Unsupported);
-    }
     if explicit_type_arguments.is_none() {
         let request = DirectCallRequest {
             form: DirectCallForm::Call,
@@ -952,8 +943,7 @@ fn resolve_source_call_once(
                     applicability: resolution.applicability,
                 }));
             }
-            Err(DirectCallError::Unsupported(DirectCallUnsupported::GenericSignature(_)))
-                if callee_form == SourceCallCalleeForm::Identifier => {}
+            Err(DirectCallError::Unsupported(DirectCallUnsupported::GenericSignature(_))) => {}
             Err(
                 DirectCallError::Unsupported(DirectCallUnsupported::UnresolvedReturnType(
                     signature,
@@ -1876,7 +1866,6 @@ pub(super) fn check_direct_source_call(
             existing_call_signature,
             session,
             SourceCallResolutionRequest {
-                callee_form: plan.callee_form,
                 callee_type,
                 argument_types,
                 explicit_type_arguments: explicit_type_arguments.as_deref(),
@@ -1898,11 +1887,10 @@ pub(super) fn check_direct_source_call(
             }
             Err(SourceCallResolutionError::Relation(error)) => return Err(error.into()),
             Err(SourceCallResolutionError::Unsupported)
-                if plan.callee_form == SourceCallCalleeForm::Identifier
-                    && matches!(
-                        validate_stored_callable_set(store, callee_type),
-                        StoredCallableSetValidation::NotCallable
-                    ) =>
+                if matches!(
+                    validate_stored_callable_set(store, callee_type),
+                    StoredCallableSetValidation::NotCallable
+                ) =>
             {
                 return recover_non_callable_source_call(
                     store,
@@ -2116,7 +2104,7 @@ mod tests {
 
     use super::*;
     use crate::semantic::{
-        CanonicalCheckerContext, SourceFileLinks,
+        CanonicalCheckerContext, IntrinsicBootstrapOptions, SourceFileLinks,
         bootstrap::UnionReduction,
         module_resolution::{
             CanonicalModuleResolutionEntry, CanonicalModuleResolutionManifestInput,
@@ -2136,6 +2124,14 @@ mod tests {
     }
 
     fn context(parsed: &ParseResult, file: FileId) -> CanonicalCheckerContext<'_> {
+        context_with_options(parsed, file, CanonicalCheckerOptions::default())
+    }
+
+    fn context_with_options(
+        parsed: &ParseResult,
+        file: FileId,
+        options: CanonicalCheckerOptions,
+    ) -> CanonicalCheckerContext<'_> {
         let mut binder = CanonicalBinder::new();
         binder
             .bind_source_file_with_facts(
@@ -2156,7 +2152,7 @@ mod tests {
         CanonicalCheckerContext::new(
             binder.finish(),
             [(file, &parsed.arena)].into_iter().collect(),
-            CanonicalCheckerOptions::default(),
+            options,
         )
         .unwrap()
     }
@@ -2208,6 +2204,26 @@ mod tests {
         target: &'arena ParseResult,
         target_file: FileId,
     ) -> CanonicalCheckerContext<'arena> {
+        imported_context_with_target_facts(
+            importer,
+            importer_file,
+            target,
+            target_file,
+            false,
+            CanonicalModuleResolutionMode::Esm,
+            CanonicalCheckerOptions::default(),
+        )
+    }
+
+    fn imported_context_with_target_facts<'arena>(
+        importer: &'arena ParseResult,
+        importer_file: FileId,
+        target: &'arena ParseResult,
+        target_file: FileId,
+        declaration_target: bool,
+        resolution_mode: CanonicalModuleResolutionMode,
+        options: CanonicalCheckerOptions,
+    ) -> CanonicalCheckerContext<'arena> {
         let files = [(importer_file, importer), (target_file, target)];
         let mut binder = CanonicalBinder::new();
         for (file, parsed) in files {
@@ -2219,7 +2235,7 @@ mod tests {
                     CanonicalSourceFileFacts::new(
                         EscapedName::source(format!("\"/project/{}.ts\"", file.index())),
                         CanonicalSourceLanguage::TypeScript,
-                        false,
+                        declaration_target && file == target_file,
                         CanonicalModuleState::External,
                     ),
                 )
@@ -2252,15 +2268,15 @@ mod tests {
                 .into_iter()
                 .map(|(file, parsed)| (file, &parsed.arena))
                 .collect(),
-            CanonicalCheckerOptions::default(),
+            options,
             CanonicalModuleResolutionManifestInput::new(module_specifiers.into_iter().map(
                 |(_, module_specifier)| {
                     CanonicalModuleResolutionEntry::resolved(
                         module_specifier,
                         CanonicalResolvedModuleInput::new(
                             target_file,
-                            CanonicalModuleResolutionMode::Esm,
-                            CanonicalModuleResolutionMode::Esm,
+                            resolution_mode,
+                            resolution_mode,
                         ),
                     )
                 },
@@ -3364,6 +3380,83 @@ mod tests {
     }
 
     #[test]
+    fn synthetic_default_module_property_calls_preserve_ambient_return_diagnostics() {
+        let target = parsed("export function foo();\nexport function bar();");
+        let importer = parsed("import { default as Foo } from './b'; Foo.bar(); Foo.foo();");
+
+        for (index, no_implicit_any) in [false, true].into_iter().enumerate() {
+            let offset = u32::try_from(index).unwrap() * 2;
+            let importer_file = FileId::new(452 + offset);
+            let target_file = FileId::new(453 + offset);
+            let mut context = imported_context_with_target_facts(
+                &importer,
+                importer_file,
+                &target,
+                target_file,
+                true,
+                CanonicalModuleResolutionMode::CommonJs,
+                CanonicalCheckerOptions {
+                    no_implicit_any,
+                    ..CanonicalCheckerOptions::default()
+                },
+            );
+
+            context.check_source_file(target_file).unwrap();
+            context.check_source_file(importer_file).unwrap();
+
+            let expected_diagnostics = if no_implicit_any {
+                vec![7010, 7010]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(
+                context
+                    .diagnostics()
+                    .as_slice()
+                    .iter()
+                    .map(|diagnostic| diagnostic.diagnostic.code())
+                    .collect::<Vec<_>>(),
+                expected_diagnostics
+            );
+            let call_nodes = calls(&importer, importer_file);
+            assert_eq!(call_nodes.len(), 2);
+            let any = context.store().intrinsic_bootstrap().unwrap().any_type;
+            let signatures = call_nodes
+                .iter()
+                .map(|call| {
+                    assert_eq!(
+                        context
+                            .store()
+                            .type_node_links(*call)
+                            .and_then(|links| links.resolved_type),
+                        Some(any)
+                    );
+                    context
+                        .store()
+                        .signature_links(*call)
+                        .and_then(|links| links.resolved_signature.signature())
+                        .unwrap()
+                })
+                .collect::<Vec<_>>();
+            assert_ne!(signatures[0], signatures[1]);
+
+            let cold_calls = call_nodes
+                .iter()
+                .map(|call| call_publication_state(&context, *call))
+                .collect::<Vec<_>>();
+            mark_source_unchecked(&mut context, importer_file);
+            context.check_source_file(importer_file).unwrap();
+            assert_eq!(
+                call_nodes
+                    .iter()
+                    .map(|call| call_publication_state(&context, *call))
+                    .collect::<Vec<_>>(),
+                cold_calls
+            );
+        }
+    }
+
+    #[test]
     fn imported_declared_object_identity_calls_force_warm_replay_for_aliases_and_interfaces() {
         for (index, declaration) in [
             "export type User = { id: number }; ",
@@ -4046,70 +4139,245 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_property_callable_families_never_publish_calls() {
-        for (index, (text, reaches_property_execution)) in [
-            (
-                concat!(
-                    "type API = { fn: <T>(value: T) => T }; ",
-                    "function use(api: API): number { return api.fn(1); }",
-                ),
-                false,
-            ),
-            (
-                concat!(
-                    "function identity<T>(value: T): T { return value; } ",
-                    "const api = { fn: identity }; const result = api.fn(1);",
-                ),
-                true,
-            ),
-            (
-                concat!(
-                    "type API = { fn: number }; ",
-                    "function use(api: API): string { return api.fn(1); }",
-                ),
-                true,
-            ),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let parsed = parsed(text);
-            let file = FileId::new(444 + u32::try_from(index).unwrap());
-            let call_nodes = calls(&parsed, file);
-            let [call] = call_nodes.as_slice() else {
-                panic!("expected one property call")
-            };
-            let call = *call;
-            let access_nodes = property_accesses(&parsed, file);
-            let [access] = access_nodes.as_slice() else {
-                panic!("expected one property access")
-            };
-            let access = *access;
-            let mut context = context(&parsed, file);
+    fn generic_source_property_calls_infer_and_accept_explicit_type_arguments() {
+        let parsed = parsed(concat!(
+            "function identity<T>(value: T): T { return value; } ",
+            "const api = { fn: identity }; ",
+            "const inferred: string = api.fn('value'); ",
+            "const explicit: number = api.fn<number>(1);",
+        ));
+        let file = FileId::new(448);
+        let mut call_nodes = calls(&parsed, file);
+        call_nodes.sort_by_key(|call| parsed.arena.get(call.node).unwrap().range.start);
+        let [inferred, explicit] = call_nodes.as_slice() else {
+            panic!("expected inferred and explicit generic property calls")
+        };
+        let mut context = context(&parsed, file);
 
-            let result = context.check_source_file(file);
-            if reaches_property_execution {
-                assert_eq!(result, Err(SourceCheckError::Call(call)));
-            } else {
-                assert!(result.is_err());
-            }
-            assert!(context.store().type_node_links(call).is_none());
-            assert!(context.store().signature_links(call).is_none());
-            assert_eq!(
-                context
-                    .store()
-                    .type_node_links(access)
-                    .and_then(|links| links.resolved_type)
-                    .is_some(),
-                reaches_property_execution
-            );
-            assert_eq!(
-                context
-                    .store()
-                    .symbol_node_links(access)
-                    .is_some_and(|links| links.resolved_symbol.is_some()),
-                reaches_property_execution
-            );
-        }
+        context.check_source_file(file).unwrap();
+
+        assert!(context.diagnostics().is_empty());
+        let inferred_type = context
+            .store()
+            .type_node_links(*inferred)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        let TypeData::Literal(inferred_literal) =
+            context.store().type_payload(inferred_type).unwrap().data()
+        else {
+            panic!("the inferred source property call must preserve its literal")
+        };
+        assert_eq!(
+            inferred_literal.value,
+            LiteralValue::String("value".to_owned())
+        );
+        assert_eq!(
+            context
+                .store()
+                .type_node_links(*explicit)
+                .and_then(|links| links.resolved_type),
+            Some(context.store().intrinsic_bootstrap().unwrap().number_type)
+        );
+        let signatures = [*inferred, *explicit].map(|call| {
+            context
+                .store()
+                .signature_links(call)
+                .and_then(|links| links.resolved_signature.signature())
+                .unwrap()
+        });
+        assert_ne!(signatures[0], signatures[1]);
+
+        let cold_calls = [*inferred, *explicit].map(|call| call_publication_state(&context, call));
+        mark_source_unchecked(&mut context, file);
+        context.check_source_file(file).unwrap();
+        assert_eq!(
+            [*inferred, *explicit].map(|call| call_publication_state(&context, call)),
+            cold_calls
+        );
+    }
+
+    #[test]
+    fn strict_optional_generic_calls_infer_defaults_and_report_exact_arity_ranges() {
+        let parsed = parsed(concat!(
+            "declare function optional<T>(value?: T): T; ",
+            "declare function fallback<T = string>(value?: T): T; ",
+            "declare function dependent<T, U = T>(first: T, second?: U): U; ",
+            "const omitted = optional(); ",
+            "const inferred: number = optional(1); ",
+            "const explicit: string = optional<string>(); ",
+            "const defaulted: string = fallback(); ",
+            "const related: string = dependent('value'); ",
+            "const extra = optional(1, 2); ",
+            "const missing = dependent();",
+        ));
+        let file = FileId::new(451);
+        let mut call_nodes = calls(&parsed, file);
+        call_nodes.sort_by_key(|call| parsed.arena.get(call.node).unwrap().range.start);
+        let [omitted, inferred, explicit, defaulted, dependent, _, _] = call_nodes.as_slice()
+        else {
+            panic!("expected seven optional generic calls")
+        };
+        let mut context = context_with_options(
+            &parsed,
+            file,
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    exact_optional_property_types: false,
+                },
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+
+        context.check_source_file(file).unwrap();
+
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        assert_eq!(
+            context
+                .store()
+                .type_node_links(*omitted)
+                .and_then(|links| links.resolved_type),
+            Some(bootstrap.unknown_type)
+        );
+        assert_eq!(
+            context
+                .store()
+                .type_node_links(*explicit)
+                .and_then(|links| links.resolved_type),
+            Some(bootstrap.string_type)
+        );
+        assert_eq!(
+            context
+                .store()
+                .type_node_links(*defaulted)
+                .and_then(|links| links.resolved_type),
+            Some(bootstrap.string_type)
+        );
+        assert!(
+            context
+                .store()
+                .type_node_links(*inferred)
+                .and_then(|links| links.resolved_type)
+                .and_then(|type_| context.store().type_payload(type_))
+                .is_some_and(|record| record.flags().intersects(TypeFlags::NUMBER_LITERAL))
+        );
+        assert_eq!(
+            context
+                .store()
+                .type_node_links(*dependent)
+                .and_then(|links| links.resolved_type),
+            Some(bootstrap.string_type)
+        );
+        assert_eq!(
+            context
+                .diagnostics()
+                .as_slice()
+                .iter()
+                .map(|diagnostic| {
+                    (
+                        diagnostic.diagnostic.code(),
+                        diagnostic.diagnostic.render().unwrap(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            vec![
+                (2554, "Expected 0-1 arguments, but got 2.".to_owned()),
+                (2554, "Expected 1-2 arguments, but got 0.".to_owned()),
+            ]
+        );
+
+        let cold_calls = call_nodes
+            .iter()
+            .map(|call| call_publication_state(&context, *call))
+            .collect::<Vec<_>>();
+        mark_source_unchecked(&mut context, file);
+        context.check_source_file(file).unwrap();
+        assert_eq!(
+            call_nodes
+                .iter()
+                .map(|call| call_publication_state(&context, *call))
+                .collect::<Vec<_>>(),
+            cold_calls
+        );
+    }
+
+    #[test]
+    fn any_property_calls_publish_the_any_signature_without_diagnostics() {
+        let parsed = parsed(concat!(
+            "type API = { fn: any }; ",
+            "function use(api: API): any { return api.fn(1); }",
+        ));
+        let file = FileId::new(449);
+        let call_nodes = calls(&parsed, file);
+        let [call] = call_nodes.as_slice() else {
+            panic!("expected one any property call")
+        };
+        let mut context = context(&parsed, file);
+
+        context.check_source_file(file).unwrap();
+
+        assert!(context.diagnostics().is_empty());
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        assert_eq!(
+            context
+                .store()
+                .signature_links(*call)
+                .and_then(|links| links.resolved_signature.signature()),
+            Some(bootstrap.any_signature)
+        );
+        assert_eq!(
+            context
+                .store()
+                .type_node_links(*call)
+                .and_then(|links| links.resolved_type),
+            Some(bootstrap.any_type)
+        );
+    }
+
+    #[test]
+    fn noncallable_property_reports_ts2349_at_its_name() {
+        let parsed = parsed("const api = { fn: 1 }; const result = api.fn();");
+        let file = FileId::new(450);
+        let call_nodes = calls(&parsed, file);
+        let [call] = call_nodes.as_slice() else {
+            panic!("expected one noncallable property call")
+        };
+        let access_nodes = property_accesses(&parsed, file);
+        let [access] = access_nodes.as_slice() else {
+            panic!("expected one noncallable property access")
+        };
+        let mut context = context(&parsed, file);
+
+        context.check_source_file(file).unwrap();
+
+        let [diagnostic] = context.diagnostics().as_slice() else {
+            panic!("expected one TS2349 property diagnostic")
+        };
+        assert_eq!(diagnostic.node, Some(property_name(&parsed, file, *access)));
+        assert_eq!(diagnostic.diagnostic.code(), 2349);
+        assert_eq!(
+            diagnostic.diagnostic.render().unwrap(),
+            "This expression is not callable.\n  Type 'Number' has no call signatures."
+        );
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        assert_eq!(
+            context
+                .store()
+                .signature_links(*call)
+                .and_then(|links| links.resolved_signature.signature()),
+            Some(bootstrap.unknown_signature)
+        );
+        assert_eq!(
+            context
+                .store()
+                .type_node_links(*call)
+                .and_then(|links| links.resolved_type),
+            Some(bootstrap.error_type)
+        );
+
+        let cold = call_publication_state(&context, *call);
+        mark_source_unchecked(&mut context, file);
+        context.check_source_file(file).unwrap();
+        assert_eq!(call_publication_state(&context, *call), cold);
     }
 }

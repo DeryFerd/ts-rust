@@ -14,7 +14,7 @@
 //! union read adapter.
 
 use ts_ast::{NodeArena, NodeData, NodeRef, SyntaxKind};
-use ts_binder::SemanticSymbolId;
+use ts_binder::{SemanticSymbolId, SymbolFlags};
 use ts_diagnostics::{Diagnostic, message_by_code};
 
 use super::{
@@ -24,7 +24,7 @@ use super::{
     bootstrap::UnionReduction,
     formatter::type_to_string_with_host_global_types_and_flags,
     member_resolution::UnionPropertyError,
-    source::PlannedExpression,
+    source::{PlannedExpression, PlannedExpressionKind},
     spelling::get_spelling_suggestion,
     type_records::{TypeData, TypeRecord},
     types::TypeFlags,
@@ -200,6 +200,15 @@ enum CopiedMissingUnionProperty {
     Unavailable,
     PresentEverywhere,
     Missing(TypeId),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NamespaceProperty {
+    Present {
+        symbol: SemanticSymbolId,
+        type_: TypeId,
+    },
+    Missing,
 }
 
 /// Proves property syntax and existing access caches before recursive receiver
@@ -436,7 +445,30 @@ pub(super) fn check_direct_source_property(
     } else {
         CopiedSourcePropertySuggestion::Unavailable
     };
-    let (type_, property, diagnostic) = if receiver_type == any || receiver_type == error_type {
+    let namespace_property = resolve_namespace_property(store, plan, receiver_type)?;
+    let (type_, property, diagnostic) = if let Some(namespace_property) = namespace_property {
+        match namespace_property {
+            NamespaceProperty::Present { symbol, type_ } => (type_, Some(symbol), None),
+            NamespaceProperty::Missing if plan.is_read() => (
+                error_type,
+                None,
+                Some(SourcePropertyDiagnostic {
+                    name_node: plan.name_node,
+                    receiver_type,
+                    missing_type: None,
+                    suggestion: None,
+                }),
+            ),
+            NamespaceProperty::Missing => {
+                return Err(SourcePropertyError::Unsupported(
+                    SourcePropertyUnsupported::MissingOwnProperty {
+                        node: plan.node,
+                        receiver_type,
+                    },
+                ));
+            }
+        }
+    } else if receiver_type == any || receiver_type == error_type {
         (receiver_type, None, None)
     } else if union_read {
         if let Some(property) = store
@@ -533,6 +565,147 @@ pub(super) fn check_direct_source_property(
 
     publish_property_links(store, plan.node, property, type_)?;
     Ok(CheckedSourceProperty { type_, diagnostic })
+}
+
+fn resolve_namespace_property(
+    store: &CanonicalTypeMapperStore,
+    plan: &SourcePropertyPlan,
+    receiver_type: TypeId,
+) -> Result<Option<NamespaceProperty>, SourcePropertyError> {
+    let receiver = store
+        .type_payload(receiver_type)
+        .ok_or(SourcePropertyError::InvalidCache(plan.node))?;
+    let receiver_module = receiver
+        .symbol()
+        .map(|symbol| {
+            store
+                .get_merged_symbol(symbol)
+                .ok_or(SourcePropertyError::InvalidCache(plan.node))
+        })
+        .transpose()?
+        .filter(|symbol| {
+            store
+                .symbol(*symbol)
+                .is_some_and(|record| record.flags().intersects(SymbolFlags::MODULE))
+        });
+    let alias_module = if let PlannedExpressionKind::Identifier(read) = &plan.receiver.kind {
+        let receiver_symbol = store
+            .symbol(read.value_symbol)
+            .ok_or(SourcePropertyError::InvalidCache(plan.node))?;
+        if receiver_symbol.flags().contains(SymbolFlags::ALIAS) {
+            let links = store
+                .alias_symbol_links(read.value_symbol)
+                .ok_or(SourcePropertyError::InvalidCache(plan.node))?;
+            if links.type_only_declaration.is_some() {
+                return Err(SourcePropertyError::InvalidCache(plan.node));
+            }
+            links.alias_target.symbol()
+        } else if receiver_symbol.flags().intersects(SymbolFlags::MODULE) {
+            Some(read.value_symbol)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let module = match (receiver_module, alias_module) {
+        (Some(owner), Some(alias)) if owner != alias => {
+            return Err(SourcePropertyError::InvalidCache(plan.node));
+        }
+        (Some(owner), _) => owner,
+        (None, Some(alias)) => alias,
+        (None, None) => return Ok(None),
+    };
+    let owner = store
+        .symbol(module)
+        .ok_or(SourcePropertyError::InvalidCache(plan.node))?;
+    if !owner.flags().intersects(SymbolFlags::MODULE) {
+        return Ok(None);
+    }
+    let TypeData::Object(object) = receiver.data() else {
+        return Err(SourcePropertyError::InvalidCache(plan.node));
+    };
+    let exports = store
+        .module_symbol_links(module)
+        .and_then(|links| links.resolved_exports)
+        .or_else(|| owner.exports())
+        .ok_or(SourcePropertyError::InvalidCache(plan.node))?;
+    let export_table = store
+        .symbol_table(exports)
+        .ok_or(SourcePropertyError::InvalidCache(plan.node))?;
+    let Some(symbol) = export_table.get_source(&plan.name) else {
+        return Ok(Some(NamespaceProperty::Missing));
+    };
+    let symbol = store
+        .get_merged_symbol(symbol)
+        .ok_or(SourcePropertyError::InvalidCache(plan.node))?;
+    let record = store
+        .symbol(symbol)
+        .ok_or(SourcePropertyError::InvalidCache(plan.node))?;
+    if !record.flags().intersects(SymbolFlags::VALUE) {
+        return Ok(Some(NamespaceProperty::Missing));
+    }
+    let projected = match object.structured.members {
+        Some(members) if members != exports => {
+            let table = store
+                .symbol_table(members)
+                .ok_or(SourcePropertyError::InvalidCache(plan.node))?;
+            let property = table
+                .get_source(&plan.name)
+                .ok_or(SourcePropertyError::InvalidCache(plan.node))?;
+            let projected = store
+                .symbol(property)
+                .ok_or(SourcePropertyError::InvalidCache(plan.node))?;
+            let links = store
+                .value_symbol_links(property)
+                .ok_or(SourcePropertyError::InvalidCache(plan.node))?;
+            if projected.flags() != SymbolFlags::PROPERTY
+                || links.target.is_some_and(|target| target != symbol)
+                || object
+                    .structured
+                    .properties
+                    .as_deref()
+                    .is_none_or(|properties| !properties.contains(&property))
+            {
+                return Err(SourcePropertyError::InvalidCache(plan.node));
+            }
+            Some(
+                links
+                    .resolved_type
+                    .ok_or(SourcePropertyError::InvalidCache(plan.node))?,
+            )
+        }
+        _ => None,
+    };
+    let cached = store
+        .value_symbol_links(symbol)
+        .and_then(|links| links.resolved_type);
+    let callable = store.source_callable_type_for_owner(symbol);
+    if cached
+        .zip(callable)
+        .is_some_and(|(cached, callable)| cached != callable)
+    {
+        return Err(SourcePropertyError::InvalidCache(plan.node));
+    }
+    if projected
+        .zip(cached.or(callable))
+        .is_some_and(|(projected, target)| projected != target)
+    {
+        return Err(SourcePropertyError::InvalidCache(plan.node));
+    }
+    let type_ = cached
+        .or(callable)
+        .or(projected)
+        .ok_or(SourcePropertyError::Unsupported(
+            SourcePropertyUnsupported::MissingOwnProperty {
+                node: plan.node,
+                receiver_type,
+            },
+        ))?;
+    if store.type_payload(type_).is_none() {
+        return Err(SourcePropertyError::InvalidCache(plan.node));
+    }
+    Ok(Some(NamespaceProperty::Present { symbol, type_ }))
 }
 
 fn receiver_continues_optional_chain(arena: &NodeArena, receiver: &ts_ast::Node) -> bool {
@@ -983,7 +1156,7 @@ mod tests {
 
     use super::*;
     use crate::semantic::{
-        IntrinsicBootstrapOptions, ValueSymbolLinks,
+        AliasSymbolLinks, AliasTargetState, IntrinsicBootstrapOptions, ValueSymbolLinks,
         source::{PlannedExpressionKind, PlannedIdentifierRead, PlannedIdentifierReadKind},
         types::ObjectFlags,
     };
@@ -1076,6 +1249,63 @@ mod tests {
         (object, property)
     }
 
+    fn namespace_object(
+        store: &mut CanonicalTypeMapperStore,
+        name: &str,
+        type_: TypeId,
+        flags: SymbolFlags,
+    ) -> (TypeId, SemanticSymbolId, SemanticSymbolId, SemanticSymbolId) {
+        let exports = store.alloc_symbol_table();
+        let module = store
+            .alloc_symbol(SymbolData::new(
+                SymbolFlags::VALUE_MODULE,
+                EscapedName::source("\"/project/values.ts\""),
+            ))
+            .unwrap();
+        assert!(store.set_symbol_relationships(module, None, Some(exports), None, None));
+        let member = store
+            .alloc_symbol(SymbolData::new(flags, EscapedName::source(name)))
+            .unwrap();
+        assert!(store.set_symbol_relationships(member, None, None, Some(module), None));
+        assert!(store.set_value_symbol_links(
+            member,
+            ValueSymbolLinks {
+                resolved_type: Some(type_),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        assert_eq!(
+            store.insert_symbol(exports, EscapedName::source(name), member),
+            Some(None)
+        );
+        let object = store
+            .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(module))
+            .unwrap();
+        assert!(store.set_structured_type_members(
+            object,
+            Some(exports),
+            Some(vec![member]),
+            None,
+            None,
+            None,
+        ));
+        let alias = store
+            .alloc_symbol(SymbolData::new(
+                SymbolFlags::ALIAS,
+                EscapedName::source("namespace"),
+            ))
+            .unwrap();
+        assert!(store.set_alias_symbol_links(
+            alias,
+            AliasSymbolLinks {
+                immediate_target: Some(module),
+                alias_target: AliasTargetState::Resolved(module),
+                ..AliasSymbolLinks::default()
+            },
+        ));
+        (object, module, member, alias)
+    }
+
     #[test]
     fn required_own_property_publishes_exact_symbol_and_type_cold_and_warm() {
         let parsed = parsed("const result = object.value;");
@@ -1150,6 +1380,182 @@ mod tests {
                 .and_then(|links| links.resolved_type),
             Some(any)
         );
+        assert!(store.symbol_node_links(access).is_none());
+    }
+
+    #[test]
+    fn namespace_exports_publish_the_exact_value_symbol_and_type() {
+        let parsed = parsed("const result = namespace.value;");
+        let file = FileId::new(515);
+        let access = property_access(&parsed, file);
+        let mut store = registered_store(&parsed, file);
+        let string = store.intrinsic_bootstrap().unwrap().string_type;
+        let (object, _, member, alias) = namespace_object(
+            &mut store,
+            "value",
+            string,
+            SymbolFlags::BLOCK_SCOPED_VARIABLE,
+        );
+        let syntax = plan_direct_source_property_syntax(&parsed.arena, &store, access).unwrap();
+        let plan = finish_direct_source_property_plan(&syntax, identifier_receiver(&syntax, alias))
+            .unwrap();
+
+        for _ in 0..2 {
+            assert_eq!(
+                check_direct_source_property(&mut store, None, &plan, object),
+                Ok(CheckedSourceProperty {
+                    type_: string,
+                    diagnostic: None,
+                }),
+            );
+        }
+        assert_eq!(
+            store
+                .symbol_node_links(access)
+                .and_then(|links| links.resolved_symbol),
+            Some(member),
+        );
+        assert_eq!(
+            store
+                .type_node_links(access)
+                .and_then(|links| links.resolved_type),
+            Some(string),
+        );
+    }
+
+    #[test]
+    fn namespace_function_exports_remain_valid_property_call_callees() {
+        let parsed = parsed("const result = namespace.value();");
+        let file = FileId::new(516);
+        let access = property_access(&parsed, file);
+        let call = NodeRef::new(
+            parsed.arena.id(),
+            file,
+            parsed.arena.get(access.node).unwrap().parent.unwrap(),
+        );
+        let mut store = registered_store(&parsed, file);
+        let any = store.intrinsic_bootstrap().unwrap().any_type;
+        let (object, _, member, alias) =
+            namespace_object(&mut store, "value", any, SymbolFlags::FUNCTION);
+        let syntax =
+            plan_direct_source_property_call_syntax(&parsed.arena, &store, access, call).unwrap();
+        let name = syntax.name_node();
+        let plan = finish_direct_source_property_plan(&syntax, identifier_receiver(&syntax, alias))
+            .unwrap();
+
+        assert!(plan.is_call_callee_for(call, name));
+        assert_eq!(
+            check_direct_source_property(&mut store, None, &plan, object),
+            Ok(CheckedSourceProperty {
+                type_: any,
+                diagnostic: None,
+            }),
+        );
+        assert_eq!(
+            store
+                .symbol_node_links(access)
+                .and_then(|links| links.resolved_symbol),
+            Some(member),
+        );
+    }
+
+    #[test]
+    fn namespace_import_projections_keep_the_original_export_symbol() {
+        let parsed = parsed("const result = namespace.value;");
+        let file = FileId::new(518);
+        let access = property_access(&parsed, file);
+        let mut store = registered_store(&parsed, file);
+        let string = store.intrinsic_bootstrap().unwrap().string_type;
+        let (_, _, member, alias) = namespace_object(
+            &mut store,
+            "value",
+            string,
+            SymbolFlags::BLOCK_SCOPED_VARIABLE,
+        );
+        let projection = store
+            .alloc_symbol(SymbolData::new(
+                SymbolFlags::PROPERTY,
+                EscapedName::source("value"),
+            ))
+            .unwrap();
+        assert!(store.set_value_symbol_links(
+            projection,
+            ValueSymbolLinks {
+                resolved_type: Some(string),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        let projected_members = store.alloc_symbol_table();
+        assert_eq!(
+            store.insert_symbol(projected_members, EscapedName::source("value"), projection),
+            Some(None),
+        );
+        let object = store
+            .alloc_plain_object_type(ObjectFlags::ANONYMOUS, None)
+            .unwrap();
+        assert!(store.set_structured_type_members(
+            object,
+            Some(projected_members),
+            Some(vec![projection]),
+            None,
+            None,
+            None,
+        ));
+        let syntax = plan_direct_source_property_syntax(&parsed.arena, &store, access).unwrap();
+        let plan = finish_direct_source_property_plan(&syntax, identifier_receiver(&syntax, alias))
+            .unwrap();
+
+        assert_eq!(
+            check_direct_source_property(&mut store, None, &plan, object),
+            Ok(CheckedSourceProperty {
+                type_: string,
+                diagnostic: None,
+            }),
+        );
+        assert_eq!(
+            store
+                .symbol_node_links(access)
+                .and_then(|links| links.resolved_symbol),
+            Some(member),
+        );
+    }
+
+    #[test]
+    fn namespace_alias_cache_mismatches_fail_before_access_publication() {
+        let parsed = parsed("const result = namespace.value;");
+        let file = FileId::new(517);
+        let access = property_access(&parsed, file);
+        let mut store = registered_store(&parsed, file);
+        let string = store.intrinsic_bootstrap().unwrap().string_type;
+        let (object, _, _, alias) = namespace_object(
+            &mut store,
+            "value",
+            string,
+            SymbolFlags::BLOCK_SCOPED_VARIABLE,
+        );
+        let other = store
+            .alloc_symbol(SymbolData::new(
+                SymbolFlags::VALUE_MODULE,
+                EscapedName::source("\"/project/other.ts\""),
+            ))
+            .unwrap();
+        assert!(store.set_alias_symbol_links(
+            alias,
+            AliasSymbolLinks {
+                immediate_target: Some(other),
+                alias_target: AliasTargetState::Resolved(other),
+                ..AliasSymbolLinks::default()
+            },
+        ));
+        let syntax = plan_direct_source_property_syntax(&parsed.arena, &store, access).unwrap();
+        let plan = finish_direct_source_property_plan(&syntax, identifier_receiver(&syntax, alias))
+            .unwrap();
+
+        assert_eq!(
+            check_direct_source_property(&mut store, None, &plan, object),
+            Err(SourcePropertyError::InvalidCache(access)),
+        );
+        assert!(store.type_node_links(access).is_none());
         assert!(store.symbol_node_links(access).is_none());
     }
 

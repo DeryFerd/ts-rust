@@ -329,6 +329,23 @@ impl PlannedJsDocType {
         &self.type_
     }
 
+    /// Returns the original name of a locally resolved scalar typedef.
+    #[must_use]
+    pub fn resolved_alias_name(&self) -> Option<&str> {
+        match (&self.type_, self.resolved_type.as_deref()) {
+            (
+                JsDocType::Named(name),
+                Some(
+                    JsDocType::Intrinsic(_)
+                    | JsDocType::StringLiteral(_)
+                    | JsDocType::NumberLiteral(_)
+                    | JsDocType::BigIntLiteral(_),
+                ),
+            ) => Some(name),
+            _ => None,
+        }
+    }
+
     fn resolution_type(&self) -> &JsDocType {
         self.resolved_type.as_deref().unwrap_or(&self.type_)
     }
@@ -1701,62 +1718,85 @@ fn attach_local_typedef_resolutions(declarations: &mut [PlannedJavaScriptDeclara
     }
 
     for declaration in declarations {
+        let declaration_templates = shadowed_type_parameters(&declaration.template_parameters);
         if let Some(annotation) = &mut declaration.type_ {
-            attach_local_typedef_resolution(annotation, &aliases);
+            attach_local_typedef_resolution(annotation, &aliases, &declaration_templates);
         }
         if let Some(annotation) = &mut declaration.return_type {
-            attach_local_typedef_resolution(annotation, &aliases);
+            attach_local_typedef_resolution(annotation, &aliases, &declaration_templates);
         }
         if let Some(annotation) = &mut declaration.this_type {
-            attach_local_typedef_resolution(annotation, &aliases);
+            attach_local_typedef_resolution(annotation, &aliases, &declaration_templates);
         }
         if let Some(satisfies) = &mut declaration.satisfies {
-            attach_local_typedef_resolution(&mut satisfies.type_, &aliases);
+            attach_local_typedef_resolution(&mut satisfies.type_, &aliases, &declaration_templates);
         }
-        attach_template_typedef_resolutions(&mut declaration.template_parameters, &aliases);
+        attach_template_typedef_resolutions(
+            &mut declaration.template_parameters,
+            &aliases,
+            &declaration_templates,
+        );
         for parameter in &mut declaration.parameters {
             if let Some(annotation) = &mut parameter.type_ {
-                attach_local_typedef_resolution(annotation, &aliases);
+                attach_local_typedef_resolution(annotation, &aliases, &declaration_templates);
             }
         }
         for alias in &mut declaration.typedefs {
+            let alias_templates = shadowed_type_parameters(&alias.template_parameters);
             if let Some(annotation) = &mut alias.type_ {
-                attach_local_typedef_resolution(annotation, &aliases);
+                attach_local_typedef_resolution(annotation, &aliases, &alias_templates);
             }
             for property in &mut alias.properties {
                 if let Some(annotation) = &mut property.type_ {
-                    attach_local_typedef_resolution(annotation, &aliases);
+                    attach_local_typedef_resolution(annotation, &aliases, &alias_templates);
                 }
             }
-            attach_template_typedef_resolutions(&mut alias.template_parameters, &aliases);
+            attach_template_typedef_resolutions(
+                &mut alias.template_parameters,
+                &aliases,
+                &alias_templates,
+            );
         }
         for callback in &mut declaration.callbacks {
+            let callback_templates = shadowed_type_parameters(&callback.template_parameters);
             for parameter in &mut callback.parameters {
                 if let Some(annotation) = &mut parameter.type_ {
-                    attach_local_typedef_resolution(annotation, &aliases);
+                    attach_local_typedef_resolution(annotation, &aliases, &callback_templates);
                 }
             }
             if let Some(annotation) = &mut callback.return_type {
-                attach_local_typedef_resolution(annotation, &aliases);
+                attach_local_typedef_resolution(annotation, &aliases, &callback_templates);
             }
             if let Some(annotation) = &mut callback.this_type {
-                attach_local_typedef_resolution(annotation, &aliases);
+                attach_local_typedef_resolution(annotation, &aliases, &callback_templates);
             }
-            attach_template_typedef_resolutions(&mut callback.template_parameters, &aliases);
+            attach_template_typedef_resolutions(
+                &mut callback.template_parameters,
+                &aliases,
+                &callback_templates,
+            );
         }
     }
+}
+
+fn shadowed_type_parameters(parameters: &[PlannedJsDocTemplateParameter]) -> HashSet<String> {
+    parameters
+        .iter()
+        .map(|parameter| parameter.name.clone())
+        .collect()
 }
 
 fn attach_template_typedef_resolutions(
     parameters: &mut [PlannedJsDocTemplateParameter],
     aliases: &HashMap<String, JsDocType>,
+    shadowed: &HashSet<String>,
 ) {
     for parameter in parameters {
         if let Some(constraint) = &mut parameter.constraint {
-            attach_local_typedef_resolution(constraint, aliases);
+            attach_local_typedef_resolution(constraint, aliases, shadowed);
         }
         if let Some(default_type) = &mut parameter.default_type {
-            attach_local_typedef_resolution(default_type, aliases);
+            attach_local_typedef_resolution(default_type, aliases, shadowed);
         }
     }
 }
@@ -1764,8 +1804,9 @@ fn attach_template_typedef_resolutions(
 fn attach_local_typedef_resolution(
     annotation: &mut PlannedJsDocType,
     aliases: &HashMap<String, JsDocType>,
+    shadowed: &HashSet<String>,
 ) {
-    if let Some(resolved) = substitute_local_typedefs(&annotation.type_, aliases) {
+    if let Some(resolved) = substitute_local_typedefs(&annotation.type_, aliases, shadowed) {
         annotation.resolved_type = Some(Box::new(resolved));
     }
 }
@@ -1773,28 +1814,30 @@ fn attach_local_typedef_resolution(
 fn substitute_local_typedefs(
     type_: &JsDocType,
     aliases: &HashMap<String, JsDocType>,
+    shadowed: &HashSet<String>,
 ) -> Option<JsDocType> {
     match type_ {
+        JsDocType::Named(name) if shadowed.contains(name) => None,
         JsDocType::Named(name) => resolve_scalar_typedef(name, aliases, &mut HashSet::new()),
-        JsDocType::Parenthesized(inner) => substitute_local_typedefs(inner, aliases)
+        JsDocType::Parenthesized(inner) => substitute_local_typedefs(inner, aliases, shadowed)
             .map(Box::new)
             .map(JsDocType::Parenthesized),
-        JsDocType::Nullable(inner) => substitute_local_typedefs(inner, aliases)
+        JsDocType::Nullable(inner) => substitute_local_typedefs(inner, aliases, shadowed)
             .map(Box::new)
             .map(JsDocType::Nullable),
-        JsDocType::NonNullable(inner) => substitute_local_typedefs(inner, aliases)
+        JsDocType::NonNullable(inner) => substitute_local_typedefs(inner, aliases, shadowed)
             .map(Box::new)
             .map(JsDocType::NonNullable),
-        JsDocType::Optional(inner) => substitute_local_typedefs(inner, aliases)
+        JsDocType::Optional(inner) => substitute_local_typedefs(inner, aliases, shadowed)
             .map(Box::new)
             .map(JsDocType::Optional),
-        JsDocType::Variadic(inner) => substitute_local_typedefs(inner, aliases)
+        JsDocType::Variadic(inner) => substitute_local_typedefs(inner, aliases, shadowed)
             .map(Box::new)
             .map(JsDocType::Variadic),
-        JsDocType::Array(inner) => substitute_local_typedefs(inner, aliases)
+        JsDocType::Array(inner) => substitute_local_typedefs(inner, aliases, shadowed)
             .map(Box::new)
             .map(JsDocType::Array),
-        JsDocType::ReadonlyArray(inner) => substitute_local_typedefs(inner, aliases)
+        JsDocType::ReadonlyArray(inner) => substitute_local_typedefs(inner, aliases, shadowed)
             .map(Box::new)
             .map(JsDocType::ReadonlyArray),
         JsDocType::Union(members) => {
@@ -1802,7 +1845,7 @@ fn substitute_local_typedefs(
             let resolved = members
                 .iter()
                 .map(|member| {
-                    substitute_local_typedefs(member, aliases).map_or_else(
+                    substitute_local_typedefs(member, aliases, shadowed).map_or_else(
                         || member.clone(),
                         |member| {
                             changed = true;
@@ -3808,6 +3851,74 @@ mod tests {
     }
 
     #[test]
+    fn object_typedef_properties_retain_alias_names_after_canonical_resolution() {
+        let javascript = parse_javascript_source_file(concat!(
+            "/**\n",
+            " * @typedef {object} T\n",
+            " * @property {boolean} await\n",
+            " */\n",
+            "/** @type {T} */\n",
+            "const a = 1;\n",
+            "/** @type {T} */\n",
+            "const b = { await: false };\n",
+            "/** @param {boolean} await */\n",
+            "function c(await) {}",
+        ));
+        assert!(
+            javascript.diagnostics.is_empty(),
+            "{:?}",
+            javascript.diagnostics
+        );
+        let root = NodeRef::new(
+            javascript.arena.id(),
+            FileId::new(91),
+            javascript.source_file,
+        );
+        let plan = plan_javascript_source_jsdoc(&javascript.arena, root).unwrap();
+        assert!(plan.diagnostics().is_empty(), "{:?}", plan.diagnostics());
+        let [first, second, callable] = plan.declarations() else {
+            panic!("expected two annotated variables and one annotated function")
+        };
+        let [alias] = first.typedefs() else {
+            panic!("expected one object typedef")
+        };
+        let [property] = alias.properties() else {
+            panic!("expected one object typedef property")
+        };
+        assert_eq!(alias.name(), "T");
+        assert_eq!(property.name(), "await");
+        assert_eq!(
+            property.type_().unwrap().type_(),
+            &JsDocType::Intrinsic(JsDocIntrinsicType::Boolean)
+        );
+        assert_eq!(callable.parameters()[0].name(), "await");
+
+        let parsed = parse_source_file("const marker = 1;");
+        let options = CanonicalCheckerOptions::default();
+        let mut context = context(&parsed, options);
+        let globals = context.global_types().clone();
+        let object = context
+            .store()
+            .intrinsic_bootstrap()
+            .unwrap()
+            .non_primitive_type;
+        for annotation in [first.type_().unwrap(), second.type_().unwrap()] {
+            assert_eq!(annotation.type_(), &JsDocType::Named("T".to_owned()));
+            assert_eq!(annotation.resolved_alias_name(), Some("T"));
+            assert_eq!(
+                resolve_planned_jsdoc_type(
+                    context.store_mut_for_test(),
+                    &globals,
+                    options,
+                    annotation,
+                ),
+                Ok(object)
+            );
+        }
+        assert_eq!(context.type_to_string(object).unwrap(), "object");
+    }
+
+    #[test]
     fn duplicate_cyclic_and_non_scalar_typedefs_remain_typed_boundaries() {
         for source in [
             concat!(
@@ -4112,6 +4223,7 @@ mod tests {
     #[test]
     fn callback_templates_and_receiver_keep_their_own_signature() {
         let javascript = parse_javascript_source_file(concat!(
+            "/** @typedef {number} T */\n",
             "/**\n",
             " * @template T\n",
             " * @callback NS.Handler\n",
@@ -4144,10 +4256,80 @@ mod tests {
             &JsDocType::Intrinsic(JsDocIntrinsicType::Object)
         );
         assert_eq!(callback.parameters()[0].name(), "value");
+        assert!(
+            callback.parameters()[0]
+                .type_()
+                .unwrap()
+                .resolved_alias_name()
+                .is_none()
+        );
         assert_eq!(
             callback.return_type().unwrap().type_(),
             &JsDocType::Named("T".to_owned())
         );
+    }
+
+    #[test]
+    fn namespaced_typedef_aliases_resolve_inside_callback_signatures() {
+        let javascript = parse_javascript_source_file(concat!(
+            "/** @typedef {number} NS.Input */\n",
+            "/** @typedef {string} NS.Output */\n",
+            "/**\n",
+            " * @callback NS.Mapper\n",
+            " * @param {NS.Input} value\n",
+            " * @returns {NS.Output}\n",
+            " */\n",
+            "function host() {}",
+        ));
+        assert!(
+            javascript.diagnostics.is_empty(),
+            "{:?}",
+            javascript.diagnostics
+        );
+        let root = NodeRef::new(
+            javascript.arena.id(),
+            FileId::new(92),
+            javascript.source_file,
+        );
+        let plan = plan_javascript_source_jsdoc(&javascript.arena, root).unwrap();
+        assert!(plan.diagnostics().is_empty(), "{:?}", plan.diagnostics());
+        let [host] = plan.declarations() else {
+            panic!("expected one callback-hosting declaration")
+        };
+        let [callback] = host.callbacks() else {
+            panic!("expected one namespaced callback")
+        };
+        assert_eq!(callback.name(), "NS.Mapper");
+        assert_eq!(
+            callback.parameters()[0]
+                .type_()
+                .unwrap()
+                .resolved_alias_name(),
+            Some("NS.Input")
+        );
+        assert_eq!(
+            callback.return_type().unwrap().resolved_alias_name(),
+            Some("NS.Output")
+        );
+
+        let parsed = parse_source_file("const marker = 1;");
+        let options = CanonicalCheckerOptions::default();
+        let mut context = context(&parsed, options);
+        let globals = context.global_types().clone();
+        let signature = resolve_planned_jsdoc_callback_signature(
+            context.store_mut_for_test(),
+            &globals,
+            options,
+            callback,
+            &[],
+        )
+        .unwrap();
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        assert_eq!(
+            signature.parameters()[0].type_(),
+            Some(bootstrap.number_type)
+        );
+        assert_eq!(signature.return_type(), Some(bootstrap.string_type));
     }
 
     #[test]
@@ -4288,6 +4470,7 @@ mod tests {
         let type_parameter = context.get_declared_type_of_symbol(symbol).unwrap();
 
         let javascript = parse_javascript_source_file(concat!(
+            "/** @typedef {number} T */\n",
             "/**\n",
             " * @template T\n",
             " * @this {object}\n",

@@ -776,6 +776,33 @@ pub(super) fn create_direct_generic_reference_with_defaults(
 }
 
 impl CanonicalTypeMapperStore {
+    /// Returns the canonical `keyof any` constraint used by `Record` and
+    /// other built-in mapped aliases.
+    #[must_use]
+    pub fn canonical_property_key_type(&self) -> Option<TypeId> {
+        let bootstrap = self.intrinsic_bootstrap()?;
+        let property_keys = bootstrap.string_number_symbol_type;
+        let record = self.type_payload(property_keys)?;
+        let TypeData::Union(union) = record.data() else {
+            return None;
+        };
+        (union.union.types.len() == 3
+            && union.union.types.contains(&bootstrap.string_type)
+            && union.union.types.contains(&bootstrap.number_type)
+            && union.union.types.contains(&bootstrap.es_symbol_type)
+            && self
+                .validate_cached_union_result(property_keys, None)
+                .is_ok())
+        .then_some(property_keys)
+    }
+
+    /// Checks whether a type satisfies the canonical property-key domain
+    /// without allocating checker records or changing relation caches.
+    #[must_use]
+    pub fn is_valid_property_key_type(&self, type_: TypeId) -> bool {
+        property_key_type_is_valid(self, type_, &mut HashSet::new())
+    }
+
     /// Creates or reuses one node-less, full-arity direct class/interface
     /// reference from the target-owned canonical instantiation cache.
     ///
@@ -818,6 +845,56 @@ impl CanonicalTypeMapperStore {
             &mut session,
         )
     }
+}
+
+fn property_key_type_is_valid(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    active: &mut HashSet<TypeId>,
+) -> bool {
+    if !active.insert(type_) {
+        return false;
+    }
+    let Some(record) = store.type_payload(type_) else {
+        return false;
+    };
+    let result = if record.flags().intersects(
+        TypeFlags::ANY
+            | TypeFlags::NEVER
+            | TypeFlags::STRING_LIKE
+            | TypeFlags::NUMBER_LIKE
+            | TypeFlags::ES_SYMBOL_LIKE,
+    ) {
+        true
+    } else {
+        match record.data() {
+            TypeData::Union(union) => union
+                .union
+                .types
+                .iter()
+                .all(|candidate| property_key_type_is_valid(store, *candidate, active)),
+            TypeData::Intersection(intersection) => intersection
+                .intersection
+                .types
+                .iter()
+                .any(|candidate| property_key_type_is_valid(store, *candidate, active)),
+            TypeData::TypeParameter(parameter) => parameter
+                .constraint
+                .filter(|constraint| {
+                    store.intrinsic_bootstrap().is_none_or(|bootstrap| {
+                        *constraint != bootstrap.no_constraint_type
+                            && *constraint != bootstrap.circular_constraint_type
+                    })
+                })
+                .is_some_and(|constraint| property_key_type_is_valid(store, constraint, active)),
+            TypeData::Index(index) => store.intrinsic_bootstrap().is_some_and(|bootstrap| {
+                index.target == bootstrap.any_type || index.target == bootstrap.never_type
+            }),
+            _ => false,
+        }
+    };
+    active.remove(&type_);
+    result
 }
 
 #[cfg(test)]
@@ -1013,6 +1090,47 @@ mod tests {
             Ok(reference),
         );
         assert_eq!(store.type_len(), before_types);
+    }
+
+    #[test]
+    fn canonical_property_key_constraint_accepts_record_key_families() {
+        let mut store = initialized_store();
+        let (keys, any, string, number, symbol, boolean, bigint, unknown, never) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (
+                bootstrap.string_number_symbol_type,
+                bootstrap.any_type,
+                bootstrap.string_type,
+                bootstrap.number_type,
+                bootstrap.es_symbol_type,
+                bootstrap.boolean_type,
+                bootstrap.bigint_type,
+                bootstrap.unknown_type,
+                bootstrap.never_type,
+            )
+        };
+        let unicode = store
+            .regular_string_literal_type("i\u{307}spanyol".to_owned())
+            .unwrap();
+        let union = store.literal_union_type(&[unicode, number], None).unwrap();
+        let parameter = store.alloc_type_parameter(None).unwrap();
+        assert!(store.set_type_parameter_resolution(parameter, Some(keys), None, None, None));
+        let keyof_any = store
+            .alloc_index_type(any, crate::semantic::signatures::IndexFlags::NONE)
+            .unwrap();
+        let keyof_unknown = store
+            .alloc_index_type(unknown, crate::semantic::signatures::IndexFlags::NONE)
+            .unwrap();
+
+        assert_eq!(store.canonical_property_key_type(), Some(keys));
+        for valid in [
+            keys, any, string, number, symbol, unicode, union, parameter, never, keyof_any,
+        ] {
+            assert!(store.is_valid_property_key_type(valid));
+        }
+        for invalid in [boolean, bigint, unknown, keyof_unknown] {
+            assert!(!store.is_valid_property_key_type(invalid));
+        }
     }
 
     #[test]

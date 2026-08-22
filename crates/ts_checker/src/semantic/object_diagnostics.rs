@@ -28,6 +28,7 @@ use super::{
         type_to_string_with_host_global_types_and_flags,
     },
     functions::{StoredFunctionTypeValidation, validate_stored_function_type},
+    indexed_access_types::{is_template_pattern_index_key, template_pattern_index_matches_name},
     instantiate::InstantiationSession,
     object_members::{
         DeclaredPropertyTypeGraphValidation, PropertyObjectPlan,
@@ -370,8 +371,9 @@ fn elaborate_known_properties(
     {
         return Err(invalid_structure(checked.result));
     }
+    let indexed_target = declared_index_target(store, host, target_type)?;
     if target.properties().is_empty()
-        && let Some(index) = declared_index_target(store, host, target_type)?
+        && let Some(index) = indexed_target
     {
         return elaborate_indexed_properties(
             store,
@@ -401,6 +403,22 @@ fn elaborate_known_properties(
             return Err(invalid_structure(checked.result));
         }
         let Some(target_property) = target.get_source(&source_property.name) else {
+            if let Some(indexed_target) = indexed_target {
+                diagnostics.extend(elaborate_indexed_property(
+                    store,
+                    host,
+                    global_types,
+                    source_expression,
+                    checked_property,
+                    &source_property.name,
+                    source_property.name_node,
+                    source_property_type,
+                    indexed_target,
+                    flags,
+                    options,
+                    session,
+                )?);
+            }
             continue;
         };
         if store.is_type_assignable_to_with_global_types(
@@ -517,8 +535,12 @@ fn declared_index_target(
     let bootstrap = store
         .intrinsic_bootstrap()
         .ok_or(RelationUnavailable::MissingBootstrap)?;
+    let supported_key = info.key_type() == bootstrap.string_type
+        || info.key_type() == bootstrap.number_type
+        || info.key_type() == bootstrap.es_symbol_type
+        || is_template_pattern_index_key(store, info.key_type());
     if node.kind != SyntaxKind::IndexSignature
-        || info.key_type() != bootstrap.string_type && info.key_type() != bootstrap.number_type
+        || !supported_key
         || store.type_payload(info.value_type()).is_none()
         || info.index_symbol().is_some()
         || !info.components().is_empty()
@@ -546,10 +568,6 @@ fn elaborate_indexed_properties(
     options: CanonicalCheckerOptions,
     session: &mut InstantiationSession,
 ) -> Result<Vec<CanonicalCheckerDiagnostic>, SourceCheckError> {
-    let string_key = store
-        .intrinsic_bootstrap()
-        .ok_or(RelationUnavailable::MissingBootstrap)?
-        .string_type;
     let mut diagnostics = Vec::new();
     for (index, ((property, expression), source_type)) in plan
         .properties
@@ -558,57 +576,92 @@ fn elaborate_indexed_properties(
         .zip(source_types)
         .enumerate()
     {
-        if target.key_type != string_key
-            && ts_jsnum::from_string(&property.name).to_string() != property.name
-        {
-            continue;
-        }
-        if store.is_type_assignable_to_with_global_types(
-            *source_type,
-            target.value_type,
-            global_types,
-        )? {
-            continue;
-        }
-        let nested = elaborate_expression(
+        diagnostics.extend(elaborate_indexed_property(
             store,
             host,
             global_types,
             expression,
             &checked[index],
-            target.value_type,
+            &property.name,
+            property.name_node,
+            *source_type,
+            target,
             flags,
             options,
             session,
-        )?;
-        if !nested.is_empty() {
-            diagnostics.extend(nested);
-            continue;
-        }
-        let mut diagnostic = generic_assignability_diagnostic(
-            store,
-            host,
-            global_types,
-            *source_type,
-            target.value_type,
-            property.name_node,
-            flags,
-            options,
-        )?;
-        let (_, bound) = host
-            .source(target.declaration)
-            .ok_or_else(|| invalid_structure(target.value_type))?;
-        let facts = bound.source_facts().ok_or(SourceCheckError::Provenance(
-            SourceCheckProvenanceError::MissingSourceFacts(target.declaration.file),
-        ))?;
-        if !facts.is_default_library() {
-            diagnostic
-                .related_information
-                .push(related(6501, target.declaration, Vec::new())?);
-        }
-        diagnostics.push(diagnostic);
+        )?);
     }
     Ok(diagnostics)
+}
+
+#[allow(clippy::too_many_arguments)] // Retains exact property position and expression provenance.
+fn elaborate_indexed_property(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    expression: &PlannedExpression,
+    checked: &CheckedExpressionTypes,
+    name: &str,
+    name_node: NodeRef,
+    source_type: TypeId,
+    target: DeclaredIndexTarget,
+    flags: CanonicalTypeFormatFlags,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+) -> Result<Vec<CanonicalCheckerDiagnostic>, SourceCheckError> {
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or(RelationUnavailable::MissingBootstrap)?;
+    let matches_key = target.key_type == bootstrap.string_type
+        || target.key_type == bootstrap.number_type
+            && ts_jsnum::from_string(name).to_string() == name
+        || template_pattern_index_matches_name(store, target.key_type, name);
+    if !matches_key
+        || store.is_type_assignable_to_with_global_types(
+            source_type,
+            target.value_type,
+            global_types,
+        )?
+    {
+        return Ok(Vec::new());
+    }
+    let nested = elaborate_expression(
+        store,
+        host,
+        global_types,
+        expression,
+        checked,
+        target.value_type,
+        flags,
+        options,
+        session,
+    )?;
+    if !nested.is_empty() {
+        return Ok(nested);
+    }
+
+    let mut diagnostic = generic_assignability_diagnostic(
+        store,
+        host,
+        global_types,
+        source_type,
+        target.value_type,
+        name_node,
+        flags,
+        options,
+    )?;
+    let (_, bound) = host
+        .source(target.declaration)
+        .ok_or_else(|| invalid_structure(target.value_type))?;
+    let facts = bound.source_facts().ok_or(SourceCheckError::Provenance(
+        SourceCheckProvenanceError::MissingSourceFacts(target.declaration.file),
+    ))?;
+    if !facts.is_default_library() {
+        diagnostic
+            .related_information
+            .push(related(6501, target.declaration, Vec::new())?);
+    }
+    Ok(vec![diagnostic])
 }
 
 #[allow(clippy::too_many_arguments)] // Mirrors the pinned elaboration boundary.
@@ -1463,6 +1516,72 @@ mod tests {
         let published = context.diagnostics().clone();
         context.recheck_source_file(file).unwrap();
         assert_eq!(context.diagnostics(), &published);
+    }
+
+    #[test]
+    fn mixed_template_index_mismatches_keep_the_index_property_and_related_declaration() {
+        let parsed = parse_source_file(concat!(
+            "var values: { required: string; [name: `do-${string}`]: number } = ",
+            "{ required: \"ok\", \"do-save\": \"invalid\" };",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(210);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/template-index-diagnostic.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        let mut context = CanonicalCheckerContext::new(
+            binder.finish(),
+            [(file, &parsed.arena)].into_iter().collect(),
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap();
+
+        context.check_source_file(file).unwrap();
+
+        let [diagnostic] = context.diagnostics().as_slice() else {
+            panic!("expected one template index value mismatch")
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 2322);
+        assert_eq!(diagnostic.diagnostic.arguments, ["string", "number"]);
+        let property = parsed
+            .arena
+            .get(
+                diagnostic
+                    .node
+                    .expect("property has a diagnostic node")
+                    .node,
+            )
+            .unwrap();
+        let NodeData::StringLiteral(name) = &property.data else {
+            panic!("the template index mismatch must point at its quoted property")
+        };
+        assert_eq!(name.text, "do-save");
+        let [index] = diagnostic.related_information.as_slice() else {
+            panic!("a template index mismatch must retain its index declaration")
+        };
+        assert_eq!(index.diagnostic.code(), 6501);
+        assert_eq!(
+            parsed
+                .arena
+                .get(index.node.expect("index has a related node").node)
+                .unwrap()
+                .kind,
+            SyntaxKind::IndexSignature
+        );
     }
 
     #[test]

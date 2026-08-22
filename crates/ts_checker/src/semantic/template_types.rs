@@ -5,8 +5,9 @@
 
 use std::{cmp::Ordering, collections::HashSet, fmt};
 
-use ts_ast::append_js_string;
+use ts_ast::{append_js_string, decode_js_string, encode_js_string};
 use ts_binder::SemanticSymbolId;
+use ts_jsnum::Number;
 
 use super::{
     CanonicalTypeMapperStore, TypeId,
@@ -47,20 +48,71 @@ impl StringMappingKind {
             Self::Uppercase => javascript_uppercase(value),
             Self::Lowercase => javascript_lowercase(value),
             Self::Capitalize | Self::Uncapitalize => {
-                let Some(first) = value.chars().next() else {
+                let Some((first, rest)) = split_first_template_code_point(value) else {
                     return String::new();
                 };
-                let first_text = &value[..first.len_utf8()];
                 let mut result = match self {
-                    Self::Capitalize => javascript_uppercase(first_text),
-                    Self::Uncapitalize => javascript_lowercase(first_text),
+                    Self::Capitalize => javascript_uppercase(first),
+                    Self::Uncapitalize => javascript_lowercase(first),
                     Self::Uppercase | Self::Lowercase => unreachable!(),
                 };
-                result.push_str(&value[first.len_utf8()..]);
+                result.push_str(rest);
                 result
             }
         }
     }
+}
+
+/// Splits one encoded JavaScript code point without separating a lone surrogate.
+pub(super) fn split_first_template_code_point(value: &str) -> Option<(&str, &str)> {
+    let mut characters = value.char_indices();
+    let (_, first) = characters.next()?;
+    let mut boundary = first.len_utf8();
+    if first == '\u{10fffd}'
+        && let Some((offset, second)) = characters.next()
+    {
+        let candidate_end = offset + second.len_utf8();
+        let candidate = &value[..candidate_end];
+        if encode_js_string(&decode_js_string(candidate)) == candidate {
+            boundary = candidate_end;
+        }
+    }
+    Some(value.split_at(boundary))
+}
+
+fn valid_bigint_template_fragment(value: &str) -> bool {
+    let unsigned = value.strip_prefix('-').unwrap_or(value);
+    if unsigned.is_empty() {
+        return false;
+    }
+    let (digits, radix) = if let Some(digits) = unsigned
+        .strip_prefix("0x")
+        .or_else(|| unsigned.strip_prefix("0X"))
+    {
+        (digits, 16)
+    } else if let Some(digits) = unsigned
+        .strip_prefix("0o")
+        .or_else(|| unsigned.strip_prefix("0O"))
+    {
+        (digits, 8)
+    } else if let Some(digits) = unsigned
+        .strip_prefix("0b")
+        .or_else(|| unsigned.strip_prefix("0B"))
+    {
+        (digits, 2)
+    } else {
+        if unsigned.len() > 1 && unsigned.starts_with('0') {
+            return false;
+        }
+        (unsigned, 10)
+    };
+    !digits.is_empty()
+        && digits.bytes().all(|digit| match radix {
+            2 => matches!(digit, b'0' | b'1'),
+            8 => matches!(digit, b'0'..=b'7'),
+            16 => digit.is_ascii_hexdigit(),
+            _ => digit.is_ascii_digit(),
+        })
 }
 
 fn javascript_uppercase(value: &str) -> String {
@@ -268,6 +320,323 @@ impl CanonicalTypeMapperStore {
             return Err(TemplateTypeError::InvalidType(target));
         }
         self.get_string_mapping_type_worker(symbol, kind, target)
+    }
+
+    /// Tests whether a string-like source satisfies a canonical template pattern.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when either type is foreign, the target is malformed, or
+    /// a placeholder contains an invalid or recursive semantic edge.
+    pub fn is_type_matched_by_template_literal_type(
+        &self,
+        source: TypeId,
+        target: TypeId,
+    ) -> Result<bool, TemplateTypeError> {
+        if self.type_payload(source).is_none() {
+            return Err(TemplateTypeError::InvalidType(source));
+        }
+        match self.type_payload(target).map(TypeRecord::data) {
+            Some(TypeData::TemplateLiteral(template))
+                if !template.types.is_empty()
+                    && template.texts.len() == template.types.len() + 1 =>
+            {
+                self.template_source_matches_pattern(source, target, &mut HashSet::new())
+            }
+            Some(_) => Err(TemplateTypeError::InvalidTemplate(target)),
+            None => Err(TemplateTypeError::InvalidType(target)),
+        }
+    }
+
+    /// Tests whether a string literal belongs to a canonical intrinsic mapping.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for foreign types, malformed mapping symbols, or
+    /// recursive template and mapping constraints.
+    pub fn is_member_of_string_mapping(
+        &self,
+        source: TypeId,
+        target: TypeId,
+    ) -> Result<bool, TemplateTypeError> {
+        let source_record = self
+            .type_payload(source)
+            .ok_or(TemplateTypeError::InvalidType(source))?;
+        if self.type_payload(target).is_none() {
+            return Err(TemplateTypeError::InvalidType(target));
+        }
+        let TypeData::Literal(source_literal) = source_record.data() else {
+            return Ok(false);
+        };
+        let LiteralValue::String(value) = &source_literal.value else {
+            return Ok(false);
+        };
+        self.string_mapping_accepts_value(value, target, &mut HashSet::new())
+    }
+
+    fn template_source_matches_pattern(
+        &self,
+        source: TypeId,
+        target: TypeId,
+        active: &mut HashSet<TypeId>,
+    ) -> Result<bool, TemplateTypeError> {
+        let source_record = self
+            .type_payload(source)
+            .ok_or(TemplateTypeError::InvalidType(source))?;
+        match source_record.data() {
+            TypeData::Literal(source_literal) => match &source_literal.value {
+                LiteralValue::String(value) => {
+                    self.template_value_matches_pattern(value, target, active)
+                }
+                _ => Ok(false),
+            },
+            TypeData::Union(union) => {
+                union
+                    .union
+                    .types
+                    .iter()
+                    .try_fold(true, |matches, constituent| {
+                        if !matches {
+                            return Ok(false);
+                        }
+                        self.template_source_matches_pattern(*constituent, target, active)
+                    })
+            }
+            TypeData::TemplateLiteral(source_template) => {
+                let Some(TypeData::TemplateLiteral(target_template)) =
+                    self.type_payload(target).map(TypeRecord::data)
+                else {
+                    return Err(TemplateTypeError::InvalidTemplate(target));
+                };
+                if source_template.texts != target_template.texts
+                    || source_template.types.len() != target_template.types.len()
+                {
+                    return Ok(false);
+                }
+                source_template
+                    .types
+                    .iter()
+                    .zip(&target_template.types)
+                    .try_fold(true, |matches, (source, target)| {
+                        if !matches {
+                            return Ok(false);
+                        }
+                        self.template_placeholder_type_matches(*source, *target, active)
+                    })
+            }
+            _ => Ok(false),
+        }
+    }
+
+    fn template_value_matches_pattern(
+        &self,
+        value: &str,
+        target: TypeId,
+        active: &mut HashSet<TypeId>,
+    ) -> Result<bool, TemplateTypeError> {
+        if !active.insert(target) {
+            return Err(TemplateTypeError::RecursiveType(target));
+        }
+        let result = self.template_value_matches_pattern_worker(value, target, active);
+        active.remove(&target);
+        result
+    }
+
+    fn template_value_matches_pattern_worker(
+        &self,
+        value: &str,
+        target: TypeId,
+        active: &mut HashSet<TypeId>,
+    ) -> Result<bool, TemplateTypeError> {
+        let Some(TypeData::TemplateLiteral(template)) =
+            self.type_payload(target).map(TypeRecord::data)
+        else {
+            return Err(TemplateTypeError::InvalidTemplate(target));
+        };
+        if template.types.is_empty() || template.texts.len() != template.types.len() + 1 {
+            return Err(TemplateTypeError::InvalidTemplate(target));
+        }
+        let Some(remainder) = value.strip_prefix(&template.texts[0]) else {
+            return Ok(false);
+        };
+        let Some(remainder) = remainder.strip_suffix(
+            template
+                .texts
+                .last()
+                .expect("a validated template has an ending text"),
+        ) else {
+            return Ok(false);
+        };
+
+        let mut position = 0;
+        for (index, placeholder) in template.types.iter().enumerate() {
+            let capture_end = if index + 1 == template.types.len() {
+                remainder.len()
+            } else {
+                let delimiter = &template.texts[index + 1];
+                if delimiter.is_empty() {
+                    let Some((first, _)) = split_first_template_code_point(&remainder[position..])
+                    else {
+                        return Ok(false);
+                    };
+                    position + first.len()
+                } else if let Some(offset) = remainder[position..].find(delimiter) {
+                    position + offset
+                } else {
+                    return Ok(false);
+                }
+            };
+            let capture = &remainder[position..capture_end];
+            if !self.template_placeholder_accepts_value(capture, *placeholder, active)? {
+                return Ok(false);
+            }
+            position = capture_end;
+            if index + 1 != template.types.len() {
+                position += template.texts[index + 1].len();
+            }
+        }
+        Ok(position == remainder.len())
+    }
+
+    fn template_placeholder_type_matches(
+        &self,
+        source: TypeId,
+        target: TypeId,
+        active: &mut HashSet<TypeId>,
+    ) -> Result<bool, TemplateTypeError> {
+        if source == target {
+            return Ok(true);
+        }
+        let source_record = self
+            .type_payload(source)
+            .ok_or(TemplateTypeError::InvalidType(source))?;
+        let target_record = self
+            .type_payload(target)
+            .ok_or(TemplateTypeError::InvalidType(target))?;
+        if target_record
+            .flags()
+            .intersects(TypeFlags::ANY | TypeFlags::STRING)
+        {
+            return Ok(true);
+        }
+        if let TypeData::Literal(literal) = source_record.data() {
+            return match &literal.value {
+                LiteralValue::String(value) => {
+                    self.template_placeholder_accepts_value(value, target, active)
+                }
+                LiteralValue::Number(value) => {
+                    self.template_placeholder_accepts_value(&value.to_string(), target, active)
+                }
+                LiteralValue::Boolean(value) => {
+                    self.template_placeholder_accepts_value(&value.to_string(), target, active)
+                }
+                LiteralValue::BigInt(value) => {
+                    self.template_placeholder_accepts_value(&value.to_string(), target, active)
+                }
+                LiteralValue::ComputedEnum => Ok(false),
+            };
+        }
+        if matches!(target_record.data(), TypeData::TemplateLiteral(_)) {
+            return self.template_source_matches_pattern(source, target, active);
+        }
+        Ok(false)
+    }
+
+    fn template_placeholder_accepts_value(
+        &self,
+        value: &str,
+        target: TypeId,
+        active: &mut HashSet<TypeId>,
+    ) -> Result<bool, TemplateTypeError> {
+        let record = self
+            .type_payload(target)
+            .ok_or(TemplateTypeError::InvalidType(target))?;
+        if record
+            .flags()
+            .intersects(TypeFlags::ANY | TypeFlags::STRING)
+        {
+            return Ok(true);
+        }
+        match record.data() {
+            TypeData::Intrinsic(_) if record.flags().intersects(TypeFlags::NUMBER) => {
+                let parsed = Number::from_string(value);
+                Ok(!value.is_empty() && !parsed.is_nan() && !parsed.is_infinite())
+            }
+            TypeData::Intrinsic(_) if record.flags().intersects(TypeFlags::BIG_INT) => {
+                Ok(valid_bigint_template_fragment(value))
+            }
+            TypeData::Intrinsic(intrinsic)
+                if record
+                    .flags()
+                    .intersects(TypeFlags::NULL | TypeFlags::UNDEFINED) =>
+            {
+                Ok(intrinsic.intrinsic_name == value)
+            }
+            TypeData::Literal(literal) => match &literal.value {
+                LiteralValue::String(expected) => Ok(expected == value),
+                LiteralValue::Number(expected) => Ok(expected.to_string() == value),
+                LiteralValue::Boolean(expected) => Ok(expected.to_string() == value),
+                LiteralValue::BigInt(expected) => Ok(expected.to_string() == value),
+                LiteralValue::ComputedEnum => Ok(false),
+            },
+            TypeData::Union(union) => {
+                for constituent in &union.union.types {
+                    if self.template_placeholder_accepts_value(value, *constituent, active)? {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
+            TypeData::TemplateLiteral(_) => {
+                self.template_value_matches_pattern(value, target, active)
+            }
+            TypeData::StringMapping(_) => self.string_mapping_accepts_value(value, target, active),
+            TypeData::TypeParameter(parameter) => match parameter.constraint {
+                Some(constraint) if constraint != target => {
+                    self.template_placeholder_accepts_value(value, constraint, active)
+                }
+                _ => Ok(false),
+            },
+            TypeData::Intersection(intersection) => intersection
+                .intersection
+                .types
+                .iter()
+                .try_fold(true, |matches, constituent| {
+                    if !matches {
+                        return Ok(false);
+                    }
+                    self.template_placeholder_accepts_value(value, *constituent, active)
+                }),
+            _ => Ok(false),
+        }
+    }
+
+    fn string_mapping_accepts_value(
+        &self,
+        value: &str,
+        target: TypeId,
+        active: &mut HashSet<TypeId>,
+    ) -> Result<bool, TemplateTypeError> {
+        let record = self
+            .type_payload(target)
+            .ok_or(TemplateTypeError::InvalidType(target))?;
+        let TypeData::StringMapping(mapping) = record.data() else {
+            return self.template_placeholder_accepts_value(value, target, active);
+        };
+        if !active.insert(target) {
+            return Err(TemplateTypeError::RecursiveType(target));
+        }
+        let symbol = record
+            .symbol()
+            .ok_or(TemplateTypeError::InvalidTemplate(target))?;
+        let kind = self.string_mapping_kind(symbol)?;
+        let result = if kind.apply(value) == value {
+            self.string_mapping_accepts_value(value, mapping.target, active)
+        } else {
+            Ok(false)
+        };
+        active.remove(&target);
+        result
     }
 
     pub(super) fn string_mapping_kind(
@@ -1066,11 +1435,63 @@ impl CanonicalTypeMapperStore {
             });
         }
 
+        self.remove_literals_matched_by_template_patterns(&mut flattened)?;
+
         match flattened.as_slice() {
             [] => Ok(TemplateUnionPlan::Existing(bootstrap.never_type)),
             [single] => Ok(TemplateUnionPlan::Existing(*single)),
             _ => Ok(TemplateUnionPlan::Constituents(flattened)),
         }
+    }
+
+    fn remove_literals_matched_by_template_patterns(
+        &self,
+        types: &mut Vec<TypeId>,
+    ) -> Result<(), TemplateTypeError> {
+        let mut patterns = Vec::new();
+        for type_ in types.iter().copied() {
+            let record = self
+                .type_payload(type_)
+                .ok_or(TemplateTypeError::InvalidType(type_))?;
+            if record
+                .flags()
+                .intersects(TypeFlags::TEMPLATE_LITERAL | TypeFlags::STRING_MAPPING)
+                && self.is_template_pattern_literal_type(type_, &mut HashSet::new())?
+            {
+                patterns.push(type_);
+            }
+        }
+        if patterns.is_empty() {
+            return Ok(());
+        }
+
+        let mut index = types.len();
+        while index != 0 {
+            index -= 1;
+            let candidate = types[index];
+            let record = self
+                .type_payload(candidate)
+                .ok_or(TemplateTypeError::InvalidType(candidate))?;
+            if !record.flags().intersects(TypeFlags::STRING_LITERAL) {
+                continue;
+            }
+            for pattern in &patterns {
+                let matched = match self.type_payload(*pattern).map(TypeRecord::data) {
+                    Some(TypeData::TemplateLiteral(_)) => {
+                        self.is_type_matched_by_template_literal_type(candidate, *pattern)?
+                    }
+                    Some(TypeData::StringMapping(_)) => {
+                        self.is_member_of_string_mapping(candidate, *pattern)?
+                    }
+                    _ => return Err(TemplateTypeError::InvalidType(*pattern)),
+                };
+                if matched {
+                    types.remove(index);
+                    break;
+                }
+            }
+        }
+        Ok(())
     }
 
     fn find_template_result_union(&self, types: &[TypeId]) -> Option<TypeId> {
@@ -1154,6 +1575,7 @@ mod tests {
 
     use super::{
         CanonicalTypeMapperStore, MAX_TEMPLATE_UNION_SIZE, StringMappingKind, TemplateTypeError,
+        split_first_template_code_point,
     };
     use crate::semantic::{
         IntrinsicBootstrapOptions,
@@ -1167,6 +1589,206 @@ mod tests {
             .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions::default())
             .unwrap();
         store
+    }
+
+    fn string_literal(store: &mut CanonicalTypeMapperStore, value: &str) -> super::TypeId {
+        store
+            .get_template_literal_type(&[value.to_owned()], &[])
+            .unwrap()
+    }
+
+    #[test]
+    fn template_code_point_splitting_preserves_supplementary_and_lone_surrogates() {
+        assert_eq!(split_first_template_code_point("abc"), Some(("a", "bc")));
+        assert_eq!(
+            split_first_template_code_point("\u{3042}\u{3044}"),
+            Some(("\u{3042}", "\u{3044}"))
+        );
+        assert_eq!(
+            split_first_template_code_point("\u{1f600}tail"),
+            Some(("\u{1f600}", "tail"))
+        );
+
+        let encoded = encode_js_string(&JsString::from_units(vec![0xd800, u16::from(b'x')]));
+        let (first, rest) = split_first_template_code_point(&encoded).unwrap();
+        assert_eq!(decode_js_string(first).as_units(), &[0xd800]);
+        assert_eq!(rest, "x");
+
+        let real_marker = encode_js_string(&JsString::from_utf8("\u{10fffd}x"));
+        let (first, rest) = split_first_template_code_point(&real_marker).unwrap();
+        assert_eq!(decode_js_string(first), JsString::from_utf8("\u{10fffd}"));
+        assert_eq!(rest, "x");
+        assert_eq!(split_first_template_code_point(""), None);
+    }
+
+    #[test]
+    fn template_pattern_index_signatures_accept_only_matching_string_keys() {
+        let mut store = initialized_store();
+        let string = store.intrinsic_bootstrap().unwrap().string_type;
+        let pattern = store
+            .get_template_literal_type(&["do-".to_owned(), String::new()], &[string])
+            .unwrap();
+        let matching = string_literal(&mut store, "do-save");
+        let empty_suffix = string_literal(&mut store, "do-");
+        let namespaced = string_literal(&mut store, "ns:thing");
+        let bare = string_literal(&mut store, "do");
+
+        assert_eq!(
+            store.is_type_matched_by_template_literal_type(matching, pattern),
+            Ok(true)
+        );
+        assert_eq!(
+            store.is_type_matched_by_template_literal_type(empty_suffix, pattern),
+            Ok(true)
+        );
+        assert_eq!(
+            store.is_type_matched_by_template_literal_type(namespaced, pattern),
+            Ok(false)
+        );
+        assert_eq!(
+            store.is_type_matched_by_template_literal_type(bare, pattern),
+            Ok(false)
+        );
+    }
+
+    #[test]
+    fn template_pattern_placeholders_validate_number_bigint_and_intrinsic_casing() {
+        let mut store = initialized_store();
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        let string = bootstrap.string_type;
+        let number = bootstrap.number_type;
+        let bigint = bootstrap.bigint_type;
+        let numeric = store
+            .get_template_literal_type(&["id-".to_owned(), String::new()], &[number])
+            .unwrap();
+        let integral = store
+            .get_template_literal_type(&["big-".to_owned(), String::new()], &[bigint])
+            .unwrap();
+        let uppercase_symbol = store.alloc_transient_symbol(
+            SymbolFlags::TYPE_ALIAS,
+            EscapedName::source("Uppercase"),
+            CheckFlags::NONE,
+        );
+        let uppercase = store
+            .get_string_mapping_type(uppercase_symbol, string)
+            .unwrap();
+        let upper_pattern = store
+            .get_template_literal_type(&["key-".to_owned(), String::new()], &[uppercase])
+            .unwrap();
+
+        for (pattern, value, expected) in [
+            (numeric, "id-12.5", true),
+            (numeric, "id-NaN", false),
+            (numeric, "id-Infinity", false),
+            (numeric, "id-", false),
+            (integral, "big--42", true),
+            (integral, "big-0xff", true),
+            (integral, "big-1.5", false),
+            (upper_pattern, "key-ABC", true),
+            (upper_pattern, "key-Abc", false),
+        ] {
+            let source = string_literal(&mut store, value);
+            assert_eq!(
+                store.is_type_matched_by_template_literal_type(source, pattern),
+                Ok(expected),
+                "pattern value {value}"
+            );
+        }
+
+        let upper_value = string_literal(&mut store, "ABC");
+        let lower_value = string_literal(&mut store, "abc");
+        assert_eq!(
+            store.is_member_of_string_mapping(upper_value, uppercase),
+            Ok(true)
+        );
+        assert_eq!(
+            store.is_member_of_string_mapping(lower_value, uppercase),
+            Ok(false)
+        );
+    }
+
+    #[test]
+    fn template_and_mapping_patterns_remove_covered_string_literal_union_members() {
+        let mut store = initialized_store();
+        let string = store.intrinsic_bootstrap().unwrap().string_type;
+        let pattern = store
+            .get_template_literal_type(&["do-".to_owned(), String::new()], &[string])
+            .unwrap();
+        let covered = string_literal(&mut store, "do-save");
+        let uncovered = string_literal(&mut store, "ns:thing");
+        let uppercase_symbol = store.alloc_transient_symbol(
+            SymbolFlags::TYPE_ALIAS,
+            EscapedName::source("Uppercase"),
+            CheckFlags::NONE,
+        );
+        let uppercase = store
+            .get_string_mapping_type(uppercase_symbol, string)
+            .unwrap();
+        let upper_value = string_literal(&mut store, "SAVE");
+        let mixed_value = string_literal(&mut store, "Save");
+
+        assert_eq!(
+            store.template_result_union(&[covered, pattern]),
+            Ok(pattern)
+        );
+        assert_eq!(
+            store.template_result_union(&[upper_value, uppercase]),
+            Ok(uppercase)
+        );
+
+        let uncovered_union = store.template_result_union(&[uncovered, pattern]).unwrap();
+        let Some(TypeData::Union(union)) =
+            store.type_payload(uncovered_union).map(TypeRecord::data)
+        else {
+            panic!("nonmatching literals must remain in the template union")
+        };
+        assert!(union.union.types.contains(&uncovered));
+        assert!(union.union.types.contains(&pattern));
+
+        let mixed_union = store
+            .template_result_union(&[mixed_value, uppercase])
+            .unwrap();
+        let Some(TypeData::Union(union)) = store.type_payload(mixed_union).map(TypeRecord::data)
+        else {
+            panic!("nonmatching literals must remain in the intrinsic mapping union")
+        };
+        assert!(union.union.types.contains(&mixed_value));
+        assert!(union.union.types.contains(&uppercase));
+    }
+
+    #[test]
+    fn adjacent_template_placeholders_consume_one_encoded_code_point() {
+        let mut store = initialized_store();
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        let string = bootstrap.string_type;
+        let number = bootstrap.number_type;
+        let pattern = store
+            .get_template_literal_type(
+                &[String::new(), String::new(), String::new()],
+                &[string, number],
+            )
+            .unwrap();
+        let emoji = string_literal(&mut store, "\u{1f600}42");
+        let encoded = encode_js_string(&JsString::from_units(vec![
+            0xd800,
+            u16::from(b'4'),
+            u16::from(b'2'),
+        ]));
+        let lone = string_literal(&mut store, &encoded);
+        let invalid = string_literal(&mut store, "\u{1f600}no");
+
+        assert_eq!(
+            store.is_type_matched_by_template_literal_type(emoji, pattern),
+            Ok(true)
+        );
+        assert_eq!(
+            store.is_type_matched_by_template_literal_type(lone, pattern),
+            Ok(true)
+        );
+        assert_eq!(
+            store.is_type_matched_by_template_literal_type(invalid, pattern),
+            Ok(false)
+        );
     }
 
     #[test]
@@ -1232,6 +1854,69 @@ mod tests {
             panic!("duplicate uppercase results must reduce to one canonical literal")
         };
         assert_eq!(literal.value, LiteralValue::String("A".to_owned()));
+    }
+
+    #[test]
+    fn intrinsic_union_mappings_preserve_exact_unicode_special_casing_keys() {
+        let mut store = initialized_store();
+        let cases = [
+            (
+                "Lowercase",
+                ["\u{0130}SPANYOL", "\u{039f}\u{03a3}"],
+                ["i\u{0307}spanyol", "\u{03bf}\u{03c2}"],
+            ),
+            (
+                "Uppercase",
+                ["\u{00df}foo", "\u{fb01}oo"],
+                ["SSFOO", "FIOO"],
+            ),
+            (
+                "Capitalize",
+                ["\u{00df}foo", "\u{fb01}oo"],
+                ["SSfoo", "FIoo"],
+            ),
+            (
+                "Uncapitalize",
+                ["\u{0130}foo", "\u{039f}\u{03a3}"],
+                ["i\u{0307}foo", "\u{03bf}\u{03a3}"],
+            ),
+        ];
+
+        for (name, inputs, expected) in cases {
+            let symbol = store.alloc_transient_symbol(
+                SymbolFlags::TYPE_ALIAS,
+                EscapedName::source(name),
+                CheckFlags::NONE,
+            );
+            let input_types = inputs
+                .iter()
+                .map(|value| string_literal(&mut store, value))
+                .collect::<Vec<_>>();
+            let union = store.template_result_union(&input_types).unwrap();
+            let mapped = store.get_string_mapping_type(symbol, union).unwrap();
+            let Some(TypeData::Union(mapped)) = store.type_payload(mapped).map(TypeRecord::data)
+            else {
+                panic!("{name} must retain both distinct mapped property keys")
+            };
+            let mut actual = mapped
+                .union
+                .types
+                .iter()
+                .map(
+                    |type_| match store.type_payload(*type_).map(TypeRecord::data) {
+                        Some(TypeData::Literal(literal)) => match &literal.value {
+                            LiteralValue::String(value) => value.as_str(),
+                            _ => panic!("{name} must produce string literal keys"),
+                        },
+                        _ => panic!("{name} must produce string literal keys"),
+                    },
+                )
+                .collect::<Vec<_>>();
+            actual.sort_unstable();
+            let mut expected = expected;
+            expected.sort_unstable();
+            assert_eq!(actual, expected, "{name} property keys");
+        }
     }
 
     #[test]

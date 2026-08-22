@@ -1132,14 +1132,25 @@ fn validate_generic_call_signature_shape_with_unresolved_return(
         .zip(callable.parameters.iter().copied())
         .enumerate()
     {
-        if !validate_generic_parameter_template(
+        let valid_template = validate_generic_parameter_template(
             store,
             projected,
             &type_parameter_ids,
             array_targets,
             callable.signature,
             &mut Vec::new(),
-        )? {
+        )?;
+        if !valid_template
+            && (index < minimum_argument_count
+                || optional_generic_parameter_template(
+                    store,
+                    projected,
+                    &type_parameter_ids,
+                    array_targets,
+                    callable.signature,
+                )?
+                .is_none())
+        {
             return Err(GenericCallVectorUnsupported::NonNakedParameter {
                 signature: callable.signature,
                 index,
@@ -1227,6 +1238,49 @@ fn validate_generic_parameter_template(
     )?;
     active_arrays.pop();
     Ok(contains_type_parameter)
+}
+
+fn optional_generic_parameter_template(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    type_parameters: &[TypeId],
+    array_targets: Option<CanonicalArrayTargets>,
+    signature: SignatureId,
+) -> Result<Option<TypeId>, GenericCallVectorError> {
+    let Some(record) = store.type_payload(type_) else {
+        return Err(GenericCallVectorInvariant::CallableSignatureMismatch(signature).into());
+    };
+    let TypeData::Union(union) = record.data() else {
+        return Ok(None);
+    };
+    let [left, right] = union.union.types.as_slice() else {
+        return Ok(None);
+    };
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or(GenericCallVectorInvariant::MissingBootstrap)?;
+    let template = if *left == bootstrap.undefined_type {
+        *right
+    } else if *right == bootstrap.undefined_type {
+        *left
+    } else {
+        return Ok(None);
+    };
+    if record.alias().is_some()
+        || union.origin.is_some()
+        || bootstrap.cached_union_type(&union.union.types) != Some(type_)
+    {
+        return Err(GenericCallVectorInvariant::CallableSignatureMismatch(signature).into());
+    }
+    validate_generic_parameter_template(
+        store,
+        template,
+        type_parameters,
+        array_targets,
+        signature,
+        &mut Vec::new(),
+    )
+    .map(|valid| valid.then_some(template))
 }
 
 fn validate_generic_call_type_parameter(
@@ -1567,11 +1621,24 @@ fn infer_generic_call_type_arguments(
         .map(|parameter| parameter.type_)
         .collect::<Vec<_>>();
     let mut buckets = vec![Vec::new(); type_parameters.len()];
-    for (argument, parameter) in arguments
+    for (index, (argument, parameter)) in arguments
         .iter()
         .copied()
         .zip(shape.parameter_templates.iter().copied())
+        .enumerate()
     {
+        let parameter = if index >= shape.minimum_argument_count {
+            optional_generic_parameter_template(
+                store,
+                parameter,
+                &type_parameters,
+                shape.array_targets,
+                shape.signature,
+            )?
+            .unwrap_or(parameter)
+        } else {
+            parameter
+        };
         collect_generic_call_inferences(
             store,
             shape.array_targets,

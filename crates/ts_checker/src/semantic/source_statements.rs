@@ -184,6 +184,62 @@ pub(super) struct SourceControlIfSyntax {
     pub(super) nested_export_diagnostics: Vec<CanonicalCheckerDiagnostic>,
 }
 
+/// Loop families whose binder graph preserves source evaluation order.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SourceControlLoopKind {
+    While,
+    DoWhile,
+    For,
+    ForIn,
+    ForOf,
+}
+
+/// Proven loop children retained without evaluating their expressions.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct SourceControlLoopSyntax {
+    pub(super) statement: NodeRef,
+    pub(super) kind: SourceControlLoopKind,
+    pub(super) initializer: Option<NodeRef>,
+    pub(super) condition: Option<NodeRef>,
+    pub(super) incrementor: Option<NodeRef>,
+    pub(super) iterable: Option<NodeRef>,
+    pub(super) body: NodeRef,
+}
+
+impl SourceControlLoopSyntax {
+    /// Returns the loop's retained children in lexical source order.
+    pub(super) fn ordered_nodes(&self) -> Vec<NodeRef> {
+        if self.kind == SourceControlLoopKind::DoWhile {
+            return std::iter::once(self.body).chain(self.condition).collect();
+        }
+        self.initializer
+            .into_iter()
+            .chain(self.condition)
+            .chain(self.incrementor)
+            .chain(self.iterable)
+            .chain(std::iter::once(self.body))
+            .collect()
+    }
+}
+
+/// One ordered `case` or `default` clause in a proven switch statement.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct SourceControlSwitchClauseSyntax {
+    pub(super) clause: NodeRef,
+    pub(super) expression: Option<NodeRef>,
+    pub(super) statements: Vec<NodeRef>,
+    pub(super) unreachable_ranges: Vec<CanonicalCheckerDiagnosticRange>,
+}
+
+/// Proven switch expression and ordered case/default clause bodies.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct SourceControlSwitchSyntax {
+    pub(super) statement: NodeRef,
+    pub(super) expression: NodeRef,
+    pub(super) case_block: NodeRef,
+    pub(super) clauses: Vec<SourceControlSwitchClauseSyntax>,
+}
+
 /// Exact source nodes retained for one direct `typeof` identifier comparison.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct SourceTypeofConditionSyntax {
@@ -395,16 +451,358 @@ pub(super) fn plan_source_control_if_syntax(
         }
     }
 
-    let nested_export_diagnostics = std::iter::once(then_statement)
-        .chain(else_statement)
-        .filter_map(|branch| nested_export_declaration_diagnostic(arena, bound, branch))
-        .collect();
+    let mut nested_export_diagnostics = Vec::new();
+    for branch in std::iter::once(then_statement).chain(else_statement) {
+        collect_nested_export_diagnostics(
+            arena,
+            bound,
+            statement,
+            branch,
+            &mut nested_export_diagnostics,
+        )?;
+    }
     Ok(SourceControlIfSyntax {
         statement,
         condition,
         then_statement,
         else_statement,
         nested_export_diagnostics,
+    })
+}
+
+/// Validates one loop and retains its source-ordered initializer and body.
+pub(super) fn plan_source_control_loop_syntax(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    statement: NodeRef,
+    expected_parent: NodeRef,
+) -> Result<SourceControlLoopSyntax, SourceFunctionStatementsError> {
+    if bound.node_arena_id() != arena.id()
+        || bound.node_arena_revision() != arena.revision()
+        || !expected_parent.is_for(arena.id(), bound.file_id())
+    {
+        return Err(SourceFunctionStatementsInvariant::BoundSourceMismatch(statement).into());
+    }
+    let record = control_statement_node(arena, bound, statement)?;
+    if record.flags.0 != 0 {
+        return Err(unsupported_control_statement(statement, record.kind));
+    }
+    let syntax = control_loop_shape(statement, record)?;
+    let container = validate_control_statement_parent(arena, bound, statement, expected_parent)?;
+    if bound.flow_graph().container_is_complete(container) != Some(true) {
+        return Err(SourceFunctionStatementsError::Unsupported(
+            SourceFunctionStatementsUnsupported::IncompleteFlow(container),
+        ));
+    }
+
+    let mut previous = None;
+    for child in syntax.ordered_nodes() {
+        validate_control_statement_child(arena, bound, statement, child, container)?;
+        if let Some(previous) = previous
+            && control_statement_node(arena, bound, previous)?.range.end
+                > control_statement_node(arena, bound, child)?.range.start
+        {
+            return Err(SourceFunctionStatementsInvariant::InvalidOrder {
+                previous,
+                next: child,
+            }
+            .into());
+        }
+        previous = Some(child);
+    }
+    Ok(syntax)
+}
+
+/// Validates a switch and retains every case/default clause in source order.
+pub(super) fn plan_source_control_switch_syntax(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    statement: NodeRef,
+    expected_parent: NodeRef,
+) -> Result<SourceControlSwitchSyntax, SourceFunctionStatementsError> {
+    if bound.node_arena_id() != arena.id()
+        || bound.node_arena_revision() != arena.revision()
+        || !expected_parent.is_for(arena.id(), bound.file_id())
+    {
+        return Err(SourceFunctionStatementsInvariant::BoundSourceMismatch(statement).into());
+    }
+    let record = control_statement_node(arena, bound, statement)?;
+    let NodeData::SwitchStatement(data) = &record.data else {
+        return Err(unsupported_control_statement(statement, record.kind));
+    };
+    if record.kind != SyntaxKind::SwitchStatement
+        || record.flags.0 != 0
+        || data.flow_node.is_some()
+        || data.facts != 0
+    {
+        return Err(unsupported_control_statement(statement, record.kind));
+    }
+    let container = validate_control_statement_parent(arena, bound, statement, expected_parent)?;
+    if bound.flow_graph().container_is_complete(container) != Some(true) {
+        return Err(SourceFunctionStatementsError::Unsupported(
+            SourceFunctionStatementsUnsupported::IncompleteFlow(container),
+        ));
+    }
+
+    let expression = NodeRef::new(statement.arena, statement.file, data.expression);
+    let case_block = NodeRef::new(statement.arena, statement.file, data.case_block);
+    validate_control_statement_child(arena, bound, statement, expression, container)?;
+    validate_control_statement_child(arena, bound, statement, case_block, container)?;
+    if control_statement_node(arena, bound, expression)?.range.end
+        > control_statement_node(arena, bound, case_block)?
+            .range
+            .start
+    {
+        return Err(SourceFunctionStatementsInvariant::InvalidOrder {
+            previous: expression,
+            next: case_block,
+        }
+        .into());
+    }
+    let clauses = plan_control_switch_clauses(arena, bound, case_block, container)?;
+    Ok(SourceControlSwitchSyntax {
+        statement,
+        expression,
+        case_block,
+        clauses,
+    })
+}
+
+fn plan_control_switch_clauses(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    case_block: NodeRef,
+    container: NodeRef,
+) -> Result<Vec<SourceControlSwitchClauseSyntax>, SourceFunctionStatementsError> {
+    let record = control_statement_node(arena, bound, case_block)?;
+    let NodeData::CaseBlock(data) = &record.data else {
+        return Err(unsupported_control_statement(case_block, record.kind));
+    };
+    if record.kind != SyntaxKind::CaseBlock
+        || record.flags.0 != 0
+        || data.next_container.is_some()
+        || data.clauses.has_trailing_comma
+        || data.facts != 0
+        || !range_contains(record.range, data.clauses.range)
+    {
+        return Err(unsupported_control_statement(case_block, record.kind));
+    }
+
+    let mut clauses = Vec::with_capacity(data.clauses.nodes.len());
+    let mut previous = None;
+    for node in &data.clauses.nodes {
+        let clause = NodeRef::new(case_block.arena, case_block.file, *node);
+        validate_control_statement_child(arena, bound, case_block, clause, container)?;
+        if let Some(previous) = previous
+            && control_statement_node(arena, bound, previous)?.range.end
+                > control_statement_node(arena, bound, clause)?.range.start
+        {
+            return Err(SourceFunctionStatementsInvariant::InvalidOrder {
+                previous,
+                next: clause,
+            }
+            .into());
+        }
+        clauses.push(plan_control_switch_clause(arena, bound, clause, container)?);
+        previous = Some(clause);
+    }
+    Ok(clauses)
+}
+
+fn plan_control_switch_clause(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    clause: NodeRef,
+    container: NodeRef,
+) -> Result<SourceControlSwitchClauseSyntax, SourceFunctionStatementsError> {
+    let record = control_statement_node(arena, bound, clause)?;
+    let NodeData::CaseOrDefaultClause(data) = &record.data else {
+        return Err(unsupported_control_statement(clause, record.kind));
+    };
+    if !matches!(
+        record.kind,
+        SyntaxKind::CaseClause | SyntaxKind::DefaultClause
+    ) || record.flags.0 != 0
+        || data.fallthrough_flow_node.is_some()
+        || data.statements.has_trailing_comma
+        || data.facts != 0
+        || data.statements.range.start > data.statements.range.end
+    {
+        return Err(unsupported_control_statement(clause, record.kind));
+    }
+    let expression = (record.kind == SyntaxKind::CaseClause)
+        .then(|| NodeRef::new(clause.arena, clause.file, data.expression));
+    if let Some(expression) = expression {
+        validate_control_statement_child(arena, bound, clause, expression, container)?;
+    }
+
+    let mut statements = Vec::with_capacity(data.statements.nodes.len());
+    let mut previous = expression;
+    for node in &data.statements.nodes {
+        let statement = NodeRef::new(clause.arena, clause.file, *node);
+        validate_control_statement_child(arena, bound, clause, statement, container)?;
+        if let Some(previous) = previous
+            && control_statement_node(arena, bound, previous)?.range.end
+                > control_statement_node(arena, bound, statement)?.range.start
+        {
+            return Err(SourceFunctionStatementsInvariant::InvalidOrder {
+                previous,
+                next: statement,
+            }
+            .into());
+        }
+        statements.push(statement);
+        previous = Some(statement);
+    }
+    Ok(SourceControlSwitchClauseSyntax {
+        clause,
+        expression,
+        unreachable_ranges: switch_clause_unreachable_ranges(arena, bound, clause, &statements)?,
+        statements,
+    })
+}
+
+fn switch_clause_unreachable_ranges(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    clause: NodeRef,
+    statements: &[NodeRef],
+) -> Result<Vec<CanonicalCheckerDiagnosticRange>, SourceFunctionStatementsError> {
+    let mut ranges = Vec::new();
+    let mut start = None;
+    let mut end = None;
+    for statement in statements {
+        let record = control_statement_node(arena, bound, *statement)?;
+        let range = record.range;
+        let unreachable = match bound.flow_graph().is_unreachable(*statement) {
+            Some(unreachable) => unreachable,
+            None if matches!(
+                record.kind,
+                SyntaxKind::ExportDeclaration
+                    | SyntaxKind::ImportDeclaration
+                    | SyntaxKind::TypeAliasDeclaration
+                    | SyntaxKind::InterfaceDeclaration
+            ) =>
+            {
+                false
+            }
+            None => {
+                return Err(SourceFunctionStatementsInvariant::InvalidFlowContainer {
+                    node: *statement,
+                    expected: bound.container(clause).unwrap_or(bound.source_file()),
+                    actual: bound.flow_container(*statement),
+                }
+                .into());
+            }
+        };
+        if unreachable {
+            start.get_or_insert(range.start);
+            end = Some(range.end);
+        } else if let (Some(first), Some(last)) = (start.take(), end.take()) {
+            ranges.push(CanonicalCheckerDiagnosticRange::new(
+                clause,
+                TextRange::new(first, last),
+            ));
+        }
+    }
+    if let (Some(first), Some(last)) = (start, end) {
+        ranges.push(CanonicalCheckerDiagnosticRange::new(
+            clause,
+            TextRange::new(first, last),
+        ));
+    }
+    Ok(ranges)
+}
+
+fn control_loop_shape(
+    statement: NodeRef,
+    record: &Node,
+) -> Result<SourceControlLoopSyntax, SourceFunctionStatementsError> {
+    let reference = |node| NodeRef::new(statement.arena, statement.file, node);
+    let (kind, initializer, condition, incrementor, iterable, body) = match &record.data {
+        NodeData::WhileStatement(data)
+            if record.kind == SyntaxKind::WhileStatement
+                && data.flow_node.is_none()
+                && data.facts == 0 =>
+        {
+            (
+                SourceControlLoopKind::While,
+                None,
+                Some(reference(data.expression)),
+                None,
+                None,
+                reference(data.statement),
+            )
+        }
+        NodeData::DoStatement(data)
+            if record.kind == SyntaxKind::DoStatement
+                && data.flow_node.is_none()
+                && data.facts == 0 =>
+        {
+            (
+                SourceControlLoopKind::DoWhile,
+                None,
+                Some(reference(data.expression)),
+                None,
+                None,
+                reference(data.statement),
+            )
+        }
+        NodeData::ForStatement(data)
+            if record.kind == SyntaxKind::ForStatement
+                && data.flow_node.is_none()
+                && data.next_container.is_none()
+                && data.facts == 0 =>
+        {
+            (
+                SourceControlLoopKind::For,
+                data.initializer.map(reference),
+                data.condition.map(reference),
+                data.incrementor.map(reference),
+                None,
+                reference(data.statement),
+            )
+        }
+        NodeData::ForInOrOfStatement(data)
+            if matches!(
+                record.kind,
+                SyntaxKind::ForInStatement | SyntaxKind::ForOfStatement
+            ) && data.await_modifier.is_none()
+                && data.flow_node.is_none()
+                && data.next_container.is_none()
+                && data.facts == 0 =>
+        {
+            (
+                if record.kind == SyntaxKind::ForInStatement {
+                    SourceControlLoopKind::ForIn
+                } else {
+                    SourceControlLoopKind::ForOf
+                },
+                Some(reference(data.initializer)),
+                None,
+                None,
+                Some(reference(data.expression)),
+                reference(data.statement),
+            )
+        }
+        _ => return Err(unsupported_control_statement(statement, record.kind)),
+    };
+    Ok(SourceControlLoopSyntax {
+        statement,
+        kind,
+        initializer,
+        condition,
+        incrementor,
+        iterable,
+        body,
+    })
+}
+
+fn unsupported_control_statement(node: NodeRef, kind: SyntaxKind) -> SourceFunctionStatementsError {
+    SourceFunctionStatementsError::Unsupported(SourceFunctionStatementsUnsupported::Syntax {
+        node,
+        kind,
+        role: SourceFunctionStatementsRole::BodyStatement,
     })
 }
 
@@ -499,6 +897,146 @@ fn validate_control_statement_child(
             actual,
         }
         .into());
+    }
+    Ok(())
+}
+
+/// Returns whether a branch contains only blocks and semicolon statements.
+pub(super) fn source_control_branch_is_empty(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    statement: NodeRef,
+) -> Result<bool, SourceFunctionStatementsError> {
+    let record = control_statement_node(arena, bound, statement)?;
+    match &record.data {
+        NodeData::EmptyStatement(empty)
+            if record.kind == SyntaxKind::EmptyStatement
+                && record.flags.0 == 0
+                && empty.flow_node.is_none() =>
+        {
+            Ok(true)
+        }
+        NodeData::Block(block)
+            if record.kind == SyntaxKind::Block
+                && record.flags.0 == 0
+                && block.flow_node.is_none()
+                && block.next_container.is_none()
+                && !block.statements.has_trailing_comma
+                && block.facts == 0 =>
+        {
+            if !range_contains(record.range, block.statements.range) {
+                return Err(SourceFunctionStatementsInvariant::InvalidListRange(statement).into());
+            }
+            let container = bound.container(statement).ok_or(
+                SourceFunctionStatementsInvariant::InvalidContainer {
+                    node: statement,
+                    expected: bound.source_file(),
+                    actual: None,
+                },
+            )?;
+            for child in &block.statements.nodes {
+                let child = NodeRef::new(statement.arena, statement.file, *child);
+                validate_control_statement_child(arena, bound, statement, child, container)?;
+                if !source_control_branch_is_empty(arena, bound, child)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        NodeData::EmptyStatement(_) | NodeData::Block(_) => {
+            Err(unsupported_control_statement(statement, record.kind))
+        }
+        _ => Ok(false),
+    }
+}
+
+fn collect_nested_export_diagnostics(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    parent: NodeRef,
+    statement: NodeRef,
+    diagnostics: &mut Vec<CanonicalCheckerDiagnostic>,
+) -> Result<(), SourceFunctionStatementsError> {
+    if source_control_branch_is_empty(arena, bound, statement)? {
+        return Ok(());
+    }
+    let record = control_statement_node(arena, bound, statement)?;
+    match &record.data {
+        NodeData::ExportDeclaration(_) => {
+            let diagnostic = nested_export_declaration_diagnostic(arena, bound, statement)
+                .ok_or_else(|| unsupported_control_statement(statement, record.kind))?;
+            diagnostics.push(diagnostic);
+        }
+        NodeData::Block(block) => {
+            if record.kind != SyntaxKind::Block
+                || record.flags.0 != 0
+                || block.flow_node.is_some()
+                || block.next_container.is_some()
+                || block.statements.has_trailing_comma
+                || block.facts != 0
+            {
+                return Err(unsupported_control_statement(statement, record.kind));
+            }
+            let container = validate_control_statement_parent(arena, bound, statement, parent)?;
+            if !range_contains(record.range, block.statements.range) {
+                return Err(SourceFunctionStatementsInvariant::InvalidListRange(statement).into());
+            }
+            let mut previous = None;
+            for node in &block.statements.nodes {
+                let child = NodeRef::new(statement.arena, statement.file, *node);
+                validate_control_statement_child(arena, bound, statement, child, container)?;
+                if let Some(previous) = previous
+                    && control_statement_node(arena, bound, previous)?.range.end
+                        > control_statement_node(arena, bound, child)?.range.start
+                {
+                    return Err(SourceFunctionStatementsInvariant::InvalidOrder {
+                        previous,
+                        next: child,
+                    }
+                    .into());
+                }
+                collect_nested_export_diagnostics(arena, bound, statement, child, diagnostics)?;
+                previous = Some(child);
+            }
+        }
+        NodeData::IfStatement(_) => {
+            let nested = plan_source_control_if_syntax(arena, bound, statement, parent)?;
+            diagnostics.extend(nested.nested_export_diagnostics);
+        }
+        NodeData::WhileStatement(_)
+        | NodeData::DoStatement(_)
+        | NodeData::ForStatement(_)
+        | NodeData::ForInOrOfStatement(_) => {
+            let nested = plan_source_control_loop_syntax(arena, bound, statement, parent)?;
+            debug_assert_eq!(nested.statement, statement);
+            collect_nested_export_diagnostics(arena, bound, statement, nested.body, diagnostics)?;
+        }
+        NodeData::SwitchStatement(_) => {
+            let nested = plan_source_control_switch_syntax(arena, bound, statement, parent)?;
+            debug_assert_eq!(nested.statement, statement);
+            debug_assert_ne!(nested.expression, nested.case_block);
+            for clause in &nested.clauses {
+                debug_assert!(
+                    clause
+                        .unreachable_ranges
+                        .iter()
+                        .all(|range| range.anchor() == clause.clause)
+                );
+                if let Some(expression) = clause.expression {
+                    debug_assert!(control_statement_node(arena, bound, expression).is_ok());
+                }
+                for child in &clause.statements {
+                    collect_nested_export_diagnostics(
+                        arena,
+                        bound,
+                        clause.clause,
+                        *child,
+                        diagnostics,
+                    )?;
+                }
+            }
+        }
+        _ => {}
     }
     Ok(())
 }
@@ -2654,6 +3192,251 @@ mod joined_tests {
         .unwrap();
         assert!(syntax.else_statement.is_some());
         assert!(syntax.nested_export_diagnostics.is_empty());
+        assert!(
+            source_control_branch_is_empty(
+                &fixture.parsed.arena,
+                &fixture.bound,
+                syntax.then_statement,
+            )
+            .unwrap()
+        );
+        assert!(
+            source_control_branch_is_empty(
+                &fixture.parsed.arena,
+                &fixture.bound,
+                syntax.else_statement.unwrap(),
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn empty_control_branches_reject_real_statements_without_hiding_them() {
+        for (index, source, expected_empty) in [
+            (0u32, "if (flag) { { ; } ; }", true),
+            (1, "if (flag) { value; }", false),
+        ] {
+            let fixture = JoinedFixture::new(source, FileId::new(1_250 + index));
+            let statement = fixture
+                .parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::IfStatement).then_some(NodeRef::new(
+                        fixture.parsed.arena.id(),
+                        fixture.file,
+                        node,
+                    ))
+                })
+                .unwrap();
+            let syntax = plan_source_control_if_syntax(
+                &fixture.parsed.arena,
+                &fixture.bound,
+                statement,
+                fixture.bound.source_file(),
+            )
+            .unwrap();
+            assert_eq!(
+                source_control_branch_is_empty(
+                    &fixture.parsed.arena,
+                    &fixture.bound,
+                    syntax.then_statement,
+                )
+                .unwrap(),
+                expected_empty,
+            );
+        }
+    }
+
+    #[test]
+    fn nested_if_and_loop_blocks_retain_invalid_export_diagnostics() {
+        for (index, source) in [
+            "if (true) { if (false) export type {}; }",
+            "if (true) for (;;) { export type {}; }",
+            "if (true) { switch (value) { case 0: export type {}; } }",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let fixture =
+                JoinedFixture::new(source, FileId::new(1_216 + u32::try_from(index).unwrap()));
+            let statement = fixture
+                .parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::IfStatement
+                        && record.parent == Some(fixture.parsed.source_file))
+                    .then_some(NodeRef::new(fixture.parsed.arena.id(), fixture.file, node))
+                })
+                .unwrap();
+            let syntax = plan_source_control_if_syntax(
+                &fixture.parsed.arena,
+                &fixture.bound,
+                statement,
+                fixture.bound.source_file(),
+            )
+            .unwrap();
+            let [diagnostic] = syntax.nested_export_diagnostics.as_slice() else {
+                panic!("expected one nested export diagnostic in {source}")
+            };
+            assert_eq!(diagnostic.diagnostic.code(), 1_233);
+        }
+    }
+
+    #[test]
+    fn control_loop_syntax_preserves_all_standard_loop_orders() {
+        for (index, (source, expected_kind, expected_children)) in [
+            ("while (flag) {}", SourceControlLoopKind::While, 2usize),
+            ("do {} while (flag);", SourceControlLoopKind::DoWhile, 2),
+            (
+                "for (let index = 0; index < 3; index++) {}",
+                SourceControlLoopKind::For,
+                4,
+            ),
+            (
+                "for (const key in value) {}",
+                SourceControlLoopKind::ForIn,
+                3,
+            ),
+            (
+                "for (const item of values) {}",
+                SourceControlLoopKind::ForOf,
+                3,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let fixture =
+                JoinedFixture::new(source, FileId::new(1_230 + u32::try_from(index).unwrap()));
+            let source_node = fixture
+                .parsed
+                .arena
+                .get(fixture.parsed.source_file)
+                .unwrap();
+            let NodeData::SourceFile(root) = &source_node.data else {
+                panic!("expected source root")
+            };
+            let statement = NodeRef::new(
+                fixture.parsed.arena.id(),
+                fixture.file,
+                root.statements.nodes[0],
+            );
+            let syntax = plan_source_control_loop_syntax(
+                &fixture.parsed.arena,
+                &fixture.bound,
+                statement,
+                fixture.bound.source_file(),
+            )
+            .unwrap();
+            assert_eq!(syntax.kind, expected_kind);
+            let children = syntax.ordered_nodes();
+            assert_eq!(children.len(), expected_children);
+            assert!(children.windows(2).all(|pair| {
+                fixture.parsed.arena.get(pair[0].node).unwrap().range.end
+                    <= fixture.parsed.arena.get(pair[1].node).unwrap().range.start
+            }));
+        }
+    }
+
+    #[test]
+    fn control_switch_syntax_preserves_grouped_cases_and_default_order() {
+        let fixture = JoinedFixture::new(
+            concat!(
+                "switch (value) {\n",
+                "  case 'first': break;\n",
+                "  case 'second':\n",
+                "  case 'third': break;\n",
+                "  default: break;\n",
+                "}\n",
+            ),
+            FileId::new(1_240),
+        );
+        let source = fixture
+            .parsed
+            .arena
+            .get(fixture.parsed.source_file)
+            .unwrap();
+        let NodeData::SourceFile(source) = &source.data else {
+            panic!("expected source root")
+        };
+        let statement = NodeRef::new(
+            fixture.parsed.arena.id(),
+            fixture.file,
+            source.statements.nodes[0],
+        );
+        let syntax = plan_source_control_switch_syntax(
+            &fixture.parsed.arena,
+            &fixture.bound,
+            statement,
+            fixture.bound.source_file(),
+        )
+        .unwrap();
+        assert_eq!(syntax.clauses.len(), 4);
+        assert!(syntax.clauses[0].expression.is_some());
+        assert_eq!(syntax.clauses[0].statements.len(), 1);
+        assert!(syntax.clauses[1].expression.is_some());
+        assert!(syntax.clauses[1].statements.is_empty());
+        assert!(syntax.clauses[2].expression.is_some());
+        assert_eq!(syntax.clauses[2].statements.len(), 1);
+        assert!(syntax.clauses[3].expression.is_none());
+        assert_eq!(syntax.clauses[3].statements.len(), 1);
+        assert!(
+            syntax
+                .clauses
+                .iter()
+                .all(|clause| clause.unreachable_ranges.is_empty())
+        );
+    }
+
+    #[test]
+    fn switch_clauses_group_consecutive_unreachable_statements() {
+        let source = concat!(
+            "function choose(value: string): void {\n",
+            "  switch (value) {\n",
+            "    case 'first':\n",
+            "      return;\n",
+            "      value;\n",
+            "      value;\n",
+            "    default:\n",
+            "      return;\n",
+            "      value;\n",
+            "  }\n",
+            "}\n",
+        );
+        let fixture = JoinedFixture::new(source, FileId::new(1_241));
+        let (statement, parent) = fixture
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::SwitchStatement).then_some((
+                    NodeRef::new(fixture.parsed.arena.id(), fixture.file, node),
+                    NodeRef::new(
+                        fixture.parsed.arena.id(),
+                        fixture.file,
+                        record.parent.unwrap(),
+                    ),
+                ))
+            })
+            .unwrap();
+        let syntax = plan_source_control_switch_syntax(
+            &fixture.parsed.arena,
+            &fixture.bound,
+            statement,
+            parent,
+        )
+        .unwrap();
+        let [first, default] = syntax.clauses.as_slice() else {
+            panic!("expected one case and one default clause")
+        };
+        assert_eq!(first.unreachable_ranges.len(), 1);
+        assert_eq!(default.unreachable_ranges.len(), 1);
+        let range = first.unreachable_ranges[0].range();
+        let start = usize::try_from(range.start.get()).unwrap();
+        let end = usize::try_from(range.end.get()).unwrap();
+        assert_eq!(source.get(start..end).unwrap(), "value;\n      value;");
     }
 
     #[test]

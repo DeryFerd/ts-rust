@@ -43,10 +43,12 @@ use super::{
         CompositeSignature, IndexInfo, IndexInfoArena, Signature, SignatureArena, SignatureFlags,
         TupleElementInfo, TupleMetadata, TypePredicate, TypePredicateArena, TypePredicateKind,
     },
-    source_callables::SourceCallableTypeParameterSyntaxProof,
+    source_callables::{
+        SourceCallableTypeParameterSyntaxProof, source_type_parameter_default_is_assignable,
+    },
     type_records::{
-        CacheHashKey, ConditionalRoot, TypeAlias, TypeCacheState, TypeData, TypeRecord,
-        type_list_key,
+        CacheHashKey, ConditionalRoot, LiteralValue, TypeAlias, TypeCacheState, TypeData,
+        TypeRecord, type_list_key,
     },
     types::TypeFlags,
 };
@@ -5160,9 +5162,13 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
             };
             let trailing_default_valid = !default_seen || provenance.default_type.is_some();
             default_seen |= provenance.default_type.is_some();
-            let exact_constraint_default_pair = provenance.constraint.is_none()
+            let compatible_constraint_default_pair = provenance.constraint.is_none()
                 || provenance.default_type.is_none()
-                || row.constraint == row.default_type;
+                || source_type_parameter_default_is_assignable(
+                    self,
+                    row.constraint,
+                    row.default_type,
+                );
             if record.flags() != super::types::TypeFlags::TYPE_PARAMETER
                 || (record.object_flags() != super::types::ObjectFlags::NONE
                     && record.object_flags() != computed_type_variable_flags)
@@ -5185,7 +5191,7 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
                 || !constraint_link_valid
                 || !default_link_valid
                 || !trailing_default_valid
-                || !exact_constraint_default_pair
+                || !compatible_constraint_default_pair
                 || self.type_payload(row.constraint).is_none()
                 || self.type_payload(row.default_type).is_none()
             {
@@ -5301,10 +5307,82 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
             return result == intrinsic && type_links_valid && symbol_links_valid;
         }
 
+        if kind == Some(SyntaxKind::LiteralType) {
+            if self.type_node_links(node)
+                != Some(&TypeNodeLinks {
+                    resolved_type: Some(result),
+                    outer_type_parameters: None,
+                })
+                || self
+                    .symbol_node_links(node)
+                    .is_some_and(|links| links != &SymbolNodeLinks::default())
+            {
+                return false;
+            }
+            let Some(literal_index) = node.node.index().checked_sub(1) else {
+                return false;
+            };
+            let Some(literal) = self
+                .source_node_facts
+                .get(&node.arena)
+                .and_then(|facts| facts.get(literal_index))
+                .copied()
+                .flatten()
+            else {
+                return false;
+            };
+            if literal.parent != Some(node.node) {
+                return false;
+            }
+            let Some(record) = self.type_payload(result) else {
+                return false;
+            };
+            let TypeData::Literal(data) = record.data() else {
+                return false;
+            };
+            if record.object_flags() != super::types::ObjectFlags::NONE
+                || record.symbol().is_some()
+                || record.alias().is_some()
+                || data.regular_type != result
+            {
+                return false;
+            }
+            let (expected_kind, expected_flags, cached) = match &data.value {
+                LiteralValue::String(value) => (
+                    SyntaxKind::StringLiteral,
+                    TypeFlags::STRING_LITERAL,
+                    bootstrap.cached_string_literal_type(value),
+                ),
+                LiteralValue::Number(value) => (
+                    SyntaxKind::NumericLiteral,
+                    TypeFlags::NUMBER_LITERAL,
+                    bootstrap.cached_number_literal_type(*value),
+                ),
+                LiteralValue::BigInt(value) => (
+                    SyntaxKind::BigIntLiteral,
+                    TypeFlags::BIG_INT_LITERAL,
+                    bootstrap.cached_bigint_literal_type(value),
+                ),
+                LiteralValue::Boolean(true) => (
+                    SyntaxKind::TrueKeyword,
+                    TypeFlags::BOOLEAN_LITERAL,
+                    Some(bootstrap.regular_true_type),
+                ),
+                LiteralValue::Boolean(false) => (
+                    SyntaxKind::FalseKeyword,
+                    TypeFlags::BOOLEAN_LITERAL,
+                    Some(bootstrap.regular_false_type),
+                ),
+                LiteralValue::ComputedEnum => return false,
+            };
+            return literal.kind == expected_kind
+                && record.flags() == expected_flags
+                && cached == Some(result);
+        }
+
         // The opaque source proof does not yet retain enough structure to
-        // authenticate aliases or composite type syntax. The one supported
-        // non-keyword result is an exact reference to an earlier prepared
-        // type parameter, proven by both canonical query links.
+        // authenticate aliases or composite type syntax. Earlier type
+        // parameters are proven by both canonical query links.
         if kind != Some(SyntaxKind::TypeReference) {
             return false;
         }
@@ -5617,6 +5695,70 @@ mod tests {
             },
         ));
         assert!(!store.source_type_node_result_is_exact(null_node, null, &[]));
+    }
+
+    #[test]
+    fn source_literal_type_results_require_canonical_values_and_exact_links() {
+        let parsed = parse_source_file("type Text = 'ready'; type Numeric = 1; type Truth = true;");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(90_002);
+        let mut store = CanonicalTypeMapperStore::new();
+        assert!(
+            store
+                .register_source_file(&parsed.arena, parsed.source_file, file)
+                .is_some()
+        );
+        store
+            .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions::default())
+            .unwrap();
+        let string = store
+            .regular_string_literal_type("ready".to_owned())
+            .unwrap();
+        let number = store.regular_number_literal_type(Number::new(1.0)).unwrap();
+        let boolean = store.intrinsic_bootstrap().unwrap().regular_true_type;
+        let wrappers = parsed
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                let NodeData::LiteralTypeNode(literal) = &record.data else {
+                    return None;
+                };
+                Some((
+                    NodeRef::new(parsed.arena.id(), file, node),
+                    parsed.arena.get(literal.literal).unwrap().kind,
+                ))
+            })
+            .collect::<Vec<_>>();
+        for (node, kind) in &wrappers {
+            let expected = match kind {
+                SyntaxKind::StringLiteral => string,
+                SyntaxKind::NumericLiteral => number,
+                SyntaxKind::TrueKeyword => boolean,
+                _ => panic!("unexpected literal kind {kind:?}"),
+            };
+            assert!(!store.source_type_node_result_is_exact(*node, expected, &[]));
+            assert!(store.set_type_node_links(
+                *node,
+                TypeNodeLinks {
+                    resolved_type: Some(expected),
+                    outer_type_parameters: None,
+                },
+            ));
+            assert!(store.source_type_node_result_is_exact(*node, expected, &[]));
+        }
+
+        let string_node = wrappers
+            .iter()
+            .find_map(|(node, kind)| (*kind == SyntaxKind::StringLiteral).then_some(*node))
+            .unwrap();
+        assert!(store.set_type_node_links(
+            string_node,
+            TypeNodeLinks {
+                resolved_type: Some(number),
+                outer_type_parameters: None,
+            },
+        ));
+        assert!(!store.source_type_node_result_is_exact(string_node, number, &[]));
     }
 
     #[test]

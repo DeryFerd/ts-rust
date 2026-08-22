@@ -26,6 +26,7 @@ use super::{
     UnsupportedSourceSyntax, ValueSymbolLinks,
     callable_sets::{StoredCallableSetValidation, validate_stored_callable_set},
     formatter::{get_type_names_for_assignability_error, type_to_string},
+    indexed_access_types::template_pattern_index_matches_name,
     production::CanonicalJsxRuntimeEvidence,
     signatures::SignatureFlags,
     source::merge_retry_diagnostic,
@@ -87,11 +88,33 @@ enum JsxAttributeValue {
 
 #[derive(Clone, Debug)]
 enum JsxScalarPlan {
-    String { node: NodeRef, value: String },
-    Number { node: NodeRef, value: Number },
-    Boolean { node: NodeRef, value: bool },
+    String {
+        node: NodeRef,
+        value: String,
+    },
+    Number {
+        node: NodeRef,
+        value: Number,
+    },
+    Boolean {
+        node: NodeRef,
+        value: bool,
+    },
     Null(NodeRef),
-    Identifier { node: NodeRef, name: String },
+    Identifier {
+        node: NodeRef,
+        name: String,
+    },
+    Parenthesized {
+        node: NodeRef,
+        value: Box<Self>,
+    },
+    Conditional {
+        node: NodeRef,
+        condition: Box<Self>,
+        when_true: Box<Self>,
+        when_false: Box<Self>,
+    },
     Element(Box<JsxElementPlan>),
 }
 
@@ -834,6 +857,54 @@ fn plan_scalar(
                 name: identifier.text.clone(),
             })
         }
+        NodeData::ParenthesizedExpression(parenthesized)
+            if record.kind == SyntaxKind::ParenthesizedExpression =>
+        {
+            let expression = child_ref(node, parenthesized.expression);
+            Ok(JsxScalarPlan::Parenthesized {
+                node,
+                value: Box::new(plan_scalar(arena, bound, store, node, expression)?),
+            })
+        }
+        NodeData::ConditionalExpression(conditional)
+            if record.kind == SyntaxKind::ConditionalExpression && conditional.facts == 0 =>
+        {
+            let question = child_ref(node, conditional.question_token);
+            let colon = child_ref(node, conditional.colon_token);
+            let question_record = jsx_node(arena, bound, store, question)?;
+            let colon_record = jsx_node(arena, bound, store, colon)?;
+            if question_record.kind != SyntaxKind::QuestionToken
+                || colon_record.kind != SyntaxKind::ColonToken
+                || question_record.parent != Some(node.node)
+                || colon_record.parent != Some(node.node)
+            {
+                return Err(unsupported(node, record.kind));
+            }
+            Ok(JsxScalarPlan::Conditional {
+                node,
+                condition: Box::new(plan_scalar(
+                    arena,
+                    bound,
+                    store,
+                    node,
+                    child_ref(node, conditional.condition),
+                )?),
+                when_true: Box::new(plan_scalar(
+                    arena,
+                    bound,
+                    store,
+                    node,
+                    child_ref(node, conditional.when_true),
+                )?),
+                when_false: Box::new(plan_scalar(
+                    arena,
+                    bound,
+                    store,
+                    node,
+                    child_ref(node, conditional.when_false),
+                )?),
+            })
+        }
         NodeData::JsxElement(_) | NodeData::JsxSelfClosingElement(_) | NodeData::JsxFragment(_) => {
             Ok(JsxScalarPlan::Element(Box::new(plan_jsx_element(
                 arena, bound, store, node,
@@ -1346,11 +1417,11 @@ fn execute_jsx_element(
                 }
                 let (attributes_type, signature) = resolve_component_tag(
                     store,
-                    arena,
-                    bound,
+                    (arena, bound),
                     namespace,
                     plan.opening,
                     tag,
+                    options,
                     diagnostics,
                 )?;
                 publish_jsx_links(
@@ -1716,13 +1787,14 @@ fn intrinsic_signature(
 
 fn resolve_component_tag(
     store: &mut CanonicalTypeMapperStore,
-    arena: &NodeArena,
-    bound: &BoundFile,
+    source: (&NodeArena, &BoundFile),
     namespace: &JsxNamespace,
     opening: NodeRef,
     tag: &JsxTagPlan,
+    options: CanonicalCheckerOptions,
     diagnostics: &mut CanonicalCheckerDiagnostics,
 ) -> Result<(TypeId, SignatureId), SourceCheckError> {
+    let (arena, bound) = source;
     let Some(symbol) = resolve_source_value_symbol(store, bound, &tag.name) else {
         add_missing_component_diagnostic(store, bound, tag.node, &tag.name, diagnostics)?;
         let unknown_signature = store
@@ -1778,9 +1850,14 @@ fn resolve_component_tag(
         || signature.has_rest_parameter()
         || callable.min_argument_count > 1
         || callable.parameters.len() > 1
-        || callable.return_type.is_none()
     {
         return Err(unsupported(opening, SyntaxKind::JsxOpeningElement));
+    }
+    if callable.return_type.is_none() {
+        let host =
+            DeclaredTypeHost::new([(arena, bound)]).map_err(super::DeclaredTypeError::from)?;
+        CanonicalTypeQuery::new(store, &host, options, diagnostics)?
+            .get_return_type_of_signature(callable.signature)?;
     }
     let attributes_type = callable.parameters.first().copied().unwrap_or_else(|| {
         store
@@ -2134,8 +2211,72 @@ fn execute_scalar(
             let type_ = store
                 .value_symbol_links(symbol)
                 .and_then(|links| links.resolved_type)
+                .or_else(|| {
+                    let declaration = store.symbol(symbol)?.value_declaration()?;
+                    if !declaration.is_for(arena.id(), bound.file_id())
+                        || !bound.contains(declaration)
+                    {
+                        return None;
+                    }
+                    let NodeData::VariableDeclaration(variable) =
+                        &arena.get(declaration.node)?.data
+                    else {
+                        return None;
+                    };
+                    let initializer = child_ref(declaration, variable.initializer?);
+                    store
+                        .type_node_links(initializer)
+                        .and_then(|links| links.resolved_type)
+                        .filter(|type_| store.type_payload(*type_).is_some())
+                })
                 .ok_or(SourceCheckError::Property(*node))?;
             publish_symbol_links(store, *node, symbol)?;
+            (*node, type_)
+        }
+        JsxScalarPlan::Parenthesized { node, value } => {
+            let type_ =
+                execute_scalar(store, arena, bound, namespace, value, options, diagnostics)?;
+            (*node, type_)
+        }
+        JsxScalarPlan::Conditional {
+            node,
+            condition,
+            when_true,
+            when_false,
+        } => {
+            execute_scalar(
+                store,
+                arena,
+                bound,
+                namespace,
+                condition,
+                options,
+                diagnostics,
+            )?;
+            let true_type = execute_scalar(
+                store,
+                arena,
+                bound,
+                namespace,
+                when_true,
+                options,
+                diagnostics,
+            )?;
+            let false_type = execute_scalar(
+                store,
+                arena,
+                bound,
+                namespace,
+                when_false,
+                options,
+                diagnostics,
+            )?;
+            let type_ = if true_type == false_type {
+                true_type
+            } else {
+                let mut prepared = store.prepare_type_query_types(&[], &[], &[], 1, 0)?;
+                store.literal_union_type_prepared(&[true_type, false_type], None, &mut prepared)?
+            };
             (*node, type_)
         }
         JsxScalarPlan::Element(element) => {
@@ -2319,7 +2460,9 @@ fn check_attribute_assignability(
                 .value_symbol_links(property)
                 .and_then(|links| links.resolved_type)
                 .ok_or(SourceCheckError::Property(attribute.plan.node))?
-        } else if let Some(type_) = string_index_value_type(store, &index_infos)? {
+        } else if let Some(type_) =
+            matching_attribute_index_value_type(store, &index_infos, &attribute.plan.name)?
+        {
             type_
         } else if attribute.plan.name.contains('-') {
             continue;
@@ -2387,15 +2530,17 @@ fn check_attribute_assignability(
     Ok(())
 }
 
-fn string_index_value_type(
+fn matching_attribute_index_value_type(
     store: &CanonicalTypeMapperStore,
     indexes: &[super::IndexInfoId],
+    name: &str,
 ) -> Result<Option<TypeId>, SourceCheckError> {
     let bootstrap = store
         .intrinsic_bootstrap()
         .ok_or(SourceCheckError::LiteralCache(
             SourceLiteralCacheError::BootstrapUninitialized,
         ))?;
+    let mut string_index = None;
     for index in indexes {
         let Some(info) = store.index_info(*index) else {
             return Err(SourceCheckError::LiteralCache(
@@ -2403,10 +2548,12 @@ fn string_index_value_type(
             ));
         };
         if info.key_type() == bootstrap.string_type {
+            string_index.get_or_insert(info.value_type());
+        } else if template_pattern_index_matches_name(store, info.key_type(), name) {
             return Ok(Some(info.value_type()));
         }
     }
-    Ok(None)
+    Ok(string_index)
 }
 
 fn format_attribute_object(attributes: &[CheckedJsxAttribute]) -> String {
@@ -3155,6 +3302,54 @@ mod runtime_tests {
     }
 
     #[test]
+    fn jsx_template_index_only_matches_compatible_attribute_names() {
+        let mut fixture = RuntimeFixture::new("const view = <div />;\n", FileId::new(8_122));
+        let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+        let string = bootstrap.string_type;
+        let number = bootstrap.number_type;
+        let any = bootstrap.any_type;
+        let pattern = fixture
+            .store
+            .get_template_literal_type(&["do-".to_owned(), String::new()], &[string])
+            .unwrap();
+        let patterned = fixture
+            .store
+            .alloc_index_info(pattern, number, false, None, Vec::new())
+            .unwrap();
+        let fallback = fixture
+            .store
+            .alloc_index_info(string, any, false, None, Vec::new())
+            .unwrap();
+
+        assert_eq!(
+            matching_attribute_index_value_type(&fixture.store, &[patterned], "do-click").unwrap(),
+            Some(number),
+        );
+        assert_eq!(
+            matching_attribute_index_value_type(&fixture.store, &[patterned], "ns:thing").unwrap(),
+            None,
+        );
+        assert_eq!(
+            matching_attribute_index_value_type(
+                &fixture.store,
+                &[fallback, patterned],
+                "do-click",
+            )
+            .unwrap(),
+            Some(number),
+        );
+        assert_eq!(
+            matching_attribute_index_value_type(
+                &fixture.store,
+                &[fallback, patterned],
+                "ns:thing",
+            )
+            .unwrap(),
+            Some(any),
+        );
+    }
+
+    #[test]
     fn ambient_component_reads_its_staged_annotation_without_publishing_value_links() {
         let mut fixture = RuntimeFixture::new(
             "declare var Fragment: any;\nconst view = <Fragment></Fragment>;\n",
@@ -3313,6 +3508,150 @@ mod runtime_tests {
         context.check_source_file(file).unwrap();
 
         assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn classic_runtime_forces_lazy_ambient_function_component_returns() {
+        for (index, namespace_member) in ["ElementType", "LibraryManagedAttributes"]
+            .into_iter()
+            .enumerate()
+        {
+            let source = format!(
+                "declare namespace JSX {{ enum {namespace_member} {{}} }}\n\
+                 declare const C: () => any;\n\
+                 const view = <C />;\n"
+            );
+            let parsed = parse_jsx_source_file(&source);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let file = FileId::new(8_118 + u32::try_from(index).unwrap());
+            let mut binder = CanonicalBinder::new();
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new(
+                        EscapedName::source("\"/project/component.tsx\""),
+                        CanonicalSourceLanguage::TypeScript,
+                        false,
+                        CanonicalModuleState::Script,
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+            let mut context = crate::semantic::CanonicalCheckerContext::new(
+                binder.finish(),
+                vec![(file, &parsed.arena)],
+                CanonicalCheckerOptions::default(),
+            )
+            .unwrap();
+
+            context
+                .check_source_file_with_jsx_runtime(
+                    file,
+                    CanonicalJsxRuntimeEvidence::Classic {
+                        factory_namespace: "React",
+                        fragment_factory_namespace: "React",
+                        fragment_factory_required: false,
+                        fragment_factory_pragma_required: false,
+                    },
+                )
+                .unwrap();
+
+            assert_eq!(context.diagnostics().len(), 1);
+            assert_eq!(context.diagnostics().as_slice()[0].diagnostic.code(), 2874);
+        }
+    }
+
+    #[test]
+    fn jsx_children_accept_parenthesized_conditional_elements() {
+        let mut fixture = RuntimeFixture::new(
+            "const view = <div>{0 ? (<span />) : (<section />)}</div>;\n",
+            FileId::new(8_120),
+        );
+        let expression = fixture.expression("view");
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        fixture.check(expression, CanonicalJsxRuntime::Preserve, &mut diagnostics);
+
+        assert_eq!(
+            diagnostics
+                .as_slice()
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.code())
+                .collect::<Vec<_>>(),
+            [7026, 7026, 7026, 7026],
+        );
+        let error = fixture.store.intrinsic_bootstrap().unwrap().error_type;
+        for (node, record) in fixture.parsed.arena.iter() {
+            if matches!(
+                record.kind,
+                SyntaxKind::ConditionalExpression | SyntaxKind::ParenthesizedExpression
+            ) {
+                let node = NodeRef::new(fixture.parsed.arena.id(), fixture.file, node);
+                assert_eq!(
+                    fixture
+                        .store
+                        .type_node_links(node)
+                        .and_then(|links| links.resolved_type),
+                    Some(error),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn jsx_children_read_cached_initializers_before_value_publication() {
+        let mut fixture = RuntimeFixture::new(
+            "const saved = 1 as any;\nconst view = <div>{saved}</div>;\n",
+            FileId::new(8_121),
+        );
+        let expression = fixture.expression("view");
+        let initializer = fixture.expression("saved");
+        let any = fixture.store.intrinsic_bootstrap().unwrap().any_type;
+        assert!(fixture.store.set_type_node_links(
+            initializer,
+            TypeNodeLinks {
+                resolved_type: Some(any),
+                ..TypeNodeLinks::default()
+            },
+        ));
+
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        fixture.check(expression, CanonicalJsxRuntime::Preserve, &mut diagnostics);
+
+        assert_eq!(diagnostics.len(), 2);
+        assert!(
+            diagnostics
+                .as_slice()
+                .iter()
+                .all(|diagnostic| diagnostic.diagnostic.code() == 7026)
+        );
+        let reference = fixture
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::Identifier(identifier) = &record.data else {
+                    return None;
+                };
+                (identifier.text == "saved"
+                    && record
+                        .parent
+                        .and_then(|parent| fixture.parsed.arena.get(parent))
+                        .is_some_and(|parent| parent.kind == SyntaxKind::JsxExpression))
+                .then_some(NodeRef::new(fixture.parsed.arena.id(), fixture.file, node))
+            })
+            .unwrap();
+        assert_eq!(
+            fixture
+                .store
+                .type_node_links(reference)
+                .and_then(|links| links.resolved_type),
+            Some(any),
+        );
     }
 
     #[test]

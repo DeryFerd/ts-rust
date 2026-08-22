@@ -8,7 +8,8 @@
 
 use ts_ast::{FileId, Node, NodeArena, NodeArenaRevision, NodeData, NodeId, NodeRef, SyntaxKind};
 use ts_binder::{
-    BoundFile, CanonicalNameResolver, CanonicalResolutionLocation, SemanticSymbolId, SymbolFlags,
+    BoundFile, CanonicalNameResolver, CanonicalResolutionLocation, InternalSymbolName,
+    SemanticSymbolId, SymbolFlags,
 };
 
 use super::{
@@ -202,6 +203,12 @@ impl CanonicalCheckerContext<'_> {
             )
         };
 
+        if let Some(LocationParent::Declaration(declaration)) = parent
+            && let Some(type_) = self.global_augmentation_artifact_type(node, declaration)?
+        {
+            return Ok(type_);
+        }
+
         if is_type_node {
             return self
                 .get_type_from_type_node(node)
@@ -274,7 +281,15 @@ impl CanonicalCheckerContext<'_> {
             return Ok(None);
         }
 
+        if let Some(symbol) = self.shorthand_artifact_symbol(node)? {
+            return Ok(Some(symbol));
+        }
+
         if let Some(symbol) = self.cached_artifact_symbol(node)? {
+            return Ok(Some(symbol));
+        }
+
+        if let Some(symbol) = self.module_specifier_artifact_symbol(node)? {
             return Ok(Some(symbol));
         }
 
@@ -471,7 +486,11 @@ impl CanonicalCheckerContext<'_> {
             .store()
             .symbol(symbol)
             .ok_or(CanonicalArtifactQueryError::ForeignSymbol(symbol))?;
-        let name = record.name().escaped_display().to_string();
+        let name = if record.name() == InternalSymbolName::Global.as_ref() {
+            "global".to_owned()
+        } else {
+            record.name().escaped_display().to_string()
+        };
         if !record.flags().intersects(
             SymbolFlags::PROPERTY
                 | SymbolFlags::METHOD
@@ -608,6 +627,80 @@ impl CanonicalCheckerContext<'_> {
         self.store()
             .get_merged_symbol(symbol)
             .ok_or(CanonicalArtifactQueryError::InvalidSymbol { node, symbol })
+    }
+
+    fn global_augmentation_artifact_type(
+        &self,
+        node: NodeRef,
+        declaration: NodeRef,
+    ) -> Result<Option<TypeId>, CanonicalArtifactQueryError> {
+        let (_, bound, record) = self.validated_artifact_node(declaration)?;
+        let NodeData::ModuleDeclaration(module) = &record.data else {
+            return Ok(None);
+        };
+        if module.keyword != SyntaxKind::GlobalKeyword || module.name != node.node {
+            return Ok(None);
+        }
+        let Some(symbol) = bound.symbol(declaration) else {
+            return Ok(None);
+        };
+        let symbol = self.merged_artifact_symbol(node, symbol)?;
+        let record = self
+            .store()
+            .symbol(symbol)
+            .ok_or(CanonicalArtifactQueryError::InvalidSymbol { node, symbol })?;
+        if record.name() != InternalSymbolName::Global.as_ref() {
+            return Err(CanonicalArtifactQueryError::InvalidSymbol { node, symbol });
+        }
+        self.store()
+            .intrinsic_bootstrap()
+            .map(|bootstrap| self.validate_artifact_type(node, bootstrap.any_type))
+            .transpose()
+    }
+
+    fn shorthand_artifact_symbol(
+        &self,
+        node: NodeRef,
+    ) -> Result<Option<SemanticSymbolId>, CanonicalArtifactQueryError> {
+        let (arena, bound, record) = self.validated_artifact_node(node)?;
+        if !matches!(record.data, NodeData::Identifier(_)) {
+            return Ok(None);
+        }
+        let Some(parent_id) = record.parent else {
+            return Ok(None);
+        };
+        let Some(NodeData::ShorthandPropertyAssignment(shorthand)) =
+            arena.get(parent_id).map(|parent| &parent.data)
+        else {
+            return Ok(None);
+        };
+        if shorthand.name != node.node {
+            return Ok(None);
+        }
+        let declaration = NodeRef::new(node.arena, node.file, parent_id);
+        let Some(symbol) = bound.symbol(declaration) else {
+            return Ok(None);
+        };
+        self.merged_artifact_symbol(node, symbol).map(Some)
+    }
+
+    fn module_specifier_artifact_symbol(
+        &self,
+        node: NodeRef,
+    ) -> Result<Option<SemanticSymbolId>, CanonicalArtifactQueryError> {
+        if !matches!(
+            self.validated_artifact_node(node)?.2.data,
+            NodeData::StringLiteral(_) | NodeData::NoSubstitutionTemplateLiteral(_)
+        ) {
+            return Ok(None);
+        }
+        let super::CanonicalModuleResolutionLookup::Resolved(resolved) =
+            self.module_resolution(node)
+        else {
+            return Ok(None);
+        };
+        self.merged_artifact_symbol(node, resolved.target_symbol())
+            .map(Some)
     }
 
     fn namespace_artifact_root(
@@ -1063,6 +1156,7 @@ fn declaration_name(data: &NodeData) -> Option<NodeId> {
         NodeData::ImportEqualsDeclaration(declaration) => Some(declaration.name),
         NodeData::ImportSpecifier(declaration) => Some(declaration.name),
         NodeData::InterfaceDeclaration(declaration) => Some(declaration.name),
+        NodeData::JsxAttribute(declaration) => Some(declaration.name),
         NodeData::MethodDeclaration(declaration) => Some(declaration.name),
         NodeData::MethodSignatureDeclaration(declaration) => Some(declaration.name),
         NodeData::ModuleDeclaration(declaration) => Some(declaration.name),
@@ -1184,13 +1278,14 @@ mod tests {
         CanonicalBinder, CanonicalModuleState, CanonicalSourceFileFacts, CanonicalSourceLanguage,
         EscapedName,
     };
-    use ts_parser::{ParseResult, parse_source_file};
+    use ts_parser::{ParseResult, parse_jsx_source_file, parse_source_file};
 
     use super::CanonicalCheckerContext;
     use crate::semantic::{
         CanonicalCheckerOptions, CanonicalModuleResolutionEntry,
         CanonicalModuleResolutionManifestInput, CanonicalModuleResolutionMode,
         CanonicalResolvedModuleInput, IntrinsicBootstrapOptions, SymbolNodeLinks, TypeData,
+        TypeNodeLinks,
     };
 
     fn context(parsed: &ParseResult, file: FileId) -> CanonicalCheckerContext<'_> {
@@ -1301,6 +1396,175 @@ mod tests {
         }
 
         assert_eq!(names, ["Shape.item", "Model.value", "value"]);
+    }
+
+    #[test]
+    fn global_augmentation_names_use_their_public_spelling_and_canonical_any_type() {
+        let parsed = parse_source_file(concat!(
+            "export {};\n",
+            "declare global { interface Marker { value: string; } }\n",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(6_012);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/global.d.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    true,
+                    CanonicalModuleState::External,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        let mut context = CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![(file, &parsed.arena)],
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap();
+        let (declaration, name) = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::ModuleDeclaration(module) = &record.data else {
+                    return None;
+                };
+                (module.keyword == SyntaxKind::GlobalKeyword).then_some((
+                    NodeRef::new(parsed.arena.id(), file, node),
+                    NodeRef::new(parsed.arena.id(), file, module.name),
+                ))
+            })
+            .unwrap();
+        let symbol = context.file(file).unwrap().1.symbol(declaration).unwrap();
+
+        assert_eq!(context.get_symbol_at_location(name).unwrap(), Some(symbol));
+        assert_eq!(context.symbol_to_string(symbol).unwrap(), "global");
+        assert_eq!(
+            context.get_type_at_location(name).unwrap(),
+            context.store().intrinsic_bootstrap().unwrap().any_type
+        );
+    }
+
+    #[test]
+    fn shorthand_names_expose_property_declarations_without_replacing_value_reads() {
+        let parsed = parse_source_file(concat!(
+            "const property: string = 'ready';\n",
+            "const object: any = { property };\n",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(6_013);
+        let mut context = declaration_context(&parsed, file);
+        let (declaration, name) = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::ShorthandPropertyAssignment(property) = &record.data else {
+                    return None;
+                };
+                Some((
+                    NodeRef::new(parsed.arena.id(), file, node),
+                    NodeRef::new(parsed.arena.id(), file, property.name),
+                ))
+            })
+            .unwrap();
+        let property = context.file(file).unwrap().1.symbol(declaration).unwrap();
+        let value = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::VariableDeclaration(variable) = &record.data else {
+                    return None;
+                };
+                let NodeData::Identifier(identifier) = &parsed.arena.get(variable.name)?.data
+                else {
+                    return None;
+                };
+                (identifier.text == "property").then(|| {
+                    context
+                        .file(file)
+                        .unwrap()
+                        .1
+                        .symbol(NodeRef::new(parsed.arena.id(), file, node))
+                        .unwrap()
+                })
+            })
+            .unwrap();
+        assert_ne!(property, value);
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        assert!(context.store_mut_for_test().set_symbol_node_links(
+            name,
+            SymbolNodeLinks {
+                resolved_symbol: Some(value),
+            },
+        ));
+        assert!(context.store_mut_for_test().set_type_node_links(
+            name,
+            TypeNodeLinks {
+                resolved_type: Some(string),
+                outer_type_parameters: None,
+            },
+        ));
+
+        assert_eq!(
+            context.get_symbol_at_location(name).unwrap(),
+            Some(property)
+        );
+        assert_eq!(
+            context.get_symbol_at_location(declaration).unwrap(),
+            Some(property)
+        );
+        assert_eq!(context.get_type_at_location(name).unwrap(), string);
+        assert_eq!(
+            context
+                .store()
+                .symbol_node_links(name)
+                .and_then(|links| links.resolved_symbol),
+            Some(value)
+        );
+    }
+
+    #[test]
+    fn jsx_attribute_names_recover_their_bound_declaration_without_cached_symbols() {
+        let parsed = parse_jsx_source_file("const value = <div title=\"ready\" />;");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(6_014);
+        let mut context = context(&parsed, file);
+        context.check_source_file(file).unwrap();
+        let (declaration, name) = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::JsxAttribute(attribute) = &record.data else {
+                    return None;
+                };
+                Some((
+                    NodeRef::new(parsed.arena.id(), file, node),
+                    NodeRef::new(parsed.arena.id(), file, attribute.name),
+                ))
+            })
+            .unwrap();
+        let symbol = context.file(file).unwrap().1.symbol(declaration).unwrap();
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_symbol_node_links(name, SymbolNodeLinks::default())
+        );
+
+        assert_eq!(context.get_symbol_at_location(name).unwrap(), Some(symbol));
+        assert_eq!(
+            context
+                .store()
+                .symbol_node_links(name)
+                .and_then(|links| links.resolved_symbol),
+            None
+        );
     }
 
     #[test]
@@ -1490,6 +1754,14 @@ mod tests {
                 })
             })
             .unwrap();
+        let target_module = context
+            .file(target_file)
+            .and_then(|(_, bound)| bound.symbol(bound.source_file()))
+            .unwrap();
+        assert_eq!(
+            context.get_symbol_at_location(specifier).unwrap(),
+            Some(target_module)
+        );
 
         for (node, record) in importer.arena.iter() {
             let NodeData::QualifiedName(qualified) = &record.data else {

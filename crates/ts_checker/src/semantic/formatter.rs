@@ -5762,6 +5762,64 @@ mod tests {
     }
 
     #[test]
+    fn source_object_union_truncation_matches_element_access_diagnostic_boundaries() {
+        for count in [19_u32, 20] {
+            let members = (0..count)
+                .map(|index| format!("{{ id: \"{index:02}\" }}"))
+                .collect::<Vec<_>>();
+            let source = format!("declare const value: {};", members.join(" | "));
+            let parsed = parse_source_file(&source);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let file = FileId::new(210 + count);
+            let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+            let annotation = variable_type_node(&parsed, file, "value");
+            let union = context.get_type_from_type_node(annotation).unwrap();
+
+            let mut expected = (0..15)
+                .map(|index| format!("{{ id: \"{index:02}\"; }}"))
+                .collect::<Vec<_>>();
+            if count == 19 {
+                expected.extend(std::iter::repeat_n("{ ...; }".to_owned(), 4));
+            } else {
+                expected.push("... 4 more ...".to_owned());
+                expected.push("{ ...; }".to_owned());
+            }
+            let expected = expected.join(" | ");
+            let displayed = context.type_to_string(union).unwrap();
+            assert_eq!(displayed, expected);
+
+            let detail = Diagnostic::with_arguments(
+                message_by_code(7054).unwrap(),
+                ["string", displayed.as_str()],
+            )
+            .render()
+            .unwrap();
+            let diagnostic = Diagnostic::with_arguments(
+                message_by_code(7053).unwrap(),
+                ["string", displayed.as_str()],
+            )
+            .with_details([format!("  {detail}")]);
+            assert_eq!(
+                diagnostic.render().unwrap(),
+                format!(
+                    "Element implicitly has an 'any' type because expression of type 'string' can't be used to index type '{expected}'.\n  No index signature with a parameter of type 'string' was found on type '{expected}'."
+                )
+            );
+
+            let complete = (0..count)
+                .map(|index| format!("{{ id: \"{index:02}\"; }}"))
+                .collect::<Vec<_>>()
+                .join(" | ");
+            assert_eq!(
+                context
+                    .type_to_string_with_flags(union, CanonicalTypeFormatFlags::NO_TRUNCATION)
+                    .unwrap(),
+                complete
+            );
+        }
+    }
+
+    #[test]
     fn malformed_and_cyclic_unions_fail_typed_without_formatter_writes() {
         let mut invalid_store = bootstrapped_store();
         let bootstrap = invalid_store.intrinsic_bootstrap().unwrap();

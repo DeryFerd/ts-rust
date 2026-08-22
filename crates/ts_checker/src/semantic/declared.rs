@@ -35,8 +35,8 @@ use ts_ast::{
     SyntaxKind,
 };
 use ts_binder::{
-    BoundFile, CanonicalNameResolutionError, CanonicalNameResolver, CanonicalNameResolverOptions,
-    CanonicalResolutionLocation, SemanticStoreId, SemanticSymbolId, SymbolFlags,
+    BoundFile, CanonicalNameResolutionError, CanonicalNameResolverOptions, SemanticStoreId,
+    SemanticSymbolId, SymbolFlags,
 };
 
 pub(super) use super::type_records::type_list_key;
@@ -1357,30 +1357,8 @@ impl RecursiveInterfacePlanner<'_, '_, '_> {
         &mut self,
         expression: NodeRef,
     ) -> Result<bool, DeclaredTypeError> {
-        let expression_node = preflight_node(self.store, self.host, expression)?;
-        let NodeData::Identifier(identifier) = &expression_node.data else {
-            return Err(unavailable(
-                DeclaredTypeUnavailable::UnsupportedInterfaceHeritageResolution(expression),
-            ));
-        };
-        let source = self.host.sources.get(expression.file).ok_or_else(|| {
-            unavailable(DeclaredTypeUnavailable::MissingOrForeignFacts(expression))
-        })?;
         let mut callback_host = self.host.name_resolver_host(self.store)?;
-        let base_symbol = CanonicalNameResolver::new(
-            source.arena,
-            source.bound,
-            self.store.symbol_store(),
-            &mut callback_host,
-        )?
-        .resolve(
-            Some(CanonicalResolutionLocation::Bound(expression)),
-            &identifier.text,
-            SymbolFlags::TYPE,
-            None,
-            false,
-            false,
-        )?;
+        let base_symbol = callback_host.resolve_entity_name(expression, SymbolFlags::TYPE)?;
         let Some(base_symbol) = base_symbol else {
             return Ok(true);
         };
@@ -2874,40 +2852,36 @@ mod tests {
     }
 
     #[test]
-    fn qualified_and_alias_heritage_fail_atomically_after_supported_bases() {
+    fn qualified_interface_heritage_follows_namespace_exports() {
         let mut qualified = fixture(
             "namespace N { export interface Q {} } interface Plain {} interface Derived extends Plain, N.Q {}",
         );
         merge_fixture_globals(&mut qualified);
         let plain = named_symbol(&qualified, SyntaxKind::InterfaceDeclaration, "Plain");
+        let qualified_base = named_symbol(&qualified, SyntaxKind::InterfaceDeclaration, "Q");
         let derived = named_symbol(&qualified, SyntaxKind::InterfaceDeclaration, "Derived");
-        let type_count = qualified.store.type_len();
-        let mapper_count = qualified.store.mapper_len();
-        let link_counts = qualified.store.checker_link_allocated_lengths();
         let bound = qualified.files.get(&qualified.file).unwrap();
         let host = post_global_host(&qualified.parsed.arena, bound);
-        let qualified_error = qualified
+        let declared_type = qualified
             .store
             .get_declared_type_of_symbol(&host, derived)
-            .unwrap_err();
+            .unwrap();
+        assert!(qualified.store.declared_type_links(plain).is_some());
         assert!(
-            matches!(
-                qualified_error,
-                DeclaredTypeError::Unavailable(
-                    DeclaredTypeUnavailable::UnsupportedInterfaceHeritageResolution(_)
-                )
-            ),
-            "{qualified_error:?}"
+            qualified
+                .store
+                .declared_type_links(qualified_base)
+                .is_some()
         );
-        assert_eq!(qualified.store.type_len(), type_count);
-        assert_eq!(qualified.store.mapper_len(), mapper_count);
-        assert_eq!(
-            qualified.store.checker_link_allocated_lengths(),
-            link_counts
+        assert!(
+            interface_data(&qualified.store, declared_type)
+                .this_type
+                .is_none()
         );
-        assert!(qualified.store.declared_type_links(plain).is_none());
-        assert!(qualified.store.declared_type_links(derived).is_none());
+    }
 
+    #[test]
+    fn unresolved_alias_heritage_fails_atomically_after_supported_bases() {
         let mut alias = fixture_with_module_state(
             "namespace N { export interface Q {} } import Alias = N.Q; interface Plain {} interface Derived extends Plain, Alias {}",
             CanonicalModuleState::External,

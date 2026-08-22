@@ -5,7 +5,8 @@ use ts_binder::{
 };
 use ts_checker::semantic::{
     CanonicalCheckerContext, CanonicalCheckerDiagnosticRange, CanonicalCheckerOptions,
-    SourceCheckError, TypeData, TypeId, UnsupportedSourceSyntax, ValueSymbolLinks,
+    IntrinsicBootstrapOptions, SourceCheckError, TypeData, TypeId, UnsupportedSourceSyntax,
+    ValueSymbolLinks,
     types::{ObjectFlags, TypeFlags},
 };
 use ts_core::{TextPos, TextRange};
@@ -24,6 +25,22 @@ fn checker_context(
     file: FileId,
     declaration_file: bool,
     module_state: CanonicalModuleState,
+) -> CanonicalCheckerContext<'_> {
+    checker_context_with_options(
+        parsed,
+        file,
+        declaration_file,
+        module_state,
+        CanonicalCheckerOptions::default(),
+    )
+}
+
+fn checker_context_with_options(
+    parsed: &ParseResult,
+    file: FileId,
+    declaration_file: bool,
+    module_state: CanonicalModuleState,
+    options: CanonicalCheckerOptions,
 ) -> CanonicalCheckerContext<'_> {
     let mut binder = CanonicalBinder::new();
     binder
@@ -45,7 +62,7 @@ fn checker_context(
     CanonicalCheckerContext::new(
         binder.finish(),
         [(file, &parsed.arena)].into_iter().collect(),
-        CanonicalCheckerOptions::default(),
+        options,
     )
     .unwrap()
 }
@@ -797,7 +814,7 @@ fn invalid_later_generic_ambient_function_rejects_the_whole_source_atomically() 
     let parsed = parse_source_file(concat!(
         "const early = ready(1);\n",
         "declare function ready<T>(value: T): T;\n",
-        "declare function invalid<T>(value?: T): T;\n",
+        "declare function invalid<const T>(value: T): T;\n",
     ));
     assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
     let file = FileId::new(2_304);
@@ -919,13 +936,86 @@ fn declaration_file_and_exported_ambient_generic_functions_publish_signatures() 
 }
 
 #[test]
-fn ambient_generic_forms_outside_the_existing_exact_closure_remain_typed_boundaries() {
-    for (index, (source, declaration_file, module_state)) in [
-        (
-            "declare function optional<T>(value?: T): T;",
+fn optional_generic_ambient_functions_preserve_arity_and_inferred_returns() {
+    let parsed = parse_source_file(concat!(
+        "declare function optional<T>(value?: T): T; ",
+        "declare function fallback<T = string>(value?: T): T; ",
+        "const omitted = optional(); ",
+        "const explicit = optional<string>(); ",
+        "const defaulted = fallback(); ",
+        "const inferred = optional(1);",
+    ));
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+
+    for (index, strict_null_checks) in [false, true].into_iter().enumerate() {
+        let file = FileId::new(2_360 + u32::try_from(index).unwrap());
+        let mut context = checker_context_with_options(
+            &parsed,
+            file,
             false,
             CanonicalModuleState::Script,
-        ),
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks,
+                    ..IntrinsicBootstrapOptions::default()
+                },
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+
+        context.check_source_file(file).unwrap();
+
+        let function = function_parts(&parsed, file, "optional");
+        let signature = signature_for_declaration(&context, function.declaration);
+        let signature = context.store().signature(signature).unwrap();
+        assert_eq!(signature.min_argument_count(), 0);
+        assert_eq!(signature.parameters().len(), 1);
+
+        let calls = calls(&parsed, file);
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        for (call, expected) in [
+            (calls[0], bootstrap.unknown_type),
+            (calls[1], bootstrap.string_type),
+            (calls[2], bootstrap.string_type),
+        ] {
+            assert_eq!(
+                context
+                    .store()
+                    .type_node_links(call)
+                    .and_then(|links| links.resolved_type),
+                Some(expected)
+            );
+        }
+        assert!(
+            context
+                .store()
+                .type_node_links(calls[3])
+                .and_then(|links| links.resolved_type)
+                .and_then(|type_| context.store().type_payload(type_))
+                .is_some_and(|record| record.flags().intersects(TypeFlags::NUMBER_LITERAL))
+        );
+        assert!(context.diagnostics().is_empty());
+
+        let warm = (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.diagnostics().clone(),
+        );
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.diagnostics().clone(),
+            ),
+            warm
+        );
+    }
+}
+
+#[test]
+fn ambient_generic_forms_outside_the_existing_exact_closure_remain_typed_boundaries() {
+    for (index, (source, declaration_file, module_state)) in [
         (
             "declare function constant<const T>(value: T): T;",
             false,

@@ -1,12 +1,12 @@
 //! Canonical mutable tuple targets and concrete type references.
 //!
-//! This is the non-variadic construction slice of pinned
+//! This ports the dependency-closed construction slice of pinned
 //! `checker.go::createTupleTypeEx`, `getTupleTargetType`, and
 //! `createTupleTargetType` at
 //! `dc37b5249ab60e2bbce936f71b883e6c8136167e`. Supported shapes contain
-//! required elements, trailing optional elements, and at most one trailing
-//! syntactic-array rest element. General variadic normalization remains at the
-//! type-node boundary.
+//! required and optional elements, one syntactic-array rest element, and
+//! generic variadic elements. Layouts that require element normalization
+//! remain explicit type-node boundaries.
 
 use std::{collections::HashMap, ops::Range};
 
@@ -516,6 +516,7 @@ impl CanonicalTypeMapperStore {
             return Err(TupleTypeError::BootstrapUninitialized);
         }
         let mut saw_optional = false;
+        let mut saw_rest = false;
         for (index, info) in key.element_infos.iter().copied().enumerate() {
             if info
                 .labeled_declaration()
@@ -525,9 +526,10 @@ impl CanonicalTypeMapperStore {
             }
             match info.flags() {
                 ElementFlags::REQUIRED if !saw_optional => {}
-                ElementFlags::OPTIONAL => saw_optional = true,
-                ElementFlags::REST if index + 1 == key.element_infos.len() => {}
-                ElementFlags::REQUIRED | ElementFlags::REST => {
+                ElementFlags::OPTIONAL if !saw_rest => saw_optional = true,
+                ElementFlags::REST if !saw_rest => saw_rest = true,
+                ElementFlags::VARIADIC => {}
+                ElementFlags::REQUIRED | ElementFlags::OPTIONAL | ElementFlags::REST => {
                     return Err(TupleTypeError::UnsupportedElementOrder { index });
                 }
                 flags => {
@@ -1378,6 +1380,7 @@ impl CanonicalTypeMapperStore {
             });
         }
         let mut saw_optional = false;
+        let mut saw_rest = false;
         for (index, (type_, info)) in request
             .element_types
             .iter()
@@ -1385,9 +1388,9 @@ impl CanonicalTypeMapperStore {
             .zip(request.element_infos.iter().copied())
             .enumerate()
         {
-            if self.type_payload(type_).is_none() {
-                return Err(TupleTypeError::InvalidElementType { index, type_ });
-            }
+            let record = self
+                .type_payload(type_)
+                .ok_or(TupleTypeError::InvalidElementType { index, type_ })?;
             if info
                 .labeled_declaration()
                 .is_some_and(|node| !self.contains_node_ref(node))
@@ -1396,9 +1399,16 @@ impl CanonicalTypeMapperStore {
             }
             match info.flags() {
                 ElementFlags::REQUIRED if !saw_optional => {}
-                ElementFlags::OPTIONAL => saw_optional = true,
-                ElementFlags::REST if index + 1 == request.element_infos.len() => {}
-                ElementFlags::REQUIRED | ElementFlags::REST => {
+                ElementFlags::OPTIONAL if !saw_rest => saw_optional = true,
+                ElementFlags::REST if !saw_rest => saw_rest = true,
+                ElementFlags::VARIADIC if matches!(record.data(), TypeData::TypeParameter(_)) => {}
+                ElementFlags::VARIADIC => {
+                    return Err(TupleTypeError::UnsupportedElementFlags {
+                        index,
+                        flags: ElementFlags::VARIADIC,
+                    });
+                }
+                ElementFlags::REQUIRED | ElementFlags::OPTIONAL | ElementFlags::REST => {
                     return Err(TupleTypeError::UnsupportedElementOrder { index });
                 }
                 flags => {
@@ -3056,6 +3066,91 @@ mod tests {
     }
 
     #[test]
+    fn non_trailing_rest_and_generic_variadic_elements_preserve_canonical_targets() {
+        let mut store = initialized();
+        let (number, string) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (bootstrap.number_type, bootstrap.string_type)
+        };
+        let required = element_info(&store, ElementFlags::REQUIRED, None);
+        let rest = element_info(&store, ElementFlags::REST, None);
+        let variadic = element_info(&store, ElementFlags::VARIADIC, None);
+
+        let rest_infos = [rest, required];
+        let rest_arguments = [number, string];
+        let rest_tuple = store
+            .create_canonical_tuple_type(CanonicalTupleTypeRequest::new(
+                &rest_arguments,
+                &rest_infos,
+                false,
+            ))
+            .unwrap();
+        let rest_shape = store.canonical_tuple_shape(rest_tuple).unwrap().unwrap();
+        assert_eq!(rest_shape.element_types(), rest_arguments);
+        assert_eq!(rest_shape.min_length(), 1);
+        assert_eq!(rest_shape.fixed_length(), 0);
+        assert_eq!(
+            rest_shape.combined_flags(),
+            ElementFlags::REST | ElementFlags::REQUIRED,
+        );
+        let rest_target = rest_shape.target();
+        let rest_provenance = store
+            .canonical_tuple_target_for_type(rest_target)
+            .unwrap()
+            .1;
+        assert_eq!(rest_provenance.length_type, number);
+        assert_eq!(
+            store
+                .symbol_table(rest_provenance.declared_members)
+                .unwrap()
+                .len(),
+            1,
+        );
+
+        let generic = store.alloc_type_parameter(None).unwrap();
+        let variadic_infos = [required, variadic, required];
+        let variadic_arguments = [string, generic, number];
+        let variadic_tuple = store
+            .create_canonical_tuple_type(CanonicalTupleTypeRequest::new(
+                &variadic_arguments,
+                &variadic_infos,
+                true,
+            ))
+            .unwrap();
+        let variadic_shape = store
+            .canonical_tuple_shape(variadic_tuple)
+            .unwrap()
+            .unwrap();
+        assert_eq!(variadic_shape.element_types(), variadic_arguments);
+        assert_eq!(variadic_shape.min_length(), 3);
+        assert_eq!(variadic_shape.fixed_length(), 1);
+        assert_eq!(
+            variadic_shape.combined_flags(),
+            ElementFlags::REQUIRED | ElementFlags::VARIADIC,
+        );
+        assert!(variadic_shape.is_readonly());
+
+        let warm = observable_state(&store);
+        assert_eq!(
+            store.create_canonical_tuple_type(CanonicalTupleTypeRequest::new(
+                &rest_arguments,
+                &rest_infos,
+                false,
+            )),
+            Ok(rest_tuple),
+        );
+        assert_eq!(
+            store.create_canonical_tuple_type(CanonicalTupleTypeRequest::new(
+                &variadic_arguments,
+                &variadic_infos,
+                true,
+            )),
+            Ok(variadic_tuple),
+        );
+        assert_eq!(observable_state(&store), warm);
+    }
+
+    #[test]
     fn labels_and_readonly_state_participate_in_target_identity() {
         let mut store = initialized();
         let string = store.intrinsic_bootstrap().unwrap().string_type;
@@ -3176,10 +3271,10 @@ mod tests {
         assert_eq!(
             store.create_canonical_tuple_type(CanonicalTupleTypeRequest::new(
                 &[string, number],
-                &[rest, required],
+                &[rest, rest],
                 false,
             )),
-            Err(TupleTypeError::UnsupportedElementOrder { index: 0 }),
+            Err(TupleTypeError::UnsupportedElementOrder { index: 1 }),
         );
         assert_eq!(observable_state(&store), before);
         assert_eq!(

@@ -152,6 +152,49 @@ fn string_literal_like_text(arena: &NodeArena, node: NodeId) -> Option<&str> {
     }
 }
 
+/// Returns the top-level ambient module declaration matching one specifier.
+#[must_use]
+pub fn ambient_module_declaration(arena: &NodeArena, specifier: &str) -> Option<NodeId> {
+    let mut wildcard: Option<(usize, NodeId)> = None;
+    for (declaration, node) in arena.iter() {
+        let NodeData::ModuleDeclaration(module) = &node.data else {
+            continue;
+        };
+        let Some(parent) = node.parent.and_then(|parent| arena.get(parent)) else {
+            continue;
+        };
+        let NodeData::SourceFile(source) = &parent.data else {
+            continue;
+        };
+        if !source.statements.nodes.contains(&declaration) {
+            continue;
+        }
+        let Some(name) = string_literal_like_text(arena, module.name) else {
+            continue;
+        };
+        if name == specifier {
+            return Some(declaration);
+        }
+        let Some((prefix, suffix)) = name.split_once('*') else {
+            continue;
+        };
+        if suffix.contains('*')
+            || !specifier.starts_with(prefix)
+            || !specifier.ends_with(suffix)
+            || specifier.len() < prefix.len() + suffix.len()
+        {
+            continue;
+        }
+        if wildcard
+            .as_ref()
+            .is_none_or(|(length, _)| prefix.len() > *length)
+        {
+            wildcard = Some((prefix.len(), declaration));
+        }
+    }
+    wildcard.map(|(_, declaration)| declaration)
+}
+
 /// A successful compiler-owned resolution before checker validation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CanonicalResolvedModuleInput {
@@ -263,6 +306,7 @@ pub struct CanonicalResolvedModule {
     target_symbol: SemanticSymbolId,
     usage_mode: CanonicalModuleResolutionMode,
     target_mode: CanonicalModuleResolutionMode,
+    is_ambient_module: bool,
 }
 
 impl CanonicalResolvedModule {
@@ -271,7 +315,7 @@ impl CanonicalResolvedModule {
         self.target_file
     }
 
-    /// The canonical external-module source symbol for [`Self::target_file`].
+    /// The canonical source-module symbol or matching ambient-module symbol.
     #[must_use]
     pub const fn target_symbol(self) -> SemanticSymbolId {
         self.target_symbol
@@ -285,6 +329,12 @@ impl CanonicalResolvedModule {
     #[must_use]
     pub const fn target_mode(self) -> CanonicalModuleResolutionMode {
         self.target_mode
+    }
+
+    /// Whether the target symbol belongs to an ambient module in a script file.
+    #[must_use]
+    pub const fn is_ambient_module(self) -> bool {
+        self.is_ambient_module
     }
 }
 
@@ -303,7 +353,7 @@ pub enum CanonicalModuleResolutionLookup {
     EntryAbsent,
     /// The provider explicitly attempted and failed this exact resolution.
     Unresolved,
-    /// The provider resolved this node to a retained external-module source.
+    /// The provider resolved this node to a source module or ambient module.
     Resolved(CanonicalResolvedModule),
 }
 
@@ -502,25 +552,38 @@ where
     }
 
     let mut entries = BTreeMap::new();
-    let mut targets = BTreeMap::new();
+    let mut targets = BTreeMap::<(FileId, Option<String>), SemanticSymbolId>::new();
     for entry in input.entries {
         validate_specifier(entry.specifier, symbols, &files)?;
         let retained = match entry.resolution {
             CanonicalModuleResolutionInput::Unresolved => RetainedModuleResolution::Unresolved,
             CanonicalModuleResolutionInput::Resolved(resolution) => {
-                let target_symbol =
-                    if let Some(target) = targets.get(&resolution.target_file).copied() {
-                        target
-                    } else {
-                        let target = validate_target(resolution.target_file, symbols, &files)?;
-                        targets.insert(resolution.target_file, target);
-                        target
-                    };
+                let ambient_name = files
+                    .get(&resolution.target_file)
+                    .and_then(|(_, bound)| bound.source_facts())
+                    .filter(|facts| !facts.is_external_or_common_js_module())
+                    .and_then(|_| files.get(&entry.specifier.file))
+                    .and_then(|(arena, _)| string_literal_like_text(arena, entry.specifier.node))
+                    .map(str::to_owned);
+                let key = (resolution.target_file, ambient_name.clone());
+                let target_symbol = if let Some(target) = targets.get(&key).copied() {
+                    target
+                } else {
+                    let target = validate_target(
+                        resolution.target_file,
+                        ambient_name.as_deref(),
+                        symbols,
+                        &files,
+                    )?;
+                    targets.insert(key, target);
+                    target
+                };
                 RetainedModuleResolution::Resolved(CanonicalResolvedModule {
                     target_file: resolution.target_file,
                     target_symbol,
                     usage_mode: resolution.usage_mode,
                     target_mode: resolution.target_mode,
+                    is_ambient_module: ambient_name.is_some(),
                 })
             }
         };
@@ -606,6 +669,7 @@ fn is_supported_specifier_position(arena: &NodeArena, specifier: NodeId) -> bool
 
 fn validate_target(
     target_file: FileId,
+    ambient_module_name: Option<&str>,
     symbols: &SymbolStore,
     files: &BTreeMap<FileId, (&NodeArena, &BoundFile)>,
 ) -> Result<SemanticSymbolId, CanonicalModuleResolutionManifestError> {
@@ -631,9 +695,33 @@ fn validate_target(
                 target_file,
             ))?;
     if !facts.is_external_or_common_js_module() {
-        return Err(CanonicalModuleResolutionManifestError::ScriptTarget(
-            target_file,
-        ));
+        let Some(declaration) = ambient_module_name
+            .and_then(|name| ambient_module_declaration(arena, name))
+            .map(|node| NodeRef::new(arena.id(), target_file, node))
+        else {
+            return Err(CanonicalModuleResolutionManifestError::ScriptTarget(
+                target_file,
+            ));
+        };
+        let symbol = bound.symbol(declaration).ok_or(
+            CanonicalModuleResolutionManifestError::MissingTargetSourceSymbol(target_file),
+        )?;
+        let valid = symbols.symbol(symbol).is_some_and(|record| {
+            record.flags().intersects(SymbolFlags::MODULE)
+                && record
+                    .declarations()
+                    .is_some_and(|declarations| declarations.contains(&declaration))
+        });
+        return if valid {
+            Ok(symbol)
+        } else {
+            Err(
+                CanonicalModuleResolutionManifestError::InvalidTargetSourceSymbol {
+                    file: target_file,
+                    symbol,
+                },
+            )
+        };
     }
     let source = bound.source_file();
     let source_symbol = bound
@@ -923,6 +1011,7 @@ mod tests {
         );
         assert_eq!(found.usage_mode(), CanonicalModuleResolutionMode::Esm);
         assert_eq!(found.target_mode(), CanonicalModuleResolutionMode::CommonJs);
+        assert!(!found.is_ambient_module());
         assert!(available.store().symbol(found.target_symbol()).is_some());
     }
 
@@ -1111,6 +1200,93 @@ mod tests {
             target.target_mode(),
             CanonicalModuleResolutionMode::CommonJs
         );
+    }
+
+    #[test]
+    fn ambient_script_targets_retain_each_named_module_symbol() {
+        let importer = parsed(
+            r#"
+                import first = require("first");
+                import second = require("second");
+            "#,
+        );
+        let ambient = parsed(
+            r#"
+                declare module "first" { export const value: string; }
+                declare module "second" { export const value: number; }
+            "#,
+        );
+        let importer_file = FileId::new(24);
+        let ambient_file = FileId::new(25);
+        let specifiers = module_specifiers(&importer)
+            .into_iter()
+            .map(|specifier| node_ref(&importer, importer_file, specifier))
+            .collect::<Vec<_>>();
+        assert_eq!(specifiers.len(), 2);
+        let entries = specifiers.iter().copied().map(|specifier| {
+            CanonicalModuleResolutionEntry::resolved(
+                specifier,
+                CanonicalResolvedModuleInput::new(
+                    ambient_file,
+                    CanonicalModuleResolutionMode::CommonJs,
+                    CanonicalModuleResolutionMode::CommonJs,
+                ),
+            )
+        });
+
+        let context = CanonicalCheckerContext::new_with_module_resolutions(
+            completed_bindings(&[
+                (importer_file, &importer, CanonicalModuleState::External),
+                (ambient_file, &ambient, CanonicalModuleState::Script),
+            ]),
+            vec![
+                (importer_file, &importer.arena),
+                (ambient_file, &ambient.arena),
+            ],
+            CanonicalCheckerOptions::default(),
+            CanonicalModuleResolutionManifestInput::new(entries),
+        )
+        .unwrap();
+        let (_, bound) = context.file(ambient_file).unwrap();
+        let expected = ["first", "second"]
+            .into_iter()
+            .map(|name| {
+                let declaration = ambient_module_declaration(&ambient.arena, name).unwrap();
+                bound
+                    .symbol(node_ref(&ambient, ambient_file, declaration))
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        for (specifier, expected_symbol) in specifiers.into_iter().zip(expected.iter().copied()) {
+            let CanonicalModuleResolutionLookup::Resolved(target) =
+                context.module_resolution(specifier)
+            else {
+                panic!("ambient script module should resolve to its declaration symbol");
+            };
+            assert_eq!(target.target_file(), ambient_file);
+            assert_eq!(target.target_symbol(), expected_symbol);
+            assert!(target.is_ambient_module());
+        }
+        assert_ne!(expected[0], expected[1]);
+    }
+
+    #[test]
+    fn ambient_module_lookup_prefers_exact_names_over_wildcard_prefixes() {
+        let declarations = parsed(
+            r#"
+                declare module "*.css" { const value: string; export default value; }
+                declare module "theme.css" { const value: number; export default value; }
+                declare module "styles/*" { const value: boolean; export default value; }
+            "#,
+        );
+
+        let exact = ambient_module_declaration(&declarations.arena, "theme.css").unwrap();
+        let wildcard = ambient_module_declaration(&declarations.arena, "other.css").unwrap();
+        let prefix = ambient_module_declaration(&declarations.arena, "styles/main").unwrap();
+        assert_ne!(exact, wildcard);
+        assert_ne!(prefix, wildcard);
+        assert!(ambient_module_declaration(&declarations.arena, "missing").is_none());
     }
 
     #[test]

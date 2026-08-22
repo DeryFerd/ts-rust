@@ -420,7 +420,7 @@ fn composite_interface_imports_check_direct_and_parenthesized_array_roots() {
 }
 
 #[test]
-fn composite_import_capabilities_do_not_escape_direct_annotation_roots() {
+fn composite_import_annotations_can_include_independent_local_aliases() {
     let importer = parse_source_file(concat!(
         "import type { User } from './target'; ",
         "const direct: User | null = null; ",
@@ -432,13 +432,9 @@ fn composite_import_capabilities_do_not_escape_direct_annotation_roots() {
     let target_file = FileId::new(19);
     let (mut context, _) = make_context(&importer, &target, importer_file, target_file);
 
-    assert!(matches!(
-        context.check_source_file(importer_file),
-        Err(SourceCheckError::Unsupported(
-            UnsupportedSourceSyntax::Import(_)
-        ))
-    ));
-    assert!(!source_is_checked(&context, importer_file));
+    context.check_source_file(importer_file).unwrap();
+
+    assert!(source_is_checked(&context, importer_file));
     assert!(!source_is_checked(&context, target_file));
     assert!(context.diagnostics().is_empty());
 }
