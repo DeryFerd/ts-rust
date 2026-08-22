@@ -548,11 +548,7 @@ fn plan_source_callable_with_owner_shape(
     let bound = host
         .bound_file(declaration)
         .ok_or_else(|| invariant(SourceCallableInvariant::InvalidOwnerSymbol(declaration)))?;
-    if body_mode.is_ambient()
-        && bound
-            .source_facts()
-            .is_none_or(CanonicalSourceFileFacts::is_declaration_file)
-    {
+    if body_mode.is_ambient() && bound.source_facts().is_none() {
         return Err(SourceCallableError::Unsupported(
             SourceCallableUnsupported::Modifiers(declaration),
         ));
@@ -1794,9 +1790,34 @@ fn validate_modifiers(
     declaration_range: ts_core::TextRange,
     view: &SourceSyntaxView<'_>,
 ) -> Result<SourceCallableBodyMode, SourceCallableError> {
+    let is_declaration_file = host
+        .bound_file(declaration)
+        .and_then(ts_binder::BoundFile::source_facts)
+        .is_some_and(CanonicalSourceFileFacts::is_declaration_file);
     let Some(modifiers) = view.modifiers else {
-        return Ok(SourceCallableBodyMode::Present);
+        return Ok(
+            if is_declaration_file
+                && view.family == SourceCallableFamily::FunctionDeclaration
+                && view.body.is_none()
+            {
+                SourceCallableBodyMode::AmbientDeclaration
+            } else {
+                SourceCallableBodyMode::Present
+            },
+        );
     };
+    if view.family != SourceCallableFamily::FunctionDeclaration
+        || modifiers.flags.0 != 0
+        || modifiers.list.has_trailing_comma
+        || modifiers.list.range.start != declaration_range.start
+    {
+        return Err(SourceCallableError::Unsupported(
+            SourceCallableUnsupported::Modifiers(declaration),
+        ));
+    }
+
+    let mut modifier_kinds = Vec::with_capacity(modifiers.list.nodes.len());
+    let mut previous_end = declaration_range.start;
     for modifier_id in &modifiers.list.nodes {
         let modifier = NodeRef::new(declaration.arena, declaration.file, *modifier_id);
         let record = preflight_node(store, host, modifier)?;
@@ -1805,37 +1826,36 @@ fn validate_modifiers(
                 SourceCallableUnsupported::Async(modifier),
             ));
         }
-    }
-    let [modifier_id] = modifiers.list.nodes.as_slice() else {
-        return Err(SourceCallableError::Unsupported(
-            SourceCallableUnsupported::Modifiers(declaration),
-        ));
-    };
-    let modifier = NodeRef::new(declaration.arena, declaration.file, *modifier_id);
-    let modifier_record = preflight_node(store, host, modifier)?;
-    if view.family != SourceCallableFamily::FunctionDeclaration
-        || modifiers.flags.0 != 0
-        || modifiers.list.has_trailing_comma
-        || modifiers.list.range.start != declaration_range.start
-        || !matches!(
-            modifier_record.kind,
+        if !matches!(
+            record.kind,
             SyntaxKind::ExportKeyword | SyntaxKind::DeclareKeyword
-        )
-        || !matches!(modifier_record.data, NodeData::Token(_))
-        || modifier_record.flags.0 != 0
-        || modifier_record.parent != Some(declaration.node)
-        || modifier_record.range.start != declaration_range.start
-        || modifier_record.range.end > modifiers.list.range.end
-    {
-        return Err(SourceCallableError::Unsupported(
-            SourceCallableUnsupported::Modifiers(modifier),
-        ));
+        ) || !matches!(record.data, NodeData::Token(_))
+            || record.flags.0 != 0
+            || record.parent != Some(declaration.node)
+            || record.range.start < previous_end
+            || modifier_kinds.is_empty() && record.range.start != declaration_range.start
+            || record.range.end > view.parameters.range.start
+        {
+            return Err(SourceCallableError::Unsupported(
+                SourceCallableUnsupported::Modifiers(modifier),
+            ));
+        }
+        previous_end = record.range.end;
+        modifier_kinds.push(record.kind);
     }
-    Ok(if modifier_record.kind == SyntaxKind::DeclareKeyword {
-        SourceCallableBodyMode::AmbientDeclaration
-    } else {
-        SourceCallableBodyMode::Present
-    })
+
+    match modifier_kinds.as_slice() {
+        [SyntaxKind::DeclareKeyword] | [SyntaxKind::ExportKeyword, SyntaxKind::DeclareKeyword] => {
+            Ok(SourceCallableBodyMode::AmbientDeclaration)
+        }
+        [SyntaxKind::ExportKeyword] if is_declaration_file && view.body.is_none() => {
+            Ok(SourceCallableBodyMode::AmbientDeclaration)
+        }
+        [SyntaxKind::ExportKeyword] => Ok(SourceCallableBodyMode::Present),
+        _ => Err(SourceCallableError::Unsupported(
+            SourceCallableUnsupported::Modifiers(declaration),
+        )),
+    }
 }
 
 fn validate_owner_name_and_export_route(
@@ -1886,9 +1906,7 @@ fn validate_owner_name_and_export_route(
             match local_symbol {
                 None if owner.parent().is_none()
                     && (view.modifiers.is_none() || body_mode.is_ambient()) => {}
-                Some(local)
-                    if view.modifiers.is_some() && body_mode == SourceCallableBodyMode::Present =>
-                {
+                Some(local) if view.modifiers.is_some() => {
                     let raw_source_owner = bound.symbol(bound.source_file()).ok_or_else(|| {
                         invariant(SourceCallableInvariant::InvalidExportRoute(declaration))
                     })?;
@@ -4289,6 +4307,15 @@ mod tests {
 
     impl QueryFixture {
         fn new(source: &str, file: FileId) -> Self {
+            Self::with_source_facts(source, file, false, CanonicalModuleState::Script)
+        }
+
+        fn with_source_facts(
+            source: &str,
+            file: FileId,
+            declaration_file: bool,
+            module_state: CanonicalModuleState,
+        ) -> Self {
             let parsed = parse_source_file(source);
             assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
             let mut binder = CanonicalBinder::new();
@@ -4298,10 +4325,14 @@ mod tests {
                     parsed.source_file,
                     file,
                     CanonicalSourceFileFacts::new(
-                        EscapedName::source("\"/project/source_generic_query.ts\""),
+                        EscapedName::source(if declaration_file {
+                            "\"/project/source_generic_query.d.ts\""
+                        } else {
+                            "\"/project/source_generic_query.ts\""
+                        }),
                         CanonicalSourceLanguage::TypeScript,
-                        false,
-                        CanonicalModuleState::Script,
+                        declaration_file,
+                        module_state,
                     ),
                 )
                 .unwrap();
@@ -5742,6 +5773,117 @@ mod tests {
             validate_stored_source_callable(&fixture.store, pending.type_),
             StoredSourceCallableValidation::Valid(_)
         ));
+    }
+
+    #[test]
+    fn declaration_file_signatures_accept_implicit_and_explicit_ambient_modifiers() {
+        for (index, (source, declaration_file, module_state, exported)) in [
+            (
+                "function plain(value: number): string;",
+                true,
+                CanonicalModuleState::Script,
+                false,
+            ),
+            (
+                "declare function declared(value: number): string;",
+                true,
+                CanonicalModuleState::Script,
+                false,
+            ),
+            (
+                "export function exported(value: number): string;",
+                true,
+                CanonicalModuleState::External,
+                true,
+            ),
+            (
+                "export declare function explicit(value: number): string;",
+                true,
+                CanonicalModuleState::External,
+                true,
+            ),
+            (
+                "export declare function ordinary(value: number): string;",
+                false,
+                CanonicalModuleState::External,
+                true,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut fixture = QueryFixture::with_source_facts(
+                source,
+                FileId::new(1_060 + u32::try_from(index).unwrap()),
+                declaration_file,
+                module_state,
+            );
+            let declaration = fixture
+                .parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::FunctionDeclaration).then_some(NodeRef::new(
+                        fixture.parsed.arena.id(),
+                        fixture.file,
+                        node,
+                    ))
+                })
+                .unwrap();
+            let owner = fixture.bound.symbol(declaration).unwrap();
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&fixture.parsed.arena, &fixture.bound)],
+                GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+            )
+            .unwrap();
+            let plan = plan_source_callable(&fixture.store, &host, declaration, owner, None)
+                .unwrap_or_else(|error| panic!("{source}: {error:?}"));
+            assert_eq!(plan.body_mode, SourceCallableBodyMode::AmbientDeclaration);
+            assert_eq!(plan.body, declaration);
+            assert_eq!(plan.owner_parent.is_some(), exported);
+            assert_eq!(plan.export_local.is_some(), exported);
+            drop(host);
+
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            let callable = fixture
+                .query_callable(declaration, owner, &mut diagnostics)
+                .unwrap_or_else(|error| panic!("{source}: {error:?}"));
+            let signature = fixture
+                .store
+                .source_callable_provenance(callable)
+                .unwrap()
+                .signature;
+            let expected_return = fixture.store.intrinsic_bootstrap().unwrap().string_type;
+            assert_eq!(
+                fixture.query_return(signature, &mut diagnostics),
+                Ok(expected_return)
+            );
+            assert!(diagnostics.is_empty(), "{source}: {diagnostics:?}");
+        }
+    }
+
+    #[test]
+    fn exported_declaration_file_generic_signatures_keep_exact_owner_provenance() {
+        let mut fixture = QueryFixture::with_source_facts(
+            "export declare function identity<T>(value: T): T;",
+            FileId::new(1_065),
+            true,
+            CanonicalModuleState::External,
+        );
+        let (declaration, _, _, _) = fixture.generic_parts();
+        let owner = fixture.bound.symbol(declaration).unwrap();
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        let callable = fixture
+            .query_callable(declaration, owner, &mut diagnostics)
+            .unwrap();
+        let provenance = fixture.store.source_callable_provenance(callable).unwrap();
+        assert!(provenance.owner_parent.is_some());
+        assert!(provenance.export_local.is_some());
+        let signature = fixture.store.signature(provenance.signature).unwrap();
+        assert_eq!(signature.type_parameters().len(), 1);
+        assert_eq!(signature.parameters().len(), 1);
+        assert!(diagnostics.is_empty());
     }
 
     #[test]

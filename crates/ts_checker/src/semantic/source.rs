@@ -555,6 +555,7 @@ enum ConditionalScalarExpectation {
         type_: TypeId,
     },
     Literal(ConditionalScalarFamily),
+    Error,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -667,6 +668,7 @@ pub(super) enum PlannedIdentifierReadKind {
     Variable,
     Function,
     Import,
+    Unresolved,
 }
 
 /// A source expression read with an explicit value-family route.
@@ -699,6 +701,14 @@ impl PlannedIdentifierRead {
             resolved_symbol: read.resolved_symbol,
             value_symbol: read.value_symbol,
             kind: PlannedIdentifierReadKind::Import,
+        }
+    }
+
+    const fn unresolved(unknown_symbol: SemanticSymbolId) -> Self {
+        Self {
+            resolved_symbol: unknown_symbol,
+            value_symbol: unknown_symbol,
+            kind: PlannedIdentifierReadKind::Unresolved,
         }
     }
 }
@@ -748,7 +758,8 @@ struct PlannedFunctionHeader {
 enum PlannedFunctionModifierMode {
     None,
     Export(NodeRef),
-    Declare(NodeRef),
+    Declare,
+    ExportDeclare(NodeRef),
 }
 
 #[derive(Clone, Debug)]
@@ -1221,8 +1232,11 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             if self.node(statement)?.kind != SyntaxKind::VariableStatement {
                 continue;
             }
-            let Some(variables) =
-                self.preplan_ambient_variable_statement(statement, facts.is_declaration_file())?
+            let Some(variables) = self.preplan_ambient_variable_statement(
+                statement,
+                is_external_module,
+                facts.is_declaration_file(),
+            )?
             else {
                 continue;
             };
@@ -2457,7 +2471,10 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         let modifier_mode =
             self.validate_function_modifiers(declaration, range, name_start, modifiers.as_ref())?;
         match modifier_mode {
-            PlannedFunctionModifierMode::Export(export_modifier) if !is_external_module => {
+            PlannedFunctionModifierMode::Export(export_modifier)
+            | PlannedFunctionModifierMode::ExportDeclare(export_modifier)
+                if !is_external_module =>
+            {
                 return Err(SourceCheckError::Unsupported(
                     UnsupportedSourceSyntax::MissingExternalModuleFact {
                         node: export_modifier,
@@ -2465,14 +2482,20 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     },
                 ));
             }
-            PlannedFunctionModifierMode::Declare(declare_modifier) if is_declaration_file => {
-                return Err(self.unsupported(
-                    declare_modifier,
-                    SyntaxKind::DeclareKeyword,
-                    SourceSyntaxRole::FunctionModifier,
-                ));
-            }
             _ => {}
+        }
+        if matches!(modifier_mode, PlannedFunctionModifierMode::None)
+            && is_declaration_file
+            && self
+                .node(declaration)?
+                .parent
+                .is_none_or(|parent| parent != self.source.node_ref().node)
+        {
+            return Err(self.unsupported(
+                declaration,
+                SyntaxKind::FunctionDeclaration,
+                SourceSyntaxRole::FunctionDeclaration,
+            ));
         }
         Ok(PlannedFunctionHeader {
             name,
@@ -2502,7 +2525,11 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             declaration,
             header.name,
             &header.name_text,
-            matches!(header.modifier_mode, PlannedFunctionModifierMode::Export(_)),
+            matches!(
+                header.modifier_mode,
+                PlannedFunctionModifierMode::Export(_)
+                    | PlannedFunctionModifierMode::ExportDeclare(_)
+            ),
         )
         .map_err(Self::function_plan_error)?;
         let callable = plan_source_callable(
@@ -2516,13 +2543,21 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         let body_mode_matches = matches!(
             (header.modifier_mode, callable.body_mode),
             (
-                PlannedFunctionModifierMode::Declare(_),
+                PlannedFunctionModifierMode::Declare
+                    | PlannedFunctionModifierMode::ExportDeclare(_),
                 SourceCallableBodyMode::AmbientDeclaration
             ) | (
                 PlannedFunctionModifierMode::None | PlannedFunctionModifierMode::Export(_),
                 SourceCallableBodyMode::Present
             )
-        );
+        ) || is_declaration_file
+            && matches!(
+                (header.modifier_mode, callable.body_mode),
+                (
+                    PlannedFunctionModifierMode::None | PlannedFunctionModifierMode::Export(_),
+                    SourceCallableBodyMode::AmbientDeclaration
+                )
+            );
         if !body_mode_matches {
             return Err(SourceCheckError::Function(
                 SourceFunctionInvariant::Callable(declaration),
@@ -2614,12 +2649,10 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 is_external_module,
                 is_declaration_file,
             )?;
-            if !matches!(
-                header.modifier_mode,
-                PlannedFunctionModifierMode::Declare(_)
-            ) || expected_name
-                .as_ref()
-                .is_some_and(|name: &String| name != &header.name_text)
+            if !matches!(header.modifier_mode, PlannedFunctionModifierMode::Declare)
+                || expected_name
+                    .as_ref()
+                    .is_some_and(|name: &String| name != &header.name_text)
                 || self.bound.symbol(*declaration) != Some(owner)
             {
                 return Err(SourceCheckError::Unsupported(
@@ -2720,15 +2753,37 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         let Some(modifiers) = modifiers else {
             return Ok(PlannedFunctionModifierMode::None);
         };
-        let [modifier_id] = modifiers.list.nodes.as_slice() else {
-            return Err(self.unsupported(
-                declaration,
-                SyntaxKind::FunctionDeclaration,
-                SourceSyntaxRole::FunctionModifier,
-            ));
+        let (export_modifier, modifier_id) = match modifiers.list.nodes.as_slice() {
+            [modifier] => (None, *modifier),
+            [export, declare] => (Some(self.reference(*export)), *declare),
+            _ => {
+                return Err(self.unsupported(
+                    declaration,
+                    SyntaxKind::FunctionDeclaration,
+                    SourceSyntaxRole::FunctionModifier,
+                ));
+            }
         };
-        let modifier = self.reference(*modifier_id);
+        let modifier = self.reference(modifier_id);
         let node = self.node(modifier)?;
+        if let Some(export_modifier) = export_modifier {
+            let export_node = self.node(export_modifier)?;
+            if export_node.kind != SyntaxKind::ExportKeyword
+                || !matches!(export_node.data, NodeData::Token(_))
+                || export_node.flags.0 != 0
+                || export_node.parent != Some(declaration.node)
+                || export_node.range.start != declaration_range.start
+                || export_node.range.end > node.range.start
+                || !self.source_spelling_matches(export_modifier, "export")
+                || node.kind != SyntaxKind::DeclareKeyword
+            {
+                return Err(self.unsupported(
+                    export_modifier,
+                    export_node.kind,
+                    SourceSyntaxRole::FunctionModifier,
+                ));
+            }
+        }
         if modifiers.flags.0 != 0
             || modifiers.list.has_trailing_comma
             || modifiers.list.range.start != declaration_range.start
@@ -2740,8 +2795,9 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             || !matches!(node.data, NodeData::Token(_))
             || node.flags.0 != 0
             || node.parent != Some(declaration.node)
-            || node.range.start != declaration_range.start
-            || node.range.end.get() > modifiers.list.range.end.get()
+            || (export_modifier.is_none() && node.range.start != declaration_range.start)
+            || node.range.end.get() > name_start
+            || (export_modifier.is_none() && node.range.end.get() > modifiers.list.range.end.get())
             || !self.source_spelling_matches(
                 modifier,
                 if node.kind == SyntaxKind::ExportKeyword {
@@ -2753,10 +2809,19 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         {
             return Err(self.unsupported(modifier, node.kind, SourceSyntaxRole::FunctionModifier));
         }
-        Ok(if node.kind == SyntaxKind::ExportKeyword {
-            PlannedFunctionModifierMode::Export(modifier)
-        } else {
-            PlannedFunctionModifierMode::Declare(modifier)
+        Ok(match (export_modifier, node.kind) {
+            (Some(export), SyntaxKind::DeclareKeyword) => {
+                PlannedFunctionModifierMode::ExportDeclare(export)
+            }
+            (None, SyntaxKind::ExportKeyword) => PlannedFunctionModifierMode::Export(modifier),
+            (None, SyntaxKind::DeclareKeyword) => PlannedFunctionModifierMode::Declare,
+            _ => {
+                return Err(self.unsupported(
+                    modifier,
+                    node.kind,
+                    SourceSyntaxRole::FunctionModifier,
+                ));
+            }
         })
     }
 
@@ -3470,6 +3535,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
     fn preplan_ambient_variable_statement(
         &mut self,
         statement: NodeRef,
+        is_external_module: bool,
         is_declaration_file: bool,
     ) -> Result<Option<Vec<PlannedAmbientVariable>>, SourceCheckError> {
         let statement_node = self.node(statement)?;
@@ -3484,13 +3550,53 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         let Some(modifiers) = variable.modifiers.as_ref() else {
             return Ok(None);
         };
-        let [modifier_id] = modifiers.list.nodes.as_slice() else {
-            return Ok(None);
+        let (export_modifier, declare_modifier) = match modifiers.list.nodes.as_slice() {
+            [modifier] => {
+                let modifier = self.reference(*modifier);
+                match self.node(modifier)?.kind {
+                    SyntaxKind::DeclareKeyword => (None, Some(modifier)),
+                    SyntaxKind::ExportKeyword if is_declaration_file => (Some(modifier), None),
+                    _ => return Ok(None),
+                }
+            }
+            [export, declare] => (
+                Some(self.reference(*export)),
+                Some(self.reference(*declare)),
+            ),
+            _ => return Ok(None),
         };
-        let modifier = self.reference(*modifier_id);
+        let modifier = declare_modifier
+            .or(export_modifier)
+            .expect("ambient variable modifiers contain an export or declare token");
         let modifier_node = self.node(modifier)?;
-        if modifier_node.kind != SyntaxKind::DeclareKeyword {
+        if declare_modifier.is_some() && modifier_node.kind != SyntaxKind::DeclareKeyword {
             return Ok(None);
+        }
+        if let Some(export_modifier) = export_modifier {
+            let export_node = self.node(export_modifier)?;
+            if export_node.kind != SyntaxKind::ExportKeyword
+                || !matches!(export_node.data, NodeData::Token(_))
+                || export_node.flags.0 != 0
+                || export_node.parent != Some(statement.node)
+                || export_node.range.start != statement_node.range.start
+                || declare_modifier
+                    .is_some_and(|_| export_node.range.end > modifier_node.range.start)
+                || !self.source_spelling_matches(export_modifier, "export")
+            {
+                return Err(self.unsupported(
+                    export_modifier,
+                    export_node.kind,
+                    SourceSyntaxRole::VariableModifier,
+                ));
+            }
+            if !is_external_module {
+                return Err(SourceCheckError::Unsupported(
+                    UnsupportedSourceSyntax::MissingExternalModuleFact {
+                        node: export_modifier,
+                        role: SourceSyntaxRole::VariableModifier,
+                    },
+                ));
+            }
         }
         let declaration_list = self.reference(variable.declaration_list);
         let declaration_start = self.node(declaration_list)?.range.start.get();
@@ -3504,17 +3610,22 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             || !matches!(modifier_node.data, NodeData::Token(_))
             || modifier_node.flags.0 != 0
             || modifier_node.parent != Some(statement.node)
-            || modifier_node.range.start != statement_node.range.start
-            || modifier_node.range.end.get() >= modifiers.list.range.end.get()
-            || !self.source_spelling_matches(modifier, "declare")
-        {
-            return Err(self.unsupported(
+            || (export_modifier.is_none()
+                && modifier_node.range.start != statement_node.range.start)
+            || modifier_node.range.end.get() >= declaration_start
+            || (declare_modifier.is_none()
+                && modifier_node.range.start != statement_node.range.start)
+            || (export_modifier.is_none()
+                && modifier_node.range.end.get() >= modifiers.list.range.end.get())
+            || !self.source_spelling_matches(
                 modifier,
-                modifier_node.kind,
-                SourceSyntaxRole::VariableModifier,
-            ));
-        }
-        if is_declaration_file {
+                if declare_modifier.is_some() {
+                    "declare"
+                } else {
+                    "export"
+                },
+            )
+        {
             return Err(self.unsupported(
                 modifier,
                 modifier_node.kind,
@@ -3582,6 +3693,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 declaration_list,
                 self.reference(declaration),
                 binding,
+                export_modifier.is_some(),
             )?);
         }
         Ok(Some(variables))
@@ -3592,6 +3704,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         list: NodeRef,
         declaration: NodeRef,
         binding: VariableBindingKind,
+        exported: bool,
     ) -> Result<PlannedAmbientVariable, SourceCheckError> {
         let (
             declaration_kind,
@@ -3668,7 +3781,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             name,
             &name_text,
             binding,
-            false,
+            exported,
         )
         .map_err(Self::variable_plan_error)?;
 
@@ -4246,6 +4359,35 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         PlannedExpressionKind::Identifier(PlannedIdentifierRead::variable(read))
                     }
                     Err(VariablePlanError::Unsupported(
+                        VariableUnsupported::UnresolvedIdentifier(node),
+                    )) if node == expression => {
+                        let bootstrap =
+                            store
+                                .intrinsic_bootstrap()
+                                .ok_or(SourceCheckError::LiteralCache(
+                                    SourceLiteralCacheError::BootstrapUninitialized,
+                                ))?;
+                        preflight_source_expression_cache(store, expression, bootstrap.error_type)?;
+                        if store
+                            .symbol_node_links(expression)
+                            .and_then(|links| links.resolved_symbol)
+                            .is_some_and(|cached| cached != bootstrap.unknown_symbol)
+                        {
+                            return Err(SourceCheckError::Variable(
+                                VariableInvariant::InvalidSymbolNodeCache {
+                                    node: expression,
+                                    cached: store
+                                        .symbol_node_links(expression)
+                                        .and_then(|links| links.resolved_symbol),
+                                    expected: bootstrap.unknown_symbol,
+                                },
+                            ));
+                        }
+                        PlannedExpressionKind::Identifier(PlannedIdentifierRead::unresolved(
+                            bootstrap.unknown_symbol,
+                        ))
+                    }
+                    Err(VariablePlanError::Unsupported(
                         VariableUnsupported::NonVariableSymbol { flags, .. },
                     )) if flags == ts_binder::SymbolFlags::FUNCTION => {
                         PlannedExpressionKind::Identifier(PlannedIdentifierRead::function(
@@ -4531,7 +4673,18 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         &mut self,
         expression: NodeRef,
     ) -> Result<PlannedExpression, SourceCheckError> {
-        if !self.is_direct_top_level_variable_initializer(expression)? {
+        let mut root = expression;
+        while let Some(parent) = self.node(root)?.parent.map(|node| self.reference(node)) {
+            let parent_node = self.node(parent)?;
+            let NodeData::ConditionalExpression(conditional) = &parent_node.data else {
+                break;
+            };
+            if conditional.when_true != root.node && conditional.when_false != root.node {
+                break;
+            }
+            root = parent;
+        }
+        if !self.is_direct_top_level_variable_initializer(root)? {
             return Err(self.unsupported(
                 expression,
                 SyntaxKind::ConditionalExpression,
@@ -4539,7 +4692,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             ));
         }
         let declaration = self
-            .node(expression)?
+            .node(root)?
             .parent
             .map(|node| self.reference(node))
             .ok_or_else(|| {
@@ -4633,14 +4786,18 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 SourceSyntaxRole::VariableInitializer,
             ));
         };
-        if condition_read.kind != PlannedIdentifierReadKind::Variable {
+        if !matches!(
+            condition_read.kind,
+            PlannedIdentifierReadKind::Variable | PlannedIdentifierReadKind::Unresolved
+        ) {
             return Err(self.unsupported(
                 condition_target.node,
                 SyntaxKind::Identifier,
                 SourceSyntaxRole::VariableInitializer,
             ));
         }
-        let condition_symbol = condition_read.value_symbol;
+        let condition_symbol = (condition_read.kind == PlannedIdentifierReadKind::Variable)
+            .then_some(condition_read.value_symbol);
         let Some(condition_expectation) = self.conditional_scalar_expectation(&condition)? else {
             return Err(self.unsupported(
                 condition_target.node,
@@ -4650,7 +4807,8 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         };
         let when_true = self.plan_expression(when_true)?;
         if !conditional_scalar_operand_plan_is_supported(&when_true)
-            || planned_expression_reads_symbol(&when_true, condition_symbol)
+            || condition_symbol
+                .is_some_and(|symbol| planned_expression_reads_symbol(&when_true, symbol))
         {
             return Err(self.unsupported(
                 when_true.node,
@@ -4680,7 +4838,8 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         }
         let when_false = self.plan_expression(when_false)?;
         if !conditional_scalar_operand_plan_is_supported(&when_false)
-            || planned_expression_reads_symbol(&when_false, condition_symbol)
+            || condition_symbol
+                .is_some_and(|symbol| planned_expression_reads_symbol(&when_false, symbol))
         {
             return Err(self.unsupported(
                 when_false.node,
@@ -4749,6 +4908,24 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             PlannedExpressionKind::Boolean(_) => Some(ConditionalScalarFamily::Boolean),
             PlannedExpressionKind::Parenthesized(inner) => {
                 return self.conditional_scalar_expectation(inner);
+            }
+            PlannedExpressionKind::Identifier(read)
+                if read.kind == PlannedIdentifierReadKind::Unresolved =>
+            {
+                return Ok(Some(ConditionalScalarExpectation::Error));
+            }
+            PlannedExpressionKind::Conditional(conditional) => {
+                let Some((store, _)) = self.semantic else {
+                    return Ok(None);
+                };
+                let error_type = store
+                    .intrinsic_bootstrap()
+                    .map(|bootstrap| bootstrap.error_type)
+                    .ok_or(SourceCheckError::LiteralCache(
+                        SourceLiteralCacheError::BootstrapUninitialized,
+                    ))?;
+                return Ok((conditional.expected_result == error_type)
+                    .then_some(ConditionalScalarExpectation::Error));
             }
             PlannedExpressionKind::Identifier(read)
                 if read.kind == PlannedIdentifierReadKind::Variable =>
@@ -4859,6 +5036,9 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 SourceLiteralCacheError::BootstrapUninitialized,
             ))?;
         let result = match (when_true, when_false) {
+            (ConditionalScalarExpectation::Error, _) | (_, ConditionalScalarExpectation::Error) => {
+                Some(bootstrap.error_type)
+            }
             (
                 ConditionalScalarExpectation::Exact {
                     family: left_family,
@@ -5614,10 +5794,14 @@ fn conditional_scalar_operand_plan_is_supported(expression: &PlannedExpression) 
         | PlannedExpressionKind::Number { .. }
         | PlannedExpressionKind::BigInt { .. }
         | PlannedExpressionKind::Boolean(_) => true,
-        PlannedExpressionKind::Identifier(read) => read.kind == PlannedIdentifierReadKind::Variable,
+        PlannedExpressionKind::Identifier(read) => matches!(
+            read.kind,
+            PlannedIdentifierReadKind::Variable | PlannedIdentifierReadKind::Unresolved
+        ),
         PlannedExpressionKind::Parenthesized(inner) => {
             conditional_scalar_operand_plan_is_supported(inner)
         }
+        PlannedExpressionKind::Conditional(_) => true,
         PlannedExpressionKind::Null
         | PlannedExpressionKind::GlobalUndefined
         | PlannedExpressionKind::TypeImportValueUse(_)
@@ -5629,8 +5813,7 @@ fn conditional_scalar_operand_plan_is_supported(expression: &PlannedExpression) 
         | PlannedExpressionKind::Call(_)
         | PlannedExpressionKind::New(_)
         | PlannedExpressionKind::Binary(_)
-        | PlannedExpressionKind::Logical(_)
-        | PlannedExpressionKind::Conditional(_) => false,
+        | PlannedExpressionKind::Logical(_) => false,
     }
 }
 
@@ -5651,6 +5834,27 @@ fn preflight_uncached_conditional_operand_links(
     store: &CanonicalTypeMapperStore,
     expression: &PlannedExpression,
 ) -> Result<(), SourceCheckError> {
+    match &expression.kind {
+        PlannedExpressionKind::Identifier(read)
+            if read.kind == PlannedIdentifierReadKind::Unresolved =>
+        {
+            let error_type = store
+                .intrinsic_bootstrap()
+                .map(|bootstrap| bootstrap.error_type)
+                .ok_or(SourceCheckError::LiteralCache(
+                    SourceLiteralCacheError::BootstrapUninitialized,
+                ))?;
+            return preflight_source_expression_cache(store, expression.node, error_type);
+        }
+        PlannedExpressionKind::Conditional(conditional) => {
+            return preflight_source_expression_cache(
+                store,
+                expression.node,
+                conditional.expected_result,
+            );
+        }
+        _ => {}
+    }
     if store
         .type_node_links(expression.node)
         .is_some_and(|links| links != &TypeNodeLinks::default())
@@ -6048,9 +6252,11 @@ fn execute_expression_types(
             let raw = *current_flow_types
                 .get(&read.value_symbol)
                 .ok_or(match read.kind {
-                    PlannedIdentifierReadKind::Variable => SourceCheckError::Variable(
-                        VariableInvariant::MissingCurrentFlowType(read.value_symbol),
-                    ),
+                    PlannedIdentifierReadKind::Variable | PlannedIdentifierReadKind::Unresolved => {
+                        SourceCheckError::Variable(VariableInvariant::MissingCurrentFlowType(
+                            read.value_symbol,
+                        ))
+                    }
                     PlannedIdentifierReadKind::Function => SourceCheckError::Function(
                         SourceFunctionInvariant::MissingCallableType(read.value_symbol),
                     ),
@@ -6608,6 +6814,58 @@ fn check_type_import_value_use(
     ))
 }
 
+fn check_unresolved_identifier(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    expression: &PlannedExpression,
+    read: PlannedIdentifierRead,
+) -> Result<CheckedExpressionTypes, SourceCheckError> {
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or(SourceCheckError::LiteralCache(
+            SourceLiteralCacheError::BootstrapUninitialized,
+        ))?;
+    let unknown_symbol = bootstrap.unknown_symbol;
+    let error_type = bootstrap.error_type;
+    if read.kind != PlannedIdentifierReadKind::Unresolved
+        || read.resolved_symbol != unknown_symbol
+        || read.value_symbol != unknown_symbol
+        || store.symbol(unknown_symbol).is_none()
+        || store.type_payload(error_type).is_none()
+    {
+        return Err(SourceCheckError::Variable(
+            VariableInvariant::InvalidSymbolShape(read.value_symbol),
+        ));
+    }
+    let record = host
+        .node(expression.node)
+        .ok_or(SourceCheckError::Provenance(
+            SourceCheckProvenanceError::MissingNode(expression.node),
+        ))?;
+    let NodeData::Identifier(identifier) = &record.data else {
+        return Err(SourceCheckError::Variable(
+            VariableInvariant::InvalidSymbolShape(read.value_symbol),
+        ));
+    };
+    let name = identifier.text.clone();
+    preflight_source_expression_cache(store, expression.node, error_type)?;
+    publish_expression_type(store, expression.node, error_type)?;
+    merge_retry_diagnostic(
+        diagnostics,
+        CanonicalCheckerDiagnostic {
+            node: Some(expression.node),
+            range_override: None,
+            diagnostic: Diagnostic::with_arguments(
+                message_by_code(2304).ok_or(SourceCheckError::MissingDiagnostic(2304))?,
+                [name],
+            ),
+            related_information: Vec::new(),
+        },
+    );
+    Ok(CheckedExpressionTypes::leaf(error_type, error_type))
+}
+
 fn emit_uninitialized_variable_read_diagnostics(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -6802,6 +7060,11 @@ fn check_expression_type(
         )?;
     }
     match &expression.kind {
+        PlannedExpressionKind::Identifier(read)
+            if read.kind == PlannedIdentifierReadKind::Unresolved =>
+        {
+            check_unresolved_identifier(store, host, diagnostics, expression, *read)
+        }
         PlannedExpressionKind::TypeImportValueUse(read) => check_type_import_value_use(
             store,
             diagnostics,
@@ -6812,11 +7075,29 @@ fn check_expression_type(
             if contextual_type.is_some() {
                 return Err(SourceCheckError::Conditional(conditional.node));
             }
-            let condition = check_uncached_conditional_scalar(
-                store,
-                current_flow_types,
-                &conditional.condition,
-            )?;
+            let condition =
+                if conditional.condition_expectation == ConditionalScalarExpectation::Error {
+                    check_expression_type(
+                        store,
+                        host,
+                        global_types,
+                        source,
+                        options,
+                        session,
+                        diagnostics,
+                        current_flow_types,
+                        preflighted_type_import_value_uses,
+                        &conditional.condition,
+                        None,
+                        deferred,
+                    )?
+                } else {
+                    check_uncached_conditional_scalar(
+                        store,
+                        current_flow_types,
+                        &conditional.condition,
+                    )?
+                };
             validate_conditional_scalar_expectation(
                 store,
                 &conditional.condition,
@@ -6839,22 +7120,58 @@ fn check_expression_type(
                 condition.result,
                 conditional.node,
             )?;
-            let when_true = check_uncached_conditional_scalar(
-                store,
-                current_flow_types,
-                &conditional.when_true,
-            )?;
+            let when_true =
+                if conditional.when_true_expectation == ConditionalScalarExpectation::Error {
+                    check_expression_type(
+                        store,
+                        host,
+                        global_types,
+                        source,
+                        options,
+                        session,
+                        diagnostics,
+                        current_flow_types,
+                        preflighted_type_import_value_uses,
+                        &conditional.when_true,
+                        None,
+                        deferred,
+                    )?
+                } else {
+                    check_uncached_conditional_scalar(
+                        store,
+                        current_flow_types,
+                        &conditional.when_true,
+                    )?
+                };
             validate_conditional_scalar_expectation(
                 store,
                 &conditional.when_true,
                 when_true.result,
                 conditional.when_true_expectation,
             )?;
-            let when_false = check_uncached_conditional_scalar(
-                store,
-                current_flow_types,
-                &conditional.when_false,
-            )?;
+            let when_false =
+                if conditional.when_false_expectation == ConditionalScalarExpectation::Error {
+                    check_expression_type(
+                        store,
+                        host,
+                        global_types,
+                        source,
+                        options,
+                        session,
+                        diagnostics,
+                        current_flow_types,
+                        preflighted_type_import_value_uses,
+                        &conditional.when_false,
+                        None,
+                        deferred,
+                    )?
+                } else {
+                    check_uncached_conditional_scalar(
+                        store,
+                        current_flow_types,
+                        &conditional.when_false,
+                    )?
+                };
             validate_conditional_scalar_expectation(
                 store,
                 &conditional.when_false,
@@ -7377,6 +7694,19 @@ fn validate_conditional_scalar_expectation(
         }
         ConditionalScalarExpectation::Exact { .. } => {
             Err(SourceCheckError::Conditional(expression.node))
+        }
+        ConditionalScalarExpectation::Error => {
+            let expected = store
+                .intrinsic_bootstrap()
+                .map(|bootstrap| bootstrap.error_type)
+                .ok_or(SourceCheckError::LiteralCache(
+                    SourceLiteralCacheError::BootstrapUninitialized,
+                ))?;
+            if type_ == expected {
+                Ok(())
+            } else {
+                Err(SourceCheckError::Conditional(expression.node))
+            }
         }
     }
 }
@@ -11664,6 +11994,38 @@ mod tests {
         .unwrap()
     }
 
+    fn context_with_declaration_facts<'arena>(
+        file: FileId,
+        source: &'arena ParseResult,
+        module_state: CanonicalModuleState,
+        is_declaration_file: bool,
+    ) -> CanonicalCheckerContext<'arena> {
+        let extension = if is_declaration_file { "d.ts" } else { "ts" };
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &source.arena,
+                source.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source(format!("\"/project/{}.{extension}\"", file.index())),
+                    CanonicalSourceLanguage::TypeScript,
+                    is_declaration_file,
+                    module_state,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&source.arena, file)
+            .unwrap();
+        CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![(file, &source.arena)],
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap()
+    }
+
     #[derive(Clone, Copy)]
     struct SourceImportRoute {
         source: usize,
@@ -14677,6 +15039,112 @@ mod tests {
     }
 
     #[test]
+    fn declaration_file_ambient_variables_publish_script_and_exported_values() {
+        let cases = [
+            (
+                "declare const value: number;",
+                CanonicalModuleState::Script,
+                "number",
+                true,
+            ),
+            (
+                "export declare const value: 1;",
+                CanonicalModuleState::External,
+                "1",
+                true,
+            ),
+            (
+                "export const value: string;",
+                CanonicalModuleState::External,
+                "string",
+                true,
+            ),
+            (
+                "export declare const value: number;",
+                CanonicalModuleState::External,
+                "number",
+                false,
+            ),
+        ];
+
+        for (index, (text, module_state, expected, is_declaration_file)) in
+            cases.into_iter().enumerate()
+        {
+            let source = parsed(text);
+            let file = FileId::new(2_170 + u32::try_from(index).unwrap());
+            let mut context =
+                context_with_declaration_facts(file, &source, module_state, is_declaration_file);
+
+            context.check_source_file(file).unwrap();
+
+            let value = variable_value_type(&context, &source, file, "value");
+            assert_eq!(context.type_to_string(value).unwrap(), expected);
+            assert!(context.diagnostics().is_empty());
+            assert!(is_type_checked(&context, file));
+
+            let warm = observable_state(&context, file);
+            mark_source_unchecked(&mut context, file);
+            context.check_source_file(file).unwrap();
+            assert_eq!(observable_state(&context, file), warm);
+        }
+    }
+
+    #[test]
+    fn declaration_file_ambient_functions_publish_script_and_exported_values() {
+        let cases = [
+            (
+                "declare function value(): number;",
+                CanonicalModuleState::Script,
+                true,
+            ),
+            (
+                "export declare function value(): number;",
+                CanonicalModuleState::External,
+                true,
+            ),
+            (
+                "export function value(): number;",
+                CanonicalModuleState::External,
+                true,
+            ),
+            (
+                "export declare function value(): number;",
+                CanonicalModuleState::External,
+                false,
+            ),
+        ];
+
+        for (index, (text, module_state, is_declaration_file)) in cases.into_iter().enumerate() {
+            let source = parsed(text);
+            let file = FileId::new(2_180 + u32::try_from(index).unwrap());
+            let mut context =
+                context_with_declaration_facts(file, &source, module_state, is_declaration_file);
+
+            context.check_source_file(file).unwrap();
+
+            let owner = function_symbol(&context, &source, file, "value");
+            let callable = context
+                .store()
+                .source_callable_type_for_owner(owner)
+                .expect("ambient functions must publish their callable type");
+            assert_eq!(
+                context
+                    .store()
+                    .value_symbol_links(owner)
+                    .and_then(|links| links.resolved_type),
+                Some(callable)
+            );
+            assert!(context.diagnostics().is_empty());
+            assert!(is_type_checked(&context, file));
+
+            let warm = observable_state(&context, file);
+            mark_source_unchecked(&mut context, file);
+            context.check_source_file(file).unwrap();
+            assert_eq!(observable_state(&context, file), warm);
+        }
+    }
+
+    #[test]
     fn ambient_variable_links_preflight_atomically_and_repair_warm() {
         let source = parsed(concat!(
             "declare const early: number;\n",
@@ -16972,7 +17440,7 @@ mod tests {
             ("export type {};", SourceSyntaxRole::ExportDeclaration),
             (
                 r#"export declare const value: string = "ok";"#,
-                SourceSyntaxRole::VariableStatement,
+                SourceSyntaxRole::VariableInitializer,
             ),
             (
                 "export default interface Model {}",
@@ -19232,7 +19700,7 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_source_function_plans_are_atomic_and_preserve_variable_errors() {
+    fn unsupported_source_function_plans_are_atomic_and_missing_names_recover() {
         let source = parsed(concat!(
             "function ready(): void {} ",
             "function generic<T>(value: T) { return value; }",
@@ -19265,12 +19733,41 @@ mod tests {
             CanonicalCheckerOptions::default(),
         );
         let read = variable_initializer(&unresolved, unresolved_file, "value");
+        let (error_type, unknown_symbol) = {
+            let bootstrap = unresolved_context.store().intrinsic_bootstrap().unwrap();
+            (bootstrap.error_type, bootstrap.unknown_symbol)
+        };
+
+        unresolved_context
+            .check_source_file(unresolved_file)
+            .unwrap();
+
+        let [diagnostic] = unresolved_context.diagnostics().as_slice() else {
+            panic!("expected one missing-name diagnostic")
+        };
+        assert_eq!(diagnostic.node, Some(read));
+        assert_eq!(diagnostic.diagnostic.code(), 2304);
+        assert_eq!(diagnostic.diagnostic.arguments, ["missing"]);
+        assert_eq!(resolved_node_type(&unresolved_context, read), error_type);
         assert_eq!(
-            unresolved_context.check_source_file(unresolved_file),
-            Err(SourceCheckError::Unsupported(
-                UnsupportedSourceSyntax::Variable(VariableUnsupported::UnresolvedIdentifier(read))
-            ))
+            variable_value_type(&unresolved_context, &unresolved, unresolved_file, "value"),
+            error_type
         );
+        assert_eq!(
+            unresolved_context
+                .store()
+                .symbol_node_links(read)
+                .and_then(|links| links.resolved_symbol),
+            Some(unknown_symbol)
+        );
+        assert!(is_type_checked(&unresolved_context, unresolved_file));
+
+        let warm = observable_state(&unresolved_context, unresolved_file);
+        mark_source_unchecked(&mut unresolved_context, unresolved_file);
+        unresolved_context
+            .check_source_file(unresolved_file)
+            .unwrap();
+        assert_eq!(observable_state(&unresolved_context, unresolved_file), warm);
     }
 
     #[test]
@@ -20289,6 +20786,69 @@ mod tests {
         assert_eq!(diagnostic.diagnostic.arguments, ["+", "number", "boolean"]);
         assert_eq!(resolved_node_type(&context, binary), expected);
         assert!(is_type_checked(&context, file));
+    }
+
+    #[test]
+    fn missing_names_in_conditionals_report_ts2304_in_source_order() {
+        let cases: [(&str, &[&str]); 2] = [
+            ("var v = a ? b : c;", &["a", "b", "c"]),
+            (
+                "var v = a\n  ? b ? d : e\n  : c ? f : g;",
+                &["a", "b", "d", "e", "c", "f", "g"],
+            ),
+        ];
+
+        for (index, (text, expected_names)) in cases.into_iter().enumerate() {
+            let source = parsed(text);
+            let file = FileId::new(2_190 + u32::try_from(index).unwrap());
+            let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+            let (error_type, unknown_symbol) = {
+                let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+                (bootstrap.error_type, bootstrap.unknown_symbol)
+            };
+
+            context.check_source_file(file).unwrap();
+
+            let diagnostics = context.diagnostics().as_slice();
+            assert_eq!(diagnostics.len(), expected_names.len());
+            for (diagnostic, expected_name) in diagnostics.iter().zip(expected_names) {
+                let reads = identifier_expressions(&source, file, expected_name);
+                let [read] = reads.as_slice() else {
+                    panic!("expected one missing identifier named {expected_name}")
+                };
+                assert_eq!(diagnostic.node, Some(*read));
+                assert_eq!(diagnostic.diagnostic.code(), 2304);
+                assert_eq!(diagnostic.diagnostic.arguments, [*expected_name]);
+                assert_eq!(resolved_node_type(&context, *read), error_type);
+                assert_eq!(
+                    context
+                        .store()
+                        .symbol_node_links(*read)
+                        .and_then(|links| links.resolved_symbol),
+                    Some(unknown_symbol)
+                );
+            }
+
+            for (node, record) in source.arena.iter() {
+                if record.kind == SyntaxKind::ConditionalExpression {
+                    assert_eq!(
+                        resolved_node_type(&context, NodeRef::new(source.arena.id(), file, node)),
+                        error_type
+                    );
+                }
+            }
+            assert_eq!(
+                variable_value_type(&context, &source, file, "v"),
+                error_type
+            );
+            assert_eq!(context.type_to_string(error_type).unwrap(), "any");
+            assert!(is_type_checked(&context, file));
+
+            let warm = observable_state(&context, file);
+            mark_source_unchecked(&mut context, file);
+            context.check_source_file(file).unwrap();
+            assert_eq!(observable_state(&context, file), warm);
+        }
     }
 
     #[test]
