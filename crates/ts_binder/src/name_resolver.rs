@@ -565,7 +565,9 @@ impl<'a, H: CanonicalNameResolverHost> CanonicalNameResolver<'a, H> {
         if facts.is_javascript_file() && bound.phase() != BindingPhase::Declarations {
             return Err(CanonicalNameResolutionError::JavaScriptDeferred(file));
         }
-        if facts.is_common_js_module() {
+        if facts.is_common_js_module()
+            && (!facts.is_javascript_file() || bound.phase() != BindingPhase::Declarations)
+        {
             return Err(CanonicalNameResolutionError::CommonJsDeferred(file));
         }
         if bound.phase() != BindingPhase::Declarations {
@@ -3866,6 +3868,48 @@ export { remote } from "pkg";
             resolve(&source, &mut host, location, "value", SymbolFlags::VALUE),
             Ok(Some(expected))
         );
+    }
+
+    #[test]
+    fn completed_commonjs_files_resolve_local_and_synthetic_module_names() {
+        let parsed = parse_javascript_source_file(
+            "const value = 1; exports.result = value; function read() { return value; }",
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                FILE,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/name-resolver.cjs\""),
+                    CanonicalSourceLanguage::JavaScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_javascript_declaration_slice(&parsed.arena, FILE)
+            .unwrap();
+        let source = BoundSource {
+            parsed,
+            bindings: binder.finish(),
+        };
+        assert!(bound(&source).source_facts().unwrap().is_common_js_module());
+        let locals = bound(&source).locals(bound(&source).source_file()).unwrap();
+        let mut host = TestHost::for_source(&source);
+
+        for (fragment, name) in [("return value", "value"), ("exports.result", "exports")] {
+            let location = identifier_in(&source, fragment, name);
+            let expected = table_symbol(&source, locals, name);
+            assert_eq!(
+                resolve(&source, &mut host, location, name, SymbolFlags::VALUE),
+                Ok(Some(expected)),
+                "{name}"
+            );
+        }
     }
 
     #[test]

@@ -1191,11 +1191,8 @@ impl CanonicalBinder {
             !declaration_family_supported(arena, *node, &facts)
                 || declaration_name_shape_unsupported(arena, *node)
                 || (facts.is_javascript_file()
-                    && ((assignment_name_requires_javascript_file_kind(arena, *node)
-                        && javascript_assignment_kind(arena, *node).is_none())
-                        || javascript_assignment_kind(arena, *node)
-                            == Some(JavaScriptAssignmentKind::ExportsProperty)
-                            && has_dynamic_name(arena, *node)))
+                    && assignment_name_requires_javascript_file_kind(arena, *node)
+                    && javascript_assignment_kind(arena, *node).is_none())
         }) {
             return Err(CanonicalDeclarationError::UnsupportedDeclarationFamily(
                 NodeRef::new(arena.id(), file, node),
@@ -4405,7 +4402,9 @@ fn javascript_assignment_kind(
                 return Some(JavaScriptAssignmentKind::ModuleExports);
             }
             let base = access_expression_base(arena, binary.left)?;
-            if is_exports_identifier(arena, base) || is_module_exports_access(arena, base) {
+            if (is_exports_identifier(arena, base) || is_module_exports_access(arena, base))
+                && element_or_property_access_name(arena, binary.left).is_some()
+            {
                 Some(JavaScriptAssignmentKind::ExportsProperty)
             } else if arena
                 .get(base)
@@ -7771,6 +7770,85 @@ namespace Merged { export const enum E { A } }
     }
 
     #[test]
+    fn ambient_function_namespaces_preserve_callable_and_generic_export_symbols() {
+        for (index, (body, expected_module_flags)) in [
+            ("export const items: string[];", SymbolFlags::VALUE_MODULE),
+            (
+                "export interface Box<T> { value: T; }",
+                SymbolFlags::NAMESPACE_MODULE,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let parsed = parse_source_file(&format!(
+                "declare function callable(): void; declare namespace callable {{ {body} }} export = callable;"
+            ));
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let file = FileId::new(89 + u32::try_from(index).unwrap());
+            let mut binder = CanonicalBinder::new();
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new(
+                        EscapedName::source("\"/project/callable.d.ts\""),
+                        CanonicalSourceLanguage::TypeScript,
+                        true,
+                        CanonicalModuleState::External,
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+
+            let bound = binder.file(file).unwrap();
+            assert!(bound.diagnostics().is_empty(), "{:?}", bound.diagnostics());
+            let locals = binder
+                .symbol_store()
+                .symbol_table(bound.locals(bound.source_file()).unwrap())
+                .unwrap();
+            let callable = locals.get_source("callable").unwrap();
+            let record = binder.symbol_store().symbol(callable).unwrap();
+            assert_eq!(
+                record.flags(),
+                SymbolFlags::FUNCTION | expected_module_flags
+            );
+            assert_eq!(record.declarations().unwrap().len(), 2);
+            let namespace = nodes_of_kind(&parsed.arena, SyntaxKind::ModuleDeclaration)[0];
+            assert_eq!(
+                bound.symbol(node_ref(&parsed.arena, file, namespace)),
+                Some(callable)
+            );
+            let exports = binder
+                .symbol_store()
+                .symbol_table(record.exports().unwrap())
+                .unwrap();
+
+            if expected_module_flags == SymbolFlags::NAMESPACE_MODULE {
+                let interface = exports.get_source("Box").unwrap();
+                let members = binder
+                    .symbol_store()
+                    .symbol_table(
+                        binder
+                            .symbol_store()
+                            .symbol(interface)
+                            .unwrap()
+                            .members()
+                            .unwrap(),
+                    )
+                    .unwrap();
+                assert!(members.get_source("T").is_some());
+                assert!(members.get_source("value").is_some());
+            } else {
+                assert!(exports.get_source("items").is_some());
+            }
+        }
+    }
+
+    #[test]
     fn ambient_modules_record_patterns_and_diagnostics_in_declaration_order() {
         let parsed = parse_source_file(
             r#"
@@ -8523,6 +8601,64 @@ const object = {};
     }
 
     #[test]
+    fn object_shorthand_and_computed_members_keep_exact_declaration_symbols() {
+        let parsed = parse_source_file(
+            "const value = 1; const object = { value, ['named']: value, [1]: value, [dynamic]: value };",
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(91);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/object.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+
+        let bound = binder.file(file).unwrap();
+        let object = nodes_of_kind(&parsed.arena, SyntaxKind::ObjectLiteralExpression)[0];
+        let owner = bound.symbol(node_ref(&parsed.arena, file, object)).unwrap();
+        let members = binder
+            .symbol_store()
+            .symbol_table(
+                binder
+                    .symbol_store()
+                    .symbol(owner)
+                    .unwrap()
+                    .members()
+                    .unwrap(),
+            )
+            .unwrap();
+        for name in ["value", "named", "1"] {
+            let symbol = members.get_source(name).unwrap();
+            let record = binder.symbol_store().symbol(symbol).unwrap();
+            assert_eq!(record.flags(), SymbolFlags::PROPERTY);
+            assert_eq!(record.parent(), Some(owner));
+            assert_eq!(record.declarations().unwrap().len(), 1);
+        }
+        assert_eq!(members.len(), 3);
+
+        let dynamic =
+            node_with_source_fragment(&parsed.arena, SyntaxKind::PropertyAssignment, "[dynamic]");
+        let dynamic_symbol = bound
+            .symbol(node_ref(&parsed.arena, file, dynamic))
+            .unwrap();
+        let dynamic_record = binder.symbol_store().symbol(dynamic_symbol).unwrap();
+        assert_eq!(dynamic_record.name(), InternalSymbolName::Computed.as_ref());
+        assert_eq!(dynamic_record.parent(), Some(owner));
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)]
     fn typescript_expandos_bind_after_declarations_with_exact_static_and_dynamic_records() {
         let parsed = parse_source_file(
@@ -8963,7 +9099,54 @@ Merged.fresh = 1;
     }
 
     #[test]
-    fn javascript_dynamic_commonjs_exports_reject_without_partial_declaration_writes() {
+    fn javascript_duplicate_function_implementations_share_their_declaration_symbol() {
+        let parsed =
+            parse_javascript_source_file("function repeated() {} function repeated(arg) {}");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(92);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/repeated.js\""),
+                    CanonicalSourceLanguage::JavaScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_javascript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+
+        let bound = binder.file(file).unwrap();
+        assert!(bound.diagnostics().is_empty(), "{:?}", bound.diagnostics());
+        let locals = binder
+            .symbol_store()
+            .symbol_table(bound.locals(bound.source_file()).unwrap())
+            .unwrap();
+        let repeated = locals.get_source("repeated").unwrap();
+        let record = binder.symbol_store().symbol(repeated).unwrap();
+        assert_eq!(record.flags(), SymbolFlags::FUNCTION);
+        let declarations = nodes_of_kind(&parsed.arena, SyntaxKind::FunctionDeclaration);
+        let expected = declarations
+            .iter()
+            .map(|node| node_ref(&parsed.arena, file, *node))
+            .collect::<Vec<_>>();
+        assert_eq!(record.declarations(), Some(expected.as_slice()));
+        for declaration in declarations {
+            assert_eq!(
+                bound.symbol(node_ref(&parsed.arena, file, declaration)),
+                Some(repeated)
+            );
+        }
+    }
+
+    #[test]
+    fn javascript_dynamic_export_names_do_not_create_commonjs_module_indicators() {
         let parsed = parse_javascript_source_file("function F() {} exports[dynamic] = F;");
         assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
         let file = FileId::new(69);
@@ -8992,25 +9175,24 @@ Merged.fresh = 1;
                 file
             ))
         );
-        assert_eq!(
-            binder.bind_javascript_declaration_slice(&parsed.arena, file),
-            Err(CanonicalDeclarationError::UnsupportedDeclarationFamily(
-                node_ref(&parsed.arena, file, assignment)
-            ))
-        );
+        binder
+            .bind_javascript_declaration_slice(&parsed.arena, file)
+            .unwrap();
 
         let bound = binder.file(file).unwrap();
-        assert_eq!(bound.phase(), BindingPhase::Traversal);
-        assert!(!bound.declaration_slice_bound());
-        assert_eq!(bound.symbol_count(), 0);
-        assert_eq!(bound.locals(bound.source_file()), None);
-        assert!(
-            bound
-                .traversal_order()
-                .all(|node| bound.symbol(node).is_none())
+        assert_eq!(bound.phase(), BindingPhase::Declarations);
+        assert!(!bound.source_facts().unwrap().is_common_js_module());
+        assert_eq!(bound.symbol(bound.source_file()), None);
+        assert_eq!(
+            bound.symbol(node_ref(&parsed.arena, file, assignment)),
+            None
         );
-        assert_eq!(binder.symbol_store().symbol_len(), 0);
-        assert_eq!(binder.symbol_store().symbol_table_len(), 0);
+        let locals = binder
+            .symbol_store()
+            .symbol_table(bound.locals(bound.source_file()).unwrap())
+            .unwrap();
+        assert!(locals.get_source("F").is_some());
+        assert!(locals.get_source("exports").is_none());
     }
 
     #[test]
