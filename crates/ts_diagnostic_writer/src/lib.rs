@@ -734,6 +734,84 @@ mod tests {
     }
 
     #[test]
+    fn ambient_return_diagnostics_match_the_pinned_declaration_baseline() {
+        let source = "export function foo();\r\n\r\nexport function bar();\r\n";
+        let foo_start = source.find("foo").unwrap();
+        let bar_start = source.find("bar").unwrap();
+        let first = Diagnostic {
+            file_name: Some("/project/b.d.ts"),
+            source_text: Some(source),
+            range: Some(TextRange::new(
+                TextPos::new(u32::try_from(foo_start).unwrap()),
+                TextPos::new(u32::try_from(foo_start + "foo".len()).unwrap()),
+            )),
+            code: Some(7010),
+            category: DiagnosticCategory::Error,
+            message: "'foo', which lacks return-type annotation, implicitly has an 'any' return type.",
+        };
+        let second = Diagnostic {
+            range: Some(TextRange::new(
+                TextPos::new(u32::try_from(bar_start).unwrap()),
+                TextPos::new(u32::try_from(bar_start + "bar".len()).unwrap()),
+            )),
+            message: "'bar', which lacks return-type annotation, implicitly has an 'any' return type.",
+            ..first
+        };
+
+        assert_eq!(
+            format_diagnostics(
+                &[first, second],
+                FormattingOptions {
+                    current_directory: "/project",
+                    new_line: "\r\n",
+                    ..FormattingOptions::default()
+                },
+            ),
+            concat!(
+                "b.d.ts(1,17): error TS7010: 'foo', which lacks return-type annotation, implicitly has an 'any' return type.\r\n",
+                "b.d.ts(3,17): error TS7010: 'bar', which lacks return-type annotation, implicitly has an 'any' return type.\r\n",
+            )
+        );
+    }
+
+    #[test]
+    fn ambient_grammar_diagnostics_keep_exact_token_and_initializer_locations() {
+        let source = "function foo();\ndeclare let value: number = 1;\n";
+        let initializer = source.rfind('1').unwrap();
+        let missing_modifier = Diagnostic {
+            file_name: Some("/project/ambient.d.ts"),
+            source_text: Some(source),
+            range: Some(TextRange::new(TextPos::new(0), TextPos::new(8))),
+            code: Some(1046),
+            category: DiagnosticCategory::Error,
+            message: "Top-level declarations in .d.ts files must start with either a 'declare' or 'export' modifier.",
+        };
+        let ambient_initializer = Diagnostic {
+            range: Some(TextRange::new(
+                TextPos::new(u32::try_from(initializer).unwrap()),
+                TextPos::new(u32::try_from(initializer + 1).unwrap()),
+            )),
+            code: Some(1039),
+            message: "Initializers are not allowed in ambient contexts.",
+            ..missing_modifier
+        };
+
+        assert_eq!(
+            format_diagnostics(
+                &[missing_modifier, ambient_initializer],
+                FormattingOptions {
+                    current_directory: "/project",
+                    ..FormattingOptions::default()
+                },
+            ),
+            concat!(
+                "ambient.d.ts(1,1): error TS1046: Top-level declarations in .d.ts files must start with either a 'declare' or 'export' modifier.\n",
+                "ambient.d.ts(2,29): error TS1039: Initializers are not allowed in ambient contexts.\n",
+            )
+        );
+    }
+
+    #[test]
     fn pretty_diagnostics_match_upstream_spacing_and_gutters() {
         let source = "let answer: string = 42;\n";
         let diagnostic = Diagnostic {

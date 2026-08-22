@@ -311,6 +311,43 @@ mod tests {
     }
 
     #[test]
+    fn ambient_declaration_diagnostics_match_pinned_typescript_records() {
+        let cases: &[(u32, &str, &[&str], &str)] = &[
+            (
+                1039,
+                "Initializers_are_not_allowed_in_ambient_contexts_1039",
+                &[],
+                "Initializers are not allowed in ambient contexts.",
+            ),
+            (
+                1046,
+                "Top_level_declarations_in_d_ts_files_must_start_with_either_a_declare_or_export_modifier_1046",
+                &[],
+                "Top-level declarations in .d.ts files must start with either a 'declare' or 'export' modifier.",
+            ),
+            (
+                7010,
+                "_0_which_lacks_return_type_annotation_implicitly_has_an_1_return_type_7010",
+                &["foo", "any"],
+                "'foo', which lacks return-type annotation, implicitly has an 'any' return type.",
+            ),
+        ];
+
+        for &(code, key, arguments, expected) in cases {
+            let message = message_by_code(code).expect("ambient diagnostic is in the catalog");
+            assert_eq!(message.key(), key, "TS{code}");
+            assert_eq!(message.category(), Category::Error, "TS{code}");
+            assert_eq!(
+                Diagnostic::with_arguments(message, arguments.iter().copied())
+                    .render()
+                    .unwrap(),
+                expected,
+                "TS{code}"
+            );
+        }
+    }
+
+    #[test]
     fn directive_and_related_diagnostics_keep_upstream_categories_and_flags() {
         let unused_directive = message_by_code(2578).unwrap();
         assert_eq!(unused_directive.category(), Category::Error);
