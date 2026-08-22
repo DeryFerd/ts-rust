@@ -2,8 +2,9 @@
 //!
 //! This deliberately admits only `identifier(arguments)` or a proven required
 //! own-property `identifier.name(arguments)`. Arguments may contain scalar
-//! values, identifier and property reads, object literals, nested direct calls,
-//! or recursively proven primitive expressions, optionally parenthesized.
+//! values, identifier and property reads, object and array literals, type
+//! assertions, nested direct calls, or recursively proven primitive
+//! expressions, optionally parenthesized.
 //! The semantic kernel remains in `calls`; this module owns the AST proof,
 //! lazy-return/relation retries, call caches, and source diagnostics.
 
@@ -503,12 +504,40 @@ fn is_supported_call_argument_syntax(arena: &NodeArena, node: NodeRef) -> bool {
         SyntaxKind::ObjectLiteralExpression => {
             matches!(&record.data, NodeData::ObjectLiteralExpression(_))
         }
+        SyntaxKind::ArrayLiteralExpression => {
+            matches!(&record.data, NodeData::ArrayLiteralExpression(_))
+        }
+        SyntaxKind::TypeAssertionExpression | SyntaxKind::AsExpression => {
+            is_supported_type_assertion_argument_syntax(arena, node)
+        }
         SyntaxKind::BinaryExpression => {
             is_context_insensitive_primitive_binary_syntax(arena, node)
                 || is_context_insensitive_logical_binary_syntax(arena, node)
         }
         _ => false,
     }
+}
+
+fn is_supported_type_assertion_argument_syntax(arena: &NodeArena, node: NodeRef) -> bool {
+    let Some(record) = arena.get(node.node) else {
+        return false;
+    };
+    let (type_, operand) = match (&record.data, record.kind) {
+        (NodeData::TypeAssertion(assertion), SyntaxKind::TypeAssertionExpression) => {
+            (assertion.type_, assertion.expression)
+        }
+        (NodeData::AsExpression(assertion), SyntaxKind::AsExpression) => {
+            (assertion.type_, assertion.expression)
+        }
+        _ => return false,
+    };
+    arena
+        .get(type_)
+        .is_some_and(|annotation| annotation.parent == Some(node.node))
+        && arena
+            .get(operand)
+            .is_some_and(|expression| expression.parent == Some(node.node))
+        && is_supported_call_argument_syntax(arena, NodeRef::new(node.arena, node.file, operand))
 }
 
 fn is_context_insensitive_element_syntax(arena: &NodeArena, node: NodeRef) -> bool {
@@ -730,6 +759,12 @@ fn is_supported_call_argument_plan(expression: &PlannedExpression) -> bool {
         PlannedExpressionKind::Object { properties, .. } => {
             properties.iter().all(is_supported_call_argument_plan)
         }
+        PlannedExpressionKind::Array(elements) => {
+            elements.iter().all(is_supported_call_argument_plan)
+        }
+        PlannedExpressionKind::Assertion { operand, .. } => {
+            is_supported_call_argument_plan(operand)
+        }
         PlannedExpressionKind::Parenthesized(inner) => is_supported_call_argument_plan(inner),
         PlannedExpressionKind::Binary(binary) => {
             let (left, right) = binary.operands();
@@ -745,9 +780,7 @@ fn is_supported_call_argument_plan(expression: &PlannedExpression) -> bool {
                 && is_supported_call_argument_plan(left)
                 && is_supported_call_argument_plan(right)
         }
-        PlannedExpressionKind::Assertion { .. }
-        | PlannedExpressionKind::TypeImportValueUse(_)
-        | PlannedExpressionKind::Array(_)
+        PlannedExpressionKind::TypeImportValueUse(_)
         | PlannedExpressionKind::New(_)
         | PlannedExpressionKind::Conditional(_) => false,
     }
@@ -1271,18 +1304,123 @@ fn type_contains_undefined(
         })
 }
 
+fn array_argument_diagnostics(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    argument: &PlannedExpression,
+    parameter_type: TypeId,
+) -> Result<Option<Vec<CanonicalCheckerDiagnostic>>, SourceCheckError> {
+    let mut diagnostics = Vec::new();
+    if collect_array_argument_diagnostics(
+        store,
+        host,
+        global_types,
+        options,
+        argument,
+        parameter_type,
+        &mut diagnostics,
+    )? && !diagnostics.is_empty()
+    {
+        Ok(Some(diagnostics))
+    } else {
+        Ok(None)
+    }
+}
+
+fn collect_array_argument_diagnostics(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    argument: &PlannedExpression,
+    parameter_type: TypeId,
+    diagnostics: &mut Vec<CanonicalCheckerDiagnostic>,
+) -> Result<bool, SourceCheckError> {
+    let argument = argument.unparenthesized();
+    let PlannedExpressionKind::Array(elements) = &argument.kind else {
+        return Ok(false);
+    };
+    let Some(argument_type) = store
+        .type_node_links(argument.node)
+        .and_then(|links| links.resolved_type)
+    else {
+        return Err(SourceCheckError::Call(argument.node));
+    };
+    if store
+        .canonical_array_reference(global_types, argument_type)?
+        .is_none()
+    {
+        return Ok(false);
+    }
+    let Some(target_element_type) =
+        store.canonical_array_element_type(global_types, parameter_type)?
+    else {
+        return Ok(false);
+    };
+
+    for element in elements {
+        let Some(element_type) = store
+            .type_node_links(element.node)
+            .and_then(|links| links.resolved_type)
+        else {
+            return Err(SourceCheckError::Call(element.node));
+        };
+        if store.is_type_assignable_to_with_global_types_and_strict_function_types(
+            element_type,
+            target_element_type,
+            global_types,
+            options.strict_function_types,
+        )? {
+            continue;
+        }
+        let previous_count = diagnostics.len();
+        if collect_array_argument_diagnostics(
+            store,
+            host,
+            global_types,
+            options,
+            element,
+            target_element_type,
+            diagnostics,
+        )? && diagnostics.len() != previous_count
+        {
+            continue;
+        }
+        let display = get_type_names_for_assignability_error_with_host_global_types_and_flags(
+            store,
+            host,
+            global_types,
+            element_type,
+            target_element_type,
+            source_call_display_flags(options),
+        )?;
+        diagnostics.push(CanonicalCheckerDiagnostic {
+            node: Some(element.unparenthesized().node),
+            range_override: None,
+            diagnostic: Diagnostic::with_arguments(
+                message_by_code(2322).ok_or(SourceCheckError::MissingDiagnostic(2322))?,
+                [display.source, display.target],
+            ),
+            related_information: Vec::new(),
+        });
+    }
+    Ok(true)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn prepare_legacy_source_call_diagnostic(
-    store: &CanonicalTypeMapperStore,
+    store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     global_types: &CanonicalGlobalTypes,
     options: CanonicalCheckerOptions,
     plan: &SourceCallPlan,
     argument_types: &[TypeId],
     resolution: ResolvedLegacySourceCall,
-) -> Result<Option<CanonicalCheckerDiagnostic>, SourceCheckError> {
+) -> Result<Vec<CanonicalCheckerDiagnostic>, SourceCheckError> {
     let diagnostic = match resolution.applicability {
-        DirectCallApplicability::Applicable => return Ok(None),
+        DirectCallApplicability::Applicable => return Ok(Vec::new()),
         DirectCallApplicability::TooFewArguments {
             expected_at_least,
             actual,
@@ -1371,6 +1509,16 @@ fn prepare_legacy_source_call_diagnostic(
                 .arguments
                 .get(index)
                 .ok_or(SourceCheckError::Call(plan.node))?;
+            if let Some(diagnostics) = array_argument_diagnostics(
+                store,
+                host,
+                global_types,
+                options,
+                argument,
+                parameter_type,
+            )? {
+                return Ok(diagnostics);
+            }
             let exact_optional_mismatch =
                 exact_optional_argument_mismatch(store, options, argument_type, parameter_type);
             let code = if exact_optional_mismatch { 2379 } else { 2345 };
@@ -1398,12 +1546,12 @@ fn prepare_legacy_source_call_diagnostic(
             }
         }
     };
-    Ok(Some(diagnostic))
+    Ok(vec![diagnostic])
 }
 
 #[allow(clippy::too_many_arguments)]
 fn prepare_vector_source_call_diagnostic(
-    store: &CanonicalTypeMapperStore,
+    store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     global_types: &CanonicalGlobalTypes,
     options: CanonicalCheckerOptions,
@@ -1411,14 +1559,14 @@ fn prepare_vector_source_call_diagnostic(
     argument_types: &[TypeId],
     explicit_type_arguments: Option<&[TypeId]>,
     resolution: &GenericCallVectorResolution,
-) -> Result<Option<CanonicalCheckerDiagnostic>, SourceCheckError> {
+) -> Result<Vec<CanonicalCheckerDiagnostic>, SourceCheckError> {
     let projection = resolution.projection();
     let parameter_count = store
         .signature(projection.generic_signature)
         .map(|signature| signature.parameters().len())
         .ok_or(SourceCheckError::Call(plan.node))?;
     let diagnostic = match resolution.applicability() {
-        GenericCallVectorApplicability::Applicable => return Ok(None),
+        GenericCallVectorApplicability::Applicable => return Ok(Vec::new()),
         GenericCallVectorApplicability::TypeArgumentArity {
             minimum,
             maximum,
@@ -1537,6 +1685,16 @@ fn prepare_vector_source_call_diagnostic(
                 .arguments
                 .get(index)
                 .ok_or(SourceCheckError::Call(plan.node))?;
+            if let Some(diagnostics) = array_argument_diagnostics(
+                store,
+                host,
+                global_types,
+                options,
+                argument,
+                parameter_type,
+            )? {
+                return Ok(diagnostics);
+            }
             let display = get_type_names_for_assignability_error_with_host_global_types_and_flags(
                 store,
                 host,
@@ -1572,7 +1730,7 @@ fn prepare_vector_source_call_diagnostic(
             }
         }
     };
-    Ok(Some(diagnostic))
+    Ok(vec![diagnostic])
 }
 
 fn preflight_call_publication(
@@ -1666,7 +1824,7 @@ pub(super) fn check_direct_source_call(
         }
     };
 
-    let (signature, return_type, diagnostic) = match resolution {
+    let (signature, return_type, call_diagnostics) = match resolution {
         ResolvedSourceCall::Legacy(resolution) => {
             let existing = preflight_call_publication(store, plan.node, resolution.return_type)?;
             if existing.is_some_and(|existing| existing != resolution.signature) {
@@ -1765,7 +1923,7 @@ pub(super) fn check_direct_source_call(
         }
     };
     publish_call_links(store, plan.node, signature, return_type)?;
-    if let Some(diagnostic) = diagnostic {
+    for diagnostic in call_diagnostics {
         merge_retry_diagnostic(diagnostics, diagnostic);
     }
     if session.limit_event_occurred_since(limit_mark) {

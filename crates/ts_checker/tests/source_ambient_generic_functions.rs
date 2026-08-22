@@ -734,7 +734,7 @@ fn unsupported_later_direct_call_statement_keeps_earlier_call_unpublished() {
     let parsed = parse_source_file(concat!(
         "declare function f<T>(value: T): T;\n",
         "f<string>(\"ready\");\n",
-        "f<string>([1]);\n",
+        "f<string>(new Object());\n",
     ));
     assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
     let file = FileId::new(2_303);
