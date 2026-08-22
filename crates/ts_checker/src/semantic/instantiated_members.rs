@@ -28,6 +28,10 @@ use super::{
         instantiated_member_type_matches,
     },
     links::ValueSymbolLinks,
+    object_members::{
+        DeclaredPropertyObjectProof, DeclaredPropertyObjectValidation,
+        validate_resolved_declared_property_object,
+    },
     reference_types::{DirectGenericReferenceError, validate_direct_generic_reference},
     store::SourceNodeParent,
     type_records::{ConstrainedTypeData, StructuredTypeData, TypeData},
@@ -405,9 +409,13 @@ pub(super) fn demand_instantiated_property_type(
         .and_then(|links| links.resolved_type)
         .ok_or(GenericInterfaceMemberError::InvalidMember(target))?;
     if let Some(cached) = cached {
-        if !instantiated_member_type_matches(store, template, cached, mapper, array_targets)
-            .unwrap_or(false)
-        {
+        if !cached_instantiated_property_type_matches(
+            store,
+            template,
+            cached,
+            mapper,
+            array_targets,
+        ) {
             return Err(GenericInterfaceMemberError::InvalidCachedProperty(symbol));
         }
         return Ok(cached);
@@ -537,13 +545,12 @@ fn validate_declared_target(
     let mapper_parameters = mapper_parameters_for_target(store, target, &source_parameters)?;
     active.push(target);
     for property in &mut properties {
-        property.requires_proxy = instantiable_member_type_contains_variables(
+        property.requires_proxy = member_type_requires_instantiation(
             store,
             property.type_,
             &mapper_parameters,
             array_targets,
-        )
-        .map_err(|_| GenericInterfaceMemberError::UnsupportedPropertyType(property.type_))?;
+        )?;
         validate_nested_reference_targets(
             store,
             property.type_,
@@ -560,6 +567,31 @@ fn validate_declared_target(
     debug_assert_eq!(popped, target);
     validated.insert(target);
     Ok((owner, source_parameters, declared_members, properties))
+}
+
+fn member_type_requires_instantiation(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    mapper_parameters: &[TypeId],
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<bool, GenericInterfaceMemberError> {
+    match instantiable_member_type_contains_variables(
+        store,
+        type_,
+        mapper_parameters,
+        array_targets,
+    ) {
+        Ok(requires_instantiation) => Ok(requires_instantiation),
+        Err(_)
+            if matches!(
+                validate_resolved_declared_property_object(store, type_),
+                DeclaredPropertyObjectValidation::Valid(DeclaredPropertyObjectProof::Interface)
+            ) =>
+        {
+            Ok(false)
+        }
+        Err(_) => Err(GenericInterfaceMemberError::UnsupportedPropertyType(type_)),
+    }
 }
 
 fn mapper_parameters_for_target(
@@ -745,22 +777,11 @@ fn declared_target_header(
         let type_ = links
             .resolved_type
             .ok_or(GenericInterfaceMemberError::InvalidMember(symbol))?;
-        let optional_type_is_valid = store.intrinsic_bootstrap().is_some_and(|bootstrap| {
-            if !bootstrap.options.strict_null_checks
-                || !property.flags().contains(SymbolFlags::OPTIONAL)
-            {
-                return true;
-            }
-            let sentinel = bootstrap.undefined_or_missing_type;
-            type_ == sentinel
-                || store.type_payload(type_).is_some_and(|record| {
-                    record.flags().intersects(TypeFlags::ANY_OR_UNKNOWN)
-                        || matches!(
-                            record.data(),
-                            TypeData::Union(union) if union.union.types.contains(&sentinel)
-                        )
-                })
-        });
+        let optional_type_is_valid = optional_member_type_is_normalized(
+            store,
+            type_,
+            property.flags().contains(SymbolFlags::OPTIONAL),
+        );
         if !property.flags().contains(SymbolFlags::PROPERTY)
             || property.flags().without(allowed_flags) != SymbolFlags::NONE
             || property.check_flags().bits() & !allowed_checks.bits() != 0
@@ -821,6 +842,70 @@ fn declared_target_header(
         .map(|(_, property)| property)
         .collect();
     Ok((owner, source_parameters, declared_members, properties))
+}
+
+fn optional_member_type_is_normalized(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    optional: bool,
+) -> bool {
+    let Some(bootstrap) = store.intrinsic_bootstrap() else {
+        return false;
+    };
+    if !bootstrap.options.strict_null_checks || !optional {
+        return true;
+    }
+    let sentinel = bootstrap.undefined_or_missing_type;
+    if type_ == sentinel
+        || bootstrap.options.exact_optional_property_types && type_ == bootstrap.undefined_type
+    {
+        return true;
+    }
+    store.type_payload(type_).is_some_and(|record| {
+        record.flags().intersects(TypeFlags::ANY_OR_UNKNOWN)
+            || matches!(
+                record.data(),
+                TypeData::Union(union)
+                    if {
+                        let has_sentinel = union.union.types.contains(&sentinel);
+                        let has_undefined = union.union.types.contains(&bootstrap.undefined_type);
+                        if bootstrap.options.exact_optional_property_types {
+                            has_sentinel != has_undefined
+                        } else {
+                            has_sentinel
+                        }
+                    }
+            )
+    })
+}
+
+fn cached_instantiated_property_type_matches(
+    store: &CanonicalTypeMapperStore,
+    template: TypeId,
+    cached: TypeId,
+    mapper: TypeMapperId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> bool {
+    if cached != template
+        && matches!(
+            store
+                .type_payload(cached)
+                .map(super::type_records::TypeRecord::data),
+            Some(TypeData::Union(_))
+        )
+    {
+        let valid_union = match array_targets {
+            Some(targets) => store
+                .validate_cached_union_result_with_array_targets(targets, cached, None)
+                .is_ok(),
+            None => store.validate_cached_union_result(cached, None).is_ok(),
+        };
+        if !valid_union {
+            return false;
+        }
+    }
+    instantiated_member_type_matches(store, template, cached, mapper, array_targets)
+        .unwrap_or(false)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1067,8 +1152,13 @@ fn validate_warm_members(
                 .resolved_type
                 .is_some_and(|type_| store.type_payload(type_).is_none())
             || links.resolved_type.is_some_and(|type_| {
-                !instantiated_member_type_matches(store, source.type_, type_, mapper, array_targets)
-                    .unwrap_or(false)
+                !cached_instantiated_property_type_matches(
+                    store,
+                    source.type_,
+                    type_,
+                    mapper,
+                    array_targets,
+                )
             })
         {
             return Err(GenericInterfaceMemberError::InvalidCachedProperty(
@@ -1240,6 +1330,75 @@ fn prepare_member_table(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::semantic::{
+        CanonicalCheckerContext, CanonicalCheckerOptions, IntrinsicBootstrapOptions,
+    };
+    use ts_ast::{FileId, NodeData, NodeRef};
+    use ts_binder::{
+        CanonicalBinder, CanonicalModuleState, CanonicalSourceFileFacts, CanonicalSourceLanguage,
+    };
+    use ts_parser::{ParseResult, parse_source_file};
+
+    fn checker_context(
+        parsed: &ParseResult,
+        file: FileId,
+        options: CanonicalCheckerOptions,
+    ) -> CanonicalCheckerContext<'_> {
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/generic-member-unit.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        CanonicalCheckerContext::new(
+            binder.finish(),
+            [(file, &parsed.arena)].into_iter().collect(),
+            options,
+        )
+        .unwrap()
+    }
+
+    fn source_symbol(
+        parsed: &ParseResult,
+        file: FileId,
+        context: &CanonicalCheckerContext<'_>,
+        name: &str,
+    ) -> SemanticSymbolId {
+        let declaration = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let name_node = match &record.data {
+                    NodeData::InterfaceDeclaration(interface) => interface.name,
+                    NodeData::TypeAliasDeclaration(alias) => alias.name,
+                    NodeData::VariableDeclaration(variable) => variable.name,
+                    _ => return None,
+                };
+                let NodeData::Identifier(identifier) = &parsed.arena.get(name_node)?.data else {
+                    return None;
+                };
+                (identifier.text == name).then_some(NodeRef::new(parsed.arena.id(), file, node))
+            })
+            .unwrap_or_else(|| panic!("missing source declaration {name}"));
+        context
+            .file(file)
+            .unwrap()
+            .1
+            .symbol(declaration)
+            .and_then(|symbol| context.store().get_merged_symbol(symbol))
+            .unwrap()
+    }
 
     #[test]
     fn member_table_capacity_failure_is_typed_before_publication() {
@@ -1255,5 +1414,315 @@ mod tests {
         assert_eq!(store.mapper_len(), 0);
         assert_eq!(store.symbol_len(), 0);
         assert_eq!(store.symbol_store().symbol_table_len(), 0);
+    }
+
+    #[test]
+    fn exact_optional_unions_do_not_retain_missing_and_undefined_together() {
+        let mut store = CanonicalTypeMapperStore::new();
+        store
+            .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions {
+                strict_null_checks: true,
+                exact_optional_property_types: true,
+            })
+            .unwrap();
+        let (string, undefined, missing) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (
+                bootstrap.string_type,
+                bootstrap.undefined_type,
+                bootstrap.missing_type,
+            )
+        };
+        let normalized = store
+            .alloc_union_type(ObjectFlags::NONE, vec![undefined, string])
+            .unwrap();
+        let unnormalized = store
+            .alloc_union_type(ObjectFlags::NONE, vec![undefined, missing, string])
+            .unwrap();
+
+        assert!(optional_member_type_is_normalized(&store, undefined, true));
+        assert!(optional_member_type_is_normalized(&store, missing, true));
+        assert!(optional_member_type_is_normalized(&store, normalized, true));
+        assert!(!optional_member_type_is_normalized(
+            &store,
+            unnormalized,
+            true,
+        ));
+    }
+
+    #[test]
+    fn invariant_declared_interface_property_reuses_its_source_symbol() {
+        let parsed = parse_source_file(concat!(
+            "interface Payload { label: string }\n",
+            "interface Box<T> { value: T; payload: Payload }\n",
+            "declare const model: Box<number>;\n",
+            "const payload: Payload = model.payload;\n",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(6_201);
+        let mut context = checker_context(&parsed, file, CanonicalCheckerOptions::default());
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+
+        let model = source_symbol(&parsed, file, &context, "model");
+        let reference = context
+            .store()
+            .value_symbol_links(model)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        let target = match context.store().type_payload(reference).unwrap().data() {
+            TypeData::TypeReference(reference) => reference.object.target.unwrap(),
+            _ => panic!("the source variable must retain a generic reference"),
+        };
+        let declared = match context.store().type_payload(target).unwrap().data() {
+            TypeData::Interface(interface) => interface.declared_members.unwrap(),
+            _ => panic!("the generic reference target must be an interface"),
+        };
+        let raw = context
+            .store()
+            .symbol_table(declared)
+            .and_then(|table| table.get_source("payload"))
+            .unwrap();
+        let payload = context
+            .store_mut_for_test()
+            .resolve_generic_interface_property(reference, "payload", None)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(payload.symbol(), raw);
+        assert!(
+            !context
+                .store()
+                .symbol(raw)
+                .unwrap()
+                .flags()
+                .contains(SymbolFlags::TRANSIENT)
+        );
+    }
+
+    #[test]
+    fn exact_optional_properties_accept_normalized_undefined_without_missing() {
+        for exact_optional_property_types in [false, true] {
+            let parsed = parse_source_file(concat!(
+                "interface Box<T> { value?: undefined }\n",
+                "type TextBox = Box<string>;\n",
+            ));
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let file = FileId::new(6_202);
+            let mut context = checker_context(
+                &parsed,
+                file,
+                CanonicalCheckerOptions {
+                    intrinsic: IntrinsicBootstrapOptions {
+                        strict_null_checks: true,
+                        exact_optional_property_types,
+                    },
+                    ..CanonicalCheckerOptions::default()
+                },
+            );
+            context.check_source_file(file).unwrap();
+            let alias = source_symbol(&parsed, file, &context, "TextBox");
+            let reference = context.get_declared_type_of_symbol(alias).unwrap();
+            let undefined = context
+                .store()
+                .intrinsic_bootstrap()
+                .unwrap()
+                .undefined_type;
+
+            let property = context
+                .store_mut_for_test()
+                .resolve_generic_interface_property(reference, "value", None)
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "normalized undefined was rejected with exactOptionalPropertyTypes={exact_optional_property_types}: {error:?}"
+                    )
+                })
+                .unwrap();
+
+            assert_eq!(property.type_id(), undefined);
+            assert!(property.is_optional());
+            assert_eq!(
+                context
+                    .store_mut_for_test()
+                    .resolve_generic_interface_members(reference, None)
+                    .unwrap()
+                    .mapper(),
+                None,
+            );
+        }
+    }
+
+    #[test]
+    fn inconsistent_proxy_mappers_fail_before_warm_cache_publication() {
+        let parsed = parse_source_file(concat!(
+            "interface Box<T> { first: T; second: T }\n",
+            "declare const text: Box<string>;\n",
+            "const first: string = text.first;\n",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(6_203);
+        let mut context = checker_context(&parsed, file, CanonicalCheckerOptions::default());
+        context.check_source_file(file).unwrap();
+        let text = source_symbol(&parsed, file, &context, "text");
+        let reference = context
+            .store()
+            .value_symbol_links(text)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        let members = context
+            .store_mut_for_test()
+            .resolve_generic_interface_members(reference, None)
+            .unwrap();
+        let [first, second] = members.properties() else {
+            panic!("the generic interface must retain two ordered properties")
+        };
+        let (first, second) = (*first, *second);
+        let target = members.target();
+        let (parameter, this_type) = match context.store().type_payload(target).unwrap().data() {
+            TypeData::Interface(interface) => (
+                interface
+                    .reference
+                    .resolved_type_arguments
+                    .as_ref()
+                    .unwrap()[0],
+                interface.this_type.unwrap(),
+            ),
+            _ => panic!("the member cache must retain its generic target"),
+        };
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        let forged = context
+            .store_mut_for_test()
+            .new_type_mapper(vec![parameter, this_type], vec![string, reference])
+            .unwrap();
+        let links = context.store().value_symbol_links(second).cloned().unwrap();
+        assert!(context.store_mut_for_test().set_value_symbol_links(
+            second,
+            ValueSymbolLinks {
+                mapper: Some(forged),
+                ..links
+            },
+        ));
+        let before = (
+            context.store().type_len(),
+            context.store().mapper_len(),
+            context.store().symbol_len(),
+            context.store().symbol_store().symbol_table_len(),
+        );
+
+        assert_eq!(
+            validate_generic_interface_members(context.store(), reference, None),
+            Err(GenericInterfaceMemberError::InvalidCachedProperty(second)),
+        );
+        assert_eq!(
+            context
+                .store_mut_for_test()
+                .resolve_generic_interface_property(reference, "first", None),
+            Err(GenericInterfaceMemberError::InvalidCachedProperty(second)),
+        );
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().mapper_len(),
+                context.store().symbol_len(),
+                context.store().symbol_store().symbol_table_len(),
+            ),
+            before,
+        );
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn poisoned_exact_optional_union_cache_is_rejected_without_mutation() {
+        let parsed = parse_source_file(concat!(
+            "interface Box<T> { value?: undefined }\n",
+            "type TextBox = Box<string>;\n",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(6_204);
+        let mut context = checker_context(
+            &parsed,
+            file,
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    exact_optional_property_types: true,
+                },
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+        context.check_source_file(file).unwrap();
+        let owner = source_symbol(&parsed, file, &context, "Box");
+        let alias = source_symbol(&parsed, file, &context, "TextBox");
+        let target = context.get_declared_type_of_symbol(owner).unwrap();
+        let reference = context.get_declared_type_of_symbol(alias).unwrap();
+        let (parameter, source_property) = {
+            let TypeData::Interface(interface) =
+                context.store().type_payload(target).unwrap().data()
+            else {
+                panic!("the source owner must retain its generic interface")
+            };
+            (
+                interface
+                    .reference
+                    .resolved_type_arguments
+                    .as_ref()
+                    .unwrap()[0],
+                context
+                    .store()
+                    .symbol_table(interface.declared_members.unwrap())
+                    .and_then(|table| table.get_source("value"))
+                    .unwrap(),
+            )
+        };
+        let missing = context.store().intrinsic_bootstrap().unwrap().missing_type;
+        let template = context
+            .store_mut_for_test()
+            .alloc_union_type(ObjectFlags::NONE, vec![missing, parameter])
+            .unwrap();
+        assert!(context.store_mut_for_test().set_value_symbol_links(
+            source_property,
+            ValueSymbolLinks {
+                resolved_type: Some(template),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        let property = context
+            .store_mut_for_test()
+            .resolve_generic_interface_property(reference, "value", None)
+            .unwrap()
+            .unwrap();
+        let flags = context
+            .store()
+            .type_payload(property.type_id())
+            .unwrap()
+            .object_flags();
+        assert!(flags.contains(ObjectFlags::PRIMITIVE_UNION));
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_type_object_flags(property.type_id(), flags & !ObjectFlags::PRIMITIVE_UNION,)
+        );
+        let before = (
+            context.store().type_len(),
+            context.store().mapper_len(),
+            context.store().symbol_len(),
+            context.store().symbol_store().symbol_table_len(),
+        );
+
+        assert_eq!(
+            validate_generic_interface_members(context.store(), reference, None),
+            Err(GenericInterfaceMemberError::InvalidCachedProperty(
+                property.symbol(),
+            )),
+        );
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().mapper_len(),
+                context.store().symbol_len(),
+                context.store().symbol_store().symbol_table_len(),
+            ),
+            before,
+        );
     }
 }

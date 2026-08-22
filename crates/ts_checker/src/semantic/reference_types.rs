@@ -199,6 +199,8 @@ fn validate_direct_target_shell(
         || !(record.object_flags() & !allowed_flags).is_empty()
         || record.symbol() != Some(shape.symbol)
         || !symbol_flags.intersects(SymbolFlags::CLASS | SymbolFlags::INTERFACE)
+        || target_origin == ObjectFlags::CLASS && !symbol_flags.contains(SymbolFlags::CLASS)
+        || target_origin == ObjectFlags::INTERFACE && !symbol_flags.contains(SymbolFlags::INTERFACE)
         || malformed_alias_merge(symbol_flags)
         || store
             .declared_type_links(shape.symbol)
@@ -356,24 +358,61 @@ fn validate_reference_argument_graph(
     let Some(record) = store.type_payload(reference) else {
         return Ok(());
     };
+    let constituents = match record.data() {
+        TypeData::Union(union) => Some(union.union.types.as_slice()),
+        TypeData::Intersection(intersection) => Some(intersection.intersection.types.as_slice()),
+        _ => None,
+    };
+    if let Some(constituents) = constituents {
+        active.push(reference);
+        for constituent in constituents {
+            validate_reference_argument_graph(store, *constituent, active, validated)?;
+        }
+        let popped = active
+            .pop()
+            .expect("a composite argument owns one active validation frame");
+        debug_assert_eq!(popped, reference);
+        validated.insert(reference);
+        return Ok(());
+    }
     let Some(reference_data) = direct_reference_parts(record) else {
         return Ok(());
     };
-    let (Some(target), Some(arguments)) = (
+    let (target, arguments) = match (
         reference_data.object.target,
         reference_data.resolved_type_arguments.as_deref(),
-    ) else {
-        return Ok(());
+    ) {
+        (Some(target), Some(arguments)) => (target, arguments),
+        _ if matches!(record.data(), TypeData::TypeReference(_)) => {
+            return Err(DirectGenericReferenceError::InvalidCachedReference {
+                target: reference_data.object.target.unwrap_or(reference),
+                reference,
+            });
+        }
+        _ => return Ok(()),
     };
     if target == reference {
         // The origin's `(type parameters) -> origin` edge is the legal
         // recursive identity installed by declared-type initialization.
+        let shape = direct_target_header(store, target)?;
+        validate_direct_target_shell(store, &shape)?;
         return Ok(());
     }
-    let Ok(shape) = direct_target_header(store, target) else {
-        // Tuple and deferred-reference argument families are opaque at this
-        // first direct class/interface boundary.
-        return Ok(());
+    let shape = match direct_target_header(store, target) {
+        Ok(shape) => shape,
+        Err(error)
+            if matches!(
+                store.type_payload(target).map(TypeRecord::data),
+                Some(TypeData::Interface(_))
+            ) =>
+        {
+            return Err(error);
+        }
+        Err(_) => {
+            // Tuple and deferred-reference argument families are opaque at
+            // this direct class/interface boundary.
+            return Ok(());
+        }
     };
     validate_direct_target_shell(store, &shape)?;
     let key = type_list_key(arguments);
@@ -539,6 +578,15 @@ pub(super) fn create_direct_generic_reference(
         }
     }
     validate_direct_target_and_cache(store, &shape)?;
+    let mut validated_arguments = HashSet::new();
+    for argument in type_arguments {
+        validate_reference_argument_graph(
+            store,
+            *argument,
+            &mut Vec::new(),
+            &mut validated_arguments,
+        )?;
+    }
 
     let key = type_list_key(type_arguments);
     let existing = {
@@ -625,7 +673,7 @@ mod tests {
         mapper::TypeMapper,
         type_records::TypeRecord,
     };
-    use ts_binder::{EscapedName, SymbolData};
+    use ts_binder::{CheckFlags, EscapedName, SymbolData};
 
     fn initialized_store() -> CanonicalTypeMapperStore {
         let mut store = SemanticStore::<TypeRecord, TypeMapper>::new();
@@ -843,6 +891,120 @@ mod tests {
             }),
             "the retained key must match the exact argument vector",
         );
+    }
+
+    #[test]
+    fn poisoned_nested_reference_mapper_is_rejected_before_outer_publication() {
+        let mut store = initialized_store();
+        let (outer, _) = generic_target(&mut store, "Wrapper", ObjectFlags::INTERFACE, 1);
+        let (inner, parameters) = generic_target(&mut store, "Box", ObjectFlags::INTERFACE, 1);
+        let string = store.intrinsic_bootstrap().unwrap().string_type;
+        let nested =
+            create_direct_generic_reference(&mut store, inner, &[string], ObjectFlags::NONE)
+                .unwrap();
+        let mapper = store.new_simple_type_mapper(parameters[0], string).unwrap();
+        assert!(store.set_object_target_and_mapper(nested, Some(inner), Some(mapper)));
+        let before = (store.type_len(), store.mapper_len());
+
+        assert_eq!(
+            create_direct_generic_reference(&mut store, outer, &[nested], ObjectFlags::NONE),
+            Err(DirectGenericReferenceError::InvalidCachedReference {
+                target: inner,
+                reference: nested,
+            }),
+        );
+        assert_eq!((store.type_len(), store.mapper_len()), before);
+        let TypeData::Interface(target) = store.type_payload(outer).unwrap().data() else {
+            panic!("the outer generic target must retain its canonical cache")
+        };
+        let TypeCacheState::Allocated(cache) = &target.reference.object.instantiations else {
+            panic!("the outer generic target must own its instantiation cache")
+        };
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn poisoned_references_inside_union_arguments_are_rejected_before_publication() {
+        let mut store = initialized_store();
+        let (outer, _) = generic_target(&mut store, "Wrapper", ObjectFlags::INTERFACE, 1);
+        let (inner, parameters) = generic_target(&mut store, "Box", ObjectFlags::INTERFACE, 1);
+        let (string, number) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (bootstrap.string_type, bootstrap.number_type)
+        };
+        let nested =
+            create_direct_generic_reference(&mut store, inner, &[string], ObjectFlags::NONE)
+                .unwrap();
+        let mapper = store.new_simple_type_mapper(parameters[0], number).unwrap();
+        assert!(store.set_object_target_and_mapper(nested, Some(inner), Some(mapper)));
+        let argument = store
+            .alloc_union_type(ObjectFlags::NONE, vec![nested, string])
+            .unwrap();
+        let before = store.type_len();
+
+        assert_eq!(
+            create_direct_generic_reference(&mut store, outer, &[argument], ObjectFlags::NONE),
+            Err(DirectGenericReferenceError::InvalidCachedReference {
+                target: inner,
+                reference: nested,
+            }),
+        );
+        assert_eq!(store.type_len(), before);
+    }
+
+    #[test]
+    fn malformed_nested_reference_and_origin_fail_without_outer_allocation() {
+        let mut store = initialized_store();
+        let (outer, _) = generic_target(&mut store, "Wrapper", ObjectFlags::INTERFACE, 1);
+        let orphan = store.alloc_type_reference(ObjectFlags::NONE, None).unwrap();
+        let before = store.type_len();
+
+        assert_eq!(
+            create_direct_generic_reference(&mut store, outer, &[orphan], ObjectFlags::NONE),
+            Err(DirectGenericReferenceError::InvalidCachedReference {
+                target: orphan,
+                reference: orphan,
+            }),
+        );
+        assert_eq!(store.type_len(), before);
+
+        let (inner, parameters) = generic_target(&mut store, "Inner", ObjectFlags::INTERFACE, 1);
+        let string = store.intrinsic_bootstrap().unwrap().string_type;
+        let mapper = store.new_simple_type_mapper(parameters[0], string).unwrap();
+        let this_type = match store.type_payload(inner).unwrap().data() {
+            TypeData::Interface(interface) => interface.this_type.unwrap(),
+            _ => panic!("the nested generic target must be an interface"),
+        };
+        assert!(store.set_type_parameter_resolution(
+            this_type,
+            Some(inner),
+            None,
+            Some(mapper),
+            None,
+        ));
+        let before = store.type_len();
+
+        assert_eq!(
+            create_direct_generic_reference(&mut store, outer, &[inner], ObjectFlags::NONE),
+            Err(DirectGenericReferenceError::InvalidTarget(inner)),
+        );
+        assert_eq!(store.type_len(), before);
+    }
+
+    #[test]
+    fn target_symbol_kind_must_match_its_class_or_interface_origin() {
+        let mut store = initialized_store();
+        let (target, _) = generic_target(&mut store, "Box", ObjectFlags::INTERFACE, 1);
+        let owner = store.type_payload(target).unwrap().symbol().unwrap();
+        assert!(store.set_symbol_flags(owner, SymbolFlags::CLASS, CheckFlags::NONE));
+        let string = store.intrinsic_bootstrap().unwrap().string_type;
+        let before = store.type_len();
+
+        assert_eq!(
+            create_direct_generic_reference(&mut store, target, &[string], ObjectFlags::NONE),
+            Err(DirectGenericReferenceError::InvalidTarget(target)),
+        );
+        assert_eq!(store.type_len(), before);
     }
 
     #[test]
