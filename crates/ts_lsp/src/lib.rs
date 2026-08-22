@@ -104,6 +104,7 @@ pub struct ServerCapabilities {
     pub definition_provider: bool,
     pub references_provider: bool,
     pub rename_provider: bool,
+    pub diagnostic_provider: DiagnosticOptions,
     pub document_symbol_provider: bool,
     pub workspace_symbol_provider: bool,
     pub call_hierarchy_provider: bool,
@@ -118,6 +119,13 @@ pub struct ServerCapabilities {
     pub document_range_formatting_provider: bool,
     pub document_on_type_formatting_provider: DocumentOnTypeFormattingOptions,
     pub completion_provider: CompletionOptions,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagnosticOptions {
+    pub inter_file_dependencies: bool,
+    pub workspace_diagnostics: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
@@ -495,6 +503,30 @@ pub struct PublishDiagnosticsParams {
     pub diagnostics: Vec<Diagnostic>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DocumentDiagnosticParams {
+    pub text_document: TextDocumentIdentifier,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identifier: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_result_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum DocumentDiagnosticReport {
+    Full {
+        #[serde(rename = "resultId")]
+        result_id: String,
+        items: Vec<Diagnostic>,
+    },
+    Unchanged {
+        #[serde(rename = "resultId")]
+        result_id: String,
+    },
+}
+
 /// A server-originated JSON-RPC message.
 #[derive(Clone, Debug, Serialize)]
 #[serde(untagged)]
@@ -612,6 +644,9 @@ impl Server {
         if method == "textDocument/definition" {
             return vec![self.definition(id, message.params)];
         }
+        if method == "textDocument/diagnostic" {
+            return vec![self.document_diagnostic(id, message.params)];
+        }
         if method == "textDocument/references" {
             return vec![self.references(id, message.params)];
         }
@@ -691,6 +726,10 @@ impl Server {
                 definition_provider: true,
                 references_provider: true,
                 rename_provider: true,
+                diagnostic_provider: DiagnosticOptions {
+                    inter_file_dependencies: true,
+                    workspace_diagnostics: false,
+                },
                 document_symbol_provider: true,
                 workspace_symbol_provider: true,
                 call_hierarchy_provider: true,
@@ -914,6 +953,39 @@ impl Server {
             uri,
             range: node_range(target_source, declaration)?,
         })
+    }
+
+    fn document_diagnostic(&self, id: Id, params: Option<Value>) -> OutgoingMessage {
+        let Ok(params) = deserialize_params::<DocumentDiagnosticParams>(params) else {
+            return failure(id, CODE_INVALID_PARAMS, "invalid diagnostic parameters");
+        };
+        let result_id = self.diagnostic_result_id(&params.text_document.uri);
+        let report = if params.previous_result_id.as_deref() == Some(result_id.as_str()) {
+            DocumentDiagnosticReport::Unchanged { result_id }
+        } else {
+            let program = self.build_program();
+            let items = self
+                .documents
+                .get(&params.text_document.uri)
+                .map_or_else(Vec::new, |document| {
+                    diagnostics_for_document(&program, document)
+                });
+            DocumentDiagnosticReport::Full { result_id, items }
+        };
+        OutgoingMessage::Response(Response::success(
+            id,
+            serde_json::to_value(report).unwrap_or(Value::Null),
+        ))
+    }
+
+    fn diagnostic_result_id(&self, uri: &DocumentUri) -> String {
+        let mut hash = stable_hash(uri.0.as_bytes());
+        for (document_uri, document) in &self.documents {
+            hash = continue_stable_hash(hash, document_uri.0.as_bytes());
+            hash = continue_stable_hash(hash, &document.version.to_le_bytes());
+            hash = continue_stable_hash(hash, document.text.as_bytes());
+        }
+        format!("{hash:016x}")
     }
 
     fn references(&self, id: Id, params: Option<Value>) -> OutgoingMessage {
@@ -3275,7 +3347,11 @@ const fn hex(byte: u8) -> Option<u8> {
 }
 
 fn stable_hash(bytes: &[u8]) -> u64 {
-    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+    continue_stable_hash(0xcbf2_9ce4_8422_2325, bytes)
+}
+
+fn continue_stable_hash(hash: u64, bytes: &[u8]) -> u64 {
+    bytes.iter().fold(hash, |hash, byte| {
         (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
     })
 }
@@ -3712,6 +3788,92 @@ mod tests {
     }
 
     #[test]
+    fn pull_diagnostics_invalidate_when_a_dependency_changes() {
+        let dependency_uri = DocumentUri("file:///workspace/dep.ts".to_owned());
+        let main_uri = DocumentUri("file:///workspace/main.ts".to_owned());
+        let mut server = ready_server();
+
+        for (uri, text) in [
+            (dependency_uri.clone(), "export const count: number = 1;"),
+            (
+                main_uri.clone(),
+                "import { count } from './dep'; const value: string = count;",
+            ),
+        ] {
+            let _ = server.handle_message(incoming(&Notification::new(
+                "textDocument/didOpen",
+                Some(DidOpenTextDocumentParams {
+                    text_document: TextDocumentItem {
+                        uri,
+                        language_id: "typescript".to_owned(),
+                        version: 1,
+                        text: text.to_owned(),
+                    },
+                }),
+            )));
+        }
+
+        let request = |id, previous_result_id| {
+            incoming(&Request::new(
+                id,
+                "textDocument/diagnostic",
+                Some(DocumentDiagnosticParams {
+                    text_document: TextDocumentIdentifier {
+                        uri: main_uri.clone(),
+                    },
+                    identifier: None,
+                    previous_result_id,
+                }),
+            ))
+        };
+        let initial =
+            serde_json::to_value(&server.handle_message(request(80_i64, None))[0]).unwrap();
+        assert_eq!(initial["result"]["kind"], "full");
+        assert!(
+            initial["result"]["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|diagnostic| diagnostic["code"] == 2322)
+        );
+        let result_id = initial["result"]["resultId"].as_str().unwrap().to_owned();
+
+        let unchanged = serde_json::to_value(
+            &server.handle_message(request(81_i64, Some(result_id.clone())))[0],
+        )
+        .unwrap();
+        assert_eq!(
+            unchanged["result"],
+            json!({
+                "kind": "unchanged",
+                "resultId": result_id,
+            })
+        );
+
+        let _ = server.handle_message(incoming(&Notification::new(
+            "textDocument/didChange",
+            Some(DidChangeTextDocumentParams {
+                text_document: VersionedTextDocumentIdentifier {
+                    uri: dependency_uri,
+                    version: 2,
+                },
+                content_changes: vec![TextDocumentContentChangeEvent {
+                    range: None,
+                    range_length: None,
+                    text: "export const count: string = 'fixed';".to_owned(),
+                }],
+            }),
+        )));
+        let updated = serde_json::to_value(
+            &server.handle_message(request(82_i64, Some(result_id.clone())))[0],
+        )
+        .unwrap();
+        assert_eq!(updated["result"]["kind"], "full");
+        assert_eq!(updated["result"]["items"], json!([]));
+        assert_ne!(updated["result"]["resultId"], result_id);
+    }
+
+    #[test]
     fn runs_an_in_memory_lifecycle_and_document_session() {
         let uri = DocumentUri("file:///workspace/main.ts".to_owned());
         let mut input = FramedWriter::new(Vec::new());
@@ -3780,6 +3942,10 @@ mod tests {
             2
         );
         let capabilities = &initialize["result"]["capabilities"];
+        assert_eq!(
+            capabilities["diagnosticProvider"]["interFileDependencies"],
+            true
+        );
         assert_eq!(capabilities["semanticTokensProvider"]["full"], true);
         assert_eq!(capabilities["foldingRangeProvider"], true);
         assert_eq!(capabilities["selectionRangeProvider"], true);
