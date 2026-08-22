@@ -77,23 +77,38 @@ pub enum ModuleDetectionKind {
     Force,
 }
 
+/// Line ending requested for emitted files.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum NewLineKind {
+    #[default]
+    Lf,
+    Crlf,
+}
+
 /// Normalized compiler options consumed by compiler subsystems.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct CompilerOptions {
     pub always_strict: bool,
     pub allow_arbitrary_extensions: bool,
+    pub allow_importing_ts_extensions: bool,
     pub allow_js: bool,
+    pub allow_umd_global_access: bool,
     pub allow_unreachable_code: Option<bool>,
+    pub allow_unused_labels: Option<bool>,
     pub allow_synthetic_default_imports: bool,
+    pub assume_changes_only_affect_direct_dependencies: bool,
     pub check_js: bool,
     pub composite: bool,
     pub declaration: bool,
     pub declaration_map: bool,
+    pub deduplicate_packages: bool,
+    pub disable_size_limit: bool,
     pub downlevel_iteration: bool,
     pub emit_declaration_only: bool,
     pub emit_bom: bool,
     pub emit_decorator_metadata: bool,
+    pub erasable_syntax_only: bool,
     pub experimental_decorators: bool,
     pub es_module_interop: bool,
     pub exact_optional_property_types: bool,
@@ -101,25 +116,39 @@ pub struct CompilerOptions {
     pub isolated_modules: bool,
     pub isolated_declarations: bool,
     pub import_helpers: bool,
+    pub lib_replacement: bool,
     pub module_detection: ModuleDetectionKind,
+    pub new_line: NewLineKind,
     pub no_check: bool,
     pub no_emit: bool,
     pub no_emit_helpers: bool,
     pub no_emit_on_error: bool,
+    pub no_error_truncation: bool,
     pub remove_comments: bool,
     pub rewrite_relative_import_extensions: bool,
     pub no_implicit_any: bool,
     /// Whether `noImplicitAny` was explicitly supplied rather than inherited
     /// from `strict`.
     pub no_implicit_any_specified: bool,
+    pub no_implicit_override: bool,
     pub no_implicit_returns: bool,
+    pub no_implicit_this: bool,
+    /// Whether `noImplicitThis` was explicitly supplied rather than inherited
+    /// from `strict`.
+    pub no_implicit_this_specified: bool,
     pub no_lib: bool,
     pub no_fallthrough_cases_in_switch: bool,
+    pub no_property_access_from_index_signature: bool,
+    pub no_resolve: bool,
+    pub no_unchecked_indexed_access: bool,
     pub no_unchecked_side_effect_imports: bool,
     pub no_unused_locals: bool,
     pub no_unused_parameters: bool,
     pub preserve_const_enums: bool,
+    pub preserve_symlinks: bool,
+    pub skip_default_lib_check: bool,
     pub skip_lib_check: bool,
+    pub stable_type_ordering: bool,
     pub strip_internal: bool,
     pub strict: bool,
     /// Whether `strict` was explicitly supplied.
@@ -161,6 +190,10 @@ pub struct CompilerOptions {
     pub jsx_fragment_factory: Option<String>,
     pub jsx_import_source: Option<String>,
     pub react_namespace: Option<String>,
+    pub ignore_deprecations: Option<String>,
+    pub max_node_module_js_depth: Option<i64>,
+    pub custom_conditions: Option<Vec<String>>,
+    pub module_suffixes: Option<Vec<String>>,
     pub resolve_json_module: bool,
     pub resolve_package_json_exports: bool,
     pub resolve_package_json_imports: bool,
@@ -183,21 +216,29 @@ pub struct CompilerOptions {
 }
 
 impl Default for CompilerOptions {
+    #[allow(clippy::too_many_lines)] // Each compiler option has an explicit upstream default.
     fn default() -> Self {
         Self {
             always_strict: true,
             allow_arbitrary_extensions: false,
+            allow_importing_ts_extensions: false,
             allow_js: false,
+            allow_umd_global_access: false,
             allow_unreachable_code: None,
+            allow_unused_labels: None,
             allow_synthetic_default_imports: false,
+            assume_changes_only_affect_direct_dependencies: false,
             check_js: false,
             composite: false,
             declaration: false,
             declaration_map: false,
+            deduplicate_packages: true,
+            disable_size_limit: false,
             downlevel_iteration: false,
             emit_declaration_only: false,
             emit_bom: false,
             emit_decorator_metadata: false,
+            erasable_syntax_only: false,
             experimental_decorators: false,
             es_module_interop: true,
             exact_optional_property_types: false,
@@ -205,23 +246,35 @@ impl Default for CompilerOptions {
             isolated_modules: false,
             isolated_declarations: false,
             import_helpers: false,
+            lib_replacement: false,
             module_detection: ModuleDetectionKind::Auto,
+            new_line: NewLineKind::Lf,
             no_check: false,
             no_emit: false,
             no_emit_helpers: false,
             no_emit_on_error: false,
+            no_error_truncation: false,
             remove_comments: false,
             rewrite_relative_import_extensions: false,
             no_implicit_any: true,
             no_implicit_any_specified: false,
+            no_implicit_override: false,
             no_implicit_returns: false,
+            no_implicit_this: true,
+            no_implicit_this_specified: false,
             no_lib: false,
             no_fallthrough_cases_in_switch: false,
+            no_property_access_from_index_signature: false,
+            no_resolve: false,
+            no_unchecked_indexed_access: false,
             no_unchecked_side_effect_imports: false,
             no_unused_locals: false,
             no_unused_parameters: false,
             preserve_const_enums: false,
+            preserve_symlinks: false,
+            skip_default_lib_check: false,
             skip_lib_check: false,
+            stable_type_ordering: true,
             strip_internal: false,
             strict: true,
             strict_specified: false,
@@ -249,6 +302,10 @@ impl Default for CompilerOptions {
             jsx_fragment_factory: None,
             jsx_import_source: None,
             react_namespace: None,
+            ignore_deprecations: None,
+            max_node_module_js_depth: None,
+            custom_conditions: None,
+            module_suffixes: None,
             resolve_json_module: false,
             resolve_package_json_exports: true,
             resolve_package_json_imports: true,
@@ -314,23 +371,52 @@ impl CompilerOptions {
                 "allowarbitraryextensions" => {
                     self.allow_arbitrary_extensions = overrides.allow_arbitrary_extensions;
                 }
+                "allowimportingtsextensions" => {
+                    self.allow_importing_ts_extensions = overrides.allow_importing_ts_extensions;
+                }
                 "allowjs" => self.allow_js = overrides.allow_js,
+                "allowumdglobalaccess" => {
+                    self.allow_umd_global_access = overrides.allow_umd_global_access;
+                }
                 "allowunreachablecode" => {
                     self.allow_unreachable_code = overrides.allow_unreachable_code;
                 }
+                "allowunusedlabels" => self.allow_unused_labels = overrides.allow_unused_labels,
                 "allowsyntheticdefaultimports" => {
                     self.allow_synthetic_default_imports =
                         overrides.allow_synthetic_default_imports;
                 }
+                "assumechangesonlyaffectdirectdependencies" => {
+                    self.assume_changes_only_affect_direct_dependencies =
+                        overrides.assume_changes_only_affect_direct_dependencies;
+                }
+                "baseurl" => self.base_url.clone_from(&overrides.base_url),
                 "checkjs" => {
                     self.check_js = overrides.check_js;
                     if !names.contains("allowjs") {
                         self.allow_js = overrides.allow_js;
                     }
                 }
+                "composite" => {
+                    self.composite = overrides.composite;
+                    if !names.contains("declaration") {
+                        self.declaration = overrides.declaration;
+                    }
+                }
+                "customconditions" => {
+                    self.custom_conditions
+                        .clone_from(&overrides.custom_conditions);
+                }
                 "declaration" => self.declaration = overrides.declaration,
+                "declarationdir" => self.declaration_dir.clone_from(&overrides.declaration_dir),
+                "declarationmap" => self.declaration_map = overrides.declaration_map,
+                "deduplicatepackages" => self.deduplicate_packages = overrides.deduplicate_packages,
+                "disablesizelimit" => self.disable_size_limit = overrides.disable_size_limit,
                 "downleveliteration" => {
                     self.downlevel_iteration = overrides.downlevel_iteration;
+                }
+                "emitdeclarationonly" => {
+                    self.emit_declaration_only = overrides.emit_declaration_only;
                 }
                 "esmoduleinterop" => {
                     self.es_module_interop = overrides.es_module_interop;
@@ -357,7 +443,13 @@ impl CompilerOptions {
                     self.experimental_decorators = overrides.experimental_decorators;
                 }
                 "emitbom" => self.emit_bom = overrides.emit_bom,
+                "erasablesyntaxonly" => self.erasable_syntax_only = overrides.erasable_syntax_only,
+                "ignoredeprecations" => {
+                    self.ignore_deprecations
+                        .clone_from(&overrides.ignore_deprecations);
+                }
                 "importhelpers" => self.import_helpers = overrides.import_helpers,
+                "incremental" => self.incremental = overrides.incremental,
                 "jsx" => self.jsx = overrides.jsx,
                 "jsxfactory" => self.jsx_factory.clone_from(&overrides.jsx_factory),
                 "jsxfragmentfactory" => self
@@ -366,6 +458,11 @@ impl CompilerOptions {
                 "jsximportsource" => self
                     .jsx_import_source
                     .clone_from(&overrides.jsx_import_source),
+                "lib" => self.lib.clone_from(&overrides.lib),
+                "libreplacement" => self.lib_replacement = overrides.lib_replacement,
+                "maxnodemodulejsdepth" => {
+                    self.max_node_module_js_depth = overrides.max_node_module_js_depth;
+                }
                 "reactnamespace" => self.react_namespace.clone_from(&overrides.react_namespace),
                 "module" => {
                     self.module = overrides.module;
@@ -376,10 +473,13 @@ impl CompilerOptions {
                 }
                 "moduledetection" => self.module_detection = overrides.module_detection,
                 "moduleresolution" => self.module_resolution = overrides.module_resolution,
+                "modulesuffixes" => self.module_suffixes.clone_from(&overrides.module_suffixes),
+                "newline" => self.new_line = overrides.new_line,
                 "nocheck" => self.no_check = overrides.no_check,
                 "noemit" => self.no_emit = overrides.no_emit,
                 "noemithelpers" => self.no_emit_helpers = overrides.no_emit_helpers,
                 "noemitonerror" => self.no_emit_on_error = overrides.no_emit_on_error,
+                "noerrortruncation" => self.no_error_truncation = overrides.no_error_truncation,
                 "removecomments" => self.remove_comments = overrides.remove_comments,
                 "rewriterelativeimportextensions" => {
                     self.rewrite_relative_import_extensions =
@@ -389,10 +489,23 @@ impl CompilerOptions {
                     self.no_implicit_any = overrides.no_implicit_any;
                     self.no_implicit_any_specified = true;
                 }
+                "noimplicitoverride" => self.no_implicit_override = overrides.no_implicit_override,
                 "noimplicitreturns" => self.no_implicit_returns = overrides.no_implicit_returns,
+                "noimplicitthis" => {
+                    self.no_implicit_this = overrides.no_implicit_this;
+                    self.no_implicit_this_specified = true;
+                }
                 "nolib" => self.no_lib = overrides.no_lib,
                 "nofallthroughcasesinswitch" => {
                     self.no_fallthrough_cases_in_switch = overrides.no_fallthrough_cases_in_switch;
+                }
+                "nopropertyaccessfromindexsignature" => {
+                    self.no_property_access_from_index_signature =
+                        overrides.no_property_access_from_index_signature;
+                }
+                "noresolve" => self.no_resolve = overrides.no_resolve,
+                "nouncheckedindexedaccess" => {
+                    self.no_unchecked_indexed_access = overrides.no_unchecked_indexed_access;
                 }
                 "nouncheckedsideeffectimports" => {
                     self.no_unchecked_side_effect_imports =
@@ -402,9 +515,12 @@ impl CompilerOptions {
                 "nounusedparameters" => self.no_unused_parameters = overrides.no_unused_parameters,
                 "outfile" => self.out_file.clone_from(&overrides.out_file),
                 "outdir" => self.out_dir.clone_from(&overrides.out_dir),
+                "paths" => self.paths.clone_from(&overrides.paths),
                 "preserveconstenums" => {
                     self.preserve_const_enums = overrides.preserve_const_enums;
                 }
+                "preservesymlinks" => self.preserve_symlinks = overrides.preserve_symlinks,
+                "resolvejsonmodule" => self.resolve_json_module = overrides.resolve_json_module,
                 "resolvepackagejsonexports" => {
                     self.resolve_package_json_exports = overrides.resolve_package_json_exports;
                 }
@@ -412,7 +528,12 @@ impl CompilerOptions {
                     self.resolve_package_json_imports = overrides.resolve_package_json_imports;
                 }
                 "rootdir" => self.root_dir.clone_from(&overrides.root_dir),
+                "rootdirs" => self.root_dirs.clone_from(&overrides.root_dirs),
+                "skipdefaultlibcheck" => {
+                    self.skip_default_lib_check = overrides.skip_default_lib_check;
+                }
                 "skiplibcheck" => self.skip_lib_check = overrides.skip_lib_check,
+                "stabletypeordering" => self.stable_type_ordering = overrides.stable_type_ordering,
                 "stripinternal" => self.strip_internal = overrides.strip_internal,
                 "sourcemap" => self.source_map = overrides.source_map,
                 "inlinesourcemap" => self.inline_source_map = overrides.inline_source_map,
@@ -440,6 +561,9 @@ impl CompilerOptions {
                     }
                     if !names.contains("noimplicitany") && !self.no_implicit_any_specified {
                         self.no_implicit_any = overrides.no_implicit_any;
+                    }
+                    if !names.contains("noimplicitthis") && !self.no_implicit_this_specified {
+                        self.no_implicit_this = overrides.no_implicit_this;
                     }
                     if !names.contains("strictnullchecks") && !self.strict_null_checks_specified {
                         self.strict_null_checks = overrides.strict_null_checks;
@@ -477,6 +601,12 @@ impl CompilerOptions {
                     self.strict_property_initialization = overrides.strict_property_initialization;
                     self.strict_property_initialization_specified = true;
                 }
+                "tsbuildinfofile" => {
+                    self.ts_build_info_file
+                        .clone_from(&overrides.ts_build_info_file);
+                }
+                "typeroots" => self.type_roots.clone_from(&overrides.type_roots),
+                "types" => self.types.clone_from(&overrides.types),
                 "target" => self.target = overrides.target,
                 "usedefineforclassfields" => {
                     self.use_define_for_class_fields = overrides.use_define_for_class_fields;
@@ -611,21 +741,44 @@ pub fn parse_compiler_options_map(options: &BTreeMap<String, JsonValue>) -> Pars
             "allowarbitraryextensions" => {
                 parsed.allow_arbitrary_extensions = boolean(original_name, value, &mut diagnostics);
             }
+            "allowimportingtsextensions" => {
+                parsed.allow_importing_ts_extensions =
+                    boolean(original_name, value, &mut diagnostics);
+            }
             "allowjs" => parsed.allow_js = boolean(original_name, value, &mut diagnostics),
+            "allowumdglobalaccess" => {
+                parsed.allow_umd_global_access = boolean(original_name, value, &mut diagnostics);
+            }
             "allowunreachablecode" => {
                 parsed.allow_unreachable_code = boolean(original_name, value, &mut diagnostics);
+            }
+            "allowunusedlabels" => {
+                parsed.allow_unused_labels = boolean(original_name, value, &mut diagnostics);
             }
             "allowsyntheticdefaultimports" => {
                 parsed.allow_synthetic_default_imports =
                     boolean(original_name, value, &mut diagnostics);
             }
+            "assumechangesonlyaffectdirectdependencies" => {
+                parsed.assume_changes_only_affect_direct_dependencies =
+                    boolean(original_name, value, &mut diagnostics);
+            }
             "checkjs" => parsed.check_js = boolean(original_name, value, &mut diagnostics),
             "composite" => parsed.composite = boolean(original_name, value, &mut diagnostics),
+            "customconditions" => {
+                parsed.custom_conditions = string_array(original_name, value, &mut diagnostics);
+            }
             "declaration" => {
                 parsed.declaration = boolean(original_name, value, &mut diagnostics);
             }
             "declarationmap" => {
                 parsed.declaration_map = boolean(original_name, value, &mut diagnostics);
+            }
+            "deduplicatepackages" => {
+                parsed.deduplicate_packages = boolean(original_name, value, &mut diagnostics);
+            }
+            "disablesizelimit" => {
+                parsed.disable_size_limit = boolean(original_name, value, &mut diagnostics);
             }
             "downleveliteration" => {
                 parsed.downlevel_iteration = boolean(original_name, value, &mut diagnostics);
@@ -638,6 +791,9 @@ pub fn parse_compiler_options_map(options: &BTreeMap<String, JsonValue>) -> Pars
             }
             "emitdecoratormetadata" => {
                 parsed.emit_decorator_metadata = boolean(original_name, value, &mut diagnostics);
+            }
+            "erasablesyntaxonly" => {
+                parsed.erasable_syntax_only = boolean(original_name, value, &mut diagnostics);
             }
             "experimentaldecorators" => {
                 parsed.experimental_decorators = boolean(original_name, value, &mut diagnostics);
@@ -662,9 +818,24 @@ pub fn parse_compiler_options_map(options: &BTreeMap<String, JsonValue>) -> Pars
             "importhelpers" => {
                 parsed.import_helpers = boolean(original_name, value, &mut diagnostics);
             }
+            "ignoredeprecations" => {
+                parsed.ignore_deprecations = string(original_name, value, &mut diagnostics);
+            }
+            "libreplacement" => {
+                parsed.lib_replacement = boolean(original_name, value, &mut diagnostics);
+            }
+            "maxnodemodulejsdepth" => {
+                parsed.max_node_module_js_depth = number(original_name, value, &mut diagnostics);
+            }
             "moduledetection" => {
                 parsed.module_detection =
                     enum_value(original_name, value, &mut diagnostics, module_detection);
+            }
+            "modulesuffixes" => {
+                parsed.module_suffixes = string_array(original_name, value, &mut diagnostics);
+            }
+            "newline" => {
+                parsed.new_line = enum_value(original_name, value, &mut diagnostics, new_line);
             }
             "nocheck" => parsed.no_check = boolean(original_name, value, &mut diagnostics),
             "noemit" => parsed.no_emit = boolean(original_name, value, &mut diagnostics),
@@ -673,6 +844,9 @@ pub fn parse_compiler_options_map(options: &BTreeMap<String, JsonValue>) -> Pars
             }
             "noemitonerror" => {
                 parsed.no_emit_on_error = boolean(original_name, value, &mut diagnostics);
+            }
+            "noerrortruncation" => {
+                parsed.no_error_truncation = boolean(original_name, value, &mut diagnostics);
             }
             "removecomments" => {
                 parsed.remove_comments = boolean(original_name, value, &mut diagnostics);
@@ -684,12 +858,27 @@ pub fn parse_compiler_options_map(options: &BTreeMap<String, JsonValue>) -> Pars
             "noimplicitany" => {
                 parsed.no_implicit_any = boolean(original_name, value, &mut diagnostics);
             }
+            "noimplicitoverride" => {
+                parsed.no_implicit_override = boolean(original_name, value, &mut diagnostics);
+            }
             "noimplicitreturns" => {
                 parsed.no_implicit_returns = boolean(original_name, value, &mut diagnostics);
+            }
+            "noimplicitthis" => {
+                parsed.no_implicit_this = boolean(original_name, value, &mut diagnostics);
             }
             "nolib" => parsed.no_lib = boolean(original_name, value, &mut diagnostics),
             "nofallthroughcasesinswitch" => {
                 parsed.no_fallthrough_cases_in_switch =
+                    boolean(original_name, value, &mut diagnostics);
+            }
+            "nopropertyaccessfromindexsignature" => {
+                parsed.no_property_access_from_index_signature =
+                    boolean(original_name, value, &mut diagnostics);
+            }
+            "noresolve" => parsed.no_resolve = boolean(original_name, value, &mut diagnostics),
+            "nouncheckedindexedaccess" => {
+                parsed.no_unchecked_indexed_access =
                     boolean(original_name, value, &mut diagnostics);
             }
             "nouncheckedsideeffectimports" => {
@@ -705,8 +894,18 @@ pub fn parse_compiler_options_map(options: &BTreeMap<String, JsonValue>) -> Pars
             "preserveconstenums" => {
                 parsed.preserve_const_enums = boolean(original_name, value, &mut diagnostics);
             }
+            "preservesymlinks" => {
+                parsed.preserve_symlinks = boolean(original_name, value, &mut diagnostics);
+            }
+            "plugins" => validate_plugins(original_name, value, &mut diagnostics),
+            "skipdefaultlibcheck" => {
+                parsed.skip_default_lib_check = boolean(original_name, value, &mut diagnostics);
+            }
             "skiplibcheck" => {
                 parsed.skip_lib_check = boolean(original_name, value, &mut diagnostics);
+            }
+            "stabletypeordering" => {
+                parsed.stable_type_ordering = boolean(original_name, value, &mut diagnostics);
             }
             "stripinternal" => {
                 parsed.strip_internal = boolean(original_name, value, &mut diagnostics);
@@ -809,40 +1008,62 @@ pub fn parse_compiler_options_map(options: &BTreeMap<String, JsonValue>) -> Pars
 struct PartialOptions {
     always_strict: Option<bool>,
     allow_arbitrary_extensions: Option<bool>,
+    allow_importing_ts_extensions: Option<bool>,
     allow_js: Option<bool>,
+    allow_umd_global_access: Option<bool>,
     allow_unreachable_code: Option<bool>,
+    allow_unused_labels: Option<bool>,
     allow_synthetic_default_imports: Option<bool>,
+    assume_changes_only_affect_direct_dependencies: Option<bool>,
     check_js: Option<bool>,
     composite: Option<bool>,
+    custom_conditions: Option<Vec<String>>,
     declaration: Option<bool>,
     declaration_map: Option<bool>,
+    deduplicate_packages: Option<bool>,
+    disable_size_limit: Option<bool>,
     downlevel_iteration: Option<bool>,
     emit_declaration_only: Option<bool>,
     emit_bom: Option<bool>,
     emit_decorator_metadata: Option<bool>,
+    erasable_syntax_only: Option<bool>,
     experimental_decorators: Option<bool>,
     es_module_interop: Option<bool>,
     exact_optional_property_types: Option<bool>,
     force_consistent_casing_in_file_names: Option<bool>,
     isolated_modules: Option<bool>,
     isolated_declarations: Option<bool>,
+    ignore_deprecations: Option<String>,
     import_helpers: Option<bool>,
+    lib_replacement: Option<bool>,
+    max_node_module_js_depth: Option<i64>,
     module_detection: Option<ModuleDetectionKind>,
+    module_suffixes: Option<Vec<String>>,
+    new_line: Option<NewLineKind>,
     no_check: Option<bool>,
     no_emit: Option<bool>,
     no_emit_helpers: Option<bool>,
     no_emit_on_error: Option<bool>,
+    no_error_truncation: Option<bool>,
     remove_comments: Option<bool>,
     rewrite_relative_import_extensions: Option<bool>,
     no_implicit_any: Option<bool>,
+    no_implicit_override: Option<bool>,
     no_implicit_returns: Option<bool>,
+    no_implicit_this: Option<bool>,
     no_lib: Option<bool>,
     no_fallthrough_cases_in_switch: Option<bool>,
+    no_property_access_from_index_signature: Option<bool>,
+    no_resolve: Option<bool>,
+    no_unchecked_indexed_access: Option<bool>,
     no_unchecked_side_effect_imports: Option<bool>,
     no_unused_locals: Option<bool>,
     no_unused_parameters: Option<bool>,
     preserve_const_enums: Option<bool>,
+    preserve_symlinks: Option<bool>,
+    skip_default_lib_check: Option<bool>,
     skip_lib_check: Option<bool>,
+    stable_type_ordering: Option<bool>,
     strip_internal: Option<bool>,
     strict: Option<bool>,
     strict_bind_call_apply: Option<bool>,
@@ -888,6 +1109,7 @@ impl PartialOptions {
     fn normalize(self) -> CompilerOptions {
         let check_js = self.check_js.unwrap_or(false);
         let no_implicit_any_specified = self.no_implicit_any.is_some();
+        let no_implicit_this_specified = self.no_implicit_this.is_some();
         let strict_specified = self.strict.is_some();
         let strict_bind_call_apply_specified = self.strict_bind_call_apply.is_some();
         let strict_builtin_iterator_return_specified =
@@ -917,21 +1139,30 @@ impl PartialOptions {
         CompilerOptions {
             always_strict: self.always_strict.unwrap_or(true),
             allow_arbitrary_extensions: self.allow_arbitrary_extensions.unwrap_or(false),
+            allow_importing_ts_extensions: self.allow_importing_ts_extensions.unwrap_or(false),
             allow_js: self.allow_js.unwrap_or(check_js),
+            allow_umd_global_access: self.allow_umd_global_access.unwrap_or(false),
             allow_unreachable_code: self.allow_unreachable_code,
+            allow_unused_labels: self.allow_unused_labels,
             allow_synthetic_default_imports: self.allow_synthetic_default_imports.unwrap_or(
                 es_module_interop
                     || module == ModuleKind::System
                     || module_resolution == ModuleResolutionKind::Bundler,
             ),
+            assume_changes_only_affect_direct_dependencies: self
+                .assume_changes_only_affect_direct_dependencies
+                .unwrap_or(false),
             check_js,
             composite,
             declaration: self.declaration.unwrap_or(composite),
             declaration_map: self.declaration_map.unwrap_or(false),
+            deduplicate_packages: self.deduplicate_packages.unwrap_or(true),
+            disable_size_limit: self.disable_size_limit.unwrap_or(false),
             downlevel_iteration: self.downlevel_iteration.unwrap_or(false),
             emit_declaration_only,
             emit_bom: self.emit_bom.unwrap_or(false),
             emit_decorator_metadata: self.emit_decorator_metadata.unwrap_or(false),
+            erasable_syntax_only: self.erasable_syntax_only.unwrap_or(false),
             experimental_decorators: self.experimental_decorators.unwrap_or(false),
             es_module_interop,
             exact_optional_property_types: self.exact_optional_property_types.unwrap_or(false),
@@ -941,27 +1172,41 @@ impl PartialOptions {
             isolated_modules: self.isolated_modules.unwrap_or(false),
             isolated_declarations: self.isolated_declarations.unwrap_or(false),
             import_helpers: self.import_helpers.unwrap_or(false),
+            lib_replacement: self.lib_replacement.unwrap_or(false),
             module_detection: self.module_detection.unwrap_or_default(),
+            new_line: self.new_line.unwrap_or_default(),
             no_check: self.no_check.unwrap_or(false),
             no_emit: self.no_emit.unwrap_or(false),
             no_emit_helpers: self.no_emit_helpers.unwrap_or(false),
             no_emit_on_error: self.no_emit_on_error.unwrap_or(false),
+            no_error_truncation: self.no_error_truncation.unwrap_or(false),
             remove_comments: self.remove_comments.unwrap_or(false),
             rewrite_relative_import_extensions: self
                 .rewrite_relative_import_extensions
                 .unwrap_or(false),
             no_implicit_any: self.no_implicit_any.unwrap_or(strict),
             no_implicit_any_specified,
+            no_implicit_override: self.no_implicit_override.unwrap_or(false),
             no_implicit_returns: self.no_implicit_returns.unwrap_or(false),
+            no_implicit_this: self.no_implicit_this.unwrap_or(strict),
+            no_implicit_this_specified,
             no_lib: self.no_lib.unwrap_or(false),
             no_fallthrough_cases_in_switch: self.no_fallthrough_cases_in_switch.unwrap_or(false),
+            no_property_access_from_index_signature: self
+                .no_property_access_from_index_signature
+                .unwrap_or(false),
+            no_resolve: self.no_resolve.unwrap_or(false),
+            no_unchecked_indexed_access: self.no_unchecked_indexed_access.unwrap_or(false),
             no_unchecked_side_effect_imports: self
                 .no_unchecked_side_effect_imports
                 .unwrap_or(false),
             no_unused_locals: self.no_unused_locals.unwrap_or(false),
             no_unused_parameters: self.no_unused_parameters.unwrap_or(false),
             preserve_const_enums: self.preserve_const_enums.unwrap_or(false),
+            preserve_symlinks: self.preserve_symlinks.unwrap_or(false),
+            skip_default_lib_check: self.skip_default_lib_check.unwrap_or(false),
             skip_lib_check: self.skip_lib_check.unwrap_or(false),
+            stable_type_ordering: self.stable_type_ordering.unwrap_or(true),
             strip_internal: self.strip_internal.unwrap_or(false),
             strict,
             strict_specified,
@@ -989,7 +1234,14 @@ impl PartialOptions {
             jsx_fragment_factory: self.jsx_fragment_factory,
             jsx_import_source: self.jsx_import_source,
             react_namespace: self.react_namespace,
-            resolve_json_module: self.resolve_json_module.unwrap_or(false),
+            ignore_deprecations: self.ignore_deprecations,
+            max_node_module_js_depth: self.max_node_module_js_depth,
+            custom_conditions: self.custom_conditions,
+            module_suffixes: self.module_suffixes,
+            resolve_json_module: self.resolve_json_module.unwrap_or(
+                module_resolution == ModuleResolutionKind::Bundler
+                    || matches!(module, ModuleKind::Node20 | ModuleKind::NodeNext),
+            ),
             resolve_package_json_exports: self.resolve_package_json_exports.unwrap_or(true),
             resolve_package_json_imports: self.resolve_package_json_imports.unwrap_or(true),
             source_map: self.source_map.unwrap_or(false),
@@ -1052,6 +1304,25 @@ fn validate_options(options: &PartialOptions, diagnostics: &mut Vec<Diagnostic>)
             5052,
             ["exactOptionalPropertyTypes", "strictNullChecks"],
         ));
+    }
+    if options.allow_importing_ts_extensions == Some(true)
+        && options.no_emit != Some(true)
+        && options.emit_declaration_only != Some(true)
+        && options.rewrite_relative_import_extensions != Some(true)
+    {
+        diagnostics.push(diagnostic(5096, []));
+    }
+    if options.custom_conditions.is_some()
+        && !matches!(
+            options.module_resolution.unwrap_or_else(|| {
+                default_module_resolution(options.module.unwrap_or_default())
+            }),
+            ModuleResolutionKind::Node16
+                | ModuleResolutionKind::NodeNext
+                | ModuleResolutionKind::Bundler
+        )
+    {
+        diagnostics.push(diagnostic(5098, ["customConditions"]));
     }
     if options.out_file.is_some()
         && options.module.is_some_and(|module| {
@@ -1118,6 +1389,9 @@ const fn module_resolution_name(value: ModuleResolutionKind) -> &'static str {
 }
 
 fn boolean(name: &str, value: &JsonValue, diagnostics: &mut Vec<Diagnostic>) -> Option<bool> {
+    if matches!(value, JsonValue::Null) {
+        return None;
+    }
     if let Some(value) = value.as_bool() {
         Some(value)
     } else {
@@ -1127,10 +1401,27 @@ fn boolean(name: &str, value: &JsonValue, diagnostics: &mut Vec<Diagnostic>) -> 
 }
 
 fn string(name: &str, value: &JsonValue, diagnostics: &mut Vec<Diagnostic>) -> Option<String> {
+    if matches!(value, JsonValue::Null) {
+        return None;
+    }
     if let Some(value) = value.as_str() {
         Some(value.to_owned())
     } else {
         diagnostics.push(diagnostic(5024, [name, "string"]));
+        None
+    }
+}
+
+fn number(name: &str, value: &JsonValue, diagnostics: &mut Vec<Diagnostic>) -> Option<i64> {
+    if matches!(value, JsonValue::Null) {
+        return None;
+    }
+    if let JsonValue::Number(value) = value
+        && let Some(value) = value.as_i64()
+    {
+        Some(value)
+    } else {
+        diagnostics.push(diagnostic(5024, [name, "number"]));
         None
     }
 }
@@ -1140,6 +1431,9 @@ fn string_array(
     value: &JsonValue,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> Option<Vec<String>> {
+    if matches!(value, JsonValue::Null) {
+        return None;
+    }
     let Some(values) = value.as_array() else {
         diagnostics.push(diagnostic(5024, [name, "Array"]));
         return None;
@@ -1161,6 +1455,9 @@ fn paths(
     value: &JsonValue,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> Option<BTreeMap<String, Vec<String>>> {
+    if matches!(value, JsonValue::Null) {
+        return None;
+    }
     let Some(object) = value.as_object() else {
         diagnostics.push(diagnostic(5024, [name, "object"]));
         return None;
@@ -1185,12 +1482,27 @@ fn paths(
     Some(result)
 }
 
+fn validate_plugins(name: &str, value: &JsonValue, diagnostics: &mut Vec<Diagnostic>) {
+    if matches!(value, JsonValue::Null) {
+        return;
+    }
+    if !value
+        .as_array()
+        .is_some_and(|plugins| plugins.iter().all(|plugin| plugin.as_object().is_some()))
+    {
+        diagnostics.push(diagnostic(5024, [name, "Array"]));
+    }
+}
+
 fn enum_value<T>(
     name: &str,
     value: &JsonValue,
     diagnostics: &mut Vec<Diagnostic>,
     parse: fn(&str) -> Option<T>,
 ) -> Option<T> {
+    if matches!(value, JsonValue::Null) {
+        return None;
+    }
     let Some(value) = value.as_str() else {
         diagnostics.push(diagnostic(5024, [name, "string"]));
         return None;
@@ -1242,6 +1554,14 @@ fn module_detection(value: &str) -> Option<ModuleDetectionKind> {
     })
 }
 
+fn new_line(value: &str) -> Option<NewLineKind> {
+    Some(match value.to_ascii_lowercase().as_str() {
+        "lf" => NewLineKind::Lf,
+        "crlf" => NewLineKind::Crlf,
+        _ => return None,
+    })
+}
+
 fn target(value: &str) -> Option<ScriptTarget> {
     Some(match value.to_ascii_lowercase().as_str() {
         "es3" => ScriptTarget::Es3,
@@ -1280,8 +1600,9 @@ fn allowed_values(name: &str) -> &'static str {
         }
         "moduleresolution" => "'classic', 'node10', 'node16', 'nodenext', 'bundler'",
         "moduledetection" => "'legacy', 'auto', 'force'",
+        "newline" => "'crlf', 'lf'",
         "target" => {
-            "'es3', 'es5', 'es2015', 'es2016', 'es2017', 'es2018', 'es2019', 'es2020', 'es2021', 'es2022', 'es2023', 'es2024', 'esnext'"
+            "'es3', 'es5', 'es2015', 'es2016', 'es2017', 'es2018', 'es2019', 'es2020', 'es2021', 'es2022', 'es2023', 'es2024', 'es2025', 'esnext'"
         }
         "jsx" => "'preserve', 'react', 'react-native', 'react-jsx', 'react-jsxdev'",
         _ => "a valid value",
@@ -1302,7 +1623,7 @@ mod tests {
 
     use super::{
         CompilerOptions, JsxEmit, ModuleDetectionKind, ModuleKind, ModuleResolutionKind,
-        ScriptTarget, parse_compiler_options, parse_project_options,
+        NewLineKind, ScriptTarget, parse_compiler_options, parse_project_options,
     };
 
     fn object(entries: impl IntoIterator<Item = (&'static str, JsonValue)>) -> JsonValue {
@@ -1478,6 +1799,185 @@ mod tests {
     }
 
     #[test]
+    fn parses_pinned_semantic_module_and_project_options() {
+        let config = parse_config_text(
+            "/repo/tsconfig.json",
+            r#"{
+                "compilerOptions": {
+                    "allowImportingTsExtensions": true,
+                    "allowUmdGlobalAccess": true,
+                    "allowUnusedLabels": false,
+                    "assumeChangesOnlyAffectDirectDependencies": true,
+                    "customConditions": ["development", "browser"],
+                    "deduplicatePackages": false,
+                    "disableSizeLimit": true,
+                    "erasableSyntaxOnly": true,
+                    "ignoreDeprecations": "6.0",
+                    "libReplacement": true,
+                    "maxNodeModuleJsDepth": 2,
+                    "moduleResolution": "bundler",
+                    "moduleSuffixes": [".native", ""],
+                    "newLine": "CRLF",
+                    "noEmit": true,
+                    "noErrorTruncation": true,
+                    "noImplicitOverride": true,
+                    "noImplicitThis": false,
+                    "noPropertyAccessFromIndexSignature": true,
+                    "noResolve": true,
+                    "noUncheckedIndexedAccess": true,
+                    "plugins": [{ "name": "example-plugin" }],
+                    "preserveSymlinks": true,
+                    "skipDefaultLibCheck": true,
+                    "stableTypeOrdering": false
+                }
+            }"#,
+        )
+        .value
+        .unwrap();
+        let result = parse_project_options(&config);
+        assert!(result.is_ok(), "{:?}", result.diagnostics);
+        let options = result.options;
+        assert!(options.allow_importing_ts_extensions);
+        assert!(options.allow_umd_global_access);
+        assert_eq!(options.allow_unused_labels, Some(false));
+        assert!(options.assume_changes_only_affect_direct_dependencies);
+        assert_eq!(
+            options.custom_conditions,
+            Some(vec!["development".into(), "browser".into()])
+        );
+        assert!(!options.deduplicate_packages);
+        assert!(options.disable_size_limit);
+        assert!(options.erasable_syntax_only);
+        assert_eq!(options.ignore_deprecations.as_deref(), Some("6.0"));
+        assert!(options.lib_replacement);
+        assert_eq!(options.max_node_module_js_depth, Some(2));
+        assert_eq!(
+            options.module_suffixes,
+            Some(vec![".native".into(), String::new()])
+        );
+        assert_eq!(options.new_line, NewLineKind::Crlf);
+        assert!(options.no_error_truncation);
+        assert!(options.no_implicit_override);
+        assert!(!options.no_implicit_this);
+        assert!(options.no_implicit_this_specified);
+        assert!(options.no_property_access_from_index_signature);
+        assert!(options.no_resolve);
+        assert!(options.no_unchecked_indexed_access);
+        assert!(options.preserve_symlinks);
+        assert!(options.skip_default_lib_check);
+        assert!(!options.stable_type_ordering);
+        assert!(options.resolve_json_module);
+    }
+
+    #[test]
+    fn validates_pinned_module_options() {
+        let importing = parse_compiler_options(&object([(
+            "allowImportingTsExtensions",
+            JsonValue::Bool(true),
+        )]));
+        assert_eq!(importing.diagnostics.len(), 1);
+        assert_eq!(importing.diagnostics[0].code(), 5096);
+
+        let rewritten = parse_compiler_options(&object([
+            ("allowImportingTsExtensions", JsonValue::Bool(true)),
+            ("rewriteRelativeImportExtensions", JsonValue::Bool(true)),
+        ]));
+        assert!(rewritten.is_ok(), "{:?}", rewritten.diagnostics);
+
+        let conditions = parse_compiler_options(&object([(
+            "customConditions",
+            JsonValue::Array(vec![JsonValue::String("development".into())]),
+        )]));
+        assert_eq!(conditions.diagnostics.len(), 1);
+        assert_eq!(conditions.diagnostics[0].code(), 5098);
+
+        let plugins = parse_compiler_options(&object([(
+            "plugins",
+            JsonValue::Array(vec![JsonValue::String("invalid".into())]),
+        )]));
+        assert_eq!(plugins.diagnostics.len(), 1);
+        assert_eq!(plugins.diagnostics[0].code(), 5024);
+    }
+
+    #[test]
+    fn null_values_clear_inherited_options_without_type_diagnostics() {
+        let result = parse_compiler_options(&object([
+            ("allowJs", JsonValue::Null),
+            ("customConditions", JsonValue::Null),
+            ("lib", JsonValue::Null),
+            ("maxNodeModuleJsDepth", JsonValue::Null),
+            ("module", JsonValue::Null),
+            ("outDir", JsonValue::Null),
+            ("paths", JsonValue::Null),
+            ("plugins", JsonValue::Null),
+            ("typeRoots", JsonValue::Null),
+            ("types", JsonValue::Null),
+        ]));
+        assert!(result.is_ok(), "{:?}", result.diagnostics);
+        assert!(!result.options.allow_js);
+        assert!(result.options.custom_conditions.is_none());
+        assert!(result.options.lib.is_none());
+        assert!(result.options.max_node_module_js_depth.is_none());
+        assert!(result.options.out_dir.is_none());
+        assert!(result.options.paths.is_empty());
+        assert!(result.options.type_roots.is_none());
+        assert!(result.options.types.is_none());
+    }
+
+    #[test]
+    fn applies_previously_omitted_project_option_overrides() {
+        let overrides = parse_compiler_options(&object([
+            ("allowJs", JsonValue::Bool(true)),
+            ("baseUrl", JsonValue::String("/override".into())),
+            ("composite", JsonValue::Bool(true)),
+            ("declarationMap", JsonValue::Bool(true)),
+            ("incremental", JsonValue::Bool(true)),
+            ("noImplicitThis", JsonValue::Bool(false)),
+            ("noUncheckedIndexedAccess", JsonValue::Bool(true)),
+            ("resolveJsonModule", JsonValue::Bool(true)),
+            (
+                "rootDirs",
+                JsonValue::Array(vec![JsonValue::String("/override/src".into())]),
+            ),
+            (
+                "types",
+                JsonValue::Array(vec![JsonValue::String("node".into())]),
+            ),
+        ]));
+        assert!(overrides.is_ok(), "{:?}", overrides.diagnostics);
+
+        let mut options = CompilerOptions::default();
+        options.apply_overrides(
+            &overrides.options,
+            &BTreeSet::from([
+                "allowjs".to_owned(),
+                "baseurl".to_owned(),
+                "composite".to_owned(),
+                "declarationmap".to_owned(),
+                "incremental".to_owned(),
+                "noimplicitthis".to_owned(),
+                "nouncheckedindexedaccess".to_owned(),
+                "resolvejsonmodule".to_owned(),
+                "rootdirs".to_owned(),
+                "types".to_owned(),
+            ]),
+        );
+
+        assert!(options.allow_js);
+        assert_eq!(options.base_url.as_deref(), Some("/override"));
+        assert!(options.composite);
+        assert!(options.declaration);
+        assert!(options.declaration_map);
+        assert!(options.incremental);
+        assert!(!options.no_implicit_this);
+        assert!(options.no_implicit_this_specified);
+        assert!(options.no_unchecked_indexed_access);
+        assert!(options.resolve_json_module);
+        assert_eq!(options.root_dirs, ["/override/src"]);
+        assert_eq!(options.types, Some(vec!["node".into()]));
+    }
+
+    #[test]
     fn parses_and_validates_exact_optional_property_types() {
         let enabled = parse_compiler_options(&object([
             ("strictNullChecks", JsonValue::Bool(true)),
@@ -1535,6 +2035,7 @@ mod tests {
         let defaults = parse_compiler_options(&object([])).options;
         assert!(defaults.strict);
         assert!(defaults.no_implicit_any);
+        assert!(defaults.no_implicit_this);
         assert!(defaults.strict_bind_call_apply);
         assert!(defaults.strict_builtin_iterator_return);
         assert!(defaults.strict_function_types);
@@ -1543,6 +2044,7 @@ mod tests {
         assert!(defaults.use_unknown_in_catch_variables);
         assert!(!defaults.strict_specified);
         assert!(!defaults.no_implicit_any_specified);
+        assert!(!defaults.no_implicit_this_specified);
         assert!(!defaults.strict_bind_call_apply_specified);
         assert!(!defaults.strict_builtin_iterator_return_specified);
         assert!(!defaults.strict_function_types_specified);
@@ -1554,6 +2056,7 @@ mod tests {
             parse_compiler_options(&object([("strict", JsonValue::Bool(false))])).options;
         assert!(!disabled.strict);
         assert!(!disabled.no_implicit_any);
+        assert!(!disabled.no_implicit_this);
         assert!(!disabled.strict_bind_call_apply);
         assert!(!disabled.strict_builtin_iterator_return);
         assert!(!disabled.strict_function_types);
@@ -1583,6 +2086,7 @@ mod tests {
         let mut implied = defaults;
         implied.apply_overrides(&disabled, &BTreeSet::from(["strict".to_owned()]));
         assert!(!implied.no_implicit_any);
+        assert!(!implied.no_implicit_this);
         assert!(!implied.strict_bind_call_apply);
         assert!(!implied.strict_builtin_iterator_return);
         assert!(!implied.strict_function_types);
@@ -1626,6 +2130,22 @@ mod tests {
         assert!(function_types_explicit_false.strict);
         assert!(!function_types_explicit_false.strict_function_types);
         assert!(function_types_explicit_false.strict_function_types_specified);
+    }
+
+    #[test]
+    fn preserves_explicit_no_implicit_this_when_strict_changes() {
+        let mut implicit_this_explicit_false = parse_compiler_options(&object([
+            ("strict", JsonValue::Bool(false)),
+            ("noImplicitThis", JsonValue::Bool(false)),
+        ]))
+        .options;
+        implicit_this_explicit_false.apply_overrides(
+            &CompilerOptions::default(),
+            &BTreeSet::from(["strict".to_owned()]),
+        );
+        assert!(implicit_this_explicit_false.strict);
+        assert!(!implicit_this_explicit_false.no_implicit_this);
+        assert!(implicit_this_explicit_false.no_implicit_this_specified);
     }
 
     #[test]

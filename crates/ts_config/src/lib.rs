@@ -280,7 +280,9 @@ pub fn resolve_config_file(
         stack: Vec::new(),
         diagnostics: Vec::new(),
     };
-    let value = state.resolve(&normalize_path(file_name));
+    let value = state
+        .resolve(&normalize_path(file_name))
+        .map(substitute_config_dir_templates);
     ParseResult {
         value,
         diagnostics: state.diagnostics,
@@ -359,16 +361,20 @@ fn merge_configs(mut base: ProjectConfig, child: ProjectConfig) -> ProjectConfig
         raw,
         ..
     } = child;
-    if files.is_some() {
+    if raw.contains_key("files") {
         base.files = files;
     }
-    if include.is_some() {
+    if raw.contains_key("include") {
         base.include = include;
     }
-    if exclude.is_some() {
+    if raw.contains_key("exclude") {
         base.exclude = exclude;
     }
-    base.compiler_options.extend(compiler_options);
+    for (name, value) in compiler_options {
+        base.compiler_options
+            .retain(|existing, _| !existing.eq_ignore_ascii_case(&name));
+        base.compiler_options.insert(name, value);
+    }
     base.raw.extend(raw);
     base.path = path;
     base.extends = None;
@@ -394,36 +400,121 @@ fn resolve_config_patterns(mut config: ProjectConfig) -> ProjectConfig {
         .flatten()
     {
         for value in values {
-            if !Path::new(value).is_absolute() {
+            if !Path::new(value).is_absolute() && config_dir_suffix(value).is_none() {
                 *value = resolve_relative(directory, value);
             }
         }
     }
-    if let Some(JsonValue::String(base_url)) = config.compiler_options.get_mut("baseUrl")
-        && !Path::new(base_url).is_absolute()
-    {
-        *base_url = resolve_relative(directory, base_url);
-    }
     for (name, value) in &mut config.compiler_options {
-        if matches!(
-            name.to_ascii_lowercase().as_str(),
-            "outdir" | "rootdir" | "declarationdir" | "tsbuildinfofile"
-        ) && let JsonValue::String(path) = value
-            && !Path::new(path.as_str()).is_absolute()
-        {
-            *path = resolve_relative(directory, path);
-        }
-    }
-    if let Some(JsonValue::Array(root_dirs)) = config.compiler_options.get_mut("rootDirs") {
-        for root_dir in root_dirs {
-            if let JsonValue::String(root_dir) = root_dir
-                && !Path::new(root_dir.as_str()).is_absolute()
-            {
-                *root_dir = resolve_relative(directory, root_dir);
+        match name.to_ascii_lowercase().as_str() {
+            "baseurl" | "outfile" | "outdir" | "rootdir" | "declarationdir" | "tsbuildinfofile"
+            | "maproot" => {
+                if let JsonValue::String(path) = value
+                    && !Path::new(path.as_str()).is_absolute()
+                    && config_dir_suffix(path).is_none()
+                {
+                    *path = resolve_relative(directory, path);
+                }
             }
+            "rootdirs" | "typeroots" => {
+                if let JsonValue::Array(paths) = value {
+                    for path in paths {
+                        if let JsonValue::String(path) = path
+                            && !Path::new(path.as_str()).is_absolute()
+                            && config_dir_suffix(path).is_none()
+                        {
+                            *path = resolve_relative(directory, path);
+                        }
+                    }
+                }
+            }
+            "paths" => {
+                if let JsonValue::Object(patterns) = value {
+                    for substitutions in patterns.values_mut() {
+                        if let JsonValue::Array(substitutions) = substitutions {
+                            for substitution in substitutions {
+                                if let JsonValue::String(substitution) = substitution
+                                    && !Path::new(substitution.as_str()).is_absolute()
+                                    && config_dir_suffix(substitution).is_none()
+                                {
+                                    *substitution = resolve_relative(directory, substitution);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
         }
     }
     config
+}
+
+fn substitute_config_dir_templates(mut config: ProjectConfig) -> ProjectConfig {
+    let directory = config_directory(&config.path).to_owned();
+    for values in [&mut config.files, &mut config.include, &mut config.exclude]
+        .into_iter()
+        .flatten()
+    {
+        for value in values {
+            substitute_config_dir_template(value, &directory);
+        }
+    }
+    for (name, value) in &mut config.compiler_options {
+        match name.to_ascii_lowercase().as_str() {
+            "baseurl" | "outfile" | "outdir" | "rootdir" | "declarationdir" | "tsbuildinfofile"
+            | "maproot" => {
+                if let JsonValue::String(value) = value {
+                    substitute_config_dir_template(value, &directory);
+                }
+            }
+            "rootdirs" | "typeroots" => {
+                if let JsonValue::Array(values) = value {
+                    for value in values {
+                        if let JsonValue::String(value) = value {
+                            substitute_config_dir_template(value, &directory);
+                        }
+                    }
+                }
+            }
+            "paths" => {
+                if let JsonValue::Object(patterns) = value {
+                    for substitutions in patterns.values_mut() {
+                        if let JsonValue::Array(substitutions) = substitutions {
+                            for substitution in substitutions {
+                                if let JsonValue::String(substitution) = substitution {
+                                    substitute_config_dir_template(substitution, &directory);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if config.raw.contains_key("compilerOptions") {
+        config.raw.insert(
+            "compilerOptions".to_owned(),
+            JsonValue::Object(config.compiler_options.clone()),
+        );
+    }
+    config
+}
+
+fn substitute_config_dir_template(value: &mut String, directory: &str) {
+    if let Some(suffix) = config_dir_suffix(value) {
+        let suffix = suffix.trim_start_matches(['/', '\\']);
+        *value = resolve_relative(directory, suffix);
+    }
+}
+
+fn config_dir_suffix(value: &str) -> Option<&str> {
+    const TEMPLATE: &str = "${configDir}";
+    value
+        .get(..TEMPLATE.len())
+        .filter(|prefix| prefix.eq_ignore_ascii_case(TEMPLATE))
+        .map(|_| &value[TEMPLATE.len()..])
 }
 
 fn parse_extends(value: &JsonValue) -> Option<Extends> {
@@ -902,6 +993,186 @@ mod tests {
                 Some(expected)
             );
         }
+    }
+
+    #[test]
+    fn keeps_inherited_paths_relative_to_the_config_that_declared_them() {
+        let file_system = MemoryFileSystem::default();
+        file_system
+            .write_file(
+                "/repo/config/base.json",
+                r#"{
+                    "compilerOptions": {
+                        "BASEURL": ".",
+                        "outFile": "dist/bundle.js",
+                        "mapRoot": "maps",
+                        "rootDirs": ["src", "generated"],
+                        "typeRoots": ["types"],
+                        "paths": { "@app/*": ["src/*"] }
+                    }
+                }"#,
+            )
+            .unwrap();
+        file_system
+            .write_file(
+                "/repo/app/tsconfig.json",
+                r#"{ "extends": "../config/base.json" }"#,
+            )
+            .unwrap();
+
+        let result = resolve_config_file(&file_system, "/repo/app/tsconfig.json");
+        assert!(result.is_ok(), "{:?}", result.diagnostics);
+        let config = result.value.unwrap();
+        for (name, expected) in [
+            ("BASEURL", "/repo/config"),
+            ("outFile", "/repo/config/dist/bundle.js"),
+            ("mapRoot", "/repo/config/maps"),
+        ] {
+            assert_eq!(
+                config
+                    .compiler_options
+                    .get(name)
+                    .and_then(JsonValue::as_str),
+                Some(expected)
+            );
+        }
+        assert_eq!(
+            config.compiler_options.get("rootDirs"),
+            Some(&JsonValue::Array(vec![
+                JsonValue::String("/repo/config/src".into()),
+                JsonValue::String("/repo/config/generated".into()),
+            ]))
+        );
+        assert_eq!(
+            config.compiler_options.get("typeRoots"),
+            Some(&JsonValue::Array(vec![JsonValue::String(
+                "/repo/config/types".into()
+            )]))
+        );
+        assert_eq!(
+            config
+                .compiler_options
+                .get("paths")
+                .and_then(JsonValue::as_object)
+                .and_then(|paths| paths.get("@app/*")),
+            Some(&JsonValue::Array(vec![JsonValue::String(
+                "/repo/config/src/*".into()
+            )]))
+        );
+    }
+
+    #[test]
+    fn expands_inherited_config_dir_templates_from_the_leaf_config() {
+        let file_system = MemoryFileSystem::default();
+        file_system
+            .write_file(
+                "/repo/config/base.json",
+                r#"{
+                    "files": ["${configDir}/src/index.ts"],
+                    "include": ["${configDir}/src/**/*.ts"],
+                    "compilerOptions": {
+                        "outDir": "${configDir}/dist",
+                        "rootDirs": ["${CONFIGDIR}/src"],
+                        "typeRoots": ["${configDir}/types"],
+                        "paths": { "@app/*": ["${configDir}/src/*"] }
+                    }
+                }"#,
+            )
+            .unwrap();
+        file_system
+            .write_file(
+                "/repo/app/tsconfig.json",
+                r#"{ "extends": "../config/base.json" }"#,
+            )
+            .unwrap();
+
+        let config = resolve_config_file(&file_system, "/repo/app/tsconfig.json")
+            .value
+            .unwrap();
+        assert_eq!(config.files, Some(vec!["/repo/app/src/index.ts".into()]));
+        assert_eq!(config.include, Some(vec!["/repo/app/src/**/*.ts".into()]));
+        assert_eq!(
+            config
+                .compiler_options
+                .get("outDir")
+                .and_then(JsonValue::as_str),
+            Some("/repo/app/dist")
+        );
+        assert_eq!(
+            config.compiler_options.get("rootDirs"),
+            Some(&JsonValue::Array(vec![JsonValue::String(
+                "/repo/app/src".into()
+            )]))
+        );
+        assert_eq!(
+            config.compiler_options.get("typeRoots"),
+            Some(&JsonValue::Array(vec![JsonValue::String(
+                "/repo/app/types".into()
+            )]))
+        );
+        assert_eq!(
+            config
+                .compiler_options
+                .get("paths")
+                .and_then(JsonValue::as_object)
+                .and_then(|paths| paths.get("@app/*")),
+            Some(&JsonValue::Array(vec![JsonValue::String(
+                "/repo/app/src/*".into()
+            )]))
+        );
+    }
+
+    #[test]
+    fn null_project_fields_and_case_variants_override_inherited_values() {
+        let file_system = MemoryFileSystem::default();
+        file_system
+            .write_file(
+                "/repo/base.json",
+                r#"{
+                    "files": ["base.ts"],
+                    "include": ["src/**/*.ts"],
+                    "exclude": ["dist"],
+                    "compilerOptions": {
+                        "Strict": true,
+                        "outDir": "dist",
+                        "types": ["node"]
+                    }
+                }"#,
+            )
+            .unwrap();
+        file_system
+            .write_file(
+                "/repo/app/tsconfig.json",
+                r#"{
+                    "extends": "../base.json",
+                    "files": null,
+                    "include": null,
+                    "exclude": null,
+                    "compilerOptions": {
+                        "strict": false,
+                        "outDir": null,
+                        "types": null
+                    }
+                }"#,
+            )
+            .unwrap();
+
+        let config = resolve_config_file(&file_system, "/repo/app/tsconfig.json")
+            .value
+            .unwrap();
+        assert_eq!(config.files, None);
+        assert_eq!(config.include, None);
+        assert_eq!(config.exclude, None);
+        assert_eq!(
+            config.compiler_options.get("strict"),
+            Some(&JsonValue::Bool(false))
+        );
+        assert!(!config.compiler_options.contains_key("Strict"));
+        assert_eq!(
+            config.compiler_options.get("outDir"),
+            Some(&JsonValue::Null)
+        );
+        assert_eq!(config.compiler_options.get("types"), Some(&JsonValue::Null));
     }
 
     #[test]
