@@ -3214,9 +3214,18 @@ fn base_type_of_literal_type(
 fn quote_string_literal(value: &str, quote: char) -> String {
     let mut result = String::with_capacity(value.len() + 2);
     result.push(quote);
-    let mut characters = value.chars().peekable();
+    let decoded = ts_ast::decode_js_string(value);
+    let mut characters = char::decode_utf16(decoded.as_units().iter().copied()).peekable();
     while let Some(character) = characters.next() {
-        let next_is_digit = characters.peek().is_some_and(char::is_ascii_digit);
+        let character = match character {
+            Ok(character) => character,
+            Err(surrogate) => {
+                write!(result, "\\u{:04X}", surrogate.unpaired_surrogate())
+                    .expect("writing to a String cannot fail");
+                continue;
+            }
+        };
+        let next_is_digit = matches!(characters.peek(), Some(Ok(next)) if next.is_ascii_digit());
         let needs_escape = character == '\\'
             || character == quote
             || character <= '\u{001f}'
@@ -4996,6 +5005,60 @@ mod tests {
         assert_eq!(
             type_to_string(&store, followed_by_digit).unwrap(),
             "\"\\x001\\0\""
+        );
+    }
+
+    #[test]
+    fn string_literal_diagnostics_escape_lone_utf16_surrogates() {
+        let mut store = bootstrapped_store();
+        let high = store
+            .regular_string_literal_type(ts_ast::encode_js_string(&ts_core::JsString::from_units(
+                vec![0xd800],
+            )))
+            .unwrap();
+        let low = store
+            .regular_string_literal_type(ts_ast::encode_js_string(&ts_core::JsString::from_units(
+                vec![0xdc00],
+            )))
+            .unwrap();
+        let mixed = store
+            .regular_string_literal_type(ts_ast::encode_js_string(&ts_core::JsString::from_units(
+                vec![0xd83d, u16::from(b'-'), 0xde00],
+            )))
+            .unwrap();
+        let paired = store
+            .regular_string_literal_type(ts_ast::encode_js_string(&ts_core::JsString::from_units(
+                vec![0xd83d, 0xde00],
+            )))
+            .unwrap();
+
+        assert_eq!(type_to_string(&store, high).unwrap(), "\"\\uD800\"");
+        assert_eq!(type_to_string(&store, low).unwrap(), "\"\\uDC00\"");
+        assert_eq!(
+            type_to_string(&store, mixed).unwrap(),
+            "\"\\uD83D-\\uDE00\""
+        );
+        assert_eq!(type_to_string(&store, paired).unwrap(), "\"😀\"");
+        assert_eq!(
+            type_to_string_with_flags(
+                &store,
+                high,
+                CanonicalTypeFormatFlags::USE_SINGLE_QUOTES_FOR_STRING_LITERAL_TYPE,
+            )
+            .unwrap(),
+            "'\\uD800'"
+        );
+
+        let display = get_type_names_for_assignability_error(&store, low, high).unwrap();
+        assert_eq!(display.source, "\"\\uDC00\"");
+        assert_eq!(display.target, "\"\\uD800\"");
+        let diagnostic = Diagnostic::with_arguments(
+            message_by_code(2322).unwrap(),
+            [display.source, display.target],
+        );
+        assert_eq!(
+            diagnostic.render().unwrap(),
+            "Type '\"\\uDC00\"' is not assignable to type '\"\\uD800\"'."
         );
     }
 
