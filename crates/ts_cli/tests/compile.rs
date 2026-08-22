@@ -194,6 +194,82 @@ fn common_compiler_options_match_oracle() {
 }
 
 #[test]
+fn compiler_option_aliases_match_oracle() {
+    let directory = TestDirectory::new("option-aliases");
+    fs::write(directory.0.join("main.ts"), "export const answer = 42;\n").unwrap();
+    assert_matches_oracle(
+        &directory.0,
+        &[
+            "main.ts",
+            "--ignoreConfig",
+            "--noEmit",
+            "-t",
+            "es2022",
+            "-m",
+            "esnext",
+            "-d",
+            "--pretty",
+            "false",
+        ],
+    );
+}
+
+#[test]
+fn extended_compiler_options_match_oracle() {
+    let directory = TestDirectory::new("extended-options");
+    fs::write(
+        directory.0.join("main.ts"),
+        "interface User { name?: string }\nconst user: User = {};\n",
+    )
+    .unwrap();
+    assert_matches_oracle(
+        &directory.0,
+        &[
+            "main.ts",
+            "--ignoreConfig",
+            "--noEmit",
+            "--exactOptionalPropertyTypes",
+            "--allowArbitraryExtensions",
+            "--allowImportingTsExtensions",
+            "--removeComments",
+            "--noImplicitThis",
+            "false",
+            "--noUncheckedIndexedAccess",
+            "--noUncheckedSideEffectImports",
+            "--useDefineForClassFields",
+            "false",
+            "--moduleResolution",
+            "bundler",
+            "--customConditions",
+            "browser,development",
+            "--moduleSuffixes",
+            ".native,.ios",
+            "--lib",
+            "es2022,dom",
+            "--typeRoots",
+            "./types,./vendor/types",
+            "--pretty",
+            "false",
+        ],
+    );
+}
+
+#[test]
+fn command_line_option_diagnostics_match_oracle() {
+    let directory = TestDirectory::new("option-diagnostics");
+    for arguments in [
+        &["--project"][..],
+        &["-p"][..],
+        &["--lib"][..],
+        &["--pretty=false"][..],
+        &["--build", "--wat"][..],
+        &["--build", "--pretty=false"][..],
+    ] {
+        assert_matches_oracle(&directory.0, arguments);
+    }
+}
+
+#[test]
 fn control_flow_options_match_oracle() {
     let directory = TestDirectory::new("control-flow-options");
     fs::write(

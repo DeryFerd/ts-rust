@@ -98,44 +98,67 @@ fn parse_expanded(args: &[String]) -> Result<Command, CommandLineError> {
             "--help" | "-h" | "-?" => return Ok(Command::Help),
             "--lsp" => return Ok(Command::Lsp),
             "--version" | "-v" => return Ok(Command::Version),
-            "--watch" | "-w" => options.watch = true,
-            "--ignoreconfig" => options.ignore_config = true,
-            "--pretty" => {
-                let explicit_value = args
-                    .get(index + 1)
-                    .and_then(|value| parse_bool_value(value));
-                options.pretty = Some(explicit_value.unwrap_or(true));
-                if explicit_value.is_some() {
-                    index += 1;
-                }
-            }
+            "--watch" | "-w" => options.watch = optional_boolean_value(args, &mut index),
+            "--ignoreconfig" => options.ignore_config = optional_boolean_value(args, &mut index),
+            "--pretty" => options.pretty = Some(optional_boolean_value(args, &mut index)),
             "--project" | "-p" => {
                 index += 1;
-                options.project = Some(required_option_value(args, index, argument)?);
-            }
-            _ if lower.starts_with("--pretty=") => {
-                options.pretty = Some(parse_bool_option(argument, "pretty")?);
+                options.project = Some(required_option_value(args, index, "project")?);
             }
             _ if compiler_boolean_name(&lower).is_some() => {
                 let name = compiler_boolean_name(&lower).expect("guard checked option name");
-                let explicit_value = args
-                    .get(index + 1)
-                    .and_then(|value| parse_bool_value(value));
-                compiler_options.insert(
-                    name.to_owned(),
-                    JsonValue::Bool(explicit_value.unwrap_or(true)),
-                );
-                if explicit_value.is_some() {
-                    index += 1;
+                let value = optional_boolean_value(args, &mut index);
+                if name == "composite" && value {
+                    return Err(CommandLineError {
+                        code: 6230,
+                        message: "Option 'composite' can only be specified in 'tsconfig.json' file or set to 'false' or 'null' on command line.".to_owned(),
+                    });
                 }
+                compiler_options.insert(name.to_owned(), JsonValue::Bool(value));
             }
             _ if compiler_string_name(&lower).is_some() => {
                 let name = compiler_string_name(&lower).expect("guard checked option name");
                 index += 1;
                 compiler_options.insert(
                     name.to_owned(),
-                    JsonValue::String(required_option_value(args, index, argument)?),
+                    JsonValue::String(required_option_value(args, index, name)?),
                 );
+            }
+            _ if compiler_list_name(&lower).is_some() => {
+                let name = compiler_list_name(&lower).expect("guard checked option name");
+                index += 1;
+                let values = required_option_value(args, index, name)?
+                    .split(',')
+                    .filter(|value| !value.is_empty())
+                    .map(|value| JsonValue::String(value.to_owned()))
+                    .collect();
+                compiler_options.insert(name.to_owned(), JsonValue::Array(values));
+            }
+            "--paths" | "--rootdirs" => {
+                let name = lower.trim_start_matches('-');
+                index += 1;
+                let value = required_option_value(args, index, name)?;
+                if !value.eq_ignore_ascii_case("null") {
+                    return Err(CommandLineError {
+                        code: 6064,
+                        message: format!(
+                            "Option '{}' can only be specified in 'tsconfig.json' file or set to 'null' on command line.",
+                            option_display_name(name)
+                        ),
+                    });
+                }
+                let cleared = if name == "paths" {
+                    JsonValue::Object(BTreeMap::new())
+                } else {
+                    JsonValue::Array(Vec::new())
+                };
+                compiler_options.insert(name.to_owned(), cleared);
+            }
+            "--build" | "-b" => {
+                return Err(CommandLineError {
+                    code: 6369,
+                    message: "Option '--build' must be the first command line argument.".to_owned(),
+                });
             }
             _ if argument.starts_with('-') => {
                 return Err(CommandLineError {
@@ -167,35 +190,74 @@ fn parse_expanded(args: &[String]) -> Result<Command, CommandLineError> {
 fn compiler_boolean_name(argument: &str) -> Option<&'static str> {
     Some(match argument {
         "--alwaysstrict" => "alwaysstrict",
+        "--allowarbitraryextensions" => "allowarbitraryextensions",
+        "--allowimportingtsextensions" => "allowimportingtsextensions",
         "--allowjs" => "allowjs",
+        "--allowumdglobalaccess" => "allowumdglobalaccess",
         "--allowunreachablecode" => "allowunreachablecode",
+        "--allowunusedlabels" => "allowunusedlabels",
         "--allowsyntheticdefaultimports" => "allowsyntheticdefaultimports",
+        "--assumechangesonlyaffectdirectdependencies" => {
+            "assumechangesonlyaffectdirectdependencies"
+        }
         "--checkjs" => "checkjs",
-        "--declaration" => "declaration",
+        "--composite" => "composite",
+        "--declaration" | "-d" => "declaration",
+        "--declarationmap" => "declarationmap",
+        "--deduplicatepackages" => "deduplicatepackages",
+        "--disablesizelimit" => "disablesizelimit",
+        "--downleveliteration" => "downleveliteration",
+        "--emitbom" => "emitbom",
+        "--emitdeclarationonly" => "emitdeclarationonly",
+        "--emitdecoratormetadata" => "emitdecoratormetadata",
+        "--erasablesyntaxonly" => "erasablesyntaxonly",
         "--esmoduleinterop" => "esmoduleinterop",
+        "--exactoptionalpropertytypes" => "exactoptionalpropertytypes",
+        "--experimentaldecorators" => "experimentaldecorators",
         "--forceconsistentcasinginfilenames" => "forceconsistentcasinginfilenames",
         "--importhelpers" => "importhelpers",
+        "--incremental" | "-i" => "incremental",
+        "--inlinesourcemap" => "inlinesourcemap",
+        "--inlinesources" => "inlinesources",
+        "--isolateddeclarations" => "isolateddeclarations",
         "--isolatedmodules" => "isolatedmodules",
+        "--libreplacement" => "libreplacement",
         "--nocheck" => "nocheck",
         "--noemit" => "noemit",
+        "--noemithelpers" => "noemithelpers",
         "--noemitonerror" => "noemitonerror",
+        "--noerrortruncation" => "noerrortruncation",
         "--noimplicitany" => "noimplicitany",
+        "--noimplicitoverride" => "noimplicitoverride",
         "--noimplicitreturns" => "noimplicitreturns",
+        "--noimplicitthis" => "noimplicitthis",
         "--nolib" => "nolib",
         "--nofallthroughcasesinswitch" => "nofallthroughcasesinswitch",
+        "--nopropertyaccessfromindexsignature" => "nopropertyaccessfromindexsignature",
+        "--noresolve" => "noresolve",
+        "--nouncheckedindexedaccess" => "nouncheckedindexedaccess",
+        "--nouncheckedsideeffectimports" => "nouncheckedsideeffectimports",
         "--nounusedlocals" => "nounusedlocals",
         "--nounusedparameters" => "nounusedparameters",
         "--preserveconstenums" => "preserveconstenums",
+        "--preservesymlinks" => "preservesymlinks",
+        "--removecomments" => "removecomments",
+        "--resolvejsonmodule" => "resolvejsonmodule",
         "--resolvepackagejsonexports" => "resolvepackagejsonexports",
         "--resolvepackagejsonimports" => "resolvepackagejsonimports",
+        "--rewriterelativeimportextensions" => "rewriterelativeimportextensions",
+        "--skipdefaultlibcheck" => "skipdefaultlibcheck",
         "--skiplibcheck" => "skiplibcheck",
         "--sourcemap" => "sourcemap",
+        "--stabletypeordering" => "stabletypeordering",
         "--strict" => "strict",
         "--strictbindcallapply" => "strictbindcallapply",
         "--strictbuiltiniteratorreturn" => "strictbuiltiniteratorreturn",
         "--strictfunctiontypes" => "strictfunctiontypes",
         "--strictnullchecks" => "strictnullchecks",
         "--strictpropertyinitialization" => "strictpropertyinitialization",
+        "--stripinternal" => "stripinternal",
+        "--usedefineforclassfields" => "usedefineforclassfields",
         "--useunknownincatchvariables" => "useunknownincatchvariables",
         "--verbatimmodulesyntax" => "verbatimmodulesyntax",
         _ => return None,
@@ -204,14 +266,36 @@ fn compiler_boolean_name(argument: &str) -> Option<&'static str> {
 
 fn compiler_string_name(argument: &str) -> Option<&'static str> {
     Some(match argument {
+        "--baseurl" => "baseurl",
+        "--declarationdir" => "declarationdir",
+        "--ignoredeprecations" => "ignoredeprecations",
         "--jsx" => "jsx",
-        "--module" => "module",
+        "--jsxfactory" => "jsxfactory",
+        "--jsxfragmentfactory" => "jsxfragmentfactory",
+        "--jsximportsource" => "jsximportsource",
+        "--maproot" => "maproot",
+        "--module" | "-m" => "module",
         "--moduledetection" => "moduledetection",
         "--moduleresolution" => "moduleresolution",
+        "--newline" => "newline",
         "--outfile" => "outfile",
         "--outdir" => "outdir",
+        "--reactnamespace" => "reactnamespace",
         "--rootdir" => "rootdir",
-        "--target" => "target",
+        "--sourceroot" => "sourceroot",
+        "--target" | "-t" => "target",
+        "--tsbuildinfofile" => "tsbuildinfofile",
+        _ => return None,
+    })
+}
+
+fn compiler_list_name(argument: &str) -> Option<&'static str> {
+    Some(match argument {
+        "--customconditions" => "customconditions",
+        "--lib" => "lib",
+        "--modulesuffixes" => "modulesuffixes",
+        "--typeroots" => "typeroots",
+        "--types" => "types",
         _ => return None,
     })
 }
@@ -223,24 +307,28 @@ fn parse_build_options(args: &[String]) -> Result<BuildOptions, CommandLineError
         let argument = &args[index];
         let lower = argument.to_ascii_lowercase();
         match lower.as_str() {
-            "--incremental" => options.incremental = true,
-            "--noemit" => options.no_emit = true,
-            "--watch" | "-w" => options.watch = true,
-            "--pretty" => {
-                let explicit_value = args
-                    .get(index + 1)
-                    .and_then(|value| parse_bool_value(value));
-                options.pretty = Some(explicit_value.unwrap_or(true));
-                if explicit_value.is_some() {
-                    index += 1;
-                }
+            "--incremental" | "-i" => {
+                options.incremental = optional_boolean_value(args, &mut index);
             }
-            _ if lower.starts_with("--pretty=") => {
-                options.pretty = Some(parse_bool_option(argument, "pretty")?);
+            "--noemit" => options.no_emit = optional_boolean_value(args, &mut index),
+            "--watch" | "-w" => options.watch = optional_boolean_value(args, &mut index),
+            "--pretty" => options.pretty = Some(optional_boolean_value(args, &mut index)),
+            _ if argument.starts_with("--")
+                && (compiler_boolean_name(&lower).is_some()
+                    || compiler_string_name(&lower).is_some()
+                    || compiler_list_name(&lower).is_some()
+                    || matches!(lower.as_str(), "--project" | "--paths" | "--rootdirs")) =>
+            {
+                return Err(CommandLineError {
+                    code: 5094,
+                    message: format!(
+                        "Compiler option '{argument}' may not be used with '--build'."
+                    ),
+                });
             }
             _ if argument.starts_with('-') => {
                 return Err(CommandLineError {
-                    code: 5023,
+                    code: 5072,
                     message: format!("Unknown build option '{argument}'."),
                 });
             }
@@ -261,18 +349,49 @@ fn required_option_value(
         .cloned()
         .ok_or_else(|| CommandLineError {
             code: 6044,
-            message: format!("Compiler option '{option}' expects an argument."),
+            message: format!(
+                "Compiler option '{}' expects an argument.",
+                option_display_name(option)
+            ),
         })
 }
 
-fn parse_bool_option(argument: &str, name: &str) -> Result<bool, CommandLineError> {
-    match argument.split_once('=').map(|(_, value)| value) {
-        Some(value) if value.eq_ignore_ascii_case("true") => Ok(true),
-        Some(value) if value.eq_ignore_ascii_case("false") => Ok(false),
-        _ => Err(CommandLineError {
-            code: 5024,
-            message: format!("Compiler option '{name}' requires a value of type boolean."),
-        }),
+fn option_display_name(name: &str) -> &str {
+    match name {
+        "baseurl" => "baseUrl",
+        "customconditions" => "customConditions",
+        "declarationdir" => "declarationDir",
+        "ignoredeprecations" => "ignoreDeprecations",
+        "jsxfactory" => "jsxFactory",
+        "jsxfragmentfactory" => "jsxFragmentFactory",
+        "jsximportsource" => "jsxImportSource",
+        "maproot" => "mapRoot",
+        "moduledetection" => "moduleDetection",
+        "moduleresolution" => "moduleResolution",
+        "modulesuffixes" => "moduleSuffixes",
+        "newline" => "newLine",
+        "outfile" => "outFile",
+        "outdir" => "outDir",
+        "reactnamespace" => "reactNamespace",
+        "rootdir" => "rootDir",
+        "rootdirs" => "rootDirs",
+        "sourceroot" => "sourceRoot",
+        "tsbuildinfofile" => "tsBuildInfoFile",
+        "typeroots" => "typeRoots",
+        _ => name,
+    }
+}
+
+fn optional_boolean_value(args: &[String], index: &mut usize) -> bool {
+    match args
+        .get(*index + 1)
+        .and_then(|value| parse_bool_value(value))
+    {
+        Some(value) => {
+            *index += 1;
+            value
+        }
+        None => true,
     }
 }
 
@@ -390,6 +509,222 @@ mod tests {
         );
         assert_eq!(parse(&["--project"]).unwrap_err().code, 6044);
         assert_eq!(parse(&["--target", "future"]).unwrap_err().code, 6046);
+    }
+
+    #[test]
+    fn reports_canonical_option_names_for_missing_values() {
+        assert_eq!(
+            parse(&["-p"]).unwrap_err().render(),
+            "error TS6044: Compiler option 'project' expects an argument."
+        );
+        assert_eq!(
+            parse(&["-t"]).unwrap_err().render(),
+            "error TS6044: Compiler option 'target' expects an argument."
+        );
+        assert_eq!(
+            parse(&["--lib"]).unwrap_err().render(),
+            "error TS6044: Compiler option 'lib' expects an argument."
+        );
+    }
+
+    #[test]
+    fn parses_standard_compiler_option_aliases() {
+        let Command::Compile(options) =
+            parse(&["-t", "es2022", "-m", "esnext", "-d", "-i", "main.ts"]).unwrap()
+        else {
+            panic!("expected compile command");
+        };
+
+        assert_eq!(
+            options.compiler_options.target,
+            ts_options::ScriptTarget::Es2022
+        );
+        assert_eq!(
+            options.compiler_options.module,
+            ts_options::ModuleKind::EsNext
+        );
+        assert!(options.compiler_options.declaration);
+        assert!(options.compiler_options.incremental);
+        assert_eq!(
+            options
+                .specified_options
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["declaration", "incremental", "module", "target"]
+        );
+    }
+
+    #[test]
+    fn parses_supported_boolean_compiler_options() {
+        let Command::Compile(options) = parse(&[
+            "--allowArbitraryExtensions",
+            "--allowImportingTsExtensions",
+            "--declarationMap",
+            "--downlevelIteration",
+            "--emitBOM",
+            "--emitDecoratorMetadata",
+            "--experimentalDecorators",
+            "--exactOptionalPropertyTypes",
+            "--isolatedDeclarations",
+            "--noEmitHelpers",
+            "--noImplicitThis",
+            "false",
+            "--noUncheckedIndexedAccess",
+            "--noUncheckedSideEffectImports",
+            "--removeComments",
+            "--resolveJsonModule",
+            "--rewriteRelativeImportExtensions",
+            "--stripInternal",
+            "--useDefineForClassFields",
+            "false",
+            "main.ts",
+        ])
+        .unwrap() else {
+            panic!("expected compile command");
+        };
+
+        assert!(options.compiler_options.allow_arbitrary_extensions);
+        assert!(options.compiler_options.allow_importing_ts_extensions);
+        assert!(options.compiler_options.declaration_map);
+        assert!(options.compiler_options.downlevel_iteration);
+        assert!(options.compiler_options.emit_bom);
+        assert!(options.compiler_options.emit_decorator_metadata);
+        assert!(options.compiler_options.experimental_decorators);
+        assert!(options.compiler_options.exact_optional_property_types);
+        assert!(options.compiler_options.isolated_declarations);
+        assert!(options.compiler_options.no_emit_helpers);
+        assert!(!options.compiler_options.no_implicit_this);
+        assert!(options.compiler_options.no_implicit_this_specified);
+        assert!(options.compiler_options.no_unchecked_indexed_access);
+        assert!(options.compiler_options.no_unchecked_side_effect_imports);
+        assert!(options.compiler_options.remove_comments);
+        assert!(options.compiler_options.resolve_json_module);
+        assert!(options.compiler_options.rewrite_relative_import_extensions);
+        assert!(options.compiler_options.strip_internal);
+        assert_eq!(
+            options.compiler_options.use_define_for_class_fields,
+            Some(false)
+        );
+        assert_eq!(options.files, ["main.ts"]);
+    }
+
+    #[test]
+    fn parses_supported_string_and_list_compiler_options() {
+        let Command::Compile(options) = parse(&[
+            "--baseUrl",
+            "src",
+            "--declarationDir",
+            "types",
+            "--customConditions",
+            "browser,development",
+            "--jsxFactory",
+            "h",
+            "--jsxFragmentFactory",
+            "Fragment",
+            "--jsxImportSource",
+            "preact",
+            "--mapRoot",
+            "maps",
+            "--moduleResolution",
+            "bundler",
+            "--moduleSuffixes",
+            ".native,.ios",
+            "--reactNamespace",
+            "React",
+            "--sourceRoot",
+            "sources",
+            "--tsBuildInfoFile",
+            "cache/state.tsbuildinfo",
+            "--lib",
+            "ES2022,,DOM",
+            "--types",
+            "node,vitest",
+            "--typeRoots",
+            "./types,./vendor/types",
+            "main.ts",
+        ])
+        .unwrap() else {
+            panic!("expected compile command");
+        };
+
+        assert_eq!(options.compiler_options.base_url.as_deref(), Some("src"));
+        assert_eq!(
+            options.compiler_options.declaration_dir.as_deref(),
+            Some("types")
+        );
+        assert_eq!(
+            options.compiler_options.custom_conditions,
+            Some(vec!["browser".to_owned(), "development".to_owned()])
+        );
+        assert_eq!(options.compiler_options.jsx_factory.as_deref(), Some("h"));
+        assert_eq!(
+            options.compiler_options.jsx_fragment_factory.as_deref(),
+            Some("Fragment")
+        );
+        assert_eq!(
+            options.compiler_options.jsx_import_source.as_deref(),
+            Some("preact")
+        );
+        assert_eq!(options.compiler_options.map_root.as_deref(), Some("maps"));
+        assert_eq!(
+            options.compiler_options.module_resolution,
+            ts_options::ModuleResolutionKind::Bundler
+        );
+        assert_eq!(
+            options.compiler_options.module_suffixes,
+            Some(vec![".native".to_owned(), ".ios".to_owned()])
+        );
+        assert_eq!(
+            options.compiler_options.react_namespace.as_deref(),
+            Some("React")
+        );
+        assert_eq!(
+            options.compiler_options.source_root.as_deref(),
+            Some("sources")
+        );
+        assert_eq!(
+            options.compiler_options.ts_build_info_file.as_deref(),
+            Some("cache/state.tsbuildinfo")
+        );
+        assert_eq!(
+            options.compiler_options.lib,
+            Some(vec!["ES2022".to_owned(), "DOM".to_owned()])
+        );
+        assert_eq!(
+            options.compiler_options.types,
+            Some(vec!["node".to_owned(), "vitest".to_owned()])
+        );
+        assert_eq!(
+            options.compiler_options.type_roots,
+            Some(vec!["./types".to_owned(), "./vendor/types".to_owned()])
+        );
+    }
+
+    #[test]
+    fn rejects_equals_syntax_like_the_typescript_cli() {
+        let error = parse(&["--pretty=false"]).unwrap_err();
+        assert_eq!(error.code, 5023);
+        assert_eq!(
+            error.render(),
+            "error TS5023: Unknown compiler option '--pretty=false'."
+        );
+
+        let build_error = parse(&["--build", "--pretty=false"]).unwrap_err();
+        assert_eq!(build_error.code, 5072);
+    }
+
+    #[test]
+    fn parses_explicit_command_boolean_values() {
+        let Command::Compile(options) =
+            parse(&["--watch", "false", "--ignoreConfig", "false", "main.ts"]).unwrap()
+        else {
+            panic!("expected compile command");
+        };
+
+        assert!(!options.watch);
+        assert!(!options.ignore_config);
+        assert_eq!(options.files, ["main.ts"]);
     }
 
     #[test]
@@ -627,6 +962,30 @@ mod tests {
                 pretty: Some(false),
                 watch: false,
             }))
+        );
+    }
+
+    #[test]
+    fn parses_explicit_build_boolean_values_and_incremental_alias() {
+        assert_eq!(
+            parse(&["-b", "-i", "false", "--noEmit", "false", "project"]),
+            Ok(Command::Build(BuildOptions {
+                projects: vec!["project".into()],
+                incremental: false,
+                no_emit: false,
+                pretty: None,
+                watch: false,
+            }))
+        );
+    }
+
+    #[test]
+    fn reports_unknown_build_options_with_typescript_diagnostic() {
+        let error = parse(&["--build", "--wat"]).unwrap_err();
+        assert_eq!(error.code, 5072);
+        assert_eq!(
+            error.render(),
+            "error TS5072: Unknown build option '--wat'."
         );
     }
 
