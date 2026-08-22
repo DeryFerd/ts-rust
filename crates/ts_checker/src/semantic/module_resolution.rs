@@ -1030,6 +1030,90 @@ mod tests {
     }
 
     #[test]
+    fn retains_ambient_namespace_imports_to_export_equals_declarations() {
+        let importer =
+            parsed(r#"declare module "mymod" { import * as foo from "foo"; export { foo }; }"#);
+        let target = parsed(
+            r"
+                declare function foo(): void;
+                declare namespace foo { export const items: string[]; }
+                export = foo;
+            ",
+        );
+        let importer_file = FileId::new(22);
+        let target_file = FileId::new(23);
+        let specifiers = module_specifiers(&importer);
+        assert_eq!(specifiers.len(), 1);
+        let specifier = node_ref(&importer, importer_file, specifiers[0]);
+
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &importer.arena,
+                importer.source_file,
+                importer_file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/ambient.d.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    true,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_source_file_with_facts(
+                &target.arena,
+                target.source_file,
+                target_file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/node_modules/foo/index.d.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    true,
+                    CanonicalModuleState::External,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&importer.arena, importer_file)
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&target.arena, target_file)
+            .unwrap();
+
+        let context = CanonicalCheckerContext::new_with_module_resolutions(
+            binder.finish(),
+            vec![
+                (importer_file, &importer.arena),
+                (target_file, &target.arena),
+            ],
+            CanonicalCheckerOptions::default(),
+            CanonicalModuleResolutionManifestInput::new([
+                CanonicalModuleResolutionEntry::resolved(
+                    specifier,
+                    CanonicalResolvedModuleInput::new(
+                        target_file,
+                        CanonicalModuleResolutionMode::CommonJs,
+                        CanonicalModuleResolutionMode::CommonJs,
+                    ),
+                ),
+            ]),
+        )
+        .unwrap();
+
+        let CanonicalModuleResolutionLookup::Resolved(target) =
+            context.module_resolution(specifier)
+        else {
+            panic!("ambient namespace import should retain the declaration module");
+        };
+        assert_eq!(target.target_file(), target_file);
+        assert_eq!(target.usage_mode(), CanonicalModuleResolutionMode::CommonJs);
+        assert_eq!(
+            target.target_mode(),
+            CanonicalModuleResolutionMode::CommonJs
+        );
+    }
+
+    #[test]
     fn rejects_same_node_duplicates_before_adopting_any_entry() {
         let importer = parsed("import value from './target';");
         let target = parsed("export const value = 1;");

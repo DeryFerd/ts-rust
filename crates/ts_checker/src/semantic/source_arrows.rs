@@ -8,8 +8,13 @@
 //! preserve the export route when present. Publication remains deferred to
 //! source dispatch.
 
+use std::collections::HashSet;
+
 use ts_ast::{NodeData, NodeRef, SyntaxKind};
-use ts_binder::{CheckFlags, InternalSymbolName, SemanticSymbolId, SymbolFlags};
+use ts_binder::{
+    CanonicalNameResolutionError, CanonicalNameResolver, CanonicalResolutionLocation, CheckFlags,
+    InternalSymbolName, SemanticSymbolId, SymbolFlags,
+};
 
 use super::{
     CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHost,
@@ -423,13 +428,9 @@ fn plan_contextual_target_syntax_shape(
     type_node: NodeRef,
     array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<SourceContextualSignatureShape, SourceContextualArrowError> {
-    let record = preflight_node(store, host, type_node)?;
-    if record.kind != SyntaxKind::FunctionType {
-        return Err(contextual_unsupported(
-            SourceContextualArrowUnsupported::ContextualTargetSyntax(type_node),
-        ));
-    }
-    let plan = plan_function_type(store, host, type_node, None, false, array_targets)
+    let (function, alias) =
+        contextual_function_type_syntax(store, host, type_node, None, &mut HashSet::new())?;
+    let plan = plan_function_type(store, host, function, alias, false, array_targets)
         .map_err(|error| contextual_target_plan_error(error, type_node))?;
     let return_type = plan.return_type;
     let return_record = preflight_node(store, host, return_type)?;
@@ -444,6 +445,170 @@ fn plan_contextual_target_syntax_shape(
         parameter_count: plan.parameters.len(),
         has_effective_rest: false,
     })
+}
+
+#[allow(clippy::too_many_lines)] // Keep the read-only alias and intersection proof atomic.
+fn contextual_function_type_syntax(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    node: NodeRef,
+    alias: Option<SemanticSymbolId>,
+    active_aliases: &mut HashSet<SemanticSymbolId>,
+) -> Result<(NodeRef, Option<SemanticSymbolId>), SourceContextualArrowError> {
+    let record = preflight_node(store, host, node)?;
+    match (&record.kind, &record.data) {
+        (SyntaxKind::FunctionType, NodeData::FunctionTypeNode(_)) => Ok((node, alias)),
+        (SyntaxKind::ParenthesizedType, NodeData::ParenthesizedTypeNode(parenthesized)) => {
+            let child = NodeRef::new(node.arena, node.file, parenthesized.type_);
+            let child_record = preflight_node(store, host, child)?;
+            if child_record.parent != Some(node.node)
+                || !range_contains(record.range, child_record.range)
+            {
+                return Err(contextual_invariant(
+                    SourceContextualArrowInvariant::InvalidVariableType(child),
+                ));
+            }
+            contextual_function_type_syntax(store, host, child, alias, active_aliases)
+        }
+        (SyntaxKind::TypeReference, NodeData::TypeReferenceNode(reference)) => {
+            if reference.type_arguments.is_some() {
+                return Err(contextual_unsupported(
+                    SourceContextualArrowUnsupported::ContextualTargetSyntax(node),
+                ));
+            }
+            let name = NodeRef::new(node.arena, node.file, reference.type_name);
+            let name_record = preflight_node(store, host, name)?;
+            let NodeData::Identifier(identifier) = &name_record.data else {
+                return Err(contextual_unsupported(
+                    SourceContextualArrowUnsupported::ContextualTargetSyntax(node),
+                ));
+            };
+            if name_record.kind != SyntaxKind::Identifier
+                || name_record.parent != Some(node.node)
+                || name_record.flags.0 != 0
+                || identifier.flow_node.is_some()
+            {
+                return Err(contextual_invariant(
+                    SourceContextualArrowInvariant::InvalidVariableType(name),
+                ));
+            }
+            let (arena, bound) = host.source(node).ok_or_else(|| {
+                contextual_invariant(SourceContextualArrowInvariant::InvalidVariableType(node))
+            })?;
+            let mut callback_host = host.name_resolver_host(store)?;
+            let mut resolver =
+                CanonicalNameResolver::new(arena, bound, store.symbol_store(), &mut callback_host)
+                    .map_err(DeclaredTypeError::from)?;
+            let symbol = match resolver.resolve(
+                Some(CanonicalResolutionLocation::Bound(name)),
+                &identifier.text,
+                SymbolFlags::TYPE,
+                None,
+                true,
+                false,
+            ) {
+                Ok(Some(symbol)) => symbol,
+                Ok(None) | Err(CanonicalNameResolutionError::AliasResolutionUnavailable(_)) => {
+                    return Err(contextual_unsupported(
+                        SourceContextualArrowUnsupported::ContextualTargetSyntax(node),
+                    ));
+                }
+                Err(error) => return Err(DeclaredTypeError::from(error).into()),
+            };
+            let Some(symbol) = store.get_merged_symbol(symbol) else {
+                return Err(contextual_invariant(
+                    SourceContextualArrowInvariant::InvalidVariableType(node),
+                ));
+            };
+            let Some(symbol_record) = store.symbol(symbol) else {
+                return Err(contextual_invariant(
+                    SourceContextualArrowInvariant::InvalidVariableType(node),
+                ));
+            };
+            let Some([declaration]) = symbol_record.declarations() else {
+                return Err(contextual_unsupported(
+                    SourceContextualArrowUnsupported::ContextualTargetSyntax(node),
+                ));
+            };
+            if symbol_record.flags() != SymbolFlags::TYPE_ALIAS
+                || !host.symbol_matches(store, *declaration, symbol)
+                || !active_aliases.insert(symbol)
+            {
+                return Err(contextual_unsupported(
+                    SourceContextualArrowUnsupported::ContextualTargetSyntax(node),
+                ));
+            }
+            let declaration_record = preflight_node(store, host, *declaration)?;
+            let NodeData::TypeAliasDeclaration(declaration_data) = &declaration_record.data else {
+                active_aliases.remove(&symbol);
+                return Err(contextual_invariant(
+                    SourceContextualArrowInvariant::InvalidVariableType(*declaration),
+                ));
+            };
+            if declaration_record.kind != SyntaxKind::TypeAliasDeclaration
+                || declaration_data.type_parameters.is_some()
+            {
+                active_aliases.remove(&symbol);
+                return Err(contextual_unsupported(
+                    SourceContextualArrowUnsupported::ContextualTargetSyntax(node),
+                ));
+            }
+            let body = NodeRef::new(declaration.arena, declaration.file, declaration_data.type_);
+            let body_record = preflight_node(store, host, body)?;
+            if body_record.parent != Some(declaration.node)
+                || !range_contains(declaration_record.range, body_record.range)
+            {
+                active_aliases.remove(&symbol);
+                return Err(contextual_invariant(
+                    SourceContextualArrowInvariant::InvalidVariableType(body),
+                ));
+            }
+            let alias_target =
+                contextual_function_type_syntax(store, host, body, Some(symbol), active_aliases);
+            active_aliases.remove(&symbol);
+            alias_target
+        }
+        (SyntaxKind::IntersectionType, NodeData::IntersectionTypeNode(intersection)) => {
+            let mut callable = None;
+            for constituent in &intersection.types.nodes {
+                let constituent = NodeRef::new(node.arena, node.file, *constituent);
+                let constituent_record = preflight_node(store, host, constituent)?;
+                if constituent_record.parent != Some(node.node)
+                    || !range_contains(record.range, constituent_record.range)
+                {
+                    return Err(contextual_invariant(
+                        SourceContextualArrowInvariant::InvalidVariableType(constituent),
+                    ));
+                }
+                match contextual_function_type_syntax(
+                    store,
+                    host,
+                    constituent,
+                    None,
+                    active_aliases,
+                ) {
+                    Ok(found) if callable.replace(found).is_some() => {
+                        return Err(contextual_unsupported(
+                            SourceContextualArrowUnsupported::ContextualTargetSyntax(node),
+                        ));
+                    }
+                    Ok(_)
+                    | Err(SourceContextualArrowError::Unsupported(
+                        SourceContextualArrowUnsupported::ContextualTargetSyntax(_),
+                    )) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            callable.ok_or_else(|| {
+                contextual_unsupported(SourceContextualArrowUnsupported::ContextualTargetSyntax(
+                    node,
+                ))
+            })
+        }
+        _ => Err(contextual_unsupported(
+            SourceContextualArrowUnsupported::ContextualTargetSyntax(node),
+        )),
+    }
 }
 
 /// Proves one direct context-sensitive arrow without resolving its annotation
@@ -1799,11 +1964,74 @@ mod tests {
     }
 
     #[test]
-    fn named_contextual_callable_targets_remain_atomic_typed_boundaries() {
+    fn named_contextual_callable_aliases_retain_exact_signature_shapes_without_writes() {
         for source in [
             "type Callback = () => void; export const value: Callback = () => {};",
             concat!(
+                "type Callback = (input: string) => void; ",
+                "export const value: Callback = (input) => {};",
+            ),
+            concat!(
+                "type Callback = () => void; type Alias = Callback; ",
+                "export const value: Alias = () => {};",
+            ),
+            concat!(
                 "type Page = (() => void) & { getLayout?: () => void }; ",
+                "export const value: Page = () => {};",
+            ),
+        ] {
+            let fixture = Fixture::new(source);
+            let declaration = fixture.declarations()[0];
+            let NodeData::VariableDeclaration(variable) =
+                &fixture.parsed.arena.get(declaration.node).unwrap().data
+            else {
+                panic!("expected contextual variable declaration")
+            };
+            let arrow = NodeRef::new(
+                fixture.parsed.arena.id(),
+                fixture.file,
+                variable.initializer.unwrap(),
+            );
+            let owner = fixture.bound.symbol(arrow).unwrap();
+            let cold = (
+                fixture.store.type_len(),
+                fixture.store.symbol_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+
+            let plan = fixture.contextual_plan(0).unwrap();
+            assert_eq!(plan.contextual_type.type_node.node, variable.type_.unwrap());
+            assert_eq!(plan.contextual_signature_shape.call_signature_count, 1);
+            assert_eq!(
+                plan.contextual_signature_shape.parameter_count,
+                plan.parameters.len(),
+            );
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.symbol_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                cold,
+            );
+            assert!(
+                fixture
+                    .store
+                    .source_callable_type_for_owner(owner)
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn generic_named_contextual_callable_targets_remain_atomic_typed_boundaries() {
+        for source in [
+            concat!(
+                "type Callback<Value> = (value: Value) => void; ",
+                "export const value: Callback<string> = () => {};",
+            ),
+            concat!(
+                "type Page<Props = unknown> = (() => void) & { getLayout?: () => void }; ",
                 "export const value: Page = () => {};",
             ),
         ] {

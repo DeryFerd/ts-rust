@@ -230,7 +230,7 @@ impl CanonicalCheckerDiagnostics {
 
 #[cfg(test)]
 mod tests {
-    use ts_ast::{FileId, NodeRef};
+    use ts_ast::{FileId, NodeData, NodeRef, SyntaxKind};
     use ts_core::{TextPos, TextRange};
     use ts_diagnostics::{Diagnostic, message_by_code};
     use ts_parser::parse_source_file;
@@ -372,6 +372,144 @@ mod tests {
         let primary = Diagnostic::with_arguments(message_by_code(2300).unwrap(), ["target"]);
 
         diagnostics_lookup_at_ranges(first, second, primary);
+    }
+
+    #[test]
+    fn ambient_diagnostics_preserve_pinned_messages_and_source_anchors() {
+        let source = "function foo();\ndeclare const token: number = 1 + 2;";
+        let parsed = parse_source_file(source);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(3);
+        let (function, function_record) = parsed
+            .arena
+            .iter()
+            .find(|(_, record)| record.kind == SyntaxKind::FunctionDeclaration)
+            .unwrap();
+        let NodeData::FunctionDeclaration(function_data) = &function_record.data else {
+            unreachable!()
+        };
+        let function_node = NodeRef::new(parsed.arena.id(), file, function);
+        let function_name = NodeRef::new(
+            parsed.arena.id(),
+            file,
+            function_data.name.expect("the function is named"),
+        );
+        let keyword_range = CanonicalCheckerDiagnosticRange::new(
+            function_node,
+            TextRange::new(
+                function_record.range.start,
+                TextPos::new(function_record.range.start.get() + 8),
+            ),
+        );
+        let initializer = parsed
+            .arena
+            .iter()
+            .find_map(|(_, record)| {
+                let NodeData::VariableDeclaration(variable) = &record.data else {
+                    return None;
+                };
+                Some(NodeRef::new(parsed.arena.id(), file, variable.initializer?))
+            })
+            .unwrap();
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        diagnostics.add_at_range(
+            keyword_range,
+            Diagnostic::new(message_by_code(1046).unwrap()),
+        );
+        diagnostics.add(
+            Some(function_name),
+            Diagnostic::with_arguments(message_by_code(7010).unwrap(), ["foo", "any"]),
+        );
+        diagnostics.add(
+            Some(initializer),
+            Diagnostic::new(message_by_code(1039).unwrap()),
+        );
+
+        let entries = diagnostics.as_slice();
+        assert_eq!(entries[0].diagnostic.code(), 1046);
+        assert_eq!(entries[0].node, Some(function_node));
+        assert_eq!(entries[0].range_override, Some(keyword_range));
+        assert_eq!(
+            entries[0].diagnostic.render().unwrap(),
+            "Top-level declarations in .d.ts files must start with either a 'declare' or 'export' modifier."
+        );
+        assert!(keyword_range.is_valid_for(
+            function_node,
+            function_record.range,
+            parsed.arena.get(parsed.source_file).unwrap().range,
+        ));
+        assert_eq!(source_range_text(source, keyword_range.range()), "function");
+
+        assert_eq!(entries[1].diagnostic.code(), 7010);
+        assert_eq!(entries[1].node, Some(function_name));
+        assert!(entries[1].range_override.is_none());
+        assert_eq!(
+            entries[1].diagnostic.render().unwrap(),
+            "'foo', which lacks return-type annotation, implicitly has an 'any' return type."
+        );
+        assert_eq!(
+            source_range_text(source, parsed.arena.get(function_name.node).unwrap().range),
+            "foo"
+        );
+
+        assert_eq!(entries[2].diagnostic.code(), 1039);
+        assert_eq!(entries[2].node, Some(initializer));
+        assert!(entries[2].range_override.is_none());
+        assert_eq!(
+            entries[2].diagnostic.render().unwrap(),
+            "Initializers are not allowed in ambient contexts."
+        );
+        assert_eq!(
+            source_range_text(source, parsed.arena.get(initializer.node).unwrap().range),
+            "1 + 2"
+        );
+    }
+
+    #[test]
+    fn missing_declaration_modifier_ranges_cover_only_the_first_keyword() {
+        for (source, kind, keyword) in [
+            (
+                "function missing();",
+                SyntaxKind::FunctionDeclaration,
+                "function",
+            ),
+            ("var missing: number;", SyntaxKind::VariableStatement, "var"),
+        ] {
+            let parsed = parse_source_file(source);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let file = FileId::new(4);
+            let (declaration, record) = parsed
+                .arena
+                .iter()
+                .find(|(_, record)| record.kind == kind)
+                .unwrap();
+            let anchor = NodeRef::new(parsed.arena.id(), file, declaration);
+            let range = CanonicalCheckerDiagnosticRange::new(
+                anchor,
+                TextRange::new(
+                    record.range.start,
+                    TextPos::new(record.range.start.get() + u32::try_from(keyword.len()).unwrap()),
+                ),
+            );
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            diagnostics.add_at_range(range, Diagnostic::new(message_by_code(1046).unwrap()));
+
+            let diagnostic = &diagnostics.as_slice()[0];
+            assert_eq!(diagnostic.node, Some(anchor));
+            assert_eq!(diagnostic.range_override, Some(range));
+            assert!(range.is_valid_for(
+                anchor,
+                record.range,
+                parsed.arena.get(parsed.source_file).unwrap().range,
+            ));
+            assert_eq!(source_range_text(source, range.range()), keyword);
+        }
+    }
+
+    fn source_range_text(source: &str, range: TextRange) -> &str {
+        let start = usize::try_from(range.start.get()).unwrap();
+        let end = usize::try_from(range.end.get()).unwrap();
+        &source[start..end]
     }
 
     fn diagnostics_lookup_at_ranges(

@@ -19,6 +19,7 @@ use ts_binder::{
 
 use super::{
     CanonicalGlobalTypeInitializationError, CanonicalGlobalTypes, DeclaredTypeHost,
+    ResolvedSignatureState, SignatureLinks,
     array_types::{ArrayTypeError, CanonicalArrayTargets},
     bootstrap::LiteralTypeCacheError,
     callables::{
@@ -36,7 +37,7 @@ use super::{
         ExpandingFlags, IntersectionState, RecursionFlags, RecursionIdentityUnavailable,
         RelationComparisonResult, RelationKeyUnavailable, RelationKind, SignatureCheckMode,
     },
-    signatures::Ternary,
+    signatures::{SignatureFlags, Ternary},
     store::{RelationObservationToken, SemanticStore, SourceNodeParent},
     structured_members::{
         InterfaceHeritageMembersValidation, validate_interface_heritage_members,
@@ -2660,10 +2661,10 @@ impl<'store> RelaterSession<'store> {
         }
 
         let strict_variance = !check_mode.intersects(SignatureCheckMode::CALLBACK)
+            && !target.strict_variance_exempt
             && self
                 .strict_function_types
-                .ok_or(RelationUnavailable::StructuredSignatures(target.owner))?
-            && !target.strict_variance_exempt;
+                .ok_or(RelationUnavailable::StructuredSignatures(target.owner))?;
         let mut result = Ternary::True;
         let parameter_count = source.parameters.len().max(target.parameters.len());
         for index in 0..parameter_count {
@@ -3207,6 +3208,12 @@ impl<'store> RelaterSession<'store> {
             | ObjectPropertyOrigin::ValidatedClass
             | ObjectPropertyOrigin::GenericReference(_) => {}
         }
+        if matches!(origin, ObjectPropertyOrigin::ValidatedClass)
+            && record.flags() == SymbolFlags::METHOD
+        {
+            self.validated_class_method_callable(symbol)?;
+            return Ok(record);
+        }
         let allowed_flags = SymbolFlags::PROPERTY | SymbolFlags::OPTIONAL;
         let allowed_checks = CheckFlags::READONLY.bits();
         if !record.flags().contains(SymbolFlags::PROPERTY)
@@ -3244,6 +3251,127 @@ impl<'store> RelaterSession<'store> {
             return Err(RelationUnavailable::UnsupportedProperty(symbol));
         }
         Ok(record)
+    }
+
+    fn validated_class_method_callable(
+        &self,
+        symbol: SemanticSymbolId,
+    ) -> Result<ValidatedSingleCallable, RelationUnavailable> {
+        let unsupported = || RelationUnavailable::UnsupportedProperty(symbol);
+        let method = self.store.symbol(symbol).ok_or_else(unsupported)?;
+        let Some([declaration]) = method.declarations() else {
+            return Err(unsupported());
+        };
+        let declaration = *declaration;
+        let owner = method.parent().ok_or_else(unsupported)?;
+        let class = self.store.symbol(owner).ok_or_else(unsupported)?;
+        let Some([class_declaration]) = class.declarations() else {
+            return Err(unsupported());
+        };
+        let instance = self
+            .store
+            .declared_type_links(owner)
+            .and_then(|links| links.declared_type)
+            .ok_or_else(unsupported)?;
+        if method.flags() != SymbolFlags::METHOD
+            || method.check_flags() != CheckFlags::NONE
+            || method.name().is_reserved_member_name()
+            || method.name().is_private_identifier()
+            || method.name().is_late_bound()
+            || method.value_declaration() != Some(declaration)
+            || method.members().is_some()
+            || method.exports().is_some()
+            || method.export_symbol().is_some()
+            || self.store.get_merged_symbol(symbol) != Some(symbol)
+            || !class.flags().intersects(SymbolFlags::CLASS)
+            || self.store.source_node_kind(declaration) != Some(SyntaxKind::MethodDeclaration)
+            || self.store.source_node_parent(declaration)
+                != Some(SourceNodeParent::Parent(*class_declaration))
+            || validate_class_heritage_members(self.store, instance)
+                != ClassHeritageMembersValidation::Valid
+        {
+            return Err(unsupported());
+        }
+
+        let links = self
+            .store
+            .value_symbol_links(symbol)
+            .ok_or_else(unsupported)?;
+        let owner_type = links.resolved_type.ok_or_else(unsupported)?;
+        if links
+            != &(ValueSymbolLinks {
+                resolved_type: Some(owner_type),
+                ..ValueSymbolLinks::default()
+            })
+        {
+            return Err(unsupported());
+        }
+        let record = self
+            .store
+            .type_payload(owner_type)
+            .ok_or_else(unsupported)?;
+        let TypeData::Object(object) = record.data() else {
+            return Err(unsupported());
+        };
+        let Some([signature]) = object.structured.signatures.as_deref() else {
+            return Err(unsupported());
+        };
+        let signature = *signature;
+        let signature_record = self.store.signature(signature).ok_or_else(unsupported)?;
+        let return_type = signature_record
+            .resolved_return_type()
+            .ok_or_else(unsupported)?;
+        if record.flags() != TypeFlags::OBJECT
+            || record.object_flags() != (ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED)
+            || record.symbol() != Some(symbol)
+            || record.alias().is_some()
+            || object.target.is_some()
+            || object.mapper.is_some()
+            || object.instantiations != TypeCacheState::Unallocated
+            || object.structured.constrained != ConstrainedTypeData::default()
+            || object.structured.members.is_some()
+            || object.structured.properties.is_some()
+            || object.structured.call_signature_count != 1
+            || object.structured.index_infos.is_some()
+            || object
+                .structured
+                .object_type_without_abstract_construct_signatures
+                .is_some()
+            || signature_record.flags() != SignatureFlags::NONE
+            || signature_record.declaration() != Some(declaration)
+            || !signature_record.type_parameters().is_empty()
+            || !signature_record.parameters().is_empty()
+            || signature_record.this_parameter().is_some()
+            || signature_record.min_argument_count() != 0
+            || signature_record.resolved_min_argument_count() != -1
+            || signature_record.resolved_type_predicate().is_some()
+            || signature_record.target().is_some()
+            || signature_record.mapper().is_some()
+            || signature_record.isolated_signature_type().is_some()
+            || signature_record.composite().is_some()
+            || ![
+                self.bootstrap.void_type,
+                self.bootstrap.any_type,
+                self.bootstrap.undefined_type,
+            ]
+            .contains(&return_type)
+            || self.store.signature_links(declaration)
+                != Some(&SignatureLinks {
+                    resolved_signature: ResolvedSignatureState::Resolved(signature),
+                    ..SignatureLinks::default()
+                })
+        {
+            return Err(unsupported());
+        }
+        Ok(ValidatedSingleCallable {
+            owner: owner_type,
+            signature,
+            parameters: Vec::new(),
+            rest_parameter: None,
+            min_argument_count: 0,
+            return_type: Some(return_type),
+            strict_variance_exempt: true,
+        })
     }
 
     fn is_canonical_object_literal_property(
@@ -3631,7 +3759,26 @@ impl<'store> RelaterSession<'store> {
         type_: TypeId,
     ) -> Result<Option<ValidatedSingleCallable>, RelationUnavailable> {
         let mut callable = match validate_stored_single_callable(self.store, type_) {
-            StoredSingleCallableValidation::NotCallable => return Ok(None),
+            StoredSingleCallableValidation::NotCallable => {
+                let Some(symbol) = self.store.type_payload(type_).and_then(TypeRecord::symbol)
+                else {
+                    return Ok(None);
+                };
+                if self
+                    .store
+                    .symbol(symbol)
+                    .is_none_or(|record| record.flags() != SymbolFlags::METHOD)
+                {
+                    return Ok(None);
+                }
+                let callable = self
+                    .validated_class_method_callable(symbol)
+                    .map_err(|_| RelationUnavailable::MalformedFunctionType(type_))?;
+                if callable.owner != type_ {
+                    return Err(RelationUnavailable::MalformedFunctionType(type_));
+                }
+                callable
+            }
             StoredSingleCallableValidation::Pending { .. } => {
                 return Err(if self.strict_function_types.is_some() {
                     RelationUnavailable::UnresolvedFunctionType(type_)
@@ -3644,7 +3791,7 @@ impl<'store> RelaterSession<'store> {
             }
             StoredSingleCallableValidation::Valid { callable, .. } => callable,
         };
-        if self.strict_function_types.is_none() {
+        if self.strict_function_types.is_none() && !callable.strict_variance_exempt {
             return Err(RelationUnavailable::StructuredSignatures(type_));
         }
         while callable.min_argument_count != 0
@@ -5617,6 +5764,9 @@ mod tests {
         RelationKind, SignatureId, SignatureLinks, TypeAliasLinks, TypeId, TypeNodeLinks,
         ValueSymbolLinks,
         array_types::CanonicalArrayTargets,
+        classes::{
+            ClassMembers, execute_nongeneric_class_member_query, plan_nongeneric_class_member_query,
+        },
         declared::type_list_key,
         global_types::create_type_from_generic_global_type,
         production::GlobalMergeCompletion,
@@ -5796,6 +5946,21 @@ mod tests {
         type_
     }
 
+    fn query_class_members(fixture: &mut FunctionRelationFixture, name: &str) -> ClassMembers {
+        let globals = fixture.store.intrinsic_bootstrap().unwrap().globals;
+        let symbol = fixture
+            .store
+            .symbol_table(globals)
+            .and_then(|globals| globals.get_source(name))
+            .unwrap_or_else(|| panic!("missing class {name}"));
+        let host = relation_host(
+            &fixture.parsed.arena,
+            fixture.files.get(&fixture.file).unwrap(),
+        );
+        let plan = plan_nongeneric_class_member_query(&fixture.store, &host, symbol).unwrap();
+        execute_nongeneric_class_member_query(&mut fixture.store, &host, &plan).unwrap()
+    }
+
     fn resolve_all_function_returns(fixture: &mut FunctionRelationFixture) {
         let signatures = fixture
             .parsed
@@ -5831,6 +5996,201 @@ mod tests {
         .get_return_type_of_signature(signature)
         .unwrap();
         assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn validated_class_methods_compare_structurally_without_function_variance_options() {
+        let mut fixture = function_relation_fixture(concat!(
+            "class Left { run(): void {} } ",
+            "class Right { run(): void {} } ",
+            "class UndefinedReturn { run(): undefined {} } ",
+            "class DynamicReturn { run(): any {} }",
+        ));
+        let left = query_class_members(&mut fixture, "Left")
+            .shells()
+            .instance_type();
+        let right = query_class_members(&mut fixture, "Right")
+            .shells()
+            .instance_type();
+        let undefined = query_class_members(&mut fixture, "UndefinedReturn")
+            .shells()
+            .instance_type();
+        let dynamic = query_class_members(&mut fixture, "DynamicReturn")
+            .shells()
+            .instance_type();
+
+        assert_eq!(fixture.store.is_type_assignable_to(left, right), Ok(true));
+        assert_eq!(fixture.store.is_type_identical_to(left, right), Ok(true));
+        assert_eq!(
+            fixture.store.is_type_assignable_to(undefined, left),
+            Ok(true)
+        );
+        assert_eq!(
+            fixture.store.is_type_assignable_to(left, undefined),
+            Ok(false)
+        );
+        assert_eq!(
+            fixture.store.is_type_identical_to(left, undefined),
+            Ok(false)
+        );
+        assert_eq!(
+            fixture.store.is_type_assignable_to(dynamic, undefined),
+            Ok(true)
+        );
+    }
+
+    #[test]
+    fn inherited_and_static_class_methods_retain_callable_relation_semantics() {
+        let mut fixture = function_relation_fixture(concat!(
+            "class Base { run(): void {} static shared(): void {} } ",
+            "class Derived extends Base { own(): void {} } ",
+            "class Shape { run(): void {} } ",
+            "class StaticShape { static shared(): undefined {} }",
+        ));
+        let derived = query_class_members(&mut fixture, "Derived");
+        let base = query_class_members(&mut fixture, "Base");
+        let shape = query_class_members(&mut fixture, "Shape");
+        let static_shape = query_class_members(&mut fixture, "StaticShape");
+
+        assert_eq!(
+            derived.instance_properties()[1],
+            base.instance_properties()[0]
+        );
+        assert_eq!(derived.static_properties()[0], base.static_properties()[0]);
+        assert_eq!(
+            fixture.store.is_type_assignable_to(
+                derived.shells().instance_type(),
+                shape.shells().instance_type(),
+            ),
+            Ok(true)
+        );
+        assert_eq!(
+            fixture.store.is_type_assignable_to(
+                shape.shells().instance_type(),
+                derived.shells().instance_type(),
+            ),
+            Ok(false)
+        );
+
+        let inherited_static = fixture
+            .store
+            .value_symbol_links(derived.static_properties()[0])
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        let undefined_static = fixture
+            .store
+            .value_symbol_links(static_shape.static_properties()[0])
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        assert_eq!(
+            fixture
+                .store
+                .is_type_assignable_to(inherited_static, undefined_static),
+            Ok(false)
+        );
+        assert_eq!(
+            fixture
+                .store
+                .is_type_assignable_to(undefined_static, inherited_static),
+            Ok(true)
+        );
+    }
+
+    #[test]
+    fn class_method_values_compare_with_branded_zero_argument_callbacks() {
+        let mut fixture = function_relation_fixture(concat!(
+            "class Method { run(): void {} } ",
+            "type Callback = () => void;",
+        ));
+        let method = query_class_members(&mut fixture, "Method");
+        let method_type = fixture
+            .store
+            .value_symbol_links(method.instance_properties()[0])
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        let (callback, signature) = query_function_alias(&mut fixture, "Callback");
+        resolve_function_return(&mut fixture, signature);
+
+        assert_eq!(
+            fixture
+                .store
+                .is_type_assignable_to_with_strict_function_types(method_type, callback, true),
+            Ok(true)
+        );
+        assert_eq!(
+            fixture
+                .store
+                .is_type_assignable_to_with_strict_function_types(callback, method_type, true),
+            Ok(true)
+        );
+    }
+
+    #[test]
+    fn poisoned_class_method_signatures_invalidate_warmed_structural_relations() {
+        let mut fixture = function_relation_fixture(concat!(
+            "class Source { run(): void {} } ",
+            "class Target { run(): void {} }",
+        ));
+        let source = query_class_members(&mut fixture, "Source");
+        let target = query_class_members(&mut fixture, "Target");
+        let source_type = source.shells().instance_type();
+        let target_type = target.shells().instance_type();
+        assert_eq!(
+            fixture
+                .store
+                .is_type_assignable_to(source_type, target_type),
+            Ok(true)
+        );
+        let root_key = fixture
+            .store
+            .relation_key_if_available(
+                source_type,
+                target_type,
+                super::IntersectionState::NONE,
+                false,
+                false,
+            )
+            .unwrap()
+            .key();
+        assert!(
+            fixture
+                .store
+                .relation_cache_get(RelationKind::Assignable, root_key)
+                .intersects(RelationComparisonResult::SUCCEEDED)
+        );
+
+        let method_type = fixture
+            .store
+            .value_symbol_links(target.instance_properties()[0])
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        let signature = fixture
+            .store
+            .type_payload(method_type)
+            .and_then(|record| record.data().structured())
+            .and_then(|structured| structured.signatures.as_deref())
+            .and_then(|signatures| signatures.first().copied())
+            .unwrap();
+        let invalid = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+        assert!(
+            fixture
+                .store
+                .set_signature_resolved_return_type(signature, Some(invalid))
+        );
+        assert_eq!(
+            fixture
+                .store
+                .relation_cache_get(RelationKind::Assignable, root_key),
+            RelationComparisonResult::NONE
+        );
+        let stale = fixture.store.relation_state_snapshot();
+        assert_eq!(
+            fixture
+                .store
+                .is_type_assignable_to(source_type, target_type),
+            Err(RelationUnavailable::InvalidStructuredMembers(target_type))
+        );
+        assert_eq!(fixture.store.relation_state_snapshot(), stale);
     }
 
     #[test]

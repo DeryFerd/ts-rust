@@ -1,9 +1,9 @@
-use ts_ast::FileId;
+use ts_ast::{FileId, NodeRef, SyntaxKind};
 use ts_binder::{
     CanonicalBinder, CanonicalModuleState, CanonicalSourceFileFacts, CanonicalSourceLanguage,
     EscapedName,
 };
-use ts_checker::semantic::{CanonicalCheckerContext, CanonicalCheckerOptions};
+use ts_checker::semantic::{CanonicalCheckerContext, CanonicalCheckerOptions, TypeData};
 use ts_parser::{ParseResult, parse_javascript_source_file, parse_source_file};
 
 fn context(
@@ -82,6 +82,72 @@ fn object_assertions_allow_structurally_overlapping_extra_properties() {
     context.check_source_file(file).unwrap();
 
     assert!(context.diagnostics().is_empty());
+}
+
+#[test]
+fn object_literals_preserve_shorthand_and_computed_literal_properties() {
+    let parsed = parse_source_file(concat!(
+        "const value = 1; ",
+        "const object = { value, ['label']: 'ready', [2]: true };",
+    ));
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(8_205);
+    let mut context = context(&parsed, file, CanonicalSourceLanguage::TypeScript);
+
+    context.check_source_file(file).unwrap();
+
+    let object = parsed
+        .arena
+        .iter()
+        .find_map(|(node, record)| {
+            (record.kind == SyntaxKind::ObjectLiteralExpression).then_some(NodeRef::new(
+                parsed.arena.id(),
+                file,
+                node,
+            ))
+        })
+        .unwrap();
+    let object_type = context
+        .store()
+        .type_node_links(object)
+        .and_then(|links| links.resolved_type)
+        .unwrap();
+    let TypeData::Object(object) = context.store().type_payload(object_type).unwrap().data() else {
+        panic!("object literal must publish a canonical object type")
+    };
+    let names = object
+        .structured
+        .properties
+        .as_ref()
+        .unwrap()
+        .iter()
+        .map(|symbol| {
+            context
+                .store()
+                .symbol(*symbol)
+                .unwrap()
+                .name()
+                .as_utf8()
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(names, ["value", "label", "2"]);
+    assert!(context.diagnostics().is_empty());
+
+    let warm = (
+        context.store().type_len(),
+        context.store().symbol_len(),
+        context.diagnostics().clone(),
+    );
+    context.recheck_source_file(file).unwrap();
+    assert_eq!(
+        (
+            context.store().type_len(),
+            context.store().symbol_len(),
+            context.diagnostics().clone(),
+        ),
+        warm
+    );
 }
 
 #[test]

@@ -407,6 +407,25 @@ fn primitive_scalar(
     let record = store
         .type_payload(type_)
         .ok_or(PrimitiveBinaryInvariant::InvalidType(type_))?;
+    if let TypeData::Union(union) = record.data() {
+        store.validate_union_constituent(type_)?;
+        let mut members = union.union.types.iter().copied();
+        let first = members
+            .next()
+            .ok_or(PrimitiveBinaryUnsupported::Operand { node, type_ })?;
+        let scalar = primitive_scalar(store, node, first)?;
+        for member in members {
+            let current = primitive_scalar(store, node, member)?;
+            if current.family != scalar.family {
+                return Err(PrimitiveBinaryUnsupported::Operand { node, type_ }.into());
+            }
+        }
+        return Ok(PrimitiveScalar {
+            type_,
+            base: scalar.base,
+            family: scalar.family,
+        });
+    }
     let TypeData::Literal(literal) = record.data() else {
         return Err(PrimitiveBinaryUnsupported::Operand { node, type_ }.into());
     };
@@ -872,6 +891,78 @@ mod tests {
             assert_eq!(resolution.result_type, expected, "operator {operator:?}");
             assert!(resolution.diagnostics.is_empty(), "operator {operator:?}");
         }
+    }
+
+    #[test]
+    fn homogeneous_literal_unions_keep_their_exact_primitive_operator_family() {
+        let parsed = parse_source_file("const value = left + right;");
+        assert!(parsed.diagnostics.is_empty());
+        let nodes = binary_nodes(&parsed);
+        let mut store = initialized_store();
+        let one = store.regular_number_literal_type(Number::new(1.0)).unwrap();
+        let two = store.regular_number_literal_type(Number::new(2.0)).unwrap();
+        let first = store
+            .regular_string_literal_type("first".to_owned())
+            .unwrap();
+        let second = store
+            .regular_string_literal_type("second".to_owned())
+            .unwrap();
+        let one_big = store
+            .regular_bigint_literal_type(PseudoBigInt::parse_valid("1n"))
+            .unwrap();
+        let two_big = store
+            .regular_bigint_literal_type(PseudoBigInt::parse_valid("2n"))
+            .unwrap();
+        let numeric_choices = store.literal_union_type(&[one, two], None).unwrap();
+        let text_choices = store.literal_union_type(&[first, second], None).unwrap();
+        let bigint_choices = store.literal_union_type(&[one_big, two_big], None).unwrap();
+        let mixed = store.literal_union_type(&[one, first], None).unwrap();
+        let (number, string, bigint, boolean) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (
+                bootstrap.number_type,
+                bootstrap.string_type,
+                bootstrap.bigint_type,
+                bootstrap.boolean_type,
+            )
+        };
+
+        for (operator, left, right, expected) in [
+            (SyntaxKind::PlusToken, numeric_choices, number, number),
+            (SyntaxKind::MinusToken, numeric_choices, one, number),
+            (SyntaxKind::AsteriskToken, bigint_choices, one_big, bigint),
+            (SyntaxKind::PlusToken, text_choices, numeric_choices, string),
+            (
+                SyntaxKind::LessThanToken,
+                numeric_choices,
+                bigint_choices,
+                boolean,
+            ),
+            (
+                SyntaxKind::EqualsEqualsEqualsToken,
+                numeric_choices,
+                one,
+                boolean,
+            ),
+        ] {
+            let resolved =
+                check_primitive_binary(&mut store, request(nodes, operator, left, right)).unwrap();
+            assert_eq!(resolved.result_type, expected, "operator {operator:?}");
+            assert!(resolved.diagnostics.is_empty(), "operator {operator:?}");
+        }
+
+        assert_eq!(
+            check_primitive_binary(
+                &mut store,
+                request(nodes, SyntaxKind::PlusToken, mixed, number),
+            ),
+            Err(PrimitiveBinaryError::Unsupported(
+                PrimitiveBinaryUnsupported::Operand {
+                    node: nodes.left,
+                    type_: mixed,
+                },
+            )),
+        );
     }
 
     #[test]

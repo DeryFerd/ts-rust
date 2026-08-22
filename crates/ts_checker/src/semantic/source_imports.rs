@@ -1570,7 +1570,8 @@ pub(super) fn plan_source_type_import_reference(
         );
     if !matches!(
         result,
-        Err(CanonicalNameResolutionError::AliasResolutionUnavailable(alias))
+        Ok(Some(alias))
+            | Err(CanonicalNameResolutionError::AliasResolutionUnavailable(alias))
             if alias == binding.alias_symbol
     ) {
         return Err(unsupported(SourceImportUnsupported::TypeReference(

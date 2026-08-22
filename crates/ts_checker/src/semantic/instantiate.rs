@@ -762,6 +762,34 @@ fn validate_instantiable_member_type_worker(
             }
         }
         TypeData::TypeParameter(_) if mapper_parameters.contains(&type_) => Ok(()),
+        TypeData::TemplateLiteral(template) => {
+            if template.types.is_empty() || template.texts.len() != template.types.len() + 1 {
+                Err(TemplateTypeError::InvalidTemplate(type_).into())
+            } else {
+                template.types.iter().try_for_each(|placeholder| {
+                    validate_instantiable_member_type_worker(
+                        store,
+                        *placeholder,
+                        mapper_parameters,
+                        array_targets,
+                        active,
+                    )
+                })
+            }
+        }
+        TypeData::StringMapping(mapping) => {
+            let symbol = record
+                .symbol()
+                .ok_or(InstantiationError::UnsupportedType(type_))?;
+            store.string_mapping_kind(symbol)?;
+            validate_instantiable_member_type_worker(
+                store,
+                mapping.target,
+                mapper_parameters,
+                array_targets,
+                active,
+            )
+        }
         TypeData::Union(data) => {
             if record.alias().is_some() {
                 Err(InstantiationError::UnsupportedAliasedUnion(type_))
@@ -786,6 +814,8 @@ fn validate_instantiable_member_type_worker(
                             TypeData::Intrinsic(_)
                                 | TypeData::Literal(_)
                                 | TypeData::TypeParameter(_)
+                                | TypeData::TemplateLiteral(_)
+                                | TypeData::StringMapping(_)
                         )
                     ) {
                         return Err(InstantiationError::UnsupportedUnionConstituent(
@@ -886,6 +916,10 @@ fn instantiated_member_type_matches_worker(
             .map_type(mapper, template)
             .ok_or(InstantiationError::InvalidMapper(mapper))?
             == actual),
+        TypeData::TemplateLiteral(_) | TypeData::StringMapping(_) => {
+            cached_instantiated_member_type(store, template, mapper, &mut HashSet::new())
+                .map(|expected| expected == Some(actual))
+        }
         TypeData::Union(union) => instantiated_member_union_matches(
             store,
             template,
@@ -951,6 +985,102 @@ fn instantiated_member_type_matches_worker(
     result
 }
 
+fn cached_instantiated_member_type(
+    store: &CanonicalTypeMapperStore,
+    template: TypeId,
+    mapper: TypeMapperId,
+    active: &mut HashSet<TypeId>,
+) -> Result<Option<TypeId>, InstantiationError> {
+    if !active.insert(template) {
+        return Err(InstantiationError::UnsupportedType(template));
+    }
+    let record = store
+        .type_payload(template)
+        .ok_or(InstantiationError::InvalidType(template))?;
+    let result = match record.data() {
+        TypeData::Intrinsic(_) | TypeData::Literal(_) | TypeData::UniqueEsSymbol(_) => {
+            Ok(Some(template))
+        }
+        TypeData::TypeParameter(_) => store
+            .map_type(mapper, template)
+            .map(Some)
+            .ok_or(InstantiationError::InvalidMapper(mapper)),
+        TypeData::TemplateLiteral(data) => cached_instantiated_template_member_type(
+            store,
+            template,
+            &data.texts,
+            &data.types,
+            mapper,
+            active,
+        ),
+        TypeData::StringMapping(data) => {
+            let symbol = record
+                .symbol()
+                .ok_or(InstantiationError::UnsupportedType(template))?;
+            let target = cached_instantiated_member_type(store, data.target, mapper, active)?;
+            match target {
+                Some(target) if target == data.target => Ok(Some(template)),
+                Some(target) => store
+                    .cached_resolved_string_mapping_type(symbol, target)
+                    .map_err(Into::into),
+                None => Ok(None),
+            }
+        }
+        TypeData::Union(union) => {
+            let mut types = Vec::with_capacity(union.union.types.len());
+            let mut changed = false;
+            for constituent in &union.union.types {
+                let Some(instantiated) =
+                    cached_instantiated_member_type(store, *constituent, mapper, active)?
+                else {
+                    active.remove(&template);
+                    return Ok(None);
+                };
+                changed |= instantiated != *constituent;
+                types.push(instantiated);
+            }
+            if changed {
+                store
+                    .cached_template_result_union(&types)
+                    .map_err(Into::into)
+            } else {
+                Ok(Some(template))
+            }
+        }
+        _ => Err(InstantiationError::UnsupportedType(template)),
+    };
+    active.remove(&template);
+    result
+}
+
+fn cached_instantiated_template_member_type(
+    store: &CanonicalTypeMapperStore,
+    template: TypeId,
+    texts: &[String],
+    types: &[TypeId],
+    mapper: TypeMapperId,
+    active: &mut HashSet<TypeId>,
+) -> Result<Option<TypeId>, InstantiationError> {
+    let mut placeholders = Vec::with_capacity(types.len());
+    let mut changed = false;
+    for placeholder in types {
+        let Some(instantiated) =
+            cached_instantiated_member_type(store, *placeholder, mapper, active)?
+        else {
+            return Ok(None);
+        };
+        changed |= instantiated != *placeholder;
+        placeholders.push(instantiated);
+    }
+    if changed {
+        store
+            .cached_resolved_template_literal_type(texts, &placeholders)
+            .map_err(Into::into)
+    } else {
+        Ok(Some(template))
+    }
+}
+
 fn instantiated_member_union_matches(
     store: &CanonicalTypeMapperStore,
     template: TypeId,
@@ -959,23 +1089,42 @@ fn instantiated_member_union_matches(
     mapper: TypeMapperId,
     array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<bool, InstantiationError> {
-    let substituted_types = constituents
-        .iter()
-        .map(|constituent| {
-            let record = store
-                .type_payload(*constituent)
-                .ok_or(InstantiationError::InvalidType(*constituent))?;
-            if matches!(record.data(), TypeData::TypeParameter(_)) {
-                store
-                    .map_type(mapper, *constituent)
-                    .ok_or(InstantiationError::InvalidMapper(mapper))
-            } else {
-                Ok(*constituent)
+    let mut substituted_types = Vec::with_capacity(constituents.len());
+    let mut includes_template = false;
+    for constituent in constituents {
+        let record = store
+            .type_payload(*constituent)
+            .ok_or(InstantiationError::InvalidType(*constituent))?;
+        let substituted = match record.data() {
+            TypeData::TypeParameter(_) => store
+                .map_type(mapper, *constituent)
+                .ok_or(InstantiationError::InvalidMapper(mapper))?,
+            TypeData::TemplateLiteral(_) | TypeData::StringMapping(_) => {
+                includes_template = true;
+                let Some(substituted) = cached_instantiated_member_type(
+                    store,
+                    *constituent,
+                    mapper,
+                    &mut HashSet::new(),
+                )?
+                else {
+                    return Ok(false);
+                };
+                substituted
             }
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+            _ => *constituent,
+        };
+        substituted_types.push(substituted);
+    }
     if substituted_types.as_slice() == constituents {
         return Ok(actual == template);
+    }
+
+    if includes_template {
+        return store
+            .cached_template_result_union(&substituted_types)
+            .map(|expected| expected == Some(actual))
+            .map_err(Into::into);
     }
 
     let actual_record = store
@@ -1666,6 +1815,155 @@ mod tests {
         assert_eq!(instantiate_type(&mut store, template, mapper), Ok(template));
         assert_eq!(instantiate_type(&mut store, mapping, mapper), Ok(mapping));
         assert_eq!(store.type_len(), before);
+    }
+
+    #[test]
+    fn template_and_mapping_member_types_validate_and_replay_without_allocating() {
+        let mut store = initialized_store();
+        let parameter = store.alloc_type_parameter(None).unwrap();
+        let replacement = store
+            .get_template_literal_type(&["value".to_owned()], &[])
+            .unwrap();
+        let unexpected = store
+            .get_template_literal_type(&["different".to_owned()], &[])
+            .unwrap();
+        let symbol = store
+            .alloc_symbol(SymbolData::new(
+                SymbolFlags::TYPE_ALIAS,
+                EscapedName::source("Uppercase"),
+            ))
+            .unwrap();
+        let template = store
+            .get_template_literal_type(&["prefix-".to_owned(), String::new()], &[parameter])
+            .unwrap();
+        let mapping = store.get_string_mapping_type(symbol, parameter).unwrap();
+        let mapper = store
+            .new_simple_type_mapper(parameter, replacement)
+            .unwrap();
+
+        for source in [template, mapping] {
+            assert_eq!(
+                validate_instantiable_member_type(&store, source, &[parameter], None),
+                Ok(())
+            );
+            assert_eq!(
+                instantiable_member_type_contains_variables(&store, source, &[parameter], None),
+                Ok(true)
+            );
+            let result = instantiate_type(&mut store, source, mapper).unwrap();
+            let count = store.type_len();
+            assert_eq!(
+                instantiated_member_type_matches(&store, source, result, mapper, None),
+                Ok(true)
+            );
+            assert_eq!(
+                instantiated_member_type_matches(&store, source, unexpected, mapper, None),
+                Ok(false)
+            );
+            assert_eq!(store.type_len(), count);
+        }
+    }
+
+    #[test]
+    fn template_union_member_types_replay_their_cached_distributed_identity() {
+        let mut store = initialized_store();
+        let parameter = store.alloc_type_parameter(None).unwrap();
+        let replacement = store
+            .get_template_literal_type(&["value".to_owned()], &[])
+            .unwrap();
+        let first = store
+            .get_template_literal_type(&["a-".to_owned(), String::new()], &[parameter])
+            .unwrap();
+        let second = store
+            .get_template_literal_type(&["b-".to_owned(), String::new()], &[parameter])
+            .unwrap();
+        let union = store
+            .alloc_union_type(ObjectFlags::NONE, vec![first, second])
+            .unwrap();
+        let mapper = store
+            .new_simple_type_mapper(parameter, replacement)
+            .unwrap();
+
+        assert_eq!(
+            validate_instantiable_member_type(&store, union, &[parameter], None),
+            Ok(())
+        );
+        let result = instantiate_type(&mut store, union, mapper).unwrap();
+        let count = store.type_len();
+        assert_eq!(
+            instantiated_member_type_matches(&store, union, result, mapper, None),
+            Ok(true)
+        );
+        assert_eq!(store.type_len(), count);
+    }
+
+    #[test]
+    fn dependent_generic_defaults_substitute_templates_and_intrinsic_mappings() {
+        let mut store = initialized_store();
+        let first = store.alloc_type_parameter(None).unwrap();
+        let second = store.alloc_type_parameter(None).unwrap();
+        let provided = store
+            .get_template_literal_type(&["value".to_owned()], &[])
+            .unwrap();
+        let symbol = store
+            .alloc_symbol(SymbolData::new(
+                SymbolFlags::TYPE_ALIAS,
+                EscapedName::source("Uppercase"),
+            ))
+            .unwrap();
+        let second_default = store.get_string_mapping_type(symbol, first).unwrap();
+        let outer_default = store
+            .get_template_literal_type(
+                &[String::new(), "-".to_owned(), String::new()],
+                &[first, second],
+            )
+            .unwrap();
+
+        let resolved_second =
+            instantiate_type_with_vector(&mut store, second_default, &[first], &[provided])
+                .unwrap();
+        let resolved_outer = instantiate_type_with_vector(
+            &mut store,
+            outer_default,
+            &[first, second],
+            &[provided, resolved_second],
+        )
+        .unwrap();
+
+        let Some(TypeData::Literal(result)) =
+            store.type_payload(resolved_outer).map(TypeRecord::data)
+        else {
+            panic!("dependent defaults must resolve to a canonical string literal")
+        };
+        assert_eq!(result.value, LiteralValue::String("value-VALUE".to_owned()));
+    }
+
+    #[test]
+    fn broad_string_removes_instantiated_template_union_constituents() {
+        let mut store = initialized_store();
+        let parameter = store.alloc_type_parameter(None).unwrap();
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        let string = bootstrap.string_type;
+        let number = bootstrap.number_type;
+        let template = store
+            .get_template_literal_type(&["prefix-".to_owned(), String::new()], &[parameter])
+            .unwrap();
+        let union = store
+            .alloc_union_type(ObjectFlags::NONE, vec![string, template])
+            .unwrap();
+        let mapper = store.new_simple_type_mapper(parameter, number).unwrap();
+
+        assert_eq!(
+            validate_instantiable_member_type(&store, union, &[parameter], None),
+            Ok(())
+        );
+        assert_eq!(instantiate_type(&mut store, union, mapper), Ok(string));
+        let count = store.type_len();
+        assert_eq!(
+            instantiated_member_type_matches(&store, union, string, mapper, None),
+            Ok(true)
+        );
+        assert_eq!(store.type_len(), count);
     }
 
     #[test]

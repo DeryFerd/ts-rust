@@ -378,6 +378,9 @@ pub(super) fn plan_top_level_enum(
             NodeData::StringLiteral(_) if member_name_record.kind == SyntaxKind::StringLiteral => {
                 false
             }
+            NodeData::BigIntLiteral(_) if member_name_record.kind == SyntaxKind::BigIntLiteral => {
+                false
+            }
             _ => {
                 return Err(invariant(SourceEnumInvariant::InvalidIdentifier(
                     member_name,
@@ -715,6 +718,34 @@ mod tests {
             materialized.members[0].value,
             enums::CanonicalEnumMemberValue::Computed
         );
+    }
+
+    #[test]
+    fn bigint_member_names_remain_diagnostics_instead_of_invariants() {
+        let mut fixture = fixture(
+            "enum Invalid { 0n = 0 }",
+            CanonicalModuleState::Script,
+            false,
+        );
+        let declaration = statement(&fixture, 0);
+        let bound = &fixture.files[&fixture.file];
+        let host = host(&fixture.parsed.arena, bound);
+
+        let plan = plan_top_level_enum(&fixture.store, &host, declaration).unwrap();
+        assert_eq!(plan.diagnostics.len(), 1);
+        assert_eq!(plan.diagnostics[0].code, 2452);
+        assert_eq!(
+            fixture
+                .parsed
+                .arena
+                .get(plan.members[0].name.node)
+                .unwrap()
+                .kind,
+            SyntaxKind::BigIntLiteral
+        );
+
+        let result = execute_top_level_enum(&mut fixture.store, &host, &plan).unwrap();
+        assert_eq!(result.members.len(), 1);
     }
 
     #[test]

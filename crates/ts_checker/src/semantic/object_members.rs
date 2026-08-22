@@ -543,6 +543,37 @@ pub(super) fn plan_object_literal(
     {
         return Err(PropertyObjectError::InvalidObjectLiteral(node));
     }
+    for member in &object.properties.nodes {
+        let member = NodeRef::new(node.arena, node.file, *member);
+        let member_record = preflight_node(store, host, member)
+            .map_err(|_| PropertyObjectError::InvalidObjectLiteral(node))?;
+        let NodeData::PropertyAssignment(property) = &member_record.data else {
+            continue;
+        };
+        let name = NodeRef::new(member.arena, member.file, property.name);
+        let name_record = preflight_node(store, host, name)
+            .map_err(|_| PropertyObjectError::InvalidObjectLiteral(node))?;
+        let NodeData::ComputedPropertyName(computed) = &name_record.data else {
+            continue;
+        };
+        let expression = NodeRef::new(name.arena, name.file, computed.expression);
+        let expression_record = preflight_node(store, host, expression)
+            .map_err(|_| PropertyObjectError::InvalidObjectLiteral(node))?;
+        if !matches!(
+            (&expression_record.data, expression_record.kind),
+            (NodeData::StringLiteral(_), SyntaxKind::StringLiteral)
+                | (NodeData::NumericLiteral(_), SyntaxKind::NumericLiteral)
+                | (
+                    NodeData::NoSubstitutionTemplateLiteral(_),
+                    SyntaxKind::NoSubstitutionTemplateLiteral
+                )
+        ) {
+            return Err(PropertyObjectError::UnsupportedMember {
+                node: name,
+                kind: SyntaxKind::ComputedPropertyName,
+            });
+        }
+    }
     plan_members(
         store,
         host,
@@ -1330,9 +1361,10 @@ fn plan_members(
         let member_record =
             preflight_node(store, host, member).map_err(|_| invalid_plan(&provisional))?;
         let admitted_kind = match kind {
-            PropertyObjectKind::ObjectLiteral => {
-                member_record.kind == SyntaxKind::PropertyAssignment
-            }
+            PropertyObjectKind::ObjectLiteral => matches!(
+                member_record.kind,
+                SyntaxKind::PropertyAssignment | SyntaxKind::ShorthandPropertyAssignment
+            ),
             PropertyObjectKind::TypeLiteral => matches!(
                 member_record.kind,
                 SyntaxKind::PropertyDeclaration
@@ -1429,6 +1461,24 @@ fn plan_members(
                             && property.facts == 0,
                     )
                 }
+                NodeData::ShorthandPropertyAssignment(property)
+                    if kind == PropertyObjectKind::ObjectLiteral =>
+                {
+                    (
+                        property.name,
+                        Some(property.name),
+                        property.postfix_token,
+                        property.modifiers.as_ref(),
+                        None,
+                        property.equals_token.is_none()
+                            && property.object_assignment_initializer.is_none()
+                            && property.type_.is_none()
+                            && property.postfix_token.is_none()
+                            && property.modifiers.is_none()
+                            && property.symbol.is_none()
+                            && property.facts == 0,
+                    )
+                }
                 _ => return Err(invalid_plan(&provisional)),
             };
         if !valid_payload {
@@ -1442,17 +1492,59 @@ fn plan_members(
         let name = NodeRef::new(member.arena, member.file, name_id);
         let name_record =
             preflight_node(store, host, name).map_err(|_| invalid_plan(&provisional))?;
-        let NodeData::Identifier(identifier) = &name_record.data else {
-            return Err(PropertyObjectError::UnsupportedMember {
-                node: name,
-                kind: name_record.kind,
-            });
+        let property_name = match &name_record.data {
+            NodeData::Identifier(identifier) if name_record.kind == SyntaxKind::Identifier => {
+                identifier.text.clone()
+            }
+            NodeData::ComputedPropertyName(computed)
+                if kind == PropertyObjectKind::ObjectLiteral
+                    && name_record.kind == SyntaxKind::ComputedPropertyName =>
+            {
+                let expression = NodeRef::new(name.arena, name.file, computed.expression);
+                let expression_record = preflight_node(store, host, expression)
+                    .map_err(|_| invalid_plan(&provisional))?;
+                if computed.facts != 0
+                    || expression_record.parent != Some(name.node)
+                    || expression_record.range.start < name_record.range.start
+                    || expression_record.range.end > name_record.range.end
+                {
+                    return Err(invalid_plan(&provisional));
+                }
+                match &expression_record.data {
+                    NodeData::StringLiteral(literal)
+                        if expression_record.kind == SyntaxKind::StringLiteral =>
+                    {
+                        literal.text.clone()
+                    }
+                    NodeData::NumericLiteral(literal)
+                        if expression_record.kind == SyntaxKind::NumericLiteral =>
+                    {
+                        literal.text.clone()
+                    }
+                    NodeData::NoSubstitutionTemplateLiteral(literal)
+                        if expression_record.kind == SyntaxKind::NoSubstitutionTemplateLiteral =>
+                    {
+                        literal.text.clone()
+                    }
+                    _ => {
+                        return Err(PropertyObjectError::UnsupportedMember {
+                            node: name,
+                            kind: name_record.kind,
+                        });
+                    }
+                }
+            }
+            _ => {
+                return Err(PropertyObjectError::UnsupportedMember {
+                    node: name,
+                    kind: name_record.kind,
+                });
+            }
         };
-        if name_record.kind != SyntaxKind::Identifier
-            || name_record.parent != Some(member.node)
+        if name_record.parent != Some(member.node)
             || name_record.range.start < member_record.range.start
             || name_record.range.end > member_record.range.end
-            || !seen_names.insert(identifier.text.clone())
+            || !seen_names.insert(property_name.clone())
         {
             return Err(invalid_plan(&provisional));
         }
@@ -1460,8 +1552,13 @@ fn plan_members(
         let type_node = NodeRef::new(member.arena, member.file, value_id.expect("checked above"));
         let type_record =
             preflight_node(store, host, type_node).map_err(|_| invalid_plan(&provisional))?;
+        let valid_value_range = if member_record.kind == SyntaxKind::ShorthandPropertyAssignment {
+            type_node == name && type_record.range == name_record.range
+        } else {
+            type_record.range.start >= name_record.range.end
+        };
         if type_record.parent != Some(member.node)
-            || type_record.range.start < name_record.range.end
+            || !valid_value_range
             || type_record.range.end > member_record.range.end
         {
             return Err(invalid_plan(&provisional));
@@ -1504,7 +1601,7 @@ fn plan_members(
         if property_record.flags() != expected_flags
             || (property_record.check_flags() != CheckFlags::NONE
                 && property_record.check_flags() != expected_check_flags)
-            || property_record.name().as_utf8() != Some(identifier.text.as_str())
+            || property_record.name().as_utf8() != Some(property_name.as_str())
             || property_record.declarations() != Some(&[member])
             || property_record.value_declaration() != Some(member)
             || property_record.members().is_some()
@@ -1515,7 +1612,7 @@ fn plan_members(
                 .and_then(|parent| store.get_merged_symbol(parent))
                 != Some(symbol)
             || !seen_symbols.insert(property_symbol)
-            || table.and_then(|table| table.get_source(&identifier.text)) != Some(property_symbol)
+            || table.and_then(|table| table.get_source(&property_name)) != Some(property_symbol)
         {
             return Err(invalid_plan(&provisional));
         }
@@ -1526,7 +1623,7 @@ fn plan_members(
             type_node,
             optional,
             readonly,
-            name: identifier.text.clone(),
+            name: property_name,
         });
     }
 
@@ -4314,6 +4411,62 @@ mod generic_publication_tests {
         }
     }
 
+    fn object_fixture(source: &str) -> (Fixture, NodeRef) {
+        let parsed = parse_source_file(source);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(3_705);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/object-property-forms.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        let (symbols, mut files) = binder.finish().try_into_parts().unwrap();
+        let bound = files.remove(&file).unwrap();
+        let object = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ObjectLiteralExpression).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .expect("fixture contains an object literal");
+        let symbol = bound.symbol(object).unwrap();
+        let mut store = CanonicalTypeMapperStore::from_symbol_store(symbols);
+        assert!(
+            store
+                .register_source_file(&parsed.arena, parsed.source_file, file)
+                .is_some()
+        );
+        store
+            .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions::default())
+            .unwrap();
+        (
+            Fixture {
+                parsed,
+                file,
+                bound,
+                store,
+                symbol,
+            },
+            object,
+        )
+    }
+
     fn host<'a>(parsed: &'a ParseResult, bound: &'a BoundFile) -> DeclaredTypeHost<'a> {
         DeclaredTypeHost::new_after_global_merge(
             [(&parsed.arena, bound)],
@@ -4375,6 +4528,69 @@ mod generic_publication_tests {
             store.symbol_store().symbol_table_len(),
             store.checker_link_allocated_lengths(),
         )
+    }
+
+    #[test]
+    fn object_literals_plan_shorthand_and_literal_computed_property_names() {
+        let (mut fixture, object) = object_fixture(concat!(
+            "const property = 1; const value = { property, ",
+            "[\"literal\"]: 1, [2]: \"number\", [`template`]: true, ",
+            "[\"i\\u0307spanyol\"]: \"spanish\" };",
+        ));
+        let host = host(&fixture.parsed, &fixture.bound);
+        let plan = plan_object_literal(&fixture.store, &host, object).unwrap();
+        assert_eq!(
+            plan.properties
+                .iter()
+                .map(|property| property.name.as_str())
+                .collect::<Vec<_>>(),
+            ["property", "literal", "2", "template", "i\u{307}spanyol"]
+        );
+        assert_eq!(plan.properties[0].type_node, plan.properties[0].name_node);
+        assert_eq!(
+            fixture
+                .parsed
+                .arena
+                .get(plan.properties[0].declaration.node)
+                .unwrap()
+                .kind,
+            SyntaxKind::ShorthandPropertyAssignment
+        );
+        assert!(plan.properties[1..].iter().all(|property| {
+            fixture
+                .parsed
+                .arena
+                .get(property.name_node.node)
+                .is_some_and(|record| record.kind == SyntaxKind::ComputedPropertyName)
+        }));
+
+        let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+        let property_types = [
+            bootstrap.number_type,
+            bootstrap.number_type,
+            bootstrap.string_type,
+            bootstrap.boolean_type,
+            bootstrap.string_type,
+        ];
+        let type_ = publish_object_literal(&mut fixture.store, &plan, &property_types).unwrap();
+        assert_eq!(
+            publish_object_literal(&mut fixture.store, &plan, &property_types),
+            Ok(type_)
+        );
+    }
+
+    #[test]
+    fn dynamic_computed_object_property_names_stay_unsupported() {
+        let (fixture, object) =
+            object_fixture("const key = 'property'; const value = { [key]: 1 };");
+        let host = host(&fixture.parsed, &fixture.bound);
+        assert!(matches!(
+            plan_object_literal(&fixture.store, &host, object),
+            Err(PropertyObjectError::UnsupportedMember {
+                kind: SyntaxKind::ComputedPropertyName,
+                ..
+            })
+        ));
     }
 
     #[test]

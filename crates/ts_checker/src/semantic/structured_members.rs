@@ -100,8 +100,15 @@ pub(super) fn resolve_direct_interface_members(
             kind: SyntaxKind::ExpressionWithTypeArguments,
         });
     }
-    let base_surface = validate_no_heritage_property_interface(store, *base_type)
-        .ok_or_else(|| invalid(plan, type_))?;
+    let base_surface = if store
+        .direct_interface_heritage_provenance(*base_type)
+        .is_some()
+    {
+        validate_direct_heritage_property_interface(store, *base_type)
+    } else {
+        validate_no_heritage_property_interface(store, *base_type)
+    }
+    .ok_or_else(|| invalid(plan, type_))?;
     if base_surface.owner != planned_base.symbol {
         return Err(invalid(plan, type_));
     }
@@ -376,6 +383,18 @@ fn validate_property_interface(
     type_: TypeId,
     requires_direct_base: bool,
 ) -> Option<ValidatedInterfaceSurface> {
+    validate_property_interface_worker(store, type_, requires_direct_base, &mut HashSet::new())
+}
+
+fn validate_property_interface_worker(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    requires_direct_base: bool,
+    active: &mut HashSet<TypeId>,
+) -> Option<ValidatedInterfaceSurface> {
+    if !active.insert(type_) {
+        return None;
+    }
     let record = store.type_payload(type_)?;
     let TypeData::Interface(interface) = record.data() else {
         return None;
@@ -444,7 +463,14 @@ fn validate_property_interface(
         (true, Some([base_type]))
             if *base_type != type_ && *base_type == heritage_provenance.base_type =>
         {
-            let base = validate_no_heritage_property_interface(store, *base_type)?;
+            let base = validate_property_interface_worker(
+                store,
+                *base_type,
+                store
+                    .direct_interface_heritage_provenance(*base_type)
+                    .is_some(),
+                active,
+            )?;
             if base.owner != heritage_provenance.base_symbol {
                 return None;
             }
@@ -478,11 +504,13 @@ fn validate_property_interface(
     {
         return None;
     }
-    Some(ValidatedInterfaceSurface {
+    let result = ValidatedInterfaceSurface {
         owner,
         declared_properties,
         properties: expected,
-    })
+    };
+    assert!(active.remove(&type_));
+    Some(result)
 }
 
 fn declared_properties(
@@ -1049,6 +1077,60 @@ mod tests {
             )),
         );
         assert_eq!(prepared.fixture.store.relation_state_snapshot(), warmed);
+    }
+
+    #[test]
+    fn inherited_base_cycles_fail_without_unbounded_recursive_validation() {
+        let mut prepared = prepare();
+        resolve_direct_interface_members(
+            &mut prepared.fixture.store,
+            &prepared.derived_plan,
+            prepared.derived_type,
+            &[prepared.number_type],
+            &[prepared.base_type],
+        )
+        .unwrap();
+        let base_owner = prepared
+            .fixture
+            .store
+            .type_payload(prepared.base_type)
+            .unwrap()
+            .symbol()
+            .unwrap();
+        assert!(
+            prepared
+                .fixture
+                .store
+                .try_reserve_direct_interface_heritage_provenance(1)
+        );
+        assert!(
+            prepared
+                .fixture
+                .store
+                .publish_direct_interface_heritage_provenance(
+                    prepared.base_type,
+                    DirectInterfaceHeritageProvenance {
+                        owner_symbol: base_owner,
+                        base_symbol: prepared.derived_plan.symbol,
+                        base_type: prepared.derived_type,
+                    },
+                )
+        );
+        assert!(prepared.fixture.store.set_interface_base_resolution(
+            prepared.base_type,
+            true,
+            None,
+            Some(vec![prepared.derived_type]),
+        ));
+
+        assert_eq!(
+            validate_interface_heritage_members(&prepared.fixture.store, prepared.derived_type),
+            InterfaceHeritageMembersValidation::Malformed,
+        );
+        assert_eq!(
+            validate_interface_heritage_members(&prepared.fixture.store, prepared.base_type),
+            InterfaceHeritageMembersValidation::Malformed,
+        );
     }
 
     #[test]

@@ -324,6 +324,7 @@ struct GenericCallSignatureShape {
     signature: SignatureId,
     type_parameters: Vec<GenericCallTypeParameter>,
     parameter_templates: Vec<TypeId>,
+    minimum_argument_count: usize,
     return_type: TypeId,
     array_targets: Option<CanonicalArrayTargets>,
 }
@@ -827,8 +828,10 @@ fn project_validated_generic_call_vector_with_session(
         ));
     }
 
-    let expected_arguments = shape.parameter_templates.len();
-    if request.arguments.len() != expected_arguments {
+    let maximum_arguments = shape.parameter_templates.len();
+    if request.arguments.len() < shape.minimum_argument_count
+        || request.arguments.len() > maximum_arguments
+    {
         let recovery = failure_type_arguments(
             store,
             &shape,
@@ -846,14 +849,14 @@ fn project_validated_generic_call_vector_with_session(
             existing_call_signature,
             None,
         )?;
-        let applicability = if request.arguments.len() < expected_arguments {
+        let applicability = if request.arguments.len() < shape.minimum_argument_count {
             GenericCallVectorApplicability::TooFewArguments {
-                expected: expected_arguments,
+                expected: shape.minimum_argument_count,
                 actual: request.arguments.len(),
             }
         } else {
             GenericCallVectorApplicability::TooManyArguments {
-                expected: expected_arguments,
+                expected: maximum_arguments,
                 actual: request.arguments.len(),
             }
         };
@@ -1056,10 +1059,14 @@ fn validate_generic_call_signature_shape_with_unresolved_return(
         return Err(GenericCallVectorUnsupported::RestSignature(callable.signature).into());
     }
     let parameter_count = signature.parameters().len();
-    if signature.min_argument_count() != i32::try_from(parameter_count).unwrap_or(-1)
-        || callable.min_argument_count != parameter_count
+    let minimum_argument_count = usize::try_from(signature.min_argument_count())
+        .map_err(|_| GenericCallVectorInvariant::CallableSignatureMismatch(callable.signature))?;
+    if minimum_argument_count > parameter_count
+        || callable.min_argument_count != minimum_argument_count
     {
-        return Err(GenericCallVectorUnsupported::NonRequiredParameter(callable.signature).into());
+        return Err(
+            GenericCallVectorInvariant::CallableSignatureMismatch(callable.signature).into(),
+        );
     }
     if callable.parameters.len() != parameter_count
         || signature.resolved_min_argument_count() != -1
@@ -1171,6 +1178,7 @@ fn validate_generic_call_signature_shape_with_unresolved_return(
         signature: callable.signature,
         type_parameters,
         parameter_templates: callable.parameters.clone(),
+        minimum_argument_count,
         return_type: return_type.unwrap_or(no_constraint),
         array_targets,
     })
@@ -2274,7 +2282,7 @@ fn validate_generic_call_vector_resolution(
         GenericCallVectorApplicability::TooFewArguments { expected, actual } => {
             if !resolution.projection.recovery
                 || resolution.checked_instantiation.is_some()
-                || expected != shape.parameter_templates.len()
+                || expected != shape.minimum_argument_count
                 || actual >= expected
             {
                 return Err(GenericCallVectorInvariant::InvalidCheckedInstantiation(
@@ -3632,6 +3640,7 @@ fn identity_generic_call_vector_shape(
             base_constraint: no_constraint,
         }],
         parameter_templates: vec![shape.type_parameter],
+        minimum_argument_count: 1,
         return_type: shape.type_parameter,
         array_targets: None,
     })
@@ -4126,8 +4135,29 @@ mod tests {
         parameter_indices: &[usize],
         return_type: impl FnOnce(&mut CanonicalTypeMapperStore, &[TypeId]) -> TypeId,
     ) -> (ValidatedSingleCallable, Vec<TypeId>) {
+        vector_callable_with_minimum(
+            store,
+            names,
+            constraints,
+            defaults,
+            parameter_indices,
+            parameter_indices.len(),
+            return_type,
+        )
+    }
+
+    fn vector_callable_with_minimum(
+        store: &mut CanonicalTypeMapperStore,
+        names: &[&str],
+        constraints: &[Option<GenericTypeSpec>],
+        defaults: &[Option<GenericTypeSpec>],
+        parameter_indices: &[usize],
+        minimum_argument_count: usize,
+        return_type: impl FnOnce(&mut CanonicalTypeMapperStore, &[TypeId]) -> TypeId,
+    ) -> (ValidatedSingleCallable, Vec<TypeId>) {
         assert_eq!(constraints.len(), names.len());
         assert_eq!(defaults.len(), names.len());
+        assert!(minimum_argument_count <= parameter_indices.len());
         let no_constraint = store.intrinsic_bootstrap().unwrap().no_constraint_type;
         let mut type_parameters = Vec::with_capacity(names.len());
         for name in names {
@@ -4193,7 +4223,7 @@ mod tests {
                 parameter_symbols,
                 Some(return_type),
                 None,
-                i32::try_from(parameter_types.len()).unwrap(),
+                i32::try_from(minimum_argument_count).unwrap(),
             )
             .unwrap();
         let owner = store.intrinsic_bootstrap().unwrap().any_function_type;
@@ -4203,7 +4233,7 @@ mod tests {
                 signature,
                 parameters: parameter_types,
                 rest_parameter: None,
-                min_argument_count: parameter_indices.len(),
+                min_argument_count: minimum_argument_count,
                 return_type: Some(return_type),
                 strict_variance_exempt: false,
             },
@@ -4637,6 +4667,122 @@ mod tests {
         );
         assert_eq!(vector_cache_graph_counts(store), second_warm_counts);
         first
+    }
+
+    #[test]
+    fn optional_generic_parameters_accept_omission_and_infer_unknown() {
+        let mut store = initialized_store();
+        let (number, string, unknown) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (
+                bootstrap.number_type,
+                bootstrap.string_type,
+                bootstrap.unknown_type,
+            )
+        };
+        let (optional, _) = vector_callable_with_minimum(
+            &mut store,
+            &["T"],
+            &[None],
+            &[None],
+            &[0],
+            0,
+            |_, parameters| parameters[0],
+        );
+
+        let omitted = project_vector(
+            &mut store,
+            &optional,
+            vector_request(optional.owner, None, &[]),
+        )
+        .unwrap();
+        assert_eq!(
+            omitted.applicability,
+            GenericCallVectorApplicability::Applicable
+        );
+        assert_eq!(omitted.projection.instantiation.type_arguments, [unknown]);
+
+        let explicit = project_vector(
+            &mut store,
+            &optional,
+            vector_request(optional.owner, Some(&[string]), &[]),
+        )
+        .unwrap();
+        assert_eq!(
+            explicit.applicability,
+            GenericCallVectorApplicability::Applicable
+        );
+        assert_eq!(explicit.projection.instantiation.type_arguments, [string]);
+
+        let supplied = project_vector(
+            &mut store,
+            &optional,
+            vector_request(optional.owner, None, &[number]),
+        )
+        .unwrap();
+        assert_eq!(
+            supplied.applicability,
+            GenericCallVectorApplicability::Applicable
+        );
+        assert_eq!(supplied.projection.instantiation.type_arguments, [number]);
+
+        let extra = project_vector(
+            &mut store,
+            &optional,
+            vector_request(optional.owner, None, &[number, number]),
+        )
+        .unwrap();
+        assert_eq!(
+            extra.applicability,
+            GenericCallVectorApplicability::TooManyArguments {
+                expected: 1,
+                actual: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn omitted_optional_generic_parameters_apply_dependent_defaults() {
+        let mut store = initialized_store();
+        let string = store.intrinsic_bootstrap().unwrap().string_type;
+        let (optional, _) = vector_callable_with_minimum(
+            &mut store,
+            &["T", "U"],
+            &[None, None],
+            &[None, Some(GenericTypeSpec::Parameter(0))],
+            &[0, 1],
+            1,
+            |_, parameters| parameters[1],
+        );
+
+        let omitted = project_vector(
+            &mut store,
+            &optional,
+            vector_request(optional.owner, None, &[string]),
+        )
+        .unwrap();
+        assert_eq!(
+            omitted.applicability,
+            GenericCallVectorApplicability::Applicable
+        );
+        assert_eq!(
+            omitted.projection.instantiation.type_arguments,
+            [string, string]
+        );
+
+        let missing = project_vector(
+            &mut store,
+            &optional,
+            vector_request(optional.owner, None, &[]),
+        )
+        .unwrap();
+        assert_eq!(
+            missing.applicability,
+            GenericCallVectorApplicability::TooFewArguments {
+                expected: 1,
+                actual: 0,
+            }
+        );
     }
 
     #[test]

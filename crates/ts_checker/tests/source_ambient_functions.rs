@@ -15,6 +15,22 @@ fn checker_context(
     declaration_file: bool,
     module_state: CanonicalModuleState,
 ) -> CanonicalCheckerContext<'_> {
+    checker_context_with_options(
+        parsed,
+        file,
+        declaration_file,
+        module_state,
+        CanonicalCheckerOptions::default(),
+    )
+}
+
+fn checker_context_with_options(
+    parsed: &ParseResult,
+    file: FileId,
+    declaration_file: bool,
+    module_state: CanonicalModuleState,
+    options: CanonicalCheckerOptions,
+) -> CanonicalCheckerContext<'_> {
     let mut binder = CanonicalBinder::new();
     binder
         .bind_source_file_with_facts(
@@ -35,7 +51,7 @@ fn checker_context(
     CanonicalCheckerContext::new(
         binder.finish(),
         [(file, &parsed.arena)].into_iter().collect(),
-        CanonicalCheckerOptions::default(),
+        options,
     )
     .unwrap()
 }
@@ -106,6 +122,97 @@ fn is_type_checked(context: &CanonicalCheckerContext<'_>, file: FileId) -> bool 
         .source_file(file)
         .and_then(|source| context.store().source_file_links(source))
         .is_some_and(|links| links.type_checked)
+}
+
+#[test]
+fn declaration_file_functions_without_return_types_follow_no_implicit_any() {
+    let parsed = parse_source_file("export function foo();\nexport function bar();");
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+
+    for (index, no_implicit_any) in [false, true].into_iter().enumerate() {
+        let file = FileId::new(2_395 + u32::try_from(index).unwrap());
+        let mut context = checker_context_with_options(
+            &parsed,
+            file,
+            true,
+            CanonicalModuleState::External,
+            CanonicalCheckerOptions {
+                no_implicit_any,
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+
+        context.check_source_file(file).unwrap();
+
+        let messages = context
+            .diagnostics()
+            .as_slice()
+            .iter()
+            .map(|diagnostic| {
+                (
+                    diagnostic.diagnostic.code(),
+                    diagnostic.diagnostic.render().unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let expected = if no_implicit_any {
+            ["foo", "bar"]
+                .into_iter()
+                .map(|name| {
+                    (
+                        7010,
+                        format!(
+                            "'{name}', which lacks return-type annotation, implicitly has an 'any' return type."
+                        ),
+                    )
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        assert_eq!(messages, expected);
+
+        let any = context.store().intrinsic_bootstrap().unwrap().any_type;
+        for name in ["foo", "bar"] {
+            let declaration = function_declaration(&parsed, file, name);
+            let owner = merged_symbol(&context, file, declaration);
+            assert!(
+                context
+                    .store()
+                    .value_symbol_links(owner)
+                    .and_then(|links| links.resolved_type)
+                    .is_some()
+            );
+            let signature = context
+                .store()
+                .signature_links(declaration)
+                .and_then(|links| links.resolved_signature.signature())
+                .unwrap();
+            assert_eq!(
+                context
+                    .store()
+                    .signature(signature)
+                    .unwrap()
+                    .resolved_return_type(),
+                Some(any)
+            );
+        }
+
+        let warm = (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.diagnostics().clone(),
+        );
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.diagnostics().clone(),
+            ),
+            warm
+        );
+    }
 }
 
 #[test]

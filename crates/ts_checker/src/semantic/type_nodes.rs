@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use ts_ast::{NodeData, NodeRef, SyntaxKind};
 use ts_binder::{
     CanonicalNameResolutionError, CanonicalNameResolver, CanonicalResolutionLocation,
-    SemanticSymbolId, SymbolFlags,
+    SemanticSymbolId, SymbolFlags, canonical_has_syntactic_modifier,
 };
 use ts_diagnostics::{Diagnostic, message_by_code};
 use ts_jsnum::{Number, PseudoBigInt};
@@ -71,6 +71,7 @@ use super::{
 };
 
 const NODE_FLAG_JSDOC: u32 = 1 << 22;
+const NODE_FLAG_CONST: u32 = 1 << 1;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(super) struct CanonicalTypeQueryOptions {
@@ -302,7 +303,21 @@ struct TypeQueryPlan {
     functions: BTreeMap<NodeRef, FunctionTypePlan>,
     templates: BTreeMap<NodeRef, PlannedTemplateType>,
     tuples: BTreeMap<NodeRef, TupleTypeNodePlan>,
+    unique_symbols: BTreeMap<NodeRef, PlannedUniqueSymbolType>,
     pending_function_proofs: Vec<PendingFunctionTypeProof>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PlannedUniqueSymbolType {
+    owner: Option<SemanticSymbolId>,
+    diagnostic: Option<PlannedUniqueSymbolDiagnostic>,
+    valid_operand: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PlannedUniqueSymbolDiagnostic {
+    node: NodeRef,
+    code: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1168,6 +1183,11 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             SyntaxKind::TupleType => self.plan_tuple_type(node, alias_owner),
             SyntaxKind::TypeOperator => match &record.data {
                 NodeData::TypeOperatorNode(operator)
+                    if operator.operator == SyntaxKind::UniqueKeyword =>
+                {
+                    self.plan_unique_symbol_type(node)
+                }
+                NodeData::TypeOperatorNode(operator)
                     if operator.operator == SyntaxKind::ReadonlyKeyword =>
                 {
                     self.plan_tuple_type(node, alias_owner)
@@ -1791,7 +1811,11 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                     false,
                 ) {
                     Err(CanonicalNameResolutionError::AliasResolutionUnavailable(_)) => true,
-                    Ok(_) => false,
+                    Ok(Some(symbol)) => self
+                        .store
+                        .symbol(symbol)
+                        .is_some_and(|record| record.flags().contains(SymbolFlags::ALIAS)),
+                    Ok(None) => false,
                     Err(error) => return Err(error.into()),
                 }
             }
@@ -2079,6 +2103,204 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         self.plan_type_node_in_context(target, None, false)
     }
 
+    fn plan_unique_symbol_type(&mut self, node: NodeRef) -> Result<(), DeclaredTypeError> {
+        let record = preflight_node(self.store, self.host, node)?;
+        let NodeData::TypeOperatorNode(operator) = &record.data else {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidTypeReference(node),
+            ));
+        };
+        let operand = NodeRef::new(node.arena, node.file, operator.type_);
+        let operand_record = preflight_node(self.store, self.host, operand)?;
+        if record.kind != SyntaxKind::TypeOperator
+            || operator.operator != SyntaxKind::UniqueKeyword
+            || operand_record.parent != Some(node.node)
+        {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidTypeReference(node),
+            ));
+        }
+        let valid_operand = operand_record.kind == SyntaxKind::SymbolKeyword;
+        let (owner, diagnostic) = if valid_operand {
+            self.unique_symbol_declaration_owner(node)?
+        } else {
+            (None, None)
+        };
+        if let Some(cached) = self
+            .store
+            .type_node_links(node)
+            .and_then(|links| links.resolved_type)
+        {
+            let bootstrap =
+                self.store
+                    .intrinsic_bootstrap()
+                    .ok_or(DeclaredTypeError::Unavailable(
+                        DeclaredTypeUnavailable::IntrinsicBootstrapNotInitialized,
+                    ))?;
+            let valid = if !valid_operand {
+                cached == bootstrap.error_type
+            } else if let Some(owner) = owner {
+                self.store.type_payload(cached).is_some_and(|record| {
+                    matches!(record.data(), TypeData::UniqueEsSymbol(_))
+                        && record.symbol() == Some(owner)
+                })
+            } else {
+                cached == bootstrap.es_symbol_type
+            };
+            if !valid {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidTypeReference(node),
+                ));
+            }
+        }
+        let planned = PlannedUniqueSymbolType {
+            owner,
+            diagnostic,
+            valid_operand,
+        };
+        if let Some(previous) = self.plan.unique_symbols.insert(node, planned)
+            && previous != planned
+        {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidTypeReference(node),
+            ));
+        }
+        Ok(())
+    }
+
+    fn unique_symbol_declaration_owner(
+        &self,
+        node: NodeRef,
+    ) -> Result<
+        (
+            Option<SemanticSymbolId>,
+            Option<PlannedUniqueSymbolDiagnostic>,
+        ),
+        DeclaredTypeError,
+    > {
+        let invalid = |node, code| Ok((None, Some(PlannedUniqueSymbolDiagnostic { node, code })));
+        let mut annotation = node;
+        let declaration = loop {
+            let Some(parent) = preflight_node(self.store, self.host, annotation)?.parent else {
+                return invalid(node, 1335);
+            };
+            let parent = NodeRef::new(node.arena, node.file, parent);
+            let record = preflight_node(self.store, self.host, parent)?;
+            match &record.data {
+                NodeData::ParenthesizedTypeNode(parenthesized)
+                    if record.kind == SyntaxKind::ParenthesizedType
+                        && parenthesized.type_ == annotation.node =>
+                {
+                    annotation = parent;
+                }
+                _ => break parent,
+            }
+        };
+
+        let record = preflight_node(self.store, self.host, declaration)?;
+        match &record.data {
+            NodeData::VariableDeclaration(variable)
+                if record.kind == SyntaxKind::VariableDeclaration
+                    && variable.type_ == Some(annotation.node) =>
+            {
+                let name = NodeRef::new(declaration.arena, declaration.file, variable.name);
+                if preflight_node(self.store, self.host, name)?.kind != SyntaxKind::Identifier {
+                    return invalid(node, 1333);
+                }
+                let Some(list) = record.parent else {
+                    return invalid(node, 1334);
+                };
+                let list = NodeRef::new(declaration.arena, declaration.file, list);
+                let list_record = preflight_node(self.store, self.host, list)?;
+                let NodeData::VariableDeclarationList(data) = &list_record.data else {
+                    return invalid(node, 1334);
+                };
+                let Some(statement) = list_record.parent else {
+                    return invalid(node, 1334);
+                };
+                let statement = NodeRef::new(list.arena, list.file, statement);
+                let statement_record = preflight_node(self.store, self.host, statement)?;
+                if !matches!(
+                    &statement_record.data,
+                    NodeData::VariableStatement(statement_data)
+                        if statement_record.kind == SyntaxKind::VariableStatement
+                            && statement_data.declaration_list == list.node
+                ) || list_record.kind != SyntaxKind::VariableDeclarationList
+                    || !data.declarations.nodes.contains(&declaration.node)
+                {
+                    return invalid(node, 1334);
+                }
+                if list_record.flags.0 & NODE_FLAG_CONST == 0 {
+                    return invalid(name, 1332);
+                }
+            }
+            NodeData::PropertyDeclaration(property)
+                if record.kind == SyntaxKind::PropertyDeclaration
+                    && property.type_ == Some(annotation.node) =>
+            {
+                let (arena, _) = self.host.source(declaration).ok_or({
+                    DeclaredTypeError::Unavailable(DeclaredTypeUnavailable::MissingOrForeignFacts(
+                        declaration,
+                    ))
+                })?;
+                let interface_member = record.parent.is_some_and(|parent| {
+                    self.host
+                        .node(NodeRef::new(declaration.arena, declaration.file, parent))
+                        .is_some_and(|record| {
+                            matches!(
+                                record.kind,
+                                SyntaxKind::InterfaceDeclaration | SyntaxKind::TypeLiteral
+                            )
+                        })
+                });
+                let readonly = canonical_has_syntactic_modifier(
+                    arena,
+                    declaration.node,
+                    SyntaxKind::ReadonlyKeyword,
+                );
+                let valid = readonly
+                    && (interface_member
+                        || canonical_has_syntactic_modifier(
+                            arena,
+                            declaration.node,
+                            SyntaxKind::StaticKeyword,
+                        ));
+                if !valid {
+                    let name = NodeRef::new(declaration.arena, declaration.file, property.name);
+                    return invalid(name, if interface_member { 1330 } else { 1331 });
+                }
+            }
+            NodeData::PropertySignatureDeclaration(property)
+                if record.kind == SyntaxKind::PropertySignature
+                    && property.type_ == annotation.node =>
+            {
+                let (arena, _) = self.host.source(declaration).ok_or({
+                    DeclaredTypeError::Unavailable(DeclaredTypeUnavailable::MissingOrForeignFacts(
+                        declaration,
+                    ))
+                })?;
+                if !canonical_has_syntactic_modifier(
+                    arena,
+                    declaration.node,
+                    SyntaxKind::ReadonlyKeyword,
+                ) {
+                    let name = NodeRef::new(declaration.arena, declaration.file, property.name);
+                    return invalid(name, 1330);
+                }
+            }
+            _ => return invalid(node, 1335),
+        }
+        let owner = self
+            .host
+            .bound_file(declaration)
+            .and_then(|bound| bound.symbol(declaration))
+            .and_then(|symbol| self.store.get_merged_symbol(symbol))
+            .ok_or_else(|| {
+                type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node))
+            })?;
+        Ok((Some(owner), None))
+    }
+
     fn plan_function_type(
         &mut self,
         node: NodeRef,
@@ -2298,6 +2520,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 }
                 previous_end = child_record.range.end;
                 self.plan_type_node_in_context(child, None, false)?;
+                self.plan_intersection_callable_returns(child, &mut HashSet::new())?;
                 types.push(child);
             }
             Ok(())
@@ -2331,6 +2554,69 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             ));
         }
         Ok(())
+    }
+
+    fn plan_intersection_callable_returns(
+        &mut self,
+        node: NodeRef,
+        visited: &mut HashSet<NodeRef>,
+    ) -> Result<(), DeclaredTypeError> {
+        if !visited.insert(node) {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::UnsupportedIntersectionConstituent(node),
+            ));
+        }
+        let record = preflight_node(self.store, self.host, node)?;
+        let result = match &record.data {
+            NodeData::ParenthesizedTypeNode(parenthesized)
+                if record.kind == SyntaxKind::ParenthesizedType =>
+            {
+                self.plan_intersection_callable_returns(
+                    NodeRef::new(node.arena, node.file, parenthesized.type_),
+                    visited,
+                )
+            }
+            NodeData::FunctionTypeNode(_) if record.kind == SyntaxKind::FunctionType => {
+                self.plan_function_return_type(node)
+            }
+            NodeData::TypeReferenceNode(_) if record.kind == SyntaxKind::TypeReference => {
+                let symbol = self
+                    .plan
+                    .references
+                    .get(&node)
+                    .map(|reference| reference.symbol)
+                    .or_else(|| {
+                        self.store
+                            .symbol_node_links(node)
+                            .and_then(|links| links.resolved_symbol)
+                    });
+                if let Some(symbol) = symbol
+                    && self
+                        .store
+                        .symbol(symbol)
+                        .is_some_and(|record| record.flags().contains(SymbolFlags::TYPE_ALIAS))
+                    && let Some(alias) = self.plan.aliases.get(&symbol)
+                {
+                    self.plan_intersection_callable_returns(alias.type_node, visited)
+                } else {
+                    Ok(())
+                }
+            }
+            NodeData::IntersectionTypeNode(intersection)
+                if record.kind == SyntaxKind::IntersectionType =>
+            {
+                for child in &intersection.types.nodes {
+                    self.plan_intersection_callable_returns(
+                        NodeRef::new(node.arena, node.file, *child),
+                        visited,
+                    )?;
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        };
+        assert!(visited.remove(&node));
+        result
     }
 
     fn validate_planned_intersection_constituent(
@@ -2373,6 +2659,15 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                     })?;
                     self.validate_intersection_property_plan(planned, validating)
                 }
+                NodeData::FunctionTypeNode(_) if record.kind == SyntaxKind::FunctionType => {
+                    if self.plan.functions.contains_key(&node) {
+                        Ok(())
+                    } else {
+                        Err(type_node_unavailable(
+                            TypeNodeUnavailable::UnsupportedIntersectionConstituent(node),
+                        ))
+                    }
+                }
                 NodeData::TypeReferenceNode(reference)
                     if record.kind == SyntaxKind::TypeReference =>
                 {
@@ -2390,10 +2685,11 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                         .type_node_links(node)
                         .and_then(|links| links.resolved_type)
                     {
-                        return self
-                            .store
-                            .validate_intersection_constituent(cached)
-                            .map_err(|error| intersection_type_error(error, node));
+                        match self.store.validate_intersection_constituent(cached) {
+                            Ok(()) => return Ok(()),
+                            Err(IntersectionTypeError::UnsupportedConstituent(_)) => {}
+                            Err(error) => return Err(intersection_type_error(error, node)),
+                        }
                     }
                     let reference = self.plan.references.get(&node).ok_or_else(|| {
                         type_node_unavailable(
@@ -3799,10 +4095,28 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         if name_node.flags.0 & NODE_FLAG_JSDOC != 0 {
             return Err(type_node_unavailable(TypeNodeUnavailable::JsDoc(name)));
         }
-        let NodeData::Identifier(identifier) = &name_node.data else {
-            return Err(type_node_unavailable(
-                TypeNodeUnavailable::QualifiedTypeReference(node),
-            ));
+        let (name_text, qualified) = match &name_node.data {
+            NodeData::Identifier(identifier) => (identifier.text.as_str(), false),
+            NodeData::QualifiedName(qualified) => {
+                let right = NodeRef::new(name.arena, name.file, qualified.right);
+                let right_node = preflight_node(self.store, self.host, right)?;
+                let NodeData::Identifier(identifier) = &right_node.data else {
+                    return Err(type_node_unavailable(
+                        TypeNodeUnavailable::QualifiedTypeReference(node),
+                    ));
+                };
+                if right_node.parent != Some(name.node) {
+                    return Err(type_node_unavailable(
+                        TypeNodeUnavailable::InvalidTypeReference(node),
+                    ));
+                }
+                (identifier.text.as_str(), true)
+            }
+            _ => {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::QualifiedTypeReference(node),
+                ));
+            }
         };
         let mut type_arguments = Vec::new();
         let mut previous_end = name_node.range.end;
@@ -3869,8 +4183,16 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             .symbol_node_links(node)
             .and_then(|links| links.resolved_symbol);
 
-        if exact_import.is_none() && (cached_type.is_some() || cached_symbol.is_some()) {
-            self.reject_cached_import_alias_without_capability(node, name, &identifier.text)?;
+        if qualified && exact_import.is_some() {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::ImportAliasCapabilityUnsupported(node),
+            ));
+        }
+        if !qualified
+            && exact_import.is_none()
+            && (cached_type.is_some() || cached_symbol.is_some())
+        {
+            self.reject_cached_import_alias_without_capability(node, name, name_text)?;
         }
 
         if !union_constituent
@@ -3882,21 +4204,42 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             && cached_enum_owner.is_none()
             && !cached_syntax_contains_builtin_array
             && !self.cached_class_or_interface_reference(node)
-            && !matches!(identifier.text.as_str(), "Array" | "ReadonlyArray")
+            && !qualified
+            && !matches!(name_text, "Array" | "ReadonlyArray")
         {
             return Ok(());
         }
 
-        let possible_global_array_name = self.array_targets.is_some()
-            && matches!(identifier.text.as_str(), "Array" | "ReadonlyArray");
+        let possible_global_array_name = !qualified
+            && self.array_targets.is_some()
+            && matches!(name_text, "Array" | "ReadonlyArray");
         let symbol = if let Some(capability) = exact_import {
             self.resolve_type_reference_alias_target(
                 node,
                 name,
-                &identifier.text,
+                name_text,
                 capability,
                 cached_symbol,
             )?
+        } else if qualified {
+            let resolved = self.resolve_qualified_type_reference_symbol(node, name)?;
+            if let Some(cached) = cached_symbol {
+                let canonical = self.store.get_merged_symbol(cached).ok_or_else(|| {
+                    type_node_unavailable(TypeNodeUnavailable::InvalidCachedSymbol {
+                        node,
+                        symbol: cached,
+                    })
+                })?;
+                if canonical != resolved {
+                    return Err(type_node_unavailable(
+                        TypeNodeUnavailable::InvalidCachedSymbol {
+                            node,
+                            symbol: cached,
+                        },
+                    ));
+                }
+            }
+            resolved
         } else if possible_global_array_name {
             let resolved = self.resolve_uncached_type_reference_symbol(node)?;
             let canonical = self.store.get_merged_symbol(resolved).ok_or_else(|| {
@@ -3939,7 +4282,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             )?
             .resolve(
                 Some(CanonicalResolutionLocation::Bound(name)),
-                &identifier.text,
+                name_text,
                 SymbolFlags::TYPE,
                 None,
                 true,
@@ -3966,9 +4309,10 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             }
         };
         let global_array_target = self.authoritative_global_array_target(symbol, node)?;
-        if self.array_targets.is_none()
-            && matches!(identifier.text.as_str(), "Array" | "ReadonlyArray")
-            && self.global_symbol_has_name(symbol, &identifier.text)
+        if !qualified
+            && self.array_targets.is_none()
+            && matches!(name_text, "Array" | "ReadonlyArray")
+            && self.global_symbol_has_name(symbol, name_text)
             && !type_arguments.is_empty()
         {
             return Err(type_node_unavailable(
@@ -4615,12 +4959,46 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 }
                 Ok(())
             }
+            SyntaxKind::ArrayType => {
+                if self.array_targets.is_none() {
+                    return Err(unsupported());
+                }
+                let NodeData::ArrayTypeNode(array) = &record.data else {
+                    return Err(unsupported());
+                };
+                let element = NodeRef::new(node.arena, node.file, array.element_type);
+                if preflight_node(self.store, self.host, element)?.parent != Some(node.node) {
+                    return Err(unsupported());
+                }
+                self.validate_generic_alias_constraint(
+                    alias,
+                    parameter,
+                    element,
+                    earlier_parameters,
+                )
+            }
             SyntaxKind::TypeReference => {
                 let NodeData::TypeReferenceNode(reference) = &record.data else {
                     return Err(unsupported());
                 };
                 if reference.type_arguments.is_some() {
-                    return Err(unsupported());
+                    let symbol = self.resolve_uncached_type_reference_symbol(node)?;
+                    if self
+                        .authoritative_global_array_target(symbol, node)?
+                        .is_none()
+                    {
+                        return Err(unsupported());
+                    }
+                    let arguments = self.type_reference_argument_nodes(node)?;
+                    let [element] = arguments.as_slice() else {
+                        return Err(unsupported());
+                    };
+                    return self.validate_generic_alias_constraint(
+                        alias,
+                        parameter,
+                        *element,
+                        earlier_parameters,
+                    );
                 }
                 let symbol = self.resolve_uncached_type_reference_symbol(node)?;
                 if earlier_parameters
@@ -4845,7 +5223,8 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         );
         if !matches!(
             resolved,
-            Err(CanonicalNameResolutionError::AliasResolutionUnavailable(alias))
+            Ok(Some(alias))
+                | Err(CanonicalNameResolutionError::AliasResolutionUnavailable(alias))
                 if alias == capability.alias
         ) {
             return Err(invalid());
@@ -4927,6 +5306,16 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                     TypeNodeUnavailable::ImportAliasTypeReference { node, alias },
                 ));
             }
+            Ok(Some(alias))
+                if self
+                    .store
+                    .symbol(alias)
+                    .is_some_and(|record| record.flags().contains(SymbolFlags::ALIAS)) =>
+            {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::ImportAliasTypeReference { node, alias },
+                ));
+            }
             Err(error) => return Err(error.into()),
             Ok(_) => {}
         }
@@ -4945,16 +5334,20 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         };
         let name = NodeRef::new(node.arena, node.file, reference.type_name);
         let name_node = preflight_node(self.store, self.host, name)?;
-        let NodeData::Identifier(identifier) = &name_node.data else {
-            return Err(type_node_unavailable(
-                TypeNodeUnavailable::QualifiedTypeReference(node),
-            ));
-        };
         if name_node.parent != Some(node.node) || name_node.flags.0 & NODE_FLAG_JSDOC != 0 {
             return Err(type_node_unavailable(
                 TypeNodeUnavailable::InvalidTypeReference(node),
             ));
         }
+        let NodeData::Identifier(identifier) = &name_node.data else {
+            return if matches!(&name_node.data, NodeData::QualifiedName(_)) {
+                self.resolve_qualified_type_reference_symbol(node, name)
+            } else {
+                Err(type_node_unavailable(
+                    TypeNodeUnavailable::QualifiedTypeReference(node),
+                ))
+            };
+        };
         let (arena, bound) = self.host.source(node).ok_or({
             DeclaredTypeError::Unavailable(DeclaredTypeUnavailable::MissingOrForeignFacts(node))
         })?;
@@ -4973,9 +5366,25 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             true,
             false,
         ) {
-            Ok(Some(symbol)) => self.store.symbol(symbol).map(|_| symbol).ok_or({
-                DeclaredTypeError::Unavailable(DeclaredTypeUnavailable::SymbolNotOwned(symbol))
-            }),
+            Ok(Some(symbol)) => {
+                let flags = self
+                    .store
+                    .symbol(symbol)
+                    .map(ts_binder::semantic::Symbol::flags)
+                    .ok_or(DeclaredTypeError::Unavailable(
+                        DeclaredTypeUnavailable::SymbolNotOwned(symbol),
+                    ))?;
+                if flags.contains(SymbolFlags::ALIAS) {
+                    Err(type_node_unavailable(
+                        TypeNodeUnavailable::ImportAliasTypeReference {
+                            node,
+                            alias: symbol,
+                        },
+                    ))
+                } else {
+                    Ok(symbol)
+                }
+            }
             Ok(None) => Err(type_node_unavailable(
                 TypeNodeUnavailable::MissingTypeReference(node),
             )),
@@ -4984,6 +5393,29 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                     TypeNodeUnavailable::ImportAliasTypeReference { node, alias },
                 ))
             }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn resolve_qualified_type_reference_symbol(
+        &self,
+        reference: NodeRef,
+        name: NodeRef,
+    ) -> Result<SemanticSymbolId, DeclaredTypeError> {
+        let mut callback_host = self.host.name_resolver_host(self.store)?;
+        match callback_host.resolve_entity_name(name, SymbolFlags::TYPE) {
+            Ok(Some(symbol)) => self.store.get_merged_symbol(symbol).ok_or({
+                DeclaredTypeError::Unavailable(DeclaredTypeUnavailable::SymbolNotOwned(symbol))
+            }),
+            Ok(None) => Err(type_node_unavailable(
+                TypeNodeUnavailable::MissingTypeReference(reference),
+            )),
+            Err(CanonicalNameResolutionError::AliasResolutionUnavailable(alias)) => Err(
+                type_node_unavailable(TypeNodeUnavailable::ImportAliasTypeReference {
+                    node: reference,
+                    alias,
+                }),
+            ),
             Err(error) => Err(error.into()),
         }
     }
@@ -6822,6 +7254,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             .and_then(|count| count.checked_add(plan.type_literals.len()))
             .and_then(|count| count.checked_add(plan.functions.len()))
             .and_then(|count| count.checked_add(plan.templates.len()))
+            .and_then(|count| count.checked_add(plan.unique_symbols.len()))
             .and_then(|count| {
                 plan.tuples
                     .len()
@@ -6847,6 +7280,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             .chain(plan.type_literals.keys())
             .chain(plan.functions.keys())
             .chain(plan.templates.keys())
+            .chain(plan.unique_symbols.keys())
             .chain(plan.tuples.keys())
         {
             if !nodes.contains(node) {
@@ -7025,6 +7459,21 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             .and_then(|count| count.checked_add(array_reference_types))
             .and_then(|count| count.checked_add(tuple_preflight.additional_types()))
             .and_then(|count| count.checked_add(cold_function_types))
+            .and_then(|count| {
+                count.checked_add(
+                    plan.unique_symbols
+                        .iter()
+                        .filter(|(node, unique)| {
+                            unique.owner.is_some()
+                                && self
+                                    .store
+                                    .type_node_links(**node)
+                                    .and_then(|links| links.resolved_type)
+                                    .is_none()
+                        })
+                        .count(),
+                )
+            })
             .and_then(|count| count.checked_add(additional_source_types))
             .ok_or_else(|| Self::literal_cache_error(LiteralTypeCacheError::Capacity))?;
         let type_literal_index_infos =
@@ -7521,6 +7970,11 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             SyntaxKind::TupleType => self.execute_tuple_type(node, plan, prepared),
             SyntaxKind::TypeOperator => match &record.data {
                 NodeData::TypeOperatorNode(operator)
+                    if operator.operator == SyntaxKind::UniqueKeyword =>
+                {
+                    self.execute_unique_symbol_type(node, plan)
+                }
+                NodeData::TypeOperatorNode(operator)
                     if operator.operator == SyntaxKind::ReadonlyKeyword =>
                 {
                     self.execute_tuple_type(node, plan, prepared)
@@ -7552,6 +8006,69 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 TypeNodeUnavailable::UnsupportedSyntax { node, kind },
             )),
         }
+    }
+
+    fn execute_unique_symbol_type(
+        &mut self,
+        node: NodeRef,
+        plan: &TypeQueryPlan,
+    ) -> Result<TypeId, DeclaredTypeError> {
+        let unique = plan.unique_symbols.get(&node).copied().ok_or_else(|| {
+            type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node))
+        })?;
+        if let Some(cached) = self
+            .store
+            .type_node_links(node)
+            .and_then(|links| links.resolved_type)
+        {
+            return Ok(cached);
+        }
+        if let Some(diagnostic) = unique.diagnostic {
+            self.diagnostics.add(
+                Some(diagnostic.node),
+                Diagnostic::new(
+                    message_by_code(diagnostic.code)
+                        .expect("unique symbol diagnostics are in the catalog"),
+                ),
+            );
+        }
+        let resolved = if !unique.valid_operand {
+            self.error_type()?
+        } else if let Some(owner) = unique.owner {
+            let existing = self.store.types().find_map(|(type_, record)| {
+                (matches!(record.data(), TypeData::UniqueEsSymbol(_))
+                    && record.symbol() == Some(owner))
+                .then_some(type_)
+            });
+            if let Some(existing) = existing {
+                existing
+            } else {
+                self.store
+                    .alloc_unique_es_symbol_type(owner)
+                    .ok_or_else(|| {
+                        type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node))
+                    })?
+            }
+        } else {
+            self.store
+                .intrinsic_bootstrap()
+                .ok_or(DeclaredTypeError::Unavailable(
+                    DeclaredTypeUnavailable::IntrinsicBootstrapNotInitialized,
+                ))?
+                .es_symbol_type
+        };
+        let mut links = self
+            .store
+            .type_node_links(node)
+            .cloned()
+            .unwrap_or_default();
+        links.resolved_type = Some(resolved);
+        if !self.store.set_type_node_links(node, links) {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidTypeReference(node),
+            ));
+        }
+        Ok(resolved)
     }
 
     fn execute_conditional_type(
@@ -8577,6 +9094,43 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         for constituent in intersection.types {
             types.push(self.execute_type_node(constituent, plan, prepared)?);
         }
+        self.flush_pending_function_parameters(plan, prepared)?;
+        for constituent in &types {
+            let signatures = self
+                .store
+                .type_payload(*constituent)
+                .and_then(|record| record.data().structured())
+                .and_then(|structured| structured.signatures.as_ref())
+                .cloned()
+                .unwrap_or_default();
+            for signature in signatures {
+                if self
+                    .store
+                    .signature(signature)
+                    .and_then(Signature::resolved_return_type)
+                    .is_some()
+                {
+                    continue;
+                }
+                let Some(declaration) = self
+                    .store
+                    .signature(signature)
+                    .and_then(Signature::declaration)
+                else {
+                    return Err(type_node_unavailable(
+                        TypeNodeUnavailable::InvalidFunctionSignature(signature),
+                    ));
+                };
+                let Some(function) = plan.functions.get(&declaration).cloned() else {
+                    return Err(type_node_unavailable(
+                        TypeNodeUnavailable::InvalidFunctionSignature(signature),
+                    ));
+                };
+                let return_type = self.execute_type_node(function.return_type, plan, prepared)?;
+                functions::publish_lazy_return_type(self.store, &function, signature, return_type)
+                    .map_err(function_type_error)?;
+            }
+        }
         let resolved_type = self
             .store
             .canonical_intersection_type(&types, intersection.alias_symbol)
@@ -9258,6 +9812,44 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                     .any(|constituent| mapped_parameters.contains(constituent)) =>
             {
                 Ok(())
+            }
+            TypeData::TypeReference(_) => {
+                let Some(global_types) = self.global_types.as_ref() else {
+                    return Err(type_node_unavailable(
+                        TypeNodeUnavailable::GenericAliasInstantiationUnsupported {
+                            alias: symbol,
+                            declared_type: type_,
+                        },
+                    ));
+                };
+                let array = self
+                    .store
+                    .canonical_array_reference(global_types, type_)
+                    .map_err(|_| {
+                        type_node_unavailable(
+                            TypeNodeUnavailable::GenericAliasInstantiationUnsupported {
+                                alias: symbol,
+                                declared_type: type_,
+                            },
+                        )
+                    })?
+                    .ok_or_else(|| {
+                        type_node_unavailable(
+                            TypeNodeUnavailable::GenericAliasInstantiationUnsupported {
+                                alias: symbol,
+                                declared_type: type_,
+                            },
+                        )
+                    })?;
+                if mapped_parameters.contains(&array.element_type) {
+                    return Err(type_node_unavailable(
+                        TypeNodeUnavailable::GenericAliasInstantiationUnsupported {
+                            alias: symbol,
+                            declared_type: type_,
+                        },
+                    ));
+                }
+                self.validate_direct_alias_type(symbol, array.element_type, mapped_parameters)
             }
             _ => Err(type_node_unavailable(
                 TypeNodeUnavailable::GenericAliasInstantiationUnsupported {
@@ -12414,6 +13006,194 @@ mod tests {
     }
 
     #[test]
+    fn generic_alias_array_constraints_require_authoritative_global_targets() {
+        let mut fixture = global_array_fixture(concat!(
+            "type Mutable<T extends unknown[]> = T; ",
+            "type Named<T extends Array<unknown>> = T; ",
+            "type Readonly<T extends ReadonlyArray<unknown>> = T; ",
+            "type Defaulted<T extends unknown[] = string[]> = T; ",
+            "type Strings = Mutable<string[]>; ",
+            "type Numbers = Named<Array<number>>; ",
+            "type Frozen = Readonly<ReadonlyArray<string>>; ",
+            "type Defaults = Defaulted; ",
+            "type Invalid = Mutable<string>;",
+        ));
+        let globals = initialize_fixture_global_types(&mut fixture);
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        for (name, expected_element, readonly) in [
+            ("Strings", SyntaxKind::StringKeyword, false),
+            ("Numbers", SyntaxKind::NumberKeyword, false),
+            ("Frozen", SyntaxKind::StringKeyword, true),
+            ("Defaults", SyntaxKind::StringKeyword, false),
+        ] {
+            let alias = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, name);
+            let resolved =
+                query_global_declared(&mut fixture, &globals, alias, &mut diagnostics).unwrap();
+            let array = fixture
+                .store
+                .canonical_array_reference(&globals, resolved)
+                .unwrap()
+                .unwrap();
+            let expected = if expected_element == SyntaxKind::StringKeyword {
+                fixture.store.intrinsic_bootstrap().unwrap().string_type
+            } else {
+                fixture.store.intrinsic_bootstrap().unwrap().number_type
+            };
+            assert_eq!(array.element_type, expected);
+            assert_eq!(array.readonly, readonly);
+        }
+        assert!(diagnostics.is_empty());
+
+        let invalid = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Invalid");
+        let string = fixture.store.intrinsic_bootstrap().unwrap().string_type;
+        assert_eq!(
+            query_global_declared(&mut fixture, &globals, invalid, &mut diagnostics),
+            Ok(string),
+        );
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics.as_slice()[0].diagnostic.code(), 2344);
+    }
+
+    #[test]
+    fn unique_symbol_operators_preserve_valid_declaration_identity() {
+        let mut fixture = fixture(concat!(
+            "declare const first: unique symbol; ",
+            "declare const second: (unique symbol); ",
+            "declare let mutable: unique symbol; ",
+            "type Ordinary = unique symbol;",
+        ));
+        let first = variable_type_node(&fixture, "first");
+        let second = variable_type_node(&fixture, "second");
+        let mutable = variable_type_node(&fixture, "mutable");
+        let ordinary = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Ordinary");
+        let first_owner = named_symbol(&fixture, SyntaxKind::VariableDeclaration, "first");
+        let second_owner = named_symbol(&fixture, SyntaxKind::VariableDeclaration, "second");
+        let symbol_type = fixture.store.intrinsic_bootstrap().unwrap().es_symbol_type;
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        let first_type = query_node(&mut fixture, first, &mut diagnostics).unwrap();
+        let second_type = query_node(&mut fixture, second, &mut diagnostics).unwrap();
+        assert_ne!(first_type, second_type);
+        for (type_, owner) in [(first_type, first_owner), (second_type, second_owner)] {
+            let record = fixture.store.type_payload(type_).unwrap();
+            assert!(matches!(record.data(), TypeData::UniqueEsSymbol(_)));
+            assert_eq!(record.symbol(), Some(owner));
+        }
+        assert_eq!(
+            query_node(&mut fixture, mutable, &mut diagnostics),
+            Ok(symbol_type)
+        );
+        assert_eq!(
+            query_declared(
+                &mut fixture,
+                ordinary,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Ok(symbol_type),
+        );
+        assert_eq!(
+            diagnostics
+                .as_slice()
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.code())
+                .collect::<Vec<_>>(),
+            [1332, 1335],
+        );
+
+        let warm = store_state(&fixture.store);
+        assert_eq!(
+            query_node(&mut fixture, first, &mut diagnostics),
+            Ok(first_type)
+        );
+        assert_eq!(
+            query_node(&mut fixture, second, &mut diagnostics),
+            Ok(second_type)
+        );
+        assert_eq!(store_state(&fixture.store), warm);
+        assert_eq!(diagnostics.len(), 2);
+    }
+
+    #[test]
+    fn unique_symbol_operators_reject_poisoned_warm_declaration_identity() {
+        let mut fixture = fixture("declare const token: unique symbol;");
+        let annotation = variable_type_node(&fixture, "token");
+        let symbol_type = fixture.store.intrinsic_bootstrap().unwrap().es_symbol_type;
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        query_node(&mut fixture, annotation, &mut diagnostics).unwrap();
+        assert!(fixture.store.set_type_node_links(
+            annotation,
+            TypeNodeLinks {
+                resolved_type: Some(symbol_type),
+                ..TypeNodeLinks::default()
+            },
+        ));
+        let before = store_state(&fixture.store);
+
+        assert_eq!(
+            query_node(&mut fixture, annotation, &mut diagnostics),
+            Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidTypeReference(annotation)
+            )),
+        );
+        assert_eq!(store_state(&fixture.store), before);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn unique_symbol_properties_require_the_pinned_readonly_and_static_modifiers() {
+        let mut fixture = fixture(concat!(
+            "interface Shape { readonly valid: unique symbol; invalid: unique symbol; } ",
+            "class Model { static readonly shared: unique symbol; readonly local: unique symbol; }",
+        ));
+        let annotations = ["valid", "invalid", "shared", "local"].map(|name| {
+            fixture
+                .parsed
+                .arena
+                .iter()
+                .find_map(|(id, record)| {
+                    let (property_name, annotation) = match &record.data {
+                        NodeData::PropertyDeclaration(property) => (property.name, property.type_?),
+                        NodeData::PropertySignatureDeclaration(property) => {
+                            (property.name, property.type_)
+                        }
+                        _ => return None,
+                    };
+                    (identifier_text(&fixture.parsed.arena, property_name) == Some(name)).then_some(
+                        (
+                            NodeRef::new(fixture.parsed.arena.id(), fixture.file, id),
+                            NodeRef::new(fixture.parsed.arena.id(), fixture.file, annotation),
+                        ),
+                    )
+                })
+                .unwrap_or_else(|| panic!("missing property {name}"))
+        });
+        let symbol_type = fixture.store.intrinsic_bootstrap().unwrap().es_symbol_type;
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        for (index, (declaration, annotation)) in annotations.into_iter().enumerate() {
+            let resolved = query_node(&mut fixture, annotation, &mut diagnostics).unwrap();
+            if matches!(index, 0 | 2) {
+                let owner = node_symbol(&fixture, declaration);
+                let record = fixture.store.type_payload(resolved).unwrap();
+                assert!(matches!(record.data(), TypeData::UniqueEsSymbol(_)));
+                assert_eq!(record.symbol(), Some(owner));
+            } else {
+                assert_eq!(resolved, symbol_type);
+            }
+        }
+        assert_eq!(
+            diagnostics
+                .as_slice()
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.code())
+                .collect::<Vec<_>>(),
+            [1330, 1331],
+        );
+    }
+
+    #[test]
     fn direct_generic_aliases_substitute_nested_primitive_and_union_arguments() {
         let mut fixture = fixture(concat!(
             "type Id<T> = T; ",
@@ -14162,7 +14942,6 @@ mod tests {
     #[test]
     fn named_reference_boundaries_are_typed_and_atomic_without_diagnostics() {
         let cases = [
-            ("namespace N { export interface X {} } type Bad = N.X;", 0),
             ("type Bad = Missing;", 1),
             (
                 "interface Box<T extends string> {} type Bad = Box<string>;",
@@ -14187,11 +14966,6 @@ mod tests {
                 matches!(
                     (expected, error),
                     (
-                        0,
-                        DeclaredTypeError::TypeNodeUnavailable(
-                            TypeNodeUnavailable::QualifiedTypeReference(_)
-                        )
-                    ) | (
                         1,
                         DeclaredTypeError::TypeNodeUnavailable(
                             TypeNodeUnavailable::MissingTypeReference(_)
@@ -14206,6 +14980,129 @@ mod tests {
                 "unexpected error: {error:?}"
             );
             assert_eq!(store_state(&fixture.store), before);
+            assert!(diagnostics.is_empty());
+        }
+    }
+
+    #[test]
+    fn qualified_namespace_references_follow_canonical_export_tables() {
+        let mut fixture = fixture(concat!(
+            "namespace N { ",
+            "export interface Shape { value: string; } ",
+            "export type Text = string; ",
+            "export namespace Deep { export interface Item {} } ",
+            "} ",
+            "type ResolvedShape = N.Shape; ",
+            "type ResolvedText = N.Text; ",
+            "type ResolvedItem = N.Deep.Item;",
+        ));
+        let shape = named_symbol(&fixture, SyntaxKind::InterfaceDeclaration, "Shape");
+        let item = named_symbol(&fixture, SyntaxKind::InterfaceDeclaration, "Item");
+        let resolved_shape =
+            named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "ResolvedShape");
+        let resolved_text =
+            named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "ResolvedText");
+        let resolved_item =
+            named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "ResolvedItem");
+        let string_type = fixture.store.intrinsic_bootstrap().unwrap().string_type;
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        let shape_type = query_declared(
+            &mut fixture,
+            resolved_shape,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        let item_type = query_declared(
+            &mut fixture,
+            resolved_item,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        assert_eq!(
+            query_declared(
+                &mut fixture,
+                resolved_text,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Ok(string_type),
+        );
+        assert_eq!(
+            fixture
+                .store
+                .declared_type_links(shape)
+                .and_then(|links| links.declared_type),
+            Some(shape_type),
+        );
+        assert_eq!(
+            fixture
+                .store
+                .declared_type_links(item)
+                .and_then(|links| links.declared_type),
+            Some(item_type),
+        );
+        for (name, expected) in [
+            ("ResolvedShape", shape),
+            (
+                "ResolvedText",
+                named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Text"),
+            ),
+            ("ResolvedItem", item),
+        ] {
+            let reference = alias_parts(&fixture, name).2;
+            assert_eq!(
+                fixture
+                    .store
+                    .symbol_node_links(reference)
+                    .and_then(|links| links.resolved_symbol),
+                Some(expected),
+            );
+        }
+
+        let warm = store_state(&fixture.store);
+        for symbol in [resolved_shape, resolved_text, resolved_item] {
+            query_declared(
+                &mut fixture,
+                symbol,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap();
+        }
+        assert_eq!(store_state(&fixture.store), warm);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn missing_qualified_namespace_exports_fail_before_semantic_writes() {
+        for source in [
+            "namespace N { export interface Present {} } type Bad = N.Missing;",
+            "namespace N { export interface Present {} } type Bad = Missing.Present;",
+            "namespace N { export namespace Nested {} } type Bad = N.Nested.Missing;",
+        ] {
+            let mut fixture = fixture(source);
+            let alias = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Bad");
+            let reference = alias_parts(&fixture, "Bad").2;
+            let before = store_state(&fixture.store);
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+            for _ in 0..2 {
+                assert_eq!(
+                    query_declared(
+                        &mut fixture,
+                        alias,
+                        CanonicalTypeQueryOptions::default(),
+                        &mut diagnostics,
+                    ),
+                    Err(type_node_unavailable(
+                        TypeNodeUnavailable::MissingTypeReference(reference)
+                    )),
+                );
+                assert_eq!(store_state(&fixture.store), before);
+            }
             assert!(diagnostics.is_empty());
         }
     }

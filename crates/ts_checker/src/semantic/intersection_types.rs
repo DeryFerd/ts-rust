@@ -6,7 +6,9 @@ use ts_binder::{
 };
 
 use super::{
-    CanonicalTypeMapperStore, TypeId,
+    CanonicalTypeMapperStore, SignatureId, TypeId,
+    callable_sets::{StoredCallableSetValidation, validate_stored_callable_set},
+    callables::ValidatedSingleCallable,
     links::ValueSymbolLinks,
     object_members::{
         DeclaredPropertyObjectValidation, resolved_declared_property_types,
@@ -86,7 +88,8 @@ impl CanonicalTypeMapperStore {
     ) -> Result<(), IntersectionTypeError> {
         let mut constituents = Vec::new();
         self.append_intersection_constituent(type_, &mut constituents)?;
-        expected_properties(self, &constituents).map(|_| ())
+        expected_properties(self, &constituents)?;
+        expected_call_signatures(self, &constituents).map(|_| ())
     }
 
     pub(super) fn canonical_intersection_type(
@@ -128,6 +131,7 @@ impl CanonicalTypeMapperStore {
         }
 
         let expected = expected_properties(self, &key.types)?;
+        let call_signatures = expected_call_signatures(self, &key.types)?;
         let synthetic_count = expected
             .iter()
             .filter(|property| matches!(property, ExpectedProperty::Synthetic { .. }))
@@ -181,7 +185,14 @@ impl CanonicalTypeMapperStore {
                 .expect("a preflighted intersection alias allocation is infallible");
             assert!(self.set_type_alias(intersection_type, Some(alias)));
         }
-        assert!(self.set_structured_type_members(intersection_type, None, None, None, None, None));
+        assert!(self.set_structured_type_members(
+            intersection_type,
+            None,
+            None,
+            (!call_signatures.is_empty()).then_some(call_signatures),
+            None,
+            None,
+        ));
 
         let members = self.alloc_prepared_symbol_table(prepared_members);
         let mut properties = Vec::with_capacity(expected.len());
@@ -265,7 +276,32 @@ impl CanonicalTypeMapperStore {
                 Ok(())
             }
             DeclaredPropertyObjectValidation::NotDeclared => {
-                Err(IntersectionTypeError::UnsupportedConstituent(type_))
+                match validate_stored_callable_set(self, type_) {
+                    StoredCallableSetValidation::Valid { projection, .. }
+                        if !projection.call_signatures.is_empty()
+                            && projection.construct_signatures.is_empty()
+                            && projection.call_signatures.iter().all(|callable| {
+                                callable.return_type.is_some()
+                                    && self.signature(callable.signature).is_some_and(|signature| {
+                                        signature.type_parameters().is_empty()
+                                            && signature.this_parameter().is_none()
+                                    })
+                            }) =>
+                    {
+                        if !output.contains(&type_) {
+                            output.push(type_);
+                        }
+                        Ok(())
+                    }
+                    StoredCallableSetValidation::Malformed { .. } => {
+                        Err(IntersectionTypeError::MalformedConstituent(type_))
+                    }
+                    StoredCallableSetValidation::NotCallable
+                    | StoredCallableSetValidation::Pending { .. }
+                    | StoredCallableSetValidation::Valid { .. } => {
+                        Err(IntersectionTypeError::UnsupportedConstituent(type_))
+                    }
+                }
             }
             DeclaredPropertyObjectValidation::Malformed => {
                 Err(IntersectionTypeError::MalformedConstituent(type_))
@@ -328,13 +364,18 @@ impl CanonicalTypeMapperStore {
         }
 
         for constituent in &key.types {
-            match validate_resolved_declared_property_object(self, *constituent) {
-                DeclaredPropertyObjectValidation::Valid(_) => {}
-                DeclaredPropertyObjectValidation::NotDeclared
-                | DeclaredPropertyObjectValidation::Malformed => return Err(invalid()),
+            let mut validated = Vec::new();
+            if self
+                .append_intersection_constituent(*constituent, &mut validated)
+                .is_err()
+                || validated.as_slice() != [*constituent]
+            {
+                return Err(invalid());
             }
         }
         let expected = expected_properties(self, &key.types).map_err(|_| invalid())?;
+        let expected_signatures =
+            expected_call_signatures(self, &key.types).map_err(|_| invalid())?;
         let Some(members) = data.intersection.property_cache else {
             return Err(invalid());
         };
@@ -431,8 +472,13 @@ impl CanonicalTypeMapperStore {
             } else {
                 ObjectFlags::NONE
             };
+        let expected_structured = StructuredTypeData {
+            signatures: (!expected_signatures.is_empty()).then_some(expected_signatures.clone()),
+            call_signature_count: expected_signatures.len(),
+            ..StructuredTypeData::default()
+        };
         if record.object_flags() != expected_flags
-            || data.intersection.structured != StructuredTypeData::default()
+            || data.intersection.structured != expected_structured
         {
             return Err(invalid());
         }
@@ -443,6 +489,54 @@ impl CanonicalTypeMapperStore {
             reduced_to_never,
         })
     }
+}
+
+fn expected_call_signatures(
+    store: &CanonicalTypeMapperStore,
+    types: &[TypeId],
+) -> Result<Vec<SignatureId>, IntersectionTypeError> {
+    let mut signatures = Vec::<ValidatedSingleCallable>::new();
+    for type_ in types {
+        match validate_stored_callable_set(store, *type_) {
+            StoredCallableSetValidation::NotCallable => {}
+            StoredCallableSetValidation::Pending { .. } => {
+                return Err(IntersectionTypeError::UnsupportedConstituent(*type_));
+            }
+            StoredCallableSetValidation::Malformed { .. } => {
+                return Err(IntersectionTypeError::MalformedConstituent(*type_));
+            }
+            StoredCallableSetValidation::Valid { projection, .. } => {
+                if !projection.construct_signatures.is_empty() {
+                    return Err(IntersectionTypeError::UnsupportedConstituent(*type_));
+                }
+                for callable in projection.call_signatures {
+                    let signature = store
+                        .signature(callable.signature)
+                        .ok_or(IntersectionTypeError::MalformedConstituent(*type_))?;
+                    if callable.return_type.is_none()
+                        || !signature.type_parameters().is_empty()
+                        || signature.this_parameter().is_some()
+                    {
+                        return Err(IntersectionTypeError::UnsupportedConstituent(*type_));
+                    }
+                    if signatures.iter().any(|existing| {
+                        existing.signature == callable.signature
+                            || existing.parameters == callable.parameters
+                                && existing.rest_parameter == callable.rest_parameter
+                                && existing.min_argument_count == callable.min_argument_count
+                                && existing.return_type == callable.return_type
+                    }) {
+                        continue;
+                    }
+                    signatures.push(callable);
+                }
+            }
+        }
+    }
+    Ok(signatures
+        .into_iter()
+        .map(|signature| signature.signature)
+        .collect())
 }
 
 fn expected_properties(
@@ -789,4 +883,171 @@ fn intersect_property_types(
     Ok(literal
         .or(base)
         .expect("a significant primitive type was classified"))
+}
+
+#[cfg(test)]
+mod tests {
+    use ts_ast::{FileId, NodeData, NodeRef};
+    use ts_binder::{
+        CanonicalBinder, CanonicalModuleState, CanonicalSourceFileFacts, CanonicalSourceLanguage,
+        EscapedName,
+    };
+    use ts_parser::parse_source_file;
+
+    use super::*;
+    use crate::semantic::{CanonicalCheckerContext, CanonicalCheckerOptions};
+
+    #[test]
+    fn callable_intersections_preserve_order_deduplicate_signatures_and_reject_poison() {
+        let source = parse_source_file(concat!(
+            "type First = (value: string) => number;\n",
+            "type Second = (value: number) => string;\n",
+            "type Duplicate = (value: string) => number;\n",
+            "type Shape = { marker: boolean };\n",
+        ));
+        assert!(source.diagnostics.is_empty());
+        let file = FileId::new(4_401);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &source.arena,
+                source.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/callable-intersections.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&source.arena, file)
+            .unwrap();
+        let mut context = CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![(file, &source.arena)],
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap();
+        context.check_source_file(file).unwrap();
+
+        let alias_type = |name: &str| {
+            let declaration = source
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    let NodeData::TypeAliasDeclaration(alias) = &record.data else {
+                        return None;
+                    };
+                    let NodeData::Identifier(identifier) = &source.arena.get(alias.name)?.data
+                    else {
+                        return None;
+                    };
+                    (identifier.text == name).then_some(NodeRef::new(source.arena.id(), file, node))
+                })
+                .unwrap();
+            let raw = context.file(file).unwrap().1.symbol(declaration).unwrap();
+            let symbol = context.store().get_merged_symbol(raw).unwrap();
+            context
+                .store()
+                .type_alias_links(symbol)
+                .and_then(|links| links.declared_type)
+                .unwrap()
+        };
+        let first = alias_type("First");
+        let second = alias_type("Second");
+        let duplicate = alias_type("Duplicate");
+        let shape = alias_type("Shape");
+        let callable_signature = |type_| {
+            context
+                .store()
+                .type_payload(type_)
+                .and_then(|record| record.data().structured())
+                .and_then(|structured| structured.signatures.as_deref())
+                .and_then(|signatures| signatures.first().copied())
+                .unwrap()
+        };
+        let signatures = [
+            callable_signature(first),
+            callable_signature(second),
+            callable_signature(duplicate),
+        ];
+        for signature in signatures {
+            context.get_return_type_of_signature(signature).unwrap();
+        }
+
+        let store = context.store_mut_for_test();
+        let constituents = [first, second, duplicate, shape];
+        let intersection = store
+            .canonical_intersection_type(&constituents, None)
+            .unwrap();
+        let projection = store.validate_intersection_type(intersection).unwrap();
+        assert_eq!(projection.types.as_slice(), constituents.as_slice());
+        assert_eq!(projection.properties.len(), 1);
+        assert_eq!(
+            store
+                .symbol(projection.properties[0])
+                .unwrap()
+                .name()
+                .as_utf8(),
+            Some("marker"),
+        );
+        let structured = store
+            .type_payload(intersection)
+            .and_then(|record| record.data().structured())
+            .unwrap();
+        assert_eq!(structured.call_signature_count, 2);
+        assert_eq!(structured.signatures.as_deref(), Some(&signatures[..2]));
+
+        let warm = (
+            store.type_len(),
+            store.signature_len(),
+            store.symbol_len(),
+            store.symbol_store().symbol_table_len(),
+        );
+        assert_eq!(
+            store.canonical_intersection_type(&constituents, None),
+            Ok(intersection),
+        );
+        assert_eq!(
+            (
+                store.type_len(),
+                store.signature_len(),
+                store.symbol_len(),
+                store.symbol_store().symbol_table_len(),
+            ),
+            warm,
+        );
+
+        assert!(store.set_structured_type_members(
+            intersection,
+            None,
+            None,
+            Some(vec![signatures[1], signatures[0]]),
+            None,
+            None,
+        ));
+        let poisoned = (
+            store.type_len(),
+            store.signature_len(),
+            store.symbol_len(),
+            store.symbol_store().symbol_table_len(),
+        );
+        assert_eq!(
+            store.canonical_intersection_type(&constituents, None),
+            Err(IntersectionTypeError::InvalidCachedIntersection(
+                intersection
+            )),
+        );
+        assert_eq!(
+            (
+                store.type_len(),
+                store.signature_len(),
+                store.symbol_len(),
+                store.symbol_store().symbol_table_len(),
+            ),
+            poisoned,
+        );
+    }
 }

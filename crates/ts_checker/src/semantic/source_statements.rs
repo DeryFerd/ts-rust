@@ -18,9 +18,11 @@ use ts_ast::{
     SyntaxKind,
 };
 use ts_binder::{BoundFile, SemanticSymbolId};
+use ts_core::{TextPos, TextRange};
+use ts_diagnostics::{Diagnostic, message_by_code};
 
 use super::{
-    CanonicalTypeMapperStore,
+    CanonicalCheckerDiagnostic, CanonicalCheckerDiagnosticRange, CanonicalTypeMapperStore,
     source_callables::{SourceCallableFamily, SourceCallablePlan},
     source_flow::{SourceTypeofComparison, SourceTypeofTag},
     variables::{VariableBindingKind, VariablePlanError, plan_top_level_variable},
@@ -172,6 +174,16 @@ pub(super) struct SourceFinalIfSyntax {
     pub(super) else_branch: SourceReturnBranchSyntax,
 }
 
+/// Proven `if` children and grammar diagnostics for nested export declarations.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct SourceControlIfSyntax {
+    pub(super) statement: NodeRef,
+    pub(super) condition: NodeRef,
+    pub(super) then_statement: NodeRef,
+    pub(super) else_statement: Option<NodeRef>,
+    pub(super) nested_export_diagnostics: Vec<CanonicalCheckerDiagnostic>,
+}
+
 /// Exact source nodes retained for one direct `typeof` identifier comparison.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct SourceTypeofConditionSyntax {
@@ -313,6 +325,227 @@ pub(super) fn plan_source_function_statements_syntax(
     .plan()
 }
 
+/// Validates an `if` statement independently of its enclosing source scope.
+pub(super) fn plan_source_control_if_syntax(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    statement: NodeRef,
+    expected_parent: NodeRef,
+) -> Result<SourceControlIfSyntax, SourceFunctionStatementsError> {
+    if bound.node_arena_id() != arena.id()
+        || bound.node_arena_revision() != arena.revision()
+        || !expected_parent.is_for(arena.id(), bound.file_id())
+    {
+        return Err(SourceFunctionStatementsInvariant::BoundSourceMismatch(statement).into());
+    }
+    let record = control_statement_node(arena, bound, statement)?;
+    let NodeData::IfStatement(data) = &record.data else {
+        return Err(SourceFunctionStatementsError::Unsupported(
+            SourceFunctionStatementsUnsupported::Syntax {
+                node: statement,
+                kind: record.kind,
+                role: SourceFunctionStatementsRole::IfStatement,
+            },
+        ));
+    };
+    if record.kind != SyntaxKind::IfStatement
+        || record.flags.0 != 0
+        || data.flow_node.is_some()
+        || data.facts != 0
+    {
+        return Err(SourceFunctionStatementsError::Unsupported(
+            SourceFunctionStatementsUnsupported::Syntax {
+                node: statement,
+                kind: record.kind,
+                role: SourceFunctionStatementsRole::IfStatement,
+            },
+        ));
+    }
+    let container = validate_control_statement_parent(arena, bound, statement, expected_parent)?;
+
+    let condition = NodeRef::new(statement.arena, statement.file, data.expression);
+    validate_control_statement_child(arena, bound, statement, condition, container)?;
+    let then_statement = NodeRef::new(statement.arena, statement.file, data.then_statement);
+    validate_control_statement_child(arena, bound, statement, then_statement, container)?;
+    let condition_range = control_statement_node(arena, bound, condition)?.range;
+    let then_range = control_statement_node(arena, bound, then_statement)?.range;
+    if condition_range.end > then_range.start {
+        return Err(SourceFunctionStatementsInvariant::InvalidOrder {
+            previous: condition,
+            next: then_statement,
+        }
+        .into());
+    }
+
+    let else_statement = data
+        .else_statement
+        .map(|node| NodeRef::new(statement.arena, statement.file, node));
+    if let Some(else_statement) = else_statement {
+        validate_control_statement_child(arena, bound, statement, else_statement, container)?;
+        if then_range.end
+            > control_statement_node(arena, bound, else_statement)?
+                .range
+                .start
+        {
+            return Err(SourceFunctionStatementsInvariant::InvalidOrder {
+                previous: then_statement,
+                next: else_statement,
+            }
+            .into());
+        }
+    }
+
+    let nested_export_diagnostics = std::iter::once(then_statement)
+        .chain(else_statement)
+        .filter_map(|branch| nested_export_declaration_diagnostic(arena, bound, branch))
+        .collect();
+    Ok(SourceControlIfSyntax {
+        statement,
+        condition,
+        then_statement,
+        else_statement,
+        nested_export_diagnostics,
+    })
+}
+
+fn control_statement_node<'arena>(
+    arena: &'arena NodeArena,
+    bound: &BoundFile,
+    node: NodeRef,
+) -> Result<&'arena Node, SourceFunctionStatementsError> {
+    if !node.is_for(arena.id(), bound.file_id()) {
+        return Err(SourceFunctionStatementsInvariant::BoundSourceMismatch(node).into());
+    }
+    if !bound.contains(node) {
+        return Err(SourceFunctionStatementsInvariant::NodeNotBound(node).into());
+    }
+    let record = arena
+        .get(node.node)
+        .ok_or(SourceFunctionStatementsInvariant::MissingNode(node))?;
+    if !record.data.matches_syntax_kind(record.kind) {
+        return Err(SourceFunctionStatementsInvariant::MismatchedNodeData {
+            node,
+            kind: record.kind,
+        }
+        .into());
+    }
+    Ok(record)
+}
+
+fn validate_control_statement_parent(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    statement: NodeRef,
+    expected_parent: NodeRef,
+) -> Result<NodeRef, SourceFunctionStatementsError> {
+    let record = control_statement_node(arena, bound, statement)?;
+    if record.parent != Some(expected_parent.node) {
+        return Err(SourceFunctionStatementsInvariant::InvalidParent {
+            node: statement,
+            expected: Some(expected_parent.node),
+            actual: record.parent,
+        }
+        .into());
+    }
+    let parent = control_statement_node(arena, bound, expected_parent)?;
+    if !range_contains(parent.range, record.range) {
+        return Err(SourceFunctionStatementsInvariant::InvalidRange {
+            node: statement,
+            parent: expected_parent,
+        }
+        .into());
+    }
+    bound.container(statement).ok_or_else(|| {
+        SourceFunctionStatementsInvariant::InvalidContainer {
+            node: statement,
+            expected: expected_parent,
+            actual: None,
+        }
+        .into()
+    })
+}
+
+fn validate_control_statement_child(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    parent: NodeRef,
+    child: NodeRef,
+    container: NodeRef,
+) -> Result<(), SourceFunctionStatementsError> {
+    let record = control_statement_node(arena, bound, child)?;
+    if record.parent != Some(parent.node) {
+        return Err(SourceFunctionStatementsInvariant::InvalidParent {
+            node: child,
+            expected: Some(parent.node),
+            actual: record.parent,
+        }
+        .into());
+    }
+    if !range_contains(
+        control_statement_node(arena, bound, parent)?.range,
+        record.range,
+    ) {
+        return Err(SourceFunctionStatementsInvariant::InvalidRange {
+            node: child,
+            parent,
+        }
+        .into());
+    }
+    let actual = bound.container(child);
+    if actual != Some(container) {
+        return Err(SourceFunctionStatementsInvariant::InvalidContainer {
+            node: child,
+            expected: container,
+            actual,
+        }
+        .into());
+    }
+    Ok(())
+}
+
+fn nested_export_declaration_diagnostic(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    declaration: NodeRef,
+) -> Option<CanonicalCheckerDiagnostic> {
+    let record = control_statement_node(arena, bound, declaration).ok()?;
+    if !matches!(&record.data, NodeData::ExportDeclaration(_)) {
+        return None;
+    }
+    let parent = record.parent.and_then(|node| arena.get(node))?;
+    if matches!(
+        parent.kind,
+        SyntaxKind::SourceFile | SyntaxKind::ModuleBlock | SyntaxKind::ModuleDeclaration
+    ) {
+        return None;
+    }
+    let source = arena.source_text()?;
+    let start = usize::try_from(record.range.start.get()).ok()?;
+    let end = usize::try_from(record.range.end.get()).ok()?;
+    let text = source.get(start..end)?;
+    let leading = text.find(|character: char| !character.is_whitespace())?;
+    let keyword_start = start.checked_add(leading)?;
+    let keyword_end = keyword_start.checked_add("export".len())?;
+    if source.get(keyword_start..keyword_end) != Some("export") {
+        return None;
+    }
+    let range = TextRange::new(
+        TextPos::new(u32::try_from(keyword_start).ok()?),
+        TextPos::new(u32::try_from(keyword_end).ok()?),
+    );
+    let code = if bound.source_facts()?.is_javascript_file() {
+        1_474
+    } else {
+        1_233
+    };
+    Some(CanonicalCheckerDiagnostic {
+        node: Some(declaration),
+        range_override: Some(CanonicalCheckerDiagnosticRange::new(declaration, range)),
+        diagnostic: Diagnostic::new(message_by_code(code)?),
+        related_information: Vec::new(),
+    })
+}
+
 /// Proves an inferred or annotated function body with straight-line locals.
 pub(super) fn plan_source_linear_function_statements_syntax(
     arena: &NodeArena,
@@ -405,8 +638,12 @@ impl SyntaxPlanner<'_> {
         for (index, statement_id) in statements.iter().copied().enumerate() {
             let statement = self.reference(statement_id);
             match self.node(statement)?.kind {
-                SyntaxKind::VariableStatement => {
-                    locals.extend(self.plan_local_statement(statement, body, declaration)?);
+                SyntaxKind::VariableStatement | SyntaxKind::Block | SyntaxKind::EmptyStatement => {
+                    locals.extend(self.plan_local_or_block_statement(
+                        statement,
+                        body,
+                        declaration,
+                    )?);
                 }
                 SyntaxKind::ReturnStatement if index + 1 == statements.len() => {
                     return_expression = self.plan_linear_return(statement, body, declaration)?;
@@ -492,6 +729,114 @@ impl SyntaxPlanner<'_> {
         Ok(Some(expression))
     }
 
+    fn plan_nested_local_block(
+        &self,
+        block: NodeRef,
+        parent: NodeRef,
+        callable: NodeRef,
+    ) -> Result<Vec<SourceLocalDeclarationSyntax>, SourceFunctionStatementsError> {
+        let record = self.node(block)?;
+        let NodeData::Block(data) = &record.data else {
+            return Err(self.unsupported(
+                block,
+                record.kind,
+                SourceFunctionStatementsRole::BranchBlock,
+            ));
+        };
+        if record.kind != SyntaxKind::Block
+            || record.flags.0 != 0
+            || record.parent != Some(parent.node)
+            || data.flow_node.is_some()
+            || data.next_container.is_some()
+            || data.statements.has_trailing_comma
+            || data.facts != 0
+        {
+            return Err(self.unsupported(
+                block,
+                record.kind,
+                SourceFunctionStatementsRole::BranchBlock,
+            ));
+        }
+        self.validate_range(block, parent)?;
+        self.validate_container(block, callable)?;
+        let outer_scope = if parent == self.callable.body {
+            callable
+        } else {
+            parent
+        };
+        self.validate_block_scope_container(block, outer_scope)?;
+        self.validate_node_list(block, data.statements.range, &data.statements.nodes)?;
+
+        let mut locals = Vec::new();
+        for &statement_id in &data.statements.nodes {
+            let statement = self.reference(statement_id);
+            match self.node(statement)?.kind {
+                SyntaxKind::VariableStatement | SyntaxKind::Block | SyntaxKind::EmptyStatement => {
+                    locals.extend(self.plan_local_or_block_statement(statement, block, callable)?);
+                }
+                kind => {
+                    return Err(self.unsupported(
+                        statement,
+                        kind,
+                        SourceFunctionStatementsRole::BranchStatement,
+                    ));
+                }
+            }
+        }
+        Ok(locals)
+    }
+
+    fn plan_local_or_block_statement(
+        &self,
+        statement: NodeRef,
+        parent: NodeRef,
+        callable: NodeRef,
+    ) -> Result<Vec<SourceLocalDeclarationSyntax>, SourceFunctionStatementsError> {
+        match self.node(statement)?.kind {
+            SyntaxKind::Block => self.plan_nested_local_block(statement, parent, callable),
+            SyntaxKind::EmptyStatement => {
+                self.validate_empty_statement(statement, parent, callable)?;
+                Ok(Vec::new())
+            }
+            _ => self.plan_local_statement(statement, parent, callable),
+        }
+    }
+
+    fn validate_empty_statement(
+        &self,
+        statement: NodeRef,
+        parent: NodeRef,
+        callable: NodeRef,
+    ) -> Result<(), SourceFunctionStatementsError> {
+        let record = self.node(statement)?;
+        let NodeData::EmptyStatement(empty) = &record.data else {
+            return Err(self.unsupported(
+                statement,
+                record.kind,
+                SourceFunctionStatementsRole::BodyStatement,
+            ));
+        };
+        if record.kind != SyntaxKind::EmptyStatement
+            || record.flags.0 != 0
+            || record.parent != Some(parent.node)
+            || empty.flow_node.is_some()
+        {
+            return Err(self.unsupported(
+                statement,
+                record.kind,
+                SourceFunctionStatementsRole::BodyStatement,
+            ));
+        }
+        self.validate_range(statement, parent)?;
+        self.validate_container(statement, callable)?;
+        let scope = if parent == self.callable.body {
+            callable
+        } else {
+            parent
+        };
+        self.validate_block_scope_container(statement, scope)
+    }
+
     fn plan(&self) -> Result<SourceFunctionStatementsSyntax, SourceFunctionStatementsError> {
         let declaration = self.callable.declaration;
         if !declaration.is_for(self.arena.id(), self.bound.file_id())
@@ -545,7 +890,7 @@ impl SyntaxPlanner<'_> {
         let mut leading = Vec::new();
         for &statement_id in leading_statement_ids {
             let statement = self.reference(statement_id);
-            leading.extend(self.plan_local_statement(statement, body, declaration)?);
+            leading.extend(self.plan_local_or_block_statement(statement, body, declaration)?);
         }
 
         let final_if = self.plan_final_if(self.reference(final_statement_id), body, declaration)?;
@@ -840,8 +1185,17 @@ impl SyntaxPlanner<'_> {
         self.validate_range(statement, body)?;
         self.validate_container(statement, callable)?;
         self.validate_block_scope_container(statement, callable)?;
+        let control = plan_source_control_if_syntax(self.arena, self.bound, statement, body)?;
+        debug_assert_eq!(control.statement, statement);
+        if !control.nested_export_diagnostics.is_empty() {
+            return Err(self.unsupported(
+                control.then_statement,
+                self.node(control.then_statement)?.kind,
+                SourceFunctionStatementsRole::BranchStatement,
+            ));
+        }
 
-        let condition = self.reference(if_statement.expression);
+        let condition = control.condition;
         self.validate_parent(
             condition,
             Some(statement.node),
@@ -850,13 +1204,13 @@ impl SyntaxPlanner<'_> {
         self.validate_range(condition, statement)?;
         let condition_syntax = self.plan_condition(condition, callable)?;
 
-        let then_block = self.reference(if_statement.then_statement);
-        let else_block = if_statement
-            .else_statement
-            .map(|node| self.reference(node))
-            .ok_or(SourceFunctionStatementsError::Unsupported(
-                SourceFunctionStatementsUnsupported::MissingElse(statement),
-            ))?;
+        let then_block = control.then_statement;
+        let else_block =
+            control
+                .else_statement
+                .ok_or(SourceFunctionStatementsError::Unsupported(
+                    SourceFunctionStatementsUnsupported::MissingElse(statement),
+                ))?;
         self.validate_range(then_block, statement)?;
         self.validate_range(else_block, statement)?;
         self.validate_order(condition, then_block)?;
@@ -1214,11 +1568,8 @@ impl SyntaxPlanner<'_> {
         };
         let mut locals = Vec::new();
         for &statement_id in local_statement_ids {
-            locals.extend(self.plan_local_statement(
-                self.reference(statement_id),
-                block,
-                callable,
-            )?);
+            let statement = self.reference(statement_id);
+            locals.extend(self.plan_local_or_block_statement(statement, block, callable)?);
         }
 
         let return_statement = self.reference(return_id);
@@ -1542,7 +1893,7 @@ impl SyntaxPlanner<'_> {
 
         let mut leading = Vec::new();
         for &statement_id in &preceding[..if_index] {
-            leading.extend(self.plan_local_statement(
+            leading.extend(self.plan_local_or_block_statement(
                 self.reference(statement_id),
                 body,
                 declaration,
@@ -1552,7 +1903,7 @@ impl SyntaxPlanner<'_> {
             self.plan_joined_if(self.reference(preceding[if_index]), body, declaration)?;
         let mut trailing = Vec::new();
         for &statement_id in &preceding[if_index + 1..] {
-            trailing.extend(self.plan_local_statement(
+            trailing.extend(self.plan_local_or_block_statement(
                 self.reference(statement_id),
                 body,
                 declaration,
@@ -1601,8 +1952,19 @@ impl SyntaxPlanner<'_> {
         self.validate_range(statement, body)?;
         self.validate_container(statement, callable)?;
         self.validate_block_scope_container(statement, callable)?;
+        let control = plan_source_control_if_syntax(self.arena, self.bound, statement, body)?;
+        debug_assert_eq!(control.statement, statement);
+        if !control.nested_export_diagnostics.is_empty() {
+            return Err(self
+                .unsupported(
+                    control.then_statement,
+                    self.node(control.then_statement)?.kind,
+                    SourceFunctionStatementsRole::BranchStatement,
+                )
+                .into());
+        }
 
-        let condition = self.reference(if_statement.expression);
+        let condition = control.condition;
         self.validate_parent(
             condition,
             Some(statement.node),
@@ -1611,13 +1973,11 @@ impl SyntaxPlanner<'_> {
         self.validate_range(condition, statement)?;
         let condition_syntax = self.plan_condition(condition, callable)?;
 
-        let then_block = self.reference(if_statement.then_statement);
+        let then_block = control.then_statement;
         self.validate_range(then_block, statement)?;
         self.validate_order(condition, then_block)?;
         let then_branch = self.plan_fallthrough_branch(then_block, statement, callable)?;
-        let else_branch = if let Some(else_block) =
-            if_statement.else_statement.map(|node| self.reference(node))
-        {
+        let else_branch = if let Some(else_block) = control.else_statement {
             self.validate_range(else_block, statement)?;
             self.validate_order(then_block, else_block)?;
             self.plan_fallthrough_branch(else_block, statement, callable)?
@@ -1681,11 +2041,8 @@ impl SyntaxPlanner<'_> {
 
         let mut locals = Vec::new();
         for &statement_id in &block_data.statements.nodes {
-            locals.extend(self.plan_local_statement(
-                self.reference(statement_id),
-                block,
-                callable,
-            )?);
+            let statement = self.reference(statement_id);
+            locals.extend(self.plan_local_or_block_statement(statement, block, callable)?);
         }
         Ok(SourceFallthroughBranchSyntax {
             block: Some(block),
@@ -2189,6 +2546,34 @@ mod joined_tests {
     }
 
     #[test]
+    fn linear_body_flattens_nested_lexical_blocks_and_empty_statements() {
+        let fixture = JoinedFixture::new(
+            concat!(
+                "function nested(value: number): number {\n",
+                "  ;\n",
+                "  {\n",
+                "    const first: number = value;\n",
+                "    {\n",
+                "      let second: number = first;\n",
+                "      ;\n",
+                "    }\n",
+                "  }\n",
+                "  const result: number = value;\n",
+                "  return result;\n",
+                "}\n",
+            ),
+            FileId::new(1_194),
+        );
+        let syntax = fixture.linear_plan().unwrap();
+        assert_eq!(syntax.locals.len(), 3);
+        assert_eq!(syntax.locals[0].binding, VariableBindingKind::Const);
+        assert_eq!(syntax.locals[1].binding, VariableBindingKind::Let);
+        assert_eq!(syntax.locals[2].binding, VariableBindingKind::Const);
+        assert!(syntax.return_statement.is_some());
+        assert!(syntax.return_expression.is_some());
+    }
+
+    #[test]
     fn linear_body_rejects_statements_after_return() {
         let fixture = JoinedFixture::new(
             "function invalid(): void { return; const later = 1; }",
@@ -2203,6 +2588,72 @@ mod joined_tests {
                 },
             )),
         ));
+    }
+
+    #[test]
+    fn top_level_if_retains_nested_export_grammar_diagnostic_and_token_range() {
+        let source = "if (true) export type {};";
+        let fixture = JoinedFixture::new(source, FileId::new(1_195));
+        let statement = fixture
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::IfStatement).then_some(NodeRef::new(
+                    fixture.parsed.arena.id(),
+                    fixture.file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let syntax = plan_source_control_if_syntax(
+            &fixture.parsed.arena,
+            &fixture.bound,
+            statement,
+            fixture.bound.source_file(),
+        )
+        .unwrap();
+        assert_eq!(syntax.statement, statement);
+        assert!(syntax.else_statement.is_none());
+        let [diagnostic] = syntax.nested_export_diagnostics.as_slice() else {
+            panic!("expected one nested export diagnostic")
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 1_233);
+        assert_eq!(diagnostic.node, Some(syntax.then_statement));
+        let range = diagnostic.range_override.unwrap().range();
+        let start = usize::try_from(range.start.get()).unwrap();
+        let end = usize::try_from(range.end.get()).unwrap();
+        assert_eq!(source.get(start..end).unwrap(), "export",);
+        assert_eq!(
+            diagnostic.diagnostic.render().unwrap(),
+            "An export declaration can only be used at the top level of a namespace or module.",
+        );
+    }
+
+    #[test]
+    fn top_level_if_keeps_ordered_block_branches_without_grammar_diagnostics() {
+        let fixture = JoinedFixture::new("if (true) {} else {}", FileId::new(1_196));
+        let statement = fixture
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::IfStatement).then_some(NodeRef::new(
+                    fixture.parsed.arena.id(),
+                    fixture.file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let syntax = plan_source_control_if_syntax(
+            &fixture.parsed.arena,
+            &fixture.bound,
+            statement,
+            fixture.bound.source_file(),
+        )
+        .unwrap();
+        assert!(syntax.else_statement.is_some());
+        assert!(syntax.nested_export_diagnostics.is_empty());
     }
 
     #[test]
@@ -2343,6 +2794,61 @@ mod joined_tests {
         assert!(syntax.joined_if.else_branch.locals.is_empty());
         assert_eq!(syntax.trailing.len(), 1);
         assert_eq!(syntax.trailing[0].binding, VariableBindingKind::Var);
+    }
+
+    #[test]
+    fn joined_branches_flatten_nested_blocks_in_binder_assignment_order() {
+        let fixture = JoinedFixture::new(
+            concat!(
+                "function nested(value: string | undefined): string | undefined {\n",
+                "  if (value) {\n",
+                "    ;\n",
+                "    { const selected: string = value; }\n",
+                "  } else {\n",
+                "    { const rejected: string | undefined = value; }\n",
+                "    ;\n",
+                "  }\n",
+                "  return value;\n",
+                "}\n",
+            ),
+            FileId::new(1_214),
+        );
+        let syntax = fixture.plan().unwrap();
+        assert_eq!(syntax.joined_if.then_branch.locals.len(), 1);
+        assert_eq!(syntax.joined_if.else_branch.locals.len(), 1);
+    }
+
+    #[test]
+    fn final_if_flattens_nested_blocks_before_each_return() {
+        let fixture = JoinedFixture::new(
+            concat!(
+                "function nested(value: string | undefined): string | undefined {\n",
+                "  ;\n",
+                "  { const initial: string | undefined = value; }\n",
+                "  if (value) {\n",
+                "    ;\n",
+                "    { const selected: string = value; }\n",
+                "    return value;\n",
+                "  } else {\n",
+                "    { const rejected: string | undefined = value; }\n",
+                "    ;\n",
+                "    return value;\n",
+                "  }\n",
+                "}\n",
+            ),
+            FileId::new(1_215),
+        );
+        let callable = fixture.callable();
+        let syntax = plan_source_function_statements_syntax(
+            &fixture.parsed.arena,
+            &fixture.bound,
+            &fixture.store,
+            &callable,
+        )
+        .unwrap();
+        assert_eq!(syntax.leading.len(), 1);
+        assert_eq!(syntax.final_if.then_branch.locals.len(), 1);
+        assert_eq!(syntax.final_if.else_branch.locals.len(), 1);
     }
 
     #[test]

@@ -215,6 +215,11 @@ struct NormalizedTemplate {
     types: Vec<TypeId>,
 }
 
+enum TemplateUnionPlan {
+    Existing(TypeId),
+    Constituents(Vec<TypeId>),
+}
+
 impl CanonicalTypeMapperStore {
     /// Returns the canonical type of a template and distributes union spans.
     ///
@@ -258,18 +263,23 @@ impl CanonicalTypeMapperStore {
         if self.intrinsic_bootstrap().is_none() {
             return Err(TemplateTypeError::BootstrapUninitialized);
         }
-        let symbol_record = self
-            .symbol(symbol)
-            .ok_or(TemplateTypeError::InvalidMappingSymbol(symbol))?;
-        let kind = symbol_record
-            .name()
-            .as_utf8()
-            .and_then(StringMappingKind::from_name)
-            .ok_or(TemplateTypeError::UnsupportedMappingSymbol(symbol))?;
+        let kind = self.string_mapping_kind(symbol)?;
         if self.type_payload(target).is_none() {
             return Err(TemplateTypeError::InvalidType(target));
         }
         self.get_string_mapping_type_worker(symbol, kind, target)
+    }
+
+    pub(super) fn string_mapping_kind(
+        &self,
+        symbol: SemanticSymbolId,
+    ) -> Result<StringMappingKind, TemplateTypeError> {
+        self.symbol(symbol)
+            .ok_or(TemplateTypeError::InvalidMappingSymbol(symbol))?
+            .name()
+            .as_utf8()
+            .and_then(StringMappingKind::from_name)
+            .ok_or(TemplateTypeError::UnsupportedMappingSymbol(symbol))
     }
 
     /// Computes the upstream union cross-product estimate without allocating.
@@ -301,6 +311,115 @@ impl CanonicalTypeMapperStore {
             }
         }
         Ok(size)
+    }
+
+    pub(super) fn cached_resolved_template_literal_type(
+        &self,
+        texts: &[String],
+        types: &[TypeId],
+    ) -> Result<Option<TypeId>, TemplateTypeError> {
+        if texts.len() != types.len().saturating_add(1) {
+            return Err(TemplateTypeError::InvalidShape {
+                text_count: texts.len(),
+                type_count: types.len(),
+            });
+        }
+        if self.intrinsic_bootstrap().is_none() {
+            return Err(TemplateTypeError::BootstrapUninitialized);
+        }
+        for type_ in types {
+            if self.type_payload(*type_).is_none() {
+                return Err(TemplateTypeError::InvalidType(*type_));
+            }
+        }
+        self.cached_resolved_template_literal_type_worker(texts, types)
+    }
+
+    fn cached_resolved_template_literal_type_worker(
+        &self,
+        texts: &[String],
+        types: &[TypeId],
+    ) -> Result<Option<TypeId>, TemplateTypeError> {
+        if let Some(index) = types.iter().position(|type_| {
+            self.type_payload(*type_).is_some_and(|record| {
+                record
+                    .flags()
+                    .intersects(TypeFlags::NEVER | TypeFlags::UNION)
+            })
+        }) {
+            return self.cached_distributed_template_literal_type(texts, types, index);
+        }
+
+        let bootstrap = self
+            .intrinsic_bootstrap()
+            .ok_or(TemplateTypeError::BootstrapUninitialized)?;
+        if types.contains(&bootstrap.wildcard_type) {
+            return Ok(Some(bootstrap.wildcard_type));
+        }
+
+        let mut normalized = NormalizedTemplate {
+            current: texts[0].clone(),
+            ..NormalizedTemplate::default()
+        };
+        if !self.append_template_spans(texts, types, &mut normalized, &mut HashSet::new())? {
+            return Ok(Some(bootstrap.string_type));
+        }
+        if normalized.types.is_empty() {
+            return Ok(bootstrap.cached_string_literal_type(&normalized.current));
+        }
+        normalized.texts.push(normalized.current);
+
+        if normalized.texts.iter().all(String::is_empty) {
+            if normalized.types.iter().all(|type_| {
+                self.type_payload(*type_)
+                    .is_some_and(|record| record.flags().intersects(TypeFlags::STRING))
+            }) {
+                return Ok(Some(bootstrap.string_type));
+            }
+            if let [placeholder] = normalized.types.as_slice()
+                && self.is_template_pattern_literal_type(*placeholder, &mut HashSet::new())?
+            {
+                return Ok(Some(*placeholder));
+            }
+        }
+        self.find_template_literal_type(&normalized.texts, &normalized.types)
+    }
+
+    fn cached_distributed_template_literal_type(
+        &self,
+        texts: &[String],
+        types: &[TypeId],
+        index: usize,
+    ) -> Result<Option<TypeId>, TemplateTypeError> {
+        let size = self.get_template_cross_product_union_size(types)?;
+        if size >= MAX_TEMPLATE_UNION_SIZE {
+            return Err(TemplateTypeError::CrossProductTooLarge {
+                size,
+                limit: MAX_TEMPLATE_UNION_SIZE,
+            });
+        }
+
+        let record = self
+            .type_payload(types[index])
+            .ok_or(TemplateTypeError::InvalidType(types[index]))?;
+        if record.flags().intersects(TypeFlags::NEVER) {
+            return Ok(Some(types[index]));
+        }
+        let TypeData::Union(union) = record.data() else {
+            return Err(TemplateTypeError::InvalidUnion(types[index]));
+        };
+        let mut selected = types.to_vec();
+        let mut mapped = Vec::with_capacity(union.union.types.len());
+        for constituent in &union.union.types {
+            selected[index] = *constituent;
+            let Some(result) =
+                self.cached_resolved_template_literal_type_worker(texts, &selected)?
+            else {
+                return Ok(None);
+            };
+            mapped.push(result);
+        }
+        self.cached_template_result_union(&mapped)
     }
 
     fn get_template_literal_type_worker(
@@ -619,6 +738,146 @@ impl CanonicalTypeMapperStore {
         }
     }
 
+    pub(super) fn cached_resolved_string_mapping_type(
+        &self,
+        symbol: SemanticSymbolId,
+        target: TypeId,
+    ) -> Result<Option<TypeId>, TemplateTypeError> {
+        if self.intrinsic_bootstrap().is_none() {
+            return Err(TemplateTypeError::BootstrapUninitialized);
+        }
+        let kind = self.string_mapping_kind(symbol)?;
+        if self.type_payload(target).is_none() {
+            return Err(TemplateTypeError::InvalidType(target));
+        }
+        self.cached_resolved_string_mapping_type_worker(symbol, kind, target)
+    }
+
+    fn cached_resolved_string_mapping_type_worker(
+        &self,
+        symbol: SemanticSymbolId,
+        kind: StringMappingKind,
+        target: TypeId,
+    ) -> Result<Option<TypeId>, TemplateTypeError> {
+        let record = self
+            .type_payload(target)
+            .ok_or(TemplateTypeError::InvalidType(target))?;
+        if record.flags().intersects(TypeFlags::NEVER) {
+            return Ok(Some(target));
+        }
+        match record.data() {
+            TypeData::Union(union) => {
+                if union.union.types.len() < 2 {
+                    return Err(TemplateTypeError::InvalidUnion(target));
+                }
+                let mut mapped = Vec::with_capacity(union.union.types.len());
+                for constituent in &union.union.types {
+                    let Some(result) = self.cached_resolved_string_mapping_type_worker(
+                        symbol,
+                        kind,
+                        *constituent,
+                    )?
+                    else {
+                        return Ok(None);
+                    };
+                    mapped.push(result);
+                }
+                if mapped == union.union.types {
+                    Ok(Some(target))
+                } else {
+                    self.cached_template_result_union(&mapped)
+                }
+            }
+            TypeData::Literal(literal) if record.flags().intersects(TypeFlags::STRING_LITERAL) => {
+                let LiteralValue::String(value) = &literal.value else {
+                    return Err(TemplateTypeError::InvalidLiteral(target));
+                };
+                Ok(self
+                    .intrinsic_bootstrap()
+                    .and_then(|bootstrap| bootstrap.cached_string_literal_type(&kind.apply(value))))
+            }
+            TypeData::TemplateLiteral(template) => {
+                self.cached_mapped_template_literal_type(symbol, kind, target, template)
+            }
+            TypeData::StringMapping(_) if record.symbol() == Some(symbol) => Ok(Some(target)),
+            _ if record
+                .flags()
+                .intersects(TypeFlags::ANY | TypeFlags::STRING | TypeFlags::STRING_MAPPING)
+                || self.is_template_generic_index_type(target, &mut HashSet::new())? =>
+            {
+                Ok(self.cached_generic_string_mapping_type(symbol, target))
+            }
+            _ if self.is_template_pattern_placeholder(target, &mut HashSet::new())? => {
+                let Some(template) = self.cached_resolved_template_literal_type_worker(
+                    &[String::new(), String::new()],
+                    &[target],
+                )?
+                else {
+                    return Ok(None);
+                };
+                Ok(self.cached_generic_string_mapping_type(symbol, template))
+            }
+            _ => Ok(Some(target)),
+        }
+    }
+
+    fn cached_mapped_template_literal_type(
+        &self,
+        symbol: SemanticSymbolId,
+        kind: StringMappingKind,
+        target: TypeId,
+        template: &super::type_records::TemplateLiteralTypeData,
+    ) -> Result<Option<TypeId>, TemplateTypeError> {
+        let mut texts = template.texts.clone();
+        let mut types = template.types.clone();
+        if types.is_empty() || texts.len() != types.len() + 1 {
+            return Err(TemplateTypeError::InvalidTemplate(target));
+        }
+        match kind {
+            StringMappingKind::Uppercase | StringMappingKind::Lowercase => {
+                for text in &mut texts {
+                    *text = kind.apply(text);
+                }
+                for type_ in &mut types {
+                    let Some(mapped) =
+                        self.cached_resolved_string_mapping_type_worker(symbol, kind, *type_)?
+                    else {
+                        return Ok(None);
+                    };
+                    *type_ = mapped;
+                }
+            }
+            StringMappingKind::Capitalize | StringMappingKind::Uncapitalize => {
+                if texts[0].is_empty() {
+                    let Some(mapped) =
+                        self.cached_resolved_string_mapping_type_worker(symbol, kind, types[0])?
+                    else {
+                        return Ok(None);
+                    };
+                    types[0] = mapped;
+                } else {
+                    texts[0] = kind.apply(&texts[0]);
+                }
+            }
+        }
+        self.cached_resolved_template_literal_type_worker(&texts, &types)
+    }
+
+    fn cached_generic_string_mapping_type(
+        &self,
+        symbol: SemanticSymbolId,
+        target: TypeId,
+    ) -> Option<TypeId> {
+        self.types().find_map(|(id, record)| match record.data() {
+            TypeData::StringMapping(mapping)
+                if record.symbol() == Some(symbol) && mapping.target == target =>
+            {
+                Some(id)
+            }
+            _ => None,
+        })
+    }
+
     fn get_string_mapping_type_worker(
         &mut self,
         symbol: SemanticSymbolId,
@@ -702,14 +961,7 @@ impl CanonicalTypeMapperStore {
         symbol: SemanticSymbolId,
         target: TypeId,
     ) -> Result<TypeId, TemplateTypeError> {
-        if let Some(existing) = self.types().find_map(|(id, record)| match record.data() {
-            TypeData::StringMapping(mapping)
-                if record.symbol() == Some(symbol) && mapping.target == target =>
-            {
-                Some(id)
-            }
-            _ => None,
-        }) {
+        if let Some(existing) = self.cached_generic_string_mapping_type(symbol, target) {
             return Ok(existing);
         }
         if !self.try_reserve_types(1) {
@@ -723,23 +975,10 @@ impl CanonicalTypeMapperStore {
         &mut self,
         types: &[TypeId],
     ) -> Result<TypeId, TemplateTypeError> {
-        let never = self
-            .intrinsic_bootstrap()
-            .ok_or(TemplateTypeError::BootstrapUninitialized)?
-            .never_type;
-        let mut flattened = Vec::with_capacity(types.len());
-        self.flatten_template_union_types(types, &mut flattened, &mut HashSet::new())?;
-        flattened.retain(|type_| {
-            self.type_payload(*type_)
-                .is_some_and(|record| !record.flags().intersects(TypeFlags::NEVER))
-        });
-        flattened.sort_by(|left, right| self.compare_template_union_types(*left, *right));
-        flattened.dedup();
-        match flattened.as_slice() {
-            [] => return Ok(never),
-            [single] => return Ok(*single),
-            _ => {}
-        }
+        let flattened = match self.plan_template_result_union(types)? {
+            TemplateUnionPlan::Existing(existing) => return Ok(existing),
+            TemplateUnionPlan::Constituents(types) => types,
+        };
 
         if flattened
             .iter()
@@ -751,16 +990,7 @@ impl CanonicalTypeMapperStore {
                 .map_err(Into::into);
         }
 
-        if let Some(existing) = self.types().find_map(|(id, record)| match record.data() {
-            TypeData::Union(union)
-                if record.alias().is_none()
-                    && union.origin.is_none()
-                    && union.union.types == flattened =>
-            {
-                Some(id)
-            }
-            _ => None,
-        }) {
+        if let Some(existing) = self.find_template_result_union(&flattened) {
             return Ok(existing);
         }
 
@@ -769,6 +999,95 @@ impl CanonicalTypeMapperStore {
         }
         self.alloc_union_type(ObjectFlags::NONE, flattened)
             .ok_or(TemplateTypeError::Capacity)
+    }
+
+    pub(super) fn cached_template_result_union(
+        &self,
+        types: &[TypeId],
+    ) -> Result<Option<TypeId>, TemplateTypeError> {
+        match self.plan_template_result_union(types)? {
+            TemplateUnionPlan::Existing(existing) => Ok(Some(existing)),
+            TemplateUnionPlan::Constituents(types) => Ok(self.find_template_result_union(&types)),
+        }
+    }
+
+    fn plan_template_result_union(
+        &self,
+        types: &[TypeId],
+    ) -> Result<TemplateUnionPlan, TemplateTypeError> {
+        let bootstrap = self
+            .intrinsic_bootstrap()
+            .ok_or(TemplateTypeError::BootstrapUninitialized)?;
+        let mut flattened = Vec::with_capacity(types.len());
+        self.flatten_template_union_types(types, &mut flattened, &mut HashSet::new())?;
+        flattened.retain(|type_| {
+            self.type_payload(*type_)
+                .is_some_and(|record| !record.flags().intersects(TypeFlags::NEVER))
+        });
+        flattened.sort_by(|left, right| self.compare_template_union_types(*left, *right));
+        flattened.dedup();
+
+        if flattened.iter().any(|type_| {
+            self.type_payload(*type_)
+                .is_some_and(|record| record.flags().intersects(TypeFlags::ANY))
+        }) {
+            let existing = if flattened.contains(&bootstrap.wildcard_type) {
+                bootstrap.wildcard_type
+            } else if flattened.contains(&bootstrap.error_type) {
+                bootstrap.error_type
+            } else {
+                bootstrap.any_type
+            };
+            return Ok(TemplateUnionPlan::Existing(existing));
+        }
+        if flattened.iter().any(|type_| {
+            self.type_payload(*type_)
+                .is_some_and(|record| record.flags().intersects(TypeFlags::UNKNOWN))
+        }) {
+            return Ok(TemplateUnionPlan::Existing(bootstrap.unknown_type));
+        }
+
+        let has_string = flattened.contains(&bootstrap.string_type);
+        let has_number = flattened.contains(&bootstrap.number_type);
+        let has_bigint = flattened.contains(&bootstrap.bigint_type);
+        if has_string || has_number || has_bigint {
+            flattened.retain(|type_| {
+                let Some(record) = self.type_payload(*type_) else {
+                    return false;
+                };
+                !(has_string
+                    && record.flags().intersects(
+                        TypeFlags::STRING_LITERAL
+                            | TypeFlags::TEMPLATE_LITERAL
+                            | TypeFlags::STRING_MAPPING,
+                    )
+                    || has_number && record.flags().intersects(TypeFlags::NUMBER_LITERAL)
+                    || has_bigint && record.flags().intersects(TypeFlags::BIG_INT_LITERAL))
+            });
+        }
+
+        match flattened.as_slice() {
+            [] => Ok(TemplateUnionPlan::Existing(bootstrap.never_type)),
+            [single] => Ok(TemplateUnionPlan::Existing(*single)),
+            _ => Ok(TemplateUnionPlan::Constituents(flattened)),
+        }
+    }
+
+    fn find_template_result_union(&self, types: &[TypeId]) -> Option<TypeId> {
+        self.intrinsic_bootstrap()
+            .and_then(|bootstrap| bootstrap.cached_union_type(types))
+            .or_else(|| {
+                self.types().find_map(|(id, record)| match record.data() {
+                    TypeData::Union(union)
+                        if record.alias().is_none()
+                            && union.origin.is_none()
+                            && union.union.types == types =>
+                    {
+                        Some(id)
+                    }
+                    _ => None,
+                })
+            })
     }
 
     fn flatten_template_union_types(
@@ -913,6 +1232,134 @@ mod tests {
             panic!("duplicate uppercase results must reduce to one canonical literal")
         };
         assert_eq!(literal.value, LiteralValue::String("A".to_owned()));
+    }
+
+    #[test]
+    fn cached_template_and_mapping_lookups_remain_read_only() {
+        let mut store = initialized_store();
+        let value = store
+            .get_template_literal_type(&["value".to_owned()], &[])
+            .unwrap();
+        let texts = ["prefix-".to_owned(), String::new()];
+        let symbol = store.alloc_transient_symbol(
+            SymbolFlags::TYPE_ALIAS,
+            EscapedName::source("Uppercase"),
+            CheckFlags::NONE,
+        );
+        let before = store.type_len();
+
+        assert_eq!(
+            store.cached_resolved_template_literal_type(&texts, &[value]),
+            Ok(None)
+        );
+        assert_eq!(
+            store.cached_resolved_string_mapping_type(symbol, value),
+            Ok(None)
+        );
+        assert_eq!(store.type_len(), before);
+
+        let template = store.get_template_literal_type(&texts, &[value]).unwrap();
+        let mapping = store.get_string_mapping_type(symbol, value).unwrap();
+        let warm = store.type_len();
+        assert_eq!(
+            store.cached_resolved_template_literal_type(&texts, &[value]),
+            Ok(Some(template))
+        );
+        assert_eq!(
+            store.cached_resolved_string_mapping_type(symbol, value),
+            Ok(Some(mapping))
+        );
+        assert_eq!(store.type_len(), warm);
+    }
+
+    #[test]
+    fn broad_string_absorbs_template_and_intrinsic_mapping_union_members() {
+        let mut store = initialized_store();
+        let string = store.intrinsic_bootstrap().unwrap().string_type;
+        let number = store.intrinsic_bootstrap().unwrap().number_type;
+        let literal = store
+            .get_template_literal_type(&["literal".to_owned()], &[])
+            .unwrap();
+        let template = store
+            .get_template_literal_type(&["prefix-".to_owned(), String::new()], &[number])
+            .unwrap();
+        let symbol = store.alloc_transient_symbol(
+            SymbolFlags::TYPE_ALIAS,
+            EscapedName::source("Uppercase"),
+            CheckFlags::NONE,
+        );
+        let mapping = store.get_string_mapping_type(symbol, string).unwrap();
+        let count = store.type_len();
+
+        assert_eq!(
+            store.cached_template_result_union(&[literal, template, mapping, string]),
+            Ok(Some(string))
+        );
+        assert_eq!(
+            store.template_result_union(&[literal, template, mapping, string]),
+            Ok(string)
+        );
+        assert_eq!(store.type_len(), count);
+    }
+
+    #[test]
+    fn wildcard_error_and_unknown_reduce_template_unions_by_bootstrap_identity() {
+        let mut store = initialized_store();
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        let any = bootstrap.any_type;
+        let error = bootstrap.error_type;
+        let wildcard = bootstrap.wildcard_type;
+        let unknown = bootstrap.unknown_type;
+        let number = bootstrap.number_type;
+        let pattern = store
+            .get_template_literal_type(&["id-".to_owned(), String::new()], &[number])
+            .unwrap();
+        let count = store.type_len();
+
+        assert_eq!(
+            store.template_result_union(&[pattern, unknown]),
+            Ok(unknown)
+        );
+        assert_eq!(store.template_result_union(&[pattern, any]), Ok(any));
+        assert_eq!(
+            store.template_result_union(&[pattern, any, error]),
+            Ok(error)
+        );
+        assert_eq!(
+            store.template_result_union(&[pattern, error, wildcard]),
+            Ok(wildcard)
+        );
+        assert_eq!(store.type_len(), count);
+    }
+
+    #[test]
+    fn cached_distributed_templates_find_existing_literal_unions_without_writes() {
+        let mut store = initialized_store();
+        let first = store
+            .get_template_literal_type(&["first".to_owned()], &[])
+            .unwrap();
+        let second = store
+            .get_template_literal_type(&["second".to_owned()], &[])
+            .unwrap();
+        let union = store
+            .alloc_union_type(ObjectFlags::PRIMITIVE_UNION, vec![first, second])
+            .unwrap();
+        let texts = ["id-".to_owned(), String::new()];
+        let count = store.type_len();
+
+        assert_eq!(
+            store.cached_resolved_template_literal_type(&texts, &[union]),
+            Ok(None)
+        );
+        assert_eq!(store.type_len(), count);
+
+        let distributed = store.get_template_literal_type(&texts, &[union]).unwrap();
+        let warm = store.type_len();
+        assert_eq!(
+            store.cached_resolved_template_literal_type(&texts, &[union]),
+            Ok(Some(distributed))
+        );
+        assert_eq!(store.type_len(), warm);
     }
 
     #[test]

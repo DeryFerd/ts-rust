@@ -436,8 +436,8 @@ pub(super) fn check_direct_source_property(
     } else {
         CopiedSourcePropertySuggestion::Unavailable
     };
-    let (type_, property, diagnostic) = if receiver_type == any {
-        (any, None, None)
+    let (type_, property, diagnostic) = if receiver_type == any || receiver_type == error_type {
+        (receiver_type, None, None)
     } else if union_read {
         if let Some(property) = store
             .resolved_union_property(receiver_type, &plan.name)
@@ -1149,6 +1149,42 @@ mod tests {
                 .type_node_links(access)
                 .and_then(|links| links.resolved_type),
             Some(any)
+        );
+        assert!(store.symbol_node_links(access).is_none());
+    }
+
+    #[test]
+    fn existing_error_receivers_preserve_error_type_without_another_diagnostic() {
+        let parsed = parsed("const result = missing.value;");
+        let file = FileId::new(514);
+        let access = property_access(&parsed, file);
+        let mut store = registered_store(&parsed, file);
+        let error = store.intrinsic_bootstrap().unwrap().error_type;
+        let receiver_symbol = store
+            .alloc_symbol(SymbolData::new(
+                SymbolFlags::FUNCTION_SCOPED_VARIABLE,
+                EscapedName::source("missing"),
+            ))
+            .unwrap();
+        let syntax = plan_direct_source_property_syntax(&parsed.arena, &store, access).unwrap();
+        let plan = finish_direct_source_property_plan(
+            &syntax,
+            identifier_receiver(&syntax, receiver_symbol),
+        )
+        .unwrap();
+
+        assert_eq!(
+            check_direct_source_property(&mut store, None, &plan, error),
+            Ok(CheckedSourceProperty {
+                type_: error,
+                diagnostic: None,
+            }),
+        );
+        assert_eq!(
+            store
+                .type_node_links(access)
+                .and_then(|links| links.resolved_type),
+            Some(error),
         );
         assert!(store.symbol_node_links(access).is_none());
     }

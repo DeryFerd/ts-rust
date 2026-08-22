@@ -16,6 +16,8 @@ use super::{
     object_members::{StoredDeclaredCallSetValidation, validate_stored_declared_call_set},
     signatures::SignatureFlags,
     source_overloads::{StoredSourceOverloadValidation, validate_stored_source_overload},
+    type_records::TypeData,
+    types::TypeFlags,
 };
 
 /// Immutable callable members after provider and store validation.
@@ -105,23 +107,91 @@ pub(super) fn validate_stored_callable_set(
     }
     let family = CallableFamily::DeclaredCallSignatures;
     match validate_stored_declared_call_set(store, type_) {
-        StoredDeclaredCallSetValidation::NotDeclaredCallSet => {
-            StoredCallableSetValidation::NotCallable
-        }
+        StoredDeclaredCallSetValidation::NotDeclaredCallSet => {}
         StoredDeclaredCallSetValidation::Malformed => {
-            StoredCallableSetValidation::Malformed { family }
+            return StoredCallableSetValidation::Malformed { family };
         }
         StoredDeclaredCallSetValidation::Valid(edges) => {
             let Some(projection) = validate_stored_callable_set_projection(store, type_, false)
             else {
                 return StoredCallableSetValidation::Malformed { family };
             };
-            StoredCallableSetValidation::Valid {
+            return StoredCallableSetValidation::Valid {
                 family,
                 projection,
                 edges,
+            };
+        }
+    }
+
+    validate_stored_intersection_callable_set(store, type_)
+}
+
+fn validate_stored_intersection_callable_set(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+) -> StoredCallableSetValidation {
+    let family = CallableFamily::DeclaredCallSignatures;
+    let Some(record) = store.type_payload(type_) else {
+        return StoredCallableSetValidation::NotCallable;
+    };
+    if record.flags() != TypeFlags::INTERSECTION
+        || !matches!(record.data(), TypeData::Intersection(_))
+    {
+        return StoredCallableSetValidation::NotCallable;
+    }
+    let Ok(intersection) = store.validate_intersection_type(type_) else {
+        return StoredCallableSetValidation::Malformed { family };
+    };
+    let Some(structured) = store
+        .type_payload(type_)
+        .and_then(|record| record.data().structured())
+    else {
+        return StoredCallableSetValidation::Malformed { family };
+    };
+    if structured.signatures.is_none() {
+        return StoredCallableSetValidation::NotCallable;
+    }
+    let Some(projection) = validate_stored_callable_set_projection(store, type_, false) else {
+        return StoredCallableSetValidation::Malformed { family };
+    };
+    if projection.call_signatures.is_empty() || !projection.construct_signatures.is_empty() {
+        return StoredCallableSetValidation::Malformed { family };
+    }
+
+    let mut provider_family = None;
+    let mut edges = Vec::new();
+    for constituent in intersection.types {
+        edges.push(constituent);
+        match validate_stored_callable_set(store, constituent) {
+            StoredCallableSetValidation::NotCallable => {}
+            StoredCallableSetValidation::Pending { family } => {
+                return StoredCallableSetValidation::Pending { family };
+            }
+            StoredCallableSetValidation::Malformed { family } => {
+                return StoredCallableSetValidation::Malformed { family };
+            }
+            StoredCallableSetValidation::Valid {
+                family,
+                edges: constituent_edges,
+                ..
+            } => {
+                if provider_family.is_none() {
+                    provider_family = Some(family);
+                } else if provider_family != Some(family) {
+                    provider_family = Some(CallableFamily::DeclaredCallSignatures);
+                }
+                edges.extend(constituent_edges);
             }
         }
+    }
+    let Some(family) = provider_family else {
+        return StoredCallableSetValidation::Malformed { family };
+    };
+    StoredCallableSetValidation::Valid {
+        family,
+        projection,
+        edges,
     }
 }
 
@@ -221,11 +291,17 @@ fn validate_stored_callable_set_projection_with(
 mod tests {
     use std::collections::HashMap;
 
-    use ts_binder::{EscapedName, SymbolData, SymbolFlags};
+    use ts_ast::{FileId, NodeData, NodeRef};
+    use ts_binder::{
+        CanonicalBinder, CanonicalModuleState, CanonicalSourceFileFacts, CanonicalSourceLanguage,
+        EscapedName, SymbolData, SymbolFlags,
+    };
+    use ts_parser::parse_source_file;
 
     use super::*;
     use crate::semantic::{
-        IntrinsicBootstrapOptions, SemanticStore, TypeRecord, mapper::TypeMapper,
+        CanonicalCheckerContext, CanonicalCheckerOptions, IntrinsicBootstrapOptions, SemanticStore,
+        TypeRecord, callables::validate_stored_single_callable, mapper::TypeMapper,
         types::ObjectFlags,
     };
 
@@ -460,5 +536,119 @@ mod tests {
         assert!(callable.parameters.is_empty());
         assert_eq!(callable.rest_parameter, Some(number));
         assert_eq!(callable.min_argument_count, 0);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep cold, warm, and poisoned identity checks together.
+    fn validated_callable_intersections_preserve_signature_identity_and_reject_cache_poison() {
+        let parsed = parse_source_file(concat!(
+            "type Callback = (value: string) => void; ",
+            "type Props = { label: string };",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(4_411);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/callable-set-intersection.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        let mut context = CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![(file, &parsed.arena)],
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap();
+        context.check_source_file(file).unwrap();
+
+        let alias_type = |name: &str| {
+            let declaration = parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    let NodeData::TypeAliasDeclaration(alias) = &record.data else {
+                        return None;
+                    };
+                    let NodeData::Identifier(identifier) = &parsed.arena.get(alias.name)?.data
+                    else {
+                        return None;
+                    };
+                    (identifier.text == name).then_some(NodeRef::new(parsed.arena.id(), file, node))
+                })
+                .unwrap();
+            let symbol = context.file(file).unwrap().1.symbol(declaration).unwrap();
+            context
+                .store()
+                .type_alias_links(symbol)
+                .and_then(|links| links.declared_type)
+                .unwrap()
+        };
+        let callback = alias_type("Callback");
+        let props = alias_type("Props");
+        let signature = context
+            .store()
+            .type_payload(callback)
+            .and_then(|record| record.data().structured())
+            .and_then(|structured| structured.signatures.as_deref())
+            .and_then(|signatures| signatures.first().copied())
+            .unwrap();
+        context.get_return_type_of_signature(signature).unwrap();
+
+        let store = context.store_mut_for_test();
+        let intersection = store
+            .canonical_intersection_type(&[callback, props], None)
+            .unwrap();
+        let before = (
+            store.type_len(),
+            store.signature_len(),
+            store.symbol_len(),
+            store.checker_link_allocated_lengths(),
+        );
+
+        let StoredCallableSetValidation::Valid {
+            projection, edges, ..
+        } = validate_stored_callable_set(store, intersection)
+        else {
+            panic!("a validated callable intersection must expose its call signatures")
+        };
+        assert_eq!(projection.owner, intersection);
+        let [callable] = projection.call_signatures.as_ref() else {
+            panic!("expected one preserved intersection signature")
+        };
+        assert_eq!(callable.signature, signature);
+        assert_eq!(callable.owner, intersection);
+        assert!(edges.contains(&callback));
+        assert!(edges.contains(&props));
+        assert!(matches!(
+            validate_stored_single_callable(store, intersection),
+            StoredSingleCallableValidation::Valid { callable, .. }
+                if callable.signature == signature && callable.owner == intersection
+        ));
+        assert_eq!(
+            (
+                store.type_len(),
+                store.signature_len(),
+                store.symbol_len(),
+                store.checker_link_allocated_lengths(),
+            ),
+            before,
+        );
+
+        assert!(store.set_structured_type_members(intersection, None, None, None, None, None,));
+        assert!(matches!(
+            validate_stored_callable_set(store, intersection),
+            StoredCallableSetValidation::Malformed { .. }
+        ));
     }
 }

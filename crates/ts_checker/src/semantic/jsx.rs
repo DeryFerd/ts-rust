@@ -645,15 +645,41 @@ fn plan_jsx_attributes(
             }
             let name_node = child_ref(node, attribute.name);
             let name_record = jsx_node(arena, bound, store, name_node)?;
-            let NodeData::Identifier(name) = &name_record.data else {
-                return Err(unsupported(name_node, name_record.kind));
-            };
-            if name_record.kind != SyntaxKind::Identifier
-                || name_record.parent != Some(node.node)
-                || name.text.is_empty()
-            {
+            if name_record.parent != Some(node.node) {
                 return Err(unsupported(name_node, name_record.kind));
             }
+            let name = match &name_record.data {
+                NodeData::Identifier(name)
+                    if name_record.kind == SyntaxKind::Identifier && !name.text.is_empty() =>
+                {
+                    name.text.clone()
+                }
+                NodeData::JsxNamespacedName(namespaced)
+                    if name_record.kind == SyntaxKind::JsxNamespacedName
+                        && namespaced.facts == 0 =>
+                {
+                    let namespace = child_ref(name_node, namespaced.namespace);
+                    let local = child_ref(name_node, namespaced.name);
+                    let namespace_record = jsx_node(arena, bound, store, namespace)?;
+                    let local_record = jsx_node(arena, bound, store, local)?;
+                    let (NodeData::Identifier(namespace), NodeData::Identifier(local)) =
+                        (&namespace_record.data, &local_record.data)
+                    else {
+                        return Err(unsupported(name_node, name_record.kind));
+                    };
+                    if namespace_record.kind != SyntaxKind::Identifier
+                        || local_record.kind != SyntaxKind::Identifier
+                        || namespace_record.parent != Some(name_node.node)
+                        || local_record.parent != Some(name_node.node)
+                        || namespace.text.is_empty()
+                        || local.text.is_empty()
+                    {
+                        return Err(unsupported(name_node, name_record.kind));
+                    }
+                    format!("{}:{}", namespace.text, local.text)
+                }
+                _ => return Err(unsupported(name_node, name_record.kind)),
+            };
             let symbol = bound.symbol(node).ok_or(SourceCheckError::Provenance(
                 SourceCheckProvenanceError::MissingDeclarationSymbol(node),
             ))?;
@@ -661,7 +687,7 @@ fn plan_jsx_attributes(
                 .symbol(symbol)
                 .ok_or(SourceCheckError::Property(node))?;
             if !symbol_record.flags().contains(SymbolFlags::PROPERTY)
-                || symbol_record.name().as_utf8() != Some(name.text.as_str())
+                || symbol_record.name().as_utf8() != Some(name.as_str())
             {
                 return Err(SourceCheckError::Property(node));
             }
@@ -703,7 +729,7 @@ fn plan_jsx_attributes(
             Ok(JsxAttributePlan {
                 node,
                 name_node,
-                name: name.text.clone(),
+                name,
                 symbol,
                 value,
             })
@@ -1303,15 +1329,30 @@ fn execute_jsx_element(
                     )?;
                 }
                 if let Some(closing) = closing {
-                    check_jsx_closing_tag(store, bound, namespace, closing, options, diagnostics)?;
+                    check_jsx_closing_tag(
+                        store,
+                        arena,
+                        bound,
+                        namespace,
+                        closing,
+                        options,
+                        diagnostics,
+                    )?;
                 }
                 (intrinsic.attributes_type, signature)
             } else {
                 if !type_arguments.is_empty() {
                     return Err(unsupported(plan.opening, SyntaxKind::JsxOpeningElement));
                 }
-                let (attributes_type, signature) =
-                    resolve_component_tag(store, bound, namespace, plan.opening, tag, diagnostics)?;
+                let (attributes_type, signature) = resolve_component_tag(
+                    store,
+                    arena,
+                    bound,
+                    namespace,
+                    plan.opening,
+                    tag,
+                    diagnostics,
+                )?;
                 publish_jsx_links(
                     store,
                     plan.opening,
@@ -1321,7 +1362,15 @@ fn execute_jsx_element(
                     },
                 )?;
                 if let Some(closing) = closing {
-                    check_jsx_closing_tag(store, bound, namespace, closing, options, diagnostics)?;
+                    check_jsx_closing_tag(
+                        store,
+                        arena,
+                        bound,
+                        namespace,
+                        closing,
+                        options,
+                        diagnostics,
+                    )?;
                 }
                 (attributes_type, signature)
             };
@@ -1378,6 +1427,7 @@ fn execute_jsx_element(
 
 fn check_jsx_closing_tag(
     store: &mut CanonicalTypeMapperStore,
+    arena: &NodeArena,
     bound: &BoundFile,
     namespace: &JsxNamespace,
     closing: &JsxClosingPlan,
@@ -1417,10 +1467,7 @@ fn check_jsx_closing_tag(
         )?;
         return publish_type_links(store, closing.tag.node, namespace.error_type);
     };
-    let component_type = store
-        .value_symbol_links(symbol)
-        .and_then(|links| links.resolved_type)
-        .ok_or(SourceCheckError::Call(closing.tag.node))?;
+    let component_type = jsx_component_value_type(store, arena, bound, symbol, closing.tag.node)?;
     publish_symbol_links(store, closing.tag.node, symbol)?;
     publish_type_links(store, closing.tag.node, component_type)
 }
@@ -1669,6 +1716,7 @@ fn intrinsic_signature(
 
 fn resolve_component_tag(
     store: &mut CanonicalTypeMapperStore,
+    arena: &NodeArena,
     bound: &BoundFile,
     namespace: &JsxNamespace,
     opening: NodeRef,
@@ -1686,10 +1734,7 @@ fn resolve_component_tag(
         publish_type_links(store, tag.node, namespace.error_type)?;
         return Ok((namespace.error_type, unknown_signature));
     };
-    let component = store
-        .value_symbol_links(symbol)
-        .and_then(|links| links.resolved_type)
-        .ok_or(SourceCheckError::Call(tag.node))?;
+    let component = jsx_component_value_type(store, arena, bound, symbol, tag.node)?;
     publish_symbol_links(store, tag.node, symbol)?;
     publish_type_links(store, tag.node, component)?;
     if component == namespace.any_type || component == namespace.error_type {
@@ -1744,6 +1789,46 @@ fn resolve_component_tag(
             .empty_object_type
     });
     Ok((attributes_type, callable.signature))
+}
+
+fn jsx_component_value_type(
+    store: &CanonicalTypeMapperStore,
+    arena: &NodeArena,
+    bound: &BoundFile,
+    symbol: SemanticSymbolId,
+    location: NodeRef,
+) -> Result<TypeId, SourceCheckError> {
+    if let Some(type_) = store
+        .value_symbol_links(symbol)
+        .and_then(|links| links.resolved_type)
+    {
+        return Ok(type_);
+    }
+
+    let declaration = store
+        .symbol(symbol)
+        .and_then(ts_binder::semantic::Symbol::value_declaration)
+        .ok_or(SourceCheckError::Call(location))?;
+    let record = jsx_node(arena, bound, store, declaration)?;
+    let NodeData::VariableDeclaration(variable) = &record.data else {
+        return Err(SourceCheckError::Call(location));
+    };
+    if variable.initializer.is_some() {
+        return Err(SourceCheckError::Call(location));
+    }
+    let annotation = variable
+        .type_
+        .map(|annotation| child_ref(declaration, annotation))
+        .ok_or(SourceCheckError::Call(location))?;
+    let annotation_record = jsx_node(arena, bound, store, annotation)?;
+    if annotation_record.parent != Some(declaration.node) {
+        return Err(SourceCheckError::Call(location));
+    }
+    store
+        .type_node_links(annotation)
+        .and_then(|links| links.resolved_type)
+        .filter(|type_| store.type_payload(*type_).is_some())
+        .ok_or(SourceCheckError::Call(location))
 }
 
 fn add_missing_component_diagnostic(
@@ -1880,6 +1965,21 @@ fn check_jsx_attributes(
         };
         publish_symbol_links(store, attribute.name_node, attribute.symbol)?;
         publish_type_links(store, attribute.name_node, type_)?;
+        if let Some(NodeData::JsxNamespacedName(name)) = arena
+            .get(attribute.name_node.node)
+            .map(|record| &record.data)
+        {
+            publish_type_links(
+                store,
+                child_ref(attribute.name_node, name.namespace),
+                namespace.error_type,
+            )?;
+            publish_type_links(
+                store,
+                child_ref(attribute.name_node, name.name),
+                namespace.error_type,
+            )?;
+        }
         publish_attribute_value_links(store, attribute.symbol, type_, attribute.node)?;
         publish_type_links(store, attribute.node, type_)?;
         checked.push(CheckedJsxAttribute {
@@ -2966,6 +3066,145 @@ mod runtime_tests {
         .unwrap();
 
         assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn namespaced_jsx_attributes_keep_their_combined_name_and_identifier_types() {
+        let mut fixture = RuntimeFixture::new(
+            "const view = <div ns:thing=\"ok\" />;\n",
+            FileId::new(8_114),
+        );
+        let expression = fixture.expression("view");
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        fixture.check(expression, CanonicalJsxRuntime::Preserve, &mut diagnostics);
+
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics.as_slice()[0].diagnostic.code(), 7026);
+
+        let (name, namespace, local, attribute) = fixture
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::JsxNamespacedName(name) = &record.data else {
+                    return None;
+                };
+                Some((
+                    NodeRef::new(fixture.parsed.arena.id(), fixture.file, node),
+                    NodeRef::new(fixture.parsed.arena.id(), fixture.file, name.namespace),
+                    NodeRef::new(fixture.parsed.arena.id(), fixture.file, name.name),
+                    NodeRef::new(fixture.parsed.arena.id(), fixture.file, record.parent?),
+                ))
+            })
+            .unwrap();
+        let symbol = fixture.bound.symbol(attribute).unwrap();
+        let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+
+        assert_eq!(
+            fixture
+                .store
+                .symbol_node_links(name)
+                .and_then(|links| links.resolved_symbol),
+            Some(symbol),
+        );
+        assert_eq!(
+            fixture
+                .store
+                .type_node_links(name)
+                .and_then(|links| links.resolved_type),
+            Some(bootstrap.string_type),
+        );
+        for identifier in [namespace, local] {
+            assert_eq!(
+                fixture
+                    .store
+                    .type_node_links(identifier)
+                    .and_then(|links| links.resolved_type),
+                Some(bootstrap.error_type),
+            );
+        }
+    }
+
+    #[test]
+    fn ambient_component_reads_its_staged_annotation_without_publishing_value_links() {
+        let mut fixture = RuntimeFixture::new(
+            "declare var Fragment: any;\nconst view = <Fragment></Fragment>;\n",
+            FileId::new(8_115),
+        );
+        let expression = fixture.expression("view");
+        let (declaration, annotation) = fixture
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::VariableDeclaration(variable) = &record.data else {
+                    return None;
+                };
+                let NodeData::Identifier(name) = &fixture.parsed.arena.get(variable.name)?.data
+                else {
+                    return None;
+                };
+                (name.text == "Fragment").then_some((
+                    NodeRef::new(fixture.parsed.arena.id(), fixture.file, node),
+                    NodeRef::new(fixture.parsed.arena.id(), fixture.file, variable.type_?),
+                ))
+            })
+            .unwrap();
+        let symbol = fixture.bound.symbol(declaration).unwrap();
+        let any = fixture.store.intrinsic_bootstrap().unwrap().any_type;
+        assert!(fixture.store.set_type_node_links(
+            annotation,
+            TypeNodeLinks {
+                resolved_type: Some(any),
+                ..TypeNodeLinks::default()
+            },
+        ));
+
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        fixture.check(expression, CanonicalJsxRuntime::Preserve, &mut diagnostics);
+
+        assert!(diagnostics.is_empty());
+        assert!(fixture.store.value_symbol_links(symbol).is_none());
+        let NodeData::JsxElement(element) =
+            &fixture.parsed.arena.get(expression.node).unwrap().data
+        else {
+            unreachable!("the fixture contains an opening and closing component")
+        };
+        let NodeData::JsxOpeningElement(opening) = &fixture
+            .parsed
+            .arena
+            .get(element.opening_element)
+            .unwrap()
+            .data
+        else {
+            unreachable!("the fixture contains an opening component")
+        };
+        let NodeData::JsxClosingElement(closing) = &fixture
+            .parsed
+            .arena
+            .get(element.closing_element)
+            .unwrap()
+            .data
+        else {
+            unreachable!("the fixture contains a closing component")
+        };
+        for name in [opening.tag_name, closing.tag_name] {
+            let name = NodeRef::new(expression.arena, expression.file, name);
+            assert_eq!(
+                fixture
+                    .store
+                    .symbol_node_links(name)
+                    .and_then(|links| links.resolved_symbol),
+                Some(symbol),
+            );
+            assert_eq!(
+                fixture
+                    .store
+                    .type_node_links(name)
+                    .and_then(|links| links.resolved_type),
+                Some(any),
+            );
+        }
     }
 
     #[test]

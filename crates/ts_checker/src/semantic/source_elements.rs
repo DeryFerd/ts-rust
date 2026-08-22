@@ -503,7 +503,9 @@ fn resolve_element_index(
     string: TypeId,
     undefined: TypeId,
 ) -> Result<ElementResolution, SourceElementError> {
-    Ok(if matches!(index.shape, IndexShape::Invalid) {
+    Ok(if receiver_type == error {
+        ElementResolution::success(error, None)
+    } else if matches!(index.shape, IndexShape::Invalid) {
         ElementResolution::diagnostic(error, ElementDiagnostic::InvalidIndexType)
     } else if receiver_type == any {
         ElementResolution::success(any, None)
@@ -861,7 +863,25 @@ fn resolve_object_element(
     // lookup still runs the exact own-property surface validator before a
     // diagnostic claims that the receiver has no index signature.
     if index.property_name.is_none() {
-        store.resolved_own_property(receiver_type, "")?;
+        let union_members = match store.type_payload(receiver_type).map(TypeRecord::data) {
+            Some(TypeData::Union(union)) => Some(union.union.types.clone()),
+            _ => None,
+        };
+        if let Some(union_members) = union_members {
+            if union_members.is_empty() {
+                return Err(SourceElementError::InvalidType(receiver_type));
+            }
+            for member in union_members {
+                if resolved_index_signature_surface(store, member)?.is_some() {
+                    return Err(SourceElementError::Unsupported(
+                        SourceElementUnsupported::IndexSignatureSurface(receiver_type),
+                    ));
+                }
+                store.resolved_own_property(member, "")?;
+            }
+        } else {
+            store.resolved_own_property(receiver_type, "")?;
+        }
     }
     Ok(ElementResolution::diagnostic(
         error_type,
@@ -1327,12 +1347,15 @@ fn publish_element_links(
 #[cfg(test)]
 mod tests {
     use ts_ast::{FileId, NodeArena};
-    use ts_binder::{BoundFile, EscapedName, SemanticSymbolId, SymbolData, SymbolFlags};
+    use ts_binder::{
+        BoundFile, CanonicalBinder, CanonicalModuleState, CanonicalSourceFileFacts,
+        CanonicalSourceLanguage, EscapedName, SemanticSymbolId, SymbolData, SymbolFlags,
+    };
     use ts_parser::{ParseResult, parse_source_file};
 
     use super::*;
     use crate::semantic::{
-        DeclaredTypeLinks, IntrinsicBootstrapOptions, ValueSymbolLinks,
+        CanonicalCheckerContext, DeclaredTypeLinks, IntrinsicBootstrapOptions, ValueSymbolLinks,
         declared::type_list_key,
         global_types::create_type_from_generic_global_type,
         signatures::ElementFlags,
@@ -2010,6 +2033,116 @@ mod tests {
     }
 
     #[test]
+    fn broad_keys_on_object_unions_emit_ts7053_for_the_complete_union() {
+        let parsed = parse_fixture(concat!(
+            "declare const key: string; ",
+            "declare const object: ",
+            "{ id: '00' } | { id: '01' } | { id: '02' }; ",
+            "const result = object[key];",
+        ));
+        let file = FileId::new(617);
+        let access = element_access(&parsed, file);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/union-element-access.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        let mut context = CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![(file, &parsed.arena)],
+            strict_options(),
+        )
+        .unwrap();
+        let expected_receiver = "{ id: \"00\"; } | { id: \"01\"; } | { id: \"02\"; }";
+
+        for index in 0..2 {
+            if index == 0 {
+                context.check_source_file(file).unwrap();
+            } else {
+                context.recheck_source_file(file).unwrap();
+            }
+            let [diagnostic] = context.diagnostics().as_slice() else {
+                panic!("expected one broad-key object-union diagnostic");
+            };
+            assert_eq!(diagnostic.node, Some(access));
+            assert_eq!(diagnostic.diagnostic.code(), 7053);
+            assert_eq!(
+                diagnostic.diagnostic.render().unwrap(),
+                format!(
+                    "Element implicitly has an 'any' type because expression of type 'string' can't be used to index type '{expected_receiver}'.\n  No index signature with a parameter of type 'string' was found on type '{expected_receiver}'."
+                )
+            );
+        }
+        assert_eq!(
+            context
+                .store()
+                .type_node_links(access)
+                .and_then(|links| links.resolved_type),
+            Some(context.store().intrinsic_bootstrap().unwrap().error_type),
+        );
+        assert!(context.store().symbol_node_links(access).is_none());
+    }
+
+    #[test]
+    fn broad_keys_keep_union_index_signatures_as_an_explicit_boundary() {
+        let parsed = parse_fixture("const result = object[key];");
+        let file = FileId::new(618);
+        let mut store = registered_store(&parsed, file);
+        let (string, number) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (bootstrap.string_type, bootstrap.number_type)
+        };
+        let (object, _) = property_object(&mut store, "id", number, false);
+        let dictionary = index_object(&mut store, string, number);
+        let mut members = vec![object, dictionary];
+        members.sort();
+        let union = store.alloc_union_type(ObjectFlags::NONE, members).unwrap();
+        let receiver_symbol =
+            alloc_symbol(&mut store, SymbolFlags::BLOCK_SCOPED_VARIABLE, "object");
+        let key_symbol = alloc_symbol(&mut store, SymbolFlags::BLOCK_SCOPED_VARIABLE, "key");
+        let plan = source_plan(
+            &parsed,
+            file,
+            &store,
+            PlannedExpressionKind::Identifier(PlannedIdentifierRead {
+                resolved_symbol: key_symbol,
+                value_symbol: key_symbol,
+                kind: PlannedIdentifierReadKind::Variable,
+            }),
+            receiver_symbol,
+        );
+
+        assert_eq!(
+            check_direct_source_element_with_array_targets(
+                &mut store,
+                &empty_host(),
+                CanonicalArrayTargets::for_single_target_validation(union),
+                strict_options(),
+                &plan,
+                union,
+                string,
+            ),
+            Err(SourceElementError::Unsupported(
+                SourceElementUnsupported::IndexSignatureSurface(union),
+            )),
+        );
+        assert!(store.type_node_links(plan.node).is_none());
+        assert!(store.symbol_node_links(plan.node).is_none());
+    }
+
+    #[test]
     fn string_and_number_index_signatures_follow_pinned_applicability() {
         let parsed = parse_fixture("const result = dictionary[key];");
         let file = FileId::new(606);
@@ -2117,6 +2250,49 @@ mod tests {
             diagnostic.diagnostic.render().unwrap(),
             "Type 'true' cannot be used as an index type."
         );
+    }
+
+    #[test]
+    fn existing_error_receivers_skip_index_diagnostics_and_preserve_error_type() {
+        let parsed = parse_fixture("const result = missing[true];");
+        let file = FileId::new(619);
+        let mut store = registered_store(&parsed, file);
+        let (error, boolean) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (bootstrap.error_type, bootstrap.true_type)
+        };
+        let receiver_symbol =
+            alloc_symbol(&mut store, SymbolFlags::BLOCK_SCOPED_VARIABLE, "missing");
+        let plan = source_plan(
+            &parsed,
+            file,
+            &store,
+            PlannedExpressionKind::Boolean(true),
+            receiver_symbol,
+        );
+
+        assert_eq!(
+            check_direct_source_element_with_array_targets(
+                &mut store,
+                &empty_host(),
+                CanonicalArrayTargets::for_single_target_validation(error),
+                strict_options(),
+                &plan,
+                error,
+                boolean,
+            ),
+            Ok(CheckedSourceElement {
+                type_: error,
+                diagnostic: None,
+            }),
+        );
+        assert_eq!(
+            store
+                .type_node_links(plan.node)
+                .and_then(|links| links.resolved_type),
+            Some(error),
+        );
+        assert!(store.symbol_node_links(plan.node).is_none());
     }
 
     #[test]

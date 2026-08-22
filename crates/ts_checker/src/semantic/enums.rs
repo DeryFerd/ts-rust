@@ -3,11 +3,11 @@
 //! This is the dependency-closed prefix of pinned typescript-go's
 //! `getDeclaredTypeOfEnum`, `getDeclaredTypeOfEnumMember`,
 //! `getTypeOfFuncClassEnumModule`, and `computeEnumMemberValues`. It supports
-//! one non-merged top-level enum declaration whose members have identifier or
-//! string-literal names and constant numeric or string expressions. Earlier
-//! members can be referenced by name, property access, or string element
-//! access. Numeric
-//! auto-increment, explicit ambient behavior, const-enum provenance,
+//! one non-merged top-level or namespace enum declaration whose members have
+//! identifier or string-literal names and constant numeric or string
+//! expressions. Earlier members can be referenced by name, property access,
+//! or string element access. Numeric auto-increment, explicit ambient
+//! behavior, const-enum provenance,
 //! regular/fresh member identities, the enum declared union, and the separate
 //! enum value object are published together.
 //! Numeric and string identities use the pinned `(enum owner, literal value)`
@@ -25,7 +25,7 @@
 use ts_ast::{
     BinaryExpressionData, NodeData, NodeList, NodeRef, SyntaxKind, TemplateExpressionData,
 };
-use ts_binder::{CheckFlags, SemanticSymbolId, SymbolFlags};
+use ts_binder::{CheckFlags, InternalSymbolName, SemanticSymbolId, SymbolFlags};
 use ts_evaluator::{
     Evaluation, EvaluationMetadata, EvaluationOutcome, UnknownReason, Value, evaluate_with,
 };
@@ -176,6 +176,88 @@ fn preflight_node<'a>(
         .ok_or_else(|| invariant(EnumTypeInvariant::MissingOrForeignFacts(node)))
 }
 
+fn enum_container(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    declaration: NodeRef,
+) -> Result<(Option<SemanticSymbolId>, bool), EnumTypeError> {
+    let bound = host
+        .bound_file(declaration)
+        .ok_or_else(|| invariant(EnumTypeInvariant::MissingOrForeignFacts(declaration)))?;
+    let record = preflight_node(store, host, declaration)?;
+    let parent = record
+        .parent
+        .map(|parent| NodeRef::new(declaration.arena, declaration.file, parent))
+        .ok_or_else(|| invariant(EnumTypeInvariant::InvalidDeclaration(declaration)))?;
+    if store.source_node_parent(declaration) != Some(super::store::SourceNodeParent::Parent(parent))
+    {
+        return Err(invariant(EnumTypeInvariant::InvalidDeclaration(
+            declaration,
+        )));
+    }
+    if parent == bound.source_file() {
+        return Ok((bound.symbol(parent), false));
+    }
+
+    let parent_record = preflight_node(store, host, parent)?;
+    let NodeData::ModuleBlock(block) = &parent_record.data else {
+        return Err(unsupported(EnumTypeUnsupported::NestedDeclaration(
+            declaration,
+        )));
+    };
+    if parent_record.kind != SyntaxKind::ModuleBlock
+        || block
+            .statements
+            .nodes
+            .iter()
+            .filter(|node| **node == declaration.node)
+            .count()
+            != 1
+    {
+        return Err(invariant(EnumTypeInvariant::InvalidDeclaration(
+            declaration,
+        )));
+    }
+    let namespace = parent_record
+        .parent
+        .map(|namespace| NodeRef::new(declaration.arena, declaration.file, namespace))
+        .ok_or_else(|| invariant(EnumTypeInvariant::InvalidDeclaration(declaration)))?;
+    let namespace_record = preflight_node(store, host, namespace)?;
+    let NodeData::ModuleDeclaration(namespace_data) = &namespace_record.data else {
+        return Err(unsupported(EnumTypeUnsupported::NestedDeclaration(
+            declaration,
+        )));
+    };
+    if namespace_record.kind != SyntaxKind::ModuleDeclaration
+        || namespace_data.body != Some(parent.node)
+    {
+        return Err(invariant(EnumTypeInvariant::InvalidDeclaration(
+            declaration,
+        )));
+    }
+    let namespace_symbol = bound
+        .symbol(namespace)
+        .ok_or_else(|| invariant(EnumTypeInvariant::InvalidExportRoute(declaration)))?;
+
+    let mut ambient = false;
+    let mut current = Some(namespace);
+    while let Some(node) = current {
+        let record = preflight_node(store, host, node)?;
+        if let NodeData::ModuleDeclaration(module) = &record.data {
+            ambient |= module.modifiers.as_ref().is_some_and(|modifiers| {
+                modifiers.list.nodes.iter().any(|modifier| {
+                    host.node(NodeRef::new(node.arena, node.file, *modifier))
+                        .is_some_and(|modifier| modifier.kind == SyntaxKind::DeclareKeyword)
+                })
+            });
+        }
+        current = record
+            .parent
+            .map(|parent| NodeRef::new(node.arena, node.file, parent));
+    }
+    Ok((Some(namespace_symbol), ambient))
+}
+
 fn plan_enum(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -199,19 +281,12 @@ fn plan_enum(
     };
     if record.kind != SyntaxKind::EnumDeclaration
         || store.source_node_kind(declaration) != Some(SyntaxKind::EnumDeclaration)
-        || store.source_node_parent(declaration)
-            != Some(super::store::SourceNodeParent::Parent(
-                host.bound_file(declaration)
-                    .ok_or_else(|| {
-                        invariant(EnumTypeInvariant::MissingOrForeignFacts(declaration))
-                    })?
-                    .source_file(),
-            ))
     {
         return Err(unsupported(EnumTypeUnsupported::NestedDeclaration(
             declaration,
         )));
     }
+    let (container_symbol, ambient_container) = enum_container(store, host, declaration)?;
     let name = NodeRef::new(declaration.arena, declaration.file, enumeration.name);
     let name_record = preflight_node(store, host, name)?;
     let NodeData::Identifier(identifier) = &name_record.data else {
@@ -237,6 +312,7 @@ fn plan_enum(
         .bound_file(declaration)
         .ok_or_else(|| invariant(EnumTypeInvariant::MissingOrForeignFacts(declaration)))?;
     let is_ambient = has_declare_modifier
+        || ambient_container
         || bound
             .source_facts()
             .is_some_and(ts_binder::CanonicalSourceFileFacts::is_declaration_file);
@@ -263,15 +339,31 @@ fn plan_enum(
         is_exported,
         is_ambient,
         bound.local_symbol(declaration),
-        bound.symbol(bound.source_file()),
+        container_symbol,
     )?;
 
     let member_table = owner
         .exports()
         .and_then(|members| store.symbol_table(members));
-    if member_table.map_or(0, ts_binder::semantic::SymbolTable::len)
-        != enumeration.members.nodes.len()
-    {
+    let expected_member_table_len = enumeration
+        .members
+        .nodes
+        .iter()
+        .filter(|member| {
+            let member = NodeRef::new(declaration.arena, declaration.file, **member);
+            host.node(member)
+                .and_then(|member| match &member.data {
+                    NodeData::EnumMember(member) => host.node(NodeRef::new(
+                        declaration.arena,
+                        declaration.file,
+                        member.name,
+                    )),
+                    _ => None,
+                })
+                .is_none_or(|name| !matches!(name.data, NodeData::BigIntLiteral(_)))
+        })
+        .count();
+    if member_table.map_or(0, ts_binder::semantic::SymbolTable::len) != expected_member_table_len {
         return Err(invariant(EnumTypeInvariant::InvalidOwnerSymbol(symbol)));
     }
     let mut members = Vec::with_capacity(enumeration.members.nodes.len());
@@ -293,24 +385,30 @@ fn plan_enum(
         }
         let member_name = NodeRef::new(member.arena, member.file, member_data.name);
         let member_name_record = preflight_node(store, host, member_name)?;
-        let member_name_text = match &member_name_record.data {
+        let (member_name_text, detached_bigint_name) = match &member_name_record.data {
             NodeData::Identifier(identifier)
                 if member_name_record.kind == SyntaxKind::Identifier =>
             {
-                identifier.text.as_str()
+                (identifier.text.as_str(), false)
             }
             NodeData::StringLiteral(literal)
                 if member_name_record.kind == SyntaxKind::StringLiteral =>
             {
-                literal.text.as_str()
+                (literal.text.as_str(), false)
+            }
+            NodeData::BigIntLiteral(literal)
+                if member_name_record.kind == SyntaxKind::BigIntLiteral =>
+            {
+                (literal.text.as_str(), true)
             }
             _ => return Err(unsupported(EnumTypeUnsupported::MemberName(member_name))),
         };
         if member_name_record.parent != Some(member.node) {
             return Err(invariant(EnumTypeInvariant::InvalidMember(member)));
         }
-        let name_diagnostic = (!matches!(member_name_text, "NaN" | "Infinity" | "-Infinity")
-            && Number::from_string(member_name_text).to_string() == member_name_text)
+        let name_diagnostic = (detached_bigint_name
+            || !matches!(member_name_text, "NaN" | "Infinity" | "-Infinity")
+                && Number::from_string(member_name_text).to_string() == member_name_text)
             .then_some(EnumMemberDiagnostic {
                 node: member_name,
                 code: 2452,
@@ -322,11 +420,19 @@ fn plan_enum(
         let member_symbol_record = store
             .symbol(member_symbol)
             .ok_or_else(|| invariant(EnumTypeInvariant::InvalidMemberSymbol(member)))?;
-        if member_table.and_then(|members| members.get_source(member_name_text))
-            != Some(member_symbol)
+        let valid_name_route = if detached_bigint_name {
+            member_symbol_record.name() == InternalSymbolName::Missing.as_ref()
+                && member_table
+                    .and_then(|members| members.get(InternalSymbolName::Missing.as_ref()))
+                    .is_none()
+        } else {
+            member_table.and_then(|members| members.get_source(member_name_text))
+                == Some(member_symbol)
+                && member_symbol_record.name().as_bytes() == member_name_text.as_bytes()
+        };
+        if !valid_name_route
             || member_symbol_record.flags() != SymbolFlags::ENUM_MEMBER
             || member_symbol_record.check_flags() != CheckFlags::NONE
-            || member_symbol_record.name().as_bytes() != member_name_text.as_bytes()
             || member_symbol_record.declarations() != Some(&[member])
             || member_symbol_record.value_declaration() != Some(member)
             || member_symbol_record.members().is_some()
@@ -377,6 +483,17 @@ fn plan_enum(
                                 code: if is_const { 2474 } else { 1066 },
                             }),
                         )
+                    }
+                    Err(EnumTypeError::Unsupported(EnumTypeUnsupported::Initializer(_)))
+                        if is_numeric_computed_initializer(
+                            store,
+                            host,
+                            initializer,
+                            &identifier.text,
+                            &members,
+                        ) =>
+                    {
+                        (CanonicalEnumMemberValue::Computed, None)
                     }
                     Err(error) => return Err(error),
                 };
@@ -567,6 +684,357 @@ fn constant_initializer(
         | EvaluationOutcome::Error(_) => {
             Err(unsupported(EnumTypeUnsupported::Initializer(initializer)))
         }
+    }
+}
+
+fn is_numeric_computed_initializer(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    expression: NodeRef,
+    enum_name: &str,
+    previous_members: &[EnumMemberPlan],
+) -> bool {
+    let Ok(record) = preflight_node(store, host, expression) else {
+        return false;
+    };
+    let member_is_computed = |name: &str| {
+        previous_members.iter().any(|member| {
+            matches!(member.value, CanonicalEnumMemberValue::Computed)
+                && store
+                    .symbol(member.symbol)
+                    .and_then(|symbol| symbol.name().as_utf8())
+                    == Some(name)
+        })
+    };
+    match &record.data {
+        NodeData::Identifier(identifier) => member_is_computed(&identifier.text),
+        NodeData::ParenthesizedExpression(parenthesized) => is_numeric_computed_initializer(
+            store,
+            host,
+            NodeRef::new(expression.arena, expression.file, parenthesized.expression),
+            enum_name,
+            previous_members,
+        ),
+        NodeData::PropertyAccessExpression(access) if access.question_dot_token.is_none() => {
+            let Some(base) = host.node(NodeRef::new(
+                expression.arena,
+                expression.file,
+                access.expression,
+            )) else {
+                return false;
+            };
+            let Some(name) =
+                host.node(NodeRef::new(expression.arena, expression.file, access.name))
+            else {
+                return false;
+            };
+            let NodeData::Identifier(name) = &name.data else {
+                return false;
+            };
+            matches!(
+                &base.data,
+                NodeData::StringLiteral(_) | NodeData::NoSubstitutionTemplateLiteral(_)
+            ) && name.text == "length"
+                || matches!(&base.data, NodeData::Identifier(base) if base.text == enum_name)
+                    && member_is_computed(&name.text)
+        }
+        NodeData::ElementAccessExpression(access) if access.question_dot_token.is_none() => {
+            let Some(base) = host.node(NodeRef::new(
+                expression.arena,
+                expression.file,
+                access.expression,
+            )) else {
+                return false;
+            };
+            let NodeData::Identifier(base) = &base.data else {
+                return false;
+            };
+            if base.text != enum_name {
+                return false;
+            }
+            let Some(argument) = host.node(NodeRef::new(
+                expression.arena,
+                expression.file,
+                access.argument_expression,
+            )) else {
+                return false;
+            };
+            match &argument.data {
+                NodeData::StringLiteral(name) => member_is_computed(&name.text),
+                NodeData::NoSubstitutionTemplateLiteral(name) => member_is_computed(&name.text),
+                _ => false,
+            }
+        }
+        NodeData::CallExpression(call)
+            if call.question_dot_token.is_none() && call.type_arguments.is_none() =>
+        {
+            is_numeric_computed_call(store, host, expression, call, enum_name, previous_members)
+        }
+        _ => false,
+    }
+}
+
+fn is_numeric_computed_call(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    expression: NodeRef,
+    call: &ts_ast::CallExpressionData,
+    enum_name: &str,
+    previous_members: &[EnumMemberPlan],
+) -> bool {
+    let Some(callee) = host.node(NodeRef::new(
+        expression.arena,
+        expression.file,
+        call.expression,
+    )) else {
+        return false;
+    };
+    match &callee.data {
+        NodeData::Identifier(identifier) => is_numeric_declared_function_call(
+            store,
+            host,
+            expression,
+            call,
+            &identifier.text,
+            enum_name,
+            previous_members,
+        ),
+        NodeData::PropertyAccessExpression(access) if access.question_dot_token.is_none() => {
+            is_numeric_math_call(
+                store,
+                host,
+                expression,
+                call,
+                access,
+                enum_name,
+                previous_members,
+            )
+        }
+        _ => false,
+    }
+}
+
+#[allow(clippy::too_many_arguments)] // Preserves the exact source and enum evaluation context.
+fn is_numeric_declared_function_call(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    expression: NodeRef,
+    call: &ts_ast::CallExpressionData,
+    name: &str,
+    enum_name: &str,
+    previous_members: &[EnumMemberPlan],
+) -> bool {
+    let Some(bound) = host.bound_file(expression) else {
+        return false;
+    };
+    let Some(local) = bound
+        .locals(bound.source_file())
+        .and_then(|locals| store.symbol_table(locals))
+        .and_then(|locals| locals.get_source(name))
+    else {
+        return false;
+    };
+    let Some(local_record) = store.symbol(local) else {
+        return false;
+    };
+    let Some(symbol) = store.symbol(local_record.export_symbol().unwrap_or(local)) else {
+        return false;
+    };
+    if !symbol.flags().contains(SymbolFlags::FUNCTION) {
+        return false;
+    }
+    let Some([declaration]) = symbol.declarations() else {
+        return false;
+    };
+    let Some(record) = host.node(*declaration) else {
+        return false;
+    };
+    let NodeData::FunctionDeclaration(function) = &record.data else {
+        return false;
+    };
+    let Some(annotation) = function.type_ else {
+        return false;
+    };
+    host.node(NodeRef::new(
+        declaration.arena,
+        declaration.file,
+        annotation,
+    ))
+    .is_some_and(|annotation| annotation.kind == SyntaxKind::NumberKeyword)
+        && function.parameters.nodes.len() == call.arguments.nodes.len()
+        && function.parameters.nodes.iter().all(|parameter| {
+            let Some(parameter) = host.node(NodeRef::new(
+                declaration.arena,
+                declaration.file,
+                *parameter,
+            )) else {
+                return false;
+            };
+            let NodeData::ParameterDeclaration(parameter) = &parameter.data else {
+                return false;
+            };
+            parameter.dot_dot_dot_token.is_none()
+                && parameter.question_token.is_none()
+                && parameter.initializer.is_none()
+                && parameter.type_.is_some_and(|annotation| {
+                    host.node(NodeRef::new(
+                        declaration.arena,
+                        declaration.file,
+                        annotation,
+                    ))
+                    .is_some_and(|annotation| annotation.kind == SyntaxKind::NumberKeyword)
+                })
+        })
+        && has_numeric_call_arguments(store, host, expression, call, enum_name, previous_members)
+}
+
+#[allow(clippy::too_many_arguments)] // Preserves the exact source and enum evaluation context.
+fn is_numeric_math_call(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    expression: NodeRef,
+    call: &ts_ast::CallExpressionData,
+    access: &ts_ast::PropertyAccessExpressionData,
+    enum_name: &str,
+    previous_members: &[EnumMemberPlan],
+) -> bool {
+    let Some(bound) = host.bound_file(expression) else {
+        return false;
+    };
+    let Some(base) = host.node(NodeRef::new(
+        expression.arena,
+        expression.file,
+        access.expression,
+    )) else {
+        return false;
+    };
+    let NodeData::Identifier(base) = &base.data else {
+        return false;
+    };
+    if base.text != "Math"
+        || bound
+            .locals(bound.source_file())
+            .and_then(|locals| store.symbol_table(locals))
+            .and_then(|locals| locals.get_source("Math"))
+            .is_some()
+    {
+        return false;
+    }
+    let Some(method) = host.node(NodeRef::new(expression.arena, expression.file, access.name))
+    else {
+        return false;
+    };
+    let NodeData::Identifier(method) = &method.data else {
+        return false;
+    };
+    match method.text.as_str() {
+        "random" => call.arguments.nodes.is_empty(),
+        "abs" | "ceil" | "floor" | "round" | "sqrt" | "trunc" => {
+            call.arguments.nodes.len() == 1
+                && has_numeric_call_arguments(
+                    store,
+                    host,
+                    expression,
+                    call,
+                    enum_name,
+                    previous_members,
+                )
+        }
+        _ => false,
+    }
+}
+
+fn has_numeric_call_arguments(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    expression: NodeRef,
+    call: &ts_ast::CallExpressionData,
+    enum_name: &str,
+    previous_members: &[EnumMemberPlan],
+) -> bool {
+    call.arguments.nodes.iter().all(|argument| {
+        is_known_numeric_expression(
+            store,
+            host,
+            NodeRef::new(expression.arena, expression.file, *argument),
+            enum_name,
+            previous_members,
+        )
+    })
+}
+
+fn is_known_numeric_expression(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    expression: NodeRef,
+    enum_name: &str,
+    previous_members: &[EnumMemberPlan],
+) -> bool {
+    let Some(record) = host.node(expression) else {
+        return false;
+    };
+    match &record.data {
+        NodeData::NumericLiteral(_) => true,
+        NodeData::PrefixUnaryExpression(prefix)
+            if matches!(
+                prefix.operator,
+                SyntaxKind::PlusToken | SyntaxKind::MinusToken | SyntaxKind::TildeToken
+            ) =>
+        {
+            is_known_numeric_expression(
+                store,
+                host,
+                NodeRef::new(expression.arena, expression.file, prefix.operand),
+                enum_name,
+                previous_members,
+            )
+        }
+        NodeData::BinaryExpression(binary) => {
+            let Some(operator) = host.node(NodeRef::new(
+                expression.arena,
+                expression.file,
+                binary.operator_token,
+            )) else {
+                return false;
+            };
+            matches!(
+                operator.kind,
+                SyntaxKind::PlusToken
+                    | SyntaxKind::MinusToken
+                    | SyntaxKind::AsteriskToken
+                    | SyntaxKind::SlashToken
+                    | SyntaxKind::PercentToken
+                    | SyntaxKind::AsteriskAsteriskToken
+                    | SyntaxKind::BarToken
+                    | SyntaxKind::AmpersandToken
+                    | SyntaxKind::CaretToken
+                    | SyntaxKind::LessThanLessThanToken
+                    | SyntaxKind::GreaterThanGreaterThanToken
+                    | SyntaxKind::GreaterThanGreaterThanGreaterThanToken
+            ) && is_known_numeric_expression(
+                store,
+                host,
+                NodeRef::new(expression.arena, expression.file, binary.left),
+                enum_name,
+                previous_members,
+            ) && is_known_numeric_expression(
+                store,
+                host,
+                NodeRef::new(expression.arena, expression.file, binary.right),
+                enum_name,
+                previous_members,
+            )
+        }
+        NodeData::Identifier(identifier) => previous_members.iter().any(|member| {
+            matches!(
+                member.value,
+                CanonicalEnumMemberValue::Number(_) | CanonicalEnumMemberValue::Computed
+            ) && store
+                .symbol(member.symbol)
+                .and_then(|symbol| symbol.name().as_utf8())
+                == Some(identifier.text.as_str())
+        }),
+        _ => is_numeric_computed_initializer(store, host, expression, enum_name, previous_members),
     }
 }
 
@@ -1655,6 +2123,71 @@ mod tests {
     }
 
     #[test]
+    fn ambient_namespace_enums_keep_the_namespace_owner_and_computed_values() {
+        let mut fixture = fixture(concat!(
+            "declare namespace JSX { ",
+            "enum ElementType {} ",
+            "enum Status { Ready, Active = 2 } ",
+            "}",
+        ));
+        let empty_owner = symbol(&fixture, SyntaxKind::EnumDeclaration, "ElementType");
+        let status_owner = symbol(&fixture, SyntaxKind::EnumDeclaration, "Status");
+        let bound = &fixture.files[&fixture.file];
+        let host = host(&fixture.parsed.arena, bound);
+
+        let empty = get_enum_semantics(&mut fixture.store, &host, empty_owner).unwrap();
+        assert!(empty.is_ambient);
+        assert!(empty.members.is_empty());
+        assert_eq!(
+            fixture
+                .store
+                .type_payload(empty.declared_type)
+                .unwrap()
+                .flags(),
+            TypeFlags::ENUM
+        );
+
+        let status = get_enum_semantics(&mut fixture.store, &host, status_owner).unwrap();
+        assert!(status.is_ambient);
+        assert_eq!(
+            member(&status, &fixture, "Ready").value,
+            CanonicalEnumMemberValue::Computed
+        );
+        assert_eq!(
+            member(&status, &fixture, "Active").value,
+            CanonicalEnumMemberValue::Number(Number::new(2.0))
+        );
+    }
+
+    #[test]
+    fn namespace_exported_enums_preserve_local_and_export_symbol_routes() {
+        let mut fixture = fixture(concat!(
+            "namespace Outer { ",
+            "export enum Exported { First = 1, Second } ",
+            "enum Local { Value = 3 } ",
+            "}",
+        ));
+        let exported_owner = symbol(&fixture, SyntaxKind::EnumDeclaration, "Exported");
+        let local_owner = symbol(&fixture, SyntaxKind::EnumDeclaration, "Local");
+        let bound = &fixture.files[&fixture.file];
+        let host = host(&fixture.parsed.arena, bound);
+
+        let exported = get_enum_semantics(&mut fixture.store, &host, exported_owner).unwrap();
+        assert!(!exported.is_ambient);
+        assert_eq!(
+            member(&exported, &fixture, "Second").value,
+            CanonicalEnumMemberValue::Number(Number::new(2.0))
+        );
+
+        let local = get_enum_semantics(&mut fixture.store, &host, local_owner).unwrap();
+        assert!(!local.is_ambient);
+        assert_eq!(
+            member(&local, &fixture, "Value").value,
+            CanonicalEnumMemberValue::Number(Number::new(3.0))
+        );
+    }
+
+    #[test]
     fn quoted_enum_member_names_publish_and_resolve_through_element_access() {
         let mut fixture = fixture(concat!(
             "enum Named { ",
@@ -1725,6 +2258,46 @@ mod tests {
 
         let result = get_enum_semantics(&mut fixture.store, &host, owner).unwrap();
         assert_eq!(result.members.len(), 7);
+    }
+
+    #[test]
+    fn bigint_member_names_preserve_detached_symbols_and_report_ts2452() {
+        let mut fixture = fixture("enum Invalid { 0n = 0, Valid = 1 }");
+        let owner = symbol(&fixture, SyntaxKind::EnumDeclaration, "Invalid");
+        let bound = &fixture.files[&fixture.file];
+        let host = host(&fixture.parsed.arena, bound);
+
+        let diagnostics = preflight_enum_diagnostics(&fixture.store, &host, owner).unwrap();
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code, 2452);
+        assert_eq!(
+            fixture
+                .parsed
+                .arena
+                .get(diagnostics[0].node.node)
+                .unwrap()
+                .kind,
+            SyntaxKind::BigIntLiteral
+        );
+
+        let result = get_enum_semantics(&mut fixture.store, &host, owner).unwrap();
+        assert_eq!(result.members.len(), 2);
+        assert_eq!(
+            fixture
+                .store
+                .symbol(result.members[0].symbol)
+                .unwrap()
+                .name(),
+            InternalSymbolName::Missing.as_ref()
+        );
+        assert_eq!(
+            result.members[0].value,
+            CanonicalEnumMemberValue::Number(Number::new(0.0))
+        );
+        assert_eq!(
+            member(&result, &fixture, "Valid").value,
+            CanonicalEnumMemberValue::Number(Number::new(1.0))
+        );
     }
 
     #[test]
@@ -2032,6 +2605,80 @@ mod tests {
         assert_eq!(
             member(&result, &fixture, "Second").value,
             CanonicalEnumMemberValue::Computed
+        );
+    }
+
+    #[test]
+    fn numeric_computed_initializers_remain_computed_and_reset_auto_increment() {
+        let mut fixture = fixture(concat!(
+            "enum Computed { ",
+            "Length = ''.length, ",
+            "Direct = Length, ",
+            "Qualified = Computed.Length, ",
+            "Indexed = Computed['Length'], ",
+            "Missing, ",
+            "Reset = 10, ",
+            "Next, ",
+            "}",
+        ));
+        let owner = symbol(&fixture, SyntaxKind::EnumDeclaration, "Computed");
+        let bound = &fixture.files[&fixture.file];
+        let host = host(&fixture.parsed.arena, bound);
+
+        let diagnostics = preflight_enum_diagnostics(&fixture.store, &host, owner).unwrap();
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code, 1061);
+
+        let result = get_enum_semantics(&mut fixture.store, &host, owner).unwrap();
+        for name in ["Length", "Direct", "Qualified", "Indexed", "Missing"] {
+            assert_eq!(
+                member(&result, &fixture, name).value,
+                CanonicalEnumMemberValue::Computed,
+                "member {name}"
+            );
+        }
+        assert_eq!(
+            member(&result, &fixture, "Reset").value,
+            CanonicalEnumMemberValue::Number(Number::new(10.0))
+        );
+        assert_eq!(
+            member(&result, &fixture, "Next").value,
+            CanonicalEnumMemberValue::Number(Number::new(11.0))
+        );
+    }
+
+    #[test]
+    fn numeric_function_and_math_calls_create_computed_enum_members() {
+        let mut fixture = fixture(concat!(
+            "declare function compute(input: number): number; ",
+            "enum Calls { ",
+            "First = compute(0), ",
+            "Second = compute(First), ",
+            "Random = Math.floor(Math.random() * 1000), ",
+            "Reset = 10, ",
+            "Next, ",
+            "}",
+        ));
+        let owner = symbol(&fixture, SyntaxKind::EnumDeclaration, "Calls");
+        let bound = &fixture.files[&fixture.file];
+        let host = host(&fixture.parsed.arena, bound);
+
+        assert!(
+            preflight_enum_diagnostics(&fixture.store, &host, owner)
+                .unwrap()
+                .is_empty()
+        );
+        let result = get_enum_semantics(&mut fixture.store, &host, owner).unwrap();
+        for name in ["First", "Second", "Random"] {
+            assert_eq!(
+                member(&result, &fixture, name).value,
+                CanonicalEnumMemberValue::Computed,
+                "member {name}"
+            );
+        }
+        assert_eq!(
+            member(&result, &fixture, "Next").value,
+            CanonicalEnumMemberValue::Number(Number::new(11.0))
         );
     }
 

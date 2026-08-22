@@ -4878,7 +4878,8 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         });
         let return_annotation_valid = self
             .source_return_annotation_belongs_to(prepared.declaration, prepared.return_annotation);
-        let expected_minimum = i32::try_from(prepared.parameters.len()).ok();
+        let minimum_argument_count_valid = usize::try_from(prepared.min_argument_count)
+            .is_ok_and(|minimum| minimum <= prepared.parameters.len());
         let owner_links_cold = self
             .value_symbol_links(prepared.owner_symbol)
             .is_none_or(|links| links == &ValueSymbolLinks::default());
@@ -4890,7 +4891,7 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
             || prepared.syntax.declaration() != prepared.declaration
             || self.source_node_kind(prepared.declaration) != Some(SyntaxKind::FunctionDeclaration)
             || prepared.flags != SignatureFlags::NONE
-            || expected_minimum != Some(prepared.min_argument_count)
+            || !minimum_argument_count_valid
             || !owner_valid
             || !export_route_valid
             || !parameters_valid

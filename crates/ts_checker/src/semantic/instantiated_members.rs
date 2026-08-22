@@ -21,11 +21,11 @@ use ts_binder::{
 use super::{
     CanonicalTypeMapperStore, TypeId, TypeMapperId,
     array_types::CanonicalArrayTargets,
-    declared::cached_ordinary_type_parameter_owner,
+    declared::{cached_ordinary_type_parameter_owner, type_list_key},
     instantiate::{
         InstantiationError, InstantiationLimits, InstantiationSession,
         instantiable_member_type_contains_variables, instantiate_type_with_session,
-        instantiated_member_type_matches,
+        instantiate_type_with_vector_and_session, instantiated_member_type_matches,
     },
     links::ValueSymbolLinks,
     object_members::{
@@ -34,8 +34,10 @@ use super::{
     },
     reference_types::{DirectGenericReferenceError, validate_direct_generic_reference},
     store::SourceNodeParent,
-    type_records::{ConstrainedTypeData, StructuredTypeData, TypeData},
-    types::{ObjectFlags, TypeFlags},
+    type_records::{
+        ConstrainedTypeData, LiteralValue, StructuredTypeData, TypeCacheState, TypeData,
+    },
+    types::{AccessFlags, ObjectFlags, TypeFlags},
 };
 
 /// Optional canonical `Array` capability for the context-free store adapter.
@@ -222,6 +224,9 @@ struct GenericInterfaceShape {
     source_parameters: Vec<TypeId>,
     target_arguments: Vec<TypeId>,
     properties: Vec<DeclaredProperty>,
+    base_types: Vec<TypeId>,
+    inherited_properties: Vec<SemanticSymbolId>,
+    inherited_members_ready: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -300,9 +305,16 @@ pub(super) fn resolve_members_with_array_targets(
     reference: TypeId,
     array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<InstantiatedInterfaceMembers, GenericInterfaceMemberError> {
-    let shape = validate_shape(store, reference, array_targets)?;
+    let mut shape = validate_shape(store, reference, array_targets)?;
     if let Some(cached) = validate_warm_members(store, &shape, array_targets)? {
         return Ok(cached);
+    }
+    if !shape.inherited_members_ready {
+        materialize_inherited_members(store, &shape, array_targets)?;
+        shape = validate_shape(store, reference, array_targets)?;
+        if !shape.inherited_members_ready {
+            return Err(GenericInterfaceMemberError::InvalidCachedMembers(reference));
+        }
     }
     let plan = prepare_cold_members(store, &shape)?;
     Ok(publish_cold_members(store, &shape, plan))
@@ -421,8 +433,7 @@ pub(super) fn demand_instantiated_property_type(
         return Ok(cached);
     }
     let instantiated =
-        instantiate_type_with_session(store, template, mapper, array_targets, session)
-            .map_err(|error| property_instantiation_error(template, &error))?;
+        instantiate_generic_member_type(store, template, mapper, array_targets, session)?;
     let links = store
         .value_symbol_links(symbol)
         .cloned()
@@ -466,6 +477,234 @@ fn property_instantiation_error(
     }
 }
 
+fn instantiate_generic_member_type(
+    store: &mut CanonicalTypeMapperStore,
+    template: TypeId,
+    mapper: TypeMapperId,
+    array_targets: Option<CanonicalArrayTargets>,
+    session: &mut InstantiationSession,
+) -> Result<TypeId, GenericInterfaceMemberError> {
+    let indexed = match store
+        .type_payload(template)
+        .ok_or(GenericInterfaceMemberError::UnsupportedPropertyType(
+            template,
+        ))?
+        .data()
+    {
+        TypeData::IndexedAccess(indexed) if indexed.access_flags == AccessFlags::NONE => {
+            Some((indexed.object_type, indexed.index_type))
+        }
+        TypeData::IndexedAccess(_) => {
+            return Err(GenericInterfaceMemberError::UnsupportedPropertyType(
+                template,
+            ));
+        }
+        _ => None,
+    };
+    let Some((object, index)) = indexed else {
+        return instantiate_type_with_session(store, template, mapper, array_targets, session)
+            .map_err(|error| property_instantiation_error(template, &error));
+    };
+    let object = instantiate_type_with_session(store, object, mapper, array_targets, session)
+        .map_err(|error| property_instantiation_error(template, &error))?;
+    let index = instantiate_type_with_session(store, index, mapper, array_targets, session)
+        .map_err(|error| property_instantiation_error(template, &error))?;
+    let name = indexed_property_name(store, index).ok_or(
+        GenericInterfaceMemberError::UnsupportedPropertyType(template),
+    )?;
+    if validate_direct_generic_reference(store, object).is_ok() {
+        resolve_members_with_array_targets(store, object, array_targets)?;
+    }
+    let symbol = store
+        .type_payload(object)
+        .and_then(|record| record.data().structured())
+        .and_then(|structured| structured.members)
+        .and_then(|members| store.symbol_table(members))
+        .and_then(|members| members.get_source(&name))
+        .ok_or(GenericInterfaceMemberError::UnsupportedPropertyType(
+            template,
+        ))?;
+    let checks = store
+        .symbol(symbol)
+        .ok_or(GenericInterfaceMemberError::InvalidCachedProperty(symbol))?
+        .check_flags();
+    if checks.contains(CheckFlags::MAPPED) {
+        return store
+            .resolve_mapped_symbol_type(symbol)
+            .map_err(|_| GenericInterfaceMemberError::InvalidCachedProperty(symbol));
+    }
+    if checks.contains(CheckFlags::INSTANTIATED) {
+        return demand_instantiated_property_type(store, object, symbol, array_targets, session);
+    }
+    store
+        .value_symbol_links(symbol)
+        .and_then(|links| links.resolved_type)
+        .ok_or(GenericInterfaceMemberError::InvalidCachedProperty(symbol))
+}
+
+fn indexed_property_name(store: &CanonicalTypeMapperStore, index: TypeId) -> Option<String> {
+    match store.type_payload(index)?.data() {
+        TypeData::Literal(literal) => match &literal.value {
+            LiteralValue::String(name) => Some(name.clone()),
+            LiteralValue::Number(number) => Some(number.to_string()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn cached_inherited_properties(
+    store: &CanonicalTypeMapperStore,
+    shape: &GenericInterfaceShape,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<Option<Vec<SemanticSymbolId>>, GenericInterfaceMemberError> {
+    let mut inherited = Vec::new();
+    let mut names = shape
+        .properties
+        .iter()
+        .map(|property| property.name.clone())
+        .collect::<HashSet<_>>();
+    for base in &shape.base_types {
+        let Some(base) = mapped_inherited_type(store, shape, *base)? else {
+            return Ok(None);
+        };
+        let properties = if validate_direct_generic_reference(store, base).is_ok() {
+            let Some(members) = validate_generic_interface_members(store, base, array_targets)?
+            else {
+                return Ok(None);
+            };
+            members.properties
+        } else if matches!(
+            validate_resolved_declared_property_object(store, base),
+            DeclaredPropertyObjectValidation::Valid(DeclaredPropertyObjectProof::Interface)
+        ) {
+            store
+                .type_payload(base)
+                .and_then(|record| record.data().structured())
+                .and_then(|structured| structured.properties.clone())
+                .unwrap_or_default()
+        } else {
+            return Err(GenericInterfaceMemberError::UnsupportedTarget(base));
+        };
+        for property in properties {
+            let name = store
+                .symbol(property)
+                .ok_or(GenericInterfaceMemberError::InvalidCachedProperty(property))?
+                .name()
+                .to_owned();
+            if names.insert(name) {
+                inherited.push(property);
+            }
+        }
+    }
+    Ok(Some(inherited))
+}
+
+fn mapped_inherited_type(
+    store: &CanonicalTypeMapperStore,
+    shape: &GenericInterfaceShape,
+    type_: TypeId,
+) -> Result<Option<TypeId>, GenericInterfaceMemberError> {
+    if let Some(index) = shape
+        .source_parameters
+        .iter()
+        .position(|parameter| *parameter == type_)
+    {
+        return shape
+            .target_arguments
+            .get(index)
+            .copied()
+            .map(Some)
+            .ok_or(GenericInterfaceMemberError::InvalidTarget(shape.target));
+    }
+    let this_type = store
+        .type_payload(shape.target)
+        .and_then(|record| match record.data() {
+            TypeData::Interface(interface) => interface.this_type,
+            _ => None,
+        })
+        .ok_or(GenericInterfaceMemberError::InvalidTarget(shape.target))?;
+    if type_ == this_type {
+        return Ok(Some(shape.reference));
+    }
+    let record = store
+        .type_payload(type_)
+        .ok_or(GenericInterfaceMemberError::UnsupportedPropertyType(type_))?;
+    if matches!(record.data(), TypeData::Intrinsic(_) | TypeData::Literal(_)) {
+        return Ok(Some(type_));
+    }
+    let reference = match validate_direct_generic_reference(store, type_) {
+        Ok(reference) => reference,
+        Err(_) if matches!(record.data(), TypeData::Interface(_)) => {
+            return Ok(Some(type_));
+        }
+        Err(_) => return Err(GenericInterfaceMemberError::UnsupportedPropertyType(type_)),
+    };
+    let mut arguments = Vec::with_capacity(reference.type_arguments.len());
+    for argument in &reference.type_arguments {
+        let Some(argument) = mapped_inherited_type(store, shape, *argument)? else {
+            return Ok(None);
+        };
+        arguments.push(argument);
+    }
+    if arguments == reference.type_arguments {
+        return Ok(Some(type_));
+    }
+    let TypeData::Interface(target) = store
+        .type_payload(reference.target)
+        .ok_or(GenericInterfaceMemberError::InvalidTarget(reference.target))?
+        .data()
+    else {
+        return Err(GenericInterfaceMemberError::InvalidTarget(reference.target));
+    };
+    let TypeCacheState::Allocated(cache) = &target.reference.object.instantiations else {
+        return Err(GenericInterfaceMemberError::InvalidTarget(reference.target));
+    };
+    let Some(cached) = cache.get(&type_list_key(&arguments)).copied() else {
+        return Ok(None);
+    };
+    let actual = validate_direct_generic_reference(store, cached)?;
+    if actual.target != reference.target || actual.type_arguments != arguments {
+        return Err(GenericInterfaceMemberError::InvalidCachedMembers(cached));
+    }
+    Ok(Some(cached))
+}
+
+fn materialize_inherited_members(
+    store: &mut CanonicalTypeMapperStore,
+    shape: &GenericInterfaceShape,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<(), GenericInterfaceMemberError> {
+    let sources = mapper_parameters_for_target(store, shape.target, &shape.source_parameters)?;
+    let targets = shape
+        .target_arguments
+        .iter()
+        .copied()
+        .chain(std::iter::once(shape.reference))
+        .collect::<Vec<_>>();
+    let mut session = InstantiationSession::new(InstantiationLimits::default());
+    for base in &shape.base_types {
+        let resolved = instantiate_type_with_vector_and_session(
+            store,
+            *base,
+            &sources,
+            &targets,
+            array_targets,
+            &mut session,
+        )
+        .map_err(|error| property_instantiation_error(*base, &error))?;
+        if validate_direct_generic_reference(store, resolved).is_ok() {
+            resolve_members_with_array_targets(store, resolved, array_targets)?;
+        } else if !matches!(
+            validate_resolved_declared_property_object(store, resolved),
+            DeclaredPropertyObjectValidation::Valid(DeclaredPropertyObjectProof::Interface)
+        ) {
+            return Err(GenericInterfaceMemberError::UnsupportedTarget(resolved));
+        }
+    }
+    Ok(())
+}
+
 fn validate_shape(
     store: &CanonicalTypeMapperStore,
     reference: TypeId,
@@ -478,25 +717,51 @@ fn validate_shape(
         store,
         direct.target,
         array_targets,
-        None,
         &mut active,
         &mut validated,
     )?;
-    let shape = GenericInterfaceShape {
+    let base_types = store
+        .type_payload(direct.target)
+        .and_then(|record| match record.data() {
+            TypeData::Interface(interface) => Some(
+                interface
+                    .resolved_base_types
+                    .as_deref()
+                    .unwrap_or_default()
+                    .to_vec(),
+            ),
+            _ => None,
+        })
+        .ok_or(GenericInterfaceMemberError::InvalidTarget(direct.target))?;
+    let mut shape = GenericInterfaceShape {
         reference,
         target: direct.target,
         source_parameters,
         target_arguments: direct.type_arguments,
         properties,
+        base_types,
+        inherited_properties: Vec::new(),
+        inherited_members_ready: false,
     };
+    if let Some(inherited) = cached_inherited_properties(store, &shape, array_targets)? {
+        shape.inherited_properties = inherited;
+        shape.inherited_members_ready = true;
+    }
     if reference != shape.target {
-        let target_shape = GenericInterfaceShape {
+        let mut target_shape = GenericInterfaceShape {
             reference: shape.target,
             target: shape.target,
             source_parameters: shape.source_parameters.clone(),
             target_arguments: shape.source_parameters.clone(),
             properties: shape.properties.clone(),
+            base_types: shape.base_types.clone(),
+            inherited_properties: Vec::new(),
+            inherited_members_ready: false,
         };
+        if let Some(inherited) = cached_inherited_properties(store, &target_shape, array_targets)? {
+            target_shape.inherited_properties = inherited;
+            target_shape.inherited_members_ready = true;
+        }
         validate_warm_members(store, &target_shape, array_targets)?;
     }
     Ok(shape)
@@ -506,7 +771,6 @@ fn validate_declared_target(
     store: &CanonicalTypeMapperStore,
     target: TypeId,
     array_targets: Option<CanonicalArrayTargets>,
-    root_declaration: Option<ts_ast::NodeRef>,
     active: &mut Vec<TypeId>,
     validated: &mut HashSet<TypeId>,
 ) -> Result<DeclaredTargetHeader, GenericInterfaceMemberError> {
@@ -530,20 +794,39 @@ fn validate_declared_target(
     let [declaration] = owner_record.declarations().unwrap_or_default() else {
         return Err(GenericInterfaceMemberError::UnsupportedTarget(target));
     };
-    if store.source_node_kind(*declaration) != Some(SyntaxKind::InterfaceDeclaration)
-        || store.source_node_is_exported(*declaration) != Some(false)
-        || !matches!(
-            store.source_node_parent(*declaration),
-            Some(SourceNodeParent::Parent(parent))
-                if store.source_node_kind(parent) == Some(SyntaxKind::SourceFile)
-        )
-        || root_declaration.is_some_and(|root| !declaration.is_for(root.arena, root.file))
-    {
+    if !valid_generic_interface_declaration_owner(store, owner, *declaration) {
         return Err(GenericInterfaceMemberError::UnsupportedTarget(target));
     }
 
     let mapper_parameters = mapper_parameters_for_target(store, target, &source_parameters)?;
     active.push(target);
+    let base_types = store
+        .type_payload(target)
+        .and_then(|record| match record.data() {
+            TypeData::Interface(interface) => Some(
+                interface
+                    .resolved_base_types
+                    .as_deref()
+                    .unwrap_or_default()
+                    .to_vec(),
+            ),
+            _ => None,
+        })
+        .ok_or(GenericInterfaceMemberError::InvalidTarget(target))?;
+    for base in base_types {
+        if let Ok(reference) = validate_direct_generic_reference(store, base) {
+            if active.contains(&reference.target) {
+                return Err(GenericInterfaceMemberError::InvalidTarget(target));
+            }
+            member_type_requires_instantiation(store, base, &mapper_parameters, array_targets)?;
+            validate_declared_target(store, reference.target, array_targets, active, validated)?;
+        } else if !matches!(
+            validate_resolved_declared_property_object(store, base),
+            DeclaredPropertyObjectValidation::Valid(DeclaredPropertyObjectProof::Interface)
+        ) {
+            return Err(GenericInterfaceMemberError::UnsupportedTarget(base));
+        }
+    }
     for property in &mut properties {
         property.requires_proxy = member_type_requires_instantiation(
             store,
@@ -555,7 +838,6 @@ fn validate_declared_target(
             store,
             property.type_,
             array_targets,
-            *declaration,
             active,
             validated,
             &mut HashSet::new(),
@@ -575,6 +857,27 @@ fn member_type_requires_instantiation(
     mapper_parameters: &[TypeId],
     array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<bool, GenericInterfaceMemberError> {
+    if let Some(TypeData::IndexedAccess(indexed)) = store
+        .type_payload(type_)
+        .map(super::type_records::TypeRecord::data)
+    {
+        if indexed.access_flags != AccessFlags::NONE {
+            return Err(GenericInterfaceMemberError::UnsupportedPropertyType(type_));
+        }
+        member_type_requires_instantiation(
+            store,
+            indexed.object_type,
+            mapper_parameters,
+            array_targets,
+        )?;
+        member_type_requires_instantiation(
+            store,
+            indexed.index_type,
+            mapper_parameters,
+            array_targets,
+        )?;
+        return Ok(true);
+    }
     match instantiable_member_type_contains_variables(
         store,
         type_,
@@ -675,7 +978,6 @@ fn declared_target_header(
         || owner_record.check_flags() != CheckFlags::NONE
         || owner_record.value_declaration().is_some()
         || owner_record.exports().is_some()
-        || owner_record.parent().is_some()
         || owner_record.export_symbol().is_some()
         || store.get_merged_symbol(owner) != Some(owner)
         || store
@@ -688,7 +990,10 @@ fn declared_target_header(
         || interface.outer_type_parameter_count != 0
         || !interface.base_types_resolved
         || interface.resolved_base_constructor_type.is_some()
-        || interface.resolved_base_types.is_some()
+        || interface
+            .resolved_base_types
+            .as_ref()
+            .is_some_and(Vec::is_empty)
         || !interface.declared_members_resolved
         || interface.declared_call_signatures.is_some()
         || interface.declared_construct_signatures.is_some()
@@ -734,6 +1039,9 @@ fn declared_target_header(
     let [owner_declaration] = owner_record.declarations().unwrap_or_default() else {
         return Err(GenericInterfaceMemberError::UnsupportedTarget(target));
     };
+    if !valid_generic_interface_declaration_owner(store, owner, *owner_declaration) {
+        return Err(GenericInterfaceMemberError::UnsupportedTarget(target));
+    }
     let mut parameter_symbols = HashSet::with_capacity(source_parameters.len());
     for parameter in &source_parameters {
         let parameter_symbol = cached_ordinary_type_parameter_owner(store, *parameter)
@@ -844,6 +1152,65 @@ fn declared_target_header(
     Ok((owner, source_parameters, declared_members, properties))
 }
 
+fn valid_generic_interface_declaration_owner(
+    store: &CanonicalTypeMapperStore,
+    owner: SemanticSymbolId,
+    declaration: ts_ast::NodeRef,
+) -> bool {
+    if store.source_node_kind(declaration) != Some(SyntaxKind::InterfaceDeclaration) {
+        return false;
+    }
+    let Some(record) = store.symbol(owner) else {
+        return false;
+    };
+    let Some(SourceNodeParent::Parent(parent)) = store.source_node_parent(declaration) else {
+        return false;
+    };
+    let Some(exported) = store.source_node_is_exported(declaration) else {
+        return false;
+    };
+    let container = match store.source_node_kind(parent) {
+        Some(SyntaxKind::SourceFile) => parent,
+        Some(SyntaxKind::ModuleBlock) => {
+            let Some(SourceNodeParent::Parent(module)) = store.source_node_parent(parent) else {
+                return false;
+            };
+            if store.source_node_kind(module) != Some(SyntaxKind::ModuleDeclaration) {
+                return false;
+            }
+            module
+        }
+        _ => return false,
+    };
+    let Some(raw_parent) = record.parent() else {
+        return !exported;
+    };
+    if store.source_node_kind(parent) == Some(SyntaxKind::SourceFile) && !exported {
+        return false;
+    }
+    let Some(parent_symbol) = store.get_parent_of_symbol(owner) else {
+        return false;
+    };
+    let Some(parent_record) = store.symbol(parent_symbol) else {
+        return false;
+    };
+    let raw_contains_container = store
+        .symbol(raw_parent)
+        .and_then(|parent| parent.declarations())
+        .is_some_and(|declarations| declarations.contains(&container));
+    let merged_contains_container = parent_record
+        .declarations()
+        .is_some_and(|declarations| declarations.contains(&container));
+    parent_record.flags().intersects(SymbolFlags::MODULE)
+        && (raw_contains_container || merged_contains_container)
+        && parent_record
+            .exports()
+            .and_then(|exports| store.symbol_table(exports))
+            .and_then(|exports| exports.get(record.name()))
+            .and_then(|symbol| store.get_merged_symbol(symbol))
+            == Some(owner)
+}
+
 fn optional_member_type_is_normalized(
     store: &CanonicalTypeMapperStore,
     type_: TypeId,
@@ -886,6 +1253,32 @@ fn cached_instantiated_property_type_matches(
     mapper: TypeMapperId,
     array_targets: Option<CanonicalArrayTargets>,
 ) -> bool {
+    if let Some(TypeData::IndexedAccess(indexed)) = store
+        .type_payload(template)
+        .map(super::type_records::TypeRecord::data)
+    {
+        if indexed.access_flags != AccessFlags::NONE {
+            return false;
+        }
+        let Some(object) = mapped_index_component(store, indexed.object_type, mapper) else {
+            return false;
+        };
+        let Some(index) = mapped_index_component(store, indexed.index_type, mapper) else {
+            return false;
+        };
+        let Some(name) = indexed_property_name(store, index) else {
+            return false;
+        };
+        return store
+            .type_payload(object)
+            .and_then(|record| record.data().structured())
+            .and_then(|structured| structured.members)
+            .and_then(|members| store.symbol_table(members))
+            .and_then(|members| members.get_source(&name))
+            .and_then(|symbol| store.value_symbol_links(symbol))
+            .and_then(|links| links.resolved_type)
+            == Some(cached);
+    }
     if cached != template
         && matches!(
             store
@@ -908,12 +1301,24 @@ fn cached_instantiated_property_type_matches(
         .unwrap_or(false)
 }
 
+fn mapped_index_component(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    mapper: TypeMapperId,
+) -> Option<TypeId> {
+    let record = store.type_payload(type_)?;
+    if matches!(record.data(), TypeData::TypeParameter(_)) {
+        store.map_type(mapper, type_)
+    } else {
+        Some(type_)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn validate_nested_reference_targets(
     store: &CanonicalTypeMapperStore,
     type_: TypeId,
     array_targets: Option<CanonicalArrayTargets>,
-    root_declaration: ts_ast::NodeRef,
     active_targets: &mut Vec<TypeId>,
     validated_targets: &mut HashSet<TypeId>,
     visited_types: &mut HashSet<TypeId>,
@@ -931,12 +1336,29 @@ fn validate_nested_reference_targets(
                     store,
                     *constituent,
                     array_targets,
-                    root_declaration,
                     active_targets,
                     validated_targets,
                     visited_types,
                 )?;
             }
+        }
+        TypeData::IndexedAccess(indexed) => {
+            validate_nested_reference_targets(
+                store,
+                indexed.object_type,
+                array_targets,
+                active_targets,
+                validated_targets,
+                visited_types,
+            )?;
+            validate_nested_reference_targets(
+                store,
+                indexed.index_type,
+                array_targets,
+                active_targets,
+                validated_targets,
+                visited_types,
+            )?;
         }
         TypeData::TypeReference(_) | TypeData::Interface(_) => {
             if let Some(targets) = array_targets
@@ -948,7 +1370,6 @@ fn validate_nested_reference_targets(
                     store,
                     array.element_type,
                     array_targets,
-                    root_declaration,
                     active_targets,
                     validated_targets,
                     visited_types,
@@ -958,7 +1379,6 @@ fn validate_nested_reference_targets(
                     store,
                     reference.target,
                     array_targets,
-                    Some(root_declaration),
                     active_targets,
                     validated_targets,
                 )?;
@@ -967,7 +1387,6 @@ fn validate_nested_reference_targets(
                         store,
                         argument,
                         array_targets,
-                        root_declaration,
                         active_targets,
                         validated_targets,
                         visited_types,
@@ -1008,11 +1427,21 @@ fn validate_warm_members(
         }
         return Ok(None);
     }
+    if !shape.inherited_members_ready {
+        return Err(GenericInterfaceMemberError::InvalidCachedMembers(
+            shape.reference,
+        ));
+    }
+    let expected_count = shape
+        .properties
+        .len()
+        .checked_add(shape.inherited_properties.len())
+        .ok_or(GenericInterfaceMemberError::InvalidCachedMembers(
+            shape.reference,
+        ))?;
     let properties = match structured.properties.as_deref() {
-        None if shape.properties.is_empty() => &[][..],
-        Some(properties)
-            if properties.len() == shape.properties.len() && !properties.is_empty() =>
-        {
+        None if expected_count == 0 => &[][..],
+        Some(properties) if properties.len() == expected_count && !properties.is_empty() => {
             properties
         }
         _ => {
@@ -1049,6 +1478,7 @@ fn validate_warm_members(
             shape.reference,
         ));
     }
+    let (own_properties, inherited_properties) = properties.split_at(shape.properties.len());
     let mapper_targets = shape
         .target_arguments
         .iter()
@@ -1069,7 +1499,7 @@ fn validate_warm_members(
                 .ok_or(GenericInterfaceMemberError::InvalidTarget(shape.target))?,
         ))
         .collect::<Vec<_>>();
-    let mapper = properties
+    let mapper = own_properties
         .iter()
         .zip(&shape.properties)
         .find_map(|(property, source)| {
@@ -1095,7 +1525,7 @@ fn validate_warm_members(
             shape.reference,
         ));
     }
-    for (property, source) in properties.iter().zip(&shape.properties) {
+    for (property, source) in own_properties.iter().zip(&shape.properties) {
         let symbol =
             store
                 .symbol(*property)
@@ -1166,6 +1596,14 @@ fn validate_warm_members(
             ));
         }
     }
+    for (actual, expected) in inherited_properties.iter().zip(&shape.inherited_properties) {
+        let record = store
+            .symbol(*actual)
+            .ok_or(GenericInterfaceMemberError::InvalidCachedProperty(*actual))?;
+        if actual != expected || table.and_then(|table| table.get(record.name())) != Some(*actual) {
+            return Err(GenericInterfaceMemberError::InvalidCachedProperty(*actual));
+        }
+    }
     Ok(Some(InstantiatedInterfaceMembers {
         reference: shape.reference,
         target: shape.target,
@@ -1179,7 +1617,11 @@ fn prepare_cold_members(
     store: &mut CanonicalTypeMapperStore,
     shape: &GenericInterfaceShape,
 ) -> Result<ColdMembersPlan, GenericInterfaceMemberError> {
-    let count = shape.properties.len();
+    let count = shape
+        .properties
+        .len()
+        .checked_add(shape.inherited_properties.len())
+        .ok_or(GenericInterfaceMemberError::Capacity(shape.reference))?;
     let proxy_count = shape
         .properties
         .iter()
@@ -1244,6 +1686,19 @@ fn prepare_cold_members(
             name_type: store
                 .value_symbol_links(source.symbol)
                 .and_then(|links| links.name_type),
+        });
+    }
+    for inherited in &shape.inherited_properties {
+        let name = store
+            .symbol(*inherited)
+            .ok_or(GenericInterfaceMemberError::InvalidCachedProperty(
+                *inherited,
+            ))?
+            .name()
+            .to_owned();
+        properties.push(ColdPropertyPlan::Reused {
+            symbol: *inherited,
+            name,
         });
     }
     Ok(ColdMembersPlan {
@@ -1344,6 +1799,15 @@ mod tests {
         file: FileId,
         options: CanonicalCheckerOptions,
     ) -> CanonicalCheckerContext<'_> {
+        checker_context_with_module_state(parsed, file, options, CanonicalModuleState::Script)
+    }
+
+    fn checker_context_with_module_state(
+        parsed: &ParseResult,
+        file: FileId,
+        options: CanonicalCheckerOptions,
+        module_state: CanonicalModuleState,
+    ) -> CanonicalCheckerContext<'_> {
         let mut binder = CanonicalBinder::new();
         binder
             .bind_source_file_with_facts(
@@ -1354,7 +1818,7 @@ mod tests {
                     EscapedName::source("\"/project/generic-member-unit.ts\""),
                     CanonicalSourceLanguage::TypeScript,
                     false,
-                    CanonicalModuleState::Script,
+                    module_state,
                 ),
             )
             .unwrap();
@@ -1398,6 +1862,58 @@ mod tests {
             .symbol(declaration)
             .and_then(|symbol| context.store().get_merged_symbol(symbol))
             .unwrap()
+    }
+
+    fn publish_generic_target_for_test(
+        context: &mut CanonicalCheckerContext<'_>,
+        target: TypeId,
+        properties: &[(&str, TypeId)],
+        bases: Option<Vec<TypeId>>,
+    ) {
+        let owner = context
+            .store()
+            .type_payload(target)
+            .unwrap()
+            .symbol()
+            .unwrap();
+        let raw = context.store().symbol(owner).unwrap().members().unwrap();
+        let source_properties = properties
+            .iter()
+            .map(|(name, type_)| {
+                let symbol = context
+                    .store()
+                    .symbol_table(raw)
+                    .and_then(|table| table.get_source(name))
+                    .unwrap();
+                ((*name).to_owned(), symbol, *type_)
+            })
+            .collect::<Vec<_>>();
+        let store = context.store_mut_for_test();
+        match bases {
+            None => assert!(store.publish_interface_no_base_resolution(target)),
+            Some(bases) => {
+                assert!(store.set_interface_base_resolution(target, true, None, Some(bases),));
+            }
+        }
+        let members = (!source_properties.is_empty()).then(|| store.alloc_symbol_table());
+        for (name, symbol, type_) in source_properties {
+            assert!(store.set_value_symbol_links(
+                symbol,
+                ValueSymbolLinks {
+                    resolved_type: Some(type_),
+                    ..ValueSymbolLinks::default()
+                },
+            ));
+            assert_eq!(
+                store.insert_symbol(
+                    members.expect("a declared property owns a member table"),
+                    EscapedName::source(name),
+                    symbol,
+                ),
+                Some(None),
+            );
+        }
+        assert!(store.set_interface_declared_members(target, true, members, None, None, None));
     }
 
     #[test]
@@ -1448,6 +1964,228 @@ mod tests {
             unnormalized,
             true,
         ));
+    }
+
+    #[test]
+    fn namespace_owned_and_exported_generic_interfaces_keep_canonical_parent_identity() {
+        for (source, state, file) in [
+            (
+                "declare namespace Model { interface Box<T> { value: T } }",
+                CanonicalModuleState::Script,
+                FileId::new(6_205),
+            ),
+            (
+                "export interface Box<T> { value: T }",
+                CanonicalModuleState::External,
+                FileId::new(6_206),
+            ),
+        ] {
+            let parsed = parse_source_file(source);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let context = checker_context_with_module_state(
+                &parsed,
+                file,
+                CanonicalCheckerOptions::default(),
+                state,
+            );
+            let owner = source_symbol(&parsed, file, &context, "Box");
+            let declaration = context
+                .store()
+                .symbol(owner)
+                .unwrap()
+                .declarations()
+                .unwrap()[0];
+
+            assert!(
+                valid_generic_interface_declaration_owner(context.store(), owner, declaration),
+                "generic declaration owner was rejected for {source}",
+            );
+            assert!(context.store().symbol(owner).unwrap().parent().is_some());
+        }
+    }
+
+    #[test]
+    fn generic_interface_inherits_instantiated_base_properties_in_source_order() {
+        let parsed = parse_source_file(concat!(
+            "interface Base<T> { value: T; fixed: string }\n",
+            "interface Derived<T> extends Base<T> { own: T }\n",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(6_207);
+        let mut context = checker_context(&parsed, file, CanonicalCheckerOptions::default());
+        let base_symbol = source_symbol(&parsed, file, &context, "Base");
+        let derived_symbol = source_symbol(&parsed, file, &context, "Derived");
+        let base = context.get_declared_type_of_symbol(base_symbol).unwrap();
+        let derived = context.get_declared_type_of_symbol(derived_symbol).unwrap();
+        let (base_parameter, derived_parameter) = {
+            let TypeData::Interface(base_data) = context.store().type_payload(base).unwrap().data()
+            else {
+                panic!("Base must retain a generic interface target")
+            };
+            let TypeData::Interface(derived_data) =
+                context.store().type_payload(derived).unwrap().data()
+            else {
+                panic!("Derived must retain a generic interface target")
+            };
+            (
+                base_data
+                    .reference
+                    .resolved_type_arguments
+                    .as_ref()
+                    .unwrap()[0],
+                derived_data
+                    .reference
+                    .resolved_type_arguments
+                    .as_ref()
+                    .unwrap()[0],
+            )
+        };
+        let (number, string) = {
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            (bootstrap.number_type, bootstrap.string_type)
+        };
+        publish_generic_target_for_test(
+            &mut context,
+            base,
+            &[("value", base_parameter), ("fixed", string)],
+            None,
+        );
+        let base_template = context
+            .store_mut_for_test()
+            .create_direct_generic_reference_type(base, &[derived_parameter])
+            .unwrap();
+        publish_generic_target_for_test(
+            &mut context,
+            derived,
+            &[("own", derived_parameter)],
+            Some(vec![base_template]),
+        );
+        let reference = context
+            .store_mut_for_test()
+            .create_direct_generic_reference_type(derived, &[number])
+            .unwrap();
+        let members = context
+            .store_mut_for_test()
+            .resolve_generic_interface_members(reference, None)
+            .unwrap();
+        let names = members
+            .properties()
+            .iter()
+            .map(|property| {
+                context
+                    .store()
+                    .symbol(*property)
+                    .unwrap()
+                    .name()
+                    .as_utf8()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["own", "value", "fixed"]);
+        assert_eq!(
+            context
+                .store_mut_for_test()
+                .resolve_generic_interface_property(reference, "value", None)
+                .unwrap()
+                .unwrap()
+                .type_id(),
+            number,
+        );
+        assert_eq!(
+            context
+                .store_mut_for_test()
+                .resolve_generic_interface_property(reference, "fixed", None)
+                .unwrap()
+                .unwrap()
+                .type_id(),
+            string,
+        );
+        let warm = (
+            context.store().type_len(),
+            context.store().mapper_len(),
+            context.store().symbol_len(),
+            context.store().symbol_store().symbol_table_len(),
+        );
+        assert_eq!(
+            context
+                .store_mut_for_test()
+                .resolve_generic_interface_members(reference, None),
+            Ok(members),
+        );
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().mapper_len(),
+                context.store().symbol_len(),
+                context.store().symbol_store().symbol_table_len(),
+            ),
+            warm,
+        );
+    }
+
+    #[test]
+    fn indexed_generic_member_substitution_selects_the_instantiated_property_type() {
+        let parsed = parse_source_file(concat!(
+            "interface Shape { value: string }\n",
+            "interface Pick<T> { selected: T[\"value\"] }\n",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(6_208);
+        let mut context = checker_context(&parsed, file, CanonicalCheckerOptions::default());
+        let shape_symbol = source_symbol(&parsed, file, &context, "Shape");
+        let pick_symbol = source_symbol(&parsed, file, &context, "Pick");
+        let shape = context.get_declared_type_of_symbol(shape_symbol).unwrap();
+        let target = context.get_declared_type_of_symbol(pick_symbol).unwrap();
+        let parameter = match context.store().type_payload(target).unwrap().data() {
+            TypeData::Interface(interface) => interface
+                .reference
+                .resolved_type_arguments
+                .as_ref()
+                .unwrap()[0],
+            _ => panic!("Pick must retain its generic interface target"),
+        };
+        let key = context
+            .store_mut_for_test()
+            .regular_string_literal_type("value".to_owned())
+            .unwrap();
+        let template = context
+            .store_mut_for_test()
+            .alloc_indexed_access_type(parameter, key, AccessFlags::NONE)
+            .unwrap();
+        publish_generic_target_for_test(&mut context, target, &[("selected", template)], None);
+        let reference = context
+            .store_mut_for_test()
+            .create_direct_generic_reference_type(target, &[shape])
+            .unwrap();
+        let expected = context.store().intrinsic_bootstrap().unwrap().string_type;
+
+        let selected = context
+            .store_mut_for_test()
+            .resolve_generic_interface_property(reference, "selected", None)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(selected.type_id(), expected);
+        let warm = (
+            context.store().type_len(),
+            context.store().mapper_len(),
+            context.store().symbol_len(),
+        );
+        assert_eq!(
+            context
+                .store_mut_for_test()
+                .resolve_generic_interface_property(reference, "selected", None),
+            Ok(Some(selected)),
+        );
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().mapper_len(),
+                context.store().symbol_len(),
+            ),
+            warm,
+        );
     }
 
     #[test]

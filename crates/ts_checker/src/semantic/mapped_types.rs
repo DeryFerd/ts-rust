@@ -10,8 +10,8 @@ use std::collections::{HashMap, HashSet};
 
 use ts_ast::{NodeData, NodeRef, SyntaxKind, append_js_string};
 use ts_binder::{
-    CheckFlags, EscapedName, SemanticSymbolId, SymbolData, SymbolFlags, SymbolTableId,
-    semantic::PreparedSymbolTable,
+    CheckFlags, EscapedName, InternalSymbolName, SemanticSymbolId, SymbolData, SymbolFlags,
+    SymbolTableId, semantic::PreparedSymbolTable,
 };
 
 use super::{
@@ -472,6 +472,13 @@ struct SourceProperty {
     readonly: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SourceIndex {
+    key_type: TypeId,
+    value_type: TypeId,
+    readonly: bool,
+}
+
 #[derive(Clone, Debug)]
 struct MappedShape {
     type_: TypeId,
@@ -481,6 +488,14 @@ struct MappedShape {
     modifiers_type: TypeId,
     name_type: Option<TypeId>,
     source_properties: Vec<SourceProperty>,
+    source_indexes: Vec<SourceIndex>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PlannedMappedIndex {
+    key_type: TypeId,
+    value_type: TypeId,
+    readonly: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -653,6 +668,9 @@ impl CanonicalTypeMapperStore {
         }
         validate_mapped_member_dependencies(self, type_, &mut HashSet::new())?;
         let shape = validate_mapped_shape(self, type_)?;
+        if let Some(indexes) = plan_mapped_index_signatures(self, &shape, modifiers)? {
+            return resolve_mapped_index_signatures(self, &shape, &indexes);
+        }
         let properties = plan_mapped_properties(self, &shape, modifiers)?;
         if let Some(cached) = validate_warm_mapped_members(self, &shape, &properties)? {
             return Ok(cached);
@@ -881,6 +899,7 @@ fn validate_mapped_shape(
         .modifiers_type
         .ok_or(MappedTypeError::InvalidMappedType(type_))?;
     let source_properties = source_properties(store, modifiers_type)?;
+    let source_indexes = source_indexes(store, modifiers_type)?;
     Ok(MappedShape {
         type_,
         type_parameter,
@@ -889,6 +908,7 @@ fn validate_mapped_shape(
         modifiers_type,
         name_type: mapped.name_type,
         source_properties,
+        source_indexes,
     })
 }
 
@@ -912,10 +932,7 @@ fn source_properties(
         .data()
         .structured()
         .ok_or(MappedTypeError::UnsupportedSource(type_))?;
-    if structured.call_signature_count != 0
-        || structured.signatures.is_some()
-        || structured.index_infos.is_some()
-    {
+    if structured.call_signature_count != 0 || structured.signatures.is_some() {
         return Err(MappedTypeError::UnsupportedSource(type_));
     }
     let properties = structured.properties.as_deref().unwrap_or_default();
@@ -928,8 +945,32 @@ fn source_properties(
         None if properties.is_empty() => None,
         None => return Err(MappedTypeError::InvalidSource(type_)),
     };
-    if table.is_some_and(|table| table.len() != properties.len()) {
+    let has_indexes = structured
+        .index_infos
+        .as_ref()
+        .is_some_and(|indexes| !indexes.is_empty());
+    let has_reserved_index = has_indexes && !matches!(record.data(), TypeData::Mapped(_));
+    if table.is_some_and(|table| {
+        table.len()
+            != properties
+                .len()
+                .saturating_add(usize::from(has_reserved_index))
+            || table.get(InternalSymbolName::Index.as_ref()).is_some() != has_reserved_index
+    }) || table.is_none() && has_indexes
+    {
         return Err(MappedTypeError::InvalidSource(type_));
+    }
+    if has_reserved_index {
+        let symbol = table
+            .and_then(|table| table.get(InternalSymbolName::Index.as_ref()))
+            .and_then(|symbol| store.symbol(symbol))
+            .ok_or(MappedTypeError::InvalidSource(type_))?;
+        if symbol.flags() != SymbolFlags::SIGNATURE
+            || symbol.check_flags() != CheckFlags::NONE
+            || symbol.parent() != record.symbol()
+        {
+            return Err(MappedTypeError::InvalidSource(type_));
+        }
     }
 
     let mut result = Vec::with_capacity(properties.len());
@@ -960,6 +1001,242 @@ fn source_properties(
         });
     }
     Ok(result)
+}
+
+fn source_indexes(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+) -> Result<Vec<SourceIndex>, MappedTypeError> {
+    let record = store
+        .type_payload(type_)
+        .ok_or(MappedTypeError::InvalidSource(type_))?;
+    if record.flags().contains(TypeFlags::UNKNOWN) {
+        return Ok(Vec::new());
+    }
+    let structured = record
+        .data()
+        .structured()
+        .ok_or(MappedTypeError::InvalidSource(type_))?;
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or(MappedTypeError::BootstrapUninitialized)?;
+    let mut result = Vec::new();
+    let mut seen = HashSet::new();
+    for index in structured.index_infos.as_deref().unwrap_or_default() {
+        let info = store
+            .index_info(*index)
+            .ok_or(MappedTypeError::InvalidSource(type_))?;
+        if ![bootstrap.string_type, bootstrap.number_type].contains(&info.key_type())
+            || !seen.insert(info.key_type())
+            || store.type_payload(info.value_type()).is_none()
+        {
+            return Err(MappedTypeError::InvalidSource(type_));
+        }
+        result.push(SourceIndex {
+            key_type: info.key_type(),
+            value_type: info.value_type(),
+            readonly: info.is_readonly(),
+        });
+    }
+    Ok(result)
+}
+
+fn plan_mapped_index_signatures(
+    store: &CanonicalTypeMapperStore,
+    shape: &MappedShape,
+    modifiers: MappedTypeModifiers,
+) -> Result<Option<Vec<PlannedMappedIndex>>, MappedTypeError> {
+    if shape.name_type.is_some() || !shape.source_properties.is_empty() {
+        return Ok(None);
+    }
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or(MappedTypeError::BootstrapUninitialized)?;
+    let constraint =
+        store
+            .type_payload(shape.constraint_type)
+            .ok_or(MappedTypeError::UnsupportedConstraint(
+                shape.constraint_type,
+            ))?;
+    let mut keys = match constraint.data() {
+        TypeData::Intrinsic(_)
+            if [bootstrap.string_type, bootstrap.number_type].contains(&shape.constraint_type) =>
+        {
+            vec![shape.constraint_type]
+        }
+        TypeData::Union(union)
+            if union
+                .union
+                .types
+                .iter()
+                .all(|key| [bootstrap.string_type, bootstrap.number_type].contains(key)) =>
+        {
+            if shape.source_indexes.is_empty() {
+                union.union.types.clone()
+            } else {
+                shape
+                    .source_indexes
+                    .iter()
+                    .map(|index| index.key_type)
+                    .collect()
+            }
+        }
+        TypeData::Index(index)
+            if index.target == shape.modifiers_type && !shape.source_indexes.is_empty() =>
+        {
+            shape
+                .source_indexes
+                .iter()
+                .map(|index| index.key_type)
+                .collect()
+        }
+        _ => return Ok(None),
+    };
+    keys.sort_unstable();
+    keys.dedup();
+
+    let mut result = Vec::with_capacity(keys.len());
+    for key_type in keys {
+        let source = shape
+            .source_indexes
+            .iter()
+            .find(|index| index.key_type == key_type)
+            .or_else(|| {
+                if key_type == bootstrap.number_type {
+                    shape
+                        .source_indexes
+                        .iter()
+                        .find(|index| index.key_type == bootstrap.string_type)
+                } else {
+                    None
+                }
+            });
+        let value_type = mapped_index_value_type(store, shape, key_type, source)?;
+        let readonly = modifiers.contains(MappedTypeModifiers::INCLUDE_READONLY)
+            || !modifiers.contains(MappedTypeModifiers::EXCLUDE_READONLY)
+                && source.is_some_and(|index| index.readonly);
+        result.push(PlannedMappedIndex {
+            key_type,
+            value_type,
+            readonly,
+        });
+    }
+    Ok(Some(result))
+}
+
+fn mapped_index_value_type(
+    store: &CanonicalTypeMapperStore,
+    shape: &MappedShape,
+    key_type: TypeId,
+    source: Option<&SourceIndex>,
+) -> Result<TypeId, MappedTypeError> {
+    if shape.template_type == shape.type_parameter {
+        return Ok(key_type);
+    }
+    let template = store
+        .type_payload(shape.template_type)
+        .ok_or(MappedTypeError::UnsupportedTemplate(shape.template_type))?;
+    match template.data() {
+        TypeData::IndexedAccess(indexed)
+            if indexed.object_type == shape.modifiers_type
+                && indexed.index_type == shape.type_parameter =>
+        {
+            source
+                .map(|index| index.value_type)
+                .ok_or(MappedTypeError::UnsupportedTemplate(shape.template_type))
+        }
+        TypeData::Intrinsic(_) | TypeData::Literal(_) => Ok(shape.template_type),
+        _ => Err(MappedTypeError::UnsupportedTemplate(shape.template_type)),
+    }
+}
+
+fn resolve_mapped_index_signatures(
+    store: &mut CanonicalTypeMapperStore,
+    shape: &MappedShape,
+    expected: &[PlannedMappedIndex],
+) -> Result<ResolvedMappedTypeMembers, MappedTypeError> {
+    let record = store
+        .type_payload(shape.type_)
+        .ok_or(MappedTypeError::InvalidMappedType(shape.type_))?;
+    let TypeData::Mapped(mapped) = record.data() else {
+        return Err(MappedTypeError::InvalidMappedType(shape.type_));
+    };
+    let structured = &mapped.object.structured;
+    if record
+        .object_flags()
+        .contains(ObjectFlags::MEMBERS_RESOLVED)
+    {
+        let members = structured
+            .members
+            .ok_or(MappedTypeError::InvalidCachedMembers(shape.type_))?;
+        let table = store
+            .symbol_table(members)
+            .ok_or(MappedTypeError::InvalidCachedMembers(shape.type_))?;
+        let infos = structured.index_infos.as_deref().unwrap_or_default();
+        if !table.is_empty()
+            || structured.properties.is_some()
+            || structured.signatures.is_some()
+            || structured.call_signature_count != 0
+            || infos.len() != expected.len()
+            || infos.iter().zip(expected).any(|(id, planned)| {
+                store.index_info(*id).is_none_or(|info| {
+                    info.key_type() != planned.key_type
+                        || info.value_type() != planned.value_type
+                        || info.is_readonly() != planned.readonly
+                        || info.declaration().is_some()
+                })
+            })
+        {
+            return Err(MappedTypeError::InvalidCachedMembers(shape.type_));
+        }
+        return Ok(ResolvedMappedTypeMembers {
+            type_: shape.type_,
+            members,
+            properties: Vec::new(),
+        });
+    }
+    if structured != &StructuredTypeData::default() {
+        return Err(MappedTypeError::InvalidCachedMembers(shape.type_));
+    }
+    let table = PreparedSymbolTable::new(0).ok_or(MappedTypeError::Capacity)?;
+    if !store.try_reserve_checker_symbol_allocations(0, 1)
+        || !store.try_reserve_index_infos(expected.len())
+    {
+        return Err(MappedTypeError::Capacity);
+    }
+    if !store.set_structured_type_members(shape.type_, None, None, None, None, None) {
+        return Err(MappedTypeError::InvalidCachedMembers(shape.type_));
+    }
+    let members = store.alloc_prepared_symbol_table(table);
+    let mut infos = Vec::with_capacity(expected.len());
+    for index in expected {
+        infos.push(
+            store
+                .alloc_index_info(
+                    index.key_type,
+                    index.value_type,
+                    index.readonly,
+                    None,
+                    Vec::new(),
+                )
+                .ok_or(MappedTypeError::Capacity)?,
+        );
+    }
+    if !store.set_structured_type_members(
+        shape.type_,
+        Some(members),
+        None,
+        None,
+        None,
+        (!infos.is_empty()).then_some(infos),
+    ) {
+        return Err(MappedTypeError::InvalidCachedMembers(shape.type_));
+    }
+    Ok(ResolvedMappedTypeMembers {
+        type_: shape.type_,
+        members,
+        properties: Vec::new(),
+    })
 }
 
 fn plan_mapped_properties(
@@ -2076,6 +2353,117 @@ mod tests {
             members,
         );
         assert_eq!(cache_state(context.store()), before);
+    }
+
+    #[test]
+    fn broad_mapped_constraints_publish_string_and_number_index_signatures() {
+        let parsed = parse_source_file(concat!(
+            "type Strings = { [K in string]: number };\n",
+            "type Numbers = { readonly [K in number]: string };\n",
+            "type KeyValues = { [K in string]: K };\n",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let mut context = checker_context(&parsed);
+        context.check_source_file(FileId::new(0)).unwrap();
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        let string = bootstrap.string_type;
+        let number = bootstrap.number_type;
+
+        for (name, key_type, value_type, modifiers, readonly) in [
+            ("Strings", string, number, MappedTypeModifiers::NONE, false),
+            (
+                "Numbers",
+                number,
+                string,
+                MappedTypeModifiers::INCLUDE_READONLY,
+                true,
+            ),
+            (
+                "KeyValues",
+                string,
+                string,
+                MappedTypeModifiers::NONE,
+                false,
+            ),
+        ] {
+            let mapped = alias_type(&parsed, &context, name);
+            let before = context.store().index_info_len();
+            let members = context
+                .store_mut_for_test()
+                .resolve_mapped_type_members(mapped, modifiers)
+                .unwrap();
+            assert!(members.properties().is_empty());
+            assert_eq!(context.store().index_info_len(), before + 1);
+            let TypeData::Mapped(record) = context.store().type_payload(mapped).unwrap().data()
+            else {
+                unreachable!()
+            };
+            assert!(record.object.structured.properties.is_none());
+            let [index] = record.object.structured.index_infos.as_deref().unwrap() else {
+                panic!("{name} must publish one canonical index signature");
+            };
+            let info = context.store().index_info(*index).unwrap();
+            assert_eq!(info.key_type(), key_type);
+            assert_eq!(info.value_type(), value_type);
+            assert_eq!(info.is_readonly(), readonly);
+            assert!(info.declaration().is_none());
+
+            let warm = (
+                cache_state(context.store()),
+                context.store().index_info_len(),
+            );
+            assert_eq!(
+                context
+                    .store_mut_for_test()
+                    .resolve_mapped_type_members(mapped, modifiers)
+                    .unwrap(),
+                members,
+            );
+            assert_eq!(
+                (
+                    cache_state(context.store()),
+                    context.store().index_info_len()
+                ),
+                warm,
+            );
+        }
+    }
+
+    #[test]
+    fn homomorphic_mapped_indexes_preserve_and_remove_readonly_modifiers() {
+        let parsed = parse_source_file(concat!(
+            "type Table = { readonly [name: string]: number };\n",
+            "type Preserved = { [K in keyof Table]: Table[K] };\n",
+            "type Mutable = { -readonly [K in keyof Table]: Table[K] };\n",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let mut context = checker_context(&parsed);
+        context.check_source_file(FileId::new(0)).unwrap();
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        let (string, number) = (bootstrap.string_type, bootstrap.number_type);
+
+        for (name, modifiers, readonly) in [
+            ("Preserved", MappedTypeModifiers::NONE, true),
+            ("Mutable", MappedTypeModifiers::EXCLUDE_READONLY, false),
+        ] {
+            let mapped = alias_type(&parsed, &context, name);
+            let members = context
+                .store_mut_for_test()
+                .resolve_mapped_type_members(mapped, modifiers)
+                .unwrap();
+            assert!(members.properties().is_empty());
+            let TypeData::Mapped(record) = context.store().type_payload(mapped).unwrap().data()
+            else {
+                unreachable!()
+            };
+            let [index] = record.object.structured.index_infos.as_deref().unwrap() else {
+                panic!("{name} must retain the source string index");
+            };
+            let info = context.store().index_info(*index).unwrap();
+            assert_eq!(info.key_type(), string);
+            assert_eq!(info.value_type(), number);
+            assert_eq!(info.is_readonly(), readonly);
+        }
     }
 
     #[test]

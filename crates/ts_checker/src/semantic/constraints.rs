@@ -722,6 +722,8 @@ pub(super) fn get_base_constraint_of_type_with_limits(
 
 #[cfg(test)]
 mod tests {
+    use ts_binder::{EscapedName, SymbolData, SymbolFlags};
+
     use super::*;
     use crate::semantic::{
         IntrinsicBootstrapOptions, SemanticStore,
@@ -1136,5 +1138,34 @@ mod tests {
             get_base_constraint_of_type(&mut store, intersection),
             Ok(Some(never))
         );
+    }
+
+    #[test]
+    fn string_mapping_constraints_apply_the_intrinsic_to_parameter_bounds() {
+        let mut store = initialized_store();
+        let symbol = store
+            .alloc_symbol(SymbolData::new(
+                SymbolFlags::TYPE_ALIAS,
+                EscapedName::source("Uppercase"),
+            ))
+            .unwrap();
+        let lower = store
+            .regular_string_literal_type("value".to_owned())
+            .unwrap();
+        let expected = store
+            .regular_string_literal_type("VALUE".to_owned())
+            .unwrap();
+        let parameter = store.alloc_type_parameter(None).unwrap();
+        assert!(store.set_type_parameter_resolution(parameter, Some(lower), None, None, None));
+        let mapping = store.get_string_mapping_type(symbol, parameter).unwrap();
+
+        assert_eq!(
+            get_base_constraint_of_type(&mut store, mapping),
+            Ok(Some(expected))
+        );
+        let TypeData::StringMapping(data) = store.type_payload(mapping).unwrap().data() else {
+            unreachable!();
+        };
+        assert_eq!(data.constrained.resolved_base_constraint, Some(expected));
     }
 }

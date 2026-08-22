@@ -141,6 +141,7 @@ pub(super) enum SourceCallableReturnPlan {
         null_literal_identity: bool,
     },
     Inferred,
+    AmbientImplicitAny,
 }
 
 /// Whether a source function owns executable syntax or is an exact ambient
@@ -162,7 +163,7 @@ impl SourceCallableReturnPlan {
     pub(super) const fn type_node(self) -> Option<NodeRef> {
         match self {
             Self::Annotated { type_node, .. } => Some(type_node),
-            Self::Inferred => None,
+            Self::Inferred | Self::AmbientImplicitAny => None,
         }
     }
 
@@ -173,19 +174,23 @@ impl SourceCallableReturnPlan {
                 null_literal_identity,
                 ..
             } => Some((identity_node, null_literal_identity)),
-            Self::Inferred => None,
+            Self::Inferred | Self::AmbientImplicitAny => None,
         }
     }
 
     pub(super) const fn provenance(self) -> SourceCallableReturnProvenance {
         match self {
             Self::Annotated { .. } => SourceCallableReturnProvenance::Annotated,
-            Self::Inferred => SourceCallableReturnProvenance::Inferred,
+            Self::Inferred | Self::AmbientImplicitAny => SourceCallableReturnProvenance::Inferred,
         }
     }
 
     pub(super) const fn is_inferred(self) -> bool {
         matches!(self, Self::Inferred)
+    }
+
+    pub(super) const fn is_ambient_implicit_any(self) -> bool {
+        matches!(self, Self::AmbientImplicitAny)
     }
 }
 
@@ -802,6 +807,34 @@ fn plan_source_callable_with_owner_shape(
         let symbol_record = store
             .symbol(symbol)
             .ok_or_else(|| invariant(SourceCallableInvariant::InvalidParameterSymbol(parameter)))?;
+        if symbol == raw_symbol
+            && symbol_record.flags() == SymbolFlags::FUNCTION_SCOPED_VARIABLE
+            && symbol_record.check_flags() == CheckFlags::NONE
+            && symbol_record.name().as_bytes() == identifier.text.as_bytes()
+            && symbol_record.members().is_none()
+            && symbol_record.exports().is_none()
+            && symbol_record.parent().is_none()
+            && symbol_record.export_symbol().is_none()
+            && symbol_record.declarations().is_some_and(|declarations| {
+                declarations.len() > 1
+                    && declarations
+                        .iter()
+                        .filter(|candidate| **candidate == parameter)
+                        .count()
+                        == 1
+                    && declarations.iter().all(|candidate| {
+                        candidate.is_for(declaration.arena, declaration.file)
+                            && bound.symbol(*candidate) == Some(symbol)
+                            && (*candidate == parameter
+                                || store.source_node_kind(*candidate)
+                                    == Some(SyntaxKind::VariableDeclaration))
+                    })
+            })
+        {
+            return Err(SourceCallableError::Unsupported(
+                SourceCallableUnsupported::OverloadDeclaration(parameter),
+            ));
+        }
         if symbol != raw_symbol
             || symbol_record.flags() != SymbolFlags::FUNCTION_SCOPED_VARIABLE
             || symbol_record.check_flags() != CheckFlags::NONE
@@ -855,12 +888,22 @@ fn plan_source_callable_with_owner_shape(
             },
             return_record.range.end,
         )
-    } else {
-        if body_mode.is_ambient() {
+    } else if body_mode.is_ambient() {
+        if !bound
+            .source_facts()
+            .is_some_and(CanonicalSourceFileFacts::is_declaration_file)
+            || !type_parameters.is_empty()
+            || matches!(owner_shape, SourceCallableOwnerShape::AmbientOverload(_))
+        {
             return Err(SourceCallableError::Unsupported(
                 SourceCallableUnsupported::OverloadDeclaration(declaration),
             ));
         }
+        (
+            SourceCallableReturnPlan::AmbientImplicitAny,
+            view.parameters.range.end,
+        )
+    } else {
         if !type_parameters.is_empty() {
             return Err(SourceCallableError::Unsupported(
                 SourceCallableUnsupported::GenericInferredReturn(declaration),
@@ -2607,8 +2650,56 @@ pub(super) fn finalize_source_callable_structure(
             published,
             "zero-parameter source callable provenance was prevalidated and reserved"
         );
+        if plan.return_type.is_ambient_implicit_any() {
+            publish_ambient_implicit_any_return(store, plan, pending.signature)?;
+        }
     }
     Ok(())
+}
+
+/// Publishes the canonical `any` return of a bodyless declaration signature.
+fn publish_ambient_implicit_any_return(
+    store: &mut CanonicalTypeMapperStore,
+    plan: &SourceCallablePlan,
+    signature: SignatureId,
+) -> Result<TypeId, SourceCallableError> {
+    let Some(any_type) = store
+        .intrinsic_bootstrap()
+        .map(|bootstrap| bootstrap.any_type)
+    else {
+        return Err(invariant(SourceCallableInvariant::InvalidSignatureCache(
+            plan.declaration,
+        )));
+    };
+    let Some(record) = store.signature(signature) else {
+        return Err(invariant(SourceCallableInvariant::InvalidSignatureCache(
+            plan.declaration,
+        )));
+    };
+    if !plan.return_type.is_ambient_implicit_any()
+        || !plan.body_mode.is_ambient()
+        || !plan.type_parameters.is_empty()
+        || record.declaration() != Some(plan.declaration)
+        || record
+            .resolved_return_type()
+            .is_some_and(|existing| existing != any_type)
+        || store
+            .function_signature_return_annotation(signature)
+            .is_some()
+        || store.signature_has_circular_return_type(signature)
+    {
+        return Err(invariant(SourceCallableInvariant::InvalidSignatureCache(
+            plan.declaration,
+        )));
+    }
+    if record.resolved_return_type().is_none()
+        && !store.set_signature_resolved_return_type(signature, Some(any_type))
+    {
+        return Err(invariant(SourceCallableInvariant::InvalidSignatureCache(
+            plan.declaration,
+        )));
+    }
+    Ok(any_type)
 }
 
 /// Atomically publishes all parameter value types for a prevalidated batch.
@@ -2762,6 +2853,12 @@ pub(super) fn publish_source_callable_parameter_types(
         );
     }
     for callable in pending {
+        if callable.plan.return_type.is_ambient_implicit_any() {
+            let signature = exact_signature_link(store, callable.plan.declaration)?;
+            publish_ambient_implicit_any_return(store, &callable.plan, signature)?;
+        }
+    }
+    for callable in pending {
         let state = source_callable_state(store, &callable.plan, false);
         assert!(
             matches!(
@@ -2831,7 +2928,9 @@ pub(super) fn validate_lazy_source_callable_return(
     plan: &SourceCallablePlan,
     signature: SignatureId,
 ) -> Result<Option<TypeId>, SourceCallableError> {
-    if plan.return_type.annotation_identity().is_none() {
+    if plan.return_type.annotation_identity().is_none()
+        && !plan.return_type.is_ambient_implicit_any()
+    {
         return Err(invariant(SourceCallableInvariant::InvalidSignatureCache(
             plan.declaration,
         )));
@@ -2846,10 +2945,20 @@ pub(super) fn validate_lazy_source_callable_return(
             )));
         }
     }
-    Ok(store
+    let resolved = store
         .signature(signature)
         .expect("the source callable cache was validated")
-        .resolved_return_type())
+        .resolved_return_type();
+    if plan.return_type.is_ambient_implicit_any()
+        && store
+            .intrinsic_bootstrap()
+            .is_none_or(|bootstrap| resolved != Some(bootstrap.any_type))
+    {
+        return Err(invariant(SourceCallableInvariant::InvalidSignatureCache(
+            plan.declaration,
+        )));
+    }
+    Ok(resolved)
 }
 
 pub(super) fn publish_lazy_source_callable_return(
@@ -4071,6 +4180,24 @@ fn validate_cached_return_type(
         .and_then(Signature::resolved_return_type);
     let circular_annotation = store.circular_return_annotation_type(signature);
     let stored_annotation = store.function_signature_return_annotation(signature);
+    if plan.return_type.is_ambient_implicit_any() {
+        let valid = plan.body_mode.is_ambient()
+            && plan.type_parameters.is_empty()
+            && stored_annotation.is_none()
+            && circular_annotation.is_none()
+            && resolved.is_none_or(|type_| {
+                store
+                    .intrinsic_bootstrap()
+                    .is_some_and(|bootstrap| type_ == bootstrap.any_type)
+            });
+        return if valid {
+            Ok(())
+        } else {
+            Err(invariant(SourceCallableInvariant::InvalidSignatureCache(
+                plan.declaration,
+            )))
+        };
+    }
     if plan.return_type.is_inferred() {
         let resolved_valid = resolved.is_none_or(|type_| match plan.array_targets {
             Some(targets) => store
@@ -5777,6 +5904,41 @@ mod tests {
     }
 
     #[test]
+    fn merged_arrow_parameter_and_local_var_are_typed_unsupported() {
+        let fixture = QueryFixture::new(
+            "const collision = (_i: number, ...rest: number[]): void => { var _i = 10; };",
+            FileId::new(1_078),
+        );
+        let arrow = fixture
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ArrowFunction).then_some(NodeRef::new(
+                    fixture.parsed.arena.id(),
+                    fixture.file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let owner = fixture.bound.symbol(arrow).unwrap();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&fixture.parsed.arena, &fixture.bound)],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let before = publication_state(&fixture.store);
+
+        assert!(matches!(
+            plan_source_callable(&fixture.store, &host, arrow, owner, None),
+            Err(SourceCallableError::Unsupported(
+                SourceCallableUnsupported::OverloadDeclaration(_)
+            ))
+        ));
+        assert_eq!(publication_state(&fixture.store), before);
+    }
+
+    #[test]
     fn declaration_file_signatures_accept_implicit_and_explicit_ambient_modifiers() {
         for (index, (source, declaration_file, module_state, exported)) in [
             (
@@ -5885,6 +6047,208 @@ mod tests {
         assert_eq!(signature.type_parameters().len(), 1);
         assert_eq!(signature.parameters().len(), 1);
         assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn declaration_file_functions_without_return_annotations_publish_canonical_any() {
+        for (index, (source, module_state, exported)) in [
+            ("function plain();", CanonicalModuleState::Script, false),
+            (
+                "declare function declared(value: number);",
+                CanonicalModuleState::Script,
+                false,
+            ),
+            (
+                "export function exported();",
+                CanonicalModuleState::External,
+                true,
+            ),
+            (
+                "export declare function explicit(value: number);",
+                CanonicalModuleState::External,
+                true,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut fixture = QueryFixture::with_source_facts(
+                source,
+                FileId::new(1_070 + u32::try_from(index).unwrap()),
+                true,
+                module_state,
+            );
+            let declaration = fixture
+                .parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::FunctionDeclaration).then_some(NodeRef::new(
+                        fixture.parsed.arena.id(),
+                        fixture.file,
+                        node,
+                    ))
+                })
+                .unwrap();
+            let owner = fixture.bound.symbol(declaration).unwrap();
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&fixture.parsed.arena, &fixture.bound)],
+                GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+            )
+            .unwrap();
+            let plan = plan_source_callable(&fixture.store, &host, declaration, owner, None)
+                .unwrap_or_else(|error| panic!("{source}: {error:?}"));
+            assert_eq!(plan.body_mode, SourceCallableBodyMode::AmbientDeclaration);
+            assert_eq!(
+                plan.return_type,
+                SourceCallableReturnPlan::AmbientImplicitAny
+            );
+            assert!(plan.return_type.is_ambient_implicit_any());
+            assert!(!plan.return_type.is_inferred());
+            assert_eq!(plan.return_type.type_node(), None);
+            assert_eq!(plan.owner_parent.is_some(), exported);
+            drop(host);
+
+            let any = fixture.store.intrinsic_bootstrap().unwrap().any_type;
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            let callable = fixture
+                .query_callable(declaration, owner, &mut diagnostics)
+                .unwrap_or_else(|error| panic!("{source}: {error:?}"));
+            let signature = fixture
+                .store
+                .source_callable_provenance(callable)
+                .unwrap()
+                .signature;
+            assert_eq!(
+                fixture
+                    .store
+                    .signature(signature)
+                    .unwrap()
+                    .resolved_return_type(),
+                Some(any)
+            );
+            assert!(
+                fixture
+                    .store
+                    .function_signature_return_annotation(signature)
+                    .is_none()
+            );
+            assert!(matches!(
+                validate_stored_source_callable(&fixture.store, callable),
+                StoredSourceCallableValidation::Valid(_)
+            ));
+            assert_eq!(fixture.query_return(signature, &mut diagnostics), Ok(any));
+
+            let warm = publication_state(&fixture.store);
+            assert_eq!(
+                fixture.query_callable(declaration, owner, &mut diagnostics),
+                Ok(callable)
+            );
+            assert_eq!(publication_state(&fixture.store), warm);
+            assert!(diagnostics.is_empty(), "{source}: {diagnostics:?}");
+        }
+    }
+
+    #[test]
+    fn ambient_implicit_return_rejects_non_any_cache_values() {
+        let mut fixture = QueryFixture::with_source_facts(
+            "export function implicit();",
+            FileId::new(1_074),
+            true,
+            CanonicalModuleState::External,
+        );
+        let declaration = fixture
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::FunctionDeclaration).then_some(NodeRef::new(
+                    fixture.parsed.arena.id(),
+                    fixture.file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let owner = fixture.bound.symbol(declaration).unwrap();
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let callable = fixture
+            .query_callable(declaration, owner, &mut diagnostics)
+            .unwrap();
+        let signature = fixture
+            .store
+            .source_callable_provenance(callable)
+            .unwrap()
+            .signature;
+        let string = fixture.store.intrinsic_bootstrap().unwrap().string_type;
+        assert!(
+            fixture
+                .store
+                .set_signature_resolved_return_type(signature, Some(string))
+        );
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&fixture.parsed.arena, &fixture.bound)],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            plan_source_callable(&fixture.store, &host, declaration, owner, None),
+            Err(SourceCallableError::Invariant(
+                SourceCallableInvariant::InvalidSignatureCache(_)
+            ))
+        ));
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn ordinary_ambient_and_generic_missing_returns_remain_typed_boundaries() {
+        for (index, (source, declaration_file, module_state)) in [
+            (
+                "declare function missing(value: number);",
+                false,
+                CanonicalModuleState::Script,
+            ),
+            (
+                "export declare function generic<T>(value: T);",
+                true,
+                CanonicalModuleState::External,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let fixture = QueryFixture::with_source_facts(
+                source,
+                FileId::new(1_075 + u32::try_from(index).unwrap()),
+                declaration_file,
+                module_state,
+            );
+            let declaration = fixture
+                .parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::FunctionDeclaration).then_some(NodeRef::new(
+                        fixture.parsed.arena.id(),
+                        fixture.file,
+                        node,
+                    ))
+                })
+                .unwrap();
+            let owner = fixture.bound.symbol(declaration).unwrap();
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&fixture.parsed.arena, &fixture.bound)],
+                GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+            )
+            .unwrap();
+
+            assert!(matches!(
+                plan_source_callable(&fixture.store, &host, declaration, owner, None),
+                Err(SourceCallableError::Unsupported(
+                    SourceCallableUnsupported::OverloadDeclaration(_)
+                ))
+            ));
+        }
     }
 
     #[test]

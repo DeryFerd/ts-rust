@@ -4500,6 +4500,113 @@ impl<'a> Checker<'a> {
         }
     }
 
+    fn check_type_parameter_defaults(&mut self, parameters: Option<&ts_ast::NodeList>) {
+        let Some(parameters) = parameters else {
+            return;
+        };
+        let parameters = parameters
+            .nodes
+            .iter()
+            .filter_map(|declaration| {
+                let NodeData::TypeParameterDeclaration(parameter) =
+                    &self.arena.get(*declaration)?.data
+                else {
+                    return None;
+                };
+                Some((*declaration, parameter.as_ref().clone()))
+            })
+            .collect::<Vec<_>>();
+        if parameters
+            .iter()
+            .all(|(_, parameter)| parameter.default_type.is_none())
+        {
+            return;
+        }
+
+        let mut scope = HashMap::with_capacity(parameters.len());
+        let mut semantic_parameters = Vec::with_capacity(parameters.len());
+        for (_, parameter) in &parameters {
+            let Some(name) = self.property_name(parameter.name) else {
+                return;
+            };
+            let type_id = self.result.types.alloc(TypeKind::TypeParameter {
+                name: name.clone(),
+                constraint: None,
+            });
+            scope.insert(name, type_id);
+            semantic_parameters.push(type_id);
+        }
+        self.type_parameter_scopes.push(scope);
+
+        let mut seen_default = false;
+        for (index, (declaration, parameter)) in parameters.iter().enumerate() {
+            let constraint = parameter
+                .constraint
+                .map(|constraint| self.type_from_type_node(constraint));
+            if let TypeKind::TypeParameter {
+                constraint: current,
+                ..
+            } = &mut self.result.types.types[semantic_parameters[index].index()].kind
+            {
+                *current = constraint;
+            }
+
+            let Some(default) = parameter.default_type else {
+                if seen_default {
+                    self.error(*declaration, 2706, std::iter::empty());
+                }
+                continue;
+            };
+            seen_default = true;
+
+            let disallowed = parameters[index..]
+                .iter()
+                .filter_map(|(node, _)| self.bindings.node_symbols.get(node).copied())
+                .collect::<HashSet<_>>();
+            let mut pending = vec![default];
+            let mut invalid_reference = false;
+            while let Some(node) = pending.pop() {
+                if let Some(NodeData::TypeReferenceNode(reference)) =
+                    self.arena.get(node).map(|node| &node.data)
+                    && let Some(NodeData::Identifier(identifier)) =
+                        self.arena.get(reference.type_name).map(|name| &name.data)
+                    && self
+                        .resolve_identifier(reference.type_name, &identifier.text)
+                        .is_some_and(|symbol| disallowed.contains(&symbol))
+                {
+                    self.error(node, 2744, std::iter::empty());
+                    invalid_reference = true;
+                }
+                if let Some(children) = self.children.get(&node) {
+                    pending.extend(children.iter().rev().copied());
+                }
+            }
+            if invalid_reference {
+                continue;
+            }
+
+            let Some(constraint) = constraint else {
+                continue;
+            };
+            let default_type = self.type_from_type_node(default);
+            if self.is_assignable(default_type, constraint) {
+                continue;
+            }
+            let message = message_by_code(2344).expect("checker diagnostic is in catalog");
+            let diagnostic = Diagnostic::with_arguments(
+                message,
+                [
+                    self.diagnostic_type_display(default_type),
+                    self.diagnostic_type_display(constraint),
+                ],
+            )
+            .with_details(self.assignability_details(default_type, constraint));
+            self.push_diagnostic(default, diagnostic);
+        }
+
+        self.type_parameter_scopes.pop();
+    }
+
     #[allow(clippy::too_many_lines)]
     fn exported_inferred_type_names(&self) -> BTreeSet<String> {
         fn visit(
@@ -5518,6 +5625,14 @@ impl<'a> Checker<'a> {
         let Some(node) = self.arena.get(node_id) else {
             return;
         };
+        let type_parameters = match &node.data {
+            NodeData::FunctionDeclaration(function) => function.type_parameters.clone(),
+            NodeData::ClassDeclaration(class) => class.type_parameters.clone(),
+            NodeData::InterfaceDeclaration(interface) => interface.type_parameters.clone(),
+            NodeData::TypeAliasDeclaration(alias) => alias.type_parameters.clone(),
+            _ => None,
+        };
+        self.check_type_parameter_defaults(type_parameters.as_ref());
         match &node.data {
             NodeData::SourceFile(data) => {
                 for statement in &data.statements.nodes {
@@ -5548,7 +5663,19 @@ impl<'a> Checker<'a> {
                 }
             }
             NodeData::VariableDeclaration(data) => {
-                let annotation = data.type_.map(|node| self.type_from_type_node(node));
+                let unique_symbol = self.unique_symbol_type_for_variable(node_id, data);
+                let annotation = data
+                    .type_
+                    .map(|node| unique_symbol.unwrap_or_else(|| self.type_from_type_node(node)));
+                if let Some(initializer) = data.initializer
+                    && self.variable_is_ambient(node_id)
+                {
+                    self.check_ambient_initializer(
+                        initializer,
+                        data.type_,
+                        self.is_const_declaration(node_id),
+                    );
+                }
                 let initializer = data
                     .initializer
                     .map(|node| self.type_of_expression_context(node, annotation));
@@ -5589,9 +5716,6 @@ impl<'a> Checker<'a> {
                 {
                     self.flow_types.insert(symbol, actual);
                 }
-                let unique_symbol = (annotation.is_none())
-                    .then(|| self.unique_symbol_type_for_variable(node_id, data))
-                    .flatten();
                 if let (Some(initializer), Some(unique_symbol)) = (data.initializer, unique_symbol)
                 {
                     self.result.node_types.insert(initializer, unique_symbol);
@@ -6264,6 +6388,100 @@ impl<'a> Checker<'a> {
             current = node.parent;
         }
         false
+    }
+
+    fn property_is_ambient(&self, declaration: NodeId) -> bool {
+        if self.options.is_declaration_file {
+            return true;
+        }
+        let mut current = Some(declaration);
+        while let Some(node_id) = current {
+            let Some(node) = self.arena.get(node_id) else {
+                break;
+            };
+            let modifiers = match &node.data {
+                NodeData::PropertyDeclaration(property) => property.modifiers.as_ref(),
+                NodeData::ClassDeclaration(class) => class.modifiers.as_ref(),
+                NodeData::ModuleDeclaration(namespace) => namespace.modifiers.as_ref(),
+                _ => None,
+            };
+            if self.has_ast_modifier(modifiers, SyntaxKind::DeclareKeyword) {
+                return true;
+            }
+            current = node.parent;
+        }
+        false
+    }
+
+    fn check_ambient_initializer(
+        &mut self,
+        initializer: NodeId,
+        annotation: Option<NodeId>,
+        const_or_readonly: bool,
+    ) {
+        if const_or_readonly && annotation.is_none() {
+            if !self.ambient_initializer_is_literal(initializer) {
+                self.error(initializer, 1254, std::iter::empty());
+            }
+        } else {
+            self.error(initializer, 1039, std::iter::empty());
+        }
+    }
+
+    fn ambient_initializer_is_literal(&self, initializer: NodeId) -> bool {
+        let Some(node) = self.arena.get(initializer) else {
+            return false;
+        };
+        match &node.data {
+            NodeData::StringLiteral(_)
+            | NodeData::NumericLiteral(_)
+            | NodeData::BigIntLiteral(_)
+            | NodeData::NoSubstitutionTemplateLiteral(_) => true,
+            NodeData::KeywordExpression(_) => {
+                matches!(
+                    node.kind,
+                    SyntaxKind::TrueKeyword | SyntaxKind::FalseKeyword
+                )
+            }
+            NodeData::PrefixUnaryExpression(prefix)
+                if prefix.operator == SyntaxKind::MinusToken =>
+            {
+                matches!(
+                    self.arena.get(prefix.operand).map(|operand| &operand.data),
+                    Some(NodeData::NumericLiteral(_) | NodeData::BigIntLiteral(_))
+                )
+            }
+            NodeData::PropertyAccessExpression(_) => self
+                .resolve_value_expression_symbol(initializer)
+                .and_then(|symbol| self.bindings.symbols.get(symbol))
+                .is_some_and(|symbol| symbol.flags.contains(ts_binder::SymbolFlags::ENUM_MEMBER)),
+            NodeData::ElementAccessExpression(access) => {
+                if !matches!(
+                    self.arena
+                        .get(access.argument_expression)
+                        .map(|argument| &argument.data),
+                    Some(
+                        NodeData::StringLiteral(_)
+                            | NodeData::NumericLiteral(_)
+                            | NodeData::NoSubstitutionTemplateLiteral(_)
+                    )
+                ) {
+                    return false;
+                }
+                let Some(name) = self.property_name(access.argument_expression) else {
+                    return false;
+                };
+                self.resolve_value_expression_symbol(access.expression)
+                    .and_then(|symbol| self.bindings.symbols.get(symbol))
+                    .filter(|symbol| symbol.flags.intersects(ts_binder::SymbolFlags::ENUM))
+                    .and_then(|symbol| symbol.members.get(&name))
+                    .and_then(|symbol| self.bindings.symbols.get(symbol))
+                    .is_some_and(|symbol| {
+                        symbol.flags.contains(ts_binder::SymbolFlags::ENUM_MEMBER)
+                    })
+            }
+            _ => false,
+        }
     }
 
     fn next_statement(&self, declaration: NodeId) -> Option<NodeId> {
@@ -7758,7 +7976,17 @@ impl<'a> Checker<'a> {
                             }) => *constraint,
                             _ => contextual_type,
                         };
-                        deferred_excess_property = Some((*property, name.clone(), contextual_type));
+                        let diagnostic_name = if matches!(
+                            self.arena.get(data.name).map(|name| &name.data),
+                            Some(NodeData::ComputedPropertyName(_))
+                        ) {
+                            self.node_source_text(data.name)
+                                .unwrap_or_else(|| name.clone())
+                        } else {
+                            name.clone()
+                        };
+                        deferred_excess_property =
+                            Some((data.name, diagnostic_name, contextual_type));
                     }
                     let actual = self.type_of_expression_context(data.initializer, expected);
                     let actual = if expected.is_none()
@@ -7795,7 +8023,23 @@ impl<'a> Checker<'a> {
                                 } else {
                                     expected
                                 };
-                            self.assignability_error(*property, actual, displayed_expected);
+                            if matches!(
+                                self.arena.get(data.name).map(|name| &name.data),
+                                Some(NodeData::ComputedPropertyName(_))
+                            ) {
+                                let displayed_actual =
+                                    self.diagnostic_source_type(actual, displayed_expected);
+                                self.error(
+                                    data.name,
+                                    2418,
+                                    [
+                                        self.diagnostic_type_display(displayed_actual),
+                                        self.diagnostic_type_display(displayed_expected),
+                                    ],
+                                );
+                            } else {
+                                self.assignability_error(data.name, actual, displayed_expected);
+                            }
                         }
                     }
                     if !properties.contains_key(&contextual_name) {
@@ -7810,12 +8054,64 @@ impl<'a> Checker<'a> {
                     let Some(name) = self.property_name(data.name) else {
                         continue;
                     };
+                    let contextual_name = contextual_object
+                        .as_ref()
+                        .and_then(|object| Self::matching_object_property_name(object, &name))
+                        .unwrap_or_else(|| name.clone());
+                    let expected = contextual_object.as_ref().and_then(|object| {
+                        object
+                            .properties
+                            .get(&contextual_name)
+                            .copied()
+                            .or(object.string_index_type)
+                    });
+                    if expected.is_none()
+                        && deferred_excess_property.is_none()
+                        && contextual_object
+                            .as_ref()
+                            .is_some_and(|object| !object.properties.is_empty())
+                    {
+                        let contextual_type =
+                            contextual_type.expect("contextual object has a type");
+                        let contextual_type = match self
+                            .result
+                            .types
+                            .get(contextual_type)
+                            .map(|type_| &type_.kind)
+                        {
+                            Some(TypeKind::TypeParameter {
+                                constraint: Some(constraint),
+                                ..
+                            }) => *constraint,
+                            _ => contextual_type,
+                        };
+                        deferred_excess_property = Some((data.name, name.clone(), contextual_type));
+                    }
                     let actual = self.type_of_expression(data.name);
                     let actual = self.structural_object_literal_property_type(data.name, actual);
-                    if !properties.contains_key(&name) {
-                        property_order.push(name.clone());
+                    if let Some(expected) = expected
+                        && !self.is_assignable(actual, expected)
+                        && !(self.options.exact_optional_property_types
+                            && contextual_object.as_ref().is_some_and(|object| {
+                                object.optional_properties.contains(&contextual_name)
+                                    && self.type_includes_undefined(actual)
+                            }))
+                    {
+                        reported_property_mismatch = true;
+                        let displayed_expected =
+                            if contextual_object.as_ref().is_some_and(|object| {
+                                object.optional_properties.contains(&contextual_name)
+                            }) {
+                                self.type_without_undefined(expected)
+                            } else {
+                                expected
+                            };
+                        self.assignability_error(data.name, actual, displayed_expected);
                     }
-                    properties.insert(name, actual);
+                    if !properties.contains_key(&contextual_name) {
+                        property_order.push(contextual_name.clone());
+                    }
+                    properties.insert(contextual_name, actual);
                 }
                 NodeData::GetAccessorDeclaration(data) => {
                     let Some(name) = self.property_name(data.name) else {
@@ -9187,6 +9483,16 @@ impl<'a> Checker<'a> {
             match &node.data {
                 NodeData::PropertyDeclaration(data) => {
                     if let Some(initializer) = data.initializer {
+                        if self.property_is_ambient(*member) {
+                            self.check_ambient_initializer(
+                                initializer,
+                                data.type_,
+                                self.has_ast_modifier(
+                                    data.modifiers.as_ref(),
+                                    SyntaxKind::ReadonlyKeyword,
+                                ),
+                            );
+                        }
                         let expected = data.type_.map(|node| self.type_from_type_node(node));
                         self.clear_cached_expression_types(initializer);
                         let actual = self.type_of_expression_context(initializer, expected);
@@ -11766,7 +12072,22 @@ impl<'a> Checker<'a> {
         {
             return self.import_type(&descriptor);
         }
-        self.error(node, 2304, [name.to_owned()]);
+        let shorthand = self
+            .arena
+            .get(node)
+            .and_then(|node| node.parent)
+            .and_then(|parent| self.arena.get(parent))
+            .is_some_and(|parent| {
+                matches!(
+                    &parent.data,
+                    NodeData::ShorthandPropertyAssignment(property) if property.name == node
+                )
+            });
+        self.error(
+            node,
+            if shorthand { 18004 } else { 2304 },
+            [name.to_owned()],
+        );
         self.result.types.any()
     }
 
@@ -20613,20 +20934,34 @@ impl<'a> Checker<'a> {
         if !self.is_const_declaration(declaration) {
             return None;
         }
-        let initializer = data.initializer?;
-        let NodeData::CallExpression(call) = &self.arena.get(initializer)?.data else {
-            return None;
-        };
-        let NodeData::Identifier(identifier) = &self.arena.get(call.expression)?.data else {
-            return None;
-        };
-        if identifier.text != "Symbol"
-            || self
-                .bindings
-                .resolve_name_at(call.expression, &identifier.text)
-                .is_some()
-        {
-            return None;
+        if let Some(annotation) = data.type_ {
+            let NodeData::TypeOperatorNode(operator) = &self.arena.get(annotation)?.data else {
+                return None;
+            };
+            if operator.operator != SyntaxKind::UniqueKeyword
+                || !self
+                    .arena
+                    .get(operator.type_)
+                    .is_some_and(|operand| operand.kind == SyntaxKind::SymbolKeyword)
+            {
+                return None;
+            }
+        } else {
+            let initializer = data.initializer?;
+            let NodeData::CallExpression(call) = &self.arena.get(initializer)?.data else {
+                return None;
+            };
+            let NodeData::Identifier(identifier) = &self.arena.get(call.expression)?.data else {
+                return None;
+            };
+            if identifier.text != "Symbol"
+                || self
+                    .bindings
+                    .resolve_name_at(call.expression, &identifier.text)
+                    .is_some()
+            {
+                return None;
+            }
         }
         let name = self.property_name(data.name)?;
         let reference_name = format!("typeof {name}");
@@ -21154,6 +21489,22 @@ impl<'a> Checker<'a> {
             };
             if !self.is_const_declaration(*declaration) {
                 continue;
+            }
+            if variable.type_.is_some_and(|annotation| {
+                matches!(
+                    self.arena.get(annotation).map(|node| &node.data),
+                    Some(NodeData::TypeOperatorNode(operator))
+                        if operator.operator == SyntaxKind::UniqueKeyword
+                            && self
+                                .arena
+                                .get(operator.type_)
+                                .is_some_and(|operand| operand.kind == SyntaxKind::SymbolKeyword)
+                )
+            }) {
+                let declaration_name = self
+                    .property_name(variable.name)
+                    .unwrap_or_else(|| text.clone());
+                return Some((format!("[#{declaration_name}]"), false));
             }
             if let Some(NodeData::TypeQueryNode(query)) = variable
                 .type_
@@ -30855,6 +31206,205 @@ mod tests {
                 .iter()
                 .map(|diagnostic| diagnostic.diagnostic.render().unwrap())
                 .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn ambient_initializers_follow_const_and_readonly_literal_rules() {
+        let cases = [
+            ("declare var value = 1;", false, Some((1039, "1"))),
+            ("declare let value = 1;", false, Some((1039, "1"))),
+            ("declare const value: number = 1;", false, Some((1039, "1"))),
+            ("declare const value = null;", false, Some((1254, "null"))),
+            ("declare const value = true;", false, None),
+            ("declare const value = -1;", false, None),
+            (
+                "declare enum Kind { Value } declare const value = Kind.Value;",
+                false,
+                None,
+            ),
+            (
+                "declare enum Kind { Value } declare const value = Kind[\"Value\"];",
+                false,
+                None,
+            ),
+            (
+                "declare namespace Model { const value: number = 1; }",
+                false,
+                Some((1039, "1")),
+            ),
+            ("declare class Model { readonly value = 1; }", false, None),
+            (
+                "declare class Model { value = 1; }",
+                false,
+                Some((1039, "1")),
+            ),
+            ("export const value = 1;", true, None),
+            ("export const value: number = 1;", true, Some((1039, "1"))),
+        ];
+
+        for (source, is_declaration_file, expected) in cases {
+            let parsed = parse_source_file(source);
+            assert!(
+                parsed.diagnostics.is_empty(),
+                "{source}: {:?}",
+                parsed.diagnostics
+            );
+            let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+            let result = check_source_file_with_options(
+                &parsed.arena,
+                parsed.source_file,
+                &bindings,
+                CheckerOptions {
+                    is_declaration_file,
+                    ..CheckerOptions::default()
+                },
+            );
+            let actual = result
+                .diagnostics
+                .iter()
+                .map(|diagnostic| {
+                    let range = parsed.arena.get(diagnostic.node).unwrap().range;
+                    (
+                        diagnostic.diagnostic.code(),
+                        &source[range.start.get() as usize..range.end.get() as usize],
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected.into_iter().collect::<Vec<_>>(), "{source}");
+        }
+    }
+
+    #[test]
+    fn generic_defaults_check_constraints_order_and_forward_references() {
+        let source = concat!(
+            "declare function first<T extends string = number>(): void;\n",
+            "interface Ordered<T = string, U> {}\n",
+            "type Forward<T = U, U = string> = T;\n",
+            "class Last<T extends string = number> {}\n",
+        );
+        let parsed = parse_source_file(source);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        let result = check_source_file(&parsed.arena, parsed.source_file, &bindings);
+        let actual = result
+            .diagnostics
+            .iter()
+            .map(|diagnostic| {
+                let range = parsed.arena.get(diagnostic.node).unwrap().range;
+                (
+                    diagnostic.diagnostic.code(),
+                    &source[range.start.get() as usize..range.end.get() as usize],
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            actual,
+            [(2344, "number"), (2706, "U"), (2744, "U"), (2344, "number")]
+        );
+    }
+
+    #[test]
+    fn shorthand_and_computed_properties_keep_upstream_diagnostic_locations() {
+        let cases = [
+            (
+                "const bad = 1; const value: { bad: string } = { bad };",
+                2322,
+                "bad",
+            ),
+            (
+                "const extra = 1; const value: { ok: number } = { extra };",
+                2353,
+                "extra",
+            ),
+            ("const value = { missing };", 18004, "missing"),
+            ("const value: { bad: string } = { bad: 1 };", 2322, "bad"),
+            (
+                "const key = \"bad\"; const value: { bad: string } = { [key]: 1 };",
+                2418,
+                "[key]",
+            ),
+            (
+                "const key = \"extra\"; const value: { ok: string } = { [key]: 1 };",
+                2353,
+                "[key]",
+            ),
+        ];
+
+        for (source, expected_code, expected_text) in cases {
+            let parsed = parse_source_file(source);
+            assert!(
+                parsed.diagnostics.is_empty(),
+                "{source}: {:?}",
+                parsed.diagnostics
+            );
+            let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+            let result = check_source_file(&parsed.arena, parsed.source_file, &bindings);
+            let [diagnostic] = result.diagnostics.as_slice() else {
+                panic!("{source}: {:?}", result.diagnostics);
+            };
+            let range = parsed.arena.get(diagnostic.node).unwrap().range;
+            assert_eq!(diagnostic.diagnostic.code(), expected_code, "{source}");
+            assert_eq!(
+                &source[range.start.get() as usize..range.end.get() as usize],
+                expected_text,
+                "{source}"
+            );
+            if expected_code == 2418 {
+                assert_eq!(
+                    diagnostic.diagnostic.render().unwrap(),
+                    "Type of computed property's value is 'number', which is not assignable to type 'string'."
+                );
+            }
+            if expected_code == 18004 {
+                assert_eq!(
+                    diagnostic.diagnostic.render().unwrap(),
+                    "No value exists in scope for the shorthand property 'missing'. Either declare one or provide an initializer."
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_unique_symbols_preserve_identity_and_computed_alias_keys() {
+        let source = concat!(
+            "declare const first: unique symbol;\n",
+            "declare const second: unique symbol;\n",
+            "const alias: typeof first = first;\n",
+            "const wrong: typeof first = second;\n",
+            "interface Box { [first]: string; }\n",
+            "const valid: Box = { [alias]: \"ok\" };\n",
+            "const invalid: Box = { [first]: 1 };\n",
+        );
+        let parsed = parse_source_file(source);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        let result = check_source_file(&parsed.arena, parsed.source_file, &bindings);
+        let root = bindings.root_scope().unwrap();
+        let first = result
+            .type_of_symbol(root.symbols.get("first").unwrap())
+            .unwrap();
+        let second = result
+            .type_of_symbol(root.symbols.get("second").unwrap())
+            .unwrap();
+        assert_ne!(first, second);
+        assert_eq!(
+            result
+                .named_type_references
+                .get(&first)
+                .map(|reference| reference.name.as_str()),
+            Some("typeof first")
+        );
+        assert_eq!(
+            result
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.code())
+                .collect::<Vec<_>>(),
+            [2322, 2418],
+            "{:?}",
+            result.diagnostics
         );
     }
 

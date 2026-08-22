@@ -545,6 +545,22 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
                     type_only,
                 })
             }
+            (SyntaxKind::NamespaceExportDeclaration, NodeData::NamespaceExportDeclaration(_)) => {
+                if node.parent != Some(source.bound.source_file().node) {
+                    return Err(CanonicalAliasTargetUnavailable::MalformedDeclaration(
+                        declaration,
+                    ));
+                }
+                let module = source.bound.symbol(source.bound.source_file()).ok_or(
+                    CanonicalAliasTargetUnavailable::MalformedDeclaration(declaration),
+                )?;
+                let target =
+                    Self::export_equals_target(store, declaration, module)?.unwrap_or(module);
+                Ok(SupportedAliasDeclaration::LocalModuleMember {
+                    target,
+                    type_only: false,
+                })
+            }
             (SyntaxKind::ImportEqualsDeclaration, NodeData::ImportEqualsDeclaration(import)) => {
                 match source
                     .arena
@@ -961,6 +977,73 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
             })
     }
 
+    fn can_have_synthetic_default<MapperPayload>(
+        &self,
+        store: &CanonicalSemanticStore<MapperPayload>,
+        declaration: NodeRef,
+        resolved: CanonicalResolvedModule,
+        module: SemanticSymbolId,
+        export_equals: Option<SemanticSymbolId>,
+    ) -> Result<bool, CanonicalAliasTargetUnavailable> {
+        let source = self.sources.get(resolved.target_file()).ok_or(
+            CanonicalAliasTargetUnavailable::ForeignModuleTarget {
+                declaration,
+                file: resolved.target_file(),
+            },
+        )?;
+        let facts = source.bound.source_facts().ok_or(
+            CanonicalAliasTargetUnavailable::MalformedModuleSymbol {
+                declaration,
+                module,
+            },
+        )?;
+        let exports = store
+            .symbol(module)
+            .and_then(ts_binder::semantic::Symbol::exports)
+            .map(|exports| {
+                store.symbol_table(exports).ok_or(
+                    CanonicalAliasTargetUnavailable::MalformedModuleSymbol {
+                        declaration,
+                        module,
+                    },
+                )
+            })
+            .transpose()?;
+
+        if facts.is_declaration_file() {
+            if exports.is_some_and(|exports| exports.get_source("__esModule").is_some()) {
+                return Ok(false);
+            }
+            if let Some(default) =
+                exports.and_then(|exports| exports.get(InternalSymbolName::Default.as_ref()))
+            {
+                let default = store.symbol(default).ok_or(
+                    CanonicalAliasTargetUnavailable::MalformedModuleSymbol {
+                        declaration,
+                        module,
+                    },
+                )?;
+                if default.declarations().is_some_and(|declarations| {
+                    declarations.iter().copied().any(|declaration| {
+                        is_syntactic_default_declaration(source.arena, declaration)
+                    })
+                }) {
+                    return Ok(false);
+                }
+            }
+            return Ok(export_equals.is_some()
+                || resolved.usage_mode() != CanonicalModuleResolutionMode::Esm
+                || resolved.target_mode() != CanonicalModuleResolutionMode::Esm);
+        }
+
+        if facts.is_javascript_file() {
+            return Ok(facts.is_common_js_module()
+                && exports.is_none_or(|exports| exports.get_source("__esModule").is_none()));
+        }
+
+        Ok(export_equals.is_some())
+    }
+
     fn direct_export<MapperPayload>(
         store: &CanonicalSemanticStore<MapperPayload>,
         declaration: NodeRef,
@@ -1129,14 +1212,26 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
         let module =
             self.direct_source_module(store, declaration, resolved, allow_mixed_module_modes)?;
         let export_equals = Self::export_equals_target(store, declaration, module)?;
+        let declaration_target = self
+            .sources
+            .get(resolved.target_file())
+            .and_then(|target| target.bound.source_facts())
+            .is_some_and(ts_binder::CanonicalSourceFileFacts::is_declaration_file);
+        let synthetic_default = matches!(
+            supported,
+            SupportedAliasDeclaration::DefaultModuleMember { .. }
+        ) && self.can_have_synthetic_default(
+            store,
+            declaration,
+            resolved,
+            module,
+            export_equals,
+        )?;
         if export_equals.is_some() {
             let supported_export_equals = match &supported {
                 SupportedAliasDeclaration::ExternalImportEquals { .. } => true,
-                SupportedAliasDeclaration::DefaultModuleMember { .. }
-                    if commonjs_javascript_target =>
-                {
-                    true
-                }
+                SupportedAliasDeclaration::NamespaceImport { .. } if declaration_target => true,
+                SupportedAliasDeclaration::DefaultModuleMember { .. } => synthetic_default,
                 SupportedAliasDeclaration::NamedModuleMember { name, .. }
                     if commonjs_javascript_target =>
                 {
@@ -1154,11 +1249,16 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
             }
         }
         let target = match &supported {
+            SupportedAliasDeclaration::NamespaceImport { .. }
+                if declaration_target && export_equals.is_some() =>
+            {
+                export_equals.expect("declaration namespace export-equals was preflighted")
+            }
             SupportedAliasDeclaration::NamespaceImport { .. } => {
                 Self::direct_namespace_target(store, declaration, module)?
             }
             SupportedAliasDeclaration::NamespaceExport { .. } => module,
-            SupportedAliasDeclaration::DefaultModuleMember { .. } if commonjs_javascript_target => {
+            SupportedAliasDeclaration::DefaultModuleMember { .. } if synthetic_default => {
                 export_equals.unwrap_or(module)
             }
             SupportedAliasDeclaration::DefaultModuleMember { .. } => {
@@ -1282,6 +1382,26 @@ fn is_alias_symbol_declaration(arena: &NodeArena, node: &Node, commonjs_javascri
         // predicate. Accepting every variable or binary expression could make
         // reverse declaration lookup select an unrelated merged declaration.
         _ => false,
+    }
+}
+
+fn is_syntactic_default_declaration(arena: &NodeArena, declaration: NodeRef) -> bool {
+    let Some(record) = arena.get(declaration.node) else {
+        return false;
+    };
+    match &record.data {
+        NodeData::ExportAssignment(assignment) => !assignment.is_export_equals,
+        NodeData::ExportSpecifier(_) | NodeData::NamespaceExport(_) => true,
+        _ => {
+            let mut has_default_modifier = false;
+            record.for_each_child(|child| {
+                has_default_modifier |= arena.get(child).is_some_and(|child| {
+                    child.kind == SyntaxKind::DefaultKeyword
+                        && child.parent == Some(declaration.node)
+                });
+            });
+            has_default_modifier
+        }
     }
 }
 
@@ -1653,7 +1773,11 @@ mod tests {
         parsed
     }
 
-    fn facts(file: FileId, state: CanonicalModuleState) -> CanonicalSourceFileFacts {
+    fn source_facts(
+        file: FileId,
+        state: CanonicalModuleState,
+        declaration_file: bool,
+    ) -> CanonicalSourceFileFacts {
         let javascript = matches!(
             state,
             CanonicalModuleState::CommonJs | CanonicalModuleState::ExternalAndCommonJs
@@ -1662,14 +1786,20 @@ mod tests {
             EscapedName::source(format!(
                 "\"/project/{}.{}\"",
                 file.index(),
-                if javascript { "js" } else { "ts" }
+                if javascript {
+                    "js"
+                } else if declaration_file {
+                    "d.ts"
+                } else {
+                    "ts"
+                }
             )),
             if javascript {
                 CanonicalSourceLanguage::JavaScript
             } else {
                 CanonicalSourceLanguage::TypeScript
             },
-            false,
+            declaration_file,
             state,
         )
     }
@@ -1716,6 +1846,7 @@ mod tests {
                     NodeData::ExportSpecifier(specifier) => Some(specifier.name),
                     NodeData::NamespaceImport(namespace) => Some(namespace.name),
                     NodeData::NamespaceExport(namespace) => Some(namespace.name),
+                    NodeData::NamespaceExportDeclaration(namespace) => Some(namespace.name),
                     _ => None,
                 }?;
                 (module_export_name(&parsed.arena, name_node) == Some(name))
@@ -1735,6 +1866,13 @@ mod tests {
     fn bindings(
         files: &[(FileId, &ParseResult, CanonicalModuleState)],
     ) -> (ts_binder::SymbolStore, BTreeMap<FileId, BoundFile>) {
+        bindings_with_declaration_files(files, &[])
+    }
+
+    fn bindings_with_declaration_files(
+        files: &[(FileId, &ParseResult, CanonicalModuleState)],
+        declaration_files: &[FileId],
+    ) -> (ts_binder::SymbolStore, BTreeMap<FileId, BoundFile>) {
         let mut binder = CanonicalBinder::new();
         for &(file, parsed, state) in files {
             binder
@@ -1742,7 +1880,7 @@ mod tests {
                     &parsed.arena,
                     parsed.source_file,
                     file,
-                    facts(file, state),
+                    source_facts(file, state, declaration_files.contains(&file)),
                 )
                 .unwrap();
         }
@@ -1771,7 +1909,23 @@ mod tests {
         BTreeMap<FileId, BoundFile>,
         CanonicalModuleResolutionManifest,
     ) {
-        let (symbols, bound_files) = bindings(files);
+        fixture_with_declaration_files(files, input, &[])
+    }
+
+    fn fixture_with_declaration_files(
+        files: &[(FileId, &ParseResult, CanonicalModuleState)],
+        input: CanonicalModuleResolutionManifestInput,
+        declaration_files: &[FileId],
+    ) -> (
+        TestStore,
+        BTreeMap<FileId, BoundFile>,
+        CanonicalModuleResolutionManifest,
+    ) {
+        let (symbols, bound_files) = if declaration_files.is_empty() {
+            bindings(files)
+        } else {
+            bindings_with_declaration_files(files, declaration_files)
+        };
         let manifest = validate_module_resolution_manifest(
             input,
             &symbols,
@@ -2138,6 +2292,298 @@ mod tests {
                 .unwrap()
                 .alias_target,
             AliasTargetState::Unresolved
+        );
+    }
+
+    #[test]
+    fn declaration_modules_synthesize_defaults_without_explicit_esm_markers() {
+        let importer = parsed(r#"import selected from "./target";"#);
+        let declaration = parsed("export declare function value(): number;");
+        let importer_file = FileId::new(90);
+        let declaration_file = FileId::new(91);
+        let files = [
+            (importer_file, &importer, CanonicalModuleState::External),
+            (
+                declaration_file,
+                &declaration,
+                CanonicalModuleState::External,
+            ),
+        ];
+        let specifier = module_specifiers(&importer)[0];
+        let (mut store, bound_files, manifest) = fixture_with_declaration_files(
+            &files,
+            CanonicalModuleResolutionManifestInput::new([
+                CanonicalModuleResolutionEntry::resolved(
+                    node_ref(&importer, importer_file, specifier),
+                    CanonicalResolvedModuleInput::new(
+                        declaration_file,
+                        CanonicalModuleResolutionMode::CommonJs,
+                        CanonicalModuleResolutionMode::CommonJs,
+                    ),
+                ),
+            ]),
+            &[declaration_file],
+        );
+        let mut host =
+            ProductionAliasTargetHost::new(&store, sources(&files, &bound_files), &manifest)
+                .unwrap();
+        let selected = alias(
+            &bound_files,
+            alias_declaration_named(&importer, importer_file, "selected"),
+        );
+        let module = source_module(&bound_files, declaration_file);
+
+        assert_eq!(
+            CanonicalAliasResolver::new(&mut store, &mut host)
+                .resolve_alias(selected)
+                .unwrap()
+                .target,
+            AliasTargetState::Resolved(module)
+        );
+    }
+
+    #[test]
+    fn declaration_esmodule_marker_blocks_synthetic_default() {
+        let importer = parsed(r#"import selected from "./target";"#);
+        let declaration = parsed(concat!(
+            "export declare const __esModule: boolean; ",
+            "export declare function value(): number;",
+        ));
+        let importer_file = FileId::new(92);
+        let declaration_file = FileId::new(93);
+        let files = [
+            (importer_file, &importer, CanonicalModuleState::External),
+            (
+                declaration_file,
+                &declaration,
+                CanonicalModuleState::External,
+            ),
+        ];
+        let specifier = module_specifiers(&importer)[0];
+        let (mut store, bound_files, manifest) = fixture_with_declaration_files(
+            &files,
+            CanonicalModuleResolutionManifestInput::new([
+                CanonicalModuleResolutionEntry::resolved(
+                    node_ref(&importer, importer_file, specifier),
+                    CanonicalResolvedModuleInput::new(
+                        declaration_file,
+                        CanonicalModuleResolutionMode::CommonJs,
+                        CanonicalModuleResolutionMode::CommonJs,
+                    ),
+                ),
+            ]),
+            &[declaration_file],
+        );
+        let mut host =
+            ProductionAliasTargetHost::new(&store, sources(&files, &bound_files), &manifest)
+                .unwrap();
+        let selected_declaration = alias_declaration_named(&importer, importer_file, "selected");
+        let selected = alias(&bound_files, selected_declaration);
+        let module = source_module(&bound_files, declaration_file);
+
+        assert_eq!(
+            unavailable_reason(
+                CanonicalAliasResolver::new(&mut store, &mut host)
+                    .resolve_alias(selected)
+                    .unwrap_err()
+            ),
+            CanonicalAliasTargetUnavailable::MissingExport {
+                declaration: selected_declaration,
+                module,
+            }
+        );
+        assert_eq!(
+            store.alias_symbol_links(selected).unwrap().alias_target,
+            AliasTargetState::Unresolved
+        );
+    }
+
+    #[test]
+    fn typescript_export_equals_supplies_a_synthetic_default() {
+        let importer = parsed(r#"import selected from "./target";"#);
+        let target = parsed("const value: number = 1; export = value;");
+        let importer_file = FileId::new(94);
+        let target_file = FileId::new(95);
+        let files = [
+            (importer_file, &importer, CanonicalModuleState::External),
+            (target_file, &target, CanonicalModuleState::External),
+        ];
+        let specifier = module_specifiers(&importer)[0];
+        let (mut store, bound_files, manifest) = fixture(
+            &files,
+            CanonicalModuleResolutionManifestInput::new([
+                CanonicalModuleResolutionEntry::resolved(
+                    node_ref(&importer, importer_file, specifier),
+                    CanonicalResolvedModuleInput::new(
+                        target_file,
+                        CanonicalModuleResolutionMode::CommonJs,
+                        CanonicalModuleResolutionMode::CommonJs,
+                    ),
+                ),
+            ]),
+        );
+        let mut host =
+            ProductionAliasTargetHost::new(&store, sources(&files, &bound_files), &manifest)
+                .unwrap();
+        let selected = alias(
+            &bound_files,
+            alias_declaration_named(&importer, importer_file, "selected"),
+        );
+        let module = source_module(&bound_files, target_file);
+        let module_exports = store.symbol(module).unwrap().exports().unwrap();
+        let assignment = store
+            .symbol_table(module_exports)
+            .unwrap()
+            .get(InternalSymbolName::ExportEquals.as_ref())
+            .unwrap();
+        let target_bound = bound_files.get(&target_file).unwrap();
+        let target_locals = target_bound.locals(target_bound.source_file()).unwrap();
+        let value = store
+            .symbol_table(target_locals)
+            .unwrap()
+            .get_source("value")
+            .unwrap();
+
+        assert_eq!(
+            CanonicalAliasResolver::new(&mut store, &mut host)
+                .get_immediate_aliased_symbol(selected)
+                .unwrap(),
+            Some(assignment)
+        );
+        assert_eq!(
+            CanonicalAliasResolver::new(&mut store, &mut host)
+                .resolve_alias(selected)
+                .unwrap()
+                .target,
+            AliasTargetState::Resolved(value)
+        );
+    }
+
+    #[test]
+    fn declaration_export_equals_keeps_namespace_and_default_aliases_aligned() {
+        let importer = parsed(concat!(
+            "import * as Imported from './target'; ",
+            "import Selected from './target';",
+        ));
+        let declaration = parsed(concat!(
+            "declare namespace React { export interface Model { value: number; } } ",
+            "export = React; ",
+            "export as namespace GlobalReact;",
+        ));
+        let importer_file = FileId::new(98);
+        let declaration_file = FileId::new(99);
+        let files = [
+            (importer_file, &importer, CanonicalModuleState::External),
+            (
+                declaration_file,
+                &declaration,
+                CanonicalModuleState::External,
+            ),
+        ];
+        let entries = module_specifiers(&importer)
+            .into_iter()
+            .map(|specifier| {
+                CanonicalModuleResolutionEntry::resolved(
+                    node_ref(&importer, importer_file, specifier),
+                    esm(declaration_file),
+                )
+            })
+            .collect::<Vec<_>>();
+        let (mut store, bound_files, manifest) = fixture_with_declaration_files(
+            &files,
+            CanonicalModuleResolutionManifestInput::new(entries),
+            &[declaration_file],
+        );
+        let mut host =
+            ProductionAliasTargetHost::new(&store, sources(&files, &bound_files), &manifest)
+                .unwrap();
+        let target_bound = bound_files.get(&declaration_file).unwrap();
+        let locals = target_bound.locals(target_bound.source_file()).unwrap();
+        let namespace = store
+            .symbol_table(locals)
+            .unwrap()
+            .get_source("React")
+            .unwrap();
+
+        for (file, parsed, name) in [
+            (importer_file, &importer, "Imported"),
+            (importer_file, &importer, "Selected"),
+            (declaration_file, &declaration, "GlobalReact"),
+        ] {
+            let declaration = alias_declaration_named(parsed, file, name);
+            let alias_symbol = alias(&bound_files, declaration);
+            assert_eq!(
+                CanonicalAliasResolver::new(&mut store, &mut host)
+                    .resolve_alias(alias_symbol)
+                    .unwrap()
+                    .target,
+                AliasTargetState::Resolved(namespace),
+                "namespace alias {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn javascript_esmodule_marker_preserves_the_explicit_default_alias() {
+        let importer = parsed(r#"import selected from "./target.js";"#);
+        let javascript = parse_javascript_source_file(concat!(
+            "const value = 1; ",
+            "exports.__esModule = true; ",
+            "exports.default = value;",
+        ));
+        assert!(
+            javascript.diagnostics.is_empty(),
+            "{:?}",
+            javascript.diagnostics
+        );
+        let importer_file = FileId::new(96);
+        let target_file = FileId::new(97);
+        let files = [
+            (importer_file, &importer, CanonicalModuleState::External),
+            (target_file, &javascript, CanonicalModuleState::CommonJs),
+        ];
+        let specifier = module_specifiers(&importer)[0];
+        let (mut store, bound_files, manifest) = fixture(
+            &files,
+            CanonicalModuleResolutionManifestInput::new([
+                CanonicalModuleResolutionEntry::resolved(
+                    node_ref(&importer, importer_file, specifier),
+                    CanonicalResolvedModuleInput::new(
+                        target_file,
+                        CanonicalModuleResolutionMode::CommonJs,
+                        CanonicalModuleResolutionMode::CommonJs,
+                    ),
+                ),
+            ]),
+        );
+        let mut host =
+            ProductionAliasTargetHost::new(&store, sources(&files, &bound_files), &manifest)
+                .unwrap();
+        let selected = alias(
+            &bound_files,
+            alias_declaration_named(&importer, importer_file, "selected"),
+        );
+        let exported_default = direct_export(&store, &bound_files, target_file, "default");
+        let target_bound = bound_files.get(&target_file).unwrap();
+        let target_locals = target_bound.locals(target_bound.source_file()).unwrap();
+        let value = store
+            .symbol_table(target_locals)
+            .unwrap()
+            .get_source("value")
+            .unwrap();
+
+        assert_eq!(
+            CanonicalAliasResolver::new(&mut store, &mut host)
+                .get_immediate_aliased_symbol(selected)
+                .unwrap(),
+            Some(exported_default)
+        );
+        assert_eq!(
+            CanonicalAliasResolver::new(&mut store, &mut host)
+                .resolve_alias(selected)
+                .unwrap()
+                .target,
+            AliasTargetState::Resolved(value)
         );
     }
 

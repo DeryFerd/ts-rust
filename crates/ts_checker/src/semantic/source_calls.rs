@@ -1565,9 +1565,13 @@ fn prepare_vector_source_call_diagnostic(
     resolution: &GenericCallVectorResolution,
 ) -> Result<Vec<CanonicalCheckerDiagnostic>, SourceCheckError> {
     let projection = resolution.projection();
-    let parameter_count = store
+    let (parameter_count, minimum_argument_count) = store
         .signature(projection.generic_signature)
-        .map(|signature| signature.parameters().len())
+        .and_then(|signature| {
+            usize::try_from(signature.min_argument_count())
+                .ok()
+                .map(|minimum| (signature.parameters().len(), minimum))
+        })
         .ok_or(SourceCheckError::Call(plan.node))?;
     let diagnostic = match resolution.applicability() {
         GenericCallVectorApplicability::Applicable => return Ok(Vec::new()),
@@ -1603,7 +1607,7 @@ fn prepare_vector_source_call_diagnostic(
             }
         }
         GenericCallVectorApplicability::TooFewArguments { expected, actual } => {
-            if expected != parameter_count
+            if expected != minimum_argument_count
                 || actual != plan.arguments.len()
                 || actual != argument_types.len()
             {
@@ -1614,7 +1618,10 @@ fn prepare_vector_source_call_diagnostic(
                 range_override: None,
                 diagnostic: Diagnostic::with_arguments(
                     message_by_code(2554).ok_or(SourceCheckError::MissingDiagnostic(2554))?,
-                    [expected.to_string(), actual.to_string()],
+                    [
+                        expected_count_text(minimum_argument_count, parameter_count),
+                        actual.to_string(),
+                    ],
                 ),
                 related_information: vec![missing_argument_related_information(
                     store,
@@ -1637,7 +1644,10 @@ fn prepare_vector_source_call_diagnostic(
                 range_override: Some(extra_argument_diagnostic_range(host, plan, expected)?),
                 diagnostic: Diagnostic::with_arguments(
                     message_by_code(2554).ok_or(SourceCheckError::MissingDiagnostic(2554))?,
-                    [expected.to_string(), actual.to_string()],
+                    [
+                        expected_count_text(minimum_argument_count, parameter_count),
+                        actual.to_string(),
+                    ],
                 ),
                 related_information: Vec::new(),
             }

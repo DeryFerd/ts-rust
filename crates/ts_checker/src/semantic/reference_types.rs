@@ -17,7 +17,11 @@ use ts_binder::{SemanticSymbolId, SymbolFlags};
 
 use super::{
     CanonicalTypeMapperStore, TypeId,
+    array_types::CanonicalArrayTargets,
     declared::{cached_ordinary_type_parameter_owner, malformed_alias_merge, type_list_key},
+    instantiate::{
+        InstantiationLimits, InstantiationSession, instantiate_type_with_vector_and_session,
+    },
     type_records::{CacheHashKey, TypeCacheState, TypeData, TypeRecord, TypeReferenceData},
     types::{ObjectFlags, TypeFlags},
 };
@@ -34,6 +38,11 @@ pub enum DirectGenericReferenceError {
         actual: usize,
     },
     InvalidTypeArgument {
+        target: TypeId,
+        index: usize,
+        type_: TypeId,
+    },
+    InvalidTypeParameterDefault {
         target: TypeId,
         index: usize,
         type_: TypeId,
@@ -80,6 +89,14 @@ impl std::fmt::Display for DirectGenericReferenceError {
             } => write!(
                 formatter,
                 "type argument {index} ({type_:?}) is invalid for target {target:?}"
+            ),
+            Self::InvalidTypeParameterDefault {
+                target,
+                index,
+                type_,
+            } => write!(
+                formatter,
+                "type parameter default {index} ({type_:?}) is invalid for target {target:?}"
             ),
             Self::UnsupportedCreationFlags(flags) => {
                 write!(
@@ -642,6 +659,122 @@ pub(super) fn create_direct_generic_reference(
     Ok(reference)
 }
 
+/// Fills already-resolved trailing defaults before creating one canonical
+/// class or interface reference.
+///
+/// Defaults are evaluated in declaration order with earlier arguments
+/// installed and later arguments temporarily mapped to the error type.
+pub(super) fn create_direct_generic_reference_with_defaults(
+    store: &mut CanonicalTypeMapperStore,
+    target: TypeId,
+    provided: &[TypeId],
+    creation_flags: ObjectFlags,
+    array_targets: Option<CanonicalArrayTargets>,
+    session: &mut InstantiationSession,
+) -> Result<TypeId, DirectGenericReferenceError> {
+    let shape = direct_target_header(store, target)?;
+    let (no_constraint, circular_constraint, resolving_default, error_type) = {
+        let bootstrap = store
+            .intrinsic_bootstrap()
+            .ok_or(DirectGenericReferenceError::InvalidTarget(target))?;
+        (
+            bootstrap.no_constraint_type,
+            bootstrap.circular_constraint_type,
+            bootstrap.resolving_default_type,
+            bootstrap.error_type,
+        )
+    };
+    let mut defaults = Vec::new();
+    defaults
+        .try_reserve_exact(shape.type_parameters.len())
+        .map_err(|_| DirectGenericReferenceError::Capacity(target))?;
+    let mut minimum = 0;
+    for (index, parameter) in shape.type_parameters.iter().copied().enumerate() {
+        let TypeData::TypeParameter(data) = store
+            .type_payload(parameter)
+            .ok_or(DirectGenericReferenceError::InvalidTarget(target))?
+            .data()
+        else {
+            return Err(DirectGenericReferenceError::InvalidTarget(target));
+        };
+        let default = data
+            .resolved_default_type
+            .filter(|default| *default != no_constraint);
+        if default.is_none() {
+            minimum = index + 1;
+        }
+        defaults.push(default);
+    }
+    if provided.len() < minimum || provided.len() > shape.type_parameters.len() {
+        return Err(DirectGenericReferenceError::TypeArgumentArity {
+            target,
+            expected: if provided.len() < minimum {
+                minimum
+            } else {
+                shape.type_parameters.len()
+            },
+            actual: provided.len(),
+        });
+    }
+    for (index, argument) in provided.iter().copied().enumerate() {
+        if store.type_payload(argument).is_none() {
+            return Err(DirectGenericReferenceError::InvalidTypeArgument {
+                target,
+                index,
+                type_: argument,
+            });
+        }
+    }
+    validate_direct_target_and_cache(store, &shape)?;
+    for (index, default) in defaults.iter().enumerate().skip(provided.len()) {
+        let Some(default) = *default else {
+            return Err(DirectGenericReferenceError::TypeArgumentArity {
+                target,
+                expected: index + 1,
+                actual: provided.len(),
+            });
+        };
+        if default == circular_constraint
+            || default == resolving_default
+            || store.type_payload(default).is_none()
+        {
+            return Err(DirectGenericReferenceError::InvalidTypeParameterDefault {
+                target,
+                index,
+                type_: default,
+            });
+        }
+        validate_reference_argument_graph(store, default, &mut Vec::new(), &mut HashSet::new())?;
+    }
+
+    let mut completed = Vec::new();
+    completed
+        .try_reserve_exact(shape.type_parameters.len())
+        .map_err(|_| DirectGenericReferenceError::Capacity(target))?;
+    completed.extend_from_slice(provided);
+    completed.resize(shape.type_parameters.len(), error_type);
+    for index in provided.len()..shape.type_parameters.len() {
+        let default = defaults[index].expect("missing defaults were rejected before mutation");
+        let resolved = instantiate_type_with_vector_and_session(
+            store,
+            default,
+            &shape.type_parameters,
+            &completed,
+            array_targets,
+            session,
+        )
+        .map_err(
+            |_| DirectGenericReferenceError::InvalidTypeParameterDefault {
+                target,
+                index,
+                type_: default,
+            },
+        )?;
+        completed[index] = resolved;
+    }
+    create_direct_generic_reference(store, target, &completed, creation_flags)
+}
+
 impl CanonicalTypeMapperStore {
     /// Creates or reuses one node-less, full-arity direct class/interface
     /// reference from the target-owned canonical instantiation cache.
@@ -662,6 +795,29 @@ impl CanonicalTypeMapperStore {
     ) -> Result<TypeId, DirectGenericReferenceError> {
         create_direct_generic_reference(self, target, type_arguments, ObjectFlags::NONE)
     }
+
+    /// Creates or reuses one direct reference after filling canonical cached
+    /// trailing type-parameter defaults.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DirectGenericReferenceError`] for invalid arguments, absent
+    /// required parameters, malformed defaults, or a poisoned target cache.
+    pub fn create_direct_generic_reference_type_with_defaults(
+        &mut self,
+        target: TypeId,
+        type_arguments: &[TypeId],
+    ) -> Result<TypeId, DirectGenericReferenceError> {
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        create_direct_generic_reference_with_defaults(
+            self,
+            target,
+            type_arguments,
+            ObjectFlags::NONE,
+            None,
+            &mut session,
+        )
+    }
 }
 
 #[cfg(test)]
@@ -669,9 +825,7 @@ mod tests {
     use super::*;
     use crate::semantic::{
         DeclaredTypeLinks, IntrinsicBootstrapOptions, SemanticStore,
-        instantiate::{InstantiationLimits, InstantiationSession, instantiate_type_with_session},
-        mapper::TypeMapper,
-        type_records::TypeRecord,
+        instantiate::instantiate_type_with_session, mapper::TypeMapper, type_records::TypeRecord,
     };
     use ts_binder::{CheckFlags, EscapedName, SymbolData};
 
@@ -816,6 +970,86 @@ mod tests {
                 "the declared type-parameter vector is the origin identity",
             );
         }
+    }
+
+    #[test]
+    fn direct_references_fill_trailing_and_dependent_defaults_without_mappers() {
+        let mut store = initialized_store();
+        let (target, parameters) = generic_target(&mut store, "Result", ObjectFlags::INTERFACE, 3);
+        let (string, number) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (bootstrap.string_type, bootstrap.number_type)
+        };
+        assert!(store.set_type_parameter_resolution(
+            parameters[1],
+            None,
+            None,
+            None,
+            Some(parameters[0]),
+        ));
+        assert!(
+            store.set_type_parameter_resolution(parameters[2], None, None, None, Some(string),)
+        );
+        let before_mappers = store.mapper_len();
+
+        let reference = store
+            .create_direct_generic_reference_type_with_defaults(target, &[number])
+            .unwrap();
+        assert_eq!(
+            validate_direct_generic_reference(&store, reference),
+            Ok(DirectGenericReference {
+                target,
+                type_arguments: vec![number, number, string],
+            }),
+        );
+        assert_eq!(store.mapper_len(), before_mappers);
+        assert_eq!(
+            store.create_direct_generic_reference_type(target, &[number, number, string]),
+            Ok(reference),
+        );
+        let before_types = store.type_len();
+        assert_eq!(
+            store.create_direct_generic_reference_type_with_defaults(target, &[number]),
+            Ok(reference),
+        );
+        assert_eq!(store.type_len(), before_types);
+    }
+
+    #[test]
+    fn invalid_or_circular_defaults_are_rejected_before_reference_publication() {
+        let mut store = initialized_store();
+        let (target, parameters) = generic_target(&mut store, "Result", ObjectFlags::INTERFACE, 2);
+        let string = store.intrinsic_bootstrap().unwrap().string_type;
+        assert_eq!(
+            store.create_direct_generic_reference_type_with_defaults(target, &[string]),
+            Err(DirectGenericReferenceError::TypeArgumentArity {
+                target,
+                expected: 2,
+                actual: 1,
+            }),
+        );
+
+        let circular = store
+            .intrinsic_bootstrap()
+            .unwrap()
+            .circular_constraint_type;
+        assert!(store.set_type_parameter_resolution(
+            parameters[1],
+            None,
+            None,
+            None,
+            Some(circular),
+        ));
+        let before = (store.type_len(), store.mapper_len());
+        assert_eq!(
+            store.create_direct_generic_reference_type_with_defaults(target, &[string]),
+            Err(DirectGenericReferenceError::InvalidTypeParameterDefault {
+                target,
+                index: 1,
+                type_: circular,
+            }),
+        );
+        assert_eq!((store.type_len(), store.mapper_len()), before);
     }
 
     #[test]

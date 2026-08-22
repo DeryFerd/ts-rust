@@ -517,13 +517,12 @@ fn get_type_names_for_assignability_error_with_optional_host_and_flags(
         .ok_or(TypeDisplayUnavailable::Type(target))?;
     let mut source_name =
         type_to_string_with_optional_context_and_flags(store, host, global_types, source, flags)?;
-    let target_name =
+    let mut target_name =
         type_to_string_with_optional_context_and_flags(store, host, global_types, target, flags)?;
 
     // The pinned fallback asks for fully qualified names when the ordinary
     // strings collide. Primitive/literal names are invariant under that flag.
-    // Unique symbols instead need symbol accessibility and `typeof` naming,
-    // which this context-free prefix intentionally does not guess.
+    // Unique symbols instead need a source-backed accessible `typeof` name.
     if source_name == target_name
         && (source_record
             .flags()
@@ -532,7 +531,19 @@ fn get_type_names_for_assignability_error_with_optional_host_and_flags(
                 .flags()
                 .intersects(TypeFlags::UNIQUE_ES_SYMBOL))
     {
-        return Err(TypeDisplayUnavailable::FullyQualifiedName { source, target });
+        let host = host.ok_or(TypeDisplayUnavailable::FullyQualifiedName { source, target })?;
+        if source_record
+            .flags()
+            .intersects(TypeFlags::UNIQUE_ES_SYMBOL)
+        {
+            source_name = display_unique_symbol_reference(store, host, source)?;
+        }
+        if target_record
+            .flags()
+            .intersects(TypeFlags::UNIQUE_ES_SYMBOL)
+        {
+            target_name = display_unique_symbol_reference(store, host, target)?;
+        }
     }
 
     if !target_record.flags().intersects(TypeFlags::NEVER)
@@ -547,18 +558,17 @@ fn get_type_names_for_assignability_error_with_optional_host_and_flags(
             .flags()
             .intersects(TypeFlags::UNIQUE_ES_SYMBOL)
         {
-            // `reportRelationError` switches to `getTypeNameForErrorDisplay`
-            // here. Without AllowUniqueESSymbolType, an exact result depends on
-            // value-symbol accessibility and can be `typeof <name>`.
-            return Err(TypeDisplayUnavailable::UniqueSymbolName(generalized));
+            let host = host.ok_or(TypeDisplayUnavailable::UniqueSymbolName(generalized))?;
+            source_name = display_unique_symbol_reference(store, host, generalized)?;
+        } else {
+            source_name = type_to_string_with_optional_context_and_flags(
+                store,
+                host,
+                global_types,
+                generalized,
+                flags,
+            )?;
         }
-        source_name = type_to_string_with_optional_context_and_flags(
-            store,
-            host,
-            global_types,
-            generalized,
-            flags,
-        )?;
     }
 
     Ok(AssignabilityErrorDisplay {
@@ -696,7 +706,10 @@ fn display_type_worker(
     if type_flags.intersects(TypeFlags::UNIQUE_ES_SYMBOL) {
         require_data_kind(type_id, record, TypeDataKind::UniqueEsSymbol)?;
         if !flags.contains(CanonicalTypeFormatFlags::ALLOW_UNIQUE_ES_SYMBOL_TYPE) {
-            return Err(TypeDisplayUnavailable::UniqueSymbolName(type_id));
+            let host = host.ok_or(TypeDisplayUnavailable::UniqueSymbolName(type_id))?;
+            let name = display_unique_symbol_reference(store, host, type_id)?;
+            state.add(name.len());
+            return Ok(name);
         }
         state.add(13);
         return Ok("unique symbol".to_owned());
@@ -3249,6 +3262,54 @@ fn display_symbol_name(
         .filter(|name| is_plain_identifier(name))?;
     state.add(name.len().saturating_add(1).saturating_mul(2));
     Some(name.to_owned())
+}
+
+fn display_unique_symbol_reference(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    type_id: TypeId,
+) -> Result<String, TypeDisplayUnavailable> {
+    let record = store
+        .type_payload(type_id)
+        .ok_or(TypeDisplayUnavailable::Type(type_id))?;
+    let TypeData::UniqueEsSymbol(_) = record.data() else {
+        return Err(TypeDisplayUnavailable::MalformedType(type_id));
+    };
+    let symbol = record
+        .symbol()
+        .ok_or(TypeDisplayUnavailable::UniqueSymbolName(type_id))?;
+    let owner = store
+        .symbol(symbol)
+        .ok_or(TypeDisplayUnavailable::UniqueSymbolName(type_id))?;
+    let [declaration] = owner.declarations().unwrap_or_default() else {
+        return Err(TypeDisplayUnavailable::UniqueSymbolName(type_id));
+    };
+    if record.flags() != TypeFlags::UNIQUE_ES_SYMBOL
+        || !record.object_flags().is_empty()
+        || record.alias().is_some()
+        || !owner.flags().intersects(SymbolFlags::VALUE)
+        || owner.parent().is_some()
+        || store.get_merged_symbol(symbol) != Some(symbol)
+        || !host.symbol_matches(store, *declaration, symbol)
+    {
+        return Err(TypeDisplayUnavailable::UniqueSymbolName(type_id));
+    }
+    let declaration_node = host
+        .node(*declaration)
+        .ok_or(TypeDisplayUnavailable::UniqueSymbolName(type_id))?;
+    let NodeData::VariableDeclaration(variable) = &declaration_node.data else {
+        return Err(TypeDisplayUnavailable::UniqueSymbolName(type_id));
+    };
+    let name_node = NodeRef::new(declaration.arena, declaration.file, variable.name);
+    let Some(NodeData::Identifier(identifier)) = host.node(name_node).map(|node| &node.data) else {
+        return Err(TypeDisplayUnavailable::UniqueSymbolName(type_id));
+    };
+    if !is_plain_identifier(&identifier.text)
+        || owner.name().as_utf8() != Some(identifier.text.as_str())
+    {
+        return Err(TypeDisplayUnavailable::UniqueSymbolName(type_id));
+    }
+    Ok(format!("typeof {}", identifier.text))
 }
 
 fn is_plain_identifier(name: &str) -> bool {
@@ -6099,6 +6160,177 @@ mod tests {
             type_to_string(&store, union),
             Err(TypeDisplayUnavailable::InvalidUnion(union))
         );
+    }
+
+    #[test]
+    fn source_unique_symbols_use_typeof_only_when_upstream_requests_value_names() {
+        let parsed = parse_source_file(concat!(
+            "declare const token: symbol; ",
+            "declare const other: symbol;",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(199);
+        let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+        let [token_symbol, other_symbol] = ["token", "other"].map(|expected| {
+            let declaration = parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    let NodeData::VariableDeclaration(variable) = &record.data else {
+                        return None;
+                    };
+                    let NodeData::Identifier(identifier) = &parsed.arena.get(variable.name)?.data
+                    else {
+                        return None;
+                    };
+                    (identifier.text == expected).then_some(NodeRef::new(
+                        parsed.arena.id(),
+                        file,
+                        node,
+                    ))
+                })
+                .unwrap();
+            context.file(file).unwrap().1.symbol(declaration).unwrap()
+        });
+        let (token, other, string, string_literal, never) = {
+            let store = context.store_mut_for_test();
+            let token = store.alloc_unique_es_symbol_type(token_symbol).unwrap();
+            let other = store.alloc_unique_es_symbol_type(other_symbol).unwrap();
+            let string_literal = store.regular_string_literal_type("value".into()).unwrap();
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (
+                token,
+                other,
+                bootstrap.string_type,
+                string_literal,
+                bootstrap.never_type,
+            )
+        };
+
+        assert_eq!(context.type_to_string(token).unwrap(), "unique symbol");
+        assert_eq!(
+            context
+                .type_to_string_with_flags(token, CanonicalTypeFormatFlags::NONE)
+                .unwrap(),
+            "typeof token"
+        );
+
+        let against_string = context
+            .get_type_names_for_assignability_error(token, string)
+            .unwrap();
+        assert_eq!(
+            against_string,
+            AssignabilityErrorDisplay {
+                source: "typeof token".into(),
+                target: "string".into(),
+            }
+        );
+        assert_eq!(
+            Diagnostic::with_arguments(
+                message_by_code(2322).unwrap(),
+                [against_string.source, against_string.target],
+            )
+            .render()
+            .unwrap(),
+            "Type 'typeof token' is not assignable to type 'string'."
+        );
+
+        let against_unique = context
+            .get_type_names_for_assignability_error(other, token)
+            .unwrap();
+        assert_eq!(
+            against_unique,
+            AssignabilityErrorDisplay {
+                source: "typeof other".into(),
+                target: "typeof token".into(),
+            }
+        );
+        assert_eq!(
+            Diagnostic::with_arguments(
+                message_by_code(2322).unwrap(),
+                [against_unique.source, against_unique.target],
+            )
+            .render()
+            .unwrap(),
+            "Type 'typeof other' is not assignable to type 'typeof token'."
+        );
+
+        assert_eq!(
+            context
+                .get_type_names_for_assignability_error(token, never)
+                .unwrap(),
+            AssignabilityErrorDisplay {
+                source: "unique symbol".into(),
+                target: "never".into(),
+            }
+        );
+        assert_eq!(
+            context
+                .get_type_names_for_assignability_error(string, token)
+                .unwrap(),
+            AssignabilityErrorDisplay {
+                source: "string".into(),
+                target: "unique symbol".into(),
+            }
+        );
+        assert_eq!(
+            context
+                .get_type_names_for_assignability_error(string_literal, token)
+                .unwrap(),
+            AssignabilityErrorDisplay {
+                source: "\"value\"".into(),
+                target: "unique symbol".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn source_unique_symbol_names_reject_missing_or_forged_declarations() {
+        let parsed = parse_source_file("declare const token: symbol;");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(200);
+        let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+        let declaration =
+            parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    matches!(&record.data, NodeData::VariableDeclaration(_))
+                        .then_some(NodeRef::new(parsed.arena.id(), file, node))
+                })
+                .unwrap();
+        let (missing, forged, string) = {
+            let store = context.store_mut_for_test();
+            let missing_symbol = store
+                .alloc_symbol(SymbolData::new(
+                    SymbolFlags::BLOCK_SCOPED_VARIABLE,
+                    EscapedName::source("missing"),
+                ))
+                .unwrap();
+            let mut forged_symbol_data = SymbolData::new(
+                SymbolFlags::BLOCK_SCOPED_VARIABLE,
+                EscapedName::source("token"),
+            );
+            forged_symbol_data.declarations = Some(vec![declaration]);
+            forged_symbol_data.value_declaration = Some(declaration);
+            let forged_symbol = store.alloc_symbol(forged_symbol_data).unwrap();
+            let missing = store.alloc_unique_es_symbol_type(missing_symbol).unwrap();
+            let forged = store.alloc_unique_es_symbol_type(forged_symbol).unwrap();
+            let string = store.intrinsic_bootstrap().unwrap().string_type;
+            (missing, forged, string)
+        };
+
+        for unique in [missing, forged] {
+            assert_eq!(context.type_to_string(unique).unwrap(), "unique symbol");
+            assert_eq!(
+                context.type_to_string_with_flags(unique, CanonicalTypeFormatFlags::NONE),
+                Err(TypeDisplayUnavailable::UniqueSymbolName(unique))
+            );
+            assert_eq!(
+                context.get_type_names_for_assignability_error(unique, string),
+                Err(TypeDisplayUnavailable::UniqueSymbolName(unique))
+            );
+        }
     }
 
     #[test]

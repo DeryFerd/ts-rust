@@ -1,24 +1,26 @@
 //! Production host callbacks for canonical name resolution.
 //!
 //! The binder resolver deliberately delegates checker semantics for merged
-//! symbols and aliases. This host supplies the dependency-closed production
-//! portion: declaration and table entries follow exactly one validated merge
-//! redirect before their flags are observed. Alias resolution is not yet in
-//! the port, so a lookup that actually needs alias target flags fails with an
-//! explicit capability error instead of becoming an ordinary missing name.
+//! symbols and aliases. Declaration and table entries follow exactly one
+//! validated merge redirect before their flags are observed. Resolved alias
+//! links can supply their target meaning, while unresolved aliases remain
+//! explicit capability errors.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use ts_ast::{
     FileId, Node, NodeArena, NodeArenaId, NodeArenaRevision, NodeData, NodeRef, SyntaxKind,
 };
 use ts_binder::{
-    BoundFile, CanonicalNameResolutionError, CanonicalNameResolverHost,
-    CanonicalNameResolverOptions, EscapedNameRef, SemanticStoreId, SemanticSymbolId, SymbolFlags,
-    SymbolStore, SymbolTableId, canonical_has_syntactic_modifier,
+    BoundFile, CanonicalNameResolutionError, CanonicalNameResolver, CanonicalNameResolverHost,
+    CanonicalNameResolverOptions, CanonicalResolutionLocation, EscapedNameRef, InternalSymbolName,
+    SemanticStoreId, SemanticSymbolId, SymbolFlags, SymbolStore, SymbolTableId,
+    canonical_has_syntactic_modifier,
 };
 
-use super::{CanonicalTypeMapperStore, alias_provider::ProductionAliasSourceRegistry};
+use super::{
+    AliasTargetState, CanonicalTypeMapperStore, alias_provider::ProductionAliasSourceRegistry,
+};
 
 #[derive(Clone, Copy, Debug)]
 struct ProductionNameResolverSource<'arena> {
@@ -278,11 +280,12 @@ impl<'store, 'arena> ProductionNameResolverHost<'store, 'arena> {
         self.store.get_merged_symbol(raw)
     }
 
-    /// Pinned checker table lookup for the currently dependency-closed alias
-    /// surface.
+    /// Pinned checker table lookup with already-resolved alias meanings.
     ///
-    /// An absent or wrong-meaning non-alias is an ordinary miss. A symbol whose
-    /// alias target flags are required returns an explicit capability error.
+    /// An absent or wrong-meaning symbol is an ordinary miss. A resolved alias
+    /// is returned as its alias identity when its target has the requested
+    /// meaning, matching upstream `getSymbol`. An unresolved alias returns an
+    /// explicit capability error.
     ///
     /// # Errors
     ///
@@ -318,11 +321,204 @@ impl<'store, 'arena> ProductionNameResolverHost<'store, 'arena> {
             return Ok(Some(symbol));
         }
         if flags.contains(SymbolFlags::ALIAS) {
-            return Err(CanonicalNameResolutionError::AliasResolutionUnavailable(
-                symbol,
-            ));
+            let Some(target) = self.resolved_alias_target(symbol)? else {
+                return Ok(None);
+            };
+            let target_flags = self
+                .store
+                .symbol(target)
+                .ok_or(CanonicalNameResolutionError::InvalidHostSymbol(target))?
+                .flags();
+            return Ok(target_flags.intersects(meaning).then_some(symbol));
         }
         Ok(None)
+    }
+
+    /// Resolves one identifier, qualified name, or property-access entity.
+    ///
+    /// Namespace segments follow merged export tables. Warm import aliases
+    /// retain their alias identity during lexical lookup and resolve only
+    /// after the requested meaning has been proven.
+    ///
+    /// # Errors
+    ///
+    /// Returns a provenance error for invalid syntax, symbols, or tables. An
+    /// alias without an exact cached target remains an explicit capability
+    /// error.
+    pub fn resolve_entity_name(
+        &mut self,
+        entity: NodeRef,
+        meaning: SymbolFlags,
+    ) -> Result<Option<SemanticSymbolId>, CanonicalNameResolutionError> {
+        let source = self
+            .source(entity)
+            .ok_or(CanonicalNameResolutionError::UnboundLocation(entity))?;
+        let record = source
+            .arena
+            .get(entity.node)
+            .ok_or(CanonicalNameResolutionError::UnboundLocation(entity))?;
+        match &record.data {
+            NodeData::Identifier(identifier) if record.kind == SyntaxKind::Identifier => {
+                let store = self.store;
+                let mut symbol = CanonicalNameResolver::new(
+                    source.arena,
+                    source.bound,
+                    store.symbol_store(),
+                    self,
+                )?
+                .resolve(
+                    Some(CanonicalResolutionLocation::Bound(entity)),
+                    &identifier.text,
+                    meaning,
+                    None,
+                    true,
+                    false,
+                )?;
+                if symbol.is_none() && meaning == SymbolFlags::NAMESPACE {
+                    let alias = CanonicalNameResolver::new(
+                        source.arena,
+                        source.bound,
+                        store.symbol_store(),
+                        self,
+                    )?
+                    .resolve(
+                        Some(CanonicalResolutionLocation::Bound(entity)),
+                        &identifier.text,
+                        SymbolFlags::ALIAS,
+                        None,
+                        true,
+                        false,
+                    )?;
+                    symbol = alias.and_then(|alias| {
+                        store
+                            .symbol(alias)
+                            .is_some_and(|record| {
+                                record.name() == InternalSymbolName::ExportEquals.as_ref()
+                            })
+                            .then(|| store.get_parent_of_symbol(alias))
+                            .flatten()
+                    });
+                }
+                self.resolve_entity_symbol(symbol, meaning)
+            }
+            NodeData::QualifiedName(qualified) if record.kind == SyntaxKind::QualifiedName => self
+                .resolve_qualified_entity_name(
+                    entity,
+                    NodeRef::new(entity.arena, entity.file, qualified.left),
+                    NodeRef::new(entity.arena, entity.file, qualified.right),
+                    meaning,
+                ),
+            NodeData::PropertyAccessExpression(access)
+                if record.kind == SyntaxKind::PropertyAccessExpression =>
+            {
+                self.resolve_qualified_entity_name(
+                    entity,
+                    NodeRef::new(entity.arena, entity.file, access.expression),
+                    NodeRef::new(entity.arena, entity.file, access.name),
+                    meaning,
+                )
+            }
+            _ => Err(CanonicalNameResolutionError::UnboundLocation(entity)),
+        }
+    }
+
+    fn resolve_qualified_entity_name(
+        &mut self,
+        entity: NodeRef,
+        left: NodeRef,
+        right: NodeRef,
+        meaning: SymbolFlags,
+    ) -> Result<Option<SemanticSymbolId>, CanonicalNameResolutionError> {
+        let left_record = self
+            .node(left)
+            .ok_or(CanonicalNameResolutionError::UnboundLocation(left))?;
+        let right_record = self
+            .node(right)
+            .ok_or(CanonicalNameResolutionError::UnboundLocation(right))?;
+        if left_record.parent != Some(entity.node) || right_record.parent != Some(entity.node) {
+            return Err(CanonicalNameResolutionError::UnboundLocation(entity));
+        }
+        let NodeData::Identifier(identifier) = &right_record.data else {
+            return Err(CanonicalNameResolutionError::UnboundLocation(right));
+        };
+        if right_record.kind != SyntaxKind::Identifier {
+            return Err(CanonicalNameResolutionError::UnboundLocation(right));
+        }
+        let name = identifier.text.clone();
+
+        let Some(namespace) = self.resolve_entity_name(left, SymbolFlags::NAMESPACE)? else {
+            return Ok(None);
+        };
+        let record = self
+            .store
+            .symbol(namespace)
+            .ok_or(CanonicalNameResolutionError::InvalidHostSymbol(namespace))?;
+        if !record.flags().intersects(SymbolFlags::NAMESPACE) {
+            return Ok(None);
+        }
+        let Some(exports) = self
+            .store
+            .module_symbol_links(namespace)
+            .and_then(|links| links.resolved_exports)
+            .or_else(|| record.exports())
+        else {
+            return Ok(None);
+        };
+        let symbol = self.lookup_name(exports, EscapedNameRef::source(&name), meaning)?;
+        self.resolve_entity_symbol(symbol, meaning)
+    }
+
+    fn resolve_entity_symbol(
+        &self,
+        symbol: Option<SemanticSymbolId>,
+        meaning: SymbolFlags,
+    ) -> Result<Option<SemanticSymbolId>, CanonicalNameResolutionError> {
+        let Some(mut symbol) = symbol else {
+            return Ok(None);
+        };
+        let mut seen = HashSet::new();
+        loop {
+            let flags = self
+                .store
+                .symbol(symbol)
+                .ok_or(CanonicalNameResolutionError::InvalidHostSymbol(symbol))?
+                .flags();
+            if flags.intersects(meaning) {
+                return Ok(Some(symbol));
+            }
+            if !flags.contains(SymbolFlags::ALIAS) {
+                return Ok(None);
+            }
+            if !seen.insert(symbol) {
+                return Err(CanonicalNameResolutionError::AliasResolutionUnavailable(
+                    symbol,
+                ));
+            }
+            let Some(target) = self.resolved_alias_target(symbol)? else {
+                return Ok(None);
+            };
+            symbol = target;
+        }
+    }
+
+    fn resolved_alias_target(
+        &self,
+        alias: SemanticSymbolId,
+    ) -> Result<Option<SemanticSymbolId>, CanonicalNameResolutionError> {
+        let links = self.store.alias_symbol_links(alias).ok_or(
+            CanonicalNameResolutionError::AliasResolutionUnavailable(alias),
+        )?;
+        match links.alias_target {
+            AliasTargetState::Unknown => Ok(None),
+            AliasTargetState::Unresolved => Err(
+                CanonicalNameResolutionError::AliasResolutionUnavailable(alias),
+            ),
+            AliasTargetState::Resolved(target) => self
+                .store
+                .get_merged_symbol(target)
+                .ok_or(CanonicalNameResolutionError::InvalidHostSymbol(target))
+                .map(Some),
+        }
     }
 
     fn source(&self, reference: NodeRef) -> Option<ProductionNameResolverSource<'arena>> {
@@ -435,8 +631,8 @@ mod tests {
 
     use super::*;
     use crate::semantic::{
-        DeclaredTypeHost, IntrinsicBootstrapOptions, TypeData, TypeMapper, TypeRecord,
-        types::ObjectFlags,
+        AliasSymbolLinks, DeclaredTypeHost, IntrinsicBootstrapOptions, TypeData, TypeMapper,
+        TypeRecord, types::ObjectFlags,
     };
 
     type TestStore = super::super::SemanticStore<TypeRecord, TypeMapper>;
@@ -531,6 +727,39 @@ mod tests {
         fixture.files[&declaration.file]
             .symbol(declaration)
             .unwrap()
+    }
+
+    fn type_alias_entity_name(fixture: &Fixture, file: FileId, expected: &str) -> NodeRef {
+        let parsed = &fixture.parsed[&file];
+        parsed
+            .arena
+            .iter()
+            .find_map(|(_, record)| {
+                let NodeData::TypeAliasDeclaration(alias) = &record.data else {
+                    return None;
+                };
+                let NodeData::Identifier(name) = &parsed.arena.get(alias.name)?.data else {
+                    return None;
+                };
+                if name.text != expected {
+                    return None;
+                }
+                let NodeData::TypeReferenceNode(reference) = &parsed.arena.get(alias.type_)?.data
+                else {
+                    return None;
+                };
+                Some(NodeRef::new(parsed.arena.id(), file, reference.type_name))
+            })
+            .unwrap_or_else(|| panic!("missing type alias reference {expected}"))
+    }
+
+    fn script_namespace_symbol(fixture: &Fixture, file: FileId, name: &str) -> SemanticSymbolId {
+        let bound = &fixture.files[&file];
+        bound
+            .locals(bound.source_file())
+            .and_then(|locals| fixture.store.symbol_table(locals))
+            .and_then(|locals| locals.get_source(name))
+            .unwrap_or_else(|| panic!("missing namespace {name}"))
     }
 
     fn production_host(fixture: &Fixture) -> ProductionNameResolverHost<'_, '_> {
@@ -800,6 +1029,152 @@ mod tests {
                 SymbolFlags::TYPE,
             ),
             Ok(None)
+        );
+    }
+
+    #[test]
+    fn qualified_entity_names_follow_nested_namespace_exports() {
+        let file = FileId::new(708);
+        let mut fixture = fixture(&[(
+            file,
+            concat!(
+                "namespace Outer { export namespace Inner { export interface Shape {} } } ",
+                "type Value = Outer.Inner.Shape;",
+            ),
+            CanonicalModuleState::Script,
+        )]);
+        let outer = script_namespace_symbol(&fixture, file, "Outer");
+        merge_globals(&mut fixture, &[outer]);
+        let target = declaration_symbol(
+            &fixture,
+            named_declaration(&fixture, file, SyntaxKind::InterfaceDeclaration, "Shape"),
+        );
+        let entity = type_alias_entity_name(&fixture, file, "Value");
+        let mut host = production_host(&fixture);
+
+        assert_eq!(
+            host.resolve_entity_name(entity, SymbolFlags::TYPE),
+            Ok(Some(target)),
+        );
+    }
+
+    #[test]
+    fn qualified_entity_names_do_not_expose_private_namespace_members() {
+        let file = FileId::new(709);
+        let mut fixture = fixture(&[(
+            file,
+            "namespace Outer { interface Hidden {} } type Value = Outer.Hidden;",
+            CanonicalModuleState::Script,
+        )]);
+        let outer = script_namespace_symbol(&fixture, file, "Outer");
+        merge_globals(&mut fixture, &[outer]);
+        let entity = type_alias_entity_name(&fixture, file, "Value");
+        let mut host = production_host(&fixture);
+
+        assert_eq!(
+            host.resolve_entity_name(entity, SymbolFlags::TYPE),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn qualified_entity_names_follow_reopened_namespace_redirects() {
+        let first_file = FileId::new(710);
+        let second_file = FileId::new(711);
+        let mut fixture = fixture(&[
+            (
+                first_file,
+                "declare namespace Shared { interface First {} }",
+                CanonicalModuleState::Script,
+            ),
+            (
+                second_file,
+                "declare namespace Shared { interface Last {} } type Value = Shared.Last;",
+                CanonicalModuleState::Script,
+            ),
+        ]);
+        let first = script_namespace_symbol(&fixture, first_file, "Shared");
+        let second = script_namespace_symbol(&fixture, second_file, "Shared");
+        merge_globals(&mut fixture, &[first, second]);
+        let target = declaration_symbol(
+            &fixture,
+            named_declaration(
+                &fixture,
+                second_file,
+                SyntaxKind::InterfaceDeclaration,
+                "Last",
+            ),
+        );
+        let entity = type_alias_entity_name(&fixture, second_file, "Value");
+        let mut host = production_host(&fixture);
+
+        assert_eq!(
+            host.resolve_entity_name(entity, SymbolFlags::TYPE),
+            Ok(Some(target)),
+        );
+    }
+
+    #[test]
+    fn resolved_namespace_import_keeps_alias_lookup_and_resolves_qualified_type() {
+        let target_file = FileId::new(712);
+        let source_file = FileId::new(713);
+        let mut fixture = fixture(&[
+            (
+                target_file,
+                "export interface Shape {}",
+                CanonicalModuleState::External,
+            ),
+            (
+                source_file,
+                "import * as NS from './target'; type Value = NS.Shape;",
+                CanonicalModuleState::External,
+            ),
+        ]);
+        let target_bound = &fixture.files[&target_file];
+        let target_module = target_bound.symbol(target_bound.source_file()).unwrap();
+        let target = declaration_symbol(
+            &fixture,
+            named_declaration(
+                &fixture,
+                target_file,
+                SyntaxKind::InterfaceDeclaration,
+                "Shape",
+            ),
+        );
+        let parsed = &fixture.parsed[&source_file];
+        let import = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::NamespaceImport).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    source_file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let alias = fixture.files[&source_file].symbol(import).unwrap();
+        assert!(fixture.store.set_alias_symbol_links(
+            alias,
+            AliasSymbolLinks {
+                immediate_target: Some(target_module),
+                alias_target: AliasTargetState::Resolved(target_module),
+                ..AliasSymbolLinks::default()
+            },
+        ));
+        let entity = type_alias_entity_name(&fixture, source_file, "Value");
+        let locals = fixture.files[&source_file]
+            .locals(fixture.files[&source_file].source_file())
+            .unwrap();
+        let mut host = production_host(&fixture);
+
+        assert_eq!(
+            host.lookup_name(locals, EscapedNameRef::source("NS"), SymbolFlags::NAMESPACE,),
+            Ok(Some(alias)),
+        );
+        assert_eq!(
+            host.resolve_entity_name(entity, SymbolFlags::TYPE),
+            Ok(Some(target)),
         );
     }
 
