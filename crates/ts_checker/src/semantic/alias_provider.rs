@@ -1,10 +1,9 @@
 //! Production syntax and module-resolution host for canonical alias targets.
 //!
-//! This first dependency-closed slice intentionally accepts only direct plain
-//! TypeScript ESM namespace imports, named non-default imports, and named
-//! non-default re-exports with a module specifier. The host returns immediate
-//! symbols and never follows an alias target: live recursion and transitive
-//! type-only propagation remain owned by the canonical alias kernel.
+//! This host accepts direct TypeScript ESM namespace imports, explicit default
+//! imports, named imports, and named re-exports with a module specifier. It
+//! returns immediate symbols and never follows an alias target. Live recursion
+//! and transitive type-only propagation belong to the canonical alias kernel.
 
 use std::collections::BTreeMap;
 
@@ -168,6 +167,10 @@ impl std::error::Error for ProductionAliasTargetHostError {}
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum SupportedAliasDeclaration {
     NamespaceImport {
+        specifier: NodeRef,
+        type_only: bool,
+    },
+    DefaultModuleMember {
         specifier: NodeRef,
         type_only: bool,
     },
@@ -472,9 +475,11 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
 
         match (node.kind, &node.data) {
             (SyntaxKind::ImportClause, NodeData::ImportClause(clause)) if clause.name.is_some() => {
-                Err(CanonicalAliasTargetUnavailable::UnsupportedDefaultAlias(
-                    declaration,
-                ))
+                let (specifier, clause) = default_import_context(source.arena, declaration)?;
+                Ok(SupportedAliasDeclaration::DefaultModuleMember {
+                    specifier,
+                    type_only: clause.phase_modifier == Some(SyntaxKind::TypeKeyword),
+                })
             }
             (SyntaxKind::NamespaceImport, NodeData::NamespaceImport(_)) => {
                 let (specifier, clause) = namespace_import_context(source.arena, declaration)?;
@@ -490,17 +495,20 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
                         .ok_or(CanonicalAliasTargetUnavailable::MalformedDeclaration(
                         declaration,
                     ))?;
+                let type_only =
+                    import.is_type_only || clause.phase_modifier == Some(SyntaxKind::TypeKeyword);
                 if name == "default" {
-                    return Err(CanonicalAliasTargetUnavailable::UnsupportedDefaultAlias(
-                        declaration,
-                    ));
+                    Ok(SupportedAliasDeclaration::DefaultModuleMember {
+                        specifier,
+                        type_only,
+                    })
+                } else {
+                    Ok(SupportedAliasDeclaration::NamedModuleMember {
+                        specifier,
+                        name: name.to_owned(),
+                        type_only,
+                    })
                 }
-                Ok(SupportedAliasDeclaration::NamedModuleMember {
-                    specifier,
-                    name: name.to_owned(),
-                    type_only: import.is_type_only
-                        || clause.phase_modifier == Some(SyntaxKind::TypeKeyword),
-                })
             }
             (SyntaxKind::ExportSpecifier, NodeData::ExportSpecifier(export)) => {
                 let (specifier, declaration_type_only) =
@@ -510,7 +518,7 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
                         declaration,
                     ));
                 };
-                let exported_name = module_export_name(source.arena, export.name).ok_or(
+                module_export_name(source.arena, export.name).ok_or(
                     CanonicalAliasTargetUnavailable::MalformedDeclaration(declaration),
                 )?;
                 let name =
@@ -518,16 +526,19 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
                         .ok_or(CanonicalAliasTargetUnavailable::MalformedDeclaration(
                         declaration,
                     ))?;
-                if exported_name == "default" || name == "default" {
-                    return Err(CanonicalAliasTargetUnavailable::UnsupportedDefaultAlias(
-                        declaration,
-                    ));
+                let type_only = export.is_type_only || declaration_type_only;
+                if name == "default" {
+                    Ok(SupportedAliasDeclaration::DefaultModuleMember {
+                        specifier,
+                        type_only,
+                    })
+                } else {
+                    Ok(SupportedAliasDeclaration::NamedModuleMember {
+                        specifier,
+                        name: name.to_owned(),
+                        type_only,
+                    })
                 }
-                Ok(SupportedAliasDeclaration::NamedModuleMember {
-                    specifier,
-                    name: name.to_owned(),
-                    type_only: export.is_type_only || declaration_type_only,
-                })
             }
             _ => Err(CanonicalAliasTargetUnavailable::UnsupportedAliasDeclaration(declaration)),
         }
@@ -698,9 +709,10 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
                 },
             );
         }
-        if exports
-            .get(InternalSymbolName::ExportStar.as_ref())
-            .is_some()
+        if name != "default"
+            && exports
+                .get(InternalSymbolName::ExportStar.as_ref())
+                .is_some()
         {
             return Err(
                 CanonicalAliasTargetUnavailable::ExportStarResolutionUnsupported {
@@ -772,10 +784,8 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
         &mut self,
         store: &mut CanonicalSemanticStore<MapperPayload>,
         alias: SemanticSymbolId,
-    ) -> Result<
-        (CanonicalImmediateAliasTarget, Option<NodeRef>),
-        CanonicalAliasTargetUnavailable,
-    > {
+    ) -> Result<(CanonicalImmediateAliasTarget, Option<NodeRef>), CanonicalAliasTargetUnavailable>
+    {
         if store.id() != self.store {
             return Err(CanonicalAliasTargetUnavailable::ForeignStore {
                 expected: self.store,
@@ -786,6 +796,10 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
         let supported = self.supported_declaration(store, declaration)?;
         let (specifier, type_only) = match &supported {
             SupportedAliasDeclaration::NamespaceImport {
+                specifier,
+                type_only,
+            }
+            | SupportedAliasDeclaration::DefaultModuleMember {
                 specifier,
                 type_only,
             }
@@ -803,6 +817,9 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
         let target = match &supported {
             SupportedAliasDeclaration::NamespaceImport { .. } => {
                 Self::direct_namespace_target(store, declaration, module)?
+            }
+            SupportedAliasDeclaration::DefaultModuleMember { .. } => {
+                Self::direct_export(store, declaration, module, "default")?
             }
             SupportedAliasDeclaration::NamedModuleMember { name, .. } => {
                 Self::direct_export(store, declaration, module, name)?
@@ -922,6 +939,47 @@ fn expression_is_alias(arena: &NodeArena, expression: NodeId) -> bool {
         }
         _ => false,
     }
+}
+
+fn default_import_context(
+    arena: &NodeArena,
+    declaration: NodeRef,
+) -> Result<(NodeRef, &ts_ast::ImportClauseData), CanonicalAliasTargetUnavailable> {
+    let Some(Node {
+        kind: SyntaxKind::ImportClause,
+        data: NodeData::ImportClause(clause),
+        parent: Some(import_id),
+        ..
+    }) = arena.get(declaration.node)
+    else {
+        return Err(CanonicalAliasTargetUnavailable::MalformedDeclaration(
+            declaration,
+        ));
+    };
+    if clause.name.is_none() {
+        return Err(CanonicalAliasTargetUnavailable::MalformedDeclaration(
+            declaration,
+        ));
+    }
+    let Some(Node {
+        kind: SyntaxKind::ImportDeclaration | SyntaxKind::JsImportDeclaration,
+        data: NodeData::ImportDeclaration(import),
+        ..
+    }) = arena.get(*import_id)
+    else {
+        return Err(CanonicalAliasTargetUnavailable::MalformedDeclaration(
+            declaration,
+        ));
+    };
+    if import.import_clause != Some(declaration.node) {
+        return Err(CanonicalAliasTargetUnavailable::MalformedDeclaration(
+            declaration,
+        ));
+    }
+    Ok((
+        NodeRef::new(declaration.arena, declaration.file, import.module_specifier),
+        clause,
+    ))
 }
 
 fn namespace_import_context(
@@ -1330,6 +1388,118 @@ mod tests {
     }
 
     #[test]
+    fn explicit_default_imports_and_reexports_use_the_direct_default_symbol() {
+        let importer = parsed(
+            r#"
+                import DefaultValue from "./target";
+                import { default as namedDefault } from "./target";
+                export { default as forwardedDefault } from "./target";
+                export { default } from "./target";
+            "#,
+        );
+        let target =
+            parsed("export default function value(input: number): number { return input; }");
+        let importer_file = FileId::new(5);
+        let target_file = FileId::new(6);
+        let files = [
+            (importer_file, &importer, CanonicalModuleState::External),
+            (target_file, &target, CanonicalModuleState::External),
+        ];
+        let entries = module_specifiers(&importer)
+            .into_iter()
+            .map(|specifier| {
+                CanonicalModuleResolutionEntry::resolved(
+                    node_ref(&importer, importer_file, specifier),
+                    esm(target_file),
+                )
+            })
+            .collect::<Vec<_>>();
+        let (mut store, bound_files, manifest) =
+            fixture(&files, CanonicalModuleResolutionManifestInput::new(entries));
+        let mut host =
+            ProductionAliasTargetHost::new(&store, sources(&files, &bound_files), &manifest)
+                .unwrap();
+        let default = direct_export(&store, &bound_files, target_file, "default");
+
+        for name in [
+            "DefaultValue",
+            "namedDefault",
+            "forwardedDefault",
+            "default",
+        ] {
+            let declaration = alias_declaration_named(&importer, importer_file, name);
+            let alias = alias(&bound_files, declaration);
+            assert_eq!(
+                CanonicalAliasResolver::new(&mut store, &mut host)
+                    .get_immediate_aliased_symbol(alias)
+                    .unwrap(),
+                Some(default),
+                "default alias {name} must retain the direct export symbol"
+            );
+            assert_eq!(
+                CanonicalAliasResolver::new(&mut store, &mut host)
+                    .resolve_alias(alias)
+                    .unwrap()
+                    .target,
+                AliasTargetState::Resolved(default)
+            );
+        }
+    }
+
+    #[test]
+    fn export_star_never_supplies_a_missing_default_export() {
+        let importer = parsed(
+            r#"
+                import DefaultValue from "./star";
+                import { default as namedDefault } from "./star";
+                export { default as forwardedDefault } from "./star";
+            "#,
+        );
+        let star = parsed("export * from './target';");
+        let importer_file = FileId::new(7);
+        let star_file = FileId::new(8);
+        let files = [
+            (importer_file, &importer, CanonicalModuleState::External),
+            (star_file, &star, CanonicalModuleState::External),
+        ];
+        let entries = module_specifiers(&importer)
+            .into_iter()
+            .map(|specifier| {
+                CanonicalModuleResolutionEntry::resolved(
+                    node_ref(&importer, importer_file, specifier),
+                    esm(star_file),
+                )
+            })
+            .collect::<Vec<_>>();
+        let (mut store, bound_files, manifest) =
+            fixture(&files, CanonicalModuleResolutionManifestInput::new(entries));
+        let mut host =
+            ProductionAliasTargetHost::new(&store, sources(&files, &bound_files), &manifest)
+                .unwrap();
+        let module = source_module(&bound_files, star_file);
+
+        for name in ["DefaultValue", "namedDefault", "forwardedDefault"] {
+            let declaration = alias_declaration_named(&importer, importer_file, name);
+            let alias = alias(&bound_files, declaration);
+            assert_eq!(
+                unavailable_reason(
+                    CanonicalAliasResolver::new(&mut store, &mut host)
+                        .resolve_alias(alias)
+                        .unwrap_err()
+                ),
+                CanonicalAliasTargetUnavailable::MissingExport {
+                    declaration,
+                    module,
+                }
+            );
+            assert_eq!(
+                store.alias_symbol_links(alias),
+                Some(&AliasSymbolLinks::default())
+            );
+        }
+    }
+
+    #[test]
     fn namespace_import_rejects_default_export_wrapper_while_named_member_stays_direct() {
         let importer = parsed(
             r#"
@@ -1632,7 +1802,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_default_local_star_export_equals_commonjs_and_synthetic_paths() {
+    fn rejects_missing_default_local_star_export_equals_commonjs_and_synthetic_paths() {
         let importer = parsed(
             r#"
                 import DefaultThing from "./plain";
@@ -1699,7 +1869,10 @@ mod tests {
         let aliases = declarations.map(|declaration| alias(&bound_files, declaration));
 
         let expected = [
-            CanonicalAliasTargetUnavailable::UnsupportedDefaultAlias(declarations[0]),
+            CanonicalAliasTargetUnavailable::MissingExport {
+                declaration: declarations[0],
+                module: source_module(&bound_files, plain_file),
+            },
             CanonicalAliasTargetUnavailable::UnsupportedLocalExport(declarations[1]),
             CanonicalAliasTargetUnavailable::ExportStarResolutionUnsupported {
                 declaration: declarations[2],

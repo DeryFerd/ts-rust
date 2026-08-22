@@ -45,8 +45,8 @@ pub enum CanonicalAliasTargetUnavailable {
     /// The selected alias declaration is outside the production provider's
     /// dependency-closed syntax slice.
     UnsupportedAliasDeclaration(NodeRef),
-    /// Default imports and re-exports require the default/export-equals
-    /// interoperability path, which is not part of the plain-ESM slice.
+    /// The default alias needs synthetic-default or export-equals
+    /// interoperability instead of a direct ESM default export.
     UnsupportedDefaultAlias(NodeRef),
     /// A named export without a module specifier needs lexical name
     /// resolution instead of module-resolution facts.

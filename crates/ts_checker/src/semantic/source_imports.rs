@@ -1,13 +1,12 @@
-//! Exact source planning for named TypeScript ESM imports and reexports.
+//! Exact source planning for TypeScript ESM imports and named reexports.
 //!
-//! This first slice accepts only leading, top-level imports of the form
-//! `import { exported as local } from "./target"`. The import and every
-//! specifier must be value-bearing, identifier-named, modifier-free, and
-//! attribute-free. Alias discovery is delegated to the production alias host;
-//! a successful import alias may traverse exact named reexport aliases before
-//! reaching one unique, explicitly exported declaration in another retained
-//! TypeScript ESM source. Value preparation currently supports initialized
-//! annotated `const` declarations, exact
+//! This slice accepts leading, top-level default imports and named imports,
+//! including explicit named `default` bindings. Imports and reexports must
+//! use identifier names and cannot have attributes. Alias discovery belongs
+//! to the production alias host. A successful alias may traverse named and
+//! explicit default reexports before reaching one unique exported declaration
+//! in another retained TypeScript ESM source. Value preparation supports
+//! initialized annotated `const` declarations, exact
 //! `export declare const` declarations in retained declaration files, and
 //! annotated `FunctionDeclaration`s. Declaration-file bodies are never source
 //! checked by this leaf; only the final imported annotation is queried.
@@ -64,7 +63,7 @@ enum SourceImportPhase {
     Type,
 }
 
-/// One exact local binding introduced by a supported named import.
+/// One exact local binding introduced by a supported default or named import.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct SourceImportBindingPlan {
     pub(super) declaration: NodeRef,
@@ -75,7 +74,7 @@ pub(super) struct SourceImportBindingPlan {
     pub(super) alias_symbol: SemanticSymbolId,
 }
 
-/// Read-only plan for one complete top-level named import statement.
+/// Read-only plan for one complete top-level import statement.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct SourceImportPlan {
     pub(super) declaration: NodeRef,
@@ -207,8 +206,6 @@ pub(super) enum SourceImportUnsupported {
     Binding(NodeRef),
     ExportBinding(NodeRef),
     TypeOnly(NodeRef),
-    DefaultImport(NodeRef),
-    DefaultExport(NodeRef),
     ImportAttributes(NodeRef),
     ExportAttributes(NodeRef),
     NonIdentifierImportName(NodeRef),
@@ -284,7 +281,7 @@ pub(super) enum SourceImportInvariant {
     PreparedStateChanged(SemanticSymbolId),
 }
 
-/// Exact failure domain for the direct named-value import leaf.
+/// Exact failure domain for supported ESM import and reexport bindings.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum SourceImportError {
     Unsupported(SourceImportUnsupported),
@@ -319,8 +316,6 @@ impl SourceImportError {
                 | SourceImportUnsupported::Binding(node)
                 | SourceImportUnsupported::ExportBinding(node)
                 | SourceImportUnsupported::TypeOnly(node)
-                | SourceImportUnsupported::DefaultImport(node)
-                | SourceImportUnsupported::DefaultExport(node)
                 | SourceImportUnsupported::ImportAttributes(node)
                 | SourceImportUnsupported::ExportAttributes(node)
                 | SourceImportUnsupported::NonIdentifierImportName(node)
@@ -448,7 +443,7 @@ fn invariant(reason: SourceImportInvariant) -> SourceImportError {
     SourceImportError::Invariant(reason)
 }
 
-/// Proves one complete top-level named-value import without checker writes.
+/// Proves one complete top-level default or named-value import without writes.
 ///
 /// Statement-order ownership stays with the source planner: it must call this
 /// only while traversing the leading import prefix.
@@ -461,7 +456,7 @@ pub(super) fn plan_top_level_named_value_import(
     plan_top_level_named_import(arena, bound, store, declaration, SourceImportPhase::Value)
 }
 
-/// Proves one complete leading `import type { T as Local }` declaration.
+/// Proves one complete leading default or named `import type` declaration.
 ///
 /// The clause-level `type` marker is required. Mixed imports and the
 /// specifier-level `import { type T }` spelling remain outside this leaf so a
@@ -598,113 +593,148 @@ fn plan_top_level_named_import(
         }
         return Err(unsupported(SourceImportUnsupported::ImportClause(clause)));
     }
-    if clause_data.name.is_some() {
-        return Err(unsupported(SourceImportUnsupported::DefaultImport(clause)));
-    }
     let named = clause_data
         .named_bindings
-        .map(|node| NodeRef::new(declaration.arena, declaration.file, node))
-        .ok_or_else(|| unsupported(SourceImportUnsupported::NamedBindings(clause)))?;
-    let named_record = checked_node(arena, bound, store, named)?;
-    let NodeData::NamedImports(named_data) = &named_record.data else {
-        return Err(unsupported(SourceImportUnsupported::NamedBindings(named)));
+        .map(|node| NodeRef::new(declaration.arena, declaration.file, node));
+    if clause_data.name.is_none() && named.is_none() {
+        return Err(unsupported(SourceImportUnsupported::NamedBindings(clause)));
+    }
+
+    let named_count = match named {
+        Some(named) => match &checked_node(arena, bound, store, named)?.data {
+            NodeData::NamedImports(named) => named.elements.nodes.len(),
+            _ => 0,
+        },
+        None => 0,
     };
-    if named_record.kind != SyntaxKind::NamedImports
-        || named_record.parent != Some(clause.node)
-        || named_record.flags.0 != 0
-        || !range_contains(clause_record, named_record)
-        || named_data.facts != 0
-        || named_data.elements.range != named_record.range
-        || named_data.elements.has_trailing_comma
-    {
-        return Err(unsupported(SourceImportUnsupported::NamedBindings(named)));
-    }
-    if named_data.elements.nodes.is_empty() {
-        return Err(unsupported(SourceImportUnsupported::EmptyNamedBindings(
-            named,
-        )));
-    }
+    let binding_capacity = usize::from(clause_data.name.is_some()) + named_count;
+    let mut aliases = HashSet::with_capacity(binding_capacity);
+    let mut local_names = HashSet::with_capacity(binding_capacity);
+    let mut bindings = Vec::with_capacity(binding_capacity);
 
-    let mut aliases = HashSet::with_capacity(named_data.elements.nodes.len());
-    let mut local_names = HashSet::with_capacity(named_data.elements.nodes.len());
-    let mut bindings = Vec::with_capacity(named_data.elements.nodes.len());
-    for &binding in &named_data.elements.nodes {
-        let binding = NodeRef::new(declaration.arena, declaration.file, binding);
-        let binding_record = checked_node(arena, bound, store, binding)?;
-        let NodeData::ImportSpecifier(specifier) = &binding_record.data else {
-            return Err(unsupported(SourceImportUnsupported::Binding(binding)));
-        };
-        if binding_record.kind != SyntaxKind::ImportSpecifier
-            || binding_record.parent != Some(named.node)
-            || binding_record.flags.0 != 0
-            || !range_contains(named_record, binding_record)
-            || specifier.local_symbol.is_some()
-            || specifier.symbol.is_some()
-            || specifier.facts != 0
-        {
-            return Err(unsupported(SourceImportUnsupported::Binding(binding)));
-        }
-        if specifier.is_type_only {
-            return Err(unsupported(SourceImportUnsupported::TypeOnly(binding)));
-        }
-
-        let imported_name = NodeRef::new(
-            declaration.arena,
-            declaration.file,
-            specifier.property_name.unwrap_or(specifier.name),
-        );
-        let local_name = NodeRef::new(declaration.arena, declaration.file, specifier.name);
-        let imported_text = exact_identifier(
-            arena,
-            bound,
-            store,
-            imported_name,
-            binding,
-            SourceImportUnsupported::NonIdentifierImportName(imported_name),
-        )?;
+    if let Some(name) = clause_data.name {
+        let local_name = NodeRef::new(declaration.arena, declaration.file, name);
         let local_text = exact_identifier(
             arena,
             bound,
             store,
             local_name,
-            binding,
+            clause,
             SourceImportUnsupported::NonIdentifierLocalName(local_name),
         )?;
-        if imported_text == "default" {
-            return Err(unsupported(SourceImportUnsupported::DefaultImport(
-                imported_name,
-            )));
-        }
-
         let alias_symbol = bound
-            .symbol(binding)
-            .ok_or_else(|| invariant(SourceImportInvariant::MissingAliasSymbol(binding)))?;
-        if phase == SourceImportPhase::Type {
-            if !local_names.insert(local_text.clone()) || !aliases.insert(alias_symbol) {
-                return Err(unsupported(SourceImportUnsupported::Binding(binding)));
-            }
-        } else {
-            validate_alias_symbol(store, alias_symbol, binding, local_name, &local_text)?;
-            if !aliases.insert(alias_symbol) {
-                return Err(invariant(SourceImportInvariant::DuplicateAlias(
-                    alias_symbol,
-                )));
-            }
-            if !local_names.insert(local_text.clone()) {
-                return Err(invariant(SourceImportInvariant::DuplicateLocalName(
-                    local_name,
-                )));
-            }
+            .symbol(clause)
+            .ok_or_else(|| invariant(SourceImportInvariant::MissingAliasSymbol(clause)))?;
+        if phase == SourceImportPhase::Value {
+            validate_alias_symbol(store, alias_symbol, clause, local_name, &local_text)?;
             preflight_alias_value_links(store, alias_symbol)?;
         }
+        aliases.insert(alias_symbol);
+        local_names.insert(local_text.clone());
         bindings.push(SourceImportBindingPlan {
-            declaration: binding,
-            imported_name,
+            declaration: clause,
+            imported_name: local_name,
             local_name,
-            imported_text,
+            imported_text: "default".to_owned(),
             local_text,
             alias_symbol,
         });
+    }
+
+    if let Some(named) = named {
+        let named_record = checked_node(arena, bound, store, named)?;
+        let NodeData::NamedImports(named_data) = &named_record.data else {
+            return Err(unsupported(SourceImportUnsupported::NamedBindings(named)));
+        };
+        if named_record.kind != SyntaxKind::NamedImports
+            || named_record.parent != Some(clause.node)
+            || named_record.flags.0 != 0
+            || !range_contains(clause_record, named_record)
+            || named_data.facts != 0
+            || named_data.elements.range != named_record.range
+            || named_data.elements.has_trailing_comma
+        {
+            return Err(unsupported(SourceImportUnsupported::NamedBindings(named)));
+        }
+        if named_data.elements.nodes.is_empty() && bindings.is_empty() {
+            return Err(unsupported(SourceImportUnsupported::EmptyNamedBindings(
+                named,
+            )));
+        }
+
+        for &binding in &named_data.elements.nodes {
+            let binding = NodeRef::new(declaration.arena, declaration.file, binding);
+            let binding_record = checked_node(arena, bound, store, binding)?;
+            let NodeData::ImportSpecifier(specifier) = &binding_record.data else {
+                return Err(unsupported(SourceImportUnsupported::Binding(binding)));
+            };
+            if binding_record.kind != SyntaxKind::ImportSpecifier
+                || binding_record.parent != Some(named.node)
+                || binding_record.flags.0 != 0
+                || !range_contains(named_record, binding_record)
+                || specifier.local_symbol.is_some()
+                || specifier.symbol.is_some()
+                || specifier.facts != 0
+            {
+                return Err(unsupported(SourceImportUnsupported::Binding(binding)));
+            }
+            if specifier.is_type_only {
+                return Err(unsupported(SourceImportUnsupported::TypeOnly(binding)));
+            }
+
+            let imported_name = NodeRef::new(
+                declaration.arena,
+                declaration.file,
+                specifier.property_name.unwrap_or(specifier.name),
+            );
+            let local_name = NodeRef::new(declaration.arena, declaration.file, specifier.name);
+            let imported_text = exact_identifier(
+                arena,
+                bound,
+                store,
+                imported_name,
+                binding,
+                SourceImportUnsupported::NonIdentifierImportName(imported_name),
+            )?;
+            let local_text = exact_identifier(
+                arena,
+                bound,
+                store,
+                local_name,
+                binding,
+                SourceImportUnsupported::NonIdentifierLocalName(local_name),
+            )?;
+
+            let alias_symbol = bound
+                .symbol(binding)
+                .ok_or_else(|| invariant(SourceImportInvariant::MissingAliasSymbol(binding)))?;
+            if phase == SourceImportPhase::Type {
+                if !local_names.insert(local_text.clone()) || !aliases.insert(alias_symbol) {
+                    return Err(unsupported(SourceImportUnsupported::Binding(binding)));
+                }
+            } else {
+                validate_alias_symbol(store, alias_symbol, binding, local_name, &local_text)?;
+                if !aliases.insert(alias_symbol) {
+                    return Err(invariant(SourceImportInvariant::DuplicateAlias(
+                        alias_symbol,
+                    )));
+                }
+                if !local_names.insert(local_text.clone()) {
+                    return Err(invariant(SourceImportInvariant::DuplicateLocalName(
+                        local_name,
+                    )));
+                }
+                preflight_alias_value_links(store, alias_symbol)?;
+            }
+            bindings.push(SourceImportBindingPlan {
+                declaration: binding,
+                imported_name,
+                local_name,
+                imported_text,
+                local_text,
+                alias_symbol,
+            });
+        }
     }
 
     if phase == SourceImportPhase::Type {
@@ -730,8 +760,8 @@ fn plan_top_level_named_import(
 /// Proves one complete top-level named reexport without checker writes.
 ///
 /// Only identifier-named `export { source as public } from "./target"` forms
-/// are admitted. Default, namespace, star, local, attribute-bearing, and
-/// CommonJS forms remain separate module-system slices.
+/// are admitted. Either name can be `default`. Namespace, star, local,
+/// attribute-bearing, and CommonJS forms require separate module support.
 #[cfg_attr(not(test), allow(dead_code))]
 #[allow(clippy::too_many_lines)] // One exact export-declaration provenance walk.
 pub(super) fn plan_top_level_named_reexport(
@@ -894,10 +924,6 @@ pub(super) fn plan_top_level_named_reexport(
             binding,
             SourceImportUnsupported::NonIdentifierExportName(exported_name),
         )?;
-        if imported_text == "default" || exported_text == "default" {
-            return Err(unsupported(SourceImportUnsupported::DefaultExport(binding)));
-        }
-
         let alias_symbol = bound
             .symbol(binding)
             .ok_or_else(|| invariant(SourceImportInvariant::MissingAliasSymbol(binding)))?;
@@ -1035,11 +1061,8 @@ pub(super) fn resolve_source_named_reexport_binding(
         }
         AliasTargetState::Resolved(target) => target,
     };
-    let (independent_immediate, independent_target) = independently_resolve_source_alias_chain(
-        store,
-        alias_host,
-        alias,
-    )?;
+    let (independent_immediate, independent_target) =
+        independently_resolve_source_alias_chain(store, alias_host, alias)?;
     if independent_immediate != immediate_target || independent_target != target {
         return Err(invariant(SourceImportInvariant::InvalidAliasLinks(alias)));
     }
@@ -1273,11 +1296,8 @@ fn resolve_source_import_binding_phase(
         }
         AliasTargetState::Resolved(target) => target,
     };
-    let (independent_immediate, independent_target) = independently_resolve_source_alias_chain(
-        store,
-        alias_host,
-        binding.alias_symbol,
-    )?;
+    let (independent_immediate, independent_target) =
+        independently_resolve_source_alias_chain(store, alias_host, binding.alias_symbol)?;
     if independent_immediate != direct_target || independent_target != resolved_target {
         return Err(invariant(SourceImportInvariant::InvalidAliasLinks(
             binding.alias_symbol,
@@ -1385,8 +1405,8 @@ fn independently_resolve_source_alias_chain(
         current = next;
     }
 
-    let first_target = first_target
-        .ok_or_else(|| invariant(SourceImportInvariant::InvalidAliasSymbol(alias)))?;
+    let first_target =
+        first_target.ok_or_else(|| invariant(SourceImportInvariant::InvalidAliasSymbol(alias)))?;
     let mut resolved = current;
     let mut root_target = None;
     let mut propagated_type_only = None;
@@ -1409,8 +1429,8 @@ fn independently_resolve_source_alias_chain(
             .get_merged_symbol(resolved)
             .ok_or_else(|| invariant(SourceImportInvariant::InvalidTargetSymbol(resolved)))?;
     }
-    let root_target = root_target
-        .ok_or_else(|| invariant(SourceImportInvariant::InvalidAliasSymbol(alias)))?;
+    let root_target =
+        root_target.ok_or_else(|| invariant(SourceImportInvariant::InvalidAliasSymbol(alias)))?;
     Ok((first_target, root_target))
 }
 
@@ -2915,8 +2935,17 @@ mod tests {
         routes: &[Route],
         module_states: &[CanonicalModuleState],
     ) -> Fixture {
+        fixture_with_module_states_and_wrapper_flags(sources, routes, module_states, None)
+    }
+
+    fn fixture_with_module_states_and_wrapper_flags(
+        sources: &[&str],
+        routes: &[Route],
+        module_states: &[CanonicalModuleState],
+        flagged_wrapper: Option<SyntaxKind>,
+    ) -> Fixture {
         assert_eq!(sources.len(), module_states.len());
-        let files = sources
+        let mut files = sources
             .iter()
             .enumerate()
             .map(|(index, source)| {
@@ -2927,6 +2956,15 @@ mod tests {
                 }
             })
             .collect::<Vec<_>>();
+        if let Some(kind) = flagged_wrapper {
+            let flagged = files[0]
+                .parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| (record.kind == kind).then_some(node))
+                .expect("fixture contains the requested composite wrapper");
+            files[0].parsed.arena.get_mut(flagged).unwrap().flags = NodeFlags(1);
+        }
         let mut binder = CanonicalBinder::new();
         for (file, module_state) in files.iter().zip(module_states.iter().copied()) {
             binder
@@ -2983,6 +3021,25 @@ mod tests {
         store
             .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions::default())
             .unwrap();
+        let globals = store.intrinsic_bootstrap().unwrap().globals;
+        for (file, module_state) in files.iter().zip(module_states.iter().copied()) {
+            if module_state != CanonicalModuleState::Script {
+                continue;
+            }
+            let bound = bound.get(&file.file).unwrap();
+            let Some(locals) = bound.locals(bound.source_file()) else {
+                continue;
+            };
+            let symbols = store
+                .symbol_table(locals)
+                .unwrap()
+                .iter()
+                .map(|(_, symbol)| symbol)
+                .collect::<Vec<_>>();
+            for symbol in symbols {
+                store.merge_global_symbol(globals, symbol).unwrap();
+            }
+        }
         let sources = || {
             files.iter().map(|file| {
                 (
@@ -2996,7 +3053,6 @@ mod tests {
             GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
         )
         .unwrap();
-        let globals = store.intrinsic_bootstrap().unwrap().globals;
         let global_types =
             initialize_global_library_types(&mut store, &declared_host, globals, false).unwrap();
         Fixture {
@@ -3623,25 +3679,7 @@ mod tests {
     }
 
     #[test]
-    fn default_star_namespace_local_and_commonjs_reexports_remain_boundaries() {
-        let default = fixture(
-            &[
-                r#"export { default as publicValue } from "./base";"#,
-                r"export const value: number = 1;",
-            ],
-            &[Route {
-                source: 0,
-                specifier: 0,
-                target: Some(1),
-            }],
-        );
-        assert!(matches!(
-            default.try_plan_reexport(0, 0),
-            Err(SourceImportError::Unsupported(
-                SourceImportUnsupported::DefaultExport(_)
-            ))
-        ));
-
+    fn star_namespace_local_and_commonjs_reexports_remain_boundaries() {
         let star = fixture(
             &[
                 r#"export * from "./base";"#,
@@ -3686,26 +3724,21 @@ mod tests {
             ))
         ));
 
-        let commonjs = fixture_with_module_states(
-            &[
-                r#"export { value } from "./base";"#,
-                r"export const value: number = 1;",
-            ],
-            &[Route {
-                source: 0,
-                specifier: 0,
-                target: Some(1),
-            }],
-            &[
-                CanonicalModuleState::CommonJs,
-                CanonicalModuleState::External,
-            ],
-        );
+        let commonjs = parsed(r#"export { value } from "./base";"#);
+        let commonjs_file = FileId::new(740);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &commonjs.arena,
+                commonjs.source_file,
+                commonjs_file,
+                facts(commonjs_file, CanonicalModuleState::CommonJs),
+            )
+            .unwrap();
         assert!(matches!(
-            commonjs.try_plan_reexport(0, 0),
-            Err(SourceImportError::Unsupported(
-                SourceImportUnsupported::CommonJsSource(_)
-            ))
+            binder.bind_typescript_declaration_slice(&commonjs.arena, commonjs_file),
+            Err(ts_binder::CanonicalDeclarationError::CommonJsDeclarationsDeferred(file))
+                if file == commonjs_file
         ));
     }
 
@@ -3935,7 +3968,7 @@ mod tests {
             SyntaxKind::ParenthesizedType,
             SyntaxKind::ArrayType,
         ] {
-            let mut fixture = fixture(
+            let mut fixture = fixture_with_module_states_and_wrapper_flags(
                 &[
                     r#"
                         import type { User } from "./target";
@@ -3948,6 +3981,11 @@ mod tests {
                     specifier: 0,
                     target: Some(1),
                 }],
+                &[
+                    CanonicalModuleState::External,
+                    CanonicalModuleState::External,
+                ],
+                Some(kind),
             );
             let plan = fixture.plan_type_import(0, 0);
             let root = variable_type_node(&fixture, 0, "value");
@@ -3955,19 +3993,6 @@ mod tests {
             let resolved = resolve_all_types(&mut fixture, &plan.bindings).unwrap();
             let capability =
                 plan_type_reference_capability_for_root(&fixture, &resolved[0], root, reference);
-            let flagged = fixture.files[0]
-                .parsed
-                .arena
-                .iter()
-                .find_map(|(node, record)| (record.kind == kind).then_some(node))
-                .expect("fixture contains every composite wrapper");
-            fixture.files[0]
-                .parsed
-                .arena
-                .get_mut(flagged)
-                .unwrap()
-                .flags = NodeFlags(1);
-
             let before = store_state(&fixture.store);
             assert!(matches!(
                 query_type_with_import_capability(&mut fixture, root, capability),
@@ -5053,7 +5078,6 @@ mod tests {
 
         for source in [
             r#"import type { value } from "./target";"#,
-            r#"import DefaultValue from "./target";"#,
             r#"import { type value } from "./target";"#,
         ] {
             let fixture = fixture(&[source, r"export const value: number = 1;"], &[]);

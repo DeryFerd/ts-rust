@@ -123,6 +123,23 @@ fn named_import_binding(parsed: &ParseResult, file: FileId, local: &str) -> Node
         .unwrap_or_else(|| panic!("fixture has named import binding {local}"))
 }
 
+fn default_import_binding(parsed: &ParseResult, file: FileId, local: &str) -> NodeRef {
+    parsed
+        .arena
+        .iter()
+        .find_map(|(node, record)| {
+            let NodeData::ImportClause(clause) = &record.data else {
+                return None;
+            };
+            let name = parsed.arena.get(clause.name?)?;
+            let NodeData::Identifier(identifier) = &name.data else {
+                return None;
+            };
+            (identifier.text == local).then_some(NodeRef::new(parsed.arena.id(), file, node))
+        })
+        .unwrap_or_else(|| panic!("fixture has default import binding {local}"))
+}
+
 fn named_reexport_binding(parsed: &ParseResult, file: FileId, exported: &str) -> NodeRef {
     parsed
         .arena
@@ -518,6 +535,262 @@ fn transitive_type_only_reexport_markers_preserve_annotation_checking() {
     assert_eq!(context.diagnostics().as_slice().len(), 1);
 }
 
+#[test]
+#[allow(clippy::too_many_lines)]
+fn mixed_default_and_named_imports_follow_renamed_default_reexports() {
+    let consumer = parse_source_file(concat!(
+        "import defaultLabel, { forwarded as value, default as namedLabel } from './barrel-b'; ",
+        "const good: number = value; ",
+        "const label: string = defaultLabel; ",
+        "const repeated: string = namedLabel; ",
+        "const bad: string = value;",
+    ));
+    let barrel_b =
+        parse_source_file("export { default as forwarded, label as default } from './barrel-a';");
+    let barrel_a = parse_source_file(concat!(
+        "export { originalValue as default, ",
+        "originalLabel as label } from './base';",
+    ));
+    let base = parse_source_file(concat!(
+        "export const originalValue: number = 1; ",
+        "export const originalLabel: string = 'ready';",
+    ));
+    let consumer_file = FileId::new(30);
+    let barrel_b_file = FileId::new(31);
+    let barrel_a_file = FileId::new(32);
+    let base_file = FileId::new(33);
+    let sources = [
+        Source {
+            parsed: &consumer,
+            file: consumer_file,
+            path: "\"/project/default-consumer.ts\"",
+        },
+        Source {
+            parsed: &barrel_b,
+            file: barrel_b_file,
+            path: "\"/project/default-barrel-b.ts\"",
+        },
+        Source {
+            parsed: &barrel_a,
+            file: barrel_a_file,
+            path: "\"/project/default-barrel-a.ts\"",
+        },
+        Source {
+            parsed: &base,
+            file: base_file,
+            path: "\"/project/default-base.ts\"",
+        },
+    ];
+    let mut context = make_context(
+        &sources,
+        &[
+            Route {
+                source: 0,
+                specifier: 0,
+                target: 1,
+            },
+            Route {
+                source: 1,
+                specifier: 0,
+                target: 2,
+            },
+            Route {
+                source: 2,
+                specifier: 0,
+                target: 3,
+            },
+        ],
+    );
+    let imported_default = bound_symbol(
+        &context,
+        default_import_binding(&consumer, consumer_file, "defaultLabel"),
+    );
+    let imported_named_default = bound_symbol(
+        &context,
+        named_import_binding(&consumer, consumer_file, "namedLabel"),
+    );
+    let imported_value = bound_symbol(
+        &context,
+        named_import_binding(&consumer, consumer_file, "value"),
+    );
+    let public_default = direct_export_symbol(&context, barrel_b_file, "default");
+    let public_value = direct_export_symbol(&context, barrel_b_file, "forwarded");
+    let middle_default = direct_export_symbol(&context, barrel_a_file, "default");
+    let middle_label = direct_export_symbol(&context, barrel_a_file, "label");
+    let original_value = direct_export_symbol(&context, base_file, "originalValue");
+    let original_label = direct_export_symbol(&context, base_file, "originalLabel");
+
+    context.check_source_file(consumer_file).unwrap();
+    assert_eq!(
+        context
+            .diagnostics()
+            .as_slice()
+            .iter()
+            .map(|diagnostic| diagnostic.diagnostic.code())
+            .collect::<Vec<_>>(),
+        [2322]
+    );
+    assert!(!source_is_checked(&context, barrel_b_file));
+    assert!(!source_is_checked(&context, barrel_a_file));
+    assert!(!source_is_checked(&context, base_file));
+    assert_alias_chain(
+        &context,
+        imported_default,
+        public_default,
+        original_label,
+        None,
+    );
+    assert_alias_chain(
+        &context,
+        imported_named_default,
+        public_default,
+        original_label,
+        None,
+    );
+    assert_alias_chain(&context, imported_value, public_value, original_value, None);
+    assert_lazy_alias_target(&context, public_default, original_label, None);
+    assert_lazy_alias_target(&context, public_value, original_value, None);
+    assert_lazy_alias_target(&context, middle_default, original_value, None);
+    assert_lazy_alias_target(&context, middle_label, original_label, None);
+
+    for file in [barrel_b_file, barrel_a_file, base_file] {
+        context.check_source_file(file).unwrap();
+    }
+    assert_alias_chain(&context, public_default, middle_label, original_label, None);
+    assert_alias_chain(&context, public_value, middle_default, original_value, None);
+    assert_alias_chain(
+        &context,
+        middle_default,
+        original_value,
+        original_value,
+        None,
+    );
+    assert_alias_chain(&context, middle_label, original_label, original_label, None);
+
+    let warm_state = (
+        context.store().type_len(),
+        context.store().mapper_len(),
+        context.store().signature_len(),
+    );
+    for file in [consumer_file, barrel_b_file, barrel_a_file, base_file] {
+        context.check_source_file(file).unwrap();
+    }
+    assert_eq!(
+        (
+            context.store().type_len(),
+            context.store().mapper_len(),
+            context.store().signature_len(),
+        ),
+        warm_state
+    );
+    assert_eq!(context.diagnostics().as_slice().len(), 1);
+}
+
+#[test]
+fn default_type_imports_keep_their_own_type_only_markers() {
+    let consumer = parse_source_file(concat!(
+        "import type DefaultModel from './barrel'; ",
+        "import type { default as NamedModel } from './barrel'; ",
+        "const good: DefaultModel = 1; ",
+        "const bad: NamedModel = 'wrong'; ",
+        "const invalid = DefaultModel;",
+    ));
+    let barrel = parse_source_file("export type { Model as default } from './base';");
+    let base = parse_source_file("export type Model = number;");
+    let consumer_file = FileId::new(40);
+    let barrel_file = FileId::new(41);
+    let base_file = FileId::new(42);
+    let sources = [
+        Source {
+            parsed: &consumer,
+            file: consumer_file,
+            path: "\"/project/default-type-consumer.ts\"",
+        },
+        Source {
+            parsed: &barrel,
+            file: barrel_file,
+            path: "\"/project/default-type-barrel.ts\"",
+        },
+        Source {
+            parsed: &base,
+            file: base_file,
+            path: "\"/project/default-type-base.ts\"",
+        },
+    ];
+    let mut context = make_context(
+        &sources,
+        &[
+            Route {
+                source: 0,
+                specifier: 0,
+                target: 1,
+            },
+            Route {
+                source: 0,
+                specifier: 1,
+                target: 1,
+            },
+            Route {
+                source: 1,
+                specifier: 0,
+                target: 2,
+            },
+        ],
+    );
+    let default_declaration = default_import_binding(&consumer, consumer_file, "DefaultModel");
+    let named_declaration = named_import_binding(&consumer, consumer_file, "NamedModel");
+    let export_declaration = named_reexport_binding(&barrel, barrel_file, "default");
+    let imported_default = bound_symbol(&context, default_declaration);
+    let imported_named = bound_symbol(&context, named_declaration);
+    let exported_default = bound_symbol(&context, export_declaration);
+    let model = direct_export_symbol(&context, base_file, "Model");
+
+    context.check_source_file(consumer_file).unwrap();
+    assert_eq!(
+        context
+            .diagnostics()
+            .as_slice()
+            .iter()
+            .map(|diagnostic| diagnostic.diagnostic.code())
+            .collect::<Vec<_>>(),
+        [2322, 1361]
+    );
+    assert_alias_chain(
+        &context,
+        imported_default,
+        exported_default,
+        model,
+        Some(default_declaration),
+    );
+    assert_alias_chain(
+        &context,
+        imported_named,
+        exported_default,
+        model,
+        Some(named_declaration),
+    );
+    assert_lazy_alias_target(&context, exported_default, model, Some(export_declaration));
+    assert!(
+        context
+            .store()
+            .value_symbol_links(imported_default)
+            .is_none()
+    );
+    assert!(context.store().value_symbol_links(imported_named).is_none());
+
+    context.check_source_file(barrel_file).unwrap();
+    assert_alias_chain(
+        &context,
+        exported_default,
+        model,
+        model,
+        Some(export_declaration),
+    );
+    context.check_source_file(base_file).unwrap();
+    context.check_source_file(consumer_file).unwrap();
+    assert_eq!(context.diagnostics().as_slice().len(), 2);
+}
+
 fn assert_module_reexport_shape_is_closed(source_text: &str) {
     let barrel = parse_source_file(source_text);
     let base = parse_source_file("export const value: number = 1;");
@@ -558,7 +831,7 @@ fn assert_module_reexport_shape_is_closed(source_text: &str) {
 }
 
 #[test]
-fn default_star_and_namespace_reexports_remain_typed_boundaries() {
+fn missing_default_star_and_namespace_reexports_remain_typed_boundaries() {
     assert_module_reexport_shape_is_closed("export { default as publicValue } from './base';");
     assert_module_reexport_shape_is_closed("export * from './base';");
     assert_module_reexport_shape_is_closed("export * as values from './base';");
