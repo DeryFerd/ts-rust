@@ -1092,6 +1092,7 @@ fn execute_jsx_element(
                     intrinsic.attributes_type,
                     namespace.element_type,
                 )?;
+                publish_type_links(store, tag.node, namespace.any_type)?;
                 publish_symbol_links(store, plan.opening, intrinsic.symbol)?;
                 publish_jsx_links(
                     store,
@@ -1112,6 +1113,7 @@ fn execute_jsx_element(
                     )?;
                 }
                 if let Some(closing) = closing {
+                    publish_type_links(store, closing.tag.node, namespace.any_type)?;
                     publish_symbol_links(store, closing.node, intrinsic.symbol)?;
                     publish_jsx_links(
                         store,
@@ -1159,6 +1161,7 @@ fn execute_jsx_element(
                 arena,
                 bound,
                 namespace,
+                expected_attributes,
                 attributes,
                 options,
                 diagnostics,
@@ -1552,6 +1555,7 @@ fn check_jsx_attributes(
     arena: &NodeArena,
     bound: &BoundFile,
     namespace: &JsxNamespace,
+    expected_attributes: TypeId,
     attributes: &[JsxAttributePlan],
     options: CanonicalCheckerOptions,
     diagnostics: &mut CanonicalCheckerDiagnostics,
@@ -1582,9 +1586,12 @@ fn check_jsx_attributes(
                 if let Some(wrapper) = wrapper {
                     publish_type_links(store, *wrapper, type_)?;
                 }
-                type_
+                widened_jsx_attribute_type(store, expected_attributes, attribute, type_)?
             }
         };
+        publish_symbol_links(store, attribute.name_node, attribute.symbol)?;
+        publish_type_links(store, attribute.name_node, type_)?;
+        publish_attribute_value_links(store, attribute.symbol, type_, attribute.node)?;
         publish_type_links(store, attribute.node, type_)?;
         checked.push(CheckedJsxAttribute {
             plan: attribute.clone(),
@@ -1592,6 +1599,70 @@ fn check_jsx_attributes(
         });
     }
     Ok(checked)
+}
+
+fn widened_jsx_attribute_type(
+    store: &CanonicalTypeMapperStore,
+    expected_attributes: TypeId,
+    attribute: &JsxAttributePlan,
+    value: TypeId,
+) -> Result<TypeId, SourceCheckError> {
+    let record = store
+        .type_payload(value)
+        .ok_or(SourceCheckError::Property(attribute.node))?;
+    let expected = store
+        .type_payload(expected_attributes)
+        .and_then(|expected| expected.data().structured())
+        .and_then(|expected| expected.members)
+        .and_then(|members| store.symbol_table(members))
+        .and_then(|members| members.get_source(&attribute.name))
+        .and_then(|symbol| store.value_symbol_links(symbol))
+        .and_then(|links| links.resolved_type);
+    if expected.is_some_and(|expected| {
+        store
+            .type_payload(expected)
+            .is_some_and(|target| target.flags().intersects(record.flags()))
+    }) && let super::TypeData::Literal(literal) = record.data()
+    {
+        return Ok(literal.regular_type);
+    }
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or(SourceCheckError::LiteralCache(
+            SourceLiteralCacheError::BootstrapUninitialized,
+        ))?;
+    let flags = record.flags();
+    Ok(if flags.intersects(TypeFlags::STRING_LITERAL) {
+        bootstrap.string_type
+    } else if flags.intersects(TypeFlags::NUMBER_LITERAL) {
+        bootstrap.number_type
+    } else if flags.intersects(TypeFlags::BIG_INT_LITERAL) {
+        bootstrap.bigint_type
+    } else if flags.intersects(TypeFlags::BOOLEAN_LITERAL) {
+        bootstrap.boolean_type
+    } else {
+        value
+    })
+}
+
+fn publish_attribute_value_links(
+    store: &mut CanonicalTypeMapperStore,
+    symbol: SemanticSymbolId,
+    type_: TypeId,
+    node: NodeRef,
+) -> Result<(), SourceCheckError> {
+    let expected = ValueSymbolLinks {
+        resolved_type: Some(type_),
+        ..ValueSymbolLinks::default()
+    };
+    if store
+        .value_symbol_links(symbol)
+        .is_some_and(|links| links != &ValueSymbolLinks::default() && links != &expected)
+        || !store.set_value_symbol_links(symbol, expected)
+    {
+        return Err(SourceCheckError::Property(node));
+    }
+    Ok(())
 }
 
 fn execute_scalar(

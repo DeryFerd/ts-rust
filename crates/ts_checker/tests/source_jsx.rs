@@ -405,6 +405,39 @@ fn production_source_checker_matches_upstream_multiline_jsx_diagnostics() {
             "JSX element implicitly has type 'any' because no interface 'JSX.IntrinsicElements' exists.",
         );
     }
+    let any = context.store().intrinsic_bootstrap().unwrap().any_type;
+    let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+    let locations = parsed
+        .arena
+        .iter()
+        .filter_map(|(_, record)| {
+            let NodeData::JsxSelfClosingElement(element) = &record.data else {
+                return None;
+            };
+            let tag = NodeRef::new(parsed.arena.id(), file, element.tag_name);
+            let NodeData::JsxAttributes(attributes) = &parsed.arena.get(element.attributes)?.data
+            else {
+                return None;
+            };
+            let attribute = NodeRef::new(
+                parsed.arena.id(),
+                file,
+                *attributes.properties.nodes.first()?,
+            );
+            let NodeData::JsxAttribute(data) = &parsed.arena.get(attribute.node)?.data else {
+                return None;
+            };
+            let name = NodeRef::new(parsed.arena.id(), file, data.name);
+            Some((tag, attribute, name))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(locations.len(), 4);
+    for (tag, attribute, name) in locations {
+        assert_eq!(context.get_type_at_location(tag).unwrap(), any);
+        let symbol = context.file(file).unwrap().1.symbol(attribute).unwrap();
+        assert_eq!(context.get_symbol_at_location(name).unwrap(), Some(symbol));
+        assert_eq!(context.get_type_at_location(name).unwrap(), string);
+    }
     let snapshot = (
         context.store().type_len(),
         context.store().symbol_len(),
