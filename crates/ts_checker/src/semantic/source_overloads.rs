@@ -834,7 +834,7 @@ mod tests {
                 "{ready}{}",
                 concat!(
                     "declare function bad(",
-                    "value: number extends string ? string : number",
+                    "this: object, value: number",
                     "): number;\n",
                 )
             ),
@@ -842,16 +842,15 @@ mod tests {
                 "{ready}{}",
                 concat!(
                     "const bad = (",
-                    "value: number extends string ? string : number",
+                    "{ value }: { value: number }",
                     "): number => 1;\n",
                 )
             ),
             format!(
                 "{ready}{}",
                 concat!(
-                    "const bad: (",
-                    "value: number extends string ? string : number",
-                    ") => void = value => {};\n",
+                    "const bad: (value: number) => void = ",
+                    "(value: number) => {};\n",
                 )
             ),
         ]
@@ -917,7 +916,7 @@ mod tests {
             for _ in 0..2 {
                 assert!(matches!(
                     context.check_source_file(file),
-                    Err(SourceCheckError::DeclaredType(_))
+                    Err(SourceCheckError::Unsupported(_))
                 ));
                 assert_eq!(
                     (

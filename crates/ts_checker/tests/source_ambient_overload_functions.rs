@@ -315,7 +315,7 @@ fn later_bad_overload_group_rejects_all_overload_publication() {
         concat!(
             "declare function ready(value: number): number;\n",
             "declare function ready(value: string): string;\n",
-            "declare function bad(value: number extends string ? string : number): number;\n",
+            "declare function bad(...values: number[]): number;\n",
             "declare function bad(value: string): string;\n",
         ),
     ]
@@ -356,7 +356,7 @@ fn later_bad_callable_provider_keeps_the_ready_overload_cold_across_retries() {
             "{ready}{}",
             concat!(
                 "declare function bad(",
-                "value: number extends string ? string : number",
+                "this: object, value: number",
                 "): number;\n",
             )
         ),
@@ -364,16 +364,15 @@ fn later_bad_callable_provider_keeps_the_ready_overload_cold_across_retries() {
             "{ready}{}",
             concat!(
                 "const bad = (",
-                "value: number extends string ? string : number",
+                "{ value }: { value: number }",
                 "): number => 1;\n",
             )
         ),
         format!(
             "{ready}{}",
             concat!(
-                "const bad: (",
-                "value: number extends string ? string : number",
-                ") => void = value => {};\n",
+                "const bad: (value: number) => void = ",
+                "(value: number) => {};\n",
             )
         ),
     ]
