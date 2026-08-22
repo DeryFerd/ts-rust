@@ -80,10 +80,28 @@ pub fn format_diagnostics(
     let mut output = String::new();
     for diagnostic in diagnostics {
         if options.pretty {
-            format_pretty(&mut output, diagnostic, options);
+            format_pretty(&mut output, diagnostic, &[], options);
         } else {
             format_plain(&mut output, diagnostic, options);
         }
+    }
+    output
+}
+
+/// Formats one diagnostic with its associated source locations.
+///
+/// Related locations are shown only when contextual output is enabled.
+#[must_use]
+pub fn format_diagnostic_with_related(
+    diagnostic: Diagnostic<'_>,
+    related_information: &[Diagnostic<'_>],
+    options: FormattingOptions<'_>,
+) -> String {
+    let mut output = String::new();
+    if options.pretty {
+        format_pretty(&mut output, &diagnostic, related_information, options);
+    } else {
+        format_plain(&mut output, &diagnostic, options);
     }
     output
 }
@@ -96,7 +114,12 @@ fn format_plain(output: &mut String, diagnostic: &Diagnostic<'_>, options: Forma
     output.push_str(options.new_line);
 }
 
-fn format_pretty(output: &mut String, diagnostic: &Diagnostic<'_>, options: FormattingOptions<'_>) {
+fn format_pretty(
+    output: &mut String,
+    diagnostic: &Diagnostic<'_>,
+    related_information: &[Diagnostic<'_>],
+    options: FormattingOptions<'_>,
+) {
     if let Some((file_name, line, column)) = location(diagnostic, options.current_directory) {
         let _ = write!(
             output,
@@ -113,8 +136,24 @@ fn format_pretty(output: &mut String, diagnostic: &Diagnostic<'_>, options: Form
             source,
             range,
             diagnostic.category.color(),
+            "",
             options.new_line,
         );
+        output.push_str(options.new_line);
+    }
+
+    for related in related_information {
+        if let Some((file_name, line, column)) = location(related, options.current_directory) {
+            output.push_str(options.new_line);
+            let _ = write!(
+                output,
+                "  {CYAN}{file_name}{RESET}:{YELLOW}{line}{RESET}:{YELLOW}{column}{RESET} - "
+            );
+            write_message_text(output, related.message, options.new_line);
+            if let (Some(source), Some(range)) = (related.source_text, related.range) {
+                write_snippet(output, source, range, CYAN, "    ", options.new_line);
+            }
+        }
         output.push_str(options.new_line);
     }
     output.push_str(options.new_line);
@@ -141,7 +180,11 @@ fn write_message(output: &mut String, diagnostic: &Diagnostic<'_>, color: bool, 
     } else {
         output.push_str(": ");
     }
-    let mut remaining = diagnostic.message;
+    write_message_text(output, diagnostic.message, new_line);
+}
+
+fn write_message_text(output: &mut String, message: &str, new_line: &str) {
+    let mut remaining = message;
     while let Some(index) = remaining.find(['\r', '\n']) {
         output.push_str(&remaining[..index]);
         remaining = &remaining[index..];
@@ -280,7 +323,14 @@ fn ecma_line_starts(source: &str) -> Vec<usize> {
     starts
 }
 
-fn write_snippet(output: &mut String, source: &str, range: TextRange, color: &str, new_line: &str) {
+fn write_snippet(
+    output: &mut String,
+    source: &str,
+    range: TextRange,
+    color: &str,
+    indent: &str,
+    new_line: &str,
+) {
     let starts = ecma_line_starts(source);
     let start = range.start.get() as usize;
     let end = (range.end.get() as usize).max(start);
@@ -301,7 +351,11 @@ fn write_snippet(output: &mut String, source: &str, range: TextRange, color: &st
     while line <= last_line {
         output.push_str(new_line);
         if abbreviated && line > first_line + 1 && line < last_line - 1 {
-            let _ = write!(output, "{GUTTER}{:>gutter_width$}{RESET} {new_line}", "...");
+            let _ = write!(
+                output,
+                "{indent}{GUTTER}{:>gutter_width$}{RESET} {new_line}",
+                "..."
+            );
             line = last_line - 1;
         }
 
@@ -310,10 +364,14 @@ fn write_snippet(output: &mut String, source: &str, range: TextRange, color: &st
         let content = source[line_start..line_end].trim_end().replace('\t', " ");
         let _ = write!(
             output,
-            "{GUTTER}{:>gutter_width$}{RESET} {content}{new_line}",
+            "{indent}{GUTTER}{:>gutter_width$}{RESET} {content}{new_line}",
             line + 1
         );
-        let _ = write!(output, "{GUTTER}{:>gutter_width$}{RESET} {color}", "");
+        let _ = write!(
+            output,
+            "{indent}{GUTTER}{:>gutter_width$}{RESET} {color}",
+            ""
+        );
 
         if line == first_line {
             let marked_end = if line == last_line {
@@ -339,7 +397,8 @@ mod tests {
     use ts_core::{TextPos, TextRange};
 
     use super::{
-        Diagnostic, DiagnosticCategory, FormattingOptions, format_diagnostics, relative_file_name,
+        Diagnostic, DiagnosticCategory, FormattingOptions, format_diagnostic_with_related,
+        format_diagnostics, relative_file_name,
     };
 
     #[test]
@@ -492,6 +551,133 @@ mod tests {
         assert!(formatted.contains("~~"));
         assert!(formatted.contains("global warning"));
         assert!(formatted.contains("\u{1b}[91m"));
+    }
+
+    #[test]
+    fn pretty_diagnostics_include_cross_file_related_information() {
+        let primary_source = "const result = pair(\"left\");\n";
+        let related_source = "export function pair(left: string, right: number): number;\n";
+        let primary_start = primary_source.find("pair").unwrap();
+        let related_start = related_source.find("right").unwrap();
+        let primary = Diagnostic {
+            file_name: Some("/project/importer.ts"),
+            source_text: Some(primary_source),
+            range: Some(TextRange::new(
+                TextPos::new(u32::try_from(primary_start).unwrap()),
+                TextPos::new(u32::try_from(primary_start + "pair".len()).unwrap()),
+            )),
+            code: Some(2554),
+            category: DiagnosticCategory::Error,
+            message: "Expected 2 arguments, but got 1.",
+        };
+        let related = Diagnostic {
+            file_name: Some("/project/target.ts"),
+            source_text: Some(related_source),
+            range: Some(TextRange::new(
+                TextPos::new(u32::try_from(related_start).unwrap()),
+                TextPos::new(u32::try_from(related_start + "right: number".len()).unwrap()),
+            )),
+            code: Some(6210),
+            category: DiagnosticCategory::Message,
+            message: "An argument for 'right' was not provided.",
+        };
+
+        let formatted = format_diagnostic_with_related(
+            primary,
+            &[related],
+            FormattingOptions {
+                current_directory: "/project",
+                pretty: true,
+                ..FormattingOptions::default()
+            },
+        );
+
+        assert!(formatted.contains("\u{1b}[96mimporter.ts\u{1b}[0m"));
+        assert!(formatted.contains("TS2554"));
+        assert!(formatted.contains(concat!(
+            "\n\n  \u{1b}[96mtarget.ts\u{1b}[0m:",
+            "\u{1b}[93m1\u{1b}[0m:\u{1b}[93m36\u{1b}[0m - ",
+            "An argument for 'right' was not provided.\n",
+            "    \u{1b}[7m1\u{1b}[0m export function pair(left: string, right: number): number;\n",
+            "    \u{1b}[7m \u{1b}[0m \u{1b}[96m                                   ~~~~~~~~~~~~~\u{1b}[0m\n\n",
+        )));
+        assert!(!formatted.contains("TS6210"));
+    }
+
+    #[test]
+    fn plain_diagnostics_suppress_related_information() {
+        let primary = Diagnostic {
+            file_name: Some("/project/importer.ts"),
+            source_text: Some("pair()"),
+            range: Some(TextRange::new(TextPos::new(0), TextPos::new(4))),
+            code: Some(2554),
+            category: DiagnosticCategory::Error,
+            message: "Expected 1 argument, but got 0.",
+        };
+        let related = Diagnostic {
+            file_name: Some("/project/target.ts"),
+            source_text: Some("function pair(value: string): void;"),
+            range: Some(TextRange::new(TextPos::new(14), TextPos::new(19))),
+            code: Some(6210),
+            category: DiagnosticCategory::Message,
+            message: "An argument for 'value' was not provided.",
+        };
+        let options = FormattingOptions {
+            current_directory: "/project",
+            ..FormattingOptions::default()
+        };
+
+        assert_eq!(
+            format_diagnostic_with_related(primary, &[related], options),
+            format_diagnostics(&[primary], options)
+        );
+    }
+
+    #[test]
+    fn related_information_keeps_input_order_and_configured_newlines() {
+        let primary = Diagnostic {
+            file_name: Some("/project/main.ts"),
+            source_text: Some("value"),
+            range: Some(TextRange::new(TextPos::new(0), TextPos::new(5))),
+            code: Some(2300),
+            category: DiagnosticCategory::Error,
+            message: "Duplicate identifier 'value'.",
+        };
+        let first = Diagnostic {
+            file_name: Some("/project/first.ts"),
+            source_text: Some("value"),
+            range: Some(TextRange::new(TextPos::new(0), TextPos::new(5))),
+            code: Some(6203),
+            category: DiagnosticCategory::Message,
+            message: "'value' was also declared here.\n  First detail.",
+        };
+        let second = Diagnostic {
+            file_name: Some("/project/second.ts"),
+            message: "and here.",
+            code: Some(6204),
+            ..first
+        };
+        let formatted = format_diagnostic_with_related(
+            primary,
+            &[first, second],
+            FormattingOptions {
+                current_directory: "/project",
+                new_line: "\r\n",
+                pretty: true,
+            },
+        );
+
+        let first_position = formatted.find("first.ts").unwrap();
+        let second_position = formatted.find("second.ts").unwrap();
+        assert!(first_position < second_position);
+        assert!(formatted.contains("'value' was also declared here.\r\n  First detail."));
+        assert!(
+            formatted
+                .as_bytes()
+                .windows(2)
+                .filter(|pair| pair[1] == b'\n')
+                .all(|pair| pair[0] == b'\r')
+        );
     }
 
     #[test]

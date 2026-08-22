@@ -311,6 +311,40 @@ mod tests {
     }
 
     #[test]
+    fn directive_and_related_diagnostics_keep_upstream_categories_and_flags() {
+        let unused_directive = message_by_code(2578).unwrap();
+        assert_eq!(unused_directive.category(), Category::Error);
+        assert_eq!(
+            unused_directive.text(),
+            "Unused '@ts-expect-error' directive."
+        );
+        assert!(!unused_directive.reports_unnecessary());
+        assert!(!unused_directive.reports_deprecated());
+
+        let missing_argument = message_by_code(6210).unwrap();
+        assert_eq!(missing_argument.category(), Category::Message);
+        assert_eq!(
+            Diagnostic::with_arguments(missing_argument, ["right"])
+                .render()
+                .unwrap(),
+            "An argument for 'right' was not provided."
+        );
+
+        let property_origin = message_by_code(6500).unwrap();
+        assert_eq!(property_origin.category(), Category::Message);
+        assert_eq!(
+            Diagnostic::with_arguments(property_origin, ["value", "Target"])
+                .render()
+                .unwrap(),
+            "The expected type comes from property 'value' which is declared here on type 'Target'"
+        );
+
+        let elided = message_by_code(2202).unwrap();
+        assert!(elided.elided_in_compatibility_pyramid());
+        assert!(!missing_argument.elided_in_compatibility_pyramid());
+    }
+
+    #[test]
     fn diagnostics_render_numbered_arguments() {
         let message = message_by_code(1007).unwrap();
         let diagnostic = Diagnostic::with_arguments(message, ["{", "}"]);
