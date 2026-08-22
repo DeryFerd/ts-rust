@@ -251,6 +251,8 @@ impl<'a, F: FileSystem + ?Sized> Resolver<'a, F> {
             state
                 .resolve_relative_candidate(&candidate, false)
                 .or_else(|| state.resolve_root_dirs(specifier, &containing_directory))
+        } else if is_absolute_uri_specifier(specifier) {
+            state.resolve_path_mapping(specifier)
         } else if is_absolute(specifier) {
             state.resolve_paths_or_base_url(specifier).or_else(|| {
                 let candidate = resolve_path(&containing_directory, &[specifier]);
@@ -401,6 +403,15 @@ impl<F: FileSystem + ?Sized> ResolutionState<'_, '_, F> {
     }
 
     fn resolve_paths_or_base_url(&mut self, specifier: &str) -> Option<ResolvedModule> {
+        if let Some(resolved) = self.resolve_path_mapping(specifier) {
+            return Some(resolved);
+        }
+        let base = self.resolver.options.base_url.as_deref()?;
+        let candidate = resolve_path(base, &[specifier]);
+        self.resolve_relative_candidate(&candidate, false)
+    }
+
+    fn resolve_path_mapping(&mut self, specifier: &str) -> Option<ResolvedModule> {
         if let Some((capture, substitutions)) =
             best_path_match(&self.resolver.options.paths, specifier)
         {
@@ -422,9 +433,7 @@ impl<F: FileSystem + ?Sized> ResolutionState<'_, '_, F> {
                 }
             }
         }
-        let base = self.resolver.options.base_url.as_deref()?;
-        let candidate = resolve_path(base, &[specifier]);
-        self.resolve_relative_candidate(&candidate, false)
+        None
     }
 
     fn resolve_root_dirs(
@@ -1064,6 +1073,13 @@ pub fn parse_package_json(contents: &str) -> serde_json::Result<PackageJson> {
     })
 }
 
+/// Whether a bare specifier is an absolute URL or another URI-style scheme.
+#[must_use]
+pub fn is_absolute_uri_specifier(specifier: &str) -> bool {
+    ts_path::is_url(specifier)
+        || (!is_relative(specifier) && !is_absolute(specifier) && specifier.contains(':'))
+}
+
 fn best_path_match(
     paths: &BTreeMap<String, Vec<String>>,
     specifier: &str,
@@ -1586,6 +1602,68 @@ mod tests {
                 .unwrap()
                 .resolved_file_name,
             "/repo/entry.ts"
+        );
+    }
+
+    #[test]
+    fn absolute_uri_specifiers_skip_filesystem_resolution_without_a_path_mapping() {
+        let filesystem = fs(&[
+            ("/project/node_modules/foo/index.d.ts", ""),
+            ("/project/node_modules/node:fs/index.d.ts", ""),
+        ]);
+        let resolver = Resolver::new(
+            &filesystem,
+            ResolutionOptions {
+                mode: ResolutionMode::Bundler,
+                ..ResolutionOptions::default()
+            },
+        );
+
+        for specifier in [
+            "https://deno.land/std@0.208.0/path/mod.ts",
+            "node:fs",
+            "data:text/javascript,export%20default%201",
+        ] {
+            let result = resolver.resolve(specifier, "/project/index.ts");
+            assert!(
+                result.resolved.is_none(),
+                "unexpected resolution: {specifier}"
+            );
+            assert!(
+                result.failed_lookups.is_empty(),
+                "URI specifiers must not probe files: {specifier}"
+            );
+        }
+
+        assert!(is_absolute_uri_specifier("https://example.test/mod.ts"));
+        assert!(is_absolute_uri_specifier("node:fs"));
+        assert!(!is_absolute_uri_specifier("./folder:value.js"));
+        assert!(!is_absolute_uri_specifier("C:/project/file.ts"));
+    }
+
+    #[test]
+    fn explicit_paths_can_override_absolute_uri_specifiers() {
+        let filesystem = fs(&[("/project/local.d.ts", "")]);
+        let resolver = Resolver::new(
+            &filesystem,
+            ResolutionOptions {
+                mode: ResolutionMode::Bundler,
+                base_url: Some("/project".into()),
+                paths: BTreeMap::from([(
+                    "https://example.test/types".into(),
+                    vec!["./local.d.ts".into()],
+                )]),
+                ..ResolutionOptions::default()
+            },
+        );
+
+        assert_eq!(
+            resolver
+                .resolve("https://example.test/types", "/project/main.ts")
+                .resolved
+                .unwrap()
+                .resolved_file_name,
+            "/project/local.d.ts"
         );
     }
 
@@ -2591,6 +2669,56 @@ mod tests {
             "/repo/node_modules/dependency/entry.d.ts"
         );
         assert!(dependency.is_external_library_import);
+    }
+
+    #[test]
+    fn linked_nodenext_packages_resolve_declarations_and_local_subpath_imports() {
+        let filesystem = fs(&[
+            (
+                "/packages/b/package.json",
+                r#"{"name":"package-b","type":"module","exports":{".":"./index.js"}}"#,
+            ),
+            ("/packages/b/index.js", "export {};"),
+            ("/packages/b/index.d.ts", "export interface B { b: 'b' }"),
+            (
+                "/packages/a/package.json",
+                r##"{"name":"package-a","type":"module","imports":{"#re_export":"./src/re_export.ts"},"exports":{".":"./dist/index.js"}}"##,
+            ),
+            (
+                "/packages/a/src/re_export.ts",
+                "import type { B } from 'package-b';",
+            ),
+        ]);
+        filesystem.add_directory_link("/packages/b", "/packages/a/node_modules/package-b");
+        let resolver = Resolver::new(
+            &filesystem,
+            ResolutionOptions {
+                mode: ResolutionMode::NodeNext,
+                ..ResolutionOptions::default()
+            },
+        );
+
+        let package = resolver
+            .resolve_with_mode(
+                "package-b",
+                "/packages/a/src/re_export.ts",
+                ModuleFormat::Esm,
+            )
+            .resolved
+            .unwrap();
+        assert_eq!(package.resolved_file_name, "/packages/b/index.d.ts");
+        assert!(package.is_external_library_import);
+        assert_eq!(
+            package.package_json.as_deref(),
+            Some("/packages/a/node_modules/package-b/package.json")
+        );
+
+        let subpath = resolver
+            .resolve_with_mode("#re_export", "/packages/a/src/index.ts", ModuleFormat::Esm)
+            .resolved
+            .unwrap();
+        assert_eq!(subpath.resolved_file_name, "/packages/a/src/re_export.ts");
+        assert!(!subpath.is_external_library_import);
     }
 
     #[test]
