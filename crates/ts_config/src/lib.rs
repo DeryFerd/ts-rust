@@ -238,17 +238,46 @@ pub fn parse_config_text(file_name: &str, source: &str) -> ParseResult<ProjectCo
             diagnostics: parsed.diagnostics,
         };
     };
-    let JsonValue::Object(raw) = value else {
-        return ParseResult {
-            value: None,
-            diagnostics: vec![diagnostic(file_name, 0, 1136, std::iter::empty::<String>())],
-        };
+    let raw = match value {
+        JsonValue::Object(raw) => raw,
+        JsonValue::Array(values) => {
+            let Some(raw) = values.into_iter().find_map(|value| {
+                if let JsonValue::Object(raw) = value {
+                    Some(raw)
+                } else {
+                    None
+                }
+            }) else {
+                return invalid_config_root(file_name);
+            };
+            raw
+        }
+        _ => return invalid_config_root(file_name),
     };
     let mut diagnostics = parsed.diagnostics;
     validate_project_fields(file_name, &raw, &mut diagnostics);
     ParseResult {
         value: Some(ProjectConfig::from_json(normalize_path(file_name), raw)),
         diagnostics,
+    }
+}
+
+fn invalid_config_root(file_name: &str) -> ParseResult<ProjectConfig> {
+    let display_name = if file_name
+        .rsplit('/')
+        .next()
+        .is_some_and(|name| name.eq_ignore_ascii_case("jsconfig.json"))
+    {
+        "jsconfig.json"
+    } else {
+        "tsconfig.json"
+    };
+    ParseResult {
+        value: Some(ProjectConfig::from_json(
+            normalize_path(file_name),
+            BTreeMap::new(),
+        )),
+        diagnostics: vec![diagnostic(file_name, 0, 5092, [display_name.to_owned()])],
     }
 }
 
@@ -1138,11 +1167,55 @@ mod tests {
         assert_eq!(comment.diagnostics[0].render(), "'*/' expected.");
 
         let top_level_array = parse_config_text("/repo/tsconfig.json", "[]");
-        assert_eq!(top_level_array.diagnostics[0].code(), 1136);
+        assert_eq!(top_level_array.diagnostics[0].code(), 5092);
         assert_eq!(
             top_level_array.diagnostics[0].render(),
-            "Property assignment expected."
+            "The root value of a 'tsconfig.json' file must be an object."
         );
+        assert!(top_level_array.value.unwrap().raw.is_empty());
+    }
+
+    #[test]
+    fn recovers_the_first_configuration_object_from_a_top_level_array() {
+        let recovered = parse_config_text(
+            "/repo/tsconfig.json",
+            r#"[
+                false,
+                { "compilerOptions": { "types": ["nonexistent"], "strict": true } },
+                { "compilerOptions": { "strict": false } }
+            ]"#,
+        );
+        assert!(recovered.is_ok(), "{:?}", recovered.diagnostics);
+        let config = recovered.value.unwrap();
+        assert_eq!(
+            config.compiler_options.get("strict"),
+            Some(&JsonValue::Bool(true))
+        );
+        assert_eq!(
+            config.compiler_options.get("types"),
+            Some(&JsonValue::Array(vec![JsonValue::String(
+                "nonexistent".into()
+            )]))
+        );
+    }
+
+    #[test]
+    fn reports_non_object_root_values_with_the_correct_config_name() {
+        for (file_name, source, expected_name) in [
+            ("/repo/tsconfig.json", "true", "tsconfig.json"),
+            ("/repo/jsconfig.json", "null", "jsconfig.json"),
+            ("/repo/custom.json", "[1, false]", "tsconfig.json"),
+        ] {
+            let result = parse_config_text(file_name, source);
+            assert!(result.value.is_some(), "{file_name}");
+            assert_eq!(result.diagnostics.len(), 1, "{file_name}");
+            assert_eq!(result.diagnostics[0].code(), 5092, "{file_name}");
+            assert_eq!(
+                result.diagnostics[0].render(),
+                format!("The root value of a '{expected_name}' file must be an object."),
+                "{file_name}"
+            );
+        }
     }
 
     #[test]

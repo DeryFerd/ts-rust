@@ -447,8 +447,23 @@ impl CompilerOptions {
     /// Returns the root namespace used by classic JSX factories.
     #[must_use]
     pub fn jsx_factory_namespace(&self) -> &str {
-        self.jsx_factory
-            .as_deref()
+        self.jsx_factory_namespace_for_source(None, None, false)
+    }
+
+    /// Returns the classic JSX namespace after applying per-file factory pragmas.
+    #[must_use]
+    pub fn jsx_factory_namespace_for_source<'a>(
+        &'a self,
+        factory_pragma: Option<&'a str>,
+        fragment_factory_pragma: Option<&'a str>,
+        is_fragment: bool,
+    ) -> &'a str {
+        let fragment_factory = is_fragment
+            .then(|| fragment_factory_pragma.or(self.jsx_fragment_factory.as_deref()))
+            .flatten();
+        fragment_factory
+            .or_else(|| (!is_fragment).then_some(factory_pragma).flatten())
+            .or(self.jsx_factory.as_deref())
             .and_then(|factory| factory.split('.').next())
             .filter(|namespace| !namespace.is_empty())
             .or(self.react_namespace.as_deref())
@@ -2689,6 +2704,51 @@ mod tests {
         assert_eq!(
             preserved.jsx_runtime_module_specifier().as_deref(),
             Some("@emotion/react/jsx-runtime")
+        );
+    }
+
+    #[test]
+    fn source_jsx_factory_pragmas_select_element_and_fragment_namespaces() {
+        let configured = parse_compiler_options(&object([
+            ("jsx", JsonValue::String("react".into())),
+            (
+                "jsxFactory",
+                JsonValue::String("Configured.createElement".into()),
+            ),
+            (
+                "jsxFragmentFactory",
+                JsonValue::String("ConfiguredFragment.Fragment".into()),
+            ),
+        ]))
+        .options;
+
+        assert_eq!(configured.jsx_factory_namespace(), "Configured");
+        assert_eq!(
+            configured.jsx_factory_namespace_for_source(Some("Local.createElement"), None, false),
+            "Local"
+        );
+        assert_eq!(
+            configured.jsx_factory_namespace_for_source(None, None, true),
+            "ConfiguredFragment"
+        );
+        assert_eq!(
+            configured.jsx_factory_namespace_for_source(
+                Some("Local.createElement"),
+                Some("LocalFragment.Fragment"),
+                true
+            ),
+            "LocalFragment"
+        );
+
+        let null_fragment = parse_compiler_options(&object([
+            ("jsx", JsonValue::String("react".into())),
+            ("jsxFactory", JsonValue::String("h".into())),
+            ("jsxFragmentFactory", JsonValue::String("null".into())),
+        ]))
+        .options;
+        assert_eq!(
+            null_fragment.jsx_factory_namespace_for_source(None, None, true),
+            "null"
         );
     }
 
