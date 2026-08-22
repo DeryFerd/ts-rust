@@ -48,7 +48,9 @@ use ts_ast::{
 };
 use ts_core::{Diagnostic, DiagnosticCategory, TextPos, TextRange};
 use ts_diagnostics::{Category, message_by_code};
-use ts_scanner::{LanguageVariant, Scanner, Token, TokenFlags as ScannerTokenFlags};
+use ts_scanner::{
+    CommentDirective, LanguageVariant, Scanner, Token, TokenFlags as ScannerTokenFlags,
+};
 
 const NODE_FLAG_LET: NodeFlags = NodeFlags(1 << 0);
 const NODE_FLAG_CONST: NodeFlags = NodeFlags(1 << 1);
@@ -62,6 +64,8 @@ pub struct ParseResult {
     pub arena: NodeArena,
     pub source_file: NodeId,
     pub diagnostics: Vec<Diagnostic>,
+    /// Suppression comments collected while parsing the actual source grammar.
+    pub comment_directives: Vec<CommentDirective>,
     pub amd_dependencies: Vec<AmdDependency>,
     pub amd_module_name: Option<String>,
     pub amd_module_names: Vec<AmdModuleName>,
@@ -390,6 +394,7 @@ struct Parser<'a> {
     yield_context: bool,
     await_identifier_context: bool,
     next_function_is_async: bool,
+    next_function_is_default: bool,
     type_parse_context: TypeParseContext,
 }
 
@@ -445,6 +450,7 @@ impl<'a> Parser<'a> {
             yield_context: false,
             await_identifier_context: false,
             next_function_is_async: false,
+            next_function_is_default: false,
             type_parse_context: TypeParseContext::Normal,
         }
     }
@@ -506,10 +512,12 @@ impl<'a> Parser<'a> {
                 .copied()
                 .map(|range| diagnostic_with_code(range, 1127)),
         );
+        let comment_directives = self.scanner.comment_directives().to_vec();
         ParseResult {
             arena: self.arena,
             source_file,
             diagnostics: self.diagnostics,
+            comment_directives,
             amd_dependencies: self.amd_dependencies,
             amd_module_name: self
                 .amd_module_names
@@ -1376,6 +1384,8 @@ impl<'a> Parser<'a> {
     fn parse_function_declaration(&mut self) -> NodeId {
         let is_async = self.next_function_is_async;
         self.next_function_is_async = false;
+        let is_default_export = self.next_function_is_default;
+        self.next_function_is_default = false;
         let previous_await_context = self.await_context;
         let previous_yield_context = self.yield_context;
         self.await_context = is_async;
@@ -1389,6 +1399,8 @@ impl<'a> Parser<'a> {
         let name = if self.current.kind == SyntaxKind::Identifier || self.current.kind.is_keyword()
         {
             Some(self.parse_identifier_name("Expected a function name."))
+        } else if is_default_export {
+            None
         } else {
             self.error_current("Expected a function name.");
             None
@@ -4957,7 +4969,13 @@ impl<'a> Parser<'a> {
             ) || (self.current.kind == SyntaxKind::AsyncKeyword
                 && self.next_token_kind() == SyntaxKind::FunctionKeyword)
             {
+                let previous_next_function_is_default = self.next_function_is_default;
+                self.next_function_is_default = matches!(
+                    self.current.kind,
+                    SyntaxKind::FunctionKeyword | SyntaxKind::AsyncKeyword
+                );
                 let declaration = self.parse_statement();
+                self.next_function_is_default = previous_next_function_is_default;
                 let export_modifier =
                     self.alloc_token_node(SyntaxKind::ExportKeyword, export_token.range);
                 let default_modifier =
@@ -9999,6 +10017,53 @@ mod tests {
     }
 
     #[test]
+    fn collects_comment_directives_only_from_parser_context_comment_trivia() {
+        let source = concat!(
+            "const pattern = /[// @ts-expect-error]/;\n",
+            "const quoted = '// @ts-ignore';\n",
+            "const template = `// @ts-expect-error`;\n",
+            "const view = <div>// @ts-ignore</div>;\n",
+            "// @ts-ignore actual\n",
+            "const ignored = 1;\n",
+            "/* @ts-expect-error */\n",
+            "const expected = 2;\n",
+        );
+        let result = parse_jsx_source_file(source);
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        assert_eq!(
+            result
+                .comment_directives
+                .iter()
+                .map(|directive| {
+                    (
+                        &source[directive.range.start.get() as usize
+                            ..directive.range.end.get() as usize],
+                        directive.expect_error,
+                    )
+                })
+                .collect::<Vec<_>>(),
+            [
+                ("// @ts-ignore actual", false),
+                ("/* @ts-expect-error */", true),
+            ]
+        );
+    }
+
+    #[test]
+    fn speculative_arrow_parsing_does_not_duplicate_comment_directives() {
+        let source = concat!(
+            "const value = (\n",
+            "// @ts-expect-error checked once\n",
+            "item: string\n",
+            ") => item;",
+        );
+        let result = parse_source_file(source);
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        assert_eq!(result.comment_directives.len(), 1);
+        assert!(result.comment_directives[0].expect_error);
+    }
+
+    #[test]
     fn parses_variable_types_and_binary_precedence() {
         let source = "let value: ns.Item = 1 + 2 * 3; const other: string = (value + 4);";
         let result = parse_source_file(source);
@@ -12675,6 +12740,43 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn allows_anonymous_default_exported_functions_inside_namespaces() {
+        let source = concat!(
+            "namespace Plain { export default function () {} }\n",
+            "namespace Async { export default async function () {} }",
+        );
+        let result = parse_source_file(source);
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+
+        for statement in source_statements(&result) {
+            let NodeData::ModuleDeclaration(module) = &result.arena.get(*statement).unwrap().data
+            else {
+                panic!("expected namespace declaration");
+            };
+            let NodeData::ModuleBlock(block) =
+                &result.arena.get(module.body.unwrap()).unwrap().data
+            else {
+                panic!("expected namespace body");
+            };
+            let NodeData::FunctionDeclaration(function) =
+                &result.arena.get(block.statements.nodes[0]).unwrap().data
+            else {
+                panic!("expected anonymous default-exported function");
+            };
+            assert!(function.name.is_none());
+            assert!(function.body.is_some());
+        }
+
+        let ordinary = parse_source_file("function () {}");
+        assert!(
+            ordinary
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == Some(1003))
+        );
     }
 
     #[test]
