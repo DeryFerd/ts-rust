@@ -487,6 +487,13 @@ impl<'a> Parser<'a> {
             {
                 continue;
             }
+            if self.diagnostics.iter().any(|reported| {
+                reported.range.start == diagnostic.range.start
+                    && reported.code == diagnostic.code
+                    && reported.message == diagnostic.message
+            }) {
+                continue;
+            }
             self.diagnostics.push(diagnostic);
         }
         self.diagnostics.extend(
@@ -6213,11 +6220,11 @@ impl<'a> Parser<'a> {
             self.arena.get(expression).map(|node| &node.data),
             Some(NodeData::Identifier(identifier)) if identifier.text.is_empty()
         );
-        let type_arguments = if missing_expression {
-            None
-        } else {
-            self.parse_type_arguments()
-        };
+        let type_arguments = (!missing_expression
+            && self.current.kind == SyntaxKind::LessThanToken
+            && self.is_type_argument_expression_suffix())
+        .then(|| self.parse_type_arguments())
+        .flatten();
         if self.current.kind == SyntaxKind::QuestionDotToken {
             let expression_range = self.arena.get(expression).unwrap().range;
             let expression_text = self
@@ -7451,26 +7458,32 @@ impl<'a> Parser<'a> {
             })),
             &element_children,
         );
-        let children = self.parse_jsx_children();
+        let children = self.parse_jsx_children(opening);
         let closing_start = self.current.range.start;
-        if self.current.kind == SyntaxKind::LessThanSlashToken {
-            self.current = self.scanner.scan();
+        self.parse_jsx_closing_tag_start();
+        let missing_closing_tag = self.current.kind == SyntaxKind::EndOfFile;
+        let closing_name = if missing_closing_tag {
+            self.missing_identifier(closing_start)
         } else {
-            self.error_current("Expected a JSX closing tag.");
-        }
-        let closing_name = self.parse_jsx_tag_name("Expected a JSX closing tag name.");
+            self.parse_jsx_tag_name("Expected a JSX closing tag name.")
+        };
         let source_text = self.arena.source_text();
         let tag_text = |node: NodeId| {
             let range = self.arena.get(node)?.range;
             source_text?.get(range.start.get() as usize..range.end.get() as usize)
         };
-        if tag_text(tag_name) != tag_text(closing_name)
+        if !missing_closing_tag
+            && tag_text(tag_name) != tag_text(closing_name)
             && let Some(opening_name) = tag_text(tag_name).map(str::to_owned)
         {
             let range = self.arena.get(closing_name).unwrap().range;
             self.error_code_at(range, 17002, [opening_name]);
         }
-        let end = self.finish_jsx_tag(resume_jsx);
+        let end = if missing_closing_tag {
+            closing_start
+        } else {
+            self.finish_jsx_tag(resume_jsx)
+        };
         let closing = self.alloc_node(
             SyntaxKind::JsxClosingElement,
             TextRange::new(closing_start, end),
@@ -7512,15 +7525,38 @@ impl<'a> Parser<'a> {
         )
     }
 
-    fn parse_jsx_children(&mut self) -> Vec<NodeId> {
+    fn parse_jsx_children(&mut self, opening: NodeId) -> Vec<NodeId> {
         let mut children = Vec::new();
         loop {
             self.current = self.scanner.rescan_jsx_token(true);
+            if self.current.kind == SyntaxKind::EndOfFile {
+                let diagnostic = match self.arena.get(opening).map(|node| &node.data) {
+                    Some(NodeData::JsxOpeningElement(element)) => {
+                        let range = self.arena.get(element.tag_name).unwrap().range;
+                        let name = self
+                            .arena
+                            .source_text()
+                            .and_then(|source| {
+                                source.get(range.start.get() as usize..range.end.get() as usize)
+                            })
+                            .unwrap_or_default()
+                            .to_owned();
+                        Some((range, 17008, Some(name)))
+                    }
+                    Some(NodeData::JsxOpeningFragment(_)) => self
+                        .arena
+                        .get(opening)
+                        .map(|node| (node.range, 17014, None)),
+                    _ => None,
+                };
+                if let Some((range, code, name)) = diagnostic {
+                    self.error_code_at(range, code, name);
+                }
+                break;
+            }
             if matches!(
                 self.current.kind,
-                SyntaxKind::LessThanSlashToken
-                    | SyntaxKind::ConflictMarkerTrivia
-                    | SyntaxKind::EndOfFile
+                SyntaxKind::LessThanSlashToken | SyntaxKind::ConflictMarkerTrivia
             ) {
                 break;
             }
@@ -7594,14 +7630,14 @@ impl<'a> Parser<'a> {
             NodeData::JsxOpeningFragment(Box::new(JsxOpeningFragmentData)),
             &[],
         );
-        let children = self.parse_jsx_children();
+        let children = self.parse_jsx_children(opening);
         let closing_start = self.current.range.start;
-        if self.current.kind == SyntaxKind::LessThanSlashToken {
-            self.current = self.scanner.scan();
+        self.parse_jsx_closing_tag_start();
+        let end = if self.current.kind == SyntaxKind::EndOfFile {
+            closing_start
         } else {
-            self.error_current("Expected a JSX closing fragment.");
-        }
-        let end = self.finish_jsx_tag(resume_jsx);
+            self.finish_jsx_tag(resume_jsx)
+        };
         let closing = self.alloc_node(
             SyntaxKind::JsxClosingFragment,
             TextRange::new(closing_start, end),
@@ -7626,6 +7662,20 @@ impl<'a> Parser<'a> {
             })),
             &all_children,
         )
+    }
+
+    fn parse_jsx_closing_tag_start(&mut self) {
+        if self.current.kind == SyntaxKind::LessThanSlashToken {
+            self.current = self.scanner.scan();
+            return;
+        }
+        if !self.diagnostics.iter().any(|diagnostic| {
+            diagnostic.range.start == self.current.range.start
+                && diagnostic.code == Some(1005)
+                && diagnostic.message == "'</' expected."
+        }) {
+            self.error_current("Expected '</'.");
+        }
     }
 
     fn parse_jsx_attributes(&mut self, recovered_attribute: Option<NodeId>) -> NodeId {
@@ -7956,7 +8006,7 @@ impl<'a> Parser<'a> {
             SyntaxKind::NumericLiteral,
             token.range,
             NodeData::NumericLiteral(Box::new(NumericLiteralData {
-                text: token.text.to_owned(),
+                text: token_value(&token),
                 token_flags,
             })),
             &[],
@@ -7969,7 +8019,7 @@ impl<'a> Parser<'a> {
             SyntaxKind::BigIntLiteral,
             token.range,
             NodeData::BigIntLiteral(Box::new(BigIntLiteralData {
-                text: token.text.to_owned(),
+                text: token_value(&token),
                 token_flags: TokenFlags::default(),
             })),
             &[],
@@ -9452,6 +9502,8 @@ fn parser_diagnostic(range: TextRange, message: &str) -> Diagnostic {
         "Expected an argument." => Some((1135, Vec::new())),
         "Expected a string literal." | "Expected a module specifier." => Some((1141, Vec::new())),
         "Expected 'catch' or 'finally'." => Some((1472, Vec::new())),
+        "Expected an import attribute name." => Some((1478, Vec::new())),
+        "Declaration or statement expected." => Some((1128, Vec::new())),
         "Decorators are not valid here." => Some((1206, Vec::new())),
         "Line break not permitted after 'throw'." => Some((1142, Vec::new())),
         "Expected a function name."
@@ -9945,6 +9997,62 @@ mod tests {
             SyntaxKind::ParenthesizedExpression
         );
         assert_eq!(first_statement, statements[0]);
+    }
+
+    #[test]
+    fn stores_canonical_numeric_and_bigint_values_with_original_source_ranges() {
+        let source = concat!(
+            "const values = [1_000, 0xCA_FE, 0b1010_0101, 0o7_7, 1e+2, ",
+            "9007199254740993, 0b101n, 0o77n, 0xCAn, 12_34n];",
+        );
+        let result = parse_source_file(source);
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+
+        let numeric = result
+            .arena
+            .iter()
+            .filter_map(|(_, node)| {
+                let NodeData::NumericLiteral(literal) = &node.data else {
+                    return None;
+                };
+                let start = usize::try_from(node.range.start.get()).unwrap();
+                let end = usize::try_from(node.range.end.get()).unwrap();
+                Some((literal.text.as_str(), &source[start..end]))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            numeric,
+            [
+                ("1000", "1_000"),
+                ("51966", "0xCA_FE"),
+                ("165", "0b1010_0101"),
+                ("63", "0o7_7"),
+                ("100", "1e+2"),
+                ("9007199254740992", "9007199254740993"),
+            ]
+        );
+
+        let bigint = result
+            .arena
+            .iter()
+            .filter_map(|(_, node)| {
+                let NodeData::BigIntLiteral(literal) = &node.data else {
+                    return None;
+                };
+                let start = usize::try_from(node.range.start.get()).unwrap();
+                let end = usize::try_from(node.range.end.get()).unwrap();
+                Some((literal.text.as_str(), &source[start..end]))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            bigint,
+            [
+                ("5n", "0b101n"),
+                ("63n", "0o77n"),
+                ("0xcan", "0xCAn"),
+                ("1234n", "12_34n"),
+            ]
+        );
     }
 
     #[test]
@@ -11003,6 +11111,31 @@ mod tests {
         assert!(matches!(
             result.arena.get(outer.expression).map(|node| &node.data),
             Some(NodeData::NewExpression(_))
+        ));
+    }
+
+    #[test]
+    fn parses_incomplete_constructor_type_arguments_as_comparisons() {
+        let result = parse_source_file("new Date<A;");
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+
+        let NodeData::ExpressionStatement(statement) =
+            &result.arena.get(source_statements(&result)[0]).unwrap().data
+        else {
+            panic!("expected expression statement");
+        };
+        let NodeData::BinaryExpression(comparison) =
+            &result.arena.get(statement.expression).unwrap().data
+        else {
+            panic!("expected comparison expression");
+        };
+        assert_eq!(
+            result.arena.get(comparison.operator_token).unwrap().kind,
+            SyntaxKind::LessThanToken
+        );
+        assert!(matches!(
+            result.arena.get(comparison.left).map(|node| &node.data),
+            Some(NodeData::NewExpression(expression)) if expression.type_arguments.is_none()
         ));
     }
 
@@ -13948,6 +14081,10 @@ export as namespace GlobalName;
             panic!("expected recovered import attributes");
         };
         assert!(attributes.attributes.nodes.is_empty());
+        assert!(invalid.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == Some(1478)
+                && diagnostic.message == "Identifier or string literal expected."
+        }));
     }
 
     #[test]
@@ -15648,6 +15785,91 @@ export as namespace GlobalName;
             result.arena.get(element.children.nodes[2]).unwrap().kind,
             SyntaxKind::JsxSelfClosingElement
         );
+    }
+
+    #[test]
+    fn reports_unclosed_jsx_elements_at_their_opening_tag_names() {
+        let source = "let x = <    Foo.Bar >Hello\nlet y = <   Baz >Hello";
+        let result = parse_jsx_source_file(source);
+        let mut diagnostics = result
+            .diagnostics
+            .iter()
+            .map(|diagnostic| {
+                (
+                    diagnostic.code,
+                    diagnostic.range.start.get(),
+                    diagnostic.message.as_str(),
+                )
+            })
+            .collect::<Vec<_>>();
+        diagnostics.sort_by_key(|diagnostic| diagnostic.1);
+
+        assert_eq!(
+            diagnostics,
+            [
+                (
+                    Some(17008),
+                    u32::try_from(source.find("Foo.Bar").unwrap()).unwrap(),
+                    "JSX element 'Foo.Bar' has no corresponding closing tag.",
+                ),
+                (
+                    Some(17008),
+                    u32::try_from(source.find("Baz").unwrap()).unwrap(),
+                    "JSX element 'Baz' has no corresponding closing tag.",
+                ),
+                (
+                    Some(1005),
+                    u32::try_from(source.len()).unwrap(),
+                    "'</' expected.",
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn reports_unclosed_jsx_fragments_at_their_opening_tags() {
+        let source = "const value = <>content";
+        let result = parse_jsx_source_file(source);
+        assert_eq!(
+            result
+                .diagnostics
+                .iter()
+                .map(|diagnostic| {
+                    (
+                        diagnostic.code,
+                        diagnostic.range.start.get(),
+                        diagnostic.message.as_str(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            [
+                (
+                    Some(17014),
+                    u32::try_from(source.find("<>").unwrap()).unwrap(),
+                    "JSX fragment has no corresponding closing tag.",
+                ),
+                (
+                    Some(1005),
+                    u32::try_from(source.len()).unwrap(),
+                    "'</' expected.",
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn reports_rescanned_jsx_text_diagnostics_only_once() {
+        let result = parse_jsx_source_file("const value = <div> > }</div>;");
+        let jsx_diagnostics = result
+            .diagnostics
+            .iter()
+            .filter_map(|diagnostic| {
+                matches!(diagnostic.code, Some(1381 | 1382))
+                    .then_some((diagnostic.code, diagnostic.range.start.get()))
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(jsx_diagnostics, [(Some(1382), 20), (Some(1381), 22)]);
     }
 
     #[test]
