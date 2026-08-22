@@ -79,11 +79,7 @@ fn canonical_program_emits_exact_ordered_generic_call_diagnostics() {
             ),
             (
                 Some("/project/input.ts"),
-                Some(span_within(
-                    SOURCE,
-                    "number , /* trailing */",
-                    ",",
-                )),
+                Some(span_within(SOURCE, "number , /* trailing */", ",",)),
                 Some(1009),
                 "Trailing comma not allowed.",
             ),
@@ -99,11 +95,7 @@ fn canonical_program_emits_exact_ordered_generic_call_diagnostics() {
             ),
             (
                 Some("/project/input.ts"),
-                Some(span_within(
-                    SOURCE,
-                    "string , /* trailing arity */",
-                    ",",
-                )),
+                Some(span_within(SOURCE, "string , /* trailing arity */", ",",)),
                 Some(1009),
                 "Trailing comma not allowed.",
             ),
@@ -155,9 +147,11 @@ fn canonical_program_emits_exact_ordered_generic_call_diagnostics() {
             ),
         ]
     );
-    assert!(diagnostics[..5]
-        .iter()
-        .all(|diagnostic| diagnostic.related_information.is_empty()));
+    assert!(
+        diagnostics[..5]
+            .iter()
+            .all(|diagnostic| diagnostic.related_information.is_empty())
+    );
     assert_eq!(diagnostics[5].related_information.len(), 1);
     let related = &diagnostics[5].related_information[0];
     assert_eq!(related.file_name.as_deref(), Some("/project/input.ts"));
@@ -178,8 +172,7 @@ fn canonical_program_keeps_imported_missing_argument_related_information_cross_f
         "import { pair } from './target';\n",
         "export const result = pair<string, number>(\"left\");\n",
     );
-    const TARGET: &str =
-        "export function pair<T, U>(left: T, right: U): U { return right; }\n";
+    const TARGET: &str = "export function pair<T, U>(left: T, right: U): U { return right; }\n";
     let fs = MemoryFileSystem::new(true);
     fs.write_file("/project/importer.ts", IMPORTER).unwrap();
     fs.write_file("/project/target.ts", TARGET).unwrap();
@@ -195,7 +188,10 @@ fn canonical_program_keeps_imported_missing_argument_related_information_cross_f
     let [diagnostic] = program.diagnostics() else {
         panic!("expected one imported too-few diagnostic")
     };
-    assert_eq!(diagnostic.file_name.as_deref(), Some("/project/importer.ts"));
+    assert_eq!(
+        diagnostic.file_name.as_deref(),
+        Some("/project/importer.ts")
+    );
     assert_eq!(
         diagnostic
             .range

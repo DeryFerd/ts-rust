@@ -86,7 +86,11 @@ fn source_tuple_aliases_publish_mutable_and_readonly_type_nodes_cold_and_warm() 
     else {
         panic!("Frozen has a readonly type operator")
     };
-    let frozen_tuple = NodeRef::new(readonly_operator.arena, readonly_operator.file, operator.type_);
+    let frozen_tuple = NodeRef::new(
+        readonly_operator.arena,
+        readonly_operator.file,
+        operator.type_,
+    );
 
     context.check_source_file(file).unwrap();
     assert!(context.diagnostics().is_empty());

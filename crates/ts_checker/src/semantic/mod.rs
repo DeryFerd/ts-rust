@@ -9,9 +9,9 @@
 pub mod alias;
 pub mod alias_flags;
 pub mod alias_provider;
-pub mod artifact_queries;
 mod array_diagnostics;
 mod array_types;
+pub mod artifact_queries;
 mod assignment;
 pub mod bootstrap;
 mod callable_sets;
@@ -43,8 +43,8 @@ mod jsx;
 mod keyof_types;
 pub mod links;
 mod logical_operators;
-pub mod mapper;
 mod mapped_types;
+pub mod mapper;
 mod member_resolution;
 mod merge;
 pub mod module_resolution;
@@ -137,11 +137,11 @@ pub use links::{
     Tristate, TypeAliasLinks, TypeNodeLinks, TypeResolutionBoundary, TypeResolutionTarget,
     TypeResolutionTargetError, TypeSystemPropertyName, ValueSymbolLinks, VarianceLinks,
 };
-pub use mapper::{CanonicalTypeMapperStore, TypeMapper, TypeMapperKind};
 pub use mapped_types::{
     MappedTypeError, MappedTypeModifiers, MappedTypeRequest, ResolvedMappedProperty,
     ResolvedMappedTypeMembers,
 };
+pub use mapper::{CanonicalTypeMapperStore, TypeMapper, TypeMapperKind};
 pub use member_resolution::{CanonicalUnionPropertyError, ResolvedUnionProperty};
 pub use merge::{
     CheckerDiagnosticMergeHost, FailClosedSymbolMergeHost, SymbolMergeDiagnostic,

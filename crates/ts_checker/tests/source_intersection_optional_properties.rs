@@ -7,8 +7,7 @@ use ts_checker::semantic::{
     CanonicalCheckerContext, CanonicalCheckerOptions, CanonicalModuleResolutionEntry,
     CanonicalModuleResolutionManifestInput, CanonicalModuleResolutionMode,
     CanonicalResolvedModuleInput, DeclaredTypeError, TypeData, TypeId, TypeNodeUnavailable,
-    TypeRecord, ValueSymbolLinks, type_records::IntersectionTypeData,
-    types::ObjectFlags,
+    TypeRecord, ValueSymbolLinks, type_records::IntersectionTypeData, types::ObjectFlags,
 };
 use ts_parser::{ParseResult, parse_source_file};
 
@@ -554,14 +553,8 @@ fn optional_never_discriminants_do_not_reduce_their_intersection() {
         context.store().symbol_len(),
         context.store().symbol_store().symbol_table_len(),
     );
-    assert_eq!(
-        context.get_type_from_type_node(optional_rhs),
-        Ok(optional)
-    );
-    assert_eq!(
-        context.get_type_from_type_node(required_rhs),
-        Ok(required)
-    );
+    assert_eq!(context.get_type_from_type_node(optional_rhs), Ok(optional));
+    assert_eq!(context.get_type_from_type_node(required_rhs), Ok(required));
     assert_eq!(
         (
             context.store().type_len(),

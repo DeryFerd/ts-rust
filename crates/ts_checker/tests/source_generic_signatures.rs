@@ -155,9 +155,11 @@ fn duplicate_type_parameter_names_fall_back_without_publication() {
         );
         assert!(context.store().value_symbol_links(owner).is_none());
         assert!(context.store().signature_links(declaration).is_none());
-        assert!(type_parameter_symbols
-            .iter()
-            .all(|symbol| context.store().declared_type_links(*symbol).is_none()));
+        assert!(
+            type_parameter_symbols
+                .iter()
+                .all(|symbol| context.store().declared_type_links(*symbol).is_none())
+        );
         assert!(context.diagnostics().is_empty());
     }
 }

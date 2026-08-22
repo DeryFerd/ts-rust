@@ -6,7 +6,7 @@ use ts_binder::{
 use ts_checker::semantic::{
     CanonicalCheckerContext, CanonicalCheckerOptions, IntrinsicBootstrapOptions, TypeId,
 };
-use ts_parser::{parse_source_file, ParseResult};
+use ts_parser::{ParseResult, parse_source_file};
 
 const SOURCE: &str = concat!(
     "interface LogicalObject { kind: \"a\"; }\n",

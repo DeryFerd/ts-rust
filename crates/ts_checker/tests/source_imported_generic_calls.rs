@@ -239,7 +239,10 @@ fn imported_ordered_generics_share_checked_signatures_but_not_recoveries() {
             .collect::<Vec<_>>(),
         [2345, 2345, 2554]
     );
-    assert_eq!(diagnostics[2].node.map(|node| node.file), Some(importer_file));
+    assert_eq!(
+        diagnostics[2].node.map(|node| node.file),
+        Some(importer_file)
+    );
     assert_eq!(diagnostics[2].related_information.len(), 1);
     assert_eq!(
         diagnostics[2].related_information[0]
@@ -247,7 +250,10 @@ fn imported_ordered_generics_share_checked_signatures_but_not_recoveries() {
             .map(|node| node.file),
         Some(target_file)
     );
-    assert_eq!(diagnostics[2].related_information[0].diagnostic.code(), 6210);
+    assert_eq!(
+        diagnostics[2].related_information[0].diagnostic.code(),
+        6210
+    );
     assert_eq!(
         diagnostics[2].related_information[0]
             .diagnostic

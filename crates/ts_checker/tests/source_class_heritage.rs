@@ -79,11 +79,7 @@ fn class_symbol(
     context.store().get_merged_symbol(raw).unwrap()
 }
 
-fn function_declarations(
-    parsed: &ParseResult,
-    file: FileId,
-    expected: &str,
-) -> Vec<NodeRef> {
+fn function_declarations(parsed: &ParseResult, file: FileId, expected: &str) -> Vec<NodeRef> {
     let mut declarations = parsed
         .arena
         .iter()
@@ -176,10 +172,7 @@ fn whole_source_check_materializes_inherited_surfaces_and_replays_warm() {
     assert_eq!(derived.shells().instance_type(), published_instance);
     assert_eq!(derived.shells().value_type(), published_value);
     assert_eq!(inherited.symbol(), base_symbol);
-    assert_eq!(
-        inherited.instance_type(),
-        base.shells().instance_type()
-    );
+    assert_eq!(inherited.instance_type(), base.shells().instance_type());
     assert_eq!(inherited.value_type(), base.shells().value_type());
     assert_eq!(
         names(&context, derived.declared_instance_properties()),
@@ -264,10 +257,7 @@ fn direct_heritage_composes_with_local_ambient_overloads_and_replays_warm() {
     let first_raw = context.file(file).unwrap().1.symbol(*first).unwrap();
     let owner = context.store().get_merged_symbol(first_raw).unwrap();
     let second_raw = context.file(file).unwrap().1.symbol(*second).unwrap();
-    assert_eq!(
-        context.store().get_merged_symbol(second_raw),
-        Some(owner)
-    );
+    assert_eq!(context.store().get_merged_symbol(second_raw), Some(owner));
     let call = parsed
         .arena
         .iter()
@@ -322,8 +312,7 @@ fn direct_heritage_composes_with_local_ambient_overloads_and_replays_warm() {
                 .expect("each ambient overload retains its declaration signature")
         })
         .collect::<Vec<_>>();
-    let TypeData::Object(callable_data) =
-        context.store().type_payload(callable).unwrap().data()
+    let TypeData::Object(callable_data) = context.store().type_payload(callable).unwrap().data()
     else {
         panic!("the overload owner uses anonymous object storage")
     };

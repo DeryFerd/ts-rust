@@ -5,8 +5,7 @@ use ts_binder::{
 };
 use ts_checker::semantic::{
     CanonicalCheckerContext, CanonicalCheckerOptions, DeclaredTypeError, TypeData, TypeId,
-    TypeNodeUnavailable, TypeRecord, ValueSymbolLinks,
-    type_records::IntersectionTypeData,
+    TypeNodeUnavailable, TypeRecord, ValueSymbolLinks, type_records::IntersectionTypeData,
     types::ObjectFlags,
 };
 use ts_parser::{ParseResult, parse_source_file};
@@ -72,12 +71,7 @@ fn context(parsed: &ParseResult, file: FileId) -> CanonicalCheckerContext<'_> {
     .unwrap()
 }
 
-fn declaration(
-    parsed: &ParseResult,
-    file: FileId,
-    kind: SyntaxKind,
-    expected: &str,
-) -> NodeRef {
+fn declaration(parsed: &ParseResult, file: FileId, kind: SyntaxKind, expected: &str) -> NodeRef {
     parsed
         .arena
         .iter()
@@ -208,7 +202,11 @@ fn source_intersections_preserve_order_identity_properties_reduction_and_relatio
     let file = FileId::new(1_901);
     let mut context = context(&parsed, file);
     context.check_source_file(file).unwrap();
-    assert!(context.diagnostics().is_empty(), "{:?}", context.diagnostics());
+    assert!(
+        context.diagnostics().is_empty(),
+        "{:?}",
+        context.diagnostics()
+    );
 
     let aliases = [
         "AB",
@@ -231,20 +229,20 @@ fn source_intersections_preserve_order_identity_properties_reduction_and_relatio
         "BooleanImpossible",
         "NullImpossible",
     ]
-        .into_iter()
-        .map(|name| {
-            (
+    .into_iter()
+    .map(|name| {
+        (
+            name,
+            symbol(
+                &parsed,
+                file,
+                &context,
+                SyntaxKind::TypeAliasDeclaration,
                 name,
-                symbol(
-                    &parsed,
-                    file,
-                    &context,
-                    SyntaxKind::TypeAliasDeclaration,
-                    name,
-                ),
-            )
-        })
-        .collect::<std::collections::BTreeMap<_, _>>();
+            ),
+        )
+    })
+    .collect::<std::collections::BTreeMap<_, _>>();
     let interfaces = ["A", "B", "KindA", "KindB"]
         .into_iter()
         .map(|name| {
@@ -297,12 +295,18 @@ fn source_intersections_preserve_order_identity_properties_reduction_and_relatio
     assert_eq!(context.type_to_string(ba).unwrap(), "BA");
     assert_eq!(context.type_to_string(impossible).unwrap(), "Impossible");
 
-    assert_eq!(intersection_data(&context, ab).intersection.types, vec![a, b]);
+    assert_eq!(
+        intersection_data(&context, ab).intersection.types,
+        vec![a, b]
+    );
     assert_eq!(
         intersection_data(&context, ab2).intersection.types,
         vec![a, b]
     );
-    assert_eq!(intersection_data(&context, ba).intersection.types, vec![b, a]);
+    assert_eq!(
+        intersection_data(&context, ba).intersection.types,
+        vec![b, a]
+    );
     assert_eq!(
         intersection_data(&context, direct_ab).intersection.types,
         vec![a, b]
@@ -315,7 +319,10 @@ fn source_intersections_preserve_order_identity_properties_reduction_and_relatio
         &intersection_data(&context, nested).intersection.types[..2],
         &[a, b]
     );
-    assert_eq!(intersection_data(&context, nested).intersection.types.len(), 3);
+    assert_eq!(
+        intersection_data(&context, nested).intersection.types.len(),
+        3
+    );
 
     let ab_properties = intersection_data(&context, ab)
         .intersection
@@ -468,16 +475,27 @@ fn source_intersections_preserve_order_identity_properties_reduction_and_relatio
 
     for reduced in [boolean_impossible, null_impossible] {
         assert!(
-            context.store().type_payload(reduced).unwrap().object_flags().contains(
-                ObjectFlags::IS_NEVER_INTERSECTION_COMPUTED
-                    | ObjectFlags::IS_NEVER_INTERSECTION
-            ),
+            context
+                .store()
+                .type_payload(reduced)
+                .unwrap()
+                .object_flags()
+                .contains(
+                    ObjectFlags::IS_NEVER_INTERSECTION_COMPUTED
+                        | ObjectFlags::IS_NEVER_INTERSECTION
+                ),
         );
         assert!(matches!(
-            intersection_data(&context, reduced).intersection.types.as_slice(),
+            intersection_data(&context, reduced)
+                .intersection
+                .types
+                .as_slice(),
             [_, _]
         ));
-        assert_eq!(context.is_type_assignable_to(reduced, string_type), Ok(true));
+        assert_eq!(
+            context.is_type_assignable_to(reduced, string_type),
+            Ok(true)
+        );
     }
 
     assert_eq!(context.is_type_identical_to(ab, ab2), Ok(true));
@@ -606,7 +624,11 @@ fn unsupported_intersection_syntax_fails_before_semantic_writes() {
     ];
     for (index, (source, label)) in cases.into_iter().enumerate() {
         let parsed = parse_source_file(source);
-        assert!(parsed.diagnostics.is_empty(), "{label}: {:?}", parsed.diagnostics);
+        assert!(
+            parsed.diagnostics.is_empty(),
+            "{label}: {:?}",
+            parsed.diagnostics
+        );
         let file = FileId::new(1_920 + u32::try_from(index).unwrap());
         let mut context = context(&parsed, file);
         let rhs = alias_rhs(&parsed, file, "Bad");

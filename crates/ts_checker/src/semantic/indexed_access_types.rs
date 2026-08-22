@@ -280,9 +280,7 @@ fn validate_member_domains(
     host: &DeclaredTypeHost<'_>,
     object: &PropertyObjectPlan,
 ) -> Result<(), ConcreteIndexedAccessError> {
-    if object.indexes.is_empty()
-        || object.indexes.len() == 1 && object.properties.is_empty()
-    {
+    if object.indexes.is_empty() || object.indexes.len() == 1 && object.properties.is_empty() {
         return Ok(());
     }
 
@@ -297,13 +295,12 @@ fn validate_member_domains(
             object.node,
         ));
     };
-    let string_domain = primitive_domain(store, host, string_index.value_type_node)
-        .ok_or(ConcreteIndexedAccessError::UnsupportedObjectSurface(
-            object.node,
-        ))?;
+    let string_domain = primitive_domain(store, host, string_index.value_type_node).ok_or(
+        ConcreteIndexedAccessError::UnsupportedObjectSurface(object.node),
+    )?;
 
-    let number_domain = number_index
-        .and_then(|index| primitive_domain(store, host, index.value_type_node));
+    let number_domain =
+        number_index.and_then(|index| primitive_domain(store, host, index.value_type_node));
     if number_index.is_some()
         && !number_domain.is_some_and(|domain| domain.is_subset_of(string_domain))
     {
@@ -370,13 +367,9 @@ fn validate_member_annotation_cache(
         let published = store
             .value_symbol_links(property.symbol)
             .and_then(|links| links.resolved_type)
-            .ok_or(ConcreteIndexedAccessError::InvalidCache(
-                property.type_node,
-            ))?;
+            .ok_or(ConcreteIndexedAccessError::InvalidCache(property.type_node))?;
         if cached_annotation_identity(store, host, property.type_node)? != published {
-            return Err(ConcreteIndexedAccessError::InvalidCache(
-                property.type_node,
-            ));
+            return Err(ConcreteIndexedAccessError::InvalidCache(property.type_node));
         }
     }
 
@@ -428,10 +421,7 @@ fn validate_cold_annotation_subtree(
         }
         seen.push(node);
         record.for_each_child(|child| {
-            pending.push((
-                NodeRef::new(node.arena, node.file, child),
-                Some(node.node),
-            ));
+            pending.push((NodeRef::new(node.arena, node.file, child), Some(node.node)));
         });
     }
     Ok(())
@@ -516,9 +506,10 @@ fn validate_empty_annotation_links(
     store: &CanonicalTypeMapperStore,
     node: NodeRef,
 ) -> Result<(), ConcreteIndexedAccessError> {
-    if store.type_node_links(node).is_some_and(|links| {
-        links.resolved_type.is_some() || links.outer_type_parameters.is_some()
-    }) {
+    if store
+        .type_node_links(node)
+        .is_some_and(|links| links.resolved_type.is_some() || links.outer_type_parameters.is_some())
+    {
         Err(ConcreteIndexedAccessError::InvalidCache(node))
     } else {
         Ok(())

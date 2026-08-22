@@ -9,27 +9,24 @@ use ts_ast::{
     ComputedPropertyNameData, ConditionalExpressionData, ConditionalTypeNodeData,
     ConstructSignatureDeclarationData, ConstructorDeclarationData, ConstructorTypeNodeData,
     ContinueStatementData, DebuggerStatementData, DecoratorData, DeleteExpressionData,
-    DoStatementData,
-    ElementAccessExpressionData, EmptyStatementData, EnumDeclarationData, EnumMemberData,
-    ExportAssignmentData, ExportDeclarationData, ExportSpecifierData, ExpressionStatementData,
-    ExpressionWithTypeArgumentsData, ExternalModuleReferenceData, ForInOrOfStatementData,
-    ForStatementData, FunctionDeclarationData, FunctionExpressionData, FunctionTypeNodeData,
-    GetAccessorDeclarationData, HeritageClauseData, IdentifierData, IfStatementData,
-    ImportAttributeData, ImportAttributesData, ImportClauseData, ImportDeclarationData,
-    ImportEqualsDeclarationData, ImportSpecifierData, ImportTypeNodeData,
+    DoStatementData, ElementAccessExpressionData, EmptyStatementData, EnumDeclarationData,
+    EnumMemberData, ExportAssignmentData, ExportDeclarationData, ExportSpecifierData,
+    ExpressionStatementData, ExpressionWithTypeArgumentsData, ExternalModuleReferenceData,
+    ForInOrOfStatementData, ForStatementData, FunctionDeclarationData, FunctionExpressionData,
+    FunctionTypeNodeData, GetAccessorDeclarationData, HeritageClauseData, IdentifierData,
+    IfStatementData, ImportAttributeData, ImportAttributesData, ImportClauseData,
+    ImportDeclarationData, ImportEqualsDeclarationData, ImportSpecifierData, ImportTypeNodeData,
     IndexSignatureDeclarationData, IndexedAccessTypeNodeData, InferTypeNodeData,
     InterfaceDeclarationData, IntersectionTypeNodeData, JsDocAllTypeData, JsDocData,
     JsDocNonNullableTypeData, JsDocNullableTypeData, JsDocTextData, JsDocUnknownTagData,
-    JsxAttributeData,
-    JsxAttributesData, JsxClosingElementData,
-    JsxClosingFragmentData, JsxElementData, JsxExpressionData, JsxFragmentData,
-    JsxNamespacedNameData, JsxOpeningElementData, JsxOpeningFragmentData, JsxSelfClosingElementData,
+    JsxAttributeData, JsxAttributesData, JsxClosingElementData, JsxClosingFragmentData,
+    JsxElementData, JsxExpressionData, JsxFragmentData, JsxNamespacedNameData,
+    JsxOpeningElementData, JsxOpeningFragmentData, JsxSelfClosingElementData,
     JsxSpreadAttributeData, JsxTextData, KeywordExpressionData, KeywordTypeNodeData,
     LabeledStatementData, LiteralTypeNodeData, MappedTypeNodeData, MetaPropertyData,
     MethodDeclarationData, MethodSignatureDeclarationData, ModifierList, ModuleBlockData,
-    ModuleDeclarationData,
-    NamedExportsData, NamedImportsData, NamedTupleMemberData, NamespaceExportData,
-    NamespaceExportDeclarationData, NamespaceImportData, NewExpressionData,
+    ModuleDeclarationData, NamedExportsData, NamedImportsData, NamedTupleMemberData,
+    NamespaceExportData, NamespaceExportDeclarationData, NamespaceImportData, NewExpressionData,
     NoSubstitutionTemplateLiteralData, Node, NodeArena, NodeData, NodeFlags, NodeId, NodeList,
     NonNullExpressionData, NotEmittedStatementData, NumericLiteralData,
     ObjectLiteralExpressionData, OmittedExpressionData, OptionalTypeNodeData,
@@ -39,8 +36,7 @@ use ts_ast::{
     QualifiedNameData, RegularExpressionLiteralData, RestTypeNodeData, ReturnStatementData,
     SatisfiesExpressionData, SemicolonClassElementData, SetAccessorDeclarationData,
     ShorthandPropertyAssignmentData, SourceFileData, SpreadAssignmentData, SpreadElementData,
-    StringLiteralData,
-    SwitchStatementData, SymbolTable, SyntaxKind, TaggedTemplateExpressionData,
+    StringLiteralData, SwitchStatementData, SymbolTable, SyntaxKind, TaggedTemplateExpressionData,
     TemplateExpressionData, TemplateHeadData, TemplateLiteralTypeNodeData,
     TemplateLiteralTypeSpanData, TemplateMiddleData, TemplateSpanData, TemplateTailData,
     ThisTypeNodeData, ThrowStatementData, TokenData, TokenFlags, TryStatementData,
@@ -693,10 +689,7 @@ impl<'a> Parser<'a> {
             && self.next_token_preceded_by_line_break();
         let declare_starts_expression = self.current.kind == SyntaxKind::DeclareKeyword
             && (self.next_token_kind() == SyntaxKind::InstanceOfKeyword
-                || self.next_tokens_are(
-                    SyntaxKind::ModuleKeyword,
-                    SyntaxKind::OpenBraceToken,
-                )
+                || self.next_tokens_are(SyntaxKind::ModuleKeyword, SyntaxKind::OpenBraceToken)
                 || self.declare_precedes_invalid_namespace_name());
         let async_starts_function = self.current.kind == SyntaxKind::AsyncKeyword
             && !self.next_token_preceded_by_line_break()
@@ -716,10 +709,7 @@ impl<'a> Parser<'a> {
         let (import_starts_expression, invalid_import_declaration) =
             self.classify_import_statement_start();
         let import_starts_modified_class = self.current.kind == SyntaxKind::ImportKeyword
-            && self.next_tokens_are(
-                SyntaxKind::AbstractKeyword,
-                SyntaxKind::ClassKeyword,
-            );
+            && self.next_tokens_are(SyntaxKind::AbstractKeyword, SyntaxKind::ClassKeyword);
         let recovered_bigint_module_clause = match self.current.kind {
             SyntaxKind::ImportKeyword => self.module_clause_has_unquoted_bigint(false),
             SyntaxKind::ExportKeyword => self.module_clause_has_unquoted_bigint(true),
@@ -728,16 +718,17 @@ impl<'a> Parser<'a> {
         match self.current.kind {
             SyntaxKind::OpenBraceToken => self.parse_block(),
             SyntaxKind::ConstKeyword if is_const_enum => self.parse_const_enum_declaration(),
-            SyntaxKind::VarKeyword | SyntaxKind::ConstKeyword => {
-                self.parse_variable_statement()
-            }
+            SyntaxKind::VarKeyword | SyntaxKind::ConstKeyword => self.parse_variable_statement(),
             SyntaxKind::LetKeyword if let_starts_declaration => self.parse_variable_statement(),
             SyntaxKind::UsingKeyword => self.parse_using_statement(),
             SyntaxKind::AwaitKeyword => self.parse_await_statement(),
             SyntaxKind::FunctionKeyword => self.parse_function_declaration(),
             SyntaxKind::ClassKeyword => self.parse_class_declaration(),
             SyntaxKind::InterfaceKeyword | SyntaxKind::TypeKeyword
-                if contextual_type_starts_declaration => self.parse_contextual_type_declaration(),
+                if contextual_type_starts_declaration =>
+            {
+                self.parse_contextual_type_declaration()
+            }
             SyntaxKind::EnumKeyword => self.parse_enum_declaration(),
             SyntaxKind::ReturnKeyword => self.parse_return_statement(),
             SyntaxKind::IfKeyword => self.parse_if_statement(),
@@ -769,9 +760,7 @@ impl<'a> Parser<'a> {
             SyntaxKind::DeclareKeyword if declare_starts_expression => {
                 self.parse_expression_statement()
             }
-            SyntaxKind::AsyncKeyword
-                if !async_starts_function && !async_starts_declaration =>
-            {
+            SyntaxKind::AsyncKeyword if !async_starts_function && !async_starts_declaration => {
                 self.parse_expression_statement()
             }
             SyntaxKind::StaticKeyword if static_starts_recovered_call => {
@@ -817,9 +806,7 @@ impl<'a> Parser<'a> {
         let name = self.scanner.scan();
         let next = self.scanner.scan().kind;
         self.scanner.rewind(checkpoint);
-        !name
-            .flags
-            .contains(ScannerTokenFlags::PRECEDING_LINE_BREAK)
+        !name.flags.contains(ScannerTokenFlags::PRECEDING_LINE_BREAK)
             && (name.kind == SyntaxKind::Identifier || name.kind.is_keyword())
             && next == SyntaxKind::OpenParenToken
     }
@@ -920,8 +907,8 @@ impl<'a> Parser<'a> {
 
     fn classify_import_statement_start(&mut self) -> (bool, bool) {
         let next = (self.current.kind == SyntaxKind::ImportKeyword).then(|| self.next_token_kind());
-        let line_broken_import = next == Some(SyntaxKind::ImportKeyword)
-            && self.next_token_preceded_by_line_break();
+        let line_broken_import =
+            next == Some(SyntaxKind::ImportKeyword) && self.next_token_preceded_by_line_break();
         (
             matches!(
                 next,
@@ -1160,9 +1147,7 @@ impl<'a> Parser<'a> {
             || is_import_binding_identifier_kind(next)
             || matches!(
                 next,
-                SyntaxKind::OpenBraceToken
-                    | SyntaxKind::OpenBracketToken
-                    | SyntaxKind::ColonToken
+                SyntaxKind::OpenBraceToken | SyntaxKind::OpenBracketToken | SyntaxKind::ColonToken
             )
     }
 
@@ -1486,25 +1471,25 @@ impl<'a> Parser<'a> {
             let parameter = self.parse_parameter();
             parameters.push(parameter);
             if self.current.kind != SyntaxKind::CommaToken {
-                let recovers_modifier_after_rest =
-                    matches!(
-                        self.arena.get(parameter).map(|node| &node.data),
-                        Some(NodeData::ParameterDeclaration(parameter))
-                            if parameter.dot_dot_dot_token.is_some()
-                                && matches!(
-                                    self.arena.get(parameter.name).map(|node| &node.data),
-                                    Some(NodeData::Identifier(identifier))
-                                        if matches!(
-                                            identifier.text.as_str(),
-                                            "override"
-                                                | "private"
-                                                | "protected"
-                                                | "public"
-                                                | "readonly"
-                                        )
-                                )
-                    ) && (self.current.kind == SyntaxKind::Identifier
-                        || self.current.kind.is_keyword());
+                let recovers_modifier_after_rest = matches!(
+                    self.arena.get(parameter).map(|node| &node.data),
+                    Some(NodeData::ParameterDeclaration(parameter))
+                        if parameter.dot_dot_dot_token.is_some()
+                            && matches!(
+                                self.arena.get(parameter.name).map(|node| &node.data),
+                                Some(NodeData::Identifier(identifier))
+                                    if matches!(
+                                        identifier.text.as_str(),
+                                        "override"
+                                            | "private"
+                                            | "protected"
+                                            | "public"
+                                            | "readonly"
+                                    )
+                            )
+                ) && (self.current.kind
+                    == SyntaxKind::Identifier
+                    || self.current.kind.is_keyword());
                 if recovers_modifier_after_rest || self.current.kind == SyntaxKind::AtToken {
                     self.error_current("Expected ','.");
                     continue;
@@ -1587,9 +1572,10 @@ impl<'a> Parser<'a> {
                 self.arena
                     .get(left)
                     .and_then(|left| match &left.data {
-                        NodeData::AwaitExpression(awaited) => {
-                            self.arena.get(awaited.expression).map(|operand| operand.range)
-                        }
+                        NodeData::AwaitExpression(awaited) => self
+                            .arena
+                            .get(awaited.expression)
+                            .map(|operand| operand.range),
                         _ => None,
                     })
                     .unwrap_or(self.current.range)
@@ -1716,11 +1702,7 @@ impl<'a> Parser<'a> {
                     | SyntaxKind::OpenBraceToken
             ) && !self.current.kind.is_keyword()
             {
-                self.error_code_at(
-                    self.current.range,
-                    1181,
-                    std::iter::empty::<String>(),
-                );
+                self.error_code_at(self.current.range, 1181, std::iter::empty::<String>());
                 break;
             }
             let before = (self.current.kind, self.current.range);
@@ -2044,10 +2026,10 @@ impl<'a> Parser<'a> {
         let start = self.consume().range.start;
         let name = if self.current.kind != SyntaxKind::VoidKeyword
             && !matches!(
-            self.current.kind,
-            SyntaxKind::ExtendsKeyword | SyntaxKind::ImplementsKeyword
-        ) && (self.current.kind == SyntaxKind::Identifier
-            || self.current.kind.is_keyword())
+                self.current.kind,
+                SyntaxKind::ExtendsKeyword | SyntaxKind::ImplementsKeyword
+            )
+            && (self.current.kind == SyntaxKind::Identifier || self.current.kind.is_keyword())
         {
             Some(self.parse_identifier_name("Expected a class name."))
         } else {
@@ -2502,9 +2484,7 @@ impl<'a> Parser<'a> {
             || name.is_keyword()
             || matches!(
                 name,
-                SyntaxKind::StringLiteral
-                    | SyntaxKind::NumericLiteral
-                    | SyntaxKind::BigIntLiteral
+                SyntaxKind::StringLiteral | SyntaxKind::NumericLiteral | SyntaxKind::BigIntLiteral
             ))
         {
             self.scanner.rewind(checkpoint);
@@ -2522,9 +2502,7 @@ impl<'a> Parser<'a> {
                 | SyntaxKind::SemicolonToken
                 | SyntaxKind::CloseBraceToken
                 | SyntaxKind::EndOfFile
-        ) || next
-            .flags
-            .contains(ScannerTokenFlags::PRECEDING_LINE_BREAK)
+        ) || next.flags.contains(ScannerTokenFlags::PRECEDING_LINE_BREAK)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -2539,8 +2517,7 @@ impl<'a> Parser<'a> {
         }
         while self.current.kind.is_modifier()
             && !self.current_modifier_is_member_name()
-            && !(self.current.kind == SyntaxKind::StaticKeyword
-                && self.next_token_is_open_brace())
+            && !(self.current.kind == SyntaxKind::StaticKeyword && self.next_token_is_open_brace())
         {
             modifier_nodes.push(self.consume_token_node());
         }
@@ -3394,22 +3371,19 @@ impl<'a> Parser<'a> {
                 &children,
             ));
             match self.current.kind {
-                SyntaxKind::CommaToken
-                | SyntaxKind::SemicolonToken
-                | SyntaxKind::ColonToken => {
+                SyntaxKind::CommaToken | SyntaxKind::SemicolonToken | SyntaxKind::ColonToken => {
                     self.bump();
                 }
                 SyntaxKind::CloseBraceToken | SyntaxKind::EndOfFile => break,
-                kind
-                    if kind == SyntaxKind::Identifier
-                        || kind.is_keyword()
-                        || matches!(
-                            kind,
-                            SyntaxKind::StringLiteral
-                                | SyntaxKind::NumericLiteral
-                                | SyntaxKind::BigIntLiteral
-                                | SyntaxKind::OpenBracketToken
-                        ) => {}
+                kind if kind == SyntaxKind::Identifier
+                    || kind.is_keyword()
+                    || matches!(
+                        kind,
+                        SyntaxKind::StringLiteral
+                            | SyntaxKind::NumericLiteral
+                            | SyntaxKind::BigIntLiteral
+                            | SyntaxKind::OpenBracketToken
+                    ) => {}
                 _ => {
                     self.bump();
                 }
@@ -3670,8 +3644,8 @@ impl<'a> Parser<'a> {
             Some(self.parse_binary_expression(0))
         };
         self.expect_and_bump(SyntaxKind::SemicolonToken, "Expected ';'.");
-        let recovered_close_brace = recovered_block_as_for_initializer
-            && self.current.kind == SyntaxKind::CloseBraceToken;
+        let recovered_close_brace =
+            recovered_block_as_for_initializer && self.current.kind == SyntaxKind::CloseBraceToken;
         let incrementor = if recovered_close_brace {
             self.error_current("Expected an expression.");
             None
@@ -4415,21 +4389,13 @@ impl<'a> Parser<'a> {
             let next_is_identifier = self.token_is_identifier_in_current_context(next);
             let from_starts_phase_binding = if next == SyntaxKind::FromKeyword {
                 next_is_identifier
-                    && (self.next_tokens_are(
-                        SyntaxKind::FromKeyword,
-                        SyntaxKind::FromKeyword,
-                    ) || self.next_tokens_are(
-                        SyntaxKind::FromKeyword,
-                        SyntaxKind::EqualsToken,
-                    ))
+                    && (self.next_tokens_are(SyntaxKind::FromKeyword, SyntaxKind::FromKeyword)
+                        || self.next_tokens_are(SyntaxKind::FromKeyword, SyntaxKind::EqualsToken))
             } else {
                 true
             };
             let next_starts_phase_clause = next_is_identifier
-                || matches!(
-                    next,
-                    SyntaxKind::AsteriskToken | SyntaxKind::OpenBraceToken
-                );
+                || matches!(next, SyntaxKind::AsteriskToken | SyntaxKind::OpenBraceToken);
             let type_modifier_is_unambiguous =
                 from_starts_phase_binding && next_starts_phase_clause;
             return type_modifier_is_unambiguous.then_some(SyntaxKind::TypeKeyword);
@@ -4465,10 +4431,7 @@ impl<'a> Parser<'a> {
         self.parse_binary_expression(0)
     }
 
-    fn parse_import_attributes(
-        &mut self,
-        allow_with_preceding_line_break: bool,
-    ) -> Option<NodeId> {
+    fn parse_import_attributes(&mut self, allow_with_preceding_line_break: bool) -> Option<NodeId> {
         let has_preceding_line_break = self
             .current
             .flags
@@ -4786,10 +4749,8 @@ impl<'a> Parser<'a> {
             .arena
             .get(name)
             .map_or(TextRange::new(position, position), |node| node.range);
-        self.diagnostics.push(parser_diagnostic(
-            range,
-            "Expected a local import name.",
-        ));
+        self.diagnostics
+            .push(parser_diagnostic(range, "Expected a local import name."));
         if let Some(node) = self.arena.get_mut(name) {
             node.flags.0 |= NODE_FLAG_HAS_ERROR.0;
         }
@@ -4820,10 +4781,10 @@ impl<'a> Parser<'a> {
             SyntaxKind::InterfaceKeyword | SyntaxKind::NamespaceKeyword => {
                 !is_module_name_token(next)
             }
-            SyntaxKind::TypeKeyword => !matches!(
-                next,
-                SyntaxKind::OpenBraceToken | SyntaxKind::AsteriskToken
-            ) && !is_module_name_token(next),
+            SyntaxKind::TypeKeyword => {
+                !matches!(next, SyntaxKind::OpenBraceToken | SyntaxKind::AsteriskToken)
+                    && !is_module_name_token(next)
+            }
             SyntaxKind::ModuleKeyword => {
                 next != SyntaxKind::StringLiteral && !is_module_name_token(next)
             }
@@ -5019,8 +4980,7 @@ impl<'a> Parser<'a> {
             self.bump();
             if self.current.kind == SyntaxKind::StringLiteral {
                 Some(self.parse_string_literal())
-            } else if self.current.kind == SyntaxKind::Identifier
-                || self.current.kind.is_keyword()
+            } else if self.current.kind == SyntaxKind::Identifier || self.current.kind.is_keyword()
             {
                 self.error_current("Expected a module specifier.");
                 Some(self.parse_identifier_name("Expected a module specifier."))
@@ -5031,8 +4991,7 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        let attributes = module_specifier
-            .and_then(|_| self.parse_import_attributes(false));
+        let attributes = module_specifier.and_then(|_| self.parse_import_attributes(false));
         let fallback = attributes
             .or(module_specifier)
             .or(export_clause)
@@ -5639,8 +5598,10 @@ impl<'a> Parser<'a> {
         {
             let token = self.consume();
             self.error_code_at(token.range, 1128, std::iter::empty::<String>());
-            while !matches!(self.current.kind, SyntaxKind::SemicolonToken | SyntaxKind::EndOfFile)
-            {
+            while !matches!(
+                self.current.kind,
+                SyntaxKind::SemicolonToken | SyntaxKind::EndOfFile
+            ) {
                 self.bump();
             }
             return self.missing_identifier(token.range.end);
@@ -5699,7 +5660,10 @@ impl<'a> Parser<'a> {
             let operator_token = self.consume();
             let operator = operator_token.kind;
             let missing_before_await = self.await_context
-                && matches!(operator, SyntaxKind::PlusPlusToken | SyntaxKind::MinusMinusToken)
+                && matches!(
+                    operator,
+                    SyntaxKind::PlusPlusToken | SyntaxKind::MinusMinusToken
+                )
                 && self.current.kind == SyntaxKind::AwaitKeyword;
             let operand = if missing_before_await
                 || (self
@@ -5717,8 +5681,7 @@ impl<'a> Parser<'a> {
                             | SyntaxKind::SwitchKeyword
                             | SyntaxKind::VarKeyword
                             | SyntaxKind::ConstKeyword
-                    ))
-            {
+                    )) {
                 self.error_current("Expected an expression.");
                 self.missing_identifier(self.current.range.start)
             } else {
@@ -6232,8 +6195,7 @@ impl<'a> Parser<'a> {
                 .source_text()
                 .and_then(|source| {
                     source.get(
-                        expression_range.start.get() as usize
-                            ..expression_range.end.get() as usize,
+                        expression_range.start.get() as usize..expression_range.end.get() as usize,
                     )
                 })
                 .unwrap_or_default()
@@ -6301,11 +6263,7 @@ impl<'a> Parser<'a> {
                 .arena
                 .get(name)
                 .map_or(keyword_range, |name| name.range);
-            self.error_code_at(
-                range,
-                17012,
-                [text, "new".to_owned(), "target".to_owned()],
-            );
+            self.error_code_at(range, 17012, [text, "new".to_owned(), "target".to_owned()]);
         }
         self.alloc_node(
             SyntaxKind::MetaProperty,
@@ -6551,7 +6509,10 @@ impl<'a> Parser<'a> {
             self.scanner.rewind(checkpoint);
             return false;
         }
-        if matches!(token.kind, SyntaxKind::CloseParenToken | SyntaxKind::DotDotDotToken) {
+        if matches!(
+            token.kind,
+            SyntaxKind::CloseParenToken | SyntaxKind::DotDotDotToken
+        ) {
             self.scanner.rewind(checkpoint);
             return true;
         }
@@ -7210,10 +7171,8 @@ impl<'a> Parser<'a> {
                         (
                             None,
                             None,
-                            postfix_token.map_or_else(
-                                || self.node_end(name),
-                                |token| self.node_end(token),
-                            ),
+                            postfix_token
+                                .map_or_else(|| self.node_end(name), |token| self.node_end(token)),
                             children,
                         )
                     };
@@ -8454,9 +8413,7 @@ impl<'a> Parser<'a> {
         self.alloc_node(
             SyntaxKind::JsDocNonNullableType,
             range,
-            NodeData::JsDocNonNullableType(Box::new(JsDocNonNullableTypeData {
-                type_: type_node,
-            })),
+            NodeData::JsDocNonNullableType(Box::new(JsDocNonNullableTypeData { type_: type_node })),
             &[type_node],
         )
     }
@@ -8469,7 +8426,10 @@ impl<'a> Parser<'a> {
         let name = self.scanner.scan().kind;
         let close = self.scanner.scan().kind;
         let mut next = self.scanner.scan().kind;
-        if matches!(next, SyntaxKind::QuestionToken | SyntaxKind::ExclamationToken) {
+        if matches!(
+            next,
+            SyntaxKind::QuestionToken | SyntaxKind::ExclamationToken
+        ) {
             next = self.scanner.scan().kind;
         }
         self.scanner.rewind(checkpoint);
@@ -8496,9 +8456,7 @@ impl<'a> Parser<'a> {
         self.alloc_node(
             SyntaxKind::JsDocNullableType,
             TextRange::new(start, self.node_end(type_node)),
-            NodeData::JsDocNullableType(Box::new(JsDocNullableTypeData {
-                type_: type_node,
-            })),
+            NodeData::JsDocNullableType(Box::new(JsDocNullableTypeData { type_: type_node })),
             &[type_node],
         )
     }
@@ -8536,9 +8494,7 @@ impl<'a> Parser<'a> {
                     &[],
                 )
             }
-            SyntaxKind::ThisKeyword if qualified_this => {
-                self.parse_type_reference()
-            }
+            SyntaxKind::ThisKeyword if qualified_this => self.parse_type_reference(),
             SyntaxKind::ThisKeyword => {
                 let token = self.consume();
                 self.alloc_node(
@@ -8655,7 +8611,9 @@ impl<'a> Parser<'a> {
     fn parse_function_type(&mut self, type_parameters: Option<NodeList>) -> NodeId {
         let start = type_parameters
             .as_ref()
-            .map_or(self.current.range.start, |parameters| parameters.range.start);
+            .map_or(self.current.range.start, |parameters| {
+                parameters.range.start
+            });
         let parameters = self.parse_parameter_list();
         let return_type = if self.current.kind == SyntaxKind::ColonToken {
             self.error_current("Expected '=>'.");
@@ -9194,10 +9152,7 @@ impl<'a> Parser<'a> {
                 .then(|| self.consume_token_node());
             let named = self.current.kind == SyntaxKind::Identifier
                 && (self.next_token_kind() == SyntaxKind::ColonToken
-                    || self.next_tokens_are(
-                        SyntaxKind::QuestionToken,
-                        SyntaxKind::ColonToken,
-                    ));
+                    || self.next_tokens_are(SyntaxKind::QuestionToken, SyntaxKind::ColonToken));
             if named {
                 let name = self.parse_identifier("Expected a tuple element name.");
                 let question_token = (self.current.kind == SyntaxKind::QuestionToken)
@@ -9444,12 +9399,7 @@ impl<'a> Parser<'a> {
     }
 
     fn alloc_token_node(&mut self, kind: SyntaxKind, range: TextRange) -> NodeId {
-        self.alloc_node(
-            kind,
-            range,
-            NodeData::Token(Box::new(TokenData)),
-            &[],
-        )
+        self.alloc_node(kind, range, NodeData::Token(Box::new(TokenData)), &[])
     }
 
     fn parse_expected_token_node(&mut self, kind: SyntaxKind, message: &str) -> NodeId {
@@ -10104,7 +10054,8 @@ mod tests {
                 result.arena.get(root.operator_token).unwrap().kind,
                 root_operator
             );
-            let NodeData::BinaryExpression(left) = &result.arena.get(root.left).unwrap().data else {
+            let NodeData::BinaryExpression(left) = &result.arena.get(root.left).unwrap().data
+            else {
                 panic!("expected a left-associative mixed operand");
             };
             assert_eq!(
@@ -10231,17 +10182,13 @@ mod tests {
         assert_eq!(lists[0].nodes.len(), 1);
         assert!(lists[0].has_trailing_comma);
         assert_eq!(
-            source.get(
-                lists[0].range.start.get() as usize..lists[0].range.end.get() as usize
-            ),
+            source.get(lists[0].range.start.get() as usize..lists[0].range.end.get() as usize),
             Some("<string,>")
         );
         assert!(lists[1].nodes.is_empty());
         assert!(!lists[1].has_trailing_comma);
         assert_eq!(
-            source.get(
-                lists[1].range.start.get() as usize..lists[1].range.end.get() as usize
-            ),
+            source.get(lists[1].range.start.get() as usize..lists[1].range.end.get() as usize),
             Some("<>")
         );
     }
@@ -10461,16 +10408,16 @@ mod tests {
                 .collect::<Vec<_>>(),
             [1005, 1005, 1109]
         );
-        let NodeData::ForStatement(for_) =
-            &result.arena.get(source_statements(&result)[0]).unwrap().data
+        let NodeData::ForStatement(for_) = &result
+            .arena
+            .get(source_statements(&result)[0])
+            .unwrap()
+            .data
         else {
             panic!("expected for statement");
         };
-        let NodeData::VariableDeclarationList(list) = &result
-            .arena
-            .get(for_.initializer.unwrap())
-            .unwrap()
-            .data
+        let NodeData::VariableDeclarationList(list) =
+            &result.arena.get(for_.initializer.unwrap()).unwrap().data
         else {
             panic!("expected variable declaration list");
         };
@@ -10494,8 +10441,11 @@ mod tests {
     fn preserves_semicolon_class_elements() {
         let result = parse_source_file("class C { ; value = 1; ; }");
         assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
-        let NodeData::ClassDeclaration(class) =
-            &result.arena.get(source_statements(&result)[0]).unwrap().data
+        let NodeData::ClassDeclaration(class) = &result
+            .arena
+            .get(source_statements(&result)[0])
+            .unwrap()
+            .data
         else {
             panic!("expected class declaration");
         };
@@ -10519,8 +10469,11 @@ mod tests {
         let result = parse_source_file(
             "class C { #x = 1\n constructor(x: number) { this.#x = x; } static { x(); } }",
         );
-        let NodeData::ClassDeclaration(class) =
-            &result.arena.get(source_statements(&result)[0]).unwrap().data
+        let NodeData::ClassDeclaration(class) = &result
+            .arena
+            .get(source_statements(&result)[0])
+            .unwrap()
+            .data
         else {
             panic!("expected class declaration");
         };
@@ -10546,23 +10499,23 @@ mod tests {
         let result = parse_source_file(
             "class C { @dec static {} async static {} public static {} readonly private static {} }",
         );
-        let NodeData::ClassDeclaration(class) =
-            &result.arena.get(source_statements(&result)[0]).unwrap().data
+        let NodeData::ClassDeclaration(class) = &result
+            .arena
+            .get(source_statements(&result)[0])
+            .unwrap()
+            .data
         else {
             panic!("expected class declaration");
         };
         assert_eq!(class.members.nodes.len(), 4, "{:?}", result.diagnostics);
         assert!(class.members.nodes.iter().all(|member| {
-            result.arena.get(*member).unwrap().kind
-                == SyntaxKind::ClassStaticBlockDeclaration
+            result.arena.get(*member).unwrap().kind == SyntaxKind::ClassStaticBlockDeclaration
         }));
     }
 
     #[test]
     fn recovers_await_label_inside_class_static_block() {
-        let result = parse_source_file(
-            "class C { static { await: // illegal\n break await; } }",
-        );
+        let result = parse_source_file("class C { static { await: // illegal\n break await; } }");
         let kinds = result
             .arena
             .iter()
@@ -10946,13 +10899,15 @@ mod tests {
     fn parses_optional_calls_with_type_arguments() {
         let result = parse_source_file("value?.<T>();");
         assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
-        let NodeData::ExpressionStatement(statement) =
-            &result.arena.get(source_statements(&result)[0]).unwrap().data
+        let NodeData::ExpressionStatement(statement) = &result
+            .arena
+            .get(source_statements(&result)[0])
+            .unwrap()
+            .data
         else {
             panic!("expected expression statement");
         };
-        let NodeData::CallExpression(call) =
-            &result.arena.get(statement.expression).unwrap().data
+        let NodeData::CallExpression(call) = &result.arena.get(statement.expression).unwrap().data
         else {
             panic!("expected call expression");
         };
@@ -10976,8 +10931,7 @@ mod tests {
         let bodies = statements
             .iter()
             .filter_map(|statement| {
-                let NodeData::FunctionDeclaration(function) =
-                    &result.arena.get(*statement)?.data
+                let NodeData::FunctionDeclaration(function) = &result.arena.get(*statement)?.data
                 else {
                     return None;
                 };
@@ -10995,8 +10949,7 @@ mod tests {
             .nodes
             .iter()
             .map(|member| {
-                let NodeData::MethodDeclaration(method) =
-                    &result.arena.get(*member).unwrap().data
+                let NodeData::MethodDeclaration(method) = &result.arena.get(*member).unwrap().data
                 else {
                     panic!("expected method declaration");
                 };
@@ -11016,8 +10969,7 @@ mod tests {
             "}\n",
         ));
         let statements = source_statements(&result);
-        let NodeData::ClassDeclaration(class) =
-            &result.arena.get(statements[0]).unwrap().data
+        let NodeData::ClassDeclaration(class) = &result.arena.get(statements[0]).unwrap().data
         else {
             panic!("expected class declaration");
         };
@@ -11026,8 +10978,7 @@ mod tests {
             .nodes
             .iter()
             .map(|member| {
-                let NodeData::MethodDeclaration(method) =
-                    &result.arena.get(*member).unwrap().data
+                let NodeData::MethodDeclaration(method) = &result.arena.get(*member).unwrap().data
                 else {
                     panic!("expected method declaration");
                 };
@@ -11046,8 +10997,11 @@ mod tests {
             "  static test(name?: any) { }\n",
             "}\n",
         ));
-        let NodeData::FunctionDeclaration(function) =
-            &result.arena.get(source_statements(&result)[0]).unwrap().data
+        let NodeData::FunctionDeclaration(function) = &result
+            .arena
+            .get(source_statements(&result)[0])
+            .unwrap()
+            .data
         else {
             panic!("expected function declaration");
         };
@@ -11138,8 +11092,11 @@ mod tests {
         let result = parse_source_file("new Date<A;");
         assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
 
-        let NodeData::ExpressionStatement(statement) =
-            &result.arena.get(source_statements(&result)[0]).unwrap().data
+        let NodeData::ExpressionStatement(statement) = &result
+            .arena
+            .get(source_statements(&result)[0])
+            .unwrap()
+            .data
         else {
             panic!("expected expression statement");
         };
@@ -11163,10 +11120,12 @@ mod tests {
         let result = parse_source_file("for (; i < len; i++) {} for (; j >= 0; j--) {}");
         assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
         let statements = source_statements(&result);
-        let expected = [SyntaxKind::LessThanToken, SyntaxKind::GreaterThanEqualsToken];
+        let expected = [
+            SyntaxKind::LessThanToken,
+            SyntaxKind::GreaterThanEqualsToken,
+        ];
         for (statement, expected) in statements.iter().zip(expected) {
-            let NodeData::ForStatement(for_statement) =
-                &result.arena.get(*statement).unwrap().data
+            let NodeData::ForStatement(for_statement) = &result.arena.get(*statement).unwrap().data
             else {
                 panic!("expected for statement");
             };
@@ -11255,10 +11214,12 @@ mod tests {
             "{:?}",
             comparison.diagnostics
         );
-        assert!(comparison
-            .arena
-            .iter()
-            .all(|(_, node)| !matches!(node.data, NodeData::ArrowFunction(_))));
+        assert!(
+            comparison
+                .arena
+                .iter()
+                .all(|(_, node)| !matches!(node.data, NodeData::ArrowFunction(_)))
+        );
     }
 
     #[test]
@@ -11452,14 +11413,18 @@ mod tests {
     #[test]
     fn rejects_an_arrow_lookahead_with_an_unparsed_binary_operand() {
         let result = parse_source_file("x = (y = z ==== 'function') {");
-        assert!(result
-            .arena
-            .iter()
-            .all(|(_, node)| !matches!(node.data, NodeData::ArrowFunction(_))));
-        assert!(result
-            .arena
-            .iter()
-            .any(|(_, node)| matches!(node.data, NodeData::Block(_))));
+        assert!(
+            result
+                .arena
+                .iter()
+                .all(|(_, node)| !matches!(node.data, NodeData::ArrowFunction(_)))
+        );
+        assert!(
+            result
+                .arena
+                .iter()
+                .any(|(_, node)| matches!(node.data, NodeData::Block(_)))
+        );
     }
 
     #[test]
@@ -11549,9 +11514,8 @@ mod tests {
 
     #[test]
     fn parses_private_class_accessors() {
-        let result = parse_source_file(
-            "class C { get #value() { return 1; } set #value(next: number) {} }",
-        );
+        let result =
+            parse_source_file("class C { get #value() { return 1; } set #value(next: number) {} }");
         assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
         let statements = source_statements(&result);
         let NodeData::ClassDeclaration(class) = &result.arena.get(statements[0]).unwrap().data
@@ -11595,16 +11559,12 @@ mod tests {
     fn preserves_a_private_identifier_as_a_recovered_variable_name() {
         let result = parse_source_file("const #foo = 3;");
         let statements = source_statements(&result);
-        let NodeData::VariableStatement(statement) =
-            &result.arena.get(statements[0]).unwrap().data
+        let NodeData::VariableStatement(statement) = &result.arena.get(statements[0]).unwrap().data
         else {
             panic!("expected variable statement");
         };
-        let NodeData::VariableDeclarationList(list) = &result
-            .arena
-            .get(statement.declaration_list)
-            .unwrap()
-            .data
+        let NodeData::VariableDeclarationList(list) =
+            &result.arena.get(statement.declaration_list).unwrap().data
         else {
             panic!("expected variable declaration list");
         };
@@ -11648,16 +11608,12 @@ mod tests {
     fn recovers_a_private_identifier_after_an_invalid_indexed_access_type() {
         let result = parse_source_file("const badForNow: C[#bar] = 3;");
         let statements = source_statements(&result);
-        let NodeData::VariableStatement(statement) =
-            &result.arena.get(statements[0]).unwrap().data
+        let NodeData::VariableStatement(statement) = &result.arena.get(statements[0]).unwrap().data
         else {
             panic!("expected variable statement");
         };
-        let NodeData::VariableDeclarationList(list) = &result
-            .arena
-            .get(statement.declaration_list)
-            .unwrap()
-            .data
+        let NodeData::VariableDeclarationList(list) =
+            &result.arena.get(statement.declaration_list).unwrap().data
         else {
             panic!("expected variable declaration list");
         };
@@ -11693,9 +11649,8 @@ mod tests {
 
     #[test]
     fn recovers_object_member_modifiers_and_question_marks() {
-        let result = parse_source_file(
-            "const value = { public get foo() {}, bar?() {}, baz?: 1 };",
-        );
+        let result =
+            parse_source_file("const value = { public get foo() {}, bar?() {}, baz?: 1 };");
         let object = find_descendant_kind(
             &result,
             result.source_file,
@@ -11976,9 +11931,7 @@ mod tests {
         let result = parse_source_file(source);
         assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
         let class_id = source_statements(&result)[0];
-        let NodeData::ClassDeclaration(class) =
-            &result.arena.get(class_id).unwrap().data
-        else {
+        let NodeData::ClassDeclaration(class) = &result.arena.get(class_id).unwrap().data else {
             panic!("expected class declaration");
         };
         assert_eq!(class.members.nodes.len(), 3);
@@ -12030,7 +11983,10 @@ mod tests {
         assert!(quoted.type_parameters.is_none());
         assert!(quoted.type_.is_none());
         let quoted_body = quoted.body.expect("constructor implementation body");
-        assert_eq!(result.arena.get(quoted_body).unwrap().parent, Some(quoted_id));
+        assert_eq!(
+            result.arena.get(quoted_body).unwrap().parent,
+            Some(quoted_id)
+        );
         assert_eq!(
             result
                 .arena
@@ -12067,8 +12023,11 @@ mod tests {
             "#,
         );
         assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
-        let NodeData::ClassDeclaration(class) =
-            &result.arena.get(source_statements(&result)[0]).unwrap().data
+        let NodeData::ClassDeclaration(class) = &result
+            .arena
+            .get(source_statements(&result)[0])
+            .unwrap()
+            .data
         else {
             panic!("expected class declaration");
         };
@@ -12082,14 +12041,7 @@ mod tests {
         assert_eq!(
             result
                 .arena
-                .get(
-                    static_constructor
-                        .modifiers
-                        .as_ref()
-                        .unwrap()
-                        .list
-                        .nodes[0]
-                )
+                .get(static_constructor.modifiers.as_ref().unwrap().list.nodes[0])
                 .unwrap()
                 .kind,
             SyntaxKind::StaticKeyword
@@ -12105,11 +12057,17 @@ mod tests {
             NodeData::Identifier(identifier) if identifier.text == "static"
         ));
         assert!(matches!(
-            result.arena.get(class.members.nodes[2]).map(|node| &node.data),
+            result
+                .arena
+                .get(class.members.nodes[2])
+                .map(|node| &node.data),
             Some(NodeData::GetAccessorDeclaration(_))
         ));
         assert!(matches!(
-            result.arena.get(class.members.nodes[3]).map(|node| &node.data),
+            result
+                .arena
+                .get(class.members.nodes[3])
+                .map(|node| &node.data),
             Some(NodeData::SetAccessorDeclaration(_))
         ));
 
@@ -12174,18 +12132,23 @@ mod tests {
             "async function outer() { class C { constructor(value = await) { await; } } }",
         );
         assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
-        let NodeData::FunctionDeclaration(outer) =
-            &result.arena.get(source_statements(&result)[0]).unwrap().data
+        let NodeData::FunctionDeclaration(outer) = &result
+            .arena
+            .get(source_statements(&result)[0])
+            .unwrap()
+            .data
         else {
             panic!("expected outer function");
         };
-        let NodeData::Block(outer_body) =
-            &result.arena.get(outer.body.unwrap()).unwrap().data
+        let NodeData::Block(outer_body) = &result.arena.get(outer.body.unwrap()).unwrap().data
         else {
             panic!("expected outer function body");
         };
-        let NodeData::ClassDeclaration(class) =
-            &result.arena.get(outer_body.statements.nodes[0]).unwrap().data
+        let NodeData::ClassDeclaration(class) = &result
+            .arena
+            .get(outer_body.statements.nodes[0])
+            .unwrap()
+            .data
         else {
             panic!("expected nested class");
         };
@@ -12206,8 +12169,7 @@ mod tests {
             &result.arena.get(parameter.initializer.unwrap()).unwrap().data,
             NodeData::Identifier(identifier) if identifier.text == "await"
         ));
-        let NodeData::Block(body) =
-            &result.arena.get(constructor.body.unwrap()).unwrap().data
+        let NodeData::Block(body) = &result.arena.get(constructor.body.unwrap()).unwrap().data
         else {
             panic!("expected constructor body");
         };
@@ -12452,14 +12414,12 @@ mod tests {
         ));
         assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
         let statements = source_statements(&result);
-        let NodeData::ExportDeclaration(export) =
-            &result.arena.get(statements[0]).unwrap().data
+        let NodeData::ExportDeclaration(export) = &result.arena.get(statements[0]).unwrap().data
         else {
             panic!("expected export declaration");
         };
         assert!(export.is_type_only);
-        let NodeData::ImportDeclaration(import) =
-            &result.arena.get(statements[1]).unwrap().data
+        let NodeData::ImportDeclaration(import) = &result.arena.get(statements[1]).unwrap().data
         else {
             panic!("expected import declaration");
         };
@@ -12724,9 +12684,7 @@ mod tests {
 
     #[test]
     fn malformed_escaped_import_binding_stays_inside_the_import() {
-        let result = parse_source_file(
-            "import { value as \\uD800\\uDEA7 } from \"./mod.js\";",
-        );
+        let result = parse_source_file("import { value as \\uD800\\uDEA7 } from \"./mod.js\";");
         let statements = source_statements(&result);
         assert_eq!(statements.len(), 1);
         assert_eq!(
@@ -12747,8 +12705,11 @@ mod tests {
     fn recovers_missing_export_clause_brace_before_from() {
         let result = parse_source_file("export { value, from \"./mod\"");
         assert_eq!(result.diagnostics.len(), 1, "{:?}", result.diagnostics);
-        let NodeData::ExportDeclaration(declaration) =
-            &result.arena.get(source_statements(&result)[0]).unwrap().data
+        let NodeData::ExportDeclaration(declaration) = &result
+            .arena
+            .get(source_statements(&result)[0])
+            .unwrap()
+            .data
         else {
             panic!("expected export declaration");
         };
@@ -13109,10 +13070,7 @@ export as namespace GlobalName;
         let inner_modifiers = inner.modifiers.as_ref().unwrap();
         assert_eq!(inner_modifiers.flags, ModifierFlags::EXPORT);
         assert_eq!(inner_modifiers.list.nodes.len(), 1);
-        let inner_export = result
-            .arena
-            .get(inner_modifiers.list.nodes[0])
-            .unwrap();
+        let inner_export = result.arena.get(inner_modifiers.list.nodes[0]).unwrap();
         assert_eq!(inner_export.kind, SyntaxKind::ExportKeyword);
         assert_eq!(inner_export.flags, NodeFlags::REPARSED);
         assert_eq!(inner_export.range.start, inner_export.range.end);
@@ -13192,7 +13150,10 @@ export as namespace GlobalName;
                     &source[export.range.start.get() as usize..export.range.end.get() as usize],
                     ""
                 );
-                assert_eq!(result.arena.get(nested.name).unwrap().parent, Some(nested_id));
+                assert_eq!(
+                    result.arena.get(nested.name).unwrap().parent,
+                    Some(nested_id)
+                );
                 nested_id = nested.body.unwrap();
             }
             assert!(matches!(
@@ -13260,8 +13221,7 @@ export as namespace GlobalName;
         };
         let missing_position = u32::try_from(source.find("{ const recovered").unwrap()).unwrap();
         assert_eq!(recovered_node.range.start.get(), missing_position);
-        let NodeData::Identifier(missing_name) =
-            &result.arena.get(recovered.name).unwrap().data
+        let NodeData::Identifier(missing_name) = &result.arena.get(recovered.name).unwrap().data
         else {
             panic!("expected recovered missing identifier");
         };
@@ -13727,12 +13687,12 @@ export as namespace GlobalName;
         let statements = source_statements(&result);
         assert_eq!(statements.len(), 3);
 
-        let NodeData::TypeAliasDeclaration(first) =
-            &result.arena.get(statements[0]).unwrap().data
+        let NodeData::TypeAliasDeclaration(first) = &result.arena.get(statements[0]).unwrap().data
         else {
             panic!("expected first type alias");
         };
-        let NodeData::TypeLiteralNode(literal) = &result.arena.get(first.type_).unwrap().data else {
+        let NodeData::TypeLiteralNode(literal) = &result.arena.get(first.type_).unwrap().data
+        else {
             panic!("expected type literal");
         };
         let NodeData::CallSignatureDeclaration(signature) =
@@ -13742,8 +13702,7 @@ export as namespace GlobalName;
         };
         assert!(signature.type_.is_some());
 
-        let NodeData::TypeAliasDeclaration(second) =
-            &result.arena.get(statements[1]).unwrap().data
+        let NodeData::TypeAliasDeclaration(second) = &result.arena.get(statements[1]).unwrap().data
         else {
             panic!("expected second type alias");
         };
@@ -14113,9 +14072,8 @@ export as namespace GlobalName;
 
     #[test]
     fn parses_and_recovers_import_type_attributes() {
-        let valid = parse_source_file(
-            "type T = import(\"pkg\", { with: { type: \"json\" } }).Value;",
-        );
+        let valid =
+            parse_source_file("type T = import(\"pkg\", { with: { type: \"json\" } }).Value;");
         assert!(valid.diagnostics.is_empty(), "{:?}", valid.diagnostics);
         let valid_import = valid.arena.iter().find_map(|(_, node)| {
             let NodeData::ImportTypeNode(import) = &node.data else {
@@ -14255,7 +14213,11 @@ export as namespace GlobalName;
         assert!(!value_equals.is_type_only);
         assert_eq!(identifier_text(&result, value_equals.name), "type");
         assert_eq!(
-            result.arena.get(value_equals.module_reference).unwrap().kind,
+            result
+                .arena
+                .get(value_equals.module_reference)
+                .unwrap()
+                .kind,
             SyntaxKind::ExternalModuleReference
         );
 
@@ -14292,7 +14254,8 @@ export as namespace GlobalName;
         assert_eq!(clause.phase_modifier, Some(SyntaxKind::DeferKeyword));
         assert!(clause.name.is_none());
         let namespace = clause.named_bindings.unwrap();
-        let NodeData::NamespaceImport(namespace) = &result.arena.get(namespace).unwrap().data else {
+        let NodeData::NamespaceImport(namespace) = &result.arena.get(namespace).unwrap().data
+        else {
             panic!("expected namespace import");
         };
         assert_eq!(identifier_text(&result, namespace.name), "ns");
@@ -14315,8 +14278,7 @@ export as namespace GlobalName;
         assert_eq!(statements.len(), 6);
 
         let defer_default = import_declaration(&result, statements[0]);
-        let defer_default_clause =
-            import_clause(&result, defer_default.import_clause.unwrap());
+        let defer_default_clause = import_clause(&result, defer_default.import_clause.unwrap());
         assert_eq!(defer_default_clause.phase_modifier, None);
         assert_eq!(
             identifier_text(&result, defer_default_clause.name.unwrap()),
@@ -14365,7 +14327,11 @@ export as namespace GlobalName;
         let clause = import_clause(&named, declaration.import_clause.unwrap());
         assert_eq!(clause.phase_modifier, Some(SyntaxKind::DeferKeyword));
         assert_eq!(
-            named.arena.get(clause.named_bindings.unwrap()).unwrap().kind,
+            named
+                .arena
+                .get(clause.named_bindings.unwrap())
+                .unwrap()
+                .kind,
             SyntaxKind::NamedImports
         );
 
@@ -14375,19 +14341,19 @@ export as namespace GlobalName;
             "{:?}",
             named_from.diagnostics
         );
-        let declaration =
-            import_declaration(&named_from, source_statements(&named_from)[0]);
+        let declaration = import_declaration(&named_from, source_statements(&named_from)[0]);
         let clause = import_clause(&named_from, declaration.import_clause.unwrap());
         assert_eq!(clause.phase_modifier, Some(SyntaxKind::DeferKeyword));
         assert_eq!(identifier_text(&named_from, clause.name.unwrap()), "from");
 
-        let type_conflict =
-            parse_source_file("import defer type * as ns from \"type-conflict\";");
-        let declaration =
-            import_declaration(&type_conflict, source_statements(&type_conflict)[0]);
+        let type_conflict = parse_source_file("import defer type * as ns from \"type-conflict\";");
+        let declaration = import_declaration(&type_conflict, source_statements(&type_conflict)[0]);
         let clause = import_clause(&type_conflict, declaration.import_clause.unwrap());
         assert_eq!(clause.phase_modifier, Some(SyntaxKind::DeferKeyword));
-        assert_eq!(identifier_text(&type_conflict, clause.name.unwrap()), "type");
+        assert_eq!(
+            identifier_text(&type_conflict, clause.name.unwrap()),
+            "type"
+        );
         assert!(clause.named_bindings.is_none());
         assert!(
             type_conflict
@@ -14455,9 +14421,7 @@ export as namespace GlobalName;
 
     #[test]
     fn missing_named_import_brace_does_not_consume_the_from_clause_or_next_statement() {
-        let result = parse_source_file(
-            "import value, from \"pkg\"; const survived = 1;",
-        );
+        let result = parse_source_file("import value, from \"pkg\"; const survived = 1;");
         assert!(
             result
                 .diagnostics
@@ -14498,10 +14462,7 @@ export as namespace GlobalName;
             "{:?}",
             inline_assert.diagnostics
         );
-        let declaration = import_declaration(
-            &inline_assert,
-            source_statements(&inline_assert)[0],
-        );
+        let declaration = import_declaration(&inline_assert, source_statements(&inline_assert)[0]);
         let NodeData::ImportAttributes(attributes) = &inline_assert
             .arena
             .get(declaration.attributes.unwrap())
@@ -14512,34 +14473,29 @@ export as namespace GlobalName;
         };
         assert_eq!(attributes.token, SyntaxKind::AssertKeyword);
 
-        let separated_assert = parse_source_file(
-            "import value from \"pkg\"\nassert { type: \"json\" };",
-        );
-        let declaration = import_declaration(
-            &separated_assert,
-            source_statements(&separated_assert)[0],
-        );
+        let separated_assert =
+            parse_source_file("import value from \"pkg\"\nassert { type: \"json\" };");
+        let declaration =
+            import_declaration(&separated_assert, source_statements(&separated_assert)[0]);
         assert!(declaration.attributes.is_none());
 
-        let separated_with = parse_source_file(
-            "import value from \"pkg\"\nwith { type: \"json\" };",
-        );
+        let separated_with =
+            parse_source_file("import value from \"pkg\"\nwith { type: \"json\" };");
         assert!(
             separated_with.diagnostics.is_empty(),
             "{:?}",
             separated_with.diagnostics
         );
-        let declaration = import_declaration(
-            &separated_with,
-            source_statements(&separated_with)[0],
-        );
+        let declaration =
+            import_declaration(&separated_with, source_statements(&separated_with)[0]);
         assert!(declaration.attributes.is_some());
 
-        let export = parse_source_file(
-            "export { value } from \"pkg\"\nwith { type: \"json\" };",
-        );
-        let NodeData::ExportDeclaration(declaration) =
-            &export.arena.get(source_statements(&export)[0]).unwrap().data
+        let export = parse_source_file("export { value } from \"pkg\"\nwith { type: \"json\" };");
+        let NodeData::ExportDeclaration(declaration) = &export
+            .arena
+            .get(source_statements(&export)[0])
+            .unwrap()
+            .data
         else {
             panic!("expected export declaration");
         };
@@ -14553,8 +14509,11 @@ export as namespace GlobalName;
         );
         assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
         let declaration = import_declaration(&result, source_statements(&result)[0]);
-        let NodeData::ImportAttributes(attributes) =
-            &result.arena.get(declaration.attributes.unwrap()).unwrap().data
+        let NodeData::ImportAttributes(attributes) = &result
+            .arena
+            .get(declaration.attributes.unwrap())
+            .unwrap()
+            .data
         else {
             panic!("expected import attributes");
         };
@@ -14574,8 +14533,7 @@ export as namespace GlobalName;
             SyntaxKind::Identifier
         );
 
-        let invalid =
-            parse_source_file("import value from \"pkg\" with { 0: \"json\" };");
+        let invalid = parse_source_file("import value from \"pkg\" with { 0: \"json\" };");
         assert!(
             invalid
                 .diagnostics
@@ -14598,8 +14556,7 @@ export as namespace GlobalName;
 
     #[test]
     fn import_bindings_use_await_and_yield_identifier_contexts() {
-        let generator =
-            parse_source_file("function* g() { import type yield from \"pkg\"; }");
+        let generator = parse_source_file("function* g() { import type yield from \"pkg\"; }");
         assert!(!generator.diagnostics.is_empty());
         let declaration = generator.arena.iter().find_map(|(_, node)| {
             let NodeData::ImportEqualsDeclaration(declaration) = &node.data else {
@@ -14611,8 +14568,7 @@ export as namespace GlobalName;
         assert!(!declaration.is_type_only);
         assert_eq!(identifier_text(&generator, declaration.name), "type");
 
-        let namespace =
-            parse_source_file("async function f() { import * as await from \"pkg\"; }");
+        let namespace = parse_source_file("async function f() { import * as await from \"pkg\"; }");
         assert!(
             namespace
                 .diagnostics
@@ -14632,9 +14588,8 @@ export as namespace GlobalName;
             NODE_FLAG_HAS_ERROR
         );
 
-        let named = parse_source_file(
-            "async function f() { import { value as await } from \"pkg\"; }",
-        );
+        let named =
+            parse_source_file("async function f() { import { value as await } from \"pkg\"; }");
         assert!(
             named
                 .diagnostics
@@ -14657,8 +14612,7 @@ export as namespace GlobalName;
 
     #[test]
     fn import_equals_entity_names_restrict_only_the_first_segment() {
-        let valid =
-            parse_source_file("function* g() { import Alias = namespace.yield; }");
+        let valid = parse_source_file("function* g() { import Alias = namespace.yield; }");
         assert!(valid.diagnostics.is_empty(), "{:?}", valid.diagnostics);
         let declaration = valid.arena.iter().find_map(|(_, node)| {
             let NodeData::ImportEqualsDeclaration(declaration) = &node.data else {
@@ -15395,8 +15349,11 @@ export as namespace GlobalName;
     #[test]
     fn recovers_optional_object_and_void_class_heritage() {
         let optional = parse_source_file("class C extends A?.B {}");
-        let NodeData::ClassDeclaration(class) =
-            &optional.arena.get(source_statements(&optional)[0]).unwrap().data
+        let NodeData::ClassDeclaration(class) = &optional
+            .arena
+            .get(source_statements(&optional)[0])
+            .unwrap()
+            .data
         else {
             panic!("expected class declaration");
         };
@@ -15415,15 +15372,22 @@ export as namespace GlobalName;
         ));
 
         let object = parse_source_file("class C extends { foo: string; } {}");
-        let NodeData::ClassDeclaration(class) =
-            &object.arena.get(source_statements(&object)[0]).unwrap().data
+        let NodeData::ClassDeclaration(class) = &object
+            .arena
+            .get(source_statements(&object)[0])
+            .unwrap()
+            .data
         else {
             panic!("expected class declaration");
         };
         assert_eq!(class.members.nodes.len(), 0);
 
         let void = parse_source_file("class C extends void {}");
-        assert!(source_statements(&void).len() >= 2, "{:?}", void.diagnostics);
+        assert!(
+            source_statements(&void).len() >= 2,
+            "{:?}",
+            void.diagnostics
+        );
     }
 
     #[test]
@@ -15718,8 +15682,7 @@ export as namespace GlobalName;
         let names = statements
             .iter()
             .filter_map(|statement| {
-                let NodeData::ExpressionStatement(expression) =
-                    &result.arena.get(*statement)?.data
+                let NodeData::ExpressionStatement(expression) = &result.arena.get(*statement)?.data
                 else {
                     return None;
                 };
@@ -16002,8 +15965,11 @@ export as namespace GlobalName;
     #[test]
     fn javascript_jsx_recovers_unary_elements_without_type_arguments() {
         let less_than = parse_javascript_source_file("~< <");
-        let NodeData::ExpressionStatement(statement) =
-            &less_than.arena.get(source_statements(&less_than)[0]).unwrap().data
+        let NodeData::ExpressionStatement(statement) = &less_than
+            .arena
+            .get(source_statements(&less_than)[0])
+            .unwrap()
+            .data
         else {
             panic!("expected expression statement");
         };
@@ -16025,8 +15991,11 @@ export as namespace GlobalName;
         assert!(element.type_arguments.is_none());
 
         let spread = parse_javascript_source_file("!< {:>");
-        let NodeData::ExpressionStatement(statement) =
-            &spread.arena.get(source_statements(&spread)[0]).unwrap().data
+        let NodeData::ExpressionStatement(statement) = &spread
+            .arena
+            .get(source_statements(&spread)[0])
+            .unwrap()
+            .data
         else {
             panic!("expected expression statement");
         };
@@ -16101,8 +16070,11 @@ export as namespace GlobalName;
             result.arena.get(tuple.elements.nodes[0]).unwrap().kind,
             SyntaxKind::OptionalType
         );
-        let NodeData::TypeAliasDeclaration(alias) =
-            &result.arena.get(source_statements(&result)[1]).unwrap().data
+        let NodeData::TypeAliasDeclaration(alias) = &result
+            .arena
+            .get(source_statements(&result)[1])
+            .unwrap()
+            .data
         else {
             panic!("expected type alias");
         };
@@ -16256,8 +16228,7 @@ export as namespace GlobalName;
             panic!("expected variable declaration");
         };
         let initializer = declaration.initializer.expect("initializer");
-        let NodeData::ArrayLiteralExpression(array) =
-            &result.arena.get(initializer).unwrap().data
+        let NodeData::ArrayLiteralExpression(array) = &result.arena.get(initializer).unwrap().data
         else {
             panic!("expected array literal");
         };
@@ -16667,10 +16638,7 @@ export as namespace GlobalName;
         let NodeData::ParameterDeclaration(parameter) = &parameter_node.data else {
             unreachable!();
         };
-        let question = result
-            .arena
-            .get(parameter.question_token.unwrap())
-            .unwrap();
+        let question = result.arena.get(parameter.question_token.unwrap()).unwrap();
 
         assert_eq!(
             (
@@ -16690,9 +16658,7 @@ export as namespace GlobalName;
 
     #[test]
     fn recovers_await_named_arrow_inside_async_call_parameters() {
-        let result = parse_source_file(
-            "var foo = async (a = await => await): Promise<void> => {}",
-        );
+        let result = parse_source_file("var foo = async (a = await => await): Promise<void> => {}");
         let arrows = result
             .arena
             .iter()
@@ -16703,8 +16669,7 @@ export as namespace GlobalName;
             unreachable!();
         };
         let parameter = arrow.parameters.nodes[0];
-        let NodeData::ParameterDeclaration(parameter) =
-            &result.arena.get(parameter).unwrap().data
+        let NodeData::ParameterDeclaration(parameter) = &result.arena.get(parameter).unwrap().data
         else {
             unreachable!();
         };
@@ -16738,9 +16703,7 @@ export as namespace GlobalName;
 
     #[test]
     fn recovers_await_arrow_in_async_function_parameters_as_comma_expression() {
-        let result = parse_source_file(
-            "async function foo(a = await => await): Promise<void> {}",
-        );
+        let result = parse_source_file("async function foo(a = await => await): Promise<void> {}");
         let statements = source_statements(&result);
         assert_eq!(
             statements
@@ -16770,18 +16733,14 @@ export as namespace GlobalName;
 
     #[test]
     fn separates_invalid_prefix_updates_from_await_expressions() {
-        let result = parse_source_file(
-            "async function f() { ++await 1; --await 2; }",
-        );
+        let result = parse_source_file("async function f() { ++await 1; --await 2; }");
         let statements = source_statements(&result);
         let NodeData::FunctionDeclaration(function) =
             &result.arena.get(statements[0]).unwrap().data
         else {
             unreachable!();
         };
-        let NodeData::Block(block) =
-            &result.arena.get(function.body.unwrap()).unwrap().data
-        else {
+        let NodeData::Block(block) = &result.arena.get(function.body.unwrap()).unwrap().data else {
             unreachable!();
         };
         assert_eq!(block.statements.nodes.len(), 4);
@@ -16803,7 +16762,10 @@ export as namespace GlobalName;
                 ));
             } else {
                 assert!(matches!(
-                    result.arena.get(statement.expression).map(|node| &node.data),
+                    result
+                        .arena
+                        .get(statement.expression)
+                        .map(|node| &node.data),
                     Some(NodeData::AwaitExpression(_))
                 ));
             }
@@ -16840,9 +16802,7 @@ export as namespace GlobalName;
 
     #[test]
     fn parses_bare_await_before_expression_terminators_as_an_identifier() {
-        let result = parse_source_file(
-            "var value = { [await]: 1 }; function f(await = await) {}",
-        );
+        let result = parse_source_file("var value = { [await]: 1 }; function f(await = await) {}");
         assert_eq!(
             result
                 .arena
@@ -17106,12 +17066,8 @@ export as namespace GlobalName;
         };
         assert_eq!(property.modifiers.as_ref().unwrap().list.nodes.len(), 1);
 
-        let index = find_descendant_kind(
-            &result,
-            result.source_file,
-            SyntaxKind::IndexSignature,
-        )
-        .expect("index signature");
+        let index = find_descendant_kind(&result, result.source_file, SyntaxKind::IndexSignature)
+            .expect("index signature");
         let NodeData::IndexSignatureDeclaration(index) = &result.arena.get(index).unwrap().data
         else {
             panic!("expected index signature");
@@ -17134,9 +17090,8 @@ export as namespace GlobalName;
 
     #[test]
     fn object_literal_property_type_slots_are_nil_and_children_are_unique() {
-        let result = parse_source_file(
-            "const shorthand = 2; const value = { property: 1, shorthand };",
-        );
+        let result =
+            parse_source_file("const shorthand = 2; const value = { property: 1, shorthand };");
         assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
         let object = find_descendant_kind(
             &result,
@@ -17151,8 +17106,7 @@ export as namespace GlobalName;
         assert_eq!(object.properties.nodes.len(), 2);
 
         let property_id = object.properties.nodes[0];
-        let NodeData::PropertyAssignment(property) =
-            &result.arena.get(property_id).unwrap().data
+        let NodeData::PropertyAssignment(property) = &result.arena.get(property_id).unwrap().data
         else {
             panic!("expected property assignment");
         };
@@ -17232,7 +17186,10 @@ export as namespace GlobalName;
         };
         assert_eq!(object.properties.nodes.len(), 2);
         assert!(matches!(
-            result.arena.get(object.properties.nodes[0]).map(|node| &node.data),
+            result
+                .arena
+                .get(object.properties.nodes[0])
+                .map(|node| &node.data),
             Some(NodeData::PropertyAssignment(_))
         ));
         let Some(NodeData::ShorthandPropertyAssignment(property)) = result
@@ -17296,15 +17253,16 @@ export as namespace GlobalName;
 
     #[test]
     fn recovers_reserved_words_as_declaration_names() {
-        let result = parse_source_file(
-            "let let = 1; interface implements {} enum package {}",
-        );
+        let result = parse_source_file("let let = 1; interface implements {} enum package {}");
         let statements = source_statements(&result);
         assert_eq!(statements.len(), 3, "{:?}", result.diagnostics);
 
         let (list, _) = variable_list(&result, statements[0]);
-        let NodeData::VariableDeclaration(variable) =
-            &result.arena.get(declaration_nodes(&result, list)[0]).unwrap().data
+        let NodeData::VariableDeclaration(variable) = &result
+            .arena
+            .get(declaration_nodes(&result, list)[0])
+            .unwrap()
+            .data
         else {
             panic!("expected variable declaration");
         };

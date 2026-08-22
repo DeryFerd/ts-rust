@@ -4,8 +4,8 @@ use ts_binder::{
     EscapedName, SemanticSymbolId,
 };
 use ts_checker::semantic::{
-    CanonicalCheckerContext, CanonicalCheckerOptions, IntrinsicBootstrapOptions,
-    SourceCheckError, SymbolNodeLinks, TypeData, UnsupportedSourceSyntax,
+    CanonicalCheckerContext, CanonicalCheckerOptions, IntrinsicBootstrapOptions, SourceCheckError,
+    SymbolNodeLinks, TypeData, UnsupportedSourceSyntax,
     types::{ObjectFlags, TypeFlags},
 };
 use ts_parser::{ParseResult, parse_source_file};
@@ -52,11 +52,7 @@ fn checker_context(
     .unwrap()
 }
 
-fn function_declarations(
-    parsed: &ParseResult,
-    file: FileId,
-    expected: &str,
-) -> Vec<NodeRef> {
+fn function_declarations(parsed: &ParseResult, file: FileId, expected: &str) -> Vec<NodeRef> {
     let mut declarations = parsed
         .arena
         .iter()
@@ -161,9 +157,11 @@ fn ambient_overload_groups_preserve_provenance_order_and_select_hoisted_calls_co
             panic!("fixture must retain three ordered overload declarations")
         };
         let owner = merged_symbol(&context, file, *broad);
-        assert!(declarations
-            .iter()
-            .all(|declaration| merged_symbol(&context, file, *declaration) == owner));
+        assert!(
+            declarations
+                .iter()
+                .all(|declaration| merged_symbol(&context, file, *declaration) == owner)
+        );
         let calls = calls(&parsed, file);
         let [before, literal_call, text_call, optional_call] = calls.as_slice() else {
             panic!("fixture must retain four calls")
@@ -222,11 +220,13 @@ fn ambient_overload_groups_preserve_provenance_order_and_select_hoisted_calls_co
                     resolved_symbol: Some(owner),
                 })
             );
-            assert!(context
-                .store()
-                .type_node_links(*call)
-                .and_then(|links| links.resolved_type)
-                .is_some());
+            assert!(
+                context
+                    .store()
+                    .type_node_links(*call)
+                    .and_then(|links| links.resolved_type)
+                    .is_some()
+            );
         }
         let text_parameters = context
             .store()
@@ -325,21 +325,21 @@ fn later_bad_overload_group_rejects_all_overload_publication() {
         let parsed = parse_source_file(source);
         assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
         let file = FileId::new(2_410 + u32::try_from(index).unwrap());
-        let mut context =
-            checker_context(&parsed, file, false, CanonicalModuleState::Script);
+        let mut context = checker_context(&parsed, file, false, CanonicalModuleState::Script);
         let ready = function_declarations(&parsed, file, "ready");
         let ready_owner = merged_symbol(&context, file, ready[0]);
 
         assert!(matches!(
             context.check_source_file(file),
-            Err(SourceCheckError::Unsupported(_))
-                | Err(SourceCheckError::DeclaredType(_))
+            Err(SourceCheckError::Unsupported(_)) | Err(SourceCheckError::DeclaredType(_))
         ));
 
         assert!(context.store().value_symbol_links(ready_owner).is_none());
-        assert!(ready.iter().all(|declaration| {
-            context.store().signature_links(*declaration).is_none()
-        }));
+        assert!(
+            ready
+                .iter()
+                .all(|declaration| { context.store().signature_links(*declaration).is_none() })
+        );
         assert!(context.diagnostics().is_empty());
         assert!(!is_type_checked(&context, file));
     }
@@ -382,18 +382,14 @@ fn later_bad_callable_provider_keeps_the_ready_overload_cold_across_retries() {
         let parsed = parse_source_file(&source);
         assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
         let file = FileId::new(2_413 + u32::try_from(index).unwrap());
-        let mut context =
-            checker_context(&parsed, file, false, CanonicalModuleState::Script);
+        let mut context = checker_context(&parsed, file, false, CanonicalModuleState::Script);
         let declarations = function_declarations(&parsed, file, "ready");
         let [first, second] = declarations.as_slice() else {
             panic!("fixture must retain the ready overload group")
         };
         let ready_owner = merged_symbol(&context, file, *first);
         assert_eq!(ready_owner, merged_symbol(&context, file, *second));
-        let cold = (
-            context.store().type_len(),
-            context.store().signature_len(),
-        );
+        let cold = (context.store().type_len(), context.store().signature_len());
 
         for _ in 0..2 {
             assert!(
@@ -406,16 +402,15 @@ fn later_bad_callable_provider_keeps_the_ready_overload_cold_across_retries() {
                 "later provider escaped its typed boundary: {source}",
             );
             assert_eq!(
-                (
-                    context.store().type_len(),
-                    context.store().signature_len(),
-                ),
+                (context.store().type_len(), context.store().signature_len(),),
                 cold,
             );
             assert!(context.store().value_symbol_links(ready_owner).is_none());
-            assert!(declarations.iter().all(|declaration| {
-                context.store().signature_links(*declaration).is_none()
-            }));
+            assert!(
+                declarations
+                    .iter()
+                    .all(|declaration| { context.store().signature_links(*declaration).is_none() })
+            );
             assert!(context.diagnostics().is_empty());
             assert!(!is_type_checked(&context, file));
         }
@@ -540,8 +535,7 @@ fn overload_forms_outside_the_exact_leaf_remain_typed_boundaries() {
         let parsed = parse_source_file(source);
         assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
         let file = FileId::new(2_420 + u32::try_from(index).unwrap());
-        let mut context =
-            checker_context(&parsed, file, declaration_file, module_state);
+        let mut context = checker_context(&parsed, file, declaration_file, module_state);
         assert!(
             matches!(
                 context.check_source_file(file),
@@ -586,12 +580,9 @@ fn global_script_overloads_spanning_files_are_a_typed_boundary() {
     }
     let mut context = CanonicalCheckerContext::new(
         binder.finish(),
-        [
-            (first_file, &first.arena),
-            (second_file, &second.arena),
-        ]
-        .into_iter()
-        .collect(),
+        [(first_file, &first.arena), (second_file, &second.arena)]
+            .into_iter()
+            .collect(),
         checker_options(),
     )
     .unwrap();

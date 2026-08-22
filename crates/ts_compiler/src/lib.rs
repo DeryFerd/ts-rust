@@ -171,10 +171,7 @@ pub struct ProgramDiagnostic {
 /// it supplies the deterministic message-argument/chain tie-break after the
 /// exact path, location, and code keys. Related records retain the pinned
 /// longer-first ordering and recurse through the same comparator.
-fn compare_program_diagnostics(
-    left: &ProgramDiagnostic,
-    right: &ProgramDiagnostic,
-) -> Ordering {
+fn compare_program_diagnostics(left: &ProgramDiagnostic, right: &ProgramDiagnostic) -> Ordering {
     left.file_name
         .as_deref()
         .unwrap_or("")
@@ -293,12 +290,8 @@ pub enum CanonicalProgramCheckError {
 /// text or weakening the compiler's fail-closed behavior.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CanonicalProgramCheckFailureClass {
-    Unsupported {
-        capability_code: &'static str,
-    },
-    Fatal {
-        invariant_code: &'static str,
-    },
+    Unsupported { capability_code: &'static str },
+    Fatal { invariant_code: &'static str },
 }
 
 impl CanonicalProgramCheckFailureClass {
@@ -341,9 +334,7 @@ impl CanonicalProgramCheckError {
     }
 }
 
-fn canonical_program_capability_code(
-    error: &CanonicalProgramCheckError,
-) -> Option<&'static str> {
+fn canonical_program_capability_code(error: &CanonicalProgramCheckError) -> Option<&'static str> {
     match error {
         CanonicalProgramCheckError::UnsupportedSourceKind { .. } => Some("C00.SOURCE_KIND"),
         CanonicalProgramCheckError::FixedModuleFormatUnsupported { .. } => {
@@ -406,14 +397,10 @@ fn source_check_capability_code(error: &SourceCheckError) -> Option<&'static str
                 DeclaredTypeError::NameResolution(_) => "B03.NAME_RESOLUTION",
             })
         }
-        SourceCheckError::RelationUnavailable(error)
-            if relation_error_is_unsupported(error) =>
-        {
+        SourceCheckError::RelationUnavailable(error) if relation_error_is_unsupported(error) => {
             Some("R01.RELATION")
         }
-        SourceCheckError::TypeDisplayUnavailable(error)
-            if display_error_is_unsupported(error) =>
-        {
+        SourceCheckError::TypeDisplayUnavailable(error) if display_error_is_unsupported(error) => {
             Some("T07.TYPE_DISPLAY")
         }
         SourceCheckError::LiteralCache(error) if literal_cache_error_is_unsupported(error) => {
@@ -3218,10 +3205,12 @@ impl Program {
                 };
                 self.require_plain_esm_bundler_target(target)?;
                 if !source_file_is_external_module(&target.parse) {
-                    return Err(CanonicalProgramCheckError::ExternalModuleTargetUnsupported {
-                        specifier,
-                        target_file_name: target.file_name.clone(),
-                    });
+                    return Err(
+                        CanonicalProgramCheckError::ExternalModuleTargetUnsupported {
+                            specifier,
+                            target_file_name: target.file_name.clone(),
+                        },
+                    );
                 }
                 entries.push(CanonicalModuleResolutionEntry::resolved(
                     specifier,
@@ -3260,7 +3249,10 @@ impl Program {
             source_kind,
             ts_path::ScriptKind::Ts | ts_path::ScriptKind::Tsx
         ) || (self.options.allow_js
-            && matches!(source_kind, ts_path::ScriptKind::Js | ts_path::ScriptKind::Jsx)))
+            && matches!(
+                source_kind,
+                ts_path::ScriptKind::Js | ts_path::ScriptKind::Jsx
+            )))
             && (allow_declaration_file || !ts_path::is_declaration_file(&source.file_name))
             && Path::new(&source.file_name)
                 .extension()
@@ -3336,9 +3328,7 @@ impl Program {
             // Keep declaration files bound so their symbols remain available
             // to importers, but mirror pinned SkipTypeChecking by suppressing
             // their bind diagnostics together with checker diagnostics.
-            if self.options.skip_lib_check
-                && ts_path::is_declaration_file(&source.file_name)
-            {
+            if self.options.skip_lib_check && ts_path::is_declaration_file(&source.file_name) {
                 continue;
             }
             let bound = binder.file(source.id).ok_or_else(|| {
@@ -3496,11 +3486,8 @@ impl Program {
                 continue;
             };
             for declaration in &list.declarations.nodes {
-                let Some(NodeData::VariableDeclaration(declaration)) = source
-                    .parse
-                    .arena
-                    .get(*declaration)
-                    .map(|node| &node.data)
+                let Some(NodeData::VariableDeclaration(declaration)) =
+                    source.parse.arena.get(*declaration).map(|node| &node.data)
                 else {
                     continue;
                 };
@@ -3672,9 +3659,7 @@ impl Program {
                         is_javascript_file: is_javascript_file_name(&source_file.file_name),
                         no_fallthrough_cases_in_switch: self.options.no_fallthrough_cases_in_switch,
                         strict_null_checks: self.options.strict_null_checks,
-                        strict_property_initialization: self
-                            .options
-                            .strict_property_initialization,
+                        strict_property_initialization: self.options.strict_property_initialization,
                         no_implicit_any: self.options.no_implicit_any,
                         no_implicit_returns: self.options.no_implicit_returns,
                         no_unused_locals: self.options.no_unused_locals,
@@ -3980,9 +3965,8 @@ impl Program {
 
     fn insert_source_file(&mut self, canonical: String, source_file: SourceFile) {
         let index = self.source_files.len();
-        let expected_id = FileId::new(
-            u32::try_from(index).expect("Program exceeds u32::MAX source files"),
-        );
+        let expected_id =
+            FileId::new(u32::try_from(index).expect("Program exceeds u32::MAX source files"));
         assert_eq!(
             source_file.id, expected_id,
             "SourceFile identity does not match its Program slot"
@@ -4048,9 +4032,8 @@ impl Program {
             });
         }
         let index = self.source_files.len();
-        let file_id = FileId::new(
-            u32::try_from(index).expect("Program exceeds u32::MAX source files"),
-        );
+        let file_id =
+            FileId::new(u32::try_from(index).expect("Program exceeds u32::MAX source files"));
         // SourceFile retains this compatibility binding for existing Program
         // consumers. Canonical mode never publishes its diagnostics or passes
         // it to the canonical checker.
@@ -4101,16 +4084,19 @@ impl Program {
             }
         }
         let checking = empty_check_result();
-        self.insert_source_file(canonical, SourceFile {
-            id: file_id,
-            file_name: file_name.to_owned(),
-            source_text,
-            parse,
-            binding,
-            checking,
-            is_default_library: false,
-            implied_node_format: implied_node_format(file_system, file_name),
-        });
+        self.insert_source_file(
+            canonical,
+            SourceFile {
+                id: file_id,
+                file_name: file_name.to_owned(),
+                source_text,
+                parse,
+                binding,
+                checking,
+                is_default_library: false,
+                implied_node_format: implied_node_format(file_system, file_name),
+            },
+        );
     }
 
     fn load_default_libraries(&mut self) {
@@ -4219,21 +4205,23 @@ impl Program {
         let source_text = source.to_owned();
         let parse = parse_source_file(&source_text);
         let index = self.source_files.len();
-        let file_id = FileId::new(
-            u32::try_from(index).expect("Program exceeds u32::MAX source files"),
-        );
+        let file_id =
+            FileId::new(u32::try_from(index).expect("Program exceeds u32::MAX source files"));
         let binding = bind_source_file_in_file(&parse.arena, parse.source_file, file_id);
         let checking = empty_check_result();
-        self.insert_source_file(canonical, SourceFile {
-            id: file_id,
-            file_name,
-            source_text,
-            parse,
-            binding,
-            checking,
-            is_default_library: true,
-            implied_node_format: ModuleKind::CommonJs,
-        });
+        self.insert_source_file(
+            canonical,
+            SourceFile {
+                id: file_id,
+                file_name,
+                source_text,
+                parse,
+                binding,
+                checking,
+                is_default_library: true,
+                implied_node_format: ModuleKind::CommonJs,
+            },
+        );
     }
 }
 
@@ -6542,11 +6530,8 @@ fn append_bundle_declaration_module(
         })
         .is_some_and(|file| {
             file.statements.nodes.iter().any(|statement| {
-                let Some(NodeData::ExportDeclaration(export)) = source
-                    .parse
-                    .arena
-                    .get(*statement)
-                    .map(|node| &node.data)
+                let Some(NodeData::ExportDeclaration(export)) =
+                    source.parse.arena.get(*statement).map(|node| &node.data)
                 else {
                     return false;
                 };
@@ -6847,11 +6832,7 @@ fn percent_encode_source_map_url(url: &str) -> String {
 fn canonical_static_esm_module_specifiers(
     source: &SourceFile,
 ) -> Result<Vec<(NodeRef, String)>, CanonicalProgramCheckError> {
-    let source_ref = NodeRef::new(
-        source.parse.arena.id(),
-        source.id,
-        source.parse.source_file,
-    );
+    let source_ref = NodeRef::new(source.parse.arena.id(), source.id, source.parse.source_file);
     let Some(NodeData::SourceFile(file)) = source
         .parse
         .arena
@@ -6885,15 +6866,10 @@ fn canonical_static_esm_module_specifiers(
                 else {
                     continue;
                 };
-                let specifier = NodeRef::new(
-                    source.parse.arena.id(),
-                    source.id,
-                    reference.expression,
-                );
+                let specifier =
+                    NodeRef::new(source.parse.arena.id(), source.id, reference.expression);
                 return Err(
-                    CanonicalProgramCheckError::ModuleSpecifierResolutionModeUnsupported(
-                        specifier,
-                    ),
+                    CanonicalProgramCheckError::ModuleSpecifierResolutionModeUnsupported(specifier),
                 );
             }
             _ => continue,
@@ -7558,11 +7534,7 @@ mod tests {
     #[test]
     fn canonical_program_failure_class_exposes_stable_fatal_codes() {
         let parsed = parse_source_file("const value = () => 1;");
-        let node = ts_ast::NodeRef::new(
-            parsed.arena.id(),
-            FileId::new(7),
-            parsed.source_file,
-        );
+        let node = ts_ast::NodeRef::new(parsed.arena.id(), FileId::new(7), parsed.source_file);
         let error = CanonicalProgramCheckError::SourceCheck {
             file_name: "/project/input.ts".to_owned(),
             error: SourceCheckError::Arrow(node),
@@ -8043,17 +8015,22 @@ mod tests {
         );
         let importer = program.source_file("/project/importer.ts").unwrap();
         let target = program.source_file("/project/target.ts").unwrap();
-        assert!(importer.id.index() < target.id.index(), "importer must load first");
+        assert!(
+            importer.id.index() < target.id.index(),
+            "importer must load first"
+        );
 
         let manifest = program.canonical_module_resolution_manifest().unwrap();
         let entries = manifest.entries();
         assert_eq!(entries.len(), 4);
         let entry_texts = entries
             .iter()
-            .map(|entry| match &program.node(entry.specifier()).unwrap().data {
-                NodeData::StringLiteral(literal) => literal.text.as_str(),
-                other => panic!("unexpected module specifier {other:?}"),
-            })
+            .map(
+                |entry| match &program.node(entry.specifier()).unwrap().data {
+                    NodeData::StringLiteral(literal) => literal.text.as_str(),
+                    other => panic!("unexpected module specifier {other:?}"),
+                },
+            )
             .collect::<Vec<_>>();
         assert_eq!(
             entry_texts,
@@ -8097,11 +8074,8 @@ mod tests {
         let fs = MemoryFileSystem::new(true);
         fs.write_file("/project/target.ts", "export const value: number = 1;")
             .unwrap();
-        fs.write_file(
-            "/project/importer.ts",
-            "import { value } from './target';",
-        )
-        .unwrap();
+        fs.write_file("/project/importer.ts", "import { value } from './target';")
+            .unwrap();
         let mut program = Program::new_with_options(
             &fs,
             "/project",
@@ -8126,8 +8100,12 @@ mod tests {
             .arena
             .alloc(detached_import);
         let source = &program.source_files[importer_index];
-        let NodeData::SourceFile(root) =
-            &source.parse.arena.get(source.parse.source_file).unwrap().data
+        let NodeData::SourceFile(root) = &source
+            .parse
+            .arena
+            .get(source.parse.source_file)
+            .unwrap()
+            .data
         else {
             panic!("importer root must remain a source file");
         };
@@ -8150,24 +8128,15 @@ mod tests {
             let fs = MemoryFileSystem::new(true);
             fs.write_file("/project/target.ts", "export const value: number = 1;")
                 .unwrap();
-            fs.write_file(
-                "/project/importer.ts",
-                "import { value } from './target';",
-            )
-            .unwrap();
+            fs.write_file("/project/importer.ts", "import { value } from './target';")
+                .unwrap();
             let mut options = plain_esm_bundler_options();
             options.module = module;
             options.module_resolution = module_resolution;
-            let program = Program::new_with_options(
-                &fs,
-                "/project",
-                &["importer.ts".to_owned()],
-                options,
-            );
+            let program =
+                Program::new_with_options(&fs, "/project", &["importer.ts".to_owned()], options);
 
-            let error = program
-                .canonical_module_resolution_manifest()
-                .unwrap_err();
+            let error = program.canonical_module_resolution_manifest().unwrap_err();
             assert!(error.is_unsupported_boundary());
             assert!(matches!(
                 error,
@@ -8200,9 +8169,7 @@ mod tests {
                 plain_esm_bundler_options(),
             );
 
-            let error = program
-                .canonical_module_resolution_manifest()
-                .unwrap_err();
+            let error = program.canonical_module_resolution_manifest().unwrap_err();
             assert!(error.is_unsupported_boundary());
             assert!(matches!(
                 error,
@@ -8219,11 +8186,8 @@ mod tests {
             "export declare const value: number;",
         )
         .unwrap();
-        fs.write_file(
-            "/project/importer.ts",
-            "import { value } from './target';",
-        )
-        .unwrap();
+        fs.write_file("/project/importer.ts", "import { value } from './target';")
+            .unwrap();
         let program = Program::new_with_options(
             &fs,
             "/project",
@@ -8242,14 +8206,8 @@ mod tests {
             panic!("expected the declaration target to resolve");
         };
         assert_eq!(resolution.target_file(), target.id);
-        assert_eq!(
-            resolution.usage_mode(),
-            CanonicalModuleResolutionMode::Esm
-        );
-        assert_eq!(
-            resolution.target_mode(),
-            CanonicalModuleResolutionMode::Esm
-        );
+        assert_eq!(resolution.usage_mode(), CanonicalModuleResolutionMode::Esm);
+        assert_eq!(resolution.target_mode(), CanonicalModuleResolutionMode::Esm);
     }
 
     #[test]
@@ -8257,11 +8215,8 @@ mod tests {
         let fs = MemoryFileSystem::new(true);
         fs.write_file("/project/script.ts", "const value: number = 1;")
             .unwrap();
-        fs.write_file(
-            "/project/importer.ts",
-            "import { value } from './script';",
-        )
-        .unwrap();
+        fs.write_file("/project/importer.ts", "import { value } from './script';")
+            .unwrap();
         let program = Program::new_with_options(
             &fs,
             "/project",
@@ -8269,9 +8224,7 @@ mod tests {
             plain_esm_bundler_options(),
         );
 
-        let error = program
-            .canonical_module_resolution_manifest()
-            .unwrap_err();
+        let error = program.canonical_module_resolution_manifest().unwrap_err();
         assert!(error.is_unsupported_boundary());
         assert!(matches!(
             error,
@@ -8605,10 +8558,7 @@ mod tests {
         let fs = MemoryFileSystem::new(true);
         fs.write_file(
             "/project/input.d.ts",
-            concat!(
-                "export default class first {}\n",
-                "export default 0;",
-            ),
+            concat!("export default class first {}\n", "export default 0;",),
         )
         .unwrap();
         let program = Program::try_new_with_canonical_checker(
@@ -8749,11 +8699,8 @@ mod tests {
     #[test]
     fn canonical_program_checks_typescript_syntax_in_tsx_files() {
         let fs = MemoryFileSystem::new(true);
-        fs.write_file(
-            "/project/component.tsx",
-            "const value: number = 'wrong';",
-        )
-        .unwrap();
+        fs.write_file("/project/component.tsx", "const value: number = 'wrong';")
+            .unwrap();
 
         let program = Program::try_new_with_canonical_checker(
             &fs,
@@ -8766,9 +8713,15 @@ mod tests {
         )
         .unwrap();
         let [diagnostic] = program.diagnostics() else {
-            panic!("expected one TSX semantic diagnostic: {:?}", program.diagnostics());
+            panic!(
+                "expected one TSX semantic diagnostic: {:?}",
+                program.diagnostics()
+            );
         };
-        assert_eq!(diagnostic.file_name.as_deref(), Some("/project/component.tsx"));
+        assert_eq!(
+            diagnostic.file_name.as_deref(),
+            Some("/project/component.tsx")
+        );
         assert_eq!(diagnostic.code, Some(2322));
     }
 
@@ -8934,8 +8887,14 @@ mod tests {
         let first_ref = first.node_ref(first.parse.source_file).unwrap();
         let second_ref = second.node_ref(second.parse.source_file).unwrap();
         assert_ne!(first_ref, second_ref);
-        assert_eq!(program.node(first_ref).unwrap().kind, SyntaxKind::SourceFile);
-        assert_eq!(program.node(second_ref).unwrap().kind, SyntaxKind::SourceFile);
+        assert_eq!(
+            program.node(first_ref).unwrap().kind,
+            SyntaxKind::SourceFile
+        );
+        assert_eq!(
+            program.node(second_ref).unwrap().kind,
+            SyntaxKind::SourceFile
+        );
     }
 
     #[test]
@@ -8947,14 +8906,9 @@ mod tests {
             no_lib: true,
             ..CompilerOptions::default()
         };
-        let first = Program::new_with_options(
-            &fs,
-            "/project",
-            &["main.ts".to_owned()],
-            options.clone(),
-        );
-        let second =
-            Program::new_with_options(&fs, "/project", &["main.ts".to_owned()], options);
+        let first =
+            Program::new_with_options(&fs, "/project", &["main.ts".to_owned()], options.clone());
+        let second = Program::new_with_options(&fs, "/project", &["main.ts".to_owned()], options);
         let first_source = first.source_file("/project/main.ts").unwrap();
         let second_source = second.source_file("/project/main.ts").unwrap();
         let reference = first_source
@@ -8962,8 +8916,14 @@ mod tests {
             .unwrap();
 
         assert_eq!(first_source.id, second_source.id);
-        assert_eq!(first_source.parse.source_file, second_source.parse.source_file);
-        assert_ne!(first_source.parse.arena.id(), second_source.parse.arena.id());
+        assert_eq!(
+            first_source.parse.source_file,
+            second_source.parse.source_file
+        );
+        assert_ne!(
+            first_source.parse.arena.id(),
+            second_source.parse.arena.id()
+        );
         assert!(first.node(reference).is_some());
         assert!(second.node(reference).is_none());
     }
@@ -9072,10 +9032,7 @@ mod tests {
         );
 
         let first_id = first_program.source_file("first.ts").unwrap().id;
-        assert_eq!(
-            first_program.source_file("first.ts").unwrap().id,
-            first_id
-        );
+        assert_eq!(first_program.source_file("first.ts").unwrap().id, first_id);
         assert_eq!(first_id, FileId::new(0));
         assert_eq!(
             rebuilt_program.source_file("first.ts").unwrap().id,

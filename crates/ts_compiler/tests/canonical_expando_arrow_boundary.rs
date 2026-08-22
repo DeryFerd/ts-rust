@@ -7,11 +7,7 @@ fn canonical_expando_arrow_is_a_typed_boundary_not_an_invariant() {
     let fs = MemoryFileSystem::new(true);
     fs.write_file(
         "/project/main.ts",
-        concat!(
-            "const foo = () => {};\n",
-            "foo.bar = 42;\n",
-            "export {};\n",
-        ),
+        concat!("const foo = () => {};\n", "foo.bar = 42;\n", "export {};\n",),
     )
     .unwrap();
 

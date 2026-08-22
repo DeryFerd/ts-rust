@@ -624,10 +624,7 @@ fn unused_imports_resolve_without_eager_value_typing_or_partial_source_publicati
     assert!(context.store().value_symbol_links(alias).is_none());
     assert!(context.diagnostics().is_empty());
 
-    let rejected = parse_source_file(concat!(
-        "import { value } from './target'; ",
-        "debugger;",
-    ));
+    let rejected = parse_source_file(concat!("import { value } from './target'; ", "debugger;",));
     let rejected_file = FileId::new(4);
     let rejected_target_file = FileId::new(5);
     let (mut rejected_context, rejected_binding) =

@@ -242,10 +242,7 @@ fn strict_typeof_flow_narrows_all_tags_joins_and_replays_warm() {
         context.global_types().function_type,
     );
     assert_eq!(
-        resolved_type(
-            &context,
-            variable_initializer(&parsed, file, "broadAfter"),
-        ),
+        resolved_type(&context, variable_initializer(&parsed, file, "broadAfter"),),
         bootstrap.non_primitive_type,
     );
     assert_eq!(
