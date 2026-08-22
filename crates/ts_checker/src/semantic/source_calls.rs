@@ -25,7 +25,10 @@ use super::{
         DirectCallApplicability, DirectCallError, DirectCallForm, DirectCallRequest,
         DirectCallUnsupported, resolve_direct_call,
     },
-    formatter::get_type_names_for_assignability_error_with_host_global_types_and_flags,
+    formatter::{
+        get_type_names_for_assignability_error_with_host_global_types_and_flags,
+        type_to_string_with_host_global_types_and_flags,
+    },
     generic_calls::{
         GenericCallVectorApplicability, GenericCallVectorError, GenericCallVectorRequest,
         GenericCallVectorResolution, GenericCallVectorUnsupported, IdentityGenericCallError,
@@ -47,6 +50,7 @@ use super::{
     source_callables::{StoredSourceCallableValidation, validate_stored_source_callable},
     type_nodes::CanonicalTypeQuery,
     type_records::TypeData,
+    types::TypeFlags,
 };
 
 /// Fully proven syntax plus source-planned callee and arguments.
@@ -1750,6 +1754,80 @@ fn preflight_call_publication(
         .and_then(|links| links.resolved_signature.signature()))
 }
 
+fn recover_non_callable_source_call(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    plan: &SourceCallPlan,
+    callee_type: TypeId,
+) -> Result<CheckedSourceCall, SourceCheckError> {
+    let flags = store
+        .type_payload(callee_type)
+        .map(super::type_records::TypeRecord::flags)
+        .ok_or(SourceCheckError::Call(plan.node))?;
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or(SourceCheckError::Call(plan.node))?;
+    let (return_type, signature, report_diagnostic) = if flags.intersects(TypeFlags::ANY) {
+        if callee_type == bootstrap.error_type {
+            (bootstrap.error_type, bootstrap.unknown_signature, false)
+        } else {
+            (bootstrap.any_type, bootstrap.any_signature, false)
+        }
+    } else {
+        (bootstrap.error_type, bootstrap.unknown_signature, true)
+    };
+    let existing = preflight_call_publication(store, plan.node, return_type)?;
+    if existing.is_some_and(|existing| existing != signature) {
+        return Err(SourceCheckError::Call(plan.node));
+    }
+    let diagnostic = if report_diagnostic {
+        let apparent_type = if flags.intersects(TypeFlags::NUMBER_LIKE) {
+            "Number".to_owned()
+        } else if flags.intersects(TypeFlags::STRING_LIKE) {
+            "String".to_owned()
+        } else if flags.intersects(TypeFlags::BOOLEAN_LIKE) {
+            "Boolean".to_owned()
+        } else if flags.intersects(TypeFlags::BIG_INT_LIKE) {
+            "BigInt".to_owned()
+        } else if flags.intersects(TypeFlags::ES_SYMBOL | TypeFlags::UNIQUE_ES_SYMBOL) {
+            "Symbol".to_owned()
+        } else {
+            type_to_string_with_host_global_types_and_flags(
+                store,
+                host,
+                global_types,
+                callee_type,
+                source_call_display_flags(options),
+            )?
+        };
+        let detail = Diagnostic::with_arguments(
+            message_by_code(2757).ok_or(SourceCheckError::MissingDiagnostic(2757))?,
+            [apparent_type],
+        )
+        .render()
+        .expect("TS2757 has one formatting argument");
+        Some(CanonicalCheckerDiagnostic {
+            node: Some(plan.callee_diagnostic_node),
+            range_override: None,
+            diagnostic: Diagnostic::new(
+                message_by_code(2349).ok_or(SourceCheckError::MissingDiagnostic(2349))?,
+            )
+            .with_details([format!("  {detail}")]),
+            related_information: Vec::new(),
+        })
+    } else {
+        None
+    };
+    publish_call_links(store, plan.node, signature, return_type)?;
+    if let Some(diagnostic) = diagnostic {
+        merge_retry_diagnostic(diagnostics, diagnostic);
+    }
+    Ok(CheckedSourceCall { return_type })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn check_direct_source_call(
     store: &mut CanonicalTypeMapperStore,
@@ -1809,6 +1887,23 @@ pub(super) fn check_direct_source_call(
                 )?;
             }
             Err(SourceCallResolutionError::Relation(error)) => return Err(error.into()),
+            Err(SourceCallResolutionError::Unsupported)
+                if plan.callee_form == SourceCallCalleeForm::Identifier
+                    && matches!(
+                        validate_stored_callable_set(store, callee_type),
+                        StoredCallableSetValidation::NotCallable
+                    ) =>
+            {
+                return recover_non_callable_source_call(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    diagnostics,
+                    plan,
+                    callee_type,
+                );
+            }
             Err(SourceCallResolutionError::Unsupported) if plan.type_arguments.is_some() => {
                 return Err(SourceCheckError::Unsupported(
                     UnsupportedSourceSyntax::Call(plan.node),
@@ -3854,6 +3949,90 @@ mod tests {
                 UnsupportedSourceSyntax::Call(_)
             ))
         ));
+    }
+
+    #[test]
+    fn noncallable_identifier_reports_ts2349_and_publishes_error_recovery() {
+        let parsed = parsed("const value = 1; const result = value();");
+        let file = FileId::new(446);
+        let mut context = context(&parsed, file);
+        let call_nodes = calls(&parsed, file);
+        let [call] = call_nodes.as_slice() else {
+            panic!("fixture must contain one invalid call")
+        };
+        let call = *call;
+
+        context.check_source_file(file).unwrap();
+
+        let diagnostics = context.diagnostics().as_slice();
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].diagnostic.code(), 2349);
+        assert_eq!(
+            diagnostics[0].diagnostic.render().unwrap(),
+            "This expression is not callable.\n  Type 'Number' has no call signatures."
+        );
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        assert_eq!(
+            context
+                .store()
+                .signature_links(call)
+                .and_then(|links| links.resolved_signature.signature()),
+            Some(bootstrap.unknown_signature)
+        );
+        assert_eq!(
+            context
+                .store()
+                .type_node_links(call)
+                .and_then(|links| links.resolved_type),
+            Some(bootstrap.error_type)
+        );
+
+        let counts = (
+            context.store().type_len(),
+            context.store().mapper_len(),
+            context.store().signature_len(),
+        );
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(context.diagnostics().len(), 1);
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().mapper_len(),
+                context.store().signature_len(),
+            ),
+            counts
+        );
+    }
+
+    #[test]
+    fn any_identifier_calls_publish_the_any_signature_without_diagnostics() {
+        let parsed = parsed("function use(value: any): any { return value(); }");
+        let file = FileId::new(447);
+        let mut context = context(&parsed, file);
+        let call_nodes = calls(&parsed, file);
+        let [call] = call_nodes.as_slice() else {
+            panic!("fixture must contain one any call")
+        };
+        let call = *call;
+
+        context.check_source_file(file).unwrap();
+
+        assert!(context.diagnostics().is_empty());
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        assert_eq!(
+            context
+                .store()
+                .signature_links(call)
+                .and_then(|links| links.resolved_signature.signature()),
+            Some(bootstrap.any_signature)
+        );
+        assert_eq!(
+            context
+                .store()
+                .type_node_links(call)
+                .and_then(|links| links.resolved_type),
+            Some(bootstrap.any_type)
+        );
     }
 
     #[test]
