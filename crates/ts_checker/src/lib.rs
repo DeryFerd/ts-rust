@@ -11107,9 +11107,25 @@ impl<'a> Checker<'a> {
             NodeData::TemplateExpression(_) | NodeData::TypeOfExpression(_) => {
                 self.result.types.string()
             }
-            NodeData::JsxElement(_)
-            | NodeData::JsxSelfClosingElement(_)
-            | NodeData::JsxFragment(_) => self.jsx_element_type(),
+            NodeData::JsxElement(element) => {
+                if let Some(NodeData::JsxOpeningElement(opening)) = self
+                    .arena
+                    .get(element.opening_element)
+                    .map(|opening| &opening.data)
+                {
+                    self.check_jsx_intrinsic_attributes(opening.tag_name, opening.attributes);
+                }
+                self.check_jsx_children(&element.children.nodes);
+                self.jsx_element_type()
+            }
+            NodeData::JsxSelfClosingElement(element) => {
+                self.check_jsx_intrinsic_attributes(element.tag_name, element.attributes);
+                self.jsx_element_type()
+            }
+            NodeData::JsxFragment(fragment) => {
+                self.check_jsx_children(&fragment.children.nodes);
+                self.jsx_element_type()
+            }
             NodeData::FunctionDeclaration(data) => self.function_type(data),
             _ => self.result.types.unknown(),
         };
@@ -11184,6 +11200,103 @@ impl<'a> Checker<'a> {
             },
         );
         imported
+    }
+
+    fn check_jsx_children(&mut self, children: &[NodeId]) {
+        for child in children {
+            match self.arena.get(*child).map(|child| &child.data) {
+                Some(NodeData::JsxExpression(expression)) => {
+                    if let Some(expression) = expression.expression {
+                        self.type_of_expression(expression);
+                    }
+                }
+                Some(
+                    NodeData::JsxElement(_)
+                    | NodeData::JsxSelfClosingElement(_)
+                    | NodeData::JsxFragment(_),
+                ) => {
+                    self.type_of_expression(*child);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn check_jsx_intrinsic_attributes(&mut self, tag_name: NodeId, attributes: NodeId) {
+        let Some(name) = self.property_name(tag_name) else {
+            return;
+        };
+        if !name.starts_with(|character: char| character.is_ascii_lowercase())
+            && !name.contains('-')
+        {
+            return;
+        }
+
+        let namespace = self
+            .bindings
+            .resolve_name_at(tag_name, "JSX")
+            .and_then(|symbol| self.result.symbol_types.get(&symbol).copied())
+            .or_else(|| {
+                self.external_names
+                    .get("JSX")
+                    .cloned()
+                    .map(|namespace| self.import_type(&namespace))
+            });
+        let Some(namespace) = namespace else {
+            return;
+        };
+        let Some(intrinsic_elements) = self.lookup_property_type(namespace, "IntrinsicElements")
+        else {
+            return;
+        };
+        let Some(expected_attributes) = self.lookup_property_type(intrinsic_elements, &name) else {
+            return;
+        };
+        let Some(NodeData::JsxAttributes(attributes)) = self
+            .arena
+            .get(attributes)
+            .map(|attributes| &attributes.data)
+        else {
+            return;
+        };
+
+        for attribute_node in &attributes.properties.nodes {
+            let Some(NodeData::JsxAttribute(attribute)) = self
+                .arena
+                .get(*attribute_node)
+                .map(|attribute| &attribute.data)
+            else {
+                continue;
+            };
+            let Some(attribute_name) = self.property_name(attribute.name) else {
+                continue;
+            };
+            let Some(expected) = self.lookup_property_type(expected_attributes, &attribute_name)
+            else {
+                continue;
+            };
+            let expected =
+                if self.property_is_optional(expected_attributes, &attribute_name) == Some(true) {
+                    self.type_without_undefined(expected)
+                } else {
+                    expected
+                };
+            let actual = match attribute.initializer {
+                Some(initializer) => match self.arena.get(initializer).map(|node| &node.data) {
+                    Some(NodeData::JsxExpression(expression)) => match expression.expression {
+                        Some(expression) => {
+                            self.type_of_expression_context(expression, Some(expected))
+                        }
+                        None => self.result.types.any(),
+                    },
+                    _ => self.type_of_expression_context(initializer, Some(expected)),
+                },
+                None => self.result.types.alloc(TypeKind::BooleanLiteral(true)),
+            };
+            if !self.is_assignable(actual, expected) {
+                self.assignability_error(attribute.name, actual, expected);
+            }
+        }
     }
 
     fn jsx_element_type(&mut self) -> TypeId {
@@ -12434,6 +12547,7 @@ impl<'a> Checker<'a> {
         name: &str,
     ) -> TypeId {
         if let Some(property) = self.lookup_property_type(receiver, name) {
+            self.check_private_property_access(node, name_node, receiver, name);
             let property = if name == "flat"
                 && let Some(flat) = self.array_flat_property_type(receiver, property)
             {
@@ -12445,12 +12559,19 @@ impl<'a> Checker<'a> {
                 self.non_widening_types.insert(property);
             }
             property
-        } else if let Some(property) = self.partial_union_property_type(receiver, name) {
-            self.error(
-                name_node,
-                2339,
-                [name.to_owned(), self.property_receiver_display(receiver)],
-            );
+        } else if let Some((property, missing_member)) =
+            self.partial_union_property_type(receiver, name)
+        {
+            let message = message_by_code(2339).expect("checker diagnostic is in catalog");
+            let diagnostic = Diagnostic::with_arguments(
+                message,
+                [name.to_owned(), self.diagnostic_type_display(receiver)],
+            )
+            .with_details([format!(
+                "  Property '{name}' does not exist on type '{}'.",
+                self.diagnostic_type_display(missing_member)
+            )]);
+            self.push_diagnostic(name_node, diagnostic);
             property
         } else if self.options.is_javascript_file && self.is_assignment_left_hand_side(node) {
             let property = self.result.types.any();
@@ -12477,15 +12598,147 @@ impl<'a> Checker<'a> {
         }
     }
 
-    fn partial_union_property_type(&mut self, receiver: TypeId, name: &str) -> Option<TypeId> {
+    fn property_access_class_symbol(&self, access: NodeId, receiver: TypeId) -> Option<SymbolId> {
+        let is_class = |symbol| {
+            self.bindings
+                .symbols
+                .get(symbol)
+                .is_some_and(|symbol| symbol.flags.contains(ts_binder::SymbolFlags::CLASS))
+        };
+        self.result
+            .named_type_references
+            .get(&receiver)
+            .and_then(|reference| self.resolve_identifier(access, &reference.name))
+            .filter(|symbol| is_class(*symbol))
+            .or_else(|| match self.arena.get(access).map(|node| &node.data) {
+                Some(NodeData::PropertyAccessExpression(property)) => self
+                    .resolve_value_expression_symbol(property.expression)
+                    .filter(|symbol| is_class(*symbol)),
+                _ => None,
+            })
+            .or_else(|| {
+                self.bindings.symbols.iter().find_map(|symbol| {
+                    (is_class(symbol.id)
+                        && self.result.symbol_types.get(&symbol.id).copied() == Some(receiver))
+                    .then_some(symbol.id)
+                })
+            })
+    }
+
+    fn check_private_property_access(
+        &mut self,
+        access: NodeId,
+        name_node: NodeId,
+        receiver: TypeId,
+        name: &str,
+    ) {
+        let mut class_symbol = self.property_access_class_symbol(access, receiver);
+        let mut visited = HashSet::new();
+
+        while let Some(symbol) = class_symbol {
+            if !visited.insert(symbol) {
+                return;
+            }
+            let Some(class_symbol_record) = self.bindings.symbols.get(symbol) else {
+                return;
+            };
+            let Some((declaration, class)) =
+                class_symbol_record
+                    .declarations
+                    .iter()
+                    .find_map(|declaration| {
+                        let NodeData::ClassDeclaration(class) = &self.arena.get(*declaration)?.data
+                        else {
+                            return None;
+                        };
+                        Some((*declaration, class.as_ref()))
+                    })
+            else {
+                return;
+            };
+
+            if let Some(member) = class_symbol_record.members.get(name) {
+                let private = self
+                    .bindings
+                    .symbols
+                    .get(member)
+                    .is_some_and(|member| {
+                        member.declarations.iter().any(|declaration| {
+                            let Some(record) = self.arena.get(*declaration) else {
+                                return false;
+                            };
+                            match &record.data {
+                                NodeData::ParameterDeclaration(parameter) => self
+                                    .has_ast_modifier(
+                                        parameter.modifiers.as_ref(),
+                                        SyntaxKind::PrivateKeyword,
+                                    ),
+                                _ => self
+                                    .member_modifier(*declaration, SyntaxKind::PrivateKeyword)
+                                    .is_some(),
+                            }
+                        })
+                    });
+                if !private {
+                    return;
+                }
+                let mut current = Some(access);
+                while let Some(node) = current {
+                    if node == declaration {
+                        return;
+                    }
+                    current = self.arena.get(node).and_then(|node| node.parent);
+                }
+                self.error(
+                    name_node,
+                    2341,
+                    [name.to_owned(), class_symbol_record.name.clone()],
+                );
+                return;
+            }
+
+            class_symbol = class.heritage_clauses.as_ref().and_then(|clauses| {
+                clauses.nodes.iter().find_map(|clause| {
+                    let NodeData::HeritageClause(clause) = &self.arena.get(*clause)?.data else {
+                        return None;
+                    };
+                    if clause.token != SyntaxKind::ExtendsKeyword {
+                        return None;
+                    }
+                    let heritage = clause.types.nodes.first()?;
+                    let NodeData::ExpressionWithTypeArguments(heritage) =
+                        &self.arena.get(*heritage)?.data
+                    else {
+                        return None;
+                    };
+                    self.resolve_value_expression_symbol(heritage.expression)
+                })
+            });
+        }
+    }
+
+    fn partial_union_property_type(
+        &mut self,
+        receiver: TypeId,
+        name: &str,
+    ) -> Option<(TypeId, TypeId)> {
         let TypeKind::Union(members) = self.result.types.get(receiver)?.kind.clone() else {
             return None;
         };
-        let properties = members
-            .into_iter()
-            .filter_map(|member| self.lookup_property_type(member, name))
-            .collect::<Vec<_>>();
-        (!properties.is_empty()).then(|| self.result.types.union(properties))
+        let mut properties = Vec::new();
+        let mut first_missing = None;
+        for member in members {
+            match self.lookup_property_type(member, name) {
+                Some(property) => properties.push(property),
+                None => {
+                    first_missing.get_or_insert(member);
+                }
+            }
+        }
+        if properties.is_empty() {
+            return None;
+        }
+        Some((self.result.types.union(properties), first_missing?))
     }
 
     fn property_name_suggestion(&mut self, receiver: TypeId, wanted: &str) -> Option<String> {
@@ -12758,6 +13011,10 @@ impl<'a> Checker<'a> {
                     .collect::<Vec<_>>();
                 (!properties.is_empty()).then(|| self.result.types.intersection(properties))
             }
+            TypeKind::TypeParameter {
+                constraint: Some(constraint),
+                ..
+            } => self.lookup_property_type(constraint, name),
             _ => None,
         }
     }
@@ -26973,7 +27230,7 @@ mod tests {
     };
     use ts_binder::{bind_source_file, bind_source_file_in_file};
     use ts_core::TextRange;
-    use ts_parser::parse_source_file;
+    use ts_parser::{parse_jsx_source_file, parse_source_file};
 
     use super::{
         Checker, CheckerOptions, EnumConstantValue, FunctionType, ImportTypeReference,
@@ -27775,6 +28032,112 @@ mod tests {
         assert_eq!(
             result.diagnostics[2].diagnostic.render().unwrap(),
             "Argument of type 'string' is not assignable to parameter of type 'number'."
+        );
+    }
+
+    #[test]
+    fn constrained_type_parameters_expose_their_constraint_properties() {
+        let parsed = parse_source_file(concat!(
+            "function read<T extends { id: number }>(value: T): number { ",
+            "return value.id; } ",
+            "const good = read({ id: 1 }); ",
+            "const bad = read({ name: 'wrong' });",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        let result = check_source_file(&parsed.arena, parsed.source_file, &bindings);
+
+        assert_eq!(
+            result
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.code())
+                .collect::<Vec<_>>(),
+            [2353]
+        );
+    }
+
+    #[test]
+    fn private_class_members_are_only_accessible_inside_the_declaring_class() {
+        let parsed = parse_source_file(concat!(
+            "class Box { ",
+            "private value = 1; ",
+            "private read(): number { return this.value; } ",
+            "copy(other: Box): number { return other.value + this.read(); } ",
+            "} ",
+            "class ParameterBox { ",
+            "constructor(private secret: string) {} ",
+            "read(): string { return this.secret; } ",
+            "} ",
+            "const outside = new Box().value; ",
+            "const outsideMethod = new Box().read(); ",
+            "const outsideParameter = new ParameterBox('x').secret;",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        let result = check_source_file(&parsed.arena, parsed.source_file, &bindings);
+
+        assert_eq!(
+            result
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.render().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "Property 'value' is private and only accessible within class 'Box'.",
+                "Property 'read' is private and only accessible within class 'Box'.",
+                "Property 'secret' is private and only accessible within class 'ParameterBox'.",
+            ]
+        );
+    }
+
+    #[test]
+    fn jsx_intrinsic_attributes_check_self_closing_paired_and_nested_elements() {
+        let parsed = parse_jsx_source_file(concat!(
+            "declare namespace JSX { interface IntrinsicElements { ",
+            "div: { title?: string; count: number; enabled?: boolean } ",
+            "} } ",
+            "const valid = <div title=\"ok\" count={1} enabled />; ",
+            "const invalid = <div title={1} count=\"bad\" />; ",
+            "const nested = <div count={1}><div count=\"bad\" /></div>;",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        let result = check_source_file(&parsed.arena, parsed.source_file, &bindings);
+
+        assert_eq!(
+            result
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.render().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "Type 'number' is not assignable to type 'string'.",
+                "Type 'string' is not assignable to type 'number'.",
+                "Type 'string' is not assignable to type 'number'.",
+            ]
+        );
+    }
+
+    #[test]
+    fn union_property_diagnostics_preserve_aliases_and_missing_constituents() {
+        let parsed = parse_source_file(concat!(
+            "type Shape = { radius: number } | { size: number }; ",
+            "declare const shape: Shape; ",
+            "const value = shape.radius;",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        let result = check_source_file(&parsed.arena, parsed.source_file, &bindings);
+
+        assert_eq!(result.diagnostics.len(), 1, "{:?}", result.diagnostics);
+        assert_eq!(result.diagnostics[0].diagnostic.code(), 2339);
+        assert_eq!(
+            result.diagnostics[0].diagnostic.render().unwrap(),
+            concat!(
+                "Property 'radius' does not exist on type 'Shape'.\n",
+                "  Property 'radius' does not exist on type '{ size: number; }'.",
+            )
         );
     }
 
