@@ -263,6 +263,50 @@ fn javascript_emission_reports_ts5055_without_overwriting_its_input() {
 }
 
 #[test]
+fn canonical_javascript_program_reports_ts5055_before_emission() {
+    let filesystem = MemoryFileSystem::new(true);
+    filesystem
+        .write_file("/project/input.js", "const value = 1;\n")
+        .unwrap();
+
+    for no_emit in [false, true] {
+        let program = Program::try_new_with_canonical_checker(
+            &filesystem,
+            "/project",
+            &["input.js".to_owned()],
+            CompilerOptions {
+                allow_js: true,
+                lib: Some(vec!["es5".to_owned()]),
+                no_emit,
+                ..CompilerOptions::default()
+            },
+        )
+        .unwrap();
+
+        if no_emit {
+            assert!(
+                program.diagnostics().is_empty(),
+                "{:?}",
+                program.diagnostics()
+            );
+            continue;
+        }
+
+        let [diagnostic] = program.diagnostics() else {
+            panic!(
+                "expected one pre-emit output collision: {:?}",
+                program.diagnostics()
+            );
+        };
+        assert_eq!(diagnostic.code, Some(5055));
+        assert_eq!(
+            diagnostic.message,
+            "Cannot write file '/project/input.js' because it would overwrite input file."
+        );
+    }
+}
+
+#[test]
 fn ordinary_declaration_modules_are_checked_without_skip_lib_check() {
     let filesystem = MemoryFileSystem::new(true);
     filesystem

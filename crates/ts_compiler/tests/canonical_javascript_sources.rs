@@ -9,6 +9,7 @@ fn javascript_options() -> CompilerOptions {
         module_specified: true,
         module_resolution: ModuleResolutionKind::Bundler,
         lib: Some(vec!["es5".to_owned()]),
+        no_emit: true,
         ..CompilerOptions::default()
     }
 }

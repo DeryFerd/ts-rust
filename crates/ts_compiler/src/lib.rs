@@ -1811,6 +1811,10 @@ impl Program {
             ProgramChecker::Canonical,
         );
         program.load_remaining_program_graph(file_system);
+        if program.options.printer_settings().emit_javascript {
+            let diagnostics = program.canonical_javascript_output_diagnostics();
+            program.diagnostics.extend(diagnostics);
+        }
         let mut result = None;
         if !program.options.no_check {
             let (diagnostics, query_result) = program.check_program_canonical(queries)?;
@@ -1841,6 +1845,57 @@ impl Program {
             self.load_automatic_type_directives(file_system, &resolution_options);
         }
         self.load_module_graph(file_system, resolution_options);
+    }
+
+    fn canonical_javascript_output_diagnostics(&self) -> Vec<ProgramDiagnostic> {
+        let source_names = self
+            .source_files
+            .iter()
+            .filter(|source| {
+                !source.is_default_library
+                    && self.source_should_emit(source)
+                    && (!ts_path::is_declaration_file(&source.file_name)
+                        || self.root_file_names.contains(&canonicalize(
+                            &source.file_name,
+                            &self.current_directory,
+                            self.case_sensitivity,
+                        )))
+            })
+            .map(|source| source.file_name.clone())
+            .collect::<Vec<_>>();
+        let common_source_directory = ts_outputpaths::common_source_directory(
+            &source_names,
+            &self.current_directory,
+            self.case_sensitivity,
+        );
+        let mut checked_paths = BTreeSet::new();
+
+        self.source_files
+            .iter()
+            .filter(|source| {
+                !source.is_default_library
+                    && !ts_path::is_declaration_file(&source.file_name)
+                    && self.source_should_emit(source)
+            })
+            .filter_map(|source| {
+                let paths = if self.options.out_file.is_some() {
+                    ts_outputpaths::bundle_output_paths(&self.options, &self.current_directory)?
+                } else {
+                    ts_outputpaths::output_paths(
+                        &source.file_name,
+                        &self.options,
+                        &self.current_directory,
+                        &common_source_directory,
+                        self.case_sensitivity,
+                    )
+                };
+                let file_name = paths.javascript?;
+                let canonical =
+                    canonicalize(&file_name, &self.current_directory, self.case_sensitivity);
+                (self.output_overwrites_input(&file_name) && checked_paths.insert(canonical))
+                    .then(|| output_overwrites_input_diagnostic(&file_name))
+            })
+            .collect()
     }
 
     /// Creates a Program from the explicit `files` list in a tsconfig.
