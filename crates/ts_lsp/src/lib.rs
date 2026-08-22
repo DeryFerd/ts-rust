@@ -103,7 +103,7 @@ pub struct ServerCapabilities {
     pub hover_provider: bool,
     pub definition_provider: bool,
     pub references_provider: bool,
-    pub rename_provider: bool,
+    pub rename_provider: RenameOptions,
     pub diagnostic_provider: DiagnosticOptions,
     pub document_symbol_provider: bool,
     pub workspace_symbol_provider: bool,
@@ -126,6 +126,12 @@ pub struct ServerCapabilities {
 pub struct DiagnosticOptions {
     pub inter_file_dependencies: bool,
     pub workspace_diagnostics: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RenameOptions {
+    pub prepare_provider: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
@@ -244,6 +250,12 @@ pub struct RenameParams {
     pub text_document: TextDocumentIdentifier,
     pub position: Position,
     pub new_name: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct PrepareRenameResult {
+    pub range: Range,
+    pub placeholder: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
@@ -650,6 +662,9 @@ impl Server {
         if method == "textDocument/references" {
             return vec![self.references(id, message.params)];
         }
+        if method == "textDocument/prepareRename" {
+            return vec![self.prepare_rename(id, message.params)];
+        }
         if method == "textDocument/rename" {
             return vec![self.rename(id, message.params)];
         }
@@ -725,7 +740,9 @@ impl Server {
                 hover_provider: true,
                 definition_provider: true,
                 references_provider: true,
-                rename_provider: true,
+                rename_provider: RenameOptions {
+                    prepare_provider: true,
+                },
                 diagnostic_provider: DiagnosticOptions {
                     inter_file_dependencies: true,
                     workspace_diagnostics: false,
@@ -1045,6 +1062,34 @@ impl Server {
             })
         })
         .collect()
+    }
+
+    fn prepare_rename(&self, id: Id, params: Option<Value>) -> OutgoingMessage {
+        let Ok(params) = deserialize_params::<TextDocumentPositionParams>(params) else {
+            return failure(id, CODE_INVALID_PARAMS, "invalid prepare rename parameters");
+        };
+        let result = self.prepare_rename_at(&params);
+        OutgoingMessage::Response(Response::success(
+            id,
+            serde_json::to_value(result).unwrap_or(Value::Null),
+        ))
+    }
+
+    fn prepare_rename_at(
+        &self,
+        params: &TextDocumentPositionParams,
+    ) -> Option<PrepareRenameResult> {
+        let document = self.documents.get(&params.text_document.uri)?;
+        let offset = u32::try_from(byte_offset(&document.text, params.position).ok()?).ok()?;
+        let program = self.build_program();
+        let source = program.source_file(&document.file_name)?;
+        let node = identifier_at(source, offset)?;
+        let name = identifier_text(source, node)?;
+        semantic_target(&program, &self.workspace, source, node, name)?;
+        Some(PrepareRenameResult {
+            range: node_range(source, node)?,
+            placeholder: name.to_owned(),
+        })
     }
 
     fn rename(&self, id: Id, params: Option<Value>) -> OutgoingMessage {
@@ -4036,6 +4081,7 @@ mod tests {
             2
         );
         let capabilities = &initialize["result"]["capabilities"];
+        assert_eq!(capabilities["renameProvider"]["prepareProvider"], true);
         assert_eq!(
             capabilities["diagnosticProvider"]["interFileDependencies"],
             true
@@ -4221,6 +4267,23 @@ mod tests {
             },
             "renamed",
         );
+        write_position_request(
+            &mut input,
+            27,
+            "textDocument/prepareRename",
+            main_uri.clone(),
+            position("total"),
+        );
+        write_position_request(
+            &mut input,
+            28,
+            "textDocument/prepareRename",
+            main_uri.clone(),
+            Position {
+                line: 1,
+                character: 5,
+            },
+        );
 
         let output = finish_framed_session(input);
         let response = |id| output.iter().find(|message| message["id"] == id).unwrap();
@@ -4233,6 +4296,12 @@ mod tests {
         assert_eq!(edit_count(response(24), &main_uri), 2);
         assert_eq!(edit_count(response(25), &main_uri), 2);
         assert_eq!(response(26)["error"]["code"], CODE_INVALID_PARAMS);
+        assert_eq!(response(27)["result"]["placeholder"], "total");
+        assert_eq!(
+            response(27)["result"]["range"]["start"],
+            serde_json::to_value(position("total")).unwrap()
+        );
+        assert!(response(28)["result"].is_null());
     }
 
     #[test]
