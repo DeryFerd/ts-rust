@@ -9595,6 +9595,7 @@ fn parser_diagnostic(range: TextRange, message: &str) -> Diagnostic {
         "Expected a variable name." => Some((1134, Vec::new())),
         "Expected an argument." => Some((1135, Vec::new())),
         "Expected a string literal." | "Expected a module specifier." => Some((1141, Vec::new())),
+        "Expected a JSX attribute value." => Some((1145, Vec::new())),
         "Expected 'catch' or 'finally'." => Some((1472, Vec::new())),
         "Expected an import attribute name." => Some((1478, Vec::new())),
         "Declaration or statement expected." => Some((1128, Vec::new())),
@@ -9616,6 +9617,7 @@ fn parser_diagnostic(range: TextRange, message: &str) -> Diagnostic {
         | "Expected a namespace import name."
         | "Expected an export name."
         | "Expected an exported name."
+        | "Expected a JSX tag name."
         | "Expected a predicate parameter name." => Some((1003, Vec::new())),
         "Expected a method body." => Some((1005, vec!["{".to_owned()])),
         _ => expected_token_argument(message).map(|token| (1005, vec![token])),
@@ -16257,6 +16259,27 @@ export as namespace GlobalName;
     }
 
     #[test]
+    fn reports_the_catalog_diagnostic_for_a_missing_jsx_attribute_value() {
+        let result = parse_jsx_source_file("const x = <div foo= ></div>;\nconst y = 0;");
+        assert_eq!(
+            result
+                .diagnostics
+                .iter()
+                .map(|diagnostic| {
+                    (
+                        diagnostic.code,
+                        diagnostic.range.start.get(),
+                        diagnostic.range.end.get(),
+                        diagnostic.message.as_str(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            [(Some(1145), 20, 21, "'{' or JSX element expected.")]
+        );
+        assert_eq!(source_statements(&result).len(), 2);
+    }
+
+    #[test]
     fn parses_jsx_element_attribute_values_and_reports_adjacent_parents() {
         let source = "<X a=<b/><c/> />";
         let result = parse_jsx_source_file(source);
@@ -16439,6 +16462,24 @@ export as namespace GlobalName;
     #[test]
     fn javascript_jsx_recovers_unary_elements_without_type_arguments() {
         let less_than = parse_javascript_source_file("~< <");
+        assert_eq!(
+            less_than
+                .diagnostics
+                .iter()
+                .map(|diagnostic| {
+                    (
+                        diagnostic.code,
+                        diagnostic.range.start.get(),
+                        diagnostic.range.end.get(),
+                        diagnostic.message.as_str(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            [
+                (Some(1003), 3, 4, "Identifier expected."),
+                (Some(1109), 4, 4, "Expression expected."),
+            ]
+        );
         let NodeData::ExpressionStatement(statement) = &less_than
             .arena
             .get(source_statements(&less_than)[0])
