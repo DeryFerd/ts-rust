@@ -249,12 +249,12 @@ impl<'a, F: FileSystem + ?Sized> Resolver<'a, F> {
         let resolved = if is_relative(specifier) {
             let candidate = resolve_path(&containing_directory, &[specifier]);
             state
-                .resolve_candidate(&candidate, false)
+                .resolve_relative_candidate(&candidate, false)
                 .or_else(|| state.resolve_root_dirs(specifier, &containing_directory))
         } else if is_absolute(specifier) {
             state.resolve_paths_or_base_url(specifier).or_else(|| {
                 let candidate = resolve_path(&containing_directory, &[specifier]);
-                state.resolve_candidate(&candidate, false)
+                state.resolve_relative_candidate(&candidate, false)
             })
         } else if self.options.mode == ResolutionMode::Classic {
             state.resolve_paths_or_base_url(specifier).or_else(|| {
@@ -415,7 +415,7 @@ impl<F: FileSystem + ?Sized> ResolutionState<'_, '_, F> {
                 let candidate = resolve_path(&base, &[&mapped]);
                 let previous_ending = self.candidate_ending_is_from_config;
                 self.candidate_ending_is_from_config = source_extension(&substitution).is_some();
-                let resolved = self.resolve_candidate(&candidate, false);
+                let resolved = self.resolve_relative_candidate(&candidate, false);
                 self.candidate_ending_is_from_config = previous_ending;
                 if let Some(resolved) = resolved {
                     return Some(resolved);
@@ -424,7 +424,7 @@ impl<F: FileSystem + ?Sized> ResolutionState<'_, '_, F> {
         }
         let base = self.resolver.options.base_url.as_deref()?;
         let candidate = resolve_path(base, &[specifier]);
-        self.resolve_candidate(&candidate, false)
+        self.resolve_relative_candidate(&candidate, false)
     }
 
     fn resolve_root_dirs(
@@ -449,7 +449,7 @@ impl<F: FileSystem + ?Sized> ResolutionState<'_, '_, F> {
                 resolve_path(&root, &[&suffix])
             };
             let candidate = resolve_path(&candidate_directory, &[specifier]);
-            if let Some(resolved) = self.resolve_candidate(&candidate, false) {
+            if let Some(resolved) = self.resolve_relative_candidate(&candidate, false) {
                 return Some(resolved);
             }
         }
@@ -609,6 +609,16 @@ impl<F: FileSystem + ?Sized> ResolutionState<'_, '_, F> {
         rest: &str,
     ) -> Option<ResolvedModule> {
         let package_directory = join(node_modules, package_name);
+        if !rest.is_empty() {
+            let nested_directory = join(&package_directory, rest);
+            let nested_package_json = join(&nested_directory, "package.json");
+            if self.resolver.file_system.file_exists(&nested_package_json)
+                && !self.package_exports_apply(&package_directory)
+                && let Some(resolved) = self.resolve_candidate(&nested_directory, true)
+            {
+                return Some(resolved);
+            }
+        }
         match self.resolve_package_metadata(&package_directory, rest) {
             PackageMetadataResolution::Resolved(resolved) => return Some(resolved),
             PackageMetadataResolution::Blocked => return None,
@@ -684,9 +694,19 @@ impl<F: FileSystem + ?Sized> ResolutionState<'_, '_, F> {
                     return PackageMetadataResolution::Resolved(resolved);
                 }
             }
-            return PackageMetadataResolution::Blocked;
         }
         PackageMetadataResolution::NotApplicable
+    }
+
+    fn package_exports_apply(&mut self, package_directory: &str) -> bool {
+        self.resolver.options.resolve_package_json_exports
+            && matches!(
+                self.resolver.options.mode,
+                ResolutionMode::Node16 | ResolutionMode::NodeNext | ResolutionMode::Bundler
+            )
+            && self
+                .read_package_json(&join(package_directory, "package.json"))
+                .is_some_and(|package| package.exports.is_some_and(|exports| !exports.is_null()))
     }
 
     fn resolve_package_target(
@@ -726,7 +746,7 @@ impl<F: FileSystem + ?Sized> ResolutionState<'_, '_, F> {
                 }
                 let candidate = resolve_path(package_directory, &[&expanded]);
                 let external = package_directory.contains("/node_modules/");
-                self.resolve_candidate_with_package(&candidate, package_json, external)
+                self.resolve_package_map_file(&candidate, package_json, external)
                     .map_or(PackageTargetResolution::NotMatched, |mut resolved| {
                         resolved.is_external_library_import = external;
                         resolved.resolved_using_ts_extension = is_pattern
@@ -788,6 +808,40 @@ impl<F: FileSystem + ?Sized> ResolutionState<'_, '_, F> {
             return self.resolve_index(candidate, external, Some(package_json));
         }
         None
+    }
+
+    fn resolve_package_map_file(
+        &mut self,
+        candidate: &str,
+        package_json: &str,
+        external: bool,
+    ) -> Option<ResolvedModule> {
+        if !path_has_extension(candidate) {
+            return None;
+        }
+        if is_typescript_extension(candidate) {
+            return self.try_file(candidate, external, Some(package_json));
+        }
+        self.resolve_file(candidate, external, Some(package_json))
+    }
+
+    fn resolve_relative_candidate(
+        &mut self,
+        candidate: &str,
+        external: bool,
+    ) -> Option<ResolvedModule> {
+        if self.import_condition
+            && matches!(
+                self.resolver.options.mode,
+                ResolutionMode::Node16 | ResolutionMode::NodeNext
+            )
+        {
+            if !path_has_extension(candidate) {
+                return None;
+            }
+            return self.resolve_file(candidate, external, None);
+        }
+        self.resolve_candidate(candidate, external)
     }
 
     fn resolve_candidate(&mut self, candidate: &str, external: bool) -> Option<ResolvedModule> {
@@ -878,20 +932,32 @@ impl<F: FileSystem + ?Sized> ResolutionState<'_, '_, F> {
         package_json: Option<&str>,
     ) -> Option<ResolvedModule> {
         for path in self.file_candidates(candidate) {
-            for candidate in self.module_suffix_candidates(&path) {
-                if self.resolver.file_system.file_exists(&candidate) {
-                    let resolved_file_name = self.resolver.file_system.realpath(&candidate);
-                    return Some(ResolvedModule {
-                        extension: ts_path::extension_from_path(&resolved_file_name),
-                        resolved_file_name,
-                        resolved_using_ts_extension: self.specifier_uses_ts_extension
-                            && !self.candidate_ending_is_from_config,
-                        is_external_library_import: external,
-                        package_json: package_json.map(str::to_owned),
-                    });
-                }
-                self.failed(FailedLookupKind::File, &candidate);
+            if let Some(resolved) = self.try_file(&path, external, package_json) {
+                return Some(resolved);
             }
+        }
+        None
+    }
+
+    fn try_file(
+        &mut self,
+        path: &str,
+        external: bool,
+        package_json: Option<&str>,
+    ) -> Option<ResolvedModule> {
+        for candidate in self.module_suffix_candidates(path) {
+            if self.resolver.file_system.file_exists(&candidate) {
+                let resolved_file_name = self.resolver.file_system.realpath(&candidate);
+                return Some(ResolvedModule {
+                    extension: ts_path::extension_from_path(&resolved_file_name),
+                    resolved_file_name,
+                    resolved_using_ts_extension: self.specifier_uses_ts_extension
+                        && !self.candidate_ending_is_from_config,
+                    is_external_library_import: external,
+                    package_json: package_json.map(str::to_owned),
+                });
+            }
+            self.failed(FailedLookupKind::File, &candidate);
         }
         None
     }
@@ -1002,19 +1068,28 @@ fn best_path_match(
     paths: &BTreeMap<String, Vec<String>>,
     specifier: &str,
 ) -> Option<(String, Vec<String>)> {
-    paths
-        .iter()
-        .filter_map(|(pattern, substitutions)| {
-            match_pattern(pattern, specifier).map(|capture| {
-                (
-                    pattern.len().saturating_sub(1),
-                    capture,
-                    substitutions.as_slice(),
-                )
-            })
-        })
-        .max_by_key(|(specificity, _, _)| *specificity)
-        .map(|(_, capture, substitutions)| (capture.to_owned(), substitutions.to_vec()))
+    if let Some(substitutions) = paths.get(specifier) {
+        return Some((String::new(), substitutions.clone()));
+    }
+    let mut best: Option<(usize, &str, &[String])> = None;
+    for (pattern, substitutions) in paths {
+        let Some(star) = pattern.find('*') else {
+            continue;
+        };
+        if pattern[star + 1..].contains('*') {
+            continue;
+        }
+        let Some(capture) = match_pattern(pattern, specifier) else {
+            continue;
+        };
+        if best
+            .as_ref()
+            .is_none_or(|(prefix_length, _, _)| star > *prefix_length)
+        {
+            best = Some((star, capture, substitutions.as_slice()));
+        }
+    }
+    best.map(|(_, capture, substitutions)| (capture.to_owned(), substitutions.to_vec()))
 }
 
 fn match_pattern<'a>(pattern: &str, value: &'a str) -> Option<&'a str> {
@@ -1194,15 +1269,32 @@ fn types_version_targets(types_versions: &Value, rest: &str) -> Option<Vec<Strin
             .filter(|range| range.test(&compiler_version))
             .and_then(|_| mapping.as_object())
     })?;
-    let (_, capture, targets) = mapping
-        .iter()
-        .filter_map(|(pattern, targets)| {
-            match_pattern(pattern, rest)
-                .map(|capture| (pattern.len().saturating_sub(1), capture, targets.as_array()))
-        })
-        .max_by_key(|(specificity, _, _)| *specificity)?;
+    let (capture, targets) = if let Some(targets) = mapping.get(rest) {
+        ("", targets.as_array()?)
+    } else {
+        let mut best: Option<(usize, &str, &Value)> = None;
+        for (pattern, targets) in mapping {
+            let Some(star) = pattern.find('*') else {
+                continue;
+            };
+            if pattern[star + 1..].contains('*') {
+                continue;
+            }
+            let Some(capture) = match_pattern(pattern, rest) else {
+                continue;
+            };
+            if best
+                .as_ref()
+                .is_none_or(|(prefix_length, _, _)| star > *prefix_length)
+            {
+                best = Some((star, capture, targets));
+            }
+        }
+        let (_, capture, targets) = best?;
+        (capture, targets.as_array()?)
+    };
     Some(
-        targets?
+        targets
             .iter()
             .filter_map(Value::as_str)
             .map(|target| target.replace('*', capture))
@@ -1221,6 +1313,12 @@ fn source_extension(path: &str) -> Option<&'static str> {
     ]
     .into_iter()
     .find(|extension| path.ends_with(extension))
+}
+
+fn path_has_extension(path: &str) -> bool {
+    path.rsplit('/')
+        .next()
+        .is_some_and(|name| name.contains('.'))
 }
 
 fn is_typescript_extension(path: &str) -> bool {
@@ -1436,6 +1534,59 @@ mod tests {
         assert_eq!(resolved.extension, Some(FileExtension::Ts));
         assert!(!resolved.is_external_library_import);
         assert!(!resolved.resolved_using_ts_extension);
+    }
+
+    #[test]
+    fn node_esm_requires_explicit_relative_file_extensions() {
+        let fs = fs(&[
+            ("/repo/package.json", r#"{"type":"module"}"#),
+            ("/repo/entry.ts", ""),
+            ("/repo/directory/index.ts", ""),
+        ]);
+        let node = Resolver::new(
+            &fs,
+            ResolutionOptions {
+                mode: ResolutionMode::NodeNext,
+                ..ResolutionOptions::default()
+            },
+        );
+
+        assert!(node.resolve("./entry", "/repo/main.ts").resolved.is_none());
+        assert!(
+            node.resolve("./directory", "/repo/main.ts")
+                .resolved
+                .is_none()
+        );
+        assert_eq!(
+            node.resolve("./entry.js", "/repo/main.ts")
+                .resolved
+                .unwrap()
+                .resolved_file_name,
+            "/repo/entry.ts"
+        );
+        assert_eq!(
+            node.resolve_with_mode("./entry", "/repo/main.ts", ModuleFormat::CommonJs)
+                .resolved
+                .unwrap()
+                .resolved_file_name,
+            "/repo/entry.ts"
+        );
+
+        let bundler = Resolver::new(
+            &fs,
+            ResolutionOptions {
+                mode: ResolutionMode::Bundler,
+                ..ResolutionOptions::default()
+            },
+        );
+        assert_eq!(
+            bundler
+                .resolve("./entry", "/repo/main.ts")
+                .resolved
+                .unwrap()
+                .resolved_file_name,
+            "/repo/entry.ts"
+        );
     }
 
     #[test]
@@ -1657,6 +1808,79 @@ mod tests {
     }
 
     #[test]
+    fn paths_prefer_exact_matches_then_the_longest_wildcard_prefix() {
+        let fs = fs(&[
+            ("/repo/exact.d.ts", ""),
+            ("/repo/empty-capture.d.ts", ""),
+            ("/repo/broad/deep/tool.d.ts", ""),
+            ("/repo/deep/tool.development.d.ts", ""),
+        ]);
+        let resolver = Resolver::new(
+            &fs,
+            ResolutionOptions {
+                base_url: Some("/repo".into()),
+                paths: BTreeMap::from([
+                    ("foo/*bar.js".into(), vec!["empty-capture".into()]),
+                    ("foo/bar.js".into(), vec!["exact".into()]),
+                    ("pkg/*.development.js".into(), vec!["broad/*".into()]),
+                    ("pkg/deep/*".into(), vec!["deep/*".into()]),
+                ]),
+                ..ResolutionOptions::default()
+            },
+        );
+
+        assert_eq!(
+            resolver
+                .resolve("foo/bar.js", "/repo/main.ts")
+                .resolved
+                .unwrap()
+                .resolved_file_name,
+            "/repo/exact.d.ts"
+        );
+        assert_eq!(
+            resolver
+                .resolve("pkg/deep/tool.development.js", "/repo/main.ts")
+                .resolved
+                .unwrap()
+                .resolved_file_name,
+            "/repo/deep/tool.development.d.ts"
+        );
+    }
+
+    #[test]
+    fn trailing_directory_paths_prefer_nested_package_types_over_at_types() {
+        let fs = fs(&[
+            (
+                "/repo/node_modules/preact/compat/package.json",
+                r#"{"name":"preact-compat","types":"./index.d.ts"}"#,
+            ),
+            ("/repo/node_modules/preact/compat/index.d.ts", ""),
+            ("/repo/node_modules/@types/react/index.d.ts", ""),
+        ]);
+        let resolver = Resolver::new(
+            &fs,
+            ResolutionOptions {
+                mode: ResolutionMode::Bundler,
+                base_url: Some("/repo".into()),
+                paths: BTreeMap::from([(
+                    "react".into(),
+                    vec!["./node_modules/preact/compat/".into()],
+                )]),
+                ..ResolutionOptions::default()
+            },
+        );
+
+        assert_eq!(
+            resolver
+                .resolve("react", "/repo/app.ts")
+                .resolved
+                .unwrap()
+                .resolved_file_name,
+            "/repo/node_modules/preact/compat/index.d.ts"
+        );
+    }
+
+    #[test]
     fn configured_path_extensions_do_not_count_as_imported_typescript_extensions() {
         let fs = fs(&[("/repo/some-path/index.d.ts", "")]);
         let resolver = Resolver::new(
@@ -1755,6 +1979,48 @@ mod tests {
         assert!(
             resolver
                 .resolve("pkg/private", "/app/src/main.ts")
+                .resolved
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn package_exports_use_exact_declarations_and_require_explicit_targets() {
+        let fs = fs(&[
+            (
+                "/app/node_modules/pkg/package.json",
+                r#"{"exports":{".":"./types/index.d.ts","./implicit":"./types/implicit","./directory":"./types/folder"}}"#,
+            ),
+            ("/app/node_modules/pkg/types/index.ts", ""),
+            ("/app/node_modules/pkg/types/index.d.ts", ""),
+            ("/app/node_modules/pkg/types/implicit.d.ts", ""),
+            ("/app/node_modules/pkg/types/folder/index.d.ts", ""),
+        ]);
+        let resolver = Resolver::new(
+            &fs,
+            ResolutionOptions {
+                mode: ResolutionMode::Bundler,
+                ..ResolutionOptions::default()
+            },
+        );
+
+        assert_eq!(
+            resolver
+                .resolve("pkg", "/app/main.ts")
+                .resolved
+                .unwrap()
+                .resolved_file_name,
+            "/app/node_modules/pkg/types/index.d.ts"
+        );
+        assert!(
+            resolver
+                .resolve("pkg/implicit", "/app/main.ts")
+                .resolved
+                .is_none()
+        );
+        assert!(
+            resolver
+                .resolve("pkg/directory", "/app/main.ts")
                 .resolved
                 .is_none()
         );
@@ -2126,6 +2392,107 @@ mod tests {
         assert_eq!(
             resolved.package_json.as_deref(),
             Some("/app/node_modules/pkg/package.json")
+        );
+    }
+
+    #[test]
+    fn nested_package_types_take_priority_over_root_types_versions() {
+        let fs = fs(&[
+            (
+                "/app/node_modules/pkg/package.json",
+                r#"{"typesVersions":{">=7":{"sub":["./root.d.ts"]}}}"#,
+            ),
+            ("/app/node_modules/pkg/root.d.ts", ""),
+            (
+                "/app/node_modules/pkg/sub/package.json",
+                r#"{"types":"./nested.d.ts"}"#,
+            ),
+            ("/app/node_modules/pkg/sub/nested.d.ts", ""),
+            (
+                "/app/node_modules/protected/package.json",
+                r#"{"exports":{"./sub":"./public.d.ts"}}"#,
+            ),
+            ("/app/node_modules/protected/public.d.ts", ""),
+            (
+                "/app/node_modules/protected/sub/package.json",
+                r#"{"types":"./private.d.ts"}"#,
+            ),
+            ("/app/node_modules/protected/sub/private.d.ts", ""),
+        ]);
+        let resolver = Resolver::new(
+            &fs,
+            ResolutionOptions {
+                mode: ResolutionMode::Bundler,
+                ..ResolutionOptions::default()
+            },
+        );
+
+        assert_eq!(
+            resolver
+                .resolve("pkg/sub", "/app/main.ts")
+                .resolved
+                .unwrap()
+                .resolved_file_name,
+            "/app/node_modules/pkg/sub/nested.d.ts"
+        );
+        assert_eq!(
+            resolver
+                .resolve("protected/sub", "/app/main.ts")
+                .resolved
+                .unwrap()
+                .resolved_file_name,
+            "/app/node_modules/protected/public.d.ts"
+        );
+    }
+
+    #[test]
+    fn missing_types_versions_targets_fall_back_to_direct_package_files() {
+        let fs = fs(&[
+            (
+                "/app/node_modules/pkg/package.json",
+                r#"{"typesVersions":{">=7":{"feature/*":["./missing/*"]}}}"#,
+            ),
+            ("/app/node_modules/pkg/feature/tool.d.ts", ""),
+        ]);
+
+        assert_eq!(
+            Resolver::new(&fs, ResolutionOptions::default())
+                .resolve("pkg/feature/tool", "/app/main.ts")
+                .resolved
+                .unwrap()
+                .resolved_file_name,
+            "/app/node_modules/pkg/feature/tool.d.ts"
+        );
+    }
+
+    #[test]
+    fn types_versions_prefer_exact_keys_then_the_longest_wildcard_prefix() {
+        let fs = fs(&[
+            (
+                "/app/node_modules/pkg/package.json",
+                r#"{"typesVersions":{">=7":{"feature/*-suffix":["./broad/*"],"feature/deep/*":["./deep/*"],"feature/deep/exact-suffix":["./exact.d.ts"]}}}"#,
+            ),
+            ("/app/node_modules/pkg/broad/deep/item.d.ts", ""),
+            ("/app/node_modules/pkg/deep/item-suffix.d.ts", ""),
+            ("/app/node_modules/pkg/exact.d.ts", ""),
+        ]);
+        let resolver = Resolver::new(&fs, ResolutionOptions::default());
+
+        assert_eq!(
+            resolver
+                .resolve("pkg/feature/deep/item-suffix", "/app/main.ts")
+                .resolved
+                .unwrap()
+                .resolved_file_name,
+            "/app/node_modules/pkg/deep/item-suffix.d.ts"
+        );
+        assert_eq!(
+            resolver
+                .resolve("pkg/feature/deep/exact-suffix", "/app/main.ts")
+                .resolved
+                .unwrap()
+                .resolved_file_name,
+            "/app/node_modules/pkg/exact.d.ts"
         );
     }
 
