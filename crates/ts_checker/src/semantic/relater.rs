@@ -5667,7 +5667,10 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         let record = self
             .type_payload(type_id)
             .ok_or(RelationUnavailable::Type(type_id))?;
-        if !bootstrap.strict_null_checks || !record.flags().intersects(TypeFlags::UNION) {
+        if !bootstrap.strict_null_checks
+            || !record.flags().intersects(TypeFlags::UNION)
+            || record.flags().intersects(TypeFlags::ENUM_LITERAL)
+        {
             return Ok(false);
         }
         if record

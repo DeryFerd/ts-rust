@@ -14765,39 +14765,54 @@ mod tests {
             "current = Colors.Second; ",
             "const exact = Colors.First;",
         ));
-        let file = FileId::new(8_299);
-        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        for strict_null_checks in [false, true] {
+            let file = FileId::new(8_299 + u32::from(strict_null_checks));
+            let mut context = context(
+                &[(file, &source)],
+                CanonicalCheckerOptions {
+                    intrinsic: IntrinsicBootstrapOptions {
+                        strict_null_checks,
+                        ..IntrinsicBootstrapOptions::default()
+                    },
+                    ..CanonicalCheckerOptions::default()
+                },
+            );
 
-        context.check_source_file(file).unwrap();
+            context.check_source_file(file).unwrap();
 
-        let owner = global_symbol(&context, "Colors");
-        let declared = context
-            .store()
-            .declared_type_links(owner)
-            .and_then(|links| links.declared_type)
-            .expect("Colors must retain its declared enum type");
-        let exact = variable_value_type(&context, &source, file, "exact");
-        let regular = match context.store().type_payload(exact).unwrap().data() {
-            TypeData::Literal(literal) => literal.regular_type,
-            _ => panic!("Colors.First must retain an enum literal type"),
-        };
-        assert_eq!(
-            variable_value_type(&context, &source, file, "current"),
-            declared
-        );
-        assert_eq!(
-            widened_fresh_literal_type(context.store(), exact),
-            Ok(declared)
-        );
-        assert_eq!(
-            widened_fresh_literal_type(context.store(), regular),
-            Ok(regular)
-        );
-        assert!(context.diagnostics().is_empty());
+            let owner = global_symbol(&context, "Colors");
+            let declared = context
+                .store()
+                .declared_type_links(owner)
+                .and_then(|links| links.declared_type)
+                .expect("Colors must retain its declared enum type");
+            let exact = variable_value_type(&context, &source, file, "exact");
+            let regular = match context.store().type_payload(exact).unwrap().data() {
+                TypeData::Literal(literal) => literal.regular_type,
+                _ => panic!("Colors.First must retain an enum literal type"),
+            };
+            assert_eq!(
+                variable_value_type(&context, &source, file, "current"),
+                declared
+            );
+            assert_eq!(
+                widened_fresh_literal_type(context.store(), exact),
+                Ok(declared)
+            );
+            assert_eq!(
+                widened_fresh_literal_type(context.store(), regular),
+                Ok(regular)
+            );
+            assert_eq!(
+                context.store().type_payload(declared).unwrap().object_flags(),
+                ObjectFlags::PRIMITIVE_UNION,
+            );
+            assert!(context.diagnostics().is_empty());
 
-        let warm = observable_state(&context, file);
-        context.recheck_source_file(file).unwrap();
-        assert_eq!(observable_state(&context, file), warm);
+            let warm = observable_state(&context, file);
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(observable_state(&context, file), warm);
+        }
     }
 
     #[test]
