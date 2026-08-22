@@ -5,15 +5,16 @@
 //! tags, then parses each type with the ordinary TypeScript type parser. The
 //! resulting values never contain node identities from that temporary arena.
 
-use std::fmt;
+use std::{collections::HashSet, fmt};
 
 use ts_ast::{NodeArena, NodeData, NodeId, NodeRef, SyntaxKind};
 use ts_core::{Diagnostic, DiagnosticCategory, TextPos, TextRange};
-use ts_diagnostics::{Category, message_by_code};
+use ts_diagnostics::{Category, Diagnostic as CheckerDiagnostic, message_by_code};
 use ts_parser::{parse_jsdoc_comment, parse_source_file};
 
 use super::{
-    ArrayTypeError, CanonicalCheckerOptions, CanonicalGlobalTypes, CanonicalTypeMapperStore,
+    ArrayTypeError, CanonicalCheckerDiagnostic, CanonicalCheckerDiagnosticRange,
+    CanonicalCheckerOptions, CanonicalGlobalTypes, CanonicalTypeMapperStore,
     IntrinsicBootstrapOptions, TypeId, bootstrap::UnionReduction,
 };
 
@@ -26,6 +27,7 @@ pub enum JsDocTagKind {
     Parameter,
     Return,
     Typedef,
+    Augments,
 }
 
 /// Intrinsic types accepted by the pinned `JSDoc` type grammar.
@@ -85,6 +87,33 @@ impl<'source> JsDocTypeExpression<'source> {
     pub const fn type_(&self) -> &JsDocType {
         &self.type_
     }
+
+    #[must_use]
+    pub fn planned(&self) -> PlannedJsDocType {
+        PlannedJsDocType {
+            range: self.range,
+            type_: self.type_.clone(),
+        }
+    }
+}
+
+/// An owned annotation that can outlive its parsed source comment.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlannedJsDocType {
+    range: TextRange,
+    type_: JsDocType,
+}
+
+impl PlannedJsDocType {
+    #[must_use]
+    pub const fn range(&self) -> TextRange {
+        self.range
+    }
+
+    #[must_use]
+    pub const fn type_(&self) -> &JsDocType {
+        &self.type_
+    }
 }
 
 /// The parameter or typedef name carried by one `JSDoc` tag.
@@ -110,6 +139,7 @@ impl<'source> JsDocTagName<'source> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct JsDocTag<'source> {
     kind: JsDocTagKind,
+    tag_name: &'source str,
     range: TextRange,
     name: Option<JsDocTagName<'source>>,
     type_expression: Option<JsDocTypeExpression<'source>>,
@@ -121,6 +151,11 @@ impl<'source> JsDocTag<'source> {
     #[must_use]
     pub const fn kind(&self) -> JsDocTagKind {
         self.kind
+    }
+
+    #[must_use]
+    pub const fn tag_name(&self) -> &'source str {
+        self.tag_name
     }
 
     #[must_use]
@@ -192,6 +227,146 @@ impl<'source> ParsedJsDocComment<'source> {
                 && tag.name.is_some_and(|parameter| parameter.text == name)
         })
     }
+
+    #[must_use]
+    pub fn augments_tag(&self) -> Option<&JsDocTag<'source>> {
+        self.tags
+            .iter()
+            .find(|tag| tag.kind == JsDocTagKind::Augments)
+    }
+}
+
+/// One owned `JSDoc` parameter and its declaration name.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlannedJsDocParameter {
+    name: String,
+    range: TextRange,
+    type_: Option<PlannedJsDocType>,
+    optional: bool,
+    name_first: bool,
+}
+
+impl PlannedJsDocParameter {
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    #[must_use]
+    pub const fn range(&self) -> TextRange {
+        self.range
+    }
+
+    #[must_use]
+    pub const fn type_(&self) -> Option<&PlannedJsDocType> {
+        self.type_.as_ref()
+    }
+
+    #[must_use]
+    pub const fn is_optional(&self) -> bool {
+        self.optional
+    }
+}
+
+/// A `JSDoc` typedef retained before its synthetic binder declaration exists.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlannedJsDocTypedef {
+    name: String,
+    range: TextRange,
+    type_: Option<PlannedJsDocType>,
+}
+
+impl PlannedJsDocTypedef {
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    #[must_use]
+    pub const fn range(&self) -> TextRange {
+        self.range
+    }
+
+    #[must_use]
+    pub const fn type_(&self) -> Option<&PlannedJsDocType> {
+        self.type_.as_ref()
+    }
+}
+
+/// Source-owned `JSDoc` annotations for one JavaScript declaration.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlannedJavaScriptDeclaration {
+    node: NodeRef,
+    type_: Option<PlannedJsDocType>,
+    parameters: Vec<PlannedJsDocParameter>,
+    return_type: Option<PlannedJsDocType>,
+    typedefs: Vec<PlannedJsDocTypedef>,
+    augments_type: Option<PlannedJsDocType>,
+}
+
+impl PlannedJavaScriptDeclaration {
+    #[must_use]
+    pub const fn node(&self) -> NodeRef {
+        self.node
+    }
+
+    #[must_use]
+    pub const fn type_(&self) -> Option<&PlannedJsDocType> {
+        self.type_.as_ref()
+    }
+
+    #[must_use]
+    pub fn parameters(&self) -> &[PlannedJsDocParameter] {
+        &self.parameters
+    }
+
+    #[must_use]
+    pub fn parameter(&self, name: &str) -> Option<&PlannedJsDocParameter> {
+        self.parameters
+            .iter()
+            .find(|parameter| parameter.name == name)
+    }
+
+    #[must_use]
+    pub const fn return_type(&self) -> Option<&PlannedJsDocType> {
+        self.return_type.as_ref()
+    }
+
+    #[must_use]
+    pub fn typedefs(&self) -> &[PlannedJsDocTypedef] {
+        &self.typedefs
+    }
+
+    #[must_use]
+    pub const fn augments_type(&self) -> Option<&PlannedJsDocType> {
+        self.augments_type.as_ref()
+    }
+}
+
+/// The complete owned `JSDoc` plan for one JavaScript source file.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlannedJavaScriptJsDoc {
+    declarations: Vec<PlannedJavaScriptDeclaration>,
+    diagnostics: Vec<CanonicalCheckerDiagnostic>,
+}
+
+impl PlannedJavaScriptJsDoc {
+    #[must_use]
+    pub fn declarations(&self) -> &[PlannedJavaScriptDeclaration] {
+        &self.declarations
+    }
+
+    #[must_use]
+    pub fn declaration(&self, node: NodeRef) -> Option<&PlannedJavaScriptDeclaration> {
+        self.declarations
+            .iter()
+            .find(|declaration| declaration.node == node)
+    }
+
+    #[must_use]
+    pub fn diagnostics(&self) -> &[CanonicalCheckerDiagnostic] {
+        &self.diagnostics
+    }
 }
 
 /// Invalid source provenance or an inconsistent standalone `JSDoc` parse.
@@ -202,6 +377,7 @@ pub enum JsDocCommentError {
     InvalidParserTree(TextRange),
     InvalidSourceNode(NodeRef),
     MissingSourceText(NodeRef),
+    UnsupportedParserDiagnostic { code: Option<u32>, range: TextRange },
     SourcePositionOverflow,
 }
 
@@ -236,6 +412,12 @@ impl fmt::Display for JsDocCommentError {
                 write!(
                     formatter,
                     "JSDoc comment source text is unavailable for {node:?}"
+                )
+            }
+            Self::UnsupportedParserDiagnostic { code, range } => {
+                write!(
+                    formatter,
+                    "JSDoc diagnostic {code:?} cannot be retained at {range:?}"
                 )
             }
             Self::SourcePositionOverflow => {
@@ -458,6 +640,139 @@ pub fn leading_jsdoc_comment(
     parse_jsdoc_comment_at(source, range).map(Some)
 }
 
+/// Returns all adjacent leading `JSDoc` comments in source order.
+///
+/// # Errors
+///
+/// Returns an error when the node or any retained comment has invalid source
+/// provenance.
+pub fn leading_jsdoc_comments(
+    arena: &NodeArena,
+    node: NodeRef,
+) -> Result<Vec<ParsedJsDocComment<'_>>, JsDocCommentError> {
+    if node.arena != arena.id() {
+        return Err(JsDocCommentError::InvalidSourceNode(node));
+    }
+    let record = arena
+        .get(node.node)
+        .ok_or(JsDocCommentError::InvalidSourceNode(node))?;
+    let source = arena
+        .source_text()
+        .ok_or(JsDocCommentError::MissingSourceText(node))?;
+    let mut end = usize::try_from(record.range.start.get())
+        .map_err(|_| JsDocCommentError::InvalidSourceNode(node))?;
+    let mut comments = Vec::new();
+    loop {
+        let prefix = source
+            .get(..end)
+            .ok_or(JsDocCommentError::InvalidSourceNode(node))?
+            .trim_end_matches(char::is_whitespace);
+        if !prefix.ends_with("*/") {
+            break;
+        }
+        let Some(start) = prefix.rfind("/**") else {
+            break;
+        };
+        comments.push(parse_jsdoc_comment_at(
+            source,
+            checked_range(start, prefix.len())?,
+        )?);
+        end = start;
+    }
+    comments.reverse();
+    Ok(comments)
+}
+
+/// Collects source-owned `JSDoc` annotations for JavaScript declarations.
+///
+/// Parser and semantic diagnostics are anchored to the source root because
+/// comment ranges precede the declaration nodes they annotate.
+///
+/// # Errors
+///
+/// Returns an error for invalid source identity, malformed parser trees, or
+/// parser diagnostics whose catalog arguments cannot be reconstructed.
+pub fn plan_javascript_source_jsdoc(
+    arena: &NodeArena,
+    source: NodeRef,
+) -> Result<PlannedJavaScriptJsDoc, JsDocCommentError> {
+    if source.arena != arena.id() {
+        return Err(JsDocCommentError::InvalidSourceNode(source));
+    }
+    let root = arena
+        .get(source.node)
+        .ok_or(JsDocCommentError::InvalidSourceNode(source))?;
+    if root.kind != SyntaxKind::SourceFile || !matches!(root.data, NodeData::SourceFile(_)) {
+        return Err(JsDocCommentError::InvalidSourceNode(source));
+    }
+    if arena.source_text().is_none() {
+        return Err(JsDocCommentError::MissingSourceText(source));
+    }
+
+    let mut pending = vec![source.node];
+    let mut seen_comments = HashSet::new();
+    let mut declarations = Vec::new();
+    let mut diagnostics = Vec::new();
+
+    while let Some(node) = pending.pop() {
+        let record = arena
+            .get(node)
+            .ok_or(JsDocCommentError::InvalidSourceNode(source))?;
+        let reference = NodeRef::new(arena.id(), source.file, node);
+        if is_jsdoc_declaration_candidate(record.kind) {
+            let comments = leading_jsdoc_comments(arena, reference)?
+                .into_iter()
+                .filter(|comment| {
+                    seen_comments.insert((comment.range().start.get(), comment.range().end.get()))
+                })
+                .collect::<Vec<_>>();
+            if !comments.is_empty() {
+                let declaration = javascript_jsdoc_owner(arena, reference)?;
+                let mut planned = PlannedJavaScriptDeclaration {
+                    node: declaration,
+                    type_: None,
+                    parameters: Vec::new(),
+                    return_type: None,
+                    typedefs: Vec::new(),
+                    augments_type: None,
+                };
+                for comment in comments {
+                    for diagnostic in comment.diagnostics() {
+                        diagnostics.push(canonical_parser_diagnostic(source, diagnostic)?);
+                    }
+                    for tag in comment.tags() {
+                        apply_jsdoc_tag(arena, source, &mut planned, tag, &mut diagnostics)?;
+                    }
+                }
+                append_unmatched_parameter_diagnostics(arena, source, &planned, &mut diagnostics)?;
+                declarations.push(planned);
+            }
+        }
+        let mut children = Vec::new();
+        record.for_each_child(|child| children.push(child));
+        pending.extend(children.into_iter().rev());
+    }
+
+    Ok(PlannedJavaScriptJsDoc {
+        declarations,
+        diagnostics,
+    })
+}
+
+/// Appends planned comment diagnostics with the source checker's retry rules.
+pub fn append_javascript_jsdoc_diagnostics(
+    plan: &PlannedJavaScriptJsDoc,
+    diagnostics: &mut super::CanonicalCheckerDiagnostics,
+) {
+    for diagnostic in &plan.diagnostics {
+        diagnostics.lookup_primary_or_issue(
+            diagnostic.node,
+            diagnostic.range_override,
+            diagnostic.diagnostic.clone(),
+        );
+    }
+}
+
 /// Resolves a primitive `JSDoc` annotation without mutating the checker store.
 ///
 /// # Errors
@@ -522,12 +837,350 @@ pub fn resolve_jsdoc_type(
     )
 }
 
+/// Validates an owned `JSDoc` annotation before any semantic allocation.
+///
+/// # Errors
+///
+/// Returns the same unsupported-reference, option, and global-identity errors
+/// as [`resolve_planned_jsdoc_type`].
+pub fn preflight_planned_jsdoc_type(
+    store: &CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    annotation: &PlannedJsDocType,
+) -> Result<(), JsDocTypeResolutionError> {
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or(JsDocTypeResolutionError::MissingBootstrap)?;
+    if bootstrap.options != options.intrinsic {
+        return Err(JsDocTypeResolutionError::OptionsMismatch {
+            initialized: bootstrap.options,
+            requested: options.intrinsic,
+        });
+    }
+    validate_resolvable_type(
+        store,
+        global_types,
+        options,
+        annotation.type_(),
+        annotation.range(),
+    )
+}
+
+/// Resolves an owned annotation into the source checker's canonical store.
+///
+/// # Errors
+///
+/// Returns an error for unsupported syntax, invalid global identities,
+/// inconsistent options, or failed union/array allocation.
+pub fn resolve_planned_jsdoc_type(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    annotation: &PlannedJsDocType,
+) -> Result<TypeId, JsDocTypeResolutionError> {
+    preflight_planned_jsdoc_type(store, global_types, options, annotation)?;
+    resolve_complete_type(
+        store,
+        global_types,
+        options,
+        annotation.type_(),
+        annotation.range(),
+    )
+}
+
+fn is_jsdoc_declaration_candidate(kind: SyntaxKind) -> bool {
+    matches!(
+        kind,
+        SyntaxKind::VariableStatement
+            | SyntaxKind::FunctionDeclaration
+            | SyntaxKind::FunctionExpression
+            | SyntaxKind::ArrowFunction
+            | SyntaxKind::ClassDeclaration
+            | SyntaxKind::PropertyDeclaration
+            | SyntaxKind::MethodDeclaration
+    )
+}
+
+fn javascript_jsdoc_owner(arena: &NodeArena, node: NodeRef) -> Result<NodeRef, JsDocCommentError> {
+    let record = arena
+        .get(node.node)
+        .ok_or(JsDocCommentError::InvalidSourceNode(node))?;
+    let NodeData::VariableStatement(statement) = &record.data else {
+        return Ok(node);
+    };
+    let declaration_list = arena
+        .get(statement.declaration_list)
+        .ok_or(JsDocCommentError::InvalidSourceNode(node))?;
+    let NodeData::VariableDeclarationList(declarations) = &declaration_list.data else {
+        return Err(JsDocCommentError::InvalidSourceNode(node));
+    };
+    let first = declarations
+        .declarations
+        .nodes
+        .first()
+        .copied()
+        .ok_or(JsDocCommentError::InvalidSourceNode(node))?;
+    Ok(NodeRef::new(node.arena, node.file, first))
+}
+
+fn apply_jsdoc_tag(
+    arena: &NodeArena,
+    source: NodeRef,
+    declaration: &mut PlannedJavaScriptDeclaration,
+    tag: &JsDocTag<'_>,
+    diagnostics: &mut Vec<CanonicalCheckerDiagnostic>,
+) -> Result<(), JsDocCommentError> {
+    match tag.kind() {
+        JsDocTagKind::Type => {
+            declaration.type_ = tag.type_expression().map(JsDocTypeExpression::planned);
+        }
+        JsDocTagKind::Parameter => {
+            if let Some(name) = tag.name() {
+                declaration.parameters.push(PlannedJsDocParameter {
+                    name: name.text().to_owned(),
+                    range: name.range(),
+                    type_: tag.type_expression().map(JsDocTypeExpression::planned),
+                    optional: tag.is_optional(),
+                    name_first: tag.is_name_first(),
+                });
+            }
+        }
+        JsDocTagKind::Return => {
+            declaration.return_type = tag.type_expression().map(JsDocTypeExpression::planned);
+        }
+        JsDocTagKind::Typedef => {
+            if let Some(name) = tag.name() {
+                declaration.typedefs.push(PlannedJsDocTypedef {
+                    name: name.text().to_owned(),
+                    range: name.range(),
+                    type_: tag.type_expression().map(JsDocTypeExpression::planned),
+                });
+            }
+        }
+        JsDocTagKind::Augments => {
+            if let Some(annotation) = tag.type_expression() {
+                append_augments_diagnostic(arena, source, declaration.node, tag, diagnostics)?;
+                declaration.augments_type = Some(annotation.planned());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn append_unmatched_parameter_diagnostics(
+    arena: &NodeArena,
+    source: NodeRef,
+    declaration: &PlannedJavaScriptDeclaration,
+    diagnostics: &mut Vec<CanonicalCheckerDiagnostic>,
+) -> Result<(), JsDocCommentError> {
+    let Some(record) = arena.get(declaration.node.node) else {
+        return Err(JsDocCommentError::InvalidSourceNode(declaration.node));
+    };
+    let parameters = match &record.data {
+        NodeData::FunctionDeclaration(function) => &function.parameters,
+        NodeData::FunctionExpression(function) => &function.parameters,
+        NodeData::ArrowFunction(function) => &function.parameters,
+        NodeData::MethodDeclaration(function) => &function.parameters,
+        _ => return Ok(()),
+    };
+    let mut names = HashSet::new();
+    let mut excluded = HashSet::new();
+    for (index, parameter) in parameters.nodes.iter().enumerate() {
+        let Some(parameter) = arena.get(*parameter) else {
+            return Err(JsDocCommentError::InvalidSourceNode(declaration.node));
+        };
+        let NodeData::ParameterDeclaration(parameter) = &parameter.data else {
+            return Err(JsDocCommentError::InvalidSourceNode(declaration.node));
+        };
+        match arena.get(parameter.name).map(|name| &name.data) {
+            Some(NodeData::Identifier(name)) => {
+                names.insert(name.text.as_str());
+            }
+            Some(_) => {
+                excluded.insert(index);
+            }
+            None => return Err(JsDocCommentError::InvalidSourceNode(declaration.node)),
+        }
+    }
+
+    for (index, parameter) in declaration.parameters.iter().enumerate() {
+        if excluded.contains(&index) || names.contains(parameter.name.as_str()) {
+            continue;
+        }
+        if let Some((left, _)) = parameter.name.rsplit_once('.') {
+            diagnostics.push(canonical_jsdoc_diagnostic(
+                source,
+                parameter.range,
+                8032,
+                [parameter.name.clone(), left.to_owned()],
+            )?);
+        } else if !parameter.name_first {
+            diagnostics.push(canonical_jsdoc_diagnostic(
+                source,
+                parameter.range,
+                8024,
+                [parameter.name.clone()],
+            )?);
+        }
+    }
+    Ok(())
+}
+
+fn append_augments_diagnostic(
+    arena: &NodeArena,
+    source: NodeRef,
+    declaration: NodeRef,
+    tag: &JsDocTag<'_>,
+    diagnostics: &mut Vec<CanonicalCheckerDiagnostic>,
+) -> Result<(), JsDocCommentError> {
+    let Some(class) = arena.get(declaration.node) else {
+        return Err(JsDocCommentError::InvalidSourceNode(declaration));
+    };
+    let NodeData::ClassDeclaration(class) = &class.data else {
+        return Ok(());
+    };
+    let Some(annotation) = tag.type_expression() else {
+        return Ok(());
+    };
+    let JsDocType::Named(expected) = annotation.type_() else {
+        return Ok(());
+    };
+    let Some(actual) = class_extends_name(arena, class.heritage_clauses.as_ref()) else {
+        return Ok(());
+    };
+    let expected_name = expected.rsplit('.').next().unwrap_or(expected);
+    let actual_name = actual.rsplit('.').next().unwrap_or(&actual);
+    if expected_name == actual_name {
+        return Ok(());
+    }
+    let relative_start = annotation
+        .text()
+        .rfind(expected_name)
+        .ok_or(JsDocCommentError::InvalidParserTree(annotation.range()))?;
+    let start = (annotation.range().start.get() as usize)
+        .checked_add(relative_start)
+        .ok_or(JsDocCommentError::SourcePositionOverflow)?;
+    let end = start
+        .checked_add(expected_name.len())
+        .ok_or(JsDocCommentError::SourcePositionOverflow)?;
+    diagnostics.push(canonical_jsdoc_diagnostic(
+        source,
+        checked_range(start, end)?,
+        8023,
+        [
+            tag.tag_name().to_owned(),
+            expected_name.to_owned(),
+            actual_name.to_owned(),
+        ],
+    )?);
+    Ok(())
+}
+
+fn class_extends_name(arena: &NodeArena, clauses: Option<&ts_ast::NodeList>) -> Option<String> {
+    let clauses = clauses?;
+    for clause in &clauses.nodes {
+        let NodeData::HeritageClause(clause) = &arena.get(*clause)?.data else {
+            continue;
+        };
+        if clause.token != SyntaxKind::ExtendsKeyword {
+            continue;
+        }
+        let [base] = clause.types.nodes.as_slice() else {
+            return None;
+        };
+        let NodeData::ExpressionWithTypeArguments(base) = &arena.get(*base)?.data else {
+            return None;
+        };
+        return property_expression_name(arena, base.expression);
+    }
+    None
+}
+
+fn property_expression_name(arena: &NodeArena, node: NodeId) -> Option<String> {
+    match &arena.get(node)?.data {
+        NodeData::Identifier(name) => Some(name.text.clone()),
+        NodeData::QualifiedName(_) => qualified_type_name(arena, node),
+        NodeData::PropertyAccessExpression(property) => {
+            let owner = property_expression_name(arena, property.expression)?;
+            let NodeData::Identifier(name) = &arena.get(property.name)?.data else {
+                return None;
+            };
+            Some(format!("{owner}.{}", name.text))
+        }
+        _ => None,
+    }
+}
+
+fn canonical_parser_diagnostic(
+    source: NodeRef,
+    diagnostic: &Diagnostic,
+) -> Result<CanonicalCheckerDiagnostic, JsDocCommentError> {
+    let Some(code) = diagnostic.code else {
+        return Err(JsDocCommentError::UnsupportedParserDiagnostic {
+            code: None,
+            range: diagnostic.range,
+        });
+    };
+    let message = message_by_code(code).ok_or(JsDocCommentError::UnsupportedParserDiagnostic {
+        code: Some(code),
+        range: diagnostic.range,
+    })?;
+    let arguments = if message
+        .format(&[])
+        .is_ok_and(|text| text == diagnostic.message)
+    {
+        Vec::new()
+    } else if code == 1005 {
+        let token = diagnostic
+            .message
+            .strip_prefix('\'')
+            .and_then(|text| text.strip_suffix("' expected."))
+            .ok_or(JsDocCommentError::UnsupportedParserDiagnostic {
+                code: Some(code),
+                range: diagnostic.range,
+            })?;
+        vec![token.to_owned()]
+    } else {
+        return Err(JsDocCommentError::UnsupportedParserDiagnostic {
+            code: Some(code),
+            range: diagnostic.range,
+        });
+    };
+    canonical_jsdoc_diagnostic(source, diagnostic.range, code, arguments)
+}
+
+fn canonical_jsdoc_diagnostic(
+    source: NodeRef,
+    range: TextRange,
+    code: u32,
+    arguments: impl IntoIterator<Item = impl Into<String>>,
+) -> Result<CanonicalCheckerDiagnostic, JsDocCommentError> {
+    if range.is_empty() {
+        return Err(JsDocCommentError::UnsupportedParserDiagnostic {
+            code: Some(code),
+            range,
+        });
+    }
+    let message = message_by_code(code).ok_or(JsDocCommentError::UnsupportedParserDiagnostic {
+        code: Some(code),
+        range,
+    })?;
+    Ok(CanonicalCheckerDiagnostic {
+        node: Some(source),
+        range_override: Some(CanonicalCheckerDiagnosticRange::new(source, range)),
+        diagnostic: CheckerDiagnostic::with_arguments(message, arguments),
+        related_information: Vec::new(),
+    })
+}
+
 fn tag_kind(name: &str) -> Option<JsDocTagKind> {
     match name {
         "type" => Some(JsDocTagKind::Type),
         "param" | "arg" | "argument" => Some(JsDocTagKind::Parameter),
         "return" | "returns" => Some(JsDocTagKind::Return),
         "typedef" => Some(JsDocTagKind::Typedef),
+        "extends" | "augments" => Some(JsDocTagKind::Augments),
         _ => None,
     }
 }
@@ -555,7 +1208,8 @@ fn recover_keyword_tags<'source>(comment: &'source str, tags: &mut Vec<ScannedTa
         let Some(name) = rest.get(..name_length) else {
             continue;
         };
-        if !matches!(name, "type" | "return") || tags.iter().any(|existing| existing.start == start)
+        if !matches!(name, "type" | "return" | "extends")
+            || tags.iter().any(|existing| existing.start == start)
         {
             continue;
         }
@@ -595,7 +1249,7 @@ fn is_top_level_tag(comment: &str, position: usize) -> bool {
 fn parse_supported_tag<'source>(
     source: &'source str,
     comment_start: usize,
-    tag: ScannedTag<'_>,
+    tag: ScannedTag<'source>,
     tag_end: usize,
     kind: JsDocTagKind,
     diagnostics: &mut Vec<Diagnostic>,
@@ -625,7 +1279,7 @@ fn parse_supported_tag<'source>(
         let type_end = unbraced_type_end(source, cursor, absolute_end);
         type_expression = parse_type_expression(source, cursor, type_end, diagnostics)?;
         cursor = skip_doc_whitespace(source, type_end, absolute_end);
-    } else if kind == JsDocTagKind::Type {
+    } else if matches!(kind, JsDocTagKind::Type | JsDocTagKind::Augments) {
         diagnostics.push(type_expected_diagnostic(source, cursor, absolute_end)?);
     }
 
@@ -646,6 +1300,7 @@ fn parse_supported_tag<'source>(
             .is_some_and(|expression| matches!(expression.type_, JsDocType::Optional(_)));
     Ok(JsDocTag {
         kind,
+        tag_name: tag.name,
         range: checked_range(absolute_start, absolute_end)?,
         name,
         type_expression,
@@ -843,6 +1498,9 @@ fn project_type(
             match (&name.data, &data.type_arguments) {
                 (NodeData::Identifier(name), None) => boxed_intrinsic(&name.text)
                     .map_or_else(|| JsDocType::Named(name.text.clone()), JsDocType::Intrinsic),
+                (NodeData::QualifiedName(_), None) => qualified_type_name(arena, data.type_name)
+                    .map(JsDocType::Named)
+                    .ok_or(JsDocCommentError::InvalidParserTree(range))?,
                 _ => JsDocType::Unsupported(record.kind),
             }
         }
@@ -860,6 +1518,20 @@ fn project_type(
         _ => JsDocType::Unsupported(record.kind),
     };
     Ok(type_)
+}
+
+fn qualified_type_name(arena: &NodeArena, node: NodeId) -> Option<String> {
+    match &arena.get(node)?.data {
+        NodeData::Identifier(name) => Some(name.text.clone()),
+        NodeData::QualifiedName(qualified) => {
+            let left = qualified_type_name(arena, qualified.left)?;
+            let NodeData::Identifier(right) = &arena.get(qualified.right)?.data else {
+                return None;
+            };
+            Some(format!("{left}.{}", right.text))
+        }
+        _ => None,
+    }
 }
 
 const fn keyword_intrinsic(kind: SyntaxKind) -> Option<JsDocIntrinsicType> {
