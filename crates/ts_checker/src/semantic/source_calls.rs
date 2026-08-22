@@ -19,6 +19,7 @@ use super::{
     CanonicalCheckerOptions, CanonicalCheckerRelatedInformation, CanonicalGlobalTypes,
     CanonicalTypeFormatFlags, CanonicalTypeMapperStore, DeclaredTypeHost, RelationUnavailable,
     ResolvedSignatureState, SignatureId, SignatureLinks, TypeId, TypeNodeLinks,
+    callable_sets::{StoredCallableSetValidation, validate_stored_callable_set},
     calls::{
         DirectCallApplicability, DirectCallError, DirectCallForm, DirectCallRequest,
         DirectCallUnsupported, resolve_direct_call,
@@ -36,6 +37,7 @@ use super::{
     },
     inference::{NakedTypeCandidateError, NakedTypeInferenceError},
     instantiate::InstantiationSession,
+    object_diagnostics::exact_optional_property_mismatch_details,
     source::{
         PlannedExpression, PlannedExpressionKind, SourceCheckError, UnsupportedSourceSyntax,
         logical_binary_operator_text, merge_retry_diagnostic, merge_retry_diagnostics,
@@ -111,6 +113,64 @@ impl DirectSourceCallSyntax {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct CheckedSourceCall {
     pub(super) return_type: TypeId,
+}
+
+/// Returns the shared parameter context for an object or array argument.
+///
+/// Generic signatures and overloads with different parameter types require
+/// inference or overload selection before they can provide an exact context.
+pub(super) fn source_call_argument_contextual_type(
+    store: &CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
+    plan: &SourceCallPlan,
+    callee_type: TypeId,
+    argument_index: usize,
+) -> Result<Option<TypeId>, SourceCheckError> {
+    let Some(argument) = plan.arguments.get(argument_index) else {
+        return Err(SourceCheckError::Call(plan.node));
+    };
+    if !matches!(
+        argument.unparenthesized().kind,
+        PlannedExpressionKind::Object { .. } | PlannedExpressionKind::Array(_)
+    ) {
+        return Ok(None);
+    }
+
+    let StoredCallableSetValidation::Valid { projection, .. } =
+        validate_stored_callable_set(store, callee_type)
+    else {
+        return Ok(None);
+    };
+    if !projection.construct_signatures.is_empty() || projection.call_signatures.is_empty() {
+        return Ok(None);
+    }
+
+    let mut contextual_type = None;
+    for callable in &projection.call_signatures {
+        let Some(signature) = store.signature(callable.signature) else {
+            return Err(SourceCheckError::Call(plan.node));
+        };
+        if !signature.type_parameters().is_empty() {
+            return Ok(None);
+        }
+        let parameter_type = match callable.parameters.get(argument_index).copied() {
+            Some(parameter) => Some(parameter),
+            None => callable
+                .rest_parameter
+                .map(|rest| store.canonical_array_element_type(global_types, rest))
+                .transpose()?
+                .flatten(),
+        };
+        let Some(parameter_type) = parameter_type else {
+            return Ok(None);
+        };
+        match contextual_type {
+            None => contextual_type = Some(parameter_type),
+            Some(existing) if existing == parameter_type => {}
+            Some(_) => return Ok(None),
+        }
+    }
+    Ok(contextual_type)
 }
 
 /// Proves the complete direct-call syntax and rejects poisoned cold/warm cache
@@ -1314,15 +1374,20 @@ fn prepare_legacy_source_call_diagnostic(
                 .arguments
                 .get(index)
                 .ok_or(SourceCheckError::Call(plan.node))?;
-            let code = if exact_optional_argument_mismatch(
-                store,
-                options,
-                argument_type,
-                parameter_type,
-            ) {
-                2379
+            let exact_optional_mismatch =
+                exact_optional_argument_mismatch(store, options, argument_type, parameter_type);
+            let code = if exact_optional_mismatch { 2379 } else { 2345 };
+            let details = if exact_optional_mismatch {
+                exact_optional_property_mismatch_details(
+                    store,
+                    host,
+                    global_types,
+                    argument_type,
+                    parameter_type,
+                    source_call_display_flags(options),
+                )?
             } else {
-                2345
+                Vec::new()
             };
             CanonicalCheckerDiagnostic {
                 node: Some(argument.unparenthesized().node),
@@ -1330,7 +1395,8 @@ fn prepare_legacy_source_call_diagnostic(
                 diagnostic: Diagnostic::with_arguments(
                     message_by_code(code).ok_or(SourceCheckError::MissingDiagnostic(code))?,
                     [display.source, display.target],
-                ),
+                )
+                .with_details(details),
                 related_information: Vec::new(),
             }
         }
@@ -1482,15 +1548,20 @@ fn prepare_vector_source_call_diagnostic(
                 parameter_type,
                 source_call_display_flags(options),
             )?;
-            let code = if exact_optional_argument_mismatch(
-                store,
-                options,
-                argument_type,
-                parameter_type,
-            ) {
-                2379
+            let exact_optional_mismatch =
+                exact_optional_argument_mismatch(store, options, argument_type, parameter_type);
+            let code = if exact_optional_mismatch { 2379 } else { 2345 };
+            let details = if exact_optional_mismatch {
+                exact_optional_property_mismatch_details(
+                    store,
+                    host,
+                    global_types,
+                    argument_type,
+                    parameter_type,
+                    source_call_display_flags(options),
+                )?
             } else {
-                2345
+                Vec::new()
             };
             CanonicalCheckerDiagnostic {
                 node: Some(argument.unparenthesized().node),
@@ -1498,7 +1569,8 @@ fn prepare_vector_source_call_diagnostic(
                 diagnostic: Diagnostic::with_arguments(
                     message_by_code(code).ok_or(SourceCheckError::MissingDiagnostic(code))?,
                     [display.source, display.target],
-                ),
+                )
+                .with_details(details),
                 related_information: Vec::new(),
             }
         }
