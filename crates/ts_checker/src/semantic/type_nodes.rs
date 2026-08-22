@@ -1517,12 +1517,18 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         }
         self.plan_type_node_in_context(object, None, false)?;
         self.plan_type_node_in_context(index, None, false)?;
-        if self
+        let is_mapped_parameter = self
             .plan
             .references
             .get(&index)
-            .is_none_or(|reference| reference.symbol != type_parameter)
-        {
+            .is_some_and(|reference| reference.symbol == type_parameter)
+            || self
+                .store
+                .type_node_links(index)
+                .and_then(|links| links.resolved_type)
+                .and_then(|resolved| cached_ordinary_type_parameter_owner(self.store, resolved))
+                == Some(type_parameter);
+        if !is_mapped_parameter {
             return self.plan_type_node_in_context(node, None, false);
         }
         let planned = PlannedMappedIndexedAccess { object, index };
