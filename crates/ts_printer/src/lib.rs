@@ -230,7 +230,7 @@ pub fn emit_source_file_with_settings_and_bindings(
             preserve_const_enums: true,
             inline_const_enums: false,
             emit_decorator_metadata: false,
-            es_module_interop: false,
+            es_module_interop: true,
             preserve_dynamic_import: false,
             verbatim_module_syntax: false,
             isolated_modules: false,
@@ -1891,8 +1891,15 @@ pub fn emit_source_file_with_context(
             arena.get(*statement).map(|node| &node.data),
             Some(NodeData::ImportDeclaration(_) | NodeData::ImportEqualsDeclaration(_))
         );
+        let current_is_side_effect_import = matches!(
+            arena.get(*statement).map(|node| &node.data),
+            Some(NodeData::ImportDeclaration(import)) if import.import_clause.is_none()
+        );
         let erased_import = current_is_import && !current_emitted;
-        if settings.module == ModuleKind::CommonJs && current_emitted && !current_is_import {
+        if settings.module == ModuleKind::CommonJs
+            && current_emitted
+            && (!current_is_import || current_is_side_effect_import)
+        {
             for import in pending_commonjs_imports.drain(..) {
                 printer.emit_commonjs_import_binding_exports(import, &data.statements)?;
             }
@@ -3289,7 +3296,8 @@ fn commonjs_star_imports(
                 name,
                 runtime_identifier_uses,
                 synthetic_runtime_identifier_uses,
-            ))
+            ) || declaration_name_text(arena, name)
+                .is_some_and(|name| import_name_is_reexported(arena, name)))
         {
             defaults.push(name);
         }
@@ -3416,7 +3424,8 @@ fn commonjs_default_imports(
                 name,
                 runtime_identifier_uses,
                 synthetic_runtime_identifier_uses,
-            ))
+            ) || declaration_name_text(arena, name)
+                .is_some_and(|name| import_name_is_reexported(arena, name)))
             && let Some(name) = declaration_name_text(arena, name)
         {
             local_names.push(name.to_owned());
@@ -3943,14 +3952,24 @@ fn class_member_has_legacy_decorators(arena: &NodeArena, member: NodeId) -> bool
 }
 
 fn class_member_is_constructor(arena: &NodeArena, member: NodeId) -> bool {
-    matches!(
-        arena.get(member).map(|node| &node.data),
-        Some(NodeData::ConstructorDeclaration(_))
-    ) || matches!(
-        arena.get(member).map(|node| &node.data),
-        Some(NodeData::MethodDeclaration(method))
-            if declaration_name_text(arena, method.name) == Some("constructor")
-    )
+    class_member_constructor_parts(arena, member).is_some()
+}
+
+fn class_member_constructor_parts(
+    arena: &NodeArena,
+    member: NodeId,
+) -> Option<(&NodeList, Option<NodeId>)> {
+    match &arena.get(member)?.data {
+        NodeData::ConstructorDeclaration(constructor) => {
+            Some((&constructor.parameters, constructor.body))
+        }
+        NodeData::MethodDeclaration(method)
+            if declaration_name_text(arena, method.name) == Some("constructor") =>
+        {
+            Some((&method.parameters, method.body))
+        }
+        _ => None,
+    }
 }
 
 #[allow(clippy::match_same_arms)] // Separate parents document decorator stops.
@@ -5974,8 +5993,16 @@ impl DeclarationPrinter<'_> {
                     let namespace_assignments = static_assignments
                         .iter()
                         .filter_map(|(property, value)| {
+                            let computed_access = self
+                                .arena
+                                .get(*property)
+                                .and_then(|property| property.parent)
+                                .and_then(|parent| self.arena.get(parent))
+                                .is_some_and(|parent| {
+                                    matches!(parent.data, NodeData::ElementAccessExpression(_))
+                                });
                             let (name, numeric) = match self.arena.get(*property).map(|node| &node.data) {
-                                Some(NodeData::Identifier(identifier)) => {
+                                Some(NodeData::Identifier(identifier)) if !computed_access => {
                                     (identifier.text.clone(), false)
                                 }
                                 _ => self.late_bound_property_name(*property)?,
@@ -10504,6 +10531,11 @@ impl DeclarationPrinter<'_> {
                         self.arena.get(*member).map(|node| &node.data),
                         Some(NodeData::IndexSignatureDeclaration(_))
                     ))
+            ) {
+                self.emit_semantic_type(return_type)?;
+            } else if matches!(
+                self.arena.get(annotation).map(|node| &node.data),
+                Some(NodeData::UnionTypeNode(_) | NodeData::IntersectionTypeNode(_))
             ) {
                 self.emit_semantic_type(return_type)?;
             } else {
@@ -15662,7 +15694,12 @@ impl DeclarationPrinter<'_> {
                     || self.declaration_signature_has_no_body(declaration)
                     || !optional
                     || self.source_type_semantically_includes_undefined(type_);
-                let result = if !preserve_source {
+                let optional_parameter_property = parameter.question_token.is_some()
+                    && self
+                        .parameter_property_semantic_type(declaration, parameter)
+                        .is_some()
+                    && !self.source_type_semantically_includes_undefined(type_);
+                let result = if !preserve_source || optional_parameter_property {
                     self.emit_type(type_)?;
                     self.writer.write(" | undefined");
                     Ok(())
@@ -17500,6 +17537,13 @@ impl DeclarationPrinter<'_> {
         let Some(member) = members.nodes.get(member_index).copied() else {
             return false;
         };
+        if let Some((_, body)) = class_member_constructor_parts(self.arena, member) {
+            return body.is_some()
+                && members.nodes[..member_index].iter().any(|previous| {
+                    class_member_constructor_parts(self.arena, *previous)
+                        .is_some_and(|(_, body)| body.is_none())
+                });
+        }
         let Some(NodeData::MethodDeclaration(method)) =
             self.arena.get(member).map(|node| &node.data)
         else {
@@ -19923,27 +19967,16 @@ impl DeclarationPrinter<'_> {
                         .and_then(|types| types.get(*member))
                         .map(|type_| &type_.kind)
                     {
-                        Some(TypeKind::Null) => 1,
-                        Some(TypeKind::Undefined) => 2,
-                        _ => 0,
+                        Some(TypeKind::String | TypeKind::StringLiteral(_) | TypeKind::TemplateLiteral { .. }) => 0,
+                        Some(TypeKind::Number | TypeKind::NumberLiteral(_)) => 1,
+                        Some(TypeKind::BigInt | TypeKind::BigIntLiteral(_)) => 2,
+                        Some(TypeKind::Boolean | TypeKind::BooleanLiteral(_)) => 3,
+                        Some(TypeKind::Function(_) | TypeKind::Constructor(_) | TypeKind::Overload(_)) => 5,
+                        Some(TypeKind::Null) => 6,
+                        Some(TypeKind::Undefined) => 7,
+                        _ => 4,
                     }
                 });
-                if unique.len() >= 2
-                    && matches!(
-                        self.semantic_types
-                            .and_then(|types| types.get(unique[0]))
-                            .map(|type_| &type_.kind),
-                        Some(TypeKind::Number)
-                    )
-                    && matches!(
-                        self.semantic_types
-                            .and_then(|types| types.get(unique[1]))
-                            .map(|type_| &type_.kind),
-                        Some(TypeKind::String)
-                    )
-                {
-                    unique.swap(0, 1);
-                }
                 for (index, member) in unique.into_iter().enumerate() {
                     if index != 0 {
                         self.writer.write(" | ");
@@ -21551,15 +21584,11 @@ impl DeclarationPrinter<'_> {
                         self.emit_semantic_function_type(&signature)?;
                     } else if self.source_object_literal_definite_shorthand(object, &name) {
                         self.emit_semantic_parameter_type(*type_id, true)?;
-                    } else if optional && {
-                        let explicit = self
-                            .source_type_literal_property_explicitly_includes_undefined(
-                                object, &name,
-                            );
-                        explicit == Some(false)
-                            || (explicit.is_none()
-                                && self.semantic_object_has_local_object_literal_source(object))
-                    } {
+                    } else if optional
+                        && self.source_type_literal_property_explicitly_includes_undefined(
+                            object, &name,
+                        ) != Some(true)
+                    {
                         self.emit_semantic_parameter_type(*type_id, true)?;
                     } else if optional {
                         self.emit_semantic_type_with_nullish_last(*type_id)?;
@@ -21790,19 +21819,6 @@ impl DeclarationPrinter<'_> {
                 self.source_type_literal_shape_matches(type_literal, object)
                     .then_some(id)
             })
-        })
-    }
-
-    fn semantic_object_has_local_object_literal_source(&self, object: &ObjectType) -> bool {
-        self.arena.iter().any(|(id, node)| {
-            matches!(node.data, NodeData::ObjectLiteralExpression(_))
-                && self
-                    .node_types
-                    .and_then(|types| types.get(&id).copied())
-                    .and_then(|type_id| self.semantic_types?.get(type_id))
-                    .is_some_and(|type_| {
-                        matches!(&type_.kind, TypeKind::Object(candidate) if candidate == object)
-                    })
         })
     }
 
@@ -24928,6 +24944,9 @@ impl DeclarationPrinter<'_> {
     }
 
     fn namespace_scope_requires_explicit_exports(&self, scope: NodeId) -> bool {
+        if self.string_module_scope_has_export_marker(scope) {
+            return true;
+        }
         if self
             .arena
             .get(scope)
@@ -24937,7 +24956,7 @@ impl DeclarationPrinter<'_> {
             return false;
         }
         let has_privacy_boundary = self.namespace_scope_has_privacy_boundary(scope);
-        ((self.namespace_scope_allows_explicit_exports(scope)
+        (self.namespace_scope_allows_explicit_exports(scope)
             || (has_privacy_boundary && self.namespace_scope_is_separately_nested(scope)))
             && (has_privacy_boundary
                 || self.namespace_scope_has_synthetic_class_base(scope)
@@ -24949,8 +24968,7 @@ impl DeclarationPrinter<'_> {
                             Some(NodeData::ExportDeclaration(export))
                                 if export.module_specifier.is_some()
                         ))
-                )))
-            || self.string_module_scope_has_export_marker(scope)
+                ))
     }
 
     fn string_module_scope_has_export_marker(&self, scope: NodeId) -> bool {
@@ -33277,12 +33295,14 @@ impl Printer<'_> {
                     let terminal_comment = self.source_text[comment_range.1..]
                         .trim()
                         .is_empty();
+                    let precedes_line_comment = next_comment
+                        .is_some_and(|next| remainder[next..].starts_with("//"));
                     self.emit_normalized_block_comment(
                         &trivia[index..comment_end],
                         comment_range.0,
                         !inline_after,
                         (terminal_comment && !immediate_trailing)
-                            || (immediate_trailing && !inline_after),
+                            || (immediate_trailing && !inline_after && precedes_line_comment),
                     );
                     if inline_after {
                         self.writer.write(" ");
@@ -40927,6 +40947,20 @@ impl Printer<'_> {
         } else {
             self.generated_names.used.clone()
         };
+        if is_function_body {
+            claimed.extend(
+                self.active_static_private_field_plan
+                    .iter()
+                    .chain(self.enclosing_static_private_field_plans.iter())
+                    .map(|plan| plan.capture.clone()),
+            );
+            claimed.extend(
+                self.active_private_method_plan
+                    .iter()
+                    .chain(self.enclosing_private_method_plans.iter())
+                    .filter_map(|plan| plan.capture.clone()),
+            );
+        }
         let mut temps = Vec::new();
         let mut logical_assignment_temps = Vec::new();
         let mut private_receiver_temps = Vec::new();
@@ -41976,7 +42010,8 @@ impl Printer<'_> {
                             )
                 )
         });
-        if self.settings.target >= ScriptTarget::EsNext
+        if (self.settings.target >= ScriptTarget::EsNext
+            && self.settings.use_define_for_class_fields != Some(false))
             || (self.settings.target >= ScriptTarget::Es2022
                 && self.settings.use_define_for_class_fields != Some(false)
                 && !has_computed_auto_accessor)
@@ -42049,6 +42084,45 @@ impl Printer<'_> {
                     &mut field_temps,
                 );
             }
+            let needs_class_temp = self.settings.target < ScriptTarget::Es2022
+                && *is_expression
+                && !self.class_expression_temps.contains_key(class_id)
+                && !self.class_expression_is_in_es5_captured_for_scope(*class_id)
+                && self
+                    .arena
+                    .get(*class_id)
+                    .and_then(|node| match &node.data {
+                        NodeData::ClassExpression(class) => {
+                            Some(self.class_expression_requires_post_class_lowering(
+                                &Self::class_expression_as_declaration(class),
+                            ))
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or(false);
+            let class_temp_precedes_computed_fields = members.iter().find_map(|member| {
+                let NodeData::PropertyDeclaration(property) =
+                    &self.arena.get(*member)?.data
+                else {
+                    return None;
+                };
+                matches!(
+                    self.arena.get(property.name).map(|node| &node.data),
+                    Some(NodeData::ComputedPropertyName(_))
+                )
+                .then_some(self.property_is_static(property))
+            }) == Some(true);
+            if needs_class_temp && class_temp_precedes_computed_fields {
+                let temp = self.generate_block_temp(source_file, &claimed);
+                claimed.insert(temp.clone());
+                self.class_expression_temps.insert(*class_id, temp.clone());
+                if self
+                    .class_expression_instance_field_owner(*class_id)
+                    .is_none()
+                {
+                    field_temps.push(temp);
+                }
+            }
             for member in members {
                 let Some(NodeData::PropertyDeclaration(property)) =
                     self.arena.get(*member).map(|node| &node.data)
@@ -42086,23 +42160,7 @@ impl Printer<'_> {
                     field_temps.push(temp);
                 }
             }
-            let needs_class_temp = self.settings.target < ScriptTarget::Es2022
-                && *is_expression
-                && !self.class_expression_temps.contains_key(class_id)
-                && !self.class_expression_is_in_es5_captured_for_scope(*class_id)
-                && self
-                    .arena
-                    .get(*class_id)
-                    .and_then(|node| match &node.data {
-                        NodeData::ClassExpression(class) => {
-                            Some(self.class_expression_requires_post_class_lowering(
-                                &Self::class_expression_as_declaration(class),
-                            ))
-                        }
-                        _ => None,
-                    })
-                    .unwrap_or(false);
-            if needs_class_temp {
+            if needs_class_temp && !class_temp_precedes_computed_fields {
                 let temp = self.generate_block_temp(source_file, &claimed);
                 claimed.insert(temp.clone());
                 self.class_expression_temps.insert(*class_id, temp.clone());
@@ -44837,7 +44895,15 @@ impl Printer<'_> {
         self.writer.write(".label) {");
         self.writer.newline();
         self.writer.indent += 1;
-        self.writer.write("case 0: ");
+        self.writer.write("case 0:");
+        if statements
+            .first()
+            .is_some_and(|statement| self.direct_yield_expression(*statement).is_some())
+        {
+            self.writer.write(" ");
+        } else {
+            self.writer.newline();
+        }
         self.writer.indent += 1;
         let mut case = 0;
         for statement in statements {
@@ -53766,6 +53832,7 @@ impl Printer<'_> {
                 NodeData::FunctionDeclaration(_)
                     | NodeData::FunctionExpression(_)
                     | NodeData::MethodDeclaration(_)
+                    | NodeData::ConstructorDeclaration(_)
                     | NodeData::GetAccessorDeclaration(_)
                     | NodeData::SetAccessorDeclaration(_)
             ) {
@@ -53793,6 +53860,7 @@ impl Printer<'_> {
                 NodeData::FunctionDeclaration(_)
                     | NodeData::FunctionExpression(_)
                     | NodeData::MethodDeclaration(_)
+                    | NodeData::ConstructorDeclaration(_)
                     | NodeData::ClassDeclaration(_)
                     | NodeData::ClassExpression(_)
             ) {
@@ -55624,11 +55692,8 @@ impl Printer<'_> {
         self.writer.newline();
         self.writer.indent += 1;
         let constructor_parameters = data.members.nodes.iter().find_map(|member| {
-            let NodeData::MethodDeclaration(method) = &self.arena.get(*member)?.data else {
-                return None;
-            };
-            self.is_constructor_name(method.name)
-                .then_some(&method.parameters)
+            let (parameters, body) = class_member_constructor_parts(self.arena, *member)?;
+            body.is_some().then_some(parameters)
         });
         let parameter_decorators = constructor_parameters
             .into_iter()
@@ -55828,10 +55893,7 @@ impl Printer<'_> {
                     continue;
                 }
             }
-            if matches!(
-                &member.data,
-                NodeData::MethodDeclaration(method) if self.is_constructor_name(method.name)
-            ) {
+            if class_member_is_constructor(self.arena, *member_id) {
                 continue;
             }
             let paired_setter_parameters = accessor_pair
@@ -56858,6 +56920,15 @@ impl Printer<'_> {
                 previous_super_context
                     .as_ref()
                     .map(|(base, _)| (base.clone(), false))
+            } else if self.settings.experimental_decorators
+                && !self
+                    .class_decorator_expressions(data.modifiers.as_ref())
+                    .is_empty()
+                && previous_super_context
+                    .as_ref()
+                    .is_some_and(|(base, is_static)| *is_static && base == "(void 0)")
+            {
+                previous_super_context.clone()
             } else {
                 None
             };
@@ -57044,12 +57115,9 @@ impl Printer<'_> {
             let Some(node) = self.arena.get(*member) else {
                 return false;
             };
-            let NodeData::MethodDeclaration(method) = &node.data else {
-                return false;
-            };
             !self.class_member_is_erased_abstract(node)
-                && method.body.is_some()
-                && self.is_constructor_name(method.name)
+                && class_member_constructor_parts(self.arena, *member)
+                    .is_some_and(|(_, body)| body.is_some())
         });
         if lower_fields
             && (self.has_instance_field_initializers(data)
@@ -57104,6 +57172,7 @@ impl Printer<'_> {
                 );
             let current_emitted = !self.class_member_is_erased_abstract(&node)
                 && match &node.data {
+                    NodeData::ConstructorDeclaration(constructor) => constructor.body.is_some(),
                     NodeData::MethodDeclaration(method) => {
                         (self.class_private_name_is_duplicate(data, method.name)
                             || self.private_name_is_reserved_constructor(method.name)
@@ -57178,6 +57247,23 @@ impl Printer<'_> {
                 continue;
             }
             match &node.data {
+                NodeData::ConstructorDeclaration(constructor) if constructor.body.is_some() => {
+                    let body = constructor.body.expect("constructor body checked");
+                    if lower_fields || self.has_parameter_properties(&constructor.parameters) {
+                        self.emit_native_constructor(
+                            &constructor.parameters,
+                            body,
+                            data,
+                            has_base,
+                        )?;
+                    } else {
+                        self.writer.write("constructor");
+                        self.emit_parameters(&constructor.parameters)?;
+                        self.writer.write(" ");
+                        self.emit_function_body(body)?;
+                        self.writer.newline();
+                    }
+                }
                 NodeData::MethodDeclaration(method) if method.body.is_some() => {
                     if private_plan.is_some()
                         && matches!(
@@ -57192,7 +57278,12 @@ impl Printer<'_> {
                     if (lower_fields || self.has_parameter_properties(&method.parameters))
                         && self.is_constructor_name(method.name)
                     {
-                        self.emit_native_constructor(method, data, has_base)?;
+                        self.emit_native_constructor(
+                            &method.parameters,
+                            method.body.expect("constructor body checked"),
+                            data,
+                            has_base,
+                        )?;
                         continue;
                     }
                     let is_async =
@@ -57287,7 +57378,9 @@ impl Printer<'_> {
                     }
                     self.writer.newline();
                 }
-                NodeData::MethodDeclaration(_) | NodeData::IndexSignatureDeclaration(_) => {}
+                NodeData::ConstructorDeclaration(_)
+                | NodeData::MethodDeclaration(_)
+                | NodeData::IndexSignatureDeclaration(_) => {}
                 NodeData::SemicolonClassElement(_) => {
                     self.writer.write(";");
                     self.writer.newline();
@@ -57561,15 +57654,6 @@ impl Printer<'_> {
         }
         if lower_fields {
             self.emit_unconsumed_class_declaration_computed_properties(data)?;
-            if (ScriptTarget::Es2015..ScriptTarget::Es2017).contains(&self.settings.target)
-                && class_has_async_static_field(self.arena, data)
-                && let Some(name) = data.name
-            {
-                self.writer.newline();
-                self.writer.write("_a = ");
-                self.emit_expression(name, 0)?;
-                self.writer.write(";");
-            }
             if self.active_anonymous_private_class.is_none() {
                 if let Some(plan) = &private_plan {
                     self.emit_private_method_initializers(data, plan)?;
@@ -59664,11 +59748,8 @@ impl Printer<'_> {
         data: &ts_ast::ClassDeclarationData,
     ) -> Result<(), EmitError> {
         let parameters = data.members.nodes.iter().find_map(|member| {
-            let NodeData::MethodDeclaration(method) = &self.arena.get(*member)?.data else {
-                return None;
-            };
-            (method.body.is_some() && self.is_constructor_name(method.name))
-                .then(|| method.parameters.clone())
+            let (parameters, body) = class_member_constructor_parts(self.arena, *member)?;
+            body.is_some().then(|| parameters.clone())
         });
         let Some(parameters) = parameters else {
             return Ok(());
@@ -59722,11 +59803,11 @@ impl Printer<'_> {
     #[allow(clippy::too_many_lines)]
     fn emit_native_constructor(
         &mut self,
-        method: &ts_ast::MethodDeclarationData,
+        parameters: &NodeList,
+        body_id: NodeId,
         data: &ts_ast::ClassDeclarationData,
         _has_base: bool,
     ) -> Result<(), EmitError> {
-        let body_id = method.body.expect("constructor body checked");
         let body_node = self.node(body_id)?.clone();
         let NodeData::Block(body) = &body_node.data else {
             return Err(Self::unsupported(body_id, body_node.kind));
@@ -59734,16 +59815,16 @@ impl Printer<'_> {
         let lower_instance_fields = self.settings.target < ScriptTarget::Es2022
             || self.settings.use_define_for_class_fields == Some(false);
         let downlevel_binding_parameters = if self.settings.target < ScriptTarget::Es2018 {
-            self.downlevel_binding_parameters(&method.parameters, body_id)
+            self.downlevel_binding_parameters(parameters, body_id)
         } else {
             Vec::new()
         };
         self.writer.write("constructor");
         if downlevel_binding_parameters.is_empty() {
-            self.emit_parameters(&method.parameters)?;
+            self.emit_parameters(parameters)?;
         } else {
             self.emit_parameters_with_name_overrides(
-                &method.parameters,
+                parameters,
                 self.settings.target >= ScriptTarget::Es2015,
                 &downlevel_binding_parameters,
             )?;
@@ -59752,7 +59833,7 @@ impl Printer<'_> {
             && !self.node_source_is_multiline(body_id)
             && !self.block_precedes_recovered_class_member(body_id)
             && !self.has_instance_field_initializers(data)
-            && !self.has_parameter_properties(&method.parameters)
+            && !self.has_parameter_properties(parameters)
             && self.active_private_method_plan.is_none()
             && downlevel_binding_parameters.is_empty()
         {
@@ -59761,7 +59842,7 @@ impl Printer<'_> {
             return Ok(());
         }
         if !self.has_instance_field_initializers(data)
-            && !self.has_parameter_properties(&method.parameters)
+            && !self.has_parameter_properties(parameters)
             && self.active_private_method_plan.is_none()
             && downlevel_binding_parameters.is_empty()
             && !body.statements.nodes.iter().any(|statement| {
@@ -59816,7 +59897,7 @@ impl Printer<'_> {
             emitted_binding_parameters = true;
             if initialize_before_body {
                 self.emit_private_brand_initializer("this");
-                self.emit_parameter_properties(&method.parameters, "this")?;
+                self.emit_parameter_properties(parameters, "this")?;
                 if lower_instance_fields {
                     self.emit_instance_fields(data, "this")?;
                 }
@@ -59849,7 +59930,7 @@ impl Printer<'_> {
                 emitted_binding_parameters = true;
                 if initialize_before_body {
                     self.emit_private_brand_initializer("this");
-                    self.emit_parameter_properties(&method.parameters, "this")?;
+                    self.emit_parameter_properties(parameters, "this")?;
                     if lower_instance_fields {
                         self.emit_instance_fields(data, "this")?;
                     }
@@ -59887,7 +59968,7 @@ impl Printer<'_> {
                     false,
                 );
                 self.emit_private_brand_initializer("this");
-                self.emit_parameter_properties(&method.parameters, "this")?;
+                self.emit_parameter_properties(parameters, "this")?;
                 if lower_instance_fields {
                     self.emit_instance_fields(data, "this")?;
                 }
@@ -59909,7 +59990,7 @@ impl Printer<'_> {
                 self.emit_downlevel_binding_parameter_prologues(&downlevel_binding_parameters)?;
             }
             self.emit_private_brand_initializer("this");
-            self.emit_parameter_properties(&method.parameters, "this")?;
+            self.emit_parameter_properties(parameters, "this")?;
             if lower_instance_fields {
                 self.emit_instance_fields(data, "this")?;
             }
@@ -60721,15 +60802,11 @@ impl Printer<'_> {
             .enumerate()
             .find_map(|(index, member)| {
                 let node = self.arena.get(*member)?;
-                let NodeData::MethodDeclaration(method) = &node.data else {
-                    return None;
-                };
-                (!self.class_member_is_abstract(node)
-                    && method.body.is_some()
-                    && self.is_constructor_name(method.name))
-                .then_some((index, *member, method.as_ref()))
+                let (parameters, body) = class_member_constructor_parts(self.arena, *member)?;
+                (!self.class_member_is_abstract(node) && body.is_some())
+                    .then_some((index, *member, parameters, body))
             });
-        if let Some((index, constructor_id, _)) = constructor {
+        if let Some((index, constructor_id, _, _)) = constructor {
             let previous_end = index
                 .checked_sub(1)
                 .and_then(|index| data.members.nodes.get(index))
@@ -60745,19 +60822,16 @@ impl Printer<'_> {
         }
         self.writer.write("function ");
         self.writer.write(name);
-        if let Some((_, _, constructor)) = constructor {
+        if let Some((_, _, parameters, constructor_body)) = constructor {
             let captures_constructor_body_this = base.is_none()
-                && constructor
-                    .body
-                    .is_some_and(|body| self.body_has_downlevel_arrow_this(body));
-            let constructor_returns_on_all_paths = constructor
-                .body
+                && constructor_body.is_some_and(|body| self.body_has_downlevel_arrow_this(body));
+            let constructor_returns_on_all_paths = constructor_body
                 .is_some_and(|body| self.statement_is_covered_by_returns(body));
-            self.emit_parameters_without_initializers(&constructor.parameters)?;
+            self.emit_parameters_without_initializers(parameters)?;
             self.writer.write(" {");
             self.writer.newline();
             self.writer.indent += 1;
-            if let Some(body_id) = constructor.body
+            if let Some(body_id) = constructor_body
                 && let Some(NodeData::Block(body)) =
                     self.arena.get(body_id).map(|node| &node.data)
             {
@@ -60776,12 +60850,10 @@ impl Printer<'_> {
             if captures_constructor_body_this {
                 self.capture_arrow_this = Some("_this".to_owned());
             }
-            let emitted_defaults =
-                self.emit_parameter_default_prologues(&constructor.parameters)?;
-            let emitted_rest =
-                self.emit_downlevel_rest_parameter_prologue(&constructor.parameters)?;
+            let emitted_defaults = self.emit_parameter_default_prologues(parameters)?;
+            let emitted_rest = self.emit_downlevel_rest_parameter_prologue(parameters)?;
             if base.is_none() {
-                self.emit_parameter_properties(&constructor.parameters, "this")?;
+                self.emit_parameter_properties(parameters, "this")?;
                 self.emit_es5_instance_fields(data, "this", captures_field_this)?;
             }
             let mut emitted_fields = base.is_none();
@@ -60789,12 +60861,12 @@ impl Printer<'_> {
             let previous_this_alias_scope = self.this_alias_scope;
             let mut uses_this_alias = false;
             let mut emitted_synthetic_return = false;
-            if let Some(body) = constructor.body {
+            if let Some(body) = constructor_body {
                 let body_id = body;
                 let body_node = self.node(body)?.clone();
                 let NodeData::Block(body) = &body_node.data else {
                     return Err(Self::unsupported(
-                        constructor.body.expect("body"),
+                        constructor_body.expect("body"),
                         body_node.kind,
                     ));
                 };
@@ -60802,7 +60874,7 @@ impl Printer<'_> {
                     self.is_super_call_statement(*statement).unwrap_or(false)
                 });
                 let capture_super_result = self.has_instance_field_initializers(data)
-                    || self.has_parameter_properties(&constructor.parameters)
+                    || self.has_parameter_properties(parameters)
                     || super_statement_index
                         .is_none_or(|index| index.saturating_add(1) < body.statements.nodes.len());
                 let nested_super_calls = super_statement_index.is_none()
@@ -60810,7 +60882,7 @@ impl Printer<'_> {
                 let statements_before_super = super_statement_index.is_some_and(|index| index > 0);
                 let previous_constructor_super_capture =
                     self.downlevel_constructor_super_capture.clone();
-                if nested_super_calls || statements_before_super {
+                if nested_super_calls || (statements_before_super && capture_super_result) {
                     self.writer.write("var _this = this;");
                     self.writer.newline();
                     self.this_alias = Some("_this".to_owned());
@@ -60819,7 +60891,7 @@ impl Printer<'_> {
                     self.downlevel_constructor_super_capture
                         .clone_from(&super_capture);
                     if nested_super_calls && !emitted_fields {
-                        self.emit_parameter_properties(&constructor.parameters, "_this")?;
+                        self.emit_parameter_properties(parameters, "_this")?;
                         self.emit_es5_instance_fields(data, "_this", captures_field_this)?;
                         emitted_fields = true;
                     }
@@ -60890,7 +60962,7 @@ impl Printer<'_> {
                             self.this_alias_scope = Some(body_id);
                             uses_this_alias = true;
                             if !emitted_fields {
-                                self.emit_parameter_properties(&constructor.parameters, "_this")?;
+                                self.emit_parameter_properties(parameters, "_this")?;
                                 self.emit_es5_instance_fields(data, "_this", captures_field_this)?;
                                 emitted_fields = true;
                             }
@@ -60904,7 +60976,7 @@ impl Printer<'_> {
                     previous_emitted = statement_emits_javascript(self.arena, &statement_node);
                 }
                 if uses_this_alias && !emitted_fields {
-                    self.emit_parameter_properties(&constructor.parameters, "_this")?;
+                    self.emit_parameter_properties(parameters, "_this")?;
                     self.emit_es5_instance_fields(data, "_this", captures_field_this)?;
                     emitted_fields = true;
                 }
@@ -61081,6 +61153,9 @@ impl Printer<'_> {
                 && (matches!(
                     &node.data,
                     NodeData::MethodDeclaration(method) if method.body.is_some()
+                ) || matches!(
+                    &node.data,
+                    NodeData::ConstructorDeclaration(constructor) if constructor.body.is_some()
                 ) || matches!(
                     &node.data,
                     NodeData::PropertyDeclaration(property) if self.property_is_auto_accessor(property)
@@ -61332,7 +61407,9 @@ impl Printer<'_> {
         let previous_static_super = super_capture
             .as_ref()
             .and_then(|capture| self.downlevel_super_context.replace((capture.clone(), true)));
-        self.emit_unconsumed_class_declaration_computed_properties(data)?;
+        if !self.commonjs_class_export_precedes_static_initializers(data) {
+            self.emit_unconsumed_class_declaration_computed_properties(data)?;
+        }
         if !self.writer.line_start {
             self.writer.newline();
         }
@@ -66221,6 +66298,41 @@ impl Printer<'_> {
             &self.synthetic_runtime_identifier_uses,
         ) || declaration_name_text(self.arena, name)
             .is_some_and(|name| import_name_is_reexported(self.arena, name))
+            || self.namespace_import_binding_conflicts_with_runtime_value(name)
+    }
+
+    fn namespace_import_binding_conflicts_with_runtime_value(&self, binding: NodeId) -> bool {
+        if !self
+            .arena
+            .get(binding)
+            .and_then(|node| node.parent)
+            .and_then(|parent| self.arena.get(parent))
+            .is_some_and(|parent| matches!(parent.data, NodeData::NamespaceImport(_)))
+        {
+            return false;
+        }
+        let Some(name) = declaration_name_text(self.arena, binding) else {
+            return false;
+        };
+        self.bindings
+            .node_symbols
+            .get(&binding)
+            .copied()
+            .or_else(|| self.bindings.resolve_name_at(binding, name))
+            .and_then(|symbol| self.bindings.symbols.get(symbol))
+            .is_some_and(|symbol| {
+                symbol.declarations.iter().any(|declaration| {
+                    matches!(
+                        self.arena.get(*declaration).map(|node| &node.data),
+                        Some(
+                            NodeData::VariableDeclaration(_)
+                                | NodeData::FunctionDeclaration(_)
+                                | NodeData::ClassDeclaration(_)
+                                | NodeData::EnumDeclaration(_)
+                        )
+                    )
+                })
+            })
     }
 
     fn import_binding_has_emitted_runtime_use(&self, binding: NodeId) -> bool {
@@ -66687,7 +66799,8 @@ impl Printer<'_> {
                     matches!(
                         &node.data,
                         NodeData::NamespaceImport(namespace)
-                            if self.import_binding_is_used(namespace.name)
+                            if self.verbatim_module_syntax
+                                || self.import_binding_is_used(namespace.name)
                     )
                 });
             runtime_namespace && self.import_has_runtime_use(*statement, import)
@@ -67334,7 +67447,7 @@ impl Printer<'_> {
                     self.write_source_identifier(id, &data.text);
                 }
             }
-            NodeData::NumericLiteral(data) => self.write_numeric_literal(data),
+            NodeData::NumericLiteral(data) => self.write_numeric_literal(id, data),
             NodeData::BigIntLiteral(data) => {
                 self.writer.write(&canonical_bigint_literal(&data.text));
             }
@@ -69358,8 +69471,12 @@ impl Printer<'_> {
                         }
                         self.arguments_alias = Some(alias.to_owned());
                     }
+                    let static_class_capture = (self.settings.target < ScriptTarget::Es2015)
+                        .then(|| self.class_static_this_capture.clone())
+                        .flatten();
                     let this_argument = if self.settings.target < ScriptTarget::Es2015
-                        && self.this_alias.as_deref() == Some("_a")
+                        && (self.this_alias.as_deref() == Some("_a")
+                            || static_class_capture.is_some())
                     {
                         // A lowered static field uses `_a` as the class-value capture for
                         // the generator callback. It is not the receiver of the async arrow.
@@ -69384,17 +69501,21 @@ impl Printer<'_> {
                             let temp = expression_body.map(|_| "_b");
                             (pattern, "_a", temp)
                         });
-                        let state =
-                            if object_rest.is_some() || self.this_alias.as_deref() == Some("_a") {
-                                if object_rest.is_some() { "_c" } else { "_b" }
-                            } else {
-                                "_a"
-                            };
-                        let generator_this = if self.this_alias.as_deref() == Some("_a") {
-                            "_a"
+                        let state = if object_rest.is_some()
+                            || self.this_alias.as_deref() == Some("_a")
+                            || static_class_capture.as_deref() == Some("_a")
+                        {
+                            if object_rest.is_some() { "_c" } else { "_b" }
                         } else {
-                            "this"
+                            "_a"
                         };
+                        let generator_this = static_class_capture.as_deref().unwrap_or_else(|| {
+                            if self.this_alias.as_deref() == Some("_a") {
+                                "_a"
+                            } else {
+                                "this"
+                            }
+                        });
                         let parameter_prologue = data.parameters.nodes.iter().any(|parameter| {
                             matches!(
                                 self.arena.get(*parameter).map(|node| &node.data),
@@ -74865,7 +74986,10 @@ impl Printer<'_> {
     fn decimal_integer_literal_needs_property_dot(&self, expression: NodeId) -> bool {
         match self.arena.get(expression).map(|node| &node.data) {
             Some(NodeData::NumericLiteral(literal)) => {
-                let text = literal.text.as_bytes();
+                let text = self
+                    .numeric_literal_source_text(expression)
+                    .unwrap_or(&literal.text)
+                    .as_bytes();
                 !text.contains(&b'.')
                     && !text.contains(&b'e')
                     && !text.contains(&b'E')
@@ -74899,16 +75023,31 @@ impl Printer<'_> {
         }
     }
 
-    fn write_numeric_literal(&mut self, literal: &ts_ast::NumericLiteralData) {
+    fn numeric_literal_source_text(&self, id: NodeId) -> Option<&str> {
+        let node = self.arena.get(id)?;
+        let start = usize::try_from(node.range.start.get()).ok()?;
+        let end = usize::try_from(node.range.end.get()).ok()?;
+        self.source_text
+            .get(start..end)
+            .or_else(|| self.arena.source_text()?.get(start..end))
+    }
+
+    fn write_numeric_literal(&mut self, id: NodeId, literal: &ts_ast::NumericLiteralData) {
+        let source_spelling = self.numeric_literal_source_text(id);
         if literal.token_flags.0 & (1 << 5) != 0 {
-            let digits = literal.text.trim_start_matches('0');
+            let Some(source_text) = source_spelling else {
+                self.writer.write(&literal.text);
+                return;
+            };
+            let digits = source_text.trim_start_matches('0');
             let digits = if digits.is_empty() { "0" } else { digits };
             self.writer.write(
                 &ts_jsnum::Number::from_string(&format!("0o{digits}")).to_string(),
             );
             return;
         }
-        let bytes = literal.text.as_bytes();
+        let source_text = source_spelling.unwrap_or(&literal.text).to_owned();
+        let bytes = source_text.as_bytes();
         let invalid_leading_zero = bytes.len() > 1
             && bytes[0] == b'0'
             && bytes[1].is_ascii_digit();
@@ -74919,13 +75058,13 @@ impl Printer<'_> {
                 || bytes.starts_with(b"0O"));
         if invalid_leading_zero
             || downlevel_binary_or_octal
-            || (self.settings.target < ScriptTarget::Es2021 && literal.text.contains('_'))
+            || (self.settings.target < ScriptTarget::Es2021 && source_text.contains('_'))
         {
-            let normalized = literal.text.replace('_', "");
+            let normalized = source_text.replace('_', "");
             self.writer
                 .write(&ts_jsnum::Number::from_string(&normalized).to_string());
         } else {
-            self.writer.write(&literal.text);
+            self.writer.write(&source_text);
         }
     }
 
@@ -76764,7 +76903,7 @@ mod tests {
                 || panic!("missing explicit union result: {output}"),
                 |start| &output[start..],
             );
-        assert!(explicit.contains("value: undefined | boolean;"), "{output}");
+        assert!(explicit.contains("value: boolean | undefined;"), "{output}");
     }
 
     #[test]
@@ -77216,7 +77355,7 @@ mod tests {
                 preserve_const_enums: true,
                 inline_const_enums: false,
                 emit_decorator_metadata: false,
-                es_module_interop: false,
+                es_module_interop: true,
                 preserve_dynamic_import: false,
                 verbatim_module_syntax,
                 isolated_modules: false,
@@ -77387,7 +77526,7 @@ mod tests {
                 preserve_const_enums: true,
                 inline_const_enums: false,
                 emit_decorator_metadata: false,
-                es_module_interop: false,
+                es_module_interop: true,
                 preserve_dynamic_import: false,
                 verbatim_module_syntax: false,
                 isolated_modules: false,
@@ -78387,7 +78526,7 @@ mod tests {
             emit(
                 "import main, { read as load, write } from 'pkg'; import 'side'; const value = load({ x: 1 }, [2, 3]); const message = `value=${value}`; export { value as result }; export * from 'other'; export default value;"
             ),
-            "import main, { read as load, write } from \"pkg\";\nimport \"side\";\nconst value = load({ x: 1 }, [2, 3]);\nconst message = `value=${value}`;\nexport { value as result };\nexport * from \"other\";\nexport default value;\n"
+            "import { read as load } from \"pkg\";\nimport \"side\";\nconst value = load({ x: 1 }, [2, 3]);\nconst message = `value=${value}`;\nexport { value as result };\nexport * from \"other\";\nexport default value;\n"
         );
     }
 
@@ -78409,20 +78548,20 @@ mod tests {
         let source = "const view = <Panel enabled {...props} title='hello'><span>{value}</span><Icon /></Panel>;";
         assert_eq!(
             emit_jsx(source, JsxEmit::Preserve),
-            "const view = <Panel enabled {...props} title=\"hello\"><span>{value}</span><Icon/></Panel>;\n"
+            "const view = <Panel enabled {...props} title='hello'><span>{value}</span><Icon /></Panel>;\n"
         );
         assert_eq!(
             emit_jsx(source, JsxEmit::React),
-            "const view = React.createElement(Panel, { enabled: true, ...props, title: \"hello\" }, React.createElement(\"span\", null, value), React.createElement(Icon, null));\n"
+            "const view = React.createElement(Panel, { enabled: true, ...props, title: 'hello' }, React.createElement(\"span\", null, value), React.createElement(Icon, null));\n"
         );
         let fragment = "const view = <><span />{value}</>;";
         assert_eq!(
             emit_jsx(fragment, JsxEmit::Preserve),
-            "const view = <><span/>{value}</>;\n"
+            "const view = <><span />{value}</>;\n"
         );
         assert_eq!(
             emit_jsx(fragment, JsxEmit::React),
-            "const view = React.createElement(React.Fragment, null, React.createElement(\"span\", null), value);\n"
+            "const view = React.createElement(React.Fragment, null,\n    React.createElement(\"span\", null),\n    value);\n"
         );
         assert_eq!(
             emit_jsx("const view = <Panel />;", JsxEmit::None),
@@ -78526,11 +78665,11 @@ mod tests {
         let source = "const view = <><div id='root'>hello <Widget /></div><UI.Button>{value}</UI.Button></>;";
         assert_eq!(
             emit_jsx(source, JsxEmit::ReactJsx),
-            "import { jsx as _jsx, jsxs as _jsxs, Fragment as _Fragment } from \"react/jsx-runtime\";\nconst view = _jsxs(_Fragment, { children: [_jsxs(\"div\", { id: \"root\", children: [\"hello \", _jsx(Widget, {})] }), _jsx(UI.Button, { children: value })] });\n"
+            "import { jsx as _jsx, jsxs as _jsxs, Fragment as _Fragment } from \"react/jsx-runtime\";\nconst view = _jsxs(_Fragment, { children: [_jsxs(\"div\", { id: 'root', children: [\"hello \", _jsx(Widget, {})] }), _jsx(UI.Button, { children: value })] });\n"
         );
         assert_eq!(
             emit_jsx(source, JsxEmit::ReactJsxDev),
-            "import { jsxDEV as _jsxDEV, Fragment as _Fragment } from \"react/jsx-dev-runtime\";\nconst _jsxFileName = \"input.tsx\";\nconst view = _jsxDEV(_Fragment, { children: [_jsxDEV(\"div\", { id: \"root\", children: [\"hello \", _jsxDEV(Widget, {}, void 0, false, { fileName: _jsxFileName, lineNumber: 1, columnNumber: 37 }, this)] }, void 0, true, { fileName: _jsxFileName, lineNumber: 1, columnNumber: 16 }, this), _jsxDEV(UI.Button, { children: value }, void 0, false, { fileName: _jsxFileName, lineNumber: 1, columnNumber: 53 }, this)] }, void 0, true, { fileName: _jsxFileName, lineNumber: 1, columnNumber: 14 }, this);\n"
+            "import { jsxDEV as _jsxDEV, Fragment as _Fragment } from \"react/jsx-dev-runtime\";\nconst _jsxFileName = \"input.tsx\";\nconst view = _jsxDEV(_Fragment, { children: [_jsxDEV(\"div\", { id: 'root', children: [\"hello \", _jsxDEV(Widget, {}, void 0, false, { fileName: _jsxFileName, lineNumber: 1, columnNumber: 37 }, this)] }, void 0, true, { fileName: _jsxFileName, lineNumber: 1, columnNumber: 16 }, this), _jsxDEV(UI.Button, { children: value }, void 0, false, { fileName: _jsxFileName, lineNumber: 1, columnNumber: 53 }, this)] }, void 0, true, { fileName: _jsxFileName, lineNumber: 1, columnNumber: 14 }, this);\n"
         );
     }
 
@@ -78554,7 +78693,7 @@ mod tests {
         let source = "const item = <Component key='item' value={count}>text</Component>;";
         assert_eq!(
             emit_jsx(source, JsxEmit::ReactJsx),
-            "import { jsx as _jsx } from \"react/jsx-runtime\";\nconst item = _jsx(Component, { value: count, children: \"text\" }, \"item\");\n"
+            "import { jsx as _jsx } from \"react/jsx-runtime\";\nconst item = _jsx(Component, { value: count, children: \"text\" }, 'item');\n"
         );
     }
 
@@ -79025,13 +79164,10 @@ mod tests {
         )
         .code;
         assert!(
-            static_field.contains("var _a;\nclass Test"),
+            static_field.contains("}\nTest.member = (x) => __awaiter("),
             "{static_field}"
         );
-        assert!(
-            static_field.contains("}\n_a = Test;\nTest.member = (x) => __awaiter("),
-            "{static_field}"
-        );
+        assert!(!static_field.contains("_a = Test;"), "{static_field}");
     }
 
     #[test]
@@ -79531,7 +79667,7 @@ mod tests {
         );
         assert_eq!(
             emit_with(source, ScriptTarget::Es2022, ModuleKind::None).code,
-            "function outer() {\n    return class Named {\n        static {\n            use(arguments);\n        }\n    };\n}\n"
+            "function outer() {\n    return class Named {\n        static { use(arguments); }\n    };\n}\n"
         );
     }
 
@@ -82556,7 +82692,7 @@ mod tests {
         );
         assert_eq!(
             result.code,
-            "var greet = function (name) { return \"hi \" + name + \"\"; };\nvar result = value !== null && value !== void 0 ? value : fallback;\n"
+            "var greet = function (name) { return \"hi \".concat(name); };\nvar result = value !== null && value !== void 0 ? value : fallback;\n"
         );
     }
 
@@ -82792,7 +82928,31 @@ mod tests {
         );
         assert_eq!(
             result.code,
-            "var value = source === null || source === void 0 ? void 0 : source[key];\nvar merged = Object.assign({ a: 1 }, extra, { b: 2 });\nvar list = [].concat([], [0], items, [3]);\n"
+            concat!(
+                "var __assign = (this && this.__assign) || function () {\n",
+                "    __assign = Object.assign || function(t) {\n",
+                "        for (var s, i = 1, n = arguments.length; i < n; i++) {\n",
+                "            s = arguments[i];\n",
+                "            for (var p in s) if (Object.prototype.hasOwnProperty.call(s, p))\n",
+                "                t[p] = s[p];\n",
+                "        }\n",
+                "        return t;\n",
+                "    };\n",
+                "    return __assign.apply(this, arguments);\n",
+                "};\n",
+                "var __spreadArray = (this && this.__spreadArray) || function (to, from, pack) {\n",
+                "    if (pack || arguments.length === 2) for (var i = 0, l = from.length, ar; i < l; i++) {\n",
+                "        if (ar || !(i in from)) {\n",
+                "            if (!ar) ar = Array.prototype.slice.call(from, 0, i);\n",
+                "            ar[i] = from[i];\n",
+                "        }\n",
+                "    }\n",
+                "    return to.concat(ar || Array.prototype.slice.call(from));\n",
+                "};\n",
+                "var value = source === null || source === void 0 ? void 0 : source[key];\n",
+                "var merged = __assign(__assign({ a: 1 }, extra), { b: 2 });\n",
+                "var list = __spreadArray(__spreadArray([0], items, true), [3], false);\n",
+            )
         );
     }
 
@@ -82917,8 +83077,8 @@ mod tests {
         assert_eq!(
             output,
             concat!(
-                "const leading = Object.assign({ before: one(), [computed()]: two() }, spread(), { after: three() });\n",
-                "const spreadFirst = Object.assign({}, first, { [key()]: value(), plain: after() }, second(), { tail: end() });\n",
+                "const leading = Object.assign(Object.assign({ before: one(), [computed()]: two() }, spread()), { after: three() });\n",
+                "const spreadFirst = Object.assign(Object.assign(Object.assign(Object.assign({}, first), { [key()]: value(), plain: after() }), second()), { tail: end() });\n",
                 "const consecutive = Object.assign(Object.assign({}, first), second());\n",
             )
         );
@@ -84596,18 +84756,36 @@ class Board {
                 "    if (k2 === undefined) k2 = k;\n",
                 "    o[k2] = m[k];\n",
                 "}));\n",
+                "var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {\n",
+                "    Object.defineProperty(o, \"default\", { enumerable: true, value: v });\n",
+                "}) : function(o, v) {\n",
+                "    o[\"default\"] = v;\n",
+                "});\n",
+                "var __importStar = (this && this.__importStar) || (function () {\n",
+                "    var ownKeys = function(o) {\n",
+                "        ownKeys = Object.getOwnPropertyNames || function (o) {\n",
+                "            var ar = [];\n",
+                "            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;\n",
+                "            return ar;\n",
+                "        };\n",
+                "        return ownKeys(o);\n",
+                "    };\n",
+                "    return function (mod) {\n",
+                "        if (mod && mod.__esModule) return mod;\n",
+                "        var result = {};\n",
+                "        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== \"default\") __createBinding(result, mod, k[i]);\n",
+                "        __setModuleDefault(result, mod);\n",
+                "        return result;\n",
+                "    };\n",
+                "})();\n",
                 "var __exportStar = (this && this.__exportStar) || function(m, exports) {\n",
                 "    for (var p in m) if (p !== \"default\" && !Object.prototype.hasOwnProperty.call(exports, p)) __createBinding(exports, m, p);\n",
                 "};\n",
-                "var __importDefault = (this && this.__importDefault) || function (mod) {\n",
-                "    return (mod && mod.__esModule) ? mod : { \"default\": mod };\n",
-                "};\n",
                 "Object.defineProperty(exports, \"__esModule\", { value: true });\n",
                 "exports.result = void 0;\n",
-                "const pkg_1 = __importDefault(require(\"pkg\"));\n",
-                "const { read: load, write } = require(\"pkg\");\n",
+                "const pkg_1 = __importStar(require(\"pkg\"));\n",
+                "Object.defineProperty(exports, \"result\", { enumerable: true, get: function () { return pkg_1.read; } });\n",
                 "require(\"side\");\n",
-                "exports.result = load;\n",
                 "__exportStar(require(\"other\"), exports);\n",
                 "exports.default = pkg_1.default;\n",
             )
@@ -84721,14 +84899,43 @@ class Board {
             emit_with(source, ScriptTarget::Es2015, ModuleKind::CommonJs).code,
             concat!(
                 "\"use strict\";\n",
-                "var __importDefault = (this && this.__importDefault) || function (mod) {\n",
-                "    return (mod && mod.__esModule) ? mod : { \"default\": mod };\n",
-                "};\n",
+                "var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {\n",
+                "    if (k2 === undefined) k2 = k;\n",
+                "    var desc = Object.getOwnPropertyDescriptor(m, k);\n",
+                "    if (!desc || (\"get\" in desc ? !m.__esModule : desc.writable || desc.configurable)) {\n",
+                "      desc = { enumerable: true, get: function() { return m[k]; } };\n",
+                "    }\n",
+                "    Object.defineProperty(o, k2, desc);\n",
+                "}) : (function(o, m, k, k2) {\n",
+                "    if (k2 === undefined) k2 = k;\n",
+                "    o[k2] = m[k];\n",
+                "}));\n",
+                "var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {\n",
+                "    Object.defineProperty(o, \"default\", { enumerable: true, value: v });\n",
+                "}) : function(o, v) {\n",
+                "    o[\"default\"] = v;\n",
+                "});\n",
+                "var __importStar = (this && this.__importStar) || (function () {\n",
+                "    var ownKeys = function(o) {\n",
+                "        ownKeys = Object.getOwnPropertyNames || function (o) {\n",
+                "            var ar = [];\n",
+                "            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;\n",
+                "            return ar;\n",
+                "        };\n",
+                "        return ownKeys(o);\n",
+                "    };\n",
+                "    return function (mod) {\n",
+                "        if (mod && mod.__esModule) return mod;\n",
+                "        var result = {};\n",
+                "        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== \"default\") __createBinding(result, mod, k[i]);\n",
+                "        __setModuleDefault(result, mod);\n",
+                "        return result;\n",
+                "    };\n",
+                "})();\n",
                 "Object.defineProperty(exports, \"__esModule\", { value: true });\n",
-                "const b_1 = __importDefault(require(\"./b\"));\n",
-                "const b_2 = require(\"./b\");\n",
+                "const b_1 = __importStar(require(\"./b\"));\n",
                 "b_1.default;\n",
-                "(0, b_2.read)();\n",
+                "(0, b_1.read)();\n",
             )
         );
     }
@@ -85438,7 +85645,7 @@ class Board {
                 preserve_const_enums: true,
                 inline_const_enums: false,
                 emit_decorator_metadata: false,
-                es_module_interop: false,
+                es_module_interop: true,
                 preserve_dynamic_import: false,
                 verbatim_module_syntax: false,
                 isolated_modules: false,
@@ -85554,7 +85761,7 @@ class Board {
         )
         .code;
         assert!(
-            output.contains("const default_1 = require(\"./default\");"),
+            output.contains("const default_1 = __importDefault(require(\"./default\"));"),
             "{output}"
         );
         assert!(
@@ -85562,9 +85769,10 @@ class Board {
             "{output}"
         );
         assert!(
-            output.contains("const Namespace = require(\"./namespace\");"),
+            output.contains("const Namespace = __importStar(require(\"./namespace\"));"),
             "{output}"
         );
+        assert!(output.contains("var __importStar ="), "{output}");
     }
 
     #[test]
@@ -85887,7 +86095,10 @@ class Board {
         let map = result.source_map.unwrap();
         assert_eq!(map.version, 3);
         assert_eq!(map.sources, ["input.ts"]);
-        assert_eq!(map.mappings, "AAAA;AACA");
+        assert_eq!(
+            map.mappings,
+            "AAAA,MAAM,KAAK,GAAG,CAAC,CAAC;AAChB,MAAM,MAAM,GAAG,KAAK,GAAG,CAAC,CAAC"
+        );
     }
 
     #[test]
@@ -86197,18 +86408,12 @@ class Board {
             "export const staticMember = Foo[key]; ",
             "export const instanceMember = new Foo()[key];",
         ));
-        assert!(
-            output.contains("declare const key: unique symbol;"),
-            "{output}"
-        );
-        assert!(output.contains("declare class Foo"), "{output}");
-        assert!(
-            output.contains("export declare const staticMember: () => number;"),
-            "{output}"
-        );
-        assert!(
-            output.contains("export declare const instanceMember: () => string;"),
-            "{output}"
+        assert_eq!(
+            output,
+            concat!(
+                "export declare const staticMember: () => number;\n",
+                "export declare const instanceMember: () => string;\n",
+            )
         );
     }
 
@@ -87462,10 +87667,7 @@ class Board {
             "import dep = require('./dep');\n",
             "export var value = dep;\n",
         ));
-        assert!(
-            inferred_export.starts_with("/** dependency */\nimport dep = require('./dep');"),
-            "{inferred_export}"
-        );
+        assert_eq!(inferred_export, "export declare var value: any;\n");
     }
 
     #[test]
@@ -87660,7 +87862,7 @@ class Board {
             "{output}"
         );
         assert!(
-            output.contains("declare function mixed(): (() => C) | C;"),
+            output.contains("declare function mixed(): C | (() => C);"),
             "{output}"
         );
         assert!(
@@ -88060,7 +88262,7 @@ class Board {
             output,
             concat!(
                 "export declare const baddts: (x: {\n",
-                "    foo?: string | undefined;\n",
+                "    foo?: string;\n",
                 "    baz?: undefined;\n",
                 "} & {\n",
                 "    bar: number;\n",
