@@ -934,37 +934,30 @@ mod tests {
         }
     }
 
-    fn resolve_inline_literal(fixture: &mut Fixture, paired_indexes: bool) -> TypeId {
-        resolve_literal(fixture, paired_indexes, None)
+    fn resolve_inline_literal(fixture: &mut Fixture) -> TypeId {
+        resolve_literal(fixture, None)
     }
 
     fn resolve_aliased_literal(fixture: &mut Fixture) -> TypeId {
         let alias = node_of_kind(fixture, SyntaxKind::TypeAliasDeclaration);
         let symbol = bound_symbol(fixture, alias);
-        resolve_literal(fixture, false, Some(symbol))
+        resolve_literal(fixture, Some(symbol))
     }
 
-    fn resolve_literal(
-        fixture: &mut Fixture,
-        paired_indexes: bool,
-        alias: Option<SemanticSymbolId>,
-    ) -> TypeId {
+    fn resolve_literal(fixture: &mut Fixture, alias: Option<SemanticSymbolId>) -> TypeId {
         let literal = node_of_kind(fixture, SyntaxKind::TypeLiteral);
         let host = DeclaredTypeHost::new([(
             &fixture.parsed.arena,
             fixture.files.get(&fixture.file).unwrap(),
         )])
         .unwrap();
-        let plan = if paired_indexes {
-            object_members::plan_concrete_indexed_access_type_literal(
-                &fixture.store,
-                &host,
-                literal,
-            )
-            .unwrap()
-        } else {
-            object_members::plan_type_literal(&fixture.store, &host, literal, alias).unwrap()
-        };
+        let mut plan = object_members::plan_concrete_indexed_access_type_literal(
+            &fixture.store,
+            &host,
+            literal,
+        )
+        .unwrap();
+        plan.alias_symbol = alias;
         let property_types = plan
             .property_type_nodes()
             .map(|node| keyword_type(&fixture.store, node, literal_type_sentinel(&fixture.store)))
@@ -1053,7 +1046,7 @@ mod tests {
     #[test]
     fn anonymous_property_keys_are_canonical_and_warm_is_allocation_free() {
         let mut fixture = fixture("type Keys = keyof { alpha: string; beta: number };");
-        let object = resolve_inline_literal(&mut fixture, false);
+        let object = resolve_inline_literal(&mut fixture);
         let plan = plan_nongeneric_keyof_type(&fixture.store, object).unwrap();
         assert_eq!(plan.property_names(), ["alpha", "beta"]);
         assert!(!plan.preserves_origin());
@@ -1078,7 +1071,7 @@ mod tests {
     #[test]
     fn index_precedence_matches_pinned_keyof_reduction() {
         let mut number = fixture("type Keys = keyof { named: string; [key: number]: number };");
-        let number_object = resolve_inline_literal(&mut number, false);
+        let number_object = resolve_inline_literal(&mut number);
         let number_plan = plan_nongeneric_keyof_type(&number.store, number_object).unwrap();
         assert!(!number_plan.has_string_index());
         assert!(number_plan.has_number_index());
@@ -1092,7 +1085,7 @@ mod tests {
         assert_eq!(union_constituents(&number.store, number_result), expected);
 
         let mut string = fixture("type Keys = keyof { named: string; [key: string]: string };");
-        let string_object = resolve_inline_literal(&mut string, false);
+        let string_object = resolve_inline_literal(&mut string);
         let string_plan = plan_nongeneric_keyof_type(&string.store, string_object).unwrap();
         assert!(string_plan.has_string_index());
         let string_result = resolve_nongeneric_keyof_type(&mut string.store, &string_plan).unwrap();
@@ -1122,7 +1115,7 @@ mod tests {
 
         let mut paired =
             fixture("type Keys = keyof { [text: string]: string; [position: number]: string };");
-        let paired_object = resolve_inline_literal(&mut paired, true);
+        let paired_object = resolve_inline_literal(&mut paired);
         let paired_plan = plan_nongeneric_keyof_type(&paired.store, paired_object).unwrap();
         assert!(paired_plan.has_string_index());
         assert!(paired_plan.has_number_index());
@@ -1262,7 +1255,7 @@ mod tests {
     #[test]
     fn duplicate_and_poisoned_member_surfaces_fail_closed() {
         let mut duplicate = fixture("type Keys = keyof { left: string; right: number };");
-        let object = resolve_inline_literal(&mut duplicate, false);
+        let object = resolve_inline_literal(&mut duplicate);
         let (members, property, indexes) = {
             let structured = duplicate
                 .store
@@ -1289,7 +1282,7 @@ mod tests {
         );
 
         let mut poisoned = fixture("type Keys = keyof { named: string; [key: number]: number };");
-        let indexed = resolve_inline_literal(&mut poisoned, false);
+        let indexed = resolve_inline_literal(&mut poisoned);
         let (members, properties, index) = {
             let structured = poisoned
                 .store
@@ -1319,7 +1312,7 @@ mod tests {
     #[test]
     fn foreign_and_composite_targets_are_explicit_boundaries() {
         let mut first = fixture("type Keys = keyof { local: string };");
-        let local = resolve_inline_literal(&mut first, false);
+        let local = resolve_inline_literal(&mut first);
         let second = fixture("type Other = string;");
         assert_eq!(
             plan_nongeneric_keyof_type(&second.store, local),
@@ -1344,7 +1337,7 @@ mod tests {
     #[test]
     fn empty_anonymous_literal_reuses_never() {
         let mut fixture = fixture("type Keys = keyof {};");
-        let object = resolve_inline_literal(&mut fixture, false);
+        let object = resolve_inline_literal(&mut fixture);
         let plan = plan_nongeneric_keyof_type(&fixture.store, object).unwrap();
         assert_eq!(plan.reduced_key_count(), 0);
         assert_eq!(

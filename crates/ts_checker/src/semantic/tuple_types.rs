@@ -909,8 +909,7 @@ impl CanonicalTypeMapperStore {
         for length in &mut preflight.cold_lengths {
             for value in &preflight.length_values[length.values.clone()] {
                 length.constituents.push(
-                    self.regular_number_literal_type(*value)
-                        .map_err(length_type_error)
+                    self.canonical_tuple_length_literal(*value)
                         .map_err(|error| preparation_error(length.node, error))?,
                 );
             }
@@ -1416,6 +1415,25 @@ impl CanonicalTypeMapperStore {
         Ok(())
     }
 
+    fn canonical_tuple_length_literal(&mut self, value: Number) -> Result<TypeId, TupleTypeError> {
+        let bootstrap = self
+            .intrinsic_bootstrap()
+            .ok_or(TupleTypeError::BootstrapUninitialized)?;
+        if value == Number::new(0.0) {
+            let zero = bootstrap.zero_type;
+            if bootstrap.cached_number_literal_type(value) != Some(zero) {
+                return Err(length_type_error(
+                    LiteralTypeCacheError::InvalidCachedLiteral(zero),
+                ));
+            }
+            self.validate_union_constituent(zero)
+                .map_err(length_type_error)?;
+            return Ok(zero);
+        }
+        self.regular_number_literal_type(value)
+            .map_err(length_type_error)
+    }
+
     #[allow(clippy::too_many_lines)]
     fn create_cold_canonical_tuple_type(
         &mut self,
@@ -1556,7 +1574,7 @@ impl CanonicalTypeMapperStore {
                 .expect("preflighted tuple length vector capacity");
             for value in length_values {
                 constituents.push(
-                    self.regular_number_literal_type(value)
+                    self.canonical_tuple_length_literal(value)
                         .expect("preflighted tuple length literal"),
                 );
             }
@@ -1848,7 +1866,13 @@ impl CanonicalTypeMapperStore {
             && data
                 .constrained
                 .resolved_base_constraint
-                .is_none_or(|type_| self.type_payload(type_).is_some())
+                .is_none_or(|type_| {
+                    if is_this_type {
+                        constraint == Some(type_)
+                    } else {
+                        self.type_payload(type_).is_some()
+                    }
+                })
             && data
                 .resolved_default_type
                 .is_none_or(|type_| self.type_payload(type_).is_some())
@@ -2626,6 +2650,7 @@ mod tests {
         assert!(store.set_resolved_base_constraint(empty, Some(string)));
         assert!(store.set_object_type_without_abstract_construct_signatures(empty, Some(empty),));
         assert!(store.set_interface_base_resolution(empty, true, None, Some(Vec::new()),));
+        assert!(store.set_resolved_base_constraint(this_type, Some(empty)));
         let resolved_type_variable_flags = ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES_COMPUTED
             | ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES;
         assert!(store.add_type_object_flags(empty, resolved_type_variable_flags));
@@ -2917,7 +2942,13 @@ mod tests {
 
     #[test]
     fn required_optional_and_rest_shapes_own_exact_targets_and_instances() {
-        let mut store = initialized();
+        let mut store = TestStore::new();
+        store
+            .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions {
+                strict_null_checks: true,
+                ..IntrinsicBootstrapOptions::default()
+            })
+            .unwrap();
         let (string, number, undefined) = {
             let bootstrap = store.intrinsic_bootstrap().unwrap();
             (
