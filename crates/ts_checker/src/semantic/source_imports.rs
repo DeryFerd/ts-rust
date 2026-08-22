@@ -47,6 +47,10 @@ use super::{
     },
     array_types::CanonicalArrayTargets,
     instantiate::InstantiationSession,
+    jsdoc::{
+        PlannedJsDocType, plan_javascript_source_jsdoc, preflight_planned_jsdoc_type,
+        resolve_planned_jsdoc_type,
+    },
     source_callables::{
         SourceCallableError, SourceCallableFamily, SourceCallablePlan,
         StoredSourceCallableValidation, plan_source_callable, validate_stored_source_callable,
@@ -168,6 +172,9 @@ enum PreparedSourceImportTarget {
     AnnotatedFunction {
         signature: SignatureId,
     },
+    JavaScriptAnnotatedConst {
+        annotation: Option<PlannedJsDocType>,
+    },
 }
 
 enum PlannedSourceImportValueTarget {
@@ -176,6 +183,11 @@ enum PlannedSourceImportValueTarget {
         type_node: NodeRef,
     },
     AnnotatedFunction(Box<SourceCallablePlan>),
+    JavaScriptAnnotatedConst {
+        declaration: NodeRef,
+        annotation: Option<PlannedJsDocType>,
+        cached_type: Option<TypeId>,
+    },
 }
 
 /// One fully preflighted value-link payload for the source checker's combined
@@ -482,12 +494,12 @@ fn plan_top_level_named_import(
     let facts = bound
         .source_facts()
         .ok_or_else(|| invariant(SourceImportInvariant::MissingSourceFacts(source)))?;
-    if facts.is_javascript_file() {
+    if facts.is_javascript_file() && phase == SourceImportPhase::Type {
         return Err(unsupported(SourceImportUnsupported::JavaScriptSource(
             source,
         )));
     }
-    if facts.is_common_js_module() {
+    if facts.is_common_js_module() && !facts.is_javascript_file() {
         return Err(unsupported(SourceImportUnsupported::CommonJsSource(source)));
     }
     if !facts.is_external_module() {
@@ -837,12 +849,7 @@ pub(super) fn plan_top_level_named_reexport(
     let facts = bound
         .source_facts()
         .ok_or_else(|| invariant(SourceImportInvariant::MissingSourceFacts(source)))?;
-    if facts.is_javascript_file() {
-        return Err(unsupported(SourceImportUnsupported::JavaScriptSource(
-            source,
-        )));
-    }
-    if facts.is_common_js_module() {
+    if facts.is_common_js_module() && !facts.is_javascript_file() {
         return Err(unsupported(SourceImportUnsupported::CommonJsSource(source)));
     }
     if !facts.is_external_module() {
@@ -1713,11 +1720,15 @@ pub(super) fn prepare_source_import_value(
         store,
         declared_host,
         global_types,
+        options,
         binding.alias_symbol,
         target,
     )?;
     let target_declaration = match &planned_target {
-        PlannedSourceImportValueTarget::AnnotatedConst { declaration, .. } => *declaration,
+        PlannedSourceImportValueTarget::AnnotatedConst { declaration, .. }
+        | PlannedSourceImportValueTarget::JavaScriptAnnotatedConst { declaration, .. } => {
+            *declaration
+        }
         PlannedSourceImportValueTarget::AnnotatedFunction(callable) => callable.declaration,
     };
     if target_declaration.file == binding.declaration.file {
@@ -1790,6 +1801,27 @@ pub(super) fn prepare_source_import_value(
                 PreparedSourceImportTarget::AnnotatedFunction {
                     signature: provenance.signature,
                 },
+            )
+        }
+        PlannedSourceImportValueTarget::JavaScriptAnnotatedConst {
+            declaration,
+            annotation,
+            cached_type,
+        } => {
+            let type_ = if let Some(annotation) = &annotation {
+                resolve_planned_jsdoc_type(store, global_types, options, annotation).map_err(
+                    |_| unsupported(SourceImportUnsupported::TargetDeclaration(declaration)),
+                )?
+            } else {
+                cached_type.ok_or_else(|| {
+                    unsupported(SourceImportUnsupported::MissingTargetAnnotation(
+                        declaration,
+                    ))
+                })?
+            };
+            (
+                type_,
+                PreparedSourceImportTarget::JavaScriptAnnotatedConst { annotation },
             )
         }
     };
@@ -2225,9 +2257,10 @@ fn plan_direct_exported_type_target(
             bound.source_file(),
         ))
     })?;
-    if facts.is_javascript_file()
-        || facts.is_common_js_module()
-        || !facts.is_external_module()
+    let commonjs_javascript = facts.is_javascript_file() && facts.is_common_js_module();
+    if (facts.is_javascript_file() && !commonjs_javascript)
+        || (facts.is_common_js_module() && !commonjs_javascript)
+        || !facts.is_external_or_common_js_module()
         || !host.symbol_matches(store, declaration, target)
     {
         return Err(unsupported(SourceImportUnsupported::TargetTypeDeclaration(
@@ -2261,7 +2294,8 @@ fn plan_direct_exported_type_target(
     }
     let (name_node, modifiers) = match &record.data {
         NodeData::TypeAliasDeclaration(type_alias)
-            if record.kind == SyntaxKind::TypeAliasDeclaration
+            if (record.kind == SyntaxKind::TypeAliasDeclaration
+                || commonjs_javascript && record.kind == SyntaxKind::JsTypeAliasDeclaration)
                 && target_record.flags() == SymbolFlags::TYPE_ALIAS
                 && type_alias.flow_node.is_none()
                 && type_alias.local_symbol.is_none()
@@ -2310,7 +2344,22 @@ fn plan_direct_exported_type_target(
             name,
         }));
     }
-    if !has_exact_export_modifier(arena, bound, store, declaration, modifiers)? {
+    let explicitly_exported = if commonjs_javascript {
+        let Some(module) = bound.symbol(bound.source_file()) else {
+            return Err(unsupported(SourceImportUnsupported::TargetTypeNotExported(
+                declaration,
+            )));
+        };
+        store
+            .symbol(module)
+            .and_then(|module| module.exports())
+            .and_then(|exports| store.symbol_table(exports))
+            .and_then(|exports| exports.get(target_record.name()))
+            == Some(target)
+    } else {
+        has_exact_export_modifier(arena, bound, store, declaration, modifiers)?
+    };
+    if !explicitly_exported {
         return Err(unsupported(SourceImportUnsupported::TargetTypeNotExported(
             declaration,
         )));
@@ -2322,14 +2371,30 @@ fn plan_direct_import_value_target(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
     alias: SemanticSymbolId,
     target: SemanticSymbolId,
 ) -> Result<PlannedSourceImportValueTarget, SourceImportError> {
-    let flags = store
+    let record = store
         .symbol(target)
-        .ok_or_else(|| invariant(SourceImportInvariant::InvalidTargetSymbol(target)))?
-        .flags();
+        .ok_or_else(|| invariant(SourceImportInvariant::InvalidTargetSymbol(target)))?;
+    let flags = record.flags();
     if flags == SymbolFlags::BLOCK_SCOPED_VARIABLE {
+        let javascript = record
+            .value_declaration()
+            .and_then(|declaration| host.source(declaration))
+            .and_then(|(_, bound)| bound.source_facts())
+            .is_some_and(ts_binder::CanonicalSourceFileFacts::is_javascript_file);
+        if javascript {
+            return plan_direct_javascript_const_target(
+                store,
+                host,
+                global_types,
+                options,
+                alias,
+                target,
+            );
+        }
         let (declaration, type_node) =
             plan_direct_annotated_const_target(store, host, alias, target)?;
         return Ok(PlannedSourceImportValueTarget::AnnotatedConst {
@@ -2347,6 +2412,102 @@ fn plan_direct_import_value_target(
         target,
         flags,
     }))
+}
+
+fn plan_direct_javascript_const_target(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    alias: SemanticSymbolId,
+    target: SemanticSymbolId,
+) -> Result<PlannedSourceImportValueTarget, SourceImportError> {
+    let target_record = store
+        .symbol(target)
+        .ok_or_else(|| invariant(SourceImportInvariant::InvalidTargetSymbol(target)))?;
+    let Some([declaration]) = target_record.declarations() else {
+        return Err(unsupported(SourceImportUnsupported::TargetSymbol {
+            alias,
+            target,
+            flags: target_record.flags(),
+        }));
+    };
+    let declaration = *declaration;
+    let (arena, bound) = host
+        .source(declaration)
+        .ok_or_else(|| unsupported(SourceImportUnsupported::TargetDeclaration(declaration)))?;
+    let facts = bound.source_facts().ok_or_else(|| {
+        invariant(SourceImportInvariant::MissingSourceFacts(
+            bound.source_file(),
+        ))
+    })?;
+    let record = checked_node(arena, bound, store, declaration)?;
+    let NodeData::VariableDeclaration(variable) = &record.data else {
+        return Err(unsupported(SourceImportUnsupported::TargetDeclaration(
+            declaration,
+        )));
+    };
+    if !facts.is_javascript_file()
+        || !facts.is_external_or_common_js_module()
+        || record.kind != SyntaxKind::VariableDeclaration
+        || target_record.flags() != SymbolFlags::BLOCK_SCOPED_VARIABLE
+        || target_record.value_declaration() != Some(declaration)
+        || variable.type_.is_some()
+        || variable.initializer.is_none()
+        || variable.exclamation_token.is_some()
+        || variable.local_symbol.is_some()
+        || variable.symbol.is_some()
+        || variable.facts != 0
+    {
+        return Err(unsupported(SourceImportUnsupported::TargetDeclaration(
+            declaration,
+        )));
+    }
+    let name = NodeRef::new(declaration.arena, declaration.file, variable.name);
+    let name_text = exact_identifier(
+        arena,
+        bound,
+        store,
+        name,
+        declaration,
+        SourceImportUnsupported::TargetDeclaration(name),
+    )?;
+    if name_text.as_bytes() != target_record.name().as_bytes() {
+        return Err(invariant(SourceImportInvariant::TargetNameMismatch {
+            target,
+            name,
+        }));
+    }
+
+    let jsdoc = plan_javascript_source_jsdoc(arena, bound.source_file())
+        .map_err(|_| unsupported(SourceImportUnsupported::TargetDeclaration(declaration)))?;
+    if !jsdoc.diagnostics().is_empty() {
+        return Err(unsupported(SourceImportUnsupported::TargetDeclaration(
+            declaration,
+        )));
+    }
+    let annotation = jsdoc
+        .declaration(declaration)
+        .and_then(|declaration| declaration.type_())
+        .cloned();
+    let cached_type = store
+        .value_symbol_links(target)
+        .and_then(|links| links.resolved_type);
+    if annotation.is_none() && cached_type.is_none() {
+        return Err(unsupported(
+            SourceImportUnsupported::MissingTargetAnnotation(declaration),
+        ));
+    }
+    if let Some(annotation) = &annotation {
+        preflight_planned_jsdoc_type(store, global_types, options, annotation)
+            .map_err(|_| unsupported(SourceImportUnsupported::TargetDeclaration(declaration)))?;
+    }
+
+    Ok(PlannedSourceImportValueTarget::JavaScriptAnnotatedConst {
+        declaration,
+        annotation,
+        cached_type,
+    })
 }
 
 fn plan_direct_annotated_function_target(
@@ -2816,6 +2977,18 @@ fn validate_prepared_import_value(
                     validate_stored_source_callable(store, prepared.type_),
                     StoredSourceCallableValidation::Valid(_)
                 )
+        }
+        PreparedSourceImportTarget::JavaScriptAnnotatedConst { annotation } => {
+            let valid_target = store.symbol(prepared.target_symbol).is_some_and(|target| {
+                target.flags() == SymbolFlags::BLOCK_SCOPED_VARIABLE
+                    && target.value_declaration() == Some(prepared.target_declaration)
+            });
+            valid_target
+                && (annotation.is_some()
+                    || store
+                        .value_symbol_links(prepared.target_symbol)
+                        .and_then(|links| links.resolved_type)
+                        == Some(prepared.type_))
         }
     };
     if alias_links.immediate_target != Some(prepared.immediate_target_symbol)
