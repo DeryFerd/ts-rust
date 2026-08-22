@@ -1165,12 +1165,11 @@ fn source_line_of_position(line_starts: &[usize], position: usize) -> usize {
 }
 
 fn source_comment_directives(
-    source: &str,
+    parse: &ParseResult,
     line_starts: &[usize],
 ) -> BTreeMap<usize, SourceCommentDirective> {
-    let mut scanner = ts_scanner::Scanner::new(source);
-    scanner
-        .scan_comment_directives()
+    parse
+        .comment_directives
         .iter()
         .filter_map(|directive| {
             let position = usize::try_from(directive.range.start.get()).ok()?;
@@ -2294,6 +2293,7 @@ impl Program {
                             make_source_map_sources_relative(
                                 &mut source_map,
                                 &source_map_directory,
+                                self.case_sensitivity,
                             );
                             let serialized = serialize_source_map(
                                 &source_map,
@@ -2304,13 +2304,11 @@ impl Program {
                                     .code
                                     .push_str("//# sourceMappingURL=data:application/json;base64,");
                                 emitted.code.push_str(&base64_encode(serialized.as_bytes()));
-                                emitted.code.push('\n');
                             } else if let Some(map_file_name) = paths.source_map.clone() {
                                 emitted.code.push_str("//# sourceMappingURL=");
                                 emitted
                                     .code
                                     .push_str(&self.source_map_url(&file_name, &map_file_name));
-                                emitted.code.push('\n');
                                 output.files.push(OutputFile {
                                     file_name: map_file_name,
                                     text: serialized,
@@ -2391,17 +2389,26 @@ impl Program {
                             emitted.code.insert_str(0, &reference_directives);
                         }
                         if let Some(mut source_map) = emitted.source_map {
-                            if self.options.inline_sources {
-                                source_map.sources_content =
-                                    Some(vec![source_file.source_text.clone()]);
-                            }
+                            source_map.sources_content = None;
                             source_map.file = file_name.rsplit('/').next().map(str::to_owned);
                             if let Some(map_file_name) = paths.declaration_map.clone() {
+                                let source_map_directory = if self.options.source_root.is_some() {
+                                    common_source_directory.clone()
+                                } else {
+                                    self.logical_source_map_path(&map_file_name).map_or_else(
+                                        || directory_path(&file_name),
+                                        |path| directory_path(&path),
+                                    )
+                                };
+                                make_source_map_sources_relative(
+                                    &mut source_map,
+                                    &source_map_directory,
+                                    self.case_sensitivity,
+                                );
                                 emitted.code.push_str("//# sourceMappingURL=");
                                 emitted.code.push_str(&percent_encode_source_map_url(
                                     map_file_name.rsplit('/').next().unwrap_or(&map_file_name),
                                 ));
-                                emitted.code.push('\n');
                                 output.files.push(OutputFile {
                                     file_name: map_file_name,
                                     text: serialize_source_map(
@@ -2750,11 +2757,9 @@ impl Program {
                 if settings.inline_source_map {
                     code.push_str("//# sourceMappingURL=data:application/json;base64,");
                     code.push_str(&base64_encode(serialized.as_bytes()));
-                    code.push('\n');
                 } else if let Some(map_file_name) = paths.source_map.clone() {
                     code.push_str("//# sourceMappingURL=");
                     code.push_str(&self.source_map_url(file_name, &map_file_name));
-                    code.push('\n');
                     output.files.push(OutputFile {
                         file_name: map_file_name,
                         text: serialized,
@@ -2911,7 +2916,6 @@ impl Program {
                     code.push_str(&percent_encode_source_map_url(
                         map_file_name.rsplit('/').next().unwrap_or(&map_file_name),
                     ));
-                    code.push('\n');
                     output.files.push(OutputFile {
                         file_name: map_file_name,
                         text: serialize_source_map(&map, self.options.source_root.as_deref()),
@@ -3755,7 +3759,7 @@ impl Program {
                 continue;
             };
             let line_starts = source_line_starts(&source.source_text);
-            let mut directives = source_comment_directives(&source.source_text, &line_starts);
+            let mut directives = source_comment_directives(&source.parse, &line_starts);
             if directives.is_empty() {
                 continue;
             }
@@ -4864,10 +4868,18 @@ fn serialize_source_map(source_map: &SourceMap, source_root: Option<&str>) -> St
     .expect("source map fields are JSON-serializable")
 }
 
-fn make_source_map_sources_relative(source_map: &mut SourceMap, source_directory: &str) {
+fn make_source_map_sources_relative(
+    source_map: &mut SourceMap,
+    source_directory: &str,
+    case_sensitivity: CaseSensitivity,
+) {
     for source in &mut source_map.sources {
         if is_absolute(source) {
-            *source = relative_path(source_directory, source);
+            *source = ts_path::relative_path_to_directory_or_url(
+                source_directory,
+                source,
+                case_sensitivity,
+            );
         }
     }
 }
@@ -7937,6 +7949,54 @@ mod tests {
         );
         assert_eq!(program.source_files().len(), 1);
         assert!(program.source_file("/project/main.ts").is_some());
+    }
+
+    #[test]
+    fn parser_context_comment_directives_exclude_regex_and_jsx_text() {
+        let fs = MemoryFileSystem::new(true);
+        let source = concat!(
+            "const pattern = /[// @ts-expect-error]/;\n",
+            "const view = <div>// @ts-ignore</div>;\n",
+            "const visible: string = 1;\n",
+            "const ready = true; // @ts-ignore\n",
+            "const lineIgnored: string = 2;\n",
+            "/* details\n",
+            " * @ts-expect-error */\n",
+            "const blockIgnored: string = 3;\n",
+        );
+        fs.write_file("/project/input.tsx", source).unwrap();
+
+        let program = Program::new_with_options(
+            &fs,
+            "/project",
+            &["input.tsx".to_owned()],
+            CompilerOptions {
+                jsx: ts_options::JsxEmit::Preserve,
+                no_lib: true,
+                ..CompilerOptions::default()
+            },
+        );
+        let file = program.source_file("/project/input.tsx").unwrap();
+        assert_eq!(file.parse.comment_directives.len(), 2);
+
+        let mut diagnostics = program
+            .diagnostics()
+            .iter()
+            .filter(|diagnostic| diagnostic.code == Some(2322))
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(diagnostics.len(), 3);
+        program.apply_comment_directives(&mut diagnostics, &[file.id]);
+
+        let [visible] = diagnostics.as_slice() else {
+            panic!("expected one unsuppressed assignment error: {diagnostics:?}");
+        };
+        assert_eq!(visible.code, Some(2322));
+        let range = visible.range.unwrap();
+        assert!(
+            source[range.start.get() as usize..range.end.get() as usize].contains("visible"),
+            "unexpected diagnostic range: {range:?}"
+        );
     }
 
     #[test]
@@ -11962,7 +12022,7 @@ export function create() { return new M.Value(); }"#,
             .unwrap();
         assert_eq!(
             javascript.text,
-            "\"use strict\";\nconst second = 2;\nconst first = 1;\n//# sourceMappingURL=out.js.map\n"
+            "\"use strict\";\nconst second = 2;\nconst first = 1;\n//# sourceMappingURL=out.js.map"
         );
         let map = emitted
             .files
@@ -12628,7 +12688,7 @@ export function create() { return new M.Value(); }"#,
             .unwrap();
         assert_eq!(
             declaration.text,
-            "export declare const version: number;\nexport declare function identity<T>(value: T): T;\nexport interface Box<T> {\n    value: T;\n}\nexport type Maybe<T> = T | undefined;\nexport declare enum Color {\n    Red = 0,\n    Blue = 2\n}\n//# sourceMappingURL=api.d.mts.map\n"
+            "export declare const version: number;\nexport declare function identity<T>(value: T): T;\nexport interface Box<T> {\n    value: T;\n}\nexport type Maybe<T> = T | undefined;\nexport declare enum Color {\n    Red = 0,\n    Blue = 2\n}\n//# sourceMappingURL=api.d.mts.map"
         );
         assert!(
             emitted
@@ -13522,7 +13582,7 @@ export function create() { return new M.Value(); }"#,
                 .iter()
                 .filter_map(|diagnostic| diagnostic.code)
                 .collect::<Vec<_>>(),
-            [2322]
+            [1039, 2322]
         );
 
         fs.write_file(
@@ -14073,16 +14133,16 @@ export function create() { return new M.Value(); }"#,
                 "declare function f(x: any, ...args: any[]): void;\n",
                 "declare namespace bar {\n    let arguments: {};\n}\n",
                 "declare class A {\n",
-                "    /** @param {object} [foo={}] */\n",
-                "    constructor(foo?: object);\n",
                 "    /** @type object */\n",
                 "    arguments: object;\n",
+                "    /** @param {object} [foo={}] */\n",
+                "    constructor(foo?: object);\n",
                 "    get info(): {\n        bar: {};\n    };\n",
                 "}\n",
                 "declare class B {\n",
-                "    m(...args: any[]): void;\n",
                 "    /** @type object */\n",
                 "    foo: object | undefined;\n",
+                "    m(...args: any[]): void;\n",
                 "}\n",
             )
         );

@@ -113,7 +113,7 @@ fn node_next_resolutions_follow_the_nearest_package_type() {
         filesystem
             .write_file(
                 "/project/importer.ts",
-                "import { value } from './target';\nconst copy: number = value;\n",
+                "import { value } from './target.js';\nconst copy: number = value;\n",
             )
             .unwrap();
 
@@ -123,7 +123,7 @@ fn node_next_resolutions_follow_the_nearest_package_type() {
             &["importer.ts".to_owned()],
             module_options(ModuleKind::NodeNext, ModuleResolutionKind::NodeNext),
             |program, queries| {
-                let import = specifier(program, "/project/importer.ts", "./target");
+                let import = specifier(program, "/project/importer.ts", "./target.js");
                 let CanonicalModuleResolutionLookup::Resolved(resolved) =
                     queries.module_resolution(import)
                 else {
@@ -322,6 +322,74 @@ fn source_map_paths_are_relative_to_the_emitted_map_directory() {
     assert_eq!(
         json["sources"],
         serde_json::json!(["../../src/nested/main.ts"])
+    );
+}
+
+#[test]
+fn declaration_maps_use_relative_paths_without_inlining_source_text() {
+    const SOURCE: &str = "export const greeting = 'hello';\n";
+    let filesystem = MemoryFileSystem::new(true);
+    filesystem
+        .write_file("/project/src/nested/api.ts", SOURCE)
+        .unwrap();
+    let program = Program::new_with_options(
+        &filesystem,
+        "/project",
+        &["src/nested/api.ts".to_owned()],
+        CompilerOptions {
+            declaration: true,
+            declaration_dir: Some("/project/types".to_owned()),
+            declaration_map: true,
+            inline_sources: true,
+            out_dir: Some("/project/dist".to_owned()),
+            root_dir: Some("/project/src".to_owned()),
+            source_map: true,
+            no_lib: true,
+            ..CompilerOptions::default()
+        },
+    );
+    let emitted = program.emit();
+    let javascript = emitted
+        .files
+        .iter()
+        .find(|file| file.file_name == "/project/dist/nested/api.js")
+        .expect("JavaScript output");
+    let javascript_map = emitted
+        .files
+        .iter()
+        .find(|file| file.file_name == "/project/dist/nested/api.js.map")
+        .expect("JavaScript source map");
+    let declaration = emitted
+        .files
+        .iter()
+        .find(|file| file.file_name == "/project/types/nested/api.d.ts")
+        .expect("declaration output");
+    let declaration_map = emitted
+        .files
+        .iter()
+        .find(|file| file.file_name == "/project/types/nested/api.d.ts.map")
+        .expect("declaration source map");
+    let javascript_json: serde_json::Value = serde_json::from_str(&javascript_map.text).unwrap();
+    let declaration_json: serde_json::Value = serde_json::from_str(&declaration_map.text).unwrap();
+
+    assert_eq!(
+        javascript_json["sources"],
+        serde_json::json!(["../../src/nested/api.ts"])
+    );
+    assert_eq!(
+        declaration_json["sources"],
+        serde_json::json!(["../../src/nested/api.ts"])
+    );
+    assert_eq!(
+        javascript_json["sourcesContent"],
+        serde_json::json!([SOURCE])
+    );
+    assert!(declaration_json.get("sourcesContent").is_none());
+    assert!(javascript.text.ends_with("//# sourceMappingURL=api.js.map"));
+    assert!(
+        declaration
+            .text
+            .ends_with("//# sourceMappingURL=api.d.ts.map")
     );
 }
 
