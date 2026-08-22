@@ -3,7 +3,10 @@
 use std::collections::{HashMap, HashSet};
 use std::io;
 
-use ts_path::{FileExtension, SUPPORTED_TS_EXTENSIONS, is_absolute, normalize_path, resolve_path};
+use ts_path::{
+    CaseSensitivity, FileExtension, SUPPORTED_TS_EXTENSIONS, canonical_file_name, normalize_path,
+    resolve_path,
+};
 use ts_vfs::FileSystem;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -18,20 +21,17 @@ pub struct GlobPattern {
     components: Vec<Component>,
     case_sensitive: bool,
     exclude: bool,
-    absolute: bool,
 }
 
 impl GlobPattern {
     #[must_use]
     pub fn compile(
         spec: &str,
-        _base_path: &str,
+        base_path: &str,
         case_sensitive: bool,
         exclude: bool,
     ) -> Option<Self> {
-        let mut spec = normalize_path(spec);
-        let absolute = is_absolute(&spec);
-        spec = spec.trim_start_matches("./").to_owned();
+        let spec = resolve_path(base_path, &[spec]);
         let mut parts: Vec<String> = spec
             .split('/')
             .filter(|part| !part.is_empty() && *part != ".")
@@ -62,7 +62,6 @@ impl GlobPattern {
             components,
             case_sensitive,
             exclude,
-            absolute,
         })
     }
 
@@ -77,10 +76,6 @@ impl GlobPattern {
         self.matches_from(&parts, 0, 0, &mut memo)
     }
 
-    fn matches_candidate(&self, absolute: &str, relative: &str) -> bool {
-        self.matches(if self.absolute { absolute } else { relative })
-    }
-
     fn matches_from(
         &self,
         path: &[&str],
@@ -92,7 +87,7 @@ impl GlobPattern {
             return *result;
         }
         let result = if pattern_index == self.components.len() {
-            path_index == path.len()
+            path_index == path.len() || self.exclude
         } else {
             match &self.components[pattern_index] {
                 Component::Recursive => {
@@ -110,6 +105,9 @@ impl GlobPattern {
                     (self.exclude || !is_package_folder(part))
                         && (self.exclude || !part.starts_with('.') || wildcard.starts_with('.'))
                         && wildcard_component_matches(wildcard, part, self.case_sensitive)
+                        && (self.exclude
+                            || path_index + 1 != path.len()
+                            || should_include_file(wildcard, part, self.case_sensitive))
                         && self.matches_from(path, path_index + 1, pattern_index + 1, memo)
                 }),
             }
@@ -122,7 +120,8 @@ impl GlobPattern {
         if self.case_sensitive {
             left == right
         } else {
-            left.eq_ignore_ascii_case(right)
+            canonical_file_name(left, CaseSensitivity::Insensitive)
+                == canonical_file_name(right, CaseSensitivity::Insensitive)
         }
     }
 }
@@ -165,7 +164,7 @@ pub fn discover_files<F: FileSystem + ?Sized>(
     let mut seen_roots = HashSet::new();
     for spec in &options.include {
         if let Some(pattern) = GlobPattern::compile(spec, &base, case_sensitive, false) {
-            let root = include_traversal_root(file_system, spec, &base);
+            let root = include_traversal_root(file_system, spec, &base, case_sensitive);
             if seen_roots.insert(canonical(&root, case_sensitive)) {
                 traversal_roots.push(root);
             }
@@ -188,16 +187,17 @@ pub fn discover_files<F: FileSystem + ?Sized>(
     }
 
     let mut buckets = vec![Vec::new(); includes.len().max(1)];
+    let mut visited = HashSet::new();
     for root in traversal_roots {
         if file_system.directory_exists(&root) {
             visit(
                 file_system,
-                &base,
                 &root,
                 &includes,
                 &excludes,
                 &options.extensions,
                 &mut buckets,
+                &mut visited,
             )?;
         }
     }
@@ -213,13 +213,20 @@ pub fn discover_files<F: FileSystem + ?Sized>(
 
 fn visit<F: FileSystem + ?Sized>(
     file_system: &F,
-    base: &str,
     directory: &str,
     includes: &[GlobPattern],
     excludes: &[GlobPattern],
     extensions: &[FileExtension],
     buckets: &mut [Vec<String>],
+    visited: &mut HashSet<String>,
 ) -> io::Result<()> {
+    let canonical_directory = canonical(
+        &file_system.realpath(directory),
+        file_system.use_case_sensitive_file_names(),
+    );
+    if !visited.insert(canonical_directory) {
+        return Ok(());
+    }
     let mut entries = file_system.read_directory(directory)?;
     entries.files.sort();
     entries.directories.sort();
@@ -228,37 +235,29 @@ fn visit<F: FileSystem + ?Sized>(
             continue;
         }
         let absolute = join(directory, &file);
-        let relative = relative_to(&absolute, base).unwrap_or(&absolute);
-        if excludes
-            .iter()
-            .any(|pattern| pattern.matches_candidate(&absolute, relative))
-        {
+        if excludes.iter().any(|pattern| pattern.matches(&absolute)) {
             continue;
         }
         let include_index = includes
             .iter()
-            .position(|pattern| pattern.matches_candidate(&absolute, relative));
+            .position(|pattern| pattern.matches(&absolute));
         if let Some(index) = include_index {
             buckets[index].push(absolute);
         }
     }
     for child in entries.directories {
         let absolute = join(directory, &child);
-        let relative = relative_to(&absolute, base).unwrap_or(&absolute);
-        if excludes
-            .iter()
-            .any(|pattern| pattern.matches_candidate(&absolute, relative))
-        {
+        if excludes.iter().any(|pattern| pattern.matches(&absolute)) {
             continue;
         }
         visit(
             file_system,
-            base,
             &absolute,
             includes,
             excludes,
             extensions,
             buckets,
+            visited,
         )?;
     }
     Ok(())
@@ -268,9 +267,10 @@ fn include_traversal_root<F: FileSystem + ?Sized>(
     file_system: &F,
     spec: &str,
     base: &str,
+    case_sensitive: bool,
 ) -> String {
-    let normalized = normalize_path(spec);
-    if !is_absolute(&normalized) {
+    let normalized = resolve_path(base, &[spec]);
+    if contains_path(base, &normalized, case_sensitive) {
         return base.to_owned();
     }
     if let Some(wildcard) = normalized.find(['*', '?']) {
@@ -306,6 +306,15 @@ fn include_traversal_root<F: FileSystem + ?Sized>(
     }
 }
 
+fn contains_path(directory: &str, path: &str, case_sensitive: bool) -> bool {
+    let directory = canonical(directory, case_sensitive);
+    let path = canonical(path, case_sensitive);
+    path == directory
+        || path
+            .strip_prefix(&directory)
+            .is_some_and(|remainder| directory.ends_with('/') || remainder.starts_with('/'))
+}
+
 fn wildcard_component_matches(pattern: &str, value: &str, case_sensitive: bool) -> bool {
     let pattern: Vec<char> = pattern.chars().collect();
     let value: Vec<char> = value.chars().collect();
@@ -333,7 +342,27 @@ fn wildcard_component_matches(pattern: &str, value: &str, case_sensitive: bool) 
 fn chars_equal(left: char, right: char, case_sensitive: bool) -> bool {
     left == right
         || !case_sensitive
-            && left.to_lowercase().collect::<String>() == right.to_lowercase().collect::<String>()
+            && canonical_file_name(&left.to_string(), CaseSensitivity::Insensitive)
+                == canonical_file_name(&right.to_string(), CaseSensitivity::Insensitive)
+}
+
+fn should_include_file(pattern: &str, file_name: &str, case_sensitive: bool) -> bool {
+    let has_min_suffix = if case_sensitive {
+        file_name.ends_with(".min.js")
+    } else {
+        file_name
+            .get(file_name.len().saturating_sub(".min.js".len())..)
+            .is_some_and(|suffix| suffix.eq_ignore_ascii_case(".min.js"))
+    };
+    if !has_min_suffix {
+        return true;
+    }
+    let pattern = if case_sensitive {
+        pattern.to_owned()
+    } else {
+        pattern.to_ascii_lowercase()
+    };
+    pattern.contains(".min.js") || pattern.contains(".min.")
 }
 
 fn has_allowed_extension(file: &str, extensions: &[FileExtension]) -> bool {
@@ -354,26 +383,18 @@ fn is_package_folder(component: &str) -> bool {
 }
 
 fn canonical(path: &str, case_sensitive: bool) -> String {
-    if case_sensitive {
-        path.to_owned()
-    } else {
-        path.to_ascii_lowercase()
-    }
+    canonical_file_name(
+        path,
+        if case_sensitive {
+            CaseSensitivity::Sensitive
+        } else {
+            CaseSensitivity::Insensitive
+        },
+    )
 }
 
 fn join(directory: &str, name: &str) -> String {
     resolve_path(directory, &[name])
-}
-
-fn relative_to<'a>(path: &'a str, base: &str) -> Option<&'a str> {
-    if path == base {
-        return Some("");
-    }
-    if base.ends_with('/') {
-        path.strip_prefix(base)
-    } else {
-        path.strip_prefix(base)?.strip_prefix('/')
-    }
 }
 
 #[cfg(test)]
@@ -464,6 +485,85 @@ mod tests {
 
         let sensitive = file_system(true, &["/dev/Src/Main.ts"]);
         assert!(discover_files(&sensitive, &options).unwrap().is_empty());
+    }
+
+    #[test]
+    fn matches_unicode_case_and_keeps_dotted_i_distinct() {
+        let insensitive = file_system(
+            false,
+            &["/Dev/CAF\u{00c9}/Main.ts", "/Dev/\u{0130}/other.ts"],
+        );
+        let mut options = DiscoveryOptions::new("/dev");
+        options.include = vec!["caf\u{00e9}/*.ts".into(), "i/*.ts".into()];
+
+        assert_eq!(
+            discover_files(&insensitive, &options).unwrap(),
+            vec!["/dev/CAF\u{00c9}/Main.ts"]
+        );
+    }
+
+    #[test]
+    fn relative_patterns_can_include_sibling_directories() {
+        let file_system = file_system(
+            true,
+            &[
+                "/repo/app/local.ts",
+                "/repo/shared/entry.ts",
+                "/repo/shared/nested/deep.ts",
+            ],
+        );
+        let mut options = DiscoveryOptions::new("/repo/app");
+        options.include = vec!["../shared/**/*.ts".into(), "*.ts".into()];
+
+        assert_eq!(
+            discover_files(&file_system, &options).unwrap(),
+            vec![
+                "/repo/shared/entry.ts",
+                "/repo/shared/nested/deep.ts",
+                "/repo/app/local.ts"
+            ]
+        );
+    }
+
+    #[test]
+    fn wildcard_javascript_patterns_skip_minified_files_unless_requested() {
+        let file_system = file_system(
+            false,
+            &["/dev/app.js", "/dev/vendor.min.js", "/dev/other.MIN.js"],
+        );
+        let mut options = DiscoveryOptions::new("/dev");
+        options.extensions = vec![FileExtension::Js];
+        options.include = vec!["*.js".into()];
+        assert_eq!(
+            discover_files(&file_system, &options).unwrap(),
+            vec!["/dev/app.js"]
+        );
+
+        options.include = vec!["*.min.js".into()];
+        assert_eq!(
+            discover_files(&file_system, &options).unwrap(),
+            vec!["/dev/other.MIN.js", "/dev/vendor.min.js"]
+        );
+    }
+
+    #[test]
+    fn wildcard_question_marks_match_unicode_characters() {
+        let file_system = file_system(
+            true,
+            &[
+                "/dev/a.ts",
+                "/dev/\u{00e9}.ts",
+                "/dev/\u{1f389}.ts",
+                "/dev/ab.ts",
+            ],
+        );
+        let mut options = DiscoveryOptions::new("/dev");
+        options.include = vec!["?.ts".into()];
+
+        assert_eq!(
+            discover_files(&file_system, &options).unwrap(),
+            vec!["/dev/a.ts", "/dev/\u{00e9}.ts", "/dev/\u{1f389}.ts"]
+        );
     }
 
     #[test]

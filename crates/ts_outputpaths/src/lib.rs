@@ -2,9 +2,9 @@
 
 use ts_options::{CompilerOptions, JsxEmit};
 use ts_path::{
-    CaseSensitivity, FileExtension, canonicalize, change_extension, common_path_prefix,
-    declaration_emit_extension, directory_path, ensure_trailing_directory_separator,
-    extension_from_path, normalize_path, resolve_path,
+    CaseSensitivity, FileExtension, canonical_file_name, canonicalize, change_extension,
+    common_path_prefix, declaration_emit_extension, directory_path,
+    ensure_trailing_directory_separator, extension_from_path, normalize_path, resolve_path,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -104,16 +104,17 @@ pub fn source_file_path_in_new_directory(
         current_directory,
         CaseSensitivity::Sensitive,
     ));
-    let in_common = match case_sensitivity {
-        CaseSensitivity::Sensitive => source.starts_with(&common),
-        CaseSensitivity::Insensitive => source
-            .get(..common.len())
-            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(&common)),
-    };
-    if !in_common {
+    let canonical_source = canonical_file_name(&source, case_sensitivity);
+    let canonical_common = canonical_file_name(&common, case_sensitivity);
+    let Some(remainder) = canonical_source.strip_prefix(&canonical_common) else {
         return source;
-    }
-    resolve_path(new_directory, &[&source[common.len()..]])
+    };
+    let component_count = remainder.bytes().filter(|byte| *byte == b'/').count() + 1;
+    let display_remainder = source
+        .rmatch_indices('/')
+        .nth(component_count - 1)
+        .map_or(source.as_str(), |(separator, _)| &source[separator + 1..]);
+    resolve_path(new_directory, &[display_remainder])
 }
 
 #[must_use]
@@ -124,25 +125,34 @@ pub fn output_paths(
     common_source_directory: &str,
     case_sensitivity: CaseSensitivity,
 ) -> OutputPaths {
+    let is_json = extension_from_path(file_name) == Some(FileExtension::Json);
     let source_root = options
         .root_dir
         .as_deref()
         .unwrap_or(common_source_directory);
-    let javascript = options.printer_settings().emit_javascript.then(|| {
-        output_file_path(
-            file_name,
-            options.out_dir.as_deref(),
-            current_directory,
-            source_root,
-            case_sensitivity,
-            output_extension(file_name, options.jsx),
-        )
-    });
+    let javascript = options
+        .printer_settings()
+        .emit_javascript
+        .then(|| {
+            output_file_path(
+                file_name,
+                options.out_dir.as_deref(),
+                current_directory,
+                source_root,
+                case_sensitivity,
+                output_extension(file_name, options.jsx),
+            )
+        })
+        .filter(|output| {
+            !is_json
+                || canonicalize(output, current_directory, case_sensitivity)
+                    != canonicalize(file_name, current_directory, case_sensitivity)
+        });
     let source_map = javascript
         .as_ref()
-        .filter(|_| options.source_map && !options.inline_source_map)
+        .filter(|_| !is_json && options.source_map && !options.inline_source_map)
         .map(|javascript| format!("{javascript}.map"));
-    let declaration = options.printer_settings().emit_declarations.then(|| {
+    let declaration = (options.printer_settings().emit_declarations && !is_json).then(|| {
         output_file_path(
             file_name,
             options
@@ -255,6 +265,16 @@ mod tests {
             ),
             "/dist/a.ts"
         );
+        assert_eq!(
+            source_file_path_in_new_directory(
+                "/PROJECT/\u{1e9e}RC/a.ts",
+                "/dist",
+                "/project",
+                "/project/\u{00df}rc",
+                CaseSensitivity::Insensitive,
+            ),
+            "/dist/a.ts"
+        );
     }
 
     #[test]
@@ -328,6 +348,45 @@ mod tests {
         );
         assert_eq!(paths.javascript.as_deref(), Some("/project/dist/main.js"));
         assert!(paths.source_map.is_none());
+    }
+
+    #[test]
+    fn json_outputs_never_emit_declarations_or_source_maps() {
+        let options = CompilerOptions {
+            declaration: true,
+            declaration_map: true,
+            source_map: true,
+            out_dir: Some("dist".into()),
+            ..CompilerOptions::default()
+        };
+        let paths = output_paths(
+            "/project/src/data.json",
+            &options,
+            "/project",
+            "/project/src/",
+            CaseSensitivity::Sensitive,
+        );
+
+        assert_eq!(paths.javascript.as_deref(), Some("/project/dist/data.json"));
+        assert!(paths.source_map.is_none());
+        assert!(paths.declaration.is_none());
+        assert!(paths.declaration_map.is_none());
+    }
+
+    #[test]
+    fn json_inputs_are_not_written_back_to_their_source_paths() {
+        let paths = output_paths(
+            "/project/src/data.json",
+            &CompilerOptions::default(),
+            "/project",
+            "/project/src/",
+            CaseSensitivity::Sensitive,
+        );
+
+        assert!(paths.javascript.is_none());
+        assert!(paths.source_map.is_none());
+        assert!(paths.declaration.is_none());
+        assert!(paths.declaration_map.is_none());
     }
 
     #[test]

@@ -308,9 +308,15 @@ pub fn canonicalize(
     } else {
         resolve_path(current_directory, &[path])
     };
+    canonical_file_name(&normalized, case_sensitivity)
+}
+
+/// Applies TypeScript's case-insensitive file-name rules without changing the path.
+#[must_use]
+pub fn canonical_file_name(path: &str, case_sensitivity: CaseSensitivity) -> String {
     match case_sensitivity {
-        CaseSensitivity::Sensitive => normalized,
-        CaseSensitivity::Insensitive => normalized
+        CaseSensitivity::Sensitive => path.to_owned(),
+        CaseSensitivity::Insensitive => path
             .chars()
             .flat_map(|ch| {
                 if ch == '\u{0130}' {
@@ -347,7 +353,10 @@ pub fn common_path_prefix(paths: &[&str], case_sensitivity: CaseSensitivity) -> 
             .zip(parts)
             .take_while(|(left, right)| match case_sensitivity {
                 CaseSensitivity::Sensitive => left == &right,
-                CaseSensitivity::Insensitive => left.eq_ignore_ascii_case(right),
+                CaseSensitivity::Insensitive => {
+                    canonical_file_name(left, case_sensitivity)
+                        == canonical_file_name(right, case_sensitivity)
+                }
             })
             .count();
         common.truncate(shared);
@@ -379,7 +388,18 @@ pub fn directory_path(path: &str) -> String {
 
 #[must_use]
 pub fn base_file_name(path: &str) -> &str {
-    path.rsplit(['/', '\\']).next().unwrap_or(path)
+    let root_len = root_length(path);
+    if root_len == path.len() {
+        return "";
+    }
+    let path = path
+        .strip_suffix('/')
+        .or_else(|| path.strip_suffix('\\'))
+        .unwrap_or(path);
+    let start = path
+        .rfind(['/', '\\'])
+        .map_or(root_len, |separator| (separator + 1).max(root_len));
+    &path[start..]
 }
 
 #[must_use]
@@ -525,6 +545,17 @@ mod tests {
             common_path_prefix(&["c:/a", "d:/a"], CaseSensitivity::Insensitive),
             None
         );
+        assert_eq!(
+            common_path_prefix(
+                &["/src/CAF\u{00c9}/first.ts", "/src/caf\u{00e9}/second.ts",],
+                CaseSensitivity::Insensitive,
+            ),
+            Some("/src/CAF\u{00c9}".into())
+        );
+        assert_eq!(
+            canonical_file_name("/SRC/CAF\u{00c9}/\u{0130}.ts", CaseSensitivity::Insensitive),
+            "/src/caf\u{00e9}/\u{0130}.ts"
+        );
     }
 
     #[test]
@@ -547,6 +578,10 @@ mod tests {
         assert_eq!(directory_path("C:/file.ts"), "C:/");
         assert_eq!(directory_path("file.ts"), "");
         assert_eq!(base_file_name(r"C:\src\file.ts"), "file.ts");
+        assert_eq!(base_file_name("/src/nested/"), "nested");
+        assert_eq!(base_file_name("//server"), "");
+        assert_eq!(base_file_name("file://server"), "");
+        assert_eq!(base_file_name("file:///src/nested/"), "nested");
         assert_eq!(ensure_trailing_directory_separator("/src"), "/src/");
         assert_eq!(remove_file_extension("/src/file.d.mts"), "/src/file");
         assert_eq!(remove_file_extension("/src/file.custom"), "/src/file");

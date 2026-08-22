@@ -160,7 +160,12 @@ impl FileSystem for OsFileSystem {
         if let Some(decoded) = decode_utf16_bom(&bytes) {
             return Ok(decoded);
         }
-        String::from_utf8(bytes).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+        let mut contents = String::from_utf8(bytes)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        if contents.starts_with('\u{feff}') {
+            contents.drain(..'\u{feff}'.len_utf8());
+        }
+        Ok(contents)
     }
 
     fn write_file(&self, path: &str, contents: &str) -> io::Result<()> {
@@ -270,9 +275,16 @@ impl MemoryFileSystem {
         if self.case_sensitive {
             normalized
         } else {
-            // TypeScript deliberately preserves non-ASCII path characters when
-            // canonicalizing case-insensitive file names.
-            normalized.to_ascii_lowercase()
+            normalized
+                .chars()
+                .flat_map(|character| {
+                    if character == '\u{0130}' {
+                        character.to_string().chars().collect::<Vec<_>>()
+                    } else {
+                        character.to_lowercase().collect()
+                    }
+                })
+                .collect()
         }
     }
 
@@ -321,15 +333,25 @@ impl FileSystem for MemoryFileSystem {
             return path;
         };
         for _ in 0..links.len() {
+            let canonical = self.canonical_path(&path);
             let Some((alias, source)) = links.iter().find(|(alias, _)| {
-                path == *alias
-                    || path
-                        .strip_prefix(alias)
+                let canonical_alias = self.canonical_path(alias);
+                canonical == canonical_alias
+                    || canonical
+                        .strip_prefix(&canonical_alias)
                         .is_some_and(|rest| rest.starts_with('/'))
             }) else {
                 break;
             };
-            path = format!("{source}{}", &path[alias.len()..]);
+            let canonical_alias = self.canonical_path(alias);
+            if canonical == canonical_alias {
+                path.clone_from(source);
+            } else {
+                let remainder = path_relative_to(&canonical, &canonical_alias)
+                    .expect("matched directory alias has a relative suffix");
+                let suffix = display_remainder(&path, remainder);
+                path = format!("{source}/{suffix}");
+            }
         }
         path
     }
@@ -403,10 +425,7 @@ impl FileSystem for MemoryFileSystem {
                 continue;
             }
 
-            // ASCII case folding preserves byte lengths, so the canonical
-            // remainder identifies the corresponding suffix in the display
-            // path even when the lookup used different casing.
-            let display_remainder = &file.path[file.path.len() - remainder.len()..];
+            let display_remainder = display_remainder(&file.path, remainder);
             if let Some((directory, _)) = display_remainder.split_once('/') {
                 child_directories.insert(directory.to_owned());
             } else {
@@ -433,6 +452,17 @@ fn path_relative_to<'a>(path: &'a str, directory: &str) -> Option<&'a str> {
         return path.strip_prefix(directory);
     }
     path.strip_prefix(directory)?.strip_prefix('/')
+}
+
+fn display_remainder<'a>(path: &'a str, canonical_remainder: &str) -> &'a str {
+    let component_count = canonical_remainder
+        .bytes()
+        .filter(|byte| *byte == b'/')
+        .count()
+        + 1;
+    path.rmatch_indices('/')
+        .nth(component_count - 1)
+        .map_or(path, |(separator, _)| &path[separator + 1..])
 }
 
 #[cfg(test)]
@@ -489,6 +519,38 @@ mod tests {
         assert_eq!(
             insensitive.file_paths()?,
             vec!["/Src/Main.ts", "/Src/Util/strings.ts"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn insensitive_paths_fold_unicode_without_collapsing_dotted_i() -> io::Result<()> {
+        let file_system = MemoryFileSystem::new(false);
+        file_system.write_file("/CAF\u{00c9}/\u{1e9e}OURCE.ts", "first")?;
+        file_system.write_file("/caf\u{00e9}/\u{00df}ource.ts", "second")?;
+        file_system.write_file("/caf\u{00e9}/\u{0130}.ts", "dotted")?;
+
+        assert_eq!(
+            file_system.read_file("/caf\u{00e9}/\u{00df}OURCE.TS")?,
+            "second"
+        );
+        assert!(!file_system.file_exists("/caf\u{00e9}/i.ts"));
+        assert_eq!(
+            file_system.read_directory("/caf\u{00e9}")?.files,
+            vec!["\u{0130}.ts", "\u{1e9e}OURCE.ts"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolves_directory_links_with_file_system_case_rules() -> io::Result<()> {
+        let file_system = MemoryFileSystem::new(false);
+        file_system.write_file("/packages/Caf\u{00e9}/entry.ts", "")?;
+        file_system.add_directory_link("/packages/Caf\u{00e9}", "/Node_Modules/CAF\u{00c9}");
+
+        assert_eq!(
+            file_system.realpath("/node_modules/caf\u{00e9}/Entry.ts"),
+            "/packages/Caf\u{00e9}/Entry.ts"
         );
         Ok(())
     }
@@ -555,6 +617,12 @@ mod tests {
                 directories: Vec::new(),
             }
         );
+
+        fs::write(path, b"\xef\xbb\xbfconst value = 2;")?;
+        assert_eq!(vfs.read_file(path)?, "const value = 2;");
+
+        fs::write(path, [0xff, 0xfe, b'o', 0, b'k', 0])?;
+        assert_eq!(vfs.read_file(path)?, "ok");
 
         fs::remove_dir_all(directory)
     }
