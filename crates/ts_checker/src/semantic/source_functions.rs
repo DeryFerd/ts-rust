@@ -292,12 +292,7 @@ pub(super) fn plan_function_identifier_read(
                 ));
             }
             validate_function_target(store, declaration, node, name, routed.target)?;
-            validate_function_read_declaration_symbol(
-                bound,
-                store,
-                declaration,
-                routed.target,
-            )?;
+            validate_function_read_declaration_symbol(bound, store, declaration, routed.target)?;
             if let Some(local) = routed.export_local {
                 validate_export_local(store, local, declaration, routed.target, name)?;
             }

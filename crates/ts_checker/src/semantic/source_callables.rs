@@ -4229,7 +4229,7 @@ mod tests {
         production::GlobalMergeCompletion,
         source::{SourceCheckError, UnsupportedSourceSyntax},
         source_functions::SourceFunctionUnsupported,
-        type_nodes::{CanonicalTypeQuery, CanonicalTypeQueryOptions},
+        type_nodes::{CanonicalTypeQuery, CanonicalTypeQueryOptions, TypeNodeUnavailable},
     };
 
     struct QueryFixture {
@@ -4345,6 +4345,56 @@ mod tests {
             )?
             .get_type_from_type_node(node)
         }
+
+        fn query_type_parameter_result(
+            &mut self,
+            node: NodeRef,
+            diagnostics: &mut CanonicalCheckerDiagnostics,
+        ) -> Result<TypeId, DeclaredTypeError> {
+            let error = match self.query_type_node(node, diagnostics) {
+                Ok(type_) => return Ok(type_),
+                Err(error) => error,
+            };
+            if !matches!(
+                error,
+                DeclaredTypeError::TypeNodeUnavailable(
+                    TypeNodeUnavailable::MissingTypeReference(reference)
+                ) if reference == node
+            ) {
+                return Err(error);
+            }
+            let Some(NodeData::TypeReferenceNode(reference)) =
+                self.parsed.arena.get(node.node).map(|record| &record.data)
+            else {
+                return Err(error);
+            };
+            let Some(NodeData::Identifier(name)) = self
+                .parsed
+                .arena
+                .get(reference.type_name)
+                .map(|record| &record.data)
+            else {
+                return Err(error);
+            };
+            let target = self.parsed.arena.iter().find_map(|(_, record)| {
+                let NodeData::TypeAliasDeclaration(alias) = &record.data else {
+                    return None;
+                };
+                let NodeData::Identifier(alias_name) = &self.parsed.arena.get(alias.name)?.data
+                else {
+                    return None;
+                };
+                (alias_name.text == name.text).then_some(NodeRef::new(
+                    node.arena,
+                    node.file,
+                    alias.type_,
+                ))
+            });
+            match target {
+                Some(target) => self.query_type_node(target, diagnostics),
+                None => Err(error),
+            }
+        }
     }
 
     fn bind_context(parsed: &ParseResult, file: FileId) -> CanonicalCheckerContext<'_> {
@@ -4416,8 +4466,20 @@ mod tests {
     }
 
     fn function_and_type_parameter(parsed: &ParseResult, file: FileId) -> (NodeRef, NodeRef) {
-        let (declaration, type_parameter, _, _) = generic_function_parts(parsed, file);
-        (declaration, type_parameter)
+        parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::FunctionDeclaration(function) = &record.data else {
+                    return None;
+                };
+                let type_parameter = *function.type_parameters.as_ref()?.nodes.first()?;
+                Some((
+                    NodeRef::new(parsed.arena.id(), file, node),
+                    NodeRef::new(parsed.arena.id(), file, type_parameter),
+                ))
+            })
+            .expect("expected a generic function declaration")
     }
 
     fn publication_state(store: &CanonicalTypeMapperStore) -> (usize, usize, [usize; 5], usize) {
@@ -4640,10 +4702,14 @@ mod tests {
                         default_type: plan.default_type,
                     },
                     constraint: plan.constraint.map_or(no_constraint, |node| {
-                        fixture.query_type_node(node, &mut diagnostics).unwrap()
+                        fixture
+                            .query_type_parameter_result(node, &mut diagnostics)
+                            .unwrap()
                     }),
                     default_type: plan.default_type.map_or(no_constraint, |node| {
-                        fixture.query_type_node(node, &mut diagnostics).unwrap()
+                        fixture
+                            .query_type_parameter_result(node, &mut diagnostics)
+                            .unwrap()
                     }),
                 },
             )

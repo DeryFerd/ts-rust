@@ -1,15 +1,16 @@
 //! Exact source integration for one ordinary identifier or own-property call.
 //!
 //! This deliberately admits only `identifier(arguments)` or a proven required
-//! own-property `identifier.name(arguments)` where every argument is a
-//! context-insensitive scalar, identifier, property read, or recursively proven
-//! primitive binary expression, optionally parenthesized.
+//! own-property `identifier.name(arguments)`. Arguments may contain scalar
+//! values, identifier and property reads, object literals, nested direct calls,
+//! or recursively proven primitive expressions, optionally parenthesized.
 //! The semantic kernel remains in `calls`; this module owns the AST proof,
 //! lazy-return/relation retries, call caches, and source diagnostics.
 
 use std::collections::HashSet;
 
 use ts_ast::{NodeArena, NodeData, NodeRef, SyntaxKind};
+use ts_binder::SymbolFlags;
 use ts_core::{TextPos, TextRange};
 use ts_diagnostics::{Diagnostic, message_by_code};
 
@@ -42,6 +43,7 @@ use super::{
     },
     source_callables::{StoredSourceCallableValidation, validate_stored_source_callable},
     type_nodes::CanonicalTypeQuery,
+    type_records::TypeData,
 };
 
 /// Fully proven syntax plus source-planned callee and arguments.
@@ -270,7 +272,7 @@ pub(super) fn plan_direct_source_call_syntax(
             return Err(SourceCheckError::Call(node));
         };
         if argument_record.parent != Some(node.node)
-            || !is_context_insensitive_argument_syntax(arena, argument)
+            || !is_supported_call_argument_syntax(arena, argument)
         {
             return Err(SourceCheckError::Unsupported(
                 UnsupportedSourceSyntax::Call(node),
@@ -349,7 +351,7 @@ pub(super) fn finish_direct_source_call_plan(
             .iter()
             .zip(&syntax.arguments)
             .all(|(argument, syntax_node)| {
-                argument.node == *syntax_node && is_context_insensitive_argument_plan(argument)
+                argument.node == *syntax_node && is_supported_call_argument_plan(argument)
             })
     {
         return Err(SourceCheckError::Unsupported(
@@ -366,7 +368,7 @@ pub(super) fn finish_direct_source_call_plan(
     })
 }
 
-fn is_context_insensitive_argument_syntax(arena: &NodeArena, node: NodeRef) -> bool {
+fn is_supported_call_argument_syntax(arena: &NodeArena, node: NodeRef) -> bool {
     let Some(record) = arena.get(node.node) else {
         return false;
     };
@@ -388,7 +390,7 @@ fn is_context_insensitive_argument_syntax(arena: &NodeArena, node: NodeRef) -> b
                 .get(parenthesized.expression)
                 .is_some_and(|inner_record| {
                     inner_record.parent == Some(node.node)
-                        && is_context_insensitive_argument_syntax(arena, inner)
+                        && is_supported_call_argument_syntax(arena, inner)
                 })
         }
         SyntaxKind::PrefixUnaryExpression => {
@@ -437,6 +439,10 @@ fn is_context_insensitive_argument_syntax(arena: &NodeArena, node: NodeRef) -> b
                 )
         }
         SyntaxKind::ElementAccessExpression => is_context_insensitive_element_syntax(arena, node),
+        SyntaxKind::CallExpression => matches!(&record.data, NodeData::CallExpression(_)),
+        SyntaxKind::ObjectLiteralExpression => {
+            matches!(&record.data, NodeData::ObjectLiteralExpression(_))
+        }
         SyntaxKind::BinaryExpression => {
             is_context_insensitive_primitive_binary_syntax(arena, node)
                 || is_context_insensitive_logical_binary_syntax(arena, node)
@@ -546,11 +552,11 @@ fn is_context_insensitive_logical_binary_syntax(arena: &NodeArena, node: NodeRef
         && operator.flags.0 == 0
         && matches!(operator.data, NodeData::Token(_))
         && logical_binary_operator_text(operator.kind).is_some()
-        && is_context_insensitive_argument_syntax(
+        && is_supported_call_argument_syntax(
             arena,
             NodeRef::new(node.arena, node.file, binary.left),
         )
-        && is_context_insensitive_argument_syntax(
+        && is_supported_call_argument_syntax(
             arena,
             NodeRef::new(node.arena, node.file, binary.right),
         )
@@ -646,7 +652,7 @@ fn is_context_insensitive_primitive_binary_operand_syntax(
     }
 }
 
-fn is_context_insensitive_argument_plan(expression: &PlannedExpression) -> bool {
+fn is_supported_call_argument_plan(expression: &PlannedExpression) -> bool {
     match &expression.kind {
         PlannedExpressionKind::Null
         | PlannedExpressionKind::String(_)
@@ -657,7 +663,14 @@ fn is_context_insensitive_argument_plan(expression: &PlannedExpression) -> bool 
         | PlannedExpressionKind::Identifier(_)
         | PlannedExpressionKind::Property(_)
         | PlannedExpressionKind::Element(_) => true,
-        PlannedExpressionKind::Parenthesized(inner) => is_context_insensitive_argument_plan(inner),
+        PlannedExpressionKind::Call(call) => {
+            call.node == expression.node
+                && call.arguments.iter().all(is_supported_call_argument_plan)
+        }
+        PlannedExpressionKind::Object { properties, .. } => {
+            properties.iter().all(is_supported_call_argument_plan)
+        }
+        PlannedExpressionKind::Parenthesized(inner) => is_supported_call_argument_plan(inner),
         PlannedExpressionKind::Binary(binary) => {
             let (left, right) = binary.operands();
             binary.node() == expression.node
@@ -669,14 +682,12 @@ fn is_context_insensitive_argument_plan(expression: &PlannedExpression) -> bool 
             let (left, right) = binary.operands();
             binary.node() == expression.node
                 && logical_binary_operator_text(binary.operator()).is_some()
-                && is_context_insensitive_argument_plan(left)
-                && is_context_insensitive_argument_plan(right)
+                && is_supported_call_argument_plan(left)
+                && is_supported_call_argument_plan(right)
         }
         PlannedExpressionKind::Assertion { .. }
         | PlannedExpressionKind::TypeImportValueUse(_)
         | PlannedExpressionKind::Array(_)
-        | PlannedExpressionKind::Object { .. }
-        | PlannedExpressionKind::Call(_)
         | PlannedExpressionKind::New(_)
         | PlannedExpressionKind::Conditional(_) => false,
     }
@@ -1135,6 +1146,74 @@ fn expected_count_text(minimum: usize, maximum: usize) -> String {
     }
 }
 
+fn exact_optional_argument_mismatch(
+    store: &CanonicalTypeMapperStore,
+    options: CanonicalCheckerOptions,
+    source: TypeId,
+    target: TypeId,
+) -> bool {
+    if !options.intrinsic.exact_optional_property_types {
+        return false;
+    }
+    let Some(undefined) = store
+        .intrinsic_bootstrap()
+        .map(|bootstrap| bootstrap.undefined_type)
+    else {
+        return false;
+    };
+    let Some(source_members) = store
+        .type_payload(source)
+        .and_then(|record| record.data().structured())
+        .and_then(|structured| structured.members)
+        .and_then(|members| store.symbol_table(members))
+    else {
+        return false;
+    };
+    let Some(target_properties) = store
+        .type_payload(target)
+        .and_then(|record| record.data().structured())
+        .and_then(|structured| structured.properties.as_deref())
+    else {
+        return false;
+    };
+    target_properties.iter().any(|property| {
+        let Some(target_property) = store.symbol(*property) else {
+            return false;
+        };
+        if !target_property.flags().contains(SymbolFlags::OPTIONAL) {
+            return false;
+        }
+        let Some(source_property) = source_members.get(target_property.name()) else {
+            return false;
+        };
+        let Some(source_type) = store
+            .value_symbol_links(source_property)
+            .and_then(|links| links.resolved_type)
+        else {
+            return false;
+        };
+        let Some(target_type) = store
+            .value_symbol_links(*property)
+            .and_then(|links| links.resolved_type)
+        else {
+            return false;
+        };
+        type_contains_undefined(store, source_type, undefined)
+            && !type_contains_undefined(store, target_type, undefined)
+    })
+}
+
+fn type_contains_undefined(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    undefined: TypeId,
+) -> bool {
+    type_ == undefined
+        || store.type_payload(type_).is_some_and(|record| {
+            matches!(record.data(), TypeData::Union(union) if union.union.types.contains(&undefined))
+        })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn prepare_legacy_source_call_diagnostic(
     store: &CanonicalTypeMapperStore,
@@ -1235,11 +1314,21 @@ fn prepare_legacy_source_call_diagnostic(
                 .arguments
                 .get(index)
                 .ok_or(SourceCheckError::Call(plan.node))?;
+            let code = if exact_optional_argument_mismatch(
+                store,
+                options,
+                argument_type,
+                parameter_type,
+            ) {
+                2379
+            } else {
+                2345
+            };
             CanonicalCheckerDiagnostic {
                 node: Some(argument.unparenthesized().node),
                 range_override: None,
                 diagnostic: Diagnostic::with_arguments(
-                    message_by_code(2345).ok_or(SourceCheckError::MissingDiagnostic(2345))?,
+                    message_by_code(code).ok_or(SourceCheckError::MissingDiagnostic(code))?,
                     [display.source, display.target],
                 ),
                 related_information: Vec::new(),
@@ -1393,11 +1482,21 @@ fn prepare_vector_source_call_diagnostic(
                 parameter_type,
                 source_call_display_flags(options),
             )?;
+            let code = if exact_optional_argument_mismatch(
+                store,
+                options,
+                argument_type,
+                parameter_type,
+            ) {
+                2379
+            } else {
+                2345
+            };
             CanonicalCheckerDiagnostic {
                 node: Some(argument.unparenthesized().node),
                 range_override: None,
                 diagnostic: Diagnostic::with_arguments(
-                    message_by_code(2345).ok_or(SourceCheckError::MissingDiagnostic(2345))?,
+                    message_by_code(code).ok_or(SourceCheckError::MissingDiagnostic(code))?,
                     [display.source, display.target],
                 ),
                 related_information: Vec::new(),
@@ -3469,24 +3568,65 @@ mod tests {
     }
 
     #[test]
-    fn nested_and_explicitly_instantiated_identifier_calls_fail_closed() {
-        for (index, text) in [
-            "function f(value: number): number { return 1; } const x = f(f(1));",
-            "function f(value: number): number { return 1; } const x = f<number>(1);",
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let parsed = parsed(text);
-            let file = FileId::new(405 + u32::try_from(index).unwrap());
-            let mut context = context(&parsed, file);
-            assert!(matches!(
-                context.check_source_file(file),
-                Err(SourceCheckError::Unsupported(
-                    UnsupportedSourceSyntax::Call(_)
-                ))
-            ));
+    fn nested_identifier_calls_publish_each_signature_and_return_type() {
+        let parsed = parsed(concat!(
+            "function number(value: number): number { return value; } ",
+            "function text(value: number): string { return 'ok'; } ",
+            "const result: string = text(number(number(1)));",
+        ));
+        let file = FileId::new(405);
+        let mut context = context(&parsed, file);
+
+        context.check_source_file(file).unwrap();
+
+        assert!(context.diagnostics().is_empty());
+        let calls = calls(&parsed, file);
+        assert_eq!(calls.len(), 3);
+        for call in &calls {
+            assert!(
+                context
+                    .store()
+                    .signature_links(*call)
+                    .and_then(|links| links.resolved_signature.signature())
+                    .is_some()
+            );
+            assert!(
+                context
+                    .store()
+                    .type_node_links(*call)
+                    .and_then(|links| links.resolved_type)
+                    .is_some()
+            );
         }
+
+        let warm_counts = (
+            context.store().type_len(),
+            context.store().mapper_len(),
+            context.store().signature_len(),
+        );
+        context.check_source_file(file).unwrap();
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().mapper_len(),
+                context.store().signature_len(),
+            ),
+            warm_counts
+        );
+    }
+
+    #[test]
+    fn explicitly_instantiated_nongeneric_identifier_calls_fail_closed() {
+        let parsed =
+            parsed("function f(value: number): number { return 1; } const x = f<number>(1);");
+        let file = FileId::new(406);
+        let mut context = context(&parsed, file);
+        assert!(matches!(
+            context.check_source_file(file),
+            Err(SourceCheckError::Unsupported(
+                UnsupportedSourceSyntax::Call(_)
+            ))
+        ));
     }
 
     #[test]

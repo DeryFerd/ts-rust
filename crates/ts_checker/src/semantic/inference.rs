@@ -215,12 +215,7 @@ fn infer_naked_type_parameter_candidates_with_optional_array_targets(
     } else if literal_candidates_have_same_base(store, &primary) {
         canonical_anonymous_union(store, &primary)?
     } else {
-        single_common_supertype(
-            store,
-            &primary,
-            &mut is_strict_subtype,
-            &mut is_subtype,
-        )?
+        single_common_supertype(store, &primary, &mut is_strict_subtype, &mut is_subtype)?
     };
     if strict_null_checks && nullable != TypeFlags::NONE {
         add_nullable_to_candidate(store, common, nullable).map(Some)
@@ -298,9 +293,12 @@ fn remove_nullable_from_candidate(
     store: &mut CanonicalTypeMapperStore,
     candidate: TypeId,
 ) -> Result<TypeId, NakedTypeCandidateError> {
-    let record = store.type_payload(candidate).ok_or(
-        LiteralTypeCacheError::UnsupportedUnionConstituent(candidate),
-    )?;
+    let record =
+        store
+            .type_payload(candidate)
+            .ok_or(LiteralTypeCacheError::UnsupportedUnionConstituent(
+                candidate,
+            ))?;
     if record.flags().intersects(TypeFlags::NULLABLE) {
         return store
             .intrinsic_bootstrap()
@@ -482,13 +480,7 @@ fn validate_inference_leaf_with_optional_array_targets(
     candidate: TypeId,
     array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<(), NakedTypeInferenceError> {
-    validate_inference_candidate(
-        store,
-        candidate,
-        true,
-        array_targets,
-        &mut HashSet::new(),
-    )
+    validate_inference_candidate(store, candidate, true, array_targets, &mut HashSet::new())
 }
 
 fn validate_inference_candidate(
@@ -584,13 +576,7 @@ fn validate_inference_candidate(
                         constituent: *constituent,
                     });
                 }
-                validate_inference_candidate(
-                    store,
-                    *constituent,
-                    false,
-                    None,
-                    active_arrays,
-                )?;
+                validate_inference_candidate(store, *constituent, false, None, active_arrays)?;
             }
             Ok(())
         }
@@ -622,12 +608,17 @@ fn literal_leaf_flags(flags: TypeFlags) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use ts_binder::{EscapedName, SymbolData, SymbolFlags};
+    use ts_ast::{FileId, NodeRef, SyntaxKind};
+    use ts_binder::{
+        CanonicalBinder, CanonicalModuleState, CanonicalSourceFileFacts, CanonicalSourceLanguage,
+        EscapedName, SymbolData, SymbolFlags,
+    };
     use ts_jsnum::Number;
+    use ts_parser::parse_source_file;
 
     use super::*;
     use crate::semantic::{
-        IntrinsicBootstrapOptions, SemanticStore, SemanticSymbolId, ValueSymbolLinks,
+        CanonicalCheckerContext, CanonicalCheckerOptions, IntrinsicBootstrapOptions, SemanticStore,
         bootstrap::UnionReduction, mapper::TypeMapper, type_records::TypeRecord,
     };
 
@@ -657,62 +648,6 @@ mod tests {
             CanonicalTypeMapperStore::is_type_strict_subtype_of,
             CanonicalTypeMapperStore::is_type_subtype_of,
         )
-    }
-
-    fn typed_property(
-        store: &mut CanonicalTypeMapperStore,
-        name: &str,
-        type_: TypeId,
-    ) -> SemanticSymbolId {
-        let property = store
-            .alloc_symbol(SymbolData::new(
-                SymbolFlags::PROPERTY,
-                EscapedName::source(name),
-            ))
-            .unwrap();
-        assert!(store.set_value_symbol_links(
-            property,
-            ValueSymbolLinks {
-                resolved_type: Some(type_),
-                ..ValueSymbolLinks::default()
-            },
-        ));
-        property
-    }
-
-    fn property_object(
-        store: &mut CanonicalTypeMapperStore,
-        properties: &[SemanticSymbolId],
-    ) -> TypeId {
-        let object = store
-            .alloc_plain_object_type(ObjectFlags::ANONYMOUS, None)
-            .unwrap();
-        let members = (!properties.is_empty()).then(|| {
-            let members = store.alloc_symbol_table();
-            for property in properties {
-                let name = store
-                    .symbol(*property)
-                    .unwrap()
-                    .name()
-                    .as_utf8()
-                    .unwrap()
-                    .to_owned();
-                assert_eq!(
-                    store.insert_symbol(members, EscapedName::source(name), *property),
-                    Some(None)
-                );
-            }
-            members
-        });
-        assert!(store.set_structured_type_members(
-            object,
-            members,
-            (!properties.is_empty()).then(|| properties.to_vec()),
-            None,
-            None,
-            None,
-        ));
-        object
     }
 
     #[test]
@@ -777,16 +712,10 @@ mod tests {
             assert_eq!(infer_preserved(&mut store, &candidates), Ok(Some(any)));
         }
         for candidates in [[unknown, a], [a, unknown]] {
-            assert_eq!(
-                infer_preserved(&mut store, &candidates),
-                Ok(Some(unknown))
-            );
+            assert_eq!(infer_preserved(&mut store, &candidates), Ok(Some(unknown)));
         }
         for candidates in [[string, a], [a, string]] {
-            assert_eq!(
-                infer_preserved(&mut store, &candidates),
-                Ok(Some(string))
-            );
+            assert_eq!(infer_preserved(&mut store, &candidates), Ok(Some(string)));
         }
 
         let one = store.regular_number_literal_type(Number::new(1.0)).unwrap();
@@ -794,9 +723,7 @@ mod tests {
         let three = store.regular_number_literal_type(Number::new(3.0)).unwrap();
         let one_or_two = store.literal_union_type(&[one, two], None).unwrap();
         for candidates in [[one_or_two, three], [three, one_or_two]] {
-            let result = infer_preserved(&mut store, &candidates)
-                .unwrap()
-                .unwrap();
+            let result = infer_preserved(&mut store, &candidates).unwrap().unwrap();
             let TypeData::Union(data) = store.type_payload(result).unwrap().data() else {
                 panic!("homogeneous literal-union buckets must remain a union");
             };
@@ -824,9 +751,7 @@ mod tests {
         let false_ = store.intrinsic_bootstrap().unwrap().false_type;
         let mut fresh_boolean = None;
         for candidates in [[true_, false_], [false_, true_]] {
-            let result = infer_preserved(&mut store, &candidates)
-                .unwrap()
-                .unwrap();
+            let result = infer_preserved(&mut store, &candidates).unwrap().unwrap();
             assert_eq!(fresh_boolean.get_or_insert(result), &result);
             assert_ne!(result, boolean);
             let record = store.type_payload(result).unwrap();
@@ -849,9 +774,7 @@ mod tests {
         let a = store.regular_string_literal_type("a".into()).unwrap();
         for nullable in [null, undefined] {
             for candidates in [[nullable, a], [a, nullable]] {
-                let result = infer_preserved(&mut store, &candidates)
-                    .unwrap()
-                    .unwrap();
+                let result = infer_preserved(&mut store, &candidates).unwrap().unwrap();
                 let TypeData::Union(data) = store.type_payload(result).unwrap().data() else {
                     panic!("strict-null inference must restore the nullable member");
                 };
@@ -864,31 +787,75 @@ mod tests {
 
     #[test]
     fn declared_object_common_supertype_is_structural_then_left_biased() {
-        let mut store = initialized_store();
-        let (string, number) = {
-            let bootstrap = store.intrinsic_bootstrap().unwrap();
-            (bootstrap.string_type, bootstrap.number_type)
-        };
-        let a = typed_property(&mut store, "a", string);
-        let b = typed_property(&mut store, "b", number);
-        let c = typed_property(&mut store, "c", number);
-        let narrow = property_object(&mut store, &[a]);
-        let wide = property_object(&mut store, &[a, b]);
-        let unrelated = property_object(&mut store, &[c]);
+        let parsed = parse_source_file(concat!(
+            "type Narrow = { a: string }; ",
+            "type Wide = { a: string; b: number }; ",
+            "type Unrelated = { c: number };",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(1_060);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/inference-objects.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        let mut context = CanonicalCheckerContext::new(
+            binder.finish(),
+            [(file, &parsed.arena)].into_iter().collect(),
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap();
+        context.check_source_file(file).unwrap();
+        let mut type_literals = parsed
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                (record.kind == SyntaxKind::TypeLiteral).then_some((
+                    record.range.start,
+                    NodeRef::new(parsed.arena.id(), file, node),
+                ))
+            })
+            .collect::<Vec<_>>();
+        type_literals.sort_by_key(|(start, _)| *start);
+        let [narrow, wide, unrelated] = type_literals
+            .iter()
+            .map(|(_, node)| {
+                context
+                    .store()
+                    .type_node_links(*node)
+                    .and_then(|links| links.resolved_type)
+                    .expect("source checking must publish each declared type literal")
+            })
+            .collect::<Vec<_>>()
+            .try_into()
+            .unwrap();
+        let store = context.store_mut_for_test();
 
         for candidates in [[narrow, wide], [wide, narrow]] {
             assert_eq!(
-                infer_preserved(&mut store, &candidates),
+                infer_preserved(store, &candidates),
                 Ok(Some(narrow)),
                 "the broader structural base wins regardless of order"
             );
         }
         assert_eq!(
-            infer_preserved(&mut store, &[narrow, unrelated]),
+            infer_preserved(store, &[narrow, unrelated]),
             Ok(Some(narrow))
         );
         assert_eq!(
-            infer_preserved(&mut store, &[unrelated, narrow]),
+            infer_preserved(store, &[unrelated, narrow]),
             Ok(Some(unrelated)),
             "unrelated candidates remain left-biased for later applicability"
         );

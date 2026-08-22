@@ -92,8 +92,7 @@ pub(super) fn validate_stored_callable_set(
             return StoredCallableSetValidation::Malformed { family };
         }
         StoredSourceOverloadValidation::Valid(edges) => {
-            let Some(projection) =
-                validate_stored_callable_set_projection(store, type_, false)
+            let Some(projection) = validate_stored_callable_set_projection(store, type_, false)
             else {
                 return StoredCallableSetValidation::Malformed { family };
             };

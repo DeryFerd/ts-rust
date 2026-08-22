@@ -13,8 +13,10 @@ use ts_binder::SemanticSymbolId;
 use super::{
     CanonicalGlobalTypes, CanonicalTypeMapperStore, DeclaredTypeHost, RelationUnavailable, TypeId,
     VariableInvariant,
+    object_members::PlannedProperty,
+    relater::ResolvedDeclaredPropertyObject,
     source::{PlannedExpression, PlannedExpressionKind, SourceCheckError, UnsupportedSourceSyntax},
-    type_records::{TypeData, TypeRecord},
+    type_records::{LiteralValue, TypeData, TypeRecord},
     types::TypeFlags,
 };
 
@@ -179,7 +181,25 @@ fn preflight_contextual_type_graph(
             .map(TypeRecord::flags)
             .ok_or(RelationUnavailable::Type(contextual_type))?;
         if flags.intersects(TypeFlags::UNION) {
-            return validate_contextual_union(store, global_types, contextual_type);
+            validate_contextual_union(store, global_types, contextual_type)?;
+            let TypeData::Union(union) = store
+                .type_payload(contextual_type)
+                .ok_or(RelationUnavailable::Type(contextual_type))?
+                .data()
+            else {
+                return Err(RelationUnavailable::MalformedUnion(contextual_type).into());
+            };
+            for constituent in union.union.types.clone() {
+                preflight_contextual_type_graph(
+                    store,
+                    host,
+                    global_types,
+                    constituent,
+                    validated,
+                    visiting,
+                )?;
+            }
+            return Ok(());
         }
         if flags.intersects(TypeFlags::OBJECT) {
             if let Some(global_types) = global_types
@@ -322,13 +342,24 @@ fn prepare_expression(
         }
         PlannedExpressionKind::Object { plan, properties } => {
             debug_assert_eq!(plan.properties.len(), properties.len());
-            let contextual = contextual_object(store, host, contextual_type)?;
+            let contextual = contextual_objects(
+                store,
+                host,
+                global_types,
+                contextual_type,
+                &plan.properties,
+                properties,
+                current_flow_types,
+            )?;
             let mut prepared = Vec::with_capacity(properties.len());
             for (property, expression) in plan.properties.iter().zip(properties) {
-                let property_context = contextual
-                    .as_ref()
-                    .and_then(|contextual| contextual.get_source(&property.name))
-                    .map(|property| property.type_);
+                let property_context = contextual_property_type(
+                    store,
+                    &contextual,
+                    &property.name,
+                    expression,
+                    current_flow_types,
+                )?;
                 prepared.push(prepare_expression(
                     store,
                     host,
@@ -378,35 +409,185 @@ fn prepare_expression(
     Ok(prepared)
 }
 
-fn contextual_object(
+fn contextual_objects(
     store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
+    global_types: Option<&CanonicalGlobalTypes>,
     contextual_type: Option<TypeId>,
-) -> Result<Option<super::relater::ResolvedDeclaredPropertyObject>, SourceCheckError> {
+    source_properties: &[PlannedProperty],
+    expressions: &[PlannedExpression],
+    current_flow_types: &HashMap<SemanticSymbolId, TypeId>,
+) -> Result<Vec<ResolvedDeclaredPropertyObject>, SourceCheckError> {
     let Some(contextual_type) = contextual_type else {
-        return Ok(None);
+        return Ok(Vec::new());
     };
     let flags = store
         .type_payload(contextual_type)
         .map(TypeRecord::flags)
         .ok_or(RelationUnavailable::Type(contextual_type))?;
     if flags.intersects(TypeFlags::UNION) {
-        // The installed union validator admits only the primitive/literal
-        // union domain. An object constituent (or an OBJECT-claiming malformed
-        // union) is therefore a typed failure here, before source publication.
-        // A valid primitive union has no members to propagate to an object.
-        validate_contextual_union(store, None, contextual_type)?;
-        return Ok(None);
+        validate_contextual_union(store, global_types, contextual_type)?;
+        let TypeData::Union(union) = store
+            .type_payload(contextual_type)
+            .ok_or(RelationUnavailable::Type(contextual_type))?
+            .data()
+        else {
+            return Err(RelationUnavailable::MalformedUnion(contextual_type).into());
+        };
+        let constituents = union.union.types.clone();
+        let mut candidates = Vec::new();
+        for constituent in constituents {
+            let flags = store
+                .type_payload(constituent)
+                .map(TypeRecord::flags)
+                .ok_or(RelationUnavailable::Type(constituent))?;
+            if flags.intersects(TypeFlags::OBJECT) {
+                let candidate = store
+                    .resolved_declared_property_object(host, constituent)?
+                    .ok_or(RelationUnavailable::UnsupportedStructuredType(constituent))?;
+                candidates.push(candidate);
+            } else if flags.intersects(TypeFlags::STRUCTURED_OR_INSTANTIABLE) {
+                return Err(RelationUnavailable::UnsupportedStructuredType(constituent).into());
+            }
+        }
+        for (property, expression) in source_properties.iter().zip(expressions) {
+            let discriminates = candidates.iter().try_fold(false, |found, candidate| {
+                if found {
+                    return Ok::<_, SourceCheckError>(true);
+                }
+                let Some(target) = candidate.get_source(&property.name) else {
+                    return Ok(false);
+                };
+                Ok(source_matches_discriminant(
+                    store,
+                    expression,
+                    target.type_,
+                    current_flow_types,
+                )?
+                .is_some())
+            })?;
+            if !discriminates {
+                continue;
+            }
+            let retained = candidates
+                .iter()
+                .filter_map(|candidate| {
+                    let Some(target) = candidate.get_source(&property.name) else {
+                        return Some(Ok(candidate.clone()));
+                    };
+                    match source_matches_discriminant(
+                        store,
+                        expression,
+                        target.type_,
+                        current_flow_types,
+                    ) {
+                        Ok(Some(false)) => None,
+                        Ok(_) => Some(Ok(candidate.clone())),
+                        Err(error) => Some(Err(error)),
+                    }
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            if !retained.is_empty() {
+                candidates = retained;
+            }
+        }
+        return Ok(candidates);
     }
     if flags.intersects(TypeFlags::OBJECT) {
         return store
             .resolved_declared_property_object(host, contextual_type)
+            .map(|object| object.into_iter().collect())
             .map_err(Into::into);
     }
     if flags.intersects(TypeFlags::STRUCTURED_OR_INSTANTIABLE) {
         return Err(RelationUnavailable::UnsupportedStructuredType(contextual_type).into());
     }
-    Ok(None)
+    Ok(Vec::new())
+}
+
+fn contextual_property_type(
+    store: &CanonicalTypeMapperStore,
+    candidates: &[ResolvedDeclaredPropertyObject],
+    name: &str,
+    expression: &PlannedExpression,
+    current_flow_types: &HashMap<SemanticSymbolId, TypeId>,
+) -> Result<Option<TypeId>, SourceCheckError> {
+    let mut fallback = None;
+    for candidate in candidates {
+        let Some(property) = candidate.get_source(name) else {
+            continue;
+        };
+        fallback.get_or_insert(property.type_);
+        if source_matches_discriminant(store, expression, property.type_, current_flow_types)?
+            == Some(true)
+        {
+            return Ok(Some(property.type_));
+        }
+    }
+    Ok(fallback)
+}
+
+fn source_matches_discriminant(
+    store: &CanonicalTypeMapperStore,
+    expression: &PlannedExpression,
+    target: TypeId,
+    current_flow_types: &HashMap<SemanticSymbolId, TypeId>,
+) -> Result<Option<bool>, SourceCheckError> {
+    let target_record = store
+        .type_payload(target)
+        .ok_or(RelationUnavailable::Type(target))?;
+    if let TypeData::Union(union) = target_record.data() {
+        let mut contains_discriminant = false;
+        for constituent in &union.union.types {
+            match source_matches_discriminant(store, expression, *constituent, current_flow_types)?
+            {
+                Some(true) => return Ok(Some(true)),
+                Some(false) => contains_discriminant = true,
+                None => {}
+            }
+        }
+        return Ok(contains_discriminant.then_some(false));
+    }
+    let result = match (&expression.kind, target_record.data()) {
+        (PlannedExpressionKind::Parenthesized(inner), _) => {
+            return source_matches_discriminant(store, inner, target, current_flow_types);
+        }
+        (PlannedExpressionKind::String(actual), TypeData::Literal(literal)) => {
+            let LiteralValue::String(expected) = &literal.value else {
+                return Ok(None);
+            };
+            Some(actual == expected)
+        }
+        (PlannedExpressionKind::Number { value, .. }, TypeData::Literal(literal)) => {
+            let LiteralValue::Number(expected) = &literal.value else {
+                return Ok(None);
+            };
+            Some(value == expected)
+        }
+        (PlannedExpressionKind::BigInt { value, .. }, TypeData::Literal(literal)) => {
+            let LiteralValue::BigInt(expected) = &literal.value else {
+                return Ok(None);
+            };
+            Some(value == expected)
+        }
+        (PlannedExpressionKind::Boolean(actual), TypeData::Literal(literal)) => {
+            let LiteralValue::Boolean(expected) = &literal.value else {
+                return Ok(None);
+            };
+            Some(actual == expected)
+        }
+        (PlannedExpressionKind::Null, _) if target_record.flags() == TypeFlags::NULL => Some(true),
+        (PlannedExpressionKind::GlobalUndefined, _)
+            if target_record.flags() == TypeFlags::UNDEFINED =>
+        {
+            Some(true)
+        }
+        (PlannedExpressionKind::Identifier(read), TypeData::Literal(_)) => current_flow_types
+            .get(&read.value_symbol)
+            .map(|actual| *actual == target),
+        _ => None,
+    };
+    Ok(result)
 }
 
 fn literal_treatment(
@@ -552,9 +733,17 @@ fn validate_contextual_union(
 #[cfg(test)]
 mod tests {
     use ts_ast::{FileId, NodeArena, NodeId, NodeRef};
+    use ts_binder::{
+        CanonicalBinder, CanonicalModuleState, CanonicalSourceFileFacts, CanonicalSourceLanguage,
+        EscapedName,
+    };
+    use ts_parser::parse_source_file;
 
     use super::*;
-    use crate::semantic::{IntrinsicBootstrapOptions, types::ObjectFlags};
+    use crate::semantic::{
+        CanonicalCheckerContext, CanonicalCheckerOptions, IntrinsicBootstrapOptions,
+        types::ObjectFlags,
+    };
 
     fn initialized() -> CanonicalTypeMapperStore {
         let mut store = CanonicalTypeMapperStore::new();
@@ -748,5 +937,77 @@ mod tests {
             ),
             before
         );
+    }
+
+    #[test]
+    fn contextual_object_unions_preserve_literals_and_identify_excess_properties() {
+        let parsed = parse_source_file(concat!(
+            "type Thing = { str: 'a'; num: 0 } | { str: 'b' } | { num: 1 }; ",
+            "const first: Thing = { str: 'a', num: 0 }; ",
+            "const second: Thing = { str: 'b', num: 1 }; ",
+            "const third: Thing = { num: 1, str: 'b' }; ",
+            "type Item = { kind: 'a'; subkind: 0; value: string } ",
+            "| { kind: 'a'; subkind: 1; value: number } | { kind: 'b' }; ",
+            "const fourth: Item = { subkind: 1, kind: 'b' }; ",
+            "const fifth: Item = { kind: 'b', subkind: 1 };",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(1_061);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/contextual-discriminants.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        let mut context = CanonicalCheckerContext::new(
+            binder.finish(),
+            [(file, &parsed.arena)].into_iter().collect(),
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    ..IntrinsicBootstrapOptions::default()
+                },
+                ..CanonicalCheckerOptions::default()
+            },
+        )
+        .unwrap();
+
+        context.check_source_file(file).unwrap();
+
+        assert_eq!(
+            context
+                .diagnostics()
+                .as_slice()
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.code())
+                .collect::<Vec<_>>(),
+            [2353, 2353]
+        );
+        let counts = (
+            context.store().type_len(),
+            context.store().mapper_len(),
+            context.store().signature_len(),
+        );
+        context.check_source_file(file).unwrap();
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().mapper_len(),
+                context.store().signature_len(),
+            ),
+            counts
+        );
+        assert_eq!(context.diagnostics().len(), 2);
     }
 }

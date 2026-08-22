@@ -11,6 +11,94 @@ use ts_core::{TextPos, TextRange};
 use ts_parser::parse_source_file;
 
 #[test]
+fn nested_generic_calls_preserve_inference_and_inner_diagnostics() {
+    let parsed = parse_source_file(concat!(
+        "function identity<T>(value: T): T { return value; } ",
+        "function number(value: number): number { return value; } ",
+        "const inferred: 1 = identity(identity(1)); ",
+        "const explicit: string = identity<string>(identity('value')); ",
+        "const bad: number = number(identity<string>(1));",
+    ));
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(4);
+    let mut binder = CanonicalBinder::new();
+    binder
+        .bind_source_file_with_facts(
+            &parsed.arena,
+            parsed.source_file,
+            file,
+            CanonicalSourceFileFacts::new(
+                EscapedName::source("\"/project/nested-generic-calls.ts\""),
+                CanonicalSourceLanguage::TypeScript,
+                false,
+                CanonicalModuleState::Script,
+            ),
+        )
+        .unwrap();
+    binder
+        .bind_typescript_declaration_slice(&parsed.arena, file)
+        .unwrap();
+    let mut context = CanonicalCheckerContext::new(
+        binder.finish(),
+        [(file, &parsed.arena)].into_iter().collect(),
+        CanonicalCheckerOptions::default(),
+    )
+    .unwrap();
+
+    context.check_source_file(file).unwrap();
+
+    assert_eq!(
+        context
+            .diagnostics()
+            .as_slice()
+            .iter()
+            .map(|diagnostic| diagnostic.diagnostic.code())
+            .collect::<Vec<_>>(),
+        [2345, 2345]
+    );
+    let calls = parsed
+        .arena
+        .iter()
+        .filter_map(|(node, record)| {
+            (record.kind == SyntaxKind::CallExpression).then_some(NodeRef::new(
+                parsed.arena.id(),
+                file,
+                node,
+            ))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(calls.len(), 6);
+    assert!(calls.iter().all(|call| {
+        context
+            .store()
+            .signature_links(*call)
+            .and_then(|links| links.resolved_signature.signature())
+            .is_some()
+            && context
+                .store()
+                .type_node_links(*call)
+                .and_then(|links| links.resolved_type)
+                .is_some()
+    }));
+
+    let warm_counts = (
+        context.store().type_len(),
+        context.store().mapper_len(),
+        context.store().signature_len(),
+    );
+    context.check_source_file(file).unwrap();
+    assert_eq!(
+        (
+            context.store().type_len(),
+            context.store().mapper_len(),
+            context.store().signature_len(),
+        ),
+        warm_counts
+    );
+    assert_eq!(context.diagnostics().len(), 2);
+}
+
+#[test]
 fn identity_generic_calls_infer_and_apply_explicit_type_arguments() {
     let parsed = parse_source_file(concat!(
         "type User = { id: number }; ",
@@ -206,10 +294,7 @@ fn ordered_generic_calls_publish_go_style_checked_and_recovery_signatures() {
         })
         .collect::<Vec<_>>();
     calls.sort_by_key(|(start, _)| *start);
-    let calls = calls
-        .into_iter()
-        .map(|(_, call)| call)
-        .collect::<Vec<_>>();
+    let calls = calls.into_iter().map(|(_, call)| call).collect::<Vec<_>>();
     assert_eq!(calls.len(), 16);
     let signature = |index: usize| {
         context
@@ -243,7 +328,10 @@ fn ordered_generic_calls_publish_go_style_checked_and_recovery_signatures() {
             .flags(),
         TypeFlags::TYPE_PARAMETER
     );
-    assert_eq!(context.type_to_string(resolved_type(14)).unwrap(), "\"a\" | \"b\"");
+    assert_eq!(
+        context.type_to_string(resolved_type(14)).unwrap(),
+        "\"a\" | \"b\""
+    );
     assert_eq!(
         context
             .store()
@@ -334,5 +422,4 @@ fn generic_call_grammar_precedes_argument_diagnostics_and_uses_exact_ranges() {
             ),
         ))
     );
-
 }

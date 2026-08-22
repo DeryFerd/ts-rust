@@ -4,8 +4,8 @@ use ts_binder::{
     EscapedName, SemanticSymbolId,
 };
 use ts_checker::semantic::{
-    CanonicalCheckerContext, CanonicalCheckerOptions, SourceCheckError, SymbolNodeLinks,
-    TypeNodeLinks, UnsupportedSourceSyntax, ValueSymbolLinks,
+    CanonicalCheckerContext, CanonicalCheckerOptions, IntrinsicBootstrapOptions, SourceCheckError,
+    SymbolNodeLinks, TypeNodeLinks, UnsupportedSourceSyntax, ValueSymbolLinks,
 };
 use ts_parser::{ParseResult, parse_source_file};
 
@@ -106,6 +106,74 @@ fn is_type_checked(context: &CanonicalCheckerContext<'_>, file: FileId) -> bool 
         .source_file(file)
         .and_then(|source| context.store().source_file_links(source))
         .is_some_and(|links| links.type_checked)
+}
+
+#[test]
+fn ambient_object_arguments_report_exact_optional_property_mismatches() {
+    let parsed = parse_source_file(concat!(
+        "declare function accept(value: { y?: string }): void; ",
+        "accept({ y: undefined });",
+    ));
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+
+    for (index, exact_optional_property_types) in [false, true].into_iter().enumerate() {
+        let file = FileId::new(2_390 + u32::try_from(index).unwrap());
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/exact-optional-argument.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        let mut context = CanonicalCheckerContext::new(
+            binder.finish(),
+            [(file, &parsed.arena)].into_iter().collect(),
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    exact_optional_property_types,
+                },
+                ..CanonicalCheckerOptions::default()
+            },
+        )
+        .unwrap();
+
+        context.check_source_file(file).unwrap();
+
+        let expected = if exact_optional_property_types {
+            vec![2379]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(
+            context
+                .diagnostics()
+                .as_slice()
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.code())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        if exact_optional_property_types {
+            assert_eq!(
+                context.diagnostics().as_slice()[0]
+                    .diagnostic
+                    .render()
+                    .unwrap(),
+                "Argument of type '{ y: undefined; }' is not assignable to parameter of type '{ y?: string; }' with 'exactOptionalPropertyTypes: true'. Consider adding 'undefined' to the types of the target's properties."
+            );
+        }
+    }
 }
 
 #[test]
