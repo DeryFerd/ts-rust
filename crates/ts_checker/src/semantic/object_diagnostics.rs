@@ -145,29 +145,17 @@ fn diagnostics_for_failed_assignment_once(
             expression.unparenthesized().kind,
             PlannedExpressionKind::Object { .. }
         )
-    {
-        let details = exact_optional_property_mismatch_details(
+        && let Some(diagnostic) = exact_optional_assignment_diagnostic(
             store,
             host,
             global_types,
             checked.result,
             target_type,
+            fallback_node,
             flags,
-        )?;
-        if !details.is_empty() {
-            let AssignabilityErrorDisplay { source, target } =
-                get_type_names_for_assignability_error_with_host_global_types_and_flags(
-                    store,
-                    host,
-                    global_types,
-                    checked.result,
-                    target_type,
-                    flags,
-                )?;
-            let mut diagnostic = primary(2375, fallback_node, vec![source, target])?;
-            diagnostic.diagnostic.details = details;
-            return Ok(vec![diagnostic]);
-        }
+        )?
+    {
+        return Ok(vec![diagnostic]);
     }
     let mut elaborated = elaborate_expression(
         store,
@@ -195,6 +183,40 @@ fn diagnostics_for_failed_assignment_once(
         options,
     )?);
     Ok(elaborated)
+}
+
+fn exact_optional_assignment_diagnostic(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    source_type: TypeId,
+    target_type: TypeId,
+    node: NodeRef,
+    flags: CanonicalTypeFormatFlags,
+) -> Result<Option<CanonicalCheckerDiagnostic>, SourceCheckError> {
+    let details = exact_optional_property_mismatch_details(
+        store,
+        host,
+        global_types,
+        source_type,
+        target_type,
+        flags,
+    )?;
+    if details.is_empty() {
+        return Ok(None);
+    }
+    let AssignabilityErrorDisplay { source, target } =
+        get_type_names_for_assignability_error_with_host_global_types_and_flags(
+            store,
+            host,
+            global_types,
+            source_type,
+            target_type,
+            flags,
+        )?;
+    let mut diagnostic = primary(2375, node, vec![source, target])?;
+    diagnostic.diagnostic.details = details;
+    Ok(Some(diagnostic))
 }
 
 fn exact_function_type_signature(
@@ -369,6 +391,34 @@ fn elaborate_known_properties(
             target_property.type_,
             global_types,
         )? {
+            continue;
+        }
+
+        if options.intrinsic.exact_optional_property_types
+            && matches!(
+                source_expression.unparenthesized().kind,
+                PlannedExpressionKind::Object { .. }
+            )
+            && let Some(mut diagnostic) = exact_optional_assignment_diagnostic(
+                store,
+                host,
+                global_types,
+                source_property_type,
+                target_property.type_,
+                source_property.name_node,
+                flags,
+            )?
+        {
+            append_expected_property_related(
+                &mut diagnostic,
+                store,
+                host,
+                global_types,
+                target_type,
+                target_property,
+                flags,
+            )?;
+            diagnostics.push(diagnostic);
             continue;
         }
 
@@ -1171,7 +1221,15 @@ fn invalid_structure(type_id: TypeId) -> SourceCheckError {
 
 #[cfg(test)]
 mod tests {
+    use ts_ast::FileId;
+    use ts_binder::{
+        CanonicalBinder, CanonicalModuleState, CanonicalSourceFileFacts, CanonicalSourceLanguage,
+        EscapedName,
+    };
+    use ts_parser::parse_source_file;
+
     use super::*;
+    use crate::semantic::{CanonicalCheckerContext, IntrinsicBootstrapOptions};
 
     #[test]
     fn object_diagnostic_display_flags_preserve_type_to_string_defaults() {
@@ -1185,5 +1243,96 @@ mod tests {
         });
         assert!(complete.contains(CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT));
         assert!(complete.contains(CanonicalTypeFormatFlags::NO_TRUNCATION));
+    }
+
+    #[test]
+    fn nested_exact_optional_mismatches_keep_property_spans_and_related_info() {
+        let text = concat!(
+            "type Optional = { value?: string };\n",
+            "type Nested = { child: Optional };\n",
+            "type Outer = { middle: Nested };\n",
+            "declare let uncertain: string | undefined;\n",
+            "const direct: Nested = { child: { value: undefined } };\n",
+            "const union: Nested = { child: { value: uncertain } };\n",
+            "const deep: Outer = { middle: { child: { value: undefined } } };\n",
+        );
+        let parsed = parse_source_file(text);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(208);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/nested-exact-optional.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        let mut context = CanonicalCheckerContext::new(
+            binder.finish(),
+            [(file, &parsed.arena)].into_iter().collect(),
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    exact_optional_property_types: true,
+                },
+                ..CanonicalCheckerOptions::default()
+            },
+        )
+        .unwrap();
+
+        context.check_source_file(file).unwrap();
+
+        let diagnostics = context.diagnostics().as_slice();
+        assert_eq!(diagnostics.len(), 3, "{diagnostics:?}");
+        for (diagnostic, union) in diagnostics.iter().zip([false, true, false]) {
+            assert_eq!(diagnostic.diagnostic.code(), 2375);
+            let range = parsed
+                .arena
+                .get(diagnostic.node.expect("property has an anchor").node)
+                .unwrap()
+                .range;
+            assert_eq!(
+                &text[usize::try_from(range.start.get()).unwrap()
+                    ..usize::try_from(range.end.get()).unwrap()],
+                "child"
+            );
+            let expected = if union {
+                concat!(
+                    "Type '{ value: string | undefined; }' is not assignable to type ",
+                    "'Optional' with 'exactOptionalPropertyTypes: true'. Consider ",
+                    "adding 'undefined' to the types of the target's properties.\n",
+                    "  Types of property 'value' are incompatible.\n",
+                    "    Type 'string | undefined' is not assignable to type 'string'.\n",
+                    "      Type 'undefined' is not assignable to type 'string'.",
+                )
+            } else {
+                concat!(
+                    "Type '{ value: undefined; }' is not assignable to type 'Optional' ",
+                    "with 'exactOptionalPropertyTypes: true'. Consider adding ",
+                    "'undefined' to the types of the target's properties.\n",
+                    "  Types of property 'value' are incompatible.\n",
+                    "    Type 'undefined' is not assignable to type 'string'.",
+                )
+            };
+            assert_eq!(diagnostic.diagnostic.render().unwrap(), expected);
+            let [related] = diagnostic.related_information.as_slice() else {
+                panic!("a nested mismatch must retain its immediate expected property")
+            };
+            assert_eq!(related.diagnostic.code(), 6500);
+            assert_eq!(related.diagnostic.arguments, ["child", "Nested"]);
+        }
+
+        let published = context.diagnostics().clone();
+        context.check_source_file(file).unwrap();
+        assert_eq!(context.diagnostics(), &published);
     }
 }
