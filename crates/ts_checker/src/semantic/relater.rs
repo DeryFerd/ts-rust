@@ -1295,6 +1295,13 @@ impl<'store> RelaterSession<'store> {
             {
                 return self.union_or_intersection_related_to(source, target, intersection_state);
             }
+            if source_flags.intersects(TypeFlags::PRIMITIVE)
+                && target_flags.intersects(TypeFlags::OBJECT)
+                && let Some(array_target) = self.configured_array_reference_target(target)?
+            {
+                self.canonical_array_reference_argument(target, array_target)?;
+                return Ok(Ternary::False);
+            }
             if self.relation != RelationKind::Identity
                 && target_flags.intersects(TypeFlags::OBJECT)
                 && let Some(apparent_source) = self
@@ -8876,6 +8883,47 @@ mod tests {
             Ok(false),
             "different canonical array targets are never identical"
         );
+    }
+
+    #[test]
+    fn primitives_do_not_acquire_canonical_array_shape_from_boxed_global_types() {
+        let mut store = initialized(true);
+        let (number, string, zero, empty_object) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (
+                bootstrap.number_type,
+                bootstrap.string_type,
+                bootstrap.zero_type,
+                bootstrap.empty_object_type,
+            )
+        };
+        let array = alloc_canonical_array_target(&mut store, "Array");
+        let global_types = RelationGlobalTypes {
+            array_targets: CanonicalArrayTargets::for_test(array.target, array.target),
+            string_wrapper: empty_object,
+            number_wrapper: empty_object,
+            boolean_wrapper: empty_object,
+        };
+        let array_number = canonical_array_reference(&mut store, array.target, number);
+
+        for source in [number, string, zero] {
+            for relation in [
+                RelationKind::Assignable,
+                RelationKind::Subtype,
+                RelationKind::StrictSubtype,
+                RelationKind::Comparable,
+            ] {
+                assert_eq!(
+                    store.is_type_related_to_with_optional_global_types(
+                        source,
+                        array_number,
+                        relation,
+                        Some(global_types),
+                    ),
+                    Ok(false),
+                );
+            }
+        }
     }
 
     #[test]

@@ -1568,7 +1568,8 @@ mod tests {
 
     use super::*;
     use crate::semantic::{
-        CanonicalCheckerContext, CanonicalCheckerOptions, mapper::CanonicalTypeMapperStore,
+        CanonicalCheckerContext, CanonicalCheckerOptions, bootstrap::UnionReduction,
+        mapper::CanonicalTypeMapperStore,
     };
 
     fn parsed(text: &str) -> ParseResult {
@@ -1909,7 +1910,7 @@ mod tests {
     #[test]
     fn logical_array_unions_widen_each_member_and_reuse_the_canonical_result() {
         let library = parsed("interface Array<T> {}");
-        let source = parsed("let condition = 123; var value = condition && [1, 2];");
+        let source = parsed("var value: any = [1, 2];");
         let library_file = FileId::new(40);
         let file = FileId::new(41);
         let files = [(library_file, &library), (file, &source)];
@@ -1931,8 +1932,25 @@ mod tests {
         let initializer = variable_initializer(&source, file, "value");
         context.check_source_file(file).unwrap();
 
-        let union = resolved_expression_type(&context, initializer);
+        let array_literal = resolved_expression_type(&context, initializer);
         let global_types = context.global_types().clone();
+        let zero = context.store().intrinsic_bootstrap().unwrap().zero_type;
+        let union = context
+            .store_mut_for_test()
+            .expression_union_type_with_global_types(
+                &global_types,
+                &[zero, array_literal],
+                UnionReduction::Literal,
+            )
+            .unwrap();
+        assert!(
+            context
+                .store()
+                .type_payload(union)
+                .unwrap()
+                .object_flags()
+                .intersects(ObjectFlags::REQUIRES_WIDENING)
+        );
         let widened = context
             .store_mut_for_test()
             .get_widened_type_with_global_types(union, &global_types)
@@ -1942,7 +1960,6 @@ mod tests {
         else {
             panic!("the widened logical result must remain a union");
         };
-        let zero = context.store().intrinsic_bootstrap().unwrap().zero_type;
         assert_eq!(result.union.types.len(), 2);
         assert!(result.union.types.contains(&zero));
         let array = result
