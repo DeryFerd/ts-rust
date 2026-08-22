@@ -72601,8 +72601,26 @@ impl Printer<'_> {
                             binary.left,
                             binary.operator_token,
                         );
+                    let missing_right = self.arena.get(binary.right).is_some_and(|right| {
+                        matches!(
+                            &right.data,
+                            NodeData::Identifier(identifier) if identifier.text.is_empty()
+                        )
+                    });
                     let line_break_after_operator = self
-                        .source_has_known_line_break_between(binary.operator_token, binary.right);
+                        .source_has_known_line_break_between(binary.operator_token, binary.right)
+                        || (missing_right
+                            && operator == SyntaxKind::LessThanToken
+                            && self.source_is_javascript_input()
+                            && usize::try_from(self.node(binary.operator_token)?.range.end.get())
+                                .ok()
+                                .and_then(|end| self.source_text.get(end..))
+                                .is_some_and(|trivia| {
+                                    matches!(
+                                        trivia.trim_start_matches([' ', '\t']).as_bytes().first(),
+                                        Some(b'\n' | b'\r')
+                                    )
+                                }));
                     let operator_starts_source_line =
                         usize::try_from(self.node(binary.operator_token)?.range.start.get())
                             .ok()
@@ -72611,12 +72629,6 @@ impl Printer<'_> {
                             .is_some_and(|line| line.trim().is_empty());
                     let missing_left_continuation =
                         missing_left && line_break_after_operator && operator_starts_source_line;
-                    let missing_right = self.arena.get(binary.right).is_some_and(|right| {
-                        matches!(
-                            &right.data,
-                            NodeData::Identifier(identifier) if identifier.text.is_empty()
-                        )
-                    });
 
                     if missing_left_continuation {
                         actions.push(Action::Dedent);
@@ -76014,6 +76026,28 @@ mod tests {
             .unwrap()
             .code;
         assert_eq!(output, "(a, new );\n");
+    }
+
+    #[test]
+    fn preserves_newline_after_incomplete_javascript_jsx_comparison() {
+        let source = "~< <\n";
+        let parsed = ts_parser::parse_javascript_source_file(source);
+        assert!(!parsed.diagnostics.is_empty());
+        let mut settings = ts_options::CompilerOptions::default().printer_settings();
+        settings.always_strict = false;
+        settings.target = ScriptTarget::Es2015;
+        settings.module = ModuleKind::None;
+        settings.jsx = JsxEmit::None;
+        let output = emit_source_file_with_settings(
+            &parsed.arena,
+            parsed.source_file,
+            "input.js",
+            source,
+            settings,
+        )
+        .unwrap()
+        .code;
+        assert_eq!(output, "~< /> <\n;\n");
     }
 
     #[test]
