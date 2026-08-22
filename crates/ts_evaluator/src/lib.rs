@@ -445,8 +445,9 @@ impl<F: FnMut(NodeId) -> Evaluation> Evaluator<'_, F> {
             };
             match &node.data {
                 NodeData::PropertyAssignment(property) => {
-                    let Some(name) = self.property_node_name(property.name) else {
-                        return Evaluation::unknown(UnknownReason::UnsupportedSyntax(node.kind));
+                    let name = match self.object_property_name(property.name, &mut metadata) {
+                        Ok(name) => name,
+                        Err(outcome) => return Evaluation { outcome, metadata },
                     };
                     let result = self.evaluate(property.initializer);
                     metadata = metadata.merge(result.metadata);
@@ -459,8 +460,9 @@ impl<F: FnMut(NodeId) -> Evaluation> Evaluator<'_, F> {
                     values.insert(name, value);
                 }
                 NodeData::ShorthandPropertyAssignment(property) => {
-                    let Some(name) = self.property_node_name(property.name) else {
-                        return Evaluation::unknown(UnknownReason::UnsupportedSyntax(node.kind));
+                    let name = match self.object_property_name(property.name, &mut metadata) {
+                        Ok(name) => name,
+                        Err(outcome) => return Evaluation { outcome, metadata },
                     };
                     let result = (self.resolve_entity)(property.name);
                     metadata = metadata.merge(result.metadata);
@@ -488,6 +490,28 @@ impl<F: FnMut(NodeId) -> Evaluation> Evaluator<'_, F> {
             outcome: EvaluationOutcome::Value(Value::Object(values)),
             metadata,
         }
+    }
+
+    fn object_property_name(
+        &mut self,
+        id: NodeId,
+        metadata: &mut EvaluationMetadata,
+    ) -> Result<String, EvaluationOutcome> {
+        let Some(node) = self.arena.get(id).cloned() else {
+            return Err(EvaluationOutcome::Error(EvaluationError::MissingNode(id)));
+        };
+        if let NodeData::ComputedPropertyName(computed) = &node.data {
+            let result = self.evaluate(computed.expression);
+            *metadata = metadata.merge(result.metadata);
+            return match result.outcome {
+                EvaluationOutcome::Value(value) => Ok(value.js_string()),
+                outcome => Err(outcome),
+            };
+        }
+        self.property_node_name(id)
+            .ok_or(EvaluationOutcome::Unknown(
+                UnknownReason::UnsupportedSyntax(node.kind),
+            ))
     }
 
     fn evaluate_property(
@@ -542,7 +566,9 @@ impl<F: FnMut(NodeId) -> Evaluation> Evaluator<'_, F> {
         match &self.arena.get(id)?.data {
             NodeData::Identifier(data) => Some(data.text.clone()),
             NodeData::StringLiteral(data) => Some(data.text.clone()),
-            NodeData::NumericLiteral(data) => Some(Number::from_string(&data.text).to_string()),
+            NodeData::NumericLiteral(data) => {
+                Some(Number::from_string(&data.text.replace('_', "")).to_string())
+            }
             _ => None,
         }
     }
@@ -914,6 +940,43 @@ mod tests {
         );
         assert_eq!(value("[10, 20]['01'];"), Value::Undefined);
         assert_eq!(value("'ab'['01'];"), Value::Undefined);
+    }
+
+    #[test]
+    fn evaluates_computed_and_separator_normalized_object_property_names() {
+        assert_eq!(
+            value("({ [1 + 2]: 'three' })[3];"),
+            Value::String("three".into())
+        );
+        assert_eq!(
+            value("({ ['left' + 'right']: 4 }).leftright;"),
+            Value::Number(ts_jsnum::Number(4.0))
+        );
+        assert_eq!(
+            value("({ 1_000: 5 })[1000];"),
+            Value::Number(ts_jsnum::Number(5.0))
+        );
+        assert_eq!(
+            value("({ [true]: 6 }).true;"),
+            Value::Number(ts_jsnum::Number(6.0))
+        );
+    }
+
+    #[test]
+    fn computed_object_property_names_preserve_entity_metadata() {
+        let (arena, expression) = parse_expression("({ [external]: 1 }).value;");
+        let result = evaluate_with(&arena, expression, &mut |_| Evaluation {
+            outcome: EvaluationOutcome::Value(Value::String("value".into())),
+            metadata: EvaluationMetadata {
+                is_syntactically_string: true,
+                resolved_other_files: true,
+                has_external_references: true,
+            },
+        });
+
+        assert_eq!(result.value(), Some(&Value::Number(ts_jsnum::Number(1.0))));
+        assert!(result.metadata.resolved_other_files);
+        assert!(result.metadata.has_external_references);
     }
 
     #[test]
