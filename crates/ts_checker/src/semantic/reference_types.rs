@@ -877,11 +877,11 @@ mod tests {
         };
         let mapper = store.new_simple_type_mapper(parameters[0], string).unwrap();
         let mut session = InstantiationSession::new(InstantiationLimits::default());
-        let mapped =
+        let instantiated_reference =
             instantiate_type_with_session(&mut store, target, mapper, None, &mut session).unwrap();
         assert_eq!(session.query_count(), 2);
         assert_eq!(
-            validate_direct_generic_reference(&store, mapped),
+            validate_direct_generic_reference(&store, instantiated_reference),
             Ok(DirectGenericReference {
                 target,
                 type_arguments: vec![string],
@@ -891,7 +891,7 @@ mod tests {
         session.reset_query();
         assert_eq!(
             instantiate_type_with_session(&mut store, target, mapper, None, &mut session),
-            Ok(mapped),
+            Ok(instantiated_reference),
         );
         assert_eq!(session.query_count(), 2);
         assert_eq!(store.type_len(), warm_types);
@@ -899,8 +899,14 @@ mod tests {
         let identity_mapper = store.new_simple_type_mapper(string, error_type).unwrap();
         let before = session.query_count();
         assert_eq!(
-            instantiate_type_with_session(&mut store, mapped, identity_mapper, None, &mut session,),
-            Ok(mapped),
+            instantiate_type_with_session(
+                &mut store,
+                instantiated_reference,
+                identity_mapper,
+                None,
+                &mut session,
+            ),
+            Ok(instantiated_reference),
         );
         assert_eq!(
             session.query_count(),

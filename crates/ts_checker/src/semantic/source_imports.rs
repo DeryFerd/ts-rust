@@ -3548,10 +3548,10 @@ mod tests {
         let mut resolved_imports = resolve_all(&mut fixture, &import.bindings).unwrap();
         assert_eq!(resolved_imports.len(), 1);
         let resolved = resolved_imports.pop().unwrap();
-        let barrel_b_alias = direct_export(&fixture, 1, "publicValue");
-        let barrel_a_alias = direct_export(&fixture, 2, "intermediate");
+        let public_alias = direct_export(&fixture, 1, "publicValue");
+        let intermediate_alias = direct_export(&fixture, 2, "intermediate");
         let base = direct_export(&fixture, 3, "original");
-        assert_eq!(resolved.immediate_target_symbol, barrel_b_alias);
+        assert_eq!(resolved.immediate_target_symbol, public_alias);
         assert_eq!(resolved.target_symbol, base);
 
         let mut resolved_barrel_b =
@@ -3562,7 +3562,10 @@ mod tests {
             resolve_all_reexports(&mut fixture, &barrel_a.bindings).unwrap();
         assert_eq!(resolved_barrel_a.len(), 1);
         let resolved_barrel_a = resolved_barrel_a.pop().unwrap();
-        assert_eq!(resolved_barrel_b.immediate_target_symbol, barrel_a_alias);
+        assert_eq!(
+            resolved_barrel_b.immediate_target_symbol,
+            intermediate_alias
+        );
         assert_eq!(resolved_barrel_b.target_symbol, base);
         assert_eq!(resolved_barrel_a.immediate_target_symbol, base);
         assert_eq!(resolved_barrel_a.target_symbol, base);
@@ -3574,7 +3577,7 @@ mod tests {
             prepared.type_,
             fixture.store.intrinsic_bootstrap().unwrap().number_type
         );
-        assert_eq!(prepared.immediate_target_symbol, barrel_b_alias);
+        assert_eq!(prepared.immediate_target_symbol, public_alias);
         assert_eq!(prepared.target_symbol, base);
         publish_for_test(&mut fixture.store, std::slice::from_ref(&prepared));
 
@@ -3622,8 +3625,8 @@ mod tests {
         assert!(!barrel_b.bindings[0].syntactic_type_only);
         assert!(barrel_a.bindings[0].syntactic_type_only);
 
-        let barrel_b_alias = direct_export(&fixture, 1, "PublicModel");
-        let barrel_a_alias = direct_export(&fixture, 2, "IntermediateModel");
+        let public_alias = direct_export(&fixture, 1, "PublicModel");
+        let intermediate_alias = direct_export(&fixture, 2, "IntermediateModel");
         let base = direct_export(&fixture, 3, "Model");
 
         let mut resolved_barrel_a =
@@ -3640,7 +3643,10 @@ mod tests {
             resolve_all_reexports(&mut fixture, &barrel_b.bindings).unwrap();
         assert_eq!(resolved_barrel_b.len(), 1);
         let resolved_barrel_b = resolved_barrel_b.pop().unwrap();
-        assert_eq!(resolved_barrel_b.immediate_target_symbol, barrel_a_alias);
+        assert_eq!(
+            resolved_barrel_b.immediate_target_symbol,
+            intermediate_alias
+        );
         assert_eq!(resolved_barrel_b.target_symbol, base);
         assert_eq!(
             resolved_barrel_b.type_only_declaration,
@@ -3650,7 +3656,7 @@ mod tests {
         let mut resolved_imports = resolve_all_types(&mut fixture, &import.bindings).unwrap();
         assert_eq!(resolved_imports.len(), 1);
         let resolved = resolved_imports.pop().unwrap();
-        assert_eq!(resolved.immediate_target_symbol, barrel_b_alias);
+        assert_eq!(resolved.immediate_target_symbol, public_alias);
         assert_eq!(resolved.target_symbol, base);
         assert_eq!(
             fixture

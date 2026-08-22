@@ -1696,11 +1696,11 @@ mod tests {
         );
 
         let mut poisoned = fixture("type Keys = keyof { named: string; [key: number]: number };");
-        let indexed = resolve_inline_literal(&mut poisoned);
+        let indexed_object_type = resolve_inline_literal(&mut poisoned);
         let (members, properties, index) = {
             let structured = poisoned
                 .store
-                .type_payload(indexed)
+                .type_payload(indexed_object_type)
                 .and_then(|record| record.data().structured())
                 .unwrap();
             (
@@ -1710,7 +1710,7 @@ mod tests {
             )
         };
         assert!(poisoned.store.set_structured_type_members(
-            indexed,
+            indexed_object_type,
             members,
             properties,
             None,
@@ -1718,8 +1718,8 @@ mod tests {
             Some(vec![index, index]),
         ));
         assert_eq!(
-            plan_nongeneric_keyof_type(&poisoned.store, indexed),
-            Err(NongenericKeyofError::MalformedObject(indexed))
+            plan_nongeneric_keyof_type(&poisoned.store, indexed_object_type),
+            Err(NongenericKeyofError::MalformedObject(indexed_object_type))
         );
     }
 

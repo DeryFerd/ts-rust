@@ -3653,7 +3653,7 @@ mod tests {
             fixture
                 .store
                 .signature(members.default_construct_signature())
-                .and_then(|signature| signature.resolved_return_type()),
+                .and_then(super::super::signatures::Signature::resolved_return_type),
             Some(wrong)
         );
     }
@@ -3894,7 +3894,7 @@ mod tests {
                 let declared = fixture
                     .store
                     .symbol(derived_symbol)
-                    .and_then(|symbol| symbol.members())
+                    .and_then(Symbol::members)
                     .expect("Derived retains its declared instance table");
                 assert_ne!(members.instance_members(), Some(declared));
                 assert!(fixture.store.set_structured_type_members(
@@ -3910,7 +3910,7 @@ mod tests {
                 let declared = fixture
                     .store
                     .symbol(derived_symbol)
-                    .and_then(|symbol| symbol.exports())
+                    .and_then(Symbol::exports)
                     .expect("Derived retains its declared static table");
                 assert_ne!(members.static_members(), declared);
                 let mut properties = members.static_properties().to_vec();
@@ -3995,7 +3995,7 @@ mod tests {
         let exports = fixture
             .store
             .symbol(model_symbol)
-            .and_then(|symbol| symbol.exports())
+            .and_then(Symbol::exports)
             .expect("Model retains its static table");
         let wrong_members = fixture.store.alloc_symbol_table();
         assert_eq!(
