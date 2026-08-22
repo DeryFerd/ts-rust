@@ -3667,6 +3667,8 @@ fn pinned_directive_unsupported_details(case: &Case) -> Vec<String> {
             || matches!(
                 lower.as_str(),
                 "filename"
+                    | "currentdirectory"
+                    | "fullemitpaths"
                     | "noimplicitreferences"
                     | "notypesandsymbols"
                     | "traceresolution"
@@ -3680,7 +3682,6 @@ fn pinned_directive_unsupported_details(case: &Case) -> Vec<String> {
             "capturesuggestions" => {
                 "the pinned harness adds suggestion diagnostics, which Rust does not collect"
             }
-            "currentdirectory" => "custom current-directory path semantics are not proven exact",
             "link" => {
                 if directive
                     .value
@@ -3704,7 +3705,6 @@ fn pinned_directive_unsupported_details(case: &Case) -> Vec<String> {
                 "the pinned harness requires a nonempty file symlink target"
             }
             "typescriptversion" => "version-specific harness semantics are not proven exact",
-            "fullemitpaths" => "pinned root-file and output-path semantics are not modeled exactly",
             "usecasesensitivefilenames" => {
                 let value = pinned_setting_value(&directive.value);
                 if value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("false") {
@@ -3914,7 +3914,7 @@ pub fn compare_emitted_output_sections(
     outputs: &BTreeMap<String, String>,
     baseline: &str,
 ) -> BaselineComparison {
-    compare_emitted_output_sections_excluding(outputs, baseline, &BTreeSet::new(), &[])
+    compare_emitted_output_sections_excluding(outputs, baseline, &BTreeSet::new(), &[], false)
 }
 
 fn compare_case_emitted_output_sections(
@@ -4003,7 +4003,17 @@ fn compare_case_emitted_output_sections(
             )
         })
         .collect::<Vec<_>>();
-    compare_emitted_output_sections_excluding(outputs, baseline, &excluded_expected, &input_echoes)
+    let require_full_paths = case
+        .directive_values("fullEmitPaths")
+        .last()
+        .is_some_and(|value| value.eq_ignore_ascii_case("true"));
+    compare_emitted_output_sections_excluding(
+        outputs,
+        baseline,
+        &excluded_expected,
+        &input_echoes,
+        require_full_paths,
+    )
 }
 
 fn compare_emitted_output_sections_excluding(
@@ -4011,6 +4021,7 @@ fn compare_emitted_output_sections_excluding(
     baseline: &str,
     excluded_expected: &BTreeSet<String>,
     input_echoes: &[(String, String)],
+    require_full_paths: bool,
 ) -> BaselineComparison {
     let mut expected = parse_baseline_section_list(baseline)
         .into_iter()
@@ -4034,7 +4045,7 @@ fn compare_emitted_output_sections_excluding(
         })
         .collect::<Vec<_>>();
     exclude_input_echo_sections(&mut expected, &actual, input_echoes);
-    let differences = compare_section_multisets(&expected, &actual);
+    let differences = compare_section_multisets(&expected, &actual, require_full_paths);
     BaselineComparison { differences }
 }
 
@@ -4068,6 +4079,7 @@ fn exclude_input_echo_sections(
 fn compare_section_multisets(
     expected: &[(String, String)],
     actual: &[(String, String)],
+    require_full_paths: bool,
 ) -> Vec<OutputDifference> {
     let mut expected_match = vec![None; expected.len()];
     let mut actual_matched = vec![false; actual.len()];
@@ -4083,7 +4095,7 @@ fn compare_section_multisets(
     }
 
     for (expected_index, (expected_name, expected_text)) in expected.iter().enumerate() {
-        if expected_match[expected_index].is_some() {
+        if require_full_paths || expected_match[expected_index].is_some() {
             continue;
         }
         let basename = section_basename(expected_name);
@@ -4107,12 +4119,14 @@ fn compare_section_multisets(
             actual_matched[actual_index] = true;
             continue;
         }
-        let basename = section_basename(expected_name);
-        if let Some(actual_index) = actual.iter().enumerate().find_map(|(index, (name, _))| {
-            (!actual_matched[index] && section_basename(name) == basename).then_some(index)
-        }) {
-            expected_match[expected_index] = Some(actual_index);
-            actual_matched[actual_index] = true;
+        if !require_full_paths {
+            let basename = section_basename(expected_name);
+            if let Some(actual_index) = actual.iter().enumerate().find_map(|(index, (name, _))| {
+                (!actual_matched[index] && section_basename(name) == basename).then_some(index)
+            }) {
+                expected_match[expected_index] = Some(actual_index);
+                actual_matched[actual_index] = true;
+            }
         }
     }
 
@@ -4315,12 +4329,7 @@ fn compile_case_variant(
     checker: FixtureChecker,
     walk_semantic_artifacts: bool,
 ) -> Result<Compilation, FixtureCompilationFailure> {
-    let case_sensitive = case
-        .directive_values("useCaseSensitiveFileNames")
-        .last()
-        .map(pinned_setting_value)
-        .is_none_or(|value| !value.eq_ignore_ascii_case("false"));
-    let file_system = MemoryFileSystem::new(case_sensitive);
+    let file_system = MemoryFileSystem::new(fixture_case_sensitive(case));
     let project_directory = project_config_unit(case).and_then(|(path, _)| {
         path.rsplit_once('/')
             .map(|(directory, _)| directory.to_owned())
@@ -4330,8 +4339,8 @@ fn compile_case_variant(
         .filter_map(|value| value.split_once("->"))
         .map(|(source, target)| {
             (
-                virtual_harness_path(source.trim()),
-                virtual_harness_path(target.trim()),
+                virtual_harness_path(case, source.trim()),
+                virtual_harness_path(case, target.trim()),
             )
         })
         .collect::<Vec<_>>();
@@ -4358,7 +4367,7 @@ fn compile_case_variant(
             .map(str::trim)
             .filter(|alias| !alias.is_empty())
         {
-            file_system.add_file_link(&path, &virtual_harness_path(alias));
+            file_system.add_file_link(&path, &virtual_harness_path(case, alias));
         }
         if is_pinned_program_root(&path) {
             roots.push(path);
@@ -4404,15 +4413,12 @@ fn compile_case_variant(
     if project_config_unit(case).is_none() && case.directive_values("noLib").next().is_none() {
         compiler_options.no_lib = false;
     }
-    let current_directory = project_directory
-        .as_deref()
-        .or_else(|| case.directive_values("currentDirectory").next())
-        .unwrap_or_else(|| virtual_unit_root(case));
+    let current_directory = virtual_unit_root(case);
     let (program, semantic_artifacts) = match checker {
         FixtureChecker::Legacy => (
             ts_compiler::Program::new_with_options(
                 &file_system,
-                current_directory,
+                &current_directory,
                 &roots,
                 compiler_options,
             ),
@@ -4422,7 +4428,7 @@ fn compile_case_variant(
             let (program, rendered) = catch_canonical_checker_unwind(|| {
                 ts_compiler::Program::try_new_with_canonical_checker_and_queries(
                     &file_system,
-                    current_directory,
+                    &current_directory,
                     &roots,
                     compiler_options,
                     |program, queries| artifacts::render_program(case, program, queries),
@@ -4445,7 +4451,7 @@ fn compile_case_variant(
             catch_canonical_checker_unwind(|| {
                 ts_compiler::Program::try_new_with_canonical_checker(
                     &file_system,
-                    current_directory,
+                    &current_directory,
                     &roots,
                     compiler_options,
                 )
@@ -4568,11 +4574,11 @@ fn compile_case_variant(
     })
 }
 
-fn virtual_harness_path(path: &str) -> String {
-    if path.starts_with('/') {
+fn virtual_harness_path(case: &Case, path: &str) -> String {
+    if ts_path::is_absolute(path) {
         ts_path::normalize_path(path)
     } else {
-        ts_path::resolve_path("/.src", &[path])
+        ts_path::resolve_path(&virtual_unit_root(case), &[path])
     }
 }
 
@@ -4584,16 +4590,23 @@ fn virtual_unit_path(case: &Case, unit: &Unit, index: usize) -> String {
             .file_name()
             .and_then(|name| name.to_str())
             .map_or_else(|| format!("unit{index}.ts"), str::to_owned);
-        return ts_path::resolve_path(virtual_unit_root(case), &[&base]);
+        return ts_path::resolve_path(&virtual_unit_root(case), &[&base]);
     }
-    if path.starts_with('/') {
+    if ts_path::is_absolute(&path) {
         return ts_path::normalize_path(&path);
     }
-    ts_path::resolve_path(virtual_unit_root(case), &[&path])
+    ts_path::resolve_path(&virtual_unit_root(case), &[&path])
 }
 
-fn virtual_unit_root(_case: &Case) -> &'static str {
-    "/.src"
+fn virtual_unit_root(case: &Case) -> String {
+    case.directive_values("currentDirectory")
+        .last()
+        .map(str::trim)
+        .filter(|directory| !directory.is_empty())
+        .map_or_else(
+            || "/.src".to_owned(),
+            |directory| ts_path::resolve_path("/.src", &[directory]),
+        )
 }
 
 fn is_pinned_program_root(path: &str) -> bool {
@@ -4750,24 +4763,30 @@ fn project_configuration_unsupported_details(case: &Case) -> Vec<String> {
         details
             .push("virtual project configuration diagnostics are not modeled exactly".to_owned());
     }
-    if config.extends.is_some() {
-        details.push("virtual project extends resolution is not modeled exactly".to_owned());
-    }
     if !config.references.is_empty() {
         details.push("virtual project references are not modeled exactly".to_owned());
     }
-    if config.include.is_some() || config.exclude.is_some() {
-        details.push("virtual project include/exclude patterns are not modeled exactly".to_owned());
+    let directory = config
+        .path
+        .rsplit_once('/')
+        .map_or("", |(directory, _)| directory);
+    let case_sensitive = fixture_case_sensitive(case);
+    for pattern in config.include.iter().chain(config.exclude.iter()).flatten() {
+        if project_pattern_matches(directory, directory, pattern, case_sensitive).is_none() {
+            details.push(format!(
+                "virtual project include/exclude pattern {pattern:?} is not modeled exactly"
+            ));
+        }
     }
     if let Some(files) = config.files.as_ref() {
-        let directory = config
-            .path
-            .rsplit_once('/')
-            .map_or("", |(directory, _)| directory);
         for file in files {
             let expected = ts_path::resolve_path(directory, &[file]);
             if !case.units.iter().enumerate().any(|(index, unit)| {
-                virtual_unit_path(case, unit, index).eq_ignore_ascii_case(&expected)
+                project_paths_equal(
+                    &virtual_unit_path(case, unit, index),
+                    &expected,
+                    case_sensitive,
+                )
             }) {
                 details.push(format!(
                     "virtual project explicitly references unavailable input {file:?}"
@@ -4782,6 +4801,19 @@ fn pinned_project_config(case: &Case) -> Option<ts_config::ProjectConfig> {
     let (path, unit) = project_config_unit(case)?;
     let source = unit.source_text.as_scannable_str();
     if let Some(config) = ts_config::parse_config_text(&path, source).value {
+        if config.extends.is_some() {
+            let filesystem = MemoryFileSystem::new(fixture_case_sensitive(case));
+            for (index, unit) in case.units.iter().enumerate() {
+                filesystem
+                    .write_file(
+                        &virtual_unit_path(case, unit, index),
+                        unit.source_text.as_scannable_str(),
+                    )
+                    .ok()?;
+            }
+            let resolved = ts_config::resolve_config_file(&filesystem, &path);
+            return resolved.diagnostics.is_empty().then_some(resolved.value)?;
+        }
         return Some(config);
     }
 
@@ -4827,10 +4859,13 @@ fn project_root_unit_indices(
         .path
         .rsplit_once('/')
         .map_or("", |(directory, _)| directory);
+    let case_sensitive = fixture_case_sensitive(case);
     let explicit_files = config.files.as_ref().map(|files| {
         files
             .iter()
-            .map(|file| ts_path::resolve_path(directory, &[file]))
+            .map(|file| {
+                project_canonical_path(&ts_path::resolve_path(directory, &[file]), case_sensitive)
+            })
             .collect::<BTreeSet<_>>()
     });
     case.units
@@ -4841,13 +4876,14 @@ fn project_root_unit_indices(
             if !is_pinned_program_root(&path) {
                 return None;
             }
-            if let Some(files) = explicit_files.as_ref() {
-                return files.contains(&path).then_some(index);
+            if explicit_files
+                .as_ref()
+                .is_some_and(|files| files.contains(&project_canonical_path(&path, case_sensitive)))
+            {
+                return Some(index);
             }
 
-            let relative = path
-                .strip_prefix(directory)
-                .and_then(|relative| relative.strip_prefix('/'))?;
+            let relative = project_relative_path(&path, directory, case_sensitive)?;
             if relative.split('/').any(|component| {
                 component.starts_with('.')
                     || matches!(
@@ -4863,9 +4899,139 @@ fn project_root_unit_indices(
                     Some(index)
                 }
                 _ => None,
+            }?;
+
+            let included = config.include.as_ref().map_or_else(
+                || explicit_files.is_none(),
+                |patterns| {
+                    patterns.iter().any(|pattern| {
+                        project_pattern_matches(directory, &path, pattern, case_sensitive)
+                            == Some(true)
+                    })
+                },
+            );
+            if !included {
+                return None;
             }
+            if config.exclude.as_ref().is_some_and(|patterns| {
+                patterns.iter().any(|pattern| {
+                    project_pattern_matches(directory, &path, pattern, case_sensitive) == Some(true)
+                })
+            }) {
+                return None;
+            }
+            Some(index)
         })
         .collect()
+}
+
+fn fixture_case_sensitive(case: &Case) -> bool {
+    case.directive_values("useCaseSensitiveFileNames")
+        .last()
+        .map(pinned_setting_value)
+        .is_none_or(|value| !value.eq_ignore_ascii_case("false"))
+}
+
+fn project_canonical_path(path: &str, case_sensitive: bool) -> String {
+    ts_path::canonical_file_name(
+        &ts_path::normalize_path(path),
+        if case_sensitive {
+            ts_path::CaseSensitivity::Sensitive
+        } else {
+            ts_path::CaseSensitivity::Insensitive
+        },
+    )
+}
+
+fn project_paths_equal(left: &str, right: &str, case_sensitive: bool) -> bool {
+    project_canonical_path(left, case_sensitive) == project_canonical_path(right, case_sensitive)
+}
+
+fn project_relative_path<'path>(
+    path: &'path str,
+    directory: &str,
+    case_sensitive: bool,
+) -> Option<&'path str> {
+    let directory = directory.trim_end_matches('/');
+    if directory.is_empty() {
+        return path.strip_prefix('/');
+    }
+    let prefix = path.get(..directory.len())?;
+    if !project_paths_equal(prefix, directory, case_sensitive) {
+        return None;
+    }
+    path.get(directory.len()..)?.strip_prefix('/')
+}
+
+fn project_pattern_matches(
+    directory: &str,
+    path: &str,
+    pattern: &str,
+    case_sensitive: bool,
+) -> Option<bool> {
+    let normalized = ts_path::resolve_path(directory, &[&pattern.replace('\\', "/")]);
+    if normalized.contains(['?', '[', ']', '{', '}']) {
+        return None;
+    }
+
+    if let Some((base, tail)) = normalized.split_once("/**/") {
+        if tail.contains('/') || tail.contains('?') {
+            return None;
+        }
+        let base = if base.is_empty() { "/" } else { base };
+        let Some(relative) = project_relative_path(path, base, case_sensitive) else {
+            return Some(false);
+        };
+        return project_pattern_leaf_matches(
+            tail,
+            relative.rsplit('/').next().unwrap_or(relative),
+            case_sensitive,
+        );
+    }
+
+    if normalized.contains("**") {
+        return None;
+    }
+    if normalized.contains('*') {
+        let (parent, leaf) = normalized.rsplit_once('/')?;
+        let Some(relative) = project_relative_path(path, parent, case_sensitive) else {
+            return Some(false);
+        };
+        if relative.contains('/') {
+            return Some(false);
+        }
+        return project_pattern_leaf_matches(leaf, relative, case_sensitive);
+    }
+
+    Some(
+        project_paths_equal(path, &normalized, case_sensitive)
+            || project_relative_path(path, &normalized, case_sensitive).is_some(),
+    )
+}
+
+fn project_pattern_leaf_matches(
+    pattern: &str,
+    file_name: &str,
+    case_sensitive: bool,
+) -> Option<bool> {
+    if pattern == "*" {
+        return Some(true);
+    }
+    let suffix = pattern.strip_prefix('*')?;
+    if !suffix.starts_with('.') || suffix.contains('*') {
+        return None;
+    }
+    let file_name = if case_sensitive {
+        file_name.to_owned()
+    } else {
+        ts_path::canonical_file_name(file_name, ts_path::CaseSensitivity::Insensitive)
+    };
+    let suffix = if case_sensitive {
+        suffix.to_owned()
+    } else {
+        ts_path::canonical_file_name(suffix, ts_path::CaseSensitivity::Insensitive)
+    };
+    Some(file_name.ends_with(&suffix))
 }
 
 fn project_config_unit(case: &Case) -> Option<(String, &Unit)> {
@@ -6053,6 +6219,52 @@ mod tests {
     }
 
     #[test]
+    fn full_emit_paths_require_exact_output_paths_instead_of_basename_fallback() {
+        let case = Case::parse(
+            "fullPaths.ts",
+            concat!(
+                "// @fullEmitPaths: true\n",
+                "// @filename: /src/first/index.ts\n",
+                "const value = 1;\n",
+            ),
+        )
+        .unwrap();
+        let variant = expand_option_matrix(&case).remove(0);
+        assert!(
+            variant.unsupported_details.is_empty(),
+            "{:?}",
+            variant.unsupported_details
+        );
+        let outputs = BTreeMap::from([(
+            "/src/first/index.js".to_owned(),
+            "const value = 1;\n".to_owned(),
+        )]);
+        let matching = compare_case_emitted_output_sections(
+            &outputs,
+            "//// [/src/first/index.js] ////\nconst value = 1;\n",
+            &case,
+            &variant,
+        );
+        assert!(matching.is_match(), "{:?}", matching.differences);
+
+        let wrong_directory = compare_case_emitted_output_sections(
+            &outputs,
+            "//// [/src/second/index.js] ////\nconst value = 1;\n",
+            &case,
+            &variant,
+        );
+        assert_eq!(wrong_directory.differences.len(), 2);
+        assert!(matches!(
+            wrong_directory.differences[0].kind,
+            OutputDifferenceKind::Missing { .. }
+        ));
+        assert!(matches!(
+            wrong_directory.differences[1].kind,
+            OutputDifferenceKind::Unexpected { .. }
+        ));
+    }
+
+    #[test]
     fn omitted_fixture_target_uses_the_current_upstream_default() {
         let case = Case::parse("defaultTarget.ts", "const answer = 42;\n").unwrap();
         let options = fixture_compiler_options(&case, &OptionVariant::default());
@@ -6415,6 +6627,80 @@ mod tests {
     }
 
     #[test]
+    fn custom_current_directory_controls_relative_sources_and_directory_links() {
+        let case = Case::parse(
+            "customDirectory.ts",
+            concat!(
+                "// @currentDirectory: /workspace/app\n",
+                "// @module: commonjs\n",
+                "// @target: es2015\n",
+                "// @noLib: true\n",
+                "// @noImplicitReferences: true\n",
+                "// @filename: packages/pkg/index.ts\n",
+                "export const shared: number = 1;\n",
+                "// @filename: src/main.ts\n",
+                "import { shared } from 'pkg';\n",
+                "export const value: number = shared;\n",
+                "// @link: packages/pkg -> src/node_modules/pkg\n",
+            ),
+        )
+        .unwrap();
+        let variant = expand_option_matrix(&case).remove(0);
+        assert!(
+            variant.unsupported_details.is_empty(),
+            "{:?}",
+            variant.unsupported_details
+        );
+        assert_eq!(
+            virtual_unit_path(&case, &case.units[0], 0),
+            "/workspace/app/packages/pkg/index.ts"
+        );
+        assert_eq!(
+            virtual_unit_path(&case, &case.units[1], 1),
+            "/workspace/app/src/main.ts"
+        );
+        let compilation = compile_case(&case).unwrap();
+        assert!(
+            compilation.diagnostics.is_empty(),
+            "{:?}",
+            compilation.diagnostics
+        );
+        assert!(
+            compilation
+                .outputs
+                .contains_key("/workspace/app/src/main.js")
+        );
+    }
+
+    #[test]
+    fn relative_current_directory_is_normalized_against_the_upstream_source_root() {
+        let case = Case::parse(
+            "relativeDirectory.ts",
+            concat!(
+                "// @currentDirectory: workspace/../project\n",
+                "// @filename: src/index.ts\n",
+                "const value: number = 1;\n",
+            ),
+        )
+        .unwrap();
+        assert!(
+            expand_option_matrix(&case)[0]
+                .unsupported_details
+                .is_empty()
+        );
+        assert_eq!(
+            virtual_unit_path(&case, &case.units[0], 0),
+            "/.src/project/src/index.ts"
+        );
+        assert!(
+            compile_case(&case)
+                .unwrap()
+                .outputs
+                .contains_key("/.src/project/src/index.js")
+        );
+    }
+
+    #[test]
     fn honors_no_emit_from_the_nearest_virtual_project_config() {
         let case = Case::parse(
             "projectNoEmit.ts",
@@ -6508,6 +6794,146 @@ mod tests {
         let (order, issues) = error_baseline_unit_order(&case);
         assert!(issues.is_empty(), "{issues:?}");
         assert_eq!(order, [0, 2, 1]);
+    }
+
+    #[test]
+    fn project_include_and_exclude_patterns_select_exact_virtual_inputs() {
+        let case = Case::parse(
+            "projectPatterns.ts",
+            concat!(
+                "// @filename: /app/tsconfig.json\n",
+                "{ \"include\": [\"src/**/*.ts\"], \"exclude\": [\"src/generated\"] }\n",
+                "// @filename: /app/src/main.ts\n",
+                "const first: number = 1;\n",
+                "// @filename: /app/src/nested/value.ts\n",
+                "const second: number = 2;\n",
+                "// @filename: /app/src/generated/ignored.ts\n",
+                "const ignored: string = 1;\n",
+                "// @filename: /app/outside.ts\n",
+                "const outside: string = 1;\n",
+            ),
+        )
+        .unwrap();
+        let variant = expand_option_matrix(&case).remove(0);
+        assert!(
+            variant.unsupported_details.is_empty(),
+            "{:?}",
+            variant.unsupported_details
+        );
+        let compilation = compile_case(&case).unwrap();
+        assert!(
+            compilation.diagnostics.is_empty(),
+            "{:?}",
+            compilation.diagnostics
+        );
+        assert!(compilation.outputs.contains_key("/app/src/main.js"));
+        assert!(compilation.outputs.contains_key("/app/src/nested/value.js"));
+        assert!(
+            !compilation
+                .outputs
+                .contains_key("/app/src/generated/ignored.js")
+        );
+        assert!(!compilation.outputs.contains_key("/app/outside.js"));
+        let (order, issues) = error_baseline_unit_order(&case);
+        assert!(issues.is_empty(), "{issues:?}");
+        assert_eq!(order, [0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn project_explicit_files_and_direct_globs_are_combined_in_fixture_order() {
+        let case = Case::parse(
+            "projectMixedInputs.ts",
+            concat!(
+                "// @filename: /app/tsconfig.json\n",
+                "{ \"files\": [\"outside.ts\"], \"include\": [\"src/*.ts\"] }\n",
+                "// @filename: /app/src/nested/ignored.ts\n",
+                "const ignored: string = 1;\n",
+                "// @filename: /app/outside.ts\n",
+                "const outside: number = 1;\n",
+                "// @filename: /app/src/main.ts\n",
+                "const main: number = 1;\n",
+            ),
+        )
+        .unwrap();
+        let variant = expand_option_matrix(&case).remove(0);
+        assert!(
+            variant.unsupported_details.is_empty(),
+            "{:?}",
+            variant.unsupported_details
+        );
+        let compilation = compile_case(&case).unwrap();
+        assert!(
+            compilation.diagnostics.is_empty(),
+            "{:?}",
+            compilation.diagnostics
+        );
+        assert!(compilation.outputs.contains_key("/app/outside.js"));
+        assert!(compilation.outputs.contains_key("/app/src/main.js"));
+        assert!(
+            !compilation
+                .outputs
+                .contains_key("/app/src/nested/ignored.js")
+        );
+        let (order, issues) = error_baseline_unit_order(&case);
+        assert!(issues.is_empty(), "{issues:?}");
+        assert_eq!(order, [0, 2, 3, 1]);
+    }
+
+    #[test]
+    fn project_patterns_honor_case_insensitive_fixture_filesystems() {
+        let case = Case::parse(
+            "projectCaseInsensitive.ts",
+            concat!(
+                "// @useCaseSensitiveFileNames: false\n",
+                "// @filename: /App/tsconfig.json\n",
+                "{ \"include\": [\"SRC/**/*.TS\"] }\n",
+                "// @filename: /app/src/nested/Main.ts\n",
+                "const value: number = 1;\n",
+            ),
+        )
+        .unwrap();
+        assert!(
+            expand_option_matrix(&case)[0]
+                .unsupported_details
+                .is_empty()
+        );
+        assert!(
+            compile_case(&case)
+                .unwrap()
+                .outputs
+                .contains_key("/app/src/nested/Main.js")
+        );
+    }
+
+    #[test]
+    fn project_extends_lists_apply_each_base_and_preserve_baseline_order() {
+        let case = Case::parse(
+            "projectExtends.ts",
+            concat!(
+                "// @filename: /base-one.json\n",
+                "{ \"compilerOptions\": { \"strictNullChecks\": true } }\n",
+                "// @filename: /base-two.json\n",
+                "{ \"compilerOptions\": { \"noImplicitAny\": true } }\n",
+                "// @filename: /tsconfig.json\n",
+                "{ \"extends\": [\"./base-one.json\", \"./base-two.json\"] }\n",
+                "// @filename: /index.ts\n",
+                "const value: string = undefined;\n",
+            ),
+        )
+        .unwrap();
+        let variant = expand_option_matrix(&case).remove(0);
+        assert!(
+            variant.unsupported_details.is_empty(),
+            "{:?}",
+            variant.unsupported_details
+        );
+        let options = fixture_compiler_options(&case, &variant);
+        assert!(options.strict_null_checks);
+        assert!(options.no_implicit_any);
+        let (order, issues) = error_baseline_unit_order(&case);
+        assert!(issues.is_empty(), "{issues:?}");
+        assert_eq!(order, [2, 3, 0, 1]);
+        assert_eq!(compile_case(&case).unwrap().diagnostics.len(), 1);
     }
 
     #[test]
@@ -7391,17 +7817,17 @@ mod tests {
                 "boolean useCaseSensitiveFileNames",
             ),
             (
-                "// @fullEmitPaths: true\nconst value = 1;\n",
-                "root-file and output-path",
+                "// @fullEmitPaths: invalid\nconst value = 1;\n",
+                "invalid boolean value",
             ),
             (
                 concat!(
                     "// @filename: tsconfig.json\n",
-                    "{\"include\":[\"src/**/*.ts\"]}\n",
+                    "{\"include\":[\"src/**/generated/*.ts\"]}\n",
                     "// @filename: src/index.ts\n",
                     "const value = 1;\n",
                 ),
-                "include/exclude patterns",
+                "include/exclude pattern",
             ),
             (
                 "// @captureSuggestions: true\nconst value = 1;\n",

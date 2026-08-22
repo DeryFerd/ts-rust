@@ -1072,6 +1072,65 @@ fn semantic_artifact_mode_matches_real_type_and_symbol_baselines() {
 }
 
 #[test]
+fn semantic_artifacts_resolve_relative_units_from_the_configured_current_directory() {
+    let repository = TestRepository::new();
+    repository.write_case(
+        "currentDirectoryArtifacts",
+        concat!(
+            "// @currentDirectory: /workspace/app\n",
+            "// @module: esnext\n",
+            "// @filename: src/value.ts\n",
+            "export const value: number = 1;\n",
+        ),
+        None,
+    );
+    repository.write_baseline(
+        "currentDirectoryArtifacts.types",
+        concat!(
+            "//// [tests/cases/compiler/currentDirectoryArtifacts.ts] ////\r\n\r\n",
+            "=== src/value.ts ===\r\n",
+            "export const value: number = 1;\r\n",
+            ">value : number\r\n",
+            ">1 : 1\r\n\r\n",
+        ),
+    );
+    repository.write_baseline(
+        "currentDirectoryArtifacts.symbols",
+        concat!(
+            "//// [tests/cases/compiler/currentDirectoryArtifacts.ts] ////\r\n\r\n",
+            "=== src/value.ts ===\r\n",
+            "export const value: number = 1;\r\n",
+            ">value : Symbol(value, Decl(value.ts, 0, 12))\r\n\r\n",
+        ),
+    );
+    let scorecard_path = repository.0.join("current-directory-artifacts.json");
+
+    let output = run(
+        &repository.0,
+        &[
+            "--diagnostics",
+            "--canonical-checker",
+            "--semantic-artifacts",
+            "--scorecard-json",
+            scorecard_path.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}\nscorecard:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+        fs::read_to_string(&scorecard_path).unwrap_or_default(),
+    );
+    let scorecard: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(scorecard_path).unwrap()).unwrap();
+    assert_eq!(scorecard["summary"]["exactMatches"], 1);
+    assert_eq!(scorecard["summary"]["unsupportedDetails"], 0);
+    assert_eq!(scorecard["semanticArtifacts"]["types"]["exactMatches"], 1);
+    assert_eq!(scorecard["semanticArtifacts"]["symbols"]["exactMatches"], 1);
+}
+
+#[test]
 fn semantic_artifact_mode_matches_the_pinned_single_file_oracles() {
     let repository = TestRepository::new();
     repository.write_case("simpleTestSingleFile", "const x: number = \"\";", None);
