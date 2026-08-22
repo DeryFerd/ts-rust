@@ -8,25 +8,26 @@
 //! (`symbol.members`) and annotated static properties (`symbol.exports`).
 //!
 //! The member transaction adds direct primitive property annotations,
-//! retained readonly state, final instance/static structured caches, and the
-//! mandatory default construct signature. The public query additionally
-//! admits one direct local nongeneric base whose own completed graph is in the
-//! same exact property-only family; the whole-source adapter consumes that
-//! graph only after seeing the exact direct base plan earlier in source.
-//! Methods, executable bodies, general heritage, non-primitive annotations,
-//! and class diagnostics remain later class stages.
+//! retained readonly state, final instance/static structured caches, and one
+//! default or explicit zero-argument construct signature. The public query
+//! additionally admits one direct local nongeneric base whose own completed
+//! graph is in the same supported family; the whole-source adapter consumes
+//! that graph only after seeing the exact direct base plan earlier in source.
+//! Methods, nonempty constructor bodies, general heritage, and non-primitive
+//! annotations remain later class stages.
 
 use std::collections::HashSet;
 
 use ts_ast::{NodeData, NodeRef, SyntaxKind};
 use ts_binder::{
-    CanonicalNameResolver, CanonicalResolutionLocation, CheckFlags, EscapedName, SemanticSymbolId,
-    SymbolFlags, SymbolTableId,
+    CanonicalNameResolver, CanonicalResolutionLocation, CheckFlags, EscapedName,
+    InternalSymbolName, SemanticSymbolId, SymbolFlags, SymbolTableId,
     semantic::{PreparedSymbolTable, Symbol},
 };
 
 use super::{
-    CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHost, SignatureId, TypeId,
+    CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHost, ResolvedSignatureState,
+    SignatureId, SignatureLinks, TypeId,
     declared::{preflight_class_or_interface_reference, preflight_node, type_list_key},
     links::{TypeNodeLinks, ValueSymbolLinks},
     signatures::SignatureFlags,
@@ -46,6 +47,20 @@ const PROTOTYPE_NAME: &str = "prototype";
 pub(super) enum ClassPropertySide {
     Instance,
     Static,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ClassConstructorVisibility {
+    Public,
+    Protected,
+    Private,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ClassConstructorPlan {
+    declaration: NodeRef,
+    symbol: SemanticSymbolId,
+    visibility: ClassConstructorVisibility,
 }
 
 /// One source property whose annotation can be executed by the root query
@@ -110,6 +125,7 @@ pub(super) struct ClassDeclarationPlan {
     declaration: NodeRef,
     symbol: SemanticSymbolId,
     base: Option<DirectClassBasePlan>,
+    constructor: Option<ClassConstructorPlan>,
     instance_members: Option<SymbolTableId>,
     static_members: SymbolTableId,
     properties: Vec<ClassPropertyPlan>,
@@ -509,6 +525,170 @@ fn class_property_modifiers(
         return Err(invariant(ClassInvariant::InvalidProperty(declaration)));
     }
     Ok(supported)
+}
+
+fn class_constructor_visibility(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    declaration: NodeRef,
+    parameter_start: ts_core::TextPos,
+    modifiers: Option<&ts_ast::ModifierList>,
+) -> Result<ClassConstructorVisibility, ClassError> {
+    let Some(modifiers) = modifiers else {
+        return Ok(ClassConstructorVisibility::Public);
+    };
+    let [modifier] = modifiers.list.nodes.as_slice() else {
+        return Err(unsupported(ClassUnsupported::Member {
+            node: declaration,
+            kind: SyntaxKind::Constructor,
+        }));
+    };
+    let modifier = NodeRef::new(declaration.arena, declaration.file, *modifier);
+    let record = preflight_node(store, host, modifier)?;
+    let visibility = match record.kind {
+        SyntaxKind::PublicKeyword => ClassConstructorVisibility::Public,
+        SyntaxKind::ProtectedKeyword => ClassConstructorVisibility::Protected,
+        SyntaxKind::PrivateKeyword => ClassConstructorVisibility::Private,
+        _ => {
+            return Err(unsupported(ClassUnsupported::Member {
+                node: declaration,
+                kind: SyntaxKind::Constructor,
+            }));
+        }
+    };
+    let declaration_record = preflight_node(store, host, declaration)?;
+    if modifiers.flags.0 != 0
+        || modifiers.list.has_trailing_comma
+        || modifiers.list.range.start != declaration_record.range.start
+        || modifiers.list.range.end > parameter_start
+        || record.parent != Some(declaration.node)
+        || record.flags.0 != 0
+        || !matches!(record.data, NodeData::Token(_))
+        || record.range.start < modifiers.list.range.start
+        || record.range.end > modifiers.list.range.end
+    {
+        return Err(invariant(ClassInvariant::InvalidProperty(declaration)));
+    }
+    Ok(visibility)
+}
+
+fn plan_constructor(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    owner: SemanticSymbolId,
+    declaration: NodeRef,
+    instance_members: Option<SymbolTableId>,
+) -> Result<ClassConstructorPlan, ClassError> {
+    let record = preflight_node(store, host, declaration)?;
+    let NodeData::ConstructorDeclaration(constructor) = &record.data else {
+        return Err(invariant(ClassInvariant::InvalidProperty(declaration)));
+    };
+    if record.kind != SyntaxKind::Constructor
+        || record.flags.0 != 0
+        || constructor.asterisk_token.is_some()
+        || constructor.end_flow_node.is_some()
+        || constructor.full_signature.is_some()
+        || constructor.next_container.is_some()
+        || constructor.return_flow_node.is_some()
+        || constructor.symbol.is_some()
+        || constructor.type_.is_some()
+        || constructor.type_parameters.is_some()
+        || constructor.facts != 0
+    {
+        return Err(invariant(ClassInvariant::InvalidProperty(declaration)));
+    }
+    if !constructor.parameters.nodes.is_empty() || constructor.parameters.has_trailing_comma {
+        return Err(unsupported(ClassUnsupported::Member {
+            node: declaration,
+            kind: SyntaxKind::Constructor,
+        }));
+    }
+    let body = constructor
+        .body
+        .map(|body| NodeRef::new(declaration.arena, declaration.file, body))
+        .ok_or_else(|| {
+            unsupported(ClassUnsupported::Member {
+                node: declaration,
+                kind: SyntaxKind::Constructor,
+            })
+        })?;
+    let body_record = preflight_node(store, host, body)?;
+    let NodeData::Block(block) = &body_record.data else {
+        return Err(invariant(ClassInvariant::InvalidProperty(declaration)));
+    };
+    if body_record.kind != SyntaxKind::Block
+        || body_record.parent != Some(declaration.node)
+        || body_record.flags.0 != 0
+        || body_record.range.start < constructor.parameters.range.end
+        || body_record.range.end != record.range.end
+        || block.facts != 0
+        || block.statements.has_trailing_comma
+    {
+        return Err(invariant(ClassInvariant::InvalidProperty(declaration)));
+    }
+    if !block.statements.nodes.is_empty() {
+        return Err(unsupported(ClassUnsupported::Member {
+            node: declaration,
+            kind: SyntaxKind::Constructor,
+        }));
+    }
+
+    let visibility = class_constructor_visibility(
+        store,
+        host,
+        declaration,
+        constructor.parameters.range.start,
+        constructor.modifiers.as_ref(),
+    )?;
+    let symbol = bound_symbol(store, host, declaration)
+        .ok_or_else(|| invariant(ClassInvariant::InvalidConstructSignature(owner)))?;
+    let symbol_record = store
+        .symbol(symbol)
+        .ok_or_else(|| invariant(ClassInvariant::InvalidConstructSignature(owner)))?;
+    let table = instance_members.and_then(|members| store.symbol_table(members));
+    if symbol_record.flags() != SymbolFlags::CONSTRUCTOR
+        || symbol_record.check_flags() != CheckFlags::NONE
+        || symbol_record.name() != InternalSymbolName::Constructor.as_ref()
+        || symbol_record.declarations() != Some(&[declaration])
+        || symbol_record.value_declaration().is_some()
+        || symbol_record.members().is_some()
+        || symbol_record.exports().is_some()
+        || symbol_record.parent() != Some(owner)
+        || symbol_record.export_symbol().is_some()
+        || store.get_merged_symbol(symbol) != Some(symbol)
+        || table.and_then(|table| table.get(InternalSymbolName::Constructor.as_ref()))
+            != Some(symbol)
+    {
+        return Err(invariant(ClassInvariant::InvalidConstructSignature(owner)));
+    }
+    if let Some(links) = store.signature_links(declaration)
+        && links != &SignatureLinks::default()
+    {
+        let ResolvedSignatureState::Resolved(signature) = links.resolved_signature else {
+            return Err(invariant(ClassInvariant::InvalidConstructSignature(owner)));
+        };
+        let Some(instance_type) = store
+            .declared_type_links(owner)
+            .and_then(|links| links.declared_type)
+        else {
+            return Err(invariant(ClassInvariant::InvalidConstructSignature(owner)));
+        };
+        if links
+            != &(SignatureLinks {
+                resolved_signature: ResolvedSignatureState::Resolved(signature),
+                ..SignatureLinks::default()
+            })
+            || !exact_construct_signature(store, signature, instance_type, Some(declaration))
+        {
+            return Err(invariant(ClassInvariant::InvalidConstructSignature(owner)));
+        }
+    }
+
+    Ok(ClassConstructorPlan {
+        declaration,
+        symbol,
+        visibility,
+    })
 }
 
 fn plan_property(
@@ -950,6 +1130,7 @@ fn plan_class_declaration(
     let mut properties = Vec::with_capacity(class.members.nodes.len());
     let mut instance_names = HashSet::new();
     let mut static_names = HashSet::new();
+    let mut constructor = None;
     let mut previous_end = class.members.range.start;
     for member in &class.members.nodes {
         let member = NodeRef::new(declaration.arena, declaration.file, *member);
@@ -962,6 +1143,22 @@ fn plan_class_declaration(
             return Err(invariant(ClassInvariant::InvalidProperty(member)));
         }
         previous_end = member_record.range.end;
+        if member_record.kind == SyntaxKind::Constructor {
+            if base.is_some() || constructor.is_some() {
+                return Err(unsupported(ClassUnsupported::Member {
+                    node: member,
+                    kind: SyntaxKind::Constructor,
+                }));
+            }
+            constructor = Some(plan_constructor(
+                store,
+                host,
+                symbol,
+                member,
+                instance_members,
+            )?);
+            continue;
+        }
         if member_record.kind != SyntaxKind::PropertyDeclaration {
             return Err(unsupported(ClassUnsupported::Member {
                 node: member,
@@ -991,8 +1188,12 @@ fn plan_class_declaration(
     }
 
     let instance_table = instance_members.and_then(|table| store.symbol_table(table));
-    if instance_members.is_some() == instance_properties.is_empty()
-        || instance_table.is_some_and(|table| table.len() != instance_properties.len())
+    let expected_instance_members = instance_properties
+        .len()
+        .checked_add(usize::from(constructor.is_some()))
+        .ok_or_else(|| invariant(ClassInvariant::Capacity(declaration)))?;
+    if instance_members.is_some() == (expected_instance_members == 0)
+        || instance_table.is_some_and(|table| table.len() != expected_instance_members)
     {
         return Err(invariant(ClassInvariant::InvalidOwnerSymbol(symbol)));
     }
@@ -1012,6 +1213,7 @@ fn plan_class_declaration(
         declaration,
         symbol,
         base,
+        constructor,
         instance_members,
         static_members,
         properties,
@@ -1050,15 +1252,28 @@ impl ClassMemberPlan {
     pub(super) fn uninitialized_instance_properties(&self) -> &[NodeRef] {
         &self.uninitialized_instance_properties
     }
+
+    const fn constructor_declaration(&self) -> Option<NodeRef> {
+        match self.class.constructor {
+            Some(constructor) => Some(constructor.declaration),
+            None => None,
+        }
+    }
+
+    const fn constructor_visibility(&self) -> ClassConstructorVisibility {
+        match self.class.constructor {
+            Some(constructor) => constructor.visibility,
+            None => ClassConstructorVisibility::Public,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-#[allow(clippy::large_enum_variant)] // Keep class plans inline without adding preflight allocations.
 pub(super) enum ClassMemberQueryPlan {
     Direct(ClassMemberPlan),
     Derived {
         class: ClassMemberPlan,
-        base: ClassMemberPlan,
+        base: Box<ClassMemberPlan>,
     },
 }
 
@@ -1083,6 +1298,29 @@ impl ClassMemberQueryPlan {
         }
     }
 
+    pub(super) fn constructor_declaration(&self) -> Option<NodeRef> {
+        match self {
+            Self::Direct(plan) => plan.constructor_declaration(),
+            Self::Derived { class, base } => match class.constructor_declaration() {
+                Some(declaration) => Some(declaration),
+                None => base.constructor_declaration(),
+            },
+        }
+    }
+
+    pub(super) fn constructor_visibility(&self) -> ClassConstructorVisibility {
+        match self {
+            Self::Direct(plan) => plan.constructor_visibility(),
+            Self::Derived { class, base } => {
+                if class.class.constructor.is_some() {
+                    class.constructor_visibility()
+                } else {
+                    base.constructor_visibility()
+                }
+            }
+        }
+    }
+
     pub(super) const fn direct_plan(&self) -> Option<&ClassMemberPlan> {
         match self {
             Self::Direct(plan) => Some(plan),
@@ -1090,10 +1328,10 @@ impl ClassMemberQueryPlan {
         }
     }
 
-    pub(super) const fn base_plan(&self) -> Option<&ClassMemberPlan> {
+    pub(super) fn base_plan(&self) -> Option<&ClassMemberPlan> {
         match self {
             Self::Direct(_) => None,
-            Self::Derived { base, .. } => Some(base),
+            Self::Derived { base, .. } => Some(base.as_ref()),
         }
     }
 }
@@ -1294,10 +1532,13 @@ pub(super) fn plan_nongeneric_class_member_query(
         return plan_class_members(store, host, class).map(ClassMemberQueryPlan::Direct);
     };
     let base_plan = plan_nongeneric_class_members(store, host, base.symbol)?;
+    if base_plan.constructor_visibility() == ClassConstructorVisibility::Private {
+        return Err(unsupported(ClassUnsupported::Heritage(base.expression)));
+    }
     let class = plan_class_members(store, host, class)?;
     Ok(ClassMemberQueryPlan::Derived {
         class,
-        base: base_plan,
+        base: Box::new(base_plan),
     })
 }
 
@@ -1379,16 +1620,17 @@ fn exact_instance_identity<'a>(
     exact_class_instance_identity(store, plan.symbol, instance_type)
 }
 
-fn exact_default_construct_signature(
+fn exact_construct_signature(
     store: &CanonicalTypeMapperStore,
     signature: SignatureId,
     instance_type: TypeId,
+    declaration: Option<NodeRef>,
 ) -> bool {
     store.signature(signature).is_some_and(|signature| {
         signature.flags() == SignatureFlags::CONSTRUCT
             && signature.min_argument_count() == 0
             && signature.resolved_min_argument_count() == -1
-            && signature.declaration().is_none()
+            && signature.declaration() == declaration
             && signature.type_parameters().is_empty()
             && signature.parameters().is_empty()
             && signature.this_parameter().is_none()
@@ -1494,7 +1736,21 @@ fn completed_class_members(
             .structured
             .object_type_without_abstract_construct_signatures
             .is_some()
-        || !exact_default_construct_signature(store, *default_construct_signature, instance_type)
+        || !exact_construct_signature(
+            store,
+            *default_construct_signature,
+            instance_type,
+            plan.constructor_declaration(),
+        )
+        || plan.class.constructor.is_some_and(|constructor| {
+            store.signature_links(constructor.declaration)
+                != Some(&SignatureLinks {
+                    resolved_signature: ResolvedSignatureState::Resolved(
+                        *default_construct_signature,
+                    ),
+                    ..SignatureLinks::default()
+                })
+        })
     {
         return None;
     }
@@ -1751,7 +2007,14 @@ fn completed_derived_class_members(
             .is_some()
         || value.structured.members == Some(plan.class.static_members)
         || !exact_symbol_table_entries(store, value.structured.members, &surfaces.static_entries)
-        || !exact_default_construct_signature(store, *default_construct_signature, instance_type)
+        || !exact_construct_signature(
+            store,
+            *default_construct_signature,
+            instance_type,
+            store
+                .signature(base.default_construct_signature)
+                .and_then(super::signatures::Signature::declaration),
+        )
     {
         return None;
     }
@@ -2220,6 +2483,11 @@ pub(super) fn execute_nongeneric_class_members(
         .count();
     let missing_owner_value_link =
         usize::from(store.value_symbol_links(plan.class.symbol).is_none());
+    let missing_constructor_signature_links = usize::from(
+        plan.class
+            .constructor
+            .is_some_and(|constructor| store.signature_links(constructor.declaration).is_none()),
+    );
     let missing_value_links = missing_property_value_links
         .checked_add(missing_owner_value_link)
         .ok_or_else(|| invariant(ClassInvariant::Capacity(plan.class.declaration)))?;
@@ -2231,6 +2499,7 @@ pub(super) fn execute_nongeneric_class_members(
         )
         || !store.try_reserve_type_node_links(missing_type_node_links)
         || !store.try_reserve_value_symbol_links(missing_value_links)
+        || !store.try_reserve_signature_links(missing_constructor_signature_links)
     {
         return Err(invariant(ClassInvariant::Capacity(plan.class.declaration)));
     }
@@ -2246,7 +2515,7 @@ pub(super) fn execute_nongeneric_class_members(
     let default_construct_signature = store
         .alloc_signature(
             SignatureFlags::CONSTRUCT,
-            None,
+            plan.constructor_declaration(),
             Vec::new(),
             None,
             Vec::new(),
@@ -2256,6 +2525,15 @@ pub(super) fn execute_nongeneric_class_members(
         )
         .expect("the class-member transaction reserved one exact default signature");
     construct_signatures.push(default_construct_signature);
+    if let Some(constructor) = plan.class.constructor {
+        assert!(store.set_signature_links(
+            constructor.declaration,
+            SignatureLinks {
+                resolved_signature: ResolvedSignatureState::Resolved(default_construct_signature),
+                ..SignatureLinks::default()
+            },
+        ));
+    }
 
     for (property, property_type) in plan.class.properties.iter().zip(&plan.property_types) {
         assert!(store.set_type_node_links(
@@ -2466,6 +2744,11 @@ fn execute_direct_derived_class_members(
         .chain([plan.class.symbol, base_plan.class.symbol])
         .filter(|symbol| store.value_symbol_links(*symbol).is_none())
         .count();
+    let missing_constructor_signature_links = [plan.class.constructor, base_plan.class.constructor]
+        .into_iter()
+        .flatten()
+        .filter(|constructor| store.signature_links(constructor.declaration).is_none())
+        .count();
     if !store.try_reserve_types(6)
         || !store.try_reserve_signatures(2)
         || !store.try_reserve_checker_symbol_allocations(
@@ -2475,6 +2758,7 @@ fn execute_direct_derived_class_members(
         || !store.try_reserve_declared_type_links(missing_declared_links)
         || !store.try_reserve_type_node_links(missing_type_node_links)
         || !store.try_reserve_value_symbol_links(missing_value_links)
+        || !store.try_reserve_signature_links(missing_constructor_signature_links)
         || !store.try_reserve_direct_class_heritage_provenance(1)
     {
         return Err(invariant(ClassInvariant::Capacity(plan.class.declaration)));
@@ -2505,10 +2789,13 @@ fn execute_direct_derived_class_members(
             Some(None),
         );
     }
+    let inherited_constructor_declaration = store
+        .signature(base.default_construct_signature)
+        .and_then(super::signatures::Signature::declaration);
     let default_construct_signature = store
         .alloc_signature(
             SignatureFlags::CONSTRUCT,
-            None,
+            inherited_constructor_declaration,
             Vec::new(),
             None,
             Vec::new(),
@@ -2720,15 +3007,76 @@ fn exact_stored_property(
         .then_some(*declaration)
 }
 
+#[derive(Clone, Copy)]
+enum StoredClassConstructor {
+    Absent,
+    Present {
+        symbol: SemanticSymbolId,
+        declaration: NodeRef,
+    },
+}
+
+impl StoredClassConstructor {
+    const fn symbol(self) -> Option<SemanticSymbolId> {
+        match self {
+            Self::Absent => None,
+            Self::Present { symbol, .. } => Some(symbol),
+        }
+    }
+
+    const fn declaration(self) -> Option<NodeRef> {
+        match self {
+            Self::Absent => None,
+            Self::Present { declaration, .. } => Some(declaration),
+        }
+    }
+}
+
+fn stored_class_constructor(
+    store: &CanonicalTypeMapperStore,
+    owner: SemanticSymbolId,
+    owner_declaration: NodeRef,
+    table: Option<SymbolTableId>,
+) -> Option<StoredClassConstructor> {
+    let Some(table) = table else {
+        return Some(StoredClassConstructor::Absent);
+    };
+    let table = store.symbol_table(table)?;
+    let Some(symbol) = table.get(InternalSymbolName::Constructor.as_ref()) else {
+        return Some(StoredClassConstructor::Absent);
+    };
+    let record = store.symbol(symbol)?;
+    let [declaration] = record.declarations()? else {
+        return None;
+    };
+    (record.flags() == SymbolFlags::CONSTRUCTOR
+        && record.check_flags() == CheckFlags::NONE
+        && record.name() == InternalSymbolName::Constructor.as_ref()
+        && record.value_declaration().is_none()
+        && record.members().is_none()
+        && record.exports().is_none()
+        && record.parent() == Some(owner)
+        && record.export_symbol().is_none()
+        && store.get_merged_symbol(symbol) == Some(symbol)
+        && store.source_node_kind(*declaration) == Some(SyntaxKind::Constructor)
+        && store.source_node_parent(*declaration)
+            == Some(SourceNodeParent::Parent(owner_declaration)))
+    .then_some(StoredClassConstructor::Present {
+        symbol,
+        declaration: *declaration,
+    })
+}
+
 fn stored_declared_properties(
     store: &CanonicalTypeMapperStore,
     owner: SemanticSymbolId,
     owner_declaration: NodeRef,
     table: Option<SymbolTableId>,
     prototype: Option<SemanticSymbolId>,
+    constructor: Option<SemanticSymbolId>,
 ) -> Option<Vec<SemanticSymbolId>> {
     let Some(table) = table else {
-        return prototype.is_none().then(Vec::new);
+        return (prototype.is_none() && constructor.is_none()).then(Vec::new);
     };
     let table = store.symbol_table(table)?;
     if table.is_empty() && prototype.is_none() {
@@ -2740,7 +3088,7 @@ fn stored_declared_properties(
         if store.symbol(property)?.name() != name {
             return None;
         }
-        if Some(property) == prototype {
+        if Some(property) == prototype || Some(property) == constructor {
             continue;
         }
         exact_stored_property(store, owner, owner_declaration, property)?;
@@ -2758,7 +3106,8 @@ fn stored_declared_properties(
     }
     let expected_len = properties
         .len()
-        .checked_add(usize::from(prototype.is_some()))?;
+        .checked_add(usize::from(prototype.is_some()))?
+        .checked_add(usize::from(constructor.is_some()))?;
     (table.len() == expected_len).then_some(properties)
 }
 
@@ -2797,10 +3146,23 @@ fn stored_class_parts(
     let exports = owner.exports()?;
     validate_prototype(store, symbol, exports).ok()?;
     let prototype = store.symbol_table(exports)?.get_source(PROTOTYPE_NAME)?;
-    let declared_instance_properties =
-        stored_declared_properties(store, symbol, declaration, owner.members(), None)?;
-    let declared_static_properties =
-        stored_declared_properties(store, symbol, declaration, Some(exports), Some(prototype))?;
+    let constructor = stored_class_constructor(store, symbol, declaration, owner.members())?;
+    let declared_instance_properties = stored_declared_properties(
+        store,
+        symbol,
+        declaration,
+        owner.members(),
+        None,
+        constructor.symbol(),
+    )?;
+    let declared_static_properties = stored_declared_properties(
+        store,
+        symbol,
+        declaration,
+        Some(exports),
+        Some(prototype),
+        None,
+    )?;
 
     let links = store.value_symbol_links(symbol)?;
     let value_type = links.resolved_type?;
@@ -2819,6 +3181,17 @@ fn stored_class_parts(
     let [signature] = value.structured.signatures.as_deref()? else {
         return None;
     };
+    let expected_constructor_declaration = if let Some(declaration) = constructor.declaration() {
+        Some(declaration)
+    } else if let Some(provenance) = store.direct_class_heritage_provenance(instance_type) {
+        let base = store.type_payload(provenance.base_value_type)?;
+        let [signature] = base.data().structured()?.signatures.as_deref()? else {
+            return None;
+        };
+        store.signature(*signature)?.declaration()
+    } else {
+        None
+    };
     if value_record.flags() != TypeFlags::OBJECT
         || value_record.object_flags() != (ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED)
         || value_record.symbol() != Some(symbol)
@@ -2833,7 +3206,19 @@ fn stored_class_parts(
             .structured
             .object_type_without_abstract_construct_signatures
             .is_some()
-        || !exact_default_construct_signature(store, *signature, instance_type)
+        || !exact_construct_signature(
+            store,
+            *signature,
+            instance_type,
+            expected_constructor_declaration,
+        )
+        || constructor.declaration().is_some_and(|declaration| {
+            store.signature_links(declaration)
+                != Some(&SignatureLinks {
+                    resolved_signature: ResolvedSignatureState::Resolved(*signature),
+                    ..SignatureLinks::default()
+                })
+        })
     {
         return None;
     }

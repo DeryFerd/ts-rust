@@ -488,7 +488,7 @@ fn unsupported_new_forms_stop_at_typed_boundaries() {
 
     for source in [
         "abstract class Model { value!: string; } const model = new Model();",
-        "class Model { constructor() {} value!: string; } const model = new Model();",
+        "class Model { constructor(value: string) {} value!: string; } const model = new Model();",
     ] {
         let parsed = parse_source_file(source);
         assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);

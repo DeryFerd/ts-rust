@@ -3,11 +3,12 @@
 //! This is the dependency-closed `new Model()` and `new Model` branch of pinned
 //! TypeScript-Go `checkCallExpression`, `getResolvedSignature`,
 //! `resolveNewExpression`, and `resolveCall`. The admitted constructor is one
-//! preceding local class whose primitive member transaction owns exactly one
-//! non-abstract, zero-parameter construct signature. Direct local inheritance
-//! reuses the existing completed class graph. Planning proves the complete
-//! syntax, resolver route, class provenance, and cold/warm cache shape before
-//! source execution may publish any class or expression state.
+//! preceding local class whose member transaction owns exactly one public,
+//! non-abstract, zero-parameter construct signature. Default and explicit
+//! constructor declarations share the same canonical class graph. Planning
+//! proves the complete syntax, resolver route, class provenance, and cold/warm
+//! cache shape before source execution may publish any class or expression
+//! state.
 
 use std::collections::{HashMap, HashSet};
 
@@ -22,8 +23,9 @@ use super::{
     ResolvedSignatureState, SignatureId, SignatureLinks, SymbolNodeLinks, TypeData, TypeId,
     TypeNodeLinks, ValueSymbolLinks,
     classes::{
-        ClassMemberPlan, ClassMemberQueryPlan, execute_nongeneric_class_member_query,
-        plan_nongeneric_class_member_query, preflight_nongeneric_class_member_query,
+        ClassConstructorVisibility, ClassMemberPlan, ClassMemberQueryPlan,
+        execute_nongeneric_class_member_query, plan_nongeneric_class_member_query,
+        preflight_nongeneric_class_member_query,
     },
     signatures::SignatureFlags,
 };
@@ -297,7 +299,7 @@ pub(super) fn plan_direct_default_new(
             .get(declaration.node)
             .ok_or_else(|| invariant(SourceNewInvariant::MissingNode(declaration)))?;
         if declaration_record.range.end > record.range.start
-            || prior_classes.get(&base.symbol()) != Some(base)
+            || prior_classes.get(&base.symbol()) != Some(base.as_ref())
         {
             return Err(unsupported(SourceNewUnsupported::ConstructorNotPrior {
                 node: constructor,
@@ -310,6 +312,12 @@ pub(super) fn plan_direct_default_new(
         return Err(invariant(SourceNewInvariant::InvalidClassPlan(
             class.declaration(),
         )));
+    }
+    if class.constructor_visibility() != ClassConstructorVisibility::Public {
+        return Err(unsupported(SourceNewUnsupported::ConstructorClass {
+            node: constructor,
+            symbol,
+        }));
     }
     preflight_nongeneric_class_member_query(store, host, &class)?;
 
@@ -659,7 +667,7 @@ fn validate_selected_default_signature(
         || signature_record
             .flags()
             .intersects(SignatureFlags::ABSTRACT)
-        || signature_record.declaration().is_some()
+        || signature_record.declaration() != plan.class.constructor_declaration()
         || !signature_record.type_parameters().is_empty()
         || !signature_record.parameters().is_empty()
         || signature_record.this_parameter().is_some()
