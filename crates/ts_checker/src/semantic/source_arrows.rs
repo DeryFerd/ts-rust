@@ -423,6 +423,12 @@ fn plan_contextual_target_syntax_shape(
     type_node: NodeRef,
     array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<SourceContextualSignatureShape, SourceContextualArrowError> {
+    let record = preflight_node(store, host, type_node)?;
+    if record.kind != SyntaxKind::FunctionType {
+        return Err(contextual_unsupported(
+            SourceContextualArrowUnsupported::ContextualTargetSyntax(type_node),
+        ));
+    }
     let plan = plan_function_type(store, host, type_node, None, false, array_targets)
         .map_err(|error| contextual_target_plan_error(error, type_node))?;
     let return_type = plan.return_type;
@@ -1789,6 +1795,62 @@ mod tests {
                 exported,
             );
             assert_ne!(plan.variable_symbol, plan.owner_symbol);
+        }
+    }
+
+    #[test]
+    fn named_contextual_callable_targets_remain_atomic_typed_boundaries() {
+        for source in [
+            "type Callback = () => void; export const value: Callback = () => {};",
+            concat!(
+                "type Page = (() => void) & { getLayout?: () => void }; ",
+                "export const value: Page = () => {};",
+            ),
+        ] {
+            let fixture = Fixture::new(source);
+            let declaration = fixture.declarations()[0];
+            let NodeData::VariableDeclaration(variable) =
+                &fixture.parsed.arena.get(declaration.node).unwrap().data
+            else {
+                panic!("expected contextual variable declaration")
+            };
+            let annotation = NodeRef::new(
+                fixture.parsed.arena.id(),
+                fixture.file,
+                variable.type_.unwrap(),
+            );
+            let arrow = NodeRef::new(
+                fixture.parsed.arena.id(),
+                fixture.file,
+                variable.initializer.unwrap(),
+            );
+            let owner = fixture.bound.symbol(arrow).unwrap();
+            let cold = (
+                fixture.store.type_len(),
+                fixture.store.symbol_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+
+            assert_eq!(
+                fixture.contextual_plan(0),
+                Err(SourceContextualArrowError::Unsupported(
+                    SourceContextualArrowUnsupported::ContextualTargetSyntax(annotation),
+                )),
+            );
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.symbol_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                cold,
+            );
+            assert!(
+                fixture
+                    .store
+                    .source_callable_type_for_owner(owner)
+                    .is_none()
+            );
         }
     }
 
