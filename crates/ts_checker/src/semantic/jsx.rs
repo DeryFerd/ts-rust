@@ -2,9 +2,10 @@
 //!
 //! This module follows the pinned JSX checker for global `JSX` namespaces,
 //! named or indexed intrinsic tags, and fixed function components. It writes
-//! only to the existing semantic graph. Spread attributes, generic components,
-//! dotted component names, contextual children, and factory imports remain
-//! explicit source-capability boundaries.
+//! only to the existing semantic graph. Inline object-literal spreads reuse
+//! canonical object publication. Other spreads, generic components, dotted
+//! component names, contextual children, and factory imports remain explicit
+//! source-capability boundaries.
 
 use std::collections::HashSet;
 
@@ -48,7 +49,7 @@ enum JsxElementPlanKind {
     Element {
         tag: JsxTagPlan,
         attributes_node: NodeRef,
-        attributes: Vec<JsxAttributePlan>,
+        attributes: JsxAttributesPlan,
         type_arguments: Vec<NodeRef>,
         closing: Option<JsxClosingPlan>,
     },
@@ -78,6 +79,19 @@ struct JsxAttributePlan {
 }
 
 #[derive(Clone, Debug)]
+enum JsxAttributesPlan {
+    Properties(Vec<JsxAttributePlan>),
+    ObjectSpread(Box<JsxObjectSpreadPlan>),
+}
+
+#[derive(Clone, Debug)]
+struct JsxObjectSpreadPlan {
+    node: NodeRef,
+    object: super::object_members::PropertyObjectPlan,
+    properties: Vec<JsxAttributePlan>,
+}
+
+#[derive(Clone, Debug)]
 enum JsxAttributeValue {
     ImplicitTrue,
     Expression {
@@ -104,6 +118,11 @@ enum JsxScalarPlan {
     Identifier {
         node: NodeRef,
         name: String,
+    },
+    AnyAssertion {
+        node: NodeRef,
+        type_node: NodeRef,
+        value: Box<Self>,
     },
     Parenthesized {
         node: NodeRef,
@@ -167,7 +186,7 @@ impl CanonicalTypeMapperStore {
     /// Validates a JSX expression and every supported child without mutation.
     ///
     /// Source planners can call this before executing earlier statements. It
-    /// rejects unsupported tags, spreads, malformed binder ownership, and
+    /// rejects unsupported tags, spread forms, malformed binder ownership, and
     /// unsupported scalar expressions across the complete JSX tree.
     ///
     /// # Errors
@@ -635,7 +654,7 @@ fn plan_jsx_attributes(
     store: &CanonicalTypeMapperStore,
     opening: NodeRef,
     attributes_node: NodeRef,
-) -> Result<Vec<JsxAttributePlan>, SourceCheckError> {
+) -> Result<JsxAttributesPlan, SourceCheckError> {
     let attributes_record = jsx_node(arena, bound, store, attributes_node)?;
     let NodeData::JsxAttributes(attributes) = &attributes_record.data else {
         return Err(unsupported(attributes_node, attributes_record.kind));
@@ -647,6 +666,15 @@ fn plan_jsx_attributes(
         || bound.symbol(attributes_node).is_none()
     {
         return Err(unsupported(attributes_node, attributes_record.kind));
+    }
+
+    if let [attribute] = attributes.properties.nodes.as_slice() {
+        let node = child_ref(attributes_node, *attribute);
+        let record = jsx_node(arena, bound, store, node)?;
+        if matches!(&record.data, NodeData::JsxSpreadAttribute(_)) {
+            return plan_jsx_object_spread(arena, bound, store, attributes_node, node)
+                .map(|spread| JsxAttributesPlan::ObjectSpread(Box::new(spread)));
+        }
     }
 
     attributes
@@ -757,7 +785,88 @@ fn plan_jsx_attributes(
                 value,
             })
         })
-        .collect()
+        .collect::<Result<Vec<_>, _>>()
+        .map(JsxAttributesPlan::Properties)
+}
+
+fn plan_jsx_object_spread(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    attributes: NodeRef,
+    node: NodeRef,
+) -> Result<JsxObjectSpreadPlan, SourceCheckError> {
+    let record = jsx_node(arena, bound, store, node)?;
+    let NodeData::JsxSpreadAttribute(spread) = &record.data else {
+        return Err(unsupported(node, record.kind));
+    };
+    if record.kind != SyntaxKind::JsxSpreadAttribute
+        || record.parent != Some(attributes.node)
+        || record.flags.0 != 0
+    {
+        return Err(unsupported(node, record.kind));
+    }
+
+    let object_node = child_ref(node, spread.expression);
+    let object_record = jsx_node(arena, bound, store, object_node)?;
+    if object_record.kind != SyntaxKind::ObjectLiteralExpression
+        || !matches!(&object_record.data, NodeData::ObjectLiteralExpression(_))
+        || object_record.parent != Some(node.node)
+    {
+        return Err(unsupported(node, SyntaxKind::JsxSpreadAttribute));
+    }
+
+    let host = DeclaredTypeHost::new([(arena, bound)]).map_err(super::DeclaredTypeError::from)?;
+    let object =
+        super::object_members::plan_object_literal(store, &host, object_node).map_err(|error| {
+            match error {
+                super::object_members::PropertyObjectError::UnsupportedMember { node, kind } => {
+                    unsupported(node, kind)
+                }
+                _ => SourceCheckError::Property(object_node),
+            }
+        })?;
+    super::object_members::object_literal_state(store, &object)
+        .map_err(|_| SourceCheckError::Property(object_node))?;
+
+    let mut properties = Vec::with_capacity(object.properties.len());
+    for property in &object.properties {
+        let property_record = jsx_node(arena, bound, store, property.declaration)?;
+        if property_record.kind != SyntaxKind::PropertyAssignment
+            || !matches!(&property_record.data, NodeData::PropertyAssignment(_))
+        {
+            return Err(unsupported(property.declaration, property_record.kind));
+        }
+        let name_record = jsx_node(arena, bound, store, property.name_node)?;
+        if name_record.kind != SyntaxKind::Identifier
+            || !matches!(&name_record.data, NodeData::Identifier(_))
+            || name_record.parent != Some(property.declaration.node)
+        {
+            return Err(unsupported(property.name_node, name_record.kind));
+        }
+        properties.push(JsxAttributePlan {
+            node: property.declaration,
+            name_node: property.name_node,
+            name: property.name.clone(),
+            symbol: property.symbol,
+            value: JsxAttributeValue::Expression {
+                wrapper: None,
+                value: plan_scalar(
+                    arena,
+                    bound,
+                    store,
+                    property.declaration,
+                    property.type_node,
+                )?,
+            },
+        });
+    }
+
+    Ok(JsxObjectSpreadPlan {
+        node,
+        object,
+        properties,
+    })
 }
 
 fn plan_jsx_children(
@@ -855,6 +964,27 @@ fn plan_scalar(
             Ok(JsxScalarPlan::Identifier {
                 node,
                 name: identifier.text.clone(),
+            })
+        }
+        NodeData::AsExpression(assertion) if record.kind == SyntaxKind::AsExpression => {
+            let type_node = child_ref(node, assertion.type_);
+            let type_record = jsx_node(arena, bound, store, type_node)?;
+            if type_record.kind != SyntaxKind::AnyKeyword
+                || !matches!(&type_record.data, NodeData::KeywordTypeNode(_))
+                || type_record.parent != Some(node.node)
+            {
+                return Err(unsupported(type_node, type_record.kind));
+            }
+            Ok(JsxScalarPlan::AnyAssertion {
+                node,
+                type_node,
+                value: Box::new(plan_scalar(
+                    arena,
+                    bound,
+                    store,
+                    node,
+                    child_ref(node, assertion.expression),
+                )?),
             })
         }
         NodeData::ParenthesizedExpression(parenthesized)
@@ -1447,17 +1577,35 @@ fn execute_jsx_element(
             };
 
             publish_signature_links(store, plan.opening, signature)?;
-            let checked = check_jsx_attributes(
-                store,
-                (arena, bound),
-                namespace,
-                expected_attributes,
-                attributes,
-                options,
-                diagnostics,
-            )?;
-            let actual_attributes =
-                publish_attribute_object(store, bound, *attributes_node, &checked)?;
+            let (checked, actual_attributes) = match attributes {
+                JsxAttributesPlan::Properties(attributes) => {
+                    let checked = check_jsx_attributes(
+                        store,
+                        (arena, bound),
+                        namespace,
+                        expected_attributes,
+                        attributes,
+                        options,
+                        diagnostics,
+                    )?;
+                    let actual =
+                        publish_attribute_object(store, bound, *attributes_node, &checked)?;
+                    (checked, actual)
+                }
+                JsxAttributesPlan::ObjectSpread(spread) => {
+                    let (checked, actual) = check_jsx_object_spread(
+                        store,
+                        (arena, bound),
+                        namespace,
+                        expected_attributes,
+                        spread,
+                        options,
+                        diagnostics,
+                    )?;
+                    publish_type_links(store, *attributes_node, actual)?;
+                    (checked, actual)
+                }
+            };
             check_attribute_assignability(
                 store,
                 plan.opening,
@@ -2096,6 +2244,49 @@ fn check_jsx_attributes(
     Ok(checked)
 }
 
+fn check_jsx_object_spread(
+    store: &mut CanonicalTypeMapperStore,
+    source: (&NodeArena, &BoundFile),
+    namespace: &JsxNamespace,
+    expected_attributes: TypeId,
+    spread: &JsxObjectSpreadPlan,
+    options: CanonicalCheckerOptions,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+) -> Result<(Vec<CheckedJsxAttribute>, TypeId), SourceCheckError> {
+    let (arena, bound) = source;
+    let mut checked = Vec::with_capacity(spread.properties.len());
+    let mut property_types = Vec::with_capacity(spread.properties.len());
+
+    for property in &spread.properties {
+        let JsxAttributeValue::Expression {
+            wrapper: None,
+            value,
+        } = &property.value
+        else {
+            return Err(SourceCheckError::Property(spread.node));
+        };
+        let value_type =
+            execute_scalar(store, arena, bound, namespace, value, options, diagnostics)?;
+        let property_type =
+            widened_jsx_attribute_type(store, expected_attributes, property, value_type)?;
+        property_types.push(property_type);
+        checked.push(CheckedJsxAttribute {
+            plan: property.clone(),
+            type_: property_type,
+        });
+    }
+
+    let object =
+        super::object_members::publish_object_literal(store, &spread.object, &property_types)
+            .map_err(|_| SourceCheckError::Property(spread.object.node))?;
+    for property in &checked {
+        publish_symbol_links(store, property.plan.name_node, property.plan.symbol)?;
+        publish_type_links(store, property.plan.name_node, property.type_)?;
+    }
+
+    Ok((checked, object))
+}
+
 fn widened_jsx_attribute_type(
     store: &CanonicalTypeMapperStore,
     expected_attributes: TypeId,
@@ -2232,6 +2423,21 @@ fn execute_scalar(
                 .ok_or(SourceCheckError::Property(*node))?;
             publish_symbol_links(store, *node, symbol)?;
             (*node, type_)
+        }
+        JsxScalarPlan::AnyAssertion {
+            node,
+            type_node,
+            value,
+        } => {
+            execute_scalar(store, arena, bound, namespace, value, options, diagnostics)?;
+            let any = store
+                .intrinsic_bootstrap()
+                .ok_or(SourceCheckError::LiteralCache(
+                    SourceLiteralCacheError::BootstrapUninitialized,
+                ))?
+                .any_type;
+            publish_type_links(store, *type_node, any)?;
+            (*node, any)
         }
         JsxScalarPlan::Parenthesized { node, value } => {
             let type_ =
@@ -3299,6 +3505,176 @@ mod runtime_tests {
                 Some(bootstrap.error_type),
             );
         }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep all upstream spread artifacts in one fixture.
+    fn inline_object_spread_preserves_runtime_and_property_artifacts() {
+        let mut fixture = RuntimeFixture::new(
+            concat!(
+                "declare const EntryTextDialog: any;\n",
+                "const view = <EntryTextDialog {...{ ",
+                "first: 0, foo: 1, bar: 2 as any, baz: 3, last: 4 ",
+                "}} />;\n",
+            ),
+            FileId::new(8_123),
+        );
+        let expression = fixture.expression("view");
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        fixture.check(expression, CanonicalJsxRuntime::Automatic, &mut diagnostics);
+
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics.as_slice()[0].diagnostic.code(), 2875);
+        let object = fixture
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ObjectLiteralExpression).then_some(NodeRef::new(
+                    fixture.parsed.arena.id(),
+                    fixture.file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let object_type = fixture
+            .store
+            .type_node_links(object)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        assert_eq!(
+            type_to_string(&fixture.store, object_type).unwrap(),
+            "{ first: number; foo: number; bar: any; baz: number; last: number; }",
+        );
+
+        let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+        let number = bootstrap.number_type;
+        let any = bootstrap.any_type;
+        let error = bootstrap.error_type;
+        let members = fixture
+            .store
+            .type_payload(object_type)
+            .and_then(|record| record.data().structured())
+            .and_then(|structured| structured.members)
+            .unwrap();
+        for (node, record) in fixture.parsed.arena.iter() {
+            let NodeData::PropertyAssignment(property) = &record.data else {
+                continue;
+            };
+            let declaration = NodeRef::new(fixture.parsed.arena.id(), fixture.file, node);
+            let name = NodeRef::new(fixture.parsed.arena.id(), fixture.file, property.name);
+            let NodeData::Identifier(identifier) =
+                &fixture.parsed.arena.get(property.name).unwrap().data
+            else {
+                unreachable!("the fixture uses identifier object properties")
+            };
+            let expected = if identifier.text == "bar" {
+                any
+            } else {
+                number
+            };
+            let source_symbol = fixture.bound.symbol(declaration).unwrap();
+            let cloned = fixture
+                .store
+                .symbol_table(members)
+                .and_then(|members| members.get_source(&identifier.text))
+                .unwrap();
+
+            assert_eq!(
+                fixture
+                    .store
+                    .symbol_node_links(name)
+                    .and_then(|links| links.resolved_symbol),
+                Some(source_symbol),
+            );
+            assert_eq!(
+                fixture
+                    .store
+                    .type_node_links(name)
+                    .and_then(|links| links.resolved_type),
+                Some(expected),
+            );
+            assert_eq!(
+                fixture.store.value_symbol_links(cloned),
+                Some(&ValueSymbolLinks {
+                    resolved_type: Some(expected),
+                    target: Some(source_symbol),
+                    ..ValueSymbolLinks::default()
+                }),
+            );
+        }
+
+        let assertion = fixture
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::AsExpression).then_some(NodeRef::new(
+                    fixture.parsed.arena.id(),
+                    fixture.file,
+                    node,
+                ))
+            })
+            .unwrap();
+        assert_eq!(
+            fixture
+                .store
+                .type_node_links(assertion)
+                .and_then(|links| links.resolved_type),
+            Some(any),
+        );
+        assert_eq!(
+            fixture
+                .store
+                .type_node_links(expression)
+                .and_then(|links| links.resolved_type),
+            Some(error),
+        );
+    }
+
+    #[test]
+    fn inline_object_spread_preserves_strict_property_diagnostics() {
+        let mut fixture = RuntimeFixture::new(
+            concat!(
+                "declare namespace JSX {\n",
+                "  interface Element {}\n",
+                "  interface IntrinsicElements { div: { count: string }; }\n",
+                "}\n",
+                "const view = <div {...{ count: 1 }} />;\n",
+            ),
+            FileId::new(8_124),
+        );
+        let namespace = fixture
+            .bound
+            .locals(fixture.bound.source_file())
+            .and_then(|locals| fixture.store.symbol_table(locals))
+            .and_then(|locals| locals.get_source("JSX"))
+            .unwrap();
+        let globals = fixture.store.intrinsic_bootstrap().unwrap().globals;
+        assert_eq!(
+            fixture
+                .store
+                .insert_symbol(globals, EscapedName::source("JSX"), namespace),
+            Some(None),
+        );
+        let expression = fixture.expression("view");
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        fixture.check(expression, CanonicalJsxRuntime::Preserve, &mut diagnostics);
+
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics.as_slice()[0].diagnostic.code(), 2322);
+        assert_eq!(
+            diagnostics.as_slice()[0].diagnostic.render().unwrap(),
+            "Type 'number' is not assignable to type 'string'.",
+        );
+        let anchor = diagnostics.as_slice()[0].node.unwrap();
+        let NodeData::Identifier(name) = &fixture.parsed.arena.get(anchor.node).unwrap().data
+        else {
+            unreachable!("the object property name owns its assignment diagnostic")
+        };
+        assert_eq!(name.text, "count");
     }
 
     #[test]

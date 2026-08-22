@@ -717,20 +717,7 @@ pub(super) fn is_template_pattern_index_key(
     store: &CanonicalTypeMapperStore,
     key_type: TypeId,
 ) -> bool {
-    let Some(TypeData::TemplateLiteral(pattern)) =
-        store.type_payload(key_type).map(TypeRecord::data)
-    else {
-        return false;
-    };
-    !pattern.types.is_empty()
-        && pattern.texts.len() == pattern.types.len() + 1
-        && pattern.types.iter().all(|placeholder| {
-            store.type_payload(*placeholder).is_some_and(|record| {
-                record.flags().intersects(
-                    TypeFlags::ANY | TypeFlags::STRING | TypeFlags::NUMBER | TypeFlags::BIG_INT,
-                )
-            })
-        })
+    store.is_template_pattern_index_key(key_type)
 }
 
 /// Checks a literal property name against one canonical template index key.
@@ -739,46 +726,7 @@ pub(super) fn template_pattern_index_matches_name(
     key_type: TypeId,
     name: &str,
 ) -> bool {
-    if !is_template_pattern_index_key(store, key_type) {
-        return false;
-    }
-    let Some(TypeData::TemplateLiteral(pattern)) =
-        store.type_payload(key_type).map(TypeRecord::data)
-    else {
-        return false;
-    };
-    let Some(mut remaining) = name.strip_prefix(&pattern.texts[0]) else {
-        return false;
-    };
-    for (index, placeholder) in pattern.types.iter().enumerate() {
-        let delimiter = &pattern.texts[index + 1];
-        let (matched, tail) = if index + 1 == pattern.types.len() {
-            let Some(value) = remaining.strip_suffix(delimiter) else {
-                return false;
-            };
-            (value, "")
-        } else if delimiter.is_empty() {
-            ("", remaining)
-        } else {
-            let Some(position) = remaining.find(delimiter) else {
-                return false;
-            };
-            (
-                &remaining[..position],
-                &remaining[position + delimiter.len()..],
-            )
-        };
-        let Some(record) = store.type_payload(*placeholder) else {
-            return false;
-        };
-        if record.flags().intersects(TypeFlags::NUMBER) && !is_numeric_literal_name(matched)
-            || record.flags().intersects(TypeFlags::BIG_INT) && matched.parse::<i128>().is_err()
-        {
-            return false;
-        }
-        remaining = tail;
-    }
-    remaining.is_empty()
+    store.template_pattern_index_matches_name(key_type, name)
 }
 
 fn select_concrete_member(
@@ -1062,6 +1010,8 @@ fn resolved_selection_type(
 
 #[cfg(test)]
 mod tests {
+    use ts_binder::{CheckFlags, EscapedName, SymbolFlags};
+
     use super::{is_template_pattern_index_key, template_pattern_index_matches_name};
     use crate::semantic::{CanonicalTypeMapperStore, IntrinsicBootstrapOptions};
 
@@ -1108,5 +1058,66 @@ mod tests {
         assert!(!template_pattern_index_matches_name(
             &store, pattern, "id-value"
         ));
+    }
+
+    #[test]
+    fn template_pattern_indexes_reuse_canonical_placeholder_matching() {
+        let mut store = CanonicalTypeMapperStore::new();
+        store
+            .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions::default())
+            .unwrap();
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        let (string, number, bigint) = (
+            bootstrap.string_type,
+            bootstrap.number_type,
+            bootstrap.bigint_type,
+        );
+        let uppercase_symbol = store.alloc_transient_symbol(
+            SymbolFlags::TYPE_ALIAS,
+            EscapedName::source("Uppercase"),
+            CheckFlags::NONE,
+        );
+        let uppercase = store
+            .get_string_mapping_type(uppercase_symbol, string)
+            .unwrap();
+        let uppercase_pattern = store
+            .get_template_literal_type(&["key-".to_owned(), String::new()], &[uppercase])
+            .unwrap();
+        let adjacent = store
+            .get_template_literal_type(
+                &[String::new(), String::new(), String::new()],
+                &[string, number],
+            )
+            .unwrap();
+        let numeric = store
+            .get_template_literal_type(&["id-".to_owned(), String::new()], &[number])
+            .unwrap();
+        let integral = store
+            .get_template_literal_type(&["big-".to_owned(), String::new()], &[bigint])
+            .unwrap();
+
+        assert!(is_template_pattern_index_key(&store, uppercase_pattern));
+        for (pattern, name, expected) in [
+            (uppercase_pattern, "key-ABC", true),
+            (uppercase_pattern, "key-Abc", false),
+            (adjacent, "a42", true),
+            (adjacent, "1", false),
+            (numeric, "id-1.0", true),
+            (numeric, "id-NaN", false),
+            (numeric, "id-Infinity", false),
+            (integral, "big-0xff", true),
+            (
+                integral,
+                "big-340282366920938463463374607431768211456",
+                true,
+            ),
+            (integral, "big-+1", false),
+        ] {
+            assert_eq!(
+                template_pattern_index_matches_name(&store, pattern, name),
+                expected,
+                "pattern value {name}",
+            );
+        }
     }
 }

@@ -1,7 +1,7 @@
 use ts_ast::{FileId, NodeData, NodeRef, SyntaxKind};
 use ts_binder::{
     CanonicalBinder, CanonicalModuleState, CanonicalSourceFileFacts, CanonicalSourceLanguage,
-    EscapedName, SemanticSymbolId,
+    EscapedName, SemanticSymbolId, SymbolFlags,
 };
 use ts_checker::semantic::{
     CanonicalCheckerContext, CanonicalCheckerOptions, IntrinsicBootstrapOptions, SourceCheckError,
@@ -213,6 +213,178 @@ fn declaration_file_functions_without_return_types_follow_no_implicit_any() {
             warm
         );
     }
+}
+
+#[test]
+fn ambient_script_functions_without_return_types_follow_no_implicit_any() {
+    let parsed = parse_source_file(concat!(
+        "declare function missing(value: number);\n",
+        "const result = missing(1);\n",
+    ));
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+
+    for (index, no_implicit_any) in [false, true].into_iter().enumerate() {
+        let file = FileId::new(2_398 + u32::try_from(index).unwrap());
+        let mut context = checker_context_with_options(
+            &parsed,
+            file,
+            false,
+            CanonicalModuleState::Script,
+            CanonicalCheckerOptions {
+                no_implicit_any,
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+
+        context.check_source_file(file).unwrap();
+
+        let expected = if no_implicit_any {
+            vec![7010]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(
+            context
+                .diagnostics()
+                .as_slice()
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.code())
+                .collect::<Vec<_>>(),
+            expected,
+        );
+
+        let declaration = function_declaration(&parsed, file, "missing");
+        let signature = context
+            .store()
+            .signature_links(declaration)
+            .and_then(|links| links.resolved_signature.signature())
+            .expect("ambient declaration must own one canonical signature");
+        assert_eq!(
+            context
+                .store()
+                .signature(signature)
+                .and_then(ts_checker::semantic::signatures::Signature::resolved_return_type),
+            Some(context.store().intrinsic_bootstrap().unwrap().any_type),
+        );
+
+        let warm = (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.diagnostics().clone(),
+        );
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.diagnostics().clone(),
+            ),
+            warm,
+        );
+    }
+}
+
+#[test]
+fn typed_ambient_rest_parameters_publish_signatures_and_accept_variable_arity() {
+    let parsed = parse_source_file(concat!(
+        "interface Array<T> {}\n",
+        "interface ReadonlyArray<T> {}\n",
+        "declare function collect(head: string, ...values: number[]): string;\n",
+        "const first = collect('ready');\n",
+        "const second = collect('ready', 1, 2);\n",
+    ));
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(2_401);
+    let mut context = checker_context(&parsed, file, false, CanonicalModuleState::Script);
+
+    context.check_source_file(file).unwrap();
+    assert!(
+        context.diagnostics().is_empty(),
+        "{:?}",
+        context.diagnostics()
+    );
+
+    let declaration = function_declaration(&parsed, file, "collect");
+    let signature = context
+        .store()
+        .signature_links(declaration)
+        .and_then(|links| links.resolved_signature.signature())
+        .and_then(|signature| context.store().signature(signature))
+        .expect("the ambient rest declaration retains its signature");
+    assert!(signature.has_rest_parameter());
+    assert_eq!(signature.min_argument_count(), 1);
+
+    for call in calls(&parsed, file) {
+        let return_type = context
+            .store()
+            .type_node_links(call)
+            .and_then(|links| links.resolved_type)
+            .expect("ambient rest calls retain their result type");
+        assert_eq!(context.type_to_string(return_type).unwrap(), "string");
+    }
+
+    let warm = (
+        context.store().type_len(),
+        context.store().signature_len(),
+        context.diagnostics().clone(),
+    );
+    context.recheck_source_file(file).unwrap();
+    assert_eq!(
+        (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.diagnostics().clone(),
+        ),
+        warm,
+    );
+}
+
+#[test]
+fn ambient_functions_merged_with_type_only_namespaces_remain_callable() {
+    let parsed = parse_source_file(concat!(
+        "declare function formatNumber(value: number): string;\n",
+        "declare namespace formatNumber { export interface Options { value: number; } }\n",
+        "const result: string = formatNumber(1);\n",
+    ));
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(2_400);
+    let mut context = checker_context(&parsed, file, false, CanonicalModuleState::Script);
+    let declaration = function_declaration(&parsed, file, "formatNumber");
+    let owner = merged_symbol(&context, file, declaration);
+    assert_eq!(
+        context.store().symbol(owner).unwrap().flags(),
+        SymbolFlags::FUNCTION | SymbolFlags::NAMESPACE_MODULE,
+    );
+
+    context.check_source_file(file).unwrap();
+    assert!(
+        context.diagnostics().is_empty(),
+        "{:?}",
+        context.diagnostics()
+    );
+
+    let call = calls(&parsed, file)[0];
+    let return_type = context
+        .store()
+        .type_node_links(call)
+        .and_then(|links| links.resolved_type)
+        .expect("merged function call must retain its return type");
+    assert_eq!(context.type_to_string(return_type).unwrap(), "string");
+
+    let warm = (
+        context.store().type_len(),
+        context.store().signature_len(),
+        context.diagnostics().clone(),
+    );
+    context.recheck_source_file(file).unwrap();
+    assert_eq!(
+        (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.diagnostics().clone(),
+        ),
+        warm,
+    );
 }
 
 #[test]
@@ -452,7 +624,7 @@ fn later_invalid_ambient_signature_rejects_the_whole_source_before_publication()
     let parsed = parse_source_file(concat!(
         "const early = ready(1);\n",
         "declare function ready(value: number): number;\n",
-        "declare function missing(value: number);\n",
+        "declare function missing({ value }: { value: number }): void;\n",
     ));
     assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
     let file = FileId::new(2_202);
@@ -562,12 +734,7 @@ fn ambient_function_forms_outside_the_exact_leaf_remain_typed_boundaries() {
             CanonicalModuleState::Script,
         ),
         (
-            "declare function missing(value: number);",
-            false,
-            CanonicalModuleState::Script,
-        ),
-        (
-            "declare function rest(...values: number[]): void;",
+            "declare function missing(this: number, value: number): void;",
             false,
             CanonicalModuleState::Script,
         ),

@@ -554,6 +554,20 @@ fn declared_index_target(
     }))
 }
 
+fn declared_index_accepts_name(
+    store: &CanonicalTypeMapperStore,
+    target: DeclaredIndexTarget,
+    name: &str,
+) -> Result<bool, SourceCheckError> {
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or(RelationUnavailable::MissingBootstrap)?;
+    Ok(target.key_type == bootstrap.string_type
+        || target.key_type == bootstrap.number_type
+            && ts_jsnum::from_string(name).to_string() == name
+        || template_pattern_index_matches_name(store, target.key_type, name))
+}
+
 #[allow(clippy::too_many_arguments)] // Keeps the retained expression tree and relation context explicit.
 fn elaborate_indexed_properties(
     store: &mut CanonicalTypeMapperStore,
@@ -609,14 +623,7 @@ fn elaborate_indexed_property(
     options: CanonicalCheckerOptions,
     session: &mut InstantiationSession,
 ) -> Result<Vec<CanonicalCheckerDiagnostic>, SourceCheckError> {
-    let bootstrap = store
-        .intrinsic_bootstrap()
-        .ok_or(RelationUnavailable::MissingBootstrap)?;
-    let matches_key = target.key_type == bootstrap.string_type
-        || target.key_type == bootstrap.number_type
-            && ts_jsnum::from_string(name).to_string() == name
-        || template_pattern_index_matches_name(store, target.key_type, name);
-    if !matches_key
+    if !declared_index_accepts_name(store, target, name)?
         || store.is_type_assignable_to_with_global_types(
             source_type,
             target.value_type,
@@ -713,11 +720,7 @@ fn shape_or_generic_diagnostic(
         );
     };
 
-    if let Some(excess) = plan
-        .properties
-        .iter()
-        .find(|property| target.get_source(&property.name).is_none())
-    {
+    if let Some(excess) = first_excess_property(store, host, plan, &target, target_type)? {
         return excess_property_diagnostic(
             store,
             host,
@@ -764,6 +767,28 @@ fn shape_or_generic_diagnostic(
         flags,
         options,
     )
+}
+
+fn first_excess_property<'source>(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    source: &'source PropertyObjectPlan,
+    target: &ResolvedDeclaredPropertyObject,
+    target_type: TypeId,
+) -> Result<Option<&'source super::object_members::PlannedProperty>, SourceCheckError> {
+    let index = declared_index_target(store, host, target_type)?;
+    for property in &source.properties {
+        if target.get_source(&property.name).is_some() {
+            continue;
+        }
+        if let Some(index) = index
+            && declared_index_accepts_name(store, index, &property.name)?
+        {
+            continue;
+        }
+        return Ok(Some(property));
+    }
+    Ok(None)
 }
 
 #[allow(clippy::too_many_arguments)] // Preserve the existing immutable diagnostic inputs.
@@ -846,10 +871,7 @@ fn discriminated_union_excess_property_diagnostic(
     if selected.next().is_some() {
         return Ok(None);
     }
-    let Some(excess) = plan
-        .properties
-        .iter()
-        .find(|property| selected_target.get_source(&property.name).is_none())
+    let Some(excess) = first_excess_property(store, host, plan, selected_target, *selected_type)?
     else {
         return Ok(None);
     };
@@ -1582,6 +1604,75 @@ mod tests {
                 .kind,
             SyntaxKind::IndexSignature
         );
+    }
+
+    #[test]
+    fn indexed_properties_do_not_hide_a_different_missing_required_property() {
+        let parsed = parse_source_file(concat!(
+            "type Options = { required: string; [name: `do-${string}`]: number }; ",
+            "var missing: Options = { \"do-save\": 1 }; ",
+            "var excess: Options = { \"unknown\": 1 };",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(211);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/indexed-missing-property.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        let mut context = CanonicalCheckerContext::new(
+            binder.finish(),
+            [(file, &parsed.arena)].into_iter().collect(),
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap();
+
+        context.check_source_file(file).unwrap();
+
+        let [missing, excess] = context.diagnostics().as_slice() else {
+            panic!("expected one missing property and one actual excess property")
+        };
+        assert_eq!(missing.diagnostic.code(), 2741);
+        assert_eq!(missing.diagnostic.arguments[0], "required");
+        let missing_name = parsed
+            .arena
+            .get(missing.node.expect("missing property has a location").node)
+            .unwrap();
+        let NodeData::Identifier(name) = &missing_name.data else {
+            panic!("the missing-property diagnostic must point at its variable")
+        };
+        assert_eq!(name.text, "missing");
+        let [declaration] = missing.related_information.as_slice() else {
+            panic!("the required member must retain its declaration")
+        };
+        assert_eq!(declaration.diagnostic.code(), 2728);
+        assert_eq!(declaration.diagnostic.arguments, ["required"]);
+
+        assert_eq!(excess.diagnostic.code(), 2353);
+        let excess_name = parsed
+            .arena
+            .get(excess.node.expect("excess property has a location").node)
+            .unwrap();
+        let NodeData::StringLiteral(name) = &excess_name.data else {
+            panic!("a nonmatching property must keep its original quoted name")
+        };
+        assert_eq!(name.text, "unknown");
+
+        let published = context.diagnostics().clone();
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(context.diagnostics(), &published);
     }
 
     #[test]

@@ -151,6 +151,47 @@ fn object_literals_preserve_shorthand_and_computed_literal_properties() {
 }
 
 #[test]
+fn numeric_and_quoted_object_keys_keep_distinct_assignment_diagnostics() {
+    let parsed = parse_source_file(concat!(
+        "const numeric: number = { 0: 1 }; ",
+        "const quoted: string = { \"0\": 1 };",
+    ));
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(8_206);
+    let mut context = context(&parsed, file, CanonicalSourceLanguage::TypeScript);
+
+    context.check_source_file(file).unwrap();
+
+    assert_eq!(
+        context
+            .diagnostics()
+            .as_slice()
+            .iter()
+            .map(|diagnostic| diagnostic.diagnostic.render().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "Type '{ 0: number; }' is not assignable to type 'number'.",
+            "Type '{ \"0\": number; }' is not assignable to type 'string'.",
+        ],
+    );
+
+    let warm = (
+        context.store().type_len(),
+        context.store().symbol_len(),
+        context.diagnostics().clone(),
+    );
+    context.recheck_source_file(file).unwrap();
+    assert_eq!(
+        (
+            context.store().type_len(),
+            context.store().symbol_len(),
+            context.diagnostics().clone(),
+        ),
+        warm,
+    );
+}
+
+#[test]
 fn javascript_inferred_variables_report_incompatible_assignments() {
     let parsed = parse_javascript_source_file("var value = 'ready'; value = 1;");
     assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);

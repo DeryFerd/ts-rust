@@ -2405,13 +2405,22 @@ fn concrete_tuple_types_are_assignable(
     if target_rest.is_none() && source_len > target_len {
         return Ok(false);
     }
+    let target_suffix_len = target_rest.map_or(0, |rest| target_len - rest - 1);
+    if source_len < target_suffix_len {
+        return Ok(false);
+    }
+    let target_suffix_start = source_len - target_suffix_len;
     for (index, source_type) in source.element_types.iter().copied().enumerate() {
-        let target_index = if index < target_len {
-            index
-        } else if let Some(rest) = target_rest {
-            rest
+        let target_index = if let Some(rest) = target_rest {
+            if index < rest {
+                index
+            } else if index >= target_suffix_start {
+                target_len - (source_len - index)
+            } else {
+                rest
+            }
         } else {
-            return Ok(false);
+            index
         };
         if source.element_infos[index]
             .flags()
@@ -3684,6 +3693,76 @@ mod tests {
                     None,
                 ),
                 Ok(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn tuple_assignability_aligns_rest_elements_with_required_suffixes() {
+        let mut fixture = Fixture::new("type Target = [...number[], string];");
+        let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+        let (string, number) = (bootstrap.string_type, bootstrap.number_type);
+        let required = fixture
+            .store
+            .create_tuple_element_info(ElementFlags::REQUIRED, None)
+            .unwrap();
+        let rest = fixture
+            .store
+            .create_tuple_element_info(ElementFlags::REST, None)
+            .unwrap();
+        let target = fixture
+            .store
+            .create_canonical_tuple_type(CanonicalTupleTypeRequest::new(
+                &[number, string],
+                &[rest, required],
+                false,
+            ))
+            .unwrap();
+
+        let cases: &[(&[TypeId], bool)] = &[
+            (&[number, number, string], true),
+            (&[string], true),
+            (&[number, number, number], false),
+            (&[string, string], false),
+        ];
+        for (elements, expected) in cases {
+            let infos = vec![required; elements.len()];
+            let source = fixture
+                .store
+                .create_canonical_tuple_type(CanonicalTupleTypeRequest::new(
+                    elements, &infos, false,
+                ))
+                .unwrap();
+            assert_eq!(
+                conditional_check_is_assignable(&mut fixture.store, source, target, None),
+                Ok(*expected),
+                "elements={elements:?}"
+            );
+        }
+
+        let prefixed_target = fixture
+            .store
+            .create_canonical_tuple_type(CanonicalTupleTypeRequest::new(
+                &[string, number, string],
+                &[required, rest, required],
+                false,
+            ))
+            .unwrap();
+        for elements in [
+            &[string, number, number, string][..],
+            &[string, string][..],
+        ] {
+            let infos = vec![required; elements.len()];
+            let source = fixture
+                .store
+                .create_canonical_tuple_type(CanonicalTupleTypeRequest::new(
+                    elements, &infos, false,
+                ))
+                .unwrap();
+            assert_eq!(
+                conditional_check_is_assignable(&mut fixture.store, source, prefixed_target, None),
+                Ok(true),
+                "elements={elements:?}"
             );
         }
     }

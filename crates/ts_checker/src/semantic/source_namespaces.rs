@@ -26,7 +26,7 @@ use super::{
     declared::cached_ordinary_type_parameter_owner,
     instantiate::InstantiationSession,
     reference_types::validate_direct_generic_reference,
-    type_nodes::CanonicalTypeQuery,
+    type_nodes::{CanonicalTypeQuery, TypeNodeUnavailable},
     types::{ObjectFlags, TypeFlags},
 };
 
@@ -1382,21 +1382,22 @@ fn namespace_import_is_circular(
     true
 }
 
-fn resolve_namespace_imports(
-    store: &mut CanonicalTypeMapperStore,
+fn preflight_namespace_imports<'plan>(
+    store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
-    diagnostics: &mut CanonicalCheckerDiagnostics,
-    plan: &SourceNamespacePlan,
-) -> Result<(), SourceCheckError> {
+    plan: &'plan SourceNamespacePlan,
+) -> Result<Vec<ResolvedNamespaceImport<'plan>>, SourceCheckError> {
     let mut imports = Vec::new();
     namespace_imports(plan, &mut imports);
     if imports.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
 
-    let circular_message = message_by_code(CIRCULAR_DEFINITION_OF_IMPORT_ALIAS).ok_or(
-        SourceCheckError::MissingDiagnostic(CIRCULAR_DEFINITION_OF_IMPORT_ALIAS),
-    )?;
+    if message_by_code(CIRCULAR_DEFINITION_OF_IMPORT_ALIAS).is_none() {
+        return Err(SourceCheckError::MissingDiagnostic(
+            CIRCULAR_DEFINITION_OF_IMPORT_ALIAS,
+        ));
+    }
     let mut resolved_imports = Vec::with_capacity(imports.len());
     for import in imports {
         let mut resolution_host = host.name_resolver_host(store)?;
@@ -1428,10 +1429,23 @@ fn resolve_namespace_imports(
         }
         resolved_imports.push(ResolvedNamespaceImport { import, target });
     }
+    Ok(resolved_imports)
+}
 
-    let mut alias_host = NamespaceAliasTargetHost {
-        imports: resolved_imports,
-    };
+fn resolve_namespace_imports(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    imports: Vec<ResolvedNamespaceImport<'_>>,
+) -> Result<(), SourceCheckError> {
+    if imports.is_empty() {
+        return Ok(());
+    }
+
+    let circular_message = message_by_code(CIRCULAR_DEFINITION_OF_IMPORT_ALIAS).ok_or(
+        SourceCheckError::MissingDiagnostic(CIRCULAR_DEFINITION_OF_IMPORT_ALIAS),
+    )?;
+    let mut alias_host = NamespaceAliasTargetHost { imports };
     let mut circular = Vec::new();
     for index in 0..alias_host.imports.len() {
         let import = alias_host.imports[index].import;
@@ -1749,9 +1763,34 @@ pub(super) fn execute_source_namespace(
         }
     }
 
-    resolve_namespace_imports(store, host, diagnostics, plan)?;
-
+    let imports = preflight_namespace_imports(store, host, plan)?;
+    let mut alias_dependent_annotations = Vec::new();
     for annotation in annotations {
+        session.reset_query();
+        let mut staged = CanonicalCheckerDiagnostics::default();
+        let result = CanonicalTypeQuery::new_with_global_types_and_session(
+            store,
+            host,
+            global_types,
+            options,
+            session,
+            &mut staged,
+        )?
+        .preflight_type_from_type_node(annotation);
+        match result {
+            Ok(()) => {}
+            Err(DeclaredTypeError::TypeNodeUnavailable(
+                TypeNodeUnavailable::ImportAliasTypeReference { alias, .. },
+            )) if imports.iter().any(|import| import.import.symbol == alias) => {
+                alias_dependent_annotations.push(annotation);
+            }
+            Err(error) => return Err(error.into()),
+        }
+        debug_assert!(staged.is_empty());
+    }
+
+    resolve_namespace_imports(store, host, diagnostics, imports)?;
+    for annotation in alias_dependent_annotations {
         session.reset_query();
         let mut staged = CanonicalCheckerDiagnostics::default();
         CanonicalTypeQuery::new_with_global_types_and_session(
@@ -2089,6 +2128,96 @@ mod tests {
             fixture.context.store().checker_link_allocated_lengths(),
             before,
         );
+    }
+
+    #[test]
+    fn namespace_imports_preserve_alias_dependent_type_annotations() {
+        let mut fixture = fixture(
+            concat!(
+                "namespace Outer { ",
+                "export namespace Inner { export interface Shape {} } ",
+                "export import Visible = Inner; ",
+                "type Value = Visible.Shape; ",
+                "}",
+            ),
+            CanonicalModuleState::Script,
+        );
+        let plan = plan(&fixture, 0);
+        let [import] = plan.imports.as_slice() else {
+            panic!("the namespace must retain its import-equals declaration")
+        };
+        let alias = import.symbol;
+        let [
+            SourceNamespaceMemberPlan::Namespace(inner),
+            SourceNamespaceMemberPlan::TypeAlias { symbol: value, .. },
+        ] = plan.members.as_slice()
+        else {
+            panic!("the namespace must retain its target and alias-dependent type")
+        };
+        let target = inner.symbol;
+        let value = *value;
+
+        assert!(execute(&mut fixture, &plan).unwrap().is_empty());
+        assert_eq!(
+            fixture
+                .context
+                .store()
+                .alias_symbol_links(alias)
+                .map(|links| links.alias_target),
+            Some(AliasTargetState::Resolved(target)),
+        );
+        assert!(
+            fixture
+                .context
+                .store()
+                .type_alias_links(value)
+                .and_then(|links| links.declared_type)
+                .is_some(),
+        );
+
+        let before = fixture.context.store().checker_link_allocated_lengths();
+        assert!(execute(&mut fixture, &plan).unwrap().is_empty());
+        assert_eq!(
+            fixture.context.store().checker_link_allocated_lengths(),
+            before,
+        );
+    }
+
+    #[test]
+    fn invalid_later_annotation_cannot_publish_namespace_import_aliases() {
+        let mut fixture = fixture(
+            concat!(
+                "namespace Outer { ",
+                "export namespace Inner { export interface Shape {} } ",
+                "export import Visible = Inner; ",
+                "type Value = Visible.Shape; ",
+                "type Broken = Missing; ",
+                "}",
+            ),
+            CanonicalModuleState::Script,
+        );
+        let plan = plan(&fixture, 0);
+        let [import] = plan.imports.as_slice() else {
+            panic!("the namespace must retain its import-equals declaration")
+        };
+        let alias = import.symbol;
+        let before = fixture.context.store().checker_link_allocated_lengths();
+
+        for _ in 0..2 {
+            assert!(matches!(
+                execute(&mut fixture, &plan),
+                Err(SourceCheckError::DeclaredType(
+                    DeclaredTypeError::TypeNodeUnavailable(
+                        TypeNodeUnavailable::MissingTypeReference(_)
+                    )
+                ))
+            ));
+            assert!(fixture.context.store().alias_symbol_links(alias).is_none());
+            assert_eq!(
+                fixture.context.store().checker_link_allocated_lengths(),
+                before,
+            );
+        }
     }
 
     #[test]

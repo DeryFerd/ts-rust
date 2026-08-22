@@ -1099,7 +1099,7 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
             })
             .transpose()?;
 
-        if facts.is_declaration_file() {
+        if facts.is_declaration_file() || resolved.is_ambient_module() {
             if exports.is_some_and(|exports| exports.get_source("__esModule").is_some()) {
                 return Ok(false);
             }
@@ -1120,7 +1120,8 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
                     return Ok(false);
                 }
             }
-            return Ok(export_equals.is_some()
+            return Ok(resolved.is_ambient_module()
+                || export_equals.is_some()
                 || resolved.usage_mode() != CanonicalModuleResolutionMode::Esm
                 || resolved.target_mode() != CanonicalModuleResolutionMode::Esm);
         }
@@ -1197,20 +1198,12 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
                     module,
                 })?;
         if let Some(exports) = module_record.exports() {
-            let exports = store.symbol_table(exports).ok_or(
+            store.symbol_table(exports).ok_or(
                 CanonicalAliasTargetUnavailable::MalformedModuleSymbol {
                     declaration,
                     module,
                 },
             )?;
-            if exports.get(InternalSymbolName::Default.as_ref()).is_some() {
-                return Err(
-                    CanonicalAliasTargetUnavailable::SyntheticModuleResolutionUnsupported {
-                        declaration,
-                        module,
-                    },
-                );
-            }
         }
         Ok(module)
     }
@@ -3208,7 +3201,7 @@ mod tests {
     }
 
     #[test]
-    fn namespace_import_rejects_default_export_wrapper_while_named_member_stays_direct() {
+    fn namespace_import_retains_modules_with_default_and_named_exports() {
         let importer = parsed(
             r#"
                 import * as ns from "./target";
@@ -3256,19 +3249,11 @@ mod tests {
         );
 
         assert_eq!(
-            unavailable_reason(
-                CanonicalAliasResolver::new(&mut store, &mut host)
-                    .resolve_alias(namespace_alias)
-                    .unwrap_err()
-            ),
-            CanonicalAliasTargetUnavailable::SyntheticModuleResolutionUnsupported {
-                declaration: namespace_declaration,
-                module,
-            }
-        );
-        assert_eq!(
-            store.alias_symbol_links(namespace_alias),
-            Some(&AliasSymbolLinks::default())
+            CanonicalAliasResolver::new(&mut store, &mut host)
+                .resolve_alias(namespace_alias)
+                .unwrap()
+                .target,
+            AliasTargetState::Resolved(module),
         );
         assert!(store.type_resolution_is_empty());
         assert_eq!(

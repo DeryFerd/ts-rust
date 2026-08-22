@@ -285,6 +285,10 @@ impl CanonicalCheckerContext<'_> {
             return Ok(Some(symbol));
         }
 
+        if let Some(symbol) = self.literal_computed_artifact_symbol(node)? {
+            return Ok(Some(symbol));
+        }
+
         if let Some(symbol) = self.cached_artifact_symbol(node)? {
             return Ok(Some(symbol));
         }
@@ -486,6 +490,12 @@ impl CanonicalCheckerContext<'_> {
             .store()
             .symbol(symbol)
             .ok_or(CanonicalArtifactQueryError::ForeignSymbol(symbol))?;
+        if record
+            .check_flags()
+            .contains(ts_binder::CheckFlags::INDEX_SYMBOL)
+        {
+            return self.index_artifact_symbol_name(symbol);
+        }
         let name = if record.name() == InternalSymbolName::Global.as_ref() {
             "global".to_owned()
         } else {
@@ -500,7 +510,10 @@ impl CanonicalCheckerContext<'_> {
             return Ok(name);
         }
 
-        let mut names = vec![name];
+        let (name, indexed) = self
+            .literal_artifact_symbol_name(symbol)?
+            .unwrap_or((name, false));
+        let mut names = Vec::new();
         let mut owner = record.parent();
         while let Some(parent) = owner {
             let record = self
@@ -516,8 +529,16 @@ impl CanonicalCheckerContext<'_> {
             names.push(record.name().escaped_display().to_string());
             owner = record.parent();
         }
+        if names.is_empty() {
+            return Ok(name);
+        }
         names.reverse();
-        Ok(names.join("."))
+        let prefix = names.join(".");
+        Ok(if indexed {
+            format!("{prefix}{name}")
+        } else {
+            format!("{prefix}.{name}")
+        })
     }
 
     fn prepare_artifact_location(
@@ -682,6 +703,148 @@ impl CanonicalCheckerContext<'_> {
             return Ok(None);
         };
         self.merged_artifact_symbol(node, symbol).map(Some)
+    }
+
+    fn literal_computed_artifact_symbol(
+        &self,
+        node: NodeRef,
+    ) -> Result<Option<SemanticSymbolId>, CanonicalArtifactQueryError> {
+        let (arena, bound, record) = self.validated_artifact_node(node)?;
+        if !matches!(
+            record.data,
+            NodeData::StringLiteral(_)
+                | NodeData::NumericLiteral(_)
+                | NodeData::NoSubstitutionTemplateLiteral(_)
+        ) {
+            return Ok(None);
+        }
+        let Some(name_id) = record.parent else {
+            return Ok(None);
+        };
+        let Some(name) = arena.get(name_id) else {
+            return Ok(None);
+        };
+        let NodeData::ComputedPropertyName(computed) = &name.data else {
+            return Ok(None);
+        };
+        if computed.expression != node.node {
+            return Ok(None);
+        }
+        let Some(declaration_id) = name.parent else {
+            return Ok(None);
+        };
+        let declaration = NodeRef::new(node.arena, node.file, declaration_id);
+        let (_, _, declaration_record) = self.validated_artifact_node(declaration)?;
+        if declaration_name(&declaration_record.data) != Some(name_id) {
+            return Ok(None);
+        }
+        let Some(symbol) = bound.symbol(declaration) else {
+            return Ok(None);
+        };
+        self.merged_artifact_symbol(node, symbol).map(Some)
+    }
+
+    fn literal_artifact_symbol_name(
+        &self,
+        symbol: SemanticSymbolId,
+    ) -> Result<Option<(String, bool)>, CanonicalArtifactQueryError> {
+        let record = self
+            .store()
+            .symbol(symbol)
+            .ok_or(CanonicalArtifactQueryError::ForeignSymbol(symbol))?;
+        let Some(declaration) = record.value_declaration().or_else(|| {
+            record
+                .declarations()
+                .and_then(|declarations| declarations.first().copied())
+        }) else {
+            return Ok(None);
+        };
+        let (arena, _, declaration_record) = self.validated_artifact_node(declaration)?;
+        let Some(name_id) = declaration_name(&declaration_record.data) else {
+            return Ok(None);
+        };
+        let Some(name_record) = arena.get(name_id) else {
+            return Ok(None);
+        };
+        let (literal, computed) = match &name_record.data {
+            NodeData::ComputedPropertyName(name) => {
+                let Some(literal) = arena.get(name.expression) else {
+                    return Ok(None);
+                };
+                if !matches!(
+                    literal.data,
+                    NodeData::StringLiteral(_)
+                        | NodeData::NumericLiteral(_)
+                        | NodeData::NoSubstitutionTemplateLiteral(_)
+                ) {
+                    return Ok(None);
+                }
+                (literal, true)
+            }
+            NodeData::StringLiteral(_) | NodeData::NumericLiteral(_) => (name_record, false),
+            _ => return Ok(None),
+        };
+        let Some(spelling) = arena.source_text().and_then(|source| {
+            source.get(literal.range.start.get() as usize..literal.range.end.get() as usize)
+        }) else {
+            return Ok(None);
+        };
+        let qualified_owner = record
+            .parent()
+            .and_then(|owner| self.store().symbol(owner))
+            .is_some_and(|owner| {
+                owner
+                    .flags()
+                    .intersects(SymbolFlags::CLASS | SymbolFlags::INTERFACE | SymbolFlags::ENUM)
+            });
+        Ok(Some((
+            if computed || qualified_owner {
+                format!("[{spelling}]")
+            } else {
+                spelling.to_owned()
+            },
+            computed || qualified_owner,
+        )))
+    }
+
+    fn index_artifact_symbol_name(
+        &self,
+        symbol: SemanticSymbolId,
+    ) -> Result<String, CanonicalArtifactQueryError> {
+        let record = self
+            .store()
+            .symbol(symbol)
+            .ok_or(CanonicalArtifactQueryError::ForeignSymbol(symbol))?;
+        let mut owners = Vec::new();
+        let mut owner = record.parent();
+        while let Some(parent) = owner {
+            let record = self
+                .store()
+                .symbol(parent)
+                .ok_or(CanonicalArtifactQueryError::ForeignSymbol(parent))?;
+            if !record.flags().intersects(
+                SymbolFlags::CLASS
+                    | SymbolFlags::INTERFACE
+                    | SymbolFlags::ENUM
+                    | SymbolFlags::MODULE,
+            ) || record.name().is_internal()
+            {
+                break;
+            }
+            let name = record.name().escaped_display().to_string();
+            if record.flags().intersects(SymbolFlags::MODULE) && name.starts_with('"') {
+                break;
+            }
+            owners.push(name);
+            owner = record.parent();
+        }
+        owners.reverse();
+        let name = record.name().escaped_display();
+        Ok(if owners.is_empty() {
+            format!("[{name}]")
+        } else {
+            format!("{}[{name}]", owners.join("."))
+        })
     }
 
     fn module_specifier_artifact_symbol(
@@ -1276,7 +1439,7 @@ mod tests {
     use ts_ast::{FileId, NodeData, NodeRef, SyntaxKind};
     use ts_binder::{
         CanonicalBinder, CanonicalModuleState, CanonicalSourceFileFacts, CanonicalSourceLanguage,
-        EscapedName,
+        CheckFlags, EscapedName, InternalSymbolName, SymbolData, SymbolFlags,
     };
     use ts_parser::{ParseResult, parse_jsx_source_file, parse_source_file};
 
@@ -1396,6 +1559,128 @@ mod tests {
         }
 
         assert_eq!(names, ["Shape.item", "Model.value", "value"]);
+    }
+
+    #[test]
+    fn literal_computed_property_names_reuse_their_bound_symbols_and_source_spelling() {
+        let parsed = parse_source_file(concat!(
+            "const value: any = { ",
+            "['quoted']: 1, [2]: 'two', [`template`]: true, ",
+            "\"plain\": 4, 3: 5 };",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(6_015);
+        let mut context = declaration_context(&parsed, file);
+        let mut names = Vec::new();
+
+        for (node, record) in parsed.arena.iter() {
+            let NodeData::PropertyAssignment(property) = &record.data else {
+                continue;
+            };
+            let declaration = NodeRef::new(parsed.arena.id(), file, node);
+            let name = NodeRef::new(parsed.arena.id(), file, property.name);
+            let symbol = context.file(file).unwrap().1.symbol(declaration).unwrap();
+            assert_eq!(context.get_symbol_at_location(name).unwrap(), Some(symbol));
+
+            if let NodeData::ComputedPropertyName(computed) =
+                &parsed.arena.get(property.name).unwrap().data
+            {
+                let literal = NodeRef::new(parsed.arena.id(), file, computed.expression);
+                assert_eq!(
+                    context.get_symbol_at_location(literal).unwrap(),
+                    Some(symbol)
+                );
+                assert!(context.store().symbol_node_links(literal).is_none());
+            }
+
+            names.push(context.symbol_to_string(symbol).unwrap());
+        }
+
+        assert_eq!(
+            names,
+            ["['quoted']", "[2]", "[`template`]", "\"plain\"", "3"]
+        );
+    }
+
+    #[test]
+    fn literal_class_and_interface_members_keep_bracketed_owner_spelling() {
+        let parsed = parse_source_file(concat!(
+            "interface Shape { 1: string; \"named\": number; [\"computed\"]: boolean; }\n",
+            "class Model { [2]!: string; \"literal\"!: number; }\n",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(6_016);
+        let context = declaration_context(&parsed, file);
+        let names = parsed
+            .arena
+            .iter()
+            .filter(|(_, record)| matches!(record.data, NodeData::PropertyDeclaration(_)))
+            .map(|(node, _)| {
+                let declaration = NodeRef::new(parsed.arena.id(), file, node);
+                let symbol = context.file(file).unwrap().1.symbol(declaration).unwrap();
+                context.symbol_to_string(symbol).unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            names,
+            [
+                "Shape[1]",
+                "Shape[\"named\"]",
+                "Shape[\"computed\"]",
+                "Model[2]",
+                "Model[\"literal\"]",
+            ]
+        );
+    }
+
+    #[test]
+    fn indexed_jsx_symbols_include_the_namespace_and_bracketed_index_name() {
+        let parsed = parse_source_file(concat!(
+            "declare namespace JSX {\n",
+            "  interface IntrinsicElements { [tag: string]: any; }\n",
+            "}\n",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(6_017);
+        let mut context = declaration_context(&parsed, file);
+        let interface =
+            parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    matches!(record.data, NodeData::InterfaceDeclaration(_))
+                        .then_some(NodeRef::new(parsed.arena.id(), file, node))
+                })
+                .unwrap();
+        let index = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                matches!(record.data, NodeData::IndexSignatureDeclaration(_))
+                    .then_some(NodeRef::new(parsed.arena.id(), file, node))
+            })
+            .unwrap();
+        let owner = context.file(file).unwrap().1.symbol(interface).unwrap();
+        let symbol = context
+            .store_mut_for_test()
+            .alloc_symbol(SymbolData {
+                flags: SymbolFlags::PROPERTY | SymbolFlags::TRANSIENT,
+                check_flags: CheckFlags::INDEX_SYMBOL,
+                name: EscapedName::internal(InternalSymbolName::Index),
+                declarations: Some(vec![index]),
+                value_declaration: Some(index),
+                members: None,
+                exports: None,
+                parent: Some(owner),
+                export_symbol: None,
+            })
+            .unwrap();
+
+        assert_eq!(
+            context.symbol_to_string(symbol).unwrap(),
+            "JSX.IntrinsicElements[__index]"
+        );
     }
 
     #[test]

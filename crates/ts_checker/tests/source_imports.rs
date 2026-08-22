@@ -206,6 +206,48 @@ fn importer_first_named_value_reads_are_exact_and_warm_stable() {
 }
 
 #[test]
+fn imports_after_earlier_statements_remain_hoisted_and_warm_stable() {
+    let importer = parse_source_file(concat!(
+        "const first: number = 1; ",
+        "import { value as renamed } from './target'; ",
+        "const good: number = renamed; ",
+        "const bad: string = renamed;",
+    ));
+    let target = parse_source_file("export const value: number = 1;");
+    let importer_file = FileId::new(24);
+    let target_file = FileId::new(25);
+    let (mut context, _) = make_context(&importer, &target, importer_file, target_file);
+
+    context.check_source_file(importer_file).unwrap();
+    assert_eq!(
+        context
+            .diagnostics()
+            .as_slice()
+            .iter()
+            .map(|diagnostic| diagnostic.diagnostic.code())
+            .collect::<Vec<_>>(),
+        [2322],
+    );
+    assert!(source_is_checked(&context, importer_file));
+    assert!(!source_is_checked(&context, target_file));
+
+    let warm = (
+        context.store().type_len(),
+        context.store().symbol_len(),
+        context.diagnostics().clone(),
+    );
+    context.check_source_file(importer_file).unwrap();
+    assert_eq!(
+        (
+            context.store().type_len(),
+            context.store().symbol_len(),
+            context.diagnostics().clone(),
+        ),
+        warm,
+    );
+}
+
+#[test]
 fn importer_first_type_only_imports_check_annotations_and_reject_value_uses() {
     let importer = parse_source_file(concat!(
         "import type { User as LocalUser } from './target'; ",

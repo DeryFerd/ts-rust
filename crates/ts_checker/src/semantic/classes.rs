@@ -14,6 +14,7 @@
 //! graph is in the same supported family; the whole-source adapter consumes
 //! that graph only after seeing the exact direct base plan earlier in source.
 //! Empty zero-argument methods retain their canonical callable identities.
+//! Direct classes can also retain one string-to-number index signature.
 //! Nonempty executable bodies, general heritage, and non-primitive annotations
 //! remain later class stages.
 
@@ -27,8 +28,8 @@ use ts_binder::{
 };
 
 use super::{
-    CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHost, ResolvedSignatureState,
-    SignatureId, SignatureLinks, TypeId,
+    CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHost, IndexInfoId,
+    ResolvedSignatureState, SignatureId, SignatureLinks, TypeId,
     declared::{preflight_class_or_interface_reference, preflight_node, type_list_key},
     links::{TypeNodeLinks, ValueSymbolLinks},
     signatures::SignatureFlags,
@@ -72,6 +73,14 @@ struct ClassMethodPlan {
     name: String,
     side: ClassPropertySide,
     return_type_node: Option<NodeRef>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ClassIndexSignaturePlan {
+    declaration: NodeRef,
+    symbol: SemanticSymbolId,
+    key_type_node: NodeRef,
+    value_type_node: NodeRef,
 }
 
 /// One source property whose annotation can be executed by the root query
@@ -138,6 +147,7 @@ pub(super) struct ClassDeclarationPlan {
     base: Option<DirectClassBasePlan>,
     implementations: Vec<DirectClassImplementationPlan>,
     constructor: Option<ClassConstructorPlan>,
+    index: Option<ClassIndexSignaturePlan>,
     instance_members: Option<SymbolTableId>,
     static_members: SymbolTableId,
     properties: Vec<ClassPropertyPlan>,
@@ -865,6 +875,165 @@ fn plan_method(
     })
 }
 
+fn plan_class_index_signature(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    owner: SemanticSymbolId,
+    owner_declaration: NodeRef,
+    declaration: NodeRef,
+    instance_members: Option<SymbolTableId>,
+) -> Result<ClassIndexSignaturePlan, ClassError> {
+    let unsupported_index = || {
+        unsupported(ClassUnsupported::Member {
+            node: declaration,
+            kind: SyntaxKind::IndexSignature,
+        })
+    };
+    let record = preflight_node(store, host, declaration)?;
+    let NodeData::IndexSignatureDeclaration(index) = &record.data else {
+        return Err(unsupported_index());
+    };
+    if record.kind != SyntaxKind::IndexSignature
+        || record.parent != Some(owner_declaration.node)
+        || record.flags.0 != 0
+        || index.full_signature.is_some()
+        || index.next_container.is_some()
+        || index.symbol.is_some()
+        || index.type_parameters.is_some()
+        || index.modifiers.is_some()
+        || index.parameters.has_trailing_comma
+        || index.parameters.nodes.len() != 1
+        || index.parameters.range.start < record.range.start
+        || index.parameters.range.end > record.range.end
+    {
+        return Err(unsupported_index());
+    }
+
+    let parameter = NodeRef::new(
+        declaration.arena,
+        declaration.file,
+        index.parameters.nodes[0],
+    );
+    let parameter_record = preflight_node(store, host, parameter)?;
+    let NodeData::ParameterDeclaration(parameter_data) = &parameter_record.data else {
+        return Err(unsupported_index());
+    };
+    if parameter_record.kind != SyntaxKind::Parameter
+        || parameter_record.parent != Some(declaration.node)
+        || parameter_record.flags.0 != 0
+        || parameter_record.range.start < index.parameters.range.start
+        || parameter_record.range.end > index.parameters.range.end
+        || parameter_data.dot_dot_dot_token.is_some()
+        || parameter_data.initializer.is_some()
+        || parameter_data.question_token.is_some()
+        || parameter_data.symbol.is_some()
+        || parameter_data.facts != 0
+        || parameter_data.modifiers.is_some()
+    {
+        return Err(unsupported_index());
+    }
+    let name = NodeRef::new(parameter.arena, parameter.file, parameter_data.name);
+    let name_record = preflight_node(store, host, name)?;
+    let NodeData::Identifier(identifier) = &name_record.data else {
+        return Err(unsupported_index());
+    };
+    if name_record.kind != SyntaxKind::Identifier
+        || name_record.parent != Some(parameter.node)
+        || name_record.range.start < parameter_record.range.start
+        || name_record.range.end > parameter_record.range.end
+        || identifier.text.is_empty()
+        || identifier.text == "this"
+    {
+        return Err(unsupported_index());
+    }
+
+    let Some(key_type) = parameter_data.type_ else {
+        return Err(unsupported_index());
+    };
+    let key_type_node = NodeRef::new(parameter.arena, parameter.file, key_type);
+    let key_record = preflight_node(store, host, key_type_node)?;
+    if key_record.kind != SyntaxKind::StringKeyword
+        || !matches!(key_record.data, NodeData::KeywordTypeNode(_))
+        || key_record.flags.0 != 0
+        || key_record.parent != Some(parameter.node)
+        || key_record.range.start < name_record.range.end
+        || key_record.range.end > parameter_record.range.end
+    {
+        return Err(unsupported_index());
+    }
+
+    let value_type_node = NodeRef::new(declaration.arena, declaration.file, index.type_);
+    let value_record = preflight_node(store, host, value_type_node)?;
+    if value_record.kind != SyntaxKind::NumberKeyword
+        || !matches!(value_record.data, NodeData::KeywordTypeNode(_))
+        || value_record.flags.0 != 0
+        || value_record.parent != Some(declaration.node)
+        || value_record.range.start < index.parameters.range.end
+        || value_record.range.end > record.range.end
+    {
+        return Err(unsupported_index());
+    }
+
+    let Some(bound) = host.bound_file(declaration) else {
+        return Err(invariant(ClassInvariant::InvalidPropertySymbol(
+            declaration,
+        )));
+    };
+    let symbol = bound_symbol(store, host, declaration)
+        .ok_or_else(|| invariant(ClassInvariant::InvalidPropertySymbol(declaration)))?;
+    let symbol_record = store
+        .symbol(symbol)
+        .ok_or_else(|| invariant(ClassInvariant::InvalidPropertySymbol(declaration)))?;
+    let member_table = instance_members.and_then(|table| store.symbol_table(table));
+    if symbol_record.flags() != SymbolFlags::SIGNATURE
+        || symbol_record.check_flags() != CheckFlags::NONE
+        || symbol_record.name() != InternalSymbolName::Index.as_ref()
+        || symbol_record.declarations() != Some(&[declaration])
+        || symbol_record.value_declaration().is_some()
+        || symbol_record.members().is_some()
+        || symbol_record.exports().is_some()
+        || symbol_record.parent() != Some(owner)
+        || symbol_record.export_symbol().is_some()
+        || member_table.and_then(|table| table.get(InternalSymbolName::Index.as_ref()))
+            != Some(symbol)
+    {
+        return Err(invariant(ClassInvariant::InvalidPropertySymbol(
+            declaration,
+        )));
+    }
+
+    let parameter_symbol = bound_symbol(store, host, parameter)
+        .ok_or_else(|| invariant(ClassInvariant::InvalidPropertySymbol(parameter)))?;
+    let parameter_symbol_record = store
+        .symbol(parameter_symbol)
+        .ok_or_else(|| invariant(ClassInvariant::InvalidPropertySymbol(parameter)))?;
+    let locals = bound
+        .locals(declaration)
+        .and_then(|locals| store.symbol_table(locals));
+    if parameter_symbol_record.flags() != SymbolFlags::FUNCTION_SCOPED_VARIABLE
+        || parameter_symbol_record.check_flags() != CheckFlags::NONE
+        || parameter_symbol_record.name().as_utf8() != Some(identifier.text.as_str())
+        || parameter_symbol_record.declarations() != Some(&[parameter])
+        || parameter_symbol_record.value_declaration() != Some(parameter)
+        || parameter_symbol_record.members().is_some()
+        || parameter_symbol_record.exports().is_some()
+        || parameter_symbol_record.parent().is_some()
+        || parameter_symbol_record.export_symbol().is_some()
+        || locals.is_none_or(|locals| {
+            locals.len() != 1 || locals.get_source(&identifier.text) != Some(parameter_symbol)
+        })
+    {
+        return Err(invariant(ClassInvariant::InvalidPropertySymbol(parameter)));
+    }
+
+    Ok(ClassIndexSignaturePlan {
+        declaration,
+        symbol,
+        key_type_node,
+        value_type_node,
+    })
+}
+
 fn plan_property(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -1465,6 +1634,7 @@ fn plan_class_declaration(
     let mut instance_names = HashSet::new();
     let mut static_names = HashSet::new();
     let mut constructor = None;
+    let mut index = None;
     let mut previous_end = class.members.range.start;
     for member in &class.members.nodes {
         let member = NodeRef::new(declaration.arena, declaration.file, *member);
@@ -1488,6 +1658,23 @@ fn plan_class_declaration(
                 store,
                 host,
                 symbol,
+                member,
+                instance_members,
+            )?);
+            continue;
+        }
+        if member_record.kind == SyntaxKind::IndexSignature {
+            if base.is_some() || index.is_some() {
+                return Err(unsupported(ClassUnsupported::Member {
+                    node: member,
+                    kind: SyntaxKind::IndexSignature,
+                }));
+            }
+            index = Some(plan_class_index_signature(
+                store,
+                host,
+                symbol,
+                declaration,
                 member,
                 instance_members,
             )?);
@@ -1543,12 +1730,21 @@ fn plan_class_declaration(
             ClassPropertySide::Static => static_properties.push(property),
         }
     }
+    if let Some(index) = index
+        && (!instance_properties.is_empty() || !instance_methods.is_empty())
+    {
+        return Err(unsupported(ClassUnsupported::Member {
+            node: index.declaration,
+            kind: SyntaxKind::IndexSignature,
+        }));
+    }
 
     let instance_table = instance_members.and_then(|table| store.symbol_table(table));
     let expected_instance_members = instance_properties
         .len()
         .checked_add(instance_methods.len())
         .and_then(|count| count.checked_add(usize::from(constructor.is_some())))
+        .and_then(|count| count.checked_add(usize::from(index.is_some())))
         .ok_or_else(|| invariant(ClassInvariant::Capacity(declaration)))?;
     if instance_members.is_some() == (expected_instance_members == 0)
         || instance_table.is_some_and(|table| table.len() != expected_instance_members)
@@ -1578,6 +1774,7 @@ fn plan_class_declaration(
         base,
         implementations,
         constructor,
+        index,
         instance_members,
         static_members,
         properties,
@@ -1604,6 +1801,7 @@ pub(super) struct ClassMemberPlan {
     class: ClassDeclarationPlan,
     property_types: Vec<TypeId>,
     method_return_types: Vec<TypeId>,
+    index_types: Option<(TypeId, TypeId)>,
     uninitialized_instance_properties: Vec<NodeRef>,
 }
 
@@ -1973,6 +2171,41 @@ fn validate_property_cache_state(
     Ok(())
 }
 
+fn validate_index_type_cache(
+    store: &CanonicalTypeMapperStore,
+    node: NodeRef,
+    expected: TypeId,
+) -> Result<(), ClassError> {
+    if store.type_node_links(node).is_some_and(|links| {
+        links != &TypeNodeLinks::default()
+            && links
+                != &(TypeNodeLinks {
+                    resolved_type: Some(expected),
+                    ..TypeNodeLinks::default()
+                })
+    }) {
+        return Err(invariant(ClassInvariant::InvalidPropertyTypeCache(node)));
+    }
+    Ok(())
+}
+
+fn plan_index_types(
+    store: &CanonicalTypeMapperStore,
+    index: Option<&ClassIndexSignaturePlan>,
+) -> Result<Option<(TypeId, TypeId)>, ClassError> {
+    let Some(index) = index else {
+        return Ok(None);
+    };
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or_else(|| invariant(ClassInvariant::BootstrapUnavailable(index.declaration)))?;
+    let key_type = bootstrap.string_type;
+    let value_type = bootstrap.number_type;
+    validate_index_type_cache(store, index.key_type_node, key_type)?;
+    validate_index_type_cache(store, index.value_type_node, value_type)?;
+    Ok(Some((key_type, value_type)))
+}
+
 /// Preflights the first exact class-member cut.
 ///
 /// Every property must have one direct primitive keyword annotation. This
@@ -2012,12 +2245,14 @@ fn plan_class_members(
         validate_method_cache_state(store, method, return_type)?;
         method_return_types.push(return_type);
     }
+    let index_types = plan_index_types(store, class.index.as_ref())?;
     let uninitialized_instance_properties =
         uninitialized_instance_properties(store, &class, &property_types)?;
     Ok(ClassMemberPlan {
         class,
         property_types,
         method_return_types,
+        index_types,
         uninitialized_instance_properties,
     })
 }
@@ -2045,7 +2280,9 @@ pub(super) fn plan_nongeneric_class_member_query(
         return plan_class_members(store, host, class).map(ClassMemberQueryPlan::Direct);
     };
     let base_plan = plan_nongeneric_class_members(store, host, base.symbol)?;
-    if base_plan.constructor_visibility() == ClassConstructorVisibility::Private {
+    if base_plan.constructor_visibility() == ClassConstructorVisibility::Private
+        || base_plan.class.index.is_some()
+    {
         return Err(unsupported(ClassUnsupported::Heritage(base.expression)));
     }
     let class = plan_class_members(store, host, class)?;
@@ -2186,6 +2423,43 @@ fn exact_construct_signature(
     })
 }
 
+fn exact_class_index_infos(
+    store: &CanonicalTypeMapperStore,
+    plan: &ClassMemberPlan,
+    indexes: Option<&[IndexInfoId]>,
+) -> bool {
+    match (plan.class.index, plan.index_types, indexes) {
+        (None, None, None) => true,
+        (Some(index), Some((key_type, value_type)), Some([info])) => {
+            store.index_info(*info).is_some_and(|info| {
+                info.key_type() == key_type
+                    && info.value_type() == value_type
+                    && !info.is_readonly()
+                    && info.declaration() == Some(index.declaration)
+                    && info.index_symbol().is_none()
+                    && info.components().is_empty()
+                    && plan
+                        .class
+                        .instance_members
+                        .and_then(|members| store.symbol_table(members))
+                        .and_then(|members| members.get(InternalSymbolName::Index.as_ref()))
+                        == Some(index.symbol)
+                    && store.type_node_links(index.key_type_node)
+                        == Some(&TypeNodeLinks {
+                            resolved_type: Some(key_type),
+                            ..TypeNodeLinks::default()
+                        })
+                    && store.type_node_links(index.value_type_node)
+                        == Some(&TypeNodeLinks {
+                            resolved_type: Some(value_type),
+                            ..TypeNodeLinks::default()
+                        })
+            })
+        }
+        _ => false,
+    }
+}
+
 fn completed_class_members(
     store: &CanonicalTypeMapperStore,
     plan: &ClassMemberPlan,
@@ -2212,7 +2486,7 @@ fn completed_class_members(
         || instance.declared_members != plan.class.instance_members
         || instance.declared_call_signatures.is_some()
         || instance.declared_construct_signatures.is_some()
-        || instance.declared_index_infos.is_some()
+        || !exact_class_index_infos(store, plan, instance.declared_index_infos.as_deref())
     {
         return None;
     }
@@ -2233,7 +2507,7 @@ fn completed_class_members(
             != (!instance_properties.is_empty()).then_some(instance_properties.as_slice())
         || instance_structured.signatures.is_some()
         || instance_structured.call_signature_count != 0
-        || instance_structured.index_infos.is_some()
+        || instance_structured.index_infos.as_deref() != instance.declared_index_infos.as_deref()
         || instance_structured
             .object_type_without_abstract_construct_signatures
             .is_some()
@@ -2707,12 +2981,14 @@ fn cached_primitive_member_plan(
         validate_method_cache_state(store, method, return_type).ok()?;
         method_return_types.push(return_type);
     }
+    let index_types = plan_index_types(store, class.index.as_ref()).ok()?;
     let uninitialized_instance_properties =
         uninitialized_instance_properties(store, class, &property_types).ok()?;
     Some(ClassMemberPlan {
         class: class.clone(),
         property_types,
         method_return_types,
+        index_types,
         uninitialized_instance_properties,
     })
 }
@@ -3108,6 +3384,8 @@ pub(super) fn execute_nongeneric_class_members(
     let mut static_properties = Vec::new();
     let mut all_static_properties = Vec::new();
     let mut construct_signatures = Vec::new();
+    let mut declared_index_infos = Vec::new();
+    let mut resolved_index_infos = Vec::new();
     let method_signature_lists = prepare_class_method_signatures(plan)?;
     instance_properties
         .try_reserve_exact(planned_instance_entries.len())
@@ -3129,6 +3407,12 @@ pub(super) fn execute_nongeneric_class_members(
     construct_signatures
         .try_reserve_exact(1)
         .map_err(|_| invariant(ClassInvariant::Capacity(plan.class.declaration)))?;
+    declared_index_infos
+        .try_reserve_exact(usize::from(plan.class.index.is_some()))
+        .map_err(|_| invariant(ClassInvariant::Capacity(plan.class.declaration)))?;
+    resolved_index_infos
+        .try_reserve_exact(usize::from(plan.class.index.is_some()))
+        .map_err(|_| invariant(ClassInvariant::Capacity(plan.class.declaration)))?;
     instance_properties.extend(planned_instance_entries.iter().map(|(_, symbol)| *symbol));
     instance_member_entries.extend(planned_instance_entries);
     static_properties.extend(planned_static_entries.iter().map(|(_, symbol)| *symbol));
@@ -3148,8 +3432,15 @@ pub(super) fn execute_nongeneric_class_members(
         .filter_map(|method| method.return_type_node)
         .filter(|type_node| store.type_node_links(*type_node).is_none())
         .count();
+    let missing_index_type_node_links = plan.class.index.map_or(0, |index| {
+        [index.key_type_node, index.value_type_node]
+            .into_iter()
+            .filter(|type_node| store.type_node_links(*type_node).is_none())
+            .count()
+    });
     let missing_type_node_links = missing_property_type_node_links
         .checked_add(missing_method_type_node_links)
+        .and_then(|count| count.checked_add(missing_index_type_node_links))
         .ok_or_else(|| invariant(ClassInvariant::Capacity(plan.class.declaration)))?;
     let missing_property_value_links = plan
         .class
@@ -3191,6 +3482,7 @@ pub(super) fn execute_nongeneric_class_members(
         .ok_or_else(|| invariant(ClassInvariant::Capacity(plan.class.declaration)))?;
     if !store.try_reserve_types(additional_types)
         || !store.try_reserve_signatures(signature_count)
+        || !store.try_reserve_index_infos(usize::from(plan.class.index.is_some()))
         || !store.try_reserve_checker_symbol_allocations(
             0,
             usize::from(prepared_instance_members.is_some()),
@@ -3250,6 +3542,36 @@ pub(super) fn execute_nongeneric_class_members(
             },
         ));
     }
+    if let Some(index) = plan.class.index {
+        let (key_type, value_type) = plan
+            .index_types
+            .expect("an admitted class index retains both resolved keyword types");
+        assert!(store.set_type_node_links(
+            index.key_type_node,
+            TypeNodeLinks {
+                resolved_type: Some(key_type),
+                ..TypeNodeLinks::default()
+            },
+        ));
+        assert!(store.set_type_node_links(
+            index.value_type_node,
+            TypeNodeLinks {
+                resolved_type: Some(value_type),
+                ..TypeNodeLinks::default()
+            },
+        ));
+        let info = store
+            .alloc_index_info(
+                key_type,
+                value_type,
+                false,
+                Some(index.declaration),
+                Vec::new(),
+            )
+            .expect("the class transaction reserved its validated index information");
+        declared_index_infos.push(info);
+        resolved_index_infos.push(info);
+    }
     publish_class_methods(store, plan, method_signature_lists);
     assert!(store.set_interface_declared_members(
         shells.instance_type,
@@ -3257,7 +3579,7 @@ pub(super) fn execute_nongeneric_class_members(
         plan.class.instance_members,
         None,
         None,
-        None,
+        (!declared_index_infos.is_empty()).then_some(declared_index_infos),
     ));
     let undefined_type = store
         .intrinsic_bootstrap()
@@ -3275,7 +3597,7 @@ pub(super) fn execute_nongeneric_class_members(
         (!instance_properties.is_empty()).then_some(instance_properties),
         None,
         None,
-        None,
+        (!resolved_index_infos.is_empty()).then_some(resolved_index_infos),
     ));
     assert!(store.set_structured_type_members(
         shells.value_type,
@@ -3694,6 +4016,7 @@ struct StoredClassParts {
     instance: super::type_records::InterfaceTypeData,
     value_type: TypeId,
     value: ObjectTypeData,
+    index: Option<StoredClassIndex>,
     declared_instance_properties: Vec<SemanticSymbolId>,
     declared_static_properties: Vec<SemanticSymbolId>,
     prototype: SemanticSymbolId,
@@ -3703,6 +4026,18 @@ struct StoredClassSurface {
     parts: StoredClassParts,
     instance_properties: Vec<SemanticSymbolId>,
     static_properties: Vec<SemanticSymbolId>,
+}
+
+#[derive(Clone, Copy)]
+struct StoredClassIndex {
+    symbol: SemanticSymbolId,
+    info: IndexInfoId,
+}
+
+#[derive(Clone, Copy)]
+enum StoredClassIndexState {
+    Absent,
+    Present(StoredClassIndex),
 }
 
 fn exact_stored_property(
@@ -3867,6 +4202,54 @@ fn stored_class_constructor(
     })
 }
 
+fn stored_class_index(
+    store: &CanonicalTypeMapperStore,
+    owner: SemanticSymbolId,
+    owner_declaration: NodeRef,
+    members: Option<SymbolTableId>,
+    indexes: Option<&[IndexInfoId]>,
+) -> Option<StoredClassIndexState> {
+    let Some(members) = members else {
+        return indexes.is_none().then_some(StoredClassIndexState::Absent);
+    };
+    let table = store.symbol_table(members)?;
+    let symbol = table.get(InternalSymbolName::Index.as_ref());
+    match (symbol, indexes) {
+        (None, None) => Some(StoredClassIndexState::Absent),
+        (Some(symbol), Some([info])) => {
+            let symbol_record = store.symbol(symbol)?;
+            let [declaration] = symbol_record.declarations()? else {
+                return None;
+            };
+            let index = store.index_info(*info)?;
+            let bootstrap = store.intrinsic_bootstrap()?;
+            (symbol_record.flags() == SymbolFlags::SIGNATURE
+                && symbol_record.check_flags() == CheckFlags::NONE
+                && symbol_record.name() == InternalSymbolName::Index.as_ref()
+                && symbol_record.value_declaration().is_none()
+                && symbol_record.members().is_none()
+                && symbol_record.exports().is_none()
+                && symbol_record.parent() == Some(owner)
+                && symbol_record.export_symbol().is_none()
+                && store.get_merged_symbol(symbol) == Some(symbol)
+                && store.source_node_kind(*declaration) == Some(SyntaxKind::IndexSignature)
+                && store.source_node_parent(*declaration)
+                    == Some(SourceNodeParent::Parent(owner_declaration))
+                && index.key_type() == bootstrap.string_type
+                && index.value_type() == bootstrap.number_type
+                && !index.is_readonly()
+                && index.declaration() == Some(*declaration)
+                && index.index_symbol().is_none()
+                && index.components().is_empty())
+            .then_some(StoredClassIndexState::Present(StoredClassIndex {
+                symbol,
+                info: *info,
+            }))
+        }
+        _ => None,
+    }
+}
+
 fn stored_declared_properties(
     store: &CanonicalTypeMapperStore,
     owner: SemanticSymbolId,
@@ -3874,9 +4257,10 @@ fn stored_declared_properties(
     table: Option<SymbolTableId>,
     prototype: Option<SemanticSymbolId>,
     constructor: Option<SemanticSymbolId>,
+    index: Option<SemanticSymbolId>,
 ) -> Option<Vec<SemanticSymbolId>> {
     let Some(table) = table else {
-        return (prototype.is_none() && constructor.is_none()).then(Vec::new);
+        return (prototype.is_none() && constructor.is_none() && index.is_none()).then(Vec::new);
     };
     let table = store.symbol_table(table)?;
     if table.is_empty() && prototype.is_none() {
@@ -3888,7 +4272,7 @@ fn stored_declared_properties(
         if store.symbol(property)?.name() != name {
             return None;
         }
-        if Some(property) == prototype || Some(property) == constructor {
+        if Some(property) == prototype || Some(property) == constructor || Some(property) == index {
             continue;
         }
         exact_stored_class_member(store, owner, owner_declaration, property)?;
@@ -3907,7 +4291,8 @@ fn stored_declared_properties(
     let expected_len = properties
         .len()
         .checked_add(usize::from(prototype.is_some()))?
-        .checked_add(usize::from(constructor.is_some()))?;
+        .checked_add(usize::from(constructor.is_some()))?
+        .checked_add(usize::from(index.is_some()))?;
     (table.len() == expected_len).then_some(properties)
 }
 
@@ -3939,7 +4324,6 @@ fn stored_class_parts(
         || instance.declared_members != owner.members()
         || instance.declared_call_signatures.is_some()
         || instance.declared_construct_signatures.is_some()
-        || instance.declared_index_infos.is_some()
     {
         return None;
     }
@@ -3947,6 +4331,16 @@ fn stored_class_parts(
     validate_prototype(store, symbol, exports).ok()?;
     let prototype = store.symbol_table(exports)?.get_source(PROTOTYPE_NAME)?;
     let constructor = stored_class_constructor(store, symbol, declaration, owner.members())?;
+    let index = match stored_class_index(
+        store,
+        symbol,
+        declaration,
+        owner.members(),
+        instance.declared_index_infos.as_deref(),
+    )? {
+        StoredClassIndexState::Absent => None,
+        StoredClassIndexState::Present(index) => Some(index),
+    };
     let declared_instance_properties = stored_declared_properties(
         store,
         symbol,
@@ -3954,6 +4348,7 @@ fn stored_class_parts(
         owner.members(),
         None,
         constructor.symbol(),
+        index.map(|index| index.symbol),
     )?;
     let declared_static_properties = stored_declared_properties(
         store,
@@ -3961,6 +4356,7 @@ fn stored_class_parts(
         declaration,
         Some(exports),
         Some(prototype),
+        None,
         None,
     )?;
 
@@ -4027,6 +4423,7 @@ fn stored_class_parts(
         instance,
         value_type,
         value: value.clone(),
+        index,
         declared_instance_properties,
         declared_static_properties,
         prototype,
@@ -4073,7 +4470,11 @@ fn validate_stored_no_base_class(
                 .then_some(parts.declared_instance_properties.as_slice())
         || structured.signatures.is_some()
         || structured.call_signature_count != 0
-        || structured.index_infos.is_some()
+        || match (parts.index, structured.index_infos.as_deref()) {
+            (None, None) => false,
+            (Some(index), Some([info])) => index.info != *info,
+            _ => true,
+        }
         || structured
             .object_type_without_abstract_construct_signatures
             .is_some()
@@ -4129,12 +4530,14 @@ fn validate_stored_derived_class(
     if provenance.owner_symbol != parts.symbol
         || provenance.owner_value_type != parts.value_type
         || provenance.base_symbol == parts.symbol
+        || parts.index.is_some()
     {
         return None;
     }
     let base = validate_stored_no_base_class(store, provenance.base_instance_type)?;
     if base.parts.symbol != provenance.base_symbol
         || base.parts.value_type != provenance.base_value_type
+        || base.parts.index.is_some()
         || !parts.instance.base_types_resolved
         || parts.instance.resolved_base_constructor_type != Some(provenance.base_value_type)
         || parts.instance.resolved_base_types.as_deref()
@@ -4321,6 +4724,191 @@ mod tests {
         fixture.files[&fixture.file]
             .symbol(class_node(fixture, name))
             .unwrap()
+    }
+
+    #[test]
+    fn class_string_index_publishes_one_shared_index_and_replays_warm() {
+        let mut fixture = fixture("class Indexed { [key: string]: number; constructor() {} }");
+        let owner = class_symbol(&fixture, "Indexed");
+        let bound = &fixture.files[&fixture.file];
+        let host = host(&fixture.parsed.arena, bound);
+        let plan = plan_nongeneric_class_member_query(&fixture.store, &host, owner).unwrap();
+        let ClassMemberQueryPlan::Direct(class) = &plan else {
+            panic!("an indexed class without heritage retains one direct class plan")
+        };
+        let index = class.class.index.unwrap();
+        let declared_table = fixture
+            .store
+            .symbol_table(class.class.instance_members.unwrap())
+            .unwrap();
+        assert_eq!(
+            declared_table.get(InternalSymbolName::Index.as_ref()),
+            Some(index.symbol)
+        );
+        assert!(
+            declared_table
+                .get(InternalSymbolName::Constructor.as_ref())
+                .is_some()
+        );
+        let initial_index_count = fixture.store.index_info_len();
+
+        let members =
+            execute_nongeneric_class_member_query(&mut fixture.store, &host, &plan).unwrap();
+
+        assert_eq!(fixture.store.index_info_len(), initial_index_count + 1);
+        assert!(members.instance_properties().is_empty());
+        assert_eq!(members.instance_members(), None);
+        let TypeData::Interface(instance) = fixture
+            .store
+            .type_payload(members.shells().instance_type())
+            .unwrap()
+            .data()
+        else {
+            panic!("the indexed class retains its canonical instance type")
+        };
+        let [info] = instance.declared_index_infos.as_deref().unwrap() else {
+            panic!("the indexed class publishes exactly one declared index")
+        };
+        assert_eq!(
+            instance.reference.object.structured.index_infos.as_deref(),
+            Some(&[*info][..])
+        );
+        let index_info = fixture.store.index_info(*info).unwrap();
+        let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+        assert_eq!(index_info.key_type(), bootstrap.string_type);
+        assert_eq!(index_info.value_type(), bootstrap.number_type);
+        assert_eq!(index_info.declaration(), Some(index.declaration));
+        assert!(!index_info.is_readonly());
+        assert_eq!(index_info.index_symbol(), None);
+        assert_eq!(
+            fixture.store.type_node_links(index.key_type_node),
+            Some(&TypeNodeLinks {
+                resolved_type: Some(bootstrap.string_type),
+                ..TypeNodeLinks::default()
+            })
+        );
+        assert_eq!(
+            fixture.store.type_node_links(index.value_type_node),
+            Some(&TypeNodeLinks {
+                resolved_type: Some(bootstrap.number_type),
+                ..TypeNodeLinks::default()
+            })
+        );
+        assert_eq!(
+            validate_class_heritage_members(&fixture.store, members.shells().instance_type()),
+            ClassHeritageMembersValidation::Valid
+        );
+        let warm = (
+            fixture.store.type_len(),
+            fixture.store.signature_len(),
+            fixture.store.index_info_len(),
+            fixture.store.symbol_store().symbol_table_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+
+        assert_eq!(
+            execute_nongeneric_class_member_query(&mut fixture.store, &host, &plan),
+            Ok(members)
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.index_info_len(),
+                fixture.store.symbol_store().symbol_table_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            warm
+        );
+    }
+
+    #[test]
+    fn class_string_index_with_empty_constructor_checks_from_source() {
+        let parsed = parse_source_file("class C123 { [s: string]: number; constructor() {} }");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(302);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/classIndexer.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        let mut context = CanonicalCheckerContext::new(
+            binder.finish(),
+            [(file, &parsed.arena)].into_iter().collect(),
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap();
+
+        context.check_source_file(file).unwrap();
+
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn poisoned_class_index_cache_rejects_warm_replay_without_publication() {
+        let mut fixture = fixture("class Indexed { [key: string]: number; constructor() {} }");
+        let owner = class_symbol(&fixture, "Indexed");
+        let bound = &fixture.files[&fixture.file];
+        let host = host(&fixture.parsed.arena, bound);
+        let plan = plan_nongeneric_class_member_query(&fixture.store, &host, owner).unwrap();
+        let ClassMemberQueryPlan::Direct(class) = &plan else {
+            panic!("an indexed class without heritage retains one direct class plan")
+        };
+        let index_symbol = class.class.index.unwrap().symbol;
+        let members =
+            execute_nongeneric_class_member_query(&mut fixture.store, &host, &plan).unwrap();
+        let TypeData::Interface(instance) = fixture
+            .store
+            .type_payload(members.shells().instance_type())
+            .unwrap()
+            .data()
+        else {
+            panic!("the indexed class retains its canonical instance type")
+        };
+        let info = instance.declared_index_infos.as_deref().unwrap()[0];
+        assert!(
+            fixture
+                .store
+                .set_index_info_symbol(info, Some(index_symbol))
+        );
+        let poisoned = (
+            fixture.store.type_len(),
+            fixture.store.signature_len(),
+            fixture.store.index_info_len(),
+            fixture.store.symbol_store().symbol_table_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+
+        assert_eq!(
+            validate_class_heritage_members(&fixture.store, members.shells().instance_type()),
+            ClassHeritageMembersValidation::Malformed
+        );
+        assert_eq!(
+            execute_nongeneric_class_member_query(&mut fixture.store, &host, &plan),
+            Err(invariant(ClassInvariant::InvalidInstanceMembers(owner)))
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.index_info_len(),
+                fixture.store.symbol_store().symbol_table_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            poisoned
+        );
     }
 
     #[test]

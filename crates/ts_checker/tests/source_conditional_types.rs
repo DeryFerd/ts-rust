@@ -268,3 +268,51 @@ fn short_variadic_tuple_inference_preserves_warm_tuple_cache_identity() {
         warm
     );
 }
+
+#[test]
+fn conditional_tuple_rest_preserves_its_required_suffix() {
+    let parsed = parse_source_file(concat!(
+        "interface Array<T> {}\n",
+        "interface ReadonlyArray<T> {}\n",
+        "type EndsWithText<T> = T extends [...number[], string] ? true : false;\n",
+        "type Many = EndsWithText<[number, number, string]>;\n",
+        "type Only = EndsWithText<[string]>;\n",
+        "type Wrong = EndsWithText<[number, number, number]>;\n",
+    ));
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(4);
+    let mut context = context(&parsed, file);
+
+    context.check_source_file(file).unwrap();
+    assert!(
+        context.diagnostics().is_empty(),
+        "{:?}",
+        context.diagnostics()
+    );
+
+    for (name, expected) in [("Many", "true"), ("Only", "true"), ("Wrong", "false")] {
+        let alias = alias_symbol(&parsed, file, &context, name);
+        assert_eq!(
+            context.type_to_string(alias_type(&context, alias)).unwrap(),
+            expected,
+            "alias {name}"
+        );
+    }
+
+    let warm = (
+        context.store().type_len(),
+        context.store().conditional_root_len(),
+        context.store().mapper_len(),
+        context.diagnostics().clone(),
+    );
+    context.check_source_file(file).unwrap();
+    assert_eq!(
+        (
+            context.store().type_len(),
+            context.store().conditional_root_len(),
+            context.store().mapper_len(),
+            context.diagnostics().clone(),
+        ),
+        warm
+    );
+}

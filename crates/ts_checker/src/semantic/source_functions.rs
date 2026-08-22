@@ -13,7 +13,10 @@ use ts_binder::{
     CheckFlags, SemanticSymbolId, SymbolFlags,
 };
 
-use super::{CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHost, TypeId};
+use super::{
+    CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHost, TypeId,
+    source_callables::valid_source_function_owner_shape,
+};
 
 /// Binder identities retained for one exact top-level function declaration.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -261,7 +264,13 @@ pub(super) fn plan_function_identifier_read(
             },
         ));
     }
-    if record.flags() != SymbolFlags::FUNCTION {
+    let merged_declaration = (record.flags() != SymbolFlags::FUNCTION)
+        .then(|| record.value_declaration())
+        .flatten()
+        .filter(|declaration| {
+            valid_source_function_owner_shape(store, routed.target, *declaration)
+        });
+    if record.flags() != SymbolFlags::FUNCTION && merged_declaration.is_none() {
         return Err(SourceFunctionPlanError::Unsupported(
             SourceFunctionUnsupported::NonFunctionSymbol {
                 node,
@@ -283,66 +292,60 @@ pub(super) fn plan_function_identifier_read(
             },
         ));
     }
-    match declarations {
-        [declaration] => {
-            let declaration = *declaration;
+    let unique_declaration = match declarations {
+        [declaration] => Some(*declaration),
+        _ => merged_declaration,
+    };
+    if let Some(declaration) = unique_declaration {
+        if declaration.file != node.file || declaration.arena != node.arena {
+            return Err(SourceFunctionPlanError::Unsupported(
+                SourceFunctionUnsupported::CrossFileDeclaration { node, declaration },
+            ));
+        }
+        validate_function_target(store, declaration, node, name, routed.target)?;
+        validate_function_read_declaration_symbol(bound, store, declaration, routed.target)?;
+        if let Some(local) = routed.export_local {
+            validate_export_local(store, local, declaration, routed.target, name)?;
+        }
+        if bound.local_symbol(declaration) != routed.export_local {
+            return Err(SourceFunctionInvariant::LocalExportSymbolMismatch {
+                declaration,
+                expected: routed.export_local,
+                actual: bound.local_symbol(declaration),
+            }
+            .into());
+        }
+        validate_target_parent(bound, store, routed.target, routed.export_local.is_some())?;
+    } else if declarations.len() >= 2 && routed.export_local.is_none() {
+        validate_function_overload_read_target(store, node, name, routed.target, declarations)?;
+        for declaration in declarations {
             if declaration.file != node.file || declaration.arena != node.arena {
                 return Err(SourceFunctionPlanError::Unsupported(
-                    SourceFunctionUnsupported::CrossFileDeclaration { node, declaration },
+                    SourceFunctionUnsupported::CrossFileDeclaration {
+                        node,
+                        declaration: *declaration,
+                    },
                 ));
             }
-            validate_function_target(store, declaration, node, name, routed.target)?;
-            validate_function_read_declaration_symbol(bound, store, declaration, routed.target)?;
-            if let Some(local) = routed.export_local {
-                validate_export_local(store, local, declaration, routed.target, name)?;
-            }
-            if bound.local_symbol(declaration) != routed.export_local {
+            validate_function_read_declaration_symbol(bound, store, *declaration, routed.target)?;
+            if bound.local_symbol(*declaration).is_some() {
                 return Err(SourceFunctionInvariant::LocalExportSymbolMismatch {
-                    declaration,
-                    expected: routed.export_local,
-                    actual: bound.local_symbol(declaration),
+                    declaration: *declaration,
+                    expected: None,
+                    actual: bound.local_symbol(*declaration),
                 }
                 .into());
             }
-            validate_target_parent(bound, store, routed.target, routed.export_local.is_some())?;
         }
-        declarations if declarations.len() >= 2 && routed.export_local.is_none() => {
-            validate_function_overload_read_target(store, node, name, routed.target, declarations)?;
-            for declaration in declarations {
-                if declaration.file != node.file || declaration.arena != node.arena {
-                    return Err(SourceFunctionPlanError::Unsupported(
-                        SourceFunctionUnsupported::CrossFileDeclaration {
-                            node,
-                            declaration: *declaration,
-                        },
-                    ));
-                }
-                validate_function_read_declaration_symbol(
-                    bound,
-                    store,
-                    *declaration,
-                    routed.target,
-                )?;
-                if bound.local_symbol(*declaration).is_some() {
-                    return Err(SourceFunctionInvariant::LocalExportSymbolMismatch {
-                        declaration: *declaration,
-                        expected: None,
-                        actual: bound.local_symbol(*declaration),
-                    }
-                    .into());
-                }
-            }
-            validate_target_parent(bound, store, routed.target, false)?;
-        }
-        _ => {
-            return Err(SourceFunctionPlanError::Unsupported(
-                SourceFunctionUnsupported::NonUniqueDeclaration {
-                    node,
-                    symbol: routed.target,
-                    declaration_count: declarations.len(),
-                },
-            ));
-        }
+        validate_target_parent(bound, store, routed.target, false)?;
+    } else {
+        return Err(SourceFunctionPlanError::Unsupported(
+            SourceFunctionUnsupported::NonUniqueDeclaration {
+                node,
+                symbol: routed.target,
+                declaration_count: declarations.len(),
+            },
+        ));
     }
     if store.symbol_node_links(node).is_some_and(|links| {
         links
@@ -490,7 +493,8 @@ fn validate_function_target(
     let record = store
         .symbol(symbol)
         .ok_or(SourceFunctionInvariant::InvalidSymbol(symbol))?;
-    if record.flags() != SymbolFlags::FUNCTION {
+    let valid_owner = valid_source_function_owner_shape(store, symbol, declaration);
+    if record.flags() != SymbolFlags::FUNCTION && !valid_owner {
         return Err(SourceFunctionPlanError::Unsupported(
             SourceFunctionUnsupported::NonFunctionSymbol {
                 node: declaration,
@@ -499,7 +503,7 @@ fn validate_function_target(
             },
         ));
     }
-    if record.exports().is_some() {
+    if record.exports().is_some() && !valid_owner {
         return Err(SourceFunctionPlanError::Unsupported(
             SourceFunctionUnsupported::ExpandoFunction {
                 node: declaration,
@@ -516,7 +520,11 @@ fn validate_function_target(
     let declarations = record
         .declarations()
         .ok_or(SourceFunctionInvariant::MissingDeclarations(symbol))?;
-    let [actual] = declarations else {
+    if let [actual] = declarations {
+        if *actual != declaration {
+            return Err(SourceFunctionInvariant::InvalidSymbolShape(symbol).into());
+        }
+    } else if !valid_owner {
         return Err(SourceFunctionPlanError::Unsupported(
             SourceFunctionUnsupported::NonUniqueDeclaration {
                 node: declaration,
@@ -524,9 +532,6 @@ fn validate_function_target(
                 declaration_count: declarations.len(),
             },
         ));
-    };
-    if *actual != declaration {
-        return Err(SourceFunctionInvariant::InvalidSymbolShape(symbol).into());
     }
     if record.value_declaration() != Some(declaration) {
         return Err(SourceFunctionInvariant::ValueDeclarationMismatch {

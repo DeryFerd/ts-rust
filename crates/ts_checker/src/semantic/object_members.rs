@@ -954,11 +954,12 @@ pub(super) fn plan_interface(
     Ok(plan)
 }
 
-/// Plans the property declarations of one direct, local generic interface.
+/// Plans the property declarations of one source-owned generic interface.
 ///
 /// The bound member table also contains the interface's type parameters. The
-/// publication step creates a separate declared-property table instead of
-/// replacing that binder-owned table.
+/// plan accepts merged declarations and canonical exported owners. Publication
+/// creates a separate declared-property table instead of replacing the
+/// binder-owned table.
 pub(super) fn plan_generic_interface(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -970,70 +971,121 @@ pub(super) fn plan_generic_interface(
     let symbol_record = store
         .symbol(symbol)
         .ok_or(PropertyObjectError::InvalidInterfaceSymbol(symbol))?;
-    let [declaration] = symbol_record.declarations().unwrap_or_default() else {
+    let Some(declarations) = symbol_record
+        .declarations()
+        .filter(|declarations| !declarations.is_empty())
+    else {
         return Err(PropertyObjectError::InvalidInterfaceSymbol(symbol));
     };
-    let declaration = *declaration;
+    let declaration = declarations[0];
     let invalid = || PropertyObjectError::InvalidInterface {
         declaration,
         symbol,
     };
-    let record = preflight_node(store, host, declaration).map_err(|_| invalid())?;
-    let NodeData::InterfaceDeclaration(interface) = &record.data else {
-        return Err(invalid());
-    };
-    let Some(parameters) = interface.type_parameters.as_ref() else {
-        return Err(invalid());
-    };
     let raw_members = symbol_record.members().ok_or_else(invalid)?;
     let raw_table = store.symbol_table(raw_members).ok_or_else(invalid)?;
-    let name = NodeRef::new(declaration.arena, declaration.file, interface.name);
-    let name_record = preflight_node(store, host, name).map_err(|_| invalid())?;
-    let NodeData::Identifier(identifier) = &name_record.data else {
-        return Err(invalid());
-    };
-    if record.kind != SyntaxKind::InterfaceDeclaration
-        || record.flags.0 != 0
-        || parameters.nodes.is_empty()
-        || !host.symbol_matches(store, declaration, symbol)
-        || symbol_record.flags() != SymbolFlags::INTERFACE
+    if symbol_record.flags() != SymbolFlags::INTERFACE
         || symbol_record.check_flags() != CheckFlags::NONE
-        || symbol_record.name().as_utf8() != Some(identifier.text.as_str())
         || symbol_record.value_declaration().is_some()
-        || symbol_record.parent().is_some()
         || symbol_record.exports().is_some()
         || symbol_record.export_symbol().is_some()
-        || name_record.kind != SyntaxKind::Identifier
-        || name_record.parent != Some(declaration.node)
-        || interface.modifiers.is_some()
-        || interface.flow_node.is_some()
-        || interface.local_symbol.is_some()
-        || interface.symbol.is_some()
-        || interface.heritage_clauses.is_some()
-        || interface.members.has_trailing_comma
-        || interface.members.range.start < record.range.start
-        || interface.members.range.end != record.range.end
     {
         return Err(invalid());
     }
 
-    let mut parameter_symbols = HashSet::with_capacity(parameters.nodes.len());
-    for parameter in &parameters.nodes {
-        let parameter = NodeRef::new(declaration.arena, declaration.file, *parameter);
-        let parameter_record = preflight_node(store, host, parameter).map_err(|_| invalid())?;
-        if parameter_record.kind != SyntaxKind::TypeParameter
-            || parameter_record.parent != Some(declaration.node)
-        {
-            return Err(invalid());
+    let mut seen_declarations = HashSet::with_capacity(declarations.len());
+    let mut parameter_symbols = None;
+    let mut first_members = None;
+    let mut additional_members = Vec::with_capacity(declarations.len().saturating_sub(1));
+    for &candidate in declarations {
+        let invalid_declaration = || PropertyObjectError::InvalidInterface {
+            declaration: candidate,
+            symbol,
+        };
+        if !seen_declarations.insert(candidate) {
+            return Err(invalid_declaration());
         }
-        let parameter_symbol = bound_symbol(store, host, parameter).ok_or_else(invalid)?;
-        let parameter_symbol_record = store.symbol(parameter_symbol).ok_or_else(invalid)?;
-        if parameter_symbol_record.flags() != SymbolFlags::TYPE_PARAMETER
-            || parameter_symbol_record.parent() != Some(symbol)
-            || raw_table.get(parameter_symbol_record.name()) != Some(parameter_symbol)
-            || !parameter_symbols.insert(parameter_symbol)
+        let record = preflight_node(store, host, candidate).map_err(|_| invalid_declaration())?;
+        let NodeData::InterfaceDeclaration(interface) = &record.data else {
+            return Err(invalid_declaration());
+        };
+        let Some(parameters) = interface.type_parameters.as_ref() else {
+            return Err(invalid_declaration());
+        };
+        let name = NodeRef::new(candidate.arena, candidate.file, interface.name);
+        let name_record = preflight_node(store, host, name).map_err(|_| invalid_declaration())?;
+        let NodeData::Identifier(identifier) = &name_record.data else {
+            return Err(invalid_declaration());
+        };
+        let expected_parent = declared_type_declaration_parent(
+            store,
+            host,
+            candidate,
+            symbol,
+            name,
+            interface.modifiers.as_ref(),
+        )
+        .map_err(|()| invalid_declaration())?;
+        if record.kind != SyntaxKind::InterfaceDeclaration
+            || record.flags.0 != 0
+            || parameters.nodes.is_empty()
+            || !host.symbol_matches(store, candidate, symbol)
+            || symbol_record.name().as_utf8() != Some(identifier.text.as_str())
+            || symbol_record.parent().is_some() != expected_parent.is_some()
+            || store.get_parent_of_symbol(symbol) != expected_parent
+            || name_record.kind != SyntaxKind::Identifier
+            || name_record.parent != Some(candidate.node)
+            || interface.flow_node.is_some()
+            || interface.local_symbol.is_some()
+            || interface.symbol.is_some()
+            || interface.heritage_clauses.is_some()
+            || interface.members.has_trailing_comma
+            || interface.members.range.start < record.range.start
+            || interface.members.range.end != record.range.end
         {
-            return Err(invalid());
+            return Err(invalid_declaration());
+        }
+
+        let mut current_parameters = Vec::with_capacity(parameters.nodes.len());
+        let mut unique_parameters = HashSet::with_capacity(parameters.nodes.len());
+        for parameter in &parameters.nodes {
+            let parameter = NodeRef::new(candidate.arena, candidate.file, *parameter);
+            let parameter_record =
+                preflight_node(store, host, parameter).map_err(|_| invalid_declaration())?;
+            if parameter_record.kind != SyntaxKind::TypeParameter
+                || parameter_record.parent != Some(candidate.node)
+            {
+                return Err(invalid_declaration());
+            }
+            let parameter_symbol =
+                bound_symbol(store, host, parameter).ok_or_else(invalid_declaration)?;
+            let parameter_symbol_record = store
+                .symbol(parameter_symbol)
+                .ok_or_else(invalid_declaration)?;
+            if parameter_symbol_record.flags() != SymbolFlags::TYPE_PARAMETER
+                || store.get_parent_of_symbol(parameter_symbol) != Some(symbol)
+                || raw_table
+                    .get(parameter_symbol_record.name())
+                    .and_then(|parameter| store.get_merged_symbol(parameter))
+                    != Some(parameter_symbol)
+                || !unique_parameters.insert(parameter_symbol)
+            {
+                return Err(invalid_declaration());
+            }
+            current_parameters.push(parameter_symbol);
+        }
+        match parameter_symbols.as_ref() {
+            Some(expected) if expected != &current_parameters => {
+                return Err(invalid_declaration());
+            }
+            None => parameter_symbols = Some(current_parameters),
+            Some(_) => {}
+        }
+
+        if candidate == declaration {
+            first_members = Some(&interface.members);
+        } else {
+            additional_members.push((candidate, &interface.members));
         }
     }
 
@@ -1044,8 +1096,8 @@ pub(super) fn plan_generic_interface(
         declaration,
         symbol,
         Some(raw_members),
-        &interface.members,
-        &[],
+        first_members.ok_or_else(invalid)?,
+        &additional_members,
         None,
         TypeLiteralMemberPolicy::GenericInterface,
     )?;
@@ -1061,7 +1113,7 @@ pub(super) fn plan_generic_interface(
             kind: SyntaxKind::CallSignature,
         });
     }
-    if raw_table.len() != parameter_symbols.len() + plan.properties.len() {
+    if raw_table.len() != parameter_symbols.as_ref().map_or(0, Vec::len) + plan.properties.len() {
         return Err(invalid());
     }
     Ok(plan)
@@ -1544,16 +1596,10 @@ fn plan_members(
             NodeData::Identifier(identifier) if name_record.kind == SyntaxKind::Identifier => {
                 identifier.text.clone()
             }
-            NodeData::StringLiteral(literal)
-                if kind != PropertyObjectKind::TypeLiteral
-                    && name_record.kind == SyntaxKind::StringLiteral =>
-            {
+            NodeData::StringLiteral(literal) if name_record.kind == SyntaxKind::StringLiteral => {
                 literal.text.clone()
             }
-            NodeData::NumericLiteral(literal)
-                if kind != PropertyObjectKind::TypeLiteral
-                    && name_record.kind == SyntaxKind::NumericLiteral =>
-            {
+            NodeData::NumericLiteral(literal) if name_record.kind == SyntaxKind::NumericLiteral => {
                 literal.text.clone()
             }
             NodeData::NoSubstitutionTemplateLiteral(literal)
@@ -1563,8 +1609,7 @@ fn plan_members(
                 literal.text.clone()
             }
             NodeData::ComputedPropertyName(computed)
-                if kind != PropertyObjectKind::TypeLiteral
-                    && name_record.kind == SyntaxKind::ComputedPropertyName =>
+                if name_record.kind == SyntaxKind::ComputedPropertyName =>
             {
                 let expression = NodeRef::new(name.arena, name.file, computed.expression);
                 let expression_record = preflight_node(store, host, expression)
@@ -4247,6 +4292,12 @@ fn valid_generic_publication_target(
     let Some(owner) = store.symbol(plan.symbol) else {
         return false;
     };
+    let Some(owner_declarations) = owner
+        .declarations()
+        .filter(|declarations| !declarations.is_empty())
+    else {
+        return false;
+    };
     let Some(raw_members) = plan.members else {
         return false;
     };
@@ -4264,11 +4315,11 @@ fn valid_generic_publication_target(
         || record.alias().is_some()
         || owner.flags() != SymbolFlags::INTERFACE
         || owner.check_flags() != CheckFlags::NONE
-        || owner.declarations() != Some(&[plan.node])
+        || owner_declarations != plan.declarations.as_slice()
+        || plan.declarations.first().copied() != Some(plan.node)
         || owner.value_declaration().is_some()
         || owner.members() != Some(raw_members)
         || owner.exports().is_some()
-        || owner.parent().is_some()
         || owner.export_symbol().is_some()
         || store.get_merged_symbol(plan.symbol) != Some(plan.symbol)
         || store
@@ -4288,6 +4339,21 @@ fn valid_generic_publication_target(
         return false;
     }
 
+    let parent = store.get_parent_of_symbol(plan.symbol);
+    if owner.parent().is_some() != parent.is_some()
+        || parent.is_some_and(|parent| {
+            store
+                .symbol(parent)
+                .and_then(ts_binder::semantic::Symbol::exports)
+                .and_then(|exports| store.symbol_table(exports))
+                .and_then(|exports| exports.get(owner.name()))
+                .and_then(|symbol| store.get_merged_symbol(symbol))
+                != Some(plan.symbol)
+        })
+    {
+        return false;
+    }
+
     let mut symbols = HashSet::with_capacity(raw_table.len());
     for parameter in reference.type_arguments {
         let Some(symbol) = cached_ordinary_type_parameter_owner(store, parameter) else {
@@ -4296,8 +4362,11 @@ fn valid_generic_publication_target(
         let Some(record) = store.symbol(symbol) else {
             return false;
         };
-        if record.parent() != Some(plan.symbol)
-            || raw_table.get(record.name()) != Some(symbol)
+        if store.get_parent_of_symbol(symbol) != Some(plan.symbol)
+            || raw_table
+                .get(record.name())
+                .and_then(|parameter| store.get_merged_symbol(parameter))
+                != Some(symbol)
             || !symbols.insert(symbol)
         {
             return false;
@@ -4305,10 +4374,29 @@ fn valid_generic_publication_target(
     }
     let mut names = HashSet::with_capacity(plan.properties.len());
     let mut declarations = HashSet::with_capacity(plan.properties.len());
+    let mut previous_position = None;
     for property in &plan.properties {
         let Some(record) = store.symbol(property.symbol) else {
             return false;
         };
+        let Some(property_declarations) = record
+            .declarations()
+            .filter(|declarations| !declarations.is_empty())
+        else {
+            return false;
+        };
+        let Some(SourceNodeParent::Parent(property_owner)) =
+            store.source_node_parent(property.declaration)
+        else {
+            return false;
+        };
+        let Some(owner_index) = owner_declarations
+            .iter()
+            .position(|declaration| *declaration == property_owner)
+        else {
+            return false;
+        };
+        let position = (owner_index, property.declaration);
         let expected_flags = SymbolFlags::PROPERTY
             | if property.optional {
                 SymbolFlags::OPTIONAL
@@ -4319,29 +4407,48 @@ fn valid_generic_publication_target(
         if record.flags() != expected_flags
             || record.check_flags() != CheckFlags::NONE && record.check_flags() != expected_checks
             || record.name().as_utf8() != Some(property.name.as_str())
-            || record.declarations() != Some(&[property.declaration])
+            || property_declarations.first().copied() != Some(property.declaration)
             || record.value_declaration() != Some(property.declaration)
-            || record.parent() != Some(plan.symbol)
+            || store.get_parent_of_symbol(property.symbol) != Some(plan.symbol)
             || record.members().is_some()
             || record.exports().is_some()
             || record.export_symbol().is_some()
             || store.get_merged_symbol(property.symbol) != Some(property.symbol)
-            || raw_table.get(record.name()) != Some(property.symbol)
-            || store.source_node_parent(property.declaration)
-                != Some(SourceNodeParent::Parent(plan.node))
+            || raw_table
+                .get(record.name())
+                .and_then(|symbol| store.get_merged_symbol(symbol))
+                != Some(property.symbol)
+            || previous_position.is_some_and(|previous| previous >= position)
             || store.source_node_parent(property.name_node)
                 != Some(SourceNodeParent::Parent(property.declaration))
             || store.source_node_parent(property.type_node)
                 != Some(SourceNodeParent::Parent(property.declaration))
             || !symbols.insert(property.symbol)
             || !names.insert(property.name.as_str())
-            || !declarations.insert(property.declaration)
         {
             return false;
         }
+        if !property_declarations.iter().all(|declaration| {
+            let Some(SourceNodeParent::Parent(owner)) = store.source_node_parent(*declaration)
+            else {
+                return false;
+            };
+            owner_declarations.contains(&owner)
+                && declaration.is_for(owner.arena, owner.file)
+                && matches!(
+                    store.source_node_kind(*declaration),
+                    Some(SyntaxKind::PropertyDeclaration | SyntaxKind::PropertySignature)
+                )
+                && declarations.insert(*declaration)
+        }) {
+            return false;
+        }
+        previous_position = Some(position);
     }
     raw_table.iter().all(|(name, symbol)| {
-        symbols.contains(&symbol)
+        store
+            .get_merged_symbol(symbol)
+            .is_some_and(|symbol| symbols.contains(&symbol))
             && store
                 .symbol(symbol)
                 .is_some_and(|record| record.name() == name)
@@ -4553,6 +4660,14 @@ mod generic_publication_tests {
     }
 
     fn interface_fixture(source: &str, file: u32) -> Fixture {
+        interface_fixture_with_module_state(source, file, CanonicalModuleState::Script)
+    }
+
+    fn interface_fixture_with_module_state(
+        source: &str,
+        file: u32,
+        module_state: CanonicalModuleState,
+    ) -> Fixture {
         let parsed = parse_source_file(source);
         assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
         let file = FileId::new(file);
@@ -4566,7 +4681,7 @@ mod generic_publication_tests {
                     EscapedName::source("\"/generic-publication.ts\""),
                     CanonicalSourceLanguage::TypeScript,
                     false,
-                    CanonicalModuleState::Script,
+                    module_state,
                 ),
             )
             .unwrap();
@@ -4594,8 +4709,11 @@ mod generic_publication_tests {
         store
             .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions::default())
             .unwrap();
-        let globals = store.intrinsic_bootstrap().unwrap().globals;
-        store.merge_global_symbol(globals, symbol).unwrap();
+        if module_state == CanonicalModuleState::Script {
+            let globals = store.intrinsic_bootstrap().unwrap().globals;
+            let global = store.get_parent_of_symbol(symbol).unwrap_or(symbol);
+            store.merge_global_symbol(globals, global).unwrap();
+        }
         Fixture {
             parsed,
             file,
@@ -4774,6 +4892,113 @@ mod generic_publication_tests {
     }
 
     #[test]
+    fn type_literals_plan_literal_property_names_and_preserve_bound_symbols() {
+        let mut fixture = interface_fixture(
+            concat!(
+                "interface Owner {} ",
+                "type Shape = { ",
+                "'quoted': string; ",
+                "7: number; ",
+                "['computed']: boolean; ",
+                "[8]: bigint; ",
+                "[`template`]: symbol; ",
+                "['i\\u0307spanyol']: string ",
+                "};",
+            ),
+            3_709,
+        );
+        let literal = fixture
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::TypeLiteral).then_some(NodeRef::new(
+                    fixture.parsed.arena.id(),
+                    fixture.file,
+                    node,
+                ))
+            })
+            .expect("the fixture contains a type literal");
+        let alias = fixture
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::TypeAliasDeclaration).then_some(NodeRef::new(
+                    fixture.parsed.arena.id(),
+                    fixture.file,
+                    node,
+                ))
+            })
+            .and_then(|declaration| fixture.bound.symbol(declaration))
+            .expect("the fixture contains a bound type alias");
+        let host = host(&fixture.parsed, &fixture.bound);
+        let plan = plan_type_literal(&fixture.store, &host, literal, Some(alias)).unwrap();
+
+        assert_eq!(
+            plan.properties
+                .iter()
+                .map(|property| property.name.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "quoted",
+                "7",
+                "computed",
+                "8",
+                "template",
+                "i\u{307}spanyol"
+            ],
+        );
+        for property in &plan.properties {
+            assert_eq!(
+                fixture.bound.symbol(property.declaration),
+                Some(property.symbol)
+            );
+        }
+
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let type_ = CanonicalTypeQuery::new(
+            &mut fixture.store,
+            &host,
+            CanonicalCheckerOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap()
+        .get_declared_type_of_symbol(alias)
+        .unwrap();
+        let TypeData::Object(object) = fixture.store.type_payload(type_).unwrap().data() else {
+            panic!("the alias must publish one anonymous type literal")
+        };
+        assert_eq!(
+            object.structured.properties.as_deref(),
+            Some(plan.property_symbols().as_slice()),
+        );
+        let warm = (
+            fixture.store.type_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+        assert_eq!(
+            CanonicalTypeQuery::new(
+                &mut fixture.store,
+                &host,
+                CanonicalCheckerOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_declared_type_of_symbol(alias),
+            Ok(type_),
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
     fn dynamic_computed_object_property_names_stay_unsupported() {
         let (fixture, object) =
             object_fixture("const key = 'property'; const value = { [key]: 1 };");
@@ -4850,6 +5075,172 @@ mod generic_publication_tests {
             warm
         );
         assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn merged_generic_interfaces_publish_once_and_preserve_declaration_order() {
+        let mut fixture = interface_fixture(
+            concat!(
+                "interface Box<T> { first: T; shared: string } ",
+                "interface Box<T> { shared: string; second: T }",
+            ),
+            3_710,
+        );
+        let host = host(&fixture.parsed, &fixture.bound);
+        let plan = plan_generic_interface(&fixture.store, &host, fixture.symbol).unwrap();
+        assert_eq!(plan.declarations.len(), 2);
+        assert_eq!(
+            plan.properties
+                .iter()
+                .map(|property| property.name.as_str())
+                .collect::<Vec<_>>(),
+            ["first", "shared", "second"],
+        );
+        assert_eq!(
+            fixture
+                .store
+                .symbol(plan.properties[1].symbol)
+                .and_then(ts_binder::semantic::Symbol::declarations)
+                .map(<[NodeRef]>::len),
+            Some(2),
+        );
+
+        let flags = fixture.store.symbol(fixture.symbol).unwrap().flags();
+        let target = get_declared_class_interface_or_type_parameter(
+            &mut fixture.store,
+            &host,
+            fixture.symbol,
+            flags,
+        )
+        .unwrap()
+        .unwrap();
+        let parameter = match fixture.store.type_payload(target).unwrap().data() {
+            TypeData::Interface(interface) => interface
+                .reference
+                .resolved_type_arguments
+                .as_ref()
+                .unwrap()[0],
+            _ => panic!("merged declarations must produce one generic interface target"),
+        };
+        let string = fixture.store.intrinsic_bootstrap().unwrap().string_type;
+        let property_types = [parameter, string, parameter];
+        assert!(fixture.store.publish_interface_no_base_resolution(target));
+
+        let mut invalid_plan = plan.clone();
+        invalid_plan.declarations.reverse();
+        let before = state(&fixture.store, &plan, target);
+        assert_eq!(
+            publish_generic_interface_declared_members(
+                &mut fixture.store,
+                &invalid_plan,
+                target,
+                &property_types,
+            ),
+            Err(PropertyObjectError::InvalidCachedInterface {
+                symbol: fixture.symbol,
+                type_: target,
+            }),
+        );
+        assert_eq!(state(&fixture.store, &plan, target), before);
+
+        assert_eq!(
+            publish_generic_interface_declared_members(
+                &mut fixture.store,
+                &plan,
+                target,
+                &property_types,
+            ),
+            Ok(target),
+        );
+        let warm = state(&fixture.store, &plan, target);
+        assert_eq!(
+            publish_generic_interface_declared_members(
+                &mut fixture.store,
+                &plan,
+                target,
+                &property_types,
+            ),
+            Ok(target),
+        );
+        assert_eq!(state(&fixture.store, &plan, target), warm);
+
+        let number = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+        let reference = fixture
+            .store
+            .create_direct_generic_reference_type(target, &[number])
+            .unwrap();
+        for (name, expected) in [("first", number), ("shared", string), ("second", number)] {
+            let property = fixture
+                .store
+                .resolve_generic_interface_property(reference, name, None)
+                .unwrap()
+                .unwrap();
+            assert_eq!(property.type_id(), expected);
+        }
+    }
+
+    #[test]
+    fn exported_generic_interfaces_publish_with_their_canonical_parent() {
+        for (source, module_state, file) in [
+            (
+                "export interface Box<T> { value: T }",
+                CanonicalModuleState::External,
+                3_711,
+            ),
+            (
+                "declare namespace Models { interface Box<T> { value: T } }",
+                CanonicalModuleState::Script,
+                3_712,
+            ),
+        ] {
+            let mut fixture = interface_fixture_with_module_state(source, file, module_state);
+            let host = host(&fixture.parsed, &fixture.bound);
+            let plan = plan_generic_interface(&fixture.store, &host, fixture.symbol).unwrap();
+            assert!(fixture.store.get_parent_of_symbol(plan.symbol).is_some());
+
+            let flags = fixture.store.symbol(fixture.symbol).unwrap().flags();
+            let target = get_declared_class_interface_or_type_parameter(
+                &mut fixture.store,
+                &host,
+                fixture.symbol,
+                flags,
+            )
+            .unwrap()
+            .unwrap();
+            let parameter = match fixture.store.type_payload(target).unwrap().data() {
+                TypeData::Interface(interface) => interface
+                    .reference
+                    .resolved_type_arguments
+                    .as_ref()
+                    .unwrap()[0],
+                _ => panic!("exported declaration must produce one generic interface target"),
+            };
+            assert!(fixture.store.publish_interface_no_base_resolution(target));
+            assert_eq!(
+                publish_generic_interface_declared_members(
+                    &mut fixture.store,
+                    &plan,
+                    target,
+                    &[parameter],
+                ),
+                Ok(target),
+            );
+
+            let string = fixture.store.intrinsic_bootstrap().unwrap().string_type;
+            let reference = fixture
+                .store
+                .create_direct_generic_reference_type(target, &[string])
+                .unwrap();
+            assert_eq!(
+                fixture
+                    .store
+                    .resolve_generic_interface_property(reference, "value", None)
+                    .unwrap()
+                    .unwrap()
+                    .type_id(),
+                string,
+            );
+        }
     }
 
     #[test]

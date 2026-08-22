@@ -614,6 +614,14 @@ fn tuple_type_error(error: TupleTypeError, node: NodeRef) -> DeclaredTypeError {
         | TupleTypeError::InvalidInstantiationCache {
             instance: type_, ..
         } => type_node_unavailable(TypeNodeUnavailable::InvalidCachedTupleType(type_)),
+        TupleTypeError::UnsupportedElementFlags { .. }
+        | TupleTypeError::UnsupportedElementOrder { .. }
+        | TupleTypeError::ArrayRestCollapseUnavailable => {
+            type_node_unavailable(TypeNodeUnavailable::UnsupportedSyntax {
+                node,
+                kind: SyntaxKind::TupleType,
+            })
+        }
         _ => type_node_unavailable(TypeNodeUnavailable::InvalidTupleType(node)),
     }
 }
@@ -4479,6 +4487,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 if flags.contains(SymbolFlags::INTERFACE)
                     && !flags.contains(SymbolFlags::CLASS)
                     && type_arguments.is_empty()
+                    && !self.is_initialized_global_function(symbol)
                 {
                     self.plan_property_interface(symbol)?;
                 }
@@ -4750,6 +4759,22 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             .and_then(|globals| globals.get_source(name))
             .and_then(|global| self.store.get_merged_symbol(global))
             == Some(symbol)
+    }
+
+    fn is_initialized_global_function(&self, symbol: SemanticSymbolId) -> bool {
+        self.global_symbol_has_name(symbol, "Function")
+            && self
+                .store
+                .declared_type_links(symbol)
+                .and_then(|links| links.declared_type)
+                .and_then(|type_| self.store.type_payload(type_))
+                .is_some_and(|record| {
+                    matches!(record.data(), TypeData::Interface(_))
+                        && record
+                            .symbol()
+                            .and_then(|owner| self.store.get_merged_symbol(owner))
+                            == Some(symbol)
+                })
     }
 
     fn cached_class_or_interface_reference(&self, node: NodeRef) -> bool {
@@ -16685,6 +16710,61 @@ mod tests {
     }
 
     #[test]
+    fn initialized_global_function_reuses_identity_without_expanding_method_members() {
+        let mut fixture = global_array_fixture(concat!(
+            "interface Function { invoke(value: string): number; } ",
+            "interface FunctionConstructor {} ",
+            "declare var Function: FunctionConstructor; ",
+            "let callable: Function;",
+        ));
+        let reference = variable_type_node(&fixture, "callable");
+        let function = named_symbol(&fixture, SyntaxKind::InterfaceDeclaration, "Function");
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        assert!(matches!(
+            query_node(&mut fixture, reference, &mut diagnostics),
+            Err(DeclaredTypeError::TypeNodeUnavailable(
+                TypeNodeUnavailable::UnsupportedSyntax {
+                    kind: SyntaxKind::MethodSignature,
+                    ..
+                }
+            ))
+        ));
+        assert!(fixture.store.declared_type_links(function).is_none());
+
+        let global_types = initialize_fixture_global_types(&mut fixture);
+        let expected = global_types.function_type;
+        assert_eq!(
+            fixture
+                .store
+                .declared_type_links(function)
+                .and_then(|links| links.declared_type),
+            Some(expected),
+        );
+        assert_eq!(
+            query_node(&mut fixture, reference, &mut diagnostics),
+            Ok(expected)
+        );
+        assert_eq!(
+            query_global_node(&mut fixture, &global_types, reference, &mut diagnostics),
+            Ok(expected),
+        );
+        let TypeData::Interface(interface) = fixture.store.type_payload(expected).unwrap().data()
+        else {
+            panic!("global Function must retain its initialized interface identity")
+        };
+        assert!(!interface.declared_members_resolved);
+
+        let warm = store_state(&fixture.store);
+        assert_eq!(
+            query_global_node(&mut fixture, &global_types, reference, &mut diagnostics),
+            Ok(expected),
+        );
+        assert_eq!(store_state(&fixture.store), warm);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
     fn interface_member_cache_accepts_cold_bases_warm_and_members_warm_states() {
         let mut cold = fixture("interface Model { value: string } let model: Model;");
         let model = canonical_fixture_symbol(&cold, SyntaxKind::InterfaceDeclaration, "Model");
@@ -17092,7 +17172,7 @@ mod tests {
                 SyntaxKind::TypeAliasDeclaration,
             ),
             (
-                "type Bad = { 'value': string };",
+                "declare const key: string; type Bad = { [key]: string };",
                 SyntaxKind::TypeAliasDeclaration,
             ),
         ];
@@ -21025,6 +21105,51 @@ mod tests {
             );
         }
         assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn unsupported_tuple_constructor_shapes_do_not_hide_poisoned_cache_errors() {
+        let fixture = fixture("let values: [string];");
+        let tuple = variable_type_node(&fixture, "values");
+        let expected =
+            DeclaredTypeError::TypeNodeUnavailable(TypeNodeUnavailable::UnsupportedSyntax {
+                node: tuple,
+                kind: SyntaxKind::TupleType,
+            });
+
+        for error in [
+            TupleTypeError::UnsupportedElementFlags {
+                index: 0,
+                flags: ElementFlags::VARIADIC,
+            },
+            TupleTypeError::UnsupportedElementOrder { index: 0 },
+            TupleTypeError::ArrayRestCollapseUnavailable,
+        ] {
+            assert_eq!(tuple_type_error(error, tuple), expected);
+        }
+
+        let cached = fixture.store.intrinsic_bootstrap().unwrap().string_type;
+        for error in [
+            TupleTypeError::InvalidTargetCache(cached),
+            TupleTypeError::InvalidInstantiationCache {
+                target: cached,
+                instance: cached,
+            },
+        ] {
+            assert_eq!(
+                tuple_type_error(error, tuple),
+                DeclaredTypeError::TypeNodeUnavailable(
+                    TypeNodeUnavailable::InvalidCachedTupleType(cached,)
+                ),
+            );
+        }
+        assert_eq!(
+            tuple_type_error(
+                TupleTypeError::UnsupportedCreationFlags(ObjectFlags::ARRAY_LITERAL),
+                tuple,
+            ),
+            DeclaredTypeError::TypeNodeUnavailable(TypeNodeUnavailable::InvalidTupleType(tuple)),
+        );
     }
 
     #[test]

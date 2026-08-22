@@ -669,14 +669,16 @@ impl CanonicalTypeMapperStore {
         }
         validate_mapped_member_dependencies(self, type_, &mut HashSet::new())?;
         let shape = validate_mapped_shape(self, type_)?;
-        if let Some(indexes) = plan_mapped_index_signatures(self, &shape, modifiers)? {
-            return resolve_mapped_index_signatures(self, &shape, &indexes);
-        }
-        let properties = plan_mapped_properties(self, &shape, modifiers)?;
-        if let Some(cached) = validate_warm_mapped_members(self, &shape, &properties)? {
+        let indexes = plan_mapped_index_signatures(self, &shape, modifiers)?.unwrap_or_default();
+        let properties = if indexes.is_empty() || !shape.source_properties.is_empty() {
+            plan_mapped_properties(self, &shape, modifiers)?
+        } else {
+            Vec::new()
+        };
+        if let Some(cached) = validate_warm_mapped_members(self, &shape, &properties, &indexes)? {
             return Ok(cached);
         }
-        publish_mapped_members(self, &shape, properties)
+        publish_mapped_members(self, &shape, properties, &indexes)
     }
 
     /// Resolves one mapped property and evaluates its value type on demand.
@@ -1049,7 +1051,10 @@ fn plan_mapped_index_signatures(
     shape: &MappedShape,
     modifiers: MappedTypeModifiers,
 ) -> Result<Option<Vec<PlannedMappedIndex>>, MappedTypeError> {
-    if shape.name_type.is_some() || !shape.source_properties.is_empty() {
+    if shape
+        .name_type
+        .is_some_and(|name| name != shape.type_parameter)
+    {
         return Ok(None);
     }
     let bootstrap = store
@@ -1072,14 +1077,26 @@ fn plan_mapped_index_signatures(
         {
             vec![shape.constraint_type]
         }
-        TypeData::Union(union)
-            if union.union.types.iter().all(|key| {
-                [bootstrap.string_type, bootstrap.number_type].contains(key)
-                    || is_template_pattern_index_key(store, *key)
-            }) =>
-        {
+        TypeData::Union(union) => {
+            let index_keys = union
+                .union
+                .types
+                .iter()
+                .copied()
+                .filter(|key| {
+                    [bootstrap.string_type, bootstrap.number_type].contains(key)
+                        || is_template_pattern_index_key(store, *key)
+                })
+                .collect::<Vec<_>>();
+            if index_keys.is_empty()
+                || union.union.types.iter().any(|key| {
+                    !index_keys.contains(key) && property_name_from_type(store, *key).is_none()
+                })
+            {
+                return Ok(None);
+            }
             if shape.source_indexes.is_empty() {
-                union.union.types.clone()
+                index_keys
             } else {
                 shape
                     .source_indexes
@@ -1159,95 +1176,6 @@ fn mapped_index_value_type(
     }
 }
 
-fn resolve_mapped_index_signatures(
-    store: &mut CanonicalTypeMapperStore,
-    shape: &MappedShape,
-    expected: &[PlannedMappedIndex],
-) -> Result<ResolvedMappedTypeMembers, MappedTypeError> {
-    let record = store
-        .type_payload(shape.type_)
-        .ok_or(MappedTypeError::InvalidMappedType(shape.type_))?;
-    let TypeData::Mapped(mapped) = record.data() else {
-        return Err(MappedTypeError::InvalidMappedType(shape.type_));
-    };
-    let structured = &mapped.object.structured;
-    if record
-        .object_flags()
-        .contains(ObjectFlags::MEMBERS_RESOLVED)
-    {
-        let members = structured
-            .members
-            .ok_or(MappedTypeError::InvalidCachedMembers(shape.type_))?;
-        let table = store
-            .symbol_table(members)
-            .ok_or(MappedTypeError::InvalidCachedMembers(shape.type_))?;
-        let infos = structured.index_infos.as_deref().unwrap_or_default();
-        if !table.is_empty()
-            || structured.properties.is_some()
-            || structured.signatures.is_some()
-            || structured.call_signature_count != 0
-            || infos.len() != expected.len()
-            || infos.iter().zip(expected).any(|(id, planned)| {
-                store.index_info(*id).is_none_or(|info| {
-                    info.key_type() != planned.key_type
-                        || info.value_type() != planned.value_type
-                        || info.is_readonly() != planned.readonly
-                        || info.declaration().is_some()
-                })
-            })
-        {
-            return Err(MappedTypeError::InvalidCachedMembers(shape.type_));
-        }
-        return Ok(ResolvedMappedTypeMembers {
-            type_: shape.type_,
-            members,
-            properties: Vec::new(),
-        });
-    }
-    if structured != &StructuredTypeData::default() {
-        return Err(MappedTypeError::InvalidCachedMembers(shape.type_));
-    }
-    let table = PreparedSymbolTable::new(0).ok_or(MappedTypeError::Capacity)?;
-    if !store.try_reserve_checker_symbol_allocations(0, 1)
-        || !store.try_reserve_index_infos(expected.len())
-    {
-        return Err(MappedTypeError::Capacity);
-    }
-    if !store.set_structured_type_members(shape.type_, None, None, None, None, None) {
-        return Err(MappedTypeError::InvalidCachedMembers(shape.type_));
-    }
-    let members = store.alloc_prepared_symbol_table(table);
-    let mut infos = Vec::with_capacity(expected.len());
-    for index in expected {
-        infos.push(
-            store
-                .alloc_index_info(
-                    index.key_type,
-                    index.value_type,
-                    index.readonly,
-                    None,
-                    Vec::new(),
-                )
-                .ok_or(MappedTypeError::Capacity)?,
-        );
-    }
-    if !store.set_structured_type_members(
-        shape.type_,
-        Some(members),
-        None,
-        None,
-        None,
-        (!infos.is_empty()).then_some(infos),
-    ) {
-        return Err(MappedTypeError::InvalidCachedMembers(shape.type_));
-    }
-    Ok(ResolvedMappedTypeMembers {
-        type_: shape.type_,
-        members,
-        properties: Vec::new(),
-    })
-}
-
 fn plan_mapped_properties(
     store: &CanonicalTypeMapperStore,
     shape: &MappedShape,
@@ -1318,19 +1246,20 @@ fn constraint_keys(
                 shape.constraint_type,
             ))?;
     let keys = match record.data() {
-        TypeData::Index(index) if index.target == shape.modifiers_type => shape
-            .source_properties
-            .iter()
-            .map(|property| {
-                property
-                    .name
-                    .as_ref()
-                    .as_utf8()
-                    .map(str::to_owned)
-                    .map(|name| MappedTypeKey::source_string(store, name))
-                    .ok_or(MappedTypeError::InvalidSource(shape.modifiers_type))
-            })
-            .collect::<Result<Vec<_>, _>>()?,
+        TypeData::Index(index) if index.target == shape.modifiers_type => {
+            mapped_source_property_keys(store, shape)?
+        }
+        TypeData::Union(union)
+            if !shape.source_indexes.is_empty()
+                && union.union.types.iter().any(|key| {
+                    shape
+                        .source_indexes
+                        .iter()
+                        .any(|index| index.key_type == *key)
+                }) =>
+        {
+            mapped_source_property_keys(store, shape)?
+        }
         TypeData::Union(union) => union
             .union
             .types
@@ -1371,6 +1300,25 @@ fn constraint_keys(
         }
     }
     Ok(keys)
+}
+
+fn mapped_source_property_keys(
+    store: &CanonicalTypeMapperStore,
+    shape: &MappedShape,
+) -> Result<Vec<MappedTypeKey>, MappedTypeError> {
+    shape
+        .source_properties
+        .iter()
+        .map(|property| {
+            property
+                .name
+                .as_ref()
+                .as_utf8()
+                .map(str::to_owned)
+                .map(|name| MappedTypeKey::source_string(store, name))
+                .ok_or(MappedTypeError::InvalidSource(shape.modifiers_type))
+        })
+        .collect()
 }
 
 fn mapped_name_types(
@@ -1498,7 +1446,8 @@ fn property_name_from_type(store: &CanonicalTypeMapperStore, type_: TypeId) -> O
 fn validate_warm_mapped_members(
     store: &CanonicalTypeMapperStore,
     shape: &MappedShape,
-    expected: &[PlannedMappedProperty],
+    expected_properties: &[PlannedMappedProperty],
+    expected_indexes: &[PlannedMappedIndex],
 ) -> Result<Option<ResolvedMappedTypeMembers>, MappedTypeError> {
     let record = store
         .type_payload(shape.type_)
@@ -1523,16 +1472,26 @@ fn validate_warm_mapped_members(
     let table = store
         .symbol_table(members)
         .ok_or(MappedTypeError::InvalidCachedMembers(shape.type_))?;
-    if properties.len() != expected.len()
-        || structured.properties.is_some() == expected.is_empty()
-        || table.len() != expected.len()
+    let indexes = structured.index_infos.as_deref().unwrap_or_default();
+    if properties.len() != expected_properties.len()
+        || structured.properties.is_some() == expected_properties.is_empty()
+        || table.len() != expected_properties.len()
         || structured.signatures.is_some()
         || structured.call_signature_count != 0
-        || structured.index_infos.is_some()
+        || indexes.len() != expected_indexes.len()
+        || structured.index_infos.is_some() == expected_indexes.is_empty()
+        || indexes.iter().zip(expected_indexes).any(|(id, expected)| {
+            store.index_info(*id).is_none_or(|index| {
+                index.key_type() != expected.key_type
+                    || index.value_type() != expected.value_type
+                    || index.is_readonly() != expected.readonly
+                    || index.declaration().is_some()
+            })
+        })
     {
         return Err(MappedTypeError::InvalidCachedMembers(shape.type_));
     }
-    for (symbol, expected) in properties.iter().zip(expected) {
+    for (symbol, expected) in properties.iter().zip(expected_properties) {
         let property = store
             .symbol(*symbol)
             .ok_or(MappedTypeError::InvalidCachedProperty(*symbol))?;
@@ -1649,6 +1608,7 @@ fn publish_mapped_members(
     store: &mut CanonicalTypeMapperStore,
     shape: &MappedShape,
     planned: Vec<PlannedMappedProperty>,
+    indexes: &[PlannedMappedIndex],
 ) -> Result<ResolvedMappedTypeMembers, MappedTypeError> {
     let table = PreparedSymbolTable::new(planned.len()).ok_or(MappedTypeError::Capacity)?;
     let mut pending_strings = Vec::new();
@@ -1680,6 +1640,7 @@ fn publish_mapped_members(
     }
     if !store.try_reserve_checker_symbol_allocations(planned.len(), 1)
         || !store.try_reserve_value_symbol_links(planned.len())
+        || !store.try_reserve_index_infos(indexes.len())
     {
         return Err(MappedTypeError::Capacity);
     }
@@ -1743,13 +1704,27 @@ fn publish_mapped_members(
         );
         properties.push(symbol);
     }
+    let mut infos = Vec::with_capacity(indexes.len());
+    for index in indexes {
+        infos.push(
+            store
+                .alloc_index_info(
+                    index.key_type,
+                    index.value_type,
+                    index.readonly,
+                    None,
+                    Vec::new(),
+                )
+                .ok_or(MappedTypeError::Capacity)?,
+        );
+    }
     assert!(store.set_structured_type_members(
         shape.type_,
         Some(members),
         (!properties.is_empty()).then_some(properties.clone()),
         None,
         None,
-        None,
+        (!infos.is_empty()).then_some(infos),
     ));
     Ok(ResolvedMappedTypeMembers {
         type_: shape.type_,
@@ -2464,7 +2439,9 @@ mod tests {
         let parsed = parse_source_file(concat!(
             "type Table = { readonly [name: string]: number };\n",
             "type Preserved = { [K in keyof Table]: Table[K] };\n",
+            "type Identity = { [K in keyof Table as K]: Table[K] };\n",
             "type Mutable = { -readonly [K in keyof Table]: Table[K] };\n",
+            "type MutableIdentity = { -readonly [K in keyof Table as K]: Table[K] };\n",
         ));
         assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
         let mut context = checker_context(&parsed);
@@ -2474,7 +2451,13 @@ mod tests {
 
         for (name, modifiers, readonly) in [
             ("Preserved", MappedTypeModifiers::NONE, true),
+            ("Identity", MappedTypeModifiers::NONE, true),
             ("Mutable", MappedTypeModifiers::EXCLUDE_READONLY, false),
+            (
+                "MutableIdentity",
+                MappedTypeModifiers::EXCLUDE_READONLY,
+                false,
+            ),
         ] {
             let mapped = alias_type(&parsed, &context, name);
             let members = context
@@ -2493,6 +2476,79 @@ mod tests {
             assert_eq!(info.key_type(), string);
             assert_eq!(info.value_type(), number);
             assert_eq!(info.is_readonly(), readonly);
+        }
+    }
+
+    #[test]
+    fn homomorphic_mapped_types_preserve_properties_and_index_signatures_together() {
+        let parsed = parse_source_file(concat!(
+            "interface Table { fixed: number; readonly [name: string]: number }\n",
+            "type Preserved = { [K in keyof Table]: Table[K] };\n",
+            "type Identity = { [K in keyof Table as K]: Table[K] };\n",
+            "type Mutable = { -readonly [K in keyof Table as K]: Table[K] };\n",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let mut context = checker_context(&parsed);
+        context.check_source_file(FileId::new(0)).unwrap();
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        let (string, number) = (bootstrap.string_type, bootstrap.number_type);
+
+        for (name, modifiers, readonly) in [
+            ("Preserved", MappedTypeModifiers::NONE, true),
+            ("Identity", MappedTypeModifiers::NONE, true),
+            ("Mutable", MappedTypeModifiers::EXCLUDE_READONLY, false),
+        ] {
+            let mapped = alias_type(&parsed, &context, name);
+            let members = context
+                .store_mut_for_test()
+                .resolve_mapped_type_members(mapped, modifiers)
+                .unwrap();
+            assert_eq!(members.properties().len(), 1, "mapped alias {name}");
+            let TypeData::Mapped(record) = context.store().type_payload(mapped).unwrap().data()
+            else {
+                unreachable!()
+            };
+            assert_eq!(
+                context
+                    .store()
+                    .symbol_table(record.object.structured.members.unwrap())
+                    .unwrap()
+                    .len(),
+                1,
+            );
+            let [index] = record.object.structured.index_infos.as_deref().unwrap() else {
+                panic!("{name} must retain its source string index");
+            };
+            let index = context.store().index_info(*index).unwrap();
+            assert_eq!(index.key_type(), string);
+            assert_eq!(index.value_type(), number);
+            assert_eq!(index.is_readonly(), readonly);
+
+            let property = context
+                .store_mut_for_test()
+                .resolve_mapped_type_property(mapped, "fixed", modifiers)
+                .unwrap()
+                .unwrap();
+            assert_eq!(property.type_id(), number);
+
+            let warm = (
+                cache_state(context.store()),
+                context.store().index_info_len(),
+            );
+            assert_eq!(
+                context
+                    .store_mut_for_test()
+                    .resolve_mapped_type_members(mapped, modifiers)
+                    .unwrap(),
+                members,
+            );
+            assert_eq!(
+                (
+                    cache_state(context.store()),
+                    context.store().index_info_len(),
+                ),
+                warm,
+            );
         }
     }
 

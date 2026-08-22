@@ -2469,8 +2469,9 @@ impl<'store> RelaterSession<'store> {
                 (info.key_type() == target_key
                     || !self.relation.is_identity()
                         && info.key_type() == self.bootstrap.string_type
-                        && target_key == self.bootstrap.number_type)
-                    .then_some((info.value_type(), info.is_readonly()))
+                        && (target_key == self.bootstrap.number_type
+                            || is_template_pattern_index_key(self.store, target_key)))
+                .then_some((info.value_type(), info.is_readonly()))
             });
             if let Some((source_value, source_readonly)) = source_index {
                 if self.relation.is_identity() && source_readonly != target_readonly {
@@ -10215,6 +10216,52 @@ mod tests {
                 .is_type_identical_to(numbers, readonly_numbers),
             Ok(false)
         );
+    }
+
+    #[test]
+    fn broad_string_indexes_cover_matching_template_pattern_index_values() {
+        fn declared_alias(fixture: &mut FunctionRelationFixture, name: &str) -> TypeId {
+            let globals = fixture.store.intrinsic_bootstrap().unwrap().globals;
+            let symbol = fixture
+                .store
+                .symbol_table(globals)
+                .and_then(|globals| globals.get_source(name))
+                .unwrap_or_else(|| panic!("missing declared alias {name}"));
+            let host = relation_host(
+                &fixture.parsed.arena,
+                fixture.files.get(&fixture.file).unwrap(),
+            );
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            let type_ = CanonicalTypeQuery::new(
+                &mut fixture.store,
+                &host,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_declared_type_of_symbol(symbol)
+            .unwrap();
+            assert!(diagnostics.is_empty());
+            type_
+        }
+
+        let mut fixture = function_relation_fixture(concat!(
+            "type All = { [name: string]: number }; ",
+            "type Actions = { [name: `do-${string}`]: number }; ",
+            "type WrongActions = { [name: `do-${string}`]: string };",
+        ));
+        let all = declared_alias(&mut fixture, "All");
+        let actions = declared_alias(&mut fixture, "Actions");
+        let wrong_actions = declared_alias(&mut fixture, "WrongActions");
+
+        assert_eq!(fixture.store.is_type_assignable_to(all, actions), Ok(true));
+        assert_eq!(fixture.store.is_type_subtype_of(all, actions), Ok(true));
+        assert_eq!(fixture.store.is_type_assignable_to(actions, all), Ok(false));
+        assert_eq!(
+            fixture.store.is_type_assignable_to(all, wrong_actions),
+            Ok(false)
+        );
+        assert_eq!(fixture.store.is_type_identical_to(all, actions), Ok(false));
     }
 
     #[test]

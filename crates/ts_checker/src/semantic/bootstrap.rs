@@ -49,6 +49,7 @@ use super::{
     relation::RelationStateSnapshot,
     signatures::{IndexFlags, SignatureFlags, TypePredicateKind},
     store::SemanticStore,
+    structured_members::{InterfaceHeritageMembersValidation, validate_interface_heritage_members},
     tuple_types::PreparedCanonicalTupleType,
     type_records::{
         ConstituentMapState, ConstrainedTypeData, LiteralValue, ObjectTypeData, RegularLiteralLink,
@@ -2115,6 +2116,38 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     }
                     StoredCallableSetValidation::NotCallable => {}
                 }
+                if let TypeData::Interface(interface) = record.data()
+                    && self.direct_interface_heritage_provenance(type_).is_some()
+                {
+                    match validate_interface_heritage_members(self, type_) {
+                        InterfaceHeritageMembersValidation::Valid => {
+                            for property in interface
+                                .reference
+                                .object
+                                .structured
+                                .properties
+                                .as_deref()
+                                .unwrap_or_default()
+                            {
+                                let property_type = self
+                                    .value_symbol_links(*property)
+                                    .and_then(|links| links.resolved_type)
+                                    .ok_or(LiteralTypeCacheError::InvalidCachedUnion(type_))?;
+                                self.validate_cached_array_capability_worker(
+                                    property_type,
+                                    array_validation,
+                                    visited,
+                                    allowed_pending,
+                                )?;
+                            }
+                            return Ok(());
+                        }
+                        InterfaceHeritageMembersValidation::Malformed
+                        | InterfaceHeritageMembersValidation::NotHeritage => {
+                            return Err(LiteralTypeCacheError::InvalidCachedUnion(type_));
+                        }
+                    }
+                }
                 match object_members::validate_resolved_declared_property_type_graph(self, type_) {
                     object_members::DeclaredPropertyTypeGraphValidation::Traversable(
                         property_types,
@@ -2483,6 +2516,19 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                         return Err(LiteralTypeCacheError::InvalidCachedUnion(type_));
                     }
                     StoredCallableSetValidation::NotCallable => {}
+                }
+                if self.direct_interface_heritage_provenance(type_).is_some() {
+                    if validate_interface_heritage_members(self, type_)
+                        != InterfaceHeritageMembersValidation::Valid
+                    {
+                        return Err(LiteralTypeCacheError::InvalidCachedUnion(type_));
+                    }
+                    return self.validate_cached_array_capability_worker(
+                        type_,
+                        array_validation,
+                        &mut HashSet::new(),
+                        allowed_pending,
+                    );
                 }
                 match object_members::validate_resolved_declared_property_object(self, type_) {
                     object_members::DeclaredPropertyObjectValidation::Valid(_) => self
@@ -6235,6 +6281,88 @@ mod tests {
                     .union_of_union_cache_len(),
             ),
             warm
+        );
+    }
+
+    #[test]
+    fn inherited_interface_union_constituents_require_exact_heritage_provenance() {
+        let parsed = parse_source_file(concat!(
+            "interface Base { inherited: number }\n",
+            "interface Derived extends Base { own: string }\n",
+            "declare const value: Derived;\n",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(144);
+        let mut context = checker_context(file, &parsed);
+        context.check_source_file(file).unwrap();
+        let declaration = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::InterfaceDeclaration(interface) = &record.data else {
+                    return None;
+                };
+                let NodeData::Identifier(name) = &parsed.arena.get(interface.name)?.data else {
+                    return None;
+                };
+                (name.text == "Derived").then_some(NodeRef::new(parsed.arena.id(), file, node))
+            })
+            .expect("fixture declares Derived");
+        let owner = context
+            .file(file)
+            .unwrap()
+            .1
+            .symbol(declaration)
+            .and_then(|owner| context.store().get_merged_symbol(owner))
+            .expect("Derived has a canonical declaration symbol");
+        let inherited = context
+            .store()
+            .declared_type_links(owner)
+            .and_then(|links| links.declared_type)
+            .expect("Derived has a resolved declared type");
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        let store = context.store_mut_for_test();
+
+        assert_eq!(store.validate_union_constituent(inherited), Ok(()));
+        let union = store
+            .literal_union_type(&[inherited, number], None)
+            .unwrap();
+        assert_eq!(union_types(store, union), &[number, inherited]);
+        let warm = (
+            store.type_len(),
+            store.intrinsic_bootstrap().unwrap().union_cache_len(),
+        );
+        assert_eq!(
+            store.literal_union_type(&[inherited, number], None),
+            Ok(union)
+        );
+        assert_eq!(
+            (
+                store.type_len(),
+                store.intrinsic_bootstrap().unwrap().union_cache_len(),
+            ),
+            warm,
+        );
+
+        assert!(store.set_interface_base_resolution(inherited, true, None, None));
+        assert_eq!(
+            store.validate_union_constituent(inherited),
+            Err(LiteralTypeCacheError::InvalidCachedUnion(inherited)),
+        );
+        let poisoned = (
+            store.type_len(),
+            store.intrinsic_bootstrap().unwrap().union_cache_len(),
+        );
+        assert_eq!(
+            store.literal_union_type(&[inherited, number], None),
+            Err(LiteralTypeCacheError::InvalidCachedUnion(inherited)),
+        );
+        assert_eq!(
+            (
+                store.type_len(),
+                store.intrinsic_bootstrap().unwrap().union_cache_len(),
+            ),
+            poisoned,
         );
     }
 

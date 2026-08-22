@@ -1037,6 +1037,128 @@ fn nested_elements_and_fragments_keep_closing_tag_identity() {
 }
 
 #[test]
+fn inline_object_spread_attributes_publish_jsx_property_types() {
+    let source =
+        format!("{NAMESPACE}const view = <div {{...{{ label: \"ok\", enabled: true }} }} />;\n");
+    let mut fixture = Fixture::new(&source, FileId::new(3_709));
+    let opening = fixture.expression("view");
+    let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+    let element = fixture
+        .check(
+            opening,
+            CanonicalCheckerOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    assert_eq!(
+        fixture
+            .store
+            .type_node_links(opening)
+            .and_then(|links| links.resolved_type),
+        Some(element)
+    );
+
+    let object = fixture
+        .parsed
+        .arena
+        .iter()
+        .find_map(|(node, record)| {
+            (record.kind == SyntaxKind::ObjectLiteralExpression).then_some(NodeRef::new(
+                fixture.parsed.arena.id(),
+                fixture.file,
+                node,
+            ))
+        })
+        .expect("spread has an object literal");
+    assert!(
+        fixture
+            .store
+            .type_node_links(object)
+            .and_then(|links| links.resolved_type)
+            .is_some()
+    );
+}
+
+#[test]
+fn inline_object_spread_attributes_share_the_published_object_type() {
+    let source = format!(
+        "{NAMESPACE}const view = <div {{...{{ label: \"ok\", enabled: true as any }}}} />;\n"
+    );
+    let mut fixture = Fixture::new(&source, FileId::new(3_711));
+    let opening = fixture.expression("view");
+    let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+    let element = fixture
+        .check(
+            opening,
+            CanonicalCheckerOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+
+    let NodeData::JsxSelfClosingElement(jsx) =
+        &fixture.parsed.arena.get(opening.node).unwrap().data
+    else {
+        panic!("expected a self-closing JSX expression")
+    };
+    let attributes = NodeRef::new(opening.arena, opening.file, jsx.attributes);
+    let NodeData::JsxAttributes(attribute_list) =
+        &fixture.parsed.arena.get(attributes.node).unwrap().data
+    else {
+        panic!("expected JSX attributes")
+    };
+    let [spread] = attribute_list.properties.nodes.as_slice() else {
+        panic!("expected one JSX object spread")
+    };
+    let NodeData::JsxSpreadAttribute(spread) = &fixture.parsed.arena.get(*spread).unwrap().data
+    else {
+        panic!("expected an object spread attribute")
+    };
+    let object = NodeRef::new(opening.arena, opening.file, spread.expression);
+    let object_type = fixture
+        .store
+        .type_node_links(object)
+        .and_then(|links| links.resolved_type)
+        .expect("the spread object has one published type");
+    assert_eq!(
+        fixture
+            .store
+            .type_node_links(attributes)
+            .and_then(|links| links.resolved_type),
+        Some(object_type),
+    );
+
+    let warm = (
+        fixture.store.type_len(),
+        fixture.store.symbol_len(),
+        fixture.store.signature_len(),
+    );
+    assert_eq!(
+        fixture
+            .check(
+                opening,
+                CanonicalCheckerOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap(),
+        element,
+    );
+    assert_eq!(
+        (
+            fixture.store.type_len(),
+            fixture.store.symbol_len(),
+            fixture.store.signature_len(),
+        ),
+        warm,
+    );
+    assert!(diagnostics.is_empty());
+}
+
+#[test]
 fn spread_attributes_fail_before_jsx_semantic_publication() {
     let source =
         format!("{NAMESPACE}declare const props: any;\nconst view = <div {{...props}} />;\n");

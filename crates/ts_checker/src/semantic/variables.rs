@@ -389,6 +389,121 @@ pub(super) fn plan_identifier_read(
     })
 }
 
+/// Resolves one already-planned class or enum value without treating it as a variable.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn plan_declared_value_identifier_read(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    node: NodeRef,
+    name: &str,
+    expected: SemanticSymbolId,
+) -> Result<PlannedIdentifierRead, VariablePlanError> {
+    let mut callback_host = host
+        .name_resolver_host(store)
+        .map_err(VariablePlanError::DeclaredType)?;
+    let mut name_lookup =
+        CanonicalNameResolver::new(arena, bound, store.symbol_store(), &mut callback_host)
+            .map_err(|error| name_resolution_error(node, error))?;
+    let resolved_symbol = name_lookup
+        .resolve(
+            Some(CanonicalResolutionLocation::Bound(node)),
+            name,
+            SymbolFlags::VALUE | SymbolFlags::EXPORT_VALUE,
+            None,
+            false,
+            false,
+        )
+        .map_err(|error| name_resolution_error(node, error))?
+        .ok_or(VariablePlanError::Unsupported(
+            VariableUnsupported::UnresolvedIdentifier(node),
+        ))?;
+    let routed = route_value_symbol(store, node, resolved_symbol)?;
+    if routed.target != expected {
+        return Err(VariableInvariant::InvalidSymbolShape(expected).into());
+    }
+    let record = store
+        .symbol(routed.target)
+        .ok_or(VariableInvariant::InvalidSymbol(routed.target))?;
+    if !record
+        .flags()
+        .intersects(SymbolFlags::CLASS | SymbolFlags::ENUM)
+    {
+        return Err(VariablePlanError::Unsupported(
+            VariableUnsupported::NonVariableSymbol {
+                node,
+                symbol: routed.target,
+                flags: record.flags(),
+            },
+        ));
+    }
+    let Some([declaration]) = record.declarations() else {
+        return Err(VariablePlanError::Unsupported(
+            VariableUnsupported::NonUniqueDeclaration {
+                node,
+                symbol: routed.target,
+                declaration_count: record.declarations().map_or(0, <[NodeRef]>::len),
+            },
+        ));
+    };
+    let declaration = *declaration;
+    if declaration.file != node.file || declaration.arena != node.arena {
+        return Err(VariablePlanError::Unsupported(
+            VariableUnsupported::CrossFileDeclaration { node, declaration },
+        ));
+    }
+    if !matches!(
+        store.source_node_kind(declaration),
+        Some(SyntaxKind::ClassDeclaration | SyntaxKind::EnumDeclaration)
+    ) || record.value_declaration() != Some(declaration)
+        || record.name().as_bytes() != name.as_bytes()
+    {
+        return Err(VariableInvariant::InvalidSymbolShape(routed.target).into());
+    }
+    let declaration_symbol = bound
+        .symbol(declaration)
+        .ok_or(VariableInvariant::MissingDeclarationSymbol(declaration))?;
+    if store.get_merged_symbol(declaration_symbol) != Some(routed.target) {
+        return Err(VariableInvariant::DeclarationSymbolMismatch {
+            declaration,
+            expected: routed.target,
+            actual: declaration_symbol,
+        }
+        .into());
+    }
+    if let Some(local) = routed.export_local {
+        validate_export_local(store, local, declaration, routed.target, name)?;
+    }
+    if bound.local_symbol(declaration) != routed.export_local {
+        return Err(VariableInvariant::LocalExportSymbolMismatch {
+            declaration,
+            expected: routed.export_local,
+            actual: bound.local_symbol(declaration),
+        }
+        .into());
+    }
+    validate_target_parent(bound, store, routed.target, routed.export_local.is_some())?;
+    if store.symbol_node_links(node).is_some_and(|links| {
+        links
+            .resolved_symbol
+            .is_some_and(|cached| cached != routed.resolved)
+    }) {
+        return Err(VariableInvariant::InvalidSymbolNodeCache {
+            node,
+            cached: store
+                .symbol_node_links(node)
+                .and_then(|links| links.resolved_symbol),
+            expected: routed.resolved,
+        }
+        .into());
+    }
+    Ok(PlannedIdentifierRead {
+        resolved_symbol: routed.resolved,
+        value_symbol: routed.target,
+    })
+}
+
 fn route_value_symbol(
     store: &CanonicalTypeMapperStore,
     node: NodeRef,

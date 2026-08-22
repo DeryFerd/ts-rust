@@ -2153,6 +2153,8 @@ mod tests {
         let parsed = ts_parser::parse_jsx_source_file(concat!(
             "const concise = (): unknown => <div />; ",
             "const returned = (): unknown => { return <span />; };",
+            "const wrapped = (): unknown => (<section />); ",
+            "const wrapped_return = (): unknown => { return (<article />); };",
         ));
         assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
         let fixture = Fixture::from_parsed(parsed);
@@ -2171,6 +2173,22 @@ mod tests {
             SourceArrowBodyPlan::ReturnExpression { expression, .. }
                 if fixture.parsed.arena.get(expression.node).unwrap().kind
                     == SyntaxKind::JsxSelfClosingElement
+        ));
+
+        let wrapped = fixture.plan(2).unwrap();
+        assert!(matches!(
+            wrapped.body,
+            SourceArrowBodyPlan::ConciseExpression { expression }
+                if fixture.parsed.arena.get(expression.node).unwrap().kind
+                    == SyntaxKind::ParenthesizedExpression
+        ));
+
+        let wrapped_return = fixture.plan(3).unwrap();
+        assert!(matches!(
+            wrapped_return.body,
+            SourceArrowBodyPlan::ReturnExpression { expression, .. }
+                if fixture.parsed.arena.get(expression.node).unwrap().kind
+                    == SyntaxKind::ParenthesizedExpression
         ));
     }
 

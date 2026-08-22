@@ -890,6 +890,7 @@ struct ResolvedLegacySourceCall {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum ResolvedSourceCall {
     Legacy(ResolvedLegacySourceCall),
+    NongenericTypeArguments(ResolvedLegacySourceCall),
     Vector(GenericCallVectorResolution),
     Identity(IdentityGenericCallResolution),
 }
@@ -923,7 +924,29 @@ fn resolve_source_call_once(
         argument_types,
         explicit_type_arguments,
     } = request;
-    if explicit_type_arguments.is_none() {
+    let nongeneric_type_arguments = if explicit_type_arguments.is_some() {
+        match validate_stored_callable_set(store, callee_type) {
+            StoredCallableSetValidation::Valid { projection, .. }
+                if projection.construct_signatures.is_empty()
+                    && projection.call_signatures.len() == 1 =>
+            {
+                store
+                    .signature(projection.call_signatures[0].signature)
+                    .ok_or(SourceCallResolutionError::Invariant)?
+                    .type_parameters()
+                    .is_empty()
+            }
+            StoredCallableSetValidation::Malformed { .. } => {
+                return Err(SourceCallResolutionError::Invariant);
+            }
+            StoredCallableSetValidation::NotCallable
+            | StoredCallableSetValidation::Pending { .. }
+            | StoredCallableSetValidation::Valid { .. } => false,
+        }
+    } else {
+        false
+    };
+    if explicit_type_arguments.is_none() || nongeneric_type_arguments {
         let request = DirectCallRequest {
             form: DirectCallForm::Call,
             optional_chain: false,
@@ -934,14 +957,19 @@ fn resolve_source_call_once(
         };
         match resolve_direct_call(store, global_types, options.strict_function_types, request) {
             Ok(resolution) => {
-                return Ok(ResolvedSourceCall::Legacy(ResolvedLegacySourceCall {
+                let resolved = ResolvedLegacySourceCall {
                     signature: resolution.projection.signature,
                     return_type: resolution.projection.return_type,
                     minimum_argument_count: resolution.projection.minimum_argument_count,
                     maximum_argument_count: resolution.projection.maximum_argument_count,
                     has_effective_rest: resolution.projection.has_effective_rest,
                     applicability: resolution.applicability,
-                }));
+                };
+                return Ok(if nongeneric_type_arguments {
+                    ResolvedSourceCall::NongenericTypeArguments(resolved)
+                } else {
+                    ResolvedSourceCall::Legacy(resolved)
+                });
             }
             Err(DirectCallError::Unsupported(DirectCallUnsupported::GenericSignature(_))) => {}
             Err(
@@ -1543,6 +1571,38 @@ fn prepare_legacy_source_call_diagnostic(
     Ok(vec![diagnostic])
 }
 
+fn prepare_source_type_argument_arity_diagnostic(
+    plan: &SourceCallPlan,
+    explicit_type_arguments: &[TypeId],
+    minimum: usize,
+    maximum: usize,
+) -> Result<CanonicalCheckerDiagnostic, SourceCheckError> {
+    let syntax = plan
+        .type_arguments
+        .as_ref()
+        .ok_or(SourceCheckError::Call(plan.node))?;
+    let actual = explicit_type_arguments.len();
+    if actual == 0
+        || actual != syntax.nodes.len()
+        || minimum > maximum
+        || (minimum..=maximum).contains(&actual)
+    {
+        return Err(SourceCheckError::Call(plan.node));
+    }
+    let range = syntax
+        .diagnostic_range
+        .ok_or(SourceCheckError::Call(plan.node))?;
+    Ok(CanonicalCheckerDiagnostic {
+        node: Some(plan.node),
+        range_override: Some(CanonicalCheckerDiagnosticRange::new(plan.node, range)),
+        diagnostic: Diagnostic::with_arguments(
+            message_by_code(2558).ok_or(SourceCheckError::MissingDiagnostic(2558))?,
+            [expected_count_text(minimum, maximum), actual.to_string()],
+        ),
+        related_information: Vec::new(),
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn prepare_vector_source_call_diagnostic(
     store: &mut CanonicalTypeMapperStore,
@@ -1570,31 +1630,11 @@ fn prepare_vector_source_call_diagnostic(
             maximum,
             actual,
         } => {
-            let syntax = plan
-                .type_arguments
-                .as_ref()
-                .ok_or(SourceCheckError::Call(plan.node))?;
             let resolved = explicit_type_arguments.ok_or(SourceCheckError::Call(plan.node))?;
-            if actual == 0
-                || actual != syntax.nodes.len()
-                || actual != resolved.len()
-                || minimum > maximum
-                || maximum != projection.type_parameters.len()
-            {
+            if actual != resolved.len() || maximum != projection.type_parameters.len() {
                 return Err(SourceCheckError::Call(plan.node));
             }
-            let range = syntax
-                .diagnostic_range
-                .ok_or(SourceCheckError::Call(plan.node))?;
-            CanonicalCheckerDiagnostic {
-                node: Some(plan.node),
-                range_override: Some(CanonicalCheckerDiagnosticRange::new(plan.node, range)),
-                diagnostic: Diagnostic::with_arguments(
-                    message_by_code(2558).ok_or(SourceCheckError::MissingDiagnostic(2558))?,
-                    [expected_count_text(minimum, maximum), actual.to_string()],
-                ),
-                related_information: Vec::new(),
-            }
+            prepare_source_type_argument_arity_diagnostic(plan, resolved, minimum, maximum)?
         }
         GenericCallVectorApplicability::TooFewArguments { expected, actual } => {
             if expected != minimum_argument_count
@@ -1770,14 +1810,15 @@ fn recover_non_callable_source_call(
     let bootstrap = store
         .intrinsic_bootstrap()
         .ok_or(SourceCheckError::Call(plan.node))?;
+    let error_type = bootstrap.error_type;
     let (return_type, signature, report_diagnostic) = if flags.intersects(TypeFlags::ANY) {
-        if callee_type == bootstrap.error_type {
-            (bootstrap.error_type, bootstrap.unknown_signature, false)
+        if callee_type == error_type {
+            (error_type, bootstrap.unknown_signature, false)
         } else {
             (bootstrap.any_type, bootstrap.any_signature, false)
         }
     } else {
-        (bootstrap.error_type, bootstrap.unknown_signature, true)
+        (error_type, bootstrap.unknown_signature, true)
     };
     let existing = preflight_call_publication(store, plan.node, return_type)?;
     if existing.is_some_and(|existing| existing != signature) {
@@ -1816,6 +1857,20 @@ fn recover_non_callable_source_call(
                 message_by_code(2349).ok_or(SourceCheckError::MissingDiagnostic(2349))?,
             )
             .with_details([format!("  {detail}")]),
+            related_information: Vec::new(),
+        })
+    } else if return_type != error_type
+        && plan
+            .type_arguments
+            .as_ref()
+            .is_some_and(|arguments| !arguments.nodes.is_empty())
+    {
+        Some(CanonicalCheckerDiagnostic {
+            node: Some(plan.node),
+            range_override: None,
+            diagnostic: Diagnostic::new(
+                message_by_code(2347).ok_or(SourceCheckError::MissingDiagnostic(2347))?,
+            ),
             related_information: Vec::new(),
         })
     } else {
@@ -1933,6 +1988,21 @@ pub(super) fn check_direct_source_call(
                 resolution,
             )?;
             (resolution.signature, resolution.return_type, diagnostic)
+        }
+        ResolvedSourceCall::NongenericTypeArguments(resolution) => {
+            let existing = preflight_call_publication(store, plan.node, resolution.return_type)?;
+            if existing.is_some_and(|existing| existing != resolution.signature) {
+                return Err(SourceCheckError::Call(plan.node));
+            }
+            let explicit = explicit_type_arguments
+                .as_deref()
+                .ok_or(SourceCheckError::Call(plan.node))?;
+            let diagnostic = prepare_source_type_argument_arity_diagnostic(plan, explicit, 0, 0)?;
+            (
+                resolution.signature,
+                resolution.return_type,
+                vec![diagnostic],
+            )
         }
         ResolvedSourceCall::Vector(resolution) => {
             let diagnostic = prepare_vector_source_call_diagnostic(
@@ -4041,17 +4111,90 @@ mod tests {
     }
 
     #[test]
-    fn explicitly_instantiated_nongeneric_identifier_calls_fail_closed() {
-        let parsed =
-            parsed("function f(value: number): number { return 1; } const x = f<number>(1);");
+    fn nongeneric_explicit_type_arguments_report_ts2558_and_reuse_the_original_signature() {
+        let text = concat!(
+            "function f(value: number): number { return value; } ",
+            "const api = { fn: f }; ",
+            "const direct = f<  /* leading */ string, number >(1); ",
+            "const member = api.fn< /* member */ string >(1); ",
+            "const missing = f< /* missing */ number >();",
+        );
+        let parsed = parsed(text);
         let file = FileId::new(406);
         let mut context = context(&parsed, file);
-        assert!(matches!(
-            context.check_source_file(file),
-            Err(SourceCheckError::Unsupported(
-                UnsupportedSourceSyntax::Call(_)
-            ))
-        ));
+        let mut call_nodes = calls(&parsed, file);
+        call_nodes.sort_by_key(|call| parsed.arena.get(call.node).unwrap().range.start);
+        let [direct, member, missing] = call_nodes.as_slice() else {
+            panic!("expected three nongeneric calls with explicit type arguments")
+        };
+
+        context.check_source_file(file).unwrap();
+
+        let diagnostics = context.diagnostics().as_slice();
+        assert_eq!(diagnostics.len(), 3, "{diagnostics:?}");
+        let expected = [
+            (*direct, "string, number", 2),
+            (*member, "string", 1),
+            (*missing, "number", 1),
+        ];
+        for (diagnostic, (call, expected_text, actual)) in diagnostics.iter().zip(expected) {
+            assert_eq!(diagnostic.diagnostic.code(), 2558);
+            assert_eq!(diagnostic.node, Some(call));
+            assert_eq!(
+                diagnostic.diagnostic.render().unwrap(),
+                format!("Expected 0 type arguments, but got {actual}.")
+            );
+            let range = diagnostic
+                .range_override
+                .expect("TS2558 must retain the exact type argument range")
+                .range();
+            let start = usize::try_from(range.start.get()).unwrap();
+            let end = usize::try_from(range.end.get()).unwrap();
+            assert_eq!(&text[start..end], expected_text);
+            assert!(diagnostic.related_information.is_empty());
+        }
+
+        let owner = first_function_symbol(&parsed, &context, file);
+        let callable = context
+            .store()
+            .source_callable_type_for_owner(owner)
+            .unwrap();
+        let signature = context
+            .store()
+            .source_callable_provenance(callable)
+            .unwrap()
+            .signature;
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        for call in call_nodes.iter().copied() {
+            assert_eq!(
+                context
+                    .store()
+                    .signature_links(call)
+                    .and_then(|links| links.resolved_signature.signature()),
+                Some(signature)
+            );
+            assert_eq!(
+                context
+                    .store()
+                    .type_node_links(call)
+                    .and_then(|links| links.resolved_type),
+                Some(number)
+            );
+        }
+
+        let cold_calls = call_nodes
+            .iter()
+            .map(|call| call_publication_state(&context, *call))
+            .collect::<Vec<_>>();
+        mark_source_unchecked(&mut context, file);
+        context.check_source_file(file).unwrap();
+        assert_eq!(
+            call_nodes
+                .iter()
+                .map(|call| call_publication_state(&context, *call))
+                .collect::<Vec<_>>(),
+            cold_calls
+        );
     }
 
     #[test]
@@ -4135,6 +4278,64 @@ mod tests {
                 .type_node_links(call)
                 .and_then(|links| links.resolved_type),
             Some(bootstrap.any_type)
+        );
+    }
+
+    #[test]
+    fn any_calls_with_explicit_type_arguments_report_ts2347_and_keep_any_recovery() {
+        let parsed = parsed(concat!(
+            "function direct(value: any): any { return value<number>(1); } ",
+            "type API = { fn: any }; ",
+            "function member(api: API): any { return api.fn<string>('value'); }",
+        ));
+        let file = FileId::new(456);
+        let mut context = context(&parsed, file);
+        let mut call_nodes = calls(&parsed, file);
+        call_nodes.sort_by_key(|call| parsed.arena.get(call.node).unwrap().range.start);
+        assert_eq!(call_nodes.len(), 2);
+
+        context.check_source_file(file).unwrap();
+
+        let diagnostics = context.diagnostics().as_slice();
+        assert_eq!(diagnostics.len(), 2, "{diagnostics:?}");
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        for (diagnostic, call) in diagnostics.iter().zip(&call_nodes) {
+            assert_eq!(diagnostic.diagnostic.code(), 2347);
+            assert_eq!(diagnostic.node, Some(*call));
+            assert_eq!(diagnostic.range_override, None);
+            assert_eq!(
+                diagnostic.diagnostic.render().unwrap(),
+                "Untyped function calls may not accept type arguments."
+            );
+            assert!(diagnostic.related_information.is_empty());
+            assert_eq!(
+                context
+                    .store()
+                    .signature_links(*call)
+                    .and_then(|links| links.resolved_signature.signature()),
+                Some(bootstrap.any_signature)
+            );
+            assert_eq!(
+                context
+                    .store()
+                    .type_node_links(*call)
+                    .and_then(|links| links.resolved_type),
+                Some(bootstrap.any_type)
+            );
+        }
+
+        let cold_calls = call_nodes
+            .iter()
+            .map(|call| call_publication_state(&context, *call))
+            .collect::<Vec<_>>();
+        mark_source_unchecked(&mut context, file);
+        context.check_source_file(file).unwrap();
+        assert_eq!(
+            call_nodes
+                .iter()
+                .map(|call| call_publication_state(&context, *call))
+                .collect::<Vec<_>>(),
+            cold_calls
         );
     }
 

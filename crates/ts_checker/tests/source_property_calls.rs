@@ -389,6 +389,65 @@ fn nested_property_receivers_publish_their_call_signature_and_return_type() {
 }
 
 #[test]
+fn nongeneric_property_type_arguments_report_ts2558_and_preserve_public_links() {
+    let source = concat!(
+        "type API = { fn: (value: number) => string }; ",
+        "function use(api: API): string { return api.fn<number>(1); }",
+    );
+    let parsed = parse_source_file(source);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(31);
+    let calls = nodes_of_kind(&parsed, file, SyntaxKind::CallExpression);
+    let accesses = nodes_of_kind(&parsed, file, SyntaxKind::PropertyAccessExpression);
+    let [call] = calls.as_slice() else {
+        panic!("expected one nongeneric property call")
+    };
+    let [access] = accesses.as_slice() else {
+        panic!("expected one property access")
+    };
+    let mut context = context(&parsed, file);
+
+    context.check_source_file(file).unwrap();
+
+    let [diagnostic] = context.diagnostics().as_slice() else {
+        panic!("expected one type-argument arity diagnostic")
+    };
+    assert_eq!(diagnostic.diagnostic.code(), 2558);
+    assert_eq!(diagnostic.node, Some(*call));
+    assert_eq!(
+        diagnostic.diagnostic.render().unwrap(),
+        "Expected 0 type arguments, but got 1."
+    );
+    let range = diagnostic
+        .range_override
+        .expect("TS2558 retains its type-argument range")
+        .range();
+    assert_eq!(
+        &source[usize::try_from(range.start.get()).unwrap()
+            ..usize::try_from(range.end.get()).unwrap()],
+        "number"
+    );
+    let return_type = context
+        .store()
+        .type_node_links(*call)
+        .and_then(|links| links.resolved_type)
+        .expect("the rejected type arguments retain the call result");
+    assert_eq!(context.type_to_string(return_type).unwrap(), "string");
+    assert!(
+        context
+            .store()
+            .signature_links(*call)
+            .is_some_and(|links| links.resolved_signature.signature().is_some())
+    );
+    assert!(context.store().type_node_links(*access).is_some());
+    assert!(context.store().symbol_node_links(*access).is_some());
+
+    let diagnostics = context.diagnostics().clone();
+    context.recheck_source_file(file).unwrap();
+    assert_eq!(context.diagnostics(), &diagnostics);
+}
+
+#[test]
 #[allow(clippy::too_many_lines)] // All unsupported call families share one publication check.
 fn unsupported_property_call_families_fail_closed_without_call_publication() {
     let fixtures = [
@@ -472,13 +531,6 @@ fn unsupported_property_call_families_fail_closed_without_call_publication() {
             concat!(
                 "type API = { fn: (callback: (value: number) => number) => string }; ",
                 "function use(api: API): string { return api.fn(value => value); }",
-            ),
-        ),
-        (
-            "explicit type arguments",
-            concat!(
-                "type API = { fn: (value: number) => string }; ",
-                "function use(api: API): string { return api.fn<number>(1); }",
             ),
         ),
     ];

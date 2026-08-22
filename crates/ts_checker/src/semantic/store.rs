@@ -72,6 +72,7 @@ impl PreparedEntityName {
 struct SourceNodeFacts {
     kind: SyntaxKind,
     parent: Option<NodeId>,
+    prefix_unary_operator: Option<SyntaxKind>,
     exported: bool,
     signature_links_eligible: bool,
 }
@@ -4199,6 +4200,10 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             *slot = Some(SourceNodeFacts {
                 kind: node.kind,
                 parent: node.parent,
+                prefix_unary_operator: match &node.data {
+                    NodeData::PrefixUnaryExpression(prefix) => Some(prefix.operator),
+                    _ => None,
+                },
                 exported: match &node.data {
                     NodeData::TypeAliasDeclaration(declaration) => {
                         declaration.modifiers.as_ref().is_some_and(|modifiers| {
@@ -5334,6 +5339,29 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
             if literal.parent != Some(node.node) {
                 return false;
             }
+            let (literal_kind, negative) = if literal.kind == SyntaxKind::PrefixUnaryExpression {
+                if literal.prefix_unary_operator != Some(SyntaxKind::MinusToken) {
+                    return false;
+                }
+                let Some(operand_index) = literal_index.checked_sub(1) else {
+                    return false;
+                };
+                let Some(operand) = self
+                    .source_node_facts
+                    .get(&node.arena)
+                    .and_then(|facts| facts.get(operand_index))
+                    .copied()
+                    .flatten()
+                else {
+                    return false;
+                };
+                if operand.parent.map(NodeId::index) != Some(literal_index) {
+                    return false;
+                }
+                (operand.kind, true)
+            } else {
+                (literal.kind, false)
+            };
             let Some(record) = self.type_payload(result) else {
                 return false;
             };
@@ -5348,34 +5376,42 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
                 return false;
             }
             let (expected_kind, expected_flags, cached) = match &data.value {
-                LiteralValue::String(value) => (
+                LiteralValue::String(value) if !negative => (
                     SyntaxKind::StringLiteral,
                     TypeFlags::STRING_LITERAL,
                     bootstrap.cached_string_literal_type(value),
                 ),
-                LiteralValue::Number(value) => (
-                    SyntaxKind::NumericLiteral,
-                    TypeFlags::NUMBER_LITERAL,
-                    bootstrap.cached_number_literal_type(*value),
-                ),
-                LiteralValue::BigInt(value) => (
-                    SyntaxKind::BigIntLiteral,
-                    TypeFlags::BIG_INT_LITERAL,
-                    bootstrap.cached_bigint_literal_type(value),
-                ),
-                LiteralValue::Boolean(true) => (
+                LiteralValue::Number(value)
+                    if value.value() == 0.0 || value.value().is_sign_negative() == negative =>
+                {
+                    (
+                        SyntaxKind::NumericLiteral,
+                        TypeFlags::NUMBER_LITERAL,
+                        bootstrap.cached_number_literal_type(*value),
+                    )
+                }
+                LiteralValue::BigInt(value)
+                    if value.negative == negative || value.base10_value.is_empty() =>
+                {
+                    (
+                        SyntaxKind::BigIntLiteral,
+                        TypeFlags::BIG_INT_LITERAL,
+                        bootstrap.cached_bigint_literal_type(value),
+                    )
+                }
+                LiteralValue::Boolean(true) if !negative => (
                     SyntaxKind::TrueKeyword,
                     TypeFlags::BOOLEAN_LITERAL,
                     Some(bootstrap.regular_true_type),
                 ),
-                LiteralValue::Boolean(false) => (
+                LiteralValue::Boolean(false) if !negative => (
                     SyntaxKind::FalseKeyword,
                     TypeFlags::BOOLEAN_LITERAL,
                     Some(bootstrap.regular_false_type),
                 ),
-                LiteralValue::ComputedEnum => return false,
+                _ => return false,
             };
-            return literal.kind == expected_kind
+            return literal_kind == expected_kind
                 && record.flags() == expected_flags
                 && cached == Some(result);
         }
@@ -5638,7 +5674,7 @@ mod tests {
         signatures::{ElementFlags, SignatureFlags, TypePredicateKind},
         types::{ObjectFlags, TypeFlags},
     };
-    use ts_jsnum::Number;
+    use ts_jsnum::{Number, PseudoBigInt};
 
     type TestStore = SemanticStore<&'static str, &'static str>;
     type CanonicalTestStore = SemanticStore<TypeRecord, &'static str>;
@@ -5759,6 +5795,100 @@ mod tests {
             },
         ));
         assert!(!store.source_type_node_result_is_exact(string_node, number, &[]));
+    }
+
+    #[test]
+    fn signed_source_literal_results_require_minus_operator_and_owned_operand() {
+        let parsed = parse_source_file("type NegativeNumber = -1; type NegativeBigInt = -2n;");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(90_003);
+        let mut store = CanonicalTypeMapperStore::new();
+        assert!(
+            store
+                .register_source_file(&parsed.arena, parsed.source_file, file)
+                .is_some()
+        );
+        store
+            .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions::default())
+            .unwrap();
+        let positive_number = store.regular_number_literal_type(Number::new(1.0)).unwrap();
+        let negative_number = store
+            .regular_number_literal_type(Number::new(-1.0))
+            .unwrap();
+        let positive_bigint = store
+            .regular_bigint_literal_type(PseudoBigInt::new("2", false))
+            .unwrap();
+        let negative_bigint = store
+            .regular_bigint_literal_type(PseudoBigInt::new("2", true))
+            .unwrap();
+        let signed_literals = parsed
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                let NodeData::LiteralTypeNode(literal) = &record.data else {
+                    return None;
+                };
+                let prefix = parsed.arena.get(literal.literal)?;
+                let NodeData::PrefixUnaryExpression(prefix_data) = &prefix.data else {
+                    return None;
+                };
+                Some((
+                    NodeRef::new(parsed.arena.id(), file, node),
+                    literal.literal,
+                    prefix_data.operand,
+                    parsed.arena.get(prefix_data.operand)?.kind,
+                ))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(signed_literals.len(), 2);
+
+        for (node, _, _, kind) in &signed_literals {
+            let (expected, wrong_sign) = match kind {
+                SyntaxKind::NumericLiteral => (negative_number, positive_number),
+                SyntaxKind::BigIntLiteral => (negative_bigint, positive_bigint),
+                _ => panic!("unexpected signed literal kind {kind:?}"),
+            };
+            assert!(!store.source_type_node_result_is_exact(*node, expected, &[]));
+            assert!(store.set_type_node_links(
+                *node,
+                TypeNodeLinks {
+                    resolved_type: Some(expected),
+                    outer_type_parameters: None,
+                },
+            ));
+            assert!(store.source_type_node_result_is_exact(*node, expected, &[]));
+            assert!(store.set_type_node_links(
+                *node,
+                TypeNodeLinks {
+                    resolved_type: Some(wrong_sign),
+                    outer_type_parameters: None,
+                },
+            ));
+            assert!(!store.source_type_node_result_is_exact(*node, wrong_sign, &[]));
+            assert!(store.set_type_node_links(
+                *node,
+                TypeNodeLinks {
+                    resolved_type: Some(expected),
+                    outer_type_parameters: None,
+                },
+            ));
+        }
+
+        let (number_node, prefix, operand, _) = signed_literals[0];
+        store.source_node_facts.get_mut(&parsed.arena.id()).unwrap()[prefix.index()]
+            .as_mut()
+            .unwrap()
+            .prefix_unary_operator = Some(SyntaxKind::PlusToken);
+        assert!(!store.source_type_node_result_is_exact(number_node, negative_number, &[]));
+        store.source_node_facts.get_mut(&parsed.arena.id()).unwrap()[prefix.index()]
+            .as_mut()
+            .unwrap()
+            .prefix_unary_operator = Some(SyntaxKind::MinusToken);
+        store.source_node_facts.get_mut(&parsed.arena.id()).unwrap()[operand.index()]
+            .as_mut()
+            .unwrap()
+            .parent = Some(number_node.node);
+        assert!(!store.source_type_node_result_is_exact(number_node, negative_number, &[]));
     }
 
     #[test]

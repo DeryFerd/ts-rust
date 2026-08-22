@@ -1471,7 +1471,77 @@ impl SyntaxPlanner<'_> {
         self.validate_container(body, declaration)?;
         self.validate_block_scope_container(body, declaration)?;
         self.validate_node_list(body, block.statements.range, &block.statements.nodes)?;
-        Ok(block.statements.nodes.clone())
+
+        let mut statements = Vec::with_capacity(block.statements.nodes.len());
+        let mut directive_prologue = true;
+        for &statement_id in &block.statements.nodes {
+            let statement = self.reference(statement_id);
+            if directive_prologue && self.node(statement)?.kind == SyntaxKind::ExpressionStatement {
+                self.validate_directive_statement(statement, body, declaration)?;
+            } else {
+                directive_prologue = false;
+                statements.push(statement_id);
+            }
+        }
+        Ok(statements)
+    }
+
+    fn validate_directive_statement(
+        &self,
+        statement: NodeRef,
+        body: NodeRef,
+        callable: NodeRef,
+    ) -> Result<(), SourceFunctionStatementsError> {
+        let record = self.node(statement)?;
+        let NodeData::ExpressionStatement(data) = &record.data else {
+            return Err(self.unsupported(
+                statement,
+                record.kind,
+                SourceFunctionStatementsRole::BodyStatement,
+            ));
+        };
+        if record.kind != SyntaxKind::ExpressionStatement
+            || record.flags.0 != 0
+            || record.parent != Some(body.node)
+            || data.flow_node.is_some()
+        {
+            return Err(self.unsupported(
+                statement,
+                record.kind,
+                SourceFunctionStatementsRole::BodyStatement,
+            ));
+        }
+        self.validate_range(statement, body)?;
+        self.validate_container(statement, callable)?;
+        self.validate_block_scope_container(statement, callable)?;
+
+        let expression = self.reference(data.expression);
+        let expression_record = self.node(expression)?;
+        let NodeData::StringLiteral(literal) = &expression_record.data else {
+            return Err(self.unsupported(
+                expression,
+                expression_record.kind,
+                SourceFunctionStatementsRole::BodyStatement,
+            ));
+        };
+        if expression_record.kind != SyntaxKind::StringLiteral
+            || expression_record.flags.0 != 0
+            || literal.token_flags.0 != 0
+        {
+            return Err(self.unsupported(
+                expression,
+                expression_record.kind,
+                SourceFunctionStatementsRole::BodyStatement,
+            ));
+        }
+        self.validate_parent(
+            expression,
+            Some(statement.node),
+            SourceFunctionStatementsRole::BodyStatement,
+        )?;
+        self.validate_range(expression, statement)?;
+        self.validate_container(expression, callable)?;
+        self.validate_block_scope_container(expression, callable)
     }
 
     fn plan_local_statement(
@@ -3052,6 +3122,61 @@ mod joined_tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn linear_body_ignores_leading_string_directives_without_changing_flow() {
+        let fixture = JoinedFixture::new(
+            concat!(
+                "var abstract = true;\n",
+                "function foo() {\n",
+                "  \"use strict\";\n",
+                "  \"another directive\";\n",
+                "  var abstract = true;\n",
+                "}\n",
+            ),
+            FileId::new(1_196),
+        );
+        let syntax = fixture.linear_plan().unwrap();
+        assert_eq!(syntax.locals.len(), 1);
+        assert_eq!(syntax.locals[0].binding, VariableBindingKind::Var);
+        assert!(syntax.return_statement.is_none());
+
+        let assignments = syntax.locals.iter().map(|local| SourceFlowAssignment {
+            declaration: local.declaration,
+            symbol: local.symbol,
+        });
+        assert!(
+            SourceFlowPlan::preflight(
+                &fixture.bound,
+                fixture.declaration(),
+                None,
+                syntax.locals.iter().map(|local| local.name),
+                [],
+                assignments,
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn linear_body_rejects_non_directive_expression_statements() {
+        for source in [
+            "function invalid() { 1; var value = 1; }",
+            "function invalid() { var value = 1; \"use strict\"; }",
+            "function invalid() { ; \"use strict\"; var value = 1; }",
+        ] {
+            let fixture = JoinedFixture::new(source, FileId::new(1_197));
+            assert!(matches!(
+                fixture.linear_plan(),
+                Err(SourceFunctionStatementsError::Unsupported(
+                    SourceFunctionStatementsUnsupported::Syntax {
+                        role: SourceFunctionStatementsRole::BodyStatement,
+                        ..
+                    },
+                )),
+            ));
+        }
     }
 
     #[test]

@@ -1,8 +1,10 @@
 //! Exact source integration for direct and chained property reads.
 //!
-//! The recursively planned receiver must already have a canonical `any` type or
-//! belong to the validated own-property object domain in `relater`. Exact
-//! two-constituent
+//! The recursively planned receiver must already have a canonical `any` type,
+//! a published enum value, an imported namespace, or belong to the validated
+//! own-property object domain in `relater`. Enum values reuse their published
+//! member identities. Namespace reexports retain their export alias while
+//! reading the final value symbol. Exact two-constituent
 //! unions of source-declared type literals reuse the canonical union-property
 //! adapter. A property missing from any union constituent recovers with
 //! `errorType` plus a deferred TS2339 or stable-common-candidate TS2551
@@ -22,6 +24,7 @@ use super::{
     CanonicalTypeFormatFlags, CanonicalTypeMapperStore, DeclaredTypeHost, RelationUnavailable,
     SymbolNodeLinks, TypeDisplayUnavailable, TypeId, TypeNodeLinks,
     bootstrap::UnionReduction,
+    enums,
     formatter::type_to_string_with_host_global_types_and_flags,
     member_resolution::UnionPropertyError,
     source::{PlannedExpression, PlannedExpressionKind},
@@ -445,9 +448,12 @@ pub(super) fn check_direct_source_property(
     } else {
         CopiedSourcePropertySuggestion::Unavailable
     };
-    let namespace_property = resolve_namespace_property(store, plan, receiver_type)?;
-    let (type_, property, diagnostic) = if let Some(namespace_property) = namespace_property {
-        match namespace_property {
+    let declared_property = match resolve_enum_property(store, plan, receiver_type)? {
+        Some(property) => Some(property),
+        None => resolve_namespace_property(store, plan, receiver_type)?,
+    };
+    let (type_, property, diagnostic) = if let Some(declared_property) = declared_property {
+        match declared_property {
             NamespaceProperty::Present { symbol, type_ } => (type_, Some(symbol), None),
             NamespaceProperty::Missing if plan.is_read() => (
                 error_type,
@@ -567,6 +573,51 @@ pub(super) fn check_direct_source_property(
     Ok(CheckedSourceProperty { type_, diagnostic })
 }
 
+fn resolve_enum_property(
+    store: &CanonicalTypeMapperStore,
+    plan: &SourcePropertyPlan,
+    receiver_type: TypeId,
+) -> Result<Option<NamespaceProperty>, SourcePropertyError> {
+    let receiver = store
+        .type_payload(receiver_type)
+        .ok_or(SourcePropertyError::InvalidCache(plan.node))?;
+    let Some(owner) = receiver.symbol() else {
+        return Ok(None);
+    };
+    let owner = store
+        .get_merged_symbol(owner)
+        .ok_or(SourcePropertyError::InvalidCache(plan.node))?;
+    let record = store
+        .symbol(owner)
+        .ok_or(SourcePropertyError::InvalidCache(plan.node))?;
+    if !record.flags().intersects(SymbolFlags::ENUM) {
+        return Ok(None);
+    }
+    if store
+        .value_symbol_links(owner)
+        .and_then(|links| links.resolved_type)
+        != Some(receiver_type)
+    {
+        return Err(SourcePropertyError::InvalidCache(plan.node));
+    }
+    let member = match record.exports() {
+        Some(exports) => store
+            .symbol_table(exports)
+            .ok_or(SourcePropertyError::InvalidCache(plan.node))?
+            .get_source(&plan.name),
+        None => None,
+    };
+    let Some(member) = member else {
+        return Ok(Some(NamespaceProperty::Missing));
+    };
+    let (symbol, type_) = enums::enum_value_member_type(store, receiver_type, &plan.name)
+        .ok_or(SourcePropertyError::InvalidCache(plan.node))?;
+    if store.get_merged_symbol(member) != Some(symbol) {
+        return Err(SourcePropertyError::InvalidCache(plan.node));
+    }
+    Ok(Some(NamespaceProperty::Present { symbol, type_ }))
+}
+
 fn resolve_namespace_property(
     store: &CanonicalTypeMapperStore,
     plan: &SourcePropertyPlan,
@@ -642,7 +693,25 @@ fn resolve_namespace_property(
     let record = store
         .symbol(symbol)
         .ok_or(SourcePropertyError::InvalidCache(plan.node))?;
-    if !record.flags().intersects(SymbolFlags::VALUE) {
+    let value_symbol = if record.flags().contains(SymbolFlags::ALIAS) {
+        let links = store
+            .alias_symbol_links(symbol)
+            .ok_or(SourcePropertyError::InvalidCache(plan.node))?;
+        if links.type_only_declaration.is_some() {
+            return Ok(Some(NamespaceProperty::Missing));
+        }
+        links
+            .alias_target
+            .symbol()
+            .and_then(|target| store.get_merged_symbol(target))
+            .ok_or(SourcePropertyError::InvalidCache(plan.node))?
+    } else {
+        symbol
+    };
+    let value_record = store
+        .symbol(value_symbol)
+        .ok_or(SourcePropertyError::InvalidCache(plan.node))?;
+    if !value_record.flags().intersects(SymbolFlags::VALUE) {
         return Ok(Some(NamespaceProperty::Missing));
     }
     let projected = match object.structured.members {
@@ -678,9 +747,9 @@ fn resolve_namespace_property(
         _ => None,
     };
     let cached = store
-        .value_symbol_links(symbol)
+        .value_symbol_links(value_symbol)
         .and_then(|links| links.resolved_type);
-    let callable = store.source_callable_type_for_owner(symbol);
+    let callable = store.source_callable_type_for_owner(value_symbol);
     if cached
         .zip(callable)
         .is_some_and(|(cached, callable)| cached != callable)
@@ -1151,7 +1220,10 @@ fn publish_property_links(
 #[cfg(test)]
 mod tests {
     use ts_ast::FileId;
-    use ts_binder::{EscapedName, SemanticSymbolId, SymbolData, SymbolFlags};
+    use ts_binder::{
+        CanonicalBinder, CanonicalModuleState, CanonicalSourceFileFacts, CanonicalSourceLanguage,
+        EscapedName, SemanticSymbolId, SymbolData, SymbolFlags,
+    };
     use ts_parser::{ParseResult, parse_source_file};
 
     use super::*;
@@ -1306,6 +1378,68 @@ mod tests {
         (object, module, member, alias)
     }
 
+    fn published_enum(
+        parsed: &ParseResult,
+        file: FileId,
+    ) -> (
+        CanonicalTypeMapperStore,
+        SemanticSymbolId,
+        TypeId,
+        SemanticSymbolId,
+        TypeId,
+    ) {
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/properties.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        let (symbols, files) = binder.finish().try_into_parts().unwrap();
+        let bound = files.get(&file).unwrap();
+        let declaration = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::EnumDeclaration).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .expect("fixture has one enum declaration");
+        let owner = bound.symbol(declaration).unwrap();
+        let mut store = CanonicalTypeMapperStore::from_symbol_store(symbols);
+        assert!(
+            store
+                .register_source_file(&parsed.arena, parsed.source_file, file)
+                .is_some()
+        );
+        store
+            .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions::default())
+            .unwrap();
+        let host = DeclaredTypeHost::new([(&parsed.arena, bound)]).unwrap();
+        let enumeration = enums::get_enum_semantics(&mut store, &host, owner).unwrap();
+        let member = enumeration.members[0].clone();
+        (
+            store,
+            owner,
+            enumeration.value_type,
+            member.symbol,
+            member.fresh_type,
+        )
+    }
+
     #[test]
     fn required_own_property_publishes_exact_symbol_and_type_cold_and_warm() {
         let parsed = parsed("const result = object.value;");
@@ -1380,6 +1514,70 @@ mod tests {
                 .and_then(|links| links.resolved_type),
             Some(any)
         );
+        assert!(store.symbol_node_links(access).is_none());
+    }
+
+    #[test]
+    fn enum_value_properties_publish_the_exact_member_symbol_and_fresh_type() {
+        let parsed = parsed("enum Status { Ready = 1 } const result = Status.Ready;");
+        let file = FileId::new(519);
+        let access = property_access(&parsed, file);
+        let (mut store, owner, value_type, member, fresh_type) = published_enum(&parsed, file);
+        let syntax = plan_direct_source_property_syntax(&parsed.arena, &store, access).unwrap();
+        let receiver = PlannedExpression::new(
+            syntax.receiver(),
+            PlannedExpressionKind::Identifier(PlannedIdentifierRead {
+                resolved_symbol: owner,
+                value_symbol: owner,
+                kind: PlannedIdentifierReadKind::DeclaredValue,
+            }),
+        );
+        let plan = finish_direct_source_property_plan(&syntax, receiver).unwrap();
+
+        for _ in 0..2 {
+            assert_eq!(
+                check_direct_source_property(&mut store, None, &plan, value_type),
+                Ok(CheckedSourceProperty {
+                    type_: fresh_type,
+                    diagnostic: None,
+                }),
+            );
+        }
+        assert_eq!(
+            store
+                .symbol_node_links(access)
+                .and_then(|links| links.resolved_symbol),
+            Some(member),
+        );
+        assert_eq!(
+            store
+                .type_node_links(access)
+                .and_then(|links| links.resolved_type),
+            Some(fresh_type),
+        );
+    }
+
+    #[test]
+    fn missing_enum_value_properties_recover_without_publishing_a_symbol() {
+        let parsed = parsed("enum Status { Ready = 1 } const result = Status.Missing;");
+        let file = FileId::new(520);
+        let access = property_access(&parsed, file);
+        let (mut store, owner, value_type, _, _) = published_enum(&parsed, file);
+        let error_type = store.intrinsic_bootstrap().unwrap().error_type;
+        let syntax = plan_direct_source_property_syntax(&parsed.arena, &store, access).unwrap();
+        let receiver = PlannedExpression::new(
+            syntax.receiver(),
+            PlannedExpressionKind::Identifier(PlannedIdentifierRead {
+                resolved_symbol: owner,
+                value_symbol: owner,
+                kind: PlannedIdentifierReadKind::DeclaredValue,
+            }),
+        );
+        let plan = finish_direct_source_property_plan(&syntax, receiver).unwrap();
+
+        let checked = check_direct_source_property(&mut store, None, &plan, value_type).unwrap();
+        assert_eq!(checked.type_, error_type);
+        assert!(checked.diagnostic.is_some());
         assert!(store.symbol_node_links(access).is_none());
     }
 
@@ -1517,6 +1715,93 @@ mod tests {
                 .symbol_node_links(access)
                 .and_then(|links| links.resolved_symbol),
             Some(member),
+        );
+    }
+
+    #[test]
+    fn namespace_reexport_properties_keep_the_alias_and_read_the_final_value() {
+        let parsed = parsed("const result = namespace.value;");
+        let file = FileId::new(521);
+        let access = property_access(&parsed, file);
+        let mut store = registered_store(&parsed, file);
+        let string = store.intrinsic_bootstrap().unwrap().string_type;
+        let (_, module, target, namespace_alias) = namespace_object(
+            &mut store,
+            "value",
+            string,
+            SymbolFlags::BLOCK_SCOPED_VARIABLE,
+        );
+        let export_alias = store
+            .alloc_symbol(SymbolData::new(
+                SymbolFlags::ALIAS,
+                EscapedName::source("value"),
+            ))
+            .unwrap();
+        assert!(store.set_symbol_relationships(export_alias, None, None, Some(module), None));
+        assert!(store.set_alias_symbol_links(
+            export_alias,
+            AliasSymbolLinks {
+                immediate_target: Some(target),
+                alias_target: AliasTargetState::Resolved(target),
+                ..AliasSymbolLinks::default()
+            },
+        ));
+        let exports = store.symbol(module).unwrap().exports().unwrap();
+        assert_eq!(
+            store.insert_symbol(exports, EscapedName::source("value"), export_alias),
+            Some(Some(target)),
+        );
+
+        let projection = store
+            .alloc_symbol(SymbolData::new(
+                SymbolFlags::PROPERTY,
+                EscapedName::source("value"),
+            ))
+            .unwrap();
+        assert!(store.set_value_symbol_links(
+            projection,
+            ValueSymbolLinks {
+                resolved_type: Some(string),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        let members = store.alloc_symbol_table();
+        assert_eq!(
+            store.insert_symbol(members, EscapedName::source("value"), projection),
+            Some(None),
+        );
+        let object = store
+            .alloc_plain_object_type(ObjectFlags::ANONYMOUS, None)
+            .unwrap();
+        assert!(store.set_structured_type_members(
+            object,
+            Some(members),
+            Some(vec![projection]),
+            None,
+            None,
+            None,
+        ));
+        let syntax = plan_direct_source_property_syntax(&parsed.arena, &store, access).unwrap();
+        let plan = finish_direct_source_property_plan(
+            &syntax,
+            identifier_receiver(&syntax, namespace_alias),
+        )
+        .unwrap();
+
+        for _ in 0..2 {
+            assert_eq!(
+                check_direct_source_property(&mut store, None, &plan, object),
+                Ok(CheckedSourceProperty {
+                    type_: string,
+                    diagnostic: None,
+                }),
+            );
+        }
+        assert_eq!(
+            store
+                .symbol_node_links(access)
+                .and_then(|links| links.resolved_symbol),
+            Some(export_alias),
         );
     }
 
