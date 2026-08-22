@@ -5,8 +5,6 @@ use ts_ast::{Node, NodeArena, NodeData, NodeFlags, NodeId, SyntaxKind};
 use super::declaration_name;
 
 pub(crate) const EXTENSION: &str = ".types";
-pub(crate) const UNAVAILABLE_DETAIL: &str =
-    "semantic .types baseline requires Program access to its production canonical checker context";
 
 pub(crate) fn baseline_base(file_name: &str) -> Option<&str> {
     file_name.strip_suffix(EXTENSION)

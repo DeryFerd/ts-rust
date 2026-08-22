@@ -1,11 +1,13 @@
 //! Ordered AST walks for the pinned type and symbol baseline generator.
 
-use std::{error::Error, fmt};
+use std::{error::Error, fmt, fmt::Write as _};
 
 use ts_ast::{Node, NodeArena, NodeData, NodeFlags, NodeId, NodeRef, SyntaxKind};
-use ts_compiler::{Program, SourceFile};
+use ts_compiler::{CanonicalProgramQueries, CanonicalTypeFormatFlags, Program, SourceFile};
 
-use crate::{Case, virtual_unit_path};
+use crate::{
+    Case, baseline_unit_name, is_default_library_file, remove_test_path_prefixes, virtual_unit_path,
+};
 
 pub(crate) mod symbols;
 pub(crate) mod types;
@@ -24,13 +26,6 @@ impl SemanticArtifactKind {
         }
     }
 
-    pub(crate) const fn unavailable_detail(self) -> &'static str {
-        match self {
-            Self::Types => types::UNAVAILABLE_DETAIL,
-            Self::Symbols => symbols::UNAVAILABLE_DETAIL,
-        }
-    }
-
     pub(crate) fn baseline_base(self, file_name: &str) -> Option<&str> {
         match self {
             Self::Types => types::baseline_base(file_name),
@@ -44,6 +39,45 @@ impl SemanticArtifactKind {
 pub(crate) struct SemanticArtifactWalk {
     pub(crate) types: Vec<NodeRef>,
     pub(crate) symbols: Vec<NodeRef>,
+}
+
+/// Owned baselines produced while the original canonical checker remains alive.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct GeneratedSemanticArtifacts {
+    pub(crate) walk: SemanticArtifactWalk,
+    pub(crate) types: Result<String, String>,
+    pub(crate) symbols: Result<String, String>,
+}
+
+impl GeneratedSemanticArtifacts {
+    pub(crate) fn unavailable(walk: SemanticArtifactWalk, detail: &str) -> Self {
+        Self {
+            walk,
+            types: Err(detail.to_owned()),
+            symbols: Err(detail.to_owned()),
+        }
+    }
+
+    pub(crate) fn result(&self, kind: SemanticArtifactKind) -> &Result<String, String> {
+        match kind {
+            SemanticArtifactKind::Types => &self.types,
+            SemanticArtifactKind::Symbols => &self.symbols,
+        }
+    }
+
+    pub(crate) fn visited_nodes(&self, kind: SemanticArtifactKind) -> usize {
+        match kind {
+            SemanticArtifactKind::Types => self.walk.types.len(),
+            SemanticArtifactKind::Symbols => self.walk.symbols.len(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ArtifactLine {
+    line: usize,
+    source_text: String,
+    value: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -104,6 +138,266 @@ pub(crate) fn walk_program(
         walk_source(source, SemanticArtifactKind::Symbols, &mut result.symbols)?;
     }
     Ok(result)
+}
+
+pub(crate) fn render_program(
+    case: &Case,
+    program: &Program,
+    queries: &mut CanonicalProgramQueries<'_>,
+) -> Result<GeneratedSemanticArtifacts, ArtifactWalkError> {
+    let walk = walk_program(case, program)?;
+    let types = render_baseline(
+        case,
+        program,
+        queries,
+        SemanticArtifactKind::Types,
+        &walk.types,
+    );
+    let symbols = render_baseline(
+        case,
+        program,
+        queries,
+        SemanticArtifactKind::Symbols,
+        &walk.symbols,
+    );
+    Ok(GeneratedSemanticArtifacts {
+        walk,
+        types,
+        symbols,
+    })
+}
+
+fn render_baseline(
+    case: &Case,
+    program: &Program,
+    queries: &mut CanonicalProgramQueries<'_>,
+    kind: SemanticArtifactKind,
+    nodes: &[NodeRef],
+) -> Result<String, String> {
+    let mut sections = String::new();
+    for (index, unit) in case.units.iter().enumerate() {
+        let file_name = virtual_unit_path(case, unit, index);
+        let Some(source) = program.source_file(&file_name) else {
+            continue;
+        };
+        let lines = nodes
+            .iter()
+            .copied()
+            .filter(|node| node.file == source.id)
+            .map(|node| artifact_line(program, queries, source, node, kind))
+            .filter_map(Result::transpose)
+            .collect::<Result<Vec<_>, _>>()?;
+        render_source_section(
+            &mut sections,
+            &baseline_unit_name(case, unit, index),
+            unit.source_text.as_scannable_str(),
+            &lines,
+        );
+    }
+
+    if sections.is_empty() {
+        return Ok("<no content>".to_owned());
+    }
+
+    Ok(format!(
+        "//// [{}] ////\r\n\r\n{}",
+        baseline_header(case),
+        remove_test_path_prefixes(&sections),
+    ))
+}
+
+fn artifact_line(
+    program: &Program,
+    queries: &mut CanonicalProgramQueries<'_>,
+    source: &SourceFile,
+    reference: NodeRef,
+    kind: SemanticArtifactKind,
+) -> Result<Option<ArtifactLine>, String> {
+    let node = program
+        .node(reference)
+        .ok_or_else(|| format!("semantic baseline references foreign node {reference:?}"))?;
+    let start = usize::try_from(node.range.start.get())
+        .map_err(|_| format!("semantic baseline position exceeds usize at {reference:?}"))?;
+    let end = usize::try_from(node.range.end.get())
+        .map_err(|_| format!("semantic baseline position exceeds usize at {reference:?}"))?;
+    let source_text = source
+        .source_text
+        .get(start..end)
+        .ok_or_else(|| format!("semantic baseline node {reference:?} has an invalid source range"))?
+        .replace("\r\n", "")
+        .replace('\n', "");
+
+    let value = match kind {
+        SemanticArtifactKind::Types => {
+            let type_id = queries
+                .get_type_at_location(reference)
+                .map_err(|error| format!("semantic .types query failed: {error}"))?;
+            queries
+                .type_to_string_with_flags(
+                    type_id,
+                    CanonicalTypeFormatFlags::NO_TRUNCATION
+                        | CanonicalTypeFormatFlags::ALLOW_UNIQUE_ES_SYMBOL_TYPE,
+                )
+                .map_err(|error| format!("semantic .types formatting failed: {error}"))?
+        }
+        SemanticArtifactKind::Symbols => {
+            let Some(symbol) = queries
+                .get_symbol_at_location(reference)
+                .map_err(|error| format!("semantic .symbols query failed: {error}"))?
+            else {
+                return Ok(None);
+            };
+            render_symbol(program, queries, symbol)?
+        }
+    };
+
+    Ok(Some(ArtifactLine {
+        line: ecma_line_and_utf16_column(&source.source_text, start).0,
+        source_text,
+        value,
+    }))
+}
+
+fn render_symbol(
+    program: &Program,
+    queries: &CanonicalProgramQueries<'_>,
+    symbol: ts_compiler::CanonicalSymbolId,
+) -> Result<String, String> {
+    let name = queries
+        .symbol_to_string(symbol)
+        .map_err(|error| format!("semantic .symbols formatting failed: {error}"))?;
+    let declarations = queries
+        .get_symbol_declarations(symbol)
+        .map_err(|error| format!("semantic .symbols declarations failed: {error}"))?;
+    let mut result = format!("Symbol({name}");
+    for (index, declaration) in declarations.iter().enumerate() {
+        if index == 5 {
+            write!(result, " ... and {} more", declarations.len() - index)
+                .expect("writing to a String cannot fail");
+            break;
+        }
+        let source = program.source_file_by_id(declaration.file).ok_or_else(|| {
+            format!("semantic .symbols declaration has no source file: {declaration:?}")
+        })?;
+        let record = program.node(*declaration).ok_or_else(|| {
+            format!("semantic .symbols declaration is foreign to its Program: {declaration:?}")
+        })?;
+        let file_name = source
+            .file_name
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(&source.file_name);
+        if source.is_default_library || is_default_library_file(file_name) {
+            write!(result, ", Decl({file_name}, --, --)").expect("writing to a String cannot fail");
+            continue;
+        }
+
+        let position = declaration_full_start(
+            &source.source_text,
+            usize::try_from(record.range.start.get()).map_err(|_| {
+                format!("semantic .symbols declaration position exceeds usize: {declaration:?}")
+            })?,
+        );
+        let (line, column) = ecma_line_and_utf16_column(&source.source_text, position);
+        write!(result, ", Decl({file_name}, {line}, {column})")
+            .expect("writing to a String cannot fail");
+    }
+    result.push(')');
+    Ok(result)
+}
+
+fn declaration_full_start(source: &str, position: usize) -> usize {
+    let mut start = position.min(source.len());
+    while start > 0 && source.as_bytes()[start - 1].is_ascii_whitespace() {
+        start -= 1;
+    }
+    start
+}
+
+fn ecma_line_and_utf16_column(source: &str, position: usize) -> (usize, usize) {
+    let prefix = &source[..position.min(source.len())];
+    let mut line = 0;
+    let mut column = 0;
+    let mut previous_carriage_return = false;
+    for character in prefix.chars() {
+        match character {
+            '\r' => {
+                line += 1;
+                column = 0;
+                previous_carriage_return = true;
+            }
+            '\n' if previous_carriage_return => previous_carriage_return = false,
+            '\n' | '\u{2028}' | '\u{2029}' => {
+                line += 1;
+                column = 0;
+                previous_carriage_return = false;
+            }
+            _ => {
+                column += character.len_utf16();
+                previous_carriage_return = false;
+            }
+        }
+    }
+    (line, column)
+}
+
+fn render_source_section(output: &mut String, name: &str, source: &str, results: &[ArtifactLine]) {
+    write!(output, "=== {name} ===\r\n").expect("writing to a String cannot fail");
+    let code_lines = source
+        .split(['\n', '\r', '\u{2028}', '\u{2029}'])
+        .collect::<Vec<_>>();
+    let mut last_written = None;
+    for result in results {
+        let line = result.line.min(code_lines.len().saturating_sub(1));
+        match last_written {
+            None => append_code_lines(output, &code_lines[..=line]),
+            Some(previous) if previous != line => {
+                if !suppresses_blank_separator(code_lines.get(previous + 1).copied()) {
+                    output.push_str("\r\n");
+                }
+                append_code_lines(output, &code_lines[previous + 1..=line]);
+            }
+            Some(_) => {}
+        }
+        last_written = Some(line);
+        write!(output, ">{} : {}\r\n", result.source_text, result.value)
+            .expect("writing to a String cannot fail");
+    }
+
+    let next = last_written.map_or(0, |line| line + 1);
+    if next < code_lines.len() {
+        if !suppresses_blank_separator(code_lines.get(next).copied()) {
+            output.push_str("\r\n");
+        }
+        output.push_str(&code_lines[next..].join("\r\n"));
+    }
+    output.push_str("\r\n");
+}
+
+fn append_code_lines(output: &mut String, lines: &[&str]) {
+    output.push_str(&lines.join("\r\n"));
+    output.push_str("\r\n");
+}
+
+fn suppresses_blank_separator(line: Option<&str>) -> bool {
+    line.is_some_and(|line| {
+        let trimmed = line.trim();
+        trimmed.is_empty() || matches!(trimmed, "{" | "|" | "}")
+    })
+}
+
+fn baseline_header(case: &Case) -> String {
+    let path = case.path.to_string_lossy().replace('\\', "/");
+    if let Some((_, relative)) = path.rsplit_once("/_submodules/TypeScript/") {
+        return relative.to_owned();
+    }
+    if let Some((_, relative)) = path.rsplit_once("/testdata/") {
+        return relative.to_owned();
+    }
+    path.strip_prefix("_submodules/TypeScript/")
+        .or_else(|| path.strip_prefix("testdata/"))
+        .unwrap_or(&path)
+        .to_owned()
 }
 
 fn walk_source(

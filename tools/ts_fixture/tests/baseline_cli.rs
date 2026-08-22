@@ -657,7 +657,7 @@ fn filters_limits_and_reports_matches() {
 }
 
 #[test]
-fn canonical_checker_matches_pinned_simple_multi_file_diagnostic_baseline() {
+fn canonical_checker_matches_pinned_simple_multi_file_diagnostic_and_semantic_baselines() {
     let repository = TestRepository::new();
     repository.write_case(
         "simpleTestMultiFile",
@@ -688,6 +688,32 @@ fn canonical_checker_matches_pinned_simple_multi_file_diagnostic_baseline() {
             "!!! error TS2322: Type 'number' is not assignable to type 'string'.",
         ),
     );
+    repository.write_baseline(
+        "simpleTestMultiFile.types",
+        concat!(
+            "//// [tests/cases/compiler/simpleTestMultiFile.ts] ////\r\n\r\n",
+            "=== /src/foo.ts ===\r\n",
+            "const x: number = \"\";\r\n",
+            ">x : number\r\n",
+            ">\"\" : \"\"\r\n\r\n",
+            "=== /src/bar.ts ===\r\n",
+            "const y: string = 1;\r\n",
+            ">y : string\r\n",
+            ">1 : 1\r\n\r\n",
+        ),
+    );
+    repository.write_baseline(
+        "simpleTestMultiFile.symbols",
+        concat!(
+            "//// [tests/cases/compiler/simpleTestMultiFile.ts] ////\r\n\r\n",
+            "=== /src/foo.ts ===\r\n",
+            "const x: number = \"\";\r\n",
+            ">x : Symbol(x, Decl(foo.ts, 0, 5))\r\n\r\n",
+            "=== /src/bar.ts ===\r\n",
+            "const y: string = 1;\r\n",
+            ">y : Symbol(y, Decl(bar.ts, 0, 5))\r\n\r\n",
+        ),
+    );
 
     let scorecard_path = repository.0.join("canonical-scorecard.json");
     let output = run(
@@ -695,6 +721,7 @@ fn canonical_checker_matches_pinned_simple_multi_file_diagnostic_baseline() {
         &[
             "--diagnostics",
             "--canonical-checker",
+            "--semantic-artifacts",
             "--scorecard-json",
             scorecard_path.to_str().unwrap(),
             "--filter",
@@ -714,6 +741,8 @@ fn canonical_checker_matches_pinned_simple_multi_file_diagnostic_baseline() {
         serde_json::from_str(&fs::read_to_string(scorecard_path).unwrap()).unwrap();
     assert_eq!(scorecard["schemaVersion"], 5);
     assert_eq!(scorecard["checkerMode"], "canonical");
+    assert_eq!(scorecard["semanticArtifacts"]["types"]["exactMatches"], 1);
+    assert_eq!(scorecard["semanticArtifacts"]["symbols"]["exactMatches"], 1);
     assert_eq!(
         scorecard["variants"][0]["diagnostics"][0]["relatedInformation"],
         serde_json::json!([])
@@ -793,16 +822,155 @@ fn canonical_checker_matches_related_information_artifact_and_scorecard_exactly(
 }
 
 #[test]
-fn semantic_artifact_mode_never_counts_unavailable_queries_as_exact() {
+fn semantic_artifact_mode_matches_real_type_and_symbol_baselines() {
     let repository = TestRepository::new();
-    repository.write_case(
-        "semanticArtifacts",
-        "// @noLib: true\nconst value: number = 1;\n",
-        None,
+    repository.write_case("semanticArtifacts", "const value: number = 1;\n", None);
+    repository.write_baseline(
+        "semanticArtifacts.types",
+        concat!(
+            "//// [tests/cases/compiler/semanticArtifacts.ts] ////\r\n\r\n",
+            "=== semanticArtifacts.ts ===\r\n",
+            "const value: number = 1;\r\n",
+            ">value : number\r\n",
+            ">1 : 1\r\n\r\n",
+        ),
     );
-    repository.write_baseline("semanticArtifacts.types", "expected type baseline\n");
-    repository.write_baseline("semanticArtifacts.symbols", "expected symbol baseline\n");
+    repository.write_baseline(
+        "semanticArtifacts.symbols",
+        concat!(
+            "//// [tests/cases/compiler/semanticArtifacts.ts] ////\r\n\r\n",
+            "=== semanticArtifacts.ts ===\r\n",
+            "const value: number = 1;\r\n",
+            ">value : Symbol(value, Decl(semanticArtifacts.ts, 0, 5))\r\n\r\n",
+        ),
+    );
     let scorecard_path = repository.0.join("semantic-scorecard.json");
+
+    let output = run(
+        &repository.0,
+        &[
+            "--diagnostics",
+            "--canonical-checker",
+            "--semantic-artifacts",
+            "--scorecard-json",
+            scorecard_path.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}\nscorecard:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+        fs::read_to_string(&scorecard_path).unwrap_or_default(),
+    );
+    let scorecard: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(scorecard_path).unwrap()).unwrap();
+
+    assert_eq!(scorecard["summary"]["executedVariants"], 1);
+    assert_eq!(scorecard["summary"]["exactMatches"], 1);
+    assert_eq!(scorecard["summary"]["unsupportedDetails"], 0);
+    assert_eq!(scorecard["variants"][0]["status"], "exact_match");
+    assert_eq!(scorecard["variants"][0]["outcomeClass"], "exact");
+    for kind in ["types", "symbols"] {
+        assert_eq!(scorecard["semanticArtifacts"][kind]["expectedBaselines"], 1);
+        assert_eq!(scorecard["semanticArtifacts"][kind]["missingBaselines"], 0);
+        assert_eq!(scorecard["semanticArtifacts"][kind]["exactMatches"], 1);
+        assert_eq!(scorecard["semanticArtifacts"][kind]["unsupported"], 0);
+        assert_eq!(
+            scorecard["variants"][0]["semanticArtifacts"][kind]["status"],
+            "exact_match"
+        );
+        assert!(
+            scorecard["variants"][0]["semanticArtifacts"][kind]["visitedNodes"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+        assert!(
+            scorecard["variants"][0]["semanticArtifacts"][kind]["expectedBaseline"]
+                .as_str()
+                .unwrap()
+                .ends_with(kind)
+        );
+    }
+}
+
+#[test]
+fn semantic_artifact_mode_matches_the_pinned_single_file_oracles() {
+    let repository = TestRepository::new();
+    repository.write_case("simpleTestSingleFile", "const x: number = \"\";", None);
+    repository.write_baseline(
+        "simpleTestSingleFile.errors.txt",
+        concat!(
+            "simpleTestSingleFile.ts(1,7): error TS2322: Type 'string' is not assignable to type 'number'.\r\n",
+            "\r\n\r\n",
+            "==== simpleTestSingleFile.ts (1 errors) ====\r\n",
+            "    const x: number = \"\";\r\n",
+            "          ~\r\n",
+            "!!! error TS2322: Type 'string' is not assignable to type 'number'.",
+        ),
+    );
+    repository.write_baseline(
+        "simpleTestSingleFile.types",
+        concat!(
+            "//// [tests/cases/compiler/simpleTestSingleFile.ts] ////\r\n\r\n",
+            "=== simpleTestSingleFile.ts ===\r\n",
+            "const x: number = \"\";\r\n",
+            ">x : number\r\n",
+            ">\"\" : \"\"\r\n\r\n",
+        ),
+    );
+    repository.write_baseline(
+        "simpleTestSingleFile.symbols",
+        concat!(
+            "//// [tests/cases/compiler/simpleTestSingleFile.ts] ////\r\n\r\n",
+            "=== simpleTestSingleFile.ts ===\r\n",
+            "const x: number = \"\";\r\n",
+            ">x : Symbol(x, Decl(simpleTestSingleFile.ts, 0, 5))\r\n\r\n",
+        ),
+    );
+    let scorecard_path = repository.0.join("upstream-semantic-scorecard.json");
+
+    let output = run(
+        &repository.0,
+        &[
+            "--diagnostics",
+            "--canonical-checker",
+            "--semantic-artifacts",
+            "--scorecard-json",
+            scorecard_path.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}\nscorecard:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+        fs::read_to_string(&scorecard_path).unwrap_or_default(),
+    );
+    let scorecard: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(scorecard_path).unwrap()).unwrap();
+    assert_eq!(scorecard["summary"]["exactMatches"], 1);
+    assert_eq!(scorecard["summary"]["actualDiagnostics"], 1);
+    assert_eq!(scorecard["semanticArtifacts"]["types"]["exactMatches"], 1);
+    assert_eq!(scorecard["semanticArtifacts"]["symbols"]["exactMatches"], 1);
+}
+
+#[test]
+fn semantic_artifact_mismatches_fail_an_otherwise_exact_diagnostic_variant() {
+    let repository = TestRepository::new();
+    repository.write_case("semanticMismatch", "const value: number = 1;\n", None);
+    repository.write_baseline("semanticMismatch.types", "incorrect type baseline\r\n");
+    repository.write_baseline(
+        "semanticMismatch.symbols",
+        concat!(
+            "//// [tests/cases/compiler/semanticMismatch.ts] ////\r\n\r\n",
+            "=== semanticMismatch.ts ===\r\n",
+            "const value: number = 1;\r\n",
+            ">value : Symbol(value, Decl(semanticMismatch.ts, 0, 5))\r\n\r\n",
+        ),
+    );
+    let scorecard_path = repository.0.join("semantic-mismatch-scorecard.json");
 
     let output = run(
         &repository.0,
@@ -817,32 +985,58 @@ fn semantic_artifact_mode_never_counts_unavailable_queries_as_exact() {
     assert_eq!(output.status.code(), Some(1));
     let scorecard: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(scorecard_path).unwrap()).unwrap();
-
-    assert_eq!(scorecard["summary"]["executedVariants"], 1);
     assert_eq!(scorecard["summary"]["exactMatches"], 0);
+    assert_eq!(scorecard["summary"]["artifactMismatches"], 1);
+    assert_eq!(scorecard["variants"][0]["status"], "artifact_mismatch");
+    assert_eq!(
+        scorecard["variants"][0]["outcomeClass"],
+        "supported_mismatch"
+    );
+    assert_eq!(scorecard["semanticArtifacts"]["types"]["mismatches"], 1);
+    assert_eq!(scorecard["semanticArtifacts"]["symbols"]["exactMatches"], 1);
+    assert_eq!(
+        scorecard["variants"][0]["semanticArtifacts"]["types"]["firstDifference"]["line"],
+        1
+    );
+}
+
+#[test]
+fn semantic_artifact_mode_reports_when_no_check_prevents_checker_queries() {
+    let repository = TestRepository::new();
+    repository.write_case(
+        "noCheckSemanticArtifacts",
+        "// @noCheck: true\n// @noLib: true\nconst value: number = 1;\n",
+        None,
+    );
+    repository.write_baseline("noCheckSemanticArtifacts.types", "expected types\r\n");
+    repository.write_baseline("noCheckSemanticArtifacts.symbols", "expected symbols\r\n");
+    let scorecard_path = repository.0.join("no-check-semantic-scorecard.json");
+
+    let output = run(
+        &repository.0,
+        &[
+            "--diagnostics",
+            "--canonical-checker",
+            "--semantic-artifacts",
+            "--scorecard-json",
+            scorecard_path.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(output.status.code(), Some(1));
+    let scorecard: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(scorecard_path).unwrap()).unwrap();
     assert_eq!(scorecard["summary"]["unsupportedDetails"], 1);
-    assert_eq!(scorecard["variants"][0]["status"], "unsupported_detail");
-    assert_eq!(scorecard["variants"][0]["outcomeClass"], "harness_config");
     for kind in ["types", "symbols"] {
-        assert_eq!(scorecard["semanticArtifacts"][kind]["expectedBaselines"], 1);
-        assert_eq!(scorecard["semanticArtifacts"][kind]["missingBaselines"], 0);
-        assert_eq!(scorecard["semanticArtifacts"][kind]["exactMatches"], 0);
         assert_eq!(scorecard["semanticArtifacts"][kind]["unsupported"], 1);
         assert_eq!(
             scorecard["variants"][0]["semanticArtifacts"][kind]["status"],
             "unsupported"
         );
         assert!(
-            scorecard["variants"][0]["semanticArtifacts"][kind]["visitedNodes"]
-                .as_u64()
-                .unwrap()
-                > 0
-        );
-        assert!(
-            scorecard["variants"][0]["semanticArtifacts"][kind]["expectedBaseline"]
+            scorecard["variants"][0]["semanticArtifacts"][kind]["unsupportedDetail"]
                 .as_str()
                 .unwrap()
-                .ends_with(kind)
+                .contains("noCheck")
         );
     }
 }
@@ -874,7 +1068,12 @@ fn semantic_artifact_mode_does_not_assume_missing_baselines_are_empty_matches() 
     for kind in ["types", "symbols"] {
         assert_eq!(scorecard["semanticArtifacts"][kind]["expectedBaselines"], 0);
         assert_eq!(scorecard["semanticArtifacts"][kind]["missingBaselines"], 1);
-        assert_eq!(scorecard["semanticArtifacts"][kind]["unsupported"], 1);
+        assert_eq!(scorecard["semanticArtifacts"][kind]["mismatches"], 1);
+        assert_eq!(scorecard["semanticArtifacts"][kind]["unsupported"], 0);
+        assert_eq!(
+            scorecard["variants"][0]["semanticArtifacts"][kind]["status"],
+            "mismatch"
+        );
         assert!(scorecard["variants"][0]["semanticArtifacts"][kind]["expectedBaseline"].is_null());
     }
 }
@@ -1173,6 +1372,72 @@ fn upstream_skipped_option_variants_are_not_executed_or_counted_as_matches() {
             .unwrap()
             .contains("classic module resolution")
     );
+}
+
+#[test]
+fn upstream_skipped_resolution_variants_do_not_change_runnable_denominators() {
+    let repository = TestRepository::new();
+    repository.write_case(
+        "mixedResolutionModes",
+        concat!(
+            "// @moduleResolution: classic,bundler\n",
+            "// @module: esnext\n",
+            "const value: number = 1;\n",
+        ),
+        None,
+    );
+    repository.write_baseline(
+        "mixedResolutionModes(moduleresolution=bundler).types",
+        concat!(
+            "//// [tests/cases/compiler/mixedResolutionModes.ts] ////\r\n\r\n",
+            "=== mixedResolutionModes.ts ===\r\n",
+            "const value: number = 1;\r\n",
+            ">value : number\r\n",
+            ">1 : 1\r\n\r\n",
+        ),
+    );
+    repository.write_baseline(
+        "mixedResolutionModes(moduleresolution=bundler).symbols",
+        concat!(
+            "//// [tests/cases/compiler/mixedResolutionModes.ts] ////\r\n\r\n",
+            "=== mixedResolutionModes.ts ===\r\n",
+            "const value: number = 1;\r\n",
+            ">value : Symbol(value, Decl(mixedResolutionModes.ts, 0, 5))\r\n\r\n",
+        ),
+    );
+    let scorecard_path = repository.0.join("mixed-resolution-scorecard.json");
+
+    let output = run(
+        &repository.0,
+        &[
+            "--diagnostics",
+            "--canonical-checker",
+            "--semantic-artifacts",
+            "--scorecard-json",
+            scorecard_path.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}\nscorecard:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+        fs::read_to_string(&scorecard_path).unwrap_or_default(),
+    );
+    let scorecard: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(scorecard_path).unwrap()).unwrap();
+    assert_eq!(scorecard["summary"]["selectedCases"], 1);
+    assert_eq!(scorecard["summary"]["upstreamSkippedVariants"], 1);
+    assert_eq!(scorecard["summary"]["executedVariants"], 1);
+    assert_eq!(scorecard["summary"]["exactMatches"], 1);
+    for kind in ["types", "symbols"] {
+        assert_eq!(scorecard["semanticArtifacts"][kind]["upstreamSkipped"], 1);
+        assert_eq!(scorecard["semanticArtifacts"][kind]["expectedBaselines"], 1);
+        assert_eq!(scorecard["semanticArtifacts"][kind]["exactMatches"], 1);
+        assert_eq!(scorecard["semanticArtifacts"][kind]["missingBaselines"], 0);
+    }
+    assert_eq!(scorecard["variants"][0]["status"], "upstream_skipped");
+    assert_eq!(scorecard["variants"][1]["status"], "exact_match");
 }
 
 #[test]

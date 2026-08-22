@@ -24,7 +24,7 @@ use xxhash_rust::xxh3::xxh3_128;
 mod artifacts;
 mod oracle;
 
-use artifacts::{SemanticArtifactKind, SemanticArtifactWalk};
+use artifacts::{GeneratedSemanticArtifacts, SemanticArtifactKind};
 
 pub use oracle::{
     OracleArtifactCounts, UpstreamCaseDisposition, UpstreamCaseManifest, UpstreamManifest,
@@ -147,7 +147,7 @@ pub struct Compilation {
     /// Non-pretty diagnostic header text in the same form as TypeScript error baselines.
     pub diagnostic_text: String,
     pub outputs: BTreeMap<String, String>,
-    semantic_artifact_walk: Option<SemanticArtifactWalk>,
+    semantic_artifacts: Option<GeneratedSemanticArtifacts>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1789,58 +1789,91 @@ fn semantic_artifact_result(
     kind: SemanticArtifactKind,
     expected_baseline: Option<&str>,
     upstream_skipped: bool,
-    walk: Option<&SemanticArtifactWalk>,
-) -> SemanticArtifactResult {
+    artifacts: Option<&GeneratedSemanticArtifacts>,
+    repository: &Path,
+) -> io::Result<SemanticArtifactResult> {
     if upstream_skipped {
-        return SemanticArtifactResult {
+        return Ok(SemanticArtifactResult {
             expected_baseline: None,
             status: SemanticArtifactStatus::UpstreamSkipped,
             visited_nodes: 0,
             unsupported_detail: None,
             first_difference: None,
-        };
+        });
     }
 
-    let Some(walk) = walk else {
-        return SemanticArtifactResult {
+    let Some(artifacts) = artifacts else {
+        return Ok(SemanticArtifactResult {
             expected_baseline: expected_baseline.map(str::to_owned),
             status: SemanticArtifactStatus::NotReached,
             visited_nodes: 0,
             unsupported_detail: None,
             first_difference: None,
-        };
+        });
     };
 
-    SemanticArtifactResult {
+    let mut result = SemanticArtifactResult {
         expected_baseline: expected_baseline.map(str::to_owned),
-        status: SemanticArtifactStatus::Unsupported,
-        visited_nodes: match kind {
-            SemanticArtifactKind::Types => walk.types.len(),
-            SemanticArtifactKind::Symbols => walk.symbols.len(),
-        },
-        unsupported_detail: Some(kind.unavailable_detail().to_owned()),
+        status: SemanticArtifactStatus::ExactMatch,
+        visited_nodes: artifacts.visited_nodes(kind),
+        unsupported_detail: None,
         first_difference: None,
+    };
+    let actual = match artifacts.result(kind) {
+        Ok(actual) => actual,
+        Err(detail) => {
+            result.status = SemanticArtifactStatus::Unsupported;
+            result.unsupported_detail = Some(detail.clone());
+            return Ok(result);
+        }
+    };
+
+    let Some(expected_baseline) = expected_baseline else {
+        if actual != "<no content>" {
+            result.status = SemanticArtifactStatus::Mismatch;
+            result.first_difference = Some(DiagnosticArtifactDifference {
+                line: 1,
+                expected: "<missing baseline>".to_owned(),
+                actual: actual.lines().next().unwrap_or_default().to_owned(),
+            });
+        }
+        return Ok(result);
+    };
+
+    let expected = fs::read_to_string(repository.join(expected_baseline))?;
+    if expected != *actual {
+        let (line, expected, actual) = first_different_line(&expected, actual);
+        result.status = SemanticArtifactStatus::Mismatch;
+        result.first_difference = Some(DiagnosticArtifactDifference {
+            line,
+            expected: expected.to_owned(),
+            actual: actual.to_owned(),
+        });
     }
+    Ok(result)
 }
 
 fn semantic_variant_results(
     plan: &SemanticArtifactPlan,
-    walk: Option<&SemanticArtifactWalk>,
-) -> SemanticVariantArtifacts {
-    SemanticVariantArtifacts {
+    artifacts: Option<&GeneratedSemanticArtifacts>,
+    repository: &Path,
+) -> io::Result<SemanticVariantArtifacts> {
+    Ok(SemanticVariantArtifacts {
         types: semantic_artifact_result(
             SemanticArtifactKind::Types,
             plan.types.as_deref(),
             plan.upstream_skipped,
-            walk,
-        ),
+            artifacts,
+            repository,
+        )?,
         symbols: semantic_artifact_result(
             SemanticArtifactKind::Symbols,
             plan.symbols.as_deref(),
             plan.upstream_skipped,
-            walk,
-        ),
-    }
+            artifacts,
+            repository,
+        )?,
+    })
 }
 
 fn record_semantic_artifact(
@@ -1879,6 +1912,7 @@ fn record_semantic_variant(
 fn record_upstream_skipped_variant(
     plan: DiagnosticVariantPlan,
     reasons: Vec<String>,
+    repository: &Path,
     summary: &mut RunnerSummary,
     scorecard: &mut DiagnosticScorecard,
     writer: &mut impl Write,
@@ -1894,16 +1928,21 @@ fn record_upstream_skipped_variant(
         variant_label(&plan.variant, &plan.axes),
     )?;
 
-    let semantic_artifacts = plan.semantic_artifacts.as_ref().map(|_| {
-        semantic_variant_results(
-            &SemanticArtifactPlan {
-                types: None,
-                symbols: None,
-                upstream_skipped: true,
-            },
-            None,
-        )
-    });
+    let semantic_artifacts = plan
+        .semantic_artifacts
+        .as_ref()
+        .map(|_| {
+            semantic_variant_results(
+                &SemanticArtifactPlan {
+                    types: None,
+                    symbols: None,
+                    upstream_skipped: true,
+                },
+                None,
+                repository,
+            )
+        })
+        .transpose()?;
     if let Some(artifacts) = semantic_artifacts.as_ref() {
         record_semantic_variant(scorecard, artifacts);
     }
@@ -1946,6 +1985,7 @@ fn execute_diagnostic_variant(
         return record_upstream_skipped_variant(
             plan,
             upstream_skip_reasons,
+            repository,
             summary,
             scorecard,
             writer,
@@ -2040,9 +2080,17 @@ fn execute_diagnostic_variant(
         .extend(plan.variant.unsupported_details.iter().cloned());
     let mut comparison =
         compare_diagnostic_artifacts(&plan.expected, &actual, &compilation.diagnostics);
-    let semantic_artifacts = plan.semantic_artifacts.as_ref().map(|artifacts| {
-        semantic_variant_results(artifacts, compilation.semantic_artifact_walk.as_ref())
-    });
+    let semantic_artifacts = plan
+        .semantic_artifacts
+        .as_ref()
+        .map(|artifacts| {
+            semantic_variant_results(
+                artifacts,
+                compilation.semantic_artifacts.as_ref(),
+                repository,
+            )
+        })
+        .transpose()?;
     if let Some(artifacts) = semantic_artifacts.as_ref() {
         record_semantic_variant(scorecard, artifacts);
         if comparison.is_exact() {
@@ -2053,6 +2101,16 @@ fn execute_diagnostic_variant(
             );
             comparison =
                 compare_diagnostic_artifacts(&plan.expected, &actual, &compilation.diagnostics);
+            if comparison.is_exact()
+                && let Some(mismatch) = [&artifacts.types, &artifacts.symbols]
+                    .into_iter()
+                    .find(|artifact| artifact.status == SemanticArtifactStatus::Mismatch)
+            {
+                comparison
+                    .mismatch_kinds
+                    .push(DiagnosticArtifactMismatchKind::Artifact);
+                comparison.first_difference = mismatch.first_difference.clone();
+            }
         }
     }
     let checker_blocked = checker_frontier.is_some();
@@ -2481,7 +2539,8 @@ fn retain_fatal_variant(
     )?;
     let semantic_artifacts = record
         .semantic_artifacts
-        .map(|artifacts| semantic_variant_results(artifacts, None));
+        .map(|artifacts| semantic_variant_results(artifacts, None, record.repository))
+        .transpose()?;
     if let Some(artifacts) = semantic_artifacts.as_ref() {
         record_semantic_variant(scorecard, artifacts);
     }
@@ -4363,21 +4422,50 @@ fn compile_case_variant(
         .as_deref()
         .or_else(|| case.directive_values("currentDirectory").next())
         .unwrap_or_else(|| virtual_unit_root(case));
-    let program = match checker {
-        FixtureChecker::Legacy => ts_compiler::Program::new_with_options(
-            &file_system,
-            current_directory,
-            &roots,
-            compiler_options,
-        ),
-        FixtureChecker::Canonical => catch_canonical_checker_unwind(|| {
-            ts_compiler::Program::try_new_with_canonical_checker(
+    let (program, semantic_artifacts) = match checker {
+        FixtureChecker::Legacy => (
+            ts_compiler::Program::new_with_options(
                 &file_system,
                 current_directory,
                 &roots,
                 compiler_options,
-            )
-        })?,
+            ),
+            None,
+        ),
+        FixtureChecker::Canonical if walk_semantic_artifacts => {
+            let (program, rendered) = catch_canonical_checker_unwind(|| {
+                ts_compiler::Program::try_new_with_canonical_checker_and_queries(
+                    &file_system,
+                    current_directory,
+                    &roots,
+                    compiler_options,
+                    |program, queries| artifacts::render_program(case, program, queries),
+                )
+            })?;
+            let rendered = rendered
+                .transpose()
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            let artifacts = match rendered {
+                Some(rendered) => rendered,
+                None => GeneratedSemanticArtifacts::unavailable(
+                    artifacts::walk_program(case, &program)
+                        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
+                    "semantic baselines require a canonical checker, but noCheck prevented checker construction",
+                ),
+            };
+            (program, Some(artifacts))
+        }
+        FixtureChecker::Canonical => (
+            catch_canonical_checker_unwind(|| {
+                ts_compiler::Program::try_new_with_canonical_checker(
+                    &file_system,
+                    current_directory,
+                    &roots,
+                    compiler_options,
+                )
+            })?,
+            None,
+        ),
     };
     // The Go harness baselines pre-emit program/syntactic/semantic/global and
     // declaration diagnostics. Emit-result diagnostics are not part of that
@@ -4455,17 +4543,11 @@ fn compile_case_variant(
             .collect(),
         FixtureChecker::Canonical => BTreeMap::new(),
     };
-    let semantic_artifact_walk = walk_semantic_artifacts
-        .then(|| {
-            artifacts::walk_program(case, &program)
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
-        })
-        .transpose()?;
     Ok(Compilation {
         diagnostics,
         diagnostic_text,
         outputs,
-        semantic_artifact_walk,
+        semantic_artifacts,
     })
 }
 
