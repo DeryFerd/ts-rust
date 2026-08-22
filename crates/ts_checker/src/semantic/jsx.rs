@@ -19,14 +19,16 @@ use ts_jsnum::Number;
 
 use super::{
     CanonicalCheckerDiagnostic, CanonicalCheckerDiagnosticRange, CanonicalCheckerDiagnostics,
-    CanonicalCheckerOptions, CanonicalTypeMapperStore, DeclaredTypeHost, DeclaredTypeLinks,
-    JsxElementLinks, JsxFlags, ResolvedSignatureState, SignatureId, SignatureLinks,
-    SourceCheckError, SourceCheckProvenanceError, SourceLiteralCacheError, SourceSyntaxRole,
-    SymbolNodeLinks, TypeId, TypeNodeLinks, UnsupportedSourceSyntax, ValueSymbolLinks,
+    CanonicalCheckerOptions, CanonicalCheckerRelatedInformation, CanonicalTypeMapperStore,
+    DeclaredTypeHost, DeclaredTypeLinks, JsxElementLinks, JsxFlags, ResolvedSignatureState,
+    SignatureId, SignatureLinks, SourceCheckError, SourceCheckProvenanceError,
+    SourceLiteralCacheError, SourceSyntaxRole, SymbolNodeLinks, TypeId, TypeNodeLinks,
+    UnsupportedSourceSyntax, ValueSymbolLinks,
     callable_sets::{StoredCallableSetValidation, validate_stored_callable_set},
     formatter::{get_type_names_for_assignability_error, type_to_string},
     signatures::SignatureFlags,
     source::merge_retry_diagnostic,
+    spelling::get_spelling_suggestion,
     type_nodes::CanonicalTypeQuery,
     types::{ObjectFlags, TypeFlags},
 };
@@ -277,9 +279,6 @@ fn plan_jsx_element(
             }
             let closing_tag =
                 plan_jsx_tag(arena, bound, store, closing_node, closing_data.tag_name)?;
-            if closing_tag.name != tag.name || closing_tag.intrinsic != tag.intrinsic {
-                return Err(unsupported(closing_tag.node, SyntaxKind::JsxClosingElement));
-            }
             Ok(JsxElementPlan {
                 expression,
                 opening,
@@ -1113,17 +1112,7 @@ fn execute_jsx_element(
                     )?;
                 }
                 if let Some(closing) = closing {
-                    publish_type_links(store, closing.tag.node, namespace.any_type)?;
-                    publish_symbol_links(store, closing.node, intrinsic.symbol)?;
-                    publish_jsx_links(
-                        store,
-                        closing.node,
-                        JsxElementLinks {
-                            jsx_flags: intrinsic.flags,
-                            jsx_namespace: Some(namespace.unknown_symbol),
-                            ..JsxElementLinks::default()
-                        },
-                    )?;
+                    check_jsx_closing_tag(store, bound, namespace, closing, options, diagnostics)?;
                 }
                 (intrinsic.attributes_type, signature)
             } else {
@@ -1141,16 +1130,7 @@ fn execute_jsx_element(
                     },
                 )?;
                 if let Some(closing) = closing {
-                    let symbol = store
-                        .symbol_node_links(tag.node)
-                        .and_then(|links| links.resolved_symbol)
-                        .ok_or(SourceCheckError::Call(closing.tag.node))?;
-                    publish_symbol_links(store, closing.tag.node, symbol)?;
-                    let component_type = store
-                        .type_node_links(tag.node)
-                        .and_then(|links| links.resolved_type)
-                        .ok_or(SourceCheckError::Call(closing.tag.node))?;
-                    publish_type_links(store, closing.tag.node, component_type)?;
+                    check_jsx_closing_tag(store, bound, namespace, closing, options, diagnostics)?;
                 }
                 (attributes_type, signature)
             };
@@ -1203,6 +1183,55 @@ fn execute_jsx_element(
 
     publish_type_links(store, plan.expression, namespace.element_type)?;
     Ok(namespace.element_type)
+}
+
+fn check_jsx_closing_tag(
+    store: &mut CanonicalTypeMapperStore,
+    bound: &BoundFile,
+    namespace: &JsxNamespace,
+    closing: &JsxClosingPlan,
+    options: CanonicalCheckerOptions,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+) -> Result<(), SourceCheckError> {
+    if closing.tag.intrinsic {
+        let intrinsic = resolve_intrinsic_tag(
+            store,
+            bound,
+            namespace,
+            closing.node,
+            &closing.tag,
+            options,
+            diagnostics,
+        )?;
+        publish_type_links(store, closing.tag.node, namespace.any_type)?;
+        publish_symbol_links(store, closing.node, intrinsic.symbol)?;
+        return publish_jsx_links(
+            store,
+            closing.node,
+            JsxElementLinks {
+                jsx_flags: intrinsic.flags,
+                jsx_namespace: Some(namespace.unknown_symbol),
+                ..JsxElementLinks::default()
+            },
+        );
+    }
+
+    let Some(symbol) = resolve_source_value_symbol(store, bound, &closing.tag.name) else {
+        add_missing_component_diagnostic(
+            store,
+            bound,
+            closing.tag.node,
+            &closing.tag.name,
+            diagnostics,
+        )?;
+        return publish_type_links(store, closing.tag.node, namespace.error_type);
+    };
+    let component_type = store
+        .value_symbol_links(symbol)
+        .and_then(|links| links.resolved_type)
+        .ok_or(SourceCheckError::Call(closing.tag.node))?;
+    publish_symbol_links(store, closing.tag.node, symbol)?;
+    publish_type_links(store, closing.tag.node, component_type)
 }
 
 #[allow(clippy::too_many_lines)] // Named and indexed lookup must retain pinned precedence.
@@ -1456,7 +1485,7 @@ fn resolve_component_tag(
     diagnostics: &mut CanonicalCheckerDiagnostics,
 ) -> Result<(TypeId, SignatureId), SourceCheckError> {
     let Some(symbol) = resolve_source_value_symbol(store, bound, &tag.name) else {
-        add_diagnostic(diagnostics, tag.node, 2304, [tag.name.as_str()])?;
+        add_missing_component_diagnostic(store, bound, tag.node, &tag.name, diagnostics)?;
         let unknown_signature = store
             .intrinsic_bootstrap()
             .ok_or(SourceCheckError::LiteralCache(
@@ -1524,6 +1553,76 @@ fn resolve_component_tag(
             .empty_object_type
     });
     Ok((attributes_type, callable.signature))
+}
+
+fn add_missing_component_diagnostic(
+    store: &CanonicalTypeMapperStore,
+    bound: &BoundFile,
+    node: NodeRef,
+    name: &str,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+) -> Result<(), SourceCheckError> {
+    let suggestion = bound
+        .locals(bound.source_file())
+        .and_then(|locals| store.symbol_table(locals))
+        .and_then(|locals| {
+            get_spelling_suggestion(
+                name,
+                locals.iter().map(|(_, symbol)| symbol),
+                |symbol| {
+                    let symbol = store.symbol(*symbol)?;
+                    symbol
+                        .flags()
+                        .intersects(SymbolFlags::VALUE)
+                        .then(|| symbol.name().as_utf8())
+                        .flatten()
+                },
+                |left, right| {
+                    store
+                        .symbol(*left)
+                        .and_then(|symbol| symbol.name().as_utf8())
+                        .cmp(
+                            &store
+                                .symbol(*right)
+                                .and_then(|symbol| symbol.name().as_utf8()),
+                        )
+                },
+            )
+        });
+    let Some(suggestion) = suggestion else {
+        return add_diagnostic(diagnostics, node, 2304, [name]);
+    };
+    let suggestion_record = store
+        .symbol(suggestion)
+        .ok_or(SourceCheckError::Property(node))?;
+    let suggestion_name = suggestion_record
+        .name()
+        .as_utf8()
+        .ok_or(SourceCheckError::Property(node))?;
+    let related_information = if let Some(declaration) = suggestion_record.value_declaration() {
+        vec![CanonicalCheckerRelatedInformation {
+            node: Some(declaration),
+            diagnostic: Diagnostic::with_arguments(
+                message_by_code(2728).ok_or(SourceCheckError::MissingDiagnostic(2728))?,
+                [suggestion_name],
+            ),
+        }]
+    } else {
+        Vec::new()
+    };
+    merge_retry_diagnostic(
+        diagnostics,
+        CanonicalCheckerDiagnostic {
+            node: Some(node),
+            range_override: None,
+            diagnostic: Diagnostic::with_arguments(
+                message_by_code(2552).ok_or(SourceCheckError::MissingDiagnostic(2552))?,
+                [name, suggestion_name],
+            ),
+            related_information,
+        },
+    );
+    Ok(())
 }
 
 fn resolve_source_value_symbol(

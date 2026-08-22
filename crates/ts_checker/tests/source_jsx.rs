@@ -21,8 +21,18 @@ struct Fixture {
 
 impl Fixture {
     fn new(source: &str, file: FileId) -> Self {
+        Self::build(source, file, false)
+    }
+
+    fn allowing_parser_diagnostics(source: &str, file: FileId) -> Self {
+        Self::build(source, file, true)
+    }
+
+    fn build(source: &str, file: FileId, allow_parser_diagnostics: bool) -> Self {
         let parsed = parse_jsx_source_file(source);
-        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        if !allow_parser_diagnostics {
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        }
         let mut binder = CanonicalBinder::new();
         binder
             .bind_source_file_with_facts(
@@ -324,6 +334,187 @@ fn missing_intrinsic_interface_emits_exact_ts7026_for_each_opening() {
 
     fixture.check(first, options, &mut diagnostics).unwrap();
     assert_eq!(diagnostics.len(), 2);
+}
+
+#[test]
+fn missing_intrinsic_interface_checks_every_opening_and_closing_tag() {
+    let source = concat!(
+        "var t02 = <a>{0}#</a>;\n",
+        "var t03 = <a>#{0}</a>;\n",
+        "var t04 = <a>#{0}#</a>;\n",
+        "var t05 = <a>#<i></i></a>;\n",
+        "var t06 = <a>#<i></i></a>;\n",
+        "var t07 = <a>#<i>#</i></a>;\n",
+        "var t08 = <a><i></i>#</a>;\n",
+        "var t09 = <a>#<i></i>#</a>;\n",
+        "var t10 = <a><i/>#</a>;\n",
+        "var t11 = <a>#<i/></a>;\n",
+        "var t12 = <a>#</a>;\n",
+    );
+    let mut fixture = Fixture::new(source, FileId::new(3_711));
+    let options = CanonicalCheckerOptions {
+        no_implicit_any: true,
+        ..CanonicalCheckerOptions::default()
+    };
+    let mut diagnostics = CanonicalCheckerDiagnostics::default();
+    for index in 2..=12 {
+        let expression = fixture.expression(&format!("t{index:02}"));
+        fixture
+            .check(expression, options, &mut diagnostics)
+            .unwrap();
+    }
+
+    let mut expected = fixture
+        .parsed
+        .arena
+        .iter()
+        .filter_map(|(node, record)| {
+            matches!(
+                record.kind,
+                SyntaxKind::JsxOpeningElement
+                    | SyntaxKind::JsxClosingElement
+                    | SyntaxKind::JsxSelfClosingElement
+            )
+            .then_some((
+                record.range.start,
+                NodeRef::new(fixture.parsed.arena.id(), fixture.file, node),
+            ))
+        })
+        .collect::<Vec<_>>();
+    expected.sort_by_key(|(start, _)| *start);
+    let mut actual = diagnostics
+        .as_slice()
+        .iter()
+        .map(|diagnostic| {
+            assert_eq!(diagnostic.diagnostic.code(), 7026);
+            let node = diagnostic.node.unwrap();
+            (
+                fixture.parsed.arena.get(node.node).unwrap().range.start,
+                node,
+            )
+        })
+        .collect::<Vec<_>>();
+    actual.sort_by_key(|(start, _)| *start);
+    assert_eq!(actual, expected);
+    assert_eq!(actual.len(), 34);
+}
+
+#[test]
+fn multiline_intrinsic_tags_diagnose_opening_and_closing_ranges() {
+    let source = concat!(
+        "const a = <input value=\"\n  foo: 23\n\"></input>;\n",
+        "const b = <input value='\nfoo: 23\n'></input>;\n",
+    );
+    let mut fixture = Fixture::new(source, FileId::new(3_712));
+    let options = CanonicalCheckerOptions {
+        no_implicit_any: true,
+        ..CanonicalCheckerOptions::default()
+    };
+    let mut diagnostics = CanonicalCheckerDiagnostics::default();
+    for name in ["a", "b"] {
+        let expression = fixture.expression(name);
+        fixture
+            .check(expression, options, &mut diagnostics)
+            .unwrap();
+    }
+
+    assert_eq!(diagnostics.len(), 4);
+    let kinds = diagnostics
+        .as_slice()
+        .iter()
+        .map(|diagnostic| {
+            assert_eq!(diagnostic.diagnostic.code(), 7026);
+            let node = diagnostic.node.unwrap();
+            fixture.parsed.arena.get(node.node).unwrap().kind
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        kinds,
+        [
+            SyntaxKind::JsxOpeningElement,
+            SyntaxKind::JsxClosingElement,
+            SyntaxKind::JsxOpeningElement,
+            SyntaxKind::JsxClosingElement,
+        ],
+    );
+}
+
+#[test]
+fn mismatched_intrinsic_closing_tags_remain_semantically_checkable() {
+    let mut fixture =
+        Fixture::allowing_parser_diagnostics("const view = <div></span>;\n", FileId::new(3_713));
+    assert_eq!(fixture.parsed.diagnostics.len(), 1);
+    assert_eq!(fixture.parsed.diagnostics[0].code, Some(17002));
+    let expression = fixture.expression("view");
+    let mut diagnostics = CanonicalCheckerDiagnostics::default();
+    fixture
+        .check(
+            expression,
+            CanonicalCheckerOptions {
+                no_implicit_any: true,
+                ..CanonicalCheckerOptions::default()
+            },
+            &mut diagnostics,
+        )
+        .unwrap();
+
+    assert_eq!(diagnostics.len(), 2);
+    for diagnostic in diagnostics.as_slice() {
+        assert_eq!(diagnostic.diagnostic.code(), 7026);
+    }
+    let NodeData::JsxElement(element) = &fixture.parsed.arena.get(expression.node).unwrap().data
+    else {
+        panic!("expected a JSX element with a mismatched closing name")
+    };
+    let closing = NodeRef::new(expression.arena, expression.file, element.closing_element);
+    assert_eq!(diagnostics.as_slice()[1].node, Some(closing));
+}
+
+#[test]
+fn missing_component_uses_ts2552_and_the_declaration_related_record() {
+    let mut fixture = Fixture::new("const app = <App />;\n", FileId::new(3_714));
+    let expression = fixture.expression("app");
+    let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+    fixture
+        .check(
+            expression,
+            CanonicalCheckerOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+
+    let [diagnostic] = diagnostics.as_slice() else {
+        panic!("one missing component must produce one spelling diagnostic")
+    };
+    assert_eq!(diagnostic.diagnostic.code(), 2552);
+    assert_eq!(
+        diagnostic.diagnostic.render().unwrap(),
+        "Cannot find name 'App'. Did you mean 'app'?",
+    );
+    let [related] = diagnostic.related_information.as_slice() else {
+        panic!("the suggested declaration must have exactly one related record")
+    };
+    assert_eq!(related.diagnostic.code(), 2728);
+    assert_eq!(
+        related.diagnostic.render().unwrap(),
+        "'app' is declared here."
+    );
+    let declaration = related.node.unwrap();
+    assert_eq!(
+        fixture.parsed.arena.get(declaration.node).unwrap().kind,
+        SyntaxKind::VariableDeclaration,
+    );
+
+    fixture
+        .check(
+            expression,
+            CanonicalCheckerOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+    assert_eq!(diagnostics.len(), 1);
+    assert_eq!(diagnostics.as_slice()[0].related_information.len(), 1);
 }
 
 #[test]
