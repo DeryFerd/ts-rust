@@ -2654,6 +2654,73 @@ mod tests {
     }
 
     #[test]
+    fn parser_context_keeps_regular_expression_contents_out_of_directives() {
+        let source = "/[// @ts-ignore]/; // @ts-expect-error\nnext";
+        let mut scanner = Scanner::new(source);
+
+        assert_eq!(scanner.scan().kind, SyntaxKind::SlashToken);
+        let expression = scanner.rescan_slash_token();
+        assert_eq!(expression.kind, SyntaxKind::RegularExpressionLiteral);
+        assert_eq!(expression.text, "/[// @ts-ignore]/");
+        assert!(scanner.comment_directives().is_empty());
+
+        assert_eq!(scanner.scan().kind, SyntaxKind::SemicolonToken);
+        assert_eq!(scanner.scan().text, "next");
+        let directives = scanner.comment_directives();
+        assert_eq!(directives.len(), 1);
+        assert!(directives[0].expect_error);
+        assert_eq!(
+            &source
+                [directives[0].range.start.get() as usize..directives[0].range.end.get() as usize],
+            "// @ts-expect-error"
+        );
+    }
+
+    #[test]
+    fn parser_context_keeps_jsx_text_out_of_directives() {
+        let source = "// @ts-ignore\ninside</div> // @ts-expect-error\nnext";
+        let mut scanner = Scanner::new(source);
+        scanner.set_language_variant(LanguageVariant::Jsx);
+
+        let text = scanner.scan_jsx_token();
+        assert_eq!(text.kind, SyntaxKind::JsxText);
+        assert_eq!(text.text, "// @ts-ignore\ninside");
+        assert!(scanner.comment_directives().is_empty());
+        assert_eq!(
+            scanner.scan_jsx_token().kind,
+            SyntaxKind::LessThanSlashToken
+        );
+        assert_eq!(scanner.scan().text, "div");
+        assert_eq!(scanner.scan().kind, SyntaxKind::GreaterThanToken);
+        assert_eq!(scanner.scan().text, "next");
+
+        let directives = scanner.comment_directives();
+        assert_eq!(directives.len(), 1);
+        assert!(directives[0].expect_error);
+    }
+
+    #[test]
+    fn speculative_regex_scans_rewind_false_comment_directives() {
+        let source = "/[// @ts-ignore]/\nnext";
+        let mut scanner = Scanner::new(source);
+        assert_eq!(scanner.scan().kind, SyntaxKind::SlashToken);
+        let checkpoint = scanner.mark();
+
+        assert_eq!(scanner.scan().kind, SyntaxKind::OpenBracketToken);
+        assert_eq!(scanner.scan().text, "next");
+        assert_eq!(scanner.comment_directives().len(), 1);
+
+        scanner.rewind(checkpoint);
+        assert!(scanner.comment_directives().is_empty());
+        assert_eq!(
+            scanner.rescan_slash_token().kind,
+            SyntaxKind::RegularExpressionLiteral
+        );
+        assert!(scanner.comment_directives().is_empty());
+        assert_eq!(scanner.scan().text, "next");
+    }
+
+    #[test]
     fn comment_directives_follow_trivia_mode_checkpoints_and_text_resets() {
         let mut scanner = Scanner::new("// @ts-ignore\nvalue");
         scanner.set_skip_trivia(false);
