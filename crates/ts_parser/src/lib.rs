@@ -726,16 +726,16 @@ impl<'a> Parser<'a> {
             self.classify_import_statement_start();
         let import_starts_modified_class = self.current.kind == SyntaxKind::ImportKeyword
             && self.next_tokens_are(SyntaxKind::AbstractKeyword, SyntaxKind::ClassKeyword);
-        let recovered_bigint_module_clause = match self.current.kind {
-            SyntaxKind::ImportKeyword => self.module_clause_has_unquoted_bigint(false),
-            SyntaxKind::ExportKeyword => self.module_clause_has_unquoted_bigint(true),
-            _ => false,
-        };
+        let using_starts_expression = self.current.kind == SyntaxKind::UsingKeyword
+            && self.next_token_preceded_by_line_break();
         match self.current.kind {
             SyntaxKind::OpenBraceToken => self.parse_block(),
             SyntaxKind::ConstKeyword if is_const_enum => self.parse_const_enum_declaration(),
             SyntaxKind::VarKeyword | SyntaxKind::ConstKeyword => self.parse_variable_statement(),
             SyntaxKind::LetKeyword if let_starts_declaration => self.parse_variable_statement(),
+            SyntaxKind::UsingKeyword if using_starts_expression => {
+                self.parse_expression_statement()
+            }
             SyntaxKind::UsingKeyword => self.parse_using_statement(),
             SyntaxKind::AwaitKeyword => self.parse_await_statement(),
             SyntaxKind::FunctionKeyword => self.parse_function_declaration(),
@@ -799,13 +799,7 @@ impl<'a> Parser<'a> {
             SyntaxKind::ImportKeyword if invalid_import_declaration => {
                 self.parse_invalid_import_statement()
             }
-            SyntaxKind::ImportKeyword if recovered_bigint_module_clause => {
-                self.parse_recovered_bigint_module_clause(false)
-            }
             SyntaxKind::ImportKeyword => self.parse_import_declaration(),
-            SyntaxKind::ExportKeyword if recovered_bigint_module_clause => {
-                self.parse_recovered_bigint_module_clause(true)
-            }
             SyntaxKind::ExportKeyword => self.parse_export_declaration(),
             SyntaxKind::ColonToken => self.parse_recovered_labeled_statement(),
             SyntaxKind::SemicolonToken => self.parse_empty_statement(),
@@ -858,55 +852,6 @@ impl<'a> Parser<'a> {
             SyntaxKind::TypeKeyword => self.parse_type_alias_declaration(),
             _ => unreachable!("expected a contextual type declaration"),
         }
-    }
-
-    fn module_clause_has_unquoted_bigint(&mut self, require_first: bool) -> bool {
-        let checkpoint = self.scanner.mark();
-        let mut token = self.scanner.scan();
-        if token.kind != SyntaxKind::OpenBraceToken {
-            self.scanner.rewind(checkpoint);
-            return false;
-        }
-        token = self.scanner.scan();
-        let result = if require_first {
-            token.kind == SyntaxKind::BigIntLiteral
-        } else {
-            let mut found = token.kind == SyntaxKind::BigIntLiteral;
-            while !found
-                && !matches!(
-                    token.kind,
-                    SyntaxKind::CloseBraceToken | SyntaxKind::EndOfFile
-                )
-            {
-                token = self.scanner.scan();
-                found = token.kind == SyntaxKind::BigIntLiteral;
-            }
-            found
-        };
-        self.scanner.rewind(checkpoint);
-        result
-    }
-
-    fn parse_recovered_bigint_module_clause(&mut self, leave_bigint: bool) -> NodeId {
-        let start = self.consume().range.start;
-        self.expect_and_bump(SyntaxKind::OpenBraceToken, "Expected '{'.");
-        if !leave_bigint {
-            while !matches!(
-                self.current.kind,
-                SyntaxKind::CloseBraceToken | SyntaxKind::EndOfFile
-            ) {
-                self.bump();
-            }
-            if self.current.kind == SyntaxKind::CloseBraceToken {
-                self.bump();
-            }
-        }
-        self.alloc_node(
-            SyntaxKind::NotEmittedStatement,
-            TextRange::new(start, self.current.range.start),
-            NodeData::NotEmittedStatement(Box::new(NotEmittedStatementData { flow_node: None })),
-            &[],
-        )
     }
 
     fn parse_invalid_import_statement(&mut self) -> NodeId {
@@ -4694,9 +4639,14 @@ impl<'a> Parser<'a> {
         while self.current.kind != SyntaxKind::CloseBraceToken
             && self.current.kind != SyntaxKind::EndOfFile
         {
-            if !can_parse_module_export_name(self.current.kind)
-                || (self.current.kind == SyntaxKind::FromKeyword
-                    && self.next_token_kind() == SyntaxKind::StringLiteral)
+            if !can_parse_module_export_name(self.current.kind) {
+                if self.current.kind == SyntaxKind::BigIntLiteral {
+                    self.error_current("Expected an import name.");
+                }
+                break;
+            }
+            if self.current.kind == SyntaxKind::FromKeyword
+                && self.next_token_kind() == SyntaxKind::StringLiteral
             {
                 break;
             }
@@ -4746,7 +4696,7 @@ impl<'a> Parser<'a> {
         }
         if !(matches!(
             self.current.kind,
-            SyntaxKind::CloseBraceToken | SyntaxKind::EndOfFile
+            SyntaxKind::BigIntLiteral | SyntaxKind::CloseBraceToken | SyntaxKind::EndOfFile
         ) || (self.current.kind == SyntaxKind::FromKeyword
             && self.next_token_kind() == SyntaxKind::StringLiteral))
         {
@@ -5069,6 +5019,10 @@ impl<'a> Parser<'a> {
         while self.current.kind != SyntaxKind::CloseBraceToken
             && self.current.kind != SyntaxKind::EndOfFile
         {
+            if self.current.kind == SyntaxKind::BigIntLiteral {
+                self.error_current("Expected an export name.");
+                break;
+            }
             // Recover a missing `}` before the `from` clause without turning
             // `from` into another exported name. A closed clause can still
             // legitimately export a binding named `from`.
@@ -5154,6 +5108,14 @@ impl<'a> Parser<'a> {
             )
         {
             self.error_code_at(self.current.range, 1437, []);
+            expression_end
+        } else if self.current.kind == SyntaxKind::StringLiteral
+            && matches!(
+                self.arena.get(expression).map(|node| &node.data),
+                Some(NodeData::Identifier(identifier)) if identifier.text == "from"
+            )
+        {
+            self.error_code_at(TextRange::new(start, expression_end), 1434, []);
             expression_end
         } else if self.current.kind == SyntaxKind::Unknown {
             // Match parseErrorForMissingSemicolonAfter: a scanner error at the next
@@ -12963,6 +12925,76 @@ mod tests {
     }
 
     #[test]
+    fn preserves_declarations_when_module_export_names_are_unquoted_bigints() {
+        for (source, expected_kind, expects_from_recovery) in [
+            (
+                r#"import { 0n as foo } from "./foo";"#,
+                SyntaxKind::ImportDeclaration,
+                true,
+            ),
+            (
+                r#"import { foo as 0n } from "./foo";"#,
+                SyntaxKind::ImportDeclaration,
+                true,
+            ),
+            (
+                "export { foo as 0n };",
+                SyntaxKind::ExportDeclaration,
+                false,
+            ),
+            (
+                "export { 0n as foo };",
+                SyntaxKind::ExportDeclaration,
+                false,
+            ),
+        ] {
+            let result = parse_source_file(source);
+            let statement = source_statements(&result)[0];
+            assert_eq!(
+                result.arena.get(statement).unwrap().kind,
+                expected_kind,
+                "{source}: {:?}",
+                result.diagnostics
+            );
+
+            let bigint_start = u32::try_from(source.find("0n").unwrap()).unwrap();
+            let close_brace = u32::try_from(source.find('}').unwrap()).unwrap();
+            let mut expected = vec![
+                (Some(1003), bigint_start, bigint_start + 2),
+                (Some(1128), close_brace, close_brace + 1),
+            ];
+            if expects_from_recovery {
+                let from_start = u32::try_from(source.find("from").unwrap()).unwrap();
+                expected.push((Some(1434), from_start, from_start + 4));
+
+                let NodeData::ImportDeclaration(import) =
+                    &result.arena.get(statement).unwrap().data
+                else {
+                    panic!("expected import declaration");
+                };
+                assert!(import.import_clause.is_some());
+                assert!(matches!(
+                    result.arena.get(import.module_specifier).unwrap().kind,
+                    SyntaxKind::AsExpression | SyntaxKind::BigIntLiteral
+                ));
+            }
+
+            let actual = result
+                .diagnostics
+                .iter()
+                .map(|diagnostic| {
+                    (
+                        diagnostic.code,
+                        diagnostic.range.start.get(),
+                        diagnostic.range.end.get(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected, "{source}");
+        }
+    }
+
+    #[test]
     fn malformed_escaped_import_binding_stays_inside_the_import() {
         let result = parse_source_file("import { value as \\uD800\\uDEA7 } from \"./mod.js\";");
         let statements = source_statements(&result);
@@ -14379,6 +14411,25 @@ export as namespace GlobalName;
             .collect();
         assert!(declaration_flags.contains(&NODE_FLAG_USING));
         assert!(declaration_flags.contains(&NODE_FLAG_AWAIT_USING));
+    }
+
+    #[test]
+    fn newline_after_using_starts_separate_identifier_expressions() {
+        let result = parse_source_file("using\nidentifier;");
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+
+        let names = source_statements(&result)
+            .iter()
+            .map(|statement| {
+                let NodeData::ExpressionStatement(expression) =
+                    &result.arena.get(*statement).unwrap().data
+                else {
+                    panic!("expected expression statement");
+                };
+                identifier_text(&result, expression.expression)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["using", "identifier"]);
     }
 
     #[test]
