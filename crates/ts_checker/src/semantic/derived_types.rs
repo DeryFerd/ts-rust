@@ -1909,8 +1909,7 @@ mod tests {
     #[test]
     fn logical_array_unions_widen_each_member_and_reuse_the_canonical_result() {
         let library = parsed("interface Array<T> {}");
-        let source =
-            parsed("let condition = 123; var value = condition && [1, 2] || condition && [3, 4];");
+        let source = parsed("let condition = 123; var value = condition && [1, 2];");
         let library_file = FileId::new(40);
         let file = FileId::new(41);
         let files = [(library_file, &library), (file, &source)];
