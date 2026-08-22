@@ -13,8 +13,9 @@
 //! additionally admits one direct local nongeneric base whose own completed
 //! graph is in the same supported family; the whole-source adapter consumes
 //! that graph only after seeing the exact direct base plan earlier in source.
-//! Methods, nonempty constructor bodies, general heritage, and non-primitive
-//! annotations remain later class stages.
+//! Empty zero-argument methods retain their canonical callable identities.
+//! Nonempty executable bodies, general heritage, and non-primitive annotations
+//! remain later class stages.
 
 use std::collections::HashSet;
 
@@ -61,6 +62,16 @@ struct ClassConstructorPlan {
     declaration: NodeRef,
     symbol: SemanticSymbolId,
     visibility: ClassConstructorVisibility,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ClassMethodPlan {
+    declaration: NodeRef,
+    symbol: SemanticSymbolId,
+    name_node: NodeRef,
+    name: String,
+    side: ClassPropertySide,
+    return_type_node: Option<NodeRef>,
 }
 
 /// One source property whose annotation can be executed by the root query
@@ -131,6 +142,9 @@ pub(super) struct ClassDeclarationPlan {
     properties: Vec<ClassPropertyPlan>,
     instance_properties: Vec<ClassPropertyPlan>,
     static_properties: Vec<ClassPropertyPlan>,
+    methods: Vec<ClassMethodPlan>,
+    instance_methods: Vec<ClassMethodPlan>,
+    static_methods: Vec<ClassMethodPlan>,
 }
 
 impl ClassDeclarationPlan {
@@ -691,6 +705,157 @@ fn plan_constructor(
     })
 }
 
+fn plan_method(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    owner: SemanticSymbolId,
+    declaration: NodeRef,
+    instance_members: Option<SymbolTableId>,
+    static_members: SymbolTableId,
+) -> Result<ClassMethodPlan, ClassError> {
+    let record = preflight_node(store, host, declaration)?;
+    let NodeData::MethodDeclaration(method) = &record.data else {
+        return Err(invariant(ClassInvariant::InvalidProperty(declaration)));
+    };
+    if record.kind != SyntaxKind::MethodDeclaration
+        || record.flags.0 != 0
+        || method.asterisk_token.is_some()
+        || method.end_flow_node.is_some()
+        || method.flow_node.is_some()
+        || method.full_signature.is_some()
+        || method.next_container.is_some()
+        || method.postfix_token.is_some()
+        || method.symbol.is_some()
+        || method.type_parameters.is_some()
+        || method.facts != 0
+    {
+        return Err(unsupported(ClassUnsupported::Member {
+            node: declaration,
+            kind: SyntaxKind::MethodDeclaration,
+        }));
+    }
+    if !method.parameters.nodes.is_empty() || method.parameters.has_trailing_comma {
+        return Err(unsupported(ClassUnsupported::Member {
+            node: declaration,
+            kind: SyntaxKind::MethodDeclaration,
+        }));
+    }
+    let name_node = NodeRef::new(declaration.arena, declaration.file, method.name);
+    let name_record = preflight_node(store, host, name_node)?;
+    let NodeData::Identifier(identifier) = &name_record.data else {
+        return Err(unsupported(ClassUnsupported::PropertyName {
+            node: name_node,
+            kind: name_record.kind,
+        }));
+    };
+    if name_record.kind != SyntaxKind::Identifier
+        || name_record.parent != Some(declaration.node)
+        || name_record.range.start < record.range.start
+        || name_record.range.end > method.parameters.range.start
+    {
+        return Err(invariant(ClassInvariant::InvalidName(name_node)));
+    }
+    let (side, readonly) = class_property_modifiers(
+        store,
+        host,
+        declaration,
+        name_node,
+        method.modifiers.as_ref(),
+    )?;
+    if readonly
+        || side == ClassPropertySide::Static
+            && matches!(
+                identifier.text.as_str(),
+                "prototype" | "name" | "length" | "caller" | "arguments"
+            )
+    {
+        return Err(unsupported(ClassUnsupported::Member {
+            node: declaration,
+            kind: SyntaxKind::MethodDeclaration,
+        }));
+    }
+
+    let return_type_node = method
+        .type_
+        .map(|node| NodeRef::new(declaration.arena, declaration.file, node));
+    let mut body_start = method.parameters.range.end;
+    if let Some(type_node) = return_type_node {
+        let type_record = preflight_node(store, host, type_node)?;
+        if type_record.parent != Some(declaration.node)
+            || type_record.range.start < method.parameters.range.end
+            || type_record.range.end > record.range.end
+        {
+            return Err(invariant(ClassInvariant::InvalidProperty(declaration)));
+        }
+        body_start = type_record.range.end;
+    }
+    let body = method
+        .body
+        .map(|node| NodeRef::new(declaration.arena, declaration.file, node))
+        .ok_or_else(|| {
+            unsupported(ClassUnsupported::Member {
+                node: declaration,
+                kind: SyntaxKind::MethodDeclaration,
+            })
+        })?;
+    let body_record = preflight_node(store, host, body)?;
+    let NodeData::Block(block) = &body_record.data else {
+        return Err(invariant(ClassInvariant::InvalidProperty(declaration)));
+    };
+    if body_record.kind != SyntaxKind::Block
+        || body_record.parent != Some(declaration.node)
+        || body_record.flags.0 != 0
+        || body_record.range.start < body_start
+        || body_record.range.end != record.range.end
+        || block.facts != 0
+        || block.statements.has_trailing_comma
+    {
+        return Err(invariant(ClassInvariant::InvalidProperty(declaration)));
+    }
+    if !block.statements.nodes.is_empty() {
+        return Err(unsupported(ClassUnsupported::Member {
+            node: declaration,
+            kind: SyntaxKind::MethodDeclaration,
+        }));
+    }
+
+    let symbol = bound_symbol(store, host, declaration)
+        .ok_or_else(|| invariant(ClassInvariant::InvalidPropertySymbol(declaration)))?;
+    let symbol_record = store
+        .symbol(symbol)
+        .ok_or_else(|| invariant(ClassInvariant::InvalidPropertySymbol(declaration)))?;
+    let table = match side {
+        ClassPropertySide::Instance => instance_members,
+        ClassPropertySide::Static => Some(static_members),
+    }
+    .and_then(|table| store.symbol_table(table));
+    if symbol_record.flags() != SymbolFlags::METHOD
+        || symbol_record.check_flags() != CheckFlags::NONE
+        || symbol_record.name().as_utf8() != Some(identifier.text.as_str())
+        || symbol_record.declarations() != Some(&[declaration])
+        || symbol_record.value_declaration() != Some(declaration)
+        || symbol_record.members().is_some()
+        || symbol_record.exports().is_some()
+        || symbol_record.parent() != Some(owner)
+        || symbol_record.export_symbol().is_some()
+        || store.get_merged_symbol(symbol) != Some(symbol)
+        || table.and_then(|table| table.get_source(&identifier.text)) != Some(symbol)
+    {
+        return Err(invariant(ClassInvariant::InvalidPropertySymbol(
+            declaration,
+        )));
+    }
+
+    Ok(ClassMethodPlan {
+        declaration,
+        symbol,
+        name_node,
+        name: identifier.text.clone(),
+        side,
+        return_type_node,
+    })
+}
+
 fn plan_property(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -1128,6 +1293,9 @@ fn plan_class_declaration(
     let mut instance_properties = Vec::new();
     let mut static_properties = Vec::new();
     let mut properties = Vec::with_capacity(class.members.nodes.len());
+    let mut methods = Vec::new();
+    let mut instance_methods = Vec::new();
+    let mut static_methods = Vec::new();
     let mut instance_names = HashSet::new();
     let mut static_names = HashSet::new();
     let mut constructor = None;
@@ -1157,6 +1325,35 @@ fn plan_class_declaration(
                 member,
                 instance_members,
             )?);
+            continue;
+        }
+        if member_record.kind == SyntaxKind::MethodDeclaration {
+            if base.is_some() {
+                return Err(unsupported(ClassUnsupported::Member {
+                    node: member,
+                    kind: SyntaxKind::MethodDeclaration,
+                }));
+            }
+            let method = plan_method(
+                store,
+                host,
+                symbol,
+                member,
+                instance_members,
+                static_members,
+            )?;
+            let names = match method.side {
+                ClassPropertySide::Instance => &mut instance_names,
+                ClassPropertySide::Static => &mut static_names,
+            };
+            if !names.insert(method.name.clone()) {
+                return Err(unsupported(ClassUnsupported::DuplicateProperty(member)));
+            }
+            methods.push(method.clone());
+            match method.side {
+                ClassPropertySide::Instance => instance_methods.push(method),
+                ClassPropertySide::Static => static_methods.push(method),
+            }
             continue;
         }
         if member_record.kind != SyntaxKind::PropertyDeclaration {
@@ -1190,7 +1387,8 @@ fn plan_class_declaration(
     let instance_table = instance_members.and_then(|table| store.symbol_table(table));
     let expected_instance_members = instance_properties
         .len()
-        .checked_add(usize::from(constructor.is_some()))
+        .checked_add(instance_methods.len())
+        .and_then(|count| count.checked_add(usize::from(constructor.is_some())))
         .ok_or_else(|| invariant(ClassInvariant::Capacity(declaration)))?;
     if instance_members.is_some() == (expected_instance_members == 0)
         || instance_table.is_some_and(|table| table.len() != expected_instance_members)
@@ -1200,7 +1398,12 @@ fn plan_class_declaration(
     let static_table = store
         .symbol_table(static_members)
         .expect("the class export table was validated above");
-    if static_table.len() != static_properties.len() + 1 {
+    let expected_static_members = static_properties
+        .len()
+        .checked_add(static_methods.len())
+        .and_then(|count| count.checked_add(1))
+        .ok_or_else(|| invariant(ClassInvariant::Capacity(declaration)))?;
+    if static_table.len() != expected_static_members {
         return Err(invariant(ClassInvariant::InvalidOwnerSymbol(symbol)));
     }
 
@@ -1219,6 +1422,9 @@ fn plan_class_declaration(
         properties,
         instance_properties,
         static_properties,
+        methods,
+        instance_methods,
+        static_methods,
     })
 }
 
@@ -1236,6 +1442,7 @@ pub(super) fn plan_nongeneric_class(
 pub(super) struct ClassMemberPlan {
     class: ClassDeclarationPlan,
     property_types: Vec<TypeId>,
+    method_return_types: Vec<TypeId>,
     uninitialized_instance_properties: Vec<NodeRef>,
 }
 
@@ -1366,6 +1573,141 @@ fn expected_property_check_flags(property: &ClassPropertyPlan) -> CheckFlags {
     } else {
         CheckFlags::NONE
     }
+}
+
+fn method_return_type(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    method: &ClassMethodPlan,
+) -> Result<TypeId, ClassError> {
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or_else(|| invariant(ClassInvariant::BootstrapUnavailable(method.declaration)))?;
+    let Some(type_node) = method.return_type_node else {
+        return Ok(bootstrap.void_type);
+    };
+    let record = preflight_node(store, host, type_node)?;
+    if record.flags.0 != 0
+        || record.parent != Some(method.declaration.node)
+        || !matches!(record.data, NodeData::KeywordTypeNode(_))
+        || !matches!(
+            record.kind,
+            SyntaxKind::VoidKeyword | SyntaxKind::AnyKeyword | SyntaxKind::UndefinedKeyword
+        )
+    {
+        return Err(unsupported(ClassUnsupported::Member {
+            node: method.declaration,
+            kind: SyntaxKind::MethodDeclaration,
+        }));
+    }
+    primitive_keyword_type(store, type_node, record.kind)
+}
+
+fn exact_method_callable(
+    store: &CanonicalTypeMapperStore,
+    method: &ClassMethodPlan,
+    return_type: TypeId,
+) -> Option<(TypeId, SignatureId)> {
+    exact_method_value(store, method.symbol, method.declaration, return_type)
+}
+
+fn exact_method_value(
+    store: &CanonicalTypeMapperStore,
+    symbol: SemanticSymbolId,
+    declaration: NodeRef,
+    return_type: TypeId,
+) -> Option<(TypeId, SignatureId)> {
+    let links = store.value_symbol_links(symbol)?;
+    let type_ = links.resolved_type?;
+    if links
+        != &(ValueSymbolLinks {
+            resolved_type: Some(type_),
+            ..ValueSymbolLinks::default()
+        })
+    {
+        return None;
+    }
+    let record = store.type_payload(type_)?;
+    let TypeData::Object(object) = record.data() else {
+        return None;
+    };
+    let [signature] = object.structured.signatures.as_deref()? else {
+        return None;
+    };
+    let signature_record = store.signature(*signature)?;
+    if record.flags() != TypeFlags::OBJECT
+        || record.object_flags() != (ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED)
+        || record.symbol() != Some(symbol)
+        || record.alias().is_some()
+        || object.target.is_some()
+        || object.mapper.is_some()
+        || object.instantiations != TypeCacheState::Unallocated
+        || object.structured.constrained != ConstrainedTypeData::default()
+        || object.structured.members.is_some()
+        || object.structured.properties.is_some()
+        || object.structured.call_signature_count != 1
+        || object.structured.index_infos.is_some()
+        || object
+            .structured
+            .object_type_without_abstract_construct_signatures
+            .is_some()
+        || signature_record.flags() != SignatureFlags::NONE
+        || signature_record.declaration() != Some(declaration)
+        || !signature_record.type_parameters().is_empty()
+        || !signature_record.parameters().is_empty()
+        || signature_record.this_parameter().is_some()
+        || signature_record.min_argument_count() != 0
+        || signature_record.resolved_min_argument_count() != -1
+        || signature_record.resolved_return_type() != Some(return_type)
+        || signature_record.resolved_type_predicate().is_some()
+        || signature_record.target().is_some()
+        || signature_record.mapper().is_some()
+        || signature_record.isolated_signature_type().is_some()
+        || signature_record.composite().is_some()
+        || store.signature_links(declaration)
+            != Some(&SignatureLinks {
+                resolved_signature: ResolvedSignatureState::Resolved(*signature),
+                ..SignatureLinks::default()
+            })
+    {
+        return None;
+    }
+    Some((type_, *signature))
+}
+
+fn validate_method_cache_state(
+    store: &CanonicalTypeMapperStore,
+    method: &ClassMethodPlan,
+    return_type: TypeId,
+) -> Result<(), ClassError> {
+    if let Some(type_node) = method.return_type_node
+        && store.type_node_links(type_node).is_some_and(|links| {
+            links != &TypeNodeLinks::default()
+                && links
+                    != &(TypeNodeLinks {
+                        resolved_type: Some(return_type),
+                        ..TypeNodeLinks::default()
+                    })
+        })
+    {
+        return Err(invariant(ClassInvariant::InvalidPropertyTypeCache(
+            type_node,
+        )));
+    }
+    let value_links = store.value_symbol_links(method.symbol);
+    let signature_links = store.signature_links(method.declaration);
+    let value_cold = value_links.is_none_or(|links| links == &ValueSymbolLinks::default());
+    let signature_cold = signature_links.is_none_or(|links| links == &SignatureLinks::default());
+    if value_cold && signature_cold {
+        return Ok(());
+    }
+    if !value_cold && !signature_cold && exact_method_callable(store, method, return_type).is_some()
+    {
+        return Ok(());
+    }
+    Err(invariant(ClassInvariant::InvalidPropertyValueCache(
+        method.symbol,
+    )))
 }
 
 fn uninitialized_instance_properties(
@@ -1500,11 +1842,21 @@ fn plan_class_members(
         validate_property_cache_state(store, property, property_type)?;
         property_types.push(property_type);
     }
+    let mut method_return_types = Vec::new();
+    method_return_types
+        .try_reserve_exact(class.methods.len())
+        .map_err(|_| invariant(ClassInvariant::Capacity(class.declaration)))?;
+    for method in &class.methods {
+        let return_type = method_return_type(store, host, method)?;
+        validate_method_cache_state(store, method, return_type)?;
+        method_return_types.push(return_type);
+    }
     let uninitialized_instance_properties =
         uninitialized_instance_properties(store, &class, &property_types)?;
     Ok(ClassMemberPlan {
         class,
         property_types,
+        method_return_types,
         uninitialized_instance_properties,
     })
 }
@@ -1532,7 +1884,9 @@ pub(super) fn plan_nongeneric_class_member_query(
         return plan_class_members(store, host, class).map(ClassMemberQueryPlan::Direct);
     };
     let base_plan = plan_nongeneric_class_members(store, host, base.symbol)?;
-    if base_plan.constructor_visibility() == ClassConstructorVisibility::Private {
+    if base_plan.constructor_visibility() == ClassConstructorVisibility::Private
+        || !base_plan.class.methods.is_empty()
+    {
         return Err(unsupported(ClassUnsupported::Heritage(base.expression)));
     }
     let class = plan_class_members(store, host, class)?;
@@ -1551,18 +1905,48 @@ fn prototype_symbol(
         .and_then(|members| members.get_source(PROTOTYPE_NAME))
 }
 
+fn planned_class_member_entries(
+    properties: &[ClassPropertyPlan],
+    methods: &[ClassMethodPlan],
+) -> Vec<(EscapedName, SemanticSymbolId)> {
+    let mut entries = properties
+        .iter()
+        .map(|property| {
+            (
+                property.declaration,
+                EscapedName::source(property.name.as_str()),
+                property.symbol,
+            )
+        })
+        .chain(methods.iter().map(|method| {
+            (
+                method.declaration,
+                EscapedName::source(method.name.as_str()),
+                method.symbol,
+            )
+        }))
+        .collect::<Vec<_>>();
+    entries.sort_unstable_by_key(|(declaration, _, _)| *declaration);
+    entries
+        .into_iter()
+        .map(|(_, name, symbol)| (name, symbol))
+        .collect()
+}
+
 fn exact_member_table(
     store: &CanonicalTypeMapperStore,
     table: Option<SymbolTableId>,
     properties: &[ClassPropertyPlan],
+    methods: &[ClassMethodPlan],
 ) -> bool {
-    match (table, properties.is_empty()) {
+    let entries = planned_class_member_entries(properties, methods);
+    match (table, entries.is_empty()) {
         (None, true) => true,
         (Some(table), false) => store.symbol_table(table).is_some_and(|table| {
-            table.len() == properties.len()
-                && properties
+            table.len() == entries.len()
+                && entries
                     .iter()
-                    .all(|property| table.get_source(&property.name) == Some(property.symbol))
+                    .all(|(name, symbol)| table.get(name.as_ref()) == Some(*symbol))
         }),
         _ => false,
     }
@@ -1675,12 +2059,13 @@ fn completed_class_members(
     }
 
     let instance_structured = &instance.reference.object.structured;
-    let instance_properties = plan
-        .class
-        .instance_properties
-        .iter()
-        .map(|property| property.symbol)
-        .collect::<Vec<_>>();
+    let instance_properties = planned_class_member_entries(
+        &plan.class.instance_properties,
+        &plan.class.instance_methods,
+    )
+    .into_iter()
+    .map(|(_, symbol)| symbol)
+    .collect::<Vec<_>>();
     if store.type_payload(instance_type).is_none_or(|record| {
         record.object_flags()
             != (ObjectFlags::CLASS | ObjectFlags::REFERENCE | ObjectFlags::MEMBERS_RESOLVED)
@@ -1699,6 +2084,7 @@ fn completed_class_members(
             store,
             instance_structured.members,
             &plan.class.instance_properties,
+            &plan.class.instance_methods,
         )
     {
         return None;
@@ -1709,12 +2095,11 @@ fn completed_class_members(
         return None;
     };
     let prototype = prototype_symbol(store, &plan.class)?;
-    let static_properties = plan
-        .class
-        .static_properties
-        .iter()
-        .map(|property| property.symbol)
-        .collect::<Vec<_>>();
+    let static_properties =
+        planned_class_member_entries(&plan.class.static_properties, &plan.class.static_methods)
+            .into_iter()
+            .map(|(_, symbol)| symbol)
+            .collect::<Vec<_>>();
     let mut all_static_properties = static_properties.clone();
     all_static_properties.push(prototype);
     let [default_construct_signature] = value.structured.signatures.as_deref()? else {
@@ -1774,6 +2159,24 @@ fn completed_class_members(
                     symbol.check_flags() != expected_property_check_flags(property)
                 })
                 || !exact_property_value_links(store, property, *property_type)
+        })
+    {
+        return None;
+    }
+    if plan
+        .class
+        .methods
+        .iter()
+        .zip(&plan.method_return_types)
+        .any(|(method, return_type)| {
+            exact_method_callable(store, method, *return_type).is_none()
+                || method.return_type_node.is_some_and(|type_node| {
+                    store.type_node_links(type_node)
+                        != Some(&TypeNodeLinks {
+                            resolved_type: Some(*return_type),
+                            ..TypeNodeLinks::default()
+                        })
+                })
         })
     {
         return None;
@@ -2113,11 +2516,18 @@ fn cached_primitive_member_plan(
         validate_property_cache_state(store, property, property_type).ok()?;
         property_types.push(property_type);
     }
+    let mut method_return_types = Vec::with_capacity(class.methods.len());
+    for method in &class.methods {
+        let return_type = method_return_type(store, host, method).ok()?;
+        validate_method_cache_state(store, method, return_type).ok()?;
+        method_return_types.push(return_type);
+    }
     let uninitialized_instance_properties =
         uninitialized_instance_properties(store, class, &property_types).ok()?;
     Some(ClassMemberPlan {
         class: class.clone(),
         property_types,
+        method_return_types,
         uninitialized_instance_properties,
     })
 }
@@ -2409,15 +2819,22 @@ pub(super) fn execute_nongeneric_class_members(
     let cold_value = matches!(shell.value, StaticShellState::Cold);
     let additional_types = usize::from(cold_value)
         .checked_add(usize::from(cold_instance) * 2)
+        .and_then(|count| count.checked_add(plan.class.methods.len()))
         .ok_or_else(|| invariant(ClassInvariant::Capacity(plan.class.declaration)))?;
 
     let prototype = prototype_symbol(store, &plan.class)
         .ok_or_else(|| invariant(ClassInvariant::InvalidPrototype(plan.class.symbol)))?;
-    let prepared_instance_members = if plan.class.instance_properties.is_empty() {
+    let planned_instance_entries = planned_class_member_entries(
+        &plan.class.instance_properties,
+        &plan.class.instance_methods,
+    );
+    let planned_static_entries =
+        planned_class_member_entries(&plan.class.static_properties, &plan.class.static_methods);
+    let prepared_instance_members = if planned_instance_entries.is_empty() {
         None
     } else {
         Some(
-            PreparedSymbolTable::new(plan.class.instance_properties.len())
+            PreparedSymbolTable::new(planned_instance_entries.len())
                 .ok_or_else(|| invariant(ClassInvariant::Capacity(plan.class.declaration)))?,
         )
     };
@@ -2427,19 +2844,19 @@ pub(super) fn execute_nongeneric_class_members(
     let mut static_properties = Vec::new();
     let mut all_static_properties = Vec::new();
     let mut construct_signatures = Vec::new();
+    let mut method_signature_lists = Vec::new();
     instance_properties
-        .try_reserve_exact(plan.class.instance_properties.len())
+        .try_reserve_exact(planned_instance_entries.len())
         .map_err(|_| invariant(ClassInvariant::Capacity(plan.class.declaration)))?;
     instance_member_entries
-        .try_reserve_exact(plan.class.instance_properties.len())
+        .try_reserve_exact(planned_instance_entries.len())
         .map_err(|_| invariant(ClassInvariant::Capacity(plan.class.declaration)))?;
     static_properties
-        .try_reserve_exact(plan.class.static_properties.len())
+        .try_reserve_exact(planned_static_entries.len())
         .map_err(|_| invariant(ClassInvariant::Capacity(plan.class.declaration)))?;
     all_static_properties
         .try_reserve_exact(
-            plan.class
-                .static_properties
+            planned_static_entries
                 .len()
                 .checked_add(1)
                 .ok_or_else(|| invariant(ClassInvariant::Capacity(plan.class.declaration)))?,
@@ -2448,33 +2865,38 @@ pub(super) fn execute_nongeneric_class_members(
     construct_signatures
         .try_reserve_exact(1)
         .map_err(|_| invariant(ClassInvariant::Capacity(plan.class.declaration)))?;
-    instance_properties.extend(
-        plan.class
-            .instance_properties
-            .iter()
-            .map(|property| property.symbol),
-    );
-    instance_member_entries.extend(
-        plan.class
-            .instance_properties
-            .iter()
-            .map(|property| (EscapedName::source(property.name.as_str()), property.symbol)),
-    );
-    static_properties.extend(
-        plan.class
-            .static_properties
-            .iter()
-            .map(|property| property.symbol),
-    );
+    method_signature_lists
+        .try_reserve_exact(plan.class.methods.len())
+        .map_err(|_| invariant(ClassInvariant::Capacity(plan.class.declaration)))?;
+    for _ in &plan.class.methods {
+        let mut signatures = Vec::new();
+        signatures
+            .try_reserve_exact(1)
+            .map_err(|_| invariant(ClassInvariant::Capacity(plan.class.declaration)))?;
+        method_signature_lists.push(signatures);
+    }
+    instance_properties.extend(planned_instance_entries.iter().map(|(_, symbol)| *symbol));
+    instance_member_entries.extend(planned_instance_entries);
+    static_properties.extend(planned_static_entries.iter().map(|(_, symbol)| *symbol));
     all_static_properties.extend_from_slice(&static_properties);
     all_static_properties.push(prototype);
 
-    let missing_type_node_links = plan
+    let missing_property_type_node_links = plan
         .class
         .properties
         .iter()
         .filter(|property| store.type_node_links(property.type_node).is_none())
         .count();
+    let missing_method_type_node_links = plan
+        .class
+        .methods
+        .iter()
+        .filter_map(|method| method.return_type_node)
+        .filter(|type_node| store.type_node_links(*type_node).is_none())
+        .count();
+    let missing_type_node_links = missing_property_type_node_links
+        .checked_add(missing_method_type_node_links)
+        .ok_or_else(|| invariant(ClassInvariant::Capacity(plan.class.declaration)))?;
     let missing_property_value_links = plan
         .class
         .properties
@@ -2483,23 +2905,45 @@ pub(super) fn execute_nongeneric_class_members(
         .count();
     let missing_owner_value_link =
         usize::from(store.value_symbol_links(plan.class.symbol).is_none());
+    let missing_method_value_links = plan
+        .class
+        .methods
+        .iter()
+        .filter(|method| store.value_symbol_links(method.symbol).is_none())
+        .count();
     let missing_constructor_signature_links = usize::from(
         plan.class
             .constructor
             .is_some_and(|constructor| store.signature_links(constructor.declaration).is_none()),
     );
+    let missing_method_signature_links = plan
+        .class
+        .methods
+        .iter()
+        .filter(|method| store.signature_links(method.declaration).is_none())
+        .count();
+    let missing_signature_links = missing_constructor_signature_links
+        .checked_add(missing_method_signature_links)
+        .ok_or_else(|| invariant(ClassInvariant::Capacity(plan.class.declaration)))?;
     let missing_value_links = missing_property_value_links
         .checked_add(missing_owner_value_link)
+        .and_then(|count| count.checked_add(missing_method_value_links))
+        .ok_or_else(|| invariant(ClassInvariant::Capacity(plan.class.declaration)))?;
+    let signature_count = plan
+        .class
+        .methods
+        .len()
+        .checked_add(1)
         .ok_or_else(|| invariant(ClassInvariant::Capacity(plan.class.declaration)))?;
     if !store.try_reserve_types(additional_types)
-        || !store.try_reserve_signatures(1)
+        || !store.try_reserve_signatures(signature_count)
         || !store.try_reserve_checker_symbol_allocations(
             0,
             usize::from(prepared_instance_members.is_some()),
         )
         || !store.try_reserve_type_node_links(missing_type_node_links)
         || !store.try_reserve_value_symbol_links(missing_value_links)
-        || !store.try_reserve_signature_links(missing_constructor_signature_links)
+        || !store.try_reserve_signature_links(missing_signature_links)
     {
         return Err(invariant(ClassInvariant::Capacity(plan.class.declaration)));
     }
@@ -2550,6 +2994,61 @@ pub(super) fn execute_nongeneric_class_members(
                 resolved_type: Some(*property_type),
                 ..ValueSymbolLinks::default()
             },
+        ));
+    }
+    for ((method, return_type), mut method_signatures) in plan
+        .class
+        .methods
+        .iter()
+        .zip(&plan.method_return_types)
+        .zip(method_signature_lists)
+    {
+        let method_type = store
+            .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(method.symbol))
+            .expect("the class transaction reserved the method value identity");
+        let method_signature = store
+            .alloc_signature(
+                SignatureFlags::NONE,
+                Some(method.declaration),
+                Vec::new(),
+                None,
+                Vec::new(),
+                Some(*return_type),
+                None,
+                0,
+            )
+            .expect("the class transaction reserved the method signature");
+        method_signatures.push(method_signature);
+        if let Some(type_node) = method.return_type_node {
+            assert!(store.set_type_node_links(
+                type_node,
+                TypeNodeLinks {
+                    resolved_type: Some(*return_type),
+                    ..TypeNodeLinks::default()
+                },
+            ));
+        }
+        assert!(store.set_signature_links(
+            method.declaration,
+            SignatureLinks {
+                resolved_signature: ResolvedSignatureState::Resolved(method_signature),
+                ..SignatureLinks::default()
+            },
+        ));
+        assert!(store.set_value_symbol_links(
+            method.symbol,
+            ValueSymbolLinks {
+                resolved_type: Some(method_type),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        assert!(store.set_structured_type_members(
+            method_type,
+            None,
+            None,
+            Some(method_signatures),
+            None,
+            None,
         ));
     }
     assert!(store.set_interface_declared_members(
@@ -3007,6 +3506,59 @@ fn exact_stored_property(
         .then_some(*declaration)
 }
 
+fn exact_stored_method(
+    store: &CanonicalTypeMapperStore,
+    owner: SemanticSymbolId,
+    owner_declaration: NodeRef,
+    method: SemanticSymbolId,
+) -> Option<NodeRef> {
+    let record = store.symbol(method)?;
+    let [declaration] = record.declarations()? else {
+        return None;
+    };
+    let links = store.value_symbol_links(method)?;
+    let method_type = links.resolved_type?;
+    let structured = store.type_payload(method_type)?.data().structured()?;
+    let [signature] = structured.signatures.as_deref()? else {
+        return None;
+    };
+    let return_type = store.signature(*signature)?.resolved_return_type()?;
+    let bootstrap = store.intrinsic_bootstrap()?;
+    (record.flags() == SymbolFlags::METHOD
+        && record.check_flags() == CheckFlags::NONE
+        && record.value_declaration() == Some(*declaration)
+        && record.members().is_none()
+        && record.exports().is_none()
+        && record.parent() == Some(owner)
+        && record.export_symbol().is_none()
+        && store.get_merged_symbol(method) == Some(method)
+        && store.source_node_kind(*declaration) == Some(SyntaxKind::MethodDeclaration)
+        && store.source_node_parent(*declaration)
+            == Some(SourceNodeParent::Parent(owner_declaration))
+        && [
+            bootstrap.void_type,
+            bootstrap.any_type,
+            bootstrap.undefined_type,
+        ]
+        .contains(&return_type)
+        && exact_method_value(store, method, *declaration, return_type)
+            == Some((method_type, *signature)))
+    .then_some(*declaration)
+}
+
+fn exact_stored_class_member(
+    store: &CanonicalTypeMapperStore,
+    owner: SemanticSymbolId,
+    owner_declaration: NodeRef,
+    member: SemanticSymbolId,
+) -> Option<NodeRef> {
+    if store.symbol(member)?.flags() == SymbolFlags::METHOD {
+        exact_stored_method(store, owner, owner_declaration, member)
+    } else {
+        exact_stored_property(store, owner, owner_declaration, member)
+    }
+}
+
 #[derive(Clone, Copy)]
 enum StoredClassConstructor {
     Absent,
@@ -3091,16 +3643,16 @@ fn stored_declared_properties(
         if Some(property) == prototype || Some(property) == constructor {
             continue;
         }
-        exact_stored_property(store, owner, owner_declaration, property)?;
+        exact_stored_class_member(store, owner, owner_declaration, property)?;
         properties.push(property);
     }
     properties.sort_unstable_by_key(|property| {
-        exact_stored_property(store, owner, owner_declaration, *property)
-            .expect("validated class property retains one declaration")
+        exact_stored_class_member(store, owner, owner_declaration, *property)
+            .expect("validated class member retains one declaration")
     });
     if properties.windows(2).any(|pair| {
-        exact_stored_property(store, owner, owner_declaration, pair[0])
-            >= exact_stored_property(store, owner, owner_declaration, pair[1])
+        exact_stored_class_member(store, owner, owner_declaration, pair[0])
+            >= exact_stored_class_member(store, owner, owner_declaration, pair[1])
     }) {
         return None;
     }
@@ -3672,6 +4224,156 @@ mod tests {
     }
 
     #[test]
+    fn static_zero_argument_methods_publish_canonical_callables_and_replay_warm() {
+        let mut fixture = fixture(concat!(
+            "class Greeter { ",
+            "static try() {} ",
+            "public static named(): any {} ",
+            "static count: number; ",
+            "}",
+        ));
+        let owner = class_symbol(&fixture, "Greeter");
+        let bound = &fixture.files[&fixture.file];
+        let host = host(&fixture.parsed.arena, bound);
+        let plan = plan_nongeneric_class_member_query(&fixture.store, &host, owner).unwrap();
+
+        let members =
+            execute_nongeneric_class_member_query(&mut fixture.store, &host, &plan).unwrap();
+
+        let names = members
+            .static_properties()
+            .iter()
+            .map(|symbol| {
+                fixture
+                    .store
+                    .symbol(*symbol)
+                    .unwrap()
+                    .name()
+                    .as_utf8()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["try", "named", "count"]);
+        assert_eq!(members.instance_members(), None);
+        let methods = match &plan {
+            ClassMemberQueryPlan::Direct(plan) => &plan.class.methods,
+            ClassMemberQueryPlan::Derived { .. } => unreachable!("Greeter has no base"),
+        };
+        let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+        for (method, expected) in methods
+            .iter()
+            .zip([bootstrap.void_type, bootstrap.any_type])
+        {
+            let (type_, signature) =
+                exact_method_callable(&fixture.store, method, expected).unwrap();
+            assert_eq!(
+                fixture.store.type_payload(type_).unwrap().symbol(),
+                Some(method.symbol)
+            );
+            assert_eq!(
+                fixture.store.signature_links(method.declaration),
+                Some(&SignatureLinks {
+                    resolved_signature: ResolvedSignatureState::Resolved(signature),
+                    ..SignatureLinks::default()
+                })
+            );
+        }
+        assert_eq!(
+            validate_class_heritage_members(&fixture.store, members.shells().instance_type()),
+            ClassHeritageMembersValidation::Valid
+        );
+        let warm = (
+            fixture.store.type_len(),
+            fixture.store.signature_len(),
+            fixture.store.symbol_store().symbol_table_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+        assert_eq!(
+            execute_nongeneric_class_member_query(&mut fixture.store, &host, &plan),
+            Ok(members)
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.symbol_store().symbol_table_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            warm
+        );
+    }
+
+    #[test]
+    fn instance_zero_argument_methods_share_the_ordered_class_member_table() {
+        let mut fixture = fixture("class Model { public run(): void {} value: string; }");
+        let owner = class_symbol(&fixture, "Model");
+        let bound = &fixture.files[&fixture.file];
+        let host = host(&fixture.parsed.arena, bound);
+        let plan = plan_nongeneric_class_member_query(&fixture.store, &host, owner).unwrap();
+
+        let members =
+            execute_nongeneric_class_member_query(&mut fixture.store, &host, &plan).unwrap();
+
+        let names = members
+            .instance_properties()
+            .iter()
+            .map(|symbol| {
+                fixture
+                    .store
+                    .symbol(*symbol)
+                    .unwrap()
+                    .name()
+                    .as_utf8()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["run", "value"]);
+        let declared = fixture.store.symbol(owner).unwrap().members().unwrap();
+        assert_ne!(members.instance_members(), Some(declared));
+        assert_eq!(
+            validate_class_heritage_members(&fixture.store, members.shells().instance_type()),
+            ClassHeritageMembersValidation::Valid
+        );
+    }
+
+    #[test]
+    fn unsupported_method_return_or_body_keeps_all_class_members_cold() {
+        for source in [
+            "class Model { static first() {} static second(): number {} }",
+            "class Model { static first() {} static second() { return; } }",
+            "class Model { static first() {} static second(value: string) {} }",
+        ] {
+            let fixture = fixture(source);
+            let owner = class_symbol(&fixture, "Model");
+            let bound = &fixture.files[&fixture.file];
+            let host = host(&fixture.parsed.arena, bound);
+            let cold = (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+
+            assert!(matches!(
+                plan_nongeneric_class_member_query(&fixture.store, &host, owner),
+                Err(ClassError::Unsupported(ClassUnsupported::Member {
+                    kind: SyntaxKind::MethodDeclaration,
+                    ..
+                }))
+            ));
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.signature_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                cold
+            );
+            assert!(fixture.store.declared_type_links(owner).is_none());
+            assert!(fixture.store.value_symbol_links(owner).is_none());
+        }
+    }
+
+    #[test]
     fn uninitialized_property_plan_matches_strict_checker_type_exemptions() {
         let fixture = fixture(concat!(
             "class Model { ",
@@ -3852,7 +4554,7 @@ mod tests {
         let cases = [
             ("class Generic<T> {}", "Generic"),
             ("class Base {} class Derived extends Base {}", "Derived"),
-            ("class Method { method(): void {} }", "Method"),
+            ("class Method { method(): void { return; } }", "Method"),
             ("class Initialized { value = 1; }", "Initialized"),
             ("class Reserved { static prototype: number; }", "Reserved"),
             (
