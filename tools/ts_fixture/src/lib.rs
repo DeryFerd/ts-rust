@@ -2728,46 +2728,24 @@ fn error_baseline_unit_order(case: &Case) -> (Vec<usize>, Vec<String>) {
         })
         .collect::<Vec<_>>();
     if let Some(&config_index) = config_indices.first() {
-        let mut issues = Vec::new();
+        let mut issues = project_configuration_unsupported_details(case);
+        let roots = pinned_project_config(case)
+            .map(|config| {
+                let variant = expand_option_matrix(case)
+                    .into_iter()
+                    .next()
+                    .unwrap_or_default();
+                let options = fixture_compiler_options(case, &variant);
+                project_root_unit_indices(case, &config, &options)
+            })
+            .unwrap_or_default();
         if config_indices.len() > 1 {
             issues.push(
                 "multiple project configuration units make upstream tsConfigFiles ordering ambiguous"
                     .to_owned(),
             );
         }
-        let config_path = virtual_unit_path(case, &case.units[config_index], config_index);
-        let config_directory = config_path
-            .rsplit_once('/')
-            .map_or("", |(directory, _)| directory);
-        let parsed = ts_config::parse_config_text(
-            &config_path,
-            case.units[config_index].source_text.as_scannable_str(),
-        );
-        let explicit_files = parsed.value.and_then(|config| config.files);
-        let mut roots = Vec::new();
-        if let Some(files) = explicit_files {
-            let configured = files
-                .iter()
-                .map(|file| ts_path::resolve_path(config_directory, &[file]))
-                .collect::<BTreeSet<_>>();
-            roots.extend(
-                case.units
-                    .iter()
-                    .enumerate()
-                    .filter(|(index, _)| !config_indices.contains(index))
-                    .filter_map(|(index, unit)| {
-                        configured
-                            .contains(&virtual_unit_path(case, unit, index))
-                            .then_some(index)
-                    }),
-            );
-        } else {
-            issues.push(
-                "project include/exclude expansion is not exposed to the fixture renderer; input-file order cannot be proven exact"
-                    .to_owned(),
-            );
-        }
-        let mut order = config_indices;
+        let mut order = vec![config_index];
         order.extend(roots.iter().copied());
         let remaining = case
             .units
@@ -3654,12 +3632,7 @@ fn expanded_option_values(case: &Case) -> (BTreeMap<String, Vec<String>>, Vec<St
             option_values.insert(name.to_owned(), vec![value.to_owned()]);
         }
     }
-    if project_config_unit(case).is_some() {
-        unsupported_details.push(
-            "virtual project configurations are not modeled with pinned root/other-file semantics"
-                .to_owned(),
-        );
-    }
+    unsupported_details.extend(project_configuration_unsupported_details(case));
     unsupported_details.sort();
     unsupported_details.dedup();
     (option_values, unsupported_details)
@@ -3688,7 +3661,11 @@ fn pinned_directive_unsupported_details(case: &Case) -> Vec<String> {
                 .any(|name| name.eq_ignore_ascii_case(&directive.name))
             || matches!(
                 lower.as_str(),
-                "filename" | "notypesandsymbols" | "traceresolution" | "reportdiagnostics"
+                "filename"
+                    | "noimplicitreferences"
+                    | "notypesandsymbols"
+                    | "traceresolution"
+                    | "reportdiagnostics"
             )
         {
             continue;
@@ -3699,22 +3676,36 @@ fn pinned_directive_unsupported_details(case: &Case) -> Vec<String> {
                 "the pinned harness adds suggestion diagnostics, which Rust does not collect"
             }
             "currentdirectory" => "custom current-directory path semantics are not proven exact",
-            "link" | "symlink" => "virtual link semantics are not proven exact",
-            "typescriptversion" => "version-specific harness semantics are not proven exact",
-            "noimplicitreferences" => {
-                "pinned root-file selection semantics are not modeled exactly"
+            "link" => {
+                if directive
+                    .value
+                    .split_once("->")
+                    .is_some_and(|(source, target)| {
+                        !source.trim().is_empty() && !target.trim().is_empty()
+                    })
+                {
+                    continue;
+                }
+                "the pinned harness requires a nonempty source -> target directory link"
             }
+            "symlink" => {
+                if directive
+                    .value
+                    .split(',')
+                    .any(|alias| !alias.trim().is_empty())
+                {
+                    continue;
+                }
+                "the pinned harness requires a nonempty file symlink target"
+            }
+            "typescriptversion" => "version-specific harness semantics are not proven exact",
             "fullemitpaths" => "pinned root-file and output-path semantics are not modeled exactly",
             "usecasesensitivefilenames" => {
                 let value = pinned_setting_value(&directive.value);
-                if value.eq_ignore_ascii_case("true") {
+                if value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("false") {
                     continue;
                 }
-                if value.eq_ignore_ascii_case("false") {
-                    "case-insensitive virtual filesystem semantics are not modeled exactly"
-                } else {
-                    "the pinned harness requires a boolean useCaseSensitiveFileNames value"
-                }
+                "the pinned harness requires a boolean useCaseSensitiveFileNames value"
             }
             _ => "the pinned compiler or harness setting is not modeled by Rust",
         };
@@ -3799,22 +3790,18 @@ fn effective_option_value(case: &Case, variant: &OptionVariant, name: &str) -> O
                 .then(|| value.clone())
         })
         .or_else(|| {
-            project_config_unit(case)
-                .and_then(|(path, unit)| {
-                    ts_config::parse_config_text(&path, unit.source_text.as_scannable_str()).value
-                })
-                .and_then(|config| {
-                    config
-                        .compiler_options
-                        .into_iter()
-                        .find(|(configured_name, _)| configured_name.eq_ignore_ascii_case(name))
-                        .and_then(|(_, value)| match value {
-                            ts_config::JsonValue::String(value) => Some(value),
-                            ts_config::JsonValue::Bool(value) => Some(value.to_string()),
-                            ts_config::JsonValue::Number(value) => Some(value.as_str().to_owned()),
-                            _ => None,
-                        })
-                })
+            pinned_project_config(case).and_then(|config| {
+                config
+                    .compiler_options
+                    .into_iter()
+                    .find(|(configured_name, _)| configured_name.eq_ignore_ascii_case(name))
+                    .and_then(|(_, value)| match value {
+                        ts_config::JsonValue::String(value) => Some(value),
+                        ts_config::JsonValue::Bool(value) => Some(value.to_string()),
+                        ts_config::JsonValue::Number(value) => Some(value.as_str().to_owned()),
+                        _ => None,
+                    })
+            })
         })
 }
 
@@ -4323,7 +4310,12 @@ fn compile_case_variant(
     checker: FixtureChecker,
     walk_semantic_artifacts: bool,
 ) -> Result<Compilation, FixtureCompilationFailure> {
-    let file_system = MemoryFileSystem::new(true);
+    let case_sensitive = case
+        .directive_values("useCaseSensitiveFileNames")
+        .last()
+        .map(pinned_setting_value)
+        .is_none_or(|value| !value.eq_ignore_ascii_case("false"));
+    let file_system = MemoryFileSystem::new(case_sensitive);
     let project_directory = project_config_unit(case).and_then(|(path, _)| {
         path.rsplit_once('/')
             .map(|(directory, _)| directory.to_owned())
@@ -4339,29 +4331,12 @@ fn compile_case_variant(
         })
         .collect::<Vec<_>>();
     for (source, alias) in &links {
-        let nested_dependency = links.iter().any(|(containing_source, _)| {
-            alias != containing_source
-                && alias
-                    .strip_prefix(containing_source)
-                    .is_some_and(|rest| rest.starts_with('/'))
-        });
-        let exposes_nested_dependency = links.iter().any(|(_, nested_alias)| {
-            nested_alias != source
-                && nested_alias
-                    .strip_prefix(source)
-                    .is_some_and(|rest| rest.starts_with('/'))
-        });
-        if !nested_dependency && exposes_nested_dependency {
-            file_system.add_directory_link(source, alias);
-        }
+        file_system.add_directory_link(source, alias);
     }
     let mut roots = Vec::with_capacity(case.units.len());
     for (index, unit) in case.units.iter().enumerate() {
         let path = virtual_unit_path(case, unit, index);
         file_system.write_file(&path, unit.source_text.as_scannable_str())?;
-        for alias in linked_aliases(&path, &links) {
-            file_system.write_file(&alias, unit.source_text.as_scannable_str())?;
-        }
         let next_unit_line = case
             .units
             .get(index + 1)
@@ -4378,34 +4353,40 @@ fn compile_case_variant(
             .map(str::trim)
             .filter(|alias| !alias.is_empty())
         {
-            file_system.write_file(
-                &virtual_harness_path(alias),
-                unit.source_text.as_scannable_str(),
-            )?;
+            file_system.add_file_link(&path, &virtual_harness_path(alias));
         }
         if is_pinned_program_root(&path) {
             roots.push(path);
         }
     }
-    let last_unit_uses_implicit_references =
-        case.units.last().is_some_and(unit_uses_implicit_references);
-    if project_directory.is_none()
-        && (case
-            .directive_values("noImplicitReferences")
-            .last()
-            .is_some_and(|value| !value.is_empty())
-            || last_unit_uses_implicit_references)
-    {
-        roots.clear();
-        if let Some((index, last_unit)) = case.units.iter().enumerate().next_back() {
-            let last_root = virtual_unit_path(case, last_unit, index);
-            if is_pinned_program_root(&last_root) {
-                roots.push(last_root);
+    let parsed_options = fixture_compiler_options_result(case, variant);
+    let option_diagnostics = parsed_options.diagnostics;
+    let mut compiler_options = parsed_options.options;
+    if let Some(config) = pinned_project_config(case) {
+        roots = project_root_unit_indices(case, &config, &compiler_options)
+            .into_iter()
+            .map(|index| virtual_unit_path(case, &case.units[index], index))
+            .collect();
+    } else {
+        let last_unit_uses_implicit_references =
+            case.units.last().is_some_and(unit_uses_implicit_references);
+        if project_directory.is_none()
+            && (case
+                .directive_values("noImplicitReferences")
+                .last()
+                .is_some_and(|value| !value.is_empty())
+                || last_unit_uses_implicit_references)
+        {
+            roots.clear();
+            if let Some((index, last_unit)) = case.units.iter().enumerate().next_back() {
+                let last_root = virtual_unit_path(case, last_unit, index);
+                if is_pinned_program_root(&last_root) {
+                    roots.push(last_root);
+                }
             }
         }
     }
 
-    let mut compiler_options = fixture_compiler_options(case, variant);
     if compiler_options.root_dir.is_none()
         && let Some(project_directory) = project_directory.as_ref()
         && !project_directory.is_empty()
@@ -4488,7 +4469,7 @@ fn compile_case_variant(
                 ts_diagnostics::Category::Suggestion => CompilationDiagnosticCategory::Suggestion,
                 ts_diagnostics::Category::Message => CompilationDiagnosticCategory::Message,
             }),
-            message: diagnostic.message.clone(),
+            message: pinned_program_diagnostic_message(&program, diagnostic),
             related_information: match checker {
                 // Legacy Program diagnostics still do not expose whether
                 // related records exist. Do not manufacture canonical detail
@@ -4530,6 +4511,37 @@ fn compile_case_variant(
             },
         })
         .collect::<Vec<_>>();
+    for diagnostic in option_diagnostics {
+        let message = diagnostic
+            .render()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let option_diagnostic = CompilationDiagnostic {
+            file_name: None,
+            source_text: None,
+            range: None,
+            code: Some(diagnostic.code()),
+            category: Some(match diagnostic.category() {
+                ts_diagnostics::Category::Error => CompilationDiagnosticCategory::Error,
+                ts_diagnostics::Category::Warning => CompilationDiagnosticCategory::Warning,
+                ts_diagnostics::Category::Suggestion => CompilationDiagnosticCategory::Suggestion,
+                ts_diagnostics::Category::Message => CompilationDiagnosticCategory::Message,
+            }),
+            message,
+            related_information: match checker {
+                FixtureChecker::Legacy => None,
+                FixtureChecker::Canonical => Some(Vec::new()),
+            },
+        };
+        if !diagnostics.iter().any(|existing| {
+            existing.file_name == option_diagnostic.file_name
+                && existing.range == option_diagnostic.range
+                && existing.code == option_diagnostic.code
+                && existing.category == option_diagnostic.category
+                && existing.message == option_diagnostic.message
+        }) {
+            diagnostics.push(option_diagnostic);
+        }
+    }
     diagnostics.sort_by(compare_compilation_diagnostics);
     let ordered = diagnostics.iter().collect::<Vec<_>>();
     let mut unsupported_details = Vec::new();
@@ -4557,26 +4569,6 @@ fn virtual_harness_path(path: &str) -> String {
     } else {
         ts_path::resolve_path("/.src", &[path])
     }
-}
-
-fn linked_aliases(path: &str, links: &[(String, String)]) -> BTreeSet<String> {
-    let mut paths = BTreeSet::from([path.to_owned()]);
-    for _ in 0..links.len() {
-        let candidates = paths.iter().cloned().collect::<Vec<_>>();
-        for candidate in candidates {
-            for (source, target) in links {
-                if candidate == *source
-                    || candidate
-                        .strip_prefix(source)
-                        .is_some_and(|rest| rest.starts_with('/'))
-                {
-                    paths.insert(format!("{target}{}", &candidate[source.len()..]));
-                }
-            }
-        }
-    }
-    paths.remove(path);
-    paths
 }
 
 fn virtual_unit_path(case: &Case, unit: &Unit, index: usize) -> String {
@@ -4614,10 +4606,58 @@ fn unit_uses_implicit_references(unit: &Unit) -> bool {
         })
 }
 
+fn pinned_program_diagnostic_message(
+    program: &ts_compiler::Program,
+    diagnostic: &ts_compiler::ProgramDiagnostic,
+) -> String {
+    if diagnostic.code != Some(2688) || diagnostic.file_name.is_some() {
+        return diagnostic.message.clone();
+    }
+
+    let Some(missing_message) = ts_diagnostics::message_by_code(2688) else {
+        return diagnostic.message.clone();
+    };
+    let matching = program
+        .options()
+        .types
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .filter(|name| {
+            missing_message
+                .format(&[(*name).clone()])
+                .is_ok_and(|message| message == diagnostic.message)
+        })
+        .collect::<Vec<_>>();
+    let [name] = matching.as_slice() else {
+        return diagnostic.message.clone();
+    };
+    let Some(program_reason) = ts_diagnostics::message_by_code(1430) else {
+        return diagnostic.message.clone();
+    };
+    let Some(type_reason) = ts_diagnostics::message_by_code(1417) else {
+        return diagnostic.message.clone();
+    };
+    let Ok(type_reason) = type_reason.format(&[(*name).clone()]) else {
+        return diagnostic.message.clone();
+    };
+
+    format!(
+        "{}\n  {}\n    {type_reason}",
+        diagnostic.message,
+        program_reason.text(),
+    )
+}
+
 fn fixture_compiler_options(case: &Case, variant: &OptionVariant) -> ts_options::CompilerOptions {
-    let project_config = project_config_unit(case).and_then(|(path, unit)| {
-        ts_config::parse_config_text(&path, unit.source_text.as_scannable_str()).value
-    });
+    fixture_compiler_options_result(case, variant).options
+}
+
+fn fixture_compiler_options_result(
+    case: &Case,
+    variant: &OptionVariant,
+) -> ts_options::ParseOptionsResult {
+    let project_config = pinned_project_config(case);
     let mut values = project_config
         .as_ref()
         .map_or_else(BTreeMap::new, |config| config.compiler_options.clone());
@@ -4631,12 +4671,13 @@ fn fixture_compiler_options(case: &Case, variant: &OptionVariant) -> ts_options:
     let has_explicit_module = values
         .keys()
         .any(|name| name.eq_ignore_ascii_case("module"));
-    let mut options = if let Some(mut config) = project_config {
+    let mut parsed = if let Some(mut config) = project_config {
         config.compiler_options = values;
-        ts_options::parse_project_options(&config).options
+        ts_options::parse_project_options(&config)
     } else {
-        ts_options::parse_compiler_options(&ts_config::JsonValue::Object(values)).options
+        ts_options::parse_compiler_options(&ts_config::JsonValue::Object(values))
     };
+    let options = &mut parsed.options;
     // The current ts-go compiler treats an omitted target as the latest
     // standard language version rather than the historical ES5 default.
     if !has_explicit_target {
@@ -4667,7 +4708,156 @@ fn fixture_compiler_options(case: &Case, variant: &OptionVariant) -> ts_options:
     {
         options.module = ts_options::ModuleKind::CommonJs;
     }
-    options
+    parsed
+}
+
+fn project_configuration_unsupported_details(case: &Case) -> Vec<String> {
+    let Some((path, unit)) = project_config_unit(case) else {
+        return Vec::new();
+    };
+    let config_count = case
+        .units
+        .iter()
+        .filter(|unit| {
+            unit.path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    name.eq_ignore_ascii_case("tsconfig.json")
+                        || name.eq_ignore_ascii_case("jsconfig.json")
+                })
+        })
+        .count();
+    let mut details = Vec::new();
+    if config_count > 1 {
+        details.push("multiple virtual project configurations are not modeled exactly".to_owned());
+    }
+
+    let parsed = ts_config::parse_config_text(&path, unit.source_text.as_scannable_str());
+    let Some(config) = pinned_project_config(case) else {
+        details.push("virtual project configuration has no recoverable object".to_owned());
+        return details;
+    };
+    if parsed.value.is_some() && !parsed.diagnostics.is_empty() {
+        details
+            .push("virtual project configuration diagnostics are not modeled exactly".to_owned());
+    }
+    if config.extends.is_some() {
+        details.push("virtual project extends resolution is not modeled exactly".to_owned());
+    }
+    if !config.references.is_empty() {
+        details.push("virtual project references are not modeled exactly".to_owned());
+    }
+    if config.include.is_some() || config.exclude.is_some() {
+        details.push("virtual project include/exclude patterns are not modeled exactly".to_owned());
+    }
+    if let Some(files) = config.files.as_ref() {
+        let directory = config
+            .path
+            .rsplit_once('/')
+            .map_or("", |(directory, _)| directory);
+        for file in files {
+            let expected = ts_path::resolve_path(directory, &[file]);
+            if !case.units.iter().enumerate().any(|(index, unit)| {
+                virtual_unit_path(case, unit, index).eq_ignore_ascii_case(&expected)
+            }) {
+                details.push(format!(
+                    "virtual project explicitly references unavailable input {file:?}"
+                ));
+            }
+        }
+    }
+    details
+}
+
+fn pinned_project_config(case: &Case) -> Option<ts_config::ProjectConfig> {
+    let (path, unit) = project_config_unit(case)?;
+    let source = unit.source_text.as_scannable_str();
+    if let Some(config) = ts_config::parse_config_text(&path, source).value {
+        return Some(config);
+    }
+
+    let ts_config::JsonValue::Array(values) = ts_config::parse_jsonc(&path, source).value? else {
+        return None;
+    };
+    let first_object = values
+        .into_iter()
+        .find(|value| matches!(value, ts_config::JsonValue::Object(_)))?;
+    let recovered = serde_json::to_string(&project_json_value(&first_object)?).ok()?;
+    ts_config::parse_config_text(&path, &recovered).value
+}
+
+fn project_json_value(value: &ts_config::JsonValue) -> Option<serde_json::Value> {
+    match value {
+        ts_config::JsonValue::Null => Some(serde_json::Value::Null),
+        ts_config::JsonValue::Bool(value) => Some(serde_json::Value::Bool(*value)),
+        ts_config::JsonValue::Number(value) => value
+            .as_str()
+            .parse::<serde_json::Number>()
+            .ok()
+            .map(serde_json::Value::Number),
+        ts_config::JsonValue::String(value) => Some(serde_json::Value::String(value.clone())),
+        ts_config::JsonValue::Array(values) => values
+            .iter()
+            .map(project_json_value)
+            .collect::<Option<Vec<_>>>()
+            .map(serde_json::Value::Array),
+        ts_config::JsonValue::Object(values) => values
+            .iter()
+            .map(|(key, value)| project_json_value(value).map(|value| (key.clone(), value)))
+            .collect::<Option<serde_json::Map<_, _>>>()
+            .map(serde_json::Value::Object),
+    }
+}
+
+fn project_root_unit_indices(
+    case: &Case,
+    config: &ts_config::ProjectConfig,
+    options: &ts_options::CompilerOptions,
+) -> Vec<usize> {
+    let directory = config
+        .path
+        .rsplit_once('/')
+        .map_or("", |(directory, _)| directory);
+    let explicit_files = config.files.as_ref().map(|files| {
+        files
+            .iter()
+            .map(|file| ts_path::resolve_path(directory, &[file]))
+            .collect::<BTreeSet<_>>()
+    });
+    case.units
+        .iter()
+        .enumerate()
+        .filter_map(|(index, unit)| {
+            let path = virtual_unit_path(case, unit, index);
+            if !is_pinned_program_root(&path) {
+                return None;
+            }
+            if let Some(files) = explicit_files.as_ref() {
+                return files.contains(&path).then_some(index);
+            }
+
+            let relative = path
+                .strip_prefix(directory)
+                .and_then(|relative| relative.strip_prefix('/'))?;
+            if relative.split('/').any(|component| {
+                component.starts_with('.')
+                    || matches!(
+                        component,
+                        "node_modules" | "bower_components" | "jspm_packages"
+                    )
+            }) {
+                return None;
+            }
+            match ts_path::script_kind_from_path(&path) {
+                ts_path::ScriptKind::Ts | ts_path::ScriptKind::Tsx => Some(index),
+                ts_path::ScriptKind::Js | ts_path::ScriptKind::Jsx if options.allow_js => {
+                    Some(index)
+                }
+                _ => None,
+            }
+        })
+        .collect()
 }
 
 fn project_config_unit(case: &Case) -> Option<(String, &Unit)> {
@@ -5778,9 +5968,10 @@ mod tests {
         let case = Case::parse(
             "unsupported.ts",
             concat!(
+                "// @module: esnext\n",
                 "// @outDir: out\n",
-                "// @filename: unsupported.mts\n",
-                "const value = 1;\n",
+                "// @filename: unsupported.ts\n",
+                "const value = import.meta.url;\n",
             ),
         )
         .unwrap();
@@ -5796,9 +5987,8 @@ mod tests {
         assert!(compilation.outputs.is_empty());
         assert_eq!(variant.unsupported_details.len(), 1);
         assert!(
-            variant.unsupported_details[0].contains(
-                "cannot yet retain fixed module-format facts for '/.src/unsupported.mts'"
-            ),
+            variant.unsupported_details[0]
+                .contains("cannot yet retain the import.meta module indicator"),
             "{:?}",
             variant.unsupported_details
         );
@@ -6072,18 +6262,18 @@ mod tests {
             compilation.diagnostics
         );
         let declaration = &compilation.outputs["/project/dist/index.d.ts"];
-        assert!(
-            declaration.contains("import { External } from 'package';"),
-            "{declaration}"
-        );
-        assert!(
-            declaration.contains("export default function value(): External;"),
-            "{declaration}"
-        );
-        assert!(!declaration.contains("node_modules"), "{declaration}");
-        assert!(
-            !declaration.contains("declare module \"package/index\""),
-            "{declaration}"
+        assert_eq!(
+            declaration,
+            concat!(
+                "declare module \"package/index\" {\n",
+                "    export class External {\n",
+                "    }\n",
+                "}\n",
+                "declare module \"project/index\" {\n",
+                "    import { External } from \"package/index\";\n",
+                "    export default function value(): External;\n",
+                "}\n",
+            )
         );
     }
 
@@ -6105,6 +6295,11 @@ mod tests {
             ),
         )
         .unwrap();
+        assert!(
+            expand_option_matrix(&symlink)[0]
+                .unsupported_details
+                .is_empty()
+        );
         let compilation = compile_case(&symlink).unwrap();
         assert!(
             compilation.diagnostics.is_empty(),
@@ -6129,6 +6324,11 @@ mod tests {
             ),
         )
         .unwrap();
+        assert!(
+            expand_option_matrix(&relative_link)[0]
+                .unsupported_details
+                .is_empty()
+        );
         let compilation = compile_case(&relative_link).unwrap();
         assert!(
             compilation.diagnostics.is_empty(),
@@ -6136,6 +6336,74 @@ mod tests {
             compilation.diagnostics
         );
         assert!(compilation.outputs.contains_key("/.src/app/index.js"));
+    }
+
+    #[test]
+    fn chained_directory_links_resolve_packages_without_copying_virtual_files() {
+        let case = Case::parse(
+            "chainedLinks.ts",
+            concat!(
+                "// @module: commonjs\n",
+                "// @target: es2015\n",
+                "// @noLib: true\n",
+                "// @noImplicitReferences: true\n",
+                "// @filename: /packages/shared/index.ts\n",
+                "export const shared: number = 1;\n",
+                "// @filename: /app/index.ts\n",
+                "import { shared } from 'shared';\n",
+                "export const value: number = shared;\n",
+                "// @link: /packages/shared -> /middle/shared\n",
+                "// @link: /middle/shared -> /app/node_modules/shared\n",
+            ),
+        )
+        .unwrap();
+        let variant = expand_option_matrix(&case).remove(0);
+        assert!(
+            variant.unsupported_details.is_empty(),
+            "{:?}",
+            variant.unsupported_details
+        );
+        let compilation = compile_case(&case).unwrap();
+        assert!(
+            compilation.diagnostics.is_empty(),
+            "{:?}",
+            compilation.diagnostics
+        );
+        assert!(compilation.outputs.contains_key("/app/index.js"));
+    }
+
+    #[test]
+    fn file_links_follow_case_insensitive_fixture_settings() {
+        let case = Case::parse(
+            "caseInsensitiveLink.ts",
+            concat!(
+                "// @module: commonjs\n",
+                "// @target: es2015\n",
+                "// @noLib: true\n",
+                "// @noImplicitReferences: true\n",
+                "// @useCaseSensitiveFileNames: false\n",
+                "// @filename: /SHARED/Index.ts\n",
+                "// @symlink: /APP/node_modules/PKG/index.ts\n",
+                "export const shared: number = 1;\n",
+                "// @filename: /app/main.ts\n",
+                "import { shared } from 'pkg';\n",
+                "export const value: number = shared;\n",
+            ),
+        )
+        .unwrap();
+        let variant = expand_option_matrix(&case).remove(0);
+        assert!(
+            variant.unsupported_details.is_empty(),
+            "{:?}",
+            variant.unsupported_details
+        );
+        let compilation = compile_case(&case).unwrap();
+        assert!(
+            compilation.diagnostics.is_empty(),
+            "{:?}",
+            compilation.diagnostics
+        );
+        assert!(compilation.outputs.contains_key("/app/main.js"));
     }
 
     #[test]
@@ -6181,6 +6449,148 @@ mod tests {
         let compilation = compile_case(&case).unwrap();
         assert_eq!(compilation.outputs.len(), 1);
         assert!(compilation.outputs.contains_key("/project/index.js"));
+    }
+
+    #[test]
+    fn project_config_default_inputs_have_proven_root_and_baseline_order() {
+        let case = Case::parse(
+            "projectDefaults.ts",
+            concat!(
+                "// @filename: tsconfig.json\n",
+                "{ \"compilerOptions\": { \"strictNullChecks\": true } }\n",
+                "// @filename: selected.ts\n",
+                "const value: string = undefined;\n",
+            ),
+        )
+        .unwrap();
+        let variant = expand_option_matrix(&case).remove(0);
+        assert!(
+            variant.unsupported_details.is_empty(),
+            "{:?}",
+            variant.unsupported_details
+        );
+        let (order, issues) = error_baseline_unit_order(&case);
+        assert!(issues.is_empty(), "{issues:?}");
+        assert_eq!(order, [0, 1]);
+        assert_eq!(compile_case(&case).unwrap().diagnostics.len(), 1);
+    }
+
+    #[test]
+    fn project_config_explicit_files_exclude_other_virtual_source_roots() {
+        let case = Case::parse(
+            "projectFiles.ts",
+            concat!(
+                "// @filename: tsconfig.json\n",
+                "{ \"files\": [\"selected.ts\"] }\n",
+                "// @filename: ignored.ts\n",
+                "const ignored: string = 1;\n",
+                "// @filename: selected.ts\n",
+                "const selected: number = 1;\n",
+            ),
+        )
+        .unwrap();
+        let compilation = compile_case(&case).unwrap();
+        assert!(
+            compilation.diagnostics.is_empty(),
+            "{:?}",
+            compilation.diagnostics
+        );
+        assert!(compilation.outputs.contains_key("/.src/selected.js"));
+        assert!(!compilation.outputs.contains_key("/.src/ignored.js"));
+        let (order, issues) = error_baseline_unit_order(&case);
+        assert!(issues.is_empty(), "{issues:?}");
+        assert_eq!(order, [0, 2, 1]);
+    }
+
+    #[test]
+    fn project_config_array_recovers_its_first_configuration_object() {
+        let case = Case::parse(
+            "malformedProject.ts",
+            concat!(
+                "// @filename: tsconfig.json\n",
+                "[{\"compilerOptions\": {\"types\": [\"nonexistent\"]}}]\n",
+                "// @filename: index.ts\n",
+                "export const value = 1;\n",
+            ),
+        )
+        .unwrap();
+        let variant = expand_option_matrix(&case).remove(0);
+        assert!(
+            variant.unsupported_details.is_empty(),
+            "{:?}",
+            variant.unsupported_details
+        );
+        let options = fixture_compiler_options(&case, &variant);
+        assert_eq!(options.types, Some(vec!["nonexistent".to_owned()]));
+        let compilation = compile_case(&case).unwrap();
+        assert_eq!(compilation.diagnostics.len(), 1);
+        assert_eq!(compilation.diagnostics[0].code, Some(2688));
+        assert_eq!(
+            compilation.diagnostics[0].message,
+            concat!(
+                "Cannot find type definition file for 'nonexistent'.\n",
+                "  The file is in the program because:\n",
+                "    Entry point of type library 'nonexistent' specified in compilerOptions",
+            )
+        );
+    }
+
+    #[test]
+    fn no_implicit_references_selects_the_last_source_without_an_unsupported_detail() {
+        let case = Case::parse(
+            "explicitRoots.ts",
+            concat!(
+                "// @noImplicitReferences: true\n",
+                "// @filename: ignored.ts\n",
+                "const ignored: string = 1;\n",
+                "// @filename: selected.ts\n",
+                "const selected: number = 1;\n",
+            ),
+        )
+        .unwrap();
+        let variant = expand_option_matrix(&case).remove(0);
+        assert!(
+            variant.unsupported_details.is_empty(),
+            "{:?}",
+            variant.unsupported_details
+        );
+        let compilation = compile_case(&case).unwrap();
+        assert!(
+            compilation.diagnostics.is_empty(),
+            "{:?}",
+            compilation.diagnostics
+        );
+        assert!(compilation.outputs.contains_key("/.src/selected.js"));
+        assert!(!compilation.outputs.contains_key("/.src/ignored.js"));
+        let (order, issues) = error_baseline_unit_order(&case);
+        assert!(issues.is_empty(), "{issues:?}");
+        assert_eq!(order, [1, 0]);
+    }
+
+    #[test]
+    fn fixture_compilation_retains_compiler_option_validation_diagnostics() {
+        let case = Case::parse(
+            "checkJsOptions.ts",
+            concat!(
+                "// @allowJs: false\n",
+                "// @checkJs: true\n",
+                "// @noEmit: true\n",
+                "// @filename: a.js\n",
+                "var value;\n",
+            ),
+        )
+        .unwrap();
+        let compilation = compile_case(&case).unwrap();
+        let option_diagnostics = compilation
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == Some(5052))
+            .collect::<Vec<_>>();
+        assert_eq!(option_diagnostics.len(), 1, "{:?}", compilation.diagnostics);
+        assert_eq!(
+            option_diagnostics[0].message,
+            "Option 'checkJs' cannot be specified without specifying option 'allowJs'."
+        );
     }
 
     #[test]
@@ -6969,25 +7379,31 @@ mod tests {
     fn refuses_exactness_for_unmodeled_harness_and_project_semantics() {
         for (source, expected) in [
             (
-                "// @useCaseSensitiveFileNames: false\nconst value = 1;\n",
-                "case-insensitive virtual filesystem",
-            ),
-            (
-                "// @noImplicitReferences: true\nconst value = 1;\n",
-                "root-file selection",
+                "// @useCaseSensitiveFileNames: invalid\nconst value = 1;\n",
+                "boolean useCaseSensitiveFileNames",
             ),
             (
                 "// @fullEmitPaths: true\nconst value = 1;\n",
                 "root-file and output-path",
             ),
             (
-                "// @filename: tsconfig.json\n{}\n// @filename: index.ts\nconst value = 1;\n",
-                "virtual project configurations",
+                concat!(
+                    "// @filename: tsconfig.json\n",
+                    "{\"include\":[\"src/**/*.ts\"]}\n",
+                    "// @filename: src/index.ts\n",
+                    "const value = 1;\n",
+                ),
+                "include/exclude patterns",
             ),
             (
                 "// @captureSuggestions: true\nconst value = 1;\n",
                 "suggestion diagnostics",
             ),
+            (
+                "// @link: missing-target\nconst value = 1;\n",
+                "source -> target directory link",
+            ),
+            ("// @symlink:   \nconst value = 1;\n", "file symlink target"),
         ] {
             let case = Case::parse("unsupported.ts", source).unwrap();
             let variant = expand_option_matrix(&case).remove(0);
@@ -7001,16 +7417,19 @@ mod tests {
             );
         }
 
-        let case = Case::parse(
-            "supported.ts",
-            "// @useCaseSensitiveFileNames: true\nconst value = 1;\n",
-        )
-        .unwrap();
-        assert!(
-            expand_option_matrix(&case)[0]
-                .unsupported_details
-                .is_empty()
-        );
+        for setting in ["true", "false"] {
+            let case = Case::parse(
+                "supported.ts",
+                format!("// @useCaseSensitiveFileNames: {setting}\nconst value = 1;\n"),
+            )
+            .unwrap();
+            assert!(
+                expand_option_matrix(&case)[0]
+                    .unsupported_details
+                    .is_empty(),
+                "setting: {setting}"
+            );
+        }
     }
 
     #[test]

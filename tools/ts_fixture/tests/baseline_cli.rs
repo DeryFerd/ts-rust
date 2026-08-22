@@ -142,8 +142,12 @@ fn canonical_scorecard_retains_capabilities_then_continues_to_exact_case() {
         None,
     );
     repository.write_case(
-        "moduleFormatUnsupported",
-        concat!("// @filename: unsupported.mts\n", "const value = 1;\n",),
+        "importMetaUnsupported",
+        concat!(
+            "// @module: esnext\n",
+            "// @filename: unsupported.ts\n",
+            "const value = import.meta.url;\n",
+        ),
         None,
     );
     repository.write_case("zzExact", "const value: number = 1;\n", None);
@@ -190,7 +194,7 @@ fn canonical_scorecard_retains_capabilities_then_continues_to_exact_case() {
     assert_eq!(variants[0]["frontierBlocker"]["code"], "E00.SOURCE_SYNTAX");
     assert_eq!(
         variants[1]["case"],
-        "testdata/tests/cases/compiler/moduleFormatUnsupported.ts"
+        "testdata/tests/cases/compiler/importMetaUnsupported.ts"
     );
     assert_eq!(variants[1]["status"], "unsupported_detail");
     assert_eq!(variants[1]["outcomeClass"], "checker_capability");
@@ -200,7 +204,7 @@ fn canonical_scorecard_retains_capabilities_then_continues_to_exact_case() {
     );
     assert_eq!(
         variants[1]["frontierBlocker"]["code"],
-        "M00.FIXED_MODULE_FORMAT"
+        "M03.IMPORT_META_MODULE_MODE"
     );
     assert_eq!(
         variants[2]["case"],
@@ -821,6 +825,180 @@ fn canonical_checker_matches_related_information_artifact_and_scorecard_exactly(
 }
 
 #[test]
+fn canonical_fixture_configs_match_pinned_project_and_type_directive_oracles() {
+    for (name, source, baseline) in [
+        (
+            "tsconfigSimpleTest",
+            concat!(
+                "// @filename: tsconfig.json\n",
+                "{\n",
+                "    \"compilerOptions\": {\n",
+                "        \"target\": \"es2020\",\n",
+                "        \"strictNullChecks\": true\n",
+                "    }\n",
+                "}\n",
+                "// @filename: foo.ts\n",
+                "export {};\n",
+                "const x: string = undefined;",
+            ),
+            concat!(
+                "foo.ts(2,7): error TS2322: Type 'undefined' is not assignable to type 'string'.\r\n",
+                "\r\n\r\n",
+                "==== tsconfig.json (0 errors) ====\r\n",
+                "    {\r\n",
+                "        \"compilerOptions\": {\r\n",
+                "            \"target\": \"es2020\",\r\n",
+                "            \"strictNullChecks\": true\r\n",
+                "        }\r\n",
+                "    }\r\n",
+                "==== foo.ts (1 errors) ====\r\n",
+                "    export {};\r\n",
+                "    const x: string = undefined;\r\n",
+                "          ~\r\n",
+                "!!! error TS2322: Type 'undefined' is not assignable to type 'string'.",
+            ),
+        ),
+        (
+            "tsconfigMalformedNonObject",
+            concat!(
+                "// @filename: tsconfig.json\n",
+                "[{\"compilerOptions\": {\"types\": [\"nonexistent\"]}}]\n",
+                "// @filename: index.ts\n",
+                "export const x = 1;\n",
+            ),
+            concat!(
+                "error TS2688: Cannot find type definition file for 'nonexistent'.\r\n",
+                "  The file is in the program because:\r\n",
+                "    Entry point of type library 'nonexistent' specified in compilerOptions\r\n",
+                "\r\n\r\n",
+                "!!! error TS2688: Cannot find type definition file for 'nonexistent'.\r\n",
+                "!!! error TS2688:   The file is in the program because:\r\n",
+                "!!! error TS2688:     Entry point of type library 'nonexistent' specified in compilerOptions\r\n",
+                "==== tsconfig.json (0 errors) ====\r\n",
+                "    [{\"compilerOptions\": {\"types\": [\"nonexistent\"]}}]\r\n",
+                "==== index.ts (0 errors) ====\r\n",
+                "    export const x = 1;\r\n",
+                "    ",
+            ),
+        ),
+        (
+            "unresolvedTypeDirectiveError",
+            concat!(
+                "// @noImplicitReferences: true\n",
+                "// @types: node\n",
+                "\n",
+                "// @filename: /a.ts\n",
+                "export {};\n",
+            ),
+            concat!(
+                "error TS2688: Cannot find type definition file for 'node'.\r\n",
+                "  The file is in the program because:\r\n",
+                "    Entry point of type library 'node' specified in compilerOptions\r\n",
+                "\r\n\r\n",
+                "!!! error TS2688: Cannot find type definition file for 'node'.\r\n",
+                "!!! error TS2688:   The file is in the program because:\r\n",
+                "!!! error TS2688:     Entry point of type library 'node' specified in compilerOptions\r\n",
+                "==== /a.ts (0 errors) ====\r\n",
+                "    export {};\r\n",
+                "    ",
+            ),
+        ),
+    ] {
+        let repository = TestRepository::new();
+        repository.write_case(name, source, None);
+        repository.write_baseline(&format!("{name}.errors.txt"), baseline);
+        let scorecard_path = repository.0.join("project-scorecard.json");
+
+        let output = run(
+            &repository.0,
+            &[
+                "--diagnostics",
+                "--canonical-checker",
+                "--scorecard-json",
+                scorecard_path.to_str().unwrap(),
+            ],
+        );
+        assert!(
+            output.status.success(),
+            "case: {name}\nstdout:\n{}\nstderr:\n{}\nscorecard:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+            fs::read_to_string(&scorecard_path).unwrap_or_default(),
+        );
+        let scorecard: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(scorecard_path).unwrap()).unwrap();
+        assert_eq!(scorecard["summary"]["exactMatches"], 1, "case: {name}");
+        assert_eq!(
+            scorecard["summary"]["unsupportedDetails"], 0,
+            "case: {name}"
+        );
+        assert_eq!(
+            scorecard["variants"][0]["outcomeClass"], "exact",
+            "case: {name}"
+        );
+    }
+}
+
+#[test]
+fn canonical_option_diagnostics_precede_invalid_javascript_root_diagnostics() {
+    let repository = TestRepository::new();
+    repository.write_case(
+        "checkJsFiles6",
+        concat!(
+            "// @target: es2015\n",
+            "// @allowJs: false\n",
+            "// @checkJs: true\n",
+            "// @noEmit: true\n",
+            "\n",
+            "// @fileName: a.js\n",
+            "var x;",
+        ),
+        None,
+    );
+    repository.write_baseline(
+        "checkJsFiles6.errors.txt",
+        concat!(
+            "error TS5052: Option 'checkJs' cannot be specified without specifying option 'allowJs'.\r\n",
+            "error TS6504: File 'a.js' is a JavaScript file. Did you mean to enable the 'allowJs' option?\r\n",
+            "  The file is in the program because:\r\n",
+            "    Root file specified for compilation\r\n",
+            "\r\n\r\n",
+            "!!! error TS5052: Option 'checkJs' cannot be specified without specifying option 'allowJs'.\r\n",
+            "!!! error TS6504: File 'a.js' is a JavaScript file. Did you mean to enable the 'allowJs' option?\r\n",
+            "!!! error TS6504:   The file is in the program because:\r\n",
+            "!!! error TS6504:     Root file specified for compilation\r\n",
+            "==== a.js (0 errors) ====\r\n",
+            "    var x;",
+        ),
+    );
+    let scorecard_path = repository.0.join("option-diagnostics-scorecard.json");
+
+    let output = run(
+        &repository.0,
+        &[
+            "--diagnostics",
+            "--canonical-checker",
+            "--scorecard-json",
+            scorecard_path.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}\nscorecard:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+        fs::read_to_string(&scorecard_path).unwrap_or_default(),
+    );
+    let scorecard: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(scorecard_path).unwrap()).unwrap();
+    assert_eq!(scorecard["summary"]["exactMatches"], 1);
+    let diagnostics = scorecard["variants"][0]["diagnostics"].as_array().unwrap();
+    assert_eq!(diagnostics.len(), 2);
+    assert_eq!(diagnostics[0]["code"], 5052);
+    assert_eq!(diagnostics[1]["code"], 6504);
+}
+
+#[test]
 fn semantic_artifact_mode_matches_real_type_and_symbol_baselines() {
     let repository = TestRepository::new();
     repository.write_case("semanticArtifacts", "const value: number = 1;\n", None);
@@ -1174,7 +1352,11 @@ fn semantic_artifacts_remain_not_reached_after_a_checker_capability() {
     let repository = TestRepository::new();
     repository.write_case(
         "unsupportedSemanticSource",
-        concat!("// @filename: unsupported.mts\n", "const value = 1;\n",),
+        concat!(
+            "// @module: esnext\n",
+            "// @filename: unsupported.ts\n",
+            "const value = import.meta.url;\n",
+        ),
         None,
     );
     let scorecard_path = repository.0.join("not-reached-semantic-scorecard.json");
@@ -1198,7 +1380,7 @@ fn semantic_artifacts_remain_not_reached_after_a_checker_capability() {
     );
     assert_eq!(
         scorecard["variants"][0]["frontierBlocker"]["code"],
-        "M00.FIXED_MODULE_FORMAT"
+        "M03.IMPORT_META_MODULE_MODE"
     );
     for kind in ["types", "symbols"] {
         assert_eq!(scorecard["semanticArtifacts"][kind]["notReached"], 1);
@@ -1814,7 +1996,7 @@ fn reports_missing_baselines() {
 }
 
 #[test]
-fn refuses_exact_emit_parity_for_a_virtual_project_config() {
+fn matches_exact_emit_parity_for_a_supported_virtual_project_config() {
     let repository = TestRepository::new();
     repository.write_case(
         "projectNoEmit",
@@ -1829,13 +2011,10 @@ fn refuses_exact_emit_parity_for_a_virtual_project_config() {
     );
 
     let output = run(&repository.0, &["--filter", "projectNoEmit"]);
-    assert_eq!(output.status.code(), Some(1));
+    assert!(output.status.success());
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
-        concat!(
-            "MISMATCH testdata/tests/cases/compiler/projectNoEmit.ts: unsupported configuration: virtual project configurations are not modeled with pinned root/other-file semantics\n",
-            "summary: discovered_cases=1 upstream_skipped_cases=0 selected_cases=1 executed_variants=1 matched=0 mismatched=1 missing=0 content=0 missing_sections=0 unexpected_sections=0 diagnostics=0\n",
-        )
+        "summary: discovered_cases=1 upstream_skipped_cases=0 selected_cases=1 executed_variants=1 matched=1 mismatched=0 missing=0 content=0 missing_sections=0 unexpected_sections=0 diagnostics=0\n"
     );
 }
 
