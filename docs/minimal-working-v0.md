@@ -36,11 +36,10 @@ performance claims:
 - JSX transformation modes other than `preserve`;
 - malformed-syntax recovery fidelity beyond the declared diagnostic corpus.
 
-The broad prototype currently has 61 known legacy-test failures outside this
-contract: 6 compiler tests, 4 malformed-recovery parser tests, and 51 printer
-tests. They are excluded rather than presented as v0 failures. The v0 gate runs
-all tests in the other workspace packages plus focused compiler/parser/CLI
-tests for this contract.
+The v0 gate runs the other workspace packages plus focused parser, compiler,
+and CLI checks for this contract. Its package exclusions define the supported
+product slice. They do not indicate known failures in the full parser,
+compiler, or printer test suites.
 
 ## Gates
 
@@ -60,5 +59,6 @@ The gate requires:
    speedup, and peak RSS for both implementations.
 
 Set `TS_GO_ORACLE` if the pinned oracle is not installed at
-`/home/theo/.local/bin/tsgo-oracle`. Cargo work is serialized and constrained by
-the repository's 1 GiB cgroup runner.
+`/home/theo/.local/bin/tsgo-oracle`. Cargo work is serialized by the capped
+runner, which defaults to an aggregate limit of up to 8 GiB. Set
+`TS_CARGO_MEMORY_LIMIT_KIB` to change that limit.

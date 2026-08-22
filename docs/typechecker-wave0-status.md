@@ -1,22 +1,73 @@
-# Typechecker Wave 0 integration status
+# Typechecker integration status
 
 - Status: active
 - Started: 2026-07-16
+- Updated: 2026-08-22
 - Upstream epoch: `dc37b5249ab60e2bbce936f71b883e6c8136167e`
 - Wave branch baseline: `cdbf749`
 - Integration branch: `july-ultra`
-- Current integrated semantic stack: through `290afc9`
+- Latest measured integration checkpoint: `d97e5de` with uncommitted fixes
 
-This is the live execution record for Wave 0 of
+This file records progress after the initial Wave 0 of
 [`typechecker-completion-goal.md`](typechecker-completion-goal.md). The port
 map remains authoritative for cluster state.
 
-## Active lanes
+## Current checkpoint
+
+The latest focused package runs pass these unit-test suites:
+
+| Package | Passing unit tests |
+|---|---:|
+| `ts_parser` | 189 |
+| `ts_binder` | 174 |
+| `ts_checker` | 1,226 |
+| `ts_compiler` | 159 |
+| `ts_printer` | 564 |
+
+The parser also reads all 108 bundled declaration libraries without
+diagnostics. The checked-in fixture manifests contain 96 smoke variants and
+512 milestone variants.
+
+Run the focused suites with:
+
+```sh
+for package in ts_parser ts_binder ts_checker ts_compiler ts_printer; do
+  ./scripts/run-cargo-capped.sh test -p "$package" --lib
+done
+./scripts/run-cargo-capped.sh test -p ts_parser --test bundled_libs
+```
+
+The latest recorded smoke scorecard is
+`/tmp/ts-rust-type-node-zero-fatal-scorecard.json`. Its provenance records
+commit `d97e5de` with a dirty worktree. The 96 selected variants contain 95
+executed variants and one upstream skip. Of the executed variants, 14 match
+exactly and 81 stop at typed unsupported boundaries. No fatal invariant occurs.
+
+Regenerate the fixed smoke scorecard with:
+
+```sh
+TS_GO_REPO=/path/to/typescript-go \
+  ./scripts/run-cargo-capped.sh run -p ts_fixture --bin ts_fixture_baseline -- \
+  --diagnostics \
+  --canonical-checker \
+  --variant-manifest tools/ts_fixture/manifests/checker-smoke-v1.json \
+  --scorecard-json /tmp/ts-rust-type-node-zero-fatal-scorecard.json
+```
+
+Production `get_type_at_location` and `get_symbol_at_location` queries now
+provide `.types` and `.symbols` fixture artifacts. Mapped, conditional, and
+template types, JSX, JavaScript, and JSDoc each have implemented checker code
+and focused tests. Their complete upstream coverage remains unverified.
+
+A complete 512-variant run, complete upstream corpus parity, and the final
+workspace verification are not established by this checkpoint.
+
+## Earlier lane history
 
 | Lane | Branch/worktree | Current task | State |
 |---|---|---|---|
-| Root/integration | `july-ultra`; repository root | contract adapters, review, serial verification | exact local ambient overload groups are integrated through `290afc9`; root is the sole Cargo/build and fixed-shard owner |
-| M0 | `july-ultra`; repository root | deterministic checker scoring | schema-5 provenance, retained fatal outcomes, exact fixed-manifest execution, and selected-case preparation integrated through `174eebf` |
+| Root/integration | `july-ultra`; repository root | contract adapters, review, serial verification | integrated checkpoint `d97e5de`; root owns Cargo, shared checker contracts, commits, and fixture scoring |
+| M0 | `july-ultra`; repository root | deterministic checker scoring | schema-5 provenance, retained fatal outcomes, 96-variant smoke selection, 512-variant milestone selection, and semantic fixture artifacts are present |
 | S2a | `july-ultra`; repository root | exact single-base interface heritage and relation-cache observation | integrated through `14ae6ce`; two exact-tip reviews found no P0/P1 issue, all five public heritage tests pass, and the fixed shard advances one interface fixture without an exact loss |
 | S2 readonly follow-up | `july-ultra`; repository root | readonly property retention and strict-subtype directionality | integrated through `d4719b3`; two independent reviews found no P0/P1 issue, the public production target passes, focused strict Clippy is green, and the fixed shard is semantically unchanged |
 | S3 session/generic calls | `july-ultra`; repository root | lazy checked shells, shared query sessions, exact demand/recovery, and TS2589 | integrated through `010d93a`; the library check and focused `source_generic_calls`/`source_instantiation_limits` targets pass, and independent review found no remaining P0/P1 issue |
@@ -33,16 +84,14 @@ map remains authoritative for cluster state.
 | W1 ambient functions | `july-ultra`; repository root | exact singleton nongeneric `declare function` declarations | integrated through `74ea3ca`; script/external-module hoisting, canonical callable/signature identity, optional parameters, TS2345, whole-source atomicity, warm replay, and typed generic/overload/export/`.d.ts` boundaries passed checker/compiler gates and independent P0/P1 review |
 | W1 ambient generic follow-up | `july-ultra`; repository root | exact singleton generic ambient functions and strict top-level direct call statements | integrated through `693d0be`; generic constraints/defaults, inference/explicit arguments, exact TS2558/TS2344/TS2345 ranges, hoisting, whole-plan atomicity, and warm replay passed focused/adjacent/compiler/strict-Clippy gates and independent P0/P1 review |
 | W1 ambient overload follow-up | `july-ultra`; repository root | exact local nongeneric ambient overload families | integrated through `290afc9`; ordered arbitrary-length signature groups, literal-first selection, complete reverse provenance, cross-provider preflight, warm poison rejection, and fail-closed recovery passed six public checker tests, two compiler tests, strict Clippy, and independent P0/P1 review |
-| W1 class-source heritage | isolated worker worktree | connect the existing direct local base-class graph to whole-source checking | active from `290afc9`; the worker is reusing the reviewed class member-query transaction while root retains Cargo, compiler integration, and scoring |
-| W1 generic interface members | isolated worker worktree | property-only concrete generic-interface member instantiation | the exact `[T..., this] -> [args..., reference]` kernel is frozen with three public tests and green check/Clippy; independent review is active before integration and the property-only declared-table/source adapter remains queued |
-| W1 review/oracle | rotating read-only lanes | pinned behavior, cache timing, and adversarial fixtures | ambient overloads are approved with no remaining P0/P1 issue; the active review audits recursive generic-interface member instantiation and its transient proxy/cache invariants |
+| W1 class-source heritage | `july-ultra`; repository root | class heritage, constructors, and initialization | class constructor and initialization work is integrated through `96c9a02`; broader class coverage remains incomplete |
+| W1 generic interface members | `july-ultra`; repository root | concrete generic-interface member instantiation | generic member instantiation and source checking are integrated through `5788e18` and `3e47a08` |
+| W1 review/oracle | rotating read-only lanes | pinned behavior, cache timing, and adversarial fixtures | historical lane assignments ended; current fixture results appear in the checkpoint above |
 
-The completed S5/S6 sub-wave validates the intended four-slot steady state:
-root integrates and builds, two isolated semantic workers own non-overlapping
-leaves, and one reviewer/oracle lane audits both Go behavior and Rust cache
-invariants. The worker slots can now rotate to the next Wave 1 leaves while
-shared store, source-dispatch, compiler, and formatter adapters remain
-serialized at root.
+The earlier S5/S6 sub-wave used four agents. The current session permits more
+agents, provided that each implementation lane owns different files. Root
+continues to serialize Cargo commands, commits, shared checker contracts, and
+fixture scoring.
 
 ## Fixed smoke evidence
 
@@ -160,11 +209,11 @@ diagnostic, or exact-match record regresses. The focused public checker surface
 is now 127 tests across 39 independently runnable targets; the semantic module
 count is 66 and the retained semantic unit-test count is 1,026.
 
-The current frontier is five exact variants, 89 typed capability boundaries,
-two supported mismatches, and zero fatal invariants. The run discovers 12,750
-upstream configurations, selects 95 cases and 96 variants, and completes in
-about 82 seconds on the recorded machine. This is a deterministic merge gate,
-not a coverage claim.
+At the historical `290afc9` checkpoint, the frontier was five exact variants,
+89 typed capability boundaries, two supported mismatches, and zero fatal
+invariants. The current checkpoint above supersedes those results. The runner
+discovers 12,750 upstream cases, but the fixed smoke selection is not a claim
+of complete corpus coverage.
 
 The S1a compiler prerequisite is now present: a plain `.d.ts` external module
 may be the resolved target of a plain TypeScript ESM/Bundler source while the
@@ -240,10 +289,8 @@ retain the exact identities whose later mutation invalidates that cache.
   query-local reset.
 - Every stack receives a Go-semantic review and a separate Rust-invariant
   review before serial integration.
-- Root runs focused public tests, production-library check, strict focused
-  Clippy, rustdoc, and the fixed scorecard after integration. On the current
-  1 GiB machine, checker-wide `cargo check --tests` and all-target Clippy enter
-  the giant unit-test crate and are killed by the cgroup; the focused public
-  binaries are therefore the executable behavior gate, while all-target
-  compilation remains a tracked infrastructure limit rather than a claimed
-  success.
+- Root runs focused public tests, the production-library check, strict Clippy,
+  rustdoc, and the fixed scorecard after integration. The capped Cargo runner
+  now allows up to 8 GiB by default when sufficient memory is available. Set
+  `TS_CARGO_MEMORY_LIMIT_KIB` to adjust the limit. Cargo commands remain
+  serialized across agent worktrees.

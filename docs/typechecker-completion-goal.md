@@ -28,16 +28,12 @@ The default topology is therefore:
 - independent typescript-go and Rust-invariant reviewers; and
 - a fixer/oracle lane that turns review and corpus output into bounded queues.
 
-With the current four-slot setup, the sustainable shape is one integrator, two
-active semantic implementers, and one rotating reviewer/oracle. The rotating
-reviewer performs the Go-semantic audit and root performs the independent
-Rust/integration audit; for root-authored changes, a leaf owner rotates into
-the second review. A third leaf can be specified or queued while another is
-under review, but three unchecked writers should not accumulate changes to
-shared semantic state. Eight slots is the best next scaling point: one
-integrator, four leaf owners, two reviewers, and one fixer/oracle. Beyond
-twelve slots, integration rather than code generation becomes the limiting
-resource.
+The current session supports more than four agents. Keep one integration owner
+and give each implementation agent exclusive ownership of specific files. Use
+additional agents for upstream audits, focused reviews, fixture analysis, and
+independent compiler subsystems. Serialize Cargo commands, commits, and edits
+to shared checker contracts. Increase the number of implementation lanes only
+when their ownership does not overlap.
 
 The implementation strategy is a faithful port of coherent typescript-go
 algorithms. Preserve recognizable upstream structure and behavior first;
@@ -136,22 +132,46 @@ inline indexed access, property objects in unions, all eight strict `typeof`
 tags, reversed comparisons, object/function classification, `void` projection,
 and base/local join identity restoration.
 
-### Execution checkpoint: 2026-07-17
+### Execution checkpoint: 2026-08-22
 
-The fixed 96-variant smoke lane is integrated and reproducible. The current
-frontier is five exact variants, 89 typed capability boundaries, two
-supported mismatches, and zero fatal invariants. S2a's exact one-base interface
-heritage and successful-relation observed-dependency invalidation are integrated
-through `14ae6ce`; all five public heritage scenarios pass, and the fixed shard
-advances one interface fixture to its next unsupported property boundary. The
-recovering S3 instantiation session is integrated through `75abbf5`; its fixed
-shard is semantically byte-identical to the S2a run after removing only commit
-and invocation provenance. The bounded readonly-property follow-up is integrated
-through `d4719b3`: source properties retain exact readonly state, direct
-heritage preserves it, strict subtype is ordered readonly-to-mutable exactly as
-upstream, ordinary assignability remains symmetric, and changed observed bits
-invalidate warmed relations. Its public target and focused strict Clippy pass,
-and its fixed shard is semantically byte-identical to `75abbf5`.
+The latest focused package runs pass 189 parser unit tests, 174 binder unit
+tests, 1,226 checker unit tests, 159 compiler unit tests, and 564 printer unit
+tests. The parser also accepts all 108 bundled declaration libraries without
+diagnostics.
+
+Both fixed checker manifests are present. The smoke manifest contains 96
+variants, and the milestone manifest contains 512 variants. The latest smoke
+scorecard records commit `d97e5de` with uncommitted fixes. Of its 96 selected
+variants, 95 execute and one is skipped by upstream. The executed variants
+produce 14 exact matches, 81 typed unsupported outcomes, and no fatal
+invariants.
+
+Production location queries and fixture walkers generate `.types` and
+`.symbols` artifacts. Mapped, conditional, and template types, JSX, JavaScript,
+and JSDoc now have production checker implementations and focused tests.
+Complete support for those features remains in progress.
+
+The latest scorecard is
+`/tmp/ts-rust-type-node-zero-fatal-scorecard.json`. A completed run of the
+512-variant milestone, complete upstream corpus parity, and the final workspace
+verification remain unverified.
+
+### Earlier implementation checkpoints
+
+At the July 17 checkpoint, the fixed 96-variant smoke lane produced five exact
+variants, 89 typed capability boundaries, two supported mismatches, and zero
+fatal invariants. S2a's exact one-base interface heritage and relation-cache
+invalidation are integrated through `14ae6ce`. All five public heritage
+scenarios pass, and the fixed shard advances one interface fixture to its next
+unsupported property boundary. The recovering S3 instantiation session is
+integrated through `75abbf5`. Its fixed shard is semantically byte-identical to
+the S2a run after removing only commit and invocation provenance. The bounded
+readonly-property follow-up is integrated through `d4719b3`: source properties
+retain exact readonly state, direct heritage preserves it, strict subtype is
+ordered readonly-to-mutable exactly as upstream, ordinary assignability remains
+symmetric, and changed observed bits invalidate warmed relations. Its public
+target and focused strict Clippy pass, and its fixed shard is semantically
+byte-identical to `75abbf5`.
 
 The recovering lazy-generic vertical is now integrated through `010d93a`,
 including query-owned sessions in source calls, assignment diagnostics, and
@@ -294,41 +314,32 @@ At the current checkpoint:
 
 | Evidence | Current value | Interpretation |
 |---|---:|---|
-| Semantic unit tests present | 1,026 | Broad invariant coverage; the monolithic binary cannot link in the current memory envelope |
-| Public checker integration tests | 127 across 39 targets | Executable production-path evidence and the mandatory home for new verticals |
-| Semantic modules | 66 | Enough leaf surfaces for bounded ownership |
-| `type_nodes.rs` | 18,293 lines | Shared type-family dispatch hotspot |
-| `source.rs` | 18,959 lines | Shared source-plan/execution hotspot |
-| `relater.rs` | 10,946 lines | Shared relation hotspot |
-| Port-map clusters | 46 | 11 verified, 24 porting, 10 blocked, 1 unmapped at this checkpoint |
+| Parser unit tests | 189 | Focused package suite passes |
+| Bundled declaration libraries | 108 | Parser accepts every bundled library without diagnostics |
+| Binder unit tests | 174 | Focused package suite passes |
+| Checker unit tests | 1,226 | Complete checker unit-test binary passes |
+| Compiler unit tests | 159 | Focused package suite passes |
+| Printer unit tests | 564 | Focused package suite passes |
+| Smoke manifest | 96 variants | 95 execute and one is skipped by upstream |
+| Smoke results | 14 exact, 81 unsupported, 0 fatal | Fixed selection only; not full corpus parity |
+| Milestone manifest | 512 variants | Checked in; complete execution remains unverified |
+| Port-map clusters | 46 | 11 verified, 30 porting, and 5 blocked |
 
 The implementation is no longer bottlenecked on basic representation. It is
 bottlenecked on semantic breadth behind intentionally fail-closed gates.
 
 ### Current measurement is a frontier, not coverage
 
-The alphabetic first-50 diagnostic run provisionally attributed by its
-filename to `4fa03b3` produced two exact artifacts and 48 explicit unsupported
-results. Its JSON does not embed the Rust SHA or dirty state, so it is useful
-frontier evidence, not a reproducible merge delta. Its unchanged headline
-relative to the earlier first-50 is consistent with most selected fixtures
-encountering a class, module mode, JS/TSX source kind, namespace, or unsupported
-statement before reaching the recent tuple, indexed-access, object-union, and
-`typeof` features.
+The current fixed smoke scorecard discovers 12,750 upstream cases. Its 96
+selected variants contain 95 executed variants and one upstream skip. The 95
+executed variants produce 14 exact matches, 81 typed unsupported outcomes, and
+no fatal invariants. Scorecard provenance identifies `d97e5de` and records a
+dirty worktree.
 
-The older complete 500-case artifact recorded 536 expanded variants: two
-exact, 533 unsupported, and one supported-path lone-surrogate mismatch. It
-predates substantial recent work. A current 500-case attempt found a valid
-trailing parameter list being treated as a fatal callable invariant; that
-boundary is fixed in `adb9089`. The restarted run advanced farther, through
-the alphabetic `export*` tranche, then aborted at
-`functionExpandoPropertyDeclaration.ts` when arrow checking returned an
-unclassified fatal error. The M0 runner now retains typed capability and fatal
-outcomes per variant, continues the shard, and writes reproducible schema-5
-provenance and stable variant keys. The balanced 96-variant merge gate is
-current; a fresh complete corpus scorecard remains to be produced at the next
-wave gate. The previous abort is the historical reason this measurement
-contract landed before further semantic slices.
+The 512-variant milestone manifest is checked in, but this checkpoint does not
+prove a completed milestone run. The complete upstream corpus also remains
+unverified. Historical first-50 and 500-case runs predate the current checker,
+so their old failure totals are not the current port status.
 
 The historical first blockers were dominated by:
 
@@ -1104,12 +1115,11 @@ RUSTDOCFLAGS='-D warnings' \
   scripts/run-cargo-capped.sh doc -p ts_checker --no-deps
 ```
 
-The checker-wide `cargo check --tests` and all-target Clippy invocations are not
-executable gates on the current 1 GiB machine: the unit-test crate reaches the
-cgroup ceiling before completion. Do not repeatedly retry them locally. Put
-every new behavioral vertical in a focused public integration binary that can
-compile and run here, and run the checker-wide compile/lint gates on a builder
-with a larger memory envelope before closing an integration wave.
+The capped runner defaults to an aggregate memory limit of up to 8 GiB when
+the host has enough available memory. Set `TS_CARGO_MEMORY_LIMIT_KIB` to adjust
+the limit. The complete checker unit-test binary now runs within the updated
+memory envelope. Keep Cargo commands serialized across agent worktrees, and
+run focused public integration tests for each changed behavior.
 
 ### Objective modern-project manifest
 
