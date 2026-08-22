@@ -318,14 +318,15 @@ impl WatchCompiler for BuildWatchCompiler {
     fn compile(&mut self) -> Result<CompileCycle, WatchError> {
         let file_system = OsFileSystem::default();
         let current_directory = self.current_directory.to_string_lossy();
+        let overrides = ProgramOptionsOverride {
+            no_emit: self.options.no_emit.then_some(true),
+            ..ProgramOptionsOverride::default()
+        };
         let result = build_projects(
             &file_system,
             &current_directory,
             &self.roots,
-            ProgramOptionsOverride {
-                no_emit: self.options.no_emit.then_some(true),
-                ..ProgramOptionsOverride::default()
-            },
+            overrides,
             self.options.incremental,
         );
         let pretty = self.options.pretty.unwrap_or(false);
@@ -335,6 +336,15 @@ impl WatchCompiler for BuildWatchCompiler {
             self.current_directory.clone(),
             WatchMode::NonRecursive,
         )];
+        for config_path in &result.skipped {
+            let program = Program::from_config_with_options(&file_system, config_path, overrides);
+            watch_paths.extend(watch_paths_for_program(
+                &program,
+                &self.current_directory,
+                Some(Path::new(config_path)),
+                &[],
+            ));
+        }
         for CompiledProject {
             config_path,
             program,
@@ -711,4 +721,89 @@ fn print_help() {
     println!("      --parse        Parse one source file (development)");
     println!("      --compile-dev  Run the development compiler pipeline");
     println!("      --tokenize     Print the token stream for one source file");
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{fs, path::PathBuf};
+
+    use ts_cli::BuildOptions;
+    use ts_watch::WatchCompiler;
+
+    use super::BuildWatchCompiler;
+
+    struct TestDirectory(PathBuf);
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn build_watch_keeps_skipped_project_source_directories() {
+        let directory = TestDirectory(std::env::temp_dir().join(format!(
+            "tsgo-build-watch-skipped-projects-{}",
+            std::process::id()
+        )));
+        let library_sources = directory.0.join("packages/lib/src");
+        let application_sources = directory.0.join("packages/app/src");
+        fs::create_dir_all(&library_sources).unwrap();
+        fs::create_dir_all(&application_sources).unwrap();
+        fs::write(
+            directory.0.join("tsconfig.json"),
+            r#"{"files":[],"references":[{"path":"./packages/app"},{"path":"./packages/lib"}]}"#,
+        )
+        .unwrap();
+        fs::write(
+            directory.0.join("packages/lib/tsconfig.json"),
+            r#"{"files":["src/index.ts"],"compilerOptions":{"composite":true,"noLib":true,"outDir":"dist"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            directory.0.join("packages/app/tsconfig.json"),
+            r#"{"files":["src/index.ts"],"references":[{"path":"../lib"}],"compilerOptions":{"composite":true,"noLib":true,"outDir":"dist"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            library_sources.join("index.ts"),
+            "export const libraryValue = 1;\n",
+        )
+        .unwrap();
+        fs::write(
+            application_sources.join("index.ts"),
+            "export const applicationValue = 2;\n",
+        )
+        .unwrap();
+
+        let mut compiler = BuildWatchCompiler {
+            options: BuildOptions {
+                incremental: true,
+                ..BuildOptions::default()
+            },
+            current_directory: directory.0.clone(),
+            roots: vec!["tsconfig.json".to_owned()],
+        };
+        let first_cycle = compiler.compile().unwrap();
+        let second_cycle = compiler.compile().unwrap();
+
+        for source_directory in [&library_sources, &application_sources] {
+            assert!(
+                first_cycle
+                    .watch_paths
+                    .iter()
+                    .any(|path| path.directory == *source_directory),
+                "first cycle does not watch {}",
+                source_directory.display()
+            );
+            assert!(
+                second_cycle
+                    .watch_paths
+                    .iter()
+                    .any(|path| path.directory == *source_directory),
+                "up-to-date cycle no longer watches {}",
+                source_directory.display()
+            );
+        }
+    }
 }
