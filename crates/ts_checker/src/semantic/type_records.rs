@@ -1420,11 +1420,7 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
             (None, Some(construct)) => Some(construct),
             (Some(call), Some(construct)) if call.is_empty() => Some(construct),
             (Some(call), Some(construct)) if construct.is_empty() => Some(call),
-            (Some(call), Some(construct)) => Some(
-                call.into_iter()
-                    .chain(construct)
-                    .collect(),
-            ),
+            (Some(call), Some(construct)) => Some(call.into_iter().chain(construct).collect()),
         };
         let relation_dirty = self.relation_type_is_observable(id)
             && self.type_payload(id).is_some_and(|record| {
@@ -3162,8 +3158,7 @@ mod tests {
             None,
             None,
         ));
-        let TypeData::Object(call_data) =
-            seeded.store.type_payload(call_object).unwrap().data()
+        let TypeData::Object(call_data) = seeded.store.type_payload(call_object).unwrap().data()
         else {
             panic!("expected object")
         };

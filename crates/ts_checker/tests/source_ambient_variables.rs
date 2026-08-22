@@ -4,9 +4,10 @@ use ts_binder::{
     EscapedName, SemanticSymbolId,
 };
 use ts_checker::semantic::{
-    CanonicalCheckerContext, CanonicalCheckerOptions, SourceCheckError, SymbolNodeLinks,
-    TypeNodeLinks, UnsupportedSourceSyntax, ValueSymbolLinks,
+    CanonicalCheckerContext, CanonicalCheckerOptions, CanonicalEnumMemberValue, SourceCheckError,
+    SymbolNodeLinks, TypeNodeLinks, UnsupportedSourceSyntax, ValueSymbolLinks,
 };
+use ts_jsnum::Number;
 use ts_parser::{ParseResult, parse_source_file};
 
 fn checker_context(
@@ -336,6 +337,82 @@ fn ambient_annotation_can_name_a_later_interface() {
                     context.store().type_node_links(read).cloned(),
                 )
             }),
+        ),
+        warm
+    );
+}
+
+#[test]
+fn ambient_variables_can_name_enums_with_constant_member_expressions() {
+    let parsed = parse_source_file(concat!(
+        "declare enum Flags { ",
+        "First = 1, ",
+        "Next = First << 1, ",
+        "Label = `flag-${Flags.Next}`, ",
+        "Copy = Flags['First'], ",
+        "}\n",
+        "declare const current: Flags;\n",
+        "const selected = current;\n",
+    ));
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(2_104);
+    let mut context = checker_context(&parsed, file, false, CanonicalModuleState::Script);
+    let owner = context
+        .store()
+        .symbol_table(context.globals())
+        .and_then(|globals| globals.get_source("Flags"))
+        .expect("the enum must have one global owner");
+    let current = variable_symbol(&parsed, file, &context, "current");
+    let selected = variable_symbol(&parsed, file, &context, "selected");
+
+    context.check_source_file(file).unwrap();
+    let enumeration = context.get_enum_semantics(owner).unwrap();
+
+    assert!(enumeration.is_ambient);
+    assert_eq!(
+        enumeration
+            .members
+            .iter()
+            .map(|member| member.value.clone())
+            .collect::<Vec<_>>(),
+        vec![
+            CanonicalEnumMemberValue::Number(Number::new(1.0)),
+            CanonicalEnumMemberValue::Number(Number::new(2.0)),
+            CanonicalEnumMemberValue::String("flag-2".to_owned()),
+            CanonicalEnumMemberValue::Number(Number::new(1.0)),
+        ]
+    );
+    assert_eq!(
+        enumeration.members[3].regular_type,
+        enumeration.members[0].regular_type
+    );
+    assert_eq!(
+        enumeration.members[3].fresh_type,
+        enumeration.members[0].fresh_type
+    );
+    for symbol in [current, selected] {
+        assert_eq!(
+            context
+                .store()
+                .value_symbol_links(symbol)
+                .and_then(|links| links.resolved_type),
+            Some(enumeration.declared_type)
+        );
+    }
+    assert!(context.diagnostics().is_empty());
+
+    let warm = (
+        context.store().type_len(),
+        context.store().mapper_len(),
+        context.store().signature_len(),
+    );
+    context.recheck_source_file(file).unwrap();
+    assert_eq!(context.get_enum_semantics(owner), Ok(enumeration));
+    assert_eq!(
+        (
+            context.store().type_len(),
+            context.store().mapper_len(),
+            context.store().signature_len(),
         ),
         warm
     );

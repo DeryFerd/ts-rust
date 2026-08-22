@@ -4,10 +4,11 @@
 //! `getDeclaredTypeOfEnum`, `getDeclaredTypeOfEnumMember`,
 //! `getTypeOfFuncClassEnumModule`, and `computeEnumMemberValues`. It supports
 //! one non-merged top-level enum declaration whose members have identifier
-//! names and numeric/string literal initializers (including parenthesized and
-//! unary `+`/`-` numeric literals). Numeric auto-increment, explicit ambient
-//! behavior, const-enum provenance, regular/fresh member identities, the enum
-//! declared union, and the separate enum value object are published together.
+//! names and constant numeric or string expressions. Earlier members can be
+//! referenced by name, property access, or string element access. Numeric
+//! auto-increment, explicit ambient behavior, const-enum provenance,
+//! regular/fresh member identities, the enum declared union, and the separate
+//! enum value object are published together.
 //! Numeric and string identities use the pinned `(enum owner, literal value)`
 //! cache key, so later duplicate-valued members route to the first member's
 //! regular/fresh pair.
@@ -16,12 +17,18 @@
 //! integration seam is [`get_enum_semantics`]: a source prepass can call it for
 //! every hoisted enum owner, then use [`CanonicalEnumSemantics::value_type`]
 //! for value reads and each member's fresh identity for property reads.
-//! Merged declarations, computed names, and non-literal initializers remain
-//! typed unsupported boundaries rather than approximate semantic records.
+//! Merged declarations, computed names, forward references, and expressions
+//! outside the upstream constant evaluator remain typed unsupported
+//! boundaries.
 
-use ts_ast::{NodeData, NodeList, NodeRef, SyntaxKind};
+use ts_ast::{
+    BinaryExpressionData, NodeData, NodeList, NodeRef, SyntaxKind, TemplateExpressionData,
+};
 use ts_binder::{CheckFlags, SemanticSymbolId, SymbolFlags};
-use ts_jsnum::{Number, from_string};
+use ts_evaluator::{
+    Evaluation, EvaluationMetadata, EvaluationOutcome, UnknownReason, Value, evaluate_with,
+};
+use ts_jsnum::Number;
 
 use super::{
     CanonicalTypeMapperStore, DeclaredTypeHost, TypeId,
@@ -308,7 +315,23 @@ fn plan_enum(
         let value = match member_data.initializer {
             Some(initializer) => {
                 let initializer = NodeRef::new(member.arena, member.file, initializer);
-                let value = literal_initializer(store, host, member, initializer)?;
+                let value = constant_initializer(
+                    store,
+                    host,
+                    member,
+                    initializer,
+                    &identifier.text,
+                    &members,
+                )?;
+                if is_const
+                    && matches!(
+                        value,
+                        CanonicalEnumMemberValue::Number(value)
+                            if value.is_nan() || value.is_infinite()
+                    )
+                {
+                    return Err(unsupported(EnumTypeUnsupported::Initializer(initializer)));
+                }
                 next_numeric = match &value {
                     CanonicalEnumMemberValue::Number(value) => Some(*value + Number::new(1.0)),
                     CanonicalEnumMemberValue::String(_) | CanonicalEnumMemberValue::Computed => {
@@ -444,70 +467,264 @@ fn validate_export_route(
     }
 }
 
-fn literal_initializer(
+fn constant_initializer(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     member: NodeRef,
     initializer: NodeRef,
+    enum_name: &str,
+    previous_members: &[EnumMemberPlan],
 ) -> Result<CanonicalEnumMemberValue, EnumTypeError> {
-    if preflight_node(store, host, initializer)?.parent != Some(member.node) {
-        return Err(invariant(EnumTypeInvariant::InvalidMember(member)));
+    preflight_constant_expression(store, host, member, initializer, member)?;
+    let (arena, _) = host
+        .source(initializer)
+        .ok_or_else(|| invariant(EnumTypeInvariant::MissingOrForeignFacts(initializer)))?;
+    let evaluation = evaluate_with(arena, initializer.node, &mut |entity| {
+        let entity = NodeRef::new(initializer.arena, initializer.file, entity);
+        resolve_enum_entity(store, host, entity, enum_name, previous_members)
+            .unwrap_or_else(|| Evaluation::unknown(UnknownReason::UnresolvedEntity(entity.node)))
+    });
+    match evaluation.outcome {
+        EvaluationOutcome::Value(Value::Number(value)) => {
+            Ok(CanonicalEnumMemberValue::Number(value))
+        }
+        EvaluationOutcome::Value(Value::String(value)) => {
+            Ok(CanonicalEnumMemberValue::String(value))
+        }
+        EvaluationOutcome::Value(_)
+        | EvaluationOutcome::Unknown(_)
+        | EvaluationOutcome::Error(_) => {
+            Err(unsupported(EnumTypeUnsupported::Initializer(initializer)))
+        }
     }
-    literal_expression(store, host, initializer)
-        .ok_or_else(|| unsupported(EnumTypeUnsupported::Initializer(initializer)))
 }
 
-fn literal_expression(
+fn preflight_constant_expression(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
+    member: NodeRef,
     expression: NodeRef,
-) -> Option<CanonicalEnumMemberValue> {
-    let record = preflight_node(store, host, expression).ok()?;
+    parent: NodeRef,
+) -> Result<(), EnumTypeError> {
+    let record = preflight_node(store, host, expression)?;
+    if record.parent != Some(parent.node) {
+        return Err(invariant(EnumTypeInvariant::InvalidMember(member)));
+    }
+    let child = |node| NodeRef::new(expression.arena, expression.file, node);
     match &record.data {
-        NodeData::NumericLiteral(literal) if record.kind == SyntaxKind::NumericLiteral => {
-            let value = from_string(&literal.text);
-            (!value.is_nan()).then_some(CanonicalEnumMemberValue::Number(value))
-        }
-        NodeData::StringLiteral(literal) if record.kind == SyntaxKind::StringLiteral => {
-            Some(CanonicalEnumMemberValue::String(literal.text.clone()))
-        }
-        NodeData::NoSubstitutionTemplateLiteral(literal)
+        NodeData::NumericLiteral(_) if record.kind == SyntaxKind::NumericLiteral => Ok(()),
+        NodeData::StringLiteral(_) if record.kind == SyntaxKind::StringLiteral => Ok(()),
+        NodeData::NoSubstitutionTemplateLiteral(_)
             if record.kind == SyntaxKind::NoSubstitutionTemplateLiteral =>
         {
-            Some(CanonicalEnumMemberValue::String(literal.text.clone()))
+            Ok(())
         }
+        NodeData::Identifier(_) if record.kind == SyntaxKind::Identifier => Ok(()),
         NodeData::ParenthesizedExpression(parenthesized)
             if record.kind == SyntaxKind::ParenthesizedExpression =>
         {
-            let inner = NodeRef::new(expression.arena, expression.file, parenthesized.expression);
-            (preflight_node(store, host, inner).ok()?.parent == Some(expression.node))
-                .then(|| literal_expression(store, host, inner))?
+            preflight_constant_expression(
+                store,
+                host,
+                member,
+                child(parenthesized.expression),
+                expression,
+            )
         }
         NodeData::PrefixUnaryExpression(prefix)
             if record.kind == SyntaxKind::PrefixUnaryExpression
                 && matches!(
                     prefix.operator,
-                    SyntaxKind::PlusToken | SyntaxKind::MinusToken
+                    SyntaxKind::PlusToken | SyntaxKind::MinusToken | SyntaxKind::TildeToken
                 ) =>
         {
-            let operand = NodeRef::new(expression.arena, expression.file, prefix.operand);
-            if preflight_node(store, host, operand).ok()?.parent != Some(expression.node) {
-                return None;
+            preflight_constant_expression(store, host, member, child(prefix.operand), expression)
+        }
+        NodeData::BinaryExpression(binary) if record.kind == SyntaxKind::BinaryExpression => {
+            preflight_binary_constant_expression(store, host, member, expression, binary)
+        }
+        NodeData::TemplateExpression(template) if record.kind == SyntaxKind::TemplateExpression => {
+            preflight_template_constant_expression(store, host, member, expression, template)
+        }
+        NodeData::PropertyAccessExpression(access)
+            if record.kind == SyntaxKind::PropertyAccessExpression
+                && access.question_dot_token.is_none() =>
+        {
+            let base = child(access.expression);
+            let base_record = preflight_node(store, host, base)?;
+            let name = child(access.name);
+            let name_record = preflight_node(store, host, name)?;
+            if base_record.parent != Some(expression.node)
+                || name_record.parent != Some(expression.node)
+                || !matches!(base_record.data, NodeData::Identifier(_))
+                || !matches!(name_record.data, NodeData::Identifier(_))
+            {
+                return Err(unsupported(EnumTypeUnsupported::Initializer(expression)));
             }
-            let CanonicalEnumMemberValue::Number(value) = literal_expression(store, host, operand)?
-            else {
+            Ok(())
+        }
+        NodeData::ElementAccessExpression(access)
+            if record.kind == SyntaxKind::ElementAccessExpression
+                && access.question_dot_token.is_none() =>
+        {
+            let base = child(access.expression);
+            let base_record = preflight_node(store, host, base)?;
+            let argument = child(access.argument_expression);
+            let argument_record = preflight_node(store, host, argument)?;
+            if base_record.parent != Some(expression.node)
+                || argument_record.parent != Some(expression.node)
+                || !matches!(base_record.data, NodeData::Identifier(_))
+                || !matches!(
+                    argument_record.data,
+                    NodeData::StringLiteral(_) | NodeData::NoSubstitutionTemplateLiteral(_)
+                )
+            {
+                return Err(unsupported(EnumTypeUnsupported::Initializer(expression)));
+            }
+            Ok(())
+        }
+        _ => Err(unsupported(EnumTypeUnsupported::Initializer(expression))),
+    }
+}
+
+fn preflight_binary_constant_expression(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    member: NodeRef,
+    expression: NodeRef,
+    binary: &BinaryExpressionData,
+) -> Result<(), EnumTypeError> {
+    let child = |node| NodeRef::new(expression.arena, expression.file, node);
+    let operator = child(binary.operator_token);
+    let operator_record = preflight_node(store, host, operator)?;
+    if operator_record.parent != Some(expression.node)
+        || !matches!(operator_record.data, NodeData::Token(_))
+    {
+        return Err(invariant(EnumTypeInvariant::InvalidMember(member)));
+    }
+    if !matches!(
+        operator_record.kind,
+        SyntaxKind::BarToken
+            | SyntaxKind::AmpersandToken
+            | SyntaxKind::GreaterThanGreaterThanToken
+            | SyntaxKind::GreaterThanGreaterThanGreaterThanToken
+            | SyntaxKind::LessThanLessThanToken
+            | SyntaxKind::CaretToken
+            | SyntaxKind::AsteriskToken
+            | SyntaxKind::SlashToken
+            | SyntaxKind::PlusToken
+            | SyntaxKind::MinusToken
+            | SyntaxKind::PercentToken
+            | SyntaxKind::AsteriskAsteriskToken
+    ) {
+        return Err(unsupported(EnumTypeUnsupported::Initializer(expression)));
+    }
+    preflight_constant_expression(store, host, member, child(binary.left), expression)?;
+    preflight_constant_expression(store, host, member, child(binary.right), expression)
+}
+
+fn preflight_template_constant_expression(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    member: NodeRef,
+    expression: NodeRef,
+    template: &TemplateExpressionData,
+) -> Result<(), EnumTypeError> {
+    let child = |node| NodeRef::new(expression.arena, expression.file, node);
+    let head = child(template.head);
+    let head_record = preflight_node(store, host, head)?;
+    if head_record.parent != Some(expression.node)
+        || !matches!(head_record.data, NodeData::TemplateHead(_))
+    {
+        return Err(invariant(EnumTypeInvariant::InvalidMember(member)));
+    }
+    for span in &template.template_spans.nodes {
+        let span = child(*span);
+        let span_record = preflight_node(store, host, span)?;
+        let NodeData::TemplateSpan(span_data) = &span_record.data else {
+            return Err(invariant(EnumTypeInvariant::InvalidMember(member)));
+        };
+        if span_record.parent != Some(expression.node) {
+            return Err(invariant(EnumTypeInvariant::InvalidMember(member)));
+        }
+        preflight_constant_expression(store, host, member, child(span_data.expression), span)?;
+        let literal = child(span_data.literal);
+        let literal_record = preflight_node(store, host, literal)?;
+        if literal_record.parent != Some(span.node)
+            || !matches!(
+                literal_record.data,
+                NodeData::TemplateMiddle(_) | NodeData::TemplateTail(_)
+            )
+        {
+            return Err(invariant(EnumTypeInvariant::InvalidMember(member)));
+        }
+    }
+    Ok(())
+}
+
+fn resolve_enum_entity(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    entity: NodeRef,
+    enum_name: &str,
+    previous_members: &[EnumMemberPlan],
+) -> Option<Evaluation> {
+    let record = preflight_node(store, host, entity).ok()?;
+    let member_name = match &record.data {
+        NodeData::Identifier(identifier) => identifier.text.as_str(),
+        NodeData::PropertyAccessExpression(access) => {
+            let base = host.node(NodeRef::new(entity.arena, entity.file, access.expression))?;
+            let NodeData::Identifier(base) = &base.data else {
                 return None;
             };
-            Some(CanonicalEnumMemberValue::Number(
-                if prefix.operator == SyntaxKind::MinusToken {
-                    -value
-                } else {
-                    value
-                },
-            ))
+            if base.text != enum_name {
+                return None;
+            }
+            let member = host.node(NodeRef::new(entity.arena, entity.file, access.name))?;
+            let NodeData::Identifier(member) = &member.data else {
+                return None;
+            };
+            member.text.as_str()
         }
-        _ => None,
-    }
+        NodeData::ElementAccessExpression(access) => {
+            let base = host.node(NodeRef::new(entity.arena, entity.file, access.expression))?;
+            let NodeData::Identifier(base) = &base.data else {
+                return None;
+            };
+            if base.text != enum_name {
+                return None;
+            }
+            let argument = host.node(NodeRef::new(
+                entity.arena,
+                entity.file,
+                access.argument_expression,
+            ))?;
+            match &argument.data {
+                NodeData::StringLiteral(literal) => literal.text.as_str(),
+                NodeData::NoSubstitutionTemplateLiteral(literal) => literal.text.as_str(),
+                _ => return None,
+            }
+        }
+        _ => return None,
+    };
+    let member = previous_members.iter().find(|member| {
+        store
+            .symbol(member.symbol)
+            .and_then(|symbol| symbol.name().as_utf8())
+            == Some(member_name)
+    })?;
+    let value = match &member.value {
+        CanonicalEnumMemberValue::Number(value) => Value::Number(*value),
+        CanonicalEnumMemberValue::String(value) => Value::String(value.clone()),
+        CanonicalEnumMemberValue::Computed => return None,
+    };
+    Some(Evaluation {
+        metadata: EvaluationMetadata {
+            is_syntactically_string: matches!(value, Value::String(_)),
+            ..EvaluationMetadata::default()
+        },
+        outcome: EvaluationOutcome::Value(value),
+    })
 }
 
 fn enum_state(
@@ -602,11 +819,9 @@ fn validate_resolved_enum(
         {
             return Err(cache_error());
         }
-        let expected_evaluator = evaluator_result(&member.value);
-        if store.enum_member_links(member.declaration)
-            != Some(&EnumMemberLinks {
-                value: expected_evaluator,
-            })
+        if !store
+            .enum_member_links(member.declaration)
+            .is_some_and(|links| evaluator_result_matches(&links.value, &member.value))
         {
             return Err(cache_error());
         }
@@ -685,8 +900,8 @@ fn validate_literal_pair(
         && regular_record.symbol() == Some(symbol)
         && fresh_record.alias().is_none()
         && regular_record.alias().is_none()
-        && fresh_data.value == literal
-        && regular_data.value == literal
+        && enum_literal_values_match(&fresh_data.value, &literal)
+        && enum_literal_values_match(&regular_data.value, &literal)
         && fresh_data.fresh_type == Some(fresh)
         && regular_data.fresh_type == Some(fresh)
         && regular_data.regular_type == regular)
@@ -702,13 +917,22 @@ fn enum_value_from_literal(value: &LiteralValue) -> Option<CanonicalEnumMemberVa
     }
 }
 
+fn enum_literal_values_match(left: &LiteralValue, right: &LiteralValue) -> bool {
+    match (left, right) {
+        (LiteralValue::Number(left), LiteralValue::Number(right)) => {
+            left == right || left.is_nan() && right.is_nan()
+        }
+        _ => left == right,
+    }
+}
+
 fn enum_literal_values_share_cache_key(
     left: &CanonicalEnumMemberValue,
     right: &CanonicalEnumMemberValue,
 ) -> bool {
     match (left, right) {
         (CanonicalEnumMemberValue::Number(left), CanonicalEnumMemberValue::Number(right)) => {
-            left == right
+            left == right || left.is_nan() && right.is_nan()
         }
         (CanonicalEnumMemberValue::String(left), CanonicalEnumMemberValue::String(right)) => {
             left == right
@@ -913,6 +1137,23 @@ fn evaluator_result(value: &CanonicalEnumMemberValue) -> EvaluatorResult {
         resolved_other_files: false,
         has_external_references: false,
     }
+}
+
+fn evaluator_result_matches(actual: &EvaluatorResult, expected: &CanonicalEnumMemberValue) -> bool {
+    let value_matches = match (&actual.value, expected) {
+        (Some(EvaluatorValue::Number(actual)), CanonicalEnumMemberValue::Number(expected)) => {
+            actual == expected || actual.is_nan() && expected.is_nan()
+        }
+        (Some(EvaluatorValue::String(actual)), CanonicalEnumMemberValue::String(expected)) => {
+            actual == expected
+        }
+        (None, CanonicalEnumMemberValue::Computed) => true,
+        _ => false,
+    };
+    value_matches
+        && actual.is_syntactically_string == matches!(expected, CanonicalEnumMemberValue::String(_))
+        && !actual.resolved_other_files
+        && !actual.has_external_references
 }
 
 fn alloc_literal_pair(
@@ -1317,6 +1558,185 @@ mod tests {
         assert_eq!(
             get_declared_enum_or_member(&mut fixture.store, &host, three.symbol),
             Ok(Some(three.fresh_type))
+        );
+    }
+
+    #[test]
+    fn constant_expressions_resolve_prior_members_and_preserve_cached_identities() {
+        let mut fixture = fixture(concat!(
+            "enum Flags { ",
+            "One = 1, ",
+            "Two = One << 1, ",
+            "Four = Flags.Two * 2, ",
+            "Mask = Four | One, ",
+            "Inverted = ~Mask, ",
+            "Power = (1 + 2) ** 2, ",
+            "Copied = Flags['One'], ",
+            "Separated = 1_000 + One, ",
+            "Word = 'flag' + Flags.One, ",
+            "Label = `value-${Flags['Two']}`, ",
+            "}",
+        ));
+        let owner = symbol(&fixture, SyntaxKind::EnumDeclaration, "Flags");
+        let bound = &fixture.files[&fixture.file];
+        let host = host(&fixture.parsed.arena, bound);
+
+        let first = get_enum_semantics(&mut fixture.store, &host, owner).unwrap();
+
+        for (name, value) in [
+            ("One", 1.0),
+            ("Two", 2.0),
+            ("Four", 4.0),
+            ("Mask", 5.0),
+            ("Inverted", -6.0),
+            ("Power", 9.0),
+            ("Copied", 1.0),
+            ("Separated", 1_001.0),
+        ] {
+            let member = member(&first, &fixture, name);
+            assert_eq!(
+                member.value,
+                CanonicalEnumMemberValue::Number(Number::new(value))
+            );
+            assert!(
+                !fixture
+                    .store
+                    .enum_member_links(member.declaration)
+                    .unwrap()
+                    .value
+                    .is_syntactically_string
+            );
+        }
+        for (name, value) in [("Word", "flag1"), ("Label", "value-2")] {
+            let member = member(&first, &fixture, name);
+            assert_eq!(
+                member.value,
+                CanonicalEnumMemberValue::String(value.to_owned())
+            );
+            assert!(
+                fixture
+                    .store
+                    .enum_member_links(member.declaration)
+                    .unwrap()
+                    .value
+                    .is_syntactically_string
+            );
+        }
+        let one = member(&first, &fixture, "One");
+        let copied = member(&first, &fixture, "Copied");
+        assert_eq!(copied.regular_type, one.regular_type);
+        assert_eq!(copied.fresh_type, one.fresh_type);
+
+        let warm = (
+            fixture.store.type_len(),
+            fixture.store.type_alias_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+        assert_eq!(
+            get_enum_semantics(&mut fixture.store, &host, owner),
+            Ok(first)
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.type_alias_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            warm
+        );
+    }
+
+    #[test]
+    fn forward_references_and_non_constant_expression_forms_are_atomic() {
+        for (source, name) in [
+            ("enum Forward { First = Later, Later = 1 }", "Forward"),
+            ("enum Outside { First = external + 1 }", "Outside"),
+            ("enum Condition { First = true ? 1 : 2 }", "Condition"),
+            ("enum Assertion { First = 1 as number }", "Assertion"),
+            ("enum Optional { First = Optional?.First }", "Optional"),
+            (
+                "const enum ConstInfinity { First = 1 / 0 }",
+                "ConstInfinity",
+            ),
+            ("const enum ConstNaN { First = 0 / 0 }", "ConstNaN"),
+        ] {
+            let mut fixture = fixture(source);
+            let owner = symbol(&fixture, SyntaxKind::EnumDeclaration, name);
+            let bound = &fixture.files[&fixture.file];
+            let host = host(&fixture.parsed.arena, bound);
+            let before = (
+                fixture.store.type_len(),
+                fixture.store.type_alias_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+
+            assert!(
+                matches!(
+                    get_enum_semantics(&mut fixture.store, &host, owner),
+                    Err(EnumTypeError::Unsupported(
+                        EnumTypeUnsupported::Initializer(_)
+                    ))
+                ),
+                "unexpected result for {source}",
+            );
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.type_alias_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                before
+            );
+        }
+    }
+
+    #[test]
+    fn computed_nan_values_share_one_enum_identity_and_validate_warm_caches() {
+        let mut fixture = fixture(concat!(
+            "enum Exceptional { ",
+            "First = 0 / 0, ",
+            "Again = 0 / 0, ",
+            "Positive = 1 / 0, ",
+            "Negative = -1 / 0, ",
+            "}",
+        ));
+        let owner = symbol(&fixture, SyntaxKind::EnumDeclaration, "Exceptional");
+        let bound = &fixture.files[&fixture.file];
+        let host = host(&fixture.parsed.arena, bound);
+
+        let first = get_enum_semantics(&mut fixture.store, &host, owner).unwrap();
+        let first_nan = member(&first, &fixture, "First");
+        let second_nan = member(&first, &fixture, "Again");
+        assert!(matches!(
+            first_nan.value,
+            CanonicalEnumMemberValue::Number(value) if value.is_nan()
+        ));
+        assert_eq!(second_nan.regular_type, first_nan.regular_type);
+        assert_eq!(second_nan.fresh_type, first_nan.fresh_type);
+        for name in ["Positive", "Negative"] {
+            assert!(matches!(
+                member(&first, &fixture, name).value,
+                CanonicalEnumMemberValue::Number(value) if value.is_infinite()
+            ));
+        }
+
+        let warm = (
+            fixture.store.type_len(),
+            fixture.store.type_alias_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+        let replay = get_enum_semantics(&mut fixture.store, &host, owner).unwrap();
+        assert_eq!(replay.declared_type, first.declared_type);
+        assert_eq!(replay.value_type, first.value_type);
+        assert_eq!(replay.members[0].fresh_type, first_nan.fresh_type);
+        assert_eq!(replay.members[1].fresh_type, first_nan.fresh_type);
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.type_alias_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            warm
         );
     }
 

@@ -1753,6 +1753,12 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         .into_iter()
         .find_map(|(candidate, flags, name, object_flags)| {
             (candidate == type_).then_some((flags, name, object_flags))
+        })
+        .or_else(|| {
+            (bootstrap.options.strict_null_checks
+                && bootstrap.options.exact_optional_property_types
+                && type_ == bootstrap.missing_type)
+                .then_some((TypeFlags::UNDEFINED, "undefined", ObjectFlags::NONE))
         });
         if expected != Some((record.flags(), intrinsic_name, record.object_flags()))
             || record.symbol().is_some()
@@ -5274,6 +5280,56 @@ mod tests {
                 store.validate_union_constituent(sentinel),
                 Err(LiteralTypeCacheError::UnsupportedUnionConstituent(sentinel)),
             );
+        }
+    }
+
+    #[test]
+    fn exact_optional_missing_type_is_a_union_constituent_only_in_strict_exact_mode() {
+        for (strict_null_checks, exact_optional_property_types) in
+            [(false, false), (false, true), (true, false), (true, true)]
+        {
+            let mut store = initialized(IntrinsicBootstrapOptions {
+                strict_null_checks,
+                exact_optional_property_types,
+            });
+            let (missing, optional, string) = {
+                let bootstrap = store.intrinsic_bootstrap().unwrap();
+                (
+                    bootstrap.missing_type,
+                    bootstrap.optional_type,
+                    bootstrap.string_type,
+                )
+            };
+
+            assert_eq!(
+                store.validate_union_constituent(optional),
+                Err(LiteralTypeCacheError::UnsupportedUnionConstituent(optional)),
+            );
+            if strict_null_checks && exact_optional_property_types {
+                assert_eq!(store.validate_union_constituent(missing), Ok(()));
+                let union = store.literal_union_type(&[string, missing], None).unwrap();
+                assert_eq!(union_types(&store, union), &[missing, string]);
+                let warm = (
+                    store.type_len(),
+                    store.intrinsic_bootstrap().unwrap().union_cache_len(),
+                );
+                assert_eq!(
+                    store.literal_union_type(&[string, missing], None),
+                    Ok(union)
+                );
+                assert_eq!(
+                    (
+                        store.type_len(),
+                        store.intrinsic_bootstrap().unwrap().union_cache_len()
+                    ),
+                    warm
+                );
+            } else {
+                assert_eq!(
+                    store.validate_union_constituent(missing),
+                    Err(LiteralTypeCacheError::UnsupportedUnionConstituent(missing)),
+                );
+            }
         }
     }
 

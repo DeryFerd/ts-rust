@@ -21,15 +21,14 @@ use ts_binder::{
 };
 
 use super::{
-    AssignabilityErrorDisplay, CanonicalCheckerDiagnostics, CanonicalEnumSemantics, ClassError,
-    ClassMembers, ClassShells,
+    AssignabilityErrorDisplay, CanonicalCheckerDiagnostics, CanonicalEnumSemantics,
     CanonicalGlobalTypeInitializationError, CanonicalGlobalTypes, CanonicalModuleResolutionLookup,
     CanonicalModuleResolutionManifest, CanonicalModuleResolutionManifestError,
     CanonicalModuleResolutionManifestInput, CanonicalTypeFormatFlags, CanonicalTypeMapperStore,
-    CanonicalUnionPropertyError, DeclaredTypeError, DeclaredTypeHost, DeclaredTypeHostError,
-    IntrinsicBootstrapError, IntrinsicBootstrapOptions, RelationUnavailable, ResolvedUnionProperty,
-    SignatureId, SourceCheckError, SourceCheckProvenanceError, SourceFileRef, SymbolMergeError,
-    TypeDisplayUnavailable, TypeId,
+    CanonicalUnionPropertyError, ClassError, ClassMembers, ClassShells, DeclaredTypeError,
+    DeclaredTypeHost, DeclaredTypeHostError, IntrinsicBootstrapError, IntrinsicBootstrapOptions,
+    RelationUnavailable, ResolvedUnionProperty, SignatureId, SourceCheckError,
+    SourceCheckProvenanceError, SourceFileRef, SymbolMergeError, TypeDisplayUnavailable, TypeId,
     alias::{CanonicalAliasResolution, CanonicalAliasResolutionError, CanonicalAliasResolver},
     alias_flags::{
         CanonicalSymbolFlagsError, CanonicalSymbolFlagsResolution, CanonicalSymbolFlagsResolver,
@@ -60,6 +59,8 @@ use super::{
 /// admission check when intrinsic strict-null identity is also enabled.
 /// `no_implicit_any` controls diagnostics and evolving inference for
 /// unannotated declarations.
+/// `emit_common_js` and `no_emit` preserve the emission conditions needed for
+/// module-scope reserved-name diagnostics.
 /// `no_error_truncation` raises semantic type display to the pinned hard output
 /// cutoff.
 #[allow(clippy::struct_excessive_bools)] // Flat immutable compiler-option projection.
@@ -71,6 +72,8 @@ pub struct CanonicalCheckerOptions {
     pub strict_function_types: bool,
     pub strict_property_initialization: bool,
     pub no_implicit_any: bool,
+    pub emit_common_js: bool,
+    pub no_emit: bool,
     pub no_error_truncation: bool,
     pub name_resolution: CanonicalNameResolverOptions,
 }
@@ -84,6 +87,8 @@ impl From<IntrinsicBootstrapOptions> for CanonicalCheckerOptions {
             strict_function_types: false,
             strict_property_initialization: false,
             no_implicit_any: false,
+            emit_common_js: false,
+            no_emit: false,
             no_error_truncation: false,
             name_resolution: CanonicalNameResolverOptions::default(),
         }
@@ -1011,13 +1016,13 @@ impl<'arena> CanonicalCheckerContext<'arena> {
         let source = self.source_file(file).ok_or(SourceCheckError::Provenance(
             SourceCheckProvenanceError::MissingFile(file),
         ))?;
-        let mut links = self
-            .store
-            .source_file_links(source)
-            .cloned()
-            .ok_or(SourceCheckError::Provenance(
-                SourceCheckProvenanceError::StoreSourceMismatch(source),
-            ))?;
+        let mut links =
+            self.store
+                .source_file_links(source)
+                .cloned()
+                .ok_or(SourceCheckError::Provenance(
+                    SourceCheckProvenanceError::StoreSourceMismatch(source),
+                ))?;
         links.type_checked = false;
         if !self.store.set_source_file_links(source, links) {
             return Err(SourceCheckError::Provenance(
@@ -2296,6 +2301,8 @@ mod tests {
         assert!(!defaults.strict_function_types);
         assert!(!defaults.strict_property_initialization);
         assert!(!defaults.no_implicit_any);
+        assert!(!defaults.emit_common_js);
+        assert!(!defaults.no_emit);
         assert!(!defaults.no_error_truncation);
 
         let intrinsic = IntrinsicBootstrapOptions {
@@ -2308,6 +2315,8 @@ mod tests {
         assert!(!options.strict_function_types);
         assert!(!options.strict_property_initialization);
         assert!(!options.no_implicit_any);
+        assert!(!options.emit_common_js);
+        assert!(!options.no_emit);
         assert!(!options.no_error_truncation);
     }
 
@@ -2398,6 +2407,8 @@ mod tests {
             strict_builtin_iterator_return: true,
             strict_function_types: true,
             no_implicit_any: true,
+            emit_common_js: true,
+            no_emit: true,
             ..CanonicalCheckerOptions::default()
         };
         let mut context = CanonicalCheckerContext::new(
@@ -2449,6 +2460,8 @@ mod tests {
         );
         assert_eq!(context.store().claimed_strict_function_types(), Some(true));
         assert!(context.options().strict_function_types);
+        assert!(context.options().emit_common_js);
+        assert!(context.options().no_emit);
         assert_eq!(context.diagnostics().len(), 2);
     }
 
@@ -2588,7 +2601,7 @@ mod tests {
         );
         assert_eq!(
             after_cached.name_resolver_views,
-            after_uncached.name_resolver_views
+            after_uncached.name_resolver_views + bodies.len()
         );
         assert_eq!(after_cached.snapshot_iterations, 0);
 

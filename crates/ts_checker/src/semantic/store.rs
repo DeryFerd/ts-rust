@@ -1351,10 +1351,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
     }
 
     #[must_use]
-    pub(super) fn source_overload_type_for_owner(
-        &self,
-        owner: SemanticSymbolId,
-    ) -> Option<TypeId> {
+    pub(super) fn source_overload_type_for_owner(&self, owner: SemanticSymbolId) -> Option<TypeId> {
         self.observe_relation_symbol_read(owner);
         self.source_overload_types_by_owner.get(&owner).copied()
     }
@@ -1389,9 +1386,10 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
     ) -> bool {
         self.source_overload_provenance.values().any(|provenance| {
             provenance.owner_symbol == owner
-                || provenance.signatures.iter().any(|signature| {
-                    declarations.contains(&signature.declaration)
-                })
+                || provenance
+                    .signatures
+                    .iter()
+                    .any(|signature| declarations.contains(&signature.declaration))
         })
     }
 
@@ -1555,20 +1553,23 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                 .copied()
                 .filter(|type_| self.type_has_declared_call_set_provenance(*type_))
         } else {
-            self.source_callable_type_for_signature(signature).filter(|type_| {
+            self.source_callable_type_for_signature(signature)
+                .filter(|type_| {
                     self.source_callable_provenance(*type_)
                         .is_some_and(|provenance| {
                             provenance.declaration == declaration
                                 && provenance.signature == signature
                         })
-                }).or_else(|| {
+                })
+                .or_else(|| {
                     self.source_overload_type_for_signature(signature)
                         .filter(|type_| {
-                            self.source_overload_provenance(*type_).is_some_and(|provenance| {
-                                provenance.signatures.iter().any(|row| {
-                                    row.declaration == declaration && row.signature == signature
+                            self.source_overload_provenance(*type_)
+                                .is_some_and(|provenance| {
+                                    provenance.signatures.iter().any(|row| {
+                                        row.declaration == declaration && row.signature == signature
+                                    })
                                 })
-                            })
                         })
                 })
         };
@@ -4340,9 +4341,9 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         prepared: Vec<PreparedSourceOverloadPublication>,
     ) -> Option<Vec<(TypeId, Box<[SignatureId]>)>> {
         let group_count = prepared.len();
-        let signature_count = prepared
-            .iter()
-            .try_fold(0usize, |count, group| count.checked_add(group.signatures.len()))?;
+        let signature_count = prepared.iter().try_fold(0usize, |count, group| {
+            count.checked_add(group.signatures.len())
+        })?;
         let parameter_count = prepared.iter().try_fold(0usize, |count, group| {
             group.signatures.iter().try_fold(count, |count, signature| {
                 count.checked_add(signature.parameters.len())
@@ -4375,13 +4376,12 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
                 || owner.export_symbol().is_some()
                 || self.get_merged_symbol(group.owner_symbol) != Some(group.owner_symbol)
                 || common_parent.is_none()
-                || common_parent
-                    .and_then(|parent| match parent {
-                        SourceNodeParent::Parent(parent) => self.source_node_kind(parent),
-                        SourceNodeParent::Root => None,
-                    })
-                    != Some(SyntaxKind::SourceFile)
-                || self.value_symbol_links(group.owner_symbol)
+                || common_parent.and_then(|parent| match parent {
+                    SourceNodeParent::Parent(parent) => self.source_node_kind(parent),
+                    SourceNodeParent::Root => None,
+                }) != Some(SyntaxKind::SourceFile)
+                || self
+                    .value_symbol_links(group.owner_symbol)
                     .is_some_and(|links| links != &ValueSymbolLinks::default())
                 || self
                     .source_callable_types_by_owner
@@ -4504,29 +4504,31 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
                 .signatures
                 .iter()
                 .zip(&signature_ids)
-                .map(|(signature, signature_id)| SourceOverloadSignatureProvenance {
-                    declaration: signature.declaration,
-                    signature: *signature_id,
-                    flags: signature.flags,
-                    parameters: signature
-                        .parameters
-                        .iter()
-                        .map(|parameter| SourceOverloadParameterProvenance {
-                            declaration: parameter.declaration,
-                            symbol: parameter.symbol,
-                            annotation: parameter.annotation,
-                            annotation_null_literal_identity: parameter
-                                .annotation_null_literal_identity,
-                            base_type: parameter.base_type,
-                            call_type: parameter.call_type,
-                            optional: parameter.optional,
-                        })
-                        .collect(),
-                    return_annotation: signature.return_annotation,
-                    return_annotation_null_literal_identity: signature
-                        .return_annotation_null_literal_identity,
-                    return_type: signature.return_type,
-                })
+                .map(
+                    |(signature, signature_id)| SourceOverloadSignatureProvenance {
+                        declaration: signature.declaration,
+                        signature: *signature_id,
+                        flags: signature.flags,
+                        parameters: signature
+                            .parameters
+                            .iter()
+                            .map(|parameter| SourceOverloadParameterProvenance {
+                                declaration: parameter.declaration,
+                                symbol: parameter.symbol,
+                                annotation: parameter.annotation,
+                                annotation_null_literal_identity: parameter
+                                    .annotation_null_literal_identity,
+                                base_type: parameter.base_type,
+                                call_type: parameter.call_type,
+                                optional: parameter.optional,
+                            })
+                            .collect(),
+                        return_annotation: signature.return_annotation,
+                        return_annotation_null_literal_identity: signature
+                            .return_annotation_null_literal_identity,
+                        return_type: signature.return_type,
+                    },
+                )
                 .collect::<Box<[_]>>();
             assert!(
                 self.source_overload_provenance
@@ -4586,23 +4588,25 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
                     signature.return_annotation_null_literal_identity,
                 ));
             }
-            assert!(self.set_callable_signature_parameter_types_batch(
-                group
-                    .signatures
-                    .iter()
-                    .zip(&signature_ids)
-                    .map(|(signature, signature_id)| {
-                        (
-                            *signature_id,
-                            signature
-                                .parameters
-                                .iter()
-                                .map(|parameter| parameter.call_type)
-                                .collect(),
-                        )
-                    })
-                    .collect(),
-            ));
+            assert!(
+                self.set_callable_signature_parameter_types_batch(
+                    group
+                        .signatures
+                        .iter()
+                        .zip(&signature_ids)
+                        .map(|(signature, signature_id)| {
+                            (
+                                *signature_id,
+                                signature
+                                    .parameters
+                                    .iter()
+                                    .map(|parameter| parameter.call_type)
+                                    .collect(),
+                            )
+                        })
+                        .collect(),
+                )
+            );
             for signature in &group.signatures {
                 for parameter in &signature.parameters {
                     assert!(self.set_value_symbol_links(
@@ -4746,52 +4750,40 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         instance_type: TypeId,
         provenance: DirectClassHeritageProvenance,
     ) -> bool {
-        let exact_class_instance =
-            |store: &Self, type_: TypeId, symbol: SemanticSymbolId| {
-                store.type_payload(type_).is_some_and(|record| {
-                    matches!(record.data(), TypeData::Interface(_))
-                        && record
-                            .object_flags()
-                            .contains(super::types::ObjectFlags::CLASS)
-                        && record
-                            .object_flags()
-                            .contains(super::types::ObjectFlags::REFERENCE)
-                        && record.symbol() == Some(symbol)
-                }) && store.get_merged_symbol(symbol) == Some(symbol)
-                    && store
-                        .declared_type_links(symbol)
-                        .is_some_and(|links| links.declared_type == Some(type_))
-            };
-        let exact_class_value =
-            |store: &Self, type_: TypeId, symbol: SemanticSymbolId| {
-                store.type_payload(type_).is_some_and(|record| {
-                    matches!(record.data(), TypeData::Object(_))
-                        && record
-                            .object_flags()
-                            .contains(super::types::ObjectFlags::ANONYMOUS)
-                        && record.symbol() == Some(symbol)
-                }) && store
-                    .value_symbol_links(symbol)
-                    .is_some_and(|links| {
-                        links
-                            == &(ValueSymbolLinks {
-                                resolved_type: Some(type_),
-                                ..ValueSymbolLinks::default()
-                            })
+        let exact_class_instance = |store: &Self, type_: TypeId, symbol: SemanticSymbolId| {
+            store.type_payload(type_).is_some_and(|record| {
+                matches!(record.data(), TypeData::Interface(_))
+                    && record
+                        .object_flags()
+                        .contains(super::types::ObjectFlags::CLASS)
+                    && record
+                        .object_flags()
+                        .contains(super::types::ObjectFlags::REFERENCE)
+                    && record.symbol() == Some(symbol)
+            }) && store.get_merged_symbol(symbol) == Some(symbol)
+                && store
+                    .declared_type_links(symbol)
+                    .is_some_and(|links| links.declared_type == Some(type_))
+        };
+        let exact_class_value = |store: &Self, type_: TypeId, symbol: SemanticSymbolId| {
+            store.type_payload(type_).is_some_and(|record| {
+                matches!(record.data(), TypeData::Object(_))
+                    && record
+                        .object_flags()
+                        .contains(super::types::ObjectFlags::ANONYMOUS)
+                    && record.symbol() == Some(symbol)
+            }) && store.value_symbol_links(symbol).is_some_and(|links| {
+                links
+                    == &(ValueSymbolLinks {
+                        resolved_type: Some(type_),
+                        ..ValueSymbolLinks::default()
                     })
-            };
+            })
+        };
         if provenance.owner_symbol == provenance.base_symbol
             || !exact_class_instance(self, instance_type, provenance.owner_symbol)
-            || !exact_class_value(
-                self,
-                provenance.owner_value_type,
-                provenance.owner_symbol,
-            )
-            || !exact_class_instance(
-                self,
-                provenance.base_instance_type,
-                provenance.base_symbol,
-            )
+            || !exact_class_value(self, provenance.owner_value_type, provenance.owner_symbol)
+            || !exact_class_instance(self, provenance.base_instance_type, provenance.base_symbol)
             || !exact_class_value(self, provenance.base_value_type, provenance.base_symbol)
         {
             return false;
