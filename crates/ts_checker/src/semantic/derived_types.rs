@@ -1913,7 +1913,22 @@ mod tests {
             parsed("let condition = 123; var value = condition && [1, 2] || condition && [3, 4];");
         let library_file = FileId::new(40);
         let file = FileId::new(41);
-        let mut context = checker_context(&[(library_file, &library), (file, &source)]);
+        let files = [(library_file, &library), (file, &source)];
+        let mut context = CanonicalCheckerContext::new(
+            completed_bindings(&files),
+            files
+                .iter()
+                .map(|(file, parsed)| (*file, &parsed.arena))
+                .collect(),
+            CanonicalCheckerOptions {
+                intrinsic: crate::semantic::IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    ..crate::semantic::IntrinsicBootstrapOptions::default()
+                },
+                ..CanonicalCheckerOptions::default()
+            },
+        )
+        .unwrap();
         let initializer = variable_initializer(&source, file, "value");
         context.check_source_file(file).unwrap();
 
