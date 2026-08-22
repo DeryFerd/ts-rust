@@ -1933,24 +1933,7 @@ impl CanonicalBinder {
             if is_external_augmentation
                 && is_parser_collected_module_augmentation(arena, node, facts)
             {
-                let Some(NodeData::ModuleDeclaration(module)) =
-                    arena.get(node).map(|node| &node.data)
-                else {
-                    unreachable!("ambient-module dispatch is kind checked");
-                };
-                let container = arena
-                    .get(node)
-                    .and_then(|module| module.parent)
-                    .expect("parser-collected module augmentation has a container");
-                let in_ambient_context = is_ambient_node(arena, container, facts);
-                self.files
-                    .get_mut(&file)
-                    .expect("module-augmentation file is registered")
-                    .module_augmentations
-                    .push(CanonicalModuleAugmentation {
-                        name: NodeRef::new(arena.id(), file, module.name),
-                        in_ambient_context,
-                    });
+                self.record_module_augmentation(arena, file, node, facts);
             }
             if is_external_augmentation {
                 self.declare_module_symbol(arena, file, node, facts, state)?;
@@ -2035,6 +2018,32 @@ impl CanonicalBinder {
                 .insert(symbol);
         }
         Ok(())
+    }
+
+    fn record_module_augmentation(
+        &mut self,
+        arena: &NodeArena,
+        file: FileId,
+        node: NodeId,
+        facts: &CanonicalSourceFileFacts,
+    ) {
+        let Some(NodeData::ModuleDeclaration(module)) = arena.get(node).map(|node| &node.data)
+        else {
+            unreachable!("ambient-module dispatch is kind checked");
+        };
+        let container = arena
+            .get(node)
+            .and_then(|module| module.parent)
+            .expect("parser-collected module augmentation has a container");
+        let in_ambient_context = is_ambient_node(arena, container, facts);
+        self.files
+            .get_mut(&file)
+            .expect("module-augmentation file is registered")
+            .module_augmentations
+            .push(CanonicalModuleAugmentation {
+                name: NodeRef::new(arena.id(), file, module.name),
+                in_ambient_context,
+            });
     }
 
     fn declare_module_symbol(
@@ -2181,9 +2190,9 @@ impl CanonicalBinder {
                 .container
                 .and_then(|container| self.lookup_entity(arena, file, parent, container));
         }
-        let Some(symbol) = symbol.and_then(|symbol| {
-            self.get_typescript_expando_initializer_symbol(arena, file, symbol)
-        }) else {
+        let Some(symbol) = symbol
+            .and_then(|symbol| self.get_typescript_expando_initializer_symbol(arena, file, symbol))
+        else {
             return;
         };
 
@@ -2201,10 +2210,7 @@ impl CanonicalBinder {
 
         let exports = self.ensure_symbol_exports(symbol);
         let name = self
-            .get_declaration_name(
-                arena,
-                NodeRef::new(arena.id(), file, assignment.node),
-            )
+            .get_declaration_name(arena, NodeRef::new(arena.id(), file, assignment.node))
             .expect("TypeScript expando name shapes were preflighted");
         let may_declare = self
             .symbols
@@ -2267,7 +2273,9 @@ impl CanonicalBinder {
             .symbols
             .symbol(assignment)
             .expect("late-bound assignment symbol is store-owned");
-        let mut declarations = record.declarations().map_or_else(Vec::new, <[NodeRef]>::to_vec);
+        let mut declarations = record
+            .declarations()
+            .map_or_else(Vec::new, <[NodeRef]>::to_vec);
         declarations.push(NodeRef::new(arena.id(), file, node));
         assert!(
             self.symbols
@@ -2352,7 +2360,9 @@ impl CanonicalBinder {
         let NodeData::VariableDeclaration(variable) = &declaration_node.data else {
             return None;
         };
-        let parent = declaration_node.parent.and_then(|parent| arena.get(parent))?;
+        let parent = declaration_node
+            .parent
+            .and_then(|parent| arena.get(parent))?;
         if parent.flags.0 & NODE_FLAG_CONST == 0 {
             return None;
         }
@@ -7376,7 +7386,11 @@ declare module "declared" { interface Visible {} }
         );
         let recovered_locals = binder
             .symbol_store()
-            .symbol_table(bound.locals(node_ref(&parsed.arena, file, modules[0])).unwrap())
+            .symbol_table(
+                bound
+                    .locals(node_ref(&parsed.arena, file, modules[0]))
+                    .unwrap(),
+            )
             .unwrap();
         assert!(recovered_locals.get_source("Hidden").is_some());
         let declared_exports = binder
@@ -7392,9 +7406,8 @@ declare module "declared" { interface Visible {} }
             .unwrap();
         assert!(declared_exports.get_source("Visible").is_some());
 
-        let declaration_file = parse_source_file(
-            r#"module "file-context" { interface FileVisible {} }"#,
-        );
+        let declaration_file =
+            parse_source_file(r#"module "file-context" { interface FileVisible {} }"#);
         let declaration_file_id = FileId::new(71);
         let mut declaration_binder = CanonicalBinder::new();
         declaration_binder
@@ -8065,9 +8078,7 @@ namespace NS {
             SyntaxKind::BinaryExpression,
             "Forward[+0] = 6",
         );
-        let signed_symbol = bound
-            .symbol(node_ref(&parsed.arena, file, signed))
-            .unwrap();
+        let signed_symbol = bound.symbol(node_ref(&parsed.arena, file, signed)).unwrap();
         assert_eq!(
             binder.symbol_store().symbol(signed_symbol).unwrap().name(),
             InternalSymbolName::Missing.as_ref()
@@ -8096,9 +8107,7 @@ namespace NS {
         assert!(module_exports.get_source("exports").is_some());
 
         let arrow = variable_initializers_named(&parsed.arena, "Arrow")[0];
-        let arrow_symbol = bound
-            .symbol(node_ref(&parsed.arena, file, arrow))
-            .unwrap();
+        let arrow_symbol = bound.symbol(node_ref(&parsed.arena, file, arrow)).unwrap();
         let arrow_exports = binder
             .symbol_store()
             .symbol(arrow_symbol)
@@ -8265,10 +8274,7 @@ Merged.fresh = 1;
             SyntaxKind::BinaryExpression,
             "Target.blocked = 1",
         );
-        assert_eq!(
-            bound.symbol(node_ref(&parsed.arena, file, blocked)),
-            None
-        );
+        assert_eq!(bound.symbol(node_ref(&parsed.arena, file, blocked)), None);
 
         for (name, assignment) in [
             ("Loose", "Loose.nope = 1"),
@@ -8287,11 +8293,8 @@ Merged.fresh = 1;
                 .and_then(|exports| binder.symbol_store().symbol_table(exports))
                 .is_some_and(|exports| exports.get_source("nope").is_some());
             assert!(!has_property, "unexpected expando on {name}");
-            let assignment = node_with_source(
-                &parsed.arena,
-                SyntaxKind::BinaryExpression,
-                assignment,
-            );
+            let assignment =
+                node_with_source(&parsed.arena, SyntaxKind::BinaryExpression, assignment);
             assert_eq!(
                 bound.symbol(node_ref(&parsed.arena, file, assignment)),
                 None
@@ -8303,15 +8306,10 @@ Merged.fresh = 1;
             .symbol_table(bound.locals(bound.source_file()).unwrap())
             .unwrap();
         let declared = source_locals.get_source("Declared").unwrap();
-        let declared_exports = binder
-            .symbol_store()
-            .symbol(declared)
-            .unwrap()
-            .exports();
+        let declared_exports = binder.symbol_store().symbol(declared).unwrap().exports();
         assert!(declared_exports.is_none_or(|exports| {
             let exports = binder.symbol_store().symbol_table(exports).unwrap();
-            exports.get_source("defined").is_none()
-                && exports.get_source("compound").is_none()
+            exports.get_source("defined").is_none() && exports.get_source("compound").is_none()
         }));
         let ignored = node_with_source(
             &parsed.arena,
@@ -8375,9 +8373,7 @@ Merged.fresh = 1;
 
     #[test]
     fn javascript_expandos_remain_deferred_without_partial_declaration_writes() {
-        let parsed = parse_source_file(
-            "F.staticName = 1; F[dynamic] = 2; function F() {}",
-        );
+        let parsed = parse_source_file("F.staticName = 1; F[dynamic] = 2; function F() {}");
         assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
         let file = FileId::new(69);
         let mut binder = CanonicalBinder::new();
@@ -8396,7 +8392,9 @@ Merged.fresh = 1;
             .unwrap();
         assert_eq!(
             binder.bind_typescript_declaration_slice(&parsed.arena, file),
-            Err(CanonicalDeclarationError::JavaScriptDeclarationsDeferred(file))
+            Err(CanonicalDeclarationError::JavaScriptDeclarationsDeferred(
+                file
+            ))
         );
 
         let bound = binder.file(file).unwrap();
@@ -8404,7 +8402,11 @@ Merged.fresh = 1;
         assert!(!bound.declaration_slice_bound());
         assert_eq!(bound.symbol_count(), 0);
         assert_eq!(bound.locals(bound.source_file()), None);
-        assert!(bound.traversal_order().all(|node| bound.symbol(node).is_none()));
+        assert!(
+            bound
+                .traversal_order()
+                .all(|node| bound.symbol(node).is_none())
+        );
         assert_eq!(binder.symbol_store().symbol_len(), 0);
         assert_eq!(binder.symbol_store().symbol_table_len(), 0);
     }

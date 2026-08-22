@@ -80,6 +80,8 @@ struct FlowBuilder<'a, 'hooks> {
     return_target: Option<FlowRef>,
     break_target: Option<FlowRef>,
     continue_target: Option<FlowRef>,
+    true_target: Option<FlowRef>,
+    false_target: Option<FlowRef>,
     active_labels: Vec<ActiveLabel>,
     pre_switch_case_flow: Option<FlowRef>,
     has_flow_effects: bool,
@@ -106,6 +108,8 @@ impl<'a, 'hooks> FlowBuilder<'a, 'hooks> {
             return_target: None,
             break_target: None,
             continue_target: None,
+            true_target: None,
+            false_target: None,
             active_labels: Vec::new(),
             pre_switch_case_flow: None,
             has_flow_effects: false,
@@ -148,7 +152,6 @@ impl<'a, 'hooks> FlowBuilder<'a, 'hooks> {
             return;
         };
         let kind = node.kind;
-        let flags = node.flags;
 
         if kind == SyntaxKind::ClassStaticBlockDeclaration {
             self.mark_unsupported(node_id, UnsupportedFlowKind::ClassStaticBlock);
@@ -202,9 +205,18 @@ impl<'a, 'hooks> FlowBuilder<'a, 'hooks> {
             self.record_node_flow(node_id);
         }
 
-        if is_optional_chain(kind, flags) {
-            self.mark_unsupported(node_id, UnsupportedFlowKind::OptionalChain);
-            self.bind_children_without_flow(node_id);
+        if self.is_optional_chain_node(node_id) {
+            if matches!(
+                kind,
+                SyntaxKind::PropertyAccessExpression | SyntaxKind::ElementAccessExpression
+            ) && self.is_narrowable_reference(node_id)
+            {
+                self.record_node_flow(node_id);
+            }
+            self.bind_optional_chain_flow(node_id);
+            if kind == SyntaxKind::CallExpression {
+                self.bind_array_mutation_call(node_id);
+            }
             return;
         }
 
@@ -744,7 +756,13 @@ impl<'a, 'hooks> FlowBuilder<'a, 'hooks> {
         false_target: FlowRef,
     ) {
         if let Some(expression) = expression {
-            self.bind_node(expression);
+            self.bind_with_conditional_branches(expression, true_target, false_target);
+            if self.current.is_none()
+                || self.is_logical_condition(expression)
+                || self.is_outermost_optional_chain(expression)
+            {
+                return;
+            }
         }
         let Some(current) = self.current else {
             return;
@@ -759,6 +777,19 @@ impl<'a, 'hooks> FlowBuilder<'a, 'hooks> {
         };
         self.add_antecedent(true_target, true_flow);
         self.add_antecedent(false_target, false_flow);
+    }
+
+    fn bind_with_conditional_branches(
+        &mut self,
+        expression: NodeId,
+        true_target: FlowRef,
+        false_target: FlowRef,
+    ) {
+        let saved_true_target = self.true_target.replace(true_target);
+        let saved_false_target = self.false_target.replace(false_target);
+        self.bind_node(expression);
+        self.true_target = saved_true_target;
+        self.false_target = saved_false_target;
     }
 
     fn bind_return_statement(&mut self, node_id: NodeId) {
@@ -874,7 +905,7 @@ impl<'a, 'hooks> FlowBuilder<'a, 'hooks> {
             return;
         };
         if is_logical_operator(operator) {
-            self.mark_unsupported(node_id, UnsupportedFlowKind::LogicalExpression);
+            self.bind_logical_expression(node_id);
             return;
         }
         if operator.is_assignment_operator()
@@ -913,6 +944,221 @@ impl<'a, 'hooks> FlowBuilder<'a, 'hooks> {
                     self.create_flow_mutation(FlowFlags::ARRAY_MUTATION, node_id);
                 }
             }
+        }
+    }
+
+    fn bind_logical_expression(&mut self, node_id: NodeId) {
+        let dependency_container = self.container;
+        self.effect_dependency_containers.push(dependency_container);
+        self.bind_logical_expression_worker(node_id);
+        let popped = self.effect_dependency_containers.pop();
+        debug_assert_eq!(popped, Some(dependency_container));
+    }
+
+    fn bind_logical_expression_worker(&mut self, node_id: NodeId) {
+        if self.is_top_level_logical_expression(node_id) {
+            let post_expression_label = self.alloc_label();
+            let saved_current = self.current;
+            let saved_effects = self.has_flow_effects;
+            self.has_flow_effects = false;
+            self.bind_logical_like_expression(
+                node_id,
+                post_expression_label,
+                post_expression_label,
+            );
+            if self.current.is_some() {
+                self.current = if self.has_flow_effects {
+                    self.finish_label(post_expression_label)
+                } else {
+                    saved_current
+                };
+            }
+            self.has_flow_effects |= saved_effects;
+        } else if let (Some(true_target), Some(false_target)) =
+            (self.true_target, self.false_target)
+        {
+            self.bind_logical_like_expression(node_id, true_target, false_target);
+        } else {
+            self.mark_unsupported(node_id, UnsupportedFlowKind::LogicalExpression);
+        }
+    }
+
+    fn bind_logical_like_expression(
+        &mut self,
+        node_id: NodeId,
+        true_target: FlowRef,
+        false_target: FlowRef,
+    ) {
+        let (left, operator_token, right) = match self.ast.get(node_id).map(|node| &node.data) {
+            Some(NodeData::BinaryExpression(data)) => (data.left, data.operator_token, data.right),
+            _ => return,
+        };
+        let Some(operator) = self.node_kind(operator_token) else {
+            return;
+        };
+        let pre_right_label = self.alloc_label();
+        if matches!(
+            operator,
+            SyntaxKind::AmpersandAmpersandToken | SyntaxKind::AmpersandAmpersandEqualsToken
+        ) {
+            self.bind_condition(left, pre_right_label, false_target);
+        } else {
+            self.bind_condition(left, true_target, pre_right_label);
+        }
+        if self.current.is_none() {
+            return;
+        }
+        self.current = self.finish_label(pre_right_label);
+        if self.current.is_none() {
+            return;
+        }
+        self.bind_node(operator_token);
+        if operator.is_logical_or_coalescing_assignment_operator() {
+            self.bind_with_conditional_branches(right, true_target, false_target);
+            if self.current.is_none() {
+                return;
+            }
+            self.bind_assignment_target_flow(left);
+            let Some(current) = self.current else {
+                return;
+            };
+            let true_flow = self.create_flow_condition(FlowFlags::TRUE_CONDITION, current, node_id);
+            let false_flow =
+                self.create_flow_condition(FlowFlags::FALSE_CONDITION, current, node_id);
+            self.add_antecedent(true_target, true_flow);
+            self.add_antecedent(false_target, false_flow);
+        } else {
+            self.bind_condition(right, true_target, false_target);
+        }
+    }
+
+    fn bind_optional_chain_flow(&mut self, node_id: NodeId) {
+        let dependency_container = self.container;
+        self.effect_dependency_containers.push(dependency_container);
+        if self.is_top_level_logical_expression(node_id) {
+            let post_expression_label = self.alloc_label();
+            let saved_current = self.current;
+            let saved_effects = self.has_flow_effects;
+            self.bind_optional_chain(node_id, post_expression_label, post_expression_label);
+            if self.current.is_some() {
+                self.current = if self.has_flow_effects {
+                    self.finish_label(post_expression_label)
+                } else {
+                    saved_current
+                };
+            }
+            self.has_flow_effects |= saved_effects;
+        } else if let (Some(true_target), Some(false_target)) =
+            (self.true_target, self.false_target)
+        {
+            self.bind_optional_chain(node_id, true_target, false_target);
+        } else {
+            self.mark_unsupported(node_id, UnsupportedFlowKind::OptionalChain);
+        }
+        let popped = self.effect_dependency_containers.pop();
+        debug_assert_eq!(popped, Some(dependency_container));
+    }
+
+    fn bind_optional_chain(
+        &mut self,
+        node_id: NodeId,
+        true_target: FlowRef,
+        false_target: FlowRef,
+    ) {
+        let Some(expression) = self.optional_chain_expression(node_id) else {
+            return;
+        };
+        let pre_chain_label = self
+            .is_optional_chain_root(node_id)
+            .then(|| self.alloc_label());
+        self.bind_optional_expression(
+            expression,
+            pre_chain_label.unwrap_or(true_target),
+            false_target,
+        );
+        if self.current.is_none() {
+            return;
+        }
+        if let Some(pre_chain_label) = pre_chain_label {
+            self.current = self.finish_label(pre_chain_label);
+        }
+        if self.current.is_none() {
+            return;
+        }
+
+        let saved_true_target = self.true_target.replace(true_target);
+        let saved_false_target = self.false_target.replace(false_target);
+        self.bind_optional_chain_rest(node_id);
+        self.true_target = saved_true_target;
+        self.false_target = saved_false_target;
+        if self.current.is_none() || !self.is_outermost_optional_chain(node_id) {
+            return;
+        }
+        let Some(current) = self.current else {
+            return;
+        };
+        let true_flow = self.create_flow_condition(FlowFlags::TRUE_CONDITION, current, node_id);
+        let false_flow = self.create_flow_condition(FlowFlags::FALSE_CONDITION, current, node_id);
+        self.add_antecedent(true_target, true_flow);
+        self.add_antecedent(false_target, false_flow);
+    }
+
+    fn bind_optional_expression(
+        &mut self,
+        expression: NodeId,
+        true_target: FlowRef,
+        false_target: FlowRef,
+    ) {
+        self.bind_with_conditional_branches(expression, true_target, false_target);
+        let Some(current) = self.current else {
+            return;
+        };
+        if !self.is_optional_chain_node(expression) || self.is_outermost_optional_chain(expression)
+        {
+            let true_flow =
+                self.create_flow_condition(FlowFlags::TRUE_CONDITION, current, expression);
+            let false_flow =
+                self.create_flow_condition(FlowFlags::FALSE_CONDITION, current, expression);
+            self.add_antecedent(true_target, true_flow);
+            self.add_antecedent(false_target, false_flow);
+        }
+    }
+
+    fn bind_optional_chain_rest(&mut self, node_id: NodeId) {
+        match self.ast.get(node_id).map(|node| &node.data) {
+            Some(NodeData::PropertyAccessExpression(data)) => {
+                let question_dot = data.question_dot_token;
+                let name = data.name;
+                if let Some(question_dot) = question_dot {
+                    self.bind_node(question_dot);
+                }
+                self.bind_node(name);
+            }
+            Some(NodeData::ElementAccessExpression(data)) => {
+                let question_dot = data.question_dot_token;
+                let argument = data.argument_expression;
+                if let Some(question_dot) = question_dot {
+                    self.bind_node(question_dot);
+                }
+                self.bind_node(argument);
+            }
+            Some(NodeData::CallExpression(data)) => {
+                let question_dot = data.question_dot_token;
+                let type_arguments = data
+                    .type_arguments
+                    .as_ref()
+                    .map(|arguments| arguments.nodes.clone())
+                    .unwrap_or_default();
+                let arguments = data.arguments.nodes.clone();
+                if let Some(question_dot) = question_dot {
+                    self.bind_node(question_dot);
+                }
+                for argument in type_arguments.into_iter().chain(arguments) {
+                    self.bind_node(argument);
+                }
+            }
+            Some(NodeData::NonNullExpression(_)) => {}
+            _ => {}
         }
     }
 
@@ -1042,6 +1288,12 @@ impl<'a, 'hooks> FlowBuilder<'a, 'hooks> {
             Some(NodeData::PrefixUnaryExpression(data)) => (data.operand, data.operator),
             _ => return,
         };
+        if operator == SyntaxKind::ExclamationToken {
+            std::mem::swap(&mut self.true_target, &mut self.false_target);
+            self.bind_node(operand);
+            std::mem::swap(&mut self.true_target, &mut self.false_target);
+            return;
+        }
         self.bind_node(operand);
         if matches!(
             operator,
@@ -1110,6 +1362,14 @@ impl<'a, 'hooks> FlowBuilder<'a, 'hooks> {
         if self.node_kind(expression) == Some(SyntaxKind::SuperKeyword) {
             self.create_flow_mutation(FlowFlags::CALL, node_id);
         }
+        self.bind_array_mutation_call(node_id);
+    }
+
+    fn bind_array_mutation_call(&mut self, node_id: NodeId) {
+        let expression = match self.ast.get(node_id).map(|node| &node.data) {
+            Some(NodeData::CallExpression(data)) => data.expression,
+            _ => return,
+        };
         if let Some((base, name)) = self.property_access_parts(expression)
             && self.is_narrowable_operand(base)
             && matches!(self.identifier_text(name), Some("push" | "unshift"))
@@ -1314,7 +1574,7 @@ impl<'a, 'hooks> FlowBuilder<'a, 'hooks> {
                 children
             }
             NodeData::CallExpression(data)
-                if !is_optional_chain(node.kind, node.flags)
+                if !self.is_optional_chain_node(node_id)
                     && self
                         .directly_invoked_function_target(data.expression)
                         .is_some() =>
@@ -1627,6 +1887,119 @@ impl<'a, 'hooks> FlowBuilder<'a, 'hooks> {
 
     fn node_kind(&self, node: NodeId) -> Option<SyntaxKind> {
         self.ast.get(node).map(|node| node.kind)
+    }
+
+    fn is_logical_condition(&self, node_id: NodeId) -> bool {
+        let node_id = self.skip_parentheses(node_id);
+        match self.ast.get(node_id).map(|node| &node.data) {
+            Some(NodeData::BinaryExpression(data)) => self
+                .node_kind(data.operator_token)
+                .is_some_and(is_logical_operator),
+            Some(NodeData::PrefixUnaryExpression(data))
+                if data.operator == SyntaxKind::ExclamationToken =>
+            {
+                self.is_logical_condition(data.operand)
+            }
+            _ => false,
+        }
+    }
+
+    fn is_top_level_logical_expression(&self, mut node_id: NodeId) -> bool {
+        while let Some(parent) = self.ast.get(node_id).and_then(|node| node.parent) {
+            match self.ast.get(parent).map(|node| &node.data) {
+                Some(NodeData::ParenthesizedExpression(_)) => node_id = parent,
+                Some(NodeData::PrefixUnaryExpression(data))
+                    if data.operator == SyntaxKind::ExclamationToken =>
+                {
+                    node_id = parent;
+                }
+                _ => break,
+            }
+        }
+        let Some(parent) = self.ast.get(node_id).and_then(|node| node.parent) else {
+            return true;
+        };
+        if self.is_statement_condition(node_id, parent) || self.is_logical_condition(parent) {
+            return false;
+        }
+        !self.is_optional_chain_node(parent)
+            || self.optional_chain_expression(parent) != Some(node_id)
+    }
+
+    fn is_statement_condition(&self, expression: NodeId, parent: NodeId) -> bool {
+        match self.ast.get(parent).map(|node| &node.data) {
+            Some(NodeData::IfStatement(data)) => data.expression == expression,
+            Some(NodeData::WhileStatement(data)) => data.expression == expression,
+            Some(NodeData::DoStatement(data)) => data.expression == expression,
+            Some(NodeData::ForStatement(data)) => data.condition == Some(expression),
+            Some(NodeData::ConditionalExpression(data)) => data.condition == expression,
+            _ => false,
+        }
+    }
+
+    fn is_optional_chain_node(&self, mut node_id: NodeId) -> bool {
+        loop {
+            let Some(node) = self.ast.get(node_id) else {
+                return false;
+            };
+            if is_optional_chain(node.kind, node.flags) {
+                return true;
+            }
+            match &node.data {
+                NodeData::PropertyAccessExpression(data) => {
+                    if data.question_dot_token.is_some() {
+                        return true;
+                    }
+                    node_id = data.expression;
+                }
+                NodeData::ElementAccessExpression(data) => {
+                    if data.question_dot_token.is_some() {
+                        return true;
+                    }
+                    node_id = data.expression;
+                }
+                NodeData::CallExpression(data) => {
+                    if data.question_dot_token.is_some() {
+                        return true;
+                    }
+                    node_id = data.expression;
+                }
+                NodeData::NonNullExpression(data) => node_id = data.expression,
+                _ => return false,
+            }
+        }
+    }
+
+    fn is_optional_chain_root(&self, node_id: NodeId) -> bool {
+        match self.ast.get(node_id).map(|node| &node.data) {
+            Some(NodeData::PropertyAccessExpression(data)) => data.question_dot_token.is_some(),
+            Some(NodeData::ElementAccessExpression(data)) => data.question_dot_token.is_some(),
+            Some(NodeData::CallExpression(data)) => data.question_dot_token.is_some(),
+            _ => false,
+        }
+    }
+
+    fn is_outermost_optional_chain(&self, node_id: NodeId) -> bool {
+        self.is_optional_chain_node(node_id)
+            && self
+                .ast
+                .get(node_id)
+                .and_then(|node| node.parent)
+                .is_none_or(|parent| {
+                    !self.is_optional_chain_node(parent)
+                        || self.is_optional_chain_root(parent)
+                        || self.optional_chain_expression(parent) != Some(node_id)
+                })
+    }
+
+    fn optional_chain_expression(&self, node_id: NodeId) -> Option<NodeId> {
+        match self.ast.get(node_id).map(|node| &node.data) {
+            Some(NodeData::PropertyAccessExpression(data)) => Some(data.expression),
+            Some(NodeData::ElementAccessExpression(data)) => Some(data.expression),
+            Some(NodeData::CallExpression(data)) => Some(data.expression),
+            Some(NodeData::NonNullExpression(data)) => Some(data.expression),
+            _ => None,
+        }
     }
 
     fn is_for_in_or_of_initializer(&self, declaration: NodeId) -> bool {

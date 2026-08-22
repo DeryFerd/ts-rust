@@ -352,6 +352,7 @@ pub struct PreparedSymbolTable(SymbolTable);
 
 impl PreparedSymbolTable {
     /// Stages one empty table with room for every planned entry.
+    #[must_use]
     pub fn new(entry_capacity: usize) -> Option<Self> {
         let mut entries = HashMap::new();
         entries.try_reserve(entry_capacity).ok()?;

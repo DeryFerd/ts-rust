@@ -2539,6 +2539,452 @@ mod tests {
     }
 
     #[test]
+    fn logical_and_conditions_preserve_short_circuit_branch_order() {
+        let parsed = parse_source_file("if (left && right) { matched; } else { missed; }");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(82);
+        let result = bind_source_file_in_file(&parsed.arena, parsed.source_file, file);
+        let graph = result
+            .flow_graph(&parsed.arena, parsed.source_file)
+            .unwrap();
+        assert!(graph.is_complete(), "{:?}", graph.unsupported());
+
+        let statement = source_statements(&parsed.arena, parsed.source_file)[0];
+        let NodeData::IfStatement(conditional) = &parsed.arena.get(statement).unwrap().data else {
+            panic!("expected if statement");
+        };
+        let NodeData::BinaryExpression(expression) =
+            &parsed.arena.get(conditional.expression).unwrap().data
+        else {
+            panic!("expected logical expression");
+        };
+        let right_entry = graph
+            .flow_at(node_ref(&parsed.arena, file, expression.right))
+            .unwrap();
+        let right_condition = graph.nodes().get(right_entry).unwrap();
+        assert!(right_condition.flags.contains(FlowFlags::TRUE_CONDITION));
+        assert_eq!(
+            right_condition.payload,
+            Some(FlowNodePayload::Ast(node_ref(
+                &parsed.arena,
+                file,
+                expression.left,
+            )))
+        );
+
+        let matched = block_statements(&parsed.arena, conditional.then_statement)[0];
+        let matched_flow = graph
+            .flow_at(node_ref(&parsed.arena, file, matched))
+            .unwrap();
+        let matched_condition = graph.nodes().get(matched_flow).unwrap();
+        assert!(matched_condition.flags.contains(FlowFlags::TRUE_CONDITION));
+        assert_eq!(matched_condition.antecedent, Some(right_entry));
+        assert_eq!(
+            matched_condition.payload,
+            Some(FlowNodePayload::Ast(node_ref(
+                &parsed.arena,
+                file,
+                expression.right,
+            )))
+        );
+
+        let missed = block_statements(&parsed.arena, conditional.else_statement.unwrap())[0];
+        let missed_flow = graph
+            .flow_at(node_ref(&parsed.arena, file, missed))
+            .unwrap();
+        let missed_join = graph.nodes().get(missed_flow).unwrap();
+        assert!(missed_join.flags.contains(FlowFlags::BRANCH_LABEL));
+        assert_eq!(missed_join.antecedents.len(), 2);
+        for (flow, operand) in missed_join
+            .antecedents
+            .iter()
+            .zip([expression.left, expression.right])
+        {
+            let condition = graph.nodes().get(*flow).unwrap();
+            assert!(condition.flags.contains(FlowFlags::FALSE_CONDITION));
+            assert_eq!(
+                condition.payload,
+                Some(FlowNodePayload::Ast(node_ref(&parsed.arena, file, operand)))
+            );
+        }
+    }
+
+    #[test]
+    fn negated_nested_logical_conditions_swap_short_circuit_targets() {
+        let parsed =
+            parse_source_file("if (!(first || second) && third) { matched; } else { missed; }");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(83);
+        let result = bind_source_file_in_file(&parsed.arena, parsed.source_file, file);
+        let graph = result
+            .flow_graph(&parsed.arena, parsed.source_file)
+            .unwrap();
+        assert!(graph.is_complete(), "{:?}", graph.unsupported());
+
+        let statement = source_statements(&parsed.arena, parsed.source_file)[0];
+        let NodeData::IfStatement(conditional) = &parsed.arena.get(statement).unwrap().data else {
+            panic!("expected if statement");
+        };
+        let NodeData::BinaryExpression(outer) =
+            &parsed.arena.get(conditional.expression).unwrap().data
+        else {
+            panic!("expected outer logical expression");
+        };
+        let NodeData::PrefixUnaryExpression(negation) = &parsed.arena.get(outer.left).unwrap().data
+        else {
+            panic!("expected negated logical expression");
+        };
+        let NodeData::ParenthesizedExpression(parenthesized) =
+            &parsed.arena.get(negation.operand).unwrap().data
+        else {
+            panic!("expected parenthesized logical expression");
+        };
+        let NodeData::BinaryExpression(inner) =
+            &parsed.arena.get(parenthesized.expression).unwrap().data
+        else {
+            panic!("expected inner logical expression");
+        };
+
+        let third_flow = graph
+            .flow_at(node_ref(&parsed.arena, file, outer.right))
+            .unwrap();
+        let third_entry = graph.nodes().get(third_flow).unwrap();
+        assert!(third_entry.flags.contains(FlowFlags::FALSE_CONDITION));
+        assert_eq!(
+            third_entry.payload,
+            Some(FlowNodePayload::Ast(node_ref(
+                &parsed.arena,
+                file,
+                inner.right,
+            )))
+        );
+
+        let missed = block_statements(&parsed.arena, conditional.else_statement.unwrap())[0];
+        let missed_flow = graph
+            .flow_at(node_ref(&parsed.arena, file, missed))
+            .unwrap();
+        let missed_join = graph.nodes().get(missed_flow).unwrap();
+        assert!(missed_join.flags.contains(FlowFlags::BRANCH_LABEL));
+        assert_eq!(missed_join.antecedents.len(), 3);
+        let expected = [
+            (inner.left, FlowFlags::TRUE_CONDITION),
+            (inner.right, FlowFlags::TRUE_CONDITION),
+            (outer.right, FlowFlags::FALSE_CONDITION),
+        ];
+        for (flow, (operand, flags)) in missed_join.antecedents.iter().zip(expected) {
+            let condition = graph.nodes().get(*flow).unwrap();
+            assert!(condition.flags.contains(flags));
+            assert_eq!(
+                condition.payload,
+                Some(FlowNodePayload::Ast(node_ref(&parsed.arena, file, operand)))
+            );
+        }
+    }
+
+    #[test]
+    fn top_level_logical_joins_exist_only_when_an_operand_changes_flow() {
+        let parsed = parse_source_file(
+            "left && right; left || (target = value); left ?? (target = fallback); after;",
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(84);
+        let result = bind_source_file_in_file(&parsed.arena, parsed.source_file, file);
+        let graph = result
+            .flow_graph(&parsed.arena, parsed.source_file)
+            .unwrap();
+        assert!(graph.is_complete(), "{:?}", graph.unsupported());
+
+        let statements = source_statements(&parsed.arena, parsed.source_file);
+        let source = node_ref(&parsed.arena, file, parsed.source_file);
+        let start = graph.container_start(source).unwrap();
+        assert_eq!(
+            graph.flow_at(node_ref(&parsed.arena, file, statements[1])),
+            Some(start)
+        );
+        for statement in [statements[2], statements[3]] {
+            let entry = graph
+                .flow_at(node_ref(&parsed.arena, file, statement))
+                .unwrap();
+            let join = graph.nodes().get(entry).unwrap();
+            assert!(join.flags.contains(FlowFlags::BRANCH_LABEL));
+            assert_eq!(join.antecedents.len(), 3);
+            assert!(join.antecedents.iter().any(|antecedent| {
+                graph
+                    .nodes()
+                    .get(*antecedent)
+                    .and_then(|condition| condition.antecedent)
+                    .and_then(|assignment| graph.nodes().get(assignment))
+                    .is_some_and(|assignment| assignment.flags.contains(FlowFlags::ASSIGNMENT))
+            }));
+        }
+    }
+
+    #[test]
+    fn logical_assignment_conditions_preserve_conditional_mutation_edges() {
+        for (operator, short_circuit_flags) in [
+            ("&&=", FlowFlags::FALSE_CONDITION),
+            ("||=", FlowFlags::TRUE_CONDITION),
+            ("??=", FlowFlags::TRUE_CONDITION),
+        ] {
+            let parsed = parse_source_file(&format!(
+                "if (value {operator} next) {{ matched; }} else {{ missed; }}"
+            ));
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let file = FileId::new(85);
+            let result = bind_source_file_in_file(&parsed.arena, parsed.source_file, file);
+            let graph = result
+                .flow_graph(&parsed.arena, parsed.source_file)
+                .unwrap();
+            assert!(graph.is_complete(), "{:?}", graph.unsupported());
+
+            let statement = source_statements(&parsed.arena, parsed.source_file)[0];
+            let NodeData::IfStatement(conditional) = &parsed.arena.get(statement).unwrap().data
+            else {
+                panic!("expected if statement");
+            };
+            let NodeData::BinaryExpression(expression) =
+                &parsed.arena.get(conditional.expression).unwrap().data
+            else {
+                panic!("expected logical assignment");
+            };
+            let assignment = graph
+                .nodes()
+                .iter()
+                .find(|flow| {
+                    flow.flags.contains(FlowFlags::ASSIGNMENT)
+                        && flow.payload
+                            == Some(FlowNodePayload::Ast(node_ref(
+                                &parsed.arena,
+                                file,
+                                expression.left,
+                            )))
+                })
+                .unwrap();
+            let assignment_flow = graph
+                .nodes()
+                .iter()
+                .filter(|flow| flow.flags.intersects(FlowFlags::CONDITION))
+                .find(|flow| {
+                    flow.payload
+                        == Some(FlowNodePayload::Ast(node_ref(
+                            &parsed.arena,
+                            file,
+                            conditional.expression,
+                        )))
+                })
+                .unwrap();
+            assert_eq!(
+                graph.nodes().get(assignment_flow.antecedent.unwrap()),
+                Some(assignment)
+            );
+            assert!(graph.nodes().iter().any(|flow| {
+                flow.flags.contains(short_circuit_flags)
+                    && flow.payload
+                        == Some(FlowNodePayload::Ast(node_ref(
+                            &parsed.arena,
+                            file,
+                            expression.left,
+                        )))
+            }));
+        }
+    }
+
+    #[test]
+    fn optional_property_conditions_preserve_receiver_and_result_branches() {
+        let parsed = parse_source_file("if (subject?.value) { present; } else { missing; }");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(86);
+        let result = bind_source_file_in_file(&parsed.arena, parsed.source_file, file);
+        let graph = result
+            .flow_graph(&parsed.arena, parsed.source_file)
+            .unwrap();
+        assert!(graph.is_complete(), "{:?}", graph.unsupported());
+
+        let statement = source_statements(&parsed.arena, parsed.source_file)[0];
+        let NodeData::IfStatement(conditional) = &parsed.arena.get(statement).unwrap().data else {
+            panic!("expected if statement");
+        };
+        let NodeData::PropertyAccessExpression(access) =
+            &parsed.arena.get(conditional.expression).unwrap().data
+        else {
+            panic!("expected optional property access");
+        };
+        assert!(access.question_dot_token.is_some());
+        assert_eq!(
+            parsed.arena.get(conditional.expression).unwrap().flags.0 & (1 << 5),
+            0
+        );
+
+        let value_flow = graph
+            .flow_at(node_ref(&parsed.arena, file, access.name))
+            .unwrap();
+        let receiver_condition = graph.nodes().get(value_flow).unwrap();
+        assert!(receiver_condition.flags.contains(FlowFlags::TRUE_CONDITION));
+        assert_eq!(
+            receiver_condition.payload,
+            Some(FlowNodePayload::Ast(node_ref(
+                &parsed.arena,
+                file,
+                access.expression,
+            )))
+        );
+
+        let present = block_statements(&parsed.arena, conditional.then_statement)[0];
+        let present_flow = graph
+            .flow_at(node_ref(&parsed.arena, file, present))
+            .unwrap();
+        let result_condition = graph.nodes().get(present_flow).unwrap();
+        assert!(result_condition.flags.contains(FlowFlags::TRUE_CONDITION));
+        assert_eq!(result_condition.antecedent, Some(value_flow));
+        assert_eq!(
+            result_condition.payload,
+            Some(FlowNodePayload::Ast(node_ref(
+                &parsed.arena,
+                file,
+                conditional.expression,
+            )))
+        );
+
+        let missing = block_statements(&parsed.arena, conditional.else_statement.unwrap())[0];
+        let missing_flow = graph
+            .flow_at(node_ref(&parsed.arena, file, missing))
+            .unwrap();
+        let missing_join = graph.nodes().get(missing_flow).unwrap();
+        assert!(missing_join.flags.contains(FlowFlags::BRANCH_LABEL));
+        assert_eq!(missing_join.antecedents.len(), 2);
+    }
+
+    #[test]
+    fn optional_element_and_call_arguments_keep_mutations_in_short_circuit_branches() {
+        let parsed = parse_source_file(
+            "subject?.deep.value; subject?.[index = 1]; subject?.(argument = 2); after;",
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(87);
+        let result = bind_source_file_in_file(&parsed.arena, parsed.source_file, file);
+        let graph = result
+            .flow_graph(&parsed.arena, parsed.source_file)
+            .unwrap();
+        assert!(graph.is_complete(), "{:?}", graph.unsupported());
+
+        let statements = source_statements(&parsed.arena, parsed.source_file);
+        let source = node_ref(&parsed.arena, file, parsed.source_file);
+        let start = graph.container_start(source).unwrap();
+        assert_eq!(
+            graph.flow_at(node_ref(&parsed.arena, file, statements[1])),
+            Some(start)
+        );
+        let NodeData::ExpressionStatement(element_statement) =
+            &parsed.arena.get(statements[1]).unwrap().data
+        else {
+            panic!("expected optional element statement");
+        };
+        let NodeData::ElementAccessExpression(element) =
+            &parsed.arena.get(element_statement.expression).unwrap().data
+        else {
+            panic!("expected optional element access");
+        };
+        let NodeData::BinaryExpression(index_assignment) =
+            &parsed.arena.get(element.argument_expression).unwrap().data
+        else {
+            panic!("expected index assignment");
+        };
+        let NodeData::ExpressionStatement(call_statement) =
+            &parsed.arena.get(statements[2]).unwrap().data
+        else {
+            panic!("expected optional call statement");
+        };
+        let NodeData::CallExpression(call) =
+            &parsed.arena.get(call_statement.expression).unwrap().data
+        else {
+            panic!("expected optional call");
+        };
+        let NodeData::BinaryExpression(argument_assignment) =
+            &parsed.arena.get(call.arguments.nodes[0]).unwrap().data
+        else {
+            panic!("expected argument assignment");
+        };
+
+        for (statement, assignment_target) in [
+            (statements[2], index_assignment.left),
+            (statements[3], argument_assignment.left),
+        ] {
+            let entry = graph
+                .flow_at(node_ref(&parsed.arena, file, statement))
+                .unwrap();
+            let entry_flow = graph.nodes().get(entry).unwrap();
+            let join = if entry_flow.flags.contains(FlowFlags::CALL) {
+                graph.nodes().get(entry_flow.antecedent.unwrap()).unwrap()
+            } else {
+                entry_flow
+            };
+            assert!(join.flags.contains(FlowFlags::BRANCH_LABEL));
+            let expected_payload = Some(FlowNodePayload::Ast(node_ref(
+                &parsed.arena,
+                file,
+                assignment_target,
+            )));
+            let mut pending = join.antecedents.clone();
+            let mut found_assignment = false;
+            while let Some(antecedent) = pending.pop() {
+                let flow = graph.nodes().get(antecedent).unwrap();
+                if flow.flags.contains(FlowFlags::ASSIGNMENT) && flow.payload == expected_payload {
+                    found_assignment = true;
+                    break;
+                }
+                pending.extend(flow.antecedent);
+                pending.extend(flow.antecedents.iter().copied());
+            }
+            assert!(found_assignment);
+        }
+    }
+
+    #[test]
+    fn nested_optional_chains_compose_with_logical_short_circuit_conditions() {
+        let parsed = parse_source_file(
+            "if (subject?.first?.second && ready) { present; } else { missing; }",
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(88);
+        let result = bind_source_file_in_file(&parsed.arena, parsed.source_file, file);
+        let graph = result
+            .flow_graph(&parsed.arena, parsed.source_file)
+            .unwrap();
+        assert!(graph.is_complete(), "{:?}", graph.unsupported());
+
+        let statement = source_statements(&parsed.arena, parsed.source_file)[0];
+        let NodeData::IfStatement(conditional) = &parsed.arena.get(statement).unwrap().data else {
+            panic!("expected if statement");
+        };
+        let NodeData::BinaryExpression(expression) =
+            &parsed.arena.get(conditional.expression).unwrap().data
+        else {
+            panic!("expected logical expression");
+        };
+        let ready_flow = graph
+            .flow_at(node_ref(&parsed.arena, file, expression.right))
+            .unwrap();
+        let chain_condition = graph.nodes().get(ready_flow).unwrap();
+        assert!(chain_condition.flags.contains(FlowFlags::TRUE_CONDITION));
+        assert_eq!(
+            chain_condition.payload,
+            Some(FlowNodePayload::Ast(node_ref(
+                &parsed.arena,
+                file,
+                expression.left,
+            )))
+        );
+
+        let missing = block_statements(&parsed.arena, conditional.else_statement.unwrap())[0];
+        let missing_flow = graph
+            .flow_at(node_ref(&parsed.arena, file, missing))
+            .unwrap();
+        let missing_join = graph.nodes().get(missing_flow).unwrap();
+        assert!(missing_join.flags.contains(FlowFlags::BRANCH_LABEL));
+        assert_eq!(missing_join.antecedents.len(), 5);
+    }
+
+    #[test]
     fn while_flow_preserves_entry_condition_and_back_edge_order() {
         let parsed = parse_source_file("let value = 0; while (value) { value = 1; } value = 2;");
         assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
@@ -5300,9 +5746,7 @@ mod tests {
 
     #[test]
     fn binds_non_ambient_dotted_namespaces_as_nested_exports() {
-        let parsed = parse_source_file(
-            "namespace Root.Middle.Leaf { export const value = 1; }",
-        );
+        let parsed = parse_source_file("namespace Root.Middle.Leaf { export const value = 1; }");
         assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
         let result = bind_source_file(&parsed.arena, parsed.source_file);
         assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
