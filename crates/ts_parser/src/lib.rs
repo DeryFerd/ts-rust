@@ -1989,6 +1989,8 @@ impl<'a> Parser<'a> {
             ) || heritage_keyword_is_recovered_name)
         {
             Some(self.parse_identifier_name("Expected a class name."))
+        } else if self.current.kind == SyntaxKind::OpenBraceToken {
+            None
         } else {
             self.error_current("Expected a class name.");
             None
@@ -5102,6 +5104,15 @@ impl<'a> Parser<'a> {
             self.error_current("Expected ';'.");
             self.bump();
             expression_end
+        } else if self.current.kind == SyntaxKind::OpenBraceToken
+            && matches!(
+                self.arena.get(expression).map(|node| &node.data),
+                Some(NodeData::Identifier(identifier))
+                    if matches!(identifier.text.as_str(), "module" | "namespace")
+            )
+        {
+            self.error_code_at(self.current.range, 1437, []);
+            expression_end
         } else if self.current.kind == SyntaxKind::Unknown {
             // Match parseErrorForMissingSemicolonAfter: a scanner error at the next
             // token is sufficient and should not also produce a missing-semicolon error.
@@ -5779,7 +5790,7 @@ impl<'a> Parser<'a> {
                         );
                     } else if self.current.kind == SyntaxKind::OpenBracketToken {
                         self.bump();
-                        let argument_expression = self.parse_binary_expression(0);
+                        let argument_expression = self.parse_element_access_argument();
                         let end = if self.current.kind == SyntaxKind::CloseBracketToken {
                             self.consume().range.end
                         } else {
@@ -5938,7 +5949,7 @@ impl<'a> Parser<'a> {
                         break;
                     }
                     self.bump();
-                    let argument_expression = self.parse_binary_expression(0);
+                    let argument_expression = self.parse_element_access_argument();
                     let end = if self.current.kind == SyntaxKind::CloseBracketToken {
                         self.consume().range.end
                     } else {
@@ -6016,6 +6027,15 @@ impl<'a> Parser<'a> {
             }
         }
         expression
+    }
+
+    fn parse_element_access_argument(&mut self) -> NodeId {
+        if self.current.kind != SyntaxKind::CloseBracketToken {
+            return self.parse_binary_expression(0);
+        }
+        let position = self.current.range.start;
+        self.error_code_at(TextRange::new(position, position), 1011, []);
+        self.missing_identifier(position)
     }
 
     fn is_type_argument_expression_suffix(&mut self) -> bool {
@@ -7653,12 +7673,35 @@ impl<'a> Parser<'a> {
             self.current = self.scanner.scan();
             return;
         }
+        let missing_position = if self.current.kind == SyntaxKind::ConflictMarkerTrivia {
+            let marker_start = usize::try_from(self.current.range.start.get()).unwrap_or(0);
+            let prefix = self
+                .arena
+                .source_text()
+                .and_then(|source| source.get(..marker_start))
+                .unwrap_or_default();
+            let position = prefix
+                .strip_suffix('\n')
+                .and_then(|line| line.strip_suffix('\r').or(Some(line)))
+                .map_or(marker_start, str::len);
+            TextPos::new(u32::try_from(position).unwrap_or(u32::MAX))
+        } else {
+            self.current.range.start
+        };
         if !self.diagnostics.iter().any(|diagnostic| {
-            diagnostic.range.start == self.current.range.start
+            diagnostic.range.start == missing_position
                 && diagnostic.code == Some(1005)
                 && diagnostic.message == "'</' expected."
         }) {
-            self.error_current("Expected '</'.");
+            if missing_position == self.current.range.start {
+                self.error_current("Expected '</'.");
+            } else {
+                self.error_code_at(
+                    TextRange::new(missing_position, missing_position),
+                    1005,
+                    ["</".to_owned()],
+                );
+            }
         }
     }
 
@@ -7690,36 +7733,7 @@ impl<'a> Parser<'a> {
                 continue;
             }
             let name = self.parse_jsx_name("Expected a JSX attribute name.");
-            let initializer = if self.current.kind == SyntaxKind::EqualsToken {
-                self.current = self.scanner.scan_jsx_attribute_value();
-                if self.current.kind == SyntaxKind::StringLiteral {
-                    Some(self.parse_string_literal())
-                } else if self.current.kind == SyntaxKind::OpenBraceToken {
-                    let expression_start = self.current.range.start;
-                    self.bump();
-                    let expression = self.parse_binary_expression(0);
-                    let end = if self.current.kind == SyntaxKind::CloseBraceToken {
-                        self.consume().range.end
-                    } else {
-                        self.error_current("Expected '}'.");
-                        self.node_end(expression)
-                    };
-                    Some(self.alloc_node(
-                        SyntaxKind::JsxExpression,
-                        TextRange::new(expression_start, end),
-                        NodeData::JsxExpression(Box::new(JsxExpressionData {
-                            dot_dot_dot_token: None,
-                            expression: Some(expression),
-                        })),
-                        &[expression],
-                    ))
-                } else {
-                    self.error_current("Expected a JSX attribute value.");
-                    None
-                }
-            } else {
-                None
-            };
+            let initializer = self.parse_jsx_attribute_initializer();
             let end = initializer.map_or_else(|| self.node_end(name), |id| self.node_end(id));
             let mut attribute_children = vec![name];
             attribute_children.extend(initializer);
@@ -7754,6 +7768,73 @@ impl<'a> Parser<'a> {
             })),
             &attributes,
         )
+    }
+
+    fn parse_jsx_attribute_initializer(&mut self) -> Option<NodeId> {
+        if self.current.kind != SyntaxKind::EqualsToken {
+            return None;
+        }
+        self.current = self.scanner.scan_jsx_attribute_value();
+        if self.current.kind == SyntaxKind::StringLiteral {
+            return Some(self.parse_string_literal());
+        }
+        if self.current.kind == SyntaxKind::OpenBraceToken {
+            let start = self.consume().range.start;
+            let expression = if self.current.kind == SyntaxKind::CloseBraceToken {
+                None
+            } else {
+                Some(self.parse_binary_expression(0))
+            };
+            let end = if self.current.kind == SyntaxKind::CloseBraceToken {
+                self.consume().range.end
+            } else {
+                self.error_current("Expected '}'.");
+                expression.map_or(start, |node| self.node_end(node))
+            };
+            let children = expression.into_iter().collect::<Vec<_>>();
+            return Some(self.alloc_node(
+                SyntaxKind::JsxExpression,
+                TextRange::new(start, end),
+                NodeData::JsxExpression(Box::new(JsxExpressionData {
+                    dot_dot_dot_token: None,
+                    expression,
+                })),
+                &children,
+            ));
+        }
+        if self.current.kind != SyntaxKind::LessThanToken {
+            self.error_current("Expected a JSX attribute value.");
+            return None;
+        }
+
+        let mut expression = self.parse_jsx_element(false);
+        while self.current.kind == SyntaxKind::LessThanToken {
+            let right = self.parse_jsx_element(false);
+            let comma_position = self.node_start(right);
+            let comma = self.alloc_node(
+                SyntaxKind::CommaToken,
+                TextRange::new(comma_position, comma_position),
+                NodeData::Token(Box::new(TokenData)),
+                &[],
+            );
+            let range = TextRange::new(self.node_start(expression), self.node_end(right));
+            self.error_code_at(range, 2657, []);
+            expression = self.alloc_node(
+                SyntaxKind::BinaryExpression,
+                range,
+                NodeData::BinaryExpression(Box::new(BinaryExpressionData {
+                    left: expression,
+                    operator_token: comma,
+                    right,
+                    symbol: None,
+                    type_: None,
+                    facts: 0,
+                    modifiers: None,
+                })),
+                &[expression, comma, right],
+            );
+        }
+        Some(expression)
     }
 
     fn finish_jsx_tag(&mut self, resume_jsx: bool) -> TextPos {
@@ -12311,7 +12392,8 @@ mod tests {
 
     #[test]
     fn conflict_marker_terminates_unclosed_jsx_children() {
-        let result = parse_jsx_source_file("const x = <div>\n<<<<<<< HEAD");
+        let source = "const x = <div>\n<<<<<<< HEAD";
+        let result = parse_jsx_source_file(source);
         let statements = source_statements(&result);
         assert_eq!(statements.len(), 1, "{:?}", result.diagnostics);
         let (list, _) = variable_list(&result, statements[0]);
@@ -12338,6 +12420,14 @@ mod tests {
             panic!("expected synthetic closing tag name");
         };
         assert!(name.text.is_empty());
+        let missing_close = result
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == Some(1005))
+            .expect("missing JSX closing-tag diagnostic");
+        assert_eq!(missing_close.message, "'</' expected.");
+        assert_eq!(missing_close.range.start.get(), 15);
+        assert_eq!(missing_close.range.end.get(), 15);
     }
 
     #[test]
@@ -13137,6 +13227,37 @@ export as namespace GlobalName;
         assert_eq!(
             result.arena.get(block.statements.nodes[0]).unwrap().parent,
             Some(block_id)
+        );
+    }
+
+    #[test]
+    fn reports_anonymous_namespace_errors_at_the_opening_brace() {
+        let source = "module { module {} }";
+        let result = parse_source_file(source);
+        let diagnostics = result
+            .diagnostics
+            .iter()
+            .map(|diagnostic| {
+                (
+                    diagnostic.code,
+                    diagnostic.range.start.get(),
+                    diagnostic.message.as_str(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            diagnostics,
+            [
+                (Some(1437), 7, "Namespace must be given a name."),
+                (Some(1437), 16, "Namespace must be given a name."),
+            ]
+        );
+        assert_eq!(
+            source_statements(&result)
+                .iter()
+                .map(|statement| result.arena.get(*statement).unwrap().kind)
+                .collect::<Vec<_>>(),
+            [SyntaxKind::ExpressionStatement, SyntaxKind::Block]
         );
     }
 
@@ -15236,6 +15357,28 @@ export as namespace GlobalName;
     }
 
     #[test]
+    fn parses_anonymous_class_declarations_with_decorated_members() {
+        let result = parse_source_file("class { @decorate method() {} };");
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let NodeData::ClassDeclaration(class) = &result
+            .arena
+            .get(source_statements(&result)[0])
+            .unwrap()
+            .data
+        else {
+            panic!("expected anonymous class declaration");
+        };
+        assert!(class.name.is_none());
+        assert_eq!(class.members.nodes.len(), 1);
+        let NodeData::MethodDeclaration(method) =
+            &result.arena.get(class.members.nodes[0]).unwrap().data
+        else {
+            panic!("expected decorated class method");
+        };
+        assert_eq!(method.modifiers.as_ref().unwrap().list.nodes.len(), 1);
+    }
+
+    #[test]
     fn parses_call_expressions_in_class_heritage() {
         let source = "class User {} class TimestampedUser extends Timestamped(User) { constructor() { super(); } }";
         let result = parse_source_file(source);
@@ -15648,6 +15791,24 @@ export as namespace GlobalName;
             panic!("expected missing identifier");
         };
         assert!(argument.text.is_empty());
+        assert_eq!(
+            result
+                .diagnostics
+                .iter()
+                .map(|diagnostic| {
+                    (
+                        diagnostic.code,
+                        diagnostic.range.start.get(),
+                        diagnostic.message.as_str(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            [(
+                Some(1011),
+                6,
+                "An element access expression should take an argument."
+            ),]
+        );
     }
 
     #[test]
@@ -15867,6 +16028,60 @@ export as namespace GlobalName;
         assert_eq!(
             result.arena.get(element.children.nodes[2]).unwrap().kind,
             SyntaxKind::JsxSelfClosingElement
+        );
+    }
+
+    #[test]
+    fn preserves_empty_jsx_attribute_expressions_for_grammar_checks() {
+        let result = parse_jsx_source_file("const view = <View onRefresh={} loading={} />;");
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let expressions = result
+            .arena
+            .iter()
+            .filter_map(|(_, node)| match &node.data {
+                NodeData::JsxExpression(expression) => Some(expression.expression),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(expressions, [None, None]);
+    }
+
+    #[test]
+    fn parses_jsx_element_attribute_values_and_reports_adjacent_parents() {
+        let source = "<X a=<b/><c/> />";
+        let result = parse_jsx_source_file(source);
+        assert_eq!(
+            result
+                .diagnostics
+                .iter()
+                .map(|diagnostic| {
+                    (
+                        diagnostic.code,
+                        diagnostic.range.start.get(),
+                        diagnostic.message.as_str(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            [(
+                Some(2657),
+                5,
+                "JSX expressions must have one parent element."
+            )]
+        );
+        let expression = result
+            .arena
+            .iter()
+            .find_map(|(_, node)| match &node.data {
+                NodeData::JsxAttribute(attribute) => attribute.initializer,
+                _ => None,
+            })
+            .expect("JSX attribute initializer");
+        let NodeData::BinaryExpression(binary) = &result.arena.get(expression).unwrap().data else {
+            panic!("expected adjacent JSX elements to form a comma expression");
+        };
+        assert_eq!(
+            result.arena.get(binary.operator_token).unwrap().kind,
+            SyntaxKind::CommaToken
         );
     }
 
