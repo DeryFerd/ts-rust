@@ -5,6 +5,7 @@
 
 use std::{cmp::Ordering, collections::HashSet, fmt};
 
+use ts_ast::append_js_string;
 use ts_binder::SemanticSymbolId;
 
 use super::{
@@ -409,10 +410,11 @@ impl CanonicalTypeMapperStore {
                 .flags()
                 .intersects(TypeFlags::LITERAL | TypeFlags::NULL | TypeFlags::UNDEFINED)
             {
-                normalized
-                    .current
-                    .push_str(&Self::template_string_for_type(type_, record)?);
-                normalized.current.push_str(&texts[index + 1]);
+                append_js_string(
+                    &mut normalized.current,
+                    &Self::template_string_for_type(type_, record)?,
+                );
+                append_js_string(&mut normalized.current, &texts[index + 1]);
             } else if record.flags().intersects(TypeFlags::TEMPLATE_LITERAL) {
                 let TypeData::TemplateLiteral(template) = record.data() else {
                     return Err(TemplateTypeError::InvalidTemplate(type_));
@@ -423,7 +425,7 @@ impl CanonicalTypeMapperStore {
                 if !visiting.insert(type_) {
                     return Err(TemplateTypeError::RecursiveType(type_));
                 }
-                normalized.current.push_str(&template.texts[0]);
+                append_js_string(&mut normalized.current, &template.texts[0]);
                 let added = self.append_template_spans(
                     &template.texts,
                     &template.types,
@@ -434,7 +436,7 @@ impl CanonicalTypeMapperStore {
                 if !added {
                     return Ok(false);
                 }
-                normalized.current.push_str(&texts[index + 1]);
+                append_js_string(&mut normalized.current, &texts[index + 1]);
             } else if self.is_template_generic_index_type(type_, &mut HashSet::new())?
                 || self.is_template_pattern_placeholder(type_, &mut HashSet::new())?
             {
@@ -442,7 +444,7 @@ impl CanonicalTypeMapperStore {
                 normalized
                     .texts
                     .push(std::mem::take(&mut normalized.current));
-                normalized.current.push_str(&texts[index + 1]);
+                append_js_string(&mut normalized.current, &texts[index + 1]);
             } else {
                 return Ok(false);
             }
