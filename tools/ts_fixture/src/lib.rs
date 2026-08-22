@@ -4662,6 +4662,9 @@ fn fixture_compiler_options_result(
         .as_ref()
         .map_or_else(BTreeMap::new, |config| config.compiler_options.clone());
     for (name, value) in &variant.values {
+        if name.eq_ignore_ascii_case("pretty") {
+            continue;
+        }
         values.retain(|configured_name, _| !configured_name.eq_ignore_ascii_case(name));
         values.insert(name.to_owned(), directive_json_value(name, value));
     }
