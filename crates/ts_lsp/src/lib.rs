@@ -3401,24 +3401,29 @@ struct PositionError;
 fn byte_offset(text: &str, position: Position) -> Result<usize, PositionError> {
     let mut line = 0_u32;
     let mut line_start = 0;
-    for (offset, byte) in text.bytes().enumerate() {
-        if line == position.line {
-            break;
-        }
-        if byte == b'\n' {
-            line += 1;
-            line_start = offset + 1;
+    let mut offset = 0;
+    while line < position.line {
+        match text.as_bytes().get(offset) {
+            Some(b'\r') => {
+                offset += 1;
+                if text.as_bytes().get(offset) == Some(&b'\n') {
+                    offset += 1;
+                }
+                line += 1;
+                line_start = offset;
+            }
+            Some(b'\n') => {
+                offset += 1;
+                line += 1;
+                line_start = offset;
+            }
+            Some(_) => offset += 1,
+            None => return Err(PositionError),
         }
     }
-    if line != position.line {
-        return Err(PositionError);
-    }
-    let mut line_end = text[line_start..]
-        .find('\n')
+    let line_end = text[line_start..]
+        .find(['\r', '\n'])
         .map_or(text.len(), |offset| line_start + offset);
-    if line_end > line_start && text.as_bytes()[line_end - 1] == b'\r' {
-        line_end -= 1;
-    }
     let mut utf16_offset = 0_u32;
     for (relative_offset, character) in text[line_start..line_end].char_indices() {
         if utf16_offset == position.character {
@@ -3445,7 +3450,8 @@ pub fn position_at(text: &str, byte_offset: u32) -> Position {
         if offset >= requested {
             break;
         }
-        if character == '\n' {
+        if character == '\n' || character == '\r' && text.as_bytes().get(offset + 1) != Some(&b'\n')
+        {
             position.line += 1;
             position.character = 0;
         } else {
@@ -3707,6 +3713,94 @@ mod tests {
         )
         .unwrap();
         assert_eq!(text, "axb\nnext");
+    }
+
+    #[test]
+    fn incremental_changes_handle_mixed_lsp_line_endings_and_utf16() {
+        let uri = DocumentUri("file:///workspace/mixed.ts".to_owned());
+        let text = concat!(
+            "const first = \"😀\";\r",
+            "const second = first;\r\n",
+            "const third = second;\n"
+        );
+        let second = text.find("const second").unwrap();
+        let third = text.find("const third").unwrap();
+        assert_eq!(
+            position_at(text, u32::try_from(second).unwrap()),
+            Position {
+                line: 1,
+                character: 0,
+            }
+        );
+        assert_eq!(
+            position_at(text, u32::try_from(third).unwrap()),
+            Position {
+                line: 2,
+                character: 0,
+            }
+        );
+        assert_eq!(
+            byte_offset(
+                text,
+                Position {
+                    line: 1,
+                    character: 6,
+                },
+            )
+            .unwrap(),
+            second + 6
+        );
+
+        let mut server = ready_server();
+        let _ = server.handle_message(incoming(&Notification::new(
+            "textDocument/didOpen",
+            Some(DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: uri.clone(),
+                    language_id: "typescript".to_owned(),
+                    version: 1,
+                    text: text.to_owned(),
+                },
+            }),
+        )));
+        let change = |line, start, end, text: &str| TextDocumentContentChangeEvent {
+            range: Some(Range {
+                start: Position {
+                    line,
+                    character: start,
+                },
+                end: Position {
+                    line,
+                    character: end,
+                },
+            }),
+            range_length: Some(end - start),
+            text: text.to_owned(),
+        };
+        let changed = server.handle_message(incoming(&Notification::new(
+            "textDocument/didChange",
+            Some(DidChangeTextDocumentParams {
+                text_document: VersionedTextDocumentIdentifier {
+                    uri: uri.clone(),
+                    version: 2,
+                },
+                content_changes: vec![
+                    change(0, 15, 17, "ok"),
+                    change(1, 6, 12, "count"),
+                    change(2, 14, 20, "count"),
+                ],
+            }),
+        )));
+        assert_eq!(
+            server.documents()[&uri].text,
+            concat!(
+                "const first = \"ok\";\r",
+                "const count = first;\r\n",
+                "const third = count;\n"
+            )
+        );
+        assert_eq!(server.documents()[&uri].version, 2);
+        assert_eq!(published_for(&changed, &uri.0)["params"]["version"], 2);
     }
 
     #[test]
