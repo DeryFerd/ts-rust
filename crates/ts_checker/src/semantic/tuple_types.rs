@@ -525,12 +525,9 @@ impl CanonicalTypeMapperStore {
             }
             match info.flags() {
                 ElementFlags::REQUIRED if !saw_optional => {}
-                ElementFlags::REQUIRED => {
-                    return Err(TupleTypeError::UnsupportedElementOrder { index });
-                }
                 ElementFlags::OPTIONAL => saw_optional = true,
                 ElementFlags::REST if index + 1 == key.element_infos.len() => {}
-                ElementFlags::REST => {
+                ElementFlags::REQUIRED | ElementFlags::REST => {
                     return Err(TupleTypeError::UnsupportedElementOrder { index });
                 }
                 flags => {
@@ -1399,12 +1396,9 @@ impl CanonicalTypeMapperStore {
             }
             match info.flags() {
                 ElementFlags::REQUIRED if !saw_optional => {}
-                ElementFlags::REQUIRED => {
-                    return Err(TupleTypeError::UnsupportedElementOrder { index });
-                }
                 ElementFlags::OPTIONAL => saw_optional = true,
                 ElementFlags::REST if index + 1 == request.element_infos.len() => {}
-                ElementFlags::REST => {
+                ElementFlags::REQUIRED | ElementFlags::REST => {
                     return Err(TupleTypeError::UnsupportedElementOrder { index });
                 }
                 flags => {

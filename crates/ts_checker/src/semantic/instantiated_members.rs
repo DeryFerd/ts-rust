@@ -204,6 +204,13 @@ struct DeclaredProperty {
     requires_proxy: bool,
 }
 
+type DeclaredTargetHeader = (
+    SemanticSymbolId,
+    Vec<TypeId>,
+    Option<SymbolTableId>,
+    Vec<DeclaredProperty>,
+);
+
 #[derive(Clone, Debug)]
 struct GenericInterfaceShape {
     reference: TypeId,
@@ -494,15 +501,7 @@ fn validate_declared_target(
     root_declaration: Option<ts_ast::NodeRef>,
     active: &mut Vec<TypeId>,
     validated: &mut HashSet<TypeId>,
-) -> Result<
-    (
-        SemanticSymbolId,
-        Vec<TypeId>,
-        Option<SymbolTableId>,
-        Vec<DeclaredProperty>,
-    ),
-    GenericInterfaceMemberError,
-> {
+) -> Result<DeclaredTargetHeader, GenericInterfaceMemberError> {
     if store
         .type_payload(target)
         .is_some_and(|record| record.object_flags().contains(ObjectFlags::CLASS))
@@ -586,15 +585,7 @@ fn mapper_parameters_for_target(
 fn declared_target_header(
     store: &CanonicalTypeMapperStore,
     target: TypeId,
-) -> Result<
-    (
-        SemanticSymbolId,
-        Vec<TypeId>,
-        Option<SymbolTableId>,
-        Vec<DeclaredProperty>,
-    ),
-    GenericInterfaceMemberError,
-> {
+) -> Result<DeclaredTargetHeader, GenericInterfaceMemberError> {
     let record = store
         .type_payload(target)
         .ok_or(GenericInterfaceMemberError::InvalidTarget(target))?;
@@ -733,7 +724,10 @@ fn declared_target_header(
     let mut properties = Vec::with_capacity(declared_count);
     let mut seen = HashSet::with_capacity(declared_count);
     let mut seen_declarations = HashSet::with_capacity(declared_count);
-    for (name, symbol) in declared_table.into_iter().flat_map(|table| table.iter()) {
+    for (name, symbol) in declared_table
+        .into_iter()
+        .flat_map(ts_binder::semantic::SymbolTable::iter)
+    {
         if !seen.insert(symbol) {
             return Err(GenericInterfaceMemberError::InvalidMember(symbol));
         }

@@ -662,8 +662,7 @@ fn resolve_object_element(
                     Some(property.symbol),
                 ));
             }
-            Ok(None) => {}
-            Err(RelationUnavailable::StructuredIndexInfos(_)) => {}
+            Ok(None) | Err(RelationUnavailable::StructuredIndexInfos(_)) => {}
             Err(error) => return Err(error.into()),
         }
     }

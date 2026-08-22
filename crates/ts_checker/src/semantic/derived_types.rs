@@ -883,7 +883,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         let property_symbols = optional_nonempty_slice(object.structured.properties.as_deref());
         let properties = property_symbols?;
         if table.len() != properties.len()
-            || owner_record.members().is_some() != !properties.is_empty()
+            || owner_record.members().is_some() == properties.is_empty()
         {
             return None;
         }

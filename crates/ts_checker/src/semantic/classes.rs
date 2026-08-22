@@ -21,7 +21,8 @@ use std::collections::HashSet;
 use ts_ast::{NodeData, NodeRef, SyntaxKind};
 use ts_binder::{
     CanonicalNameResolver, CanonicalResolutionLocation, CheckFlags, EscapedName, SemanticSymbolId,
-    SymbolFlags, SymbolTableId, semantic::PreparedSymbolTable,
+    SymbolFlags, SymbolTableId,
+    semantic::{PreparedSymbolTable, Symbol},
 };
 
 use super::{
@@ -399,8 +400,8 @@ impl ClassError {
                 | ClassInvariant::InvalidOwnerSymbol(_)
                 | ClassInvariant::InvalidPrototype(_)
                 | ClassInvariant::InvalidInstanceCache(_)
-                | ClassInvariant::InvalidValueCache(_) => return None,
-                ClassInvariant::InvalidPropertyValueCache(_)
+                | ClassInvariant::InvalidValueCache(_)
+                | ClassInvariant::InvalidPropertyValueCache(_)
                 | ClassInvariant::InvalidInstanceMembers(_)
                 | ClassInvariant::InvalidStaticMembers(_)
                 | ClassInvariant::InvalidConstructSignature(_)
@@ -990,7 +991,7 @@ fn plan_class_declaration(
     }
 
     let instance_table = instance_members.and_then(|table| store.symbol_table(table));
-    if instance_members.is_some() != !instance_properties.is_empty()
+    if instance_members.is_some() == instance_properties.is_empty()
         || instance_table.is_some_and(|table| table.len() != instance_properties.len())
     {
         return Err(invariant(ClassInvariant::InvalidOwnerSymbol(symbol)));
@@ -1052,6 +1053,7 @@ impl ClassMemberPlan {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(clippy::large_enum_variant)] // Keep class plans inline without adding preflight allocations.
 pub(super) enum ClassMemberQueryPlan {
     Direct(ClassMemberPlan),
     Derived {
@@ -2892,10 +2894,7 @@ fn validate_stored_no_base_class(
             .is_some()
         || structured.members == parts.instance.declared_members && structured.members.is_some()
         || !exact_symbol_table_entries(store, structured.members, &instance_entries)
-        || parts.value.structured.members
-            != store
-                .symbol(parts.symbol)
-                .and_then(|symbol| symbol.exports())
+        || parts.value.structured.members != store.symbol(parts.symbol).and_then(Symbol::exports)
         || parts.value.structured.properties.as_deref() != Some(all_static_properties.as_slice())
         || !exact_symbol_table_entries(
             store,
@@ -2915,11 +2914,13 @@ fn validate_stored_no_base_class(
     })
 }
 
+type StoredPropertyEntries = Vec<(EscapedName, SemanticSymbolId)>;
+
 fn compose_stored_properties(
     store: &CanonicalTypeMapperStore,
     own: &[SemanticSymbolId],
     inherited: &[SemanticSymbolId],
-) -> Option<(Vec<(EscapedName, SemanticSymbolId)>, Vec<SemanticSymbolId>)> {
+) -> Option<(StoredPropertyEntries, Vec<SemanticSymbolId>)> {
     let capacity = own.len().checked_add(inherited.len())?;
     let mut entries = Vec::with_capacity(capacity);
     let mut properties = Vec::with_capacity(capacity);
@@ -2981,10 +2982,7 @@ fn validate_stored_derived_class(
             .is_some()
         || structured.members == parts.instance.declared_members && structured.members.is_some()
         || !exact_symbol_table_entries(store, structured.members, &instance_entries)
-        || parts.value.structured.members
-            == store
-                .symbol(parts.symbol)
-                .and_then(|symbol| symbol.exports())
+        || parts.value.structured.members == store.symbol(parts.symbol).and_then(Symbol::exports)
         || parts.value.structured.properties.as_deref() != Some(all_static_properties.as_slice())
         || !exact_symbol_table_entries(store, parts.value.structured.members, &static_entries)
     {

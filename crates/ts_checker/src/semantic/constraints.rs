@@ -326,8 +326,9 @@ impl<'store> ConstraintSession<'store> {
                                     }
                                 })
                             }
-                            BaseConstraint::None => Ok(BaseConstraint::None),
-                            BaseConstraint::Circular => Ok(BaseConstraint::None),
+                            BaseConstraint::None | BaseConstraint::Circular => {
+                                Ok(BaseConstraint::None)
+                            }
                         }
                     }
                 }
@@ -375,11 +376,7 @@ impl<'store> ConstraintSession<'store> {
                     changed |= constraint != *type_;
                     constraints.push(constraint);
                 }
-                BaseConstraint::None => {
-                    changed = true;
-                    missing = true;
-                }
-                BaseConstraint::Circular => {
+                BaseConstraint::None | BaseConstraint::Circular => {
                     changed = true;
                     missing = true;
                 }

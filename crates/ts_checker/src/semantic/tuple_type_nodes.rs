@@ -238,16 +238,9 @@ pub(super) fn plan_tuple_type_node(
         let planned = plan_tuple_element(store, host, element, array_targets)?;
         match planned.info.flags() {
             ElementFlags::REQUIRED if !saw_optional => {}
-            ElementFlags::REQUIRED => {
-                return Err(TupleTypeNodeError::UnsupportedElementOrder {
-                    tuple,
-                    element,
-                    index,
-                });
-            }
             ElementFlags::OPTIONAL => saw_optional = true,
             ElementFlags::REST if index + 1 == tuple_data.elements.nodes.len() => {}
-            ElementFlags::REST => {
+            ElementFlags::REQUIRED | ElementFlags::REST => {
                 return Err(TupleTypeNodeError::UnsupportedElementOrder {
                     tuple,
                     element,

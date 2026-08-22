@@ -3267,7 +3267,7 @@ fn resolved_property_links(store: &CanonicalTypeMapperStore, plan: &PropertyObje
                         .resolved_type
                         .is_some_and(|type_| store.type_payload(type_).is_some())
             })
-    }) && resolved_call_signature_ids(store, plan).is_some() == !plan.call_signatures.is_empty()
+    }) && resolved_call_signature_ids(store, plan).is_some() != plan.call_signatures.is_empty()
 }
 
 fn resolved_call_signature_ids(
@@ -3766,7 +3766,7 @@ pub(super) fn publish_generic_interface_declared_members(
         let declared_members = interface.declared_members;
         if !interface.base_types_resolved
             || declared_members == plan.members
-            || declared_members.is_some() != !plan.properties.is_empty()
+            || declared_members.is_some() == plan.properties.is_empty()
             || declared_members
                 .and_then(|members| store.symbol_table(members))
                 .is_some_and(|table| table.len() != plan.properties.len())

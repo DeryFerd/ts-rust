@@ -3721,9 +3721,6 @@ impl<'store> RelaterSession<'store> {
             }
             match raw_members {
                 CanonicalObjectLiteralRawMembers::Nil if properties.is_empty() => {}
-                CanonicalObjectLiteralRawMembers::Nil => {
-                    return Err(RelationUnavailable::InvalidStructuredMembers(type_id));
-                }
                 CanonicalObjectLiteralRawMembers::Allocated(raw_members)
                     if !properties.is_empty() && raw_members.len() == properties.len() =>
                 {
@@ -3737,7 +3734,8 @@ impl<'store> RelaterSession<'store> {
                         }
                     }
                 }
-                CanonicalObjectLiteralRawMembers::Allocated(_) => {
+                CanonicalObjectLiteralRawMembers::Nil
+                | CanonicalObjectLiteralRawMembers::Allocated(_) => {
                     return Err(RelationUnavailable::InvalidStructuredMembers(type_id));
                 }
             }

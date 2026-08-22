@@ -472,6 +472,11 @@ impl CanonicalTypeMapperStore {
     ///
     /// Returns an error when an input belongs to another store, an existing
     /// signature or symbol is malformed, or storage cannot be reserved.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a validated allocation or mapper publication fails after its
+    /// storage has been reserved.
     pub fn instantiate_signature_ex(
         &mut self,
         signature: SignatureId,
@@ -568,6 +573,11 @@ impl CanonicalTypeMapperStore {
     ///
     /// Returns an error when the signature is not owned by this store or
     /// storage cannot be reserved.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the reserved signature cannot be allocated or its validated
+    /// provenance cannot be published.
     pub fn clone_signature(
         &mut self,
         signature: SignatureId,

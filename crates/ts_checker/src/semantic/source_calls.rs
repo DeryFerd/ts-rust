@@ -917,9 +917,6 @@ fn resolve_source_call_once(
             }
             Err(DirectCallError::Unsupported(DirectCallUnsupported::GenericSignature(_)))
                 if callee_form == SourceCallCalleeForm::Identifier => {}
-            Err(DirectCallError::Unsupported(DirectCallUnsupported::GenericSignature(_))) => {
-                return Err(SourceCallResolutionError::Unsupported);
-            }
             Err(
                 DirectCallError::Unsupported(DirectCallUnsupported::UnresolvedReturnType(
                     signature,

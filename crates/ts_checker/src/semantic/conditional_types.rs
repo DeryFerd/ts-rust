@@ -19,6 +19,7 @@ use super::{
         instantiate_type_with_vector_and_session,
     },
     mapper::CanonicalTypeMapperStore,
+    signatures::Signature,
     type_records::{CacheHashKey, TypeCacheState, TypeData, TypeRecord},
     types::TypeFlags,
 };
@@ -966,59 +967,56 @@ fn infer_from_types(
     let target_record = store
         .type_payload(target)
         .ok_or(ConditionalTypeError::InvalidType(target))?;
-    match (source_record.data(), target_record.data()) {
-        (TypeData::TypeReference(source_ref), TypeData::TypeReference(target_ref)) => {
-            if source_ref.object.target != target_ref.object.target {
+    if let (TypeData::TypeReference(source_ref), TypeData::TypeReference(target_ref)) =
+        (source_record.data(), target_record.data())
+    {
+        if source_ref.object.target != target_ref.object.target {
+            return Ok(false);
+        }
+        let source_arguments = source_ref
+            .resolved_type_arguments
+            .as_ref()
+            .ok_or(ConditionalTypeError::UnsupportedInference { source, target })?
+            .clone();
+        let target_arguments = target_ref
+            .resolved_type_arguments
+            .as_ref()
+            .ok_or(ConditionalTypeError::UnsupportedInference { source, target })?
+            .clone();
+        if source_arguments.len() != target_arguments.len() {
+            return Ok(false);
+        }
+        for (source, target) in source_arguments.into_iter().zip(target_arguments) {
+            if !infer_from_types(store, source, target, parameters, candidates, global_types)? {
                 return Ok(false);
             }
-            let source_arguments = source_ref
-                .resolved_type_arguments
-                .as_ref()
-                .ok_or(ConditionalTypeError::UnsupportedInference { source, target })?
-                .clone();
-            let target_arguments = target_ref
-                .resolved_type_arguments
-                .as_ref()
-                .ok_or(ConditionalTypeError::UnsupportedInference { source, target })?
-                .clone();
-            if source_arguments.len() != target_arguments.len() {
-                return Ok(false);
-            }
-            for (source, target) in source_arguments.into_iter().zip(target_arguments) {
-                if !infer_from_types(store, source, target, parameters, candidates, global_types)? {
-                    return Ok(false);
-                }
-            }
-            Ok(true)
         }
-        _ => {
-            let source_signature = single_call_signature(source_record.data());
-            let target_signature = single_call_signature(target_record.data());
-            if let (Some(source_signature), Some(target_signature)) =
-                (source_signature, target_signature)
-            {
-                let source_return = store
-                    .signature(source_signature)
-                    .and_then(|signature| signature.resolved_return_type())
-                    .ok_or(ConditionalTypeError::InvalidSignature(source_signature))?;
-                let target_return = store
-                    .signature(target_signature)
-                    .and_then(|signature| signature.resolved_return_type())
-                    .ok_or(ConditionalTypeError::InvalidSignature(target_signature))?;
-                infer_from_types(
-                    store,
-                    source_return,
-                    target_return,
-                    parameters,
-                    candidates,
-                    global_types,
-                )
-            } else if contains_type_parameter(store, target, &HashSet::new())? {
-                Err(ConditionalTypeError::UnsupportedInference { source, target })
-            } else {
-                is_assignable(store, source, target, global_types)
-            }
-        }
+        return Ok(true);
+    }
+
+    let source_signature = single_call_signature(source_record.data());
+    let target_signature = single_call_signature(target_record.data());
+    if let (Some(source_signature), Some(target_signature)) = (source_signature, target_signature) {
+        let source_return = store
+            .signature(source_signature)
+            .and_then(Signature::resolved_return_type)
+            .ok_or(ConditionalTypeError::InvalidSignature(source_signature))?;
+        let target_return = store
+            .signature(target_signature)
+            .and_then(Signature::resolved_return_type)
+            .ok_or(ConditionalTypeError::InvalidSignature(target_signature))?;
+        infer_from_types(
+            store,
+            source_return,
+            target_return,
+            parameters,
+            candidates,
+            global_types,
+        )
+    } else if contains_type_parameter(store, target, &HashSet::new())? {
+        Err(ConditionalTypeError::UnsupportedInference { source, target })
+    } else {
+        is_assignable(store, source, target, global_types)
     }
 }
 

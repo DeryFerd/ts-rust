@@ -77,16 +77,15 @@ pub(super) enum SourceOverloadError {
 impl SourceOverloadError {
     pub(super) const fn node(self) -> Option<NodeRef> {
         match self {
-            Self::Unsupported(node) => Some(node),
             Self::Callable(error) => error.node(),
-            Self::Literal(_) => None,
-            Self::Invariant(
+            Self::Unsupported(node)
+            | Self::Invariant(
                 SourceOverloadInvariant::Group(node)
                 | SourceOverloadInvariant::Cache(node)
                 | SourceOverloadInvariant::Publication(node)
                 | SourceOverloadInvariant::Capacity(node),
             ) => Some(node),
-            Self::Invariant(SourceOverloadInvariant::EmptyGroup) => None,
+            Self::Literal(_) | Self::Invariant(SourceOverloadInvariant::EmptyGroup) => None,
         }
     }
 }

@@ -84,9 +84,9 @@ impl CanonicalTypeMapperStore {
         &self,
         type_: TypeId,
     ) -> Result<(), IntersectionTypeError> {
-        let mut types = Vec::new();
-        self.append_intersection_constituent(type_, &mut types)?;
-        expected_properties(self, &types).map(|_| ())
+        let mut constituents = Vec::new();
+        self.append_intersection_constituent(type_, &mut constituents)?;
+        expected_properties(self, &constituents).map(|_| ())
     }
 
     pub(super) fn canonical_intersection_type(
@@ -522,7 +522,7 @@ fn expected_properties(
                 .iter()
                 .map(|source| source.type_)
                 .collect::<Vec<_>>();
-            let type_ = intersect_property_types(store, &property_types)?;
+            let merged_type = intersect_property_types(store, &property_types)?;
             let flags = SymbolFlags::PROPERTY
                 | if group
                     .sources
@@ -567,7 +567,7 @@ fn expected_properties(
                 .collect::<Vec<_>>();
             Ok(ExpectedProperty::Synthetic {
                 name: group.name,
-                type_,
+                type_: merged_type,
                 flags,
                 check_flags,
                 declarations: (!declarations.is_empty()).then_some(declarations),

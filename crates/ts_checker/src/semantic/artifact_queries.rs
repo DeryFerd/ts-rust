@@ -11,7 +11,7 @@ use ts_binder::{BoundFile, SemanticSymbolId, SymbolFlags};
 
 use super::{
     AliasTargetState, CanonicalAliasQueryError, CanonicalCheckerContext, DeclaredTypeError,
-    SourceCheckError, TypeData, TypeId,
+    SourceCheckError, TypeData, TypeId, type_records::TypeRecord,
 };
 
 /// A location query could not prove an exact result from this checker program.
@@ -224,10 +224,10 @@ impl CanonicalCheckerContext<'_> {
             }
         }
 
-        if let Some(symbol) = self.get_symbol_at_location(node)? {
-            if let Some(type_) = self.type_of_artifact_symbol(node, symbol)? {
-                return Ok(type_);
-            }
+        if let Some(symbol) = self.get_symbol_at_location(node)?
+            && let Some(type_) = self.type_of_artifact_symbol(node, symbol)?
+        {
+            return Ok(type_);
         }
 
         if supports_type_location(&self.validated_artifact_node(node)?.2.data) {
@@ -311,9 +311,11 @@ impl CanonicalCheckerContext<'_> {
                 self.get_type_from_type_node(reference)?;
                 self.cached_artifact_symbol(reference)
             }
-            Some(LocationParent::PropertyAccess(access))
-            | Some(LocationParent::ElementAccess(access))
-            | Some(LocationParent::QualifiedName(access)) => self.cached_artifact_symbol(access),
+            Some(
+                LocationParent::PropertyAccess(access)
+                | LocationParent::ElementAccess(access)
+                | LocationParent::QualifiedName(access),
+            ) => self.cached_artifact_symbol(access),
             None if supported => Ok(None),
             None => {
                 let (_, _, record) = self.validated_artifact_node(node)?;
@@ -557,10 +559,8 @@ impl CanonicalCheckerContext<'_> {
         let Some(object_type) = self.cached_artifact_type(object)? else {
             return Ok(None);
         };
-        let Some(TypeData::Object(object_data)) = self
-            .store()
-            .type_payload(object_type)
-            .map(|record| record.data())
+        let Some(TypeData::Object(object_data)) =
+            self.store().type_payload(object_type).map(TypeRecord::data)
         else {
             return Ok(None);
         };

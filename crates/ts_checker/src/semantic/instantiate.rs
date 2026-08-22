@@ -584,7 +584,6 @@ fn could_contain_installed_type_variables_worker(
         .type_payload(type_)
         .ok_or(InstantiationError::InvalidType(type_))?;
     let result = match record.data() {
-        TypeData::TypeParameter(_) => Ok(true),
         TypeData::Intrinsic(_) | TypeData::Literal(_) | TypeData::UniqueEsSymbol(_) => Ok(false),
         TypeData::Union(data) => {
             // Preserve the installed slice's typed alias/origin boundaries.
@@ -723,7 +722,6 @@ fn validate_instantiable_member_type_worker(
             }
         }
         TypeData::TypeParameter(_) if mapper_parameters.contains(&type_) => Ok(()),
-        TypeData::TypeParameter(_) => Err(InstantiationError::UnsupportedType(type_)),
         TypeData::Union(data) => {
             if record.alias().is_some() {
                 Err(InstantiationError::UnsupportedAliasedUnion(type_))
@@ -789,7 +787,6 @@ fn validate_instantiable_member_type_worker(
                 })
             }
         }
-        TypeData::UniqueEsSymbol(_) => Err(InstantiationError::UnsupportedType(type_)),
         _ => Err(InstantiationError::UnsupportedType(type_)),
     };
     active.remove(&type_);
@@ -922,7 +919,7 @@ fn instantiated_member_union_matches(
     mapper: TypeMapperId,
     array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<bool, InstantiationError> {
-    let mapped = constituents
+    let substituted_types = constituents
         .iter()
         .map(|constituent| {
             let record = store
@@ -937,7 +934,7 @@ fn instantiated_member_union_matches(
             }
         })
         .collect::<Result<Vec<_>, _>>()?;
-    if mapped.as_slice() == constituents {
+    if substituted_types.as_slice() == constituents {
         return Ok(actual == template);
     }
 
@@ -979,15 +976,15 @@ fn instantiated_member_union_matches(
         let Some(bootstrap) = store.intrinsic_bootstrap() else {
             return Ok(false);
         };
-        let has_any = mapped.iter().any(|type_| {
+        let has_any = substituted_types.iter().any(|type_| {
             store
                 .type_payload(*type_)
                 .is_some_and(|record| record.flags().intersects(TypeFlags::ANY))
         });
         let expected = if has_any {
-            if mapped.contains(&bootstrap.wildcard_type) {
+            if substituted_types.contains(&bootstrap.wildcard_type) {
                 bootstrap.wildcard_type
-            } else if mapped.contains(&bootstrap.error_type) {
+            } else if substituted_types.contains(&bootstrap.error_type) {
                 bootstrap.error_type
             } else {
                 bootstrap.any_type
@@ -995,16 +992,16 @@ fn instantiated_member_union_matches(
         } else {
             bootstrap.unknown_type
         };
-        return Ok(mapped.contains(&actual) && actual == expected);
+        return Ok(substituted_types.contains(&actual) && actual == expected);
     }
 
     if actual_types
         .iter()
-        .any(|candidate| !mapped.contains(candidate))
+        .any(|candidate| !substituted_types.contains(candidate))
     {
         return Ok(false);
     }
-    Ok(mapped.iter().all(|type_| {
+    Ok(substituted_types.iter().all(|type_| {
         actual_types.contains(type_)
             || mapped_member_union_type_is_redundant(store, *type_, actual_types)
     }))

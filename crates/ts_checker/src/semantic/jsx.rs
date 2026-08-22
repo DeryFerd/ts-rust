@@ -1158,8 +1158,7 @@ fn execute_jsx_element(
             publish_signature_links(store, plan.opening, signature)?;
             let checked = check_jsx_attributes(
                 store,
-                arena,
-                bound,
+                (arena, bound),
                 namespace,
                 expected_attributes,
                 attributes,
@@ -1552,14 +1551,14 @@ fn resolve_source_value_symbol(
 
 fn check_jsx_attributes(
     store: &mut CanonicalTypeMapperStore,
-    arena: &NodeArena,
-    bound: &BoundFile,
+    source: (&NodeArena, &BoundFile),
     namespace: &JsxNamespace,
     expected_attributes: TypeId,
     attributes: &[JsxAttributePlan],
     options: CanonicalCheckerOptions,
     diagnostics: &mut CanonicalCheckerDiagnostics,
 ) -> Result<Vec<CheckedJsxAttribute>, SourceCheckError> {
+    let (arena, bound) = source;
     let mut checked = Vec::with_capacity(attributes.len());
     let mut names = HashSet::with_capacity(attributes.len());
     for attribute in attributes {

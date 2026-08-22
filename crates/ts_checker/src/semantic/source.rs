@@ -705,6 +705,7 @@ struct PlannedVariable {
 }
 
 #[derive(Clone, Debug)]
+#[allow(clippy::large_enum_variant)] // Keeps ordinary variable expressions inline.
 enum PlannedVariableInitializer {
     Expression(PlannedExpression),
     Jsx(NodeRef),
@@ -758,6 +759,7 @@ struct PlannedContextualArrow {
 }
 
 #[derive(Clone, Debug)]
+#[allow(clippy::large_enum_variant)] // Keeps ordinary arrow return expressions inline.
 enum PlannedArrowBody {
     Empty,
     Return {
@@ -767,6 +769,7 @@ enum PlannedArrowBody {
 }
 
 #[derive(Clone, Debug)]
+#[allow(clippy::large_enum_variant)] // Keeps ordinary function return expressions inline.
 enum PlannedFunctionBody {
     Ambient,
     Empty,
@@ -807,6 +810,7 @@ struct PlannedJoinedFunctionStatements {
 }
 
 #[derive(Clone, Debug)]
+#[allow(clippy::large_enum_variant)] // Keeps ordinary truthiness expressions inline.
 enum PlannedSourceCondition {
     Truthiness {
         expression: PlannedExpression,
@@ -2184,15 +2188,17 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 let node = match reason {
                     SourcePropertyUnsupported::Access(node)
                     | SourcePropertyUnsupported::Receiver(node)
-                    | SourcePropertyUnsupported::MemberCall(node) => node,
-                    SourcePropertyUnsupported::MissingOwnProperty { node, .. }
+                    | SourcePropertyUnsupported::MemberCall(node)
+                    | SourcePropertyUnsupported::MissingOwnProperty { node, .. }
                     | SourcePropertyUnsupported::OptionalProperty { node, .. }
                     | SourcePropertyUnsupported::ApparentObjectProperty { node, .. }
                     | SourcePropertyUnsupported::AmbiguousPropertySuggestion { node, .. } => node,
                 };
                 SourceCheckError::Unsupported(UnsupportedSourceSyntax::Property(node))
             }
-            SourcePropertyError::InvalidCache(node) => SourceCheckError::Property(node),
+            SourcePropertyError::InvalidCache(node) | SourcePropertyError::Capacity(node) => {
+                SourceCheckError::Property(node)
+            }
             SourcePropertyError::Union { node, error } => {
                 use super::member_resolution::UnionPropertyError;
 
@@ -2215,7 +2221,6 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             }
             SourcePropertyError::Relation(error) => SourceCheckError::RelationUnavailable(error),
             SourcePropertyError::Display(error) => SourceCheckError::TypeDisplayUnavailable(error),
-            SourcePropertyError::Capacity(node) => SourceCheckError::Property(node),
             SourcePropertyError::MissingDiagnostic(code) => {
                 SourceCheckError::MissingDiagnostic(code)
             }
@@ -2230,8 +2235,8 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     | SourceElementUnsupported::Receiver(node)
                     | SourceElementUnsupported::Index(node)
                     | SourceElementUnsupported::MemberCall(node)
-                    | SourceElementUnsupported::Write(node) => node,
-                    SourceElementUnsupported::OptionalProperty { node, .. } => node,
+                    | SourceElementUnsupported::Write(node)
+                    | SourceElementUnsupported::OptionalProperty { node, .. } => node,
                     SourceElementUnsupported::IndexType(_)
                     | SourceElementUnsupported::IndexSignatureSurface(_) => access,
                 };
@@ -4583,7 +4588,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 };
                 let declaration = store
                     .symbol(read.value_symbol)
-                    .and_then(|symbol| symbol.value_declaration())
+                    .and_then(ts_binder::semantic::Symbol::value_declaration)
                     .ok_or(SourceCheckError::Conditional(expression.node))?;
                 let declaration_record = self.node(declaration)?;
                 let NodeData::VariableDeclaration(variable) = &declaration_record.data else {
@@ -5524,8 +5529,7 @@ fn preflight_inferred_function_return_dependencies(
                         .iter()
                         .any(|parameter| parameter.symbol == read.value_symbol)
             }
-            PlannedExpressionKind::TypeImportValueUse(_) => false,
-            PlannedExpressionKind::New(_) => false,
+            PlannedExpressionKind::TypeImportValueUse(_) | PlannedExpressionKind::New(_) => false,
             PlannedExpressionKind::Parenthesized(inner)
             | PlannedExpressionKind::Assertion { operand: inner, .. } => {
                 expression_is_closed(inner, parameters, functions)
@@ -7737,6 +7741,7 @@ fn check_planned_assignment(
     })
 }
 
+#[allow(clippy::too_many_arguments)] // Reuses the caller's checker state and instantiation session.
 fn source_type_is_assignable_to(
     store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -8736,6 +8741,7 @@ fn current_flow_type_after_assignment(
     }
 }
 
+#[allow(clippy::too_many_arguments)] // Preserves the caller's complete flow and relation context.
 fn assignment_type_maybe_assignable_to(
     store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,

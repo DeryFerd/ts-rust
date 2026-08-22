@@ -4647,12 +4647,11 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         {
             return false;
         }
-        match self.properties_types.get(&key) {
-            Some(cached) => *cached == result,
-            None => {
-                self.properties_types.insert(key, result);
-                true
-            }
+        if let Some(cached) = self.properties_types.get(&key) {
+            *cached == result
+        } else {
+            self.properties_types.insert(key, result);
+            true
         }
     }
 

@@ -317,6 +317,13 @@ struct UnionPropertyPlan {
     outcome: PropertyOutcome,
 }
 
+type ValidatedUnionShell = (
+    Vec<TypeId>,
+    Option<SymbolTableId>,
+    Option<SymbolTableId>,
+    UnionMemberMode,
+);
+
 struct PreparedColdQuery {
     cache: Option<PreparedSymbolTable>,
     types: Option<PreparedTypeQueryTypes>,
@@ -466,15 +473,7 @@ fn plan_union_property(
 fn validate_union_shell(
     store: &CanonicalTypeMapperStore,
     union: TypeId,
-) -> Result<
-    (
-        Vec<TypeId>,
-        Option<SymbolTableId>,
-        Option<SymbolTableId>,
-        UnionMemberMode,
-    ),
-    UnionPropertyError,
-> {
+) -> Result<ValidatedUnionShell, UnionPropertyError> {
     let record = store
         .type_payload(union)
         .ok_or(UnionPropertyError::InvalidUnion(union))?;
@@ -799,17 +798,20 @@ fn prepare_cold_query(
     let union_operations = match &plan.outcome {
         PropertyOutcome::Missing => 0,
         PropertyOutcome::Borrowed(source) => usize::from(strict && source.optional),
-        PropertyOutcome::Synthetic(synthetic) => strict
-            .then(|| {
+        PropertyOutcome::Synthetic(synthetic) => {
+            let optional_operations = if strict {
                 synthetic
                     .sources
                     .iter()
                     .filter(|source| source.optional)
                     .count()
-            })
-            .unwrap_or(0)
-            .checked_add(1)
-            .ok_or(UnionPropertyError::Capacity(plan.union))?,
+            } else {
+                0
+            };
+            optional_operations
+                .checked_add(1)
+                .ok_or(UnionPropertyError::Capacity(plan.union))?
+        }
     };
     let types = if union_operations != 0 {
         Some(store.prepare_type_query_types(&[], &[], &[], union_operations, 0)?)
@@ -1094,7 +1096,7 @@ fn cached_source_read_type(
 fn cached_terminal_union_identity(
     store: &CanonicalTypeMapperStore,
     receiver: TypeId,
-    types: &[TypeId],
+    inputs: &[TypeId],
 ) -> Result<TypeId, UnionPropertyError> {
     let filler = store
         .intrinsic_bootstrap()
@@ -1102,46 +1104,43 @@ fn cached_terminal_union_identity(
         .never_type;
     let mut flattened = [filler; 4];
     let mut flattened_len = 0usize;
-    for type_ in types {
+    for member in inputs {
         store
-            .validate_cached_union_result(*type_, None)
+            .validate_cached_union_result(*member, None)
             .map_err(|_| UnionPropertyError::InvalidCache(receiver))?;
-        match store
-            .type_payload(*type_)
+        if let TypeData::Union(data) = store
+            .type_payload(*member)
             .ok_or(UnionPropertyError::InvalidCache(receiver))?
             .data()
         {
-            TypeData::Union(data) => {
-                let end = flattened_len
-                    .checked_add(data.union.types.len())
-                    .filter(|end| *end <= flattened.len())
-                    .ok_or(UnionPropertyError::InvalidCache(receiver))?;
-                flattened[flattened_len..end].copy_from_slice(&data.union.types);
-                flattened_len = end;
-            }
-            _ => {
-                let slot = flattened
-                    .get_mut(flattened_len)
-                    .ok_or(UnionPropertyError::InvalidCache(receiver))?;
-                *slot = *type_;
-                flattened_len += 1;
-            }
+            let end = flattened_len
+                .checked_add(data.union.types.len())
+                .filter(|end| *end <= flattened.len())
+                .ok_or(UnionPropertyError::InvalidCache(receiver))?;
+            flattened[flattened_len..end].copy_from_slice(&data.union.types);
+            flattened_len = end;
+        } else {
+            let slot = flattened
+                .get_mut(flattened_len)
+                .ok_or(UnionPropertyError::InvalidCache(receiver))?;
+            *slot = *member;
+            flattened_len += 1;
         }
     }
-    flattened[..flattened_len].sort_by_key(|type_| {
+    flattened[..flattened_len].sort_by_key(|member| {
         (
             store
-                .type_payload(*type_)
+                .type_payload(*member)
                 .expect("flattened types remain store-owned")
                 .flags(),
-            *type_,
+            *member,
         )
     });
     let mut unique_len = 0usize;
     for index in 0..flattened_len {
-        let type_ = flattened[index];
-        if unique_len == 0 || flattened[unique_len - 1] != type_ {
-            flattened[unique_len] = type_;
+        let candidate = flattened[index];
+        if unique_len == 0 || flattened[unique_len - 1] != candidate {
+            flattened[unique_len] = candidate;
             unique_len += 1;
         }
     }
@@ -1153,11 +1152,11 @@ fn cached_terminal_union_identity(
                 .ok_or(LiteralTypeCacheError::BootstrapUninitialized)?
                 .never_type
         }
-        [type_] => *type_,
-        types => store
+        [single] => *single,
+        ordered => store
             .intrinsic_bootstrap()
             .ok_or(LiteralTypeCacheError::BootstrapUninitialized)?
-            .cached_union_type(types)
+            .cached_union_type(ordered)
             .ok_or(UnionPropertyError::InvalidCache(receiver))?,
     };
     store

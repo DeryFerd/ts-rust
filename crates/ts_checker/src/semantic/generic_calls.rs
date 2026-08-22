@@ -2480,7 +2480,6 @@ fn generic_call_type_instantiation_matches(
             active_templates.pop();
             matches
         }
-        TypeData::TypeParameter(_) => false,
         _ => false,
     }
 }
@@ -3210,12 +3209,16 @@ pub(super) fn resolve_source_identity_generic_call_with_session(
             .transpose()?
             .flatten(),
     };
-    resolve_validated_identity_call_with_proofs(
+    let prepared = prepare_validated_identity_call_with_proofs(
         store,
         request,
         &callable,
         cache_provenance,
         proofs,
+    )?;
+    resolve_prepared_identity_call(
+        store,
+        prepared,
         existing_call_signature,
         session,
         |store, source, target| {
@@ -3419,24 +3422,25 @@ fn resolve_validated_identity_call(
         TypeId,
     ) -> Result<bool, RelationUnavailable>,
 ) -> Result<IdentityGenericCallResolution, IdentityGenericCallError> {
-    resolve_validated_identity_call_with_proofs(
+    let prepared = prepare_validated_identity_call_with_proofs(
         store,
         request,
         callable,
         cache_provenance,
         SourceIdentityInferenceProofs::default(),
+    )?;
+    resolve_prepared_identity_call(
+        store,
+        prepared,
         existing_call_signature,
         session,
         is_assignable,
     )
 }
 
-fn resolve_validated_identity_call_with_proofs(
+fn resolve_prepared_identity_call(
     store: &mut CanonicalTypeMapperStore,
-    request: IdentityGenericCallRequest<'_>,
-    callable: &ValidatedSingleCallable,
-    cache_provenance: IdentityTypeParameterCacheProvenance,
-    proofs: SourceIdentityInferenceProofs,
+    prepared: PreparedIdentityGenericCall,
     existing_call_signature: Option<SignatureId>,
     session: &mut InstantiationSession,
     mut is_assignable: impl FnMut(
@@ -3445,13 +3449,6 @@ fn resolve_validated_identity_call_with_proofs(
         TypeId,
     ) -> Result<bool, RelationUnavailable>,
 ) -> Result<IdentityGenericCallResolution, IdentityGenericCallError> {
-    let prepared = prepare_validated_identity_call_with_proofs(
-        store,
-        request,
-        callable,
-        cache_provenance,
-        proofs,
-    )?;
     let shape = identity_generic_call_vector_shape(store, prepared.shape).map_err(|error| {
         map_identity_vector_error(error, prepared.shape, prepared.type_argument)
     })?;
@@ -3501,7 +3498,12 @@ fn resolve_validated_identity_call_with_proofs(
         )
         .map_err(|error| map_identity_vector_error(error, prepared.shape, prepared.type_argument))?
     };
-    project_prepared_identity_call(prepared, selected, parameter_type, applicability)
+    Ok(project_prepared_identity_call(
+        prepared,
+        selected,
+        parameter_type,
+        applicability,
+    ))
 }
 
 fn prepare_validated_identity_call(
@@ -3591,7 +3593,7 @@ fn project_prepared_identity_call(
     selected: GenericCallVectorCachedInstantiation,
     parameter_type: TypeId,
     applicability: DirectCallApplicability,
-) -> Result<IdentityGenericCallResolution, IdentityGenericCallError> {
+) -> IdentityGenericCallResolution {
     let projection = IdentityGenericCallProjection {
         callee: prepared.callee,
         generic_signature: prepared.shape.signature,
@@ -3607,10 +3609,10 @@ fn project_prepared_identity_call(
         return_type: prepared.type_argument,
         return_kind: prepared.return_kind,
     };
-    Ok(IdentityGenericCallResolution {
+    IdentityGenericCallResolution {
         projection,
         applicability,
-    })
+    }
 }
 
 fn identity_generic_call_vector_shape(

@@ -9,7 +9,9 @@
 use std::collections::HashSet;
 
 use ts_ast::{ModifierList, NodeData, NodeList, NodeRef, SyntaxKind};
-use ts_binder::{CheckFlags, InternalSymbolName, SemanticSymbolId, SymbolFlags};
+use ts_binder::{
+    CanonicalSourceFileFacts, CheckFlags, InternalSymbolName, SemanticSymbolId, SymbolFlags,
+};
 
 use super::{
     CanonicalGlobalTypes, CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHost,
@@ -522,7 +524,7 @@ fn plan_source_callable_with_owner_shape(
     if body_mode.is_ambient()
         && bound
             .source_facts()
-            .is_none_or(|facts| facts.is_declaration_file())
+            .is_none_or(CanonicalSourceFileFacts::is_declaration_file)
     {
         return Err(SourceCallableError::Unsupported(
             SourceCallableUnsupported::Modifiers(declaration),
@@ -567,7 +569,6 @@ fn plan_source_callable_with_owner_shape(
         store,
         host,
         declaration,
-        owner_symbol,
         owner,
         export_local,
         body_mode,
@@ -1783,7 +1784,6 @@ fn validate_owner_name_and_export_route(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     declaration: NodeRef,
-    owner_symbol: SemanticSymbolId,
     owner: &ts_binder::semantic::Symbol,
     local_symbol: Option<SemanticSymbolId>,
     body_mode: SourceCallableBodyMode,
@@ -1853,7 +1853,7 @@ fn validate_owner_name_and_export_route(
                         || local_record.members().is_some()
                         || local_record.exports().is_some()
                         || local_record.parent().is_some()
-                        || local_record.export_symbol() != Some(owner_symbol)
+                        || local_record.export_symbol() != bound.symbol(declaration)
                     {
                         return Err(invariant(SourceCallableInvariant::InvalidExportRoute(
                             declaration,

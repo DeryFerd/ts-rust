@@ -761,7 +761,7 @@ fn plan_top_level_named_import(
 ///
 /// Only identifier-named `export { source as public } from "./target"` forms
 /// are admitted. Either name can be `default`. Namespace, star, local,
-/// attribute-bearing, and CommonJS forms require separate module support.
+/// attribute-bearing, and `CommonJS` forms require separate module support.
 #[cfg_attr(not(test), allow(dead_code))]
 #[allow(clippy::too_many_lines)] // One exact export-declaration provenance walk.
 pub(super) fn plan_top_level_named_reexport(

@@ -1,5 +1,8 @@
 //! Initial semantic type checking over the arena-backed TypeScript AST.
 
+// Keep upstream checker algorithms intact for behavior-by-behavior parity.
+#![allow(clippy::too_many_lines)]
+
 pub mod semantic;
 
 use std::cell::RefCell;
@@ -4539,7 +4542,7 @@ impl<'a> Checker<'a> {
                     local_import_equals_names,
                 ),
                 TypeKind::Array(element) => {
-                    visit(result, *element, names, visited, local_import_equals_names)
+                    visit(result, *element, names, visited, local_import_equals_names);
                 }
                 TypeKind::Tuple(elements)
                 | TypeKind::ReadonlyTuple(elements)
@@ -11391,8 +11394,8 @@ impl<'a> Checker<'a> {
                 .get(&symbol)
                 .copied()
                 .unwrap_or(left);
-            if !self.is_assignable(right, declared)
-                && !(self.expression_is_fresh_const_array(data.right)
+            if !(self.is_assignable(right, declared)
+                || self.expression_is_fresh_const_array(data.right)
                     && self.readonly_to_mutable_mismatch(right, declared))
             {
                 self.assignability_error(node_id, right, declared);
@@ -14092,10 +14095,10 @@ impl<'a> Checker<'a> {
             let deferred_active_class_value = self
                 .resolve_value_expression_symbol(*argument)
                 .is_some_and(|symbol| self.class_value_stack.contains(&symbol));
-            if !deferred_active_class_value
-                && !self.reported_object_literals.contains(argument)
-                && !self.is_assignable(checked_actual, expected)
-                && !(self.expression_is_fresh_const_array(*argument)
+            if !(deferred_active_class_value
+                || self.reported_object_literals.contains(argument)
+                || self.is_assignable(checked_actual, expected)
+                || self.expression_is_fresh_const_array(*argument)
                     && self.readonly_to_mutable_mismatch(checked_actual, expected))
             {
                 // A fresh object literal reports property-level diagnostics
@@ -26195,10 +26198,9 @@ fn describe_type_with_imports_inner(
         TypeKind::Null => TypeDescriptor::Null,
         // Template literal patterns degrade to string across the descriptor
         // boundary.
-        TypeKind::TemplateLiteral { .. } => TypeDescriptor::String,
+        TypeKind::TemplateLiteral { .. } | TypeKind::String => TypeDescriptor::String,
         TypeKind::Boolean => TypeDescriptor::Boolean,
         TypeKind::Number => TypeDescriptor::Number,
-        TypeKind::String => TypeDescriptor::String,
         TypeKind::BigInt => TypeDescriptor::BigInt,
         TypeKind::BooleanLiteral(value) => TypeDescriptor::BooleanLiteral(*value),
         TypeKind::NumberLiteral(value) => TypeDescriptor::NumberLiteral(value.clone()),

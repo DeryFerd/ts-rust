@@ -397,12 +397,8 @@ impl AssignmentPlanner<'_, '_> {
                 },
             ));
         }
-        if (!ambient_target
-            && !uninitialized_target
-            && flags != SymbolFlags::FUNCTION_SCOPED_VARIABLE)
-            || ((ambient_target || uninitialized_target)
-                && flags != SymbolFlags::FUNCTION_SCOPED_VARIABLE
-                && flags != SymbolFlags::BLOCK_SCOPED_VARIABLE)
+        if flags != SymbolFlags::FUNCTION_SCOPED_VARIABLE
+            && flags != SymbolFlags::BLOCK_SCOPED_VARIABLE
         {
             return Err(AssignmentPlanError::Unsupported(
                 AssignmentUnsupported::NonVariableTarget {

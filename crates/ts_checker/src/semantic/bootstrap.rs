@@ -1900,7 +1900,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 Self::supported_nonempty_cache_slice(object.structured.properties.as_deref())
                     .ok_or(LiteralTypeCacheError::UnsupportedUnionConstituent(type_))?;
             if table.len() != properties.len()
-                || owner_record.members().is_some() != !properties.is_empty()
+                || owner_record.members().is_some() == properties.is_empty()
             {
                 return Err(LiteralTypeCacheError::UnsupportedUnionConstituent(type_));
             }
@@ -2100,15 +2100,13 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                         }
                         return Ok(());
                     }
-                    StoredCallableSetValidation::Malformed { .. } => {
-                        return Err(LiteralTypeCacheError::InvalidCachedUnion(type_));
-                    }
                     StoredCallableSetValidation::Pending {
                         family: CallableFamily::FunctionType,
                     } if allowed_pending.contains(&type_) => {
                         return Ok(());
                     }
-                    StoredCallableSetValidation::Pending { .. } => {
+                    StoredCallableSetValidation::Malformed { .. }
+                    | StoredCallableSetValidation::Pending { .. } => {
                         return Err(LiteralTypeCacheError::InvalidCachedUnion(type_));
                     }
                     StoredCallableSetValidation::NotCallable if unsupported_callable => {
@@ -2374,15 +2372,13 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                         }
                         return Ok(());
                     }
-                    StoredCallableSetValidation::Malformed { .. } => {
-                        return Err(LiteralTypeCacheError::InvalidCachedUnion(type_));
-                    }
                     StoredCallableSetValidation::Pending {
                         family: CallableFamily::FunctionType,
                     } if allowed_pending.contains(&type_) => {
                         return Ok(());
                     }
-                    StoredCallableSetValidation::Pending { .. } => {
+                    StoredCallableSetValidation::Malformed { .. }
+                    | StoredCallableSetValidation::Pending { .. } => {
                         return Err(LiteralTypeCacheError::InvalidCachedUnion(type_));
                     }
                     StoredCallableSetValidation::NotCallable
@@ -2431,15 +2427,13 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                         }
                         return Ok(());
                     }
-                    StoredCallableSetValidation::Malformed { .. } => {
-                        return Err(LiteralTypeCacheError::InvalidCachedUnion(type_));
-                    }
                     StoredCallableSetValidation::Pending {
                         family: CallableFamily::FunctionType,
                     } if allowed_pending.contains(&type_) => {
                         return Ok(());
                     }
-                    StoredCallableSetValidation::Pending { .. } => {
+                    StoredCallableSetValidation::Malformed { .. }
+                    | StoredCallableSetValidation::Pending { .. } => {
                         return Err(LiteralTypeCacheError::InvalidCachedUnion(type_));
                     }
                     StoredCallableSetValidation::NotCallable

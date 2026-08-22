@@ -2131,9 +2131,9 @@ fn validate_object_literal_contract(
         .symbol_table(result_members)
         .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
     let properties = object.structured.properties.as_deref().unwrap_or_default();
-    if object.structured.properties.is_some() != !properties.is_empty()
+    if object.structured.properties.is_some() == properties.is_empty()
         || result_table.len() != properties.len()
-        || owner_record.members().is_some() != !properties.is_empty()
+        || owner_record.members().is_some() == properties.is_empty()
     {
         return Err(TypeDisplayUnavailable::MalformedType(type_id));
     }

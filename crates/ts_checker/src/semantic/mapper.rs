@@ -453,17 +453,17 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 })
             }
             TypeMapperData::Deferred { sources, targets } => {
-                let mapped = sources
+                let substituted_type = sources
                     .iter()
                     .position(|source| *source == type_id)
                     .map_or(type_id, |index| (targets[index].0)());
-                self.type_payload(mapped)?;
-                TypeMapperApplication::Direct(mapped)
+                self.type_payload(substituted_type)?;
+                TypeMapperApplication::Direct(substituted_type)
             }
             TypeMapperData::Function(mapping) => {
-                let mapped = (mapping.0)(type_id);
-                self.type_payload(mapped)?;
-                TypeMapperApplication::Direct(mapped)
+                let substituted_type = (mapping.0)(type_id);
+                self.type_payload(substituted_type)?;
+                TypeMapperApplication::Direct(substituted_type)
             }
             TypeMapperData::Merged { first, second } => TypeMapperApplication::Merged {
                 first: *first,
@@ -547,15 +547,17 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 }
             }
             TypeMapperData::Deferred { sources, targets } => {
-                let mapped = sources
+                let substituted_type = sources
                     .iter()
                     .position(|source| *source == type_id)
                     .map_or(type_id, |index| (targets[index].0)());
-                self.type_payload(mapped).map(|_| mapped)
+                self.type_payload(substituted_type)
+                    .map(|_| substituted_type)
             }
             TypeMapperData::Function(mapping) => {
-                let mapped = (mapping.0)(type_id);
-                self.type_payload(mapped).map(|_| mapped)
+                let substituted_type = (mapping.0)(type_id);
+                self.type_payload(substituted_type)
+                    .map(|_| substituted_type)
             }
             TypeMapperData::Merged { first, second } => {
                 let intermediate = self.map_type_without_instantiation(*first, type_id)?;

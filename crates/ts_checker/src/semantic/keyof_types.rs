@@ -915,9 +915,7 @@ fn exact_index_kinds(
     store: &CanonicalTypeMapperStore,
     structured: &StructuredTypeData,
 ) -> Option<(bool, bool)> {
-    let Some(bootstrap) = store.intrinsic_bootstrap() else {
-        return None;
-    };
+    let bootstrap = store.intrinsic_bootstrap()?;
     let mut string = false;
     let mut number = false;
     let mut seen = HashSet::new();
@@ -951,7 +949,8 @@ fn validate_resolved_indexed_declared_object(
     if structured
         .index_infos
         .as_deref()
-        .is_none_or(|indexes| indexes.is_empty())
+        .unwrap_or_default()
+        .is_empty()
     {
         return Ok(None);
     }
