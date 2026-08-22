@@ -8,7 +8,7 @@ use ts_checker::semantic::{
     CanonicalModuleResolutionManifestInput, CanonicalModuleResolutionMode,
     CanonicalResolvedModuleInput, artifact_queries::CanonicalArtifactQueryError,
 };
-use ts_parser::{ParseResult, parse_source_file};
+use ts_parser::{ParseResult, parse_jsx_source_file, parse_source_file};
 
 fn facts(path: &str, module_state: CanonicalModuleState) -> CanonicalSourceFileFacts {
     CanonicalSourceFileFacts::new(
@@ -588,4 +588,94 @@ fn declaration_file_queries_resolve_annotations_without_forcing_source_checks() 
         context.store().intrinsic_bootstrap().unwrap().string_type
     );
     assert!(!source_checked(&context, file));
+}
+
+#[test]
+fn jsx_wrappers_hide_cached_symbols_without_changing_attribute_symbols() {
+    let parsed = parse_jsx_source_file(concat!(
+        "const single = <div className=\"one\" />;\n",
+        "const paired = <div className=\"two\"></div>;\n",
+        "const fragment = <><div /></>;\n",
+    ));
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(4_007);
+    let mut context = single_file_context(&parsed, file);
+    context.check_source_file(file).unwrap();
+
+    let wrappers = parsed
+        .arena
+        .iter()
+        .filter_map(|(id, record)| {
+            matches!(
+                record.kind,
+                SyntaxKind::JsxElement
+                    | SyntaxKind::JsxOpeningElement
+                    | SyntaxKind::JsxClosingElement
+                    | SyntaxKind::JsxSelfClosingElement
+                    | SyntaxKind::JsxFragment
+                    | SyntaxKind::JsxOpeningFragment
+                    | SyntaxKind::JsxClosingFragment
+            )
+            .then_some((node(&parsed, file, id), record.kind))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(wrappers.len(), 8);
+
+    let unknown = context
+        .store()
+        .intrinsic_bootstrap()
+        .unwrap()
+        .unknown_symbol;
+    let cached = wrappers
+        .iter()
+        .map(|(wrapper, kind)| {
+            let symbol = context
+                .store()
+                .symbol_node_links(*wrapper)
+                .and_then(|links| links.resolved_symbol);
+            if matches!(
+                kind,
+                SyntaxKind::JsxOpeningElement
+                    | SyntaxKind::JsxClosingElement
+                    | SyntaxKind::JsxSelfClosingElement
+            ) {
+                assert_eq!(symbol, Some(unknown));
+            }
+            (*wrapper, *kind, symbol)
+        })
+        .collect::<Vec<_>>();
+
+    for (wrapper, kind, _) in &cached {
+        assert_eq!(
+            context.get_symbol_at_location(*wrapper).unwrap(),
+            None,
+            "public JSX symbol query exposed {kind:?}"
+        );
+    }
+
+    for (wrapper, _, expected) in &cached {
+        assert_eq!(
+            context
+                .store()
+                .symbol_node_links(*wrapper)
+                .and_then(|links| links.resolved_symbol),
+            *expected
+        );
+    }
+
+    let attributes = parsed
+        .arena
+        .iter()
+        .filter_map(|(id, record)| {
+            let NodeData::JsxAttribute(attribute) = &record.data else {
+                return None;
+            };
+            Some((node(&parsed, file, id), node(&parsed, file, attribute.name)))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(attributes.len(), 2);
+    for (attribute, name) in attributes {
+        let symbol = declaration_symbol(&context, attribute);
+        assert_eq!(context.get_symbol_at_location(name).unwrap(), Some(symbol));
+    }
 }

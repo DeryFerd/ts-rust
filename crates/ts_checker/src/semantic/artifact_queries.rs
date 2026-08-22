@@ -253,6 +253,19 @@ impl CanonicalCheckerContext<'_> {
     ) -> Result<Option<SemanticSymbolId>, CanonicalArtifactQueryError> {
         self.prepare_artifact_location(node)?;
 
+        if matches!(
+            &self.validated_artifact_node(node)?.2.data,
+            NodeData::JsxElement(_)
+                | NodeData::JsxOpeningElement(_)
+                | NodeData::JsxClosingElement(_)
+                | NodeData::JsxSelfClosingElement(_)
+                | NodeData::JsxFragment(_)
+                | NodeData::JsxOpeningFragment(_)
+                | NodeData::JsxClosingFragment(_)
+        ) {
+            return Ok(None);
+        }
+
         if let Some(symbol) = self.cached_artifact_symbol(node)? {
             return Ok(Some(symbol));
         }
