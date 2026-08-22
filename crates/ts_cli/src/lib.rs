@@ -81,6 +81,7 @@ pub fn parse_command_line(
     parse_expanded(&expanded)
 }
 
+#[allow(clippy::too_many_lines)] // Preserve TypeScript's ordered command-line option dispatch.
 fn parse_expanded(args: &[String]) -> Result<Command, CommandLineError> {
     if args.is_empty() {
         return Ok(Command::Help);
