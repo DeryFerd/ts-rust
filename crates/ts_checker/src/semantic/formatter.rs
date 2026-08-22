@@ -1225,15 +1225,29 @@ fn display_generic_source_callable(
                 state,
                 visiting,
             )?);
-            for (node, prefix) in [
-                (parameter.constraint, " extends "),
-                (parameter.default_type, " = "),
+            let Some(TypeData::TypeParameter(parameter_type)) = store
+                .type_payload(parameter.type_parameter)
+                .map(TypeRecord::data)
+            else {
+                return Err(TypeDisplayUnavailable::MalformedType(type_id));
+            };
+            for (node, type_, prefix) in [
+                (parameter.constraint, parameter_type.constraint, " extends "),
+                (
+                    parameter.default_type,
+                    parameter_type.resolved_default_type,
+                    " = ",
+                ),
             ] {
                 if let Some(node) = node {
-                    let type_ = store
+                    let type_ = type_.ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+                    if store
                         .type_node_links(node)
                         .and_then(|links| links.resolved_type)
-                        .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+                        .is_some_and(|cached| cached != type_)
+                    {
+                        return Err(TypeDisplayUnavailable::MalformedType(type_id));
+                    }
                     result.push_str(prefix);
                     state.add(prefix.len());
                     result.push_str(&display_type_worker(
