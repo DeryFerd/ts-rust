@@ -83,6 +83,45 @@ struct PendingNamespaceValue {
     type_: super::TypeId,
 }
 
+fn is_external_module_augmentation(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    name: NodeRef,
+    parent: NamespaceParent,
+) -> bool {
+    if bound
+        .module_augmentations()
+        .iter()
+        .any(|augmentation| augmentation.name() == name)
+    {
+        return true;
+    }
+
+    let Some(facts) = bound.source_facts() else {
+        return false;
+    };
+    if parent.node == bound.source_file() {
+        return facts.is_external_module();
+    }
+    if facts.is_external_module() || !parent.ambient_module {
+        return false;
+    }
+
+    let Some(block) = arena.get(parent.node.node) else {
+        return false;
+    };
+    if block.kind != SyntaxKind::ModuleBlock {
+        return false;
+    }
+    block
+        .parent
+        .and_then(|module| arena.get(module))
+        .is_some_and(|module| {
+            module.kind == SyntaxKind::ModuleDeclaration
+                && module.parent == Some(bound.source_file().node)
+        })
+}
+
 fn unsupported(node: NodeRef, kind: SyntaxKind, role: SourceSyntaxRole) -> SourceCheckError {
     SourceCheckError::Unsupported(UnsupportedSourceSyntax::Syntax { node, kind, role })
 }
@@ -558,6 +597,8 @@ fn plan_namespace(
             SourceSyntaxRole::Statement,
         ));
     }
+    let is_external_augmentation = (is_string_module || is_global_augmentation)
+        && is_external_module_augmentation(arena, bound, name, parent);
 
     let symbol = declaration_symbol(bound, store, declaration, SymbolFlags::MODULE)?;
     let expected_parent = parent.symbol.or_else(|| {
@@ -589,7 +630,7 @@ fn plan_namespace(
                 code: GLOBAL_AUGMENTATION_DECLARE,
             });
         }
-        if !facts.is_external_module() && !parent.ambient_module {
+        if !is_external_augmentation {
             diagnostics.push(NamespaceDiagnosticPlan {
                 node: name,
                 code: GLOBAL_AUGMENTATION_CONTEXT,
@@ -597,20 +638,22 @@ fn plan_namespace(
         }
     }
     if let NodeData::StringLiteral(module_name) = &name_record.data {
-        if parent.symbol.is_some() && !parent.ambient_module {
-            diagnostics.push(NamespaceDiagnosticPlan {
-                node: name,
-                code: AMBIENT_MODULES_CANNOT_BE_NESTED,
-            });
-        } else if !facts.is_external_module()
-            && parent.node == bound.source_file()
-            && (ts_path::is_relative(&module_name.text)
-                || ts_path::is_rooted_disk_path(&module_name.text))
-        {
-            diagnostics.push(NamespaceDiagnosticPlan {
-                node: name,
-                code: AMBIENT_MODULE_NAME_CANNOT_BE_RELATIVE,
-            });
+        if !is_external_augmentation {
+            if parent.node == bound.source_file() && !facts.is_external_or_common_js_module() {
+                if ts_path::is_relative(&module_name.text)
+                    || ts_path::is_rooted_disk_path(&module_name.text)
+                {
+                    diagnostics.push(NamespaceDiagnosticPlan {
+                        node: name,
+                        code: AMBIENT_MODULE_NAME_CANNOT_BE_RELATIVE,
+                    });
+                }
+            } else {
+                diagnostics.push(NamespaceDiagnosticPlan {
+                    node: name,
+                    code: AMBIENT_MODULES_CANNOT_BE_NESTED,
+                });
+            }
         }
     }
 
@@ -1163,6 +1206,60 @@ mod tests {
         let diagnostics = execute(&mut fixture, &plan).unwrap();
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics.as_slice()[0].diagnostic.code(), 2669);
+    }
+
+    #[test]
+    fn top_level_external_global_augmentation_is_legal() {
+        let mut fixture = fixture(
+            "export {}; declare global { interface Added {} }",
+            CanonicalModuleState::External,
+        );
+        let plan = plan(&fixture, 1);
+        assert!(execute(&mut fixture, &plan).unwrap().is_empty());
+    }
+
+    #[test]
+    fn global_augmentation_inside_external_namespace_reports_ts2669() {
+        let mut fixture = fixture(
+            "export {}; namespace A { declare global { interface Added {} } }",
+            CanonicalModuleState::External,
+        );
+        let plan = plan(&fixture, 1);
+        let [SourceNamespaceMemberPlan::Namespace(nested)] = plan.members.as_slice() else {
+            panic!("the namespace must retain its global augmentation")
+        };
+        let name = nested.name;
+        let diagnostics = execute(&mut fixture, &plan).unwrap();
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics.as_slice()[0].diagnostic.code(), 2669);
+        assert_eq!(diagnostics.as_slice()[0].node, Some(name));
+    }
+
+    #[test]
+    fn direct_global_augmentation_in_top_level_ambient_module_is_legal() {
+        let mut fixture = fixture(
+            "declare module \"package\" { global { interface Added {} } }",
+            CanonicalModuleState::Script,
+        );
+        let plan = plan(&fixture, 0);
+        assert!(execute(&mut fixture, &plan).unwrap().is_empty());
+    }
+
+    #[test]
+    fn ambient_module_nested_in_external_augmentation_reports_ts2435() {
+        let mut fixture = fixture(
+            "export {}; declare module \"outer\" { module \"inner\" {} }",
+            CanonicalModuleState::External,
+        );
+        let plan = plan(&fixture, 1);
+        let [SourceNamespaceMemberPlan::Namespace(nested)] = plan.members.as_slice() else {
+            panic!("the outer module must retain its nested ambient module")
+        };
+        let name = nested.name;
+        let diagnostics = execute(&mut fixture, &plan).unwrap();
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics.as_slice()[0].diagnostic.code(), 2435);
+        assert_eq!(diagnostics.as_slice()[0].node, Some(name));
     }
 
     #[test]
