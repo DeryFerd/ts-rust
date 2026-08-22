@@ -53,6 +53,46 @@ fn canonical_program_checks_importer_first_array_values_through_bundler_manifest
 }
 
 #[test]
+fn canonical_program_resolves_referenced_ambient_modules() {
+    let fs = MemoryFileSystem::new(true);
+    fs.write_file(
+        "/project/modules.d.ts",
+        "declare module 'ambient' { export const value: number; }",
+    )
+    .unwrap();
+    fs.write_file(
+        "/project/importer.ts",
+        concat!(
+            "/// <reference path='./modules.d.ts' />\n",
+            "import { value } from 'ambient';",
+        ),
+    )
+    .unwrap();
+
+    let program = Program::try_new_with_canonical_checker(
+        &fs,
+        "/project",
+        &["importer.ts".to_owned()],
+        CompilerOptions {
+            module: ModuleKind::EsNext,
+            module_specified: true,
+            module_resolution: ModuleResolutionKind::Bundler,
+            lib: Some(vec!["es5".to_owned()]),
+            skip_lib_check: true,
+            ..CompilerOptions::default()
+        },
+    )
+    .unwrap_or_else(|error| panic!("ambient module import failed: {error:?}"));
+
+    assert!(
+        program.diagnostics().is_empty(),
+        "{:?}",
+        program.diagnostics()
+    );
+    assert!(program.source_file("/project/modules.d.ts").is_some());
+}
+
+#[test]
 fn canonical_program_combines_type_imports_with_imported_generic_calls() {
     let fs = MemoryFileSystem::new(true);
     fs.write_file(

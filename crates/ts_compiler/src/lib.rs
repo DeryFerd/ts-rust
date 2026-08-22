@@ -3412,9 +3412,8 @@ impl Program {
                 self.case_sensitivity,
             );
             for (specifier, text, requested_mode) in specifiers {
-                let Some(resolved_file_name) =
-                    self.resolved_modules.get(&(containing.clone(), text))
-                else {
+                let key = (containing.clone(), text);
+                let Some(resolved_file_name) = self.resolved_modules.get(&key) else {
                     entries.push(CanonicalModuleResolutionEntry::unresolved(specifier));
                     continue;
                 };
@@ -3432,6 +3431,11 @@ impl Program {
                 self.require_supported_module_source(target)?;
                 if !canonical_source_file_facts(target, &self.options)?
                     .is_external_or_common_js_module()
+                    && ts_checker::semantic::module_resolution::ambient_module_declaration(
+                        &target.parse.arena,
+                        &key.1,
+                    )
+                    .is_none()
                 {
                     return Err(
                         CanonicalProgramCheckError::ExternalModuleTargetUnsupported {
@@ -8848,12 +8852,25 @@ mod tests {
     }
 
     #[test]
-    fn canonical_module_manifest_rejects_resolved_script_targets_as_a_typed_boundary() {
+    fn canonical_module_manifest_admits_matching_ambient_script_targets() {
         let fs = MemoryFileSystem::new(true);
-        fs.write_file("/project/script.ts", "const value: number = 1;")
-            .unwrap();
-        fs.write_file("/project/importer.ts", "import { value } from './script';")
-            .unwrap();
+        fs.write_file(
+            "/project/modules.d.ts",
+            concat!(
+                "declare module 'first' { export const value: number; } ",
+                "declare module 'second' { export const value: string; }",
+            ),
+        )
+        .unwrap();
+        fs.write_file(
+            "/project/importer.ts",
+            concat!(
+                "/// <reference path='./modules.d.ts' />\n",
+                "import { value as first } from 'first'; ",
+                "import { value as second } from 'second';",
+            ),
+        )
+        .unwrap();
         let program = Program::new_with_options(
             &fs,
             "/project",
@@ -8861,15 +8878,44 @@ mod tests {
             plain_esm_bundler_options(),
         );
 
-        let error = program.canonical_module_resolution_manifest().unwrap_err();
-        assert!(error.is_unsupported_boundary());
-        assert!(matches!(
-            error,
-            CanonicalProgramCheckError::ExternalModuleTargetUnsupported {
-                target_file_name,
-                ..
-            } if target_file_name == "/project/script.ts"
-        ));
+        let target = program.source_file("/project/modules.d.ts").unwrap();
+        let manifest = program.canonical_module_resolution_manifest().unwrap();
+        assert_eq!(manifest.entries().len(), 2);
+        for entry in manifest.entries() {
+            let CanonicalModuleResolutionInput::Resolved(resolution) = entry.resolution() else {
+                panic!("expected the ambient module to resolve");
+            };
+            assert_eq!(resolution.target_file(), target.id);
+        }
+    }
+
+    #[test]
+    fn canonical_module_manifest_rejects_resolved_script_targets_as_a_typed_boundary() {
+        for source in [
+            "const value: number = 1;",
+            "declare module 'unrelated' { export const value: number; }",
+        ] {
+            let fs = MemoryFileSystem::new(true);
+            fs.write_file("/project/script.ts", source).unwrap();
+            fs.write_file("/project/importer.ts", "import { value } from './script';")
+                .unwrap();
+            let program = Program::new_with_options(
+                &fs,
+                "/project",
+                &["importer.ts".to_owned()],
+                plain_esm_bundler_options(),
+            );
+
+            let error = program.canonical_module_resolution_manifest().unwrap_err();
+            assert!(error.is_unsupported_boundary(), "{source}: {error:?}");
+            assert!(matches!(
+                error,
+                CanonicalProgramCheckError::ExternalModuleTargetUnsupported {
+                    target_file_name,
+                    ..
+                } if target_file_name == "/project/script.ts"
+            ));
+        }
     }
 
     #[test]
