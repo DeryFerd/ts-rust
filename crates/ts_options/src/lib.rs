@@ -93,6 +93,8 @@ pub struct CompilerOptions {
     pub allow_arbitrary_extensions: bool,
     pub allow_importing_ts_extensions: bool,
     pub allow_js: bool,
+    /// Whether `allowJs` was explicitly supplied instead of implied by `checkJs`.
+    pub allow_js_specified: bool,
     pub allow_umd_global_access: bool,
     pub allow_unreachable_code: Option<bool>,
     pub allow_unused_labels: Option<bool>,
@@ -118,6 +120,8 @@ pub struct CompilerOptions {
     pub import_helpers: bool,
     pub lib_replacement: bool,
     pub module_detection: ModuleDetectionKind,
+    /// Whether `moduleDetection` was explicitly supplied instead of inferred.
+    pub module_detection_specified: bool,
     pub new_line: NewLineKind,
     pub no_check: bool,
     pub no_emit: bool,
@@ -195,6 +199,8 @@ pub struct CompilerOptions {
     pub custom_conditions: Option<Vec<String>>,
     pub module_suffixes: Option<Vec<String>>,
     pub resolve_json_module: bool,
+    /// Whether `resolveJsonModule` was explicitly supplied instead of inferred.
+    pub resolve_json_module_specified: bool,
     pub resolve_package_json_exports: bool,
     pub resolve_package_json_imports: bool,
     pub source_map: bool,
@@ -223,6 +229,7 @@ impl Default for CompilerOptions {
             allow_arbitrary_extensions: false,
             allow_importing_ts_extensions: false,
             allow_js: false,
+            allow_js_specified: false,
             allow_umd_global_access: false,
             allow_unreachable_code: None,
             allow_unused_labels: None,
@@ -248,6 +255,7 @@ impl Default for CompilerOptions {
             import_helpers: false,
             lib_replacement: false,
             module_detection: ModuleDetectionKind::Auto,
+            module_detection_specified: false,
             new_line: NewLineKind::Lf,
             no_check: false,
             no_emit: false,
@@ -307,6 +315,7 @@ impl Default for CompilerOptions {
             custom_conditions: None,
             module_suffixes: None,
             resolve_json_module: false,
+            resolve_json_module_specified: false,
             resolve_package_json_exports: true,
             resolve_package_json_imports: true,
             source_map: false,
@@ -391,6 +400,33 @@ impl CompilerOptions {
         }
     }
 
+    /// Returns the automatic JSX runtime module selected by the emit mode.
+    #[must_use]
+    pub fn jsx_runtime_module_specifier(&self) -> Option<String> {
+        let runtime = match self.jsx {
+            JsxEmit::ReactJsx => "jsx-runtime",
+            JsxEmit::ReactJsxDev => "jsx-dev-runtime",
+            JsxEmit::None | JsxEmit::Preserve | JsxEmit::React | JsxEmit::ReactNative => {
+                return None;
+            }
+        };
+        Some(format!(
+            "{}/{runtime}",
+            self.jsx_import_source.as_deref().unwrap_or("react")
+        ))
+    }
+
+    /// Returns the root namespace used by classic JSX factories.
+    #[must_use]
+    pub fn jsx_factory_namespace(&self) -> &str {
+        self.jsx_factory
+            .as_deref()
+            .and_then(|factory| factory.split('.').next())
+            .filter(|namespace| !namespace.is_empty())
+            .or(self.react_namespace.as_deref())
+            .unwrap_or("React")
+    }
+
     #[allow(clippy::too_many_lines)]
     pub fn apply_overrides(&mut self, overrides: &Self, names: &BTreeSet<String>) {
         for name in names {
@@ -402,7 +438,10 @@ impl CompilerOptions {
                 "allowimportingtsextensions" => {
                     self.allow_importing_ts_extensions = overrides.allow_importing_ts_extensions;
                 }
-                "allowjs" => self.allow_js = overrides.allow_js,
+                "allowjs" => {
+                    self.allow_js = overrides.allow_js;
+                    self.allow_js_specified = true;
+                }
                 "allowumdglobalaccess" => {
                     self.allow_umd_global_access = overrides.allow_umd_global_access;
                 }
@@ -421,7 +460,7 @@ impl CompilerOptions {
                 "baseurl" => self.base_url.clone_from(&overrides.base_url),
                 "checkjs" => {
                     self.check_js = overrides.check_js;
-                    if !names.contains("allowjs") {
+                    if !names.contains("allowjs") && !self.allow_js_specified {
                         self.allow_js = overrides.allow_js;
                     }
                 }
@@ -498,9 +537,23 @@ impl CompilerOptions {
                     if !names.contains("moduleresolution") {
                         self.module_resolution = overrides.module_resolution;
                     }
+                    if !names.contains("moduledetection") && !self.module_detection_specified {
+                        self.module_detection = overrides.module_detection;
+                    }
+                    if !names.contains("resolvejsonmodule") && !self.resolve_json_module_specified {
+                        self.resolve_json_module = overrides.resolve_json_module;
+                    }
                 }
-                "moduledetection" => self.module_detection = overrides.module_detection,
-                "moduleresolution" => self.module_resolution = overrides.module_resolution,
+                "moduledetection" => {
+                    self.module_detection = overrides.module_detection;
+                    self.module_detection_specified = true;
+                }
+                "moduleresolution" => {
+                    self.module_resolution = overrides.module_resolution;
+                    if !names.contains("resolvejsonmodule") && !self.resolve_json_module_specified {
+                        self.resolve_json_module = overrides.resolve_json_module;
+                    }
+                }
                 "modulesuffixes" => self.module_suffixes.clone_from(&overrides.module_suffixes),
                 "newline" => self.new_line = overrides.new_line,
                 "nocheck" => self.no_check = overrides.no_check,
@@ -548,7 +601,10 @@ impl CompilerOptions {
                     self.preserve_const_enums = overrides.preserve_const_enums;
                 }
                 "preservesymlinks" => self.preserve_symlinks = overrides.preserve_symlinks,
-                "resolvejsonmodule" => self.resolve_json_module = overrides.resolve_json_module,
+                "resolvejsonmodule" => {
+                    self.resolve_json_module = overrides.resolve_json_module;
+                    self.resolve_json_module_specified = true;
+                }
                 "resolvepackagejsonexports" => {
                     self.resolve_package_json_exports = overrides.resolve_package_json_exports;
                 }
@@ -717,6 +773,14 @@ pub fn parse_compiler_options(value: &JsonValue) -> ParseOptionsResult {
 #[must_use]
 pub fn parse_project_options(config: &ProjectConfig) -> ParseOptionsResult {
     let mut result = parse_compiler_options_map(&config.compiler_options);
+    if config
+        .path
+        .rsplit('/')
+        .next()
+        .is_some_and(|name| name.eq_ignore_ascii_case("jsconfig.json"))
+    {
+        apply_javascript_project_defaults(&mut result.options, &config.compiler_options);
+    }
     let directory = config.path.rsplit_once('/').map_or(".", |(path, _)| path);
     if let Some(base_url) = &mut result.options.base_url
         && !ts_path::is_absolute(base_url)
@@ -754,6 +818,29 @@ pub fn parse_project_options(config: &ProjectConfig) -> ParseOptionsResult {
         }
     }
     result
+}
+
+fn apply_javascript_project_defaults(
+    options: &mut CompilerOptions,
+    configured: &BTreeMap<String, JsonValue>,
+) {
+    let is_specified = |name: &str| {
+        configured
+            .iter()
+            .any(|(key, value)| key.eq_ignore_ascii_case(name) && !matches!(value, JsonValue::Null))
+    };
+    if !is_specified("allowJs") {
+        options.allow_js = true;
+    }
+    if !is_specified("maxNodeModuleJsDepth") {
+        options.max_node_module_js_depth = Some(2);
+    }
+    if !is_specified("skipLibCheck") {
+        options.skip_lib_check = true;
+    }
+    if !is_specified("noEmit") {
+        options.no_emit = true;
+    }
 }
 
 /// Parses and normalizes a map of compiler option values.
@@ -1138,6 +1225,7 @@ impl PartialOptions {
     #[allow(clippy::too_many_lines)] // Flat field-by-field option mapping.
     fn normalize(self) -> CompilerOptions {
         let check_js = self.check_js.unwrap_or(false);
+        let allow_js_specified = self.allow_js.is_some();
         let no_implicit_any_specified = self.no_implicit_any.is_some();
         let no_implicit_this_specified = self.no_implicit_this.is_some();
         let strict_specified = self.strict.is_some();
@@ -1157,6 +1245,8 @@ impl PartialOptions {
         let emit_declaration_only = self.emit_declaration_only.unwrap_or(false);
         let composite = self.composite.unwrap_or(false);
         let module_specified = self.module.is_some();
+        let module_detection_specified = self.module_detection.is_some();
+        let resolve_json_module_specified = self.resolve_json_module.is_some();
         let module = self.module.unwrap_or(if self.out_file.is_some() {
             ModuleKind::None
         } else {
@@ -1171,6 +1261,7 @@ impl PartialOptions {
             allow_arbitrary_extensions: self.allow_arbitrary_extensions.unwrap_or(false),
             allow_importing_ts_extensions: self.allow_importing_ts_extensions.unwrap_or(false),
             allow_js: self.allow_js.unwrap_or(check_js),
+            allow_js_specified,
             allow_umd_global_access: self.allow_umd_global_access.unwrap_or(false),
             allow_unreachable_code: self.allow_unreachable_code,
             allow_unused_labels: self.allow_unused_labels,
@@ -1203,7 +1294,20 @@ impl PartialOptions {
             isolated_declarations: self.isolated_declarations.unwrap_or(false),
             import_helpers: self.import_helpers.unwrap_or(false),
             lib_replacement: self.lib_replacement.unwrap_or(false),
-            module_detection: self.module_detection.unwrap_or_default(),
+            module_detection: self.module_detection.unwrap_or({
+                if matches!(
+                    module,
+                    ModuleKind::Node16
+                        | ModuleKind::Node18
+                        | ModuleKind::Node20
+                        | ModuleKind::NodeNext
+                ) {
+                    ModuleDetectionKind::Force
+                } else {
+                    ModuleDetectionKind::Auto
+                }
+            }),
+            module_detection_specified,
             new_line: self.new_line.unwrap_or_default(),
             no_check: self.no_check.unwrap_or(false),
             no_emit: self.no_emit.unwrap_or(false),
@@ -1272,6 +1376,7 @@ impl PartialOptions {
                 module_resolution == ModuleResolutionKind::Bundler
                     || matches!(module, ModuleKind::Node20 | ModuleKind::NodeNext),
             ),
+            resolve_json_module_specified,
             resolve_package_json_exports: self.resolve_package_json_exports.unwrap_or(true),
             resolve_package_json_imports: self.resolve_package_json_imports.unwrap_or(true),
             source_map: self.source_map.unwrap_or(false),
@@ -1301,12 +1406,19 @@ const fn default_module_resolution(module: ModuleKind) -> ModuleResolutionKind {
             ModuleResolutionKind::Node16
         }
         ModuleKind::NodeNext => ModuleResolutionKind::NodeNext,
-        ModuleKind::Preserve => ModuleResolutionKind::Bundler,
+        ModuleKind::Es2015
+        | ModuleKind::Es2020
+        | ModuleKind::Es2022
+        | ModuleKind::EsNext
+        | ModuleKind::Preserve => ModuleResolutionKind::Bundler,
         _ => ModuleResolutionKind::Node10,
     }
 }
 
 fn validate_options(options: &PartialOptions, diagnostics: &mut Vec<Diagnostic>) {
+    if options.check_js == Some(true) && options.allow_js == Some(false) {
+        diagnostics.push(diagnostic(5052, ["checkJs", "allowJs"]));
+    }
     if options.no_emit == Some(true) && options.emit_declaration_only == Some(true) {
         diagnostics.push(diagnostic(5053, ["emitDeclarationOnly", "noEmit"]));
     }
@@ -1365,6 +1477,8 @@ fn validate_options(options: &PartialOptions, diagnostics: &mut Vec<Diagnostic>)
         diagnostics.push(diagnostic(6082, ["outFile"]));
     }
 
+    validate_jsx_options(options, diagnostics);
+
     let (Some(module), Some(resolution)) = (options.module, options.module_resolution) else {
         return;
     };
@@ -1398,6 +1512,69 @@ fn validate_options(options: &PartialOptions, diagnostics: &mut Vec<Diagnostic>)
         }
         _ => {}
     }
+}
+
+fn validate_jsx_options(options: &PartialOptions, diagnostics: &mut Vec<Diagnostic>) {
+    let Some(jsx) = options.jsx else {
+        return;
+    };
+    let automatic = matches!(jsx, JsxEmit::ReactJsx | JsxEmit::ReactJsxDev);
+    let jsx_name = match jsx {
+        JsxEmit::ReactJsx => "react-jsx",
+        JsxEmit::ReactJsxDev => "react-jsxdev",
+        JsxEmit::React => "react",
+        JsxEmit::Preserve => "preserve",
+        JsxEmit::ReactNative => "react-native",
+        JsxEmit::None => return,
+    };
+
+    if let Some(factory) = &options.jsx_factory {
+        if options.react_namespace.is_some() {
+            diagnostics.push(diagnostic(5053, ["reactNamespace", "jsxFactory"]));
+        }
+        if automatic {
+            diagnostics.push(diagnostic(5089, ["jsxFactory", jsx_name]));
+        }
+        if !is_jsx_entity_name(factory, false) {
+            diagnostics.push(diagnostic(5067, [factory.as_str()]));
+        }
+    } else if let Some(namespace) = &options.react_namespace
+        && !is_jsx_identifier(namespace)
+    {
+        diagnostics.push(diagnostic(5059, [namespace.as_str()]));
+    }
+
+    if let Some(fragment_factory) = &options.jsx_fragment_factory {
+        if options.jsx_factory.is_none() {
+            diagnostics.push(diagnostic(5052, ["jsxFragmentFactory", "jsxFactory"]));
+        }
+        if automatic {
+            diagnostics.push(diagnostic(5089, ["jsxFragmentFactory", jsx_name]));
+        }
+        if !is_jsx_entity_name(fragment_factory, true) {
+            diagnostics.push(diagnostic(18_035, [fragment_factory.as_str()]));
+        }
+    }
+
+    if automatic && options.react_namespace.is_some() {
+        diagnostics.push(diagnostic(5089, ["reactNamespace", jsx_name]));
+    }
+    if jsx == JsxEmit::React && options.jsx_import_source.is_some() {
+        diagnostics.push(diagnostic(5089, ["jsxImportSource", jsx_name]));
+    }
+}
+
+fn is_jsx_entity_name(value: &str, allow_null: bool) -> bool {
+    (allow_null && value == "null") || value.split('.').all(is_jsx_identifier)
+}
+
+fn is_jsx_identifier(value: &str) -> bool {
+    let mut characters = value.chars();
+    characters
+        .next()
+        .is_some_and(|character| character == '_' || character == '$' || character.is_alphabetic())
+        && characters
+            .all(|character| character == '_' || character == '$' || character.is_alphanumeric())
 }
 
 const fn module_name(value: ModuleKind) -> &'static str {
@@ -1706,6 +1883,146 @@ mod tests {
             result.options.module_resolution,
             ModuleResolutionKind::NodeNext
         );
+    }
+
+    #[test]
+    fn uses_bundler_resolution_for_explicit_ecmascript_modules() {
+        for module in ["es2015", "es2020", "es2022", "esnext", "preserve"] {
+            let result =
+                parse_compiler_options(&object([("module", JsonValue::String(module.into()))]));
+            assert!(result.is_ok(), "{module}: {:?}", result.diagnostics);
+            assert_eq!(
+                result.options.module_resolution,
+                ModuleResolutionKind::Bundler,
+                "{module}"
+            );
+            assert!(result.options.resolve_json_module, "{module}");
+            assert!(!result.options.resolve_json_module_specified, "{module}");
+        }
+    }
+
+    #[test]
+    fn node_module_formats_force_detection_without_replacing_explicit_modes() {
+        for (module, resolution) in [
+            ("node16", ModuleResolutionKind::Node16),
+            ("node18", ModuleResolutionKind::Node16),
+            ("node20", ModuleResolutionKind::Node16),
+            ("nodenext", ModuleResolutionKind::NodeNext),
+        ] {
+            let result =
+                parse_compiler_options(&object([("module", JsonValue::String(module.into()))]));
+            assert!(result.is_ok(), "{module}: {:?}", result.diagnostics);
+            assert_eq!(result.options.module_resolution, resolution);
+            assert_eq!(result.options.module_detection, ModuleDetectionKind::Force);
+            assert!(!result.options.module_detection_specified);
+        }
+
+        let explicit = parse_compiler_options(&object([
+            ("module", JsonValue::String("nodenext".into())),
+            ("moduleDetection", JsonValue::String("legacy".into())),
+            ("resolveJsonModule", JsonValue::Bool(false)),
+        ]));
+        assert!(explicit.is_ok(), "{:?}", explicit.diagnostics);
+        assert_eq!(
+            explicit.options.module_detection,
+            ModuleDetectionKind::Legacy
+        );
+        assert!(explicit.options.module_detection_specified);
+        assert!(!explicit.options.resolve_json_module);
+        assert!(explicit.options.resolve_json_module_specified);
+    }
+
+    #[test]
+    fn applies_jsconfig_defaults_without_overriding_explicit_settings() {
+        let defaults = parse_config_text("/repo/jsconfig.json", "{}")
+            .value
+            .unwrap();
+        let defaults = parse_project_options(&defaults);
+        assert!(defaults.is_ok(), "{:?}", defaults.diagnostics);
+        assert!(defaults.options.allow_js);
+        assert!(!defaults.options.allow_js_specified);
+        assert_eq!(defaults.options.max_node_module_js_depth, Some(2));
+        assert!(defaults.options.skip_lib_check);
+        assert!(defaults.options.no_emit);
+
+        let overrides = parse_config_text(
+            "/repo/JSCONFIG.JSON",
+            r#"{
+                "compilerOptions": {
+                    "allowJs": false,
+                    "maxNodeModuleJsDepth": 4,
+                    "skipLibCheck": false,
+                    "noEmit": false
+                }
+            }"#,
+        )
+        .value
+        .unwrap();
+        let overrides = parse_project_options(&overrides);
+        assert!(overrides.is_ok(), "{:?}", overrides.diagnostics);
+        assert!(!overrides.options.allow_js);
+        assert!(overrides.options.allow_js_specified);
+        assert_eq!(overrides.options.max_node_module_js_depth, Some(4));
+        assert!(!overrides.options.skip_lib_check);
+        assert!(!overrides.options.no_emit);
+
+        let typescript = parse_config_text("/repo/tsconfig.json", "{}")
+            .value
+            .unwrap();
+        let typescript = parse_project_options(&typescript);
+        assert!(!typescript.options.allow_js);
+        assert!(typescript.options.max_node_module_js_depth.is_none());
+        assert!(!typescript.options.skip_lib_check);
+        assert!(!typescript.options.no_emit);
+    }
+
+    #[test]
+    fn preserves_explicit_javascript_options_across_checkjs_overrides() {
+        let mut explicit =
+            parse_compiler_options(&object([("allowJs", JsonValue::Bool(false))])).options;
+        assert!(explicit.allow_js_specified);
+        let checking =
+            parse_compiler_options(&object([("checkJs", JsonValue::Bool(true))])).options;
+        explicit.apply_overrides(&checking, &BTreeSet::from(["checkjs".to_owned()]));
+        assert!(explicit.check_js);
+        assert!(!explicit.allow_js);
+
+        let mut implied = CompilerOptions::default();
+        implied.apply_overrides(&checking, &BTreeSet::from(["checkjs".to_owned()]));
+        assert!(implied.check_js);
+        assert!(implied.allow_js);
+
+        let invalid = parse_compiler_options(&object([
+            ("allowJs", JsonValue::Bool(false)),
+            ("checkJs", JsonValue::Bool(true)),
+        ]));
+        assert_eq!(invalid.diagnostics.len(), 1);
+        assert_eq!(invalid.diagnostics[0].code(), 5052);
+        assert_eq!(
+            invalid.diagnostics[0].render().unwrap(),
+            "Option 'checkJs' cannot be specified without specifying option 'allowJs'."
+        );
+    }
+
+    #[test]
+    fn tracks_module_default_provenance_across_overrides() {
+        let node =
+            parse_compiler_options(&object([("module", JsonValue::String("nodenext".into()))]))
+                .options;
+        let mut defaults = CompilerOptions::default();
+        defaults.apply_overrides(&node, &BTreeSet::from(["module".to_owned()]));
+        assert_eq!(defaults.module_resolution, ModuleResolutionKind::NodeNext);
+        assert_eq!(defaults.module_detection, ModuleDetectionKind::Force);
+        assert!(defaults.resolve_json_module);
+
+        let mut explicit = parse_compiler_options(&object([
+            ("moduleDetection", JsonValue::String("legacy".into())),
+            ("resolveJsonModule", JsonValue::Bool(false)),
+        ]))
+        .options;
+        explicit.apply_overrides(&node, &BTreeSet::from(["module".to_owned()]));
+        assert_eq!(explicit.module_detection, ModuleDetectionKind::Legacy);
+        assert!(!explicit.resolve_json_module);
     }
 
     #[test]
@@ -2244,6 +2561,113 @@ mod tests {
         let preserve =
             parse_compiler_options(&object([("jsx", JsonValue::String("preserve".into()))]));
         assert_eq!(preserve.options.jsx, JsxEmit::Preserve);
+    }
+
+    #[test]
+    fn selects_automatic_jsx_runtime_and_classic_factory_namespaces() {
+        let automatic =
+            parse_compiler_options(&object([("jsx", JsonValue::String("react-jsx".into()))]));
+        assert!(automatic.is_ok(), "{:?}", automatic.diagnostics);
+        assert_eq!(
+            automatic.options.jsx_runtime_module_specifier().as_deref(),
+            Some("react/jsx-runtime")
+        );
+
+        let development = parse_compiler_options(&object([
+            ("jsx", JsonValue::String("react-jsxdev".into())),
+            ("jsxImportSource", JsonValue::String("preact".into())),
+        ]));
+        assert!(development.is_ok(), "{:?}", development.diagnostics);
+        assert_eq!(
+            development
+                .options
+                .jsx_runtime_module_specifier()
+                .as_deref(),
+            Some("preact/jsx-dev-runtime")
+        );
+
+        let classic = parse_compiler_options(&object([
+            ("jsx", JsonValue::String("react".into())),
+            (
+                "jsxFactory",
+                JsonValue::String("MyLibrary.createElement".into()),
+            ),
+        ]));
+        assert!(classic.is_ok(), "{:?}", classic.diagnostics);
+        assert!(classic.options.jsx_runtime_module_specifier().is_none());
+        assert_eq!(classic.options.jsx_factory_namespace(), "MyLibrary");
+
+        let namespace = parse_compiler_options(&object([
+            ("jsx", JsonValue::String("react".into())),
+            ("reactNamespace", JsonValue::String("Preact".into())),
+        ]));
+        assert!(namespace.is_ok(), "{:?}", namespace.diagnostics);
+        assert_eq!(namespace.options.jsx_factory_namespace(), "Preact");
+        assert_eq!(CompilerOptions::default().jsx_factory_namespace(), "React");
+    }
+
+    #[test]
+    fn validates_classic_jsx_factories_and_preserves_null_fragment_factories() {
+        let invalid_factory = parse_compiler_options(&object([
+            ("jsx", JsonValue::String("react".into())),
+            ("jsxFactory", JsonValue::String("234".into())),
+        ]));
+        assert_eq!(invalid_factory.diagnostics.len(), 1);
+        assert_eq!(invalid_factory.diagnostics[0].code(), 5067);
+
+        let invalid_fragment = parse_compiler_options(&object([
+            ("jsx", JsonValue::String("react".into())),
+            ("jsxFactory", JsonValue::String("h".into())),
+            ("jsxFragmentFactory", JsonValue::String("234".into())),
+        ]));
+        assert_eq!(invalid_fragment.diagnostics.len(), 1);
+        assert_eq!(invalid_fragment.diagnostics[0].code(), 18_035);
+
+        let null_fragment = parse_compiler_options(&object([
+            ("jsx", JsonValue::String("react".into())),
+            ("jsxFactory", JsonValue::String("h".into())),
+            ("jsxFragmentFactory", JsonValue::String("null".into())),
+        ]));
+        assert!(null_fragment.is_ok(), "{:?}", null_fragment.diagnostics);
+
+        let invalid_namespace = parse_compiler_options(&object([
+            ("jsx", JsonValue::String("react".into())),
+            ("reactNamespace", JsonValue::String("React.Factory".into())),
+        ]));
+        assert_eq!(invalid_namespace.diagnostics.len(), 1);
+        assert_eq!(invalid_namespace.diagnostics[0].code(), 5059);
+    }
+
+    #[test]
+    fn rejects_conflicting_classic_and_automatic_jsx_options() {
+        let fragment_without_factory = parse_compiler_options(&object([
+            ("jsx", JsonValue::String("react".into())),
+            ("jsxFragmentFactory", JsonValue::String("Fragment".into())),
+        ]));
+        assert_eq!(fragment_without_factory.diagnostics.len(), 1);
+        assert_eq!(fragment_without_factory.diagnostics[0].code(), 5052);
+
+        let automatic_factory = parse_compiler_options(&object([
+            ("jsx", JsonValue::String("react-jsx".into())),
+            ("jsxFactory", JsonValue::String("h".into())),
+        ]));
+        assert_eq!(automatic_factory.diagnostics.len(), 1);
+        assert_eq!(automatic_factory.diagnostics[0].code(), 5089);
+
+        let classic_import_source = parse_compiler_options(&object([
+            ("jsx", JsonValue::String("react".into())),
+            ("jsxImportSource", JsonValue::String("preact".into())),
+        ]));
+        assert_eq!(classic_import_source.diagnostics.len(), 1);
+        assert_eq!(classic_import_source.diagnostics[0].code(), 5089);
+
+        let duplicate_classic_factories = parse_compiler_options(&object([
+            ("jsx", JsonValue::String("react".into())),
+            ("jsxFactory", JsonValue::String("h".into())),
+            ("reactNamespace", JsonValue::String("React".into())),
+        ]));
+        assert_eq!(duplicate_classic_factories.diagnostics.len(), 1);
+        assert_eq!(duplicate_classic_factories.diagnostics[0].code(), 5053);
     }
 
     #[test]
