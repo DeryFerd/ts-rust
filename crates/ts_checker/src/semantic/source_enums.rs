@@ -369,20 +369,29 @@ pub(super) fn plan_top_level_enum(
 
         let member_name = NodeRef::new(member.arena, member.file, member_data.name);
         let member_name_record = preflight_node(store, host, member_name)?;
-        let NodeData::Identifier(member_name_data) = &member_name_record.data else {
-            return Err(invariant(SourceEnumInvariant::InvalidIdentifier(
-                member_name,
-            )));
+        let has_flow_node = match &member_name_record.data {
+            NodeData::Identifier(identifier)
+                if member_name_record.kind == SyntaxKind::Identifier =>
+            {
+                identifier.flow_node.is_some()
+            }
+            NodeData::StringLiteral(_) if member_name_record.kind == SyntaxKind::StringLiteral => {
+                false
+            }
+            _ => {
+                return Err(invariant(SourceEnumInvariant::InvalidIdentifier(
+                    member_name,
+                )));
+            }
         };
-        if member_name_record.kind != SyntaxKind::Identifier
-            || member_name_record.parent != Some(member.node)
+        if member_name_record.parent != Some(member.node)
             || !range_contains(member_record, member_name_record)
         {
             return Err(invariant(SourceEnumInvariant::InvalidIdentifier(
                 member_name,
             )));
         }
-        if member_name_record.flags.0 != 0 || member_name_data.flow_node.is_some() {
+        if member_name_record.flags.0 != 0 || has_flow_node {
             return Err(unsupported(SourceEnumUnsupported::IdentifierFlags(
                 member_name,
             )));
@@ -655,6 +664,57 @@ mod tests {
             result.members[0].value,
             enums::CanonicalEnumMemberValue::Computed
         ));
+    }
+
+    #[test]
+    fn quoted_enum_member_names_have_canonical_source_plans() {
+        let mut fixture = fixture(
+            r#"export enum Named { "non identifier" = 1, "//" = 2, "-Infinity" = 3 }"#,
+            CanonicalModuleState::External,
+            false,
+        );
+        let declaration = statement(&fixture, 0);
+        let bound = &fixture.files[&fixture.file];
+        let host = host(&fixture.parsed.arena, bound);
+
+        let plan = plan_top_level_enum(&fixture.store, &host, declaration).unwrap();
+        assert_eq!(plan.members.len(), 3);
+        for member in &plan.members {
+            assert_eq!(
+                fixture.parsed.arena.get(member.name.node).unwrap().kind,
+                SyntaxKind::StringLiteral
+            );
+        }
+
+        let result = execute_top_level_enum(&mut fixture.store, &host, &plan).unwrap();
+        assert_eq!(result.members.len(), 3);
+    }
+
+    #[test]
+    fn numeric_member_name_diagnostic_precedes_ambient_initializer_diagnostic() {
+        let mut fixture = fixture(
+            r#"declare enum Invalid { "1" = 'value'.length }"#,
+            CanonicalModuleState::Script,
+            false,
+        );
+        let declaration = statement(&fixture, 0);
+        let bound = &fixture.files[&fixture.file];
+        let host = host(&fixture.parsed.arena, bound);
+
+        let plan = plan_top_level_enum(&fixture.store, &host, declaration).unwrap();
+        assert_eq!(
+            plan.diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [2452, 1066]
+        );
+
+        let materialized = execute_top_level_enum(&mut fixture.store, &host, &plan).unwrap();
+        assert_eq!(
+            materialized.members[0].value,
+            enums::CanonicalEnumMemberValue::Computed
+        );
     }
 
     #[test]

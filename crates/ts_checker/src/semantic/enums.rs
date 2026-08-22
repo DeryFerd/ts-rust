@@ -3,9 +3,10 @@
 //! This is the dependency-closed prefix of pinned typescript-go's
 //! `getDeclaredTypeOfEnum`, `getDeclaredTypeOfEnumMember`,
 //! `getTypeOfFuncClassEnumModule`, and `computeEnumMemberValues`. It supports
-//! one non-merged top-level enum declaration whose members have identifier
-//! names and constant numeric or string expressions. Earlier members can be
-//! referenced by name, property access, or string element access. Numeric
+//! one non-merged top-level enum declaration whose members have identifier or
+//! string-literal names and constant numeric or string expressions. Earlier
+//! members can be referenced by name, property access, or string element
+//! access. Numeric
 //! auto-increment, explicit ambient behavior, const-enum provenance,
 //! regular/fresh member identities, the enum declared union, and the separate
 //! enum value object are published together.
@@ -136,6 +137,7 @@ struct EnumMemberPlan {
     declaration: NodeRef,
     symbol: SemanticSymbolId,
     value: CanonicalEnumMemberValue,
+    name_diagnostic: Option<EnumMemberDiagnostic>,
     diagnostic: Option<EnumMemberDiagnostic>,
 }
 
@@ -291,14 +293,28 @@ fn plan_enum(
         }
         let member_name = NodeRef::new(member.arena, member.file, member_data.name);
         let member_name_record = preflight_node(store, host, member_name)?;
-        let NodeData::Identifier(member_identifier) = &member_name_record.data else {
-            return Err(unsupported(EnumTypeUnsupported::MemberName(member_name)));
+        let member_name_text = match &member_name_record.data {
+            NodeData::Identifier(identifier)
+                if member_name_record.kind == SyntaxKind::Identifier =>
+            {
+                identifier.text.as_str()
+            }
+            NodeData::StringLiteral(literal)
+                if member_name_record.kind == SyntaxKind::StringLiteral =>
+            {
+                literal.text.as_str()
+            }
+            _ => return Err(unsupported(EnumTypeUnsupported::MemberName(member_name))),
         };
-        if member_name_record.kind != SyntaxKind::Identifier
-            || member_name_record.parent != Some(member.node)
-        {
+        if member_name_record.parent != Some(member.node) {
             return Err(invariant(EnumTypeInvariant::InvalidMember(member)));
         }
+        let name_diagnostic = (!matches!(member_name_text, "NaN" | "Infinity" | "-Infinity")
+            && Number::from_string(member_name_text).to_string() == member_name_text)
+            .then_some(EnumMemberDiagnostic {
+                node: member_name,
+                code: 2452,
+            });
         let member_symbol = bound
             .symbol(member)
             .and_then(|candidate| store.get_merged_symbol(candidate))
@@ -306,11 +322,11 @@ fn plan_enum(
         let member_symbol_record = store
             .symbol(member_symbol)
             .ok_or_else(|| invariant(EnumTypeInvariant::InvalidMemberSymbol(member)))?;
-        if member_table.and_then(|members| members.get_source(&member_identifier.text))
+        if member_table.and_then(|members| members.get_source(member_name_text))
             != Some(member_symbol)
             || member_symbol_record.flags() != SymbolFlags::ENUM_MEMBER
             || member_symbol_record.check_flags() != CheckFlags::NONE
-            || member_symbol_record.name().as_bytes() != member_identifier.text.as_bytes()
+            || member_symbol_record.name().as_bytes() != member_name_text.as_bytes()
             || member_symbol_record.declarations() != Some(&[member])
             || member_symbol_record.value_declaration() != Some(member)
             || member_symbol_record.members().is_some()
@@ -394,6 +410,7 @@ fn plan_enum(
             declaration: member,
             symbol: member_symbol,
             value,
+            name_diagnostic,
             diagnostic,
         });
     }
@@ -428,7 +445,8 @@ pub(super) fn preflight_enum_diagnostics(
     Ok(plan
         .members
         .into_iter()
-        .filter_map(|member| member.diagnostic)
+        .flat_map(|member| [member.name_diagnostic, member.diagnostic])
+        .flatten()
         .collect())
 }
 
@@ -1496,10 +1514,11 @@ mod tests {
             NodeData::EnumMember(data) => data.name,
             _ => return None,
         };
-        let NodeData::Identifier(identifier) = &arena.get(name)?.data else {
-            return None;
-        };
-        Some(&identifier.text)
+        match &arena.get(name)?.data {
+            NodeData::Identifier(identifier) => Some(&identifier.text),
+            NodeData::StringLiteral(literal) => Some(&literal.text),
+            _ => None,
+        }
     }
 
     fn named_node(fixture: &Fixture, kind: SyntaxKind, name: &str) -> NodeRef {
@@ -1633,6 +1652,79 @@ mod tests {
             get_declared_enum_or_member(&mut fixture.store, &host, three.symbol),
             Ok(Some(three.fresh_type))
         );
+    }
+
+    #[test]
+    fn quoted_enum_member_names_publish_and_resolve_through_element_access() {
+        let mut fixture = fixture(concat!(
+            "enum Named { ",
+            "'non identifier' = 1, ",
+            "'//' = 2, ",
+            "'-Infinity' = 3, ",
+            "NaN = 4, ",
+            "Infinity = 5, ",
+            "Copied = Named['non identifier'], ",
+            "}",
+        ));
+        let owner = symbol(&fixture, SyntaxKind::EnumDeclaration, "Named");
+        let bound = &fixture.files[&fixture.file];
+        let host = host(&fixture.parsed.arena, bound);
+
+        let result = get_enum_semantics(&mut fixture.store, &host, owner).unwrap();
+        for (name, expected) in [
+            ("non identifier", 1.0),
+            ("//", 2.0),
+            ("-Infinity", 3.0),
+            ("NaN", 4.0),
+            ("Infinity", 5.0),
+            ("Copied", 1.0),
+        ] {
+            assert_eq!(
+                member(&result, &fixture, name).value,
+                CanonicalEnumMemberValue::Number(Number::new(expected)),
+                "member {name}",
+            );
+        }
+        assert_eq!(
+            member(&result, &fixture, "Copied").fresh_type,
+            member(&result, &fixture, "non identifier").fresh_type
+        );
+    }
+
+    #[test]
+    fn canonical_numeric_quoted_names_report_ts2452_without_rejecting_members() {
+        let mut fixture = fixture(concat!(
+            "enum Names { ",
+            "'1' = 0, ",
+            "'-1' = 1, ",
+            "'01' = 2, ",
+            "'1.0' = 3, ",
+            "'Infinity' = 4, ",
+            "'-Infinity' = 5, ",
+            "'NaN' = 6, ",
+            "}",
+        ));
+        let owner = symbol(&fixture, SyntaxKind::EnumDeclaration, "Names");
+        let bound = &fixture.files[&fixture.file];
+        let host = host(&fixture.parsed.arena, bound);
+
+        let diagnostics = preflight_enum_diagnostics(&fixture.store, &host, owner).unwrap();
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [2452, 2452]
+        );
+        for diagnostic in diagnostics {
+            assert_eq!(
+                fixture.parsed.arena.get(diagnostic.node.node).unwrap().kind,
+                SyntaxKind::StringLiteral
+            );
+        }
+
+        let result = get_enum_semantics(&mut fixture.store, &host, owner).unwrap();
+        assert_eq!(result.members.len(), 7);
     }
 
     #[test]

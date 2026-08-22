@@ -300,23 +300,6 @@ pub(super) fn check_primitive_binary(
         left = check_non_null_operand(request.left, left, &mut diagnostics)?;
         right = check_non_null_operand(request.right, right, &mut diagnostics)?;
     }
-    if matches!(operator, PrimitiveBinaryOperator::Equality(_)) {
-        if matches!(left, PrimitiveBinaryOperand::Nullish(_)) {
-            return Err(PrimitiveBinaryUnsupported::Operand {
-                node: request.left,
-                type_: request.left_type,
-            }
-            .into());
-        }
-        if matches!(right, PrimitiveBinaryOperand::Nullish(_)) {
-            return Err(PrimitiveBinaryUnsupported::Operand {
-                node: request.right,
-                type_: request.right_type,
-            }
-            .into());
-        }
-    }
-
     let result = match operator {
         PrimitiveBinaryOperator::Plus => check_plus(store, request, left, right, &mut diagnostics)?,
         PrimitiveBinaryOperator::Arithmetic(kind) => {
@@ -557,6 +540,21 @@ fn check_arithmetic(
         return Ok(PrimitiveBinaryValue::plain(bootstrap.number_type));
     }
     if (left_bigint || left.recovery().is_some()) && (right_bigint || right.recovery().is_some()) {
+        if kind == SyntaxKind::GreaterThanGreaterThanGreaterThanToken {
+            let left = left
+                .scalar()
+                .map_or(bootstrap.error_type, |scalar| scalar.type_);
+            let right = right
+                .scalar()
+                .map_or(bootstrap.error_type, |scalar| scalar.type_);
+            diagnostics.push(operator_diagnostic(
+                store,
+                request.expression,
+                PrimitiveBinaryOperator::Arithmetic(kind),
+                left,
+                right,
+            )?);
+        }
         check_bigint_exponentiation_target(request, kind, diagnostics)?;
         return Ok(PrimitiveBinaryValue::plain(bootstrap.bigint_type));
     }
@@ -649,7 +647,11 @@ fn check_equality(
         .intrinsic_bootstrap()
         .map(|bootstrap| bootstrap.boolean_type)
         .ok_or(PrimitiveBinaryInvariant::MissingBootstrap)?;
-    if left.recovery().is_some() || right.recovery().is_some() {
+    if left.recovery().is_some()
+        || right.recovery().is_some()
+        || matches!(left, PrimitiveBinaryOperand::Nullish(_))
+        || matches!(right, PrimitiveBinaryOperand::Nullish(_))
+    {
         return Ok(PrimitiveBinaryValue::plain(boolean));
     }
     let left = left
@@ -1022,6 +1024,106 @@ mod tests {
             assert_eq!(resolution.result_type, string);
             assert!(resolution.diagnostics.is_empty());
         }
+    }
+
+    #[test]
+    fn nullish_equality_is_valid_for_every_comparison_operator() {
+        let parsed = parse_source_file("const value = left === right;");
+        assert!(parsed.diagnostics.is_empty());
+        let nodes = binary_nodes(&parsed);
+        let mut store = initialized_store();
+        let (boolean, number, string, null, undefined) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (
+                bootstrap.boolean_type,
+                bootstrap.number_type,
+                bootstrap.string_type,
+                bootstrap.null_widening_type,
+                bootstrap.undefined_widening_type,
+            )
+        };
+
+        for operator in [
+            SyntaxKind::EqualsEqualsToken,
+            SyntaxKind::ExclamationEqualsToken,
+            SyntaxKind::EqualsEqualsEqualsToken,
+            SyntaxKind::ExclamationEqualsEqualsToken,
+        ] {
+            for (left, right) in [
+                (null, null),
+                (null, undefined),
+                (undefined, null),
+                (undefined, undefined),
+                (number, null),
+                (null, number),
+                (string, undefined),
+                (undefined, string),
+            ] {
+                let resolution =
+                    check_primitive_binary(&mut store, request(nodes, operator, left, right))
+                        .unwrap();
+                assert_eq!(resolution.result_type, boolean);
+                assert_eq!(resolution.recovery, None);
+                assert!(resolution.diagnostics.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn unsigned_bigint_shift_reports_ts2365_and_retains_bigint_result() {
+        let parsed = parse_source_file("const value = left >>> right;");
+        assert!(parsed.diagnostics.is_empty());
+        let nodes = binary_nodes(&parsed);
+        let mut store = initialized_store();
+        let bigint = store.intrinsic_bootstrap().unwrap().bigint_type;
+
+        let resolution = check_primitive_binary(
+            &mut store,
+            request(
+                nodes,
+                SyntaxKind::GreaterThanGreaterThanGreaterThanToken,
+                bigint,
+                bigint,
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(resolution.result_type, bigint);
+        assert_eq!(resolution.recovery, None);
+        assert_eq!(
+            rendered(&resolution),
+            [(
+                nodes.expression,
+                2365,
+                "Operator '>>>' cannot be applied to types 'bigint' and 'bigint'.".to_owned(),
+            )]
+        );
+
+        let one = store
+            .regular_bigint_literal_type(PseudoBigInt::parse_valid("1n"))
+            .unwrap();
+        let two = store
+            .regular_bigint_literal_type(PseudoBigInt::parse_valid("2n"))
+            .unwrap();
+        let literal = check_primitive_binary(
+            &mut store,
+            request(
+                nodes,
+                SyntaxKind::GreaterThanGreaterThanGreaterThanToken,
+                one,
+                two,
+            ),
+        )
+        .unwrap();
+        assert_eq!(literal.result_type, bigint);
+        assert_eq!(
+            rendered(&literal),
+            [(
+                nodes.expression,
+                2365,
+                "Operator '>>>' cannot be applied to types '1n' and '2n'.".to_owned(),
+            )]
+        );
     }
 
     #[test]

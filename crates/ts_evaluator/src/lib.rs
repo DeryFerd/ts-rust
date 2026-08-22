@@ -497,11 +497,14 @@ impl<F: FnMut(NodeId) -> Evaluation> Evaluator<'_, F> {
         property: Property,
         optional: bool,
     ) -> Evaluation {
+        if !optional && self.is_entity_name_expression(expression) {
+            return (self.resolve_entity)(id);
+        }
         let base = self.evaluate(expression);
         let mut metadata = base.metadata;
         let base_value = match base.outcome {
             EvaluationOutcome::Value(value) => value,
-            EvaluationOutcome::Unknown(reason) if self.is_entity_name_expression(expression) => {
+            EvaluationOutcome::Unknown(_) if self.is_entity_name_expression(expression) => {
                 return (self.resolve_entity)(id);
             }
             outcome => return Evaluation { outcome, metadata },
@@ -856,6 +859,29 @@ mod tests {
             result.outcome,
             EvaluationOutcome::Unknown(UnknownReason::UnsupportedSyntax(_))
         ));
+    }
+
+    #[test]
+    fn resolves_qualified_entity_access_without_evaluating_its_receiver() {
+        for source in [
+            "Namespace.value;",
+            "Namespace['value'];",
+            "Outer.Inner.value;",
+        ] {
+            let (arena, expression) = parse_expression(source);
+            let mut resolved = Vec::new();
+            let result = evaluate_with(&arena, expression, &mut |reference| {
+                resolved.push(reference);
+                Evaluation::known(Value::Number(ts_jsnum::Number(42.0)))
+            });
+
+            assert_eq!(resolved, [expression], "{source}");
+            assert_eq!(
+                result.value(),
+                Some(&Value::Number(ts_jsnum::Number(42.0))),
+                "{source}"
+            );
+        }
     }
 
     #[test]
