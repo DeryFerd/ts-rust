@@ -470,7 +470,7 @@ mod tests {
 
     use super::*;
     use crate::semantic::{
-        CanonicalCheckerContext, CanonicalCheckerOptions, RelationUnavailable,
+        CanonicalCheckerContext, CanonicalCheckerOptions,
         bootstrap::{LiteralTypeCacheError, UnionReduction},
     };
 
@@ -828,14 +828,15 @@ mod tests {
             Ok(true),
             "array covariance recurses through a union containing a canonical array",
         );
-        assert!(matches!(
+        assert_eq!(
             store.is_type_assignable_to_with_global_types(
                 target_outer,
                 outer_literal,
                 &global_types,
             ),
-            Err(RelationUnavailable::UnsupportedStructuredType(_)),
-        ));
+            Ok(false),
+            "a wider array element union is not assignable to its narrower element type",
+        );
 
         let outer_record = store.type_payload(outer_literal).unwrap();
         let outer_symbol = outer_record.symbol();
