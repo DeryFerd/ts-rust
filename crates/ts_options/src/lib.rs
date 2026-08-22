@@ -85,6 +85,15 @@ pub enum NewLineKind {
     Crlf,
 }
 
+/// Diagnostic treatment for an unused label under `allowUnusedLabels`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum UnusedLabelReporting {
+    Ignore,
+    #[default]
+    Suggestion,
+    Error,
+}
+
 /// Normalized compiler options consumed by compiler subsystems.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[allow(clippy::struct_excessive_bools)]
@@ -148,6 +157,8 @@ pub struct CompilerOptions {
     pub no_resolve: bool,
     pub no_unchecked_indexed_access: bool,
     pub no_unchecked_side_effect_imports: bool,
+    /// Whether side-effect import checking was explicitly enabled or disabled.
+    pub no_unchecked_side_effect_imports_specified: bool,
     pub no_unused_locals: bool,
     pub no_unused_parameters: bool,
     pub preserve_const_enums: bool,
@@ -281,7 +292,8 @@ impl Default for CompilerOptions {
             no_property_access_from_index_signature: false,
             no_resolve: false,
             no_unchecked_indexed_access: false,
-            no_unchecked_side_effect_imports: false,
+            no_unchecked_side_effect_imports: true,
+            no_unchecked_side_effect_imports_specified: false,
             no_unused_locals: false,
             no_unused_parameters: false,
             preserve_const_enums: false,
@@ -406,6 +418,36 @@ impl CompilerOptions {
         if !self.use_unknown_in_catch_variables_specified {
             self.use_unknown_in_catch_variables = self.strict;
         }
+    }
+
+    /// Returns whether a source file is exempt from semantic diagnostics.
+    #[must_use]
+    pub const fn skips_type_checking(
+        &self,
+        is_declaration_file: bool,
+        is_default_library: bool,
+    ) -> bool {
+        self.no_check
+            || (self.skip_lib_check && is_declaration_file)
+            || (self.skip_default_lib_check && is_default_library)
+    }
+
+    /// Classifies unused-label diagnostics using TypeScript's three-state option.
+    #[must_use]
+    pub const fn unused_label_reporting(&self) -> UnusedLabelReporting {
+        match self.allow_unused_labels {
+            Some(true) => UnusedLabelReporting::Ignore,
+            Some(false) => UnusedLabelReporting::Error,
+            None => UnusedLabelReporting::Suggestion,
+        }
+    }
+
+    /// Tests whether imports from this source may retain TypeScript extensions.
+    #[must_use]
+    pub fn allows_importing_typescript_extensions_from(&self, source_file: &str) -> bool {
+        self.allow_importing_ts_extensions
+            || self.rewrite_relative_import_extensions
+            || ts_path::is_declaration_file(source_file)
     }
 
     /// Returns the automatic JSX runtime module selected by the emit mode.
@@ -651,6 +693,7 @@ impl CompilerOptions {
                 "nouncheckedsideeffectimports" => {
                     self.no_unchecked_side_effect_imports =
                         overrides.no_unchecked_side_effect_imports;
+                    self.no_unchecked_side_effect_imports_specified = true;
                 }
                 "nounusedlocals" => self.no_unused_locals = overrides.no_unused_locals,
                 "nounusedparameters" => self.no_unused_parameters = overrides.no_unused_parameters,
@@ -1293,6 +1336,8 @@ impl PartialOptions {
         let allow_js_specified = self.allow_js.is_some();
         let declaration_specified = self.declaration.is_some();
         let incremental_specified = self.incremental.is_some();
+        let no_unchecked_side_effect_imports_specified =
+            self.no_unchecked_side_effect_imports.is_some();
         let no_implicit_any_specified = self.no_implicit_any.is_some();
         let no_implicit_this_specified = self.no_implicit_this.is_some();
         let strict_specified = self.strict.is_some();
@@ -1399,9 +1444,8 @@ impl PartialOptions {
                 .unwrap_or(false),
             no_resolve: self.no_resolve.unwrap_or(false),
             no_unchecked_indexed_access: self.no_unchecked_indexed_access.unwrap_or(false),
-            no_unchecked_side_effect_imports: self
-                .no_unchecked_side_effect_imports
-                .unwrap_or(false),
+            no_unchecked_side_effect_imports: self.no_unchecked_side_effect_imports.unwrap_or(true),
+            no_unchecked_side_effect_imports_specified,
             no_unused_locals: self.no_unused_locals.unwrap_or(false),
             no_unused_parameters: self.no_unused_parameters.unwrap_or(false),
             preserve_const_enums: self.preserve_const_enums.unwrap_or(false),
@@ -1959,7 +2003,8 @@ mod tests {
 
     use super::{
         CompilerOptions, JsxEmit, ModuleDetectionKind, ModuleKind, ModuleResolutionKind,
-        NewLineKind, ScriptTarget, parse_compiler_options, parse_project_options,
+        NewLineKind, ScriptTarget, UnusedLabelReporting, parse_compiler_options,
+        parse_project_options,
     };
 
     fn object(entries: impl IntoIterator<Item = (&'static str, JsonValue)>) -> JsonValue {
@@ -2277,6 +2322,104 @@ mod tests {
         )]));
         assert!(disabled.is_ok(), "{:?}", disabled.diagnostics);
         assert!(!disabled.options.force_consistent_casing_in_file_names);
+    }
+
+    #[test]
+    fn side_effect_import_checking_defaults_on_and_retains_explicit_false() {
+        let defaults = CompilerOptions::default();
+        assert!(defaults.no_unchecked_side_effect_imports);
+        assert!(!defaults.no_unchecked_side_effect_imports_specified);
+
+        let parsed = parse_compiler_options(&object([]));
+        assert!(parsed.options.no_unchecked_side_effect_imports);
+        assert!(!parsed.options.no_unchecked_side_effect_imports_specified);
+
+        let disabled = parse_compiler_options(&object([(
+            "noUncheckedSideEffectImports",
+            JsonValue::Bool(false),
+        )]));
+        assert!(disabled.is_ok(), "{:?}", disabled.diagnostics);
+        assert!(!disabled.options.no_unchecked_side_effect_imports);
+        assert!(disabled.options.no_unchecked_side_effect_imports_specified);
+
+        let mut overridden = defaults;
+        overridden.apply_overrides(
+            &disabled.options,
+            &BTreeSet::from(["nouncheckedsideeffectimports".to_owned()]),
+        );
+        assert!(!overridden.no_unchecked_side_effect_imports);
+        assert!(overridden.no_unchecked_side_effect_imports_specified);
+    }
+
+    #[test]
+    fn unused_label_reporting_preserves_type_scripts_three_states() {
+        assert_eq!(
+            CompilerOptions::default().unused_label_reporting(),
+            UnusedLabelReporting::Suggestion
+        );
+        let ignored =
+            parse_compiler_options(&object([("allowUnusedLabels", JsonValue::Bool(true))]));
+        assert_eq!(
+            ignored.options.unused_label_reporting(),
+            UnusedLabelReporting::Ignore
+        );
+        let errors =
+            parse_compiler_options(&object([("allowUnusedLabels", JsonValue::Bool(false))]));
+        assert_eq!(
+            errors.options.unused_label_reporting(),
+            UnusedLabelReporting::Error
+        );
+    }
+
+    #[test]
+    fn skip_library_options_only_suppress_their_matching_source_categories() {
+        let defaults = CompilerOptions::default();
+        assert!(!defaults.skips_type_checking(false, false));
+        assert!(!defaults.skips_type_checking(true, true));
+
+        let default_only =
+            parse_compiler_options(&object([("skipDefaultLibCheck", JsonValue::Bool(true))]));
+        assert!(default_only.options.skips_type_checking(true, true));
+        assert!(!default_only.options.skips_type_checking(true, false));
+        assert!(!default_only.options.skips_type_checking(false, false));
+
+        let all_declarations =
+            parse_compiler_options(&object([("skipLibCheck", JsonValue::Bool(true))]));
+        assert!(all_declarations.options.skips_type_checking(true, true));
+        assert!(all_declarations.options.skips_type_checking(true, false));
+        assert!(!all_declarations.options.skips_type_checking(false, false));
+
+        let unchecked = parse_compiler_options(&object([("noCheck", JsonValue::Bool(true))]));
+        assert!(unchecked.options.skips_type_checking(false, false));
+    }
+
+    #[test]
+    fn declaration_sources_and_rewritten_imports_allow_typescript_extensions() {
+        let defaults = CompilerOptions::default();
+        assert!(!defaults.allows_importing_typescript_extensions_from("/project/main.ts"));
+        assert!(defaults.allows_importing_typescript_extensions_from("/project/main.d.ts"));
+        assert!(defaults.allows_importing_typescript_extensions_from("/project/main.d.mts"));
+
+        let rewritten = parse_compiler_options(&object([(
+            "rewriteRelativeImportExtensions",
+            JsonValue::Bool(true),
+        )]));
+        assert!(
+            rewritten
+                .options
+                .allows_importing_typescript_extensions_from("/project/main.ts")
+        );
+
+        let explicit = parse_compiler_options(&object([
+            ("allowImportingTsExtensions", JsonValue::Bool(true)),
+            ("noEmit", JsonValue::Bool(true)),
+        ]));
+        assert!(explicit.is_ok(), "{:?}", explicit.diagnostics);
+        assert!(
+            explicit
+                .options
+                .allows_importing_typescript_extensions_from("/project/main.ts")
+        );
     }
 
     #[test]
