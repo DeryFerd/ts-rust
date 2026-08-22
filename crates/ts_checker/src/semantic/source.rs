@@ -13566,7 +13566,7 @@ mod tests {
     }
 
     #[test]
-    fn optional_property_read_remains_an_atomic_capability_boundary() {
+    fn optional_property_read_publishes_strict_union_and_replays_warm() {
         let source = parsed(concat!(
             "interface Model { value?: string } ",
             "const object: Model = {}; ",
@@ -13574,18 +13574,56 @@ mod tests {
         ));
         let file = FileId::new(415);
         let access = variable_initializer(&source, file, "result");
-        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        let options = CanonicalCheckerOptions {
+            intrinsic: IntrinsicBootstrapOptions {
+                strict_null_checks: true,
+                exact_optional_property_types: false,
+            },
+            ..CanonicalCheckerOptions::default()
+        };
+        let mut context = context(&[(file, &source)], options);
 
+        context.check_source_file(file).unwrap();
+
+        let (string, undefined) = {
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            (bootstrap.string_type, bootstrap.undefined_or_missing_type)
+        };
+        let result = resolved_node_type(&context, access);
+        let TypeData::Union(union) = context.store().type_payload(result).unwrap().data() else {
+            panic!("strict optional property reads must produce a union")
+        };
+        assert_eq!(union.union.types.len(), 2);
+        assert!(union.union.types.contains(&string));
+        assert!(union.union.types.contains(&undefined));
         assert_eq!(
-            context.check_source_file(file),
-            Err(SourceCheckError::Unsupported(
-                UnsupportedSourceSyntax::Property(access)
-            ))
+            variable_value_type(&context, &source, file, "result"),
+            result
         );
-        assert!(context.store().type_node_links(access).is_none());
-        assert!(context.store().symbol_node_links(access).is_none());
+        let object = variable_value_type(&context, &source, file, "object");
+        let property = declared_object_property_symbol(&context, object, "value");
+        assert_eq!(
+            context
+                .store()
+                .symbol_node_links(access)
+                .and_then(|links| links.resolved_symbol),
+            Some(property)
+        );
         assert!(context.diagnostics().is_empty());
-        assert!(!is_type_checked(&context, file));
+        assert!(is_type_checked(&context, file));
+
+        let warm = observable_state(&context, file);
+        mark_source_unchecked(&mut context, file);
+        context.check_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+        assert_eq!(resolved_node_type(&context, access), result);
+        assert_eq!(
+            context
+                .store()
+                .symbol_node_links(access)
+                .and_then(|links| links.resolved_symbol),
+            Some(property)
+        );
     }
 
     #[test]
