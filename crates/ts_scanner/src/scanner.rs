@@ -1043,13 +1043,18 @@ impl<'a> Scanner<'a> {
                 pos += 1;
             }
             let digits = self.source.get(digits_start..pos)?;
-            if digits.is_empty()
-                || digits.len() > 6
-                || self.source.as_bytes().get(pos) != Some(&b'}')
-            {
+            if digits.is_empty() || self.source.as_bytes().get(pos) != Some(&b'}') {
                 return None;
             }
-            let code_point = u32::from_str_radix(digits, 16).ok()?;
+            let significant_digits = digits.trim_start_matches('0');
+            if significant_digits.len() > 6 {
+                return None;
+            }
+            let code_point = if significant_digits.is_empty() {
+                0
+            } else {
+                u32::from_str_radix(significant_digits, 16).ok()?
+            };
             Some((char::from_u32(code_point)?, pos + 1, true))
         } else {
             let end = pos + 4;
@@ -1655,7 +1660,10 @@ impl<'a> Scanner<'a> {
         {
             return false;
         }
-        marker == b'=' || bytes.get(pos + MARKER_LENGTH) == Some(&b' ')
+        let Some(&following) = bytes.get(pos + MARKER_LENGTH) else {
+            return false;
+        };
+        marker == b'=' || following == b' '
     }
 
     fn scan_conflict_marker(&mut self) {
@@ -2300,6 +2308,35 @@ mod tests {
     }
 
     #[test]
+    fn extended_identifier_escapes_allow_arbitrarily_many_leading_zeroes() {
+        let mut scanner = Scanner::new(
+            r"\u{00000069}f value\u{000000000000000000000062} #\u{00000063} \u{000001d49c}",
+        );
+
+        for (kind, value) in [
+            (SyntaxKind::IfKeyword, "if"),
+            (SyntaxKind::Identifier, "valueb"),
+            (SyntaxKind::PrivateIdentifier, "#c"),
+            (SyntaxKind::Identifier, "𝒜"),
+        ] {
+            let token = scanner.scan();
+            assert_eq!(token.kind, kind);
+            assert_eq!(token.value.unwrap().to_string_lossy(), value);
+            assert!(token.flags.contains(TokenFlags::EXTENDED_UNICODE_ESCAPE));
+        }
+        assert!(scanner.diagnostics().is_empty());
+
+        let mut jsx = Scanner::new(r"\u{00000061}-element");
+        assert_eq!(jsx.scan().kind, SyntaxKind::Identifier);
+        let identifier = jsx.scan_jsx_identifier();
+        assert_eq!(identifier.value.unwrap().to_string_lossy(), "a-element");
+
+        let mut invalid = Scanner::new(r"\u{0000110000}");
+        assert_eq!(invalid.scan().kind, SyntaxKind::Unknown);
+        assert_eq!(invalid.diagnostics()[0].code, Some(1127));
+    }
+
+    #[test]
     fn scans_unicode_identifier_continue_categories() {
         let name = "才能ソЫⅨर्क";
         let mut scanner = Scanner::new(name);
@@ -2834,6 +2871,32 @@ mod tests {
         assert_eq!(marker.text, "<<<<<<< HEAD");
         assert_eq!(scanner.scan().kind, SyntaxKind::NewLineTrivia);
         assert_eq!(scanner.scan().text, "value");
+    }
+
+    #[test]
+    fn seven_equals_at_eof_are_operators_instead_of_a_conflict_marker() {
+        assert_eq!(
+            kinds("======="),
+            vec![
+                SyntaxKind::EqualsEqualsEqualsToken,
+                SyntaxKind::EqualsEqualsEqualsToken,
+                SyntaxKind::EqualsToken,
+                SyntaxKind::EndOfFile,
+            ]
+        );
+
+        let mut scanner = Scanner::new("value\n=======");
+        while scanner.scan().kind != SyntaxKind::EndOfFile {}
+        assert!(scanner.diagnostics().is_empty());
+
+        for source in ["=======\n", "======= content"] {
+            let mut scanner = Scanner::new(source);
+            assert_eq!(scanner.scan().kind, SyntaxKind::EndOfFile);
+            let diagnostic = &scanner.diagnostics()[0];
+            assert_eq!(diagnostic.code, Some(1185));
+            assert_eq!(diagnostic.range.start.get(), 0);
+            assert_eq!(diagnostic.range.end.get(), 7);
+        }
     }
 
     #[test]
