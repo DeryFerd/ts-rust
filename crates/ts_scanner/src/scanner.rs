@@ -14,6 +14,13 @@ pub struct Token<'a> {
     pub value: Option<JsString>,
 }
 
+/// A suppression directive found in actual line or block comment trivia.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CommentDirective {
+    pub range: TextRange,
+    pub expect_error: bool,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct TokenFlags(u32);
 
@@ -54,6 +61,7 @@ impl TokenFlags {
 pub struct ScannerCheckpoint {
     byte_pos: usize,
     diagnostics_len: usize,
+    comment_directives_len: usize,
     skip_jsdoc_leading_asterisks: u32,
     last_full_start: usize,
     last_start: usize,
@@ -70,6 +78,7 @@ pub struct Scanner<'a> {
     skip_jsdoc_leading_asterisks: u32,
     language_variant: LanguageVariant,
     diagnostics: Vec<Diagnostic>,
+    comment_directives: Vec<CommentDirective>,
     last_full_start: usize,
     last_start: usize,
     last_kind: SyntaxKind,
@@ -94,6 +103,7 @@ impl<'a> Scanner<'a> {
             skip_jsdoc_leading_asterisks: 0,
             language_variant: LanguageVariant::Standard,
             diagnostics: Vec::new(),
+            comment_directives: Vec::new(),
             last_full_start: 0,
             last_start: 0,
             last_kind: SyntaxKind::Unknown,
@@ -107,9 +117,46 @@ impl<'a> Scanner<'a> {
         &self.diagnostics
     }
 
+    /// Returns directives collected from comments encountered so far.
+    #[must_use]
+    pub fn comment_directives(&self) -> &[CommentDirective] {
+        &self.comment_directives
+    }
+
+    /// Scans the remaining source while keeping template text out of comments.
+    pub fn scan_comment_directives(&mut self) -> &[CommentDirective] {
+        let mut template_brace_depths = Vec::<usize>::new();
+        loop {
+            let token = self.scan();
+            match token.kind {
+                SyntaxKind::EndOfFile => break,
+                SyntaxKind::TemplateHead => template_brace_depths.push(0),
+                SyntaxKind::OpenBraceToken => {
+                    if let Some(depth) = template_brace_depths.last_mut() {
+                        *depth += 1;
+                    }
+                }
+                SyntaxKind::CloseBraceToken => {
+                    if let Some(depth) = template_brace_depths.last_mut() {
+                        if *depth == 0 {
+                            if self.rescan_template_token().kind == SyntaxKind::TemplateTail {
+                                template_brace_depths.pop();
+                            }
+                        } else {
+                            *depth -= 1;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.comment_directives()
+    }
+
     pub fn set_text(&mut self, source: &'a str) {
         self.source = source;
         self.diagnostics.clear();
+        self.comment_directives.clear();
         self.skip_jsdoc_leading_asterisks = 0;
         self.reset_token_state(0);
     }
@@ -117,6 +164,7 @@ impl<'a> Scanner<'a> {
     pub fn reset(&mut self) {
         self.source = "";
         self.diagnostics.clear();
+        self.comment_directives.clear();
         self.skip_trivia = true;
         self.skip_jsdoc_leading_asterisks = 0;
         self.language_variant = LanguageVariant::Standard;
@@ -166,6 +214,7 @@ impl<'a> Scanner<'a> {
         ScannerCheckpoint {
             byte_pos: self.byte_pos,
             diagnostics_len: self.diagnostics.len(),
+            comment_directives_len: self.comment_directives.len(),
             skip_jsdoc_leading_asterisks: self.skip_jsdoc_leading_asterisks,
             last_full_start: self.last_full_start,
             last_start: self.last_start,
@@ -178,6 +227,8 @@ impl<'a> Scanner<'a> {
     pub fn rewind(&mut self, checkpoint: ScannerCheckpoint) {
         self.byte_pos = checkpoint.byte_pos;
         self.diagnostics.truncate(checkpoint.diagnostics_len);
+        self.comment_directives
+            .truncate(checkpoint.comment_directives_len);
         self.skip_jsdoc_leading_asterisks = checkpoint.skip_jsdoc_leading_asterisks;
         self.last_full_start = checkpoint.last_full_start;
         self.last_start = checkpoint.last_start;
@@ -294,17 +345,23 @@ impl<'a> Scanner<'a> {
             while self.peek().is_some_and(|next| !is_line_break(next)) {
                 self.bump();
             }
+            self.process_comment_directive(start, self.byte_pos, false);
             return Some((SyntaxKind::SingleLineCommentTrivia, flags, start));
         }
         if self.starts_with("/*") {
             let start = self.byte_pos;
+            let mut last_line_start = start;
             let is_jsdoc = self.starts_with("/**") && !self.starts_with("/**/");
             self.bump_ascii(2);
             while self.peek().is_some() && !self.starts_with("*/") {
-                if self.peek().is_some_and(is_line_break) {
+                let is_line_break = self.peek().is_some_and(is_line_break);
+                if is_line_break {
                     flags.insert(TokenFlags::PRECEDING_LINE_BREAK);
                 }
                 self.bump();
+                if is_line_break {
+                    last_line_start = self.byte_pos;
+                }
             }
             if self.starts_with("*/") {
                 self.bump_ascii(2);
@@ -316,6 +373,7 @@ impl<'a> Scanner<'a> {
                 flags.insert(TokenFlags::PRECEDING_JSDOC_COMMENT);
                 self.scan_jsdoc_tags(start, self.byte_pos, &mut flags);
             }
+            self.process_comment_directive(last_line_start, self.byte_pos, true);
             return Some((SyntaxKind::MultiLineCommentTrivia, flags, start));
         }
         None
@@ -355,19 +413,26 @@ impl<'a> Scanner<'a> {
                 self.bump();
             }
             if self.starts_with("//") {
+                let start = self.byte_pos;
                 self.bump_ascii(2);
                 while self.peek().is_some_and(|ch| !is_line_break(ch)) {
                     self.bump();
                 }
+                self.process_comment_directive(start, self.byte_pos, false);
             } else if self.starts_with("/*") {
                 let start = self.byte_pos;
+                let mut last_line_start = start;
                 let is_jsdoc = self.starts_with("/**") && !self.starts_with("/**/");
                 self.bump_ascii(2);
                 while self.peek().is_some() && !self.starts_with("*/") {
-                    if self.peek().is_some_and(is_line_break) {
+                    let is_line_break = self.peek().is_some_and(is_line_break);
+                    if is_line_break {
                         flags.insert(TokenFlags::PRECEDING_LINE_BREAK);
                     }
                     self.bump();
+                    if is_line_break {
+                        last_line_start = self.byte_pos;
+                    }
                 }
                 if self.starts_with("*/") {
                     self.bump_ascii(2);
@@ -378,6 +443,7 @@ impl<'a> Scanner<'a> {
                     flags.insert(TokenFlags::PRECEDING_JSDOC_COMMENT);
                     self.scan_jsdoc_tags(start, self.byte_pos, &mut flags);
                 }
+                self.process_comment_directive(last_line_start, self.byte_pos, true);
             } else if self.byte_pos == 0 && self.starts_with("#!") {
                 while self.peek().is_some_and(|ch| !is_line_break(ch)) {
                     self.bump();
@@ -394,6 +460,42 @@ impl<'a> Scanner<'a> {
             }
         }
         flags
+    }
+
+    fn process_comment_directive(&mut self, start: usize, end: usize, multiline: bool) {
+        let bytes = self.source.as_bytes();
+        let mut position = start;
+        if multiline {
+            while position < end && matches!(bytes[position], b' ' | b'\t') {
+                position += 1;
+            }
+            while position < end && matches!(bytes[position], b'/' | b'*') {
+                position += 1;
+            }
+        } else {
+            position += 2;
+            while position < end && bytes[position] == b'/' {
+                position += 1;
+            }
+        }
+        while position < end && matches!(bytes[position], b' ' | b'\t') {
+            position += 1;
+        }
+        if position >= end || bytes[position] != b'@' {
+            return;
+        }
+        let text = &self.source[position + 1..end];
+        let expect_error = if text.starts_with("ts-expect-error") {
+            true
+        } else if text.starts_with("ts-ignore") {
+            false
+        } else {
+            return;
+        };
+        self.comment_directives.push(CommentDirective {
+            range: TextRange::new(text_pos(start), text_pos(end)),
+            expect_error,
+        });
     }
 
     fn scan_jsdoc_tags(&self, start: usize, end: usize, flags: &mut TokenFlags) {
@@ -2465,6 +2567,110 @@ mod tests {
                 .contains(TokenFlags::PRECEDING_JSDOC_WITH_DEPRECATED)
         );
         assert_eq!(scanner.scan().kind, SyntaxKind::Identifier);
+    }
+
+    #[test]
+    fn collects_comment_directives_from_actual_line_and_block_comments() {
+        let source = concat!(
+            "const first = 1; // @ts-ignore trailing\r",
+            "/// @ts-expect-error detail\u{2028}",
+            "\u{feff}/* @ts-ignore */\u{2029}",
+            "value;",
+        );
+        let mut scanner = Scanner::new(source);
+        let actual = scanner
+            .scan_comment_directives()
+            .iter()
+            .map(|directive| {
+                (
+                    &source
+                        [directive.range.start.get() as usize..directive.range.end.get() as usize],
+                    directive.expect_error,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            actual,
+            vec![
+                ("// @ts-ignore trailing", false),
+                ("/// @ts-expect-error detail", true),
+                ("/* @ts-ignore */", false),
+            ]
+        );
+    }
+
+    #[test]
+    fn block_directives_are_recognized_only_on_their_final_physical_line() {
+        let source = concat!(
+            "/* @ts-ignore\n * ordinary */\n",
+            "/* ordinary\r * @ts-expect-error because */\n",
+            "/* ordinary\u{2028}\t* @ts-ignore */\n",
+            "/* ordinary\u{2029} * @ts-expect-error */\n",
+            "value;",
+        );
+        let mut scanner = Scanner::new(source);
+        let actual = scanner
+            .scan_comment_directives()
+            .iter()
+            .map(|directive| {
+                (
+                    &source
+                        [directive.range.start.get() as usize..directive.range.end.get() as usize],
+                    directive.expect_error,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            actual,
+            vec![
+                (" * @ts-expect-error because */", true),
+                ("\t* @ts-ignore */", false),
+                (" * @ts-expect-error */", true),
+            ]
+        );
+    }
+
+    #[test]
+    fn template_and_string_contents_do_not_create_comment_directives() {
+        let source = concat!(
+            "const quoted = '// @ts-ignore';\n",
+            "const plain = `// @ts-expect-error\ninside`;\n",
+            "const nested = `prefix ${ { key: `// @ts-ignore ${ 1 }` } } ",
+            "suffix\n// @ts-expect-error`;\n",
+            "const actual = `value ${ // @ts-ignore\n item }`;\n",
+        );
+        let mut scanner = Scanner::new(source);
+        let directives = scanner.scan_comment_directives();
+
+        assert_eq!(directives.len(), 1);
+        assert!(!directives[0].expect_error);
+        assert_eq!(
+            &source
+                [directives[0].range.start.get() as usize..directives[0].range.end.get() as usize],
+            "// @ts-ignore"
+        );
+    }
+
+    #[test]
+    fn comment_directives_follow_trivia_mode_checkpoints_and_text_resets() {
+        let mut scanner = Scanner::new("// @ts-ignore\nvalue");
+        scanner.set_skip_trivia(false);
+        let checkpoint = scanner.mark();
+        assert_eq!(scanner.scan().kind, SyntaxKind::SingleLineCommentTrivia);
+        assert_eq!(scanner.comment_directives().len(), 1);
+        scanner.rewind(checkpoint);
+        assert!(scanner.comment_directives().is_empty());
+        assert_eq!(scanner.scan().kind, SyntaxKind::SingleLineCommentTrivia);
+        assert_eq!(scanner.comment_directives().len(), 1);
+
+        scanner.set_text("// @ts-expect-error\nvalue");
+        assert!(scanner.comment_directives().is_empty());
+        assert_eq!(scanner.scan().kind, SyntaxKind::SingleLineCommentTrivia);
+        assert!(scanner.comment_directives()[0].expect_error);
+        scanner.reset();
+        assert!(scanner.comment_directives().is_empty());
     }
 
     #[test]
