@@ -700,6 +700,7 @@ fn valid_optional_element_type(
     if !expected.contains(&sentinel) {
         expected.push(sentinel);
     }
+    expected.sort_unstable();
     if expected.len() == 1 {
         return resolved == expected[0];
     }

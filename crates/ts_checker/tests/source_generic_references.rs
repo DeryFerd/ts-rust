@@ -246,6 +246,67 @@ fn local_generic_class_and_interface_references_share_exact_cold_and_warm_identi
 }
 
 #[test]
+fn generic_interface_declarations_keep_their_declared_target_until_members_are_needed() {
+    let parsed = parse_source_file(concat!(
+        "interface Box<T> { value: T; }\n",
+        "type TextBox = Box<string>;\n",
+    ));
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(2);
+    let mut context = context(&parsed, file);
+    let symbol = named_symbol(
+        &parsed,
+        file,
+        &context,
+        SyntaxKind::InterfaceDeclaration,
+        "Box",
+    );
+    let (alias, reference) = alias_parts(&parsed, file, &context, "TextBox");
+    let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+
+    let target = context.get_declared_type_of_symbol(symbol).unwrap();
+    let TypeData::Interface(interface) = context.store().type_payload(target).unwrap().data()
+    else {
+        panic!("a generic interface must retain its declared interface target")
+    };
+    assert_eq!(
+        interface
+            .reference
+            .resolved_type_arguments
+            .as_deref()
+            .map(<[_]>::len),
+        Some(1)
+    );
+    assert!(!interface.declared_members_resolved);
+
+    let instantiated = context.get_declared_type_of_symbol(alias).unwrap();
+    assert_direct_reference(&context, instantiated, target, &[string]);
+    assert_eq!(
+        context
+            .store()
+            .type_node_links(reference)
+            .and_then(|links| links.resolved_type),
+        Some(instantiated)
+    );
+
+    let warm = (
+        context.store().type_len(),
+        context.store().mapper_len(),
+        context.diagnostics().clone(),
+    );
+    assert_eq!(context.get_declared_type_of_symbol(symbol), Ok(target));
+    assert_eq!(context.get_declared_type_of_symbol(alias), Ok(instantiated));
+    assert_eq!(
+        (
+            context.store().type_len(),
+            context.store().mapper_len(),
+            context.diagnostics().clone(),
+        ),
+        warm
+    );
+}
+
+#[test]
 fn local_class_interface_reference_arity_diagnostics_are_pinned_and_idempotent() {
     let parsed = parse_source_file(concat!(
         "interface Box<T> {}\n",

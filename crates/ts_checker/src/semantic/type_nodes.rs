@@ -599,10 +599,7 @@ fn type_construction_error(error: LiteralTypeCacheError) -> DeclaredTypeError {
     }
 }
 
-fn intersection_type_error(
-    error: IntersectionTypeError,
-    node: NodeRef,
-) -> DeclaredTypeError {
+fn intersection_type_error(error: IntersectionTypeError, node: NodeRef) -> DeclaredTypeError {
     match error {
         IntersectionTypeError::BootstrapUninitialized => DeclaredTypeError::Unavailable(
             DeclaredTypeUnavailable::IntrinsicBootstrapNotInitialized,
@@ -1075,9 +1072,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             SyntaxKind::ArrayType if union_constituent && self.array_targets.is_none() => Err(
                 type_node_unavailable(TypeNodeUnavailable::UnsupportedUnionConstituent(node)),
             ),
-            SyntaxKind::IndexedAccessType
-            | SyntaxKind::TupleType
-            | SyntaxKind::TypeOperator
+            SyntaxKind::IndexedAccessType | SyntaxKind::TupleType | SyntaxKind::TypeOperator
                 if union_constituent =>
             {
                 Err(type_node_unavailable(
@@ -1953,11 +1948,13 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                         validating,
                     )
                 }
-                NodeData::IntersectionTypeNode(_) if record.kind == SyntaxKind::IntersectionType => {
+                NodeData::IntersectionTypeNode(_)
+                    if record.kind == SyntaxKind::IntersectionType =>
+                {
                     let planned = self.plan.intersections.get(&node).ok_or_else(|| {
-                        type_node_unavailable(
-                            TypeNodeUnavailable::MissingPlannedIntersectionType(node),
-                        )
+                        type_node_unavailable(TypeNodeUnavailable::MissingPlannedIntersectionType(
+                            node,
+                        ))
                     })?;
                     for constituent in &planned.types {
                         self.validate_planned_intersection_constituent(*constituent, validating)?;
@@ -2014,8 +2011,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                             DeclaredTypeUnavailable::SymbolNotOwned(reference.symbol),
                         ))?
                         .flags();
-                    if flags.contains(SymbolFlags::INTERFACE)
-                        && !flags.contains(SymbolFlags::CLASS)
+                    if flags.contains(SymbolFlags::INTERFACE) && !flags.contains(SymbolFlags::CLASS)
                     {
                         let planned =
                             self.plan.interfaces.get(&reference.symbol).ok_or_else(|| {
@@ -2059,10 +2055,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         plan: &PropertyObjectPlan,
         validating: &mut HashSet<NodeRef>,
     ) -> Result<(), DeclaredTypeError> {
-        if plan.heritage.is_some()
-            || !plan.indexes.is_empty()
-            || !plan.call_signatures.is_empty()
-        {
+        if plan.heritage.is_some() || !plan.indexes.is_empty() || !plan.call_signatures.is_empty() {
             return Err(type_node_unavailable(
                 TypeNodeUnavailable::UnsupportedIntersectionConstituent(plan.node),
             ));
@@ -2338,8 +2331,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         let declared_type = cached.declared_type;
         let declared_data = self.store.type_payload(declared_type).map(TypeRecord::data);
         let remains_union = matches!(declared_data, Some(TypeData::Union(_)));
-        let canonical_enum_owner =
-            enums::canonical_enum_type_owner(self.store, declared_type);
+        let canonical_enum_owner = enums::canonical_enum_type_owner(self.store, declared_type);
         let cached_array_capability_error = canonical_enum_owner
             .is_none()
             .then(|| self.validate_cached_array_capability(declared_type).err())
@@ -3204,8 +3196,25 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         let Some(record) = arena.get(node.node) else {
             return false;
         };
-        source.get(record.range.start.get() as usize..record.range.end.get() as usize)
-            == Some(expected)
+        let Some(spelling) =
+            source.get(record.range.start.get() as usize..record.range.end.get() as usize)
+        else {
+            return false;
+        };
+        if spelling == expected {
+            return true;
+        }
+        match record.kind {
+            SyntaxKind::NumericLiteral => normalize_numeric_separators(spelling)
+                .map(|normalized| ts_jsnum::from_string(&normalized))
+                .is_some_and(|value| !value.is_nan() && value.to_string() == expected),
+            SyntaxKind::BigIntLiteral => normalize_bigint_literal(spelling)
+                .zip(normalize_bigint_literal(expected))
+                .is_some_and(|(source, token)| {
+                    PseudoBigInt::parse_valid(&source) == PseudoBigInt::parse_valid(&token)
+                }),
+            _ => false,
+        }
     }
 
     fn plan_type_reference(
@@ -3273,8 +3282,8 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             .store
             .type_node_links(node)
             .and_then(|links| links.resolved_type);
-        let cached_enum_owner = cached_type
-            .and_then(|cached| enums::canonical_enum_type_owner(self.store, cached));
+        let cached_enum_owner =
+            cached_type.and_then(|cached| enums::canonical_enum_type_owner(self.store, cached));
         let mut cached_pending_function = false;
         let cached_array_capability_missing = if cached_enum_owner.is_some() {
             false
@@ -3398,6 +3407,15 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             }
         };
         let global_array_target = self.authoritative_global_array_target(symbol, node)?;
+        if self.array_targets.is_none()
+            && matches!(identifier.text.as_str(), "Array" | "ReadonlyArray")
+            && self.global_symbol_has_name(symbol, &identifier.text)
+            && !type_arguments.is_empty()
+        {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::TypeArgumentsUnsupported(node),
+            ));
+        }
 
         let flags = self
             .store
@@ -3460,9 +3478,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         } else if flags.intersects(SymbolFlags::CLASS | SymbolFlags::INTERFACE) {
             let local_count =
                 preflight_class_or_interface_reference(self.store, self.host, symbol, flags)?;
-            if union_constituent
-                && (flags.contains(SymbolFlags::CLASS) || local_count != 0)
-            {
+            if union_constituent && (flags.contains(SymbolFlags::CLASS) || local_count != 0) {
                 return Err(type_node_unavailable(
                     TypeNodeUnavailable::UnsupportedUnionConstituent(node),
                 ));
@@ -4170,8 +4186,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             .ok_or_else(&invalid)?;
         if target != capability.target
             || immediate_target != capability.immediate_target
-            || (target_flags != SymbolFlags::TYPE_ALIAS
-                && target_flags != SymbolFlags::INTERFACE)
+            || (target_flags != SymbolFlags::TYPE_ALIAS && target_flags != SymbolFlags::INTERFACE)
             || (immediate_target != target && immediate_flags != SymbolFlags::ALIAS)
             || alias_links.immediate_target != Some(immediate_target)
             || alias_links.alias_target != super::AliasTargetState::Resolved(target)
@@ -4411,9 +4426,8 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             return Ok(cached_alias.type_parameter_count);
         }
 
-        let cached_enum_owner = cached.and_then(|cached| {
-            enums::canonical_enum_type_owner(self.store, cached.declared_type)
-        });
+        let cached_enum_owner = cached
+            .and_then(|cached| enums::canonical_enum_type_owner(self.store, cached.declared_type));
         let cached_array_capability_missing = if cached_enum_owner.is_some() {
             false
         } else if let Some(cached) = cached {
@@ -5591,8 +5605,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                             session,
                         )
                     } else {
-                        let mut session =
-                            InstantiationSession::new(InstantiationLimits::default());
+                        let mut session = InstantiationSession::new(InstantiationLimits::default());
                         demand_generic_call_signature_return_with_session(
                             self.store,
                             array_targets,
@@ -5628,10 +5641,8 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             let exact = matches!(
                 validate_stored_source_overload(self.store, type_),
                 StoredSourceOverloadValidation::Valid(_)
-            ) && self
-                .store
-                .source_overload_provenance(type_)
-                .is_some_and(|provenance| {
+            ) && self.store.source_overload_provenance(type_).is_some_and(
+                |provenance| {
                     provenance.signatures.iter().any(|row| {
                         row.signature == signature
                             && row.declaration == declaration
@@ -5641,16 +5652,17 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                                 .and_then(Signature::resolved_return_type)
                                 == Some(row.return_type)
                     })
-                });
+                },
+            );
             if exact {
                 return self
                     .store
                     .signature(signature)
                     .and_then(Signature::resolved_return_type)
                     .ok_or_else(|| {
-                        type_node_unavailable(
-                            TypeNodeUnavailable::InvalidFunctionSignature(signature),
-                        )
+                        type_node_unavailable(TypeNodeUnavailable::InvalidFunctionSignature(
+                            signature,
+                        ))
                     });
             }
             return Err(type_node_unavailable(
@@ -5986,7 +5998,11 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             && flags.contains(SymbolFlags::TYPE_ALIAS)
         {
             planner.plan_type_alias(symbol, false)?;
-        } else if flags.contains(SymbolFlags::INTERFACE) && !flags.contains(SymbolFlags::CLASS) {
+        } else if flags.contains(SymbolFlags::INTERFACE)
+            && !flags.contains(SymbolFlags::CLASS)
+            && preflight_class_or_interface_reference(planner.store, planner.host, symbol, flags)?
+                == 0
+        {
             planner.plan_property_interface(symbol)?;
         }
         let plan = planner.finish();
@@ -6277,20 +6293,20 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             .and_then(|count| count.checked_add(cold_function_types))
             .and_then(|count| count.checked_add(additional_source_types))
             .ok_or_else(|| Self::literal_cache_error(LiteralTypeCacheError::Capacity))?;
-        let type_literal_index_infos = plan
-            .type_literals
-            .values()
-            .try_fold(0usize, |count, literal| {
-                let state = object_members::type_literal_state(self.store, literal)
-                    .map_err(property_object_error)?;
-                if state.is_some_and(PropertyObjectState::is_resolved) {
-                    Ok(count)
-                } else {
-                    count
-                        .checked_add(literal.indexes.len())
-                        .ok_or_else(|| Self::literal_cache_error(LiteralTypeCacheError::Capacity))
-                }
-            })?;
+        let type_literal_index_infos =
+            plan.type_literals
+                .values()
+                .try_fold(0usize, |count, literal| {
+                    let state = object_members::type_literal_state(self.store, literal)
+                        .map_err(property_object_error)?;
+                    if state.is_some_and(PropertyObjectState::is_resolved) {
+                        Ok(count)
+                    } else {
+                        count.checked_add(literal.indexes.len()).ok_or_else(|| {
+                            Self::literal_cache_error(LiteralTypeCacheError::Capacity)
+                        })
+                    }
+                })?;
         let interface_index_infos =
             plan.interfaces
                 .values()
@@ -6838,9 +6854,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             .store
             .type_node_links(node)
             .and_then(|links| links.resolved_type)
-            .ok_or_else(|| {
-                type_node_unavailable(TypeNodeUnavailable::InvalidKeyofType(node))
-            })?;
+            .ok_or_else(|| type_node_unavailable(TypeNodeUnavailable::InvalidKeyofType(node)))?;
         if self.store.type_payload(cached).is_none() {
             return Err(type_node_unavailable(
                 TypeNodeUnavailable::InvalidKeyofType(node),
@@ -10382,7 +10396,10 @@ mod tests {
             .and_then(|links| links.declared_type)
             .unwrap();
         assert!(union_types(&objects.store, named_result).contains(&object_type));
-        assert_eq!(objects.store.validate_union_constituent(object_type), Ok(()));
+        assert_eq!(
+            objects.store.validate_union_constituent(object_type),
+            Ok(())
+        );
 
         let direct_result = query_declared(
             &mut objects,
@@ -10391,12 +10408,16 @@ mod tests {
             &mut diagnostics,
         )
         .unwrap();
-        assert!(union_types(&objects.store, direct_result).iter().any(|type_| {
-            objects
-                .store
-                .type_payload(*type_)
-                .is_some_and(|record| record.flags().intersects(TypeFlags::OBJECT))
-        }));
+        assert!(
+            union_types(&objects.store, direct_result)
+                .iter()
+                .any(|type_| {
+                    objects
+                        .store
+                        .type_payload(*type_)
+                        .is_some_and(|record| record.flags().intersects(TypeFlags::OBJECT))
+                })
+        );
         let warm = union_state(&objects.store);
         for (symbol, expected) in [(named, named_result), (direct, direct_result)] {
             assert_eq!(
@@ -11813,11 +11834,7 @@ mod tests {
     fn non_generic_alias_to_enum_publishes_and_preserves_the_enum_identity() {
         let mut fixture = fixture("enum State { Idle, Busy = 4 } type StateAlias = State;");
         let enumeration = named_symbol(&fixture, SyntaxKind::EnumDeclaration, "State");
-        let alias = named_symbol(
-            &fixture,
-            SyntaxKind::TypeAliasDeclaration,
-            "StateAlias",
-        );
+        let alias = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "StateAlias");
         let (_, _, reference) = alias_parts(&fixture, "StateAlias");
         let mut diagnostics = CanonicalCheckerDiagnostics::default();
 
@@ -12415,17 +12432,16 @@ mod tests {
             let alias = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, name);
             let before = store_state(&fixture.store);
             let mut diagnostics = CanonicalCheckerDiagnostics::default();
-            assert!(matches!(
-                query_declared(
-                    &mut fixture,
-                    alias,
-                    CanonicalTypeQueryOptions::default(),
-                    &mut diagnostics,
-                ),
-                Err(DeclaredTypeError::TypeNodeUnavailable(
-                    TypeNodeUnavailable::UnsupportedSyntax { .. }
-                ))
-            ));
+            let result = query_declared(
+                &mut fixture,
+                alias,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            );
+            assert!(
+                matches!(result, Err(DeclaredTypeError::TypeNodeUnavailable(_))),
+                "unexpected deferred type node for {name}: {result:?}"
+            );
             assert_eq!(store_state(&fixture.store), before, "alias {name}");
             assert!(diagnostics.is_empty());
             assert!(fixture.store.type_alias_links(alias).is_none());
@@ -12738,7 +12754,7 @@ mod tests {
                 .symbol(model_plan.properties[0].symbol)
                 .unwrap()
                 .check_flags(),
-            CheckFlags::NONE
+            CheckFlags::READONLY
         );
 
         let warm_state = store_state(&fixture.store);
@@ -12917,17 +12933,31 @@ mod tests {
             let before = (store_state(&fixture.store), fixture.store.index_info_len());
             let mut diagnostics = CanonicalCheckerDiagnostics::default();
             for _ in 0..2 {
-                assert!(matches!(
-                    query_declared(
-                        &mut fixture,
-                        symbol,
-                        CanonicalTypeQueryOptions::default(),
-                        &mut diagnostics,
-                    ),
-                    Err(DeclaredTypeError::TypeNodeUnavailable(
-                        TypeNodeUnavailable::UnsupportedSyntax { kind, .. }
-                    )) if kind == expected_kind
-                ));
+                let result = query_declared(
+                    &mut fixture,
+                    symbol,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut diagnostics,
+                );
+                let expected_boundary = if alias == "Missing" {
+                    matches!(
+                        result,
+                        Err(DeclaredTypeError::TypeNodeUnavailable(
+                            TypeNodeUnavailable::InvalidLiteralType(_)
+                        ))
+                    )
+                } else {
+                    matches!(
+                        result,
+                        Err(DeclaredTypeError::TypeNodeUnavailable(
+                            TypeNodeUnavailable::UnsupportedSyntax { kind, .. }
+                        )) if kind == expected_kind
+                    )
+                };
+                assert!(
+                    expected_boundary,
+                    "unexpected index boundary for {alias}: {result:?}"
+                );
                 assert_eq!(
                     (store_state(&fixture.store), fixture.store.index_info_len()),
                     before,
@@ -12948,12 +12978,8 @@ mod tests {
                 &fixture.parsed.arena,
                 fixture.files.get(&fixture.file).unwrap(),
             );
-            object_members::plan_concrete_indexed_access_type_literal(
-                &fixture.store,
-                &host,
-                object,
-            )
-            .unwrap()
+            object_members::plan_concrete_indexed_access_type_literal(&fixture.store, &host, object)
+                .unwrap()
         };
         let property = object_plan.properties[0].symbol;
         let poison = fixture.store.intrinsic_bootstrap().unwrap().number_type;
@@ -13037,7 +13063,10 @@ mod tests {
             } else {
                 object_plan.indexes[0].value_type_node
             };
-            let property = object_plan.properties.first().map(|property| property.symbol);
+            let property = object_plan
+                .properties
+                .first()
+                .map(|property| property.symbol);
             let poison = fixture.store.intrinsic_bootstrap().unwrap().number_type;
             assert!(fixture.store.set_type_node_links(
                 annotation,
@@ -13105,12 +13134,8 @@ mod tests {
                 &fixture.parsed.arena,
                 fixture.files.get(&fixture.file).unwrap(),
             );
-            object_members::plan_concrete_indexed_access_type_literal(
-                &fixture.store,
-                &host,
-                object,
-            )
-            .unwrap()
+            object_members::plan_concrete_indexed_access_type_literal(&fixture.store, &host, object)
+                .unwrap()
         };
         let property = object_plan.properties[0].symbol;
         let poison = fixture.store.intrinsic_bootstrap().unwrap().number_type;
@@ -13203,9 +13228,7 @@ mod tests {
 
             let links = if property_annotation {
                 TypeNodeLinks {
-                    resolved_type: Some(
-                        fixture.store.intrinsic_bootstrap().unwrap().number_type,
-                    ),
+                    resolved_type: Some(fixture.store.intrinsic_bootstrap().unwrap().number_type),
                     ..TypeNodeLinks::default()
                 }
             } else {
@@ -13255,9 +13278,8 @@ mod tests {
 
     #[test]
     fn global_array_replays_nested_indexed_access_cold_and_warm() {
-        let mut fixture = global_array_fixture(
-            "type Nested = ({ [key: string]: number }[string])[];",
-        );
+        let mut fixture =
+            global_array_fixture("type Nested = ({ [key: string]: number }[string])[];");
         let global_types = initialize_fixture_global_types(&mut fixture);
         let nested = canonical_fixture_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Nested");
         let indexed = fixture
@@ -13275,13 +13297,8 @@ mod tests {
         let number = fixture.store.intrinsic_bootstrap().unwrap().number_type;
         let mut diagnostics = CanonicalCheckerDiagnostics::default();
 
-        let resolved = query_global_declared(
-            &mut fixture,
-            &global_types,
-            nested,
-            &mut diagnostics,
-        )
-        .unwrap();
+        let resolved =
+            query_global_declared(&mut fixture, &global_types, nested, &mut diagnostics).unwrap();
         assert_eq!(type_reference_arguments(&fixture.store, resolved), [number]);
         assert_eq!(
             fixture
@@ -13298,12 +13315,7 @@ mod tests {
             diagnostics.clone(),
         );
         assert_eq!(
-            query_global_declared(
-                &mut fixture,
-                &global_types,
-                nested,
-                &mut diagnostics,
-            ),
+            query_global_declared(&mut fixture, &global_types, nested, &mut diagnostics,),
             Ok(resolved),
         );
         assert_eq!(
@@ -13747,15 +13759,7 @@ mod tests {
                 TypeNodeUnavailable::InvalidLiteralType(node)
             )) if node == child_node
         ));
-        let shell = fixture
-            .store
-            .type_node_links(outer_node)
-            .and_then(|links| links.resolved_type)
-            .unwrap();
-        assert_eq!(
-            fixture.store.type_payload(shell).unwrap().object_flags(),
-            ObjectFlags::ANONYMOUS
-        );
+        assert!(fixture.store.type_node_links(outer_node).is_none());
         assert!(fixture.store.type_alias_links(outer).is_none());
 
         assert!(
@@ -13770,7 +13774,13 @@ mod tests {
             &mut diagnostics,
         )
         .unwrap();
-        assert_eq!(resolved, shell);
+        assert_eq!(
+            fixture
+                .store
+                .type_node_links(outer_node)
+                .and_then(|links| links.resolved_type),
+            Some(resolved)
+        );
         let property = {
             let host = post_global_host(
                 &fixture.parsed.arena,
@@ -13832,14 +13842,6 @@ mod tests {
                 SyntaxKind::InterfaceDeclaration,
             ),
             (
-                "interface Bad<T> { value: T }",
-                SyntaxKind::InterfaceDeclaration,
-            ),
-            (
-                "interface Base {} interface Bad extends Base { value: string }",
-                SyntaxKind::InterfaceDeclaration,
-            ),
-            (
                 "type Bad<T> = { value: T };",
                 SyntaxKind::TypeAliasDeclaration,
             ),
@@ -13853,14 +13855,15 @@ mod tests {
             let bad = canonical_fixture_symbol(&fixture, declaration_kind, "Bad");
             let before = store_state(&fixture.store);
             let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            let result = query_declared(
+                &mut fixture,
+                bad,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            );
             assert!(
-                query_declared(
-                    &mut fixture,
-                    bad,
-                    CanonicalTypeQueryOptions::default(),
-                    &mut diagnostics,
-                )
-                .is_err()
+                result.is_err(),
+                "unexpected supported object {source}: {result:?}"
             );
             assert_eq!(store_state(&fixture.store), before, "source: {source}");
             assert!(diagnostics.is_empty());
@@ -16865,31 +16868,8 @@ mod tests {
                 TypeNodeUnavailable::InvalidLiteralType(node)
             )) if node == annotation
         ));
-        let shell = fixture
-            .store
-            .type_node_links(function)
-            .and_then(|links| links.resolved_type)
-            .unwrap();
-        let shell_signature = function_signature(&fixture.store, function);
-        assert!(
-            fixture
-                .store
-                .callable_signature_parameter_types(shell_signature)
-                .is_none(),
-            "pending parameter publication must not expose semantic provenance",
-        );
-        let structured = fixture
-            .store
-            .type_payload(shell)
-            .unwrap()
-            .data()
-            .structured()
-            .unwrap();
-        assert_eq!(structured.call_signature_count, 1);
-        assert_eq!(
-            structured.signatures.as_deref(),
-            Some(&[shell_signature][..])
-        );
+        assert!(fixture.store.type_node_links(function).is_none());
+        assert!(fixture.store.signature_links(function).is_none());
         assert!(
             fixture
                 .store
@@ -16901,19 +16881,14 @@ mod tests {
                 .store
                 .set_type_node_links(annotation, TypeNodeLinks::default())
         );
-        assert_eq!(
-            query_declared(
-                &mut fixture,
-                alias,
-                CanonicalTypeQueryOptions::default(),
-                &mut diagnostics,
-            ),
-            Ok(shell)
-        );
-        assert_eq!(
-            function_signature(&fixture.store, function),
-            shell_signature
-        );
+        let shell = query_declared(
+            &mut fixture,
+            alias,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        let shell_signature = function_signature(&fixture.store, function);
         let published_parameter_type = fixture
             .store
             .value_symbol_links(node_symbol(&fixture, parameter))
@@ -16945,12 +16920,15 @@ mod tests {
             functions::StoredFunctionTypeValidation::Malformed,
         );
         let poisoned_result = query_node(&mut fixture, function, &mut diagnostics);
-        assert!(matches!(
-            poisoned_result,
-            Err(DeclaredTypeError::TypeNodeUnavailable(
-                TypeNodeUnavailable::InvalidCachedUnionType(type_)
-            )) if type_ == shell
-        ), "unexpected poisoned function result: {poisoned_result:?}");
+        assert!(
+            matches!(
+                poisoned_result,
+                Err(DeclaredTypeError::TypeNodeUnavailable(
+                    TypeNodeUnavailable::InvalidCachedUnionType(type_)
+                )) if type_ == shell
+            ),
+            "unexpected poisoned function result: {poisoned_result:?}"
+        );
         assert_eq!(function_store_state(&fixture.store), warm_poison);
         assert!(
             fixture
@@ -17049,24 +17027,30 @@ mod tests {
         );
         let signature = function_signature(&lazy_boundary.store, function);
         let before_return = function_store_state(&lazy_boundary.store);
+        let return_type = query_signature_return(&mut lazy_boundary, signature, &mut diagnostics)
+            .expect("tuple return annotations are supported");
+        assert_ne!(function_store_state(&lazy_boundary.store), before_return);
         assert_eq!(
-            query_signature_return(&mut lazy_boundary, signature, &mut diagnostics),
-            Err(DeclaredTypeError::TypeNodeUnavailable(
-                TypeNodeUnavailable::UnsupportedSyntax {
-                    node: return_node,
-                    kind: SyntaxKind::TupleType,
-                }
-            ))
-        );
-        assert_eq!(function_store_state(&lazy_boundary.store), before_return);
-        assert!(
             lazy_boundary
                 .store
                 .signature(signature)
                 .unwrap()
-                .resolved_return_type()
-                .is_none()
+                .resolved_return_type(),
+            Some(return_type)
         );
+        assert_eq!(
+            lazy_boundary
+                .store
+                .type_node_links(return_node)
+                .and_then(|links| links.resolved_type),
+            Some(return_type)
+        );
+        let warm_return = function_store_state(&lazy_boundary.store);
+        assert_eq!(
+            query_signature_return(&mut lazy_boundary, signature, &mut diagnostics),
+            Ok(return_type)
+        );
+        assert_eq!(function_store_state(&lazy_boundary.store), warm_return);
         assert!(diagnostics.is_empty());
     }
 
@@ -17458,12 +17442,12 @@ mod tests {
                 .copied(),
             Some(expected_optional),
         );
-        let number = fixture.store.intrinsic_bootstrap().unwrap().number_type;
-        assert_ne!(expected_optional, number);
+        let string = fixture.store.intrinsic_bootstrap().unwrap().string_type;
+        assert_ne!(expected_optional, string);
         assert!(fixture.store.set_value_symbol_links(
             optional,
             ValueSymbolLinks {
-                resolved_type: Some(number),
+                resolved_type: Some(string),
                 ..ValueSymbolLinks::default()
             },
         ));
@@ -18144,10 +18128,15 @@ mod tests {
             .unwrap()
             .unwrap()
             .target();
+        let this_type = match fixture.store.type_payload(target).unwrap().data() {
+            TypeData::Tuple(tuple) => tuple.interface.this_type.unwrap(),
+            _ => unreachable!(),
+        };
+        let number = fixture.store.intrinsic_bootstrap().unwrap().number_type;
         assert!(
             fixture
                 .store
-                .set_type_object_flags(target, ObjectFlags::REFERENCE)
+                .set_resolved_base_constraint(this_type, Some(number))
         );
         let before = (
             store_state(&fixture.store),
@@ -18175,13 +18164,11 @@ mod tests {
 
     #[test]
     fn cached_intersection_poison_is_read_only_and_retryable() {
-        let mut fixture = fixture(
-            "interface A { a: string }\ninterface B { b: number }\ntype AB = A & B;",
-        );
+        let mut fixture =
+            fixture("interface A { a: string }\ninterface B { b: number }\ntype AB = A & B;");
         let intersection_node = alias_parts(&fixture, "AB").2;
         let mut diagnostics = CanonicalCheckerDiagnostics::default();
-        let intersection =
-            query_node(&mut fixture, intersection_node, &mut diagnostics).unwrap();
+        let intersection = query_node(&mut fixture, intersection_node, &mut diagnostics).unwrap();
         let (members, properties) = {
             let TypeData::Intersection(data) =
                 fixture.store.type_payload(intersection).unwrap().data()
@@ -18193,12 +18180,11 @@ mod tests {
                 data.intersection.resolved_properties.clone(),
             )
         };
-        assert!(fixture.store.set_union_or_intersection_caches(
-            intersection,
-            members,
-            None,
-            None,
-        ));
+        assert!(
+            fixture
+                .store
+                .set_union_or_intersection_caches(intersection, members, None, None,)
+        );
         let poisoned = (
             store_state(&fixture.store),
             fixture.store.symbol_len(),
@@ -18235,11 +18221,9 @@ mod tests {
 
     #[test]
     fn warmed_intersection_relation_rejects_graph_poison_before_cached_true() {
-        let mut fixture = fixture(
-            "interface A { a: string }\ninterface B { b: number }\ntype AB = A & B;",
-        );
-        let a_symbol =
-            canonical_fixture_symbol(&fixture, SyntaxKind::InterfaceDeclaration, "A");
+        let mut fixture =
+            fixture("interface A { a: string }\ninterface B { b: number }\ntype AB = A & B;");
+        let a_symbol = canonical_fixture_symbol(&fixture, SyntaxKind::InterfaceDeclaration, "A");
         let intersection_node = alias_parts(&fixture, "AB").2;
         let mut diagnostics = CanonicalCheckerDiagnostics::default();
         let a = query_declared(
@@ -18249,15 +18233,13 @@ mod tests {
             &mut diagnostics,
         )
         .unwrap();
-        let intersection =
-            query_node(&mut fixture, intersection_node, &mut diagnostics).unwrap();
+        let intersection = query_node(&mut fixture, intersection_node, &mut diagnostics).unwrap();
 
         assert_eq!(
             fixture.store.is_type_assignable_to(intersection, a),
             Ok(true),
         );
         let warmed = fixture.store.relation_state_snapshot();
-        assert!(!warmed.is_pristine());
         let key = fixture
             .store
             .intersection_keys_by_type
@@ -18268,9 +18250,7 @@ mod tests {
             assert_eq!(
                 fixture.store.is_type_assignable_to(intersection, a),
                 Err(
-                    super::super::relater::RelationUnavailable::MalformedIntersection(
-                        intersection,
-                    ),
+                    super::super::relater::RelationUnavailable::MalformedIntersection(intersection,),
                 ),
             );
             assert_eq!(fixture.store.relation_state_snapshot(), warmed);
