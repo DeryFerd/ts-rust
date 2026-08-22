@@ -5964,6 +5964,9 @@ impl DeclarationPrinter<'_> {
                     self.emit_name(name)?;
                 }
                 self.emit_type_parameters(data.type_parameters.as_ref())?;
+                if self.javascript_source && data.type_parameters.is_none() {
+                    self.emit_jsdoc_template_parameters(id);
+                }
                 let semantic_signature = self.semantic_function_signature(id);
                 let jsdoc_return_type = self
                     .javascript_source
@@ -5976,9 +5979,12 @@ impl DeclarationPrinter<'_> {
                         })
                     })
                     .and_then(|comment| {
-                        comment
-                            .lines()
-                            .find_map(|line| Self::jsdoc_return_type(Self::jsdoc_tag_line(line)))
+                        comment.lines().find_map(|line| {
+                            let tag = Self::jsdoc_tag_line(line);
+                            tag.find("@returns")
+                                .or_else(|| tag.find("@return"))
+                                .and_then(|start| Self::jsdoc_return_type(&tag[start..]))
+                        })
                     });
                 if let Some(signature) = &semantic_signature {
                     self.emit_declaration_parameters(&data.parameters, signature, id)?;
@@ -11461,7 +11467,14 @@ impl DeclarationPrinter<'_> {
             let expando_assignments = declaration_name_text(self.arena, declaration.name)
                 .map(|name| self.variable_static_assignments(name))
                 .unwrap_or_default();
-            if let Some(initializer) = declaration.initializer
+            if self.javascript_source
+                && let Some(hint) = node
+                    .parent
+                    .and_then(|statement| self.jsdoc_type_hint(statement))
+            {
+                self.writer.write(": ");
+                self.emit_jsdoc_type_hint(&hint);
+            } else if let Some(initializer) = declaration.initializer
                 && !expando_assignments.is_empty()
                 && matches!(
                     self.arena.get(initializer).map(|node| &node.data),
@@ -14993,6 +15006,14 @@ impl DeclarationPrinter<'_> {
         if !self.javascript_source {
             return Ok(false);
         }
+        if self
+            .arena
+            .get(list)
+            .and_then(|list| list.parent)
+            .is_some_and(|statement| self.jsdoc_type_hint(statement).is_some())
+        {
+            return Ok(false);
+        }
         let Some(NodeData::VariableDeclarationList(list)) =
             self.arena.get(list).map(|node| &node.data)
         else {
@@ -15018,6 +15039,12 @@ impl DeclarationPrinter<'_> {
         }
         if declarations
             .iter()
+            .any(|declaration| !self.javascript_object_has_namespace_members(*declaration))
+        {
+            return Ok(false);
+        }
+        if declarations
+            .iter()
             .any(|declaration| self.javascript_object_has_divergent_accessors(*declaration))
         {
             return Ok(false);
@@ -15032,6 +15059,33 @@ impl DeclarationPrinter<'_> {
             )?;
         }
         Ok(true)
+    }
+
+    fn javascript_object_has_namespace_members(&self, declaration: NodeId) -> bool {
+        let Some(NodeData::VariableDeclaration(declaration)) =
+            self.arena.get(declaration).map(|node| &node.data)
+        else {
+            return false;
+        };
+        let Some(NodeData::ObjectLiteralExpression(object)) = declaration
+            .initializer
+            .and_then(|initializer| self.arena.get(initializer))
+            .map(|node| &node.data)
+        else {
+            return false;
+        };
+        object.properties.nodes.iter().any(|property| {
+            match self.arena.get(*property).map(|node| &node.data) {
+                Some(NodeData::GetAccessorDeclaration(_) | NodeData::SetAccessorDeclaration(_)) => {
+                    true
+                }
+                Some(NodeData::PropertyAssignment(property)) => matches!(
+                    self.arena.get(property.initializer).map(|node| &node.data),
+                    Some(NodeData::ArrowFunction(_) | NodeData::FunctionExpression(_))
+                ),
+                _ => false,
+            }
+        })
     }
 
     fn javascript_object_has_divergent_accessors(&self, declaration: NodeId) -> bool {
@@ -15598,7 +15652,11 @@ impl DeclarationPrinter<'_> {
                 self.writer.write("...");
             }
             self.emit_declaration_binding_name(parameter.name)?;
-            let type_id = signature.parameters.get(index).copied();
+            let type_id = if parameter.dot_dot_dot_token.is_some() {
+                signature.rest_parameter
+            } else {
+                signature.parameters.get(index).copied()
+            };
             let precedes_required = self.parameter_precedes_required(parameters, index);
             let optional = parameter.question_token.is_some()
                 || (parameter.initializer.is_some() && !precedes_required)
@@ -15729,7 +15787,8 @@ impl DeclarationPrinter<'_> {
             }
             previous_end = node.range.end.get();
         }
-        if let Some(rest) = signature.rest_parameter
+        if !self.javascript_source
+            && let Some(rest) = signature.rest_parameter
             && !parameters.nodes.iter().any(|parameter| {
                 matches!(
                     self.arena.get(*parameter).map(|node| &node.data),
@@ -16550,6 +16609,7 @@ impl DeclarationPrinter<'_> {
                 } else {
                     tag
                 };
+                let tag = tag.split_once('@').map_or(tag, |(names, _)| names);
                 Some(
                     tag.split([',', ' ', '\t'])
                         .filter(|name| !name.is_empty())
@@ -17128,7 +17188,9 @@ impl DeclarationPrinter<'_> {
                 .trim_start_matches('*')
                 .trim()
                 .trim_end_matches("*/")
-                .trim()
+                .trim();
+            let tag = tag
+                .get(tag.find("@param")?..)?
                 .strip_prefix("@param")?
                 .trim_start();
             let tag = tag.strip_prefix('{')?;
@@ -17164,14 +17226,17 @@ impl DeclarationPrinter<'_> {
             return false;
         };
         comment.lines().any(|line| {
-            let Some(tag) = line
+            let line = line
                 .trim()
                 .trim_start_matches("/**")
                 .trim_start_matches('*')
                 .trim()
                 .trim_end_matches("*/")
-                .trim()
-                .strip_prefix("@param")
+                .trim();
+            let Some(tag) = line
+                .find("@param")
+                .and_then(|start| line.get(start..))
+                .and_then(|tag| tag.strip_prefix("@param"))
             else {
                 return false;
             };
@@ -18642,7 +18707,9 @@ impl DeclarationPrinter<'_> {
             self.emit_semantic_property_name(&name);
             self.writer.write(": ");
             let mut jsdoc_optional = false;
-            if let Some(hint) = self.jsdoc_type_hint(assignment) {
+            let explicit_jsdoc_type = self.jsdoc_type_hint(assignment);
+            let has_explicit_jsdoc_type = explicit_jsdoc_type.is_some();
+            if let Some(hint) = explicit_jsdoc_type {
                 self.writer.write(&hint);
             } else if let Some(hint) =
                 self.javascript_assignment_parameter_hint(assignment, member_id)
@@ -18668,7 +18735,9 @@ impl DeclarationPrinter<'_> {
             } else {
                 self.writer.write("any");
             }
-            if jsdoc_optional || class_type.optional_properties.contains(&name) {
+            if jsdoc_optional
+                || (!has_explicit_jsdoc_type && class_type.optional_properties.contains(&name))
+            {
                 self.writer.write(" | undefined");
             }
             self.writer.write(";");
@@ -87615,6 +87684,107 @@ class Board {
     }
 
     #[test]
+    fn javascript_arguments_do_not_synthesize_declaration_rest_parameters() {
+        let source = concat!(
+            "function free(value) { arguments; }\n",
+            "class Method {\n",
+            "    call() {\n",
+            "        /** @type object */\n",
+            "        this.value = arguments;\n",
+            "    }\n",
+            "}\n",
+            "class Constructed {\n",
+            "    constructor() {\n",
+            "        /** @type object */\n",
+            "        this.value = arguments;\n",
+            "    }\n",
+            "}\n",
+        );
+        assert_eq!(
+            emit_javascript_declarations_with_semantics(source),
+            concat!(
+                "declare function free(value: any): void;\n",
+                "declare class Method {\n",
+                "    /** @type object */\n",
+                "    value: object;\n",
+                "    call(): void;\n",
+                "}\n",
+                "declare class Constructed {\n",
+                "    /** @type object */\n",
+                "    value: object;\n",
+                "    constructor();\n",
+                "}\n",
+            )
+        );
+    }
+
+    #[test]
+    fn javascript_explicit_rest_parameters_remain_in_declarations() {
+        let output = emit_javascript_declarations_with_semantics(concat!(
+            "function free(...values) {}\n",
+            "class Example { method(...values) {} constructor(...values) {} }\n",
+        ));
+        assert!(
+            output.contains("declare function free(...values: any[]): void;"),
+            "{output}"
+        );
+        assert!(
+            output.contains("method(...values: any[]): void;"),
+            "{output}"
+        );
+        assert!(
+            output.contains("constructor(...values: any[]);"),
+            "{output}"
+        );
+        assert!(!output.contains("...args"), "{output}");
+    }
+
+    #[test]
+    fn javascript_plain_objects_emit_structural_const_declarations() {
+        assert_eq!(
+            emit_javascript_declarations_with_semantics("const bar = { arguments: {} };"),
+            "declare const bar: {\n    arguments: {};\n};\n"
+        );
+        assert_eq!(
+            emit_javascript_declarations_with_semantics("export const exposed = { value: 1 };"),
+            "export declare const exposed: {\n    value: number;\n};\n"
+        );
+    }
+
+    #[test]
+    fn javascript_jsdoc_template_tags_preserve_generic_function_signatures() {
+        for (source, expected) in [
+            (
+                "/** @template T @param {T} value @returns {T} */\nexport function id(value) { return value; }\n",
+                "/** @template T @param {T} value @returns {T} */\nexport declare function id<T>(value: T): T;\n",
+            ),
+            (
+                concat!(
+                    "/**\n",
+                    " * @template T\n",
+                    " * @param {T} value\n",
+                    " * @returns {T}\n",
+                    " */\n",
+                    "export function id(value) { return value; }\n",
+                ),
+                concat!(
+                    "/**\n",
+                    " * @template T\n",
+                    " * @param {T} value\n",
+                    " * @returns {T}\n",
+                    " */\n",
+                    "export declare function id<T>(value: T): T;\n",
+                ),
+            ),
+        ] {
+            assert_eq!(
+                emit_javascript_declarations_with_semantics(source),
+                expected
+            );
+        }
+    }
+
+    #[test]
     fn javascript_declaration_emit_parses_single_line_jsdoc_callbacks() {
         let source = concat!(
             "/** @callback Handler @param {string} value @returns {number} */\n",
@@ -87622,13 +87792,14 @@ class Board {
             "export const handler = value => value.length;\n",
         );
         let output = emit_javascript_declarations_with_semantics(source);
-        assert!(
-            output.starts_with(concat!(
+        assert_eq!(
+            output,
+            concat!(
                 "export type Handler = (value: string) => number;\n",
                 "/** @callback Handler @param {string} value @returns {number} */\n",
                 "/** @type {Handler} */\n",
-            )),
-            "{output}"
+                "export declare const handler: Handler;\n",
+            )
         );
     }
 
