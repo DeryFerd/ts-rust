@@ -1,6 +1,9 @@
 //! TypeScript-style diagnostic formatting with UTF-16 source coordinates.
 
-use std::fmt::Write as _;
+use std::{
+    fmt::Write as _,
+    path::{Path, PathBuf},
+};
 
 use ts_core::TextRange;
 
@@ -89,7 +92,7 @@ fn format_plain(output: &mut String, diagnostic: &Diagnostic<'_>, options: Forma
     if let Some((file_name, line, column)) = location(diagnostic, options.current_directory) {
         let _ = write!(output, "{file_name}({line},{column}): ");
     }
-    write_message(output, diagnostic, false);
+    write_message(output, diagnostic, false, options.new_line);
     output.push_str(options.new_line);
 }
 
@@ -100,7 +103,7 @@ fn format_pretty(output: &mut String, diagnostic: &Diagnostic<'_>, options: Form
             "{CYAN}{file_name}{RESET}:{YELLOW}{line}{RESET}:{YELLOW}{column}{RESET} - "
         );
     }
-    write_message(output, diagnostic, true);
+    write_message(output, diagnostic, true, options.new_line);
     if let (Some(source), Some(range)) = (diagnostic.source_text, diagnostic.range)
         && diagnostic.code != Some(1490)
     {
@@ -117,7 +120,7 @@ fn format_pretty(output: &mut String, diagnostic: &Diagnostic<'_>, options: Form
     output.push_str(options.new_line);
 }
 
-fn write_message(output: &mut String, diagnostic: &Diagnostic<'_>, color: bool) {
+fn write_message(output: &mut String, diagnostic: &Diagnostic<'_>, color: bool, new_line: &str) {
     if color {
         let _ = write!(
             output,
@@ -138,7 +141,18 @@ fn write_message(output: &mut String, diagnostic: &Diagnostic<'_>, color: bool) 
     } else {
         output.push_str(": ");
     }
-    output.push_str(diagnostic.message);
+    let mut remaining = diagnostic.message;
+    while let Some(index) = remaining.find(['\r', '\n']) {
+        output.push_str(&remaining[..index]);
+        remaining = &remaining[index..];
+        if let Some(tail) = remaining.strip_prefix("\r\n") {
+            remaining = tail;
+        } else {
+            remaining = &remaining[1..];
+        }
+        output.push_str(new_line);
+    }
+    output.push_str(remaining);
 }
 
 fn location(
@@ -159,6 +173,34 @@ fn relative_file_name(file_name: &str, current_directory: &str) -> String {
         && let Some(relative) = relative.strip_prefix(['/', '\\'])
     {
         return relative.to_owned();
+    }
+
+    let file_path = Path::new(file_name);
+    let current_path = Path::new(current_directory);
+    if !file_path.is_absolute() || !current_path.is_absolute() {
+        return file_name.to_owned();
+    }
+
+    let file_components = file_path.components().collect::<Vec<_>>();
+    let current_components = current_path.components().collect::<Vec<_>>();
+    let common = file_components
+        .iter()
+        .zip(&current_components)
+        .take_while(|(file, current)| file == current)
+        .count();
+    if common == 0 {
+        return file_name.to_owned();
+    }
+
+    let mut relative = PathBuf::new();
+    for _ in common..current_components.len() {
+        relative.push("..");
+    }
+    for component in &file_components[common..] {
+        relative.push(component.as_os_str());
+    }
+    if !relative.as_os_str().is_empty() {
+        return relative.to_string_lossy().replace('\\', "/");
     }
     file_name.to_owned()
 }
@@ -288,6 +330,66 @@ mod tests {
     }
 
     #[test]
+    fn formats_absolute_paths_outside_the_current_directory_relatively() {
+        let diagnostic = Diagnostic {
+            file_name: Some("/project/tests/example.ts"),
+            source_text: Some("missing"),
+            range: Some(TextRange::new(TextPos::new(0), TextPos::new(7))),
+            code: Some(2304),
+            category: DiagnosticCategory::Error,
+            message: "Cannot find name 'missing'.",
+        };
+
+        assert_eq!(
+            format_diagnostics(
+                &[diagnostic],
+                FormattingOptions {
+                    current_directory: "/project/crates/compiler",
+                    ..FormattingOptions::default()
+                },
+            ),
+            "../../tests/example.ts(1,1): error TS2304: Cannot find name 'missing'.\n"
+        );
+    }
+
+    #[test]
+    fn preserves_relative_paths_and_converts_root_children() {
+        let diagnostic = Diagnostic {
+            file_name: Some("../tests/example.ts"),
+            source_text: Some("missing"),
+            range: Some(TextRange::new(TextPos::new(0), TextPos::new(7))),
+            code: Some(2304),
+            category: DiagnosticCategory::Error,
+            message: "Cannot find name 'missing'.",
+        };
+        assert_eq!(
+            format_diagnostics(
+                &[diagnostic],
+                FormattingOptions {
+                    current_directory: "/project",
+                    ..FormattingOptions::default()
+                },
+            ),
+            "../tests/example.ts(1,1): error TS2304: Cannot find name 'missing'.\n"
+        );
+
+        let rooted = Diagnostic {
+            file_name: Some("/example.ts"),
+            ..diagnostic
+        };
+        assert_eq!(
+            format_diagnostics(
+                &[rooted],
+                FormattingOptions {
+                    current_directory: "/",
+                    ..FormattingOptions::default()
+                },
+            ),
+            "example.ts(1,1): error TS2304: Cannot find name 'missing'.\n"
+        );
+    }
+
+    #[test]
     fn formats_contextual_diagnostics_and_global_messages() {
         let source = "let answer: string = 42;";
         let diagnostics = [
@@ -321,6 +423,59 @@ mod tests {
         assert!(formatted.contains("~~"));
         assert!(formatted.contains("global warning"));
         assert!(formatted.contains("\u{1b}[91m"));
+    }
+
+    #[test]
+    fn diagnostic_details_use_the_configured_newline() {
+        let diagnostic = Diagnostic {
+            file_name: None,
+            source_text: None,
+            range: None,
+            code: Some(2322),
+            category: DiagnosticCategory::Error,
+            message: "Type mismatch.\n  First detail.\r\n    Second detail.\rThird detail.",
+        };
+
+        assert_eq!(
+            format_diagnostics(
+                &[diagnostic],
+                FormattingOptions {
+                    new_line: "\r\n",
+                    ..FormattingOptions::default()
+                },
+            ),
+            concat!(
+                "error TS2322: Type mismatch.\r\n",
+                "  First detail.\r\n",
+                "    Second detail.\r\n",
+                "Third detail.\r\n",
+            )
+        );
+    }
+
+    #[test]
+    fn preserves_duplicate_diagnostics_and_input_order() {
+        let first = Diagnostic {
+            file_name: None,
+            source_text: None,
+            range: None,
+            code: Some(2300),
+            category: DiagnosticCategory::Error,
+            message: "Duplicate identifier 'value'.",
+        };
+        let second = Diagnostic {
+            message: "Duplicate identifier 'other'.",
+            ..first
+        };
+
+        assert_eq!(
+            format_diagnostics(&[first, second, first], FormattingOptions::default()),
+            concat!(
+                "error TS2300: Duplicate identifier 'value'.\n",
+                "error TS2300: Duplicate identifier 'other'.\n",
+                "error TS2300: Duplicate identifier 'value'.\n",
+            )
+        );
     }
 
     #[test]
@@ -388,6 +543,64 @@ mod tests {
             format_diagnostics(&[last_diagnostic], FormattingOptions::default()),
             "main.ts(5,1): error TS2304: Cannot find name 'last'.\n"
         );
+    }
+
+    #[test]
+    fn pretty_diagnostics_count_surrogate_pairs_and_use_crlf() {
+        let source = "first\r\n😀name\r\n";
+        let start = source.find("name").unwrap();
+        let diagnostic = Diagnostic {
+            file_name: Some("main.ts"),
+            source_text: Some(source),
+            range: Some(TextRange::new(
+                TextPos::new(u32::try_from(start).unwrap()),
+                TextPos::new(u32::try_from(start + "name".len()).unwrap()),
+            )),
+            code: Some(2304),
+            category: DiagnosticCategory::Error,
+            message: "Cannot find name 'name'.\n  Related detail.",
+        };
+        let formatted = format_diagnostics(
+            &[diagnostic],
+            FormattingOptions {
+                new_line: "\r\n",
+                pretty: true,
+                ..FormattingOptions::default()
+            },
+        );
+
+        assert!(formatted.contains("\u{1b}[93m2\u{1b}[0m:\u{1b}[93m3\u{1b}[0m"));
+        assert!(formatted.contains("Cannot find name 'name'.\r\n  Related detail.\r\n\r\n"));
+        assert!(formatted.contains("\u{1b}[7m2\u{1b}[0m 😀name\r\n"));
+        assert!(formatted.contains("\u{1b}[91m  ~~~~\u{1b}[0m\r\n\r\n"));
+        assert!(
+            formatted
+                .as_bytes()
+                .windows(2)
+                .filter(|pair| pair[1] == b'\n')
+                .all(|pair| pair[0] == b'\r')
+        );
+    }
+
+    #[test]
+    fn pretty_diagnostics_mark_both_utf16_units_of_an_astral_character() {
+        let diagnostic = Diagnostic {
+            file_name: Some("main.ts"),
+            source_text: Some("😀value"),
+            range: Some(TextRange::new(TextPos::new(0), TextPos::new(4))),
+            code: Some(1005),
+            category: DiagnosticCategory::Error,
+            message: "Expected token.",
+        };
+        let formatted = format_diagnostics(
+            &[diagnostic],
+            FormattingOptions {
+                pretty: true,
+                ..FormattingOptions::default()
+            },
+        );
+
+        assert!(formatted.contains("\u{1b}[91m~~\u{1b}[0m"));
     }
 
     #[test]
