@@ -29,7 +29,7 @@ use ts_checker::{
 use ts_config::{ConfigDiagnostic, resolve_config_file};
 use ts_core::{TextPos, TextRange};
 use ts_diagnostics::{Category, Diagnostic, FormatError, message_by_code};
-use ts_glob::{DiscoveryOptions, discover_files};
+use ts_glob::{DiscoveryOptions, GlobPattern, discover_files};
 use ts_module::{ResolutionOptions, Resolver, automatic_type_directive_names, parse_package_json};
 use ts_options::{
     CompilerOptions, ModuleDetectionKind, ModuleKind, ModuleResolutionKind, PrinterSettings,
@@ -39,8 +39,8 @@ use ts_parser::{
     ParseResult, parse_javascript_source_file, parse_jsx_source_file, parse_source_file,
 };
 use ts_path::{
-    CaseSensitivity, canonicalize, change_extension, declaration_emit_extension, directory_path,
-    is_absolute, remove_file_extension, resolve_path,
+    CaseSensitivity, FileExtension, canonicalize, change_extension, declaration_emit_extension,
+    directory_path, is_absolute, remove_file_extension, resolve_path,
 };
 use ts_printer::{
     AmdDependency as PrinterAmdDependency, BUNDLE_EXTENDS_HELPER, EmitConstantValue, EmitContext,
@@ -1615,7 +1615,18 @@ impl Program {
             }
         });
         discovery.exclude = config.exclude.unwrap_or_default();
-        let roots = discover_files(file_system, &discovery).unwrap_or_else(|error| {
+        if options_result.options.allow_js {
+            discovery.extensions.extend([
+                FileExtension::Js,
+                FileExtension::Jsx,
+                FileExtension::Mjs,
+                FileExtension::Cjs,
+            ]);
+        }
+        if options_result.options.resolve_json_module {
+            discovery.extensions.push(FileExtension::Json);
+        }
+        let mut roots = discover_files(file_system, &discovery).unwrap_or_else(|error| {
             config_diagnostics.push(ProgramDiagnostic {
                 file_name: Some(config.path.clone()),
                 range: None,
@@ -1626,6 +1637,36 @@ impl Program {
             });
             discovery.files.clone()
         });
+        if options_result.options.resolve_json_module {
+            let case_sensitive = file_system.use_case_sensitive_file_names();
+            let case_sensitivity = if case_sensitive {
+                CaseSensitivity::Sensitive
+            } else {
+                CaseSensitivity::Insensitive
+            };
+            let explicit_files = discovery
+                .files
+                .iter()
+                .map(|file| canonicalize(file, config_directory, case_sensitivity))
+                .collect::<BTreeSet<_>>();
+            let json_patterns = discovery
+                .include
+                .iter()
+                .filter(|include| include.ends_with(".json"))
+                .filter_map(|include| {
+                    GlobPattern::compile(include, config_directory, case_sensitive, false)
+                })
+                .collect::<Vec<_>>();
+            roots.retain(|root| {
+                !root.ends_with(".json")
+                    || explicit_files.contains(&canonicalize(
+                        root,
+                        config_directory,
+                        case_sensitivity,
+                    ))
+                    || json_patterns.iter().any(|pattern| pattern.matches(root))
+            });
+        }
         let mut program = Self::new_with_options(
             file_system,
             config_directory,
@@ -2013,6 +2054,7 @@ impl Program {
                 ) {
                     Ok(mut emitted) => {
                         let file_name = declaration_file_name.to_owned();
+                        emitted.code = remove_unused_named_declaration_imports(&emitted.code);
                         let reference_directives =
                             preserved_reference_directives(source_file, &file_name);
                         if !reference_directives.is_empty() {
@@ -2174,10 +2216,7 @@ impl Program {
             for (source_index, source) in javascript_sources.iter().enumerate() {
                 let map_source_offset = map_builder.as_ref().map(|_| {
                     let offset = u32::try_from(map_sources.len()).unwrap_or(u32::MAX);
-                    map_sources.push(
-                        strip_directory_prefix(&source.file_name, &bundle_root)
-                            .unwrap_or_else(|| source.file_name.clone()),
-                    );
+                    map_sources.push(source.file_name.clone());
                     if self.options.inline_sources {
                         map_sources_content.push(source.source_text.clone());
                     }
@@ -2414,6 +2453,7 @@ impl Program {
             }
             let mut code = String::new();
             if let Some(declaration_file) = paths.declaration.as_deref() {
+                let mut seen_reference_directives = HashSet::new();
                 for source in declaration_sources {
                     let lower = source.file_name.to_ascii_lowercase();
                     if lower.ends_with(".d.ts")
@@ -2425,8 +2465,10 @@ impl Program {
                     for directive in
                         preserved_reference_directives(source, declaration_file).lines()
                     {
-                        code.push_str(directive);
-                        code.push('\n');
+                        if seen_reference_directives.insert(directive.to_owned()) {
+                            code.push_str(directive);
+                            code.push('\n');
+                        }
                     }
                 }
             }
@@ -3084,13 +3126,17 @@ impl Program {
         source: &SourceFile,
         allow_declaration_file: bool,
     ) -> Result<(), CanonicalProgramCheckError> {
-        let plain_typescript = ts_path::script_kind_from_path(&source.file_name)
-            == ts_path::ScriptKind::Ts
+        let plain_typescript = matches!(
+            ts_path::script_kind_from_path(&source.file_name),
+            ts_path::ScriptKind::Ts | ts_path::ScriptKind::Tsx
+        )
             && (allow_declaration_file || !ts_path::is_declaration_file(&source.file_name))
             && Path::new(&source.file_name)
                 .extension()
                 .and_then(|extension| extension.to_str())
-                .is_some_and(|extension| extension.eq_ignore_ascii_case("ts"));
+                .is_some_and(|extension| {
+                    extension.eq_ignore_ascii_case("ts") || extension.eq_ignore_ascii_case("tsx")
+                });
         let esm_emit = matches!(
             self.options.module,
             ModuleKind::Es2015
@@ -3177,6 +3223,12 @@ impl Program {
                     )?,
                 );
             }
+            if bound
+                .source_facts()
+                .is_some_and(CanonicalSourceFileFacts::is_external_or_common_js_module)
+            {
+                diagnostics.extend(self.canonical_commonjs_object_collisions(source)?);
+            }
         }
 
         let ordered_arenas = self
@@ -3206,7 +3258,9 @@ impl Program {
             strict_function_types: self.options.strict_function_types,
             strict_property_initialization: self.options.strict_property_initialization,
             no_implicit_any: self.options.no_implicit_any,
-            no_error_truncation: false,
+            emit_common_js: self.options.module == ModuleKind::CommonJs,
+            no_emit: self.options.no_emit,
+            no_error_truncation: self.options.no_error_truncation,
             name_resolution: (&self.options).into(),
         };
         let module_resolutions = self.canonical_module_resolution_manifest()?;
@@ -3254,6 +3308,88 @@ impl Program {
             );
         }
 
+        Ok(diagnostics)
+    }
+
+    fn canonical_commonjs_object_collisions(
+        &self,
+        source: &SourceFile,
+    ) -> Result<Vec<ProgramDiagnostic>, CanonicalProgramCheckError> {
+        if self.options.module != ModuleKind::CommonJs
+            || self.options.no_emit
+            || ts_path::is_declaration_file(&source.file_name)
+        {
+            return Ok(Vec::new());
+        }
+
+        let Some(NodeData::SourceFile(file)) = source
+            .parse
+            .arena
+            .get(source.parse.source_file)
+            .map(|node| &node.data)
+        else {
+            return Ok(Vec::new());
+        };
+        let mut diagnostics = Vec::new();
+        for statement in &file.statements.nodes {
+            let Some(NodeData::VariableStatement(variable)) =
+                source.parse.arena.get(*statement).map(|node| &node.data)
+            else {
+                continue;
+            };
+            if node_has_modifier(
+                &source.parse.arena,
+                variable.modifiers.as_ref(),
+                SyntaxKind::DeclareKeyword,
+            ) {
+                continue;
+            }
+            let Some(NodeData::VariableDeclarationList(list)) = source
+                .parse
+                .arena
+                .get(variable.declaration_list)
+                .map(|node| &node.data)
+            else {
+                continue;
+            };
+            for declaration in &list.declarations.nodes {
+                let Some(NodeData::VariableDeclaration(declaration)) = source
+                    .parse
+                    .arena
+                    .get(*declaration)
+                    .map(|node| &node.data)
+                else {
+                    continue;
+                };
+                let Some(NodeData::Identifier(identifier)) = source
+                    .parse
+                    .arena
+                    .get(declaration.name)
+                    .map(|node| &node.data)
+                else {
+                    continue;
+                };
+                if identifier.text != "Object" {
+                    continue;
+                }
+                let name = source.node_ref(declaration.name).ok_or_else(|| {
+                    CanonicalProgramCheckError::InvalidDiagnosticNode(NodeRef::new(
+                        source.parse.arena.id(),
+                        source.id,
+                        declaration.name,
+                    ))
+                })?;
+                let message =
+                    message_by_code(2441).expect("TS2441 must be in the generated catalog");
+                let diagnostic = Diagnostic::with_arguments(message, ["Object", "Object"]);
+                diagnostics.push(self.canonical_program_diagnostic(
+                    Some(name),
+                    None,
+                    &diagnostic,
+                    std::iter::empty(),
+                )?);
+            }
+        }
         Ok(diagnostics)
     }
 
@@ -3963,7 +4099,10 @@ fn canonical_source_file_facts(
     options: &CompilerOptions,
 ) -> Result<CanonicalSourceFileFacts, CanonicalProgramCheckError> {
     let script_kind = ts_path::script_kind_from_path(&source.file_name);
-    if script_kind != ts_path::ScriptKind::Ts {
+    if !matches!(
+        script_kind,
+        ts_path::ScriptKind::Ts | ts_path::ScriptKind::Tsx
+    ) {
         return Err(CanonicalProgramCheckError::UnsupportedSourceKind {
             file_name: source.file_name.clone(),
             script_kind,
@@ -8413,7 +8552,7 @@ mod tests {
         let fs = MemoryFileSystem::new(true);
         fs.write_file("/project/first.ts", r#"const first: number = "wrong";"#)
             .unwrap();
-        fs.write_file("/project/later.ts", "function later() {}")
+        fs.write_file("/project/later.ts", "class Later { method() {} }")
             .unwrap();
 
         let error = Program::try_new_with_canonical_checker(
@@ -8467,12 +8606,15 @@ mod tests {
     }
 
     #[test]
-    fn canonical_program_rejects_tsx_until_source_kind_facts_are_retained() {
+    fn canonical_program_checks_typescript_syntax_in_tsx_files() {
         let fs = MemoryFileSystem::new(true);
-        fs.write_file("/project/component.tsx", "const value: number = 1;")
-            .unwrap();
+        fs.write_file(
+            "/project/component.tsx",
+            "const value: number = 'wrong';",
+        )
+        .unwrap();
 
-        let error = Program::try_new_with_canonical_checker(
+        let program = Program::try_new_with_canonical_checker(
             &fs,
             "/project",
             &["component.tsx".to_owned()],
@@ -8481,14 +8623,12 @@ mod tests {
                 ..CompilerOptions::default()
             },
         )
-        .unwrap_err();
-        assert!(matches!(
-            error,
-            CanonicalProgramCheckError::UnsupportedSourceKind {
-                file_name,
-                script_kind: ts_path::ScriptKind::Tsx,
-            } if file_name == "/project/component.tsx"
-        ));
+        .unwrap();
+        let [diagnostic] = program.diagnostics() else {
+            panic!("expected one TSX semantic diagnostic: {:?}", program.diagnostics());
+        };
+        assert_eq!(diagnostic.file_name.as_deref(), Some("/project/component.tsx"));
+        assert_eq!(diagnostic.code, Some(2322));
     }
 
     #[test]
@@ -9574,7 +9714,11 @@ mod tests {
         let directive = "/// <reference path=\"declFile.d.ts\" preserve=\"true\" />";
         assert_eq!(declaration.text.matches(directive).count(), 1);
         assert!(declaration.text.starts_with(directive));
-        assert!(declaration.text.contains("declare var value: M.C;"));
+        assert!(
+            declaration.text.contains("declare var value: M.C;"),
+            "{}",
+            declaration.text
+        );
         assert!(!declaration.text.contains("declare namespace M"));
     }
 
